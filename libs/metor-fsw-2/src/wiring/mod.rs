@@ -99,7 +99,7 @@ pub use crate::register_system;
 /// not the params struct.
 pub(crate) const SYSTEM_RESERVED: &[&str] = &["type", "artifact", "process"];
 /// Line-property keys of a slot `allow` node that belong to the wiring surface.
-pub(crate) const ALLOW_RESERVED: &[&str] = &["occupant"];
+pub(crate) const ALLOW_RESERVED: &[&str] = &["occupant", "artifact"];
 
 // ---------------------------------------------------------------------------
 // The registry
@@ -424,10 +424,13 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
     // step position, after every producer and before telemetry. Only the
     // static branch defers; dl systems never carry capabilities.
     let mut deferred: Vec<&SystemSpec> = Vec::new();
+    let mut packs = PackCache::default();
     for spec in &wiring.systems {
         let (handle, desc) = match (&spec.artifact, spec.process) {
             (Some(artifact_id), true) => resolve_proc(spec, artifact_id, wiring, &mut builder)?,
-            (Some(artifact_id), false) => resolve_dl(spec, artifact_id, wiring, &mut builder)?,
+            (Some(artifact_id), false) => {
+                resolve_dl(spec, artifact_id, wiring, &mut packs, &mut builder)?
+            }
             (None, true) => {
                 // The KDL front-end rejects this at parse; a builder-origin
                 // spec lands here.
@@ -461,7 +464,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
     // --- Slots pass: a slot `connect`s by name like a system, so it joins
     //     `instances` before the edges pass.
     for slot in &wiring.slots {
-        let (handle, desc) = resolve_slot(slot, wiring, &mut builder)?;
+        let (handle, desc) = resolve_slot(slot, wiring, &mut packs, &mut builder)?;
         if instances
             .insert(slot.name.clone(), Instance { handle, desc })
             .is_some()
@@ -601,35 +604,81 @@ fn resolve_static(
     })
 }
 
-/// The one artifact-open pipeline [`resolve_dl`] and [`resolve_slot`] share:
-/// find the [`Artifact`] by id, require a built `path`, open it with
-/// [`DlSystem::open`], and resolve its [`ParamSource`] to canonical postcard
-/// bytes. `Kdl` text is schema-encoded against the artifact's exported
-/// `Params` schema (the host never links the type), producing the same bytes
-/// a typed builder's `Postcard` source carries. `owner` names the owning
-/// `system` or `slot` instance for diagnostics; `reserved` and `skip_args`
-/// describe the carried node's wiring surface.
-#[allow(clippy::too_many_arguments)]
-fn open_occupant<'w>(
-    wiring: &'w Wiring,
-    artifact_id: &str,
+/// The per-resolve cache of opened packs, keyed by artifact id, so an
+/// artifact serving several systems or occupants is opened (and its pack
+/// constructed) exactly once.
+#[derive(Default)]
+struct PackCache {
+    packs: HashMap<String, crate::dl::DlPack>,
+}
+
+impl PackCache {
+    /// The opened pack for `artifact_id`, opening it on first use.
+    fn open(
+        &mut self,
+        wiring: &Wiring,
+        artifact_id: &str,
+        owner: &str,
+        src: &str,
+        span: SourceSpan,
+    ) -> Result<&crate::dl::DlPack, LoadError> {
+        if !self.packs.contains_key(artifact_id) {
+            let artifact = find_built_artifact(wiring, artifact_id, owner, src, span)?;
+            let path = artifact.path.as_ref().expect("checked by find_built_artifact");
+            let pack = crate::dl::DlPack::open(path).map_err(|source| LoadError::DlOpen {
+                system: owner.to_string(),
+                artifact: artifact_id.to_string(),
+                source: Box::new(source),
+                src: src.to_string(),
+                span,
+            })?;
+            self.packs.insert(artifact_id.to_string(), pack);
+        }
+        Ok(&self.packs[artifact_id])
+    }
+}
+
+/// Select `entry` from an opened pack, or its sole entry when the spec named
+/// none. A multi-entry pack with no `type=` is a clean error listing the
+/// choices.
+fn select_entry(
+    pack: &crate::dl::DlPack,
+    entry: Option<&str>,
     owner: &str,
-    params: &ParamSource,
-    reserved: &'static [&'static str],
-    skip_args: usize,
+    artifact_id: &str,
     src: &str,
     span: SourceSpan,
-) -> Result<(DlSystem, Vec<u8>, &'w Artifact), LoadError> {
-    let artifact = find_built_artifact(wiring, artifact_id, owner, src, span)?;
-    let path = artifact.path.as_ref().expect("checked by find_built_artifact");
-    let loaded = DlSystem::open(path).map_err(|source| LoadError::DlOpen {
+) -> Result<DlSystem, LoadError> {
+    let name = match entry {
+        Some(name) => name,
+        None => pack.sole_system().ok_or_else(|| LoadError::PackTypeRequired {
+            system: owner.to_string(),
+            artifact: artifact_id.to_string(),
+            available: pack.system_names().collect::<Vec<_>>().join(", "),
+            src: src.to_string(),
+            span,
+        })?,
+    };
+    pack.system(name).map_err(|source| LoadError::PackSystem {
         system: owner.to_string(),
-        artifact: artifact_id.to_string(),
         source: Box::new(source),
         src: src.to_string(),
         span,
-    })?;
-    let params: Vec<u8> = match params {
+    })
+}
+
+/// Resolve a [`ParamSource`] to canonical postcard bytes against a loaded
+/// entry's exported `Params` schema. `Kdl` text is schema-encoded (the host
+/// never links the type), producing the same bytes a typed builder's
+/// `Postcard` source carries.
+fn encode_occupant_params(
+    loaded: &DlSystem,
+    params: &ParamSource,
+    owner: &str,
+    reserved: &'static [&'static str],
+    skip_args: usize,
+) -> Result<Vec<u8>, LoadError> {
+    Ok(match params {
         ParamSource::None => Vec::new(),
         ParamSource::Postcard(bytes) => bytes.clone(),
         ParamSource::Kdl(node_text) => encode_kdl_params(
@@ -639,45 +688,25 @@ fn open_occupant<'w>(
             reserved,
             skip_args,
         )?,
-    };
-    Ok((loaded, params, artifact))
+    })
 }
 
-/// Load a dl system through [`open_occupant`] and register it via
-/// [`CoordinatorBuilder::add_dl_cyclic`]. The artifact is opened once and
-/// reused for both the params encode and the registered system, and the
-/// reconstructed descriptor is returned for edge validation.
+/// Load a pack entry and register it via
+/// [`CoordinatorBuilder::add_dl_cyclic`]. The artifact is opened once per
+/// resolve (the cache) and the reconstructed descriptor is returned for edge
+/// validation.
 fn resolve_dl(
     spec: &SystemSpec,
     artifact_id: &str,
     wiring: &Wiring,
+    packs: &mut PackCache,
     builder: &mut CoordinatorBuilder,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     let src = system_src(spec);
     let span: SourceSpan = (0, src.len()).into();
-    let (loaded, params, artifact) = open_occupant(
-        wiring,
-        artifact_id,
-        &spec.name,
-        &spec.params,
-        SYSTEM_RESERVED,
-        1,
-        &src,
-        span,
-    )?;
-    // `type=` is optional on a dl system since the artifact's `system_type`
-    // is authoritative, but when given it must agree.
-    if let Some(ty) = &spec.ty
-        && ty != &artifact.system_type
-    {
-        return Err(LoadError::TypeMismatchesArtifact {
-            system: spec.name.clone(),
-            ty: ty.clone(),
-            artifact_type: artifact.system_type.clone(),
-            src: src.clone(),
-            span,
-        });
-    }
+    let pack = packs.open(wiring, artifact_id, &spec.name, &src, span)?;
+    let loaded = select_entry(pack, spec.ty.as_deref(), &spec.name, artifact_id, &src, span)?;
+    let params = encode_occupant_params(&loaded, &spec.params, &spec.name, SYSTEM_RESERVED, 1)?;
     let desc = loaded.descriptor().clone();
     let handle = builder.add_dl_cyclic(&spec.name, loaded, params);
     Ok((handle, desc))
@@ -728,18 +757,6 @@ fn resolve_proc(
     let src = system_src(spec);
     let span: SourceSpan = (0, src.len()).into();
     let artifact = find_built_artifact(wiring, artifact_id, &spec.name, &src, span)?;
-    // `type=` agreement, as in `resolve_dl`.
-    if let Some(ty) = &spec.ty
-        && ty != &artifact.system_type
-    {
-        return Err(LoadError::TypeMismatchesArtifact {
-            system: spec.name.clone(),
-            ty: ty.clone(),
-            artifact_type: artifact.system_type.clone(),
-            src: src.clone(),
-            span,
-        });
-    }
     let path = artifact.path.as_ref().expect("checked by find_built_artifact");
     let proc_describe = |detail: String| LoadError::ProcDescribe {
         system: spec.name.clone(),
@@ -750,17 +767,63 @@ fn resolve_proc(
     };
     let bytes = crate::proc::host::describe_via_worker(None, path)
         .map_err(|e| proc_describe(e.to_string()))?;
-    let (desc, params_schema) =
-        crate::dl::decode_descriptor_msg(&bytes).map_err(|e| proc_describe(e.to_string()))?;
+    let entries: Vec<crate::dl::PackEntryMeta> =
+        crate::dl::decode_pack_manifest(&bytes).map_err(|e| proc_describe(e.to_string()))?;
+    let meta = select_proc_entry(&entries, spec.ty.as_deref(), &spec.name, artifact_id, &src, span)?;
     let params: Vec<u8> = match &spec.params {
         ParamSource::None => Vec::new(),
         ParamSource::Postcard(bytes) => bytes.clone(),
         ParamSource::Kdl(node_text) => {
-            encode_kdl_params(node_text, &params_schema, &spec.name, SYSTEM_RESERVED, 1)?
+            encode_kdl_params(node_text, &meta.params_schema, &spec.name, SYSTEM_RESERVED, 1)?
         }
     };
-    let handle = builder.add_proc_cyclic(&spec.name, desc.clone(), path.clone(), params);
+    let desc = meta.descriptor.clone();
+    let entry_name = desc.name.to_string();
+    let handle = builder.add_proc_cyclic(&spec.name, desc.clone(), path.clone(), entry_name, params);
     Ok((handle, desc))
+}
+
+/// The manifest twin of [`select_entry`], over describe-worker entry
+/// metadata rather than an opened pack.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn select_proc_entry<'e>(
+    entries: &'e [crate::dl::PackEntryMeta],
+    entry: Option<&str>,
+    owner: &str,
+    artifact_id: &str,
+    src: &str,
+    span: SourceSpan,
+) -> Result<&'e crate::dl::PackEntryMeta, LoadError> {
+    let available = || {
+        entries
+            .iter()
+            .map(|e| e.descriptor.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    match entry {
+        Some(name) => entries
+            .iter()
+            .find(|e| e.descriptor.name == name)
+            .ok_or_else(|| LoadError::PackSystem {
+                system: owner.to_string(),
+                source: Box::new(crate::dl::DlError::UnknownPackSystem {
+                    name: name.to_string(),
+                    available: available(),
+                }),
+                src: src.to_string(),
+                span,
+            }),
+        None => match entries {
+            [only] => Ok(only),
+            _ => Err(LoadError::PackTypeRequired {
+                system: owner.to_string(),
+                artifact: artifact_id.to_string(),
+                available: available().join(", "),
+                src: src.to_string(),
+                span,
+            }),
+        },
+    }
 }
 
 /// Without a cross-process futex there is no worker to describe or run.
@@ -803,9 +866,43 @@ fn slot_src(slot: &SlotSpec) -> String {
 /// builder after [`CoordinatorBuilder::add_slot`], not a raw occupant
 /// descriptor, and the declared `input`/`output` contract is validated
 /// against it.
+/// The artifact whose pack exports `occ.occupant`: the `artifact=` the allow
+/// line named, or (absent one) the unique artifact exporting an entry of
+/// that name. No match or more than one is a clean error either way.
+fn occupant_artifact(
+    wiring: &Wiring,
+    packs: &mut PackCache,
+    occ: &AllowedOccupantSpec,
+    slot: &str,
+    src: &str,
+    span: SourceSpan,
+) -> Result<String, LoadError> {
+    if let Some(artifact) = &occ.artifact {
+        return Ok(artifact.clone());
+    }
+    let mut matches: Vec<String> = Vec::new();
+    for artifact in &wiring.artifacts {
+        let pack = packs.open(wiring, &artifact.id, slot, src, span)?;
+        if pack.system_names().any(|n| n == occ.occupant) {
+            matches.push(artifact.id.clone());
+        }
+    }
+    match matches.as_slice() {
+        [only] => Ok(only.clone()),
+        _ => Err(LoadError::OccupantAmbiguous {
+            slot: slot.to_string(),
+            occupant: occ.occupant.clone(),
+            matches,
+            src: src.to_string(),
+            span,
+        }),
+    }
+}
+
 fn resolve_slot(
     slot: &SlotSpec,
     wiring: &Wiring,
+    packs: &mut PackCache,
     builder: &mut CoordinatorBuilder,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     let src = slot_src(slot);
@@ -852,16 +949,21 @@ fn resolve_slot(
     } else {
         let mut allowed = Vec::with_capacity(slot.allow.len());
         for occ in &slot.allow {
-            let (loaded, params, _) = open_occupant(
-                wiring,
-                &occ.occupant,
-                &slot.name,
-                &occ.params,
-                ALLOW_RESERVED,
-                0,
-                &src,
-                span,
-            )?;
+            let artifact_id =
+                occupant_artifact(wiring, packs, occ, &slot.name, &src, span)?;
+            let pack = packs.open(wiring, &artifact_id, &slot.name, &src, span)?;
+            let loaded =
+                select_entry(pack, Some(&occ.occupant), &slot.name, &artifact_id, &src, span)?;
+            if !loaded.reloadable() {
+                return Err(LoadError::OccupantNotReloadable {
+                    slot: slot.name.clone(),
+                    occupant: occ.occupant.clone(),
+                    src: src.clone(),
+                    span,
+                });
+            }
+            let params =
+                encode_occupant_params(&loaded, &occ.params, &slot.name, ALLOW_RESERVED, 0)?;
             allowed.push(AllowedOccupant::dl(occ.occupant.clone(), loaded, params));
         }
         allowed
@@ -967,32 +1069,99 @@ fn describe_occupants(
     src: &str,
     span: SourceSpan,
 ) -> Result<Vec<AllowedOccupant>, LoadError> {
-    let mut allowed = Vec::with_capacity(slot.allow.len());
-    for occ in &slot.allow {
-        let artifact = find_built_artifact(wiring, &occ.occupant, &slot.name, src, span)?;
+    // Manifests by artifact id, so a slot allowing several entries of one
+    // pack runs one describe worker for it, not one per occupant.
+    let mut manifests: HashMap<String, Vec<crate::dl::PackEntryMeta>> = HashMap::new();
+    fn describe(
+        manifests: &mut HashMap<String, Vec<crate::dl::PackEntryMeta>>,
+        wiring: &Wiring,
+        slot: &SlotSpec,
+        artifact_id: &str,
+        src: &str,
+        span: SourceSpan,
+    ) -> Result<(), LoadError> {
+        if manifests.contains_key(artifact_id) {
+            return Ok(());
+        }
+        let artifact = find_built_artifact(wiring, artifact_id, &slot.name, src, span)?;
         let path = artifact.path.as_ref().expect("checked by find_built_artifact");
         let proc_describe = |detail: String| LoadError::ProcDescribe {
             system: slot.name.clone(),
-            artifact: occ.occupant.clone(),
+            artifact: artifact_id.to_string(),
             detail,
             src: src.to_string(),
             span,
         };
         let bytes = crate::proc::host::describe_via_worker(None, path)
             .map_err(|e| proc_describe(e.to_string()))?;
-        let (descriptor, params_schema) =
-            crate::dl::decode_descriptor_msg(&bytes).map_err(|e| proc_describe(e.to_string()))?;
+        let entries =
+            crate::dl::decode_pack_manifest(&bytes).map_err(|e| proc_describe(e.to_string()))?;
+        manifests.insert(artifact_id.to_string(), entries);
+        Ok(())
+    }
+
+    let mut allowed = Vec::with_capacity(slot.allow.len());
+    for occ in &slot.allow {
+        // The occupant's artifact: named, or the unique artifact whose
+        // manifest exports the entry (each described through a worker; the
+        // host never dlopens a process slot's artifacts).
+        let artifact_id = match &occ.artifact {
+            Some(id) => id.clone(),
+            None => {
+                for artifact in &wiring.artifacts {
+                    describe(&mut manifests, wiring, slot, &artifact.id, src, span)?;
+                }
+                let matches: Vec<String> = manifests
+                    .iter()
+                    .filter(|(_, entries)| {
+                        entries.iter().any(|e| e.descriptor.name == occ.occupant)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                match matches.as_slice() {
+                    [only] => only.clone(),
+                    _ => {
+                        return Err(LoadError::OccupantAmbiguous {
+                            slot: slot.name.clone(),
+                            occupant: occ.occupant.clone(),
+                            matches,
+                            src: src.to_string(),
+                            span,
+                        });
+                    }
+                }
+            }
+        };
+        describe(&mut manifests, wiring, slot, &artifact_id, src, span)?;
+        let meta = select_proc_entry(
+            &manifests[&artifact_id],
+            Some(&occ.occupant),
+            &slot.name,
+            &artifact_id,
+            src,
+            span,
+        )?;
+        if !meta.reloadable {
+            return Err(LoadError::OccupantNotReloadable {
+                slot: slot.name.clone(),
+                occupant: occ.occupant.clone(),
+                src: src.to_string(),
+                span,
+            });
+        }
         let params: Vec<u8> = match &occ.params {
             ParamSource::None => Vec::new(),
             ParamSource::Postcard(bytes) => bytes.clone(),
             ParamSource::Kdl(node_text) => {
-                encode_kdl_params(node_text, &params_schema, &slot.name, ALLOW_RESERVED, 0)?
+                encode_kdl_params(node_text, &meta.params_schema, &slot.name, ALLOW_RESERVED, 0)?
             }
         };
+        let artifact = find_built_artifact(wiring, &artifact_id, &slot.name, src, span)?;
+        let path = artifact.path.as_ref().expect("checked by find_built_artifact");
         allowed.push(AllowedOccupant {
             name: occ.occupant.clone(),
             params,
-            descriptor,
+            descriptor: meta.descriptor.clone(),
             backing: OccupantBacking::Artifact(path.clone()),
         });
     }

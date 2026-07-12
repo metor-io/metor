@@ -5,7 +5,7 @@ version.workspace = true
 repository.workspace = true
 edition = "2024"
 publish = false
-description = "A slots/sequences integration-test fixture: one #[sequence] occupant exported as a cdylib"
+description = "A slots/sequences integration-test fixture: one sequence body exported as a two-entry pack cdylib"
 
 # A real loadable shared object: the `slot_integration` test `dlopen`s the produced
 # `lib*.dylib`/`lib*.so` and drives it through a runtime slot.

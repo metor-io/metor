@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 publish = false
-description = "The ADCS safe-mode sequence of the adcs-fsw2 mission, as a #[sequence] cdylib slot occupant"
+description = "The ADCS safe-mode sequence of the adcs-fsw2 mission, as a sequence-pack cdylib slot occupant"
 
 # A loadable shared object only (a sequence occupant; see adcs-commissioning's note — no
 # static-parity rlib, hence no `export` feature).

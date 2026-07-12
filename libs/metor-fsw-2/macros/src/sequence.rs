@@ -303,94 +303,9 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // ---- The C-ABI exports. Gated on `not(test)` so an in-crate macro test
-    // can coexist with another crate-unique `fsw_*` export; a real shared
-    // object builds without `--test`. Each item carries its own clippy allow
-    // (raw-pointer parameters are the ABI contract), so consuming crates need
-    // no crate-level allow.
-    let exports = quote! {
-        /// The ABI word the host checks for equality before any other call.
-        #[cfg(not(test))]
-        #[unsafe(no_mangle)]
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn fsw_abi_version() -> u32 {
-            #fsw2::abi::FSW_ABI_VERSION
-        }
-
-        /// Serialize this sequence's descriptor (postcard) to the host sink.
-        #[cfg(not(test))]
-        #[unsafe(no_mangle)]
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn fsw_describe(
-            sink: #fsw2::abi::ByteSink,
-            ctx: *mut ::core::ffi::c_void,
-        ) -> i32 {
-            // SAFETY: the host supplies a valid sink/ctx pair.
-            unsafe { #fsw2::abi::run_seq_describe::<#wrapper>(sink, ctx) }
-        }
-
-        /// Decode the postcard `Params` blob and box the (unbound) sequence state.
-        #[cfg(not(test))]
-        #[unsafe(no_mangle)]
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn fsw_create(
-            params: *const u8,
-            params_len: usize,
-        ) -> *mut ::core::ffi::c_void {
-            // SAFETY: `params`/`params_len` name a readable byte range (or null/0).
-            unsafe { #fsw2::abi::run_seq_create::<#wrapper>(params, params_len) }
-        }
-
-        /// Bind the ports off the host's ring handles and build the future.
-        #[cfg(not(test))]
-        #[unsafe(no_mangle)]
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn fsw_bind_init(
-            state: *mut ::core::ffi::c_void,
-            inputs: *const #fsw2::abi::FswRing,
-            n_in: usize,
-            outputs: *const #fsw2::abi::FswRing,
-            n_out: usize,
-        ) {
-            // SAFETY: `state` is from `fsw_create`; the handles name live regions.
-            unsafe { #fsw2::abi::run_seq_bind_init::<#wrapper>(state, inputs, n_in, outputs, n_out) }
-        }
-
-        /// Poll the future once, returning an `FswStatus` (`Done` when terminal).
-        #[cfg(not(test))]
-        #[unsafe(no_mangle)]
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn fsw_execute(
-            state: *mut ::core::ffi::c_void,
-            now: u64,
-        ) -> #fsw2::abi::FswStatus {
-            // SAFETY: `state` is a live pointer from `fsw_create`.
-            unsafe { #fsw2::abi::run_seq_execute::<#wrapper>(state, now) }
-        }
-
-        /// No-op for sequences; the symbol exists so every export set is uniform.
-        #[cfg(not(test))]
-        #[unsafe(no_mangle)]
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn fsw_shutdown(state: *mut ::core::ffi::c_void) {
-            // SAFETY: `state` is a live pointer from `fsw_create`.
-            unsafe { #fsw2::abi::run_seq_shutdown::<#wrapper>(state) }
-        }
-
-        /// Drop the boxed sequence state inside this shared object.
-        #[cfg(not(test))]
-        #[unsafe(no_mangle)]
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
-        pub extern "C" fn fsw_destroy(state: *mut ::core::ffi::c_void) {
-            // SAFETY: `state` is from `fsw_create`, transferred here exactly once.
-            unsafe { #fsw2::abi::run_seq_destroy::<#wrapper>(state) }
-        }
-    };
-
     quote! {
         #func
         #impl_block
-        #exports
     }
     .into()
 }

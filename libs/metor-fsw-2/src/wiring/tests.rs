@@ -1001,7 +1001,7 @@ fn err_lib_on_system_is_a_rename_guidance_error() {
     // `lib=` for the stem).
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
 system "plant" type="Plant" lib="plant"
 "#;
     let err = load_err(kdl);
@@ -1023,7 +1023,7 @@ fn type_is_optional_when_artifact_is_given() {
     // authoritative and filled at resolve. A static system still requires it.
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
 system "plant" artifact="plant"
 "#;
     let wiring = parse(kdl).expect("type= is optional with artifact=");
@@ -1123,7 +1123,7 @@ fn dl_kdl_params_are_carried_as_kdl_source() {
     // for the resolve-time schema-guided encoder.
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
 system "plant" type="Plant" artifact="plant" gain=5.0
 "#;
     let wiring = parse(kdl).expect("KDL params on a dl system parse");
@@ -1137,7 +1137,7 @@ system "plant" type="Plant" artifact="plant" gain=5.0
 fn dl_system_in_kdl_parses_into_an_artifact_ref() {
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
 system "plant" type="Plant" artifact="plant"
 "#;
     let wiring = parse(kdl).expect("parse a dl system + artifact");
@@ -1150,7 +1150,6 @@ system "plant" type="Plant" artifact="plant"
         wiring.artifacts[0].cdylib,
         super::cdylib_file_name("adcs_plant")
     );
-    assert_eq!(wiring.artifacts[0].system_type, "Plant");
     assert_eq!(wiring.systems.len(), 1);
     assert_eq!(wiring.systems[0].artifact.as_deref(), Some("plant"));
     assert_eq!(
@@ -1170,8 +1169,8 @@ system "plant" type="Plant" artifact="plant"
 fn slot_node_round_trips_to_slot_spec() {
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "commissioning" crate="adcs-seqs" lib="adcs_commissioning" type="commissioning"
-artifact "safe_mode"     crate="adcs-seqs" lib="adcs_safe_mode"     type="safe_mode"
+artifact "commissioning" crate="adcs-seqs" lib="adcs_commissioning"
+artifact "safe_mode"     crate="adcs-seqs" lib="adcs_safe_mode"
 
 slot "adcs" {
     input  frame="sensors"
@@ -1276,12 +1275,7 @@ fn slot_builder_mirrors_kdl() {
     // The Rust front-end expresses the same slot the KDL `slot` node does.
     let wiring = WiringBuilder::new()
         .coordinator(100.0, ClockSpec::Wall)
-        .artifact(
-            "commissioning",
-            "adcs-seqs",
-            "adcs_commissioning",
-            "commissioning",
-        )
+        .artifact("commissioning", "adcs-seqs", "adcs_commissioning")
         .slot("adcs")
         .input("sensors")
         .output("mode")
@@ -1349,7 +1343,7 @@ fn err_unknown_initial_occupant() {
     // opened.
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "waiter" crate="seqs" lib="seq_waiter" type="waiter"
+artifact "waiter" crate="seqs" lib="seq_waiter"
 slot "adcs" {
     allow occupant="waiter"
     initial occupant="waiterr" state="running"
@@ -1748,7 +1742,7 @@ impl BuildSystem for CmdSinkInert {
 fn process_flag_parses_and_matches_builder() {
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
 system "plant" artifact="plant" process=#true
 system "obs" artifact="plant"
 "#;
@@ -1758,7 +1752,7 @@ system "obs" artifact="plant"
 
     let built = WiringBuilder::new()
         .coordinator(100.0, ClockSpec::Wall)
-        .artifact("plant", "adcs-plant", "adcs_plant", "Plant")
+        .artifact("plant", "adcs-plant", "adcs_plant")
         .system("plant")
         .from_artifact("plant")
         .process()
@@ -1810,7 +1804,7 @@ system "nav" type="Nav" process=#true
 fn slot_process_flag_parses_and_matches_builder() {
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "waiter" crate="seq-fixture" lib="seq_fixture" type="waiter"
+artifact "waiter" crate="seq-fixture" lib="seq_fixture"
 slot "adcs" process=#true {
     allow occupant="waiter"
 }
@@ -1824,7 +1818,7 @@ slot "bare" {
 
     let built = WiringBuilder::new()
         .coordinator(100.0, ClockSpec::Wall)
-        .artifact("waiter", "seq-fixture", "seq_fixture", "waiter")
+        .artifact("waiter", "seq-fixture", "seq_fixture")
         .slot("adcs")
         .process()
         .allow("waiter")

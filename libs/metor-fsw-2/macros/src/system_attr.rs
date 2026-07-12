@@ -42,26 +42,9 @@ use crate::sig;
 // Attribute arguments
 // ---------------------------------------------------------------------------
 
-/// Controls when the generated C-ABI entry points are compiled. Bare
-/// `export` gates them on `not(test)`; `export = "feat"` additionally
-/// requires that cargo feature.
-enum Export {
-    Bare(Span),
-    Feature(String, Span),
-}
-
-impl Export {
-    fn span(&self) -> Span {
-        match self {
-            Export::Bare(s) | Export::Feature(_, s) => *s,
-        }
-    }
-}
-
 #[derive(Default)]
 struct Args {
     name: Option<String>,
-    export: Option<Export>,
 }
 
 fn parse_args(attr: TokenStream) -> Result<Args, syn::Error> {
@@ -85,29 +68,14 @@ fn parse_args(attr: TokenStream) -> Result<Args, syn::Error> {
                     ));
                 }
             }
-            Meta::Path(p) if p.is_ident("export") => {
-                args.export = Some(Export::Bare(p.span()));
-            }
-            Meta::NameValue(nv) if nv.path.is_ident("export") => {
-                if let Expr::Lit(ExprLit {
-                    lit: Lit::Str(s), ..
-                }) = &nv.value
-                {
-                    args.export = Some(Export::Feature(s.value(), nv.span()));
-                } else {
-                    return Err(syn::Error::new_spanned(
-                        &nv.value,
-                        "`export` takes a cargo feature name: `export = \"export\"` (or bare `export`)",
-                    ));
-                }
-            }
             other => {
                 let name = other.path().to_token_stream().to_string();
                 return Err(syn::Error::new_spanned(
                     other,
                     format!(
-                        "unknown #[system] argument `{name}`; expected `name = \"…\"`, \
-                         `export`, `export = \"feature\"`"
+                        "unknown #[system] argument `{name}`; expected `name = \"…\"` \
+                         (a system reaches a cdylib through its crate's pack — \
+                         `Pack::system_type` + `export_pack!` — not a per-system export)"
                     ),
                 ));
             }
@@ -529,16 +497,6 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         }
     }
 
-    if let Some(export) = &args.export
-        && !is_cyclic
-    {
-        errors.push(syn::Error::new(
-            export.span(),
-            "`export` needs a cyclic system (`fn execute`): the dl ABI's `fsw_execute` \
-             drives one step per call and cannot host an `async fn run` loop",
-        ));
-    }
-
     if !errors.is_empty() {
         return Err(combined(errors));
     }
@@ -697,25 +655,12 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         }
     };
 
-    let exports = match &args.export {
-        None => quote!(),
-        Some(Export::Bare(_)) => {
-            let gate = quote! { #[cfg(not(test))] };
-            crate::export::export_items(&self_ty.to_token_stream(), &fsw2, Some(gate))
-        }
-        Some(Export::Feature(feat, _)) => {
-            let gate = quote! { #[cfg(all(feature = #feat, not(test)))] };
-            crate::export::export_items(&self_ty.to_token_stream(), &fsw2, Some(gate))
-        }
-    };
-
     Ok(quote! {
         #imp
         #bundles
         #system_impl
         #leaf_impl
         #build_impl
-        #exports
     })
 }
 

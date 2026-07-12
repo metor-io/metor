@@ -59,15 +59,15 @@ to drop to a nadir-pointing safe state).
 | Crate | Path | Role |
 |---|---|---|
 | `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / gps / body / world / attitude_estimate / mode_cmd / torque_cmd / mtq_cmd / wheels / disturb), the per-system `Params`, and only the physics **both sides** rely on — orbital constants + inertia, the actuator envelope (wheel torque/momentum limits, torquer dipole limit), the WMM magnetic-field + sun-direction models (the plant's truth *and* nav's references), the Nadir/HIL pointing laws, and the desat/detumble magnetorquer laws. Linked by the cdylibs (and the test), **not** by the host. |
-| `adcs-plant` | `systems/plant/` | The orbiting rigid-body plant and **its** physics: the wheel dynamics (`WheelDynamics` over the shared telemetry struct — bearing friction, saturation foldback), the disturbance-torque model, the GPS/magnetometer error models, magnetorquers, and the sensor suite. A `cdylib` ending in `export_system!(PlantSystem)`. |
+| `adcs-plant` | `systems/plant/` | The orbiting rigid-body plant and **its** physics: the wheel dynamics (`WheelDynamics` over the shared telemetry struct — bearing friction, saturation foldback), the disturbance-torque model, the GPS/magnetometer error models, magnetorquers, and the sensor suite. A `cdylib` exporting a one-entry pack (`export_pack!` over `pack()`). |
 | `adcs-nav` | `systems/nav/` | The MEKF filter cdylib: reconstructs the sun vector from the raw CSS readings (`sun_from_css`), models its own sun/WMM-mag references at the GPS position, and runs magnetometer-only through eclipses. |
 | `adcs-ctrl` | `systems/ctrl/` | The Yang-LQR + magnetorquer-law controller cdylib (selects the pointing-law target from `ModeCmd`, desaturates the wheels through the torquers). |
-| `adcs-commissioning` / `adcs-safe-mode` | `systems/commissioning/`, `systems/safe-mode/` | The `#[sequence]` occupants of the `mode` slot: the condition-based commissioning ladder (params on the `allow` line) and the one-shot safing drop. |
+| `adcs-commissioning` / `adcs-safe-mode` | `systems/commissioning/`, `systems/safe-mode/` | The async-fn sequence occupants of the `mode` slot (each a one-entry pack cdylib): the condition-based commissioning ladder (params on the `allow` line) and the one-shot safing drop. |
 | `adcs-fsw2` | (this crate) | The mission **host**: builds + `dlopen`s the cdylibs and runs the coordinator. Links only `metor-fsw-2` — it is fully schema-agnostic (frames validated from serialized VTables, params encoded from each `.so`'s exported schema). |
 
 Each system crate is `crate-type = ["cdylib", "rlib"]`: the cdylib is what the host loads;
 the rlib lets the convergence test also link the systems statically for the parity check.
-The `export_system!` C-ABI symbols ride an `export` feature (on by default for the cdylib,
+The `export_pack!` C-ABI symbols ride an `export` feature (on by default for the cdylib,
 off when the test links the rlib) so the system rlibs link into one test binary without a
 duplicate `fsw_*` symbol clash.
 

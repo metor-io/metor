@@ -129,7 +129,9 @@ pub fn describe_via_worker(
 pub(crate) struct SpawnSpec {
     /// The instance name (the worker's health/status identity).
     pub instance: String,
-    /// The system cdylib the worker loads.
+    /// The pack entry the worker instantiates.
+    pub system: String,
+    /// The pack cdylib the worker loads.
     pub artifact: PathBuf,
     /// Canonical postcard `Params` bytes.
     pub params: Vec<u8>,
@@ -370,6 +372,7 @@ impl ProcSlot {
             abi_version: crate::abi::FSW_ABI_VERSION,
             mode: RunMode::Cyclic,
             instance: spec.instance,
+            system: spec.system,
             artifact: spec.artifact,
             params: spec.params,
             ctl: spec.ctl_path.clone(),

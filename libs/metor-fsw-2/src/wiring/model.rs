@@ -80,12 +80,13 @@ pub enum ClockSpec {
     },
 }
 
-/// A loadable shared object and the crate it comes from.
+/// A loadable pack shared object and the crate it comes from.
 ///
-/// Each cdylib exports exactly one system type through the fixed `fsw_*`
-/// symbols. Several [`SystemSpec`]s may reference the same artifact to
-/// instance that type more than once; the loader opens the object once and
-/// calls `fsw_create` per instance.
+/// Each cdylib exports one **pack** — any number of system types — through
+/// the fixed `fsw_pack_*` symbols; a `system` node's `type=` selects an entry
+/// from the opened pack's manifest. Several [`SystemSpec`]s may reference the
+/// same artifact (and the same entry) to instance it more than once; the
+/// loader opens the object once and runs the create phase per instance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
     /// The id that [`SystemSpec::artifact`] references.
@@ -96,8 +97,6 @@ pub struct Artifact {
     /// The produced shared-object file name (`libfoo.so`, `libfoo.dylib`,
     /// `foo.dll`).
     pub cdylib: String,
-    /// The single `type=` this object's `export_system!` provides.
-    pub system_type: String,
     /// The resolved artifact location, filled in by
     /// [`build_artifacts`](super::build_artifacts). `None` until built or
     /// located.
@@ -111,10 +110,9 @@ pub struct Artifact {
 pub struct SystemSpec {
     /// The instance name, which is also the telemetry prefix.
     pub name: String,
-    /// The `type=` key, either a registry key or the artifact's `system_type`.
-    /// Required for a static system. Optional for a loaded system, where the
-    /// artifact's `system_type` is authoritative and a given `ty` is checked
-    /// against it at [`resolve`](super::resolve).
+    /// The `type=` key: a registry key for a static system, or the pack
+    /// entry name for a loaded one. Required unless the artifact's pack
+    /// exports exactly one entry.
     #[serde(default)]
     pub ty: Option<String>,
     /// `Some(artifact_id)` for a system loaded from a shared object, `None`
@@ -226,15 +224,19 @@ pub struct SlotSpec {
     pub process: bool,
 }
 
-/// One allowed occupant of a [`SlotSpec`]: an [`Artifact`] referenced by id,
-/// plus optional default params. The params are a `system`-node-shaped
-/// [`ParamSource`], schema-encoded against the occupant's shared object at
-/// resolve.
+/// One allowed occupant of a [`SlotSpec`]: a pack entry named across the
+/// slot's artifacts, plus optional default params. The params are a
+/// `system`-node-shaped [`ParamSource`], schema-encoded against the
+/// occupant's shared object at resolve.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AllowedOccupantSpec {
-    /// The occupant id, which is both the [`Artifact::id`] of the sequence
-    /// cdylib and the name a load command uses.
+    /// The pack entry name, which is also the name a load command uses.
     pub occupant: String,
+    /// The [`Artifact::id`] whose pack exports the entry. Omitted, resolve
+    /// searches every artifact for a unique entry of that name; an ambiguous
+    /// name is a clean error.
+    #[serde(default)]
+    pub artifact: Option<String>,
     /// Where this occupant's default params come from.
     pub params: ParamSource,
 }

@@ -10,7 +10,8 @@
 //! measurement — never the plant's truth.
 //!
 //! Authored with `#[system]` (`docs/design-system-macro.md`): the port set is the `execute`
-//! signature, and the bundles/trait impls/`BuildSystem`/`fsw_*` exports are all generated.
+//! signature, and the bundles/trait impls/`BuildSystem` are all generated; the `fsw_pack_*`
+//! C-ABI surface is the [`export_pack!`](metor_fsw_2::export_pack) at the bottom.
 
 use adcs_contracts::{
     AttitudeEstimate, CSS_THRESHOLD, DT, Gps, MagneticModel, NavParams, Sensors, V3, epoch_at,
@@ -45,7 +46,7 @@ pub struct NavSystem {
     t_sim: f64,
 }
 
-#[system(name = "nav", export = "export")]
+#[system(name = "nav")]
 impl NavSystem {
     pub fn new(p: NavParams) -> Self {
         let state = metor_fsw_adcs::mekf::State::new(
@@ -116,6 +117,13 @@ impl NavSystem {
         });
     }
 }
+
+/// This crate's pack: the filter as its sole entry, under the name the mission's
+/// `system` nodes select (`type="Nav"`).
+pub fn pack() -> metor_fsw_2::Pack {
+    metor_fsw_2::Pack::new().system_type::<NavSystem, _>("Nav")
+}
+metor_fsw_2::export_pack!(pack, feature = "export");
 
 #[cfg(test)]
 mod tests {

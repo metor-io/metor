@@ -1,18 +1,15 @@
 //! A test fixture exercising sequence params. The crate builds as a loadable
-//! shared library containing one `#[sequence]`, `gainer`, which takes a typed
-//! [`GainerParams`] and republishes the configured gain on its output frame.
-//! A host that loads the library and passes params can read the frame back to
-//! confirm the values reached the running sequence.
-
-// The `#[sequence]` macro generates raw-pointer C entry points, and this lint
-// fires on that generated code rather than anything written here.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//! shared library whose pack exports one sequence, `gainer`, which takes a
+//! typed [`GainerParams`] through the [`Params`] wrapper and republishes the
+//! configured gain on its output frame. A host that loads the library and
+//! passes params can read the frame back to confirm the values reached the
+//! running sequence.
 
 use core::time::Duration;
 
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::sequence::{progress, wait};
-use metor_fsw_2::{Outcome, Output};
+use metor_fsw_2::{Outcome, Output, Pack, Params};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -36,8 +33,7 @@ pub struct GainerParams {
 /// Publishes the configured gain, waits two simulated microseconds, and
 /// completes. The write lands on the first poll, so even a very short run
 /// observes the params-derived value.
-#[metor_fsw_2::sequence]
-async fn gainer(params: GainerParams, mut out: Output<GainOut>) -> Outcome {
+async fn gainer(Params(params): Params<GainerParams>, mut out: Output<GainOut>) -> Outcome {
     progress("publishing gain");
     out.write(&GainOut {
         timestamp: Timestamp(0),
@@ -50,3 +46,10 @@ async fn gainer(params: GainerParams, mut out: Output<GainOut>) -> Outcome {
     progress("done");
     Outcome::Completed
 }
+
+/// The crate's pack, referenced by `export_pack!` below.
+pub fn pack() -> Pack {
+    Pack::new().sequence("gainer", gainer)
+}
+
+metor_fsw_2::export_pack!(pack);

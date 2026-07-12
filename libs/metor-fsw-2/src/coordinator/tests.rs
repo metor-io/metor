@@ -1371,7 +1371,7 @@ fn proc_rings_are_file_backed() {
     }
     .instance_descriptor();
     let n_proc_outputs = desc.outputs.len();
-    let cons = b.add_proc_cyclic("proc-cons", desc, "/nonexistent.so".into(), Vec::new());
+    let cons = b.add_proc_cyclic("proc-cons", desc, "/nonexistent.so".into(), "cons", Vec::new());
     b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
         .unwrap();
 
@@ -1934,7 +1934,7 @@ fn proc_and_process_slot_share_a_session() {
         first_exec_init: None,
     }
     .instance_descriptor();
-    let proc_sys = b.add_proc_cyclic("proc-cons", desc, "/nonexistent.so".into(), Vec::new());
+    let proc_sys = b.add_proc_cyclic("proc-cons", desc, "/nonexistent.so".into(), "cons", Vec::new());
     b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(proc_sys))
         .unwrap();
     let slot = push_slot_reg(&mut b, "seq-slot", true);

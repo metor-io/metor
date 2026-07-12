@@ -38,7 +38,7 @@ pub use param::{BindCx, CycleCx, DeclSink, ExecParam};
 pub use task::{AsyncSystemFn, IntoOutcome, Params, TaskParam};
 pub use tuples::{ExecParamSet, ExecuteFn};
 
-pub(crate) use driver::{FnDriver, FutureDriver, bind_health_tail};
+pub(crate) use driver::{FnDriver, FutureDriver, SeqDriver, bind_health_tail};
 pub(crate) use task::TaskParamsSpec;
 
 use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind, split_decls};
@@ -177,6 +177,7 @@ where
             name,
             descriptor: descriptor_for::<F::Params>(name),
             params_schema: <() as Schema>::SCHEMA,
+            params_default: None,
             reloadable: true,
             create: Box::new(move |params: EntryParams<'_>| {
                 decode_params::<()>(params)?;
@@ -205,6 +206,7 @@ where
             name,
             descriptor: descriptor_for::<F::Params>(name),
             params_schema: <G::Params as Schema>::SCHEMA,
+            params_default: None,
             reloadable: true,
             create: Box::new(move |params: EntryParams<'_>| {
                 let p: G::Params = decode_params(params)?;
@@ -231,6 +233,7 @@ where
             name,
             descriptor: descriptor_for::<F::Params>(name),
             params_schema: <() as Schema>::SCHEMA,
+            params_default: None,
             reloadable: false,
             create: Box::new(move |params: EntryParams<'_>| {
                 decode_params::<()>(params)?;

@@ -1,8 +1,9 @@
 //! Integration tests for runtime slots driving a real `dlopen`ed sequence.
 //!
-//! Each test builds the `metor-fsw-2-seq-fixture` crate as a `cdylib`, opens the
-//! produced shared object through [`DlSystem`], registers it as the allowed
-//! occupant of a slot in a [`Coordinator`], and drives the slot's lifecycle with
+//! Each test builds the `metor-fsw-2-seq-fixture` crate as a `cdylib`, opens
+//! the produced shared object through [`DlPack`], selects the `waiter` entry,
+//! registers it as the allowed occupant of a slot in a [`Coordinator`], and
+//! drives the slot's lifecycle with
 //! [`SequenceCommand`]s. Together the tests cover the slot's ring topology (the
 //! slot-owned control ring appended to the occupant's inputs, plus the
 //! [`SlotStatus`] output), the command-to-phase state machine, name addressing,
@@ -31,7 +32,7 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
 use metor_fsw_2::{
-    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, PortRef,
+    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, DlPack, DlSystem, Input, PortRef,
     RecvTransport, SequenceStatus, SlotStatus, SystemKind, TransportError, UplinkSystem,
     split_record,
 };
@@ -127,9 +128,13 @@ fn sim_config() -> CoordinatorConfig {
     }
 }
 
-/// Open the fixture and sanity-check its reconstructed descriptor.
+/// Open the fixture, select its `waiter` entry, and sanity-check the
+/// reconstructed descriptor.
 fn open_waiter(lib: &PathBuf) -> DlSystem {
-    let loaded = DlSystem::open(lib).expect("DlSystem::open the sequence .so");
+    let loaded = DlPack::open(lib)
+        .expect("DlPack::open the sequence .so")
+        .system("waiter")
+        .expect("select the waiter entry");
     let desc = loaded.descriptor();
     assert_eq!(desc.name, "waiter");
     assert_eq!(desc.kind, SystemKind::Cyclic);

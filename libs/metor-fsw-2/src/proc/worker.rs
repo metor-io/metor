@@ -58,7 +58,9 @@ pub enum WorkerManifest {
         mode: RunMode,
         /// The instance name (health/status identity inside the `.so`).
         instance: String,
-        /// The system cdylib to load.
+        /// The pack entry to instantiate from the artifact's manifest.
+        system: String,
+        /// The pack cdylib to load.
         artifact: PathBuf,
         /// Canonical postcard `Params` bytes for `fsw_create`.
         params: Vec<u8>,
@@ -136,6 +138,7 @@ fn run_worker(manifest_path: &Path) -> i32 {
             abi_version,
             mode,
             instance,
+            system,
             artifact,
             params,
             ctl,
@@ -145,6 +148,7 @@ fn run_worker(manifest_path: &Path) -> i32 {
             abi_version,
             mode,
             instance,
+            &system,
             &artifact,
             &params,
             &ctl,
@@ -184,6 +188,7 @@ fn run_system(
     abi_version: u32,
     mode: RunMode,
     instance: String,
+    system: &str,
     artifact: &Path,
     params: &[u8],
     ctl_path: &Path,
@@ -247,12 +252,12 @@ fn run_system(
     let inputs: Vec<FswRing> = input_rings.iter().map(|r| handle(r, ROLE_INPUT)).collect();
     let outputs: Vec<FswRing> = output_rings.iter().map(|r| handle(r, ROLE_OUTPUT)).collect();
 
-    let dl = match crate::dl::DlSystem::open(artifact) {
+    let dl = match crate::dl::DlPack::open(artifact).and_then(|pack| pack.system(system)) {
         Ok(dl) => dl,
         Err(e) => {
             return fail(
                 fail_code::ARTIFACT,
-                format!("cannot load `{}`: {e}", artifact.display()),
+                format!("cannot load `{}` from `{}`: {e}", system, artifact.display()),
             );
         }
     };
@@ -323,6 +328,7 @@ mod tests {
                 abi_version: FSW_ABI_VERSION,
                 mode: RunMode::Cyclic,
                 instance: "imu".into(),
+                system: "sys".into(),
                 artifact: PathBuf::from("/a/lib.dylib"),
                 params: vec![1, 2, 3],
                 ctl: PathBuf::from("/run/imu.ctl"),
@@ -333,6 +339,7 @@ mod tests {
                 abi_version: FSW_ABI_VERSION,
                 mode: RunMode::Sequence,
                 instance: "adcs.commissioning".into(),
+                system: "sys".into(),
                 artifact: PathBuf::from("/a/seq.dylib"),
                 params: Vec::new(),
                 ctl: PathBuf::from("/run/adcs.ctl"),

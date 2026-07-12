@@ -880,6 +880,8 @@ struct DlReg {
 struct ProcReg {
     artifact: PathBuf,
     params: Vec<u8>,
+    /// The pack entry the worker instantiates.
+    system: String,
 }
 
 /// A registered pack entry, created (params decoded, state built) at
@@ -1145,6 +1147,7 @@ impl CoordinatorBuilder {
         name: impl Into<String>,
         mut descriptor: SystemDescriptor,
         artifact: PathBuf,
+        system: impl Into<String>,
         params: Vec<u8>,
     ) -> SystemHandle {
         // Cyclic-only, pinned here like the dl path: the registered kind is
@@ -1153,7 +1156,11 @@ impl CoordinatorBuilder {
         self.push_system(
             descriptor,
             name.into(),
-            Reg::Proc(ProcReg { artifact, params }),
+            Reg::Proc(ProcReg {
+                artifact,
+                params,
+                system: system.into(),
+            }),
         )
     }
 
@@ -2339,6 +2346,7 @@ fn bind_proc(
     let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
     let spec = SpawnSpec {
         instance: name.clone(),
+        system: proc_reg.system,
         artifact: proc_reg.artifact,
         params: proc_reg.params,
         ctl_path: session.path().join(format!("{name}.ctl")),
@@ -2592,6 +2600,7 @@ fn slot_proc_parts(
                 // The worker-side identity is the slot's, whoever occupies it,
                 // matching the in-process `make_slot(.., self.name)`.
                 instance: desc.name.to_string(),
+                system: occ.name.clone(),
                 artifact: artifact.clone(),
                 params: occ.params.clone(),
                 ctl: ctl_path.clone(),

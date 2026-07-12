@@ -5,7 +5,7 @@ version.workspace = true
 repository.workspace = true
 edition = "2024"
 publish = false
-description = "A slots/sequences integration-test fixture: one PARAMETERED #[sequence] occupant exported as a cdylib"
+description = "A slots/sequences integration-test fixture: one PARAMETERED sequence occupant exported as a pack cdylib"
 
 # A real loadable shared object: the `slot_wiring` test `dlopen`s the produced
 # `lib*.dylib`/`lib*.so` through a KDL `slot` and asserts its `allow` params

@@ -259,7 +259,7 @@ pub fn propagate(body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> B
     })
 }
 
-#[system(name = "plant", export = "export")]
+#[system(name = "plant")]
 impl PlantSystem {
     pub fn new(p: PlantParams) -> Self {
         // A 400 km circular orbit, booted `init_orbit_phase` radians around it: phase zero
@@ -446,6 +446,13 @@ impl PlantSystem {
         self.t_sim += DT;
     }
 }
+
+/// This crate's pack: the plant as its sole entry, under the name the mission's
+/// `system` nodes select (`type="Plant"`).
+pub fn pack() -> metor_fsw_2::Pack {
+    metor_fsw_2::Pack::new().system_type::<PlantSystem, _>("Plant")
+}
+metor_fsw_2::export_pack!(pack, feature = "export");
 
 #[cfg(test)]
 mod tests {

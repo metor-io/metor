@@ -168,11 +168,13 @@ pub trait RingSource {
 /// The ring sources a pack entry can be bound over, as one concrete type so
 /// the type-erased entry constructor (a boxed closure) can take it by `&mut`
 /// without giving up [`RingSource`]'s generic methods. The host [`Binder`] is
-/// the static-path variant; the dl/process paths add theirs when the pack ABI
-/// lands.
+/// the static-path variant; a loaded entry binds over the
+/// [`RawBinder`](crate::abi::RawBinder) cursor of host-provided ring handles.
 pub enum AnySource<'a, 'b> {
     /// The host builder's positional cursor over pre-allocated rings.
     Host(&'a mut Binder<'b>),
+    /// The `.so`-side cursor over the host's raw ring handles.
+    Raw(&'a mut crate::abi::RawBinder<'b>),
 }
 
 impl RingSource for AnySource<'_, '_> {
@@ -183,6 +185,7 @@ impl RingSource for AnySource<'_, '_> {
     {
         match self {
             Self::Host(b) => b.next_output::<WD, WS>(),
+            Self::Raw(b) => b.next_output::<WD, WS>(),
         }
     }
 
@@ -193,6 +196,7 @@ impl RingSource for AnySource<'_, '_> {
     {
         match self {
             Self::Host(b) => b.next_input::<RD, RS>(),
+            Self::Raw(b) => b.next_input::<RD, RS>(),
         }
     }
 
@@ -203,6 +207,7 @@ impl RingSource for AnySource<'_, '_> {
     {
         match self {
             Self::Host(b) => b.try_next_output::<WD, WS>(),
+            Self::Raw(b) => b.try_next_output::<WD, WS>(),
         }
     }
 
@@ -213,12 +218,16 @@ impl RingSource for AnySource<'_, '_> {
     {
         match self {
             Self::Host(b) => b.next_input_fanin::<RD, RS>(),
+            Self::Raw(b) => b.next_input_fanin::<RD, RS>(),
         }
     }
 
     fn registry(&self) -> Arc<Registry> {
         match self {
             Self::Host(b) => b.registry(),
+            // A loaded entry can never hold a broad-access capability; the
+            // loader rejects them, so this is unreachable in practice.
+            Self::Raw(_) => panic!("a loaded pack entry carries no registry"),
         }
     }
 }

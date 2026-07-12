@@ -1,6 +1,6 @@
-//! The **commissioning** sequence of the `adcs-fsw2` mission, as a `#[sequence]`-authored
-//! `dlopen`-loadable `cdylib` (sequences-slots.md §4). It is the `mode` slot's initial
-//! occupant: a **condition-based** state machine the slot polls once per cycle, walking the
+//! The **commissioning** sequence of the `adcs-fsw2` mission: an async fn registered in
+//! this crate's [`pack`], built as a `dlopen`-loadable `cdylib`. It is the `mode` slot's
+//! initial occupant: a **condition-based** state machine the slot polls once per cycle, walking the
 //! ladder
 //!
 //! ```text
@@ -22,7 +22,7 @@ use core::time::Duration;
 use adcs_contracts::{AttitudeEstimate, CommissioningParams, Gps, ModeCmd, target_for};
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::sequence::{now, progress, wait};
-use metor_fsw_2::{Input, Outcome, Output};
+use metor_fsw_2::{Input, Outcome, Output, Params};
 
 /// One coordinator cycle: under the `Simulated` clock `now` advances ≥ one cycle's worth of
 /// microseconds per poll, so a 1 µs wait is pending this poll and ready the next — the
@@ -36,11 +36,10 @@ fn secs_since(t0: Timestamp) -> f64 {
 }
 
 /// Walk the commissioning ladder, gated on the live estimate + GPS orbit state.
-#[metor_fsw_2::sequence]
 async fn commissioning(
     mut att: Input<AttitudeEstimate>,
     mut gps: Input<Gps>,
-    params: CommissioningParams,
+    Params(params): Params<CommissioningParams>,
     mut mode: Output<ModeCmd>,
 ) -> Outcome {
     // --- Phase 0: estimator warm-up ---------------------------------------------------
@@ -50,7 +49,7 @@ async fn commissioning(
     let t0 = now();
     let mut last_q = None;
     let mut settled_since: Option<Timestamp> = None;
-    let mut rate = f64::MAX;
+    let mut rate;
     loop {
         if wait(NEXT_CYCLE).await.aborted() {
             mode.publish(&ModeCmd::safe().stamped(now()));
@@ -171,3 +170,10 @@ fn tracking_error(att: &mut Input<AttitudeEstimate>, gps: &mut Input<Gps>) -> Op
     let target = target_for(ModeCmd::LAW_HIL, &g.pos_eci, &g.vel_eci);
     Some(q_hat.angular_distance(&target).into_buf().abs())
 }
+
+/// This crate's pack: the commissioning sequence as its sole entry, under the name the
+/// mission's slot `allow`/`initial` lines select (`occupant="commissioning"`).
+pub fn pack() -> metor_fsw_2::Pack {
+    metor_fsw_2::Pack::new().sequence("commissioning", commissioning)
+}
+metor_fsw_2::export_pack!(pack);

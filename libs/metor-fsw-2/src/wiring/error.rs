@@ -325,6 +325,85 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
+    /// A loaded pack has no entry under the requested name, or the entry
+    /// selection failed (the wrapped [`DlError`](crate::dl::DlError) says
+    /// which).
+    #[error("system `{system}`: {source}")]
+    #[diagnostic(code(fsw_wiring::pack_system))]
+    PackSystem {
+        system: String,
+        #[source]
+        source: Box<crate::dl::DlError>,
+        #[source_code]
+        src: String,
+        #[label("this instance")]
+        span: SourceSpan,
+    },
+
+    /// A `system` node over a multi-entry pack omitted `type=`.
+    #[error(
+        "system `{system}`: artifact `{artifact}` exports several systems ({available}); \
+         pick one with `type=`"
+    )]
+    #[diagnostic(code(fsw_wiring::pack_type_required))]
+    PackTypeRequired {
+        system: String,
+        artifact: String,
+        available: String,
+        #[source_code]
+        src: String,
+        #[label("add `type=\"…\"`")]
+        span: SourceSpan,
+    },
+
+    /// An `allow` without `artifact=` matched no artifact, or more than one.
+    #[error(
+        "slot `{slot}`: occupant `{occupant}` {}; name the pack with `artifact=`",
+        if matches.is_empty() { "matches no artifact's exports".to_string() }
+        else { format!("is exported by more than one artifact ({})", matches.join(", ")) }
+    )]
+    #[diagnostic(code(fsw_wiring::occupant_ambiguous))]
+    OccupantAmbiguous {
+        slot: String,
+        occupant: String,
+        matches: Vec<String>,
+        #[source_code]
+        src: String,
+        #[label("this slot")]
+        span: SourceSpan,
+    },
+
+    /// A `.state(...)` entry (instantiable once) was allowed as a slot
+    /// occupant, which must be reloadable.
+    #[error(
+        "slot `{slot}`: occupant `{occupant}` holds moved-in state (`.state(...)`) and cannot \
+         be reloaded; slot occupants must be reloadable"
+    )]
+    #[diagnostic(code(fsw_wiring::occupant_not_reloadable))]
+    OccupantNotReloadable {
+        slot: String,
+        occupant: String,
+        #[source_code]
+        src: String,
+        #[label("this slot")]
+        span: SourceSpan,
+    },
+
+    /// The pre-pack `artifact ... type=` surface: packs export many systems,
+    /// so the entry is named on the `system` node instead.
+    #[error(
+        "`artifact \"{artifact}\"` declares `type=`, but a pack artifact exports many systems; \
+         name the system on the `system` node (`system \"…\" artifact=\"{artifact}\" type=\"…\"`)"
+    )]
+    #[diagnostic(code(fsw_wiring::artifact_type))]
+    ArtifactType {
+        artifact: String,
+        #[source_code]
+        src: String,
+        #[label("drop this node's `type=`")]
+        span: SourceSpan,
+    },
+
     #[error("`artifact` node is missing required property `{property}`")]
     #[diagnostic(code(fsw_wiring::missing_artifact_field))]
     MissingArtifactField {
@@ -374,21 +453,6 @@ pub enum LoadError {
         #[source_code]
         src: String,
         #[label("write `artifact=` here")]
-        span: SourceSpan,
-    },
-
-    /// A dl system's explicit `type=` contradicts the type its artifact's
-    /// `.so` exports. `type=` is optional on dl systems, but when given it
-    /// must match.
-    #[error("system `{system}` declares type `{ty}` but its artifact exports `{artifact_type}`")]
-    #[diagnostic(code(fsw_wiring::type_mismatches_artifact))]
-    TypeMismatchesArtifact {
-        system: String,
-        ty: String,
-        artifact_type: String,
-        #[source_code]
-        src: String,
-        #[label("drop the `type=` or make it `{artifact_type}`")]
         span: SourceSpan,
     },
 

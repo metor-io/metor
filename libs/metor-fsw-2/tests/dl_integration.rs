@@ -3,10 +3,11 @@
 //! The `tests_abi` suite calls the generated `fsw_*` symbols inside the test
 //! binary itself; this test crosses a real shared-object boundary. It builds
 //! the `metor-fsw-2-dl-fixture` crate as a `cdylib`, opens the result with
-//! [`DlSystem`], wires it into a [`Coordinator`] next to a statically linked
-//! producer, runs a few cycles, and checks the loaded system's output. That
-//! exercises the loader, the descriptor round-trip, the ring-region hand-off,
-//! the per-cycle drive, the telemetry tap, and teardown.
+//! [`DlPack`], selects an entry, wires it into a [`Coordinator`] next to a
+//! statically linked producer, runs a few cycles, and checks the loaded
+//! system's output. That exercises the loader, the manifest round-trip, the
+//! ring-region hand-off, the per-cycle drive, the telemetry tap, and
+//! teardown.
 //!
 //! The fixture is built by a nested `cargo build` inside the test, which is
 //! safe because the outer `cargo test` lock is released before the test binary
@@ -22,7 +23,7 @@ use std::process::Command;
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Delivery, DlSystem, FanIn, Frame,
+    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Delivery, DlPack, FanIn, Frame,
     Input, MsgIn, Out, Output, PortRef, StopReason, System, SystemInput, SystemKind, SystemOutput,
 };
 use postcard_schema::Schema;
@@ -174,10 +175,17 @@ fn dlopen_cyclic_system_end_to_end() {
         return;
     };
 
-    // 1. Load the shared object and validate the reconstructed descriptor.
-    let loaded = DlSystem::open(&lib_path).expect("DlSystem::open the fixture .so");
+    // 1. Load the shared object, check the pack's exported entry names, and
+    //    validate the selected entry's reconstructed descriptor.
+    let pack = DlPack::open(&lib_path).expect("DlPack::open the fixture .so");
+    assert_eq!(
+        pack.system_names().collect::<Vec<_>>(),
+        ["DlCounter", "DlEcho"],
+        "the pack manifest lists both entries in registration order"
+    );
+    let loaded = pack.system("DlCounter").expect("select the counter entry");
     let desc = loaded.descriptor();
-    assert_eq!(desc.name, "dl_counter");
+    assert_eq!(desc.name, "DlCounter");
     assert_eq!(desc.kind, SystemKind::Cyclic);
     assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
     assert_eq!(
@@ -230,6 +238,21 @@ fn dlopen_cyclic_system_end_to_end() {
     )
     .expect("compatible tick_in edge validated");
 
+    // A second instance of the same entry, with its own params: one opened
+    // pack mints any number of independent instances.
+    let twin = pack.system("DlCounter").expect("select the entry again");
+    let twin_params = postcard::to_allocvec(&CounterParams {
+        start: 2000,
+        scale: 1.0,
+    })
+    .unwrap();
+    let counter_b = b.add_dl_cyclic("dl_counter_b", twin, twin_params);
+    b.connect(
+        PortRef::new::<TickIn>(ticker),
+        PortRef::new::<TickIn>(counter_b),
+    )
+    .expect("compatible tick_in edge validated (second instance)");
+
     let mut coord = b
         .build()
         .expect("graph builds (validation + sizing + bind)");
@@ -252,11 +275,18 @@ fn dlopen_cyclic_system_end_to_end() {
             .expect("dl message channel is registered")
             .expect("a reader slot is available"),
     );
+    let mut twin_view: Input<TickOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("dl_counter_b.tick_out"))
+            .expect("second instance's output is registered")
+            .expect("a reader slot is available"),
+    );
 
     // 4. Run several cycles. The producer runs before the consumer each cycle,
     //    so the consumer samples that cycle's fresh value. `run_for` performs
-    //    init (fsw_bind_init), the cycles (fsw_execute), and shutdown
-    //    (fsw_shutdown); `coord` is handed back so it outlives the reads below.
+    //    init (fsw_pack_bind_init), the cycles (fsw_pack_execute), and shutdown
+    //    (fsw_pack_shutdown); `coord` is handed back so it outlives the reads below.
     const CYCLES: usize = 6;
     let coord = stellarator::run(|| async move {
         coord.run_for(CYCLES).await;
@@ -275,6 +305,19 @@ fn dlopen_cyclic_system_end_to_end() {
         );
     }
 
+    // 5a. The second instance of the same entry ran independently, with its
+    //     own params.
+    {
+        let out = twin_view
+            .latest()
+            .expect("the second dl instance produced a tick_out");
+        assert_eq!(
+            out.get().count,
+            2000 + CYCLES as u64,
+            "the twin's own start + latest value"
+        );
+    }
+
     // 5b. The Postcard port carried every cycle's event, in order, decoded
     //     purely from the self-describing id.
     let mut counts: Vec<u64> = Vec::new();
@@ -285,16 +328,16 @@ fn dlopen_cyclic_system_end_to_end() {
         "every-record log semantics across the dl boundary"
     );
 
-    // 6. Teardown ordering: dropping the coordinator runs `fsw_destroy` before
+    // 6. Teardown ordering: dropping the coordinator runs `fsw_pack_destroy` before
     //    the `Library` unloads and before the `RingTable` frees the regions.
     //    Not crashing here is the assertion.
     drop(coord);
-    drop((out_view, events_in));
+    drop((out_view, events_in, twin_view));
 }
 
-/// A failing `fsw_create` must not leave the slot looking permanently
+/// A failing `fsw_pack_create` must not leave the slot looking permanently
 /// `Running`. Here the params do not postcard-decode as `CounterParams`, so
-/// the fixture's `catch_unwind` inside `fsw_create` returns a null state. The
+/// the fixture's `catch_unwind` inside `fsw_pack_create` returns a null state. The
 /// coordinator's stopped-systems telemetry must report the system from the
 /// first cycle, exactly like a lapped input or an in-cycle panic would.
 #[test]
@@ -304,10 +347,11 @@ fn dlopen_null_create_reports_stopped() {
         return;
     };
 
-    let loaded = DlSystem::open(&lib_path).expect("DlSystem::open the fixture .so");
+    let pack = DlPack::open(&lib_path).expect("DlPack::open the fixture .so");
+    let loaded = pack.system("DlCounter").expect("select the counter entry");
 
     // `CounterParams` is `{ start: u64, scale: f64 }`; three bytes cannot
-    // decode as either field, so the fixture's `fsw_create` panics inside its
+    // decode as either field, so the fixture's `fsw_pack_create` panics inside its
     // own `catch_unwind` and returns a null state rather than crashing across
     // the `extern "C"` boundary (`abi_panic_is_contained` tests that
     // containment directly, in-binary).
@@ -328,11 +372,11 @@ fn dlopen_null_create_reports_stopped() {
     )
     .expect("compatible tick_in edge validated");
 
-    // `build()` itself calls `fsw_create` at bind time, so the null state is
+    // `build()` itself calls `fsw_pack_create` at bind time, so the null state is
     // latched into the slot before any cycle runs.
     let mut coord = b
         .build()
-        .expect("graph builds even though fsw_create failed inside it");
+        .expect("graph builds even though fsw_pack_create failed inside it");
 
     let coord = stellarator::run(|| async move {
         coord.run_for(3).await;
@@ -348,7 +392,9 @@ fn dlopen_null_create_reports_stopped() {
         1,
         "the failed-create dl system is reported stopped"
     );
-    assert_eq!(stopped[0].name, "dl_counter");
+    // Stopped systems are named type-level, like a static system's
+    // `System::NAME`: for a dl system that is the pack entry name.
+    assert_eq!(stopped[0].name, "DlCounter");
     assert_eq!(stopped[0].reason, StopReason::Panicked);
 
     drop(coord);
