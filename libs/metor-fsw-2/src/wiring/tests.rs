@@ -166,7 +166,7 @@ struct NavLogger;
 
 #[derive(SystemInput)]
 struct LogIn {
-    nav: Input<Nav, Notifier, Notifier>,
+    nav: Input<Nav, Notifier>,
 }
 
 #[derive(SystemOutput)]
@@ -174,7 +174,7 @@ struct LogNoOut {}
 
 impl System for NavLogger {
     type Input = LogIn;
-    type Output = Out<LogNoOut, Notifier, Notifier>;
+    type Output = Out<LogNoOut, Notifier>;
     const NAME: &'static str = "nav_logger";
 }
 

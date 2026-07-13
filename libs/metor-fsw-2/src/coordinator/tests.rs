@@ -221,7 +221,7 @@ struct AsyncConsumer {
 
 #[derive(SystemInput)]
 struct AsyncIn {
-    imu: Input<Imu, Notifier, Notifier>,
+    imu: Input<Imu, Notifier>,
 }
 
 #[derive(SystemOutput)]
@@ -229,7 +229,7 @@ struct AsyncNoOut {}
 
 impl System for AsyncConsumer {
     type Input = AsyncIn;
-    type Output = Out<AsyncNoOut, Notifier, Notifier>;
+    type Output = Out<AsyncNoOut, Notifier>;
     const NAME: &'static str = "async_consumer";
 }
 
@@ -1771,8 +1771,8 @@ mod proc_slot {
             slot_writer::<SlotControlIn>(&control_ring),
             slot_writer::<SlotStatus>(&status_ring),
             super::super::owned_writer::<SequenceChannelEvent>(&events_ring),
-            Input::new(seq_ring.view(NoWake, NoWake).unwrap()),
-            MsgIn::from_views(vec![cmd_ring.view(NoWake, NoWake).unwrap()]),
+            Input::new(seq_ring.view(NoWake).unwrap()),
+            MsgIn::from_views(vec![cmd_ring.view(NoWake).unwrap()]),
             Some(ProcParts {
                 manifests,
                 ctl_path: ctl_path.clone(),
@@ -1784,8 +1784,8 @@ mod proc_slot {
         Harness {
             runner,
             cmds: super::super::owned_writer::<SequenceCommand>(&cmd_ring),
-            events: MsgIn::from_views(vec![events_ring.view(NoWake, NoWake).unwrap()]),
-            status: Input::new(status_ring.view(NoWake, NoWake).unwrap()),
+            events: MsgIn::from_views(vec![events_ring.view(NoWake).unwrap()]),
+            status: Input::new(status_ring.view(NoWake).unwrap()),
             seq_out: slot_writer::<SequenceStatus>(&seq_ring),
             ctl_path,
             now: 0,
@@ -2085,7 +2085,7 @@ use metor_proto_wkt::{ReloadSequences, WiringManifest};
 /// decoding each as a [`WiringManifest`]. The view must be claimed before the
 /// run so it sits at the ring's live edge when the boot record lands.
 #[cfg(not(miri))]
-fn drain_wiring(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake, metor_fsw_ring::NoWake>) -> Vec<WiringManifest> {
+fn drain_wiring(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake>) -> Vec<WiringManifest> {
     let mut out = Vec::new();
     let mut buf = Vec::new();
     while view.try_read_into(&mut buf).expect("readable wiring ring") {

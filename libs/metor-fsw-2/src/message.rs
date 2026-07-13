@@ -133,12 +133,11 @@ pub fn split_record(rec: &[u8]) -> Option<(PacketId, &[u8])> {
 /// single-writer discipline and the same `descriptor()`/`bind()` port
 /// contract, so it sits in a `SystemOutput` bundle beside frame ports. The
 /// wiring edge key is `M::ID`.
-pub struct MsgOut<M, WD = NoWake, WS = NoWake>
+pub struct MsgOut<M, WD = NoWake>
 where
     WD: WakeSource,
-    WS: WakeSink,
 {
-    writer: Writer<WD, WS>,
+    writer: Writer<WD>,
     /// Reused record buffer (the 2-byte id prefix plus the serialized
     /// payload), so a per-cycle emit grows in place instead of allocating.
     scratch: Vec<u8>,
@@ -149,9 +148,9 @@ where
     _m: PhantomData<fn() -> M>,
 }
 
-impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
+impl<M: Msg, WD: WakeSource> MsgOut<M, WD> {
     /// Wrap a writer over a log-sized byte ring.
-    pub fn new(writer: Writer<WD, WS>) -> Self {
+    pub fn new(writer: Writer<WD>) -> Self {
         Self {
             writer,
             scratch: Vec::new(),
@@ -196,7 +195,7 @@ impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
     }
 }
 
-impl<M: NamedMsg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
+impl<M: NamedMsg, WD: WakeSource> MsgOut<M, WD> {
     /// This port's static descriptor, keyed on `M::ID` and named by
     /// [`NamedMsg::NAME`].
     pub fn descriptor() -> PortDesc {
@@ -210,21 +209,20 @@ impl<M: NamedMsg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
     }
 }
 
-impl<M, WD, WS> MsgOut<M, WD, WS>
+impl<M, WD> MsgOut<M, WD>
 where
     M: Msg,
     WD: WakeSource + Default + Clone + 'static,
-    WS: WakeSink + Default + Clone + 'static,
 {
     /// Bind this port over the next ring the [`RingSource`] hands out, taking
-    /// the matched writer-side wake endpoints. Called by the derive for a
+    /// the matched writer-side data-wake endpoint. Called by the derive for a
     /// `MsgOut<M>` field in a `SystemOutput` bundle.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
-        let (ring, data, space) = src.next_output::<WD, WS>();
+        let (ring, data) = src.next_output::<WD>();
         // The coordinator allocates one ring per message output and binds it
         // exactly once, so the region's writer claim is always free here.
         let writer = ring
-            .writer(data, space)
+            .writer(data)
             .expect("message ring is bound to exactly one writer at build");
         MsgOut::new(writer)
     }
@@ -241,7 +239,7 @@ where
 /// `SystemOutput` impl must build that descriptor itself
 /// (`PortDesc::msg::<M>().untelemetered()`), because `CommandOut::descriptor()`
 /// resolves through the alias to the plain, telemetered `MsgOut` descriptor.
-pub type CommandOut<M, WD = NoWake, WS = NoWake> = MsgOut<M, WD, WS>;
+pub type CommandOut<M, WD = NoWake> = MsgOut<M, WD>;
 
 // ---------------------------------------------------------------------------
 // MsgFanOut
@@ -262,7 +260,7 @@ pub type CommandOut<M, WD = NoWake, WS = NoWake> = MsgOut<M, WD, WS>;
 /// typed `M` and no postcard step; validation happens where a typed consumer
 /// [`drain`](MsgIn::drain)s the record.
 pub struct MsgFanOut {
-    writers: Vec<Writer<NoWake, NoWake>>,
+    writers: Vec<Writer<NoWake>>,
     /// Reused record buffer, as in [`MsgOut`].
     scratch: Vec<u8>,
 }
@@ -272,11 +270,11 @@ impl MsgFanOut {
     /// the bundle's static ports have bound, in `descriptors()` order.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
         let mut writers = Vec::new();
-        while let Some((ring, data, space)) = src.try_next_output::<NoWake, NoWake>() {
+        while let Some((ring, data)) = src.try_next_output::<NoWake>() {
             // The coordinator allocates one ring per message output and binds
             // it exactly once, so the region's writer claim is always free here.
             let writer = ring
-                .writer(data, space)
+                .writer(data)
                 .expect("message ring is bound to exactly one writer at build");
             writers.push(writer);
         }
@@ -328,28 +326,26 @@ impl MsgFanOut {
 /// producer and [`drain`](Self::drain) drains them all. One view is the
 /// common single-producer case, and an empty list is a legal unconnected
 /// input.
-pub struct MsgIn<M, RD = NoWake, RS = NoWake>
+pub struct MsgIn<M, RD = NoWake>
 where
     RD: WakeSink,
-    RS: WakeSource,
 {
-    views: Vec<View<RD, RS>>,
+    views: Vec<View<RD>>,
     _marker: PhantomData<fn() -> M>,
 }
 
-impl<M, RD, RS> MsgIn<M, RD, RS>
+impl<M, RD> MsgIn<M, RD>
 where
     M: Msg + DeserializeOwned,
     RD: WakeSink,
-    RS: WakeSource,
 {
     /// Wrap a single producer [`View`].
-    pub fn new(view: View<RD, RS>) -> Self {
+    pub fn new(view: View<RD>) -> Self {
         Self::from_views(vec![view])
     }
 
     /// Wrap one [`View`] per wired producer, the fan-in case.
-    pub fn from_views(views: Vec<View<RD, RS>>) -> Self {
+    pub fn from_views(views: Vec<View<RD>>) -> Self {
         Self {
             views,
             _marker: PhantomData,
@@ -404,11 +400,10 @@ where
     }
 }
 
-impl<M, RD, RS> MsgIn<M, RD, RS>
+impl<M, RD> MsgIn<M, RD>
 where
     M: NamedMsg + DeserializeOwned,
     RD: WakeSink,
-    RS: WakeSource,
 {
     /// This port's static descriptor, sharing its edge key with the
     /// [`MsgOut<M>`](MsgOut) it consumes.
@@ -423,11 +418,10 @@ where
     }
 }
 
-impl<M, RD, RS> MsgIn<M, RD, RS>
+impl<M, RD> MsgIn<M, RD>
 where
     M: Msg + DeserializeOwned,
     RD: WakeSink + Default + Clone + 'static,
-    RS: WakeSource + Default + Clone + 'static,
 {
     /// Bind this port over every producer ring wired to the next message
     /// input, claiming the whole fan-in list
@@ -435,11 +429,11 @@ where
     /// a legal, unconnected input that drains nothing. Called by the derive
     /// for a `MsgIn<M>` field in a `SystemInput` bundle.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
-        let rings = src.next_input_fanin::<RD, RS>();
+        let rings = src.next_input_fanin::<RD>();
         let views = rings
             .into_iter()
-            .map(|(ring, data, space)| {
-                ring.view(data, space)
+            .map(|(ring, data)| {
+                ring.view(data)
                     .expect("message input reader slot (sized at build)")
             })
             .collect();
@@ -523,14 +517,14 @@ mod tests {
         };
         {
             let mut reg_out: MsgOut<SequenceRegistry> =
-                MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
+                MsgOut::new(ring.writer(NoWake).expect("first writer"));
             reg_out.emit(&registry).expect("emit registry");
         }
 
         // Second record: a different Msg type, its own typed port on the
         // same ring.
         let mut cmd_out: MsgOut<SequenceCommand> =
-            MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
+            MsgOut::new(ring.writer(NoWake).expect("claim freed on drop"));
         let command = SequenceCommand {
             channel: "mode".to_string(),
             command: SequenceCommandKind::Start,
@@ -575,14 +569,14 @@ mod tests {
         });
         // Claim the read view before any write (a view starts at the live edge).
         let mut inbox: MsgIn<SequenceCommand> =
-            MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
+            MsgIn::new(ring.view(NoWake).expect("slot"));
 
         // Two typed ports take the ring's single writer in turn (drop frees
         // the claim), so the drained view sees a mixed stream. A different
         // Msg type ahead of the commands must be skipped.
         {
             let mut reg_out: MsgOut<SequenceRegistry> =
-                MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
+                MsgOut::new(ring.writer(NoWake).expect("first writer"));
             reg_out
                 .emit(&SequenceRegistry {
                     channels: vec![SequenceChannelSpec {
@@ -593,7 +587,7 @@ mod tests {
                 .expect("emit registry");
         }
         let mut cmd_out: MsgOut<SequenceCommand> =
-            MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
+            MsgOut::new(ring.writer(NoWake).expect("claim freed on drop"));
         cmd_out
             .emit(&SequenceCommand {
                 channel: "adcs".to_string(),
@@ -630,18 +624,18 @@ mod tests {
             max_readers: 4,
         });
         let mut inbox: MsgIn<SequenceCommand> =
-            MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
+            MsgIn::new(ring.view(NoWake).expect("slot"));
 
         // A foreign-typed record ahead of the commands must be skipped.
         {
             let mut reg_out: MsgOut<SequenceRegistry> =
-                MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
+                MsgOut::new(ring.writer(NoWake).expect("first writer"));
             reg_out
                 .emit(&SequenceRegistry { channels: vec![] })
                 .expect("emit registry");
         }
         let mut cmd_out: MsgOut<SequenceCommand> =
-            MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
+            MsgOut::new(ring.writer(NoWake).expect("claim freed on drop"));
         for channel in ["a", "b", "c"] {
             cmd_out
                 .emit(&SequenceCommand {
@@ -674,9 +668,9 @@ mod tests {
             max_readers: 4,
         });
         let mut inbox: MsgIn<SequenceCommand> =
-            MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
+            MsgIn::new(ring.view(NoWake).expect("slot"));
         let mut fan = MsgFanOut {
-            writers: vec![ring.writer(NoWake, NoWake).expect("one writer")],
+            writers: vec![ring.writer(NoWake).expect("one writer")],
             scratch: Vec::new(),
         };
         assert_eq!(fan.len(), 1);
@@ -714,13 +708,13 @@ mod tests {
         let ring_a = mk();
         let ring_b = mk();
         let mut out_a: MsgOut<SequenceCommand> =
-            MsgOut::new(ring_a.writer(NoWake, NoWake).expect("one writer per ring"));
+            MsgOut::new(ring_a.writer(NoWake).expect("one writer per ring"));
         let mut out_b: MsgOut<SequenceCommand> =
-            MsgOut::new(ring_b.writer(NoWake, NoWake).expect("one writer per ring"));
+            MsgOut::new(ring_b.writer(NoWake).expect("one writer per ring"));
         // Two producer views into one input (the fan-in shape).
         let mut inbox: MsgIn<SequenceCommand> = MsgIn::from_views(vec![
-            ring_a.view(NoWake, NoWake).expect("slot a"),
-            ring_b.view(NoWake, NoWake).expect("slot b"),
+            ring_a.view(NoWake).expect("slot a"),
+            ring_b.view(NoWake).expect("slot b"),
         ]);
 
         out_a

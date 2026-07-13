@@ -245,10 +245,7 @@ fn interactive_load_then_abort_safes() {
 /// postcard-round-tripping each record — the downlink tap's decode (`docs/messages.md` §3),
 /// reused verbatim from the framework's `slot_integration` test.
 fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
-    view: &mut metor_fsw_2::ring::View<
-        metor_fsw_2::ring::NoWake,
-        metor_fsw_2::ring::NoWake,
-    >,
+    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake>,
 ) -> Vec<M> {
     let mut out = Vec::new();
     let mut buf = Vec::new();

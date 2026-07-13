@@ -724,12 +724,11 @@ struct RingTable {
 /// only for snapshot inputs; the record is borrowed in place off the upstream
 /// ring and written through, with no intermediate buffer.
 struct CopyIn {
-    upstream: View<NoWake, NoWake>,
+    upstream: View<NoWake>,
     /// The private ring's sole writer. The matched data `Notifier` wakes the
-    /// parked async `recv`; the space side is `NoWake` because a full private
-    /// ring (the consumer is behind) drops this cycle's mirror rather than
-    /// suspending the cycle loop.
-    writer: Writer<Notifier, NoWake>,
+    /// parked async `recv`; a full private ring (the consumer is behind) drops
+    /// this cycle's mirror rather than suspending the cycle loop.
+    writer: Writer<Notifier>,
     /// The upstream ring's `committed` at the last mirror, so an unchanged
     /// upstream is skipped instead of re-waking the consumer with the same
     /// pinned record every cycle. `u64::MAX` means nothing mirrored yet.
@@ -1945,16 +1944,15 @@ impl CoordinatorBuilder {
                 let (prod_id, out_idx) = cons_edges[&(sid, in_idx)][0];
                 let private = alloc_ring(port.delivery, port.max_size, depth, 1 + slack);
                 let data = Notifier::default();
-                // Only the matched DATA notifier is load-bearing (it wakes the
-                // parked async `recv`); the writer's space side is `NoWake`
-                // because the copy-in uses `try_write` and skips a full
-                // private ring. Each private copy-in ring is created here and
-                // gets this one writer, so the claim is always free.
+                // The matched DATA notifier wakes the parked async `recv`; the
+                // copy-in uses `try_write` and skips a full private ring. Each
+                // private copy-in ring is created here and gets this one
+                // writer, so the claim is always free.
                 let writer = private
-                    .writer(data.clone(), NoWake)
+                    .writer(data.clone())
                     .expect("private copy-in ring has exactly one writer");
                 let upstream = alloc.output_rings[prod_id][out_idx]
-                    .view(NoWake, NoWake)
+                    .view(NoWake)
                     .expect("producer reader slot reserved at sizing time");
                 plumbing.copy_ins.push(CopyIn {
                     upstream,
@@ -2231,7 +2229,7 @@ fn bind_coordinator(
                     .iter()
                     .map(|&(prod_id, out_idx)| {
                         output_rings[prod_id][out_idx]
-                            .view(NoWake, NoWake)
+                            .view(NoWake)
                             .expect("reload reader slot (edge fan-out sized)")
                     })
                     .collect()
@@ -2472,7 +2470,7 @@ fn bind_slot(
                     .iter()
                     .map(|&(prod_id, out_idx)| {
                         output_rings[prod_id][out_idx]
-                            .view(NoWake, NoWake)
+                            .view(NoWake)
                             .expect("command reader slot (edge fan-out sized)")
                     })
                     .collect()
@@ -2489,7 +2487,7 @@ fn bind_slot(
     );
     let seq_status = Input::new(
         output_rings[id][seq_out_idx]
-            .view(NoWake, NoWake)
+            .view(NoWake)
             .expect("SequenceStatus self-tap reader (fan-out sized)"),
     );
     // Host writers over the runner's output tail: SlotStatus plus the
@@ -2739,7 +2737,7 @@ fn owned_writer<M: Msg>(ring: &RingBuffer) -> MsgOut<M> {
     // Each coordinator-owned message ring gets its single writer minted
     // exactly once at build, so the claim is always free here.
     let writer = ring
-        .writer(NoWake, NoWake)
+        .writer(NoWake)
         .expect("coordinator message ring has exactly one writer");
     MsgOut::new(writer)
 }

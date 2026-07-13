@@ -985,7 +985,7 @@ pub(crate) fn slot_writer<F: crate::Frame + IntoBytes + Immutable>(
     // Each host-side ring gets its writer minted exactly once at build, so
     // the writer claim is always free here.
     let writer = ring
-        .writer(NoWake, NoWake)
+        .writer(NoWake)
         .expect("slot ring is bound to exactly one host writer at build");
     Output::new(writer)
 }

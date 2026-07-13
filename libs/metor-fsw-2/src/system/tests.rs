@@ -149,19 +149,19 @@ fn cyclic_filter_end_to_end() {
     let log_ring = ring_for::<SystemLog>(8, 1);
 
     // Upstream producer and downstream consumer, both built by hand.
-    let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
-    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
+    let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake).unwrap());
+    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake).unwrap());
 
     let input = FilterIn {
-        imu: Input::new(imu_ring.view(NoWake, NoWake).unwrap()),
+        imu: Input::new(imu_ring.view(NoWake).unwrap()),
     };
     let health = HealthPort::new(
-        Output::new(health_ring.writer(NoWake, NoWake).unwrap()),
-        Output::new(log_ring.writer(NoWake, NoWake).unwrap()),
+        Output::new(health_ring.writer(NoWake).unwrap()),
+        Output::new(log_ring.writer(NoWake).unwrap()),
     );
     let output = Out::new(
         FilterOut {
-            nav: Output::new(nav_ring.writer(NoWake, NoWake).unwrap()),
+            nav: Output::new(nav_ring.writer(NoWake).unwrap()),
         },
         health,
     );
@@ -200,9 +200,9 @@ fn cyclic_filter_end_to_end() {
 fn idle_input_backpressures_writer_and_latest_frees() {
     let imu_ring = ring_for::<Imu>(2, 1);
     let mut input = FilterIn {
-        imu: Input::new(imu_ring.view(NoWake, NoWake).unwrap()),
+        imu: Input::new(imu_ring.view(NoWake).unwrap()),
     };
-    let mut w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
+    let mut w = Output::<Imu>::new(imu_ring.writer(NoWake).unwrap());
     let imu = |omega: f64| Imu {
         timestamp: Timestamp(0),
         omega,
@@ -318,18 +318,18 @@ fn health_counters_published() {
     let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = ring_for::<SystemLog>(8, 1);
 
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
+    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
 
     let input = FilterIn {
-        imu: Input::new(imu_ring.view(NoWake, NoWake).unwrap()),
+        imu: Input::new(imu_ring.view(NoWake).unwrap()),
     };
     let health = HealthPort::new(
-        Output::new(health_ring.writer(NoWake, NoWake).unwrap()),
-        Output::new(log_ring.writer(NoWake, NoWake).unwrap()),
+        Output::new(health_ring.writer(NoWake).unwrap()),
+        Output::new(log_ring.writer(NoWake).unwrap()),
     );
     let output = Out::new(
         FilterOut {
-            nav: Output::new(nav_ring.writer(NoWake, NoWake).unwrap()),
+            nav: Output::new(nav_ring.writer(NoWake).unwrap()),
         },
         health,
     );
@@ -362,17 +362,17 @@ struct AsyncFilter;
 
 #[derive(SystemInput)]
 struct AsyncIn {
-    imu: Input<Imu, Notifier, Notifier>,
+    imu: Input<Imu, Notifier>,
 }
 
 #[derive(SystemOutput)]
 struct AsyncOut {
-    nav: Output<NavEstimate, Notifier, Notifier>,
+    nav: Output<NavEstimate, Notifier>,
 }
 
 impl System for AsyncFilter {
     type Input = AsyncIn;
-    type Output = Out<AsyncOut, Notifier, Notifier>;
+    type Output = Out<AsyncOut, Notifier>;
     const NAME: &'static str = "async_filter";
 }
 
@@ -403,33 +403,19 @@ async fn async_filter_one_cycle() {
     let log_ring = ring_for::<SystemLog>(8, 1);
 
     let imu_data = Notifier::default();
-    let imu_space = Notifier::default();
     let nav_data = Notifier::default();
-    let nav_space = Notifier::default();
 
     let mut input = AsyncIn {
-        imu: Input::new(imu_ring.view(imu_data.clone(), imu_space.clone()).unwrap()),
+        imu: Input::new(imu_ring.view(imu_data.clone()).unwrap()),
     };
-    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
+    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake).unwrap());
     let health = HealthPort::new(
-        Output::new(
-            health_ring
-                .writer(Notifier::default(), Notifier::default())
-                .unwrap(),
-        ),
-        Output::new(
-            log_ring
-                .writer(Notifier::default(), Notifier::default())
-                .unwrap(),
-        ),
+        Output::new(health_ring.writer(Notifier::default()).unwrap()),
+        Output::new(log_ring.writer(Notifier::default()).unwrap()),
     );
     let mut output = Out::new(
         AsyncOut {
-            nav: Output::new(
-                nav_ring
-                    .writer(nav_data.clone(), nav_space.clone())
-                    .unwrap(),
-            ),
+            nav: Output::new(nav_ring.writer(nav_data.clone()).unwrap()),
         },
         health,
     );
@@ -438,9 +424,8 @@ async fn async_filter_one_cycle() {
     let writer = {
         let imu_ring = imu_ring.clone();
         let imu_data = imu_data.clone();
-        let imu_space = imu_space.clone();
         stellarator::spawn(async move {
-            let mut w = imu_ring.writer(imu_data, imu_space).unwrap();
+            let mut w = imu_ring.writer(imu_data).unwrap();
             w.try_write(
                 Imu {
                     timestamp: Timestamp(7),
@@ -560,9 +545,9 @@ where
     let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = ring_for::<SystemLog>(8, 1);
 
-    let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
-    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
+    let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake).unwrap());
+    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake).unwrap());
+    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
 
     let input = crate::BindPorts::bind(&mut TestSource {
         rings: vec![imu_ring.clone()],
@@ -613,29 +598,26 @@ impl TestSource {
 }
 
 impl crate::RingSource for TestSource {
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
+    fn next_output<WD>(&mut self) -> (RingBuffer, WD)
     where
         WD: metor_fsw_ring::WakeSource + Default + Clone + 'static,
-        WS: metor_fsw_ring::WakeSink + Default + Clone + 'static,
     {
-        (self.pop(), WD::default(), WS::default())
+        (self.pop(), WD::default())
     }
 
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
+    fn next_input<RD>(&mut self) -> (RingBuffer, RD)
     where
         RD: metor_fsw_ring::WakeSink + Default + Clone + 'static,
-        RS: metor_fsw_ring::WakeSource + Default + Clone + 'static,
     {
-        (self.pop(), RD::default(), RS::default())
+        (self.pop(), RD::default())
     }
 
-    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)>
+    fn next_input_fanin<RD>(&mut self) -> Vec<(RingBuffer, RD)>
     where
         RD: metor_fsw_ring::WakeSink + Default + Clone + 'static,
-        RS: metor_fsw_ring::WakeSource + Default + Clone + 'static,
     {
         // A single producer, so one ring per message input.
-        vec![(self.pop(), RD::default(), RS::default())]
+        vec![(self.pop(), RD::default())]
     }
 }
 
@@ -702,7 +684,7 @@ fn publish_drop_folds_to_health() {
     });
     let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = ring_for::<SystemLog>(8, 1);
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
+    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
 
     let input = crate::BindPorts::bind(&mut TestSource {
         rings: vec![],
@@ -806,9 +788,9 @@ fn fsw_attrs_lower_onto_descriptors() {
 fn msg_log_never_loses_records() {
     let ring = msg_ring(1);
     let mut inbox: crate::MsgIn<SequenceCommand> =
-        crate::MsgIn::new(ring.view(NoWake, NoWake).unwrap());
+        crate::MsgIn::new(ring.view(NoWake).unwrap());
     let mut w: crate::MsgOut<SequenceCommand> =
-        crate::MsgOut::new(ring.writer(NoWake, NoWake).unwrap());
+        crate::MsgOut::new(ring.writer(NoWake).unwrap());
 
     // Fill until the idle inbox stalls the emitter.
     let mut sent = 0u32;
@@ -869,12 +851,12 @@ fn log_input_guaranteed_delivery_through_runner() {
     let output = Out::new(
         NothingOut {},
         HealthPort::new(
-            Output::new(health_ring.writer(NoWake, NoWake).unwrap()),
-            Output::new(log_ring.writer(NoWake, NoWake).unwrap()),
+            Output::new(health_ring.writer(NoWake).unwrap()),
+            Output::new(log_ring.writer(NoWake).unwrap()),
         ),
     );
     let mut w: crate::MsgOut<SequenceCommand> =
-        crate::MsgOut::new(ring.writer(NoWake, NoWake).unwrap());
+        crate::MsgOut::new(ring.writer(NoWake).unwrap());
     let seen = std::rc::Rc::new(core::cell::Cell::new(0));
     let mut runner = CyclicRunner::new(Guard { seen: seen.clone() }, input, output);
 

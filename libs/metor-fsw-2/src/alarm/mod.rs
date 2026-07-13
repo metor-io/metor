@@ -449,7 +449,7 @@ struct AlarmRuntime {
 /// slot on the ring.
 struct Watch {
     vtable: VTable,
-    view: View<NoWake, NoWake>,
+    view: View<NoWake>,
     members: Vec<usize>,
 }
 

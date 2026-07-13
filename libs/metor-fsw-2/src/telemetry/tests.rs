@@ -212,7 +212,7 @@ fn packet_payload(pkt: &LenPacket) -> &[u8] {
 
 /// Drain a view to its newest record and return a copy of the bytes, if any.
 fn drain_latest(
-    view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake, metor_fsw_ring::NoWake>,
+    view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake>,
 ) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     let mut last = None;
@@ -583,7 +583,7 @@ async fn message_downlink_fifo_no_coalesce() {
     // interleaved. A snapshot would coalesce the two `SequenceCommand`s; a log must not.
     {
         let mut cmd_out: MsgOut<SequenceCommand> =
-            MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
+            MsgOut::new(ring.writer(NoWake).expect("first writer"));
         cmd_out
             .emit(&SequenceCommand {
                 channel: "mode".to_string(),
@@ -593,7 +593,7 @@ async fn message_downlink_fifo_no_coalesce() {
     }
     {
         let mut reg_out: MsgOut<SequenceRegistry> =
-            MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
+            MsgOut::new(ring.writer(NoWake).expect("claim freed on drop"));
         reg_out
             .emit(&SequenceRegistry {
                 channels: vec![SequenceChannelSpec {
@@ -604,7 +604,7 @@ async fn message_downlink_fifo_no_coalesce() {
             .expect("emit registry");
     }
     let mut cmd_out: MsgOut<SequenceCommand> =
-        MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
+        MsgOut::new(ring.writer(NoWake).expect("claim freed on drop"));
     cmd_out
         .emit(&SequenceCommand {
             channel: "mode".to_string(),
