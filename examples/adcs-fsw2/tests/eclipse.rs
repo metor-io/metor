@@ -4,7 +4,7 @@
 //! lockstep and the estimate rides through the sun loss.
 //!
 //! Both runs use the static path (plant/nav/ctrl as rlibs, the `momentum.rs` pattern) off a
-//! patched `mission.kdl`: `init_orbit_phase` places the boot inside / just before the
+//! patched `mission.py`: `init_orbit_phase` places the boot inside / just before the
 //! shadow arc — the phase is **computed** by scanning [`in_earth_shadow`] at the mission
 //! epoch, never hardcoded. The `mode` slot starts empty (ctrl holds its identity reference)
 //! so the estimator behavior under sun loss is the whole subject. Deterministic: seeded
@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::f64::consts::TAU;
+use std::path::Path;
 use std::rc::Rc;
 
 use adcs_contracts::{
@@ -23,10 +24,12 @@ use adcs_contracts::{
 };
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
+use metor_fsw_2::wiring::{ParamSource, build_artifacts, eval_python_mission, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
-const MISSION_KDL: &str = include_str!("../mission.kdl");
+fn mission_py() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
+}
 
 /// The first lit→dark orbit phase at the mission epoch, by scanning the shadow function
 /// around the boot orbit (equatorial, radius `EARTH_RADIUS + ALTITUDE`) in 0.1° steps.
@@ -47,9 +50,19 @@ fn shadow_entry_phase() -> f64 {
 
 /// The patched mission: boot at `phase` radians of orbit, slot empty (no commissioning).
 fn build_static(phase: f64) -> Option<Coordinator> {
-    let kdl = MISSION_KDL.replace("init_orbit_phase 0.0", &format!("init_orbit_phase {phase}"));
-    assert!(kdl != MISSION_KDL, "the orbit-phase anchor is present in mission.kdl");
-    let mut wiring = parse(&kdl).expect("parse the patched mission.kdl");
+    let mut wiring = match eval_python_mission(&mission_py()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("skipping: mission.py did not evaluate: {e}");
+            return None;
+        }
+    };
+    // Boot the plant `phase` radians into its orbit — the eclipse-arc anchor.
+    let plant = wiring.systems.iter_mut().find(|s| s.name == "plant").expect("the plant system");
+    let ParamSource::Value(serde_json::Value::Object(params)) = &mut plant.params else {
+        panic!("plant carries a params value tree");
+    };
+    params.insert("init_orbit_phase".into(), phase.into());
     for spec in &mut wiring.systems {
         // Static rlib systems, in-process (test binaries can't host a process worker).
         spec.artifact = None;

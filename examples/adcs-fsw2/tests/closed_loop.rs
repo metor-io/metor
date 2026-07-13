@@ -2,12 +2,12 @@
 //! spacecraft to track its commanded pointing law — **through the dlopen path**, and
 //! matching the statically-linked path bit-for-bit.
 //!
-//! Both runs resolve the **same** `mission.kdl` (so the `mode` slot's async-fn pack
+//! Both runs resolve the **same** `mission.py` (so the `mode` slot's async-fn pack
 //! occupant — always a dlopen cdylib — commissions the spacecraft identically in both), and
 //! differ in exactly one thing: whether the `plant`/`nav`/`ctrl` systems are linked
 //! statically or `dlopen`'d.
 //!
-//! 1. **static** — `mission.kdl` resolved with `plant`/`nav`/`ctrl` linked as an rlib via a
+//! 1. **static** — `mission.py` resolved with `plant`/`nav`/`ctrl` linked as an rlib via a
 //!    [`Registry`] (their `artifact` refs nulled so `resolve` takes the static factory);
 //!    the `mode` slot's sequences stay dlopen.
 //! 2. **dlopen** — the SAME mission, every system `dlopen`'d
@@ -23,14 +23,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use std::path::Path;
+
 use adcs_contracts::{BodyState, ModeCmd, tracking_sample};
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
+use metor_fsw_2::wiring::{build_artifacts, eval_python_mission, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
-/// The mission wiring document — the same file the CLI runner and the other tests read.
-const MISSION_KDL: &str = include_str!("../mission.kdl");
+/// The mission file — the same one the CLI runner and the other tests read.
+fn mission_py() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
+}
 
 /// Cycles each mission runs (≈33 s of simulated time at 120 Hz) — enough to commission and
 /// converge onto the (slowly orbit-rotating) pointing target.
@@ -64,7 +68,7 @@ struct Measure {
 /// The registry gets the **same** `pack()` the cdylib exports — one registration serving
 /// the static, dlopen, and process loading modes is the pack surface's whole point.
 fn build_static() -> Coordinator {
-    let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
+    let mut wiring = eval_python_mission(&mission_py()).expect("evaluate mission.py");
     build_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
     for spec in &mut wiring.systems {
         // plant/nav/ctrl: link statically via the Registry rather than dlopen. Process

@@ -7,23 +7,42 @@
 //! resolution.
 //!
 //! Both runs use the static path (plant/nav/ctrl as rlibs, like `closed_loop.rs`'s parity
-//! reference) off a patched `mission.kdl`: the wheel preload set to a controllable level,
+//! reference) off a patched `mission.py`: the wheel preload set to a controllable level,
 //! the alarm band scaled around it, and `k_desat` set per run. Gated off `miri`
 //! (build_artifacts still builds the sequence cdylibs the `mode` slot loads).
 
 #![cfg(not(miri))]
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 
 use adcs_contracts::{BodyState, V3, Wheels};
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::AlarmRaised;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
+use metor_fsw_2::wiring::{ParamSource, Wiring, build_artifacts, eval_python_mission, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, MsgIn};
 
-const MISSION_KDL: &str = include_str!("../mission.kdl");
+fn mission_py() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
+}
+
+/// The value-tree params of the named system, for in-place patching of the evaluated IR.
+fn params_of<'a>(
+    wiring: &'a mut Wiring,
+    name: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let sys = wiring
+        .systems
+        .iter_mut()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("system `{name}`"));
+    match &mut sys.params {
+        ParamSource::Value(serde_json::Value::Object(map)) => map,
+        _ => panic!("system `{name}` carries a params value tree"),
+    }
+}
 
 /// 75 s of mission at 120 Hz. The torquers' authority against the ~40 µT field is
 /// ~1e-5 N·m at the 0.2 A·m² clamp, so the window is enough to dump a few 1e-4 N·m·s of
@@ -44,15 +63,29 @@ const PRELOAD: f64 = 0.01;
 /// test's subject). Plant/nav/ctrl link statically. `None` if the build plumbing is
 /// unavailable (offline/sandboxed cargo), so callers skip rather than fail spuriously.
 fn build_static(k_desat: f64) -> Option<Coordinator> {
-    let kdl = MISSION_KDL
-        .replace("init_wheel_h 0.0", &format!("init_wheel_h {PRELOAD}"))
-        .replace("init_rate=0.15", "init_rate=0.02")
-        .replace("k_desat=0.0005", &format!("k_desat={k_desat}"))
-        // The RW_MOMENTUM_HIGH band, scaled around the (controllable) preload.
-        .replace("warning above=0.03 below=-0.03", "warning above=0.008 below=-0.008")
-        .replace("critical above=0.038 below=-0.038", "critical above=0.012 below=-0.012");
-    assert!(kdl != MISSION_KDL, "patch points present in mission.kdl");
-    let mut wiring = parse(&kdl).expect("parse the patched mission.kdl");
+    let mut wiring = match eval_python_mission(&mission_py()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("skipping: mission.py did not evaluate: {e}");
+            return None;
+        }
+    };
+    // Preload the wheels, becalm the boot tumble, and set this run's desat gain on the
+    // evaluated IR's value tree.
+    let plant = params_of(&mut wiring, "plant");
+    plant.insert("init_wheel_h".into(), PRELOAD.into());
+    plant.insert("init_rate".into(), 0.02.into());
+    params_of(&mut wiring, "ctrl").insert("k_desat".into(), k_desat.into());
+    // The RW_MOMENTUM_HIGH band, scaled around the (controllable) preload.
+    let alarms = params_of(&mut wiring, "alarms");
+    let band = alarms["alarm"]
+        .as_array_mut()
+        .expect("alarm list")
+        .iter_mut()
+        .find(|a| a["id"] == "RW_MOMENTUM_HIGH")
+        .expect("the RW_MOMENTUM_HIGH alarm");
+    band["warning"] = serde_json::json!({ "above": 0.008, "below": -0.008 });
+    band["critical"] = serde_json::json!({ "above": 0.012, "below": -0.012 });
     if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
         eprintln!("skipping: build_artifacts failed: {e}");
         return None;

@@ -1,9 +1,8 @@
 """The adcs-fsw2 mission, expressed with the `metor_config` Python front-end.
 
-This re-states `mission.kdl` in full: the same coordinator config, artifacts,
-systems, `mode` slot, and edges, resolving to an equivalent `Wiring`
-(`tests/equivalence.rs`). `mission.kdl` stays the committed default the CLI and
-the tracked tests read; this file is the second, evaluated front-end.
+This is the mission: the coordinator config, artifacts, systems, `mode` slot,
+and edges the CLI runner and the tracked tests read, evaluated once at
+build/package time into the `Wiring` IR.
 
 Systems and occupants come from generated, `py.typed` pack modules
 (`metor-fsw stubgen`): importing `Plant`/`Nav`/`Ctrl` and

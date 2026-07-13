@@ -1,5 +1,5 @@
 //! The mission's alarm end-to-end gate (`docs/alarms.md`): the `ADCS_RATE_HIGH`
-//! alarm declared in `mission.kdl` — a shaped nox-tensor target
+//! alarm declared in `mission.py` — a shaped nox-tensor target
 //! (`plant.sensors.gyro_b` element 1) — raises on the boot tumble and clears as the
 //! controller detumbles, observed as wkt alarm Msgs on the alarm engine's registered
 //! message channels (the exact records the downlink would ship to the panel).
