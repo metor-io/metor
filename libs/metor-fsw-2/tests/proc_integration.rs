@@ -713,21 +713,23 @@ fn slow_sim_config() -> CoordinatorConfig {
 // ---------------------------------------------------------------------------
 
 fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
-    use metor_fsw_2::wiring::{Registry, parse, resolve};
+    use metor_fsw_2::wiring::{Registry, resolve};
+    use metor_fsw_2::{ClockSpec, WiringBuilder};
 
     // Two entries of the one pack (the fixture registers the same body as
     // `waiter` and `napper`): two allowed occupants with distinct Load names
-    // and identical contracts.
-    let kdl = r#"
-coordinator cycle_rate=500.0
-artifact "seqs" crate="metor-fsw-2-seq-fixture" lib="metor_fsw_2_seq_fixture"
-slot "adcs" process=#true {
-    allow occupant="waiter"
-    allow occupant="napper"
-}
-connect "coordinator" -> "adcs" msg="SequenceCommand"
-"#;
-    let mut wiring = parse(kdl).expect("the process-slot mission parses");
+    // and identical contracts. `process()` runs each occupant in its own
+    // worker, and the msg edge carries the in-proc control handle's commands.
+    let mut wiring = WiringBuilder::new()
+        .coordinator(500.0, ClockSpec::Wall)
+        .artifact("seqs", "metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture")
+        .slot("adcs")
+        .process()
+        .allow("waiter")
+        .allow("napper")
+        .end()
+        .connect_msg("coordinator", "adcs", "SequenceCommand")
+        .build();
     // `main` already built and located the fixture; fill the paths in place
     // of the build driver.
     for artifact in &mut wiring.artifacts {

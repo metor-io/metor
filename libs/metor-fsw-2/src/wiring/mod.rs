@@ -1,56 +1,29 @@
-//! Load a coordinator from a KDL wiring document.
+//! Load a coordinator from a [`Wiring`] mission IR.
 //!
-//! This module is a pure front-end onto [`CoordinatorBuilder`]. [`parse`] turns
-//! a KDL document into a [`Wiring`], a plain data model of systems, slots,
-//! edges, and coordinator config. [`resolve`] walks a `Wiring`, instantiates
-//! each system from an app-built [`Registry`], connects the edges, and calls
-//! `build()`. The Rust [`WiringBuilder`] produces the same `Wiring`, so both
-//! front-ends feed one resolver and every graph check runs identically for
+//! This module is a pure front-end onto [`CoordinatorBuilder`]. A [`Wiring`] —
+//! a plain data model of systems, slots, edges, and coordinator config — comes
+//! either from evaluating a `.py` mission ([`eval_python_mission`]) or from the
+//! Rust [`WiringBuilder`]. [`resolve`] walks it, instantiates each system from
+//! an app-built [`Registry`], connects the edges, and calls `build()`. Both
+//! front-ends feed the one resolver, so every graph check runs identically for
 //! either. No coordinator logic lives here; every error surfaced is a
-//! span-carrying [`LoadError`], a `miette` [`Diagnostic`](miette::Diagnostic).
-//!
-//! ## Document shape
-//!
-//! Scalar params and coordinator config are properties on the node line, while
-//! nested and sequence params are child nodes. Both surfaces feed the same
-//! serde deserializer in `de.rs`.
-//!
-//! ```kdl
-//! coordinator cycle_rate=200.0 default_depth=8           // wall clock, paced
-//! coordinator cycle_rate=200.0 sim_dt=0.00833            // simulated clock, free-run
-//! system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
-//! system "nav" type="MekfFilter" gain=0.8 {
-//!     pid p=1.0 i=0.5 d=0.1                  // a nested params struct
-//!     taps 1 2 3                             // a sequence param
-//! }
-//! connect "imu" -> "nav" frame="imu"          // shorthand
-//! connect from="nav" out="nav" to="log" in="nav"   // explicit long form
-//! connect "ctrl" -> "plant" frame="torque_cmd" delayed=#true   // feedback back-edge
-//! ```
-//!
-//! `sim_dt` (seconds) selects a [`ClockMode::Simulated`] clock with that
-//! logical per-cycle step and lets the loop free-run; without it the loop
-//! paces a `Wall` clock at `cycle_rate`. `delayed=#true` marks the edge as a
-//! one-cycle-delayed feedback back-edge
-//! ([`CoordinatorBuilder::connect_delayed`]).
+//! [`LoadError`], a `miette` [`Diagnostic`](miette::Diagnostic) that anchors on
+//! the spec's [`SourceRef`] when it has one.
 //!
 //! ## Params
 //!
-//! One serde deserializer over a node's params surface serves both system
-//! kinds. The static path deserializes a typed `S::Params`; the dl path
-//! deserializes a dynamic value that is then encoded to postcard bytes against
-//! the artifact's exported `Params` schema, since the host never links the
-//! occupant's `Params` type. The reserved wiring keys (`type=` and `artifact=`
-//! on `system` nodes, `occupant=` on `allow` nodes) and the leading
-//! instance-name argument never reach the params struct at all. A
-//! [`ParamSource::Value`] tree joins the same two paths one step later: serde
-//! deserialize for static (through [`StaticParams::Value`]), schema encode
-//! for loaded (through [`encode_value_params`]).
+//! Params reach `resolve` as a [`ParamSource`] — a value tree
+//! ([`ParamSource::Value`], the Python front-end's format), the Rust builder's
+//! pre-encoded postcard bytes ([`ParamSource::Postcard`]), or nothing
+//! ([`ParamSource::None`]). A static system deserializes a typed `S::Params`
+//! (serde, field defaults honored). A loaded system's `Params` type is never
+//! linked into the host, so a value tree is conformed against the artifact's
+//! exported `Params` schema and encoded to postcard bytes
+//! ([`encode_value_params`]); pre-encoded bytes pass straight through.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use kdl::{KdlDocument, KdlNode};
 use miette::SourceSpan;
 
 use metor_proto::types::ComponentId;
@@ -69,20 +42,19 @@ use crate::system::{
 };
 use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetrySystem, UplinkSystem};
 
-// The `Wiring` data model, its two front-ends (KDL parse and the Rust
-// builder), and the cargo build driver for dl artifacts.
+// The `Wiring` data model, its two front-ends (the Python-eval path and the
+// Rust builder), and the cargo build driver for dl artifacts.
 mod build_driver;
 mod builder;
 mod bundle;
-pub(crate) mod de;
 mod error;
-mod kdl_params;
-mod parse;
+mod params;
 mod py;
 mod stubgen;
 
-// The pure-data IR lives at the crate root (feature `wiring-model`) so it does
-// not require the KDL parser; the submodules here reach it as `super::model`.
+// The pure-data IR lives at the crate root (feature `wiring-model`) so it is
+// available without the front-end; the submodules here reach it as
+// `super::model`.
 pub(crate) use crate::ir as model;
 
 pub use build_driver::{BuildError, BuildOptions, build_artifacts, build_target};
@@ -92,15 +64,27 @@ pub use bundle::{
     unpack_metor, write_bundle,
 };
 pub use error::LoadError;
-pub use kdl_params::{encode_kdl_params, encode_kdl_params_with_defaults, encode_value_params};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
     InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef, SystemSpec,
     TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
-pub use parse::{cdylib_file_name, parse, parse_with_origin};
+pub use params::encode_value_params;
 pub use py::{eval_python_mission, is_python_mission, metor_config_version};
 pub use stubgen::{StubgenError, StubgenOptions, StubgenReport, stubgen};
+
+/// The shared-object file name for a library `stem` on the host platform
+/// (`libfoo.so`, `libfoo.dylib`, `foo.dll`), used by the build driver, the
+/// stub generator, and the [`WiringBuilder`] to name an [`Artifact::cdylib`].
+pub fn cdylib_file_name(stem: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("lib{stem}.dylib")
+    } else if cfg!(target_os = "windows") {
+        format!("{stem}.dll")
+    } else {
+        format!("lib{stem}.so")
+    }
+}
 
 // Re-exported so a system author only needs `metor_fsw_2::wiring`.
 pub use crate::register_system;
@@ -108,12 +92,6 @@ pub use crate::register_system;
 // ---------------------------------------------------------------------------
 // Param deserialization
 // ---------------------------------------------------------------------------
-
-/// Line-property keys of a `system` node that belong to the wiring surface,
-/// not the params struct.
-pub(crate) const SYSTEM_RESERVED: &[&str] = &["type", "artifact", "process"];
-/// Line-property keys of a slot `allow` node that belong to the wiring surface.
-pub(crate) const ALLOW_RESERVED: &[&str] = &["occupant", "artifact"];
 
 // ---------------------------------------------------------------------------
 // The registry
@@ -135,9 +113,6 @@ pub struct LoadCtx<'a> {
 /// The params surface a static-path factory decodes, the typed twin of the dl
 /// path's [`ParamSource`] reduction.
 pub enum StaticParams<'a> {
-    /// A `system` node's params surface, plus the document text its spans
-    /// index into.
-    Kdl { node: &'a KdlNode, src: &'a str },
     /// A params value tree. `src` is the best-available diagnostic snippet
     /// (a value tree carries no spans of its own), anchored by the spec's
     /// [`SourceRef`] when it has one.
@@ -145,9 +120,8 @@ pub enum StaticParams<'a> {
         value: &'a serde_json::Value,
         src: &'a str,
     },
-    /// No params. Decodes through a synthesized minimal node, so a required
-    /// field is reported as the same missing param a param-less KDL node
-    /// raises.
+    /// No params. Decodes as an all-defaults value, so a required field is
+    /// reported as the same missing param an empty params object raises.
     None,
 }
 
@@ -155,7 +129,7 @@ impl StaticParams<'_> {
     /// The diagnostic source text, for errors outside the params surface.
     fn diag_src(&self, name: &str) -> String {
         match self {
-            StaticParams::Kdl { src, .. } | StaticParams::Value { src, .. } => (*src).to_string(),
+            StaticParams::Value { src, .. } => (*src).to_string(),
             StaticParams::None => format!("system \"{name}\""),
         }
     }
@@ -213,7 +187,7 @@ where
 /// The factory [`Registry::register`] stores for one concrete type:
 /// deserialize params, `new` the system, run its host-side configure step, and
 /// add it to the builder, erased to a plain `fn` pointer. `()` params
-/// deserialize from a param-less node and reject stray properties.
+/// deserialize from a paramless surface and reject stray properties.
 fn factory<S, K>(ctx: &mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>
 where
     S: BuildSystem + AddToBuilder<K>,
@@ -244,30 +218,70 @@ where
     Ok((handle, ctx.builder.descriptor_of(handle).clone()))
 }
 
-/// Decode a typed `Params` off a [`StaticParams`] surface: KDL through the
-/// spanned node deserializer, a value tree through serde (unknown keys
-/// rejected), no params through a synthesized minimal node.
+/// Decode a typed `Params` off a [`StaticParams`] surface: a value tree
+/// through serde (unknown keys rejected), no params through the all-defaults
+/// [`NoParams`] deserializer.
 fn decode_static_params<P: serde::de::DeserializeOwned>(
     params: &StaticParams,
     name: &str,
 ) -> Result<P, LoadError> {
     match params {
-        StaticParams::Kdl { node, src } => de::from_kdl_node(node, src, name, SYSTEM_RESERVED, 1),
         StaticParams::Value { value, src } => decode_value_params(value, name, src),
-        StaticParams::None => {
-            let (src, doc) = synthesized_node(name);
-            de::from_kdl_node(&doc.nodes()[0], &src, name, SYSTEM_RESERVED, 1)
-        }
+        StaticParams::None => P::deserialize(NoParams).map_err(|e| LoadError::ValueParams {
+            system: name.to_string(),
+            reason: e.to_string(),
+            src: format!("system \"{name}\""),
+            span: (0, name.len() + 9).into(),
+        }),
     }
 }
 
-/// The minimal node a [`StaticParams::None`] surface decodes through.
-fn synthesized_node(name: &str) -> (String, KdlDocument) {
-    let src = format!("system \"{name}\"");
-    let doc = src
-        .parse::<KdlDocument>()
-        .expect("a synthesized minimal node parses");
-    (src, doc)
+/// A serde deserializer for a params surface that carries no fields: it yields
+/// the unit value for `()` and an empty map for a struct (so `#[serde(default)]`
+/// fields fill in and a required field is a clean missing-field error). This
+/// replaces the paramless synthesized node the old KDL front-end decoded — a
+/// `serde_json::Value` alone cannot serve both, since `()` needs `Null` and a
+/// defaulted struct needs `{}`.
+struct NoParams;
+
+impl<'de> serde::Deserializer<'de> for NoParams {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        // Default to an empty map, so a struct with defaulted fields decodes.
+        v.visit_map(serde::de::value::MapDeserializer::new(
+            std::iter::empty::<(&str, &str)>(),
+        ))
+    }
+
+    fn deserialize_unit<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        v.visit_unit()
+    }
+
+    fn deserialize_unit_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        v: V,
+    ) -> Result<V::Value, Self::Error> {
+        v.visit_unit()
+    }
+
+    fn deserialize_option<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        v.visit_none()
+    }
+
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        v: V,
+    ) -> Result<V::Value, Self::Error> {
+        v.visit_newtype_struct(self)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf seq tuple tuple_struct map struct enum identifier ignored_any
+    }
 }
 
 /// Deserialize a typed `Params` from a value tree.
@@ -275,9 +289,8 @@ fn synthesized_node(name: &str) -> (String, KdlDocument) {
 /// Unlike the dl path's schema conformance, this is plain serde, so
 /// `#[serde(default)]` field attributes are honored. `serde_ignored` supplies
 /// the typo guard serde_json's deserializer lacks: a key no field consumed is
-/// an [`UnknownParam`](LoadError::UnknownParam), matching the KDL
-/// deserializer's behavior, and any other decode failure is a
-/// [`ValueParams`](LoadError::ValueParams) carrying serde's own message.
+/// an [`UnknownParam`](LoadError::UnknownParam), and any other decode failure
+/// is a [`ValueParams`](LoadError::ValueParams) carrying serde's own message.
 pub(crate) fn decode_value_params<P: serde::de::DeserializeOwned>(
     value: &serde_json::Value,
     system: &str,
@@ -303,60 +316,6 @@ pub(crate) fn decode_value_params<P: serde::de::DeserializeOwned>(
         });
     }
     Ok(params)
-}
-
-/// The node kind a [`ParamSource::Kdl`] text came from, selecting which line
-/// properties and leading arguments belong to the wiring surface rather than
-/// the params. A `system` node reserves `type=`/`artifact=`/`process=` and
-/// leads with the instance-name argument; a slot `allow` node reserves
-/// `occupant=`/`artifact=` and has no positional.
-#[derive(Clone, Copy, Debug)]
-pub enum ParamNode {
-    /// A `system` node.
-    System,
-    /// A slot `allow` node.
-    Occupant,
-}
-
-/// Render a [`ParamSource`] as the plain JSON value tree it carries, joining
-/// the two front-ends' params to one comparable form for tooling and
-/// equivalence checks. [`ParamSource::Kdl`] is re-parsed through the shared
-/// params deserializer, [`ParamSource::Value`] is returned as-is, and
-/// [`ParamSource::None`] yields `None`. [`ParamSource::Postcard`] is the
-/// Rust-builder-only encoded form and has no schema-free value tree.
-pub fn param_value_tree(
-    params: &ParamSource,
-    node: ParamNode,
-) -> Result<Option<serde_json::Value>, LoadError> {
-    match params {
-        ParamSource::None => Ok(None),
-        ParamSource::Value(value) => Ok(Some(value.clone())),
-        ParamSource::Kdl(text) => {
-            let (reserved, skip_args) = match node {
-                ParamNode::System => (SYSTEM_RESERVED, 1),
-                ParamNode::Occupant => (ALLOW_RESERVED, 0),
-            };
-            let doc = text.parse::<KdlDocument>().map_err(|e| LoadError::Parse {
-                source: e,
-                src: text.clone(),
-                span: (0, text.len()).into(),
-            })?;
-            let node = doc.nodes().first().ok_or_else(|| LoadError::ValueParams {
-                system: "<params>".into(),
-                reason: "params text has no node".into(),
-                src: text.clone(),
-                span: (0, text.len()).into(),
-            })?;
-            let (value, _spans) = de::params_value(node, text, "<params>", reserved, skip_args)?;
-            Ok(Some(value))
-        }
-        ParamSource::Postcard(_) => Err(LoadError::StaticPostcardParams {
-            system: "<params>".into(),
-            ty: "<unknown>".into(),
-            src: String::new(),
-            span: (0, 0).into(),
-        }),
-    }
 }
 
 /// One registered type: its factory plus the static descriptor, available
@@ -438,7 +397,7 @@ impl Registry {
     /// Register concrete system `S` under `type_name`.
     ///
     /// `S` supplies its params type and `new` via the format-independent
-    /// [`BuildSystem`](crate::BuildSystem); the only KDL-facing requirement is
+    /// [`BuildSystem`](crate::BuildSystem); the only params requirement is
     /// `S::Params: DeserializeOwned`, the same derive the postcard contract
     /// already needs, so a statically linked system registers by implementing
     /// `BuildSystem` alone. The cyclic-versus-async branch comes from the
@@ -473,29 +432,23 @@ impl Registry {
             let entry = Rc::new(RefCell::new(entry));
             let factory = Box::new(move |ctx: &mut LoadCtx| {
                 let mut entry = entry.borrow_mut();
-                let synthesized;
-                let params = match &ctx.params {
-                    StaticParams::Kdl { node, src } => crate::pack::EntryParams::Kdl {
-                        node,
-                        src,
-                        name: ctx.name,
-                        msgs: ctx.msgs,
-                    },
-                    StaticParams::Value { value, src } => crate::pack::EntryParams::Value {
-                        value,
-                        src,
-                        name: ctx.name,
-                        msgs: ctx.msgs,
-                    },
+                // A paramless surface conforms an empty object against the
+                // entry's schema, so its declared defaults fill in — the pack
+                // twin of the static `NoParams` decode.
+                let empty = serde_json::Value::Object(serde_json::Map::new());
+                let synthesized_src;
+                let (value, src) = match &ctx.params {
+                    StaticParams::Value { value, src } => (*value, *src),
                     StaticParams::None => {
-                        synthesized = synthesized_node(ctx.name);
-                        crate::pack::EntryParams::Kdl {
-                            node: &synthesized.1.nodes()[0],
-                            src: &synthesized.0,
-                            name: ctx.name,
-                            msgs: ctx.msgs,
-                        }
+                        synthesized_src = ctx.params.diag_src(ctx.name);
+                        (&empty, synthesized_src.as_str())
                     }
+                };
+                let params = crate::pack::EntryParams::Value {
+                    value,
+                    src,
+                    name: ctx.name,
+                    msgs: ctx.msgs,
                 };
                 let handle = ctx
                     .builder
@@ -562,13 +515,6 @@ enum Dir {
     In,
 }
 
-/// Parse a KDL wiring document, instantiate every system from `registry`,
-/// connect the edges, and return a built [`Coordinator`] ready to `run`.
-pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
-    let wiring = parse(kdl)?;
-    resolve(&wiring, registry)
-}
-
 /// Walk a [`Wiring`] and produce a built [`Coordinator`].
 ///
 /// Both front-ends land here, so static and dl systems go through identical
@@ -631,8 +577,8 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
                 resolve_dl(spec, artifact_id, wiring, &mut packs, &mut builder)?
             }
             (None, true) => {
-                // The KDL front-end rejects this at parse; a builder-origin
-                // spec lands here.
+                // A process system needs an artifact to spawn a worker; a spec
+                // that sets `process` without one lands here.
                 let src = system_src(spec);
                 return Err(LoadError::ProcessNeedsArtifact {
                     name: spec.name.clone(),
@@ -736,18 +682,16 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 
 /// Instantiate a static system through the [`Registry`] factory.
 ///
-/// A KDL-origin spec re-parses the node source text the parse stage stored
-/// in [`SystemSpec::params`], and a config-less one synthesizes a minimal
-/// node, so both decode through the spanned node deserializer; a value-tree
-/// spec passes its params straight through as [`StaticParams::Value`].
+/// A value-tree spec passes its params straight through as
+/// [`StaticParams::Value`]; a config-less one decodes the entry's defaults via
+/// [`StaticParams::None`].
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
     builder: &mut CoordinatorBuilder,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     // `type=` is required for a static system; only a dl system can derive it
-    // from its artifact. The KDL front-end enforces this at parse, but a
-    // builder-origin spec could omit it.
+    // from its artifact. A builder-origin spec could omit it.
     let ty = spec.ty.as_deref().ok_or_else(|| {
         let src = system_src(spec);
         LoadError::MissingType {
@@ -764,14 +708,12 @@ fn resolve_static(
             src,
         }
     })?;
-    let node_src;
-    let doc;
     let snippet;
     let params = match &spec.params {
         // Typed builder params ([`ParamSource::Postcard`]) are rejected: the
-        // static path deserializes KDL or a value tree, not postcard, so the
-        // bytes have no decode path and would be silently dropped, leaving
-        // the system on defaults.
+        // static path deserializes a value tree, not postcard, so the bytes
+        // have no decode path and would be silently dropped, leaving the
+        // system on defaults.
         ParamSource::Postcard(_) => {
             let src = system_src(spec);
             return Err(LoadError::StaticPostcardParams {
@@ -788,30 +730,7 @@ fn resolve_static(
                 src: &snippet,
             }
         }
-        ParamSource::None | ParamSource::Kdl(_) => {
-            node_src = match &spec.params {
-                ParamSource::Kdl(text) => text.clone(),
-                _ => format!("system \"{}\" type=\"{}\"", spec.name, ty),
-            };
-            doc = node_src
-                .parse::<KdlDocument>()
-                .map_err(|source| LoadError::Parse {
-                    source,
-                    src: node_src.clone(),
-                    span: (0, node_src.len()).into(),
-                })?;
-            let node = doc
-                .nodes()
-                .first()
-                .ok_or_else(|| LoadError::MissingInstanceName {
-                    src: node_src.clone(),
-                    span: (0, node_src.len()).into(),
-                })?;
-            StaticParams::Kdl {
-                node,
-                src: &node_src,
-            }
-        }
+        ParamSource::None => StaticParams::None,
     };
     (factory.factory)(&mut LoadCtx {
         params,
@@ -944,14 +863,11 @@ impl OccupantEntry {
 /// instantiated on every load; a wired system is instantiated once, so a
 /// non-reloadable `.state(...)` entry is legal there. `owner` names the
 /// `system` or `slot` instance in diagnostics.
-#[allow(clippy::too_many_arguments)]
 fn resolve_occupant(
     source: &EntrySource<'_>,
     entry: Option<&str>,
     params: &ParamSource,
     owner: &str,
-    reserved: &'static [&'static str],
-    skip_args: usize,
     require_reloadable: bool,
     src: &str,
     span: SourceSpan,
@@ -989,8 +905,6 @@ fn resolve_occupant(
                 loaded.params_schema(),
                 loaded.params_default(),
                 owner,
-                reserved,
-                skip_args,
             )?;
             Ok((OccupantEntry::Opened(loaded), params))
         }
@@ -1013,8 +927,6 @@ fn resolve_occupant(
                 &meta.params_schema,
                 meta.params_default.as_deref(),
                 owner,
-                reserved,
-                skip_args,
             )?;
             Ok((OccupantEntry::Described(meta.descriptor.clone()), params))
         }
@@ -1022,7 +934,7 @@ fn resolve_occupant(
 }
 
 /// Resolve a [`ParamSource`] to canonical postcard bytes against an entry's
-/// exported `Params` schema and declared defaults. `Kdl` text is
+/// exported `Params` schema and declared defaults. A value tree is
 /// schema-encoded (the host never links the type), producing the same bytes
 /// a typed builder's `Postcard` source carries; an absent config takes the
 /// defaults verbatim.
@@ -1031,15 +943,10 @@ fn encode_occupant_params(
     schema: &postcard_schema::schema::owned::OwnedNamedType,
     defaults: Option<&[u8]>,
     owner: &str,
-    reserved: &'static [&'static str],
-    skip_args: usize,
 ) -> Result<Vec<u8>, LoadError> {
     Ok(match params {
         ParamSource::None => defaults.unwrap_or_default().to_vec(),
         ParamSource::Postcard(bytes) => bytes.clone(),
-        ParamSource::Kdl(node_text) => encode_kdl_params_with_defaults(
-            node_text, schema, owner, reserved, skip_args, defaults,
-        )?,
         ParamSource::Value(value) => encode_value_params(value, schema, owner, defaults)?,
     })
 }
@@ -1067,8 +974,6 @@ fn resolve_dl(
         spec.ty.as_deref(),
         &spec.params,
         &spec.name,
-        SYSTEM_RESERVED,
-        1,
         false,
         &src,
         span,
@@ -1145,8 +1050,6 @@ fn resolve_proc(
         spec.ty.as_deref(),
         &spec.params,
         &spec.name,
-        SYSTEM_RESERVED,
-        1,
         false,
         &src,
         span,
@@ -1197,7 +1100,7 @@ fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
 /// Enforce generated-stub freshness: for each artifact whose stub module
 /// recorded a `manifest_hash`, compare it against the live pack manifest and
 /// fail with [`LoadError::StaleStubs`] on a mismatch. Artifacts with no
-/// recorded hash (KDL front-end, hand-written `pack()` handles) or no built
+/// recorded hash (builder-authored, hand-written `pack()` handles) or no built
 /// path yet are skipped; the dlopen path still opens them.
 fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
     for artifact in &wiring.artifacts {
@@ -1385,8 +1288,6 @@ fn resolve_slot(
                 Some(&occ.occupant),
                 &occ.params,
                 &slot.name,
-                ALLOW_RESERVED,
-                0,
                 true,
                 &src,
                 span,
@@ -1466,7 +1367,7 @@ fn resolve_slot(
 /// artifact is described by a short-lived **describe worker** — the host
 /// never dlopens it, at resolve or at any later `Load` — the descriptor and
 /// `Params` schema are decoded from the worker's bytes, and the occupant's
-/// KDL params are encoded against that schema exactly as the dl path
+/// params are encoded against that schema exactly as the dl path
 /// encodes them. The resulting [`AllowedOccupant`]s carry
 /// [`OccupantBacking::Artifact`], which is what makes `add_slot` register
 /// the slot process-mode.
@@ -1550,8 +1451,6 @@ fn describe_occupants(
             Some(&occ.occupant),
             &occ.params,
             &slot.name,
-            ALLOW_RESERVED,
-            0,
             true,
             src,
             span,

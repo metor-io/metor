@@ -3,9 +3,9 @@
 //! The mission file imports the `metor_config` recorder, builds a mission, and
 //! at exit writes the serialized [`Wiring`] IR. This module resolves an
 //! interpreter, materializes the embedded recorder, runs the file, and ingests
-//! the JSON it produced — landing a `Wiring` exactly where the KDL front-end's
-//! [`parse`](super::parse) does, so the shared [`resolve`](super::resolve)
-//! consumes either identically.
+//! the JSON it produced — landing a `Wiring` the shared
+//! [`resolve`](super::resolve) consumes, exactly like the Rust
+//! [`WiringBuilder`](super::WiringBuilder).
 //!
 //! Errors keep their native surface: a Python-level failure prints CPython's
 //! own traceback (the mission file is just a script, so `pdb` and IDE debuggers
@@ -38,9 +38,9 @@ const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
 
 /// The embedded recorder's `__version__`, compared against the version the
 /// emitted IR carries. Kept in lockstep with `python/metor_config/__init__.py`.
-const EMBEDDED_METOR_CONFIG_VERSION: &str = "0.2.0";
+const EMBEDDED_METOR_CONFIG_VERSION: &str = "0.3.0";
 
-/// `true` if `path` dispatches to the Python front-end rather than the KDL one.
+/// `true` if `path` is a Python mission (a `.py` file the CLI evaluates).
 pub fn is_python_mission(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "py")
 }

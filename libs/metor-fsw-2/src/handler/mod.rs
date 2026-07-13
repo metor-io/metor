@@ -119,9 +119,9 @@ where
     F: ExecuteFn<S, M>,
     G: InitFn<S, M2>,
 {
-    /// Declare default params: a config (KDL or an absent params blob) need
-    /// spell only its overrides, on every loading path. The value is encoded
-    /// once here; nothing requires `Default` on the params type.
+    /// Declare default params: a config (a value tree or an absent params
+    /// blob) need spell only its overrides, on every loading path. The value
+    /// is encoded once here; nothing requires `Default` on the params type.
     pub fn defaults(mut self, value: G::Params) -> Self
     where
         G::Params: serde::Serialize,

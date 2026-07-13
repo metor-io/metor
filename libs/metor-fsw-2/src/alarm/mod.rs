@@ -455,8 +455,8 @@ struct Watch {
 
 /// The alarm engine, a cyclic system that evaluates the configured limit
 /// alarms each cycle and reports transitions as alarm messages. Registered
-/// like any system, either as `system "alarms" type="Alarms" { … }` in KDL or
-/// with `add_cyclic_named`; it reads through a receive-all tap, so it must
+/// like any system, either as `m.add("alarms", Alarms(...))` in a `mission.py`
+/// or with `add_cyclic_named`; it reads through a receive-all tap, so it must
 /// register after the systems it watches.
 pub struct AlarmSystem {
     alarms: Vec<AlarmRuntime>,

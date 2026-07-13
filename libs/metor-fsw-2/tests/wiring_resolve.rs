@@ -1,23 +1,22 @@
 //! End-to-end tests for driving a dl graph through the [`Wiring`] data model.
 //!
-//! Each test describes a mission as data, either with the Rust [`WiringBuilder`]
-//! or as KDL text. The mission wires a statically linked producer into a
-//! dlopen'd consumer loaded from the `metor-fsw-2-dl-fixture` artifact. The
-//! tests then run [`build_artifacts`] to compile the fixture and locate its
-//! shared library, [`resolve`] the wiring into a coordinator, and run it,
-//! checking that outputs appear under their instance names and that params
-//! given to either front-end reach the loaded system.
+//! Each test describes a mission as data with the Rust [`WiringBuilder`]. The
+//! mission wires a statically linked producer into a dlopen'd consumer loaded
+//! from the `metor-fsw-2-dl-fixture` artifact. The tests then run
+//! [`build_artifacts`] to compile the fixture and locate its shared library,
+//! [`resolve`] the wiring into a coordinator, and run it, checking that outputs
+//! appear under their instance names and that params reach the loaded system.
 //!
 //! When the fixture cannot be built (no cargo, no fixture crate on disk) the
 //! tests skip rather than fail.
 
-#![cfg(all(feature = "kdl", not(miri)))]
+#![cfg(all(feature = "wiring", not(miri)))]
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
-    BuildSystem, ClockSpec, CyclicSystem, DlPack, Frame, Input, Out, Output, ParamSource, System,
-    SystemInput, SystemKind, SystemOutput, Wiring, WiringBuilder,
-    wiring::{BuildOptions, Registry, build_artifacts, encode_kdl_params, parse, resolve},
+    BuildSystem, ClockSpec, CyclicSystem, DlPack, Frame, Input, Out, Output, System, SystemInput,
+    SystemKind, SystemOutput, WiringBuilder,
+    wiring::{BuildOptions, Registry, build_artifacts, resolve},
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -186,174 +185,6 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
     assert_eq!(dl.descriptor().kind, SystemKind::Cyclic);
 }
 
-/// Configures the same dl system through both front-ends, the typed Rust
-/// builder and KDL node properties, and asserts they produce byte-identical
-/// params and run to the same output. The KDL side is encoded against the
-/// `Params` schema exported by the shared library, so the host never links the
-/// fixture's params type.
-#[test]
-fn kdl_and_builder_dl_params_are_byte_identical_and_run_equal() {
-    // --- Rust-builder front-end ------------------------------------------------------
-    let mut builder_wiring = WiringBuilder::new()
-        .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })
-        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_stem())
-        .system("ticker")
-        .ty("Ticker")
-        .from_static()
-        .end()
-        .system("counter")
-        .ty("DlCounter")
-        .from_artifact("counter")
-        .params(CounterParams {
-            start: 1000,
-            scale: 2.0,
-        })
-        .end()
-        .connect("ticker", "tick_in", "counter", "tick_in")
-        .build();
-
-    // --- KDL front-end, the same mission with params as node properties ---------------
-    let kdl = format!(
-        r#"
-coordinator cycle_rate=200.0 sim_dt=0.005
-artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}"
-system "ticker" type="Ticker"
-system "counter" type="DlCounter" artifact="counter" start=1000 scale=2.0
-connect "ticker" -> "counter" frame="tick_in"
-"#,
-        lib = fixture_lib_stem()
-    );
-    let mut kdl_wiring = parse(&kdl).expect("parse the KDL mission onto Wiring");
-
-    // Build the fixture once and share the located library path with both wirings.
-    if let Err(e) = build_artifacts(&mut builder_wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
-        return;
-    }
-    kdl_wiring.artifacts[0].path = builder_wiring.artifacts[0].path.clone();
-
-    // --- (a) Byte-identical params ----------------------------------------------------
-    // The builder system already carries postcard bytes; the KDL system carries
-    // node text, encoded here against the library's exported schema exactly as
-    // the resolver would.
-    let path = builder_wiring.artifacts[0].path.as_ref().unwrap();
-    let builder_bytes = match &builder_wiring.systems[1].params {
-        ParamSource::Postcard(b) => b.clone(),
-        other => panic!("builder dl system should carry Postcard params, got {other:?}"),
-    };
-    let kdl_text = match &kdl_wiring.systems[1].params {
-        ParamSource::Kdl(t) => t.clone(),
-        other => panic!("KDL dl system should carry Kdl params, got {other:?}"),
-    };
-    let kdl_bytes = {
-        let dl = DlPack::open(path)
-            .expect("open the fixture .so for its Params schema")
-            .system("DlCounter")
-            .expect("select the counter entry");
-        encode_kdl_params(
-            &kdl_text,
-            dl.params_schema(),
-            "counter",
-            &["type", "artifact"],
-            1,
-        )
-        .expect("schema-encode KDL params")
-    };
-    assert_eq!(
-        builder_bytes, kdl_bytes,
-        "KDL and Rust-builder front-ends encode identical params bytes"
-    );
-
-    // --- (b) Both resolve and run to the same output ----------------------------------
-    // Resolve both and tap each output, then drive both inside one
-    // `stellarator::run`, since the process has a single executor.
-    let resolve_one = |wiring: &Wiring| {
-        let mut registry = Registry::new();
-        registry.register::<Ticker, _>("Ticker");
-        resolve(wiring, &registry).expect("resolve the dl Wiring")
-    };
-    let tap = |coord: &metor_fsw_2::Coordinator| -> Input<TickOut> {
-        Input::new(
-            coord
-                .registry()
-                .view(ComponentId::new("counter.tick_out"))
-                .expect("dl output registered")
-                .expect("a reader slot is available"),
-        )
-    };
-    let builder_coord = resolve_one(&builder_wiring);
-    let kdl_coord = resolve_one(&kdl_wiring);
-    let mut builder_view = tap(&builder_coord);
-    let mut kdl_view = tap(&kdl_coord);
-
-    let (builder_coord, kdl_coord) = stellarator::run(|| async move {
-        let mut bc = builder_coord;
-        let mut kc = kdl_coord;
-        bc.run_for(6).await;
-        kc.run_for(6).await;
-        (bc, kc)
-    });
-
-    let count_of = |view: &mut Input<TickOut>| -> u64 {
-        view.latest().expect("a tick_out was produced").get().count
-    };
-    let builder_count = count_of(&mut builder_view);
-    let kdl_count = count_of(&mut kdl_view);
-    // start(1000) + value(6) * scale(2.0) = 1012 on both front-ends.
-    assert_eq!(builder_count, 1012, "builder front-end output");
-    assert_eq!(
-        kdl_count, builder_count,
-        "KDL front-end runs to the same output"
-    );
-
-    drop((builder_view, kdl_view, builder_coord, kdl_coord));
-}
-
-/// A `Value` params tree schema-encodes to byte-identical postcard as the
-/// equivalent KDL node and the typed value's own encoding — the IR
-/// promotion's core equivalence claim, checked against the fixture's
-/// exported schema.
-#[test]
-fn value_and_kdl_dl_params_are_byte_identical() {
-    use metor_fsw_2::wiring::{encode_kdl_params, encode_value_params};
-
-    let mut wiring = WiringBuilder::new()
-        .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })
-        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_stem())
-        .build();
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
-        return;
-    }
-    let dl = DlPack::open(wiring.artifacts[0].path.as_ref().unwrap())
-        .expect("open the fixture .so for its Params schema")
-        .system("DlCounter")
-        .expect("select the counter entry");
-
-    let kdl_bytes = encode_kdl_params(
-        r#"system "counter" type="DlCounter" artifact="counter" start=1000 scale=2.0"#,
-        dl.params_schema(),
-        "counter",
-        &["type", "artifact"],
-        1,
-    )
-    .expect("schema-encode KDL params");
-    let value_bytes = encode_value_params(
-        &serde_json::json!({ "start": 1000, "scale": 2.0 }),
-        dl.params_schema(),
-        "counter",
-        None,
-    )
-    .expect("schema-encode Value params");
-    let typed_bytes = postcard::to_allocvec(&CounterParams {
-        start: 1000,
-        scale: 2.0,
-    })
-    .unwrap();
-    assert_eq!(value_bytes, kdl_bytes, "one params representation, two spellings");
-    assert_eq!(value_bytes, typed_bytes, "and both match the typed encoding");
-}
-
 /// `type=` selects the pack entry a dl system instantiates. Over a
 /// multi-entry pack an omitted `type=` is a clean `PackTypeRequired` error
 /// listing the choices, and a `type=` naming no exported entry fails with
@@ -363,17 +194,21 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
     use metor_fsw_2::DlError;
     use metor_fsw_2::wiring::LoadError;
 
-    let kdl = format!(
-        r#"
-coordinator cycle_rate=200.0 sim_dt=0.005
-artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}"
-system "ticker" type="Ticker"
-system "counter" artifact="counter" start=5 scale=1.0
-connect "ticker" -> "counter" frame="tick_in"
-"#,
-        lib = fixture_lib_stem()
-    );
-    let mut wiring = parse(&kdl).expect("type= is optional at parse with artifact=");
+    // A dl system with `artifact=` but no `type=`: the builder leaves the type
+    // unset, so resolve must pick the pack entry itself.
+    let mut wiring = WiringBuilder::new()
+        .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })
+        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_stem())
+        .system("ticker")
+        .ty("Ticker")
+        .from_static()
+        .end()
+        .system("counter")
+        .from_artifact("counter")
+        .params_value(serde_json::json!({ "start": 5, "scale": 1.0 }))
+        .end()
+        .connect("ticker", "tick_in", "counter", "tick_in")
+        .build();
     assert_eq!(
         wiring.systems[1].ty, None,
         "no explicit type on the dl system"

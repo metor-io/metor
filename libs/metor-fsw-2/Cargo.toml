@@ -36,7 +36,6 @@ serde = { version = "1.0", features = ["derive"] }
 postcard-dyn = { version = "0.2", optional = true }
 serde_json = { version = "1.0", optional = true }
 serde_ignored = { version = "0.1", optional = true }
-kdl = { version = "6.3.4", optional = true }
 toml = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
 zerocopy = { version = "0.8.2", features = ["derive"] }
@@ -56,16 +55,21 @@ clap = { version = "4", features = ["derive"], optional = true }
 tempfile = { version = "3.13", optional = true }
 
 [features]
-default = ["kdl"]
-# The pure-data `Wiring` IR plus its serde/serde_json codec, available without
-# the KDL parser so an evaluated front-end can emit and re-ingest the IR.
+default = ["wiring"]
+# The pure-data `Wiring` IR (`src/ir.rs`) plus its serde/serde_json codec, with
+# none of the runtime front-end. A consumer that only reads/writes the IR — the
+# panel graph tile, a diffing tool — depends on the crate with just this feature
+# and skips miette, the value-encoder, and the CLI.
 wiring-model = ["dep:serde_json"]
-kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_ignored", "dep:clap", "dep:tempfile", "dep:toml", "dep:sha2", "wiring-model"]
+# The full wiring front-end: the Python-eval path, the Rust `WiringBuilder`, the
+# resolver, bundles, stubgen, and the `metor-fsw` CLI. Pulls `wiring-model` for
+# the IR it produces and consumes.
+wiring = ["wiring-model", "dep:miette", "dep:postcard-dyn", "dep:serde_ignored", "dep:clap", "dep:tempfile", "dep:toml", "dep:sha2"]
 
 [[bin]]
 name = "metor-fsw"
 path = "src/bin/metor-fsw.rs"
-required-features = ["kdl"]
+required-features = ["wiring"]
 
 [dev-dependencies]
 tempfile = "3.13"

@@ -16,7 +16,7 @@
 //! stderr instead of failing; `tests_abi` keeps the loader logic covered
 //! regardless.
 
-#![cfg(all(feature = "kdl", not(miri)))]
+#![cfg(all(feature = "wiring", not(miri)))]
 
 use std::path::PathBuf;
 use std::process::Command;

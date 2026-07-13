@@ -9,7 +9,7 @@
 //! consumes — deserialized and re-serialized to prove it is exactly what Rust
 //! accepts and emits.
 
-#![cfg(feature = "kdl")]
+#![cfg(feature = "wiring")]
 
 use metor_fsw_2::ir::{EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
 use metor_fsw_2::{
@@ -18,7 +18,7 @@ use metor_fsw_2::{
 };
 use serde_json::{Value, json};
 
-/// A `Wiring` exercising every spec kind, all four `ParamSource` variants, both
+/// A `Wiring` exercising every spec kind, all three `ParamSource` variants, both
 /// edge kinds with and without `delayed`, a nested scope table, and source
 /// anchors — the maximal shape the representation must survive.
 fn maximal() -> Wiring {
@@ -53,15 +53,6 @@ fn maximal() -> Wiring {
                 process: true,
                 src: src(5),
                 scope: Some(0),
-            },
-            SystemSpec {
-                name: "kdl_sys".into(),
-                ty: Some(" Imu".into()),
-                artifact: Some("adcs".into()),
-                params: ParamSource::Kdl("system \"kdl_sys\" gain=1.0".into()),
-                process: false,
-                src: None,
-                scope: None,
             },
             SystemSpec {
                 name: "postcard_sys".into(),
@@ -176,9 +167,9 @@ fn representation_is_externally_tagged() {
         v["systems"][0]["params"],
         json!({ "Value": { "init_angle": 0.5, "seed": 42 } })
     );
-    assert_eq!(v["systems"][3]["params"], json!("None"));
+    assert_eq!(v["systems"][2]["params"], json!("None"));
     assert_eq!(
-        v["systems"][2]["params"],
+        v["systems"][1]["params"],
         json!({ "Postcard": [1, 2, 3, 4] })
     );
     assert_eq!(v["slots"][0]["initial"]["state"], json!("Running"));
@@ -188,8 +179,8 @@ fn representation_is_externally_tagged() {
     // The consumer input port field is `in_`, not `in`.
     assert_eq!(v["edges"][0]["in_"], json!("sensors"));
     // Absent optionals render as null, not omitted.
-    assert_eq!(v["systems"][3]["ty"], Value::Null);
-    assert_eq!(v["systems"][3]["scope"], Value::Null);
+    assert_eq!(v["systems"][2]["ty"], Value::Null);
+    assert_eq!(v["systems"][2]["scope"], Value::Null);
 }
 
 /// The shared fixture: the exact JSON the Python emitter must produce, minus

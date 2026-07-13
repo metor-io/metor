@@ -9170,7 +9170,6 @@ version = "0.14.2"
 dependencies = [
  "clap 4.6.0",
  "inventory",
- "kdl",
  "libloading",
  "memmap2",
  "metor-fsw",

@@ -6,8 +6,7 @@ use miette::IntoDiagnostic;
 use crate::wiring::{
     BuildOptions, ClockSpec, METOR_EXTENSION, PackageOptions, Registry, StubgenOptions,
     WIRING_FILE_NAME, Wiring, build_artifacts, build_target, eval_python_mission, is_python_mission,
-    load_bundle, metor_config_version, parse_with_origin, resolve, stubgen, unpack_metor,
-    write_bundle,
+    load_bundle, metor_config_version, resolve, stubgen, unpack_metor, write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -29,7 +28,7 @@ enum Command {
     Build(BuildArgs),
     /// Produce a relocatable bundle directory (the cdylibs plus a manifest).
     Package(PackageArgs),
-    /// Load a wiring (a source `.kdl` with `--build`, or a bundle dir) and run it.
+    /// Load a mission (a source `.py` with `--build`, or a bundle dir) and run it.
     Run(RunArgs),
     /// Generate the typed Python pack modules (`packs/<id>.py`) for a mission.
     Stubgen(StubgenArgs),
@@ -37,8 +36,8 @@ enum Command {
 
 #[derive(Args, Debug)]
 struct BuildArgs {
-    /// The wiring KDL file.
-    kdl: PathBuf,
+    /// The `.py` mission file.
+    mission: PathBuf,
     /// Build the `--release` profile (default: debug).
     #[arg(long)]
     release: bool,
@@ -54,8 +53,8 @@ struct BuildArgs {
 
 #[derive(Args, Debug)]
 struct PackageArgs {
-    /// The mission source (`.py` or `.kdl`). Required unless `--check-ir`.
-    kdl: Option<PathBuf>,
+    /// The `.py` mission source. Required unless `--check-ir`.
+    mission: Option<PathBuf>,
     /// The bundle output: a directory (conventionally `*.bundle`), or a
     /// single-file `*.metor` archive (dispatched by the `.metor` extension).
     #[arg(short = 'o', long = "out", value_name = "OUT")]
@@ -79,9 +78,9 @@ struct PackageArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// A source `.kdl` file (requires `--build`) or a bundle directory (cargo-free).
+    /// A source `.py` mission (requires `--build`) or a bundle directory (cargo-free).
     target: PathBuf,
-    /// Build the cdylibs first; required when the target is a source `.kdl`.
+    /// Build the cdylibs first; required when the target is a source `.py`.
     #[arg(long)]
     build: bool,
     /// Build the `--release` profile when `--build` is set.
@@ -94,11 +93,11 @@ struct RunArgs {
     /// build for the host architecture.
     #[arg(long)]
     no_manifest_sidecar: bool,
-    /// Use a paced wall clock, overriding the KDL's clock.
+    /// Use a paced wall clock, overriding the mission's clock.
     #[arg(long, group = "clock")]
     wall: bool,
     /// Use a free-running simulated clock with this per-cycle step in seconds,
-    /// overriding the KDL's clock.
+    /// overriding the mission's clock.
     #[arg(long, value_name = "SECS", group = "clock")]
     sim_dt: Option<f64>,
     /// Override the coordinator cycle rate (Hz).
@@ -165,20 +164,29 @@ fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// Load a source mission into a [`Wiring`], dispatched by extension: a `.py`
-/// mission is evaluated by a subprocess CPython, anything else is parsed as KDL.
+/// Load a source mission into a [`Wiring`]. Missions are Python: a `.py` file
+/// is evaluated by a subprocess CPython. A `.kdl` file gets a clear
+/// removed-feature error; any other extension is unrecognized.
 fn load_source(path: &Path) -> miette::Result<Wiring> {
     if is_python_mission(path) {
-        eval_python_mission(path)
-    } else {
-        let text = read_file(path)?;
-        Ok(parse_with_origin(&text, Some(&path.to_string_lossy()))?)
+        return eval_python_mission(path);
     }
+    if path.extension().is_some_and(|e| e == "kdl") {
+        return Err(miette::miette!(
+            "KDL mission support was removed; missions are Python (`.py`). Port `{}` to a \
+             `mission.py` (see docs/design-python-config.md)",
+            path.display()
+        ));
+    }
+    Err(miette::miette!(
+        "unrecognized mission `{}`; missions are Python (`.py`)",
+        path.display()
+    ))
 }
 
 /// `build`: load the wiring, compile and locate every artifact's `.so`, print them.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
-    let mut wiring = load_source(&args.kdl)?;
+    let mut wiring = load_source(&args.mission)?;
     build_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
@@ -199,17 +207,16 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     if let Some(bundle) = &args.check_ir {
         return cmd_check_ir(bundle);
     }
-    // Both front-ends produce a `Wiring`; the bundle freezes it as IR, so a
-    // `.py` mission packages through the same path a `.kdl` does — no Python
-    // and no KDL parser is needed to run the result.
-    let kdl = args.kdl.as_deref().ok_or_else(|| {
-        miette::miette!("`package` needs a mission source (`.py`/`.kdl`), or `--check-ir <bundle>`")
+    // The bundle freezes the evaluated `Wiring` as IR, so the packaged mission
+    // runs with no Python and no config parse on target.
+    let mission = args.mission.as_deref().ok_or_else(|| {
+        miette::miette!("`package` needs a mission source (`.py`), or `--check-ir <bundle>`")
     })?;
     let out = args
         .out
         .as_deref()
         .ok_or_else(|| miette::miette!("`package` needs an output path (`-o <out>`)"))?;
-    let mut wiring = load_source(kdl)?;
+    let mut wiring = load_source(mission)?;
     build_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
@@ -218,11 +225,10 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     let opts = PackageOptions {
         release: args.release,
         target: build_target(&args.cargo_arg),
-        // The recorder version is provenance; a Python mission was evaluated by
-        // this host's embedded (or $METOR_CONFIG_PY) recorder.
-        metor_config_version: is_python_mission(kdl)
-            .then(|| metor_config_version().to_string()),
-        provenance: Some(kdl.to_path_buf()),
+        // The recorder version is provenance: the mission was evaluated by this
+        // host's embedded (or $METOR_CONFIG_PY) recorder.
+        metor_config_version: Some(metor_config_version().to_string()),
+        provenance: Some(mission.to_path_buf()),
         // Current time; a reproducible build pins this.
         built_at_unix: None,
     };
@@ -264,7 +270,7 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
 
     let source = find_provenance(&dir).ok_or_else(|| {
         miette::miette!(
-            "bundle `{}` carries no provenance source (mission.py/.kdl); cannot --check-ir",
+            "bundle `{}` carries no provenance source (mission.py); cannot --check-ir",
             bundle.display()
         )
     })?;
@@ -282,13 +288,10 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
     }
 }
 
-/// The provenance source inside a bundle directory: `mission.py` preferred,
-/// then `mission.kdl`.
+/// The provenance source inside a bundle directory.
 fn find_provenance(dir: &Path) -> Option<PathBuf> {
-    ["mission.py", "mission.kdl"]
-        .into_iter()
-        .map(|n| dir.join(n))
-        .find(|p| p.exists())
+    let p = dir.join("mission.py");
+    p.exists().then_some(p)
 }
 
 /// The normalized-for-diff JSON of a `Wiring`: artifact paths stripped and
@@ -350,7 +353,7 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
 }
 
 /// Resolve `run`'s `<TARGET>` into a located [`Wiring`]. A bundle directory
-/// loads cargo-free via [`load_bundle`]. A source `.kdl` requires `--build`,
+/// loads cargo-free via [`load_bundle`]. A source `.py` requires `--build`,
 /// because the cargo build driver is the only artifact locator and `.so` paths
 /// are not persisted between a `build` and a later `run`.
 fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
@@ -358,14 +361,14 @@ fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
         if args.build {
             return Err(miette::miette!(
                 "`--build` is not valid for a bundle (nothing to build); run the bundle \
-                 directly, or `--build` a source `.kdl`"
+                 directly, or `--build` a source `.py`"
             ));
         }
         return load_bundle(&args.target).into_diagnostic();
     }
     if !args.build {
         return Err(miette::miette!(
-            "running a source `.kdl` requires `--build` (to compile and locate the cdylibs); \
+            "running a source `.py` requires `--build` (to compile and locate the cdylibs); \
              or `metor-fsw package {} -o <dir>` and run the bundle",
             args.target.display()
         ));
@@ -386,7 +389,7 @@ fn is_bundle(path: &Path) -> bool {
 }
 
 /// Apply `run`'s override flags onto the loaded [`Wiring`] before [`resolve`].
-/// A flag always beats the KDL.
+/// A flag always beats the mission's own setting.
 fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     if args.wall {
         wiring.coordinator.clock = ClockSpec::Wall;
@@ -419,25 +422,36 @@ fn read_file(path: &Path) -> miette::Result<String> {
 mod tests {
     use super::*;
 
-    /// Normalized IR ignores the `src` file name (the provenance copy sits at a
-    /// different path than the original source), so re-parsing the same text
-    /// under a different origin is not spurious drift — but a real change is.
+    /// Normalized IR clears the `src` file name (the provenance copy sits at a
+    /// different path than the original source), so the same mission evaluated
+    /// from two paths is not spurious drift — but a real emission change is.
     #[test]
     fn normalized_ir_ignores_source_path_but_not_content() {
-        let kdl = "coordinator cycle_rate=100.0\nsystem \"a\" type=\"Src\"\n";
-        let frozen = parse_with_origin(kdl, Some("/build/mission.kdl")).unwrap();
-        let reparsed = parse_with_origin(kdl, Some("/tmp/bundle/mission.kdl")).unwrap();
+        use crate::wiring::{SourceRef, WiringBuilder};
+
+        let base = || {
+            WiringBuilder::new()
+                .coordinator(100.0, ClockSpec::Wall)
+                .system("a")
+                .ty("Src")
+                .end()
+                .build()
+        };
+        let anchor = |file: &str| Some(SourceRef { file: Some(file.into()), line: 1, col: 1 });
+
+        let mut frozen = base();
+        frozen.systems[0].src = anchor("/build/mission.py");
+        let mut relocated = base();
+        relocated.systems[0].src = anchor("/tmp/bundle/mission.py");
         assert_eq!(
             normalized_ir(&frozen),
-            normalized_ir(&reparsed),
-            "same text, different origin path — not drift"
+            normalized_ir(&relocated),
+            "same mission, different provenance path — not drift"
         );
 
-        let changed = parse_with_origin(
-            "coordinator cycle_rate=200.0\nsystem \"a\" type=\"Src\"\n",
-            Some("/build/mission.kdl"),
-        )
-        .unwrap();
+        let mut changed = base();
+        changed.systems[0].src = anchor("/build/mission.py");
+        changed.coordinator.cycle_rate = 200.0;
         assert_ne!(
             normalized_ir(&frozen),
             normalized_ir(&changed),
@@ -445,14 +459,12 @@ mod tests {
         );
     }
 
-    /// Provenance discovery prefers `mission.py`, then `mission.kdl`, and is
-    /// `None` when a bundle carries neither.
+    /// Provenance discovery finds `mission.py`, and is `None` when a bundle
+    /// carries none.
     #[test]
-    fn find_provenance_prefers_python() {
+    fn find_provenance_finds_python() {
         let dir = tempfile::tempdir().unwrap();
         assert!(find_provenance(dir.path()).is_none(), "no provenance yet");
-        std::fs::write(dir.path().join("mission.kdl"), "").unwrap();
-        assert_eq!(find_provenance(dir.path()), Some(dir.path().join("mission.kdl")));
         std::fs::write(dir.path().join("mission.py"), "").unwrap();
         assert_eq!(find_provenance(dir.path()), Some(dir.path().join("mission.py")));
     }

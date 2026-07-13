@@ -70,8 +70,8 @@ pub(crate) fn resolve_worker_exe(overridden: Option<&Path>) -> Result<PathBuf, P
 /// short-lived child. Decode the bytes with
 /// [`SystemDescriptorMsg::into_descriptor`](crate::abi::SystemDescriptorMsg::into_descriptor)
 /// and register via
-/// [`add_proc_cyclic`](crate::CoordinatorBuilder::add_proc_cyclic); the KDL
-/// [`resolve`](crate::wiring::resolve) front-end does exactly this. The
+/// [`add_proc_cyclic`](crate::CoordinatorBuilder::add_proc_cyclic);
+/// [`resolve`](crate::wiring::resolve) does exactly this. The
 /// child's stderr is captured into the failure diagnostic. `worker_exe`
 /// `None` re-executes this binary (whose `main` must call [`worker_entry`]).
 ///

@@ -1,7 +1,7 @@
 //! Fluent construction of a [`Wiring`] from Rust.
 //!
-//! [`WiringBuilder`] is the programmatic counterpart to the KDL front-end.
-//! Both produce the same [`Wiring`] value, so anything a KDL document can
+//! [`WiringBuilder`] is the Rust-native counterpart to the Python front-end.
+//! Both produce the same [`Wiring`] value, so anything a `mission.py` can
 //! declare can be declared here instead.
 //!
 //! ```no_run
@@ -19,8 +19,8 @@
 //! ```
 //!
 //! Typed params are postcard-encoded into [`ParamSource::Postcard`] bytes.
-//! The encoding is byte-identical to what the KDL front-end's schema-guided
-//! encoder produces for the same logical value, and it is exactly what a
+//! The encoding is byte-identical to what the Python front-end's value tree
+//! schema-encodes to for the same logical value, and it is exactly what a
 //! loaded library's `fsw_create` decodes. A system without params carries
 //! [`ParamSource::None`].
 
@@ -412,11 +412,12 @@ impl SystemSpecBuilder {
 
     /// Sets the typed params, postcard-encoded into [`ParamSource::Postcard`]
     /// bytes. These are exactly the bytes the loaded library's `fsw_create`
-    /// decodes, and match what the KDL front-end encodes for the same value.
+    /// decodes, and match what the Python front-end's value tree encodes to
+    /// for the same value.
     ///
     /// Only a [`from_artifact`](Self::from_artifact) system accepts them. A
     /// static system takes its params through its registered
-    /// KDL-deserializing factory and has no postcard decode path, so resolve
+    /// value-tree-deserializing factory and has no postcard decode path, so resolve
     /// rejects the combination with
     /// [`LoadError::StaticPostcardParams`](super::LoadError::StaticPostcardParams)
     /// rather than silently running the system on defaults.

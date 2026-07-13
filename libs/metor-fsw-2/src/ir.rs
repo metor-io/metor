@@ -1,15 +1,15 @@
 //! The [`Wiring`] data model, a plain serializable description of a mission.
 //!
 //! This module is the mission IR: pure data plus its serde/serde_json codec,
-//! carrying no `kdl::` types, so an evaluated front-end can emit it and the
-//! host can re-ingest it with only the `wiring-model` feature. The KDL parser
-//! and the shared resolver live under the `kdl`-gated [`wiring`](crate::wiring)
-//! module, which re-exports these types.
+//! carrying no runtime types, so an evaluated front-end can emit it and the
+//! host can re-ingest it with only the `wiring-model` feature. The Python-eval
+//! path, the Rust builder, and the shared resolver live under the `wiring`-gated
+//! [`wiring`](crate::wiring) module, which re-exports these types.
 //!
-//! Both front-ends produce this type. The KDL deserializer in
-//! `wiring::parse` and the `wiring::WiringBuilder` each build a `Wiring`, and
-//! the one shared `wiring::resolve` consumes it, so anything one front-end can
-//! express the other can express too.
+//! Both front-ends produce this type. The Python `metor_config` recorder emits
+//! it as JSON and the [`wiring::WiringBuilder`](crate::wiring::WiringBuilder)
+//! builds it directly, and the one shared `wiring::resolve` consumes it, so
+//! anything one front-end can express the other can express too.
 //!
 //! The specs here deliberately hold no runtime values. A [`ClockSpec`] mirrors
 //! [`ClockMode`](crate::ClockMode) with a plain `f64` in place of a `Duration`,
@@ -25,7 +25,11 @@ use serde::{Deserialize, Serialize};
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 1;
+///
+/// v2 dropped the `ParamSource::Kdl` variant with the KDL front-end (phase 4):
+/// a wire-shape change, so a v1 bundle fails the version check and must be
+/// rebuilt.
+pub const IR_VERSION: u32 = 2;
 
 /// A plain-data description of a complete mission, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
@@ -55,7 +59,7 @@ pub struct Wiring {
     pub edges: Vec<EdgeSpec>,
     /// The scope table that [`SystemSpec::scope`]/[`SlotSpec::scope`] index
     /// into. Consumer metadata only: instance names stay flat and
-    /// collision-checked regardless. The KDL front-end leaves it empty.
+    /// collision-checked regardless. The Rust builder leaves it empty.
     #[serde(default)]
     pub scopes: Vec<ScopeSpec>,
 }
@@ -82,8 +86,8 @@ impl Wiring {
 /// breaking this shape.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceRef {
-    /// The source file, when the front-end knows it
-    /// ([`parse_with_origin`](crate::wiring::parse_with_origin)).
+    /// The source file, when the front-end knows it (the evaluated
+    /// `mission.py`'s path).
     pub file: Option<String>,
     /// 1-based line of the declaring node.
     pub line: u32,
@@ -169,8 +173,9 @@ pub struct Artifact {
     /// (`metor-fsw stubgen`) was produced against, carried through from the
     /// module's `ARTIFACT` constant. [`resolve`](crate::wiring::resolve)
     /// compares it against the live manifest and refuses a stale stub
-    /// ([`StaleStubs`](crate::wiring::LoadError::StaleStubs)). `None` for the
-    /// KDL front-end and hand-written `pack()` handles, which skip the check.
+    /// ([`StaleStubs`](crate::wiring::LoadError::StaleStubs)). `None` for a
+    /// builder-authored artifact and hand-written `pack()` handles, which skip
+    /// the check.
     #[serde(default)]
     pub manifest_hash: Option<String>,
     /// Where this artifact was declared.
@@ -205,7 +210,7 @@ pub struct SystemSpec {
     #[serde(default)]
     pub src: Option<SourceRef>,
     /// Index of this system's scope in [`Wiring::scopes`], `None` when
-    /// unscoped (always, for the KDL front-end).
+    /// unscoped (always, for the Rust builder).
     #[serde(default)]
     pub scope: Option<usize>,
 }
@@ -250,10 +255,8 @@ impl SystemSpec {
 /// the canonical postcard `Params` bytes that cross `fsw_create` for a loaded
 /// system, or a typed `S::Params` value for a static one. Which decoder runs
 /// is decided by [`SystemSpec::artifact`], not by the variant.
-/// [`Kdl`](ParamSource::Kdl) carries the node's source text verbatim, re-run
-/// through the shared KDL params deserializer at resolve.
-/// [`Value`](ParamSource::Value) carries a plain value tree — the format an
-/// evaluated front-end emits — conformed against the object's exported
+/// [`Value`](ParamSource::Value) carries a plain value tree — the format the
+/// evaluated Python front-end emits — conformed against the object's exported
 /// `Params` schema and postcard-encoded for a loaded system, or
 /// serde-deserialized (field defaults honored) for a static one.
 /// [`Postcard`](ParamSource::Postcard) carries a `Params` value the Rust
@@ -262,16 +265,13 @@ impl SystemSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ParamSource {
     /// No params. Resolves to the entry's declared defaults (or empty
-    /// postcard bytes) for a loaded system, a minimal synthesized node for a
+    /// postcard bytes) for a loaded system, an all-defaults decode for a
     /// static one.
     None,
     /// Canonical postcard `Params` bytes, the typed Rust builder path.
     /// dl-only; the static path rejects it as
     /// [`StaticPostcardParams`](crate::wiring::LoadError::StaticPostcardParams).
     Postcard(Vec<u8>),
-    /// The KDL node's source text, re-decoded at resolve (typed serde
-    /// deserialize for static, schema-guided postcard encode for loaded).
-    Kdl(String),
     /// A params value tree (schema-conform + encode for loaded, serde
     /// deserialize for static).
     Value(serde_json::Value),
@@ -318,7 +318,7 @@ pub struct SlotSpec {
     #[serde(default)]
     pub src: Option<SourceRef>,
     /// Index of this slot's scope in [`Wiring::scopes`], `None` when
-    /// unscoped (always, for the KDL front-end).
+    /// unscoped (always, for the Rust builder).
     #[serde(default)]
     pub scope: Option<usize>,
 }

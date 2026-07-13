@@ -83,14 +83,15 @@
 //! The [`Coordinator`] reads each system's static [`SystemDescriptor`] before
 //! constructing anything, validates the connection graph, allocates and sizes
 //! every ring, binds the ports, and then drives the cycle on a wall or simulated
-//! clock. Graphs are wired in Rust through [`CoordinatorBuilder`], or
-//! declaratively in KDL through the [`wiring`] module (the `kdl` feature).
+//! clock. Graphs are wired in Rust through [`CoordinatorBuilder`], or from a
+//! `mission.py` evaluated into the [`Wiring`](wiring::Wiring) IR through the
+//! [`wiring`] module (the `wiring` feature).
 //!
 //! A crate's systems can also be compiled as a **pack** `cdylib` exporting
 //! the C ABI in [`abi`] (one [`export_pack!`] per crate over its `pack()` fn)
 //! and loaded at runtime through [`dl`]. A loaded pack describes every entry
 //! over the ABI, and each is validated and wired exactly like a statically
-//! linked system. Both modules build without the `kdl` feature.
+//! linked system. Both modules build without the `wiring` feature.
 //!
 //! # Built-in systems
 //!
@@ -122,16 +123,16 @@ mod writer;
 
 pub mod health;
 
-// Not gated on `kdl`; sequences are an ABI/runtime feature.
+// Not gated on `wiring`; sequences are an ABI/runtime feature.
 pub mod sequence;
 
-// The pure-data mission IR. Available without the KDL parser (feature
-// `wiring-model`) so an evaluated front-end can emit and re-ingest it; the
-// `kdl`-gated `wiring` module re-exports these types alongside its resolver.
+// The pure-data mission IR. Available without the front-end (feature
+// `wiring-model`) so an IR consumer can emit and re-ingest it; the
+// `wiring`-gated `wiring` module re-exports these types alongside its resolver.
 #[cfg(feature = "wiring-model")]
 pub mod ir;
 
-#[cfg(feature = "kdl")]
+#[cfg(feature = "wiring")]
 pub mod wiring;
 
 pub mod abi;
@@ -224,14 +225,11 @@ pub use ir::{
     ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
 
-#[cfg(feature = "kdl")]
+#[cfg(feature = "wiring")]
 pub use wiring::{BuildError, BuildOptions, BundleError, PackageOptions, WiringBuilder};
 
-#[cfg(feature = "kdl")]
+#[cfg(feature = "wiring")]
 pub mod cli;
-
-#[cfg(feature = "kdl")]
-pub use kdl;
 
 // Frame acceptance tests span frame/dynamic/writer/reader, so they live at the
 // crate root rather than under any single module.

@@ -178,7 +178,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// System construction (kdl-independent)
+// System construction (config-independent)
 // ---------------------------------------------------------------------------
 
 /// How a concrete system is constructed from its typed params.

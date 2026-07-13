@@ -53,28 +53,17 @@ pub enum Mount {
 }
 
 /// The params surface an entry decodes at create, by loading mode. Every
-/// surface produces the same value by construction: the KDL front-end and
-/// the value tree encode against the same schema the postcard bytes decode
-/// under.
+/// surface produces the same value by construction: the value tree encodes
+/// against the same schema the postcard bytes decode under.
 pub enum EntryParams<'a> {
     /// Canonical postcard bytes (the dl / process-worker path).
     Postcard(&'a [u8]),
-    /// A `system` node's params surface (the static KDL path). `msgs` is the
-    /// registry's message table, for entries whose
-    /// [`configure`](crate::BuildSystem::configure) resolves name tokens.
-    #[cfg(feature = "kdl")]
-    Kdl {
-        node: &'a kdl::KdlNode,
-        src: &'a str,
-        name: &'a str,
-        msgs: &'a crate::message::MsgTable,
-    },
     /// A params value tree (the static [`ParamSource::Value`] path). `src`
     /// is the diagnostic snippet errors anchor on; a value tree carries no
     /// spans of its own.
     ///
     /// [`ParamSource::Value`]: crate::wiring::ParamSource::Value
-    #[cfg(feature = "kdl")]
+    #[cfg(feature = "wiring")]
     Value {
         value: &'a serde_json::Value,
         src: &'a str,
@@ -89,8 +78,8 @@ pub enum MakeError {
     /// The postcard params bytes did not decode as the entry's params type.
     #[error("pack entry params did not decode: {0}")]
     Postcard(#[from] postcard::Error),
-    /// The KDL or value params surface did not deserialize (spans inside).
-    #[cfg(feature = "kdl")]
+    /// The value params surface did not deserialize (spans inside).
+    #[cfg(feature = "wiring")]
     #[error(transparent)]
     Params(Box<crate::wiring::LoadError>),
     /// A `configure` step failed to resolve a config reference.
@@ -106,12 +95,7 @@ pub enum MakeError {
 pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Result<P, MakeError> {
     match params {
         EntryParams::Postcard(bytes) => Ok(postcard::from_bytes(bytes)?),
-        #[cfg(feature = "kdl")]
-        EntryParams::Kdl {
-            node, src, name, ..
-        } => crate::wiring::de::from_kdl_node(node, src, name, crate::wiring::SYSTEM_RESERVED, 1)
-            .map_err(|e| MakeError::Params(Box::new(e))),
-        #[cfg(feature = "kdl")]
+        #[cfg(feature = "wiring")]
         EntryParams::Value {
             value, src, name, ..
         } => crate::wiring::decode_value_params(value, name, src)
@@ -121,8 +105,12 @@ pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Res
 
 /// Resolve an entry's params surface to complete postcard bytes when the
 /// entry declared defaults: an absent config uses the defaults verbatim, a
-/// KDL or value surface is schema-encoded over the decoded default base
-/// (top-level overrides), and explicit postcard bytes pass through complete.
+/// value surface is schema-encoded over the decoded default base (top-level
+/// overrides), and explicit postcard bytes pass through complete.
+///
+/// `schema` is unused without the `wiring` feature (only the value surface
+/// consults it), so a runtime-only build carries the bytes through as-is.
+#[cfg_attr(not(feature = "wiring"), allow(unused_variables))]
 pub(crate) fn resolve_defaults(
     params: EntryParams<'_>,
     defaults: &[u8],
@@ -131,20 +119,7 @@ pub(crate) fn resolve_defaults(
     match params {
         EntryParams::Postcard(bytes) if bytes.is_empty() => Ok(defaults.to_vec()),
         EntryParams::Postcard(bytes) => Ok(bytes.to_vec()),
-        #[cfg(feature = "kdl")]
-        EntryParams::Kdl { node, name, .. } => {
-            let owned = postcard_schema::schema::owned::OwnedNamedType::from(schema);
-            crate::wiring::encode_kdl_params_with_defaults(
-                &node.to_string(),
-                &owned,
-                name,
-                crate::wiring::SYSTEM_RESERVED,
-                1,
-                Some(defaults),
-            )
-            .map_err(|e| MakeError::Params(Box::new(e)))
-        }
-        #[cfg(feature = "kdl")]
+        #[cfg(feature = "wiring")]
         EntryParams::Value { value, name, .. } => {
             let owned = postcard_schema::schema::owned::OwnedNamedType::from(schema);
             crate::wiring::encode_value_params(value, &owned, name, Some(defaults))
@@ -167,7 +142,7 @@ pub struct PackEntry {
     pub(crate) descriptor: SystemDescriptor,
     pub(crate) params_schema: &'static NamedType,
     /// Canonical postcard bytes of the entry's declared default params, the
-    /// base the KDL encoder overlays config onto. `None` until declared.
+    /// base the params encoder overlays config onto. `None` until declared.
     pub(crate) params_default: Option<Vec<u8>>,
     /// `false` for an entry whose state was moved in with `.state(...)`: it
     /// can be instantiated once, and never as a slot occupant.
@@ -433,17 +408,18 @@ where
     );
     descriptor.name = name;
     let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
-        #[cfg(feature = "kdl")]
+        #[cfg(feature = "wiring")]
         let msgs = match &params {
-            EntryParams::Kdl { msgs, .. } | EntryParams::Value { msgs, .. } => Some(*msgs),
+            EntryParams::Value { msgs, .. } => Some(*msgs),
             _ => None,
         };
         let p: T::Params = decode_params(params)?;
+        #[cfg_attr(not(feature = "wiring"), allow(unused_mut))]
         let mut system = T::new(p);
         // The host-context configure phase runs only where a message
         // table exists (the static path); the postcard path is the dl
         // parity path, where configure never runs.
-        #[cfg(feature = "kdl")]
+        #[cfg(feature = "wiring")]
         if let Some(msgs) = msgs {
             system.configure(&crate::BuildCtx { msgs })?;
         }

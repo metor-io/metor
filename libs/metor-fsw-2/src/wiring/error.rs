@@ -6,26 +6,17 @@ use thiserror::Error;
 use crate::coordinator::WireError;
 use crate::dl::DlError;
 
-/// A reason a KDL wiring document failed to parse, validate, or resolve
-/// into a runnable system graph, from syntax errors through graph-level
-/// [`WireError`]s and shared-library loading failures ([`DlError`]).
+/// A reason a wiring failed to validate or resolve into a runnable system
+/// graph, from missing params through graph-level [`WireError`]s and
+/// shared-library loading failures ([`DlError`]).
 ///
-/// Each variant carries the full KDL source and the span of the offending
-/// node, so rendering the error as a [`miette`] report points at the exact
-/// line of the document.
+/// Each variant carries a diagnostic snippet — a spec's [`SourceRef`]-anchored
+/// source when it has one — and the span of the offending node, so rendering
+/// the error as a [`miette`] report points at the mission line responsible.
+///
+/// [`SourceRef`]: super::SourceRef
 #[derive(Error, Debug, Diagnostic)]
 pub enum LoadError {
-    #[error("KDL parse error")]
-    #[diagnostic(code(fsw_wiring::parse_error))]
-    Parse {
-        #[source]
-        source: kdl::KdlError,
-        #[source_code]
-        src: String,
-        #[label("here")]
-        span: SourceSpan,
-    },
-
     /// A [`Wiring`](super::Wiring) stamped with a different
     /// [`IR_VERSION`](super::IR_VERSION) than this build's. Spanless: version
     /// skew is producer/host drift, not a mistake in the document text.
@@ -47,35 +38,15 @@ pub enum LoadError {
         len: usize,
     },
 
-    #[error("missing the single `coordinator` node")]
-    #[diagnostic(code(fsw_wiring::missing_coordinator))]
-    MissingCoordinator,
-
-    #[error("more than one `coordinator` node (exactly one is required)")]
-    #[diagnostic(code(fsw_wiring::multiple_coordinators))]
-    MultipleCoordinators {
-        #[source_code]
-        src: String,
-        #[label("extra coordinator here")]
-        span: SourceSpan,
-    },
-
-    #[error("`system` node is missing its instance name (the first argument)")]
-    #[diagnostic(code(fsw_wiring::missing_instance_name))]
-    MissingInstanceName {
-        #[source_code]
-        src: String,
-        #[label("name this system, e.g. `system \"imu\" ...`")]
-        span: SourceSpan,
-    },
-
-    #[error("`system \"{name}\"` is missing its `type=` property")]
+    /// A static system spec carries no `type`, which the registry needs to
+    /// select a factory. Only a builder-origin spec can omit it.
+    #[error("system `{name}` is missing its `type`")]
     #[diagnostic(code(fsw_wiring::missing_type))]
     MissingType {
         name: String,
         #[source_code]
         src: String,
-        #[label("add a registered `type=\"...\"`")]
+        #[label("set a registered `type`")]
         span: SourceSpan,
     },
 
@@ -89,7 +60,7 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    #[error("`system \"{name}\"` sets `process=#true` without an `artifact=`")]
+    #[error("system `{name}` sets `process` without an `artifact`")]
     #[diagnostic(
         code(fsw_wiring::process_needs_artifact),
         help(
@@ -101,7 +72,7 @@ pub enum LoadError {
         name: String,
         #[source_code]
         src: String,
-        #[label("add `artifact=\"...\"` or drop `process`")]
+        #[label("set an `artifact` or drop `process`")]
         span: SourceSpan,
     },
 
@@ -192,16 +163,6 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    #[error("`connect` is missing required property `{property}`")]
-    #[diagnostic(code(fsw_wiring::missing_edge_field))]
-    MissingEdgeField {
-        property: String,
-        #[source_code]
-        src: String,
-        #[label("this edge is incomplete")]
-        span: SourceSpan,
-    },
-
     #[error("unknown instance `{name}` referenced in a `connect`")]
     #[diagnostic(code(fsw_wiring::unknown_instance))]
     UnknownInstance {
@@ -275,9 +236,9 @@ pub enum LoadError {
     /// The generated stub module for this artifact was produced against a
     /// different pack manifest than the one now built — its params, ports, or
     /// entries have changed. Fails before any dlopen, naming the one command
-    /// that fixes it. Only the Python front-end (whose `ARTIFACT` constant
-    /// carries the recorded hash) can trigger this; the KDL front-end records
-    /// no hash and skips the check.
+    /// that fixes it. Only a stub-backed artifact (whose `ARTIFACT` constant
+    /// carries the recorded hash) can trigger this; a builder-authored
+    /// artifact records no hash and skips the check.
     #[error(
         "generated stubs for artifact `{artifact}` are stale (the pack manifest changed since \
          they were generated); regenerate with `metor-fsw stubgen`"
@@ -342,15 +303,14 @@ pub enum LoadError {
     },
 
     /// A static system was given typed builder params. The static path has no
-    /// postcard decoder; its registered factory deserializes params off the
-    /// KDL `system` node, so the postcard bytes would be silently dropped and
-    /// the system would run on defaults. Only the dl path decodes postcard
-    /// params.
+    /// postcard decoder; its registered factory deserializes params from a
+    /// value tree, so the postcard bytes would be silently dropped and the
+    /// system would run on defaults. Only the dl path decodes postcard params.
     #[error(
         "static system `{system}` (type `{ty}`) has typed builder params, but a static \
-         system takes params through its registered KDL-deserializing factory — express \
-         them as KDL config properties (`system \"{system}\" type=\"{ty}\" key=value`), or \
-         resolve the system `from_artifact` (only the dl path decodes postcard params)"
+         system takes params through its registered value-tree-deserializing factory — \
+         give it `params_value(...)`, or resolve the system `from_artifact` (only the dl \
+         path decodes postcard params)"
     )]
     #[diagnostic(code(fsw_wiring::static_postcard_params))]
     StaticPostcardParams {
@@ -363,7 +323,7 @@ pub enum LoadError {
     },
 
     /// A pack entry's create phase failed for a non-params reason (a
-    /// moved-in state instantiated twice, a configure failure); a KDL params
+    /// moved-in state instantiated twice, a configure failure); a params
     /// failure surfaces as its own spanned error instead.
     #[error("system `{system}` failed to create: {message}")]
     #[diagnostic(code(fsw_wiring::pack_create))]
@@ -440,86 +400,7 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// The pre-pack `artifact ... type=` surface: packs export many systems,
-    /// so the entry is named on the `system` node instead.
-    #[error(
-        "`artifact \"{artifact}\"` declares `type=`, but a pack artifact exports many systems; \
-         name the system on the `system` node (`system \"…\" artifact=\"{artifact}\" type=\"…\"`)"
-    )]
-    #[diagnostic(code(fsw_wiring::artifact_type))]
-    ArtifactType {
-        artifact: String,
-        #[source_code]
-        src: String,
-        #[label("drop this node's `type=`")]
-        span: SourceSpan,
-    },
-
-    #[error("`artifact` node is missing required property `{property}`")]
-    #[diagnostic(code(fsw_wiring::missing_artifact_field))]
-    MissingArtifactField {
-        property: &'static str,
-        #[source_code]
-        src: String,
-        #[label("this artifact node is incomplete")]
-        span: SourceSpan,
-    },
-
-    /// A top-level node name the wiring schema does not know. Without this
-    /// error a typo would be silently skipped.
-    #[error("unknown top-level node `{node}`")]
-    #[diagnostic(code(fsw_wiring::unknown_top_level_node))]
-    UnknownTopLevelNode {
-        node: String,
-        #[source_code]
-        src: String,
-        #[label("expected `coordinator`/`artifact`/`system`/`slot`/`connect`")]
-        span: SourceSpan,
-    },
-
-    /// A retired `telemetry { … }` or `uplink { … }` node. This guidance error
-    /// carries the ordinary `system` spelling to write instead.
-    #[error("the `{node}` node was replaced by an ordinary `system` declaration")]
-    #[diagnostic(
-        code(fsw_wiring::legacy_link_node),
-        help("declare it as a system, e.g. {example}")
-    )]
-    LegacyLinkNode {
-        node: String,
-        example: String,
-        #[source_code]
-        src: String,
-        #[label("no longer a dedicated node")]
-        span: SourceSpan,
-    },
-
-    /// The retired `lib=` spelling on a `system` node, which is now
-    /// `artifact=`. On `artifact` nodes `lib=` still means the library stem.
-    #[error(
-        "`lib=` on `system` nodes was renamed to `artifact=` (it references an artifact \
-         id; `lib=` on `artifact` nodes still means the library stem)"
-    )]
-    #[diagnostic(code(fsw_wiring::system_lib_renamed))]
-    SystemLibRenamed {
-        #[source_code]
-        src: String,
-        #[label("write `artifact=` here")]
-        span: SourceSpan,
-    },
-
     // --- slots ---------------------------------------------------------------
-    #[error(
-        "`slot` node has an unknown child `{child}` (expected `input`/`output`/`allow`/`initial`)"
-    )]
-    #[diagnostic(code(fsw_wiring::unknown_slot_child))]
-    UnknownSlotChild {
-        child: String,
-        #[source_code]
-        src: String,
-        #[label("remove or rename this child")]
-        span: SourceSpan,
-    },
-
     #[error("`slot \"{slot}\"` has no `allow` occupant (a slot needs at least one)")]
     #[diagnostic(code(fsw_wiring::empty_slot))]
     EmptySlot {
@@ -527,19 +408,6 @@ pub enum LoadError {
         #[source_code]
         src: String,
         #[label("add an `allow occupant=\"...\"` child")]
-        span: SourceSpan,
-    },
-
-    #[error(
-        "`slot \"{slot}\"` has an invalid initial `state=\"{state}\"` (expected `empty`/`loaded`/`running`)"
-    )]
-    #[diagnostic(code(fsw_wiring::bad_slot_state))]
-    BadSlotState {
-        slot: String,
-        state: String,
-        #[source_code]
-        src: String,
-        #[label("use `empty`, `loaded`, or `running`")]
         span: SourceSpan,
     },
 

@@ -544,7 +544,7 @@ pub struct PackSystemMsg {
     /// `false` for a `.state(...)` entry: one instance, never a slot occupant.
     pub reloadable: bool,
     /// Canonical postcard bytes of the entry's default params, when declared;
-    /// the KDL encoder overlays config onto them. Carried from day one so
+    /// the params encoder overlays config onto them. Carried from day one so
     /// adding defaults later is not another ABI version.
     pub params_default: Option<Vec<u8>>,
 }
@@ -946,5 +946,5 @@ macro_rules! export_pack {
     };
 }
 
-#[cfg(all(test, feature = "kdl"))]
+#[cfg(all(test, feature = "wiring"))]
 mod tests;
