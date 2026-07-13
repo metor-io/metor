@@ -142,6 +142,18 @@ impl Theme {
         }
     }
 
+    /// Tint for a component-frame edge in the system graph — the blue family,
+    /// the calmer of the two edge kinds since frame edges dominate a mission.
+    pub fn frame_edge_color(&self) -> Hsla {
+        self.line_colors[1]
+    }
+
+    /// Tint for a message edge in the system graph — the purple family, set
+    /// apart from the frame-edge blue so the two kinds read at a glance.
+    pub fn msg_edge_color(&self) -> Hsla {
+        self.line_colors[4]
+    }
+
     /// Solid color for an alarm severity (`severity_index`: 0 = info, 1 = warning,
     /// 2 = critical), used for limit lines, severity chips, and the status bar.
     /// Critical tracks the theme's `error_accent`; warning/info are fixed amber/blue

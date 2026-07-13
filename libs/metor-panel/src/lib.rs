@@ -17,6 +17,7 @@ pub mod app;
 pub mod config;
 pub mod dynamic;
 pub mod gpu_context;
+pub(crate) mod graph_canvas;
 pub mod hydration;
 pub mod icons;
 pub mod inspect;
@@ -29,6 +30,7 @@ pub mod theme;
 pub mod tiles;
 pub mod transient;
 pub mod views;
+pub mod wiring;
 pub(crate) mod window_controls;
 
 pub use app::PanelApp;

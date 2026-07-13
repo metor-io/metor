@@ -13,6 +13,7 @@ pub mod plot_common;
 pub mod scrollbar;
 pub mod sequence_grid;
 pub mod sequence_panel;
+pub mod system_graph;
 pub mod table;
 pub mod time_series;
 pub mod tooltip;

@@ -14,6 +14,9 @@ metor-proto.path = "../metor-proto"
 metor-proto.features = ["std", "facet"]
 metor-proto-wkt.path = "../metor-proto/wkt"
 metor-proto-wkt.features = ["nox"]
+# The mission wiring IR (Wiring) plus its serde_json codec, without the KDL
+# front-end: the System Graph tile decodes a WiringManifest's ir_json into it.
+metor-fsw-2 = { path = "../metor-fsw-2", default-features = false, features = ["wiring-model"] }
 nox.path = "../nox"
 facet = { version = "0.44.3", features = ["reflect", "smallvec", "gpui"] }
 # Pin the facet-format chain to the last 0.44.x set that still depends on
@@ -24,6 +27,7 @@ facet-format = "=0.44.5"
 facet-dessert = "=0.44.5"
 postcard = "1"
 serde = "1"
+serde_json = "1"
 smallvec = "1"
 peg = "0.8.5"
 rustfft = "6"
