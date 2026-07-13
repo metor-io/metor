@@ -1286,7 +1286,7 @@ mod integration {
         // A wrong recorded hash is a stale stub.
         wiring.artifacts[0].manifest_hash = Some("sha256:0000".to_string());
         match super::super::resolve(&wiring, &super::super::Registry::with_builtins()) {
-            Err(super::super::LoadError::StaleStubs { .. }) => {}
+            Err(e) if matches!(e.kind, super::super::LoadErrorKind::StaleStubs { .. }) => {}
             Err(other) => panic!("expected StaleStubs, got {other:?}"),
             Ok(_) => panic!("expected StaleStubs, resolve succeeded"),
         }
@@ -1296,8 +1296,8 @@ mod integration {
         let so = wiring.artifacts[0].path.clone().unwrap();
         let bytes = crate::dl::manifest_sidecar_bytes(&so).expect("sidecar present after build");
         wiring.artifacts[0].manifest_hash = Some(manifest_hash(&bytes));
-        if let Err(super::super::LoadError::StaleStubs { .. }) =
-            super::super::resolve(&wiring, &super::super::Registry::with_builtins())
+        if let Err(e) = super::super::resolve(&wiring, &super::super::Registry::with_builtins())
+            && matches!(e.kind, super::super::LoadErrorKind::StaleStubs { .. })
         {
             panic!("fresh hash wrongly rejected");
         }

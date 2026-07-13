@@ -173,7 +173,7 @@ pub struct Artifact {
     /// (`metor-fsw stubgen`) was produced against, carried through from the
     /// module's `ARTIFACT` constant. [`resolve`](crate::wiring::resolve)
     /// compares it against the live manifest and refuses a stale stub
-    /// ([`StaleStubs`](crate::wiring::LoadError::StaleStubs)). `None` for a
+    /// ([`StaleStubs`](crate::wiring::LoadErrorKind::StaleStubs)). `None` for a
     /// builder-authored artifact and hand-written `pack()` handles, which skip
     /// the check.
     #[serde(default)]
@@ -270,7 +270,7 @@ pub enum ParamSource {
     None,
     /// Canonical postcard `Params` bytes, the typed Rust builder path.
     /// dl-only; the static path rejects it as
-    /// [`StaticPostcardParams`](crate::wiring::LoadError::StaticPostcardParams).
+    /// [`StaticPostcardParams`](crate::wiring::LoadErrorKind::StaticPostcardParams).
     Postcard(Vec<u8>),
     /// A params value tree (schema-conform + encode for loaded, serde
     /// deserialize for static).

@@ -19,7 +19,7 @@ use metor_fsw_2::metor_proto_wkt::{
 };
 use metor_fsw_2::{
     ClockSpec, Frame, Input, SlotInitState, SlotStatus, WiringBuilder, split_record,
-    wiring::{BuildOptions, LoadError, Registry, build_artifacts, resolve},
+    wiring::{BuildOptions, LoadErrorKind, Registry, build_artifacts, resolve},
 };
 
 /// The seq fixture's cargo crate name and cdylib library stem.
@@ -186,7 +186,7 @@ fn slot_declared_contract_mismatch_is_a_clean_error() {
         Err(e) => e,
     };
     assert!(
-        matches!(err, LoadError::SlotContractMismatch { dir: "input", .. }),
+        matches!(err.kind, LoadErrorKind::SlotContractMismatch { dir: "input", .. }),
         "{err:?}"
     );
 }
@@ -377,7 +377,7 @@ fn slot_allow_unknown_param_is_a_clean_error() {
         Err(e) => e,
     };
     assert!(
-        matches!(err, LoadError::UnknownParam { ref property, .. } if property == "gian"),
+        matches!(err.kind, LoadErrorKind::UnknownParam { ref property, .. } if property == "gian"),
         "{err:?}"
     );
 }
