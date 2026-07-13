@@ -1,8 +1,11 @@
 # Design: KDL params via a serde Deserializer
 
-> **Status: LANDED** — implemented in commit `1aee7d1b` ("refactor(fsw2): wave-3 — KDL params
-> via one in-house serde Deserializer"), `src/wiring/de.rs`. `docs/wiring.md` §5/§6.3 and
-> `docs/dl-open.md` reflect the shipped shape.
+> **Status: HISTORICAL** — the KDL front-end this document designed was deleted
+> in Phase 4 (`python-config-phase4-plan.md`). `src/wiring/de.rs` and
+> `src/wiring/parse.rs` no longer exist; missions are Python (`mission.py`),
+> evaluated into the versioned `Wiring` IR (`design-python-config.md`). This
+> record is kept for the design rationale only; nothing here reflects the
+> shipped code.
 
 Status: DESIGN — approved decision is an **in-house `serde::Deserializer` over
 `&kdl::KdlNode`** (not knus/knuffel; `serde` is already a non-optional dep, `kdl`

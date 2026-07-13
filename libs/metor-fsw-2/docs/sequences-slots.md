@@ -83,8 +83,8 @@ The code this builds on:
   binds an occupant's ports over host rings via `RawBinder`/`attach_raw`.
 - `DlSystem::open`/`into_slot` (`src/dl.rs:142-260`) — opens, describes, validates, and
   (at build today) `fsw_create`s an occupant.
-- The wiring model (`src/wiring/model.rs`) — `Artifact`/`SystemSpec`/`EdgeSpec`; the KDL
-  `artifact`/`system`/`connect` surface and `resolve`.
+- The wiring model (`src/ir.rs`) — `Artifact`/`SystemSpec`/`EdgeSpec`; the Python front-end /
+  `WiringBuilder` that produce it and the shared `resolve`.
 
 ---
 
@@ -268,7 +268,7 @@ being the downlink: slot control is the **uplink**.
 >
 > - Each slot declares an ordinary `commands: MsgIn<SequenceCommand>` **fan-in** port (a wired
 >   port with `FanIn::Many`, not a coordinator capability) — every producer that should reach a
->   given slot is connected to it by an **explicit** KDL/builder edge; there is no implicit
+>   given slot is connected to it by an **explicit** config/builder edge; there is no implicit
 >   broadcast-to-every-slot sugar. A mission wires each producer × slot pair it wants:
 >   ```kdl
 >   system "uplink" type="TcpUplink" addr="127.0.0.1:2241"
@@ -540,31 +540,31 @@ status code is the one genuine ABI addition — see §8 / §9 Resolved Q6.
 
 ---
 
-## 5. Wiring / KDL
+## 5. Wiring
 
 A slot is a first-class wiring node alongside `system`, declaring its contract, its allowed
 occupants, and an optional initial occupant/state.
 
-```kdl
-// Each sequence cdylib is an artifact, like any system (one export per .so).
-artifact "commissioning" crate="adcs-seqs" lib="adcs_commissioning" type="commissioning"
-artifact "safe_mode"     crate="adcs-seqs" lib="adcs_safe_mode"     type="safe_mode"
+```python
+# The sequence cdylib is a stub-backed artifact; importing its occupants records it.
+from packs.seqs import commissioning, safe_mode
 
-slot "adcs" {
-    input  frame="sensors"        // the port contract (a VTable contract)
-    output frame="mode"
-    allow occupant="commissioning"   // pre-opened & validated against the contract at build
-    allow occupant="safe_mode"
-    initial occupant="commissioning" state="loaded"   // optional; default Empty
-}
+adcs = m.slot(
+    "adcs",
+    inputs=["sensors"],                       # the port contract (a VTable contract)
+    outputs=["mode"],
+    allow=[commissioning(), safe_mode()],     # pre-opened & validated against the contract
+    initial="commissioning",
+    initial_state="loaded",                   # optional; default Empty
+)
 
-// A slot is addressable in the graph exactly like a system instance:
-connect "plant" -> "adcs"  frame="sensors"
-connect "adcs"  -> "plant" frame="mode"   delayed=#true
+# A slot is addressable in the graph exactly like a system instance:
+m.connect(plant.sensors, adcs.sensors)
+m.connect(adcs.mode, plant.mode, delayed=True)
 ```
 
-- **Contract.** *Decided (§9 Q4): the contract is declared explicitly.* The `input`/`output`
-  lines declare the slot's port contract (frame names → `PortDesc`s, resolved like any port).
+- **Contract.** *Decided (§9 Q4): the contract is declared explicitly.* The `inputs`/`outputs`
+  lists declare the slot's port contract (frame names → `PortDesc`s, resolved like any port).
   Every `allow`ed occupant's `DlSystem::descriptor()` is checked `compatible()` against it at
   build (`src/descriptor.rs:149`), reusing the exact validation the static/dl path uses — so
   the slot's graph wiring exists before any occupant and occupants may differ
@@ -740,7 +740,7 @@ the rationale survives.
    cost of not being directly resumable. A separate explicit **`Pause`** (stop polling, keep
    the future) is possible later work; v1 is hard-drop only. (See §2.1.)
 
-4. **Slot contract — DECIDED: explicit KDL `input`/`output`.** Declared explicitly and each
+4. **Slot contract — DECIDED: explicit `inputs`/`outputs`.** Declared explicitly and each
    allowed occupant validated `compatible()` against it. *Trade-off:* more verbose than
    inferring from the allowed set, but lets the slot's graph wiring exist before any occupant
    and lets occupants differ (forward-compatible subset); inferring would force all occupants
