@@ -217,9 +217,39 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use crate::port::{Input, buffer_capacity};
+    use crate::port::{Input, buffer_capacity, frame_list_iter};
+    use metor_fsw::Decomponentize;
+    use metor_proto::types::{ComponentId, ComponentView};
     use metor_fsw_ring::{Config, RingBuffer};
+
+    /// Collects the `error_counts.<kind>` map members published on a health
+    /// record, keyed by their component id, off the vtable `apply` path.
+    #[derive(Default)]
+    struct CountSink(HashMap<ComponentId, u64>);
+
+    impl Decomponentize for CountSink {
+        type Error = core::convert::Infallible;
+        fn apply_value(
+            &mut self,
+            component_id: ComponentId,
+            value: ComponentView<'_>,
+            _timestamp: Option<metor_proto::types::Timestamp>,
+        ) -> Result<(), Self::Error> {
+            self.0.insert(component_id, value.to_f64() as u64);
+            Ok(())
+        }
+    }
+
+    impl CountSink {
+        fn count(&self, kind: &str) -> Option<u64> {
+            self.0
+                .get(&ComponentId::new(&format!("health.error_counts.{kind}")))
+                .copied()
+        }
+    }
 
     fn port_with_readers() -> (HealthPort, Input<SystemHealth>, Input<SystemLog>) {
         let health_ring = RingBuffer::create_in_memory(Config {
@@ -253,10 +283,11 @@ mod tests {
         assert_eq!(grant.cycles, 1);
         assert_eq!(grant.errors, 3);
         assert_eq!(grant.last_execute_micros, 12);
-        let counts = grant.map::<u64>(offset_of!(SystemHealth, error_counts));
-        assert_eq!(counts.get("imu_missing"), Some(2));
-        assert_eq!(counts.get("i2c_timeout"), Some(1));
-        assert_eq!(counts.get("absent"), None);
+        let mut counts = CountSink::default();
+        grant.apply(&mut counts).unwrap().unwrap();
+        assert_eq!(counts.count("imu_missing"), Some(2));
+        assert_eq!(counts.count("i2c_timeout"), Some(1));
+        assert_eq!(counts.count("absent"), None);
     }
 
     #[test]
@@ -271,11 +302,15 @@ mod tests {
 
         let grant = health_in.latest().expect("health published");
         assert_eq!(grant.get().errors, (MAX_ERR_KINDS + 3) as u64);
-        let counts = grant.map::<u64>(offset_of!(SystemHealth, error_counts));
-        assert_eq!(counts.len(), MAX_ERR_KINDS);
-        assert_eq!(counts.get("kind_0"), Some(2));
+        let mut counts = CountSink::default();
+        grant.apply(&mut counts).unwrap().unwrap();
+        let present = (0..MAX_ERR_KINDS + 2)
+            .filter(|i| counts.count(&format!("kind_{i}")).is_some())
+            .count();
+        assert_eq!(present, MAX_ERR_KINDS);
+        assert_eq!(counts.count("kind_0"), Some(2));
         // The kinds past the cap got no counter of their own.
-        assert_eq!(counts.get(&format!("kind_{MAX_ERR_KINDS}")), None);
+        assert_eq!(counts.count(&format!("kind_{MAX_ERR_KINDS}")), None);
     }
 
     #[test]
@@ -299,9 +334,10 @@ mod tests {
         port.end_cycle(Timestamp(3), 0);
 
         let grant = log_in.latest().expect("log published");
-        let lines = grant.list::<LogLine>(offset_of!(SystemLog, lines));
+        let lines: Vec<LogLine> =
+            frame_list_iter(grant.table(), offset_of!(SystemLog, lines)).collect();
         assert_eq!(lines.len(), MAX_LINES);
-        let first = lines.get(0).expect("first line");
+        let first = lines[0];
         assert_eq!(first.level, Level::Error as u8);
         assert_eq!(first.len as usize, LOG_MSG_CAP);
         assert_eq!(&first.msg[..], &long.as_bytes()[..LOG_MSG_CAP]);

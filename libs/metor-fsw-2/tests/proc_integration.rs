@@ -581,12 +581,12 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
 // Process-mode slots (docs/process-slots.md)
 // ---------------------------------------------------------------------------
 
-// SlotState wire codes (SlotState::code).
+// SlotState wire codes (SlotState::code): Empty=0, Loaded=1, Loading=2, Running=3, Done=4, Stopped=5.
 const LOADED: u8 = 1;
-const RUNNING: u8 = 2;
-const DONE: u8 = 3;
-const SLOT_STOPPED: u8 = 4;
-const LOADING: u8 = 5;
+const LOADING: u8 = 2;
+const RUNNING: u8 = 3;
+const DONE: u8 = 4;
+const SLOT_STOPPED: u8 = 5;
 // Terminal SequenceStatus run_state codes.
 const ABORTED: u8 = 2;
 

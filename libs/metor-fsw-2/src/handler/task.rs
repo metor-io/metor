@@ -6,7 +6,7 @@
 //! ownership model `#[sequence]` established. A future that returns
 //! [`Outcome`] is a sequence; one that returns `()` completed. The driver
 //! polls it once per cycle with a no-op waker under the ambient
-//! [`SeqClock`](crate::SeqClock), so `wait()`/`now()`/`progress()` work
+//! [`CycleClock`](crate::CycleClock), so `wait()`/`now()`/`progress()` work
 //! unchanged.
 
 use core::any::Any;
@@ -21,7 +21,7 @@ use crate::frame::Frame;
 use crate::message::{MsgIn, MsgOut, NamedMsg};
 use crate::pack::{EntryParams, MakeError, decode_params};
 use crate::port::{Input, Output};
-use crate::sequence::{Outcome, Seq};
+use crate::sequence::Outcome;
 
 use super::param::{BindCx, DeclSink};
 
@@ -40,7 +40,7 @@ pub struct Params<P>(pub P);
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a task parameter",
     note = "async system fns take ports by value (`Input<F>`, `Output<F>`, \
-            `MsgIn<M>`, `MsgOut<M>`), `Params<P>` for typed params, or `Seq`"
+            `MsgIn<M>`, `MsgOut<M>`) or `Params<P>` for typed params"
 )]
 pub trait TaskParam: Sized + 'static {
     fn decl(sink: &mut DeclSink);
@@ -119,17 +119,6 @@ where
         Params(
             *any.downcast::<P>()
                 .expect("params decode type matches the declared Params<P>"),
-        )
-    }
-}
-
-impl TaskParam for Seq {
-    fn decl(_sink: &mut DeclSink) {}
-    fn bind(cx: &mut BindCx) -> Self {
-        Seq::new(
-            cx.clock
-                .clone()
-                .expect("task entries bind under a sequence clock"),
         )
     }
 }

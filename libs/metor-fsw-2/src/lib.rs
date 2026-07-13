@@ -52,8 +52,8 @@
 //! [`FrameList`] and [`FrameMap`] members add bounded runtime dynamism (a
 //! variable number of elements stored past the fixed region) while keeping the
 //! worst-case frame size a compile-time constant, so rings can still be sized up
-//! front. [`FrameWriter`] builds such a frame's bytes; [`ListReader`] and
-//! [`MapReader`] read them back.
+//! front. [`FrameWriter`] builds such a frame's bytes; a consumer reads them
+//! back through the vtable [`apply`](FrameRef::apply) path.
 //!
 //! # Systems and ports
 //!
@@ -114,7 +114,6 @@ mod handler;
 mod message;
 mod pack;
 mod port;
-mod reader;
 mod registry;
 mod system;
 mod telemetry;
@@ -146,7 +145,6 @@ pub mod proc;
 
 pub use dynamic::{FrameList, FrameMap, Slot};
 pub use frame::Frame;
-pub use reader::{ListReader, MapReader};
 pub use writer::{FrameScratch, FrameWriter, KeyError, ListWriter, MapWriter};
 
 pub use metor_fsw_ring::{ReadError, WriteError};
@@ -157,13 +155,13 @@ pub use binder::{AnySource, BindPorts, Binder, BoundInput, BoundPort, RingSource
 // `#[metor_fsw_2::system]` resolve independently.
 pub use handler::{
     AsyncSystemFn, BindCx, CycleCx, DeclSink, ExecParam, ExecParamSet, ExecuteFn, InitFn,
-    IntoOutcome, IntoPackEntry, MissionTime, Params, SystemDef, TaskParam, system,
+    IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
 };
 pub use pack::{Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus};
 pub use testbench::TestBench;
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, NAME_CAP, OccupantBacking, PortRef, SLOT_NAME_CAP, SlotConfigError,
+    InitialOccupant, NAME_CAP, OccupantBacking, PortRef, SlotConfigError,
     SlotState, SlotStatus, StopReason, StoppedSystem, SystemHandle, WireError, WorkerRunState,
     WorkerStatus,
 };
@@ -212,7 +210,7 @@ pub use metor_fsw_2_macros::system;
 
 pub use metor_proto::types::Timestamp;
 
-pub use sequence::{CycleClock, Outcome, Seq, SeqClock, SequenceStatus, SlotControlIn};
+pub use sequence::{CycleClock, Outcome, SequenceStatus, SlotControlIn};
 
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt, zerocopy};
@@ -231,7 +229,7 @@ pub use wiring::{BuildError, BuildOptions, BundleError, PackageOptions, WiringBu
 #[cfg(feature = "wiring")]
 pub mod cli;
 
-// Frame acceptance tests span frame/dynamic/writer/reader, so they live at the
+// Frame acceptance tests span frame/dynamic/writer, so they live at the
 // crate root rather than under any single module.
 #[cfg(test)]
 mod tests;

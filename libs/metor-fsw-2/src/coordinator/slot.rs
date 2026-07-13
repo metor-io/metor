@@ -78,21 +78,17 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_ring::NoWake;
 
-use super::{CyclicSlot, NAME_CAP, ProcInfo, SlotState, StopReason, WorkerRunState, pack_name};
+use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus, pack_name};
 use crate::abi::FswStatus;
 use crate::descriptor::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind};
 use crate::dl::{DlSlot, DlSystem};
 use crate::message::{MsgIn, MsgOut};
-use crate::port::{Input, Output};
+use crate::port::{Input, Output, frame_list_iter};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::proc::StepOutcome;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::proc::host::{LoadPoll, SeqWorker};
 use crate::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus, SlotControlIn};
-
-/// Capacity of the occupant name field in [`SlotStatus`], the shared
-/// [`NAME_CAP`](super::NAME_CAP).
-pub const SLOT_NAME_CAP: usize = NAME_CAP;
 
 // ---------------------------------------------------------------------------
 // Host telemetry / control frames
@@ -109,13 +105,13 @@ pub struct SlotStatus {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
     /// The current [`SlotState::code`]
-    /// (Empty=0/Loaded=1/Running=2/Done=3/Stopped=4/Loading=5).
+    /// (Empty=0/Loaded=1/Loading=2/Running=3/Done=4/Stopped=5).
     pub phase: u8,
     /// Used length of `occupant`, zero when no occupant is selected.
     pub occ_len: u8,
     pub _pad: [u8; 6],
     /// The selected occupant's name, fixed buffer plus length.
-    pub occupant: [u8; SLOT_NAME_CAP],
+    pub occupant: [u8; NAME_CAP],
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +451,7 @@ pub(crate) struct SlotRunner {
     /// The live occupant, or `None` when empty or after a hard `Stop`.
     slot: Option<Occupant>,
     /// The process-mode spawn ingredients; `None` for an in-process slot,
-    /// and the seam `proc_info` keys "is there a worker behind this slot" on.
+    /// and the seam `worker_status` keys "is there a worker behind this slot" on.
     proc: Option<ProcParts>,
     /// Occupant-worker steps whose ack deadline lapsed with the worker still
     /// alive, since the coordinator last drained them into its health.
@@ -781,8 +777,7 @@ impl SlotRunner {
         let mut state = self.last_run_state;
         let _ = self.seq_status.drain(|f| {
             state = f.get().run_state;
-            let list = f.list::<ProgressLine>(offset_of!(SequenceStatus, progress));
-            for line in list.iter() {
+            for line in frame_list_iter::<ProgressLine>(f.table(), offset_of!(SequenceStatus, progress)) {
                 let n = (line.len as usize).min(PROGRESS_MSG_CAP);
                 if let Ok(s) = core::str::from_utf8(&line.msg[..n]) {
                     details.push(s.to_string());
@@ -852,7 +847,7 @@ impl SlotRunner {
     fn publish_status(&mut self, now: Timestamp) {
         let (occupant, occ_len) = match self.selected {
             Some(idx) => pack_name(&self.allowed[idx].name),
-            None => ([0u8; SLOT_NAME_CAP], 0),
+            None => ([0u8; NAME_CAP], 0),
         };
         let frame = SlotStatus {
             timestamp: now,
@@ -953,7 +948,7 @@ impl CyclicSlot for SlotRunner {
         std::mem::take(&mut self.timeouts)
     }
 
-    fn proc_info(&self) -> Option<ProcInfo> {
+    fn worker_status(&self) -> Option<WorkerStatus> {
         self.proc.as_ref()?;
         let pid = match &self.slot {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -973,7 +968,8 @@ impl CyclicSlot for SlotRunner {
         } else {
             WorkerRunState::Stopped
         };
-        Some(ProcInfo {
+        Some(WorkerStatus {
+            name: self.name(),
             pid,
             restarts: self.deaths,
             state,

@@ -161,10 +161,10 @@ fn seq_run_states(view: &mut Input<SequenceStatus>) -> Vec<u8> {
     states
 }
 
-// SlotState wire codes: Empty=0, Loaded=1, Running=2, Done=3, Stopped=4.
+// SlotState wire codes: Empty=0, Loaded=1, Loading=2, Running=3, Done=4, Stopped=5.
 const LOADED: u8 = 1;
-const RUNNING: u8 = 2;
-const DONE: u8 = 3;
+const RUNNING: u8 = 3;
+const DONE: u8 = 4;
 // Terminal run_state codes: Completed=1, Aborted=2.
 const COMPLETED: u8 = 1;
 const ABORTED: u8 = 2;

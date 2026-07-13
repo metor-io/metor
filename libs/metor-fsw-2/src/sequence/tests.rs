@@ -87,8 +87,6 @@ fn now_reads_the_stepped_ambient_clock() {
     clock.now.set(Timestamp(42));
     with_clock(&clock, || {
         assert_eq!(super::now(), Timestamp(42));
-        let seq = super::Seq::new(clock.clone());
-        assert_eq!(seq.now(), Timestamp(42), "the handle reads the same clock");
     });
     // A refresh between polls is observed by the next poll.
     clock.now.set(Timestamp(43));

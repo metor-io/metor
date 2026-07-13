@@ -34,7 +34,6 @@ use crate::binder::RingSource;
 use crate::descriptor::{PortDecl, PortDesc};
 use crate::dynamic::Slot;
 use crate::frame::Frame;
-use crate::reader::{ListReader, MapReader};
 use crate::writer::{FrameScratch, FrameWriter};
 
 /// Default in-flight record depth for a port. Must be at least 2, since a
@@ -71,6 +70,33 @@ where
             None => return Ok(()),
         }
     }
+}
+
+/// Iterate the `T` elements of a dynamic list member, reading the [`Slot`] at
+/// `slot_off` and copying each element out of the trailer. The interim decode
+/// for a fixed-struct list until the frame derive emits per-member accessors
+/// on the grant (see `docs/frames.md`); flat consumers use the `apply` path.
+pub(crate) fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
+    table: &[u8],
+    slot_off: usize,
+) -> impl Iterator<Item = T> + '_ {
+    let slot = table
+        .get(slot_off..)
+        .and_then(|b| Slot::read_from_prefix(b).ok())
+        .map(|(s, _)| s)
+        .unwrap_or_default();
+    let stride = core::mem::size_of::<T>();
+    let count = if stride == 0 {
+        0
+    } else {
+        slot.byte_len as usize / stride
+    };
+    (0..count).filter_map(move |i| {
+        let start = slot.trailer_off as usize + i * stride;
+        table
+            .get(start..start + stride)
+            .and_then(|b| T::read_from_bytes(b).ok())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -239,11 +265,6 @@ where
         self.scratch = Some(fw.finish());
         res
     }
-
-    /// Publish a fixed frame, suspending until a reader frees room.
-    pub async fn write_async(&mut self, frame: &F) -> Result<(), metor_fsw_ring::WriteError> {
-        self.writer.write(frame.as_bytes()).await
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,10 +359,10 @@ where
 // ---------------------------------------------------------------------------
 
 /// A frame ref reads one record's table bytes in place, giving typed access
-/// without copying. The fixed region is read directly as `F`, dynamic
-/// members are read with [`ListReader`] and [`MapReader`], and
+/// without copying. The fixed region is read directly as `F`, and
 /// [`apply`](Self::apply) walks the whole record through the frame's vtable
-/// for consumers that want components rather than the concrete type.
+/// for consumers that want components rather than the concrete type. There is
+/// no typed dynamic-member accessor on the grant yet (see `docs/frames.md`).
 pub struct FrameRef<'a, F> {
     table: &'a [u8],
     _f: PhantomData<F>,
@@ -371,18 +392,6 @@ where
         self.table
     }
 
-    /// A reader over the `FrameList<T, _>` member whose slot sits at
-    /// `slot_off` (use `core::mem::offset_of!`).
-    pub fn list<T: FromBytes>(&self, slot_off: usize) -> ListReader<'a, T> {
-        ListReader::new(self.table, self.slot(slot_off))
-    }
-
-    /// A reader over the `FrameMap<_, V, _>` member whose slot sits at
-    /// `slot_off`.
-    pub fn map<V: FromBytes>(&self, slot_off: usize) -> MapReader<'a, V> {
-        MapReader::new(self.table, self.slot(slot_off))
-    }
-
     /// Drive a [`Decomponentize`] sink from this record via the frame's
     /// vtable.
     pub fn apply<D: Decomponentize>(
@@ -390,16 +399,6 @@ where
         sink: &mut D,
     ) -> Result<Result<(), D::Error>, ProtoError> {
         F::as_vtable().apply(self.table, sink)
-    }
-
-    /// Read the 8-byte dynamic-member slot at `slot_off` from the fixed
-    /// region.
-    fn slot(&self, slot_off: usize) -> Slot {
-        self.table
-            .get(slot_off..)
-            .and_then(|b| Slot::read_from_prefix(b).ok())
-            .map(|(s, _)| s)
-            .unwrap_or_default()
     }
 }
 
@@ -442,18 +441,6 @@ where
     /// The raw table bytes, fixed region plus trailer.
     pub fn table(&self) -> &[u8] {
         &self.grant
-    }
-
-    /// A reader over the `FrameList<T, _>` member whose slot sits at
-    /// `slot_off`.
-    pub fn list<T: FromBytes>(&self, slot_off: usize) -> ListReader<'_, T> {
-        self.as_ref().list(slot_off)
-    }
-
-    /// A reader over the `FrameMap<_, V, _>` member whose slot sits at
-    /// `slot_off`.
-    pub fn map<V: FromBytes>(&self, slot_off: usize) -> MapReader<'_, V> {
-        self.as_ref().map(slot_off)
     }
 
     /// Drive a [`Decomponentize`] sink from this record (see

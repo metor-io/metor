@@ -1843,7 +1843,7 @@ mod proc_slot {
         }
     }
 
-    /// Load walks Empty → Loading (wire phase 5, worker `Restarting`) →
+    /// Load walks Empty → Loading (wire phase 2, worker `Restarting`) →
     /// Loaded, with the `Loading` event emitted at the spawn and the
     /// `Loaded` event deferred to the bind — and the command guards refuse
     /// `Start`/`Stop` mid-pipeline with `Refused` events.
@@ -1859,7 +1859,7 @@ mod proc_slot {
         });
         h.step();
         assert!(matches!(h.runner.state(), SlotState::Loading));
-        assert_eq!(h.phase(), 5);
+        assert_eq!(h.phase(), 2);
         assert!(
             matches!(
                 h.drain_events().as_slice(),
@@ -1867,7 +1867,7 @@ mod proc_slot {
             ),
             "the spawn announces Loading; Loaded waits for the bind"
         );
-        let info = h.runner.proc_info().expect("process-mode slot");
+        let info = h.runner.worker_status().expect("process-mode slot");
         assert_eq!(info.state, WorkerRunState::Restarting);
         assert_ne!(info.pid, 0, "the spawned worker is telemetered");
 
@@ -1900,7 +1900,7 @@ mod proc_slot {
             h.drain_events().as_slice(),
             [SequenceEventKind::Loaded { name }] if name == "alpha"
         ));
-        let info = h.runner.proc_info().unwrap();
+        let info = h.runner.worker_status().unwrap();
         assert_eq!(info.state, WorkerRunState::Running);
         assert_ne!(info.pid, 0);
         assert_eq!(info.restarts, 0);
@@ -1938,7 +1938,7 @@ mod proc_slot {
             [SequenceEventKind::Started, SequenceEventKind::Completed]
         ));
         // Done holds its worker (and so its ring roles) until Reset/Load.
-        let info = h.runner.proc_info().unwrap();
+        let info = h.runner.worker_status().unwrap();
         assert_eq!(info.state, WorkerRunState::Running);
         assert_ne!(info.pid, 0);
         // Terminal: the occupant is not polled again.
@@ -1971,14 +1971,14 @@ mod proc_slot {
             h.drain_events().as_slice(),
             [SequenceEventKind::Started, SequenceEventKind::Failed { .. }]
         ));
-        let info = h.runner.proc_info().unwrap();
+        let info = h.runner.worker_status().unwrap();
         assert_eq!((info.pid, info.state), (0, WorkerRunState::Stopped));
         assert_eq!(info.restarts, 1, "the death is counted");
 
         // No respawn behind the operator's back.
         h.step();
         assert!(matches!(h.runner.state(), SlotState::Stopped { .. }));
-        assert_eq!(h.runner.proc_info().unwrap().pid, 0);
+        assert_eq!(h.runner.worker_status().unwrap().pid, 0);
 
         // Reset spawns a fresh pipeline over the same manifest and rings.
         drop(ctl);
@@ -1999,7 +1999,7 @@ mod proc_slot {
                 SequenceEventKind::Loaded { name },
             ] if loading == "alpha" && name == "alpha"
         ));
-        let info = h.runner.proc_info().unwrap();
+        let info = h.runner.worker_status().unwrap();
         assert_eq!(info.state, WorkerRunState::Running);
         assert_ne!(info.pid, 0);
         assert_eq!(info.restarts, 1, "Reset is commanded, not a death");
@@ -2032,7 +2032,7 @@ mod proc_slot {
                 SequenceEventKind::Failed { reason },
             ] if reason.contains("attach")
         ));
-        assert_eq!(h.runner.proc_info().unwrap().restarts, 1);
+        assert_eq!(h.runner.worker_status().unwrap().restarts, 1);
     }
 }
 

@@ -14,7 +14,6 @@ layout it describes:
 | The `Frame` trait | `src/frame.rs` |
 | `FrameList`/`FrameMap`/`Slot`/`Name` + their vtable/Componentize impls | `src/dynamic.rs` |
 | `FrameWriter`/`ListWriter`/`MapWriter` (producer) | `src/writer.rs` |
-| `ListReader`/`MapReader` (typed consumer) | `src/reader.rs` |
 | `Output`/`Input`/`FrameRef` (typed ports over a ring) | `src/port.rs` |
 | `#[derive(Frame)]` and the four sub-derives | `../metor-fsw/macros/src/{frame,as_vtable,componentize,decomponentize,metadatatize}.rs` |
 | Acceptance tests (byte layouts pinned here) | `src/tests.rs` |
@@ -380,7 +379,7 @@ round this up through the ring's `frame_len` to a power-of-two ring capacity.
 The const generic on the type is the source of truth for `MAX`. `#[metor_fsw(max = N)]` is
 accepted on the field for forward-compatibility but is not consulted by the derives.
 
-### 3.6 Consumer side — flat `apply` and typed readers
+### 3.6 Consumer side — flat `apply` and the fixed region
 
 Two access modes, over the same bytes:
 
@@ -395,16 +394,12 @@ table bytes:
 
 - `get() -> &F` reads the fixed `#[repr(C)]` region directly (`ref_from_prefix`) — the producer
   wrote `fixed.as_bytes()` there, so no per-field decode.
-- `list::<T>(slot_off) -> ListReader<'a, T>` and `map::<V>(slot_off) -> MapReader<'a, V>` read
-  the slot at `slot_off` and index/scan the trailer.
 - `apply::<D>(sink)` is the uniform escape hatch onto the vtable path above.
 
-`ListReader` (`src/reader.rs`) derives `len = byte_len / size_of::<T>()` and reads element `i`
-at `trailer_off + i * size_of::<T>()`. `MapReader` derives `len = byte_len / map_stride::<V>()`,
-reads each entry's `key_off`/`key_len` (resolving the key in the pool) and the value at
-`map_value_offset::<V>()`, and offers `entry(i)`, `get(key)`, and `iter()`. These readers are a
-presentation convenience; the authoritative dotted-id/frame/timestamp semantics remain the
-`apply` path.
+Typed dynamic reads straight off a grant are a known gap: the intended future design is
+derive-emitted per-member accessors on the grant (e.g. `fn error_counts(&self) -> MapReader<'_,
+u64>`), and until they exist consumers use the vtable `apply()` path above (a fixed-struct list
+can also be copied out with the internal `port::frame_list_iter` decode).
 
 ---
 

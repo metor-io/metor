@@ -298,6 +298,25 @@ pub trait System {
     fn shutdown(&mut self, _output: &mut Self::Output) {}
 }
 
+/// The self-description shared by both leaf traits' `descriptor` defaults: the
+/// wired ports per direction plus the merged capability set of both bundles,
+/// tagged with the system's [`SystemKind`].
+fn descriptor_for<I: SystemInput, O: SystemOutput>(
+    name: &'static str,
+    kind: SystemKind,
+) -> SystemDescriptor {
+    let (inputs, mut capabilities) = split_decls(<I as SystemInput>::decls());
+    let (outputs, out_caps) = split_decls(<O as SystemOutput>::decls());
+    capabilities.extend(out_caps);
+    SystemDescriptor {
+        name,
+        kind,
+        inputs,
+        outputs,
+        capabilities,
+    }
+}
+
 /// A coordinator-driven system. The coordinator calls
 /// [`execute`](Self::execute) once per cycle; inputs are views straight into
 /// upstream output buffers, and a slow consumer backpressures its producers
@@ -318,16 +337,7 @@ pub trait CyclicSystem: System {
     /// This system's self-description for wiring: the wired ports per
     /// direction, plus the merged capability set of both bundles.
     fn descriptor() -> SystemDescriptor {
-        let (inputs, mut capabilities) = split_decls(<Self::Input as SystemInput>::decls());
-        let (outputs, out_caps) = split_decls(<Self::Output as SystemOutput>::decls());
-        capabilities.extend(out_caps);
-        SystemDescriptor {
-            name: Self::NAME,
-            kind: SystemKind::Cyclic,
-            inputs,
-            outputs,
-            capabilities,
-        }
+        descriptor_for::<Self::Input, Self::Output>(Self::NAME, SystemKind::Cyclic)
     }
 
     /// This instance's descriptor. Override it when the port set depends on
@@ -353,16 +363,7 @@ pub trait AsyncSystem: System {
     /// This system's self-description for wiring: the wired ports per
     /// direction, plus the merged capability set of both bundles.
     fn descriptor() -> SystemDescriptor {
-        let (inputs, mut capabilities) = split_decls(<Self::Input as SystemInput>::decls());
-        let (outputs, out_caps) = split_decls(<Self::Output as SystemOutput>::decls());
-        capabilities.extend(out_caps);
-        SystemDescriptor {
-            name: Self::NAME,
-            kind: SystemKind::Async,
-            inputs,
-            outputs,
-            capabilities,
-        }
+        descriptor_for::<Self::Input, Self::Output>(Self::NAME, SystemKind::Async)
     }
 
     /// This instance's descriptor. Override it when the port set depends on

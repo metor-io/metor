@@ -313,7 +313,6 @@ impl Pack {
                     let mut cx = crate::handler::BindCx {
                         src,
                         params: Some(params_any),
-                        clock: Some(clock.clone()),
                         drops: Some(drops.clone()),
                     };
                     f.build(&mut cx)
