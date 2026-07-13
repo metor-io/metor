@@ -1,6 +1,7 @@
 use convert_case::{Case, Casing};
 use darling::FromDeriveInput;
 use darling::ast;
+use darling::util::Override;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
@@ -13,7 +14,7 @@ use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 /// applied and `FRAME_ID` defaults to the snake_case struct ident.
 #[derive(Debug, FromDeriveInput)]
 #[darling(attributes(fsw, metor_fsw), supports(struct_named))]
-struct Frame {
+struct FrameInput {
     ident: Ident,
     generics: Generics,
     data: ast::Data<(), crate::Field>,
@@ -25,6 +26,23 @@ struct Frame {
     /// silently stamping `Timestamp(0)`.
     #[darling(default)]
     no_timestamp: bool,
+    /// Bare `#[fsw(group)]` emits a metadata-only parent entry named after the
+    /// struct; `#[fsw(group = "Custom")]` supplies the name instead.
+    #[darling(default)]
+    group: Option<Override<String>>,
+}
+
+/// The frame derive input, parsed once and shared by the four sub-derive
+/// emitters. `frame_name` is the explicit `name`/`parent` — the dotted
+/// component-id prefix — and is `None` when neither was given, leaving fields
+/// at the root.
+pub(crate) struct FrameArgs {
+    pub ident: Ident,
+    pub generics: Generics,
+    pub fields: Vec<crate::Field>,
+    pub frame_name: Option<String>,
+    pub no_timestamp: bool,
+    pub group: Option<Override<String>>,
 }
 
 /// Expands `#[derive(Frame)]`.
@@ -34,14 +52,23 @@ struct Frame {
 /// with a frame wrap so every member inherits the `FRAME_ID`.
 pub fn frame(input: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(input as DeriveInput);
-    let Frame {
-        ident,
-        generics,
-        data,
-        parent,
-        name,
-        no_timestamp,
-    } = Frame::from_derive_input(&parsed).unwrap();
+    let raw = match FrameInput::from_derive_input(&parsed) {
+        Ok(raw) => raw,
+        Err(e) => return e.write_errors().into(),
+    };
+    let fields = raw
+        .data
+        .take_struct()
+        .expect("Frame requires a named struct")
+        .fields;
+    let args = FrameArgs {
+        ident: raw.ident,
+        generics: raw.generics,
+        fields,
+        frame_name: raw.name.or(raw.parent),
+        no_timestamp: raw.no_timestamp,
+        group: raw.group,
+    };
 
     // The sub-derives emit `::metor_fsw_2::…` re-export paths, so a crate that
     // depends only on metor_fsw_2 can use the derive without depending on the
@@ -51,20 +78,20 @@ pub fn frame(input: TokenStream) -> TokenStream {
 
     // Explicit `name`/`parent` wins, else snake_case of the ident. This is both
     // the dotted component prefix and the `FRAME_ID`.
-    let frame_name = name
-        .or(parent)
-        .unwrap_or_else(|| ident.to_string().to_case(Case::Snake));
+    let frame_name = args
+        .frame_name
+        .clone()
+        .unwrap_or_else(|| args.ident.to_string().to_case(Case::Snake));
     let frame_id = quote! { #impeller::types::ComponentId::new(#frame_name) };
 
     // The shared timestamp accessor reads the `#[metor_fsw(timestamp)]` field.
     // A frame with neither the marker nor the `no_timestamp` opt-out is a
     // derive error; with the opt-out, the accessor returns the default stamp.
-    let fields = data.take_struct().expect("Frame requires a named struct");
-    let ts_field = fields.fields.iter().find(|f| f.timestamp);
-    let timestamp_body = match (ts_field, no_timestamp) {
+    let ts_field = args.fields.iter().find(|f| f.timestamp);
+    let timestamp_body = match (ts_field, args.no_timestamp) {
         (Some(_), true) => {
             return syn::Error::new_spanned(
-                &parsed.ident,
+                &args.ident,
                 "#[metor_fsw(no_timestamp)] contradicts the #[metor_fsw(timestamp)] field; \
                  remove one",
             )
@@ -78,7 +105,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
         (None, true) => quote! { #impeller::types::Timestamp::default() },
         (None, false) => {
             return syn::Error::new_spanned(
-                &parsed.ident,
+                &args.ident,
                 "#[derive(Frame)] requires a #[metor_fsw(timestamp)] field (the frame's \
                  shared timestamp); mark one, or opt out explicitly with \
                  #[metor_fsw(no_timestamp)] to stamp every record Timestamp(0)",
@@ -88,13 +115,15 @@ pub fn frame(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Each sub-derive reads the same `Field` attribute surface and takes the
-    // frame name as its component prefix.
-    let as_vtable = crate::as_vtable::as_vtable_impl(&parsed, Some(frame_id.clone()), &fsw2);
-    let metadatatize = crate::metadatatize::metadatatize_impl(&parsed, &fsw2);
-    let componentize = crate::componentize::componentize_impl(&parsed, &fsw2);
-    let decomponentize = crate::decomponentize::decomponentize_impl(&parsed, &fsw2);
+    // Each sub-derive reads the same parsed args and takes the frame name as
+    // its component prefix.
+    let as_vtable = crate::as_vtable::as_vtable_impl(&args, Some(frame_id.clone()), &fsw2);
+    let metadatatize = crate::metadatatize::metadatatize_impl(&args, &fsw2);
+    let componentize = crate::componentize::componentize_impl(&args, &fsw2);
+    let decomponentize = crate::decomponentize::decomponentize_impl(&args, &fsw2);
 
+    let ident = &args.ident;
+    let generics = &args.generics;
     let where_clause = &generics.where_clause;
     let frame_trait = quote! {
         impl #fsw2::Frame for #ident #generics #where_clause {

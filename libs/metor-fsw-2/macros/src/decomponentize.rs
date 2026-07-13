@@ -1,44 +1,25 @@
 use convert_case::{Case, Casing};
-use darling::FromDeriveInput;
-use darling::ast::{self};
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
-use syn::{DeriveInput, Generics, Ident};
 
-/// Input to the `Decomponentize` derive, parsed from the struct and its
-/// `#[fsw(...)]` attributes.
-#[derive(Debug, FromDeriveInput)]
-#[darling(attributes(fsw, metor_fsw), supports(struct_named))]
-pub struct Decomponentize {
-    ident: Ident,
-    generics: Generics,
-    data: ast::Data<(), crate::Field>,
-    parent: Option<String>,
-    name: Option<String>,
-    /// Accepted so the attribute parses; only the `Frame` derive acts on it.
-    #[darling(default, rename = "no_timestamp")]
-    _no_timestamp: darling::util::Ignored,
-}
+use crate::frame::FrameArgs;
 
 /// Generates the `Decomponentize` impl, which routes an incoming component
 /// value to the matching field by comparing against per-field `ComponentId`
 /// constants. Unmatched ids and values that fail conversion are silently
 /// skipped. See [`componentize_impl`](crate::componentize::componentize_impl)
 /// for the `crate_name` root-path contract.
-pub fn decomponentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> TokenStream2 {
-    let Decomponentize {
+pub fn decomponentize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> TokenStream2 {
+    let FrameArgs {
         ident,
         generics,
-        data,
-        parent,
-        name,
-        _no_timestamp: _,
-    } = Decomponentize::from_derive_input(input).unwrap();
-    let parent = parent.or(name);
+        fields,
+        frame_name: parent,
+        ..
+    } = args;
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
-    let fields = data.take_struct().unwrap();
-    let if_arms = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
+    let if_arms = fields.iter().filter(|f| !f.timestamp).map(|field| {
         let ty = &field.ty;
         let ident = &field.ident;
         // Nested and dynamic fields have no single id to match, so every value
@@ -54,8 +35,8 @@ pub fn decomponentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> To
             .expect("only named field allowed")
             .to_string()
             .to_case(Case::UpperSnake);
-        let component_id = field.component_id();
-        let component_id = match &parent {
+        let component_id = field.component_name();
+        let component_id = match parent {
             Some(parent) => format!("{parent}.{component_id}"),
             None => component_id,
         };

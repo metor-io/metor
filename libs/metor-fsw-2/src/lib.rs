@@ -204,8 +204,6 @@ pub use metor_fsw_ring as ring;
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_2_macros::{Frame, ParamsDocs, SystemInput, SystemOutput, frame};
 
-pub use metor_fsw_2_macros::sequence;
-
 pub use metor_fsw_2_macros::system;
 
 pub use metor_proto::types::Timestamp;

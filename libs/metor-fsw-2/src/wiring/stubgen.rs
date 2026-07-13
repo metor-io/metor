@@ -499,7 +499,6 @@ impl Codegen {
         out.push_str(&docstring(
             1,
             &format!("`{name}` pack entry."),
-            desc.docs.as_deref(),
             params,
             &desc.params_docs,
         ));
@@ -526,7 +525,6 @@ impl Codegen {
         let doc = docstring(
             1,
             &format!("Occupant `{name}` for a `mode`-style slot's allow set."),
-            desc.docs.as_deref(),
             params,
             &desc.params_docs,
         );
@@ -839,7 +837,6 @@ fn occupant_body(name: &str, params: &[Param]) -> String {
 fn docstring(
     indent: usize,
     summary: &str,
-    entry_doc: Option<&str>,
     params: &[Param],
     params_docs: &[(String, String)],
 ) -> String {
@@ -855,19 +852,14 @@ fn docstring(
         .collect();
 
     // A one-liner when there is nothing extra to say.
-    if entry_doc.is_none() && documented.is_empty() {
+    if documented.is_empty() {
         return format!("{pad}\"\"\"{summary}\"\"\"\n");
     }
 
     let mut out = format!("{pad}\"\"\"{summary}\n");
-    if let Some(doc) = entry_doc {
-        out.push_str(&format!("\n{pad}{doc}\n"));
-    }
-    if !documented.is_empty() {
-        out.push_str(&format!("\n{pad}Parameters:\n"));
-        for (name, doc) in documented {
-            out.push_str(&format!("{pad}    {name}: {doc}\n"));
-        }
+    out.push_str(&format!("\n{pad}Parameters:\n"));
+    for (name, doc) in documented {
+        out.push_str(&format!("{pad}    {name}: {doc}\n"));
     }
     out.push_str(&format!("{pad}\"\"\"\n"));
     out
@@ -1088,7 +1080,6 @@ mod tests {
             delivery: Delivery::Snapshot,
             fan_in: FanIn::One,
             telemetered,
-            docs: None,
         }
     }
 
@@ -1100,7 +1091,6 @@ mod tests {
             delivery: Delivery::Log,
             fan_in: FanIn::One,
             telemetered: false,
-            docs: None,
         }
     }
 
@@ -1117,7 +1107,6 @@ mod tests {
             outputs,
             params_schema: demo_schema(),
             capabilities: Vec::new(),
-            docs: None,
             params_docs,
         }
     }

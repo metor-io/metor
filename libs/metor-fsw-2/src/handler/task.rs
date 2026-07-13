@@ -2,9 +2,8 @@
 //! state in locals.
 //!
 //! [`Pack::task`](crate::Pack::task) registers an async fn whose parameters
-//! are by-value [`TaskParam`]s, moved into the future at bind — the same
-//! ownership model `#[sequence]` established. A future that returns
-//! [`Outcome`] is a sequence; one that returns `()` completed. The driver
+//! are by-value [`TaskParam`]s, moved into the future at bind. A future that
+//! returns [`Outcome`] is a sequence; one that returns `()` completed. The driver
 //! polls it once per cycle with a no-op waker under the ambient
 //! [`CycleClock`](crate::CycleClock), so `wait()`/`now()`/`progress()` work
 //! unchanged.
@@ -30,9 +29,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// The typed params of an async-fn system, decoded from the entry's params
 /// surface and handed in by value: `async fn f(Params(p): Params<MyParams>, ...)`.
 ///
-/// The trait world cannot mirror `#[sequence]`'s "any unrecognized parameter
-/// type is the params" rule, so the params parameter is named by this
-/// wrapper instead (the axum `Json<T>` shape).
+/// The trait world cannot express an "any unrecognized parameter type is the
+/// params" rule, so the params parameter is named by this wrapper instead (the
+/// axum `Json<T>` shape).
 pub struct Params<P>(pub P);
 
 /// One by-value parameter of an async-fn system, bound once and moved into

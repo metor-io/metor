@@ -70,7 +70,7 @@ pub use model::{
     TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
 pub use params::encode_value_params;
-pub use py::{eval_python_mission, is_python_mission, metor_config_version};
+pub use py::{eval_python_mission, is_python_mission};
 pub use stubgen::{StubgenError, StubgenOptions, StubgenReport, stubgen};
 
 /// The shared-object file name for a library `stem` on the host platform

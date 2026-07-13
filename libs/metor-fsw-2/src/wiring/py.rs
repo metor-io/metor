@@ -18,7 +18,7 @@ use std::process::Command;
 
 use miette::{IntoDiagnostic, miette};
 
-use super::model::{IR_VERSION, Wiring};
+use super::model::Wiring;
 
 /// The `metor_config` package, embedded file-by-file so the `metor-fsw` binary
 /// carries its own recorder. Materialized to a temp dir at eval time unless
@@ -36,19 +36,9 @@ const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
     ),
 ];
 
-/// The embedded recorder's `__version__`, compared against the version the
-/// emitted IR carries. Kept in lockstep with `python/metor_config/__init__.py`.
-const EMBEDDED_METOR_CONFIG_VERSION: &str = "0.3.0";
-
 /// `true` if `path` is a Python mission (a `.py` file the CLI evaluates).
 pub fn is_python_mission(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "py")
-}
-
-/// The embedded `metor_config` recorder version this host evaluates Python
-/// missions with, recorded as bundle provenance.
-pub fn metor_config_version() -> &'static str {
-    EMBEDDED_METOR_CONFIG_VERSION
 }
 
 /// Evaluate a `.py` mission into a [`Wiring`].
@@ -102,37 +92,12 @@ pub fn eval_python_mission(path: &Path) -> miette::Result<Wiring> {
     ingest_ir(&json, path)
 }
 
-/// Deserialize the emitted IR, checking versions before handing off to resolve.
+/// Deserialize the emitted IR. The IR version is checked at resolve time.
 fn ingest_ir(json: &str, path: &Path) -> miette::Result<Wiring> {
     let raw: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| miette!("mission `{}` emitted invalid JSON: {e}", path.display()))?;
 
-    // A friendlier message than the resolve-time `IrVersionMismatch`, naming
-    // both versions; resolve's own check still fires as the backstop.
-    if let Some(v) = raw.get("ir_version").and_then(serde_json::Value::as_u64)
-        && v != u64::from(IR_VERSION)
-    {
-        return Err(miette!(
-            "mission `{}` was emitted for IR version {v}, but this host speaks {IR_VERSION}; \
-             update `metor_config`",
-            path.display(),
-        ));
-    }
-
-    // Version skew is a warning, not an error: $METOR_CONFIG_PY makes it
-    // legitimate in development.
-    if let Some(v) = raw
-        .get("metor_config_version")
-        .and_then(serde_json::Value::as_str)
-        && v != EMBEDDED_METOR_CONFIG_VERSION
-    {
-        eprintln!(
-            "warning: mission emitted by metor_config {v}, host embeds \
-             {EMBEDDED_METOR_CONFIG_VERSION}"
-        );
-    }
-
-    serde_json::from_str(json).map_err(|e| {
+    serde_json::from_value(raw).map_err(|e| {
         miette!(
             "mission `{}` emitted an IR this host cannot read: {e}",
             path.display()

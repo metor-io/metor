@@ -15,7 +15,7 @@ ARTIFACT = Artifact(
     id="adcs",
     crate="adcs-systems",
     lib="adcs_systems",
-    manifest_hash="sha256:49a9fc76cd9f83b70512d51f388527ebeadbf512e323e9db2368278e6c0226b9",
+    manifest_hash="sha256:f230afd96254e402bed39a63a57758c1312240090b72efb90c7821f0e2716fef",
 )
 
 
