@@ -414,10 +414,11 @@ Adopted alongside (not blocked on) the front-end swap:
   out of the uplink), with explicit `msgs=` as override. Deletes exact
   duplication in every mission file; flagged in review because it couples
   ground-command surface to wiring lines.
-- KDL retirement: `parse.rs`/`de.rs` behind a feature flag for one release,
-  with a mechanical `metor migrate` KDL→Python converter (same IR), then
-  deleted. Two grammars indefinitely is how the `lib=` two-meanings bug class
-  happens.
+- KDL retirement (executed in Phase 4, §11): `parse.rs`/`de.rs` deleted
+  outright rather than deprecated behind a feature flag — the planned
+  one-release flag and `metor migrate` converter were dropped once the
+  reverse-dependency check found no KDL consumer outside the adcs example. Two
+  grammars indefinitely is how the `lib=` two-meanings bug class happens.
 
 ## 11. Phasing
 
@@ -443,8 +444,15 @@ Each phase gets its own plan doc before implementation.
   and the `package --check-ir` determinism gate. `package mission.py` now
   works end to end; a bundle runs cargo-free with no Python and no KDL parse.
   Panel graph tile proceeds independently against the frozen contract.
-- **Phase 4 — migration + retirement.** `metor migrate`, KDL behind a feature
-  flag, docs sweep, then deletion.
+- **Phase 4 — retirement. LANDED.** The KDL front-end is deleted outright:
+  `parse.rs`/`de.rs` gone, the `ParamSource::Kdl` variant dropped (IR bumped to
+  v2), the `kdl` feature collapsed into `wiring` (with `wiring-model` the light
+  IR-only surface), and the adcs example runs from `mission.py` only. Executed
+  without the design's originally-planned `metor migrate` converter and
+  one-release feature flag: nothing outside the example consumed this crate's
+  KDL surface, so the front-end was removed in one move rather than deprecated.
+  `WiringBuilder` remains the Rust-native front-end. See
+  `python-config-phase4-plan.md`.
 
 ## 12. Decisions log
 

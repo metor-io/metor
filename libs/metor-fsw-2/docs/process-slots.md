@@ -180,14 +180,14 @@ step.
 Verified against `bind_slot`'s gathering (`src/coordinator/mod.rs`): the occupant prefix
 crosses, the runner tail does not.
 
-- **Occupant outputs** — indices `0..n_occ_outputs` of the slot's own buffers: the user
-  outputs, then `SequenceStatus`, health, log. All become mmap files; the runner's
+- **Occupant outputs** — the slot descriptor's `occupant_outputs` (`src/coordinator/slot.rs`):
+  the user outputs, then `SequenceStatus`, health, log. All become mmap files; the runner's
   `SequenceStatus` self-tap and the registry/telemetry taps use the coordinator's own mapping.
 - **Producers of the occupant's Edge inputs** — the `cons_edges` producer ring behind each
-  input in `0..n_occ_inputs` with `PortConn::Edge`. `shared_outputs` extends from "inputs of
-  `Reg::Proc` systems" to also cover this index range for process `Reg::Slot`s (the range
-  excludes the `commands` fan-in and the self-tap by construction — they sit at
-  `n_occ_inputs..`).
+  `occupant_inputs` port with `PortConn::Edge`. `shared_outputs` extends from "inputs of
+  `Reg::Proc` systems" to also cover the occupant-input range for process `Reg::Slot`s (it
+  excludes the `commands` fan-in and the self-tap by construction — those sit in the framework
+  tail, after the occupant inputs).
 - **The Host `SlotControlIn` ring** — today allocated heap-only in the dedicated
   `host_input_rings` pass. For a process slot it becomes an mmap file
   (`<slot>.<port>.ring`, path recorded like an output's): the *writer stays host-side* (the
@@ -263,8 +263,8 @@ fault domain.
 `resolve_slot` forks per occupant exactly where `resolve` forks per system: the process path
 calls `describe_via_worker` for **each allowed occupant's** built artifact instead of
 `open_occupant`'s `DlSystem::open`, decodes descriptor + params schema through
-`decode_descriptor_msg`, and encodes KDL params through the same schema-guided
-`encode_kdl_params` — the `resolve_proc` recipe, once per allowed occupant, each a short-lived
+`decode_descriptor_msg`, and encodes the occupant's params value tree through the same
+schema-guided `encode_value_params` — the `resolve_proc` recipe, once per allowed occupant, each a short-lived
 bounded child with stderr folded into the diagnostic. `AllowedOccupant` therefore grows a
 backing seam: `{ name, params, descriptor: SystemDescriptor, backing: Dl(DlSystem) |
 Artifact(PathBuf) }` — the contract checks in `resolve_slot` and `add_slot` (`ports_match`

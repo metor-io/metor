@@ -1,23 +1,35 @@
 # Wiring — describing and building a mission
 
+> **Phase 4 update.** The KDL front-end this document originally described was
+> deleted (`python-config-phase4-plan.md`). Missions are now Python
+> (`mission.py`), evaluated into the versioned `Wiring` IR — see
+> `design-python-config.md`. The `Wiring` data model, the resolver, the static
+> registry, the build driver, and the Rust `WiringBuilder` are all unchanged;
+> only the front-end that produces a `Wiring` changed. The **KDL schema**
+> section below (§2) and the KDL-specific narration in §5/§6.3 are **historical**
+> — the grammar is gone (`design-kdl-serde.md`, also historical). Everything
+> else still reflects the shipped resolver.
+
 A mission is a graph of systems and the edges between them, plus the coordinator config and an
 optional telemetry downlink. The wiring layer is how that graph is **described**, **serialized**,
 and **built** into a runnable [`Coordinator`].
 
 It is a pure front-end onto the landed [`CoordinatorBuilder`] (`src/coordinator/`): it instantiates
 systems, calls `add_*`/`connect`, and `build()`s. No coordinator logic lives here. Every failure is
-a span-carrying [`LoadError`] — a `miette` `Diagnostic` mirroring `metor-proto-kdl`'s
-`KdlSchematicError`.
+a span-carrying [`LoadError`] — a `miette` `Diagnostic` that anchors on a spec's `SourceRef`.
 
-The wiring module lives at `src/wiring/` and is gated behind the `kdl` cargo feature (default-on):
+The wiring module lives at `src/wiring/` and is gated behind the `wiring` cargo feature (default-on;
+the lighter `wiring-model` feature exposes just the `Wiring` IR in `src/ir.rs`):
 
-- `src/wiring/mod.rs` — the KDL deserializer (`parse`), the shared resolver (`resolve`), the static
-  system [`Registry`], and the dl schema-guided param encoder (`encode_kdl_params`).
-- `src/wiring/de.rs` — the in-house `serde::Deserializer` over `kdl-rs` nodes (`from_kdl_node` for
-  a typed static path, `params_value` for the dl `serde_json::Value` path) — `docs/design-kdl-serde.md`.
-- `src/wiring/model.rs` — the serializable [`Wiring`] data model.
+- `src/wiring/mod.rs` — the shared resolver (`resolve`), the static system [`Registry`], and the dl
+  schema-guided value-tree param encoder (`encode_value_params`).
+- `src/wiring/py.rs` — the subprocess-CPython evaluation path (`eval_python_mission`), which runs a
+  `mission.py` against the embedded `metor_config` recorder and ingests the emitted IR.
+- `src/wiring/params.rs` — the schema-guided value-tree → postcard encoder for dl params.
+- `src/ir.rs` — the serializable [`Wiring`] data model (feature `wiring-model`).
 - `src/wiring/builder.rs` — the fluent Rust [`WiringBuilder`] front-end.
 - `src/wiring/build_driver.rs` — the cargo build driver that locates each artifact's `.so`.
+- `src/wiring/bundle.rs` — the relocatable bundle writer/loader.
 - `src/wiring/tests.rs` — the wiring unit/acceptance tests.
 
 ---
@@ -25,41 +37,39 @@ The wiring module lives at `src/wiring/` and is gated behind the `kdl` cargo fea
 ## 0. The shape of it: two front-ends, one data model, one resolver
 
 ```
-        ┌──────────────┐
-  KDL ──┤    parse     ├──┐
-        └──────────────┘  │      ┌─────────┐      ┌──────────┐      ┌─────────────┐
-                          ├─────▶│ Wiring  │─────▶│ resolve  │─────▶│ Coordinator │
-        ┌──────────────┐  │      └─────────┘      └──────────┘      └─────────────┘
-  Rust ─┤ WiringBuilder├──┘     (data model)      (shared)
-        └──────────────┘
+        ┌──────────────────┐
+  .py ──┤ eval_python_     ├──┐
+        │   mission        │  │   ┌─────────┐      ┌──────────┐      ┌─────────────┐
+        └──────────────────┘  ├──▶│ Wiring  │─────▶│ resolve  │─────▶│ Coordinator │
+        ┌──────────────────┐  │   └─────────┘      └──────────┘      └─────────────┘
+  Rust ─┤   WiringBuilder  ├──┘  (data model)      (shared)
+        └──────────────────┘
 ```
 
-[`Wiring`] (`model.rs`) is the single source of truth for a mission: a plain, serializable
+[`Wiring`] (`src/ir.rs`) is the single source of truth for a mission: a plain, serializable
 (`Serialize`/`Deserialize`) Rust description with **no runtime types** in it. There are two
 front-ends that produce a [`Wiring`] and exactly one resolver that consumes it:
 
-- [`parse`]`(kdl: &str) -> Result<Wiring, LoadError>` — deserializes a KDL document into a
-  [`Wiring`]. Parse only: it touches no [`Registry`], `dlopen`s nothing, and does not validate the
-  graph.
-- [`WiringBuilder`] — a fluent Rust builder producing the same [`Wiring`]. Anything KDL can express,
-  the Rust builder can express, because both target this type.
+- [`eval_python_mission`]`(path: &Path) -> Result<Wiring, _>` — runs a `mission.py` under a
+  subprocess CPython against the embedded `metor_config` recorder and ingests the versioned IR JSON
+  it emits. Evaluation only: it touches no [`Registry`], `dlopen`s nothing, and does not validate
+  the graph. See `design-python-config.md`.
+- [`WiringBuilder`] — a fluent Rust builder producing the same [`Wiring`]. Anything a `mission.py`
+  can express, the Rust builder can express, because both target this type.
 - [`resolve`]`(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError>` — walks a
   [`Wiring`], instantiates every system (static through the [`Registry`], dl by `dlopen`), connects
   the edges, and `build()`s. The validation/sizing/telemetry passes are identical
   for static and dl systems and for both front-ends.
 
-[`load`]`(kdl, registry)` is the convenience composition `resolve(&parse(kdl)?, registry)`.
-
-Because [`Wiring`] is format-independent and serializable, a mission can be authored in KDL or in
-Rust, round-tripped through serde, persisted, or shipped, and resolved identically. The unit tests
-assert the two front-ends produce **byte-equal** [`Wiring`] for the same graph, and that a
-builder-origin [`Wiring`] (which has no source text at all) resolves and runs.
+Because [`Wiring`] is format-independent and serializable, a mission can be authored in Python or in
+Rust, round-tripped through serde, persisted (frozen in a bundle), or shipped, and resolved
+identically. The IR carries an `ir_version` (currently 2) checked on every consumption path.
 
 ---
 
 ## 1. The `Wiring` data model
 
-[`Wiring`] (`model.rs`) and its members are deliberately decoupled from the runtime types — a
+[`Wiring`] (`src/ir.rs`) and its members are deliberately decoupled from the runtime types — a
 [`ClockSpec`] mirrors [`ClockMode`] without holding a `Duration`, a [`CoordinatorSpec`] mirrors
 [`CoordinatorConfig`] without a clock value, etc. The conversion to runtime types happens in
 [`resolve`], so the model stays a pure serde data format.
@@ -130,16 +140,18 @@ pub struct SystemSpec {
 }
 
 pub enum ParamSource {
-    None,            // a paramless system
+    None,              // a paramless system
     Postcard(Vec<u8>), // canonical postcard Params bytes (the typed Rust builder path)
-    Kdl(String),     // the KDL `system` node's source text, re-decoded at resolve
+    Value(Value),      // a params value tree (the Python front-end's format)
 }
 ```
 
 `artifact` is the static-vs-dl switch: `None` resolves through the [`Registry`], `Some(id)`
 `dlopen`s that [`Artifact`]. [`ParamSource`] is an explicit three-way so the cases never overload a
-single `Vec<u8>`. Each variant becomes the same canonical postcard `Params` bytes (dl) or feeds the
-`serde::Deserializer` re-decode (static) at resolve time — see §5.
+single `Vec<u8>`. A `Value` tree becomes canonical postcard `Params` bytes (dl, via
+`encode_value_params`) or feeds a serde deserialize into the typed `S::Params` (static) at resolve
+time — see §5. (Before Phase 4 a fourth `Kdl(String)` variant carried a KDL node's source text;
+it was dropped with the KDL front-end, bumping `ir_version` to 2.)
 
 ### 1.4 `EdgeSpec`
 
@@ -158,7 +170,14 @@ loop, excluded from cycle detection (§4.3).
 
 ---
 
-## 2. The KDL schema
+## 2. The KDL schema (historical)
+
+> **Historical.** This section documents the KDL grammar the deleted front-end
+> parsed. It is retained for the record only; missions are authored in Python
+> today (`design-python-config.md`), and the same graph is expressed with the
+> [`WiringBuilder`] in Rust. The `Wiring` node kinds it describes
+> (`coordinator`/`artifact`/`system`/`slot`/`connect`) survive as IR concepts;
+> only their KDL surface syntax is gone.
 
 A KDL wiring document has up to five node kinds at the top level: exactly one `coordinator`,
 N `artifact` nodes, N `system` nodes, N `slot` nodes, and M `connect` edges. (The
@@ -418,9 +437,10 @@ frame, `ComponentId::new` resolves it, and compatibility is checked on the **rea
 
 ## 5. Param deserialization (static systems)
 
-A static system's KDL config becomes its `Params` struct through an **in-house `serde::Deserializer`
-over `kdl-rs` nodes** (`src/wiring/de.rs`, `docs/design-kdl-serde.md`) — there is no
-`FromKdlNode`/`FromKdlScalar` trait or derive anymore. `Params` is an ordinary
+A static system's params reach resolve as a [`ParamSource::Value`] tree (the Python front-end's
+format) and become its `Params` struct through plain `serde`: `decode_value_params::<T>(value, …)`
+(`src/wiring/mod.rs`) drives `T::deserialize` over the `serde_json::Value`, with `serde_ignored`
+supplying the typo guard (a key no field consumed ⇒ `UnknownParam`). `Params` is an ordinary
 `#[derive(serde::Deserialize)]` struct:
 
 ```rust
@@ -436,20 +456,16 @@ struct RoundTrip {
 fn four() -> i64 { 4 }
 ```
 
-`from_kdl_node::<T>(node, src, system, reserved, skip_args)` (`de.rs:47`) drives `T::deserialize`
-against the node: each KDL property becomes a struct field (a required field absent ⇒
-`MissingParam`, a value whose KDL type doesn't coerce to the field's ⇒ `InvalidParam`; floats accept
-an integer literal, `rate=200` ⇒ `200.0`); a field missing from the node but with a serde `#[serde(default
-= …)]` uses that default; a `Option<T>` field absent ⇒ `None`; an `f: bool` reads a KDL `#true`/`#false`.
-`reserved` is the wiring-owned property keys the node's own surface consumes and the deserializer
-must skip (`&["type", "artifact"]` on a `system` node, `&["occupant"]` on an `allow` node);
-`skip_args` is the count of leading positional arguments the wiring surface owns (1 for the instance
-name on `system`, 0 on a node with none). An unknown top-level node or a **repeated** property is a
-load error — stricter than KDL's own last-wins semantics. This is the same deserializer the dl path's
-`params_value` uses (§6.3), just decoding to a concrete `T` instead of `serde_json::Value`.
+Because it is plain serde, `#[serde(default = …)]` field attributes are honored, an `Option<T>`
+absent ⇒ `None`, and floats accept an integer literal (`rate: 200` ⇒ `200.0` through serde_json).
+A paramless system carries [`ParamSource::None`], decoded through a small `NoParams` deserializer
+that yields unit for `()` and an empty map for a defaulted struct (so a required field absent is a
+clean missing-field error). The param schema is owned by the system crate, next to the system — the
+loader never hard-codes any system's fields. A paramless system uses `type Params = ()`.
 
-The param schema is owned by the system crate, next to the system — the loader never hard-codes any
-system's fields. A paramless system uses `type Params = ()`.
+(Historically a static system's params came from a KDL node through an in-house
+`serde::Deserializer` over `kdl-rs`; `src/wiring/de.rs` and `design-kdl-serde.md` are that deleted
+path.)
 
 ---
 
@@ -491,24 +507,23 @@ would re-run the crate's `pack()` and fork any shared state its entries captured
 [`CoordinatorBuilder::add_dl_cyclic`]`(name, loaded, params)`. The same open serves the
 param encode, the bound slot, and every other system or slot occupant the artifact backs.
 
-### 6.3 Schema-guided KDL → postcard params (the one-encoding invariant)
+### 6.3 Schema-guided value tree → postcard params (the one-encoding invariant)
 
 The headline property is that the **same** logical params produce **byte-identical** wire bytes
-whether authored in Rust or in KDL — so KDL ≡ the Rust builder on the wire.
+whether authored in Rust or in Python — so the value-tree front-end ≡ the Rust builder on the wire.
 
 - The Rust builder's [`SystemSpecBuilder::params`]`<P: Serialize>(p)` postcard-encodes `P` into
   [`ParamSource::Postcard`] — exactly the bytes `fsw_pack_create` decodes.
-- A KDL dl system carries [`ParamSource::Kdl`] (its node text). At resolve, [`encode_kdl_params`]
-  schema-encodes it against the `.so`'s **exported** `Params` schema ([`DlSystem::params_schema`],
-  an `OwnedNamedType` from `postcard-schema`) — the host never links the system's `Params` type.
+- A Python-authored dl system carries [`ParamSource::Value`] (a value tree). At resolve,
+  [`encode_value_params`] schema-encodes it against the `.so`'s **exported** `Params` schema
+  ([`DlSystem::params_schema`], an `OwnedNamedType` from `postcard-schema`) — the host never links
+  the system's `Params` type.
 
-`encode_kdl_params` first runs the node through the **same** `de.rs` deserializer §5 uses (via
-`params_value`), targeting a dynamic `serde_json::Value` rather than a concrete `T` — so KDL parsing
-itself is one code path for both the static and dl surfaces. It then `conform_to_schema`s that value
-against the `.so`'s schema (so JSON object order becomes canonical, matching the typed builder's
-struct-field order — the basis of the byte equality), recursing per field with `conform_value`, and
-hands the conformed value to `postcard_dyn::to_stdvec_dyn`. Only a top-level struct of scalar fields
-(or a unit) maps from flat KDL properties. The errors are span-aware (`src/wiring/mod.rs`):
+`encode_value_params` (`src/wiring/params.rs`) `conform_to_schema`s the value against the `.so`'s
+schema (so JSON object order becomes canonical, matching the typed builder's struct-field order —
+the basis of the byte equality), recursing per field with `conform_value`, and hands the conformed
+value to `postcard_dyn::to_stdvec_dyn`. Only a top-level struct of scalar fields (or a unit) maps
+from a flat value tree. The errors are span-aware (`src/wiring/mod.rs`):
 
 - [`UnknownParam`] — a property with no matching schema field.
 - [`MissingParam`] — a non-`Option` schema field with no property (the schema has no defaults; an
@@ -516,8 +531,8 @@ hands the conformed value to `postcard_dyn::to_stdvec_dyn`. Only a top-level str
 - [`InvalidParam`] — a property whose value type does not match the field.
 - [`DlParamEncode`] — an un-encodable schema shape, or the dynamic encoder rejected the value.
 
-The byte equality is asserted directly in the integration test (`tests/wiring_resolve.rs`): the same
-dl system configured both ways encodes to identical `Params` bytes and runs to the same output.
+The byte equality holds against the typed builder's `Postcard` bytes for the same logical value,
+which is what makes the two front-ends interchangeable on the wire.
 
 ---
 
@@ -545,26 +560,25 @@ registry (`src/registry.rs`) indexes each tappable buffer by its instance-qualif
 ## 8. Errors
 
 [`LoadError`] is a `thiserror` + `miette` `Diagnostic`, each variant carrying `#[source_code]` +
-`#[label]` so diagnostics render with the offending KDL line highlighted, mirroring
-`metor-proto-kdl`'s `KdlSchematicError`. The variants:
+`#[label]` so diagnostics render with the responsible mission line highlighted (the spec's
+`SourceRef`, a `mission.py:line` anchor, when it has one). The variants:
 
 | Variant | When |
 |---|---|
-| `Parse` | bad KDL |
-| `MissingCoordinator` / `MultipleCoordinators` | not exactly one `coordinator` |
-| `MissingInstanceName` / `MissingType` / `DuplicateInstance` | malformed/duplicate `system` |
-| `UnknownType` | `type=` not in the registry |
-| `UnknownParam` / `MissingParam` / `InvalidParam` | a param property with no schema field / a required field absent / a type mismatch — shared by the static deserializer (§5) and the dl schema-conform pass (§6.3) |
-| `MissingEdgeField` | incomplete `connect` |
+| `IrVersionMismatch` | a `Wiring` stamped with a different `ir_version` than this build |
+| `MissingType` / `DuplicateInstance` | a static system with no `type`, or two systems sharing a name |
+| `UnknownType` | `type` not in the registry |
+| `UnknownParam` / `MissingParam` / `InvalidParam` / `ValueParams` | a param key with no schema field / a required field absent / a type mismatch / a serde decode failure — shared by the static deserialize (§5) and the dl schema-conform pass (§6.3) |
 | `UnknownInstance` / `UnknownFrame` | edge endpoint resolution (§4.2) |
 | `Wire` | a `WireError` from `connect`/`build()` (§4.3) |
-| `MissingArtifactField` / `UnknownArtifact` / `ArtifactNotBuilt` / `DlOpen` | dl artifact resolution |
-| `ArtifactType` / `PackTypeRequired` / `PackSystem` / `PackCreate` / `OccupantNotReloadable` | pack surface: a legacy `artifact … type=`; a multi-entry pack with no `type=`; an unknown entry name (the choices are listed); an entry's create phase failed; a `.state(...)` entry named as a slot occupant or second instance |
+| `UnknownArtifact` / `ArtifactNotBuilt` / `DlOpen` / `StaleStubs` | dl artifact resolution and stub freshness |
+| `PackTypeRequired` / `PackSystem` / `PackCreate` / `OccupantNotReloadable` | pack surface: a multi-entry pack with no `type`; an unknown entry name (the choices are listed); an entry's create phase failed; a `.state(...)` entry named as a slot occupant or second instance |
+| `StaticPostcardParams` | typed builder (`Postcard`) params on a static system, which has no postcard decode path |
 | `DlParamEncode` | dl param encoding: an un-encodable schema shape, or the dynamic postcard encoder rejected the value (§6.3) |
 
-When [`parse`] produces the [`Wiring`], every error carries the offending document span. When
-[`resolve`] consumes a [`Wiring`], the source spans are not available (a builder-origin [`Wiring`]
-has no text), so resolve-time errors carry a best-effort reconstructed snippet — but the error
+When [`resolve`] consumes a [`Wiring`], it anchors each error on the spec's `SourceRef` when it has
+one (a Python-evaluated mission fills these with `mission.py:line` anchors; a builder-origin
+[`Wiring`] has none), falling back to a best-effort reconstructed snippet — but the error
 **variant** (what callers and tests match on) is identical either way. `build()`-time `WireError`s
 are wrapped with the error's own rendered message as the snippet.
 
@@ -575,25 +589,25 @@ are wrapped with the error's own rendered message as the snippet.
 | Concern | Reused | New here |
 |---|---|---|
 | Wiring / validation / sizing | the coordinator builder: `add_*_named`, `connect`/`connect_delayed`, `build`, `PortRef`, `SystemHandle`, `WireError` | nothing — wiring only drives it |
-| KDL parsing | the `kdl` crate + `metor-proto-kdl`'s hand-walk style | the wiring grammar (§2) |
+| Mission authoring | Python (`metor_config`, evaluated by CPython) | the value-tree IR the recorder emits (`design-python-config.md`) |
 | Frame addressing | `ComponentId::new(name)` (== `Frame::FRAME_ID`); `SystemDescriptor`/`PortDesc.frame_id` | the resolver + typo guard (§4) |
 | Error reporting | `thiserror` + `miette` `Diagnostic` | `LoadError` (§8) |
-| dl ABI | `DlPack`/`DlSystem`, `export_pack!`, the `fsw_pack_*` symbols, `params_schema` | the build driver, the schema-guided KDL encoder (§6), the per-resolve pack cache |
-| System construction | `BuildSystem::new` | `Registry`, `SystemFactory`, `AddToBuilder`, the KDL `serde::Deserializer` (§3, §5) |
-| Mission description | — | the `Wiring` data model + `WiringBuilder` + `parse`/`resolve` (§0, §1) |
+| dl ABI | `DlPack`/`DlSystem`, `export_pack!`, the `fsw_pack_*` symbols, `params_schema` | the build driver, the schema-guided value-tree encoder (§6), the per-resolve pack cache |
+| System construction | `BuildSystem::new` | `Registry`, `SystemFactory`, `AddToBuilder`, the value-tree deserialize (§3, §5) |
+| Mission description | — | the `Wiring` data model + `WiringBuilder` + `eval_python_mission`/`resolve` (§0, §1) |
 
 ---
 
 ## Tests
 
-- `src/wiring/tests.rs` — the in-crate acceptance suite: an end-to-end KDL load + run of a
-  params-bearing cyclic chain into an async logger; instance-name disambiguation of two instances of
-  one type; the span-carrying error cases; feedback-cycle detection and the `delayed=#true` break; a
-  `TcpDownlink` system-node loading; the KDL `serde::Deserializer` round-trip (`src/wiring/de.rs`); and the **front-end equivalence**
-  tests (`parse` and `WiringBuilder` produce byte-equal [`Wiring`], and a builder-origin [`Wiring`]
-  resolves and runs).
+- `src/wiring/tests.rs` — the in-crate acceptance suite, all driven through [`WiringBuilder`]:
+  an end-to-end build + run of a params-bearing cyclic chain into an async logger; instance-name
+  disambiguation of two instances of one type; the span-carrying error cases; feedback-cycle
+  detection and the `delayed` break; a `TcpDownlink` system loading; the value-tree param decode;
+  the IR-version check; and bundle round-trips.
 - `tests/wiring_resolve.rs` — the dl acceptance gate driven **through** the [`Wiring`] data model: a
   static producer + a dlopen'd consumer, the build driver locating the `.so`, then `resolve` + run;
-  and the headline KDL ≡ Rust-builder byte-equality (§6.3) run to the same output.
+  and `type=` entry selection with the unknown-type rejection.
+- `tests/py_eval.rs` — the subprocess-CPython evaluation path end to end.
 </content>
 </invoke>

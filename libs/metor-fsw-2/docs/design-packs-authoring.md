@@ -62,8 +62,9 @@ What exploration established, and this design builds on:
   sound on `FrameGrant`, whose borrow is already tied to the grant.
 - The static registry is a `type`-string → factory table (`src/wiring/mod.rs:126`,
   `:213-295`) — exactly the shape a pack can feed.
-- dl params have no defaults (`src/wiring/kdl_params.rs:93-95`), which is why mission.kdl
-  spells out every field (`examples/adcs-fsw2/mission.kdl:17`).
+- dl params carry per-field defaults (the entry's `params_default` postcard blob, overlaid by
+  `encode_value_params` in `src/wiring/params.rs`), so a `mission.py` spells only the fields it
+  overrides.
 
 ---
 
