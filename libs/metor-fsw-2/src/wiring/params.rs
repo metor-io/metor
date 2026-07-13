@@ -3,96 +3,35 @@
 //! A dynamically loaded system's `Params` type is never linked into the host.
 //! What the host has instead is the postcard schema the shared library exports
 //! ([`DlSystem::params_schema`](crate::dl::DlSystem::params_schema)). This
-//! module walks that schema to turn a params surface into the exact bytes the
-//! `Params` struct itself would postcard-encode to, so the loaded side can
+//! module walks that schema to turn a params value tree into the exact bytes
+//! the `Params` struct itself would postcard-encode to, so the loaded side can
 //! decode them as its own type.
 //!
-//! Two front-ends feed one tail. [`encode_kdl_params`] reads a system node's
-//! KDL params through the shared node deserializer ([`de`]) into a dynamic
-//! [`serde_json::Value`] plus a table mapping each top-level key to its
-//! source span; [`encode_value_params`] starts from a value tree directly
-//! (the [`ParamSource::Value`](super::ParamSource::Value) path), with no
-//! spans. Both then run the same [`conform_and_encode`] tail: overlay the
-//! entry's declared defaults, check the value against the schema —
-//! [`conform_to_schema`] turns unknown keys, missing fields, and type
-//! mismatches into [`LoadError`]s and inserts an explicit `Null` for every
-//! absent `Option` field, since postcard-dyn requires the key to be present —
-//! and emit the bytes with [`postcard_dyn::to_stdvec_dyn`].
+//! [`encode_value_params`] starts from the
+//! [`ParamSource::Value`](super::ParamSource::Value) tree the Python front-end
+//! emits and runs the [`conform_and_encode`] tail: overlay the entry's
+//! declared defaults, check the value against the schema — [`conform_to_schema`]
+//! turns unknown keys, missing fields, and type mismatches into [`LoadError`]s
+//! and inserts an explicit `Null` for every absent `Option` field, since
+//! postcard-dyn requires the key to be present — and emit the bytes with
+//! [`postcard_dyn::to_stdvec_dyn`].
 //!
-//! Two properties of the conformance walk are worth knowing. The span table
-//! covers top-level keys only (and is empty for a value tree), so an error
-//! inside a nested struct or sequence carries the span of the top-level
-//! property containing it, or the whole surface. And any schema shape the
+//! One property of the conformance walk is worth knowing: any schema shape the
 //! walk does not model (tuples, maps, enums) passes through unchecked; if
 //! postcard-dyn cannot encode it, the failure surfaces as
-//! [`LoadError::DlParamEncode`] rather than as silently wrong bytes.
+//! [`LoadError::DlParamEncode`] rather than as silently wrong bytes. Errors
+//! anchor to the whole value-tree surface, which carries no document spans.
 
 use std::collections::HashMap;
 
-use kdl::KdlDocument;
 use miette::SourceSpan;
 use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
 use serde_json::{Map, Value};
 
-use super::{de, LoadError};
-
-/// Encodes a system node's KDL params into the postcard bytes described by
-/// `schema`.
-///
-/// `node_text` must parse to a document containing the one system node.
-/// `reserved` and `skip_args` name the parts of the node that belong to the
-/// wiring surface rather than the params (reserved property names and leading
-/// positional arguments), which the deserializer skips. `system` names the
-/// instance in diagnostics.
-pub fn encode_kdl_params(
-    node_text: &str,
-    schema: &OwnedNamedType,
-    system: &str,
-    reserved: &'static [&'static str],
-    skip_args: usize,
-) -> Result<Vec<u8>, LoadError> {
-    encode_kdl_params_with_defaults(node_text, schema, system, reserved, skip_args, None)
-}
-
-/// As [`encode_kdl_params`], overlaying the node's params onto a decoded
-/// default-params base when the entry declared one.
-///
-/// `defaults` is the entry's canonical `Params` postcard blob (from the pack
-/// manifest or the entry itself). It decodes against the same schema into a
-/// complete params object; the node's top-level keys then replace matching
-/// fields, so a config spells only its overrides. The merge is top-level: a
-/// nested struct named in KDL replaces the default one wholesale.
-pub fn encode_kdl_params_with_defaults(
-    node_text: &str,
-    schema: &OwnedNamedType,
-    system: &str,
-    reserved: &'static [&'static str],
-    skip_args: usize,
-    defaults: Option<&[u8]>,
-) -> Result<Vec<u8>, LoadError> {
-    let span: SourceSpan = (0, node_text.len()).into();
-    let encode_err = |reason: String| LoadError::DlParamEncode {
-        system: system.to_string(),
-        reason,
-        src: node_text.to_string(),
-        span,
-    };
-
-    let doc = node_text
-        .parse::<KdlDocument>()
-        .map_err(|e| encode_err(e.to_string()))?;
-    let node = doc
-        .nodes()
-        .first()
-        .ok_or_else(|| encode_err("the carried params text has no node".into()))?;
-
-    let (value, spans) = de::params_value(node, node_text, system, reserved, skip_args)?;
-    conform_and_encode(value, schema, &spans, system, defaults, node_text, node.span())
-}
+use super::LoadError;
 
 /// Encodes a params value tree into the postcard bytes described by `schema`,
-/// the [`ParamSource::Value`](super::ParamSource::Value) twin of
-/// [`encode_kdl_params_with_defaults`] over the same conform-and-encode tail.
+/// over the [`conform_and_encode`] tail.
 ///
 /// A value tree carries no document spans, so the rendered JSON stands in as
 /// the diagnostic source and every error anchors to the whole surface.
@@ -201,7 +140,7 @@ fn conform_to_schema(
         OwnedDataModelType::Unit | OwnedDataModelType::UnitStruct => &[],
         other => {
             return Err(Conform::Shape(format!(
-                "the `Params` schema is `{other:?}`, which a KDL params surface cannot \
+                "the `Params` schema is `{other:?}`, which a params value tree cannot \
                  express (only a struct, or a unit)"
             )));
         }

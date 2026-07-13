@@ -114,7 +114,7 @@ static GUARD_INSTALLED: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 
 /// Whether [`worker_entry`] has run in this process, making worker re-exec
 /// available.
-#[cfg(feature = "kdl")]
+#[cfg(feature = "wiring")]
 pub(crate) fn worker_guard_installed() -> bool {
     GUARD_INSTALLED.load(core::sync::atomic::Ordering::Relaxed)
 }

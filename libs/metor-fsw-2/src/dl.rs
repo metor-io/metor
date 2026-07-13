@@ -45,7 +45,7 @@
 
 use core::ffi::c_void;
 use std::ffi::OsStr;
-#[cfg(feature = "kdl")]
+#[cfg(feature = "wiring")]
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::slice;
@@ -269,7 +269,7 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
 /// driver's manifest sidecar: the object is loaded, ABI-checked, described,
 /// and unloaded *in this process*. The worker's host decodes the bytes
 /// without ever loading the object itself (`docs/process-systems.md` §5).
-#[cfg(any(target_os = "linux", target_os = "macos", feature = "kdl"))]
+#[cfg(any(target_os = "linux", target_os = "macos", feature = "wiring"))]
 pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> {
     // Dropping the PackLib closes the pack and unloads the library.
     open_and_describe(path.as_ref()).map(|(_lib, buf)| buf)
@@ -278,7 +278,7 @@ pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> 
 /// The manifest sidecar path for a built pack library: `<so_path>.manifest`,
 /// the raw postcard [`PackManifestMsg`] bytes the build driver wrote next to
 /// the `.so` (`docs/wiring.md` §6.1).
-#[cfg(feature = "kdl")]
+#[cfg(feature = "wiring")]
 pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
     let mut name = so_path.as_os_str().to_owned();
     name.push(".manifest");
@@ -291,7 +291,7 @@ pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
 /// Phase 0 verifies sidecars without consuming them.
 // TODO(python-config phase 2): switch `resolve_proc`/`describe_occupants` to
 // prefer a sidecar over spawning a describe worker.
-#[cfg(feature = "kdl")]
+#[cfg(feature = "wiring")]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn read_manifest_sidecar(so_path: &Path) -> Option<Result<Vec<PackEntryMeta>, DlError>> {
     let bytes = std::fs::read(manifest_sidecar_path(so_path)).ok()?;
@@ -301,7 +301,7 @@ pub(crate) fn read_manifest_sidecar(so_path: &Path) -> Option<Result<Vec<PackEnt
 /// The raw postcard [`PackManifestMsg`] bytes of the `<so>.manifest` sidecar,
 /// if the build driver wrote one (sidecar-hash ≡ describe-hash). `None` when no
 /// sidecar sits next to the library, leaving the caller to describe it.
-#[cfg(feature = "kdl")]
+#[cfg(feature = "wiring")]
 pub(crate) fn manifest_sidecar_bytes(so_path: &Path) -> Option<Vec<u8>> {
     std::fs::read(manifest_sidecar_path(so_path)).ok()
 }
@@ -470,10 +470,10 @@ pub struct DlSystem {
     fns: PackFns,
     index: u32,
     descriptor: SystemDescriptor,
-    /// The exported `Params` schema, kept so the host can schema-encode KDL
-    /// params without ever linking the `Params` type.
+    /// The exported `Params` schema, kept so the host can schema-encode a
+    /// params value tree without ever linking the `Params` type.
     params_schema: OwnedNamedType,
-    /// The entry's declared default-params blob, the base KDL config
+    /// The entry's declared default-params blob, the base a config value tree
     /// overlays.
     params_default: Option<Vec<u8>>,
     reloadable: bool,
@@ -488,7 +488,7 @@ impl DlSystem {
     }
 
     /// The exported `Params` schema, which lets the wiring resolver encode a
-    /// KDL config into the canonical postcard bytes without linking the
+    /// config value tree into the canonical postcard bytes without linking the
     /// `Params` type.
     pub fn params_schema(&self) -> &OwnedNamedType {
         &self.params_schema

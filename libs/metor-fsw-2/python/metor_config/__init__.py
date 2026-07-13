@@ -28,10 +28,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Generic, Iterator, TypeVar, cast
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # The IR model version this recorder emits; must match `ir::IR_VERSION`.
-IR_VERSION = 1
+# v2 dropped the KDL front-end's `ParamSource::Kdl` variant (phase 4).
+IR_VERSION = 2
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"

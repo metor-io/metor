@@ -352,11 +352,9 @@ pub struct TelemetryConfig<T: Transport> {
 /// entry is tapped; with either present an entry is tapped when its instance
 /// or its frame/channel name is listed.
 ///
-/// ```kdl
-/// system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
-///     instances "nav" "imu"      // optional; omit both children to tap everything
-///     frames "gyro_b"
-/// }
+/// ```python
+/// # optional; omit both lists to tap everything
+/// m.add("telemetry", TcpDownlink(addr="127.0.0.1:2240", instances=["nav", "imu"], frames=["gyro_b"]))
 /// ```
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct DownlinkParams {
@@ -400,14 +398,12 @@ impl BuildSystem for TelemetrySystem<TcpTransport> {
 /// [`NamedMsg::NAME`] resolved against the registry's
 /// [`MsgTable`](crate::MsgTable); the uplink subscribes to exactly those ids
 /// and mints one ordinary message output port per msg, so
-/// `connect "uplink" -> … msg="…"` edges resolve like any other. No `msgs`
-/// child means the uplink relays nothing (and warns); there is no built-in
-/// default set.
+/// `m.route(uplink, …, msg="…")` edges resolve like any other. An empty
+/// `msgs` list means the uplink relays nothing (and warns); there is no
+/// built-in default set.
 ///
-/// ```kdl
-/// system "uplink" type="TcpUplink" addr="127.0.0.1:2241" {
-///     msgs "SequenceCommand" "AlarmAck"
-/// }
+/// ```python
+/// m.add("uplink", TcpUplink(addr="127.0.0.1:2241", msgs=["SequenceCommand", "AlarmAck"]))
 /// ```
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct UplinkParams {

@@ -32,8 +32,8 @@
 //! Authors who prefer an explicit handle over the ambient free functions can
 //! take a [`Seq`] argument instead; it reads the same clock.
 //!
-//! This module is compiled unconditionally (no `kdl` feature gate), since
-//! sequences are a runtime feature independent of configuration parsing.
+//! This module is compiled unconditionally (no `wiring` feature gate), since
+//! sequences are a runtime feature independent of the config front-end.
 
 use core::cell::{Cell, RefCell};
 use core::future::Future;

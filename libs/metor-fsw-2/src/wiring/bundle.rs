@@ -7,16 +7,16 @@
 //! `path`s stripped so the bundle stays relocatable and byte-reproducible),
 //! `meta.json` is a plain-serde [`BundleMeta`] sidecar, and every artifact's
 //! built `cdylib` — plus its `<cdylib>.manifest` sidecar when the build driver
-//! wrote one — is copied in alongside. The source file that produced the
-//! mission (`mission.py` or `mission.kdl`) rides along as verbatim provenance
-//! and is never consumed on load: the run path needs no Python and no KDL
-//! parser, strictly more hermetic than re-parsing source on target.
+//! wrote one — is copied in alongside. The `mission.py` that produced the
+//! mission rides along as verbatim provenance and is never consumed on load:
+//! the run path needs no Python and no config parse, strictly more hermetic
+//! than re-evaluating source on target.
 //!
 //! [`BundleMeta`] records the ABI version and IR version the bundle was built
 //! against, the target triple its `.so`s were compiled for, the build profile,
 //! a timestamp, the `sha256` of the `wiring.json` bytes (the determinism
-//! backstop CI diffs), and the `metor_config` recorder version when the
-//! mission was Python. [`load_bundle`] refuses any bundle whose ABI, IR, or
+//! backstop CI diffs), and the `metor_config` recorder version the mission was
+//! evaluated with. [`load_bundle`] refuses any bundle whose ABI, IR, or
 //! target does not match this host — a triple mismatch is a clean
 //! [`BundleError::TargetMismatch`] before any dlopen, where an arch mismatch
 //! used to surface as a dlopen mystery — and verifies each artifact's recorded
@@ -45,12 +45,8 @@ const META_FILE: &str = "meta.json";
 /// File name of the frozen wiring IR within a bundle.
 const WIRING_FILE: &str = "wiring.json";
 /// Base name of the optional provenance copy of the source file; the real name
-/// keeps the source's extension (`mission.py` / `mission.kdl`).
+/// keeps the source's `.py` extension.
 const PROVENANCE_STEM: &str = "mission";
-
-/// The pre-Phase-3 bundle's metadata file, still detected so an old-layout
-/// bundle is rejected with a clear message instead of a confusing parse error.
-const LEGACY_META_FILE: &str = "meta.kdl";
 
 /// Extension of the single-file bundle form: an uncompressed tar of the
 /// directory layout.
@@ -81,8 +77,8 @@ pub struct BundleMeta {
     /// `sha256:<hex>` of the `wiring.json` bytes — the determinism backstop CI
     /// re-evaluates and diffs (`metor-fsw package --check-ir`).
     pub ir_sha256: String,
-    /// The `metor_config` recorder version, when the mission was authored in
-    /// Python. `None` for a KDL mission. Provenance only.
+    /// The `metor_config` recorder version the mission was evaluated with.
+    /// `None` for a builder-authored mission. Provenance only.
     pub metor_config_version: Option<String>,
 }
 
@@ -96,12 +92,11 @@ pub struct PackageOptions {
     /// The target triple the `.so`s were built for, recorded in `meta.json`
     /// and checked against the host at load. `None` records no target.
     pub target: Option<String>,
-    /// The `metor_config` recorder version for a Python mission, recorded as
-    /// provenance. `None` for a KDL mission.
+    /// The `metor_config` recorder version, recorded as provenance. `None`
+    /// for a builder-authored mission.
     pub metor_config_version: Option<String>,
-    /// The source file to copy in verbatim as provenance (`mission.py` /
-    /// `mission.kdl`), never consumed on load. `None` writes no provenance
-    /// copy.
+    /// The `mission.py` to copy in verbatim as provenance, never consumed on
+    /// load. `None` writes no provenance copy.
     pub provenance: Option<PathBuf>,
     /// The package timestamp recorded as `built_at_unix`; `None` uses the
     /// current time. Pin it to make a `.metor` archive byte-reproducible for
@@ -136,15 +131,6 @@ pub enum BundleError {
         /// What was wrong.
         reason: String,
     },
-    /// The bundle uses the retired pre-Phase-3 layout (verbatim `mission.kdl`
-    /// with a `meta.kdl` sidecar). Bundles are rebuildable by design, so there
-    /// is no migration shim.
-    #[error(
-        "bundle uses the retired layout (`mission.kdl` + `{LEGACY_META_FILE}`); the bundle now \
-         carries the frozen IR (`{WIRING_FILE}` + `{META_FILE}`) — repackage it with \
-         `metor-fsw package`"
-    )]
-    OldLayout,
     /// The bundle's ABI version does not match this host's
     /// [`FSW_ABI_VERSION`].
     #[error(
@@ -350,8 +336,7 @@ fn write_archive(members: &[(String, MemberSource)], path: &Path) -> Result<(), 
 }
 
 /// The provenance copy's file name: `mission.<ext>` keeping the source's
-/// extension so a consumer (and `--check-ir`) can tell Python from KDL, or
-/// bare `mission` when the source has none.
+/// extension (`mission.py`), or bare `mission` when the source has none.
 fn provenance_name(source: &Path) -> String {
     match source.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!("{PROVENANCE_STEM}.{ext}"),
@@ -388,11 +373,6 @@ pub fn load_bundle(path: &Path) -> Result<Wiring, BundleError> {
 fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
     let meta_path = dir.join(META_FILE);
     if !meta_path.exists() {
-        // A pre-Phase-3 bundle is a clean, named rejection, not a missing-file
-        // surprise.
-        if dir.join(LEGACY_META_FILE).exists() {
-            return Err(BundleError::OldLayout);
-        }
         return Err(BundleError::BadMeta {
             reason: format!("no `{META_FILE}`"),
         });

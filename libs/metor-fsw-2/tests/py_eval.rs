@@ -6,7 +6,7 @@
 //! message when none is found. They share one `#[test]` so their `$METOR_PYTHON`
 //! mutations never race the other cases.
 
-#![cfg(feature = "kdl")]
+#![cfg(feature = "wiring")]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

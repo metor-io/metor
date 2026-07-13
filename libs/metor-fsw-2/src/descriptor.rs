@@ -208,7 +208,7 @@ pub fn split_decls(decls: Vec<PortDecl>) -> (Vec<PortDesc>, Vec<Capability>) {
 pub struct PortDesc {
     /// Edge key, derived from the schema by the constructors.
     pub id: PortId,
-    /// Display, KDL-token, and registry-key name (`F::NAME` or `M::NAME`).
+    /// Display, config-token, and registry-key name (`F::NAME` or `M::NAME`).
     /// The coordinator joins it with an instance name to form the qualified
     /// registry key `ComponentId::new("<instance>.<name>")` without needing a
     /// static type.
@@ -299,7 +299,7 @@ impl PortDesc {
     }
 
     /// [`msg`](Self::msg) with an explicit name override. `name` becomes the
-    /// display, KDL, and registry token while the edge key stays `M::ID`, so
+    /// display, config, and registry token while the edge key stays `M::ID`, so
     /// a channel keyed `"<instance>.commands"` keeps its key and
     /// `msg="<M::NAME>"` edges still resolve by packet id.
     pub fn msg_named<M: NamedMsg>(name: &'static str) -> Self {
@@ -541,8 +541,8 @@ mod tests {
         assert!(compatible(&log_f, &log_f.clone()));
     }
 
-    /// The well-known message name tokens are frozen; KDL files and registry
-    /// keys depend on them.
+    /// The well-known message name tokens are frozen; mission configs and
+    /// registry keys depend on them.
     #[test]
     fn wkt_named_msg_tokens_frozen() {
         assert_eq!(<SequenceCommand as NamedMsg>::NAME, "SequenceCommand");
