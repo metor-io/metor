@@ -192,7 +192,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
 #[test]
 fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
     use metor_fsw_2::DlError;
-    use metor_fsw_2::wiring::LoadError;
+    use metor_fsw_2::wiring::LoadErrorKind;
 
     // A dl system with `artifact=` but no `type=`: the builder leaves the type
     // unset, so resolve must pick the pack entry itself.
@@ -227,8 +227,8 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
         Ok(_) => panic!("expected PackTypeRequired"),
         Err(e) => e,
     };
-    match err {
-        LoadError::PackTypeRequired {
+    match err.kind {
+        LoadErrorKind::PackTypeRequired {
             system, available, ..
         } => {
             assert_eq!(system, "counter");
@@ -244,8 +244,8 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
         Ok(_) => panic!("expected PackSystem"),
         Err(e) => e,
     };
-    match err {
-        LoadError::PackSystem { system, source, .. } => {
+    match err.kind {
+        LoadErrorKind::PackSystem { system, source, .. } => {
             assert_eq!(system, "counter");
             match *source {
                 DlError::UnknownPackSystem { name, available } => {

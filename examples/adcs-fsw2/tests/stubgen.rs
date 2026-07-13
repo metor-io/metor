@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use metor_fsw_2::wiring::{
-    BuildOptions, LoadError, Registry, StubgenError, StubgenOptions, WiringBuilder,
+    BuildOptions, LoadErrorKind, Registry, StubgenError, StubgenOptions, WiringBuilder,
     build_artifacts, resolve, stubgen,
 };
 
@@ -44,7 +44,7 @@ fn stubgen_check_is_clean() {
 }
 
 /// A recorded manifest hash that no longer matches the built pack is a stale
-/// stub, refused at resolve with [`LoadError::StaleStubs`]. Driven over a
+/// stub, refused at resolve with [`LoadErrorKind::StaleStubs`]. Driven over a
 /// systemless wiring so the check fires before the (process) systems pass.
 #[test]
 fn tampered_hash_is_refused_at_resolve() {
@@ -57,8 +57,10 @@ fn tampered_hash_is_refused_at_resolve() {
     }
     wiring.artifacts[0].manifest_hash = Some("sha256:not-the-real-hash".to_string());
     match resolve(&wiring, &Registry::with_builtins()) {
-        Err(LoadError::StaleStubs { artifact }) => assert_eq!(artifact, "adcs"),
-        Err(other) => panic!("expected StaleStubs, got {other:?}"),
+        Err(e) => match e.kind {
+            LoadErrorKind::StaleStubs { artifact } => assert_eq!(artifact, "adcs"),
+            other => panic!("expected StaleStubs, got {other:?}"),
+        },
         Ok(_) => panic!("expected StaleStubs, resolve succeeded"),
     }
 }

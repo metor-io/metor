@@ -11,8 +11,8 @@ use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::wiring::{
-    ClockSpec, IR_VERSION, LoadError, ParamSource, Registry, SlotInitState, Wiring, WiringBuilder,
-    resolve,
+    ClockSpec, IR_VERSION, LoadErrorKind, ParamSource, Registry, SlotInitState, Wiring,
+    WiringBuilder, resolve,
 };
 use crate::{
     AsyncSystem, BuildSystem, CyclicSystem, Input, MsgIn, MsgOut, Out, Output, System, SystemInput,
@@ -481,7 +481,7 @@ fn err_static_system_with_typed_params() {
         Err(e) => e,
     };
     assert!(
-        matches!(err, LoadError::StaticPostcardParams { .. }),
+        matches!(err.kind, LoadErrorKind::StaticPostcardParams { .. }),
         "{err:?}"
     );
 }
@@ -686,8 +686,8 @@ fn err_value_params_unknown_key() {
     };
     assert!(
         matches!(
-            err,
-            LoadError::UnknownParam { ref property, ref system, .. }
+            err.kind,
+            LoadErrorKind::UnknownParam { ref property, ref system, .. }
                 if property == "gian" && system == "nav"
         ),
         "{err:?}"
@@ -709,8 +709,8 @@ fn err_value_params_missing_required() {
         Ok(_) => panic!("expected a ValueParams error"),
         Err(e) => e,
     };
-    match err {
-        LoadError::ValueParams { system, reason, .. } => {
+    match err.kind {
+        LoadErrorKind::ValueParams { system, reason, .. } => {
             assert_eq!(system, "nav");
             assert!(reason.contains("gain"), "names the missing field: {reason}");
         }
@@ -735,7 +735,7 @@ fn err_value_params_out_of_range_int() {
         Err(e) => e,
     };
     assert!(
-        matches!(err, LoadError::ValueParams { ref system, .. } if system == "imu"),
+        matches!(err.kind, LoadErrorKind::ValueParams { ref system, .. } if system == "imu"),
         "{err:?}"
     );
 }
@@ -875,8 +875,8 @@ fn resolve_rejects_ir_version_mismatch() {
         Ok(_) => panic!("expected an IrVersionMismatch error"),
         Err(e) => e,
     };
-    match err {
-        LoadError::IrVersionMismatch { found, expected } => {
+    match err.kind {
+        LoadErrorKind::IrVersionMismatch { found, expected } => {
             assert_eq!(found, IR_VERSION + 1);
             assert_eq!(expected, IR_VERSION);
         }
@@ -1051,8 +1051,8 @@ fn reloadable_is_required_for_slot_occupants_only() {
     };
     assert!(
         matches!(
-            err,
-            LoadError::OccupantNotReloadable { ref slot, ref occupant, .. }
+            err.kind,
+            LoadErrorKind::OccupantNotReloadable { ref slot, ref occupant, .. }
                 if slot == "adcs" && occupant == "Stateful"
         ),
         "{err:?}"
@@ -1069,8 +1069,8 @@ fn resolve_rejects_out_of_range_scope_refs() {
         Ok(_) => panic!("expected a BadScopeRef error"),
         Err(e) => e,
     };
-    match err {
-        LoadError::BadScopeRef { owner, index, len } => {
+    match err.kind {
+        LoadErrorKind::BadScopeRef { owner, index, len } => {
             assert_eq!(owner, "system `a`");
             assert_eq!((index, len), (0, 0));
         }
@@ -1088,7 +1088,7 @@ fn resolve_rejects_out_of_range_scope_refs() {
         Err(e) => e,
     };
     assert!(
-        matches!(err, LoadError::BadScopeRef { index: 3, len: 1, .. }),
+        matches!(err.kind, LoadErrorKind::BadScopeRef { index: 3, len: 1, .. }),
         "{err:?}"
     );
 }

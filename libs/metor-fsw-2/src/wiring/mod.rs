@@ -63,7 +63,7 @@ pub use bundle::{
     BundleError, BundleMeta, METOR_EXTENSION, PackageOptions, WIRING_FILE_NAME, load_bundle,
     unpack_metor, write_bundle,
 };
-pub use error::LoadError;
+pub use error::{Anchor, LoadError, LoadErrorKind};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
     InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef, SystemSpec,
@@ -200,16 +200,12 @@ where
     system
         .configure(&BuildCtx { msgs: ctx.msgs })
         .map_err(|e| match e {
-            ConfigureError::UnknownMsg { name, available } => {
-                let src = ctx.params.diag_src(ctx.name);
-                LoadError::UnknownMsgName {
-                    system: ctx.name.to_string(),
-                    msg: name,
-                    available: available.join(", "),
-                    span: (0, src.len()).into(),
-                    src,
-                }
+            ConfigureError::UnknownMsg { name, available } => LoadErrorKind::UnknownMsgName {
+                system: ctx.name.to_string(),
+                msg: name,
+                available: available.join(", "),
             }
+            .whole(ctx.params.diag_src(ctx.name)),
         })?;
     let handle = system.add_to(ctx.name, ctx.builder);
     // Return the instance descriptor, not the static one; a system whose
@@ -227,11 +223,12 @@ fn decode_static_params<P: serde::de::DeserializeOwned>(
 ) -> Result<P, LoadError> {
     match params {
         StaticParams::Value { value, src } => decode_value_params(value, name, src),
-        StaticParams::None => P::deserialize(NoParams).map_err(|e| LoadError::ValueParams {
-            system: name.to_string(),
-            reason: e.to_string(),
-            src: format!("system \"{name}\""),
-            span: (0, name.len() + 9).into(),
+        StaticParams::None => P::deserialize(NoParams).map_err(|e| {
+            LoadErrorKind::ValueParams {
+                system: name.to_string(),
+                reason: e.to_string(),
+            }
+            .at(format!("system \"{name}\""), (0, name.len() + 9).into())
         }),
     }
 }
@@ -289,31 +286,30 @@ impl<'de> serde::Deserializer<'de> for NoParams {
 /// Unlike the dl path's schema conformance, this is plain serde, so
 /// `#[serde(default)]` field attributes are honored. `serde_ignored` supplies
 /// the typo guard serde_json's deserializer lacks: a key no field consumed is
-/// an [`UnknownParam`](LoadError::UnknownParam), and any other decode failure
-/// is a [`ValueParams`](LoadError::ValueParams) carrying serde's own message.
+/// an [`UnknownParam`](LoadErrorKind::UnknownParam), and any other decode failure
+/// is a [`ValueParams`](LoadErrorKind::ValueParams) carrying serde's own message.
 pub(crate) fn decode_value_params<P: serde::de::DeserializeOwned>(
     value: &serde_json::Value,
     system: &str,
     src: &str,
 ) -> Result<P, LoadError> {
-    let span: SourceSpan = (0, src.len()).into();
     let mut unknown: Option<String> = None;
     let params = serde_ignored::deserialize(value, |path: serde_ignored::Path<'_>| {
         unknown.get_or_insert_with(|| path.to_string());
     })
-    .map_err(|e| LoadError::ValueParams {
-        system: system.to_string(),
-        reason: e.to_string(),
-        src: src.to_string(),
-        span,
+    .map_err(|e| {
+        LoadErrorKind::ValueParams {
+            system: system.to_string(),
+            reason: e.to_string(),
+        }
+        .whole(src)
     })?;
     if let Some(property) = unknown {
-        return Err(LoadError::UnknownParam {
+        return Err(LoadErrorKind::UnknownParam {
             property,
             system: system.to_string(),
-            src: src.to_string(),
-            span,
-        });
+        }
+        .whole(src));
     }
     Ok(params)
 }
@@ -456,15 +452,11 @@ impl Registry {
                     .map_err(|e| match e {
                         // The params decode already carries its span; unwrap it.
                         crate::pack::MakeError::Params(e) => *e,
-                        other => {
-                            let src = ctx.params.diag_src(ctx.name);
-                            LoadError::PackCreate {
-                                system: ctx.name.to_string(),
-                                message: other.to_string(),
-                                span: (0, src.len()).into(),
-                                src,
-                            }
+                        other => LoadErrorKind::PackCreate {
+                            system: ctx.name.to_string(),
+                            message: other.to_string(),
                         }
+                        .whole(ctx.params.diag_src(ctx.name)),
                     })?;
                 Ok((handle, ctx.builder.descriptor_of(handle).clone()))
             });
@@ -481,7 +473,7 @@ impl Registry {
 
     /// Whether `ty` names a registered system whose descriptor carries
     /// [`Capability::ReceiveAll`](crate::Capability). Unknown types answer
-    /// `false`; the systems pass reports them as [`LoadError::UnknownType`] in
+    /// `false`; the systems pass reports them as [`LoadErrorKind::UnknownType`] in
     /// document order.
     fn is_receive_all(&self, ty: Option<&str>) -> bool {
         ty.and_then(|ty| self.factories.get(ty))
@@ -528,10 +520,11 @@ enum Dir {
 /// document spans. The error variants are the same either way.
 pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError> {
     if wiring.ir_version != IR_VERSION {
-        return Err(LoadError::IrVersionMismatch {
+        return Err(LoadErrorKind::IrVersionMismatch {
             found: wiring.ir_version,
             expected: IR_VERSION,
-        });
+        }
+        .bare());
     }
     check_scope_refs(wiring)?;
     check_manifest_hashes(wiring)?;
@@ -579,12 +572,10 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             (None, true) => {
                 // A process system needs an artifact to spawn a worker; a spec
                 // that sets `process` without one lands here.
-                let src = system_src(spec);
-                return Err(LoadError::ProcessNeedsArtifact {
-                    name: spec.name.clone(),
-                    span: (0, src.len()).into(),
-                    src,
-                });
+                return Err(
+                    LoadErrorKind::ProcessNeedsArtifact { name: spec.name.clone() }
+                        .whole(system_src(spec)),
+                );
             }
             (None, false) => {
                 if registry.is_receive_all(spec.ty.as_deref()) {
@@ -598,11 +589,10 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             .insert(spec.name.clone(), Instance { handle, desc })
             .is_some()
         {
-            return Err(LoadError::DuplicateInstance {
-                name: spec.name.clone(),
-                src: system_src(spec),
-                span: (0, system_src(spec).len()).into(),
-            });
+            return Err(
+                LoadErrorKind::DuplicateInstance { name: spec.name.clone() }
+                    .whole(system_src(spec)),
+            );
         }
     }
 
@@ -614,11 +604,9 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             .insert(slot.name.clone(), Instance { handle, desc })
             .is_some()
         {
-            return Err(LoadError::DuplicateInstance {
-                name: slot.name.clone(),
-                src: slot_src(slot),
-                span: (0, slot_src(slot).len()).into(),
-            });
+            return Err(
+                LoadErrorKind::DuplicateInstance { name: slot.name.clone() }.whole(slot_src(slot)),
+            );
         }
     }
 
@@ -630,11 +618,10 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             .insert(spec.name.clone(), Instance { handle, desc })
             .is_some()
         {
-            return Err(LoadError::DuplicateInstance {
-                name: spec.name.clone(),
-                src: system_src(spec),
-                span: (0, system_src(spec).len()).into(),
-            });
+            return Err(
+                LoadErrorKind::DuplicateInstance { name: spec.name.clone() }
+                    .whole(system_src(spec)),
+            );
         }
     }
 
@@ -674,7 +661,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
         } else {
             builder.connect(producer, consumer)
         };
-        result.map_err(|source| LoadError::Wire { source, src, span })?;
+        result.map_err(|source| LoadErrorKind::Wire { source }.at(src, span))?;
     }
 
     builder.build().map_err(wire_at_build)
@@ -693,20 +680,10 @@ fn resolve_static(
     // `type=` is required for a static system; only a dl system can derive it
     // from its artifact. A builder-origin spec could omit it.
     let ty = spec.ty.as_deref().ok_or_else(|| {
-        let src = system_src(spec);
-        LoadError::MissingType {
-            name: spec.name.clone(),
-            span: (0, src.len()).into(),
-            src,
-        }
+        LoadErrorKind::MissingType { name: spec.name.clone() }.whole(system_src(spec))
     })?;
     let factory = registry.factories.get(ty).ok_or_else(|| {
-        let src = system_src(spec);
-        LoadError::UnknownType {
-            ty: ty.to_string(),
-            span: (0, src.len()).into(),
-            src,
-        }
+        LoadErrorKind::UnknownType { ty: ty.to_string() }.whole(system_src(spec))
     })?;
     let snippet;
     let params = match &spec.params {
@@ -715,13 +692,11 @@ fn resolve_static(
         // have no decode path and would be silently dropped, leaving the
         // system on defaults.
         ParamSource::Postcard(_) => {
-            let src = system_src(spec);
-            return Err(LoadError::StaticPostcardParams {
+            return Err(LoadErrorKind::StaticPostcardParams {
                 system: spec.name.clone(),
                 ty: ty.to_string(),
-                span: (0, src.len()).into(),
-                src,
-            });
+            }
+            .whole(system_src(spec)));
         }
         ParamSource::Value(value) => {
             snippet = system_src(spec);
@@ -761,12 +736,13 @@ impl PackCache {
         if !self.packs.contains_key(artifact_id) {
             let artifact = find_built_artifact(wiring, artifact_id, owner, src, span)?;
             let path = artifact.path.as_ref().expect("checked by find_built_artifact");
-            let pack = crate::dl::DlPack::open(path).map_err(|source| LoadError::DlOpen {
-                system: owner.to_string(),
-                artifact: artifact_id.to_string(),
-                source: Box::new(source),
-                src: src.to_string(),
-                span,
+            let pack = crate::dl::DlPack::open(path).map_err(|source| {
+                LoadErrorKind::DlOpen {
+                    system: owner.to_string(),
+                    artifact: artifact_id.to_string(),
+                    source: Box::new(source),
+                }
+                .at(src, span)
             })?;
             self.packs.insert(artifact_id.to_string(), pack);
         }
@@ -874,25 +850,28 @@ fn resolve_occupant(
 ) -> Result<(OccupantEntry, Vec<u8>), LoadError> {
     let name = match entry {
         Some(name) => name,
-        None => source.sole_entry().ok_or_else(|| LoadError::PackTypeRequired {
-            system: owner.to_string(),
-            artifact: source.artifact().to_string(),
-            available: source.entry_names().join(", "),
-            src: src.to_string(),
-            span,
+        None => source.sole_entry().ok_or_else(|| {
+            LoadErrorKind::PackTypeRequired {
+                system: owner.to_string(),
+                artifact: source.artifact().to_string(),
+                available: source.entry_names().join(", "),
+            }
+            .at(src, span)
         })?,
     };
-    let pack_system = |source: crate::dl::DlError| LoadError::PackSystem {
-        system: owner.to_string(),
-        source: Box::new(source),
-        src: src.to_string(),
-        span,
+    let pack_system = |source: crate::dl::DlError| {
+        LoadErrorKind::PackSystem {
+            system: owner.to_string(),
+            source: Box::new(source),
+        }
+        .at(src, span)
     };
-    let not_reloadable = || LoadError::OccupantNotReloadable {
-        slot: owner.to_string(),
-        occupant: name.to_string(),
-        src: src.to_string(),
-        span,
+    let not_reloadable = || {
+        LoadErrorKind::OccupantNotReloadable {
+            slot: owner.to_string(),
+            occupant: name.to_string(),
+        }
+        .at(src, span)
     };
     match source {
         EntrySource::Opened { pack, .. } => {
@@ -997,18 +976,17 @@ fn find_built_artifact<'w>(
         .artifacts
         .iter()
         .find(|a| a.id == artifact_id)
-        .ok_or_else(|| LoadError::UnknownArtifact {
-            system: owner.to_string(),
-            artifact: artifact_id.to_string(),
-            src: src.to_string(),
-            span,
+        .ok_or_else(|| {
+            LoadErrorKind::UnknownArtifact {
+                system: owner.to_string(),
+                artifact: artifact_id.to_string(),
+            }
+            .at(src, span)
         })?;
     if artifact.path.is_none() {
-        return Err(LoadError::ArtifactNotBuilt {
-            artifact: artifact_id.to_string(),
-            src: src.to_string(),
-            span,
-        });
+        return Err(
+            LoadErrorKind::ArtifactNotBuilt { artifact: artifact_id.to_string() }.at(src, span),
+        );
     }
     Ok(artifact)
 }
@@ -1030,12 +1008,13 @@ fn resolve_proc(
     let span: SourceSpan = (0, src.len()).into();
     let artifact = find_built_artifact(wiring, artifact_id, &spec.name, &src, span)?;
     let path = artifact.path.as_ref().expect("checked by find_built_artifact");
-    let proc_describe = |detail: String| LoadError::ProcDescribe {
-        system: spec.name.clone(),
-        artifact: artifact_id.to_string(),
-        detail,
-        src: src.clone(),
-        span,
+    let proc_describe = |detail: String| {
+        LoadErrorKind::ProcDescribe {
+            system: spec.name.clone(),
+            artifact: artifact_id.to_string(),
+            detail,
+        }
+        .at(src.clone(), span)
     };
     let bytes = crate::proc::host::describe_via_worker(None, path)
         .map_err(|e| proc_describe(e.to_string()))?;
@@ -1068,12 +1047,7 @@ fn resolve_proc(
     _wiring: &Wiring,
     _builder: &mut CoordinatorBuilder,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    let src = system_src(spec);
-    Err(LoadError::ProcessUnsupported {
-        name: spec.name.clone(),
-        span: (0, src.len()).into(),
-        src,
-    })
+    Err(LoadErrorKind::ProcessUnsupported { name: spec.name.clone() }.whole(system_src(spec)))
 }
 
 /// Range-check every scope index in the wiring — the specs' `scope` fields
@@ -1082,7 +1056,7 @@ fn resolve_proc(
 fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
     let len = wiring.scopes.len();
     let check = |owner: String, index: Option<usize>| match index {
-        Some(index) if index >= len => Err(LoadError::BadScopeRef { owner, index, len }),
+        Some(index) if index >= len => Err(LoadErrorKind::BadScopeRef { owner, index, len }.bare()),
         _ => Ok(()),
     };
     for scope in &wiring.scopes {
@@ -1099,7 +1073,7 @@ fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
 
 /// Enforce generated-stub freshness: for each artifact whose stub module
 /// recorded a `manifest_hash`, compare it against the live pack manifest and
-/// fail with [`LoadError::StaleStubs`] on a mismatch. Artifacts with no
+/// fail with [`LoadErrorKind::StaleStubs`] on a mismatch. Artifacts with no
 /// recorded hash (builder-authored, hand-written `pack()` handles) or no built
 /// path yet are skipped; the dlopen path still opens them.
 fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
@@ -1123,9 +1097,7 @@ fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
             },
         };
         if stubgen::manifest_hash(&bytes) != recorded {
-            return Err(LoadError::StaleStubs {
-                artifact: artifact.id.clone(),
-            });
+            return Err(LoadErrorKind::StaleStubs { artifact: artifact.id.clone() }.bare());
         }
     }
     Ok(())
@@ -1187,13 +1159,12 @@ fn occupant_artifact(
     }
     match matches.as_slice() {
         [only] => Ok(only.clone()),
-        _ => Err(LoadError::OccupantAmbiguous {
+        _ => Err(LoadErrorKind::OccupantAmbiguous {
             slot: slot.to_string(),
             occupant: occ.occupant.clone(),
             matches,
-            src: src.to_string(),
-            span,
-        }),
+        }
+        .at(src, span)),
     }
 }
 
@@ -1209,29 +1180,25 @@ fn slot_config_error(
     let name = slot.name.clone();
     let src = src.to_string();
     match err {
-        SlotConfigError::Empty => LoadError::EmptySlot {
-            slot: name,
-            src,
-            span,
-        },
+        SlotConfigError::Empty => LoadErrorKind::EmptySlot { slot: name }.at(src, span),
         SlotConfigError::UnknownInitial { occupant, allowed } => {
-            LoadError::UnknownInitialOccupant {
+            LoadErrorKind::UnknownInitialOccupant {
                 slot: name,
                 occupant,
                 allowed,
-                src,
-                span,
             }
+            .at(src, span)
         }
         // A mount-reserved port is an occupant-contract defect too: the
         // artifact predates the pack ABI and must be rebuilt.
         SlotConfigError::OccupantMismatch { occupant, .. }
-        | SlotConfigError::ReservedPort { occupant, .. } => LoadError::SlotOccupantMismatch {
-            slot: name,
-            occupant,
-            src,
-            span,
-        },
+        | SlotConfigError::ReservedPort { occupant, .. } => {
+            LoadErrorKind::SlotOccupantMismatch {
+                slot: name,
+                occupant,
+            }
+            .at(src, span)
+        }
         SlotConfigError::MixedBacking => {
             unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
         }
@@ -1334,13 +1301,12 @@ fn resolve_slot(
             .iter()
             .any(|p| p.conn == PortConn::Edge && p.name == frame)
         {
-            return Err(LoadError::SlotContractMismatch {
+            return Err(LoadErrorKind::SlotContractMismatch {
                 slot: slot.name.clone(),
                 dir: "input",
                 frame: frame.clone(),
-                src: src.clone(),
-                span,
-            });
+            }
+            .at(src.clone(), span));
         }
     }
     for frame in &slot.outputs {
@@ -1349,13 +1315,12 @@ fn resolve_slot(
             .iter()
             .any(|p| p.conn == PortConn::Edge && p.name == frame)
         {
-            return Err(LoadError::SlotContractMismatch {
+            return Err(LoadErrorKind::SlotContractMismatch {
                 slot: slot.name.clone(),
                 dir: "output",
                 frame: frame.clone(),
-                src: src.clone(),
-                span,
-            });
+            }
+            .at(src.clone(), span));
         }
     }
 
@@ -1394,12 +1359,13 @@ fn describe_occupants(
         }
         let artifact = find_built_artifact(wiring, artifact_id, &slot.name, src, span)?;
         let path = artifact.path.as_ref().expect("checked by find_built_artifact");
-        let proc_describe = |detail: String| LoadError::ProcDescribe {
-            system: slot.name.clone(),
-            artifact: artifact_id.to_string(),
-            detail,
-            src: src.to_string(),
-            span,
+        let proc_describe = |detail: String| {
+            LoadErrorKind::ProcDescribe {
+                system: slot.name.clone(),
+                artifact: artifact_id.to_string(),
+                detail,
+            }
+            .at(src, span)
         };
         let bytes = crate::proc::host::describe_via_worker(None, path)
             .map_err(|e| proc_describe(e.to_string()))?;
@@ -1430,13 +1396,12 @@ fn describe_occupants(
                 match matches.as_slice() {
                     [only] => only.clone(),
                     _ => {
-                        return Err(LoadError::OccupantAmbiguous {
+                        return Err(LoadErrorKind::OccupantAmbiguous {
                             slot: slot.name.clone(),
                             occupant: occ.occupant.clone(),
                             matches,
-                            src: src.to_string(),
-                            span,
-                        });
+                        }
+                        .at(src, span));
                     }
                 }
             }
@@ -1476,11 +1441,7 @@ fn describe_occupants(
     src: &str,
     span: SourceSpan,
 ) -> Result<Vec<AllowedOccupant>, LoadError> {
-    Err(LoadError::ProcessUnsupported {
-        name: slot.name.clone(),
-        src: src.to_string(),
-        span,
-    })
+    Err(LoadErrorKind::ProcessUnsupported { name: slot.name.clone() }.at(src, span))
 }
 
 /// A best-effort source snippet for an edge's resolve-time errors.
@@ -1522,7 +1483,7 @@ fn coordinator_config(spec: &CoordinatorSpec) -> CoordinatorConfig {
 /// display name (a coordinator-minted channel such as `"commands"`) is then
 /// matched by the packet id the token resolved to on the other endpoint. Only
 /// when neither endpoint matches the token is the edge an
-/// [`UnknownMsg`](LoadError::UnknownMsg).
+/// [`UnknownMsg`](LoadErrorKind::UnknownMsg).
 fn resolve_msg_edge(
     instances: &HashMap<String, Instance>,
     src: &str,
@@ -1532,11 +1493,7 @@ fn resolve_msg_edge(
     let inst = |name: &str| {
         instances
             .get(name)
-            .ok_or_else(|| LoadError::UnknownInstance {
-                name: name.to_string(),
-                src: src.to_string(),
-                span,
-            })
+            .ok_or_else(|| LoadErrorKind::UnknownInstance { name: name.to_string() }.at(src, span))
     };
     let prod = inst(&edge.from)?;
     let cons = inst(&edge.to)?;
@@ -1550,11 +1507,12 @@ fn resolve_msg_edge(
     let by_id = |ports: &[crate::descriptor::PortDesc], id: PortId| {
         ports.iter().find(|p| p.id == id).map(|p| p.id)
     };
-    let unknown = |instance: &str, msg: &str| LoadError::UnknownMsg {
-        instance: instance.to_string(),
-        msg: msg.to_string(),
-        src: src.to_string(),
-        span,
+    let unknown = |instance: &str, msg: &str| {
+        LoadErrorKind::UnknownMsg {
+            instance: instance.to_string(),
+            msg: msg.to_string(),
+        }
+        .at(src, span)
     };
 
     let p_named = by_name(&prod.desc.outputs, &edge.out);
@@ -1596,11 +1554,7 @@ fn resolve_endpoint(
 ) -> Result<PortRef, LoadError> {
     let inst = instances
         .get(name)
-        .ok_or_else(|| LoadError::UnknownInstance {
-            name: name.to_string(),
-            src: src.to_string(),
-            span,
-        })?;
+        .ok_or_else(|| LoadErrorKind::UnknownInstance { name: name.to_string() }.at(src, span))?;
     let ports = match dir {
         Dir::Out => &inst.desc.outputs,
         Dir::In => &inst.desc.inputs,
@@ -1609,12 +1563,11 @@ fn resolve_endpoint(
         EdgeKind::Frame => {
             let id = PortId::Component(ComponentId::new(port_name));
             if !ports.iter().any(|p| p.id == id) {
-                return Err(LoadError::UnknownFrame {
+                return Err(LoadErrorKind::UnknownFrame {
                     instance: name.to_string(),
                     frame: port_name.to_string(),
-                    src: src.to_string(),
-                    span,
-                });
+                }
+                .at(src, span));
             }
             id
         }
@@ -1628,12 +1581,11 @@ fn resolve_endpoint(
             match found {
                 Some(p) => p.id,
                 None => {
-                    return Err(LoadError::UnknownMsg {
+                    return Err(LoadErrorKind::UnknownMsg {
                         instance: name.to_string(),
                         msg: port_name.to_string(),
-                        src: src.to_string(),
-                        span,
-                    });
+                    }
+                    .at(src, span));
                 }
             }
         }
@@ -1644,18 +1596,13 @@ fn resolve_endpoint(
     })
 }
 
-/// Wrap a `build()`-time [`WireError`] as a [`LoadError::Wire`]. A [`Wiring`]
+/// Wrap a `build()`-time [`WireError`] as a [`LoadErrorKind::Wire`]. A [`Wiring`]
 /// is format-independent, so the diagnostic uses the error's own rendered
 /// message as its source snippet rather than original document spans; the
 /// variant callers and tests match on is unchanged.
 fn wire_at_build(err: WireError) -> LoadError {
     let src = err.to_string();
-    let span: SourceSpan = (0, src.len()).into();
-    LoadError::Wire {
-        source: err,
-        src,
-        span,
-    }
+    LoadErrorKind::Wire { source: err }.whole(src)
 }
 
 #[cfg(test)]

@@ -419,7 +419,7 @@ impl SystemSpecBuilder {
     /// static system takes its params through its registered
     /// value-tree-deserializing factory and has no postcard decode path, so resolve
     /// rejects the combination with
-    /// [`LoadError::StaticPostcardParams`](super::LoadError::StaticPostcardParams)
+    /// [`LoadErrorKind::StaticPostcardParams`](super::LoadErrorKind::StaticPostcardParams)
     /// rather than silently running the system on defaults.
     pub fn params<P: Serialize>(mut self, params: P) -> Self {
         let bytes = postcard::to_allocvec(&params)

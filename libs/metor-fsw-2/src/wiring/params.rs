@@ -19,7 +19,7 @@
 //! One property of the conformance walk is worth knowing: any schema shape the
 //! walk does not model (tuples, maps, enums) passes through unchecked; if
 //! postcard-dyn cannot encode it, the failure surfaces as
-//! [`LoadError::DlParamEncode`] rather than as silently wrong bytes. Errors
+//! [`LoadErrorKind::DlParamEncode`] rather than as silently wrong bytes. Errors
 //! anchor to the whole value-tree surface, which carries no document spans.
 
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ use miette::SourceSpan;
 use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
 use serde_json::{Map, Value};
 
-use super::LoadError;
+use super::{LoadError, LoadErrorKind};
 
 /// Encodes a params value tree into the postcard bytes described by `schema`,
 /// over the [`conform_and_encode`] tail.
@@ -67,12 +67,12 @@ fn conform_and_encode(
     src: &str,
     node_span: SourceSpan,
 ) -> Result<Vec<u8>, LoadError> {
-    let span: SourceSpan = (0, src.len()).into();
-    let encode_err = |reason: String| LoadError::DlParamEncode {
-        system: system.to_string(),
-        reason,
-        src: src.to_string(),
-        span,
+    let encode_err = |reason: String| {
+        LoadErrorKind::DlParamEncode {
+            system: system.to_string(),
+            reason,
+        }
+        .whole(src)
     };
 
     let value = match defaults {
@@ -109,7 +109,7 @@ fn merge_onto_defaults(base: Value, config: Value) -> Result<Value, String> {
 
 /// What the schema walk reports when a value does not fit, either a spanned
 /// params diagnostic ready to surface as-is or a description of a schema shape
-/// the walk cannot express (reported as [`LoadError::DlParamEncode`]).
+/// the walk cannot express (reported as [`LoadErrorKind::DlParamEncode`]).
 enum Conform {
     Load(Box<LoadError>),
     Shape(String),
@@ -157,12 +157,11 @@ fn conform_to_schema(
     // The typo guard, with the offending entry's own span when we have one.
     for key in obj.keys() {
         if !fields.iter().any(|f| f.name == *key) {
-            return Err(LoadError::UnknownParam {
+            return Err(LoadErrorKind::UnknownParam {
                 property: key.clone(),
                 system: system.to_string(),
-                src: src.to_string(),
-                span: spans.get(key).copied().unwrap_or(node_span),
             }
+            .at(src, spans.get(key).copied().unwrap_or(node_span))
             .into());
         }
     }
@@ -180,12 +179,11 @@ fn conform_to_schema(
                 out.insert(field.name.clone(), Value::Null);
             }
             None => {
-                return Err(LoadError::MissingParam {
+                return Err(LoadErrorKind::MissingParam {
                     property: field.name.clone(),
                     system: system.to_string(),
-                    src: src.to_string(),
-                    span: node_span,
                 }
+                .at(src, node_span)
                 .into());
             }
         }
@@ -208,13 +206,12 @@ fn conform_value(
 ) -> Result<Value, Conform> {
     use OwnedDataModelType as T;
     let mismatch = || -> Conform {
-        LoadError::InvalidParam {
+        LoadErrorKind::InvalidParam {
             property: property.to_string(),
             system: system.to_string(),
             expected: leaf_expected(ty),
-            src: src.to_string(),
-            span,
         }
+        .at(src, span)
         .into()
     };
     // Whether the value is an integer within the leaf's width.
@@ -292,7 +289,7 @@ fn conform_value(
 }
 
 /// The wording for the `expected` field of an
-/// [`InvalidParam`](LoadError::InvalidParam) diagnostic.
+/// [`InvalidParam`](LoadErrorKind::InvalidParam) diagnostic.
 fn leaf_expected(ty: &OwnedDataModelType) -> String {
     use OwnedDataModelType as T;
     match ty {
