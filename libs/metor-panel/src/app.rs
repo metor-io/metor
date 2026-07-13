@@ -879,6 +879,7 @@ impl PanelApp {
                 crate::node_editor::GraphCoordinator::init(cx);
                 crate::node_editor::DynamicWorker::init(cx);
                 crate::node_editor::inspector_rows::register_inspector_rows(cx);
+                crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
                 crate::wiring::WiringStore::init(db.clone(), cx);
@@ -985,6 +986,11 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         &mut reg,
         db.clone(),
         crate::node_editor::pane::NodeEditor::from_config,
+    );
+    register_panel::<crate::views::system_graph::SystemGraphPanel>(
+        &mut reg,
+        db.clone(),
+        crate::views::system_graph::SystemGraphPanel::from_config,
     );
 
     // Dashboard's deserializer returns a fully-constructed entity rather
