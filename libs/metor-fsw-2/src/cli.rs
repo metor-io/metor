@@ -6,7 +6,7 @@ use miette::IntoDiagnostic;
 use crate::wiring::{
     BuildOptions, ClockSpec, METOR_EXTENSION, PackageOptions, Registry, StubgenOptions,
     WIRING_FILE_NAME, Wiring, build_artifacts, build_target, eval_python_mission, is_python_mission,
-    load_bundle, metor_config_version, resolve, stubgen, unpack_metor, write_bundle,
+    load_bundle, resolve, stubgen, unpack_metor, write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -225,9 +225,6 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     let opts = PackageOptions {
         release: args.release,
         target: build_target(&args.cargo_arg),
-        // The recorder version is provenance: the mission was evaluated by this
-        // host's embedded (or $METOR_CONFIG_PY) recorder.
-        metor_config_version: Some(metor_config_version().to_string()),
         provenance: Some(mission.to_path_buf()),
         // Current time; a reproducible build pins this.
         built_at_unix: None,

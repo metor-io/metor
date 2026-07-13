@@ -14,8 +14,8 @@
 use std::path::{Path, PathBuf};
 
 use metor_fsw_2::wiring::{
-    Registry, Wiring, build_artifacts, build_target, eval_python_mission, load_bundle,
-    metor_config_version, resolve, write_bundle,
+    Registry, Wiring, build_artifacts, build_target, eval_python_mission, load_bundle, resolve,
+    write_bundle,
 };
 use metor_fsw_2::{BuildOptions, PackageOptions};
 
@@ -61,7 +61,6 @@ fn python_mission_packages_and_runs() {
     let _ = std::fs::remove_dir_all(&dir);
     let opts = PackageOptions {
         target: build_target(&[]),
-        metor_config_version: Some(metor_config_version().to_string()),
         provenance: Some(mission("mission.py")),
         ..PackageOptions::default()
     };
@@ -115,7 +114,6 @@ fn python_mission_round_trips_as_metor_archive() {
     let _ = std::fs::remove_file(&archive);
     let opts = PackageOptions {
         target: build_target(&[]),
-        metor_config_version: Some(metor_config_version().to_string()),
         ..PackageOptions::default()
     };
     write_bundle(&wiring, &opts, &archive).expect("write the .metor archive");

@@ -418,7 +418,7 @@ fn dl_announce_prefixes_vtable_ids() {
     // descriptor would.
     let desc = <Counter as CyclicSystem>::descriptor();
     let schema = OwnedNamedType::from(<CounterParams as Schema>::SCHEMA);
-    let msg = SystemDescriptorMsg::lower(&desc, schema, None, Vec::new());
+    let msg = SystemDescriptorMsg::lower(&desc, schema, Vec::new());
     let rebuilt = msg.into_descriptor();
 
     // The user output `out` (frame `tick_out`, field `count`) is outputs[0].

@@ -852,7 +852,7 @@ async fn builder_telemetry_and_uplink_resolve_from_value_params() {
 
 // ---------------------------------------------------------------------------
 // The versioned IR: the builder stamps IR_VERSION, serde carries it as a
-// required field, resolve refuses any other value, and bundles record it.
+// required field, and resolve refuses any other value.
 // ---------------------------------------------------------------------------
 
 /// A serialized `Wiring` with no `ir_version` fails to deserialize; an

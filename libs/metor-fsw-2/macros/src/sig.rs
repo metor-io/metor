@@ -1,6 +1,6 @@
-//! Type-shape helpers shared by `#[system]` and `#[sequence]`.
+//! Type-shape helpers for `#[system]`.
 //!
-//! Both macros classify each fn parameter as a port by the last path segment
+//! The macro classifies each fn parameter as a port by the last path segment
 //! of its type, so `fsw::Input<T>`, `crate::Input<T>`, and `Input<T>` all read
 //! the same. These helpers pull that segment and its generic arguments apart.
 

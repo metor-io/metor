@@ -38,7 +38,7 @@ use thiserror::Error;
 
 use crate::abi::FSW_ABI_VERSION;
 
-use super::model::{IR_VERSION, Wiring};
+use super::model::Wiring;
 
 /// File name of the metadata sidecar within a bundle.
 const META_FILE: &str = "meta.json";
@@ -54,16 +54,13 @@ pub const METOR_EXTENSION: &str = "metor";
 
 /// The plain-serde metadata sidecar (`meta.json`) written beside a bundle's
 /// `wiring.json`. Everything here is either a compatibility gate checked at
-/// load ([`abi_version`](Self::abi_version), [`ir_version`](Self::ir_version),
-/// [`target`](Self::target)) or provenance the run path never depends on.
+/// load ([`abi_version`](Self::abi_version), [`target`](Self::target)) or
+/// provenance the run path never depends on.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BundleMeta {
     /// The FSW ABI version the bundled `.so`s were built against; must equal
     /// this host's [`FSW_ABI_VERSION`] at load.
     pub abi_version: u32,
-    /// The wiring IR version of `wiring.json`; must equal this host's
-    /// [`IR_VERSION`] at load.
-    pub ir_version: u32,
     /// The target triple the `.so`s were compiled for, when the packager could
     /// determine it. `None` skips the load-time triple check.
     pub target: Option<String>,
@@ -77,9 +74,6 @@ pub struct BundleMeta {
     /// `sha256:<hex>` of the `wiring.json` bytes — the determinism backstop CI
     /// re-evaluates and diffs (`metor-fsw package --check-ir`).
     pub ir_sha256: String,
-    /// The `metor_config` recorder version the mission was evaluated with.
-    /// `None` for a builder-authored mission. Provenance only.
-    pub metor_config_version: Option<String>,
 }
 
 /// Caller-supplied inputs [`write_bundle`] records in `meta.json` and uses to
@@ -92,9 +86,6 @@ pub struct PackageOptions {
     /// The target triple the `.so`s were built for, recorded in `meta.json`
     /// and checked against the host at load. `None` records no target.
     pub target: Option<String>,
-    /// The `metor_config` recorder version, recorded as provenance. `None`
-    /// for a builder-authored mission.
-    pub metor_config_version: Option<String>,
     /// The `mission.py` to copy in verbatim as provenance, never consumed on
     /// load. `None` writes no provenance copy.
     pub provenance: Option<PathBuf>,
@@ -141,15 +132,6 @@ pub enum BundleError {
         /// The bundle's recorded ABI version.
         found: u32,
         /// The host's [`FSW_ABI_VERSION`].
-        expected: u32,
-    },
-    /// The bundle's recorded wiring IR version does not match this host's
-    /// [`IR_VERSION`]. Bundles are rebuildable.
-    #[error("bundle was built against wiring IR v{found}, but this host speaks v{expected} (rebuild the bundle)")]
-    IrMismatch {
-        /// The bundle's recorded IR version.
-        found: u32,
-        /// The host's [`IR_VERSION`].
         expected: u32,
     },
     /// The bundle's `.so`s were built for a different target triple than this
@@ -260,13 +242,11 @@ fn bundle_members(
     });
     let meta = BundleMeta {
         abi_version: FSW_ABI_VERSION,
-        ir_version: IR_VERSION,
         target: opts.target.clone(),
         profile: if opts.release { "release" } else { "debug" }.to_string(),
         built_at_unix,
         // Hash the exact wiring.json bytes, excluding the timestamp above.
         ir_sha256: sha256_hex(json.as_bytes()),
-        metor_config_version: opts.metor_config_version.clone(),
     };
     let meta_json = serde_json::to_string_pretty(&meta).expect("BundleMeta serializes to JSON");
 
@@ -386,12 +366,6 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
         return Err(BundleError::AbiMismatch {
             found: meta.abi_version,
             expected: FSW_ABI_VERSION,
-        });
-    }
-    if meta.ir_version != IR_VERSION {
-        return Err(BundleError::IrMismatch {
-            found: meta.ir_version,
-            expected: IR_VERSION,
         });
     }
     // The triple check needs both a recorded target and a determinable host;

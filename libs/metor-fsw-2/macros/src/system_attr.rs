@@ -219,7 +219,7 @@ fn classify_params(
                         &pt.ty,
                         format!(
                             "system ports are owned by the runner and lent per cycle: write \
-                             `{ident}: &mut {head}<…>` (only #[sequence] ports are moved by value)"
+                             `{ident}: &mut {head}<…>` (only task ports are moved by value)"
                         ),
                     ));
                 } else {
@@ -968,7 +968,7 @@ mod tests {
         );
         assert!(
             msgs.iter()
-                .any(|m| m.contains("only #[sequence] ports are moved by value")),
+                .any(|m| m.contains("only task ports are moved by value")),
             "{msgs:?}"
         );
         assert!(

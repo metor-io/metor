@@ -32,7 +32,6 @@ mod frame;
 mod frame_attr;
 mod metadatatize;
 mod params_docs;
-mod sequence;
 mod sig;
 mod system;
 mod system_attr;
@@ -63,11 +62,6 @@ impl Field {
                 ident.to_string()
             }
         }
-    }
-
-    /// Alias for [`component_name`](Field::component_name).
-    pub fn component_id(&self) -> String {
-        self.component_name()
     }
 
     /// Whether the field recurses through the component traits rather than
@@ -120,16 +114,6 @@ pub fn system_input(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(SystemOutput, attributes(fsw))]
 pub fn system_output(input: TokenStream) -> TokenStream {
     system::system_output(input)
-}
-
-
-/// Retired: a sequence is a plain `async fn` registered with
-/// `Pack::task("name", the_fn)` (typed params ride a `Params<P>` wrapper
-/// argument) and exported through the crate's `export_pack!`. The attribute
-/// now emits the annotated fn unchanged and will be removed.
-#[proc_macro_attribute]
-pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
-    sequence::sequence(attr, item)
 }
 
 /// `#[frame(name = "...")]` expands to the full frame preamble — the
