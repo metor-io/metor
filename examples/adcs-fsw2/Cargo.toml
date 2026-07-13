@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 # The mission host links ONLY the framework: `main` delegates to `metor_fsw_2::cli::main()`
-# (the runner reads `mission.kdl`), and the convergence test's `build_sim_coordinator` builds
+# (the runner evaluates `mission.py`), and the convergence test's `build_sim_coordinator` builds
 # + dlopens the system cdylibs. It links neither the system crates nor the shared
 # `adcs-contracts` — frames are validated from serialized VTables and params encoded from the
 # exported schema, so the host stays schema-agnostic (dl-open.md §6.3, §8; cli-runner.md §6).
@@ -28,5 +28,5 @@ stellarator.path = "../../libs/stellarator"
 # `(PacketId, postcard)` tap the telemetry downlink performs (docs/messages.md §3).
 postcard = { version = "1.1", features = ["alloc"] }
 serde = { version = "1.0", features = ["derive"] }
-# The equivalence test compares the two front-ends' params as JSON value trees.
+# The eclipse/momentum/sequences tests patch the evaluated mission's params value trees.
 serde_json = "1.0"

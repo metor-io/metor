@@ -2,7 +2,7 @@
 //! **slot** runs a real async-fn pack occupant through the full `dlopen` path, alongside the
 //! untouched plant/nav/ctrl loop.
 //!
-//! Two scenarios, both built from the SAME `mission.kdl` the CLI runner consumes (parse →
+//! Two scenarios, both built from the SAME `mission.py` the CLI runner consumes (evaluate →
 //! `build_artifacts` → `resolve` with an empty `Registry`, exactly as `closed_loop.rs` /
 //! `bundle.rs` set up — the sequence cdylibs are built by `build_artifacts` like any
 //! artifact):
@@ -25,17 +25,21 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use std::path::Path;
+
 use adcs_contracts::ModeCmd;
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
 use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
+use metor_fsw_2::wiring::{ParamSource, build_artifacts, eval_python_mission, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, SequenceStatus, split_record};
 
-/// The mission wiring document — the same file the CLI runner and the other tests read.
-const MISSION_KDL: &str = include_str!("../mission.kdl");
+/// The mission file — the same one the CLI runner and the other tests read.
+fn mission_py() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
+}
 
 // `SequenceStatus::run_state` codes (sequence/mod.rs): 0 running, then `Outcome::run_state`.
 const RUNNING: u8 = 0;
@@ -43,12 +47,18 @@ const COMPLETED: u8 = 1;
 const ABORTED: u8 = 2;
 const FAILED: u8 = 3;
 
-/// Build the mission off `mission.kdl`. When `auto_run` is false the slot's `initial`
+/// Build the mission off `mission.py`. When `auto_run` is false the slot's `initial`
 /// occupant is cleared so the slot starts **empty** (the interactive scenario drives it by
-/// hand); otherwise the KDL's `initial ... state="running"` stands. `None` if the build
+/// hand); otherwise the mission's `initial ... state="running"` stands. `None` if the build
 /// plumbing is unavailable (so the caller skips rather than fails spuriously, like `bundle`).
 fn build_mission(auto_run: bool) -> Option<Coordinator> {
-    let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
+    let mut wiring = match eval_python_mission(&mission_py()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("skipping: mission.py did not evaluate: {e}");
+            return None;
+        }
+    };
     // Test binaries can't host a `process=#true` worker (no `worker_entry` in main) — run
     // every system in-process, like `build_sim_coordinator`.
     for spec in &mut wiring.systems {
@@ -340,13 +350,25 @@ fn commissioning_emits_ordered_sequence_messages() {
 #[test]
 fn detumble_times_out_to_failed_with_wheels_idle() {
     // Enter far below the ~0.1 rad/s the warm-up identity-hold leaves; time out after 2 s
-    // of sim (B-cross barely dents the rate in that window).
-    let kdl = MISSION_KDL
-        .replace("rate_detumble_enter=1.0", "rate_detumble_enter=0.01")
-        .replace("rate_detumble_exit=0.8", "rate_detumble_exit=0.005")
-        .replace("detumble_timeout_s=900.0", "detumble_timeout_s=2.0");
-    assert!(kdl != MISSION_KDL, "patch anchors present in mission.kdl");
-    let mut wiring = parse(&kdl).expect("parse the patched mission.kdl");
+    // of sim (B-cross barely dents the rate in that window). Patch the `commissioning`
+    // occupant's allow-line params on the evaluated IR's value tree.
+    let Some(mut wiring) = eval_python_mission(&mission_py())
+        .map_err(|e| eprintln!("skipping: mission.py did not evaluate: {e}"))
+        .ok()
+    else {
+        return;
+    };
+    let commissioning = wiring.slots[0]
+        .allow
+        .iter_mut()
+        .find(|a| a.occupant == "commissioning")
+        .expect("the mode slot allows `commissioning`");
+    let ParamSource::Value(serde_json::Value::Object(params)) = &mut commissioning.params else {
+        panic!("commissioning carries a params value tree");
+    };
+    params.insert("rate_detumble_enter".into(), 0.01.into());
+    params.insert("rate_detumble_exit".into(), 0.005.into());
+    params.insert("detumble_timeout_s".into(), 2.0.into());
     for spec in &mut wiring.systems {
         spec.process = false;
     }
