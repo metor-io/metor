@@ -881,6 +881,7 @@ impl PanelApp {
                 crate::node_editor::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
+                crate::wiring::WiringStore::init(db.clone(), cx);
                 register_pane_item_deserializers(db.clone(), cx);
 
                 // Consumer extensions: register custom palette providers, then
