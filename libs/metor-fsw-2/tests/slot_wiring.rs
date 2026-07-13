@@ -26,9 +26,9 @@ use metor_fsw_2::{
 const FIXTURE_CRATE: &str = "metor-fsw-2-seq-fixture";
 const FIXTURE_STEM: &str = "metor_fsw_2_seq_fixture";
 
-// SlotState wire codes (SlotState::code): Empty=0, Loaded=1, Running=2, Done=3, Stopped=4.
-const RUNNING: u8 = 2;
-const DONE: u8 = 3;
+// SlotState wire codes (SlotState::code): Empty=0, Loaded=1, Loading=2, Running=3, Done=4, Stopped=5.
+const RUNNING: u8 = 3;
+const DONE: u8 = 4;
 
 /// A slot mission whose single allowed occupant is the `waiter` fixture,
 /// started at init. `waiter` has no user ports, so the slot declares no

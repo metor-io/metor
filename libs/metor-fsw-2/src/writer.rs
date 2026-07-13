@@ -206,9 +206,8 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     }
 
     fn align8(&mut self) {
-        while !self.table_len().is_multiple_of(8) {
-            self.packet.push(0);
-        }
+        let len = self.table_len();
+        pad_zero(&mut self.packet, len.next_multiple_of(8) - len);
     }
 
     /// Truncates the table back to `table_len` bytes, keeping the packet's

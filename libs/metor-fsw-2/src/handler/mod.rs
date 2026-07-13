@@ -34,7 +34,7 @@ use core::marker::PhantomData;
 use postcard_schema::Schema;
 use serde::de::DeserializeOwned;
 
-pub use param::{BindCx, CycleCx, DeclSink, ExecParam, MissionTime};
+pub use param::{BindCx, CycleCx, DeclSink, ExecParam};
 pub use task::{AsyncSystemFn, IntoOutcome, Params, TaskParam};
 pub use tuples::{ExecParamSet, ExecuteFn};
 

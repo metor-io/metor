@@ -82,20 +82,19 @@ fn multi_reader() {
 #[test]
 fn reader_table_claim_free() {
     let rb = ring(256, 2);
-    assert_eq!(rb.reader_count(), 0);
 
     let a = rb.view(NoWake, NoWake).unwrap();
     let b = rb.view(NoWake, NoWake).unwrap();
-    assert_eq!(rb.reader_count(), 2);
+    // The table is full at `max_readers`, so a third claim is refused.
     assert_eq!(rb.view(NoWake, NoWake).err(), Some(FullReaderTable));
 
     drop(b);
-    assert_eq!(rb.reader_count(), 1);
-    // The freed slot is reused.
+    // The freed slot is reused, and the table is full again.
     let _c = rb.view(NoWake, NoWake).unwrap();
-    assert_eq!(rb.reader_count(), 2);
+    assert_eq!(rb.view(NoWake, NoWake).err(), Some(FullReaderTable));
     drop(a);
-    assert_eq!(rb.reader_count(), 1);
+    // Dropping another view frees a slot for a fresh claim.
+    let _d = rb.view(NoWake, NoWake).unwrap();
 }
 
 // ----- Backpressure / borrow semantics -----
@@ -314,77 +313,6 @@ fn concurrent_reader_churn() {
     stop.store(true, O::Relaxed);
     writer.join().unwrap();
     assert_eq!(rb.reader_count(), 0);
-}
-
-// ----- Async (needs the runtime; skipped under Miri) -----
-
-/// `write().await` suspends when the buffer fills and resumes as the reader
-/// drains; the full stream arrives in order.
-#[cfg(all(feature = "async", not(miri)))]
-#[stellarator::test]
-async fn wait_writer_backpressures() {
-    let rb = ring(64, 1);
-    let data = Notifier::default();
-    let space = Notifier::default();
-    let mut view = rb.view(data.clone(), space.clone()).unwrap();
-    let n: u64 = 50;
-
-    let writer = {
-        let rb = rb.clone();
-        let data = data.clone();
-        let space = space.clone();
-        stellarator::spawn(async move {
-            let mut w = rb.writer(data, space).unwrap();
-            for i in 0..n {
-                w.write(&i.to_le_bytes()).await.unwrap();
-            }
-        })
-    };
-
-    let mut buf = Vec::new();
-    let mut got = Vec::with_capacity(n as usize);
-    for _ in 0..n {
-        view.read_into(&mut buf).await.unwrap();
-        got.push(u64::from_le_bytes(buf[..8].try_into().unwrap()));
-    }
-    let _ = writer.await;
-
-    let expected: Vec<u64> = (0..n).collect();
-    assert_eq!(got, expected);
-}
-
-/// The borrowing twin. `read().await` suspends for data and hands out a
-/// grant, and dropping the grant frees space for the suspended writer.
-#[cfg(all(feature = "async", not(miri)))]
-#[stellarator::test]
-async fn wait_reader_borrows() {
-    let rb = ring(64, 1);
-    let data = Notifier::default();
-    let space = Notifier::default();
-    let mut view = rb.view(data.clone(), space.clone()).unwrap();
-    let n: u64 = 50;
-
-    let writer = {
-        let rb = rb.clone();
-        let data = data.clone();
-        let space = space.clone();
-        stellarator::spawn(async move {
-            let mut w = rb.writer(data, space).unwrap();
-            for i in 0..n {
-                w.write(&i.to_le_bytes()).await.unwrap();
-            }
-        })
-    };
-
-    let mut got = Vec::with_capacity(n as usize);
-    for _ in 0..n {
-        let grant = view.read().await.unwrap();
-        got.push(u64::from_le_bytes(grant[..8].try_into().unwrap()));
-    }
-    let _ = writer.await;
-
-    let expected: Vec<u64> = (0..n).collect();
-    assert_eq!(got, expected);
 }
 
 // ----- attach_raw (non-owning, same-process) -----
@@ -682,20 +610,6 @@ fn writer_claim_shared_across_attach() {
         rb.writer(NoWake, NoWake).is_err(),
         "claim visible in reverse"
     );
-}
-
-/// A leaked claim (the word set with no live `Writer`, exactly what a crash
-/// leaves behind) blocks `writer()` until it is force-released.
-#[test]
-fn force_release_writer_reclaims() {
-    let rb = ring(256, 1);
-    rb.inner.writer_claim().store(1, Release);
-    assert!(rb.writer(NoWake, NoWake).is_err());
-
-    // SAFETY: no live writer exists for this region (the claim was planted).
-    unsafe { rb.force_release_writer() };
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    w.try_write(b"reclaimed").unwrap();
 }
 
 /// Claim/drop churn from several threads. The CAS admits exactly one writer

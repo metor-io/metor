@@ -184,10 +184,11 @@ fn cyclic_filter_end_to_end() {
     let est = nav.get();
     assert_eq!(est.angle, 3.0, "omega * gain");
     assert_eq!(est.timestamp, Timestamp(42), "timestamp carried through");
-    let residuals = nav.list::<Residual>(offset_of!(NavEstimate, residuals));
+    let residuals: Vec<Residual> =
+        crate::port::frame_list_iter(nav.table(), offset_of!(NavEstimate, residuals)).collect();
     assert_eq!(residuals.len(), 2);
-    assert_eq!(residuals.get(0).unwrap().value, 3.0);
-    assert_eq!(residuals.get(1).unwrap().value, -0.5);
+    assert_eq!(residuals[0].value, 3.0);
+    assert_eq!(residuals[1].value, -0.5);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +390,7 @@ impl AsyncSystem for AsyncFilter {
                 residuals: FrameList::EMPTY,
             }
         };
-        let _ = output.nav.write_async(&nav).await;
+        let _ = output.nav.write(&nav);
     }
 }
 
@@ -440,7 +441,7 @@ async fn async_filter_one_cycle() {
         let imu_space = imu_space.clone();
         stellarator::spawn(async move {
             let mut w = imu_ring.writer(imu_data, imu_space).unwrap();
-            w.write(
+            w.try_write(
                 Imu {
                     timestamp: Timestamp(7),
                     omega: 2.0,
@@ -448,7 +449,6 @@ async fn async_filter_one_cycle() {
                 }
                 .as_bytes(),
             )
-            .await
             .unwrap();
         })
     };

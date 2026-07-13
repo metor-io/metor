@@ -29,9 +29,6 @@
 //! the [`SlotControlIn`] input and [`SequenceStatus`] output are appended by
 //! the occupant *mount*, never declared by the entry (`docs/packs.md` §9).
 //!
-//! Authors who prefer an explicit handle over the ambient free functions can
-//! take a [`Seq`] argument instead; it reads the same clock.
-//!
 //! This module is compiled unconditionally (no `wiring` feature gate), since
 //! sequences are a runtime feature independent of the config front-end.
 
@@ -56,8 +53,8 @@ mod tests;
 ///
 /// The driver refreshes `now` and `cancel` before each poll and drains
 /// `progress` after it; the body reads and writes the cells through the free
-/// functions or a [`Seq`] handle. It is `!Send`, which is fine because a poll
-/// is synchronous and single-threaded.
+/// functions. It is `!Send`, which is fine because a poll is synchronous and
+/// single-threaded.
 #[derive(Default)]
 pub struct CycleClock {
     /// The cycle's coordinator time, refreshed before each poll.
@@ -68,9 +65,6 @@ pub struct CycleClock {
     /// each cycle.
     pub progress: RefCell<Vec<String>>,
 }
-
-/// The pre-unification name of [`CycleClock`], kept for callers.
-pub type SeqClock = CycleClock;
 
 impl CycleClock {
     /// Take the accumulated progress lines, leaving the buffer empty.
@@ -145,9 +139,9 @@ impl Step {
     }
 }
 
-/// A timer future driven entirely by the ambient [`SeqClock`].
+/// A timer future driven entirely by the ambient [`CycleClock`].
 ///
-/// It resolves once `SeqClock::now` reaches its stored deadline, or
+/// It resolves once `CycleClock::now` reaches its stored deadline, or
 /// immediately with [`Step::Aborted`] once `cancel` is latched. It never
 /// registers a waker; the host re-polls the sequence every cycle anyway.
 #[must_use = "a Wait does nothing unless .awaited"]
@@ -248,43 +242,6 @@ impl Future for NextCycle {
         } else {
             Poll::Pending
         }
-    }
-}
-
-/// An explicit handle over the sequence clock, for authors who prefer
-/// `seq.wait(..)` to the ambient free functions. During a poll its clock is
-/// the same one the free functions read, so the two styles are equivalent.
-pub struct Seq {
-    clock: Rc<SeqClock>,
-}
-
-impl Seq {
-    /// Build a handle over the occupant's clock.
-    pub fn new(clock: Rc<SeqClock>) -> Self {
-        Self { clock }
-    }
-
-    /// As [`wait`], but off this handle's clock.
-    #[must_use = "wait() returns a future that does nothing unless .awaited"]
-    pub fn wait(&self, dur: Duration) -> Wait {
-        Wait {
-            deadline: self.clock.now.get() + dur,
-        }
-    }
-
-    /// As [`progress`], but off this handle's clock.
-    pub fn progress(&self, msg: impl Into<String>) {
-        self.clock.progress.borrow_mut().push(msg.into());
-    }
-
-    /// As [`aborted`], but off this handle's clock.
-    pub fn aborted(&self) -> bool {
-        self.clock.cancel.get()
-    }
-
-    /// As [`now`], but off this handle's clock.
-    pub fn now(&self) -> Timestamp {
-        self.clock.now.get()
     }
 }
 

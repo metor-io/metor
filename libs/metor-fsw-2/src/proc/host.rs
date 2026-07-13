@@ -21,7 +21,7 @@ use metor_fsw_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
 use crate::abi::FswStatus;
-use crate::coordinator::{CyclicSlot, ProcInfo, SlotState, StopReason, WorkerRunState};
+use crate::coordinator::{CyclicSlot, SlotState, StopReason, WorkerRunState, WorkerStatus};
 
 use super::ctl::{CtlHost, StepOutcome, WorkerState};
 use super::session::SessionDir;
@@ -541,7 +541,7 @@ impl CyclicSlot for ProcSlot {
         std::mem::take(&mut self.restart_events)
     }
 
-    fn proc_info(&self) -> Option<ProcInfo> {
+    fn worker_status(&self) -> Option<WorkerStatus> {
         let state = match self.phase {
             Phase::Running => WorkerRunState::Running,
             Phase::Terminal => WorkerRunState::Stopped,
@@ -549,7 +549,8 @@ impl CyclicSlot for ProcSlot {
                 WorkerRunState::Restarting
             }
         };
-        Some(ProcInfo {
+        Some(WorkerStatus {
+            name: self.name(),
             pid: self.handle.pid(),
             restarts: self.restarts,
             state,

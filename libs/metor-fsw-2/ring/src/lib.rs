@@ -4,8 +4,8 @@
 //! One task or process holds the [`Writer`] while any number of [`View`]s
 //! consume the stream, each at its own pace. A write that would overwrite
 //! data a reader has not consumed yet fails with
-//! [`WouldBlock`](WriteError::WouldBlock), or suspends in the async API,
-//! until the slowest reader frees space. Since a record can never be
+//! [`WouldBlock`](WriteError::WouldBlock) until the slowest reader frees
+//! space. Since a record can never be
 //! overwritten while a reader still wants it, reads can borrow directly from
 //! the region ([`View::try_read`], [`View::try_latest`]) without copying and
 //! without having to check afterwards that the bytes held still.
@@ -319,7 +319,7 @@ impl core::fmt::Display for FullReaderTable {
 impl std::error::Error for FullReaderTable {}
 
 /// A writer already exists for this buffer, or a crashed process leaked its
-/// claim (see [`RingBuffer::force_release_writer`]).
+/// claim (reclaimable via [`RingBuffer::reclaim_owner`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterClaimed;
 
@@ -925,18 +925,18 @@ impl RingBuffer {
     ///
     /// The claim lives in the region itself, so it is enforced across handles
     /// and across processes. Dropping the [`Writer`] frees it; a crashed
-    /// process leaks it (see [`RingBuffer::force_release_writer`]).
+    /// process leaks it, and [`reclaim_owner`](RingBuffer::reclaim_owner)
+    /// frees it.
     ///
-    /// `data` is notified after every commit, and `space` is awaited by the
-    /// async [`Writer::write`] until a reader frees room. Pass [`NoWake`] for
-    /// both if only the synchronous APIs are used.
+    /// `data` is notified after every commit. Pass [`NoWake`] for both wake
+    /// endpoints if only the synchronous APIs are used.
     pub fn writer<WD: WakeSource, WS: WakeSink>(
         &self,
         data: WD,
         space: WS,
     ) -> Result<Writer<WD, WS>, WriterClaimed> {
         // Acquire on success pairs with the Release store in `Writer::drop`
-        // and `force_release_writer`, handing the region state (committed,
+        // and `reclaim_owner`, handing the region state (committed,
         // hwm, and the data bytes) from the previous writer to this one. The
         // claimed value is this process's owner tag, so `reclaim_owner` can
         // free a dead claimant's role.
@@ -949,19 +949,6 @@ impl RingBuffer {
             data,
             space,
         })
-    }
-
-    /// Forcibly release a leaked writer claim.
-    ///
-    /// # Safety
-    /// The caller asserts the claiming writer no longer exists (its process
-    /// crashed or its [`Writer`] was leaked) and none of its stores are still
-    /// in flight. Calling this while the writer is alive re-creates the very
-    /// two-writer race the claim word exists to prevent.
-    pub unsafe fn force_release_writer(&self) {
-        // Release matches `Writer::drop`, so the next claimer's Acquire CAS
-        // orders after whatever state the caller observed before reclaiming.
-        self.inner.writer_claim().store(0, Release);
     }
 
     /// Forcibly free everything a dead process left claimed in this region:
@@ -994,8 +981,8 @@ impl RingBuffer {
                 self.inner.slot_cursor(slot).store(FREE_SLOT, Release);
             }
         }
-        // Release the writer claim iff the dead process held it, matching
-        // `force_release_writer`'s ordering.
+        // Release the writer claim iff the dead process held it. Release so
+        // the next claimer's Acquire CAS orders after the observed state.
         let _ = self
             .inner
             .writer_claim()
@@ -1071,8 +1058,10 @@ impl RingBuffer {
         Err(FullReaderTable)
     }
 
-    /// Number of currently registered views.
-    pub fn reader_count(&self) -> usize {
+    /// Number of currently registered views. Test-only introspection into the
+    /// reader table, for the slot-reclamation tests.
+    #[cfg(test)]
+    pub(crate) fn reader_count(&self) -> usize {
         (0..self.inner.max_readers)
             .filter(|&s| self.inner.slot_cursor(s).load(Relaxed) != FREE_SLOT)
             .count()
@@ -1273,33 +1262,6 @@ impl<WD: WakeSource, WS: WakeSink> Writer<WD, WS> {
         // not straddle; we are the single writer.
         unsafe { self.commit(c, start_abs, gap, bytes) };
         Ok(())
-    }
-
-    /// Write one message, suspending until there is room.
-    pub async fn write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
-        let rec = frame_len(bytes.len()) as u64;
-        if rec > self.inner.capacity {
-            return Err(WriteError::InsufficientCapacity);
-        }
-        loop {
-            let c = self.inner.committed().load(Relaxed);
-            let (start_abs, gap) = self.inner.reserve(c, rec);
-            if self.fits(c, gap + rec) {
-                // SAFETY: see `try_write`.
-                unsafe { self.commit(c, start_abs, gap, bytes) };
-                return Ok(());
-            }
-            // Wait for a reader to free enough bytes, then re-evaluate.
-            let inner = self.inner.clone();
-            self.space
-                .wait_until(|| {
-                    let c = inner.committed().load(Relaxed);
-                    let (_, gap) = inner.reserve(c, rec);
-                    let slowest = inner.slowest_active_cursor().unwrap_or(c);
-                    c.wrapping_sub(slowest) + gap + rec <= inner.capacity
-                })
-                .await;
-        }
     }
 
     /// Whether a write needing `need` bytes fits without overwriting the

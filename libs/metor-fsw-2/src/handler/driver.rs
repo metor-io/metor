@@ -39,7 +39,6 @@ where
             let mut cx = BindCx {
                 src,
                 params: None,
-                clock: None,
                 drops: None,
             };
             <F::Params as ExecParamSet>::bind(&mut cx)
