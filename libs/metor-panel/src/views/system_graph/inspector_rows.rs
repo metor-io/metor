@@ -41,7 +41,6 @@ fn params_summary(params: &ParamSource) -> SharedString {
     match params {
         ParamSource::None => "none".into(),
         ParamSource::Postcard(_) => "postcard".into(),
-        ParamSource::Kdl(_) => "kdl".into(),
         ParamSource::Value(v) => {
             let s = v.to_string();
             if s.len() > 60 {
