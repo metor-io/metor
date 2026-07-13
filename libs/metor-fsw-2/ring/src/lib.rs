@@ -16,8 +16,8 @@
 //! use metor_fsw_ring::{Config, NoWake, RingBuffer};
 //!
 //! let ring = RingBuffer::create_in_memory(Config { capacity: 1024, max_readers: 4 });
-//! let mut writer = ring.writer(NoWake, NoWake)?;
-//! let mut view = ring.view(NoWake, NoWake)?;
+//! let mut writer = ring.writer(NoWake)?;
+//! let mut view = ring.view(NoWake)?;
 //!
 //! writer.try_write(b"hello")?;
 //!
@@ -94,8 +94,9 @@
 //! The shared region carries no wake state. Waking is a pair of traits
 //! injected per handle, [`WakeSource`] to notify and [`WakeSink`] to await.
 //! [`NoWake`] serves synchronous consumers, and [`Notifier`] (behind the
-//! `async` feature) wakes tasks within one process. The layout reserves a
-//! word for a future cross-process wake.
+//! `async` feature) wakes tasks within one process. Only the data direction
+//! wakes: writers use the non-blocking [`Writer::try_write`], so nothing ever
+//! waits for space.
 //!
 //! # Verification
 //!
@@ -128,8 +129,9 @@ const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 /// Layout version, bumped on any incompatible change. Regions are ephemeral
 /// IPC state rather than archives, so a stale region is recreated, never
 /// migrated. v3 added the reader-slot `owner` tag and made the writer claim
-/// carry the claimant's process id.
-const VERSION: u16 = 3;
+/// carry the claimant's process id. v4 dropped the reserved cross-process wake
+/// word from the control block.
+const VERSION: u16 = 4;
 
 /// The identifying metadata at the start of every region, occupying cache
 /// line 0. `init_region` writes it once before the region is published and
@@ -161,9 +163,6 @@ struct RegionHeader {
 struct Control {
     committed: AtomicU64,
     hwm: AtomicU64,
-    /// Reserved for a future cross-process wake (see [`FLAG_WAKE_SHARED`]).
-    #[allow(dead_code)]
-    wake_word: AtomicU64,
     /// The writer claim: `0` means free, nonzero is the claimant's process-id
     /// tag (see [`RingBuffer::writer`] and [`RingBuffer::reclaim_owner`]).
     writer: AtomicU64,
@@ -194,11 +193,6 @@ const OFF_CONTROL: usize = 0x40;
 const HEADER_SIZE: usize = 0x80;
 /// One reader-table slot's stride.
 const READER_SLOT_SIZE: usize = size_of::<ReaderSlot>();
-
-/// `flags` bit 0, set when a shared-memory wake word is present. Reserved and
-/// never set in version 2.
-#[allow(dead_code)]
-const FLAG_WAKE_SHARED: u16 = 1 << 0;
 
 /// Sentinel cursor value marking a reader slot as free. A real cursor can
 /// never reach it; that would take 16 EiB of committed data.
@@ -581,8 +575,8 @@ impl WakeSink for NoWake {
 }
 
 /// A shared wait queue that wakes tasks within one process. The writer and
-/// the views for one direction (data available or space available) share
-/// clones of a single `Notifier`. Behind the `async` feature.
+/// its views share clones of a single `Notifier`, so a commit wakes the
+/// awaiting readers. Behind the `async` feature.
 #[cfg(feature = "async")]
 #[derive(Clone)]
 pub struct Notifier(Arc<stellarator::sync::WaitQueue>);
@@ -928,13 +922,9 @@ impl RingBuffer {
     /// process leaks it, and [`reclaim_owner`](RingBuffer::reclaim_owner)
     /// frees it.
     ///
-    /// `data` is notified after every commit. Pass [`NoWake`] for both wake
-    /// endpoints if only the synchronous APIs are used.
-    pub fn writer<WD: WakeSource, WS: WakeSink>(
-        &self,
-        data: WD,
-        space: WS,
-    ) -> Result<Writer<WD, WS>, WriterClaimed> {
+    /// `data` is notified after every commit. Pass [`NoWake`] if only the
+    /// synchronous APIs are used.
+    pub fn writer<WD: WakeSource>(&self, data: WD) -> Result<Writer<WD>, WriterClaimed> {
         // Acquire on success pairs with the Release store in `Writer::drop`
         // and `reclaim_owner`, handing the region state (committed,
         // hwm, and the data bytes) from the previous writer to this one. The
@@ -947,7 +937,6 @@ impl RingBuffer {
         Ok(Writer {
             inner: self.inner.clone(),
             data,
-            space,
         })
     }
 
@@ -957,9 +946,8 @@ impl RingBuffer {
     /// writer forever, so a host that detects a peer's death runs this over
     /// each region the peer had attached.
     ///
-    /// Freed space wakes no one (the region carries no wake state); a writer
-    /// parked on a space wake is woken by its next producer-side notify, or
-    /// the caller re-drives it.
+    /// Freed space wakes no one: writers never wait for space, so the next
+    /// non-blocking write simply finds the room.
     ///
     /// # Safety
     /// The caller asserts the process identified by `pid` (its
@@ -992,13 +980,8 @@ impl RingBuffer {
     /// Register a new view, claiming a free slot in the reader table.
     ///
     /// A fresh view only sees data committed from now on. The async
-    /// [`View::read_into`] and [`View::read`] await `data`, and `space` is
-    /// notified whenever the view advances, waking a waiting writer.
-    pub fn view<RD: WakeSink, RS: WakeSource>(
-        &self,
-        data: RD,
-        space: RS,
-    ) -> Result<View<RD, RS>, FullReaderTable> {
+    /// [`View::read_into`] and [`View::read`] await `data`.
+    pub fn view<RD: WakeSink>(&self, data: RD) -> Result<View<RD>, FullReaderTable> {
         let mut start = self.inner.committed().load(Acquire);
         for slot in 0..self.inner.max_readers {
             // Acquire pairs with the Release of FREE_SLOT in `View::drop`,
@@ -1051,7 +1034,6 @@ impl RingBuffer {
                     inner: self.inner.clone(),
                     slot,
                     data,
-                    space,
                 });
             }
         }
@@ -1122,7 +1104,6 @@ unsafe fn init_region(
         base.add(OFF_CONTROL).cast::<Control>().write(Control {
             committed: AtomicU64::new(0),
             hwm: AtomicU64::new(HWM_NONE),
-            wake_word: AtomicU64::new(0),
             writer: AtomicU64::new(0),
         });
         for slot in 0..cfg.max_readers {
@@ -1239,13 +1220,12 @@ unsafe fn read_header(base: *mut u8, region_len: usize) -> Result<Geometry, Atta
 /// The single producer for a buffer and the sole mutator of `committed` and
 /// the high-water mark. At most one exists per region, enforced by the claim
 /// word that [`RingBuffer::writer`] takes.
-pub struct Writer<WD: WakeSource, WS: WakeSink> {
+pub struct Writer<WD: WakeSource> {
     inner: Arc<Inner>,
     data: WD,
-    space: WS,
 }
 
-impl<WD: WakeSource, WS: WakeSink> Writer<WD, WS> {
+impl<WD: WakeSource> Writer<WD> {
     /// Write one message without blocking. Returns [`WriteError::WouldBlock`]
     /// if writing now would overwrite the slowest active reader.
     pub fn try_write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
@@ -1296,7 +1276,7 @@ impl<WD: WakeSource, WS: WakeSink> Writer<WD, WS> {
     }
 }
 
-impl<WD: WakeSource, WS: WakeSink> Drop for Writer<WD, WS> {
+impl<WD: WakeSource> Drop for Writer<WD> {
     fn drop(&mut self) {
         // Free the writer claim. Release pairs with the Acquire CAS in
         // `RingBuffer::writer`, handing the region state to the next claimer.
@@ -1322,14 +1302,13 @@ struct Located {
 
 /// A reader with its own absolute cursor in the shared reader table,
 /// registered by [`RingBuffer::view`]. Dropping it frees its slot.
-pub struct View<RD: WakeSink, RS: WakeSource> {
+pub struct View<RD: WakeSink> {
     inner: Arc<Inner>,
     slot: u32,
     data: RD,
-    space: RS,
 }
 
-impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
+impl<RD: WakeSink> View<RD> {
     /// This view's current absolute read cursor.
     pub fn cursor(&self) -> u64 {
         self.inner.slot_cursor(self.slot).load(Acquire)
@@ -1378,7 +1357,7 @@ impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
     /// the borrow is stable for its whole lifetime. Dropping the grant
     /// consumes the record; the cursor advances past it and a waiting writer
     /// is woken.
-    pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_, RS>>, ReadError> {
+    pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError> {
         let Some(loc) = self.locate()? else {
             return Ok(None);
         };
@@ -1391,7 +1370,6 @@ impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
         };
         Ok(Some(ReadGrant {
             inner: &self.inner,
-            space: &self.space,
             slot: self.slot,
             end_abs: loc.r + loc.rec as u64,
             slice,
@@ -1400,7 +1378,7 @@ impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
 
     /// Await the next record and borrow it, the grant twin of
     /// [`View::read_into`].
-    pub async fn read(&mut self) -> Result<ReadGrant<'_, RS>, ReadError> {
+    pub async fn read(&mut self) -> Result<ReadGrant<'_>, ReadError> {
         // Awaiting and borrowing are split for the borrow checker. A grant
         // taken inside the wait loop would pin the `self` borrow across every
         // iteration. Nothing can consume a record between the successful
@@ -1425,7 +1403,7 @@ impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
     /// data returns the same record. Returns `Ok(None)` only before the first
     /// record is committed, or after the stream was fully consumed through
     /// [`View::try_read`] or [`View::try_read_into`].
-    pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_, RS>>, ReadError> {
+    pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError> {
         loop {
             let Some(loc) = self.locate()? else {
                 return Ok(None);
@@ -1443,7 +1421,6 @@ impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
                 };
                 return Ok(Some(ReadGrant {
                     inner: &self.inner,
-                    space: &self.space,
                     slot: self.slot,
                     // Park at the record's start rather than its end. This is
                     // the pin that makes the next `try_latest` re-serve it.
@@ -1476,7 +1453,6 @@ impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
                 // `hwm` cannot re-trigger.
                 let lap_end = (r & !self.inner.mask) + cap;
                 self.inner.slot_cursor(self.slot).store(lap_end, Release);
-                self.space.notify();
                 continue;
             }
             // The gap skip can transiently park the cursor ahead of
@@ -1508,15 +1484,14 @@ impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
         }
     }
 
-    /// Advance the cursor and wake a waiting writer.
+    /// Advance the cursor past a consumed record.
     #[inline]
     fn advance(&self, end_abs: u64) {
         self.inner.slot_cursor(self.slot).store(end_abs, Release);
-        self.space.notify();
     }
 }
 
-impl<RD: WakeSink, RS: WakeSource> Drop for View<RD, RS> {
+impl<RD: WakeSink> Drop for View<RD> {
     fn drop(&mut self) {
         self.inner.slot_cursor(self.slot).store(FREE_SLOT, Release);
     }
@@ -1524,31 +1499,29 @@ impl<RD: WakeSink, RS: WakeSource> Drop for View<RD, RS> {
 
 /// A borrowed, tear-free view of one record. Derefs to the payload bytes.
 ///
-/// Dropping the grant moves the view's cursor to `end_abs` and wakes a
-/// waiting writer. For a [`View::try_read`] or [`View::read`] grant that is
-/// past the record, consuming it. For a [`View::try_latest`] grant it is back
-/// to the record's start, keeping it pinned.
-pub struct ReadGrant<'a, RS: WakeSource> {
+/// Dropping the grant moves the view's cursor to `end_abs`. For a
+/// [`View::try_read`] or [`View::read`] grant that is past the record,
+/// consuming it. For a [`View::try_latest`] grant it is back to the record's
+/// start, keeping it pinned.
+pub struct ReadGrant<'a> {
     inner: &'a Inner,
-    space: &'a RS,
     slot: u32,
     end_abs: u64,
     slice: &'a [u8],
 }
 
-impl<RS: WakeSource> std::ops::Deref for ReadGrant<'_, RS> {
+impl std::ops::Deref for ReadGrant<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.slice
     }
 }
 
-impl<RS: WakeSource> Drop for ReadGrant<'_, RS> {
+impl Drop for ReadGrant<'_> {
     fn drop(&mut self) {
         self.inner
             .slot_cursor(self.slot)
             .store(self.end_abs, Release);
-        self.space.notify();
     }
 }
 

@@ -26,7 +26,7 @@
 
 use core::ops::{Deref, DerefMut};
 
-use metor_fsw_ring::{NoWake, WakeSink, WakeSource};
+use metor_fsw_ring::{NoWake, WakeSource};
 use metor_proto::types::Timestamp;
 
 use crate::binder::{BindPorts, RingSource};
@@ -85,28 +85,26 @@ pub trait SystemOutput {
 /// implicit per-system health/log port pair so `output.health()` is always
 /// available, while `Deref`/`DerefMut` expose the user's own ports
 /// (`output.<port>.write(...)`).
-pub struct Out<O, WD = NoWake, WS = NoWake>
+pub struct Out<O, WD = NoWake>
 where
     WD: WakeSource,
-    WS: WakeSink,
 {
     ports: O,
-    health: HealthPort<WD, WS>,
+    health: HealthPort<WD>,
 }
 
-impl<O, WD, WS> Out<O, WD, WS>
+impl<O, WD> Out<O, WD>
 where
     WD: WakeSource,
-    WS: WakeSink,
 {
     /// Bundle a user output struct with its framework-allocated health port.
-    pub fn new(ports: O, health: HealthPort<WD, WS>) -> Self {
+    pub fn new(ports: O, health: HealthPort<WD>) -> Self {
         Self { ports, health }
     }
 
     /// The handle a system reports through: `output.health().error("kind")`
     /// and `.log(level, msg)`.
-    pub fn health(&mut self) -> &mut HealthPort<WD, WS> {
+    pub fn health(&mut self) -> &mut HealthPort<WD> {
         &mut self.health
     }
 
@@ -114,15 +112,14 @@ where
     /// borrows the whole `Out` and so conflicts with a live `&mut` to one of
     /// the user ports; generated delegation needs to lend both to the user's
     /// `execute` at once.
-    pub fn split(&mut self) -> (&mut O, &mut HealthPort<WD, WS>) {
+    pub fn split(&mut self) -> (&mut O, &mut HealthPort<WD>) {
         (&mut self.ports, &mut self.health)
     }
 }
 
-impl<O, WD, WS> Deref for Out<O, WD, WS>
+impl<O, WD> Deref for Out<O, WD>
 where
     WD: WakeSource,
-    WS: WakeSink,
 {
     type Target = O;
     fn deref(&self) -> &O {
@@ -130,21 +127,19 @@ where
     }
 }
 
-impl<O, WD, WS> DerefMut for Out<O, WD, WS>
+impl<O, WD> DerefMut for Out<O, WD>
 where
     WD: WakeSource,
-    WS: WakeSink,
 {
     fn deref_mut(&mut self) -> &mut O {
         &mut self.ports
     }
 }
 
-impl<O, WD, WS> SystemOutput for Out<O, WD, WS>
+impl<O, WD> SystemOutput for Out<O, WD>
 where
     O: SystemOutput,
     WD: WakeSource,
-    WS: WakeSink,
 {
     fn decls() -> Vec<PortDecl> {
         // The user's decls, then the implicit health/log ports every system gets.
@@ -161,18 +156,17 @@ where
     }
 }
 
-impl<O, WD, WS> BindPorts for Out<O, WD, WS>
+impl<O, WD> BindPorts for Out<O, WD>
 where
     O: BindPorts,
     WD: WakeSource + Default + Clone + 'static,
-    WS: WakeSink + Default + Clone + 'static,
 {
     /// Bind the user ports, then the two implicit health/log ports, in the
     /// same order [`decls`](SystemOutput::decls) declares them.
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let ports = O::bind(src);
-        let health: Output<SystemHealth, WD, WS> = Output::bind(src);
-        let log: Output<SystemLog, WD, WS> = Output::bind(src);
+        let health: Output<SystemHealth, WD> = Output::bind(src);
+        let log: Output<SystemLog, WD> = Output::bind(src);
         Out::new(ports, HealthPort::new(health, log))
     }
 }
@@ -356,7 +350,8 @@ pub trait CyclicSystem: System {
 pub trait AsyncSystem: System {
     /// The system's own loop; returns when shutting down. It awaits inputs
     /// (`Input::recv`) or sleeps on a timer, doing its work on each wake, and
-    /// uses the async output path so a full output can suspend for space.
+    /// publishes through the non-blocking output path (a full ring drops the
+    /// record rather than suspending the loop).
     /// `input` is `&mut` for the same reason as [`CyclicSystem::execute`].
     async fn run(&mut self, input: &mut Self::Input, output: &mut Self::Output);
 

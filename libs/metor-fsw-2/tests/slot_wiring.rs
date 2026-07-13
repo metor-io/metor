@@ -193,7 +193,7 @@ fn slot_declared_contract_mismatch_is_a_clean_error() {
 
 /// Drain a message ring, decoding every record as one `Msg` type.
 fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
-    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake, metor_fsw_2::ring::NoWake>,
+    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake>,
 ) -> Vec<M> {
     let mut out = Vec::new();
     let mut buf = Vec::new();

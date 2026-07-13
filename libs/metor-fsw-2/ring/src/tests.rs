@@ -23,8 +23,8 @@ fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
 #[test]
 fn roundtrip() {
     let rb = ring(1024, 4);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
 
     w.try_write(b"hello world").unwrap();
     w.try_write(b"foo").unwrap();
@@ -45,8 +45,8 @@ fn wraparound_aligned() {
     // at 0 and 24; the third would straddle (48 + 24 > 64), so the writer
     // leaves a 16-byte gap and wraps to offset 0.
     let rb = ring(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
 
     for i in 0u8..12 {
@@ -62,9 +62,9 @@ fn wraparound_aligned() {
 #[test]
 fn multi_reader() {
     let rb = ring(1024, 4);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut a = rb.view(NoWake, NoWake).unwrap();
-    let mut b = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut a = rb.view(NoWake).unwrap();
+    let mut b = rb.view(NoWake).unwrap();
 
     w.try_write(b"one").unwrap();
     w.try_write(b"two").unwrap();
@@ -83,18 +83,18 @@ fn multi_reader() {
 fn reader_table_claim_free() {
     let rb = ring(256, 2);
 
-    let a = rb.view(NoWake, NoWake).unwrap();
-    let b = rb.view(NoWake, NoWake).unwrap();
+    let a = rb.view(NoWake).unwrap();
+    let b = rb.view(NoWake).unwrap();
     // The table is full at `max_readers`, so a third claim is refused.
-    assert_eq!(rb.view(NoWake, NoWake).err(), Some(FullReaderTable));
+    assert_eq!(rb.view(NoWake).err(), Some(FullReaderTable));
 
     drop(b);
     // The freed slot is reused, and the table is full again.
-    let _c = rb.view(NoWake, NoWake).unwrap();
-    assert_eq!(rb.view(NoWake, NoWake).err(), Some(FullReaderTable));
+    let _c = rb.view(NoWake).unwrap();
+    assert_eq!(rb.view(NoWake).err(), Some(FullReaderTable));
     drop(a);
     // Dropping another view frees a slot for a fresh claim.
-    let _d = rb.view(NoWake, NoWake).unwrap();
+    let _d = rb.view(NoWake).unwrap();
 }
 
 // ----- Backpressure / borrow semantics -----
@@ -104,8 +104,8 @@ fn reader_table_claim_free() {
 #[test]
 fn backpressure() {
     let rb = ring(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
 
     // Each record is 24 bytes. Two fit (48 <= 64), and a third would
@@ -128,8 +128,8 @@ fn backpressure() {
 #[test]
 fn borrow_read() {
     let rb = ring(256, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
 
     w.try_write(b"borrowed").unwrap();
     {
@@ -142,7 +142,7 @@ fn borrow_read() {
 #[test]
 fn oversize_message_rejected() {
     let rb = ring(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
     // A 64-byte payload makes a 72-byte record, more than the whole region.
     assert_eq!(
         w.try_write(&[0u8; 64]),
@@ -158,8 +158,8 @@ fn oversize_message_rejected() {
 #[test]
 fn latest_pins_newest() {
     let rb = ring(256, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
 
     assert!(v.try_latest().unwrap().is_none(), "no record committed yet");
 
@@ -188,8 +188,8 @@ fn latest_pins_newest() {
 #[test]
 fn latest_pin_backpressures_writer() {
     let rb = ring(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
 
     w.try_write(&[1u8; 16]).unwrap();
     w.try_write(&[2u8; 16]).unwrap();
@@ -226,7 +226,7 @@ use std::thread;
 fn concurrent_full_stream() {
     let n: u64 = if cfg!(miri) { 48 } else { 4_000 };
     let rb = ring(128, 1);
-    let v = rb.view(NoWake, NoWake).unwrap();
+    let v = rb.view(NoWake).unwrap();
 
     let consumer = thread::spawn(move || {
         let mut v = v;
@@ -245,7 +245,7 @@ fn concurrent_full_stream() {
     let producer = {
         let rb = rb.clone();
         thread::spawn(move || {
-            let mut w = rb.writer(NoWake, NoWake).unwrap();
+            let mut w = rb.writer(NoWake).unwrap();
             for i in 0..n {
                 loop {
                     match w.try_write(&i.to_le_bytes()) {
@@ -278,7 +278,7 @@ fn concurrent_reader_churn() {
         let rb = rb.clone();
         let stop = stop.clone();
         thread::spawn(move || {
-            let mut w = rb.writer(NoWake, NoWake).unwrap();
+            let mut w = rb.writer(NoWake).unwrap();
             let mut i = 0u64;
             while !stop.load(O::Relaxed) {
                 match w.try_write(&i.to_le_bytes()) {
@@ -296,7 +296,7 @@ fn concurrent_reader_churn() {
             let rb = rb.clone();
             thread::spawn(move || {
                 for _ in 0..rounds {
-                    if let Ok(mut v) = rb.view(NoWake, NoWake) {
+                    if let Ok(mut v) = rb.view(NoWake) {
                         let mut buf = Vec::new();
                         for _ in 0..3 {
                             let _ = v.try_read_into(&mut buf);
@@ -329,15 +329,15 @@ fn raw_attach_same_process_roundtrip() {
     let mut buf = Vec::new();
 
     {
-        let mut vr = raw.view(NoWake, NoWake).unwrap();
-        let mut wb = rb.writer(NoWake, NoWake).unwrap();
+        let mut vr = raw.view(NoWake).unwrap();
+        let mut wb = rb.writer(NoWake).unwrap();
         wb.try_write(b"box->raw").unwrap();
         assert!(vr.try_read_into(&mut buf).unwrap());
         assert_eq!(&buf[..], b"box->raw");
     }
     {
-        let mut vb = rb.view(NoWake, NoWake).unwrap();
-        let mut wr = raw.writer(NoWake, NoWake).unwrap();
+        let mut vb = rb.view(NoWake).unwrap();
+        let mut wr = raw.writer(NoWake).unwrap();
         wr.try_write(b"raw->box").unwrap();
         assert!(vb.try_read_into(&mut buf).unwrap());
         assert_eq!(&buf[..], b"raw->box");
@@ -350,7 +350,7 @@ fn raw_attach_same_process_roundtrip() {
 fn raw_attach_recovers_geometry() {
     let rb = ring(256, 3);
     // Commit something so the recovered `committed` is non-trivial.
-    rb.writer(NoWake, NoWake).unwrap().try_write(b"x").unwrap();
+    rb.writer(NoWake).unwrap().try_write(b"x").unwrap();
 
     let (base, len) = rb.region();
     let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
@@ -363,7 +363,7 @@ fn raw_attach_recovers_geometry() {
     // 248-byte payload makes a 256-byte record, which the capacity allows
     // (it is only backpressured here because the region already holds a
     // byte).
-    let mut w = raw.writer(NoWake, NoWake).unwrap();
+    let mut w = raw.writer(NoWake).unwrap();
     assert_eq!(
         w.try_write(&[0u8; 249]),
         Err(WriteError::InsufficientCapacity)
@@ -408,8 +408,8 @@ fn swap_writer_and_reader_reacquire() {
 
     // The first pair claims, writes and reads, then drops.
     {
-        let mut w1 = rb.writer(NoWake, NoWake).unwrap();
-        let mut v1 = rb.view(NoWake, NoWake).unwrap();
+        let mut w1 = rb.writer(NoWake).unwrap();
+        let mut v1 = rb.view(NoWake).unwrap();
         assert_eq!(rb.reader_count(), 1);
         w1.try_write(b"occ1-a").unwrap();
         w1.try_write(b"occ1-b").unwrap();
@@ -420,8 +420,8 @@ fn swap_writer_and_reader_reacquire() {
     assert_eq!(rb.reader_count(), 0, "reader slot freed on drop");
 
     // A fresh pair re-acquires over the same region.
-    let mut w2 = rb.writer(NoWake, NoWake).unwrap();
-    let mut v2 = rb.view(NoWake, NoWake).unwrap();
+    let mut w2 = rb.writer(NoWake).unwrap();
+    let mut v2 = rb.view(NoWake).unwrap();
     assert_eq!(
         rb.reader_count(),
         1,
@@ -448,8 +448,8 @@ fn raw_attach_swap_reacquire() {
 
     {
         let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
-        let mut w = raw.writer(NoWake, NoWake).unwrap();
-        let mut v = raw.view(NoWake, NoWake).unwrap();
+        let mut w = raw.writer(NoWake).unwrap();
+        let mut v = raw.view(NoWake).unwrap();
         assert_eq!(owner.reader_count(), 1);
         w.try_write(b"raw-occ1").unwrap();
         assert!(v.try_read_into(&mut buf).unwrap());
@@ -458,8 +458,8 @@ fn raw_attach_swap_reacquire() {
     assert_eq!(owner.reader_count(), 0, "reader slot freed on drop");
 
     let raw2 = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
-    let mut w2 = raw2.writer(NoWake, NoWake).unwrap();
-    let mut v2 = raw2.view(NoWake, NoWake).unwrap();
+    let mut w2 = raw2.writer(NoWake).unwrap();
+    let mut v2 = raw2.view(NoWake).unwrap();
     assert_eq!(
         owner.reader_count(),
         1,
@@ -486,8 +486,8 @@ fn mmap_roundtrip() {
         max_readers: 4,
     };
     let rb = RingBuffer::create_mmap(&path, cfg).unwrap();
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
 
     w.try_write(b"shared memory").unwrap();
     let mut buf = Vec::new();
@@ -508,8 +508,8 @@ fn mmap_roundtrip() {
 #[test]
 fn garbage_length_is_corrupt() {
     let rb = ring(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
 
     w.try_write(&[5u8; 16]).unwrap(); // record at phys 0, len 16
@@ -534,12 +534,12 @@ fn garbage_length_is_corrupt() {
 #[test]
 fn view_starts_stable() {
     let rb = ring(128, 2);
-    let v = rb.view(NoWake, NoWake).unwrap();
+    let v = rb.view(NoWake).unwrap();
     assert_eq!(v.cursor(), rb.committed());
     drop(v);
 
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut d = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut d = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
     for i in 0u8..40 {
         loop {
@@ -552,7 +552,7 @@ fn view_starts_stable() {
             }
         }
     }
-    let v2 = rb.view(NoWake, NoWake).unwrap();
+    let v2 = rb.view(NoWake).unwrap();
     assert_eq!(v2.cursor(), rb.committed());
 }
 
@@ -563,11 +563,11 @@ fn view_starts_stable() {
 #[test]
 fn second_writer_rejected() {
     let rb = ring(256, 1);
-    let w1 = rb.writer(NoWake, NoWake).unwrap();
-    assert!(rb.writer(NoWake, NoWake).is_err());
-    assert!(rb.clone().writer(NoWake, NoWake).is_err());
+    let w1 = rb.writer(NoWake).unwrap();
+    assert!(rb.writer(NoWake).is_err());
+    assert!(rb.clone().writer(NoWake).is_err());
     drop(w1);
-    assert!(rb.writer(NoWake, NoWake).is_ok());
+    assert!(rb.writer(NoWake).is_ok());
 }
 
 /// `Writer::drop` hands the region state to the next claimer, which continues
@@ -575,14 +575,14 @@ fn second_writer_rejected() {
 #[test]
 fn writer_claim_freed_on_drop() {
     let rb = ring(256, 2);
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
 
     {
-        let mut w1 = rb.writer(NoWake, NoWake).unwrap();
+        let mut w1 = rb.writer(NoWake).unwrap();
         w1.try_write(b"first").unwrap();
     }
-    let mut w2 = rb.writer(NoWake, NoWake).unwrap();
+    let mut w2 = rb.writer(NoWake).unwrap();
     w2.try_write(b"second").unwrap();
 
     assert!(v.try_read_into(&mut buf).unwrap());
@@ -598,16 +598,16 @@ fn writer_claim_shared_across_attach() {
     let (base, len) = rb.region();
     let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
 
-    let w1 = rb.writer(NoWake, NoWake).unwrap();
+    let w1 = rb.writer(NoWake).unwrap();
     assert!(
-        raw.writer(NoWake, NoWake).is_err(),
+        raw.writer(NoWake).is_err(),
         "claim visible cross-handle"
     );
     drop(w1);
-    let mut w2 = raw.writer(NoWake, NoWake).unwrap();
+    let mut w2 = raw.writer(NoWake).unwrap();
     w2.try_write(b"raw side").unwrap();
     assert!(
-        rb.writer(NoWake, NoWake).is_err(),
+        rb.writer(NoWake).is_err(),
         "claim visible in reverse"
     );
 }
@@ -627,7 +627,7 @@ fn concurrent_writer_claim_churn() {
             let successes = successes.clone();
             thread::spawn(move || {
                 for i in 0..rounds {
-                    match rb.writer(NoWake, NoWake) {
+                    match rb.writer(NoWake) {
                         Ok(mut w) => {
                             // No reader is registered, so the write always fits.
                             w.try_write(&(t * rounds + i).to_le_bytes()).unwrap();
@@ -646,7 +646,7 @@ fn concurrent_writer_claim_churn() {
         successes.load(O::Relaxed) > 0,
         "at least one claim succeeded"
     );
-    assert!(rb.writer(NoWake, NoWake).is_ok(), "claim free after churn");
+    assert!(rb.writer(NoWake).is_ok(), "claim free after churn");
 }
 
 // ----- Wrap-gap skip -----
@@ -658,8 +658,8 @@ fn concurrent_writer_claim_churn() {
 #[test]
 fn reader_on_gap_start_reads_through() {
     let rb = ring(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
 
     w.try_write(&[1u8; 16]).unwrap();
@@ -817,7 +817,7 @@ fn concurrent_view_churn() {
     let n: u64 = if cfg!(miri) { 32 } else { 2_000 };
     let churn_rounds = if cfg!(miri) { 8 } else { 300 };
     let rb = ring(128, 4);
-    let drainer = rb.view(NoWake, NoWake).unwrap();
+    let drainer = rb.view(NoWake).unwrap();
 
     let consumer = thread::spawn(move || {
         let mut v = drainer;
@@ -842,7 +842,7 @@ fn concurrent_view_churn() {
         let rb = rb.clone();
         thread::spawn(move || {
             for _ in 0..churn_rounds {
-                let Ok(mut v) = rb.view(NoWake, NoWake) else {
+                let Ok(mut v) = rb.view(NoWake) else {
                     thread::yield_now();
                     continue;
                 };
@@ -864,7 +864,7 @@ fn concurrent_view_churn() {
     let producer = {
         let rb = rb.clone();
         thread::spawn(move || {
-            let mut w = rb.writer(NoWake, NoWake).unwrap();
+            let mut w = rb.writer(NoWake).unwrap();
             for i in 0..n {
                 let mut payload = [0u8; 16];
                 payload[..8].copy_from_slice(&i.to_le_bytes());
@@ -893,7 +893,7 @@ fn concurrent_view_churn() {
 fn reclaim_frees_dead_reader() {
     const DEAD_PID: u64 = 4242;
     let rb = ring(64, 2);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
+    let mut w = rb.writer(NoWake).unwrap();
 
     // Plant a foreign reader claim directly, as if another process
     // registered a view at position 0 and then died: a pinned cursor with a
@@ -912,7 +912,7 @@ fn reclaim_frees_dead_reader() {
 
     w.try_write(&[1u8; 16]).expect("writer unblocked");
     // The freed slot re-registers cleanly (the handshake still converges).
-    let mut v2 = rb.view(NoWake, NoWake).unwrap();
+    let mut v2 = rb.view(NoWake).unwrap();
     w.try_write(&[2u8; 16]).unwrap();
     let g = v2.try_read().unwrap().expect("fresh view reads new data");
     assert_eq!(&g[..], &[2u8; 16]);
@@ -926,18 +926,18 @@ fn reclaim_frees_dead_reader() {
 fn reclaim_frees_dead_writer_claim() {
     const DEAD_PID: u64 = 4242;
     let rb = ring(256, 2);
-    let mut v = rb.view(NoWake, NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
     {
-        let mut w = rb.writer(NoWake, NoWake).unwrap();
+        let mut w = rb.writer(NoWake).unwrap();
         w.try_write(b"before").unwrap();
     }
     // Re-plant the (now free) claim as if a foreign process took it and died.
     rb.inner.writer_claim().store(DEAD_PID, Release);
-    assert!(rb.writer(NoWake, NoWake).is_err(), "claim held by the dead");
+    assert!(rb.writer(NoWake).is_err(), "claim held by the dead");
 
     // SAFETY: no live process holds this claim; nothing stores through it.
     unsafe { rb.reclaim_owner(DEAD_PID) };
-    let mut w2 = rb.writer(NoWake, NoWake).unwrap();
+    let mut w2 = rb.writer(NoWake).unwrap();
     w2.try_write(b"after").unwrap();
 
     let mut buf = Vec::new();
@@ -952,7 +952,7 @@ fn reclaim_frees_dead_writer_claim() {
 #[test]
 fn reclaim_skips_other_owners() {
     let rb = ring(256, 2);
-    let v = rb.view(NoWake, NoWake).unwrap();
+    let v = rb.view(NoWake).unwrap();
     // Plant a foreign owner on the view's slot (the first free one) and a
     // foreign writer claim, as if another process held both.
     rb.inner.slot_owner(0).store(999_999_999, Release);
@@ -962,7 +962,7 @@ fn reclaim_skips_other_owners() {
     unsafe { rb.reclaim_owner(std::process::id() as u64) };
     assert_eq!(rb.reader_count(), 1, "foreign reader survives");
     assert!(
-        rb.writer(NoWake, NoWake).is_err(),
+        rb.writer(NoWake).is_err(),
         "foreign writer claim survives"
     );
     drop(v);

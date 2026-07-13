@@ -184,7 +184,7 @@ impl ExecParam for Timestamp {
     }
 }
 
-impl ExecParam for &mut HealthPort<NoWake, NoWake> {
+impl ExecParam for &mut HealthPort<NoWake> {
     type State = ();
     type Item<'r> = &'r mut HealthPort;
 

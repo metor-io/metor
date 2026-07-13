@@ -20,7 +20,7 @@
 
 use core::mem::offset_of;
 
-use metor_fsw_ring::{NoWake, WakeSink, WakeSource};
+use metor_fsw_ring::{NoWake, WakeSource};
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 // `FromBytes` lets these output-only frames also be read back through a typed
@@ -104,13 +104,12 @@ pub enum Level {
 /// It bundles the [`SystemHealth`] and [`SystemLog`] output ports with the
 /// counter state behind them, and is surfaced to a system as
 /// `output.health()`. See the [module docs](self) for who calls what.
-pub struct HealthPort<WD = NoWake, WS = NoWake>
+pub struct HealthPort<WD = NoWake>
 where
     WD: WakeSource,
-    WS: WakeSink,
 {
-    health: Output<SystemHealth, WD, WS>,
-    log: Output<SystemLog, WD, WS>,
+    health: Output<SystemHealth, WD>,
+    log: Output<SystemLog, WD>,
     cycles: u64,
     errors: u64,
     last_execute_micros: u64,
@@ -118,13 +117,12 @@ where
     pending: Vec<LogLine>,
 }
 
-impl<WD, WS> HealthPort<WD, WS>
+impl<WD> HealthPort<WD>
 where
     WD: WakeSource,
-    WS: WakeSink,
 {
     /// Builds the handle from the two framework-allocated output ports.
-    pub fn new(health: Output<SystemHealth, WD, WS>, log: Output<SystemLog, WD, WS>) -> Self {
+    pub fn new(health: Output<SystemHealth, WD>, log: Output<SystemLog, WD>) -> Self {
         Self {
             health,
             log,
@@ -261,11 +259,11 @@ mod tests {
             max_readers: 1,
         });
         let port = HealthPort::new(
-            Output::new(health_ring.writer(NoWake, NoWake).unwrap()),
-            Output::new(log_ring.writer(NoWake, NoWake).unwrap()),
+            Output::new(health_ring.writer(NoWake).unwrap()),
+            Output::new(log_ring.writer(NoWake).unwrap()),
         );
-        let health_in = Input::new(health_ring.view(NoWake, NoWake).unwrap());
-        let log_in = Input::new(log_ring.view(NoWake, NoWake).unwrap());
+        let health_in = Input::new(health_ring.view(NoWake).unwrap());
+        let log_in = Input::new(log_ring.view(NoWake).unwrap());
         (port, health_in, log_in)
     }
 

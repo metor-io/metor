@@ -82,8 +82,8 @@ impl RegistryEntry {
     ///
     /// Fails with [`FullReaderTable`] if the buffer's build-time slot budget
     /// is exhausted.
-    pub fn view(&self) -> Result<View<NoWake, NoWake>, FullReaderTable> {
-        self.ring.view(NoWake, NoWake)
+    pub fn view(&self) -> Result<View<NoWake>, FullReaderTable> {
+        self.ring.view(NoWake)
     }
 }
 
@@ -125,7 +125,7 @@ impl Registry {
     /// Claim a read [`View`] into the buffer identified by `key`, or `None`
     /// if no such buffer exists. The inner `Result` is the reader slot-budget
     /// check.
-    pub fn view(&self, key: ComponentId) -> Option<Result<View<NoWake, NoWake>, FullReaderTable>> {
+    pub fn view(&self, key: ComponentId) -> Option<Result<View<NoWake>, FullReaderTable>> {
         self.get(key).map(RegistryEntry::view)
     }
 

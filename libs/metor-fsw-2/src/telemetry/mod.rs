@@ -765,7 +765,7 @@ impl BindPorts for TelemetryIn {
 /// A read view into one tapped buffer plus the delivery axis and the [`Wire`]
 /// framing projected from the entry.
 struct Tap {
-    view: View<NoWake, NoWake>,
+    view: View<NoWake>,
     delivery: Delivery,
     wire: Wire,
     /// Snapshot taps only: the ring's `committed` at the last contribution, so

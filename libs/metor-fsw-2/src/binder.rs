@@ -13,8 +13,8 @@
 //! A wake endpoint is `Arc`-backed, so a commit only wakes an awaiting reader
 //! when the writer side and the reader side hold clones of the same endpoint.
 //! Most edges never need the match. Cyclic consumers sample their inputs every
-//! cycle and can use a fresh default endpoint, and framework writers use the
-//! non-blocking `try_write`, so no writer ever awaits a space wake. The one
+//! cycle and can use a fresh default endpoint, and every writer uses the
+//! non-blocking `try_write`, so only the data direction ever wakes. The one
 //! load-bearing match is the private copy-in buffer that feeds an async
 //! input. There the builder pre-creates the data endpoint, stores it
 //! type-erased on the port's [`BoundPort`], and the binder hands the matched
@@ -111,17 +111,15 @@ impl<'a> Binder<'a> {
 /// [`RawBinder`](crate::abi::RawBinder) pops non-owning attaches to the
 /// host's regions.
 pub trait RingSource {
-    /// Pop the next output ring and its writer-side wake endpoints.
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
+    /// Pop the next output ring and its writer-side data-wake endpoint.
+    fn next_output<WD>(&mut self) -> (RingBuffer, WD)
     where
-        WD: WakeSource + Default + Clone + 'static,
-        WS: WakeSink + Default + Clone + 'static;
+        WD: WakeSource + Default + Clone + 'static;
 
-    /// Pop the next input ring and its reader-side wake endpoints.
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
+    /// Pop the next input ring and its reader-side data-wake endpoint.
+    fn next_input<RD>(&mut self) -> (RingBuffer, RD)
     where
-        RD: WakeSink + Default + Clone + 'static,
-        RS: WakeSource + Default + Clone + 'static;
+        RD: WakeSink + Default + Clone + 'static;
 
     /// Pop the next output ring if one remains.
     ///
@@ -129,10 +127,9 @@ pub trait RingSource {
     /// ([`MsgFanOut`](crate::MsgFanOut)) drains the remainder with this.
     /// Suppliers that never carry such ports use the default, which yields
     /// none.
-    fn try_next_output<WD, WS>(&mut self) -> Option<(RingBuffer, WD, WS)>
+    fn try_next_output<WD>(&mut self) -> Option<(RingBuffer, WD)>
     where
         WD: WakeSource + Default + Clone + 'static,
-        WS: WakeSink + Default + Clone + 'static,
     {
         None
     }
@@ -143,10 +140,9 @@ pub trait RingSource {
     /// nothing. Only [`MsgIn::bind`](crate::MsgIn) calls this; frame ports
     /// use [`next_input`](Self::next_input). Suppliers that never carry
     /// message ports use the default, which yields no producers.
-    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)>
+    fn next_input_fanin<RD>(&mut self) -> Vec<(RingBuffer, RD)>
     where
         RD: WakeSink + Default + Clone + 'static,
-        RS: WakeSource + Default + Clone + 'static,
     {
         Vec::new()
     }
@@ -178,47 +174,43 @@ pub enum AnySource<'a, 'b> {
 }
 
 impl RingSource for AnySource<'_, '_> {
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
+    fn next_output<WD>(&mut self) -> (RingBuffer, WD)
     where
         WD: WakeSource + Default + Clone + 'static,
-        WS: WakeSink + Default + Clone + 'static,
     {
         match self {
-            Self::Host(b) => b.next_output::<WD, WS>(),
-            Self::Raw(b) => b.next_output::<WD, WS>(),
+            Self::Host(b) => b.next_output::<WD>(),
+            Self::Raw(b) => b.next_output::<WD>(),
         }
     }
 
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
+    fn next_input<RD>(&mut self) -> (RingBuffer, RD)
     where
         RD: WakeSink + Default + Clone + 'static,
-        RS: WakeSource + Default + Clone + 'static,
     {
         match self {
-            Self::Host(b) => b.next_input::<RD, RS>(),
-            Self::Raw(b) => b.next_input::<RD, RS>(),
+            Self::Host(b) => b.next_input::<RD>(),
+            Self::Raw(b) => b.next_input::<RD>(),
         }
     }
 
-    fn try_next_output<WD, WS>(&mut self) -> Option<(RingBuffer, WD, WS)>
+    fn try_next_output<WD>(&mut self) -> Option<(RingBuffer, WD)>
     where
         WD: WakeSource + Default + Clone + 'static,
-        WS: WakeSink + Default + Clone + 'static,
     {
         match self {
-            Self::Host(b) => b.try_next_output::<WD, WS>(),
-            Self::Raw(b) => b.try_next_output::<WD, WS>(),
+            Self::Host(b) => b.try_next_output::<WD>(),
+            Self::Raw(b) => b.try_next_output::<WD>(),
         }
     }
 
-    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)>
+    fn next_input_fanin<RD>(&mut self) -> Vec<(RingBuffer, RD)>
     where
         RD: WakeSink + Default + Clone + 'static,
-        RS: WakeSource + Default + Clone + 'static,
     {
         match self {
-            Self::Host(b) => b.next_input_fanin::<RD, RS>(),
-            Self::Raw(b) => b.next_input_fanin::<RD, RS>(),
+            Self::Host(b) => b.next_input_fanin::<RD>(),
+            Self::Raw(b) => b.next_input_fanin::<RD>(),
         }
     }
 
@@ -233,31 +225,28 @@ impl RingSource for AnySource<'_, '_> {
 }
 
 impl<'a> RingSource for Binder<'a> {
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
+    fn next_output<WD>(&mut self) -> (RingBuffer, WD)
     where
         WD: WakeSource + Default + Clone + 'static,
-        WS: WakeSink + Default + Clone + 'static,
     {
         let p = self
             .outputs
             .next()
             .expect("bind() walks output ports in descriptors() order");
-        (p.ring.clone(), BoundPort::wake(&p.data), WS::default())
+        (p.ring.clone(), BoundPort::wake(&p.data))
     }
 
-    fn try_next_output<WD, WS>(&mut self) -> Option<(RingBuffer, WD, WS)>
+    fn try_next_output<WD>(&mut self) -> Option<(RingBuffer, WD)>
     where
         WD: WakeSource + Default + Clone + 'static,
-        WS: WakeSink + Default + Clone + 'static,
     {
         let p = self.outputs.next()?;
-        Some((p.ring.clone(), BoundPort::wake(&p.data), WS::default()))
+        Some((p.ring.clone(), BoundPort::wake(&p.data)))
     }
 
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
+    fn next_input<RD>(&mut self) -> (RingBuffer, RD)
     where
         RD: WakeSink + Default + Clone + 'static,
-        RS: WakeSource + Default + Clone + 'static,
     {
         let p = match self
             .inputs
@@ -269,13 +258,12 @@ impl<'a> RingSource for Binder<'a> {
                 panic!("a frame input was laid out as a message fan-in (BoundInput::Many)")
             }
         };
-        (p.ring.clone(), BoundPort::wake(&p.data), RS::default())
+        (p.ring.clone(), BoundPort::wake(&p.data))
     }
 
-    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)>
+    fn next_input_fanin<RD>(&mut self) -> Vec<(RingBuffer, RD)>
     where
         RD: WakeSink + Default + Clone + 'static,
-        RS: WakeSource + Default + Clone + 'static,
     {
         let ports: &[BoundPort] = match self
             .inputs
@@ -287,7 +275,7 @@ impl<'a> RingSource for Binder<'a> {
         };
         ports
             .iter()
-            .map(|p| (p.ring.clone(), BoundPort::wake(&p.data), RS::default()))
+            .map(|p| (p.ring.clone(), BoundPort::wake(&p.data)))
             .collect()
     }
 

@@ -44,7 +44,7 @@ pub struct TestBench {
     /// One persistent view per descriptor output, claimed before the entry
     /// binds (a view starts at the live edge, so it must exist before data
     /// flows). Reads drain them, so each read sees records since the last.
-    output_views: Vec<View<NoWake, NoWake>>,
+    output_views: Vec<View<NoWake>>,
     /// The last step's status, so a test can assert a task's terminal.
     last_status: Option<StepStatus>,
 }
@@ -68,9 +68,9 @@ impl TestBench {
         let output_rings: Vec<RingBuffer> = descriptor.outputs.iter().map(ring_for).collect();
         // Claim the bench's read views before the entry binds or inits, so
         // nothing the entry publishes is ever ahead of them.
-        let output_views: Vec<View<NoWake, NoWake>> = output_rings
+        let output_views: Vec<View<NoWake>> = output_rings
             .iter()
-            .map(|r| r.view(NoWake, NoWake).expect("bench reader slot"))
+            .map(|r| r.view(NoWake).expect("bench reader slot"))
             .collect();
 
         // The positional walk over bench-owned ports, via the host Binder so
@@ -126,7 +126,7 @@ impl TestBench {
         &self.input_rings[idx]
     }
 
-    fn output_view(&mut self, id: PortId, what: &str) -> &mut View<NoWake, NoWake> {
+    fn output_view(&mut self, id: PortId, what: &str) -> &mut View<NoWake> {
         let idx = self
             .descriptor
             .outputs
@@ -146,7 +146,7 @@ impl TestBench {
         // The writer claim frees on drop, so a per-call writer keeps the
         // bench simple; the entry only ever holds views on its inputs.
         let mut out: Output<F> =
-            Output::new(ring.writer(NoWake, NoWake).expect("bench input writer"));
+            Output::new(ring.writer(NoWake).expect("bench input writer"));
         out.write(frame).expect("bench input ring has room");
     }
 
@@ -174,7 +174,7 @@ impl TestBench {
     {
         let ring = self.input_ring(PortId::Packet(M::ID), M::NAME);
         let mut out: MsgOut<M> =
-            MsgOut::new(ring.writer(NoWake, NoWake).expect("bench msg writer"));
+            MsgOut::new(ring.writer(NoWake).expect("bench msg writer"));
         out.emit(msg).expect("bench msg ring has room");
     }
 

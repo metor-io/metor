@@ -56,13 +56,12 @@ pub fn buffer_capacity<F: Frame>(depth: usize) -> usize {
 /// drain, in order. Each grant drops, freeing its record for the writer,
 /// before the next is taken. [`ReadError::Corrupt`] stops the drain and
 /// propagates.
-pub(crate) fn drain_view<RD, RS>(
-    view: &mut View<RD, RS>,
+pub(crate) fn drain_view<RD>(
+    view: &mut View<RD>,
     mut f: impl FnMut(&[u8]),
 ) -> Result<(), ReadError>
 where
     RD: WakeSink,
-    RS: WakeSource,
 {
     loop {
         match view.try_read()? {
@@ -145,14 +144,14 @@ impl Drops {
 
 /// An output publishes a system's frames of type `F`, wrapping the single
 /// [`Writer`] into the ring that carries them to downstream [`Input`]s.
-/// Cyclic outputs default to [`NoWake`]; async outputs pick wake endpoints
-/// so a write can suspend for space.
-pub struct Output<F, WD = NoWake, WS = NoWake>
+/// Writes are the non-blocking `try_write`, so the only wake endpoint is the
+/// data notifier that wakes an awaiting reader; cyclic outputs leave it
+/// [`NoWake`].
+pub struct Output<F, WD = NoWake>
 where
     WD: WakeSource,
-    WS: WakeSink,
 {
-    writer: Writer<WD, WS>,
+    writer: Writer<WD>,
     /// Reused table-packet + key-staging backing for
     /// [`write_with`](Self::write_with), so a per-cycle publish of a dynamic
     /// frame allocates nothing after warmup. `None` until the first such
@@ -165,9 +164,9 @@ where
     _f: PhantomData<F>,
 }
 
-impl<F: Frame, WD: WakeSource, WS: WakeSink> Output<F, WD, WS> {
+impl<F: Frame, WD: WakeSource> Output<F, WD> {
     /// Wrap a writer created over an `F`-sized buffer.
-    pub fn new(writer: Writer<WD, WS>) -> Self {
+    pub fn new(writer: Writer<WD>) -> Self {
         Self {
             writer,
             scratch: None,
@@ -200,30 +199,28 @@ impl<F: Frame, WD: WakeSource, WS: WakeSink> Output<F, WD, WS> {
     }
 }
 
-impl<F: Frame, WD, WS> Output<F, WD, WS>
+impl<F: Frame, WD> Output<F, WD>
 where
     WD: WakeSource + Default + Clone + 'static,
-    WS: WakeSink + Default + Clone + 'static,
 {
     /// Bind this output over the next ring the [`RingSource`] hands out,
-    /// taking the writer-side wake endpoints matched to that buffer. The
+    /// taking the writer-side data-wake endpoint matched to that buffer. The
     /// generated bundle `bind` walks fields in `descriptors()` order.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
-        let (ring, data, space) = src.next_output::<WD, WS>();
+        let (ring, data) = src.next_output::<WD>();
         // One ring is allocated per output port and bound exactly once, so
         // the region's writer claim is always free here.
         let writer = ring
-            .writer(data, space)
+            .writer(data)
             .expect("output ring is bound to exactly one writer at build");
         Output::new(writer)
     }
 }
 
-impl<F, WD, WS> Output<F, WD, WS>
+impl<F, WD> Output<F, WD>
 where
     F: Frame + IntoBytes + Immutable,
     WD: WakeSource,
-    WS: WakeSink,
 {
     /// Publish a fixed frame (no dynamic members) as one record.
     pub fn write(&mut self, frame: &F) -> Result<(), metor_fsw_ring::WriteError> {
@@ -275,18 +272,17 @@ where
 /// read-only [`View`] of that output's ring. Records are read in place and
 /// handed out as a typed [`FrameGrant`] or [`FrameRef`]; the writer never
 /// overwrites a record a reader has yet to release.
-pub struct Input<F, RD = NoWake, RS = NoWake>
+pub struct Input<F, RD = NoWake>
 where
     RD: WakeSink,
-    RS: WakeSource,
 {
-    view: View<RD, RS>,
+    view: View<RD>,
     _f: PhantomData<F>,
 }
 
-impl<F: Frame, RD: WakeSink, RS: WakeSource> Input<F, RD, RS> {
+impl<F: Frame, RD: WakeSink> Input<F, RD> {
     /// Wrap a view registered on the producing buffer.
-    pub fn new(view: View<RD, RS>) -> Self {
+    pub fn new(view: View<RD>) -> Self {
         Self {
             view,
             _f: PhantomData,
@@ -305,29 +301,27 @@ impl<F: Frame, RD: WakeSink, RS: WakeSource> Input<F, RD, RS> {
     }
 }
 
-impl<F: Frame, RD, RS> Input<F, RD, RS>
+impl<F: Frame, RD> Input<F, RD>
 where
     RD: WakeSink + Default + Clone + 'static,
-    RS: WakeSource + Default + Clone + 'static,
 {
     /// Bind this input over the next ring the [`RingSource`] hands out,
-    /// taking the reader-side wake endpoints matched to that buffer. The
+    /// taking the reader-side data-wake endpoint matched to that buffer. The
     /// reader slot was reserved at sizing time, so registering the view
     /// cannot fail.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
-        let (ring, data, space) = src.next_input::<RD, RS>();
+        let (ring, data) = src.next_input::<RD>();
         Input::new(
-            ring.view(data, space)
+            ring.view(data)
                 .expect("reader slot reserved at sizing time"),
         )
     }
 }
 
-impl<F, RD, RS> Input<F, RD, RS>
+impl<F, RD> Input<F, RD>
 where
     F: Frame + FromBytes + KnownLayout + Immutable,
     RD: WakeSink,
-    RS: WakeSource,
 {
     /// The newest committed record as a typed zero-copy borrow, or `None` if
     /// no record has ever arrived.
@@ -337,7 +331,7 @@ where
     /// call with no new data is served the same record again, and the writer
     /// waits for space rather than overwrite it, which is why every ring
     /// holds at least two records. A corrupt region reads as `None`.
-    pub fn latest(&mut self) -> Option<FrameGrant<'_, F, RS>> {
+    pub fn latest(&mut self) -> Option<FrameGrant<'_, F>> {
         self.view.try_latest().ok().flatten().map(FrameGrant::new)
     }
 
@@ -349,7 +343,7 @@ where
 
     /// Await the next record, suspending until one commits. The record is
     /// freed for the writer when the grant drops.
-    pub async fn recv(&mut self) -> Result<FrameGrant<'_, F, RS>, ReadError> {
+    pub async fn recv(&mut self) -> Result<FrameGrant<'_, F>, ReadError> {
         Ok(FrameGrant::new(self.view.read().await?))
     }
 }
@@ -408,20 +402,16 @@ where
 /// record ([`Input::latest`], [`Input::recv`]); a callback drain passes a
 /// plain [`FrameRef`] instead. Dropping it releases the record per the
 /// grant's semantics, consumed for `recv` and kept pinned for `latest`.
-pub struct FrameGrant<'a, F, RS = NoWake>
-where
-    RS: WakeSource,
-{
-    grant: ReadGrant<'a, RS>,
+pub struct FrameGrant<'a, F> {
+    grant: ReadGrant<'a>,
     _f: PhantomData<F>,
 }
 
-impl<'a, F, RS> FrameGrant<'a, F, RS>
+impl<'a, F> FrameGrant<'a, F>
 where
     F: Frame + FromBytes + KnownLayout + Immutable,
-    RS: WakeSource,
 {
-    pub(crate) fn new(grant: ReadGrant<'a, RS>) -> Self {
+    pub(crate) fn new(grant: ReadGrant<'a>) -> Self {
         Self {
             grant,
             _f: PhantomData,
@@ -457,10 +447,9 @@ where
 /// `input.latest()` then `record.omega`. The borrow is tied to the grant
 /// (not the record's full ring lifetime), which is what keeps the deref'd
 /// reference from outliving the pin.
-impl<F, RS> core::ops::Deref for FrameGrant<'_, F, RS>
+impl<F> core::ops::Deref for FrameGrant<'_, F>
 where
     F: Frame + FromBytes + KnownLayout + Immutable,
-    RS: WakeSource,
 {
     type Target = F;
 

@@ -503,28 +503,26 @@ impl<'a> RawBinder<'a> {
 }
 
 impl<'a> RingSource for RawBinder<'a> {
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
+    fn next_output<WD>(&mut self) -> (RingBuffer, WD)
     where
         WD: WakeSource + Default + Clone + 'static,
-        WS: WakeSink + Default + Clone + 'static,
     {
         let h = self
             .outputs
             .next()
             .expect("bind() walks output ports in descriptors() order");
-        (Self::attach(h), WD::default(), WS::default())
+        (Self::attach(h), WD::default())
     }
 
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
+    fn next_input<RD>(&mut self) -> (RingBuffer, RD)
     where
         RD: WakeSink + Default + Clone + 'static,
-        RS: WakeSource + Default + Clone + 'static,
     {
         let h = self
             .inputs
             .next()
             .expect("bind() walks input ports in descriptors() order");
-        (Self::attach(h), RD::default(), RS::default())
+        (Self::attach(h), RD::default())
     }
 
     // `output_registry()` keeps the panicking default: a loaded system is never

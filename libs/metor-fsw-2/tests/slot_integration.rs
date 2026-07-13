@@ -695,7 +695,7 @@ fn load_while_running_is_refused() {
 /// Drain a message ring, decoding every record as `M` after checking its
 /// 2-byte id.
 fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
-    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake, metor_fsw_2::ring::NoWake>,
+    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake>,
 ) -> Vec<M> {
     let mut out = Vec::new();
     let mut buf = Vec::new();

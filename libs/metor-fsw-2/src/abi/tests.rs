@@ -221,7 +221,7 @@ fn abi_lifecycle_end_to_end() {
 
     // Register the host's view before the system writes; a fresh view only
     // sees data committed after it exists.
-    let mut out_view = Input::<TickOut>::new(out_ring.view(NoWake, NoWake).unwrap());
+    let mut out_view = Input::<TickOut>::new(out_ring.view(NoWake).unwrap());
 
     let inputs = [handle(&in_ring, ROLE_INPUT)];
     let outputs = [
@@ -251,7 +251,7 @@ fn abi_lifecycle_end_to_end() {
 
     // The host writes one record through its own writer over `in_ring`; the
     // system reads it through its non-owning view over the same region.
-    let mut in_writer = Output::<TickIn>::new(in_ring.writer(NoWake, NoWake).unwrap());
+    let mut in_writer = Output::<TickIn>::new(in_ring.writer(NoWake).unwrap());
     in_writer
         .write(&TickIn {
             timestamp: Timestamp(7),
@@ -579,7 +579,7 @@ fn seq_abi_runs_to_done() {
     let log_ring = ring_for::<SystemLog>(8, 1);
 
     // Register the host's view before the occupant writes.
-    let mut status_view = Input::<SequenceStatus>::new(status_ring.view(NoWake, NoWake).unwrap());
+    let mut status_view = Input::<SequenceStatus>::new(status_ring.view(NoWake).unwrap());
 
     let inputs = [handle(&control_ring, ROLE_INPUT)];
     let outputs = [
