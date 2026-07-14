@@ -22,6 +22,7 @@
 //! ([`encode_value_params`]); pre-encoded bytes pass straight through.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use miette::SourceSpan;
@@ -507,7 +508,31 @@ enum Dir {
     In,
 }
 
-/// Walk a [`Wiring`] and produce a built [`Coordinator`].
+/// Resolve-time overrides that a [`Wiring`] does not itself carry.
+///
+/// A `Wiring` is a portable mission description, so host-local paths — where a
+/// process worker's executable lives, where the shared-memory session dir is
+/// rooted — are supplied here at [`resolve_with`] time rather than baked into
+/// the IR. The defaults (re-exec the host binary as the worker, `/dev/shm` or
+/// the OS temp dir for sessions) are what [`resolve`] uses.
+#[derive(Default, Clone, Debug)]
+pub struct ResolveOptions {
+    /// The process-worker executable, instead of re-executing the host binary.
+    /// Tests point this at a fixture worker; a host whose own binary cannot
+    /// serve as a worker sets it to a leaner one.
+    pub worker_exe: Option<PathBuf>,
+    /// The shared-memory session parent dir, instead of the default
+    /// (`/dev/shm` when present, else the OS temp dir).
+    pub shm_dir: Option<PathBuf>,
+}
+
+/// Walk a [`Wiring`] and produce a built [`Coordinator`], the default-option
+/// twin of [`resolve_with`].
+pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError> {
+    resolve_with(wiring, registry, ResolveOptions::default())
+}
+
+/// Walk a [`Wiring`] and produce a built [`Coordinator`], applying `opts`.
 ///
 /// Both front-ends land here, so static and dl systems go through identical
 /// validation, sizing, and telemetry passes. A static system (no `artifact`)
@@ -518,7 +543,11 @@ enum Dir {
 /// A `Wiring` carries no source text (a builder-origin one never had any), so
 /// resolve-time [`LoadError`]s hold a best-effort snippet rather than original
 /// document spans. The error variants are the same either way.
-pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError> {
+pub fn resolve_with(
+    wiring: &Wiring,
+    registry: &Registry,
+    opts: ResolveOptions,
+) -> Result<Coordinator, LoadError> {
     if wiring.ir_version != IR_VERSION {
         return Err(LoadErrorKind::IrVersionMismatch {
             found: wiring.ir_version,
@@ -530,6 +559,12 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
     check_manifest_hashes(wiring)?;
     let config = coordinator_config(&wiring.coordinator);
     let mut builder = Coordinator::builder(config);
+    if let Some(exe) = opts.worker_exe {
+        builder.worker_exe(exe);
+    }
+    if let Some(dir) = opts.shm_dir {
+        builder.shm_dir(dir);
+    }
 
     // Broadcast the full mission IR as a `WiringManifest` at startup and on
     // reload. Serialized path-stripped so the telemetered topology matches the

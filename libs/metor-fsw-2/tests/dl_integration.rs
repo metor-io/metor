@@ -1,13 +1,13 @@
-//! End-to-end test of the shared-object loader.
+//! End-to-end test of the shared-object loader, driven through [`Wiring`].
 //!
 //! The `tests_abi` suite calls the generated `fsw_*` symbols inside the test
 //! binary itself; this test crosses a real shared-object boundary. It builds
-//! the `metor-fsw-2-dl-fixture` crate as a `cdylib`, opens the result with
-//! [`DlPack`], selects an entry, wires it into a [`Coordinator`] next to a
-//! statically linked producer, runs a few cycles, and checks the loaded
-//! system's output. That exercises the loader, the manifest round-trip, the
-//! ring-region hand-off, the per-cycle drive, the telemetry tap, and
-//! teardown.
+//! the `metor-fsw-2-dl-fixture` crate as a `cdylib`, describes the mission as a
+//! [`Wiring`] (a static producer plus one or two dlopen'd consumers), points
+//! the artifact at the freshly built `.so`, and [`resolve`]s it into a live
+//! [`Coordinator`]. Running a few cycles exercises the loader, the manifest
+//! round-trip, the ring-region hand-off, the per-cycle drive, the telemetry
+//! tap, and teardown.
 //!
 //! The fixture is built by a nested `cargo build` inside the test, which is
 //! safe because the outer `cargo test` lock is released before the test binary
@@ -23,8 +23,10 @@ use std::process::Command;
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Delivery, DlPack, FanIn, Frame,
-    Input, MsgIn, Out, Output, PortRef, StopReason, System, SystemInput, SystemKind, SystemOutput,
+    BuildSystem, ClockSpec, CoordinatorSpec, CyclicSystem, Delivery, DlPack, FanIn, Frame, Input,
+    MsgIn, Out, Output, ParamSource, StopReason, System, SystemInput, SystemKind, SystemOutput,
+    WiringBuilder,
+    wiring::{Registry, resolve},
 };
 use postcard_schema::Schema;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -105,6 +107,13 @@ impl CyclicSystem for Ticker {
     }
 }
 
+impl BuildSystem for Ticker {
+    type Params = ();
+    fn new(_params: ()) -> Self {
+        Ticker { n: 0 }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Build and locate the fixture cdylib
 // ---------------------------------------------------------------------------
@@ -164,6 +173,23 @@ fn locate_fixture() -> Option<PathBuf> {
     None
 }
 
+/// A 200 Hz, depth-8, 5 ms-per-step simulated mission, the shared coordinator
+/// config across the dl tests.
+fn dl_coordinator() -> CoordinatorSpec {
+    CoordinatorSpec {
+        cycle_rate: 200.0,
+        default_depth: Some(8),
+        clock: ClockSpec::Simulated { dt_secs: 0.005 },
+    }
+}
+
+/// A registry with `Ticker` registered as the static producer.
+fn ticker_registry() -> Registry {
+    let mut registry = Registry::new();
+    registry.register::<Ticker, _>("Ticker");
+    registry
+}
+
 // ---------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------
@@ -175,8 +201,9 @@ fn dlopen_cyclic_system_end_to_end() {
         return;
     };
 
-    // 1. Load the shared object, check the pack's exported entry names, and
-    //    validate the selected entry's reconstructed descriptor.
+    // 1. Open the shared object directly to check the pack's exported entry
+    //    names and validate the selected entry's reconstructed descriptor —
+    //    the same manifest `resolve` reads back through its own open.
     let pack = DlPack::open(&lib_path).expect("DlPack::open the fixture .so");
     assert_eq!(
         pack.system_names().collect::<Vec<_>>(),
@@ -213,49 +240,45 @@ fn dlopen_cyclic_system_end_to_end() {
         desc.capabilities.is_empty(),
         "a .so can hold no host capabilities"
     );
+    drop((loaded, pack));
 
-    // 2. Wire the static producer into the loaded consumer, params start=1000.
-    let params = postcard::to_allocvec(&CounterParams {
-        start: 1000,
-        scale: 1.0,
-    })
-    .unwrap();
-    let mut b = Coordinator::builder(CoordinatorConfig {
-        cycle_rate: 200.0,
-        default_depth: 8,
-        clock: ClockMode::Simulated {
-            dt: std::time::Duration::from_millis(5),
-        },
-        ..CoordinatorConfig::default()
-    });
-    let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
-    let counter = b.add_dl_cyclic("dl_counter", loaded, params);
-    // This `connect` runs `compatible()` over the loaded descriptor's
-    // `tick_in` input, the same wiring validation a static system gets.
-    b.connect(
-        PortRef::new::<TickIn>(ticker),
-        PortRef::new::<TickIn>(counter),
-    )
-    .expect("compatible tick_in edge validated");
+    // 2. Describe the mission: a static producer into two instances of the
+    //    same loaded entry, each with its own params (start=1000, start=2000).
+    //    One opened pack mints any number of independent instances.
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(dl_coordinator())
+        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .system("ticker")
+        .ty("Ticker")
+        .from_static()
+        .end()
+        .system("dl_counter")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .params(CounterParams {
+            start: 1000,
+            scale: 1.0,
+        })
+        .end()
+        .system("dl_counter_b")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .params(CounterParams {
+            start: 2000,
+            scale: 1.0,
+        })
+        .end()
+        // Each `connect` runs `compatible()` over the loaded descriptor's
+        // `tick_in` input, the same wiring validation a static system gets.
+        .connect("ticker", "tick_in", "dl_counter", "tick_in")
+        .connect("ticker", "tick_in", "dl_counter_b", "tick_in")
+        .build();
+    // `main`'s helper already built and located the fixture; fill the path in
+    // place of the build driver.
+    wiring.artifacts[0].path = Some(lib_path);
 
-    // A second instance of the same entry, with its own params: one opened
-    // pack mints any number of independent instances.
-    let twin = pack.system("DlCounter").expect("select the entry again");
-    let twin_params = postcard::to_allocvec(&CounterParams {
-        start: 2000,
-        scale: 1.0,
-    })
-    .unwrap();
-    let counter_b = b.add_dl_cyclic("dl_counter_b", twin, twin_params);
-    b.connect(
-        PortRef::new::<TickIn>(ticker),
-        PortRef::new::<TickIn>(counter_b),
-    )
-    .expect("compatible tick_in edge validated (second instance)");
-
-    let mut coord = b
-        .build()
-        .expect("graph builds (validation + sizing + bind)");
+    let mut coord = resolve(&wiring, &ticker_registry())
+        .expect("graph resolves (validation + sizing + bind)");
 
     // 3. Tap the loaded system's output through the telemetry registry before
     //    running; a fresh view only sees records committed from now on.
@@ -405,36 +428,32 @@ fn dlopen_null_create_reports_stopped() {
         return;
     };
 
-    let pack = DlPack::open(&lib_path).expect("DlPack::open the fixture .so");
-    let loaded = pack.system("DlCounter").expect("select the counter entry");
-
     // `CounterParams` is `{ start: u64, scale: f64 }`; three bytes cannot
     // decode as either field, so the fixture's `fsw_pack_create` panics inside its
     // own `catch_unwind` and returns a null state rather than crashing across
     // the `extern "C"` boundary (`abi_panic_is_contained` tests that
-    // containment directly, in-binary).
-    let bad_params = vec![0xFF, 0xFF, 0xFF];
-    let mut b = Coordinator::builder(CoordinatorConfig {
-        cycle_rate: 200.0,
-        default_depth: 8,
-        clock: ClockMode::Simulated {
-            dt: std::time::Duration::from_millis(5),
-        },
-        ..CoordinatorConfig::default()
-    });
-    let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
-    let counter = b.add_dl_cyclic("dl_counter", loaded, bad_params);
-    b.connect(
-        PortRef::new::<TickIn>(ticker),
-        PortRef::new::<TickIn>(counter),
-    )
-    .expect("compatible tick_in edge validated");
+    // containment directly, in-binary). The raw bytes are set straight on the
+    // spec's `ParamSource::Postcard`, which the dl path passes through verbatim.
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(dl_coordinator())
+        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .system("ticker")
+        .ty("Ticker")
+        .from_static()
+        .end()
+        .system("dl_counter")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .end()
+        .connect("ticker", "tick_in", "dl_counter", "tick_in")
+        .build();
+    wiring.artifacts[0].path = Some(lib_path);
+    wiring.systems[1].params = ParamSource::Postcard(vec![0xFF, 0xFF, 0xFF]);
 
-    // `build()` itself calls `fsw_pack_create` at bind time, so the null state is
+    // `resolve` calls `fsw_pack_create` at bind time, so the null state is
     // latched into the slot before any cycle runs.
-    let mut coord = b
-        .build()
-        .expect("graph builds even though fsw_pack_create failed inside it");
+    let mut coord = resolve(&wiring, &ticker_registry())
+        .expect("graph resolves even though fsw_pack_create failed inside it");
 
     let coord = stellarator::run(|| async move {
         coord.run_for(3).await;

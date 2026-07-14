@@ -1,47 +1,49 @@
-//! Integration tests for runtime slots driving a real `dlopen`ed sequence.
+//! Integration tests for runtime slots driving a real `dlopen`ed sequence,
+//! constructed through the [`Wiring`] front end.
 //!
-//! Each test builds the `metor-fsw-2-seq-fixture` crate as a `cdylib`, opens
-//! the produced shared object through [`DlPack`], selects the `waiter` entry,
-//! registers it as the allowed occupant of a slot in a [`Coordinator`], and
-//! drives the slot's lifecycle with
-//! [`SequenceCommand`]s. Together the tests cover the slot's ring topology (the
-//! slot-owned control ring appended to the occupant's inputs, plus the
-//! [`SlotStatus`] output), the command-to-phase state machine, name addressing,
-//! uplink routing, and clean teardown across a genuine shared-object boundary.
+//! Each test builds the `metor-fsw-2-seq-fixture` crate as a `cdylib`, declares
+//! a `slot` mission with [`WiringBuilder`], points the artifact at the located
+//! `.so`, and [`resolve`]s it into a [`Coordinator`]. The `waiter`/`napper`
+//! sequence occupants and the `beater` cyclic occupant are all pack entries the
+//! fixture exports, allowed into a slot by name. The tests then drive the
+//! slot's lifecycle with [`SequenceCommand`]s and observe it from the outside.
+//! Together they cover the command-to-phase state machine, occupant swap, name
+//! addressing, the boot registry, and the build-time rejections a bad slot
+//! wiring surfaces as a [`LoadError`](metor_fsw_2::wiring::LoadError).
 //!
 //! Two conventions run through every test:
 //!
 //! * Commands are ordinary dataflow. A slot acts only on [`SequenceCommand`]s
-//!   that arrive over an explicitly connected edge, so each test wires its
-//!   producer (the in-process control handle, an uplink, or another system) to
-//!   the slot by hand.
+//!   that arrive over an explicitly connected edge, so each mission wires its
+//!   producer (the in-process control handle or another system) to the slot
+//!   with an explicit message edge.
 //! * Status taps are opened before the run. An overwrite ring's reader starts
 //!   at the live edge, so a view created after the run would see nothing.
 //!
-//! The fixture build runs inside the test. If the build plumbing is unavailable
-//! the body is skipped rather than failed.
+//! The scripted-uplink command-dispatch tests, which need a test-double
+//! transport the `Wiring` path cannot express, live in-crate under
+//! `coordinator::uplink_tests`. The fixture build runs inside the test; if the
+//! build plumbing is unavailable the body is skipped rather than failed.
 
-#![cfg(not(miri))]
+#![cfg(all(feature = "wiring", not(miri)))]
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
-use metor_fsw_2::metor_proto::types::{ComponentId, IntoLenPacket, Msg, OwnedPacket};
+use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
 use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
+use metor_fsw_2::wiring::{LoadErrorKind, Registry, resolve};
 use metor_fsw_2::{
-    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, DlPack, DlSystem, Input, PortRef,
-    RecvTransport, SequenceStatus, SlotStatus, SystemKind, TransportError, UplinkSystem,
-    split_record,
+    BuildSystem, ClockSpec, CommandOut, Coordinator, CoordinatorSpec, CyclicSystem, Input, NAME_CAP,
+    Out, SequenceStatus, SlotInitState, SlotStatus, System, SystemInput, SystemOutput, Timestamp,
+    WireError, Wiring, WiringBuilder, split_record,
 };
 
-/// One paramless allowed occupant.
-fn occ(name: &str, system: DlSystem) -> AllowedOccupant {
-    AllowedOccupant::dl(name, system, Vec::new())
-}
-use stellarator::buf::{IoBuf, Slice};
+/// The seq fixture's cargo crate name and cdylib library stem.
+const FIXTURE_CRATE: &str = "metor-fsw-2-seq-fixture";
+const FIXTURE_STEM: &str = "metor_fsw_2_seq_fixture";
 
 /// A `Load { occupant }` command addressed to the channel named `ch`.
 fn load(ch: &str, occupant: &str) -> SequenceCommand {
@@ -62,11 +64,11 @@ fn cmd(ch: &str, command: SequenceCommandKind) -> SequenceCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Building and opening the fixture cdylib
+// Building and locating the fixture cdylib
 // ---------------------------------------------------------------------------
 
 fn fixture_lib_name() -> String {
-    let stem = "metor_fsw_2_seq_fixture";
+    let stem = FIXTURE_STEM;
     if cfg!(target_os = "macos") {
         format!("lib{stem}.dylib")
     } else if cfg!(target_os = "windows") {
@@ -81,12 +83,7 @@ fn fixture_lib_name() -> String {
 /// the build plumbing is unavailable, so the caller skips instead of failing.
 fn locate_fixture() -> Option<PathBuf> {
     let output = Command::new(env!("CARGO"))
-        .args([
-            "build",
-            "-p",
-            "metor-fsw-2-seq-fixture",
-            "--message-format=json",
-        ])
+        .args(["build", "-p", FIXTURE_CRATE, "--message-format=json"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -115,35 +112,21 @@ fn locate_fixture() -> Option<PathBuf> {
     None
 }
 
-fn sim_config() -> CoordinatorConfig {
-    CoordinatorConfig {
+/// A 1000 Hz, depth-8 simulated mission whose 2µs-per-cycle clock elapses the
+/// fixture's 2µs wait in a single step — the shared coordinator config.
+fn seq_coordinator() -> CoordinatorSpec {
+    CoordinatorSpec {
         cycle_rate: 1000.0,
-        default_depth: 8,
-        // Each simulated cycle advances 2µs, so the fixture's 2µs wait elapses
-        // after a single step.
-        clock: ClockMode::Simulated {
-            dt: Duration::from_micros(2),
-        },
-        ..CoordinatorConfig::default()
+        default_depth: Some(8),
+        clock: ClockSpec::Simulated { dt_secs: 0.000_002 },
     }
 }
 
-/// Open the fixture, select its `waiter` entry, and sanity-check the
-/// reconstructed descriptor.
-fn open_waiter(lib: &PathBuf) -> DlSystem {
-    let loaded = DlPack::open(lib)
-        .expect("DlPack::open the sequence .so")
-        .system("waiter")
-        .expect("select the waiter entry");
-    let desc = loaded.descriptor();
-    assert_eq!(desc.name, "waiter");
-    assert_eq!(desc.kind, SystemKind::Cyclic);
-    // The fixture declares no user ports, and the occupant tail is a mount
-    // property (appended at Load), not descriptor content — so the entry
-    // carries only the implicit health/log outputs.
-    assert_eq!(desc.inputs.len(), 0, "no user inputs, no descriptor tail");
-    assert_eq!(desc.outputs.len(), 2, "just the health + log tail");
-    loaded
+/// Point the mission's single artifact at the located fixture (in place of the
+/// build driver) and resolve it through the empty registry into a coordinator.
+fn resolve_slot(mut wiring: Wiring, lib: &PathBuf) -> Coordinator {
+    wiring.artifacts[0].path = Some(lib.clone());
+    resolve(&wiring, &Registry::new()).expect("resolve the slot Wiring")
 }
 
 /// Drain every `SlotStatus.phase` published over a run.
@@ -173,6 +156,19 @@ const ABORTED: u8 = 2;
 // Slot lifecycle
 // ---------------------------------------------------------------------------
 
+/// A single-`waiter` slot mission with the coordinator's command edge wired to
+/// it, the shared shape behind the lifecycle tests.
+fn waiter_slot() -> Wiring {
+    WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("adcs")
+        .allow("waiter")
+        .end()
+        .connect_msg("coordinator", "adcs", "SequenceCommand")
+        .build()
+}
+
 /// Load then Start runs the occupant to a terminal Done with a Completed
 /// run state.
 #[test]
@@ -180,16 +176,7 @@ fn slot_load_start_runs_to_done() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -247,16 +234,7 @@ fn slot_abort_completes_aborted() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut seq_view: Input<SequenceStatus> = Input::new(
         coord
@@ -312,16 +290,7 @@ fn slot_stop_hard_drops_occupant() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -378,16 +347,7 @@ fn slot_reset_reruns_from_start() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut seq_view: Input<SequenceStatus> = Input::new(
         coord
@@ -451,26 +411,29 @@ fn last_occupant(view: &mut Input<SlotStatus>) -> Option<String> {
     last
 }
 
+/// A slot allowing two distinct occupant entries (`waiter` and `napper`, the
+/// same fixture body under two names) plus the coordinator command edge.
+fn two_occupant_slot() -> Wiring {
+    WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("adcs")
+        .allow("waiter")
+        .allow("napper")
+        .end()
+        .connect_msg("coordinator", "adcs", "SequenceCommand")
+        .build()
+}
+
 /// Loading over a `Loaded` slot swaps occupants: the current occupant is
 /// dropped and the named one built, no Stop/Reset dance required. Two allow
-/// entries over the same fixture entry give the slot two distinct names.
+/// entries over distinct fixture entries give the slot two occupant names.
 #[test]
 fn load_from_loaded_swaps_occupant() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let pack = DlPack::open(&lib).expect("DlPack::open the sequence .so");
-    let first = pack.system("waiter").expect("select the waiter entry");
-    let second = pack.system("waiter").expect("select the waiter entry again");
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(two_occupant_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -485,11 +448,11 @@ fn load_from_loaded_swaps_occupant() {
         .expect("the slot events channel is registered")
         .expect("reader slot available");
 
-    // All three drain in one cycle: Load lands Loaded{first}, the second Load
-    // swaps to Loaded{second}, Start runs the swapped-in occupant.
+    // All three drain in one cycle: Load lands Loaded{waiter}, the second Load
+    // swaps to Loaded{napper}, Start runs the swapped-in occupant.
     let mut control = coord.control_handle().expect("taken once per coordinator");
-    control.emit(&load("adcs", "first")).unwrap();
-    control.emit(&load("adcs", "second")).unwrap();
+    control.emit(&load("adcs", "waiter")).unwrap();
+    control.emit(&load("adcs", "napper")).unwrap();
     control
         .emit(&cmd("adcs", SequenceCommandKind::Start))
         .unwrap();
@@ -502,11 +465,11 @@ fn load_from_loaded_swaps_occupant() {
     let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
     let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
     assert!(
-        matches!(kinds[0], SequenceEventKind::Loaded { name } if name == "first"),
-        "first event is Loaded {{ first }}: {kinds:?}"
+        matches!(kinds[0], SequenceEventKind::Loaded { name } if name == "waiter"),
+        "first event is Loaded {{ waiter }}: {kinds:?}"
     );
     assert!(
-        matches!(kinds[1], SequenceEventKind::Loaded { name } if name == "second"),
+        matches!(kinds[1], SequenceEventKind::Loaded { name } if name == "napper"),
         "the swap re-Loads in place: {kinds:?}"
     );
     assert!(
@@ -521,7 +484,7 @@ fn load_from_loaded_swaps_occupant() {
     );
     assert_eq!(
         last_occupant(&mut slot_view).as_deref(),
-        Some("second"),
+        Some("napper"),
         "the slot ends on the swapped-in occupant"
     );
 
@@ -536,18 +499,7 @@ fn reset_then_load_swaps_occupant() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let pack = DlPack::open(&lib).expect("DlPack::open the sequence .so");
-    let first = pack.system("waiter").expect("select the waiter entry");
-    let second = pack.system("waiter").expect("select the waiter entry again");
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(two_occupant_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -562,10 +514,10 @@ fn reset_then_load_swaps_occupant() {
         .expect("the slot events channel is registered")
         .expect("reader slot available");
 
-    // Cycles 1-3 run "first" to Done. The injector then replays the panel
-    // flow that used to wedge: Reset (Done -> Loaded), Load{second}, Start.
+    // Cycles 1-3 run "waiter" to Done. The injector then replays the panel
+    // flow that used to wedge: Reset (Done -> Loaded), Load{napper}, Start.
     let mut control = coord.control_handle().expect("taken once per coordinator");
-    control.emit(&load("adcs", "first")).unwrap();
+    control.emit(&load("adcs", "waiter")).unwrap();
     control
         .emit(&cmd("adcs", SequenceCommandKind::Start))
         .unwrap();
@@ -579,7 +531,7 @@ fn reset_then_load_swaps_occupant() {
             control
                 .emit(&cmd("adcs", SequenceCommandKind::Reset))
                 .unwrap();
-            control.emit(&load("adcs", "second")).unwrap();
+            control.emit(&load("adcs", "napper")).unwrap();
             control
                 .emit(&cmd("adcs", SequenceCommandKind::Start))
                 .unwrap();
@@ -600,7 +552,7 @@ fn reset_then_load_swaps_occupant() {
     assert!(
         kinds
             .iter()
-            .any(|k| matches!(k, SequenceEventKind::Loaded { name } if name == "second")),
+            .any(|k| matches!(k, SequenceEventKind::Loaded { name } if name == "napper")),
         "the post-Reset Load swapped occupants: {kinds:?}"
     );
     let completed = kinds
@@ -610,7 +562,7 @@ fn reset_then_load_swaps_occupant() {
     assert_eq!(completed, 2, "both occupants ran to Completed: {kinds:?}");
     assert_eq!(
         last_occupant(&mut slot_view).as_deref(),
-        Some("second"),
+        Some("napper"),
         "the slot ends on the swapped-in occupant"
     );
 
@@ -624,18 +576,7 @@ fn load_while_running_is_refused() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let pack = DlPack::open(&lib).expect("DlPack::open the sequence .so");
-    let first = pack.system("waiter").expect("select the waiter entry");
-    let second = pack.system("waiter").expect("select the waiter entry again");
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(two_occupant_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -650,14 +591,14 @@ fn load_while_running_is_refused() {
         .expect("the slot events channel is registered")
         .expect("reader slot available");
 
-    // One drain applies all three: Load{first} -> Loaded, Start -> Running,
-    // Load{second} -> refused (the occupant is live).
+    // One drain applies all three: Load{waiter} -> Loaded, Start -> Running,
+    // Load{napper} -> refused (the occupant is live).
     let mut control = coord.control_handle().expect("taken once per coordinator");
-    control.emit(&load("adcs", "first")).unwrap();
+    control.emit(&load("adcs", "waiter")).unwrap();
     control
         .emit(&cmd("adcs", SequenceCommandKind::Start))
         .unwrap();
-    control.emit(&load("adcs", "second")).unwrap();
+    control.emit(&load("adcs", "napper")).unwrap();
 
     let coord = stellarator::run(|| async move {
         coord.run_for(4).await;
@@ -676,12 +617,12 @@ fn load_while_running_is_refused() {
     assert!(
         !kinds
             .iter()
-            .any(|k| matches!(k, SequenceEventKind::Loaded { name } if name == "second")),
+            .any(|k| matches!(k, SequenceEventKind::Loaded { name } if name == "napper")),
         "the refused Load loaded nothing: {kinds:?}"
     );
     assert_eq!(
         last_occupant(&mut slot_view).as_deref(),
-        Some("first"),
+        Some("waiter"),
         "the running occupant kept the slot"
     );
 
@@ -718,16 +659,7 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let messages = coord.registry();
     let mut events_view = messages
@@ -744,7 +676,6 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     control
         .emit(&cmd("adcs", SequenceCommandKind::Start))
         .unwrap();
-    let mut coord = coord;
     let coord = stellarator::run(|| async move {
         coord.run_for(4).await;
         coord
@@ -795,196 +726,39 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
 }
 
 // ---------------------------------------------------------------------------
-// Uplink command dispatch
-// ---------------------------------------------------------------------------
-
-/// A [`RecvTransport`] that replays a fixed script of pre-encoded wire packets,
-/// then reports `Disconnected` like a dropped link. Each packet is real wire
-/// bytes re-parsed, so the loopback exercises the same parse-and-route path a
-/// network reader uses.
-struct MockRecv {
-    queue: std::collections::VecDeque<Vec<u8>>,
-}
-
-/// Encode one Msg to its framed wire bytes, stripping the 4-byte length prefix
-/// that `OwnedPacket::parse` does not expect.
-fn wire_msg<M: Msg + serde::Serialize>(msg: &M) -> Vec<u8> {
-    let pkt = msg.into_len_packet();
-    pkt.inner[4..].to_vec()
-}
-
-impl MockRecv {
-    fn new(cmds: Vec<SequenceCommand>) -> Self {
-        Self {
-            queue: cmds.iter().map(wire_msg).collect(),
-        }
-    }
-
-    /// A script of arbitrary pre-encoded packets.
-    fn from_packets(packets: Vec<Vec<u8>>) -> Self {
-        Self {
-            queue: packets.into(),
-        }
-    }
-}
-
-impl RecvTransport for MockRecv {
-    async fn recv(&mut self, _buf: Vec<u8>) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-        match self.queue.pop_front() {
-            Some(bytes) => {
-                let slice = bytes.try_slice(..).expect("non-empty packet");
-                OwnedPacket::parse(slice).map_err(|e| TransportError::Io(Box::new(e)))
-            }
-            None => Err(TransportError::Disconnected),
-        }
-    }
-}
-
-/// A command received over the uplink lands in the slot's command ring at the
-/// head of a cycle and dispatches that same cycle, with no off-by-one.
-#[test]
-fn uplink_command_loads_and_starts_same_cycle() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    // The slot starts empty; the uplink alone drives it.
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    let uplink = b.add_async(
-        UplinkSystem::new(MockRecv::new(vec![
-            SequenceCommand {
-                channel: "adcs".to_string(),
-                command: SequenceCommandKind::Load {
-                    name: "waiter".to_string(),
-                },
-            },
-            SequenceCommand {
-                channel: "adcs".to_string(),
-                command: SequenceCommandKind::Start,
-            },
-        ]))
-        .with_msg::<SequenceCommand>(),
-    );
-    b.connect(
-        PortRef::msg::<SequenceCommand>(uplink),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the uplink command edge connects");
-    let mut coord = b.build().expect("the slot + uplink graph builds");
-
-    let mut slot_view: Input<SlotStatus> = Input::new(
-        coord
-            .registry()
-            .view(ComponentId::new("adcs.slot_status"))
-            .expect("slot status is registered")
-            .expect("reader slot available"),
-    );
-
-    let coord = stellarator::run(|| async move {
-        coord.run_for(6).await;
-        coord
-    });
-
-    let phases = slot_phases(&mut slot_view);
-    assert!(
-        phases.contains(&RUNNING),
-        "the uplink drove the slot to Running: {phases:?}"
-    );
-    assert_eq!(
-        phases.last(),
-        Some(&DONE),
-        "the started occupant ran to Done: {phases:?}"
-    );
-    // Load and Start dispatched in the same cycle. A one-cycle-late Start would
-    // have let the slot publish a bare Loaded phase.
-    assert!(
-        !phases.contains(&LOADED),
-        "Load and Start landed the same cycle (no bare Loaded): {phases:?}"
-    );
-
-    drop((coord, slot_view));
-}
-
-/// A [`ReloadSequences`] request wired into the coordinator's #0 bundle
-/// re-emits the [`SequenceRegistry`], so a consumer that missed the one-shot
-/// boot message (a late-started panel) can recover the channel list.
-#[test]
-fn reload_request_reemits_registry() {
-    use metor_fsw_2::metor_proto_wkt::ReloadSequences;
-
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    let uplink = b.add_async(
-        UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
-            .with_msg::<ReloadSequences>(),
-    );
-    b.connect(
-        PortRef::msg::<ReloadSequences>(uplink),
-        PortRef::msg::<ReloadSequences>(b.coordinator_handle()),
-    )
-    .expect("the reload edge connects to the coordinator bundle");
-    let mut coord = b.build().expect("the slot + uplink graph builds");
-
-    let mut boot_view = coord
-        .registry()
-        .view(ComponentId::new("coordinator.sequences"))
-        .expect("the coordinator registry channel is registered")
-        .expect("reader slot available");
-
-    let coord = stellarator::run(|| async move {
-        coord.run_for(6).await;
-        coord
-    });
-
-    let registries = drain_msgs::<SequenceRegistry>(&mut boot_view);
-    assert!(
-        registries.len() >= 2,
-        "boot emission plus at least one reload re-emission: {} seen",
-        registries.len()
-    );
-    for registry in &registries {
-        assert_eq!(registry.channels.len(), 1);
-        assert_eq!(registry.channels[0].name, "adcs");
-        assert_eq!(registry.channels[0].available, vec!["waiter".to_string()]);
-    }
-
-    drop((coord, boot_view));
-}
-
-// ---------------------------------------------------------------------------
 // Name addressing
 // ---------------------------------------------------------------------------
 
 /// The slot's instance name is the wire address, so an over-long name would
-/// telemeter truncated while addressing untruncated; the build rejects it.
+/// telemeter truncated while addressing untruncated; the build rejects it. The
+/// resolve path surfaces the build-time [`WireError`] wrapped in a
+/// [`LoadErrorKind::Wire`], carrying the precise variant.
 #[test]
 fn slot_name_over_the_cap_is_a_build_error() {
-    use metor_fsw_2::{NAME_CAP, WireError};
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let loaded = open_waiter(&lib);
 
     let long = "a".repeat(NAME_CAP + 1);
-    let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot(long.clone(), vec![occ("waiter", loaded)], None).unwrap();
-    let err = b
-        .build()
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot(long.clone())
+        .allow("waiter")
+        .end()
+        .build();
+    wiring.artifacts[0].path = Some(lib);
+    let err = resolve(&wiring, &Registry::new())
         .err()
         .expect("an over-cap slot name fails the build");
-    match err {
-        WireError::SlotNameTooLong { name, len } => {
+    match err.kind {
+        LoadErrorKind::Wire {
+            source: WireError::SlotNameTooLong { name, len },
+        } => {
             assert_eq!(name, long);
             assert_eq!(len, NAME_CAP + 1);
         }
-        other => panic!("expected SlotNameTooLong, got {other:?}"),
+        other => panic!("expected wrapped SlotNameTooLong, got {other:?}"),
     }
 }
 
@@ -995,16 +769,7 @@ fn misaddressed_command_matches_no_slot() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the slot graph builds");
+    let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -1056,25 +821,24 @@ fn drive_adcs_of_two_slots(adcs_first: bool) {
         return;
     };
 
-    let mut b = Coordinator::builder(sim_config());
-    let add = |b: &mut metor_fsw_2::CoordinatorBuilder, name: &str| {
-        let slot = b.add_slot(name, vec![occ("waiter", open_waiter(&lib))], None).unwrap();
-        // The one producer is edged to both slots; only the slot whose name
-        // matches a command's channel acts on it, so broad fan-out is harmless.
-        b.connect(
-            PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-            PortRef::msg::<SequenceCommand>(slot),
-        )
-        .expect("the coordinator command edge connects");
-    };
-    if adcs_first {
-        add(&mut b, "adcs");
-        add(&mut b, "recovery");
+    // The one coordinator producer is edged to both slots; only the slot whose
+    // name matches a command's channel acts on it, so broad fan-out is
+    // harmless. Declaration order is the variable under test.
+    let mut builder = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM);
+    for name in if adcs_first {
+        ["adcs", "recovery"]
     } else {
-        add(&mut b, "recovery");
-        add(&mut b, "adcs");
+        ["recovery", "adcs"]
+    } {
+        builder = builder
+            .slot(name)
+            .allow("waiter")
+            .end()
+            .connect_msg("coordinator", name, "SequenceCommand");
     }
-    let mut coord = b.build().expect("the two-slot graph builds");
+    let mut coord = resolve_slot(builder.build(), &lib);
 
     let mut adcs_view: Input<SlotStatus> = Input::new(
         coord
@@ -1138,27 +902,22 @@ struct Autonomy {
     sent: bool,
 }
 
-#[derive(metor_fsw_2::SystemInput)]
+#[derive(SystemInput)]
 struct AutonomyIn {}
 
-#[derive(metor_fsw_2::SystemOutput)]
+#[derive(SystemOutput)]
 struct AutonomyOut {
-    commands: metor_fsw_2::CommandOut<SequenceCommand>,
+    commands: CommandOut<SequenceCommand>,
 }
 
-impl metor_fsw_2::System for Autonomy {
+impl System for Autonomy {
     type Input = AutonomyIn;
-    type Output = metor_fsw_2::Out<AutonomyOut>;
+    type Output = Out<AutonomyOut>;
     const NAME: &'static str = "autonomy";
 }
 
-impl metor_fsw_2::CyclicSystem for Autonomy {
-    fn execute(
-        &mut self,
-        _now: metor_fsw_2::Timestamp,
-        _in: &mut AutonomyIn,
-        o: &mut Self::Output,
-    ) {
+impl CyclicSystem for Autonomy {
+    fn execute(&mut self, _now: Timestamp, _in: &mut AutonomyIn, o: &mut Self::Output) {
         if !self.sent {
             self.sent = true;
             let _ = o.commands.emit(&load("adcs", "waiter"));
@@ -1167,23 +926,37 @@ impl metor_fsw_2::CyclicSystem for Autonomy {
     }
 }
 
+impl BuildSystem for Autonomy {
+    type Params = ();
+    fn new(_params: ()) -> Self {
+        Autonomy { sent: false }
+    }
+}
+
 /// Build one slot plus the autonomy emitter, with or without the command edge,
 /// and return the phases the slot published over a short run.
 fn autonomy_phases(edged: bool) -> Option<Vec<u8>> {
     let lib = locate_fixture()?;
-    let loaded = open_waiter(&lib);
 
-    let mut b = Coordinator::builder(sim_config());
-    let autonomy = b.add_cyclic(Autonomy { sent: false });
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
+    let mut builder = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .system("autonomy")
+        .ty("Autonomy")
+        .from_static()
+        .end()
+        .slot("adcs")
+        .allow("waiter")
+        .end();
     if edged {
-        b.connect(
-            PortRef::msg::<SequenceCommand>(autonomy),
-            PortRef::msg::<SequenceCommand>(slot),
-        )
-        .expect("the autonomy command edge connects");
+        builder = builder.connect_msg("autonomy", "adcs", "SequenceCommand");
     }
-    let mut coord = b.build().expect("the autonomy + slot graph builds");
+    let mut wiring = builder.build();
+    wiring.artifacts[0].path = Some(lib);
+
+    let mut registry = Registry::new();
+    registry.register::<Autonomy, _>("Autonomy");
+    let mut coord = resolve(&wiring, &registry).expect("the autonomy + slot graph resolves");
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -1228,277 +1001,89 @@ fn command_output_with_an_edge_drives_the_slot() {
 }
 
 // ---------------------------------------------------------------------------
-// The slot's registered descriptor
+// Build-time slot wiring rejections
 // ---------------------------------------------------------------------------
 
-/// The slot registers an extended occupant descriptor: the occupant's own
-/// ports come first with the mount-appended tail (`SlotControlIn` after its
-/// inputs, `SequenceStatus` after its outputs), followed by the runner tail
-/// of a command fan-in, a `SequenceStatus` self-tap, and the `SlotStatus`
-/// and events Host outputs.
-#[test]
-fn registered_descriptor_is_the_extended_occupant_shape() {
-    use metor_fsw_2::metor_proto::types::Msg;
-    use metor_fsw_2::{Delivery, FanIn, Frame, PortConn, PortId, SequenceStatus as SeqStatusFrame};
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
-    let loaded = open_waiter(&lib);
-
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    let d = b.descriptor_of(slot);
-    assert_eq!(d.name, "adcs", "registered under the slot's instance name");
-
-    // The fixture has no user ports, so the shape is exactly the implicit
-    // occupant prefix plus the runner tail.
-    let ins: Vec<(&str, PortConn)> = d.inputs.iter().map(|p| (p.name.as_str(), p.conn)).collect();
-    assert_eq!(ins.len(), 3, "{ins:?}");
-    assert_eq!(ins[0], ("slot_control", PortConn::Host), "{ins:?}");
-    assert_eq!(ins[1].0, "SequenceCommand");
-    assert_eq!(ins[1].1, PortConn::Edge);
-    assert_eq!(d.inputs[1].fan_in, FanIn::Many);
-    assert_eq!(d.inputs[1].delivery, Delivery::Log);
-    assert_eq!(
-        ins[2].1,
-        PortConn::SelfTap(PortId::Component(SeqStatusFrame::FRAME_ID)),
-        "{ins:?}"
-    );
-
-    let outs: Vec<(&str, PortConn)> = d.outputs.iter().map(|p| (p.name.as_str(), p.conn)).collect();
-    assert_eq!(outs.len(), 5, "{outs:?}");
-    // The occupant prefix is the entry's own outputs (health/log tail) with
-    // the mount-appended SequenceStatus after them.
-    assert_eq!(outs[0], ("health", PortConn::Edge), "{outs:?}");
-    assert_eq!(outs[1], ("log", PortConn::Edge), "{outs:?}");
-    assert_eq!(
-        outs[2],
-        ("sequence", PortConn::Edge),
-        "mount-appended status: {outs:?}"
-    );
-    assert_eq!(outs[3], ("slot_status", PortConn::Host), "{outs:?}");
-    // The events channel keys "<slot>.sequences" and stays telemetered.
-    assert_eq!(outs[4], ("sequences", PortConn::Host), "{outs:?}");
-    assert_eq!(
-        d.outputs[4].id(),
-        PortId::Packet(metor_fsw_2::metor_proto_wkt::SequenceChannelEvent::ID)
-    );
-    assert!(d.outputs[4].telemetered, "the events channel is downlinked");
-}
-
+/// An edge into a slot's runner-held self-tap input is rejected. Slot a's
+/// occupant-bound `SequenceStatus` output shares its id with slot b's
+/// `SequenceStatus` self-tap input, the only edge-addressable non-Edge input,
+/// so resolve's `connect` (which checks only ids) succeeds and the build fails
+/// as a [`WireError::HostPort`] — surfaced here wrapped in a
+/// [`LoadErrorKind::Wire`] — rather than binding a foreign producer into a
+/// runner-held view.
 #[test]
 fn edge_into_a_host_connected_input_is_rejected() {
-    #[allow(unused_imports)]
-    use metor_fsw_2::Frame;
-    use metor_fsw_2::{SequenceStatus as SeqStatusFrame, WireError};
     let Some(lib) = locate_fixture() else {
         return;
     };
 
-    // Slot a's occupant-bound SequenceStatus output shares its PortId with slot
-    // b's SequenceStatus self-tap input, the only edge-addressable non-Edge
-    // input, so this connect must fail as a HostPort rather than bind a foreign
-    // producer into a runner-held view.
-    let mut b = Coordinator::builder(sim_config());
-    let a = b.add_slot("a", vec![occ("waiter", open_waiter(&lib))], None).unwrap();
-    let bslot = b.add_slot("b", vec![occ("waiter", open_waiter(&lib))], None).unwrap();
-    b.connect(
-        PortRef::new::<SeqStatusFrame>(a),
-        PortRef::new::<SeqStatusFrame>(bslot),
-    )
-    .expect("push_edge only checks ids");
-    let err = b
-        .build()
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("a")
+        .allow("waiter")
+        .end()
+        .slot("b")
+        .allow("waiter")
+        .end()
+        .connect("a", "sequence", "b", "sequence")
+        .build();
+    wiring.artifacts[0].path = Some(lib);
+    let err = resolve(&wiring, &Registry::new())
         .err()
         .expect("an edge into a self-tap input fails");
-    match err {
-        WireError::HostPort { system, .. } => assert_eq!(system, "b"),
-        other => panic!("expected HostPort, got {other:?}"),
+    match err.kind {
+        LoadErrorKind::Wire {
+            source: WireError::HostPort { system, .. },
+        } => assert_eq!(system, "b"),
+        other => panic!("expected wrapped HostPort, got {other:?}"),
     }
 }
 
-/// An initial occupant outside the allowed set is rejected as soon as the slot
-/// is added.
+/// An initial occupant outside the allowed set is rejected at resolve, before
+/// any artifact is opened, as an [`LoadErrorKind::UnknownInitialOccupant`] (the
+/// front-end mapping of the builder's `SlotConfigError::UnknownInitial`, which
+/// `coordinator::tests::add_slot_rejects_contract_violations` pins directly).
 #[test]
-fn builder_initial_occupant_outside_allowed_set_is_rejected() {
-    use metor_fsw_2::{InitialOccupant, SlotConfigError};
+fn initial_occupant_outside_allowed_set_is_rejected() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let loaded = open_waiter(&lib);
 
-    let mut b = Coordinator::builder(sim_config());
-    let err = b
-        .add_slot(
-            "adcs",
-            vec![occ("waiter", loaded)],
-            Some(InitialOccupant::loaded("nonesuch")),
-        )
-        .expect_err("an initial occupant outside the allowed set is a registration error");
-    assert!(matches!(err, SlotConfigError::UnknownInitial { .. }), "got {err:?}");
-}
-
-// ---------------------------------------------------------------------------
-// Uplink multi-output routing
-// ---------------------------------------------------------------------------
-
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-use metor_fsw_2::metor_proto_wkt::ReloadSequences;
-
-static RELOADS_SEEN: AtomicU64 = AtomicU64::new(0);
-static CMDS_SEEN: AtomicU64 = AtomicU64::new(0);
-
-/// A cyclic consumer of both uplink command types, each over its own edge.
-struct CmdTap;
-
-#[derive(metor_fsw_2::SystemInput)]
-struct CmdTapIn {
-    reloads: metor_fsw_2::MsgIn<ReloadSequences>,
-    commands: metor_fsw_2::MsgIn<SequenceCommand>,
-}
-
-#[derive(metor_fsw_2::SystemOutput)]
-struct CmdTapOut {}
-
-impl metor_fsw_2::System for CmdTap {
-    type Input = CmdTapIn;
-    type Output = metor_fsw_2::Out<CmdTapOut>;
-    const NAME: &'static str = "cmd_tap";
-}
-
-impl metor_fsw_2::CyclicSystem for CmdTap {
-    fn execute(
-        &mut self,
-        _now: metor_fsw_2::Timestamp,
-        input: &mut CmdTapIn,
-        _o: &mut Self::Output,
-    ) {
-        input.reloads.drain(|_| {
-            RELOADS_SEEN.fetch_add(1, Relaxed);
-        });
-        input.commands.drain(|_| {
-            CMDS_SEEN.fetch_add(1, Relaxed);
-        });
-    }
-}
-
-/// Received Msgs route by their declared output id. A second declared command
-/// type gets its own output, an unknown id counts on the uplink's health, and
-/// a malformed payload under a known id is dropped with the link staying up.
-#[test]
-fn uplink_routes_by_declared_output_and_survives_garbage() {
-    use metor_fsw_2::metor_proto::types::LenPacket;
-
-    RELOADS_SEEN.store(0, Relaxed);
-    CMDS_SEEN.store(0, Relaxed);
-
-    // The script is a second-type command (routes to `reloads`), an id the
-    // uplink declares no output for (SequenceChannelEvent is downlink traffic),
-    // a malformed payload under a known id, and finally a valid
-    // SequenceCommand, which arrives only if the garbage did not kill the
-    // reader.
-    let unroutable = wire_msg(&SequenceChannelEvent {
-        channel: "adcs".to_string(),
-        kind: SequenceEventKind::Started,
-    });
-    let malformed = {
-        // A SequenceCommand-id Msg whose payload cannot postcard-decode; its
-        // string-length varint points far past the end.
-        let mut pkt = LenPacket::msg(SequenceCommand::ID, 4);
-        pkt.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        pkt.inner[4..].to_vec()
-    };
-    let valid = wire_msg(&SequenceCommand {
-        channel: "anything".to_string(),
-        command: SequenceCommandKind::Start,
-    });
-    let reload = wire_msg(&ReloadSequences {});
-
-    let mut b = Coordinator::builder(sim_config());
-    let tap = b.add_cyclic(CmdTap);
-    let uplink = b.add_async(
-        UplinkSystem::new(MockRecv::from_packets(vec![
-            reload, unroutable, malformed, valid,
-        ]))
-        .with_msg::<ReloadSequences>()
-        .with_msg::<SequenceCommand>(),
-    );
-    b.connect(
-        PortRef::msg::<ReloadSequences>(uplink),
-        PortRef::msg::<ReloadSequences>(tap),
-    )
-    .expect("the reloads edge connects");
-    b.connect(
-        PortRef::msg::<SequenceCommand>(uplink),
-        PortRef::msg::<SequenceCommand>(tap),
-    )
-    .expect("the commands edge connects");
-    let mut coord = b.build().expect("the uplink + tap graph builds");
-
-    let mut health: Input<metor_fsw_2::SystemHealth> = Input::new(
-        coord
-            .registry()
-            .view(ComponentId::new("uplink.health"))
-            .expect("the uplink's health is registered")
-            .expect("reader slot available"),
-    );
-
-    let coord = stellarator::run(|| async move {
-        // Plenty of cycles for the async uplink to drain its 4-packet script.
-        coord.run_for(40).await;
-        coord
-    });
-
-    assert_eq!(
-        RELOADS_SEEN.load(Relaxed),
-        1,
-        "the second declared command type routed to its own output"
-    );
-    assert_eq!(
-        CMDS_SEEN.load(Relaxed),
-        1,
-        "the valid command after the malformed one arrived; the link stayed up \
-         and the garbage payload was dropped"
-    );
-    let mut errors = 0;
-    let _ = health.drain(|f| errors = errors.max(f.get().errors));
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("adcs")
+        .allow("waiter")
+        .initial("nonesuch", SlotInitState::Loaded)
+        .end()
+        .build();
+    wiring.artifacts[0].path = Some(lib);
+    let err = resolve(&wiring, &Registry::new())
+        .err()
+        .expect("an initial occupant outside the allowed set is rejected");
     assert!(
-        errors >= 1,
-        "the unknown-id Msg bumped the uplink's unroutable counter: {errors}"
+        matches!(err.kind, LoadErrorKind::UnknownInitialOccupant { .. }),
+        "got {:?}",
+        err.kind
     );
-
-    drop((coord, health));
 }
 
 // ---------------------------------------------------------------------------
 // A plain cyclic entry as a slot occupant
 // ---------------------------------------------------------------------------
 
-/// The occupant tail is a mount property, so a slot loads an ordinary cyclic
-/// entry (the fixture's fn-style `beater`). Shared plumbing for the two
-/// cyclic-occupant tests (a stellarator run is once-per-thread, so the
-/// steady phase and the abort are separate tests).
-fn open_beater_in(lib: &PathBuf) -> DlSystem {
-    let loaded = DlPack::open(lib)
-        .expect("open the fixture pack")
-        .system("beater")
-        .expect("select the cyclic entry");
-    // A cyclic entry carries no occupant tail of its own.
-    assert_eq!(loaded.descriptor().inputs.len(), 0);
-    assert_eq!(loaded.descriptor().outputs.len(), 2, "health + log only");
-    loaded
-}
-
-fn build_beater_slot(loaded: DlSystem) -> Coordinator {
-    let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("beater", loaded)], None).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    b.build().expect("a cyclic occupant builds")
+/// A single-`beater` slot mission: the occupant tail is a mount property, so a
+/// slot loads an ordinary cyclic entry (the fixture's fn-style `beater`).
+fn beater_slot() -> Wiring {
+    WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("adcs")
+        .allow("beater")
+        .end()
+        .connect_msg("coordinator", "adcs", "SequenceCommand")
+        .build()
 }
 
 fn beater_views(coord: &Coordinator) -> (Input<SequenceStatus>, Input<SlotStatus>) {
@@ -1526,7 +1111,7 @@ fn cyclic_occupant_runs_steadily() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let mut coord = build_beater_slot(open_beater_in(&lib));
+    let mut coord = resolve_slot(beater_slot(), &lib);
     let (mut seq_view, mut slot_view) = beater_views(&coord);
     let mut control = coord.control_handle().expect("taken once per coordinator");
     control.emit(&load("adcs", "beater")).unwrap();
@@ -1555,7 +1140,7 @@ fn cyclic_occupant_abort_is_terminal() {
     let Some(lib) = locate_fixture() else {
         return;
     };
-    let mut coord = build_beater_slot(open_beater_in(&lib));
+    let mut coord = resolve_slot(beater_slot(), &lib);
     let (mut seq_view, mut slot_view) = beater_views(&coord);
     let mut control = coord.control_handle().expect("taken once per coordinator");
     control.emit(&load("adcs", "beater")).unwrap();
