@@ -78,7 +78,7 @@ use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::{Delivery, PortDecl, PortDesc, SystemDescriptor};
 use crate::health::HealthPort;
 use crate::message::{MsgFanOut, NamedMsg, split_record};
-use crate::registry::{AllOutputs, EntrySchema, RegistryEntry};
+use crate::registry::{AllOutputs, RegistryEntry};
 use crate::system::{
     AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, System, SystemInput,
     SystemOutput,
@@ -331,7 +331,7 @@ impl TelemetryMode {
             TelemetryMode::All => true,
             TelemetryMode::Subset { instances, frames } => {
                 instances.iter().any(|i| i.as_str() == &*entry.instance)
-                    || frames.iter().any(|f| f.as_str() == &*entry.name)
+                    || frames.iter().any(|f| f.as_str() == entry.name())
             }
         }
     }
@@ -859,30 +859,28 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
                 // worth diagnosing, so log the buffer by name and skip the tap
                 // instead of panicking.
                 Err(_) => {
-                    exhausted.push(format!("{}.{}", entry.instance, entry.name));
+                    exhausted.push(format!("{}.{}", entry.instance, entry.name()));
                     continue;
                 }
             };
             // Delivery and wire are independent projections of the entry:
             // delivery picks how much each cycle contributes, schema picks
             // the framing.
-            let wire = match &entry.schema {
-                EntrySchema::Table {
-                    vtable, metadata, ..
-                } => {
+            let wire = match entry.announce() {
+                Some((vtable, metadata)) => {
                     let packet_id = (announces.len() as u16).to_le_bytes();
                     announces.push(Announce {
                         packet_id,
-                        vtable: vtable.clone(),
-                        metadata: metadata.clone(),
+                        vtable,
+                        metadata,
                     });
                     Wire::Table { packet_id }
                 }
-                EntrySchema::Postcard => Wire::Msg,
+                None => Wire::Msg,
             };
             taps.push(Tap {
                 view,
-                delivery: entry.delivery,
+                delivery: entry.delivery(),
                 wire,
                 last_committed: u64::MAX,
             });

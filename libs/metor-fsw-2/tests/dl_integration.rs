@@ -189,19 +189,19 @@ fn dlopen_cyclic_system_end_to_end() {
     assert_eq!(desc.kind, SystemKind::Cyclic);
     assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
     assert_eq!(
-        desc.inputs[0].id.component().expect("table port"),
+        desc.inputs[0].id().component().expect("table port"),
         TickIn::FRAME_ID
     );
     // User `out`, user `events` (the Postcard port), implicit health, implicit log.
     assert_eq!(desc.outputs.len(), 4);
     assert_eq!(
-        desc.outputs[0].id.component().expect("table port"),
+        desc.outputs[0].id().component().expect("table port"),
         TickOut::FRAME_ID
     );
     // The message port crossed the ABI schema-tagged with its axes intact; a
     // shared object declares a Postcard port exactly like a static system.
     let events = &desc.outputs[1];
-    assert_eq!(events.id.packet().expect("postcard port"), TickEvent::ID);
+    assert_eq!(events.id().packet().expect("postcard port"), TickEvent::ID);
     assert_eq!(
         events.name, "TickEvent",
         "the NamedMsg token survives the wire"
@@ -337,13 +337,13 @@ fn dlopen_cyclic_system_end_to_end() {
 
 /// Building through the driver ([`build_artifacts`]) leaves a
 /// `<cdylib>.manifest` sidecar next to the `.so` — raw postcard
-/// [`PackManifestMsg`] bytes naming the same entries the opened pack reports
+/// [`PackManifest`] bytes naming the same entries the opened pack reports
 /// — and `manifest_sidecar: false` opts out. Byte-level sidecar ≡ describe
 /// equality is asserted in the driver's own unit tests
 /// (`wiring::build_driver`), where the raw describe bytes are reachable.
 ///
 /// [`build_artifacts`]: metor_fsw_2::wiring::build_artifacts
-/// [`PackManifestMsg`]: metor_fsw_2::abi::PackManifestMsg
+/// [`PackManifest`]: metor_fsw_2::abi::PackManifest
 #[test]
 fn build_driver_writes_manifest_sidecar() {
     use metor_fsw_2::wiring::{BuildOptions, WiringBuilder, build_artifacts};
@@ -368,7 +368,7 @@ fn build_driver_writes_manifest_sidecar() {
     let sidecar = PathBuf::from(sidecar);
 
     let bytes = std::fs::read(&sidecar).expect("sidecar written next to the built .so");
-    let manifest: metor_fsw_2::abi::PackManifestMsg =
+    let manifest: metor_fsw_2::abi::PackManifest =
         postcard::from_bytes(&bytes).expect("sidecar bytes decode as the pack manifest");
     let pack = DlPack::open(&so).expect("DlPack::open the fixture .so");
     assert_eq!(
@@ -452,7 +452,7 @@ fn dlopen_null_create_reports_stopped() {
     );
     // Stopped systems are named type-level, like a static system's
     // `System::NAME`: for a dl system that is the pack entry name.
-    assert_eq!(stopped[0].name, "DlCounter");
+    assert_eq!(&*stopped[0].name, "DlCounter");
     assert_eq!(stopped[0].reason, StopReason::Panicked);
 
     drop(coord);

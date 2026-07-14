@@ -2,6 +2,8 @@
 //! worker facts the coordinator publishes, plus the fixed-cap name packing the
 //! status frames share.
 
+use std::sync::Arc;
+
 use metor_proto::types::Timestamp;
 
 /// Why a cyclic slot hard-stopped.
@@ -107,9 +109,9 @@ impl SlotState {
 
 /// The name and stop reason of one hard-stopped cyclic system, surfaced
 /// through [`Coordinator::stopped`] and the coordinator status frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StoppedSystem {
-    pub name: &'static str,
+    pub name: Arc<str>,
     pub reason: StopReason,
 }
 
@@ -120,7 +122,7 @@ pub(crate) trait CyclicSlot {
     fn init(&mut self);
     fn step(&mut self, now: Timestamp);
     fn shutdown(&mut self);
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     fn state(&self) -> &SlotState;
     /// Host-side step timeouts since last drained. The coordinator folds them
     /// into its own health (the worker owns the system's health ring, so a
@@ -172,9 +174,9 @@ impl WorkerRunState {
 /// an operator learns a system runs out-of-process, and where), the restart
 /// count, and the run state. The same facts ride the status frame's
 /// `workers` list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerStatus {
-    pub name: &'static str,
+    pub name: Arc<str>,
     /// The live worker's pid, or `0` between workers.
     pub pid: u32,
     pub restarts: u32,

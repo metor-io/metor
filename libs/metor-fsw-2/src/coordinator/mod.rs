@@ -85,7 +85,7 @@ use crate::health::{HealthPort, Level};
 use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn, MsgOut};
 use crate::port::{Output, capacity_for};
 use crate::proc::session::SessionDir;
-use crate::registry::{EntrySchema, Registry, RegistryEntry};
+use crate::registry::{Registry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
 use crate::{DEFAULT_DEPTH, Frame};
 
@@ -567,7 +567,7 @@ impl CoordinatorBuilder {
         //   legal), drained each cycle to re-emit the registry on demand for
         //   consumers that missed the boot message.
         let desc = SystemDescriptor {
-            name: COORDINATOR_INSTANCE,
+            name: COORDINATOR_INSTANCE.into(),
             kind: SystemKind::Cyclic,
             inputs: vec![PortDesc::msg::<ReloadSequences>()],
             outputs: vec![
@@ -717,7 +717,7 @@ impl CoordinatorBuilder {
     ) -> SystemHandle {
         let mut desc = loaded.descriptor().clone();
         // Dl systems are cyclic-only: the registered kind is pinned here,
-        // never trusted from the decoded wire mirror.
+        // never trusted from the decoded manifest.
         desc.kind = SystemKind::Cyclic;
         self.push_system(
             desc,
@@ -1097,8 +1097,8 @@ impl CoordinatorBuilder {
             for port in &sys.desc.inputs {
                 if port.fan_in == FanIn::Many && port.delivery == Delivery::Snapshot {
                     return Err(WireError::SnapshotFanIn {
-                        system: sys.desc.name,
-                        port: port.id,
+                        system: sys.desc.name.clone(),
+                        port: port.id(),
                     });
                 }
             }
@@ -1128,7 +1128,7 @@ impl CoordinatorBuilder {
             let out_idx =
                 prod.outputs
                     .iter()
-                    .position(|d| d.id == p.port)
+                    .position(|d| d.id() == p.port)
                     .ok_or(WireError::UnknownPort {
                         system: p.system.id,
                         port: p.port,
@@ -1136,15 +1136,15 @@ impl CoordinatorBuilder {
             let in_idx =
                 cons.inputs
                     .iter()
-                    .position(|d| d.id == c.port)
+                    .position(|d| d.id() == c.port)
                     .ok_or(WireError::UnknownPort {
                         system: c.system.id,
                         port: c.port,
                     })?;
             if !compatible(&prod.outputs[out_idx], &cons.inputs[in_idx]) {
                 return Err(WireError::Incompatible {
-                    producer: prod.name,
-                    consumer: cons.name,
+                    producer: prod.name.clone(),
+                    consumer: cons.name.clone(),
                     port: c.port,
                 });
             }
@@ -1156,7 +1156,7 @@ impl CoordinatorBuilder {
             // exactly a Host output slots read over explicit edges.
             if in_desc.conn != PortConn::Edge {
                 return Err(WireError::HostPort {
-                    system: cons.name,
+                    system: cons.name.clone(),
                     port: c.port,
                 });
             }
@@ -1164,8 +1164,8 @@ impl CoordinatorBuilder {
             // it is meaningless and rejected instead of silently ignored.
             if *delayed && in_desc.delivery == Delivery::Log {
                 return Err(WireError::DelayedLogEdge {
-                    producer: prod.name,
-                    consumer: cons.name,
+                    producer: prod.name.clone(),
+                    consumer: cons.name.clone(),
                     port: c.port,
                 });
             }
@@ -1175,7 +1175,7 @@ impl CoordinatorBuilder {
                 FanIn::One => {
                     if !producers.is_empty() {
                         return Err(WireError::DoubleConnect {
-                            system: cons.name,
+                            system: cons.name.clone(),
                             port: c.port,
                         });
                     }
@@ -1186,8 +1186,8 @@ impl CoordinatorBuilder {
                 FanIn::Many => {
                     if producers.contains(&(p.system.id, out_idx)) {
                         return Err(WireError::DuplicateEdge {
-                            producer: prod.name,
-                            consumer: cons.name,
+                            producer: prod.name.clone(),
+                            consumer: cons.name.clone(),
                             port: c.port,
                         });
                     }
@@ -1208,7 +1208,7 @@ impl CoordinatorBuilder {
             return Err(WireError::FeedbackCycle {
                 systems: cycle
                     .into_iter()
-                    .map(|id| self.systems[id].desc.name)
+                    .map(|id| self.systems[id].desc.name.clone())
                     .collect(),
             });
         }
@@ -1233,7 +1233,7 @@ impl CoordinatorBuilder {
             let in_delivery = cons
                 .inputs
                 .iter()
-                .find(|d| d.id == c.port)
+                .find(|d| d.id() == c.port)
                 .map(|d| d.delivery);
             if in_delivery != Some(Delivery::Snapshot) {
                 continue;
@@ -1241,8 +1241,8 @@ impl CoordinatorBuilder {
             let both_cyclic = prod.kind == SystemKind::Cyclic && cons.kind == SystemKind::Cyclic;
             if both_cyclic && c.system.id < p.system.id {
                 return Err(WireError::StaleFrameEdge {
-                    producer: prod.name,
-                    consumer: cons.name,
+                    producer: prod.name.clone(),
+                    consumer: cons.name.clone(),
                     port: c.port,
                 });
             }
@@ -1259,8 +1259,8 @@ impl CoordinatorBuilder {
                     && !cons_edges.contains_key(&(sid, in_idx))
                 {
                     return Err(WireError::UnconnectedInput {
-                        system: sys.desc.name,
-                        port: port.id,
+                        system: sys.desc.name.clone(),
+                        port: port.id(),
                     });
                 }
             }
@@ -1288,7 +1288,7 @@ impl CoordinatorBuilder {
                     .desc
                     .outputs
                     .iter()
-                    .position(|o| o.id == pid)
+                    .position(|o| o.id() == pid)
                     .expect("a SelfTap names one of the system's own outputs");
                 *fan_out.entry((sid, out_idx)).or_insert(0) += 1;
             }
@@ -1415,19 +1415,18 @@ impl CoordinatorBuilder {
                         alloc.table.rings.push(RingEntry {
                             ring: ring.clone(),
                             frame_id: port
-                                .id
+                                .id()
                                 .component()
                                 .expect("table port keys on a ComponentId"),
                             role,
                             instance: Some(instance),
                         });
                     }
-                    PortSchema::Postcard => {
+                    PortSchema::Postcard { .. } => {
                         // Registered like any buffer; the downlink taps it
                         // unless the port opted out via `telemetered = false`
                         // (a command channel, for example).
-                        let entry =
-                            postcard_entry(&instance, port.name, ring.clone(), port.telemetered);
+                        let entry = registry_entry(&instance, port, ring.clone());
                         alloc.table.rings.push(RingEntry {
                             ring: ring.clone(),
                             frame_id: entry.key,
@@ -1473,7 +1472,7 @@ impl CoordinatorBuilder {
                 alloc.table.rings.push(RingEntry {
                     ring: ring.clone(),
                     frame_id: port
-                        .id
+                        .id()
                         .component()
                         .expect("v1 host-connected inputs are table ports"),
                     role: BufferRole::Private {
@@ -1555,7 +1554,7 @@ impl CoordinatorBuilder {
                 plumbing.async_wakes[sid].push(data);
                 alloc.table.rings.push(RingEntry {
                     ring: private,
-                    frame_id: port.id.component().expect("copy-in inputs are table ports"),
+                    frame_id: port.id().component().expect("copy-in inputs are table ports"),
                     role: BufferRole::Private {
                         system: sid,
                         input: in_idx,
@@ -1635,7 +1634,7 @@ fn freeze_registry(reg_entries: Vec<RegistryEntry>) -> Result<Arc<Registry>, Wir
     for (i, e) in reg_entries.iter().enumerate() {
         if seen_keys.insert(e.key, i).is_some() {
             return Err(WireError::DuplicateRegistryKey {
-                key: format!("{}.{}", e.instance, e.name),
+                key: format!("{}.{}", e.instance, e.name()),
             });
         }
     }
@@ -1786,59 +1785,19 @@ fn wiring_manifest_max_size(ir_json: &str) -> usize {
         .max(MAX_MSG_BYTES)
 }
 
-/// Build a postcard [`RegistryEntry`] for one message channel: the
-/// instance-qualified key `ComponentId::new("<instance>.<name>")` (the on-wire
-/// identity) over a clone of the ring, the [`registry_entry`] sibling for the
-/// self-describing record. No vtable or announce; the record's 2-byte id is
-/// the schema.
-fn postcard_entry(
-    instance: &str,
-    name: &str,
-    ring: RingBuffer,
-    telemetered: bool,
-) -> RegistryEntry {
-    RegistryEntry {
-        key: ComponentId::new(&format!("{instance}.{name}")),
-        instance: Arc::from(instance),
-        name: Arc::from(name),
-        schema: EntrySchema::Postcard,
-        delivery: Delivery::Log,
-        telemetered,
-        ring,
-    }
-}
-
 /// The synthetic instance prefix coordinator-owned buffers register under:
 /// they have no system instance, so their qualified key is
 /// `coordinator.health` / `coordinator.log` / `coordinator.coordinator_status`.
 const COORDINATOR_INSTANCE: &str = "coordinator";
 
-/// Build a [`RegistryEntry`] for one buffer: compute the instance-qualified
-/// key and the prefixed announce vtable and metadata once, capturing a clone
-/// of the ring as the read source.
+/// Build a [`RegistryEntry`] for one buffer: the instance-qualified key over
+/// a clone of the port's descriptor, capturing a clone of the ring as the
+/// read source. The announce form is derived from the descriptor on demand.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer) -> RegistryEntry {
-    let key = ComponentId::new(&format!("{instance}.{}", port.name));
-    // Only table ports come through here (the caller branches on the schema),
-    // so the checked accessors are always `Some`. `announce` is an
-    // `Arc<dyn Fn>` (not directly callable); deref to a `&dyn Fn`.
-    let announce = port
-        .announce()
-        .expect("table port carries an announce factory");
-    let (vtable, metadata) = (**announce)(instance);
     RegistryEntry {
-        key,
+        key: ComponentId::new(&format!("{instance}.{}", port.name)),
         instance: Arc::from(instance),
-        name: Arc::from(port.name),
-        schema: EntrySchema::Table {
-            frame_id: port
-                .id
-                .component()
-                .expect("table port keys on a ComponentId"),
-            vtable,
-            metadata,
-        },
-        delivery: port.delivery,
-        telemetered: port.telemetered,
+        desc: port.clone(),
         ring,
     }
 }
@@ -2207,7 +2166,7 @@ impl Coordinator {
             // Empty/Loaded/Done states are not (the `stop_reason` projection).
             if let Some(reason) = slot.state().stop_reason() {
                 self.stopped_scratch.push(StoppedSystem {
-                    name: slot.name(),
+                    name: Arc::from(slot.name()),
                     reason,
                 });
             }
@@ -2227,9 +2186,9 @@ impl Coordinator {
         self.publish_status(now);
         if stopped_changed {
             for i in 0..self.stopped.len() {
-                let name = self.stopped[i].name;
+                let name = self.stopped[i].name.clone();
                 self.coord_health.error("system_stopped");
-                self.coord_health.log(Level::Warn, name);
+                self.coord_health.log(Level::Warn, &name);
             }
             self.coord_health.end_cycle(now, 0);
         }
@@ -2250,7 +2209,7 @@ impl Coordinator {
         let _ = self.status_out.write_with(&frame, |fw| {
             fw.list(offset_of!(CoordinatorStatus, stopped), |l| {
                 for sys in stopped {
-                    let (name, len) = pack_name(sys.name);
+                    let (name, len) = pack_name(&sys.name);
                     l.push(StoppedEntry {
                         reason: sys.reason.code(),
                         len,
@@ -2261,7 +2220,7 @@ impl Coordinator {
             });
             fw.list(offset_of!(CoordinatorStatus, workers), |l| {
                 for w in workers {
-                    let (name, len) = pack_name(w.name);
+                    let (name, len) = pack_name(&w.name);
                     l.push(WorkerEntry {
                         pid: w.pid,
                         restarts: w.restarts,

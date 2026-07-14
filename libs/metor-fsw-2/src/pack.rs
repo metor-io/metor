@@ -296,7 +296,7 @@ impl Pack {
         outputs.push(crate::PortDesc::of::<crate::SystemHealth>());
         outputs.push(crate::PortDesc::of::<crate::SystemLog>());
         let descriptor = SystemDescriptor {
-            name,
+            name: name.into(),
             kind: crate::SystemKind::Cyclic,
             inputs,
             outputs,
@@ -405,7 +405,7 @@ where
         "pack entries cannot hold capabilities (`{name}` declares one); \
          capability systems stay on the static registry"
     );
-    descriptor.name = name;
+    descriptor.name = name.into();
     let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
         #[cfg(feature = "wiring")]
         let msgs = match &params {

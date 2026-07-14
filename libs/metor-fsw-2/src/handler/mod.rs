@@ -180,7 +180,7 @@ fn descriptor_for<P: ExecParamSet>(name: &'static str) -> SystemDescriptor {
     outputs.push(PortDesc::of::<SystemHealth>());
     outputs.push(PortDesc::of::<SystemLog>());
     SystemDescriptor {
-        name,
+        name: name.into(),
         kind: SystemKind::Cyclic,
         inputs,
         outputs,

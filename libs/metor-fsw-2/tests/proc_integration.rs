@@ -216,7 +216,7 @@ fn locate_fixture(package: &str, stem: &str) -> Option<PathBuf> {
 fn proc_descriptor(lib_path: &Path, system: &str) -> metor_fsw_2::SystemDescriptor {
     let bytes = metor_fsw_2::proc::describe_via_worker(None, lib_path)
         .expect("describe worker over the fixture");
-    let manifest: metor_fsw_2::abi::PackManifestMsg =
+    let manifest: metor_fsw_2::abi::PackManifest =
         postcard::from_bytes(&bytes).expect("pack manifest bytes decode");
     manifest
         .systems
@@ -224,7 +224,6 @@ fn proc_descriptor(lib_path: &Path, system: &str) -> metor_fsw_2::SystemDescript
         .find(|s| s.descriptor.name == system)
         .unwrap_or_else(|| panic!("the pack exports `{system}`"))
         .descriptor
-        .into_descriptor()
 }
 
 fn counter_params() -> Vec<u8> {
@@ -354,7 +353,7 @@ fn lockstep_end_to_end(lib_path: &Path) {
     // dl twin appears nowhere here).
     let workers = coord.workers();
     assert_eq!(workers.len(), 1, "one process system: {workers:?}");
-    assert_eq!(workers[0].name, "proc_counter");
+    assert_eq!(&*workers[0].name, "proc_counter");
     assert_eq!(workers[0].pid, spawned[0], "the telemetered pid is the child's");
     assert_eq!(workers[0].restarts, 0);
     assert_eq!(workers[0].state, WorkerRunState::Running);
@@ -451,7 +450,7 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     // The death is a permanent, telemetered stop...
     let stopped = coord.stopped();
     assert_eq!(stopped.len(), 1, "the killed worker is reported: {stopped:?}");
-    assert_eq!(stopped[0].name, "proc_counter");
+    assert_eq!(&*stopped[0].name, "proc_counter");
     assert_eq!(stopped[0].reason, StopReason::ProcessDied);
     // ...and the worker list reflects it: no live pid, no restarts granted.
     let workers = coord.workers();
@@ -826,7 +825,7 @@ fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
     // its roles through Done, and no unplanned death was counted.
     let workers = coord.workers();
     assert_eq!(workers.len(), 1, "{workers:?}");
-    assert_eq!(workers[0].name, "adcs");
+    assert_eq!(&*workers[0].name, "adcs");
     assert_eq!(workers[0].pid, pid_b, "the telemetered pid is napper's worker");
     assert_eq!(workers[0].restarts, 0, "Loads are commanded, not deaths");
     assert_eq!(workers[0].state, WorkerRunState::Running);

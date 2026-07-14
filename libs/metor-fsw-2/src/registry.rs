@@ -27,26 +27,7 @@ use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
 
 use crate::binder::RingSource;
-use crate::descriptor::{Capability, Delivery, PortDecl};
-
-/// How a tap decodes an entry's records.
-pub enum EntrySchema {
-    /// Announce-then-Table wire form.
-    Table {
-        /// The unprefixed frame id (`ComponentId::new("imu")`), shared across
-        /// instances of the same system.
-        frame_id: ComponentId,
-        /// The announce vtable with instance-prefixed
-        /// `<instance>.<frame>.<field>` ids, computed once at build time from
-        /// the port's announce factory.
-        vtable: VTable,
-        /// The prefixed component metadata, parallel to `vtable`.
-        metadata: Vec<ComponentMetadata>,
-    },
-    /// Self-describing `(PacketId, postcard)` records. The 2-byte id is read
-    /// from each record, so there is no vtable and no announce.
-    Postcard,
-}
+use crate::descriptor::{Capability, Delivery, PortDecl, PortDesc, PortSchema};
 
 /// One tappable buffer, indexed by its instance-qualified id.
 pub struct RegistryEntry {
@@ -56,21 +37,11 @@ pub struct RegistryEntry {
     pub key: ComponentId,
     /// The owning system's instance name (`"imu_left"`), or `"coordinator"`
     /// for the coordinator-owned buffers. Kept for human-readable subset
-    /// filtering.
+    /// filtering and as the announce prefix.
     pub instance: Arc<str>,
-    /// The port name within the instance, taken from `F::NAME`, `M::NAME`,
-    /// or an explicit coordinator channel string such as `"sequences"`.
-    pub name: Arc<str>,
-    /// How a tap decodes this entry's records.
-    pub schema: EntrySchema,
-    /// How a broad reader drains this entry, coalescing to the newest record
-    /// ([`Snapshot`](Delivery::Snapshot)) or taking every record in order
-    /// ([`Log`](Delivery::Log)).
-    pub delivery: Delivery,
-    /// Whether [`AllOutputs`] exposes this entry. Untelemetered entries stay
-    /// registered and remain visible by key through the full [`Registry`],
-    /// but are filtered out of every [`AllOutputs`] surface.
-    pub telemetered: bool,
+    /// The registered port's descriptor: its name, schema, delivery, and
+    /// telemetry flag, exactly as the owning system declared them.
+    pub desc: PortDesc,
     /// The read source. Crate-private so external callers must go through
     /// [`view()`](Self::view) and claim a slot-accounted reader rather than
     /// touching the raw buffer.
@@ -78,6 +49,44 @@ pub struct RegistryEntry {
 }
 
 impl RegistryEntry {
+    /// The port name within the instance, taken from `F::NAME`, `M::NAME`,
+    /// or an explicit coordinator channel string such as `"sequences"`.
+    pub fn name(&self) -> &str {
+        &self.desc.name
+    }
+
+    /// How a broad reader drains this entry, coalescing to the newest record
+    /// ([`Snapshot`](Delivery::Snapshot)) or taking every record in order
+    /// ([`Log`](Delivery::Log)).
+    pub fn delivery(&self) -> Delivery {
+        self.desc.delivery
+    }
+
+    /// Whether [`AllOutputs`] exposes this entry. Untelemetered entries stay
+    /// registered and remain visible by key through the full [`Registry`],
+    /// but are filtered out of every [`AllOutputs`] surface.
+    pub fn telemetered(&self) -> bool {
+        self.desc.telemetered
+    }
+
+    /// The unprefixed frame id of a Table entry (`ComponentId::new("imu")`,
+    /// shared across instances of the same system), or `None` for a
+    /// self-describing Postcard entry.
+    pub fn frame_id(&self) -> Option<ComponentId> {
+        match &self.desc.schema {
+            PortSchema::Table { frame_id, .. } => Some(*frame_id),
+            PortSchema::Postcard { .. } => None,
+        }
+    }
+
+    /// The announce form of a Table entry: the vtable and metadata with
+    /// instance-prefixed `<instance>.<frame>.<field>` ids, the identities a
+    /// tap wires records to. `None` for a Postcard entry, whose records are
+    /// self-describing.
+    pub fn announce(&self) -> Option<(VTable, Vec<ComponentMetadata>)> {
+        self.desc.announce(&self.instance)
+    }
+
     /// Claim a read [`View`] into this buffer, consuming one reader slot.
     ///
     /// Fails with [`FullReaderTable`] if the buffer's build-time slot budget
@@ -188,13 +197,13 @@ impl AllOutputs {
     /// Every telemetered entry, in build order. This is the only iteration
     /// surface.
     pub fn entries(&self) -> impl Iterator<Item = &RegistryEntry> {
-        self.registry.entries().iter().filter(|e| e.telemetered)
+        self.registry.entries().iter().filter(|e| e.telemetered())
     }
 
     /// Look up one telemetered entry by its instance-qualified id. An
     /// untelemetered entry returns `None`.
     pub fn get(&self, key: ComponentId) -> Option<&RegistryEntry> {
-        self.registry.get(key).filter(|e| e.telemetered)
+        self.registry.get(key).filter(|e| e.telemetered())
     }
 
     /// Always zero, since a tap only reads. Present so the generated

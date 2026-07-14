@@ -1252,7 +1252,7 @@ fn registered_descriptor_is_the_extended_occupant_shape() {
 
     // The fixture has no user ports, so the shape is exactly the implicit
     // occupant prefix plus the runner tail.
-    let ins: Vec<(&str, PortConn)> = d.inputs.iter().map(|p| (p.name, p.conn)).collect();
+    let ins: Vec<(&str, PortConn)> = d.inputs.iter().map(|p| (p.name.as_str(), p.conn)).collect();
     assert_eq!(ins.len(), 3, "{ins:?}");
     assert_eq!(ins[0], ("slot_control", PortConn::Host), "{ins:?}");
     assert_eq!(ins[1].0, "SequenceCommand");
@@ -1265,7 +1265,7 @@ fn registered_descriptor_is_the_extended_occupant_shape() {
         "{ins:?}"
     );
 
-    let outs: Vec<(&str, PortConn)> = d.outputs.iter().map(|p| (p.name, p.conn)).collect();
+    let outs: Vec<(&str, PortConn)> = d.outputs.iter().map(|p| (p.name.as_str(), p.conn)).collect();
     assert_eq!(outs.len(), 5, "{outs:?}");
     // The occupant prefix is the entry's own outputs (health/log tail) with
     // the mount-appended SequenceStatus after them.
@@ -1280,7 +1280,7 @@ fn registered_descriptor_is_the_extended_occupant_shape() {
     // The events channel keys "<slot>.sequences" and stays telemetered.
     assert_eq!(outs[4], ("sequences", PortConn::Host), "{outs:?}");
     assert_eq!(
-        d.outputs[4].id,
+        d.outputs[4].id(),
         PortId::Packet(metor_fsw_2::metor_proto_wkt::SequenceChannelEvent::ID)
     );
     assert!(d.outputs[4].telemetered, "the events channel is downlinked");

@@ -760,7 +760,7 @@ enum EntrySource<'a> {
     },
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Described {
-        entries: &'a [crate::dl::PackEntryMeta],
+        entries: &'a [crate::abi::PackEntryDesc],
         artifact: &'a str,
     },
 }
@@ -784,7 +784,7 @@ impl EntrySource<'_> {
             EntrySource::Opened { pack, .. } => pack.sole_system(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             EntrySource::Described { entries, .. } => match entries {
-                [only] => Some(only.descriptor.name),
+                [only] => Some(only.descriptor.name.as_str()),
                 _ => None,
             },
         }
@@ -1018,7 +1018,7 @@ fn resolve_proc(
     };
     let bytes = crate::proc::host::describe_via_worker(None, path)
         .map_err(|e| proc_describe(e.to_string()))?;
-    let entries: Vec<crate::dl::PackEntryMeta> =
+    let entries: Vec<crate::abi::PackEntryDesc> =
         crate::dl::decode_pack_manifest(&bytes).map_err(|e| proc_describe(e.to_string()))?;
     let source = EntrySource::Described {
         entries: &entries,
@@ -1299,7 +1299,7 @@ fn resolve_slot(
         if !registered
             .inputs
             .iter()
-            .any(|p| p.conn == PortConn::Edge && p.name == frame)
+            .any(|p| p.conn == PortConn::Edge && &p.name == frame)
         {
             return Err(LoadErrorKind::SlotContractMismatch {
                 slot: slot.name.clone(),
@@ -1313,7 +1313,7 @@ fn resolve_slot(
         if !registered
             .outputs
             .iter()
-            .any(|p| p.conn == PortConn::Edge && p.name == frame)
+            .any(|p| p.conn == PortConn::Edge && &p.name == frame)
         {
             return Err(LoadErrorKind::SlotContractMismatch {
                 slot: slot.name.clone(),
@@ -1345,9 +1345,9 @@ fn describe_occupants(
 ) -> Result<Vec<AllowedOccupant>, LoadError> {
     // Manifests by artifact id, so a slot allowing several entries of one
     // pack runs one describe worker for it, not one per occupant.
-    let mut manifests: HashMap<String, Vec<crate::dl::PackEntryMeta>> = HashMap::new();
+    let mut manifests: HashMap<String, Vec<crate::abi::PackEntryDesc>> = HashMap::new();
     fn describe(
-        manifests: &mut HashMap<String, Vec<crate::dl::PackEntryMeta>>,
+        manifests: &mut HashMap<String, Vec<crate::abi::PackEntryDesc>>,
         wiring: &Wiring,
         slot: &SlotSpec,
         artifact_id: &str,
@@ -1501,11 +1501,11 @@ fn resolve_msg_edge(
     let by_name = |ports: &[crate::descriptor::PortDesc], token: &str| {
         ports
             .iter()
-            .find(|p| matches!(p.id, PortId::Packet(_)) && p.name == token)
-            .map(|p| p.id)
+            .find(|p| matches!(p.id(), PortId::Packet(_)) && p.name == token)
+            .map(|p| p.id())
     };
     let by_id = |ports: &[crate::descriptor::PortDesc], id: PortId| {
-        ports.iter().find(|p| p.id == id).map(|p| p.id)
+        ports.iter().find(|p| p.id() == id).map(|p| p.id())
     };
     let unknown = |instance: &str, msg: &str| {
         LoadErrorKind::UnknownMsg {
@@ -1562,7 +1562,7 @@ fn resolve_endpoint(
     let port = match kind {
         EdgeKind::Frame => {
             let id = PortId::Component(ComponentId::new(port_name));
-            if !ports.iter().any(|p| p.id == id) {
+            if !ports.iter().any(|p| p.id() == id) {
                 return Err(LoadErrorKind::UnknownFrame {
                     instance: name.to_string(),
                     frame: port_name.to_string(),
@@ -1577,9 +1577,9 @@ fn resolve_endpoint(
         EdgeKind::Msg => {
             let found = ports
                 .iter()
-                .find(|p| matches!(p.id, PortId::Packet(_)) && p.name == port_name);
+                .find(|p| matches!(p.id(), PortId::Packet(_)) && p.name == port_name);
             match found {
-                Some(p) => p.id,
+                Some(p) => p.id(),
                 None => {
                     return Err(LoadErrorKind::UnknownMsg {
                         instance: name.to_string(),

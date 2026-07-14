@@ -29,8 +29,8 @@ use sha2::{Digest, Sha256};
 
 use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
 
-use crate::abi::{PackManifestMsg, PortDescMsg, PortSchemaMsg, SystemDescriptorMsg};
-use crate::descriptor::{Delivery, FanIn};
+use crate::abi::{PackEntryDesc, PackManifest};
+use crate::descriptor::{Delivery, FanIn, PortDesc, PortSchema};
 
 use super::model::Wiring;
 use super::{BuildOptions, WiringBuilder, build_artifacts};
@@ -337,7 +337,7 @@ pub fn render_module(
     lib: &str,
     manifest_bytes: &[u8],
 ) -> Result<String, StubgenError> {
-    let msg: PackManifestMsg =
+    let msg: PackManifest =
         postcard::from_bytes(manifest_bytes).map_err(|e| StubgenError::Manifest {
             id: id.to_string(),
             detail: format!("manifest does not decode: {e}"),
@@ -351,7 +351,7 @@ pub fn render_module(
     // easier to read and diff).
     let mut bodies: Vec<String> = Vec::new();
     for sys in &msg.systems {
-        bodies.push(cg.entry(&sys.descriptor, sys.params_default.as_deref()));
+        bodies.push(cg.entry(sys));
     }
 
     let mut out = String::new();
@@ -472,7 +472,8 @@ impl Codegen {
 
     /// Render one manifest entry: a `System` subclass for a CapWords name, a
     /// module-level occupant callable for a snake_case (sequence task) name.
-    fn entry(&mut self, desc: &SystemDescriptorMsg, defaults: Option<&[u8]>) -> String {
+    fn entry(&mut self, entry: &PackEntryDesc) -> String {
+        let desc = &entry.descriptor;
         // Collect port markers first so annotations can reference them.
         for port in desc.inputs.iter().chain(desc.outputs.iter()) {
             self.marker_name(port);
@@ -482,25 +483,26 @@ impl Codegen {
             .chars()
             .next()
             .is_some_and(char::is_uppercase);
-        let params = self.params(&desc.params_schema, defaults);
+        let params = self.params(&entry.params_schema, entry.params_default.as_deref());
         if is_class {
-            self.render_class(desc, &params)
+            self.render_class(entry, &params)
         } else {
-            self.render_occupant(desc, &params)
+            self.render_occupant(entry, &params)
         }
     }
 
     /// A `System` subclass: a typed keyword-only `__init__` plus class-level
     /// port annotations (checker-only; runtime access returns handles).
-    fn render_class(&mut self, desc: &SystemDescriptorMsg, params: &[Param]) -> String {
+    fn render_class(&mut self, entry: &PackEntryDesc, params: &[Param]) -> String {
         self.used_system = true;
+        let desc = &entry.descriptor;
         let name = &desc.name;
         let mut out = format!("class {name}(System):\n");
         out.push_str(&docstring(
             1,
             &format!("`{name}` pack entry."),
             params,
-            &desc.params_docs,
+            &entry.params_docs,
         ));
         out.push('\n');
         out.push_str(&init_signature(params));
@@ -518,22 +520,22 @@ impl Codegen {
 
     /// A sequence occupant: a module-level function with the same typed kwargs,
     /// returning an occupant spec bound to this artifact.
-    fn render_occupant(&mut self, desc: &SystemDescriptorMsg, params: &[Param]) -> String {
+    fn render_occupant(&mut self, entry: &PackEntryDesc, params: &[Param]) -> String {
         self.used_system = true;
-        let name = &desc.name;
+        let name = &entry.descriptor.name;
         let sig = occupant_signature(name, params);
         let doc = docstring(
             1,
             &format!("Occupant `{name}` for a `mode`-style slot's allow set."),
             params,
-            &desc.params_docs,
+            &entry.params_docs,
         );
         let body = occupant_body(name, params);
         format!("{sig}{doc}{body}")
     }
 
     /// The class-level `port: OutPort[Frame]  # …` annotation block.
-    fn port_annotations(&mut self, desc: &SystemDescriptorMsg) -> String {
+    fn port_annotations(&mut self, desc: &crate::descriptor::SystemDescriptor) -> String {
         let mut out = String::new();
         for port in &desc.inputs {
             out.push_str(&self.port_line(port, true));
@@ -544,7 +546,7 @@ impl Codegen {
         out
     }
 
-    fn port_line(&mut self, port: &PortDescMsg, input: bool) -> String {
+    fn port_line(&mut self, port: &PortDesc, input: bool) -> String {
         let marker = self.marker_name(port);
         let wrapper = if input {
             self.used_inport = true;
@@ -579,9 +581,9 @@ impl Codegen {
     /// the port name) and using the shared `Msg` marker for a self-describing
     /// Postcard port. Idempotent per frame id — the first caller's name wins,
     /// so the collection pass and the annotation pass agree.
-    fn marker_name(&mut self, port: &PortDescMsg) -> String {
+    fn marker_name(&mut self, port: &PortDesc) -> String {
         match &port.schema {
-            PortSchemaMsg::Table {
+            PortSchema::Table {
                 frame_id, metadata, ..
             } => {
                 let id = frame_id.0;
@@ -601,7 +603,7 @@ impl Codegen {
                 self.frame_by_id.push((id, name.clone()));
                 name
             }
-            PortSchemaMsg::Postcard { .. } => {
+            PortSchema::Postcard { .. } => {
                 self.used_msg = true;
                 "Msg".to_string()
             }
@@ -1008,7 +1010,7 @@ fn pascal_case(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::{PackManifestMsg, PackSystemMsg};
+    use crate::abi::PackManifest;
     use crate::descriptor::SystemKind;
     use metor_proto::types::ComponentId;
     use metor_proto::vtable::VTable;
@@ -1068,11 +1070,11 @@ mod tests {
         assert_eq!(by("limit").default.as_deref(), Some("None"));
     }
 
-    fn table_port(name: &str, frame: &str, telemetered: bool) -> PortDescMsg {
-        PortDescMsg {
+    fn table_port(name: &str, frame: &str, telemetered: bool) -> PortDesc {
+        PortDesc {
             name: name.to_string(),
             max_size: 16,
-            schema: PortSchemaMsg::Table {
+            schema: PortSchema::Table {
                 frame_id: ComponentId::new(frame),
                 vtable: VTable::default(),
                 metadata: vec![ComponentMetadata::from(format!("{frame}.value").as_str())],
@@ -1080,34 +1082,40 @@ mod tests {
             delivery: Delivery::Snapshot,
             fan_in: FanIn::One,
             telemetered,
+            conn: Default::default(),
         }
     }
 
-    fn msg_port(name: &str) -> PortDescMsg {
-        PortDescMsg {
+    fn msg_port(name: &str) -> PortDesc {
+        PortDesc {
             name: name.to_string(),
             max_size: 8,
-            schema: PortSchemaMsg::Postcard { id: [7, 0] },
+            schema: PortSchema::Postcard { id: [7, 0] },
             delivery: Delivery::Log,
             fan_in: FanIn::One,
             telemetered: false,
+            conn: Default::default(),
         }
     }
 
-    fn descriptor(
+    fn entry_desc(
         name: &str,
-        inputs: Vec<PortDescMsg>,
-        outputs: Vec<PortDescMsg>,
+        inputs: Vec<PortDesc>,
+        outputs: Vec<PortDesc>,
         params_docs: Vec<(String, String)>,
-    ) -> SystemDescriptorMsg {
-        SystemDescriptorMsg {
-            name: name.to_string(),
-            kind: SystemKind::Cyclic,
-            inputs,
-            outputs,
+    ) -> PackEntryDesc {
+        PackEntryDesc {
+            descriptor: crate::descriptor::SystemDescriptor {
+                name: name.to_string(),
+                kind: SystemKind::Cyclic,
+                inputs,
+                outputs,
+                capabilities: Vec::new(),
+            },
             params_schema: demo_schema(),
-            capabilities: Vec::new(),
             params_docs,
+            reloadable: true,
+            params_default: None,
         }
     }
 
@@ -1117,25 +1125,20 @@ mod tests {
             ("count".to_string(), "How many widgets to make.".to_string()),
             ("gain".to_string(), "Loop gain (1/s), ~3e-12 at 400 km.".to_string()),
         ];
-        let msg = PackManifestMsg {
+        let msg = PackManifest {
             systems: vec![
-                PackSystemMsg {
-                    descriptor: descriptor(
+                PackEntryDesc {
+                    params_default: Some(blob),
+                    ..entry_desc(
                         "Widget",
                         vec![table_port("cmd", "cmd", false)],
                         vec![table_port("sensors", "sensors", true), msg_port("events")],
                         widget_docs,
-                    ),
-                    reloadable: true,
-                    params_default: Some(blob),
+                    )
                 },
-                PackSystemMsg {
-                    descriptor: SystemDescriptorMsg {
-                        params_schema: OwnedNamedType::from(<() as Schema>::SCHEMA),
-                        ..descriptor("startup", Vec::new(), vec![table_port("mode_cmd", "mode_cmd", true)], Vec::new())
-                    },
-                    reloadable: true,
-                    params_default: None,
+                PackEntryDesc {
+                    params_schema: OwnedNamedType::from(<() as Schema>::SCHEMA),
+                    ..entry_desc("startup", Vec::new(), vec![table_port("mode_cmd", "mode_cmd", true)], Vec::new())
                 },
             ],
         };

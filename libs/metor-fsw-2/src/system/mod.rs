@@ -303,7 +303,7 @@ fn descriptor_for<I: SystemInput, O: SystemOutput>(
     let (outputs, out_caps) = split_decls(<O as SystemOutput>::decls());
     capabilities.extend(out_caps);
     SystemDescriptor {
-        name,
+        name: name.into(),
         kind,
         inputs,
         outputs,

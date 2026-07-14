@@ -166,14 +166,14 @@ pub use coordinator::{
     WorkerStatus,
 };
 
-pub use registry::{AllOutputs, EntrySchema, Registry, RegistryEntry};
+pub use registry::{AllOutputs, Registry, RegistryEntry};
 pub use telemetry::{
     DownlinkParams, RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
     TelemetrySystem, Transport, TransportError, UplinkParams, UplinkSystem,
 };
 
 pub use descriptor::{
-    AnnounceFn, Capability, Delivery, FanIn, Hz, PortConn, PortDecl, PortDesc, PortId, PortSchema,
+    Capability, Delivery, FanIn, Hz, PortConn, PortDecl, PortDesc, PortId, PortSchema,
     SystemDescriptor, SystemKind, split_decls,
 };
 pub use health::{

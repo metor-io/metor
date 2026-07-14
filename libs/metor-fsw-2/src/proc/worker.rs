@@ -49,7 +49,7 @@ pub enum WorkerManifest {
     Describe {
         /// The pack cdylib to describe.
         artifact: PathBuf,
-        /// Where to write the postcard `PackManifestMsg` bytes.
+        /// Where to write the postcard [`PackManifest`](crate::abi::PackManifest) bytes.
         out: PathBuf,
     },
     /// Drive one system instance until told to shut down.

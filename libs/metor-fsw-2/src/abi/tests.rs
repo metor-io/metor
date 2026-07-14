@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::abi::{
-    FswRing, FswStatus, PackManifestMsg, PortDescMsg, PortSchemaMsg, ROLE_INPUT, ROLE_OUTPUT,
-    SystemDescriptorMsg, run_pack_bind_init, run_pack_close, run_pack_create, run_pack_describe,
-    run_pack_destroy, run_pack_execute, run_pack_open, run_pack_shutdown,
+    FswRing, FswStatus, PackManifest, ROLE_INPUT, ROLE_OUTPUT, run_pack_bind_init, run_pack_close,
+    run_pack_create, run_pack_describe, run_pack_destroy, run_pack_execute, run_pack_open,
+    run_pack_shutdown,
 };
 use crate::sequence::{Outcome, SequenceStatus, SlotControlIn, wait};
 use crate::{
@@ -305,7 +305,7 @@ fn pack_create_bounds_and_reuse() {
 }
 
 // ---------------------------------------------------------------------------
-// Descriptor round-trip through fsw_describe and postcard.
+// Manifest round-trip through fsw_pack_describe and postcard.
 // ---------------------------------------------------------------------------
 
 extern "C" fn collect_bytes(ctx: *mut c_void, buf: *const u8, len: usize) {
@@ -324,7 +324,7 @@ fn abi_describe_round_trips() {
     let rc = unsafe { run_pack_describe(pack.0, collect_bytes, &mut buf as *mut Vec<u8> as *mut c_void) };
     assert_eq!(rc, 0, "fsw_pack_describe succeeded");
 
-    let manifest: PackManifestMsg = postcard::from_bytes(&buf).expect("manifest decodes");
+    let manifest: PackManifest = postcard::from_bytes(&buf).expect("manifest decodes");
     assert_eq!(manifest.systems.len(), 4, "one entry per pack registration");
     assert!(manifest.systems.iter().all(|s| s.reloadable));
 
@@ -345,35 +345,35 @@ fn abi_describe_round_trips() {
         "the macro's defaults probe rides the manifest"
     );
 
-    let msg = manifest.systems[COUNTER as usize].descriptor.clone();
+    let entry = &manifest.systems[COUNTER as usize];
+    let got = &entry.descriptor;
     let desc = {
         let mut d = <Counter as CyclicSystem>::descriptor();
-        d.name = "counter";
+        d.name = "counter".into();
         d
     };
 
-    assert_eq!(msg.name, "counter");
-    assert_eq!(msg.kind, SystemKind::Cyclic);
+    assert_eq!(got.name, "counter");
+    assert_eq!(got.kind, SystemKind::Cyclic);
 
     // Ports and frame ids match the static descriptor.
-    assert_eq!(msg.inputs.len(), desc.inputs.len());
-    assert_eq!(msg.inputs.len(), 1);
-    let table_frame_id = |m: &PortDescMsg| match &m.schema {
-        PortSchemaMsg::Table { frame_id, .. } => *frame_id,
-        PortSchemaMsg::Postcard { .. } => panic!("expected a Table port"),
-    };
-    assert_eq!(table_frame_id(&msg.inputs[0]), TickIn::FRAME_ID);
+    assert_eq!(got.inputs.len(), desc.inputs.len());
+    assert_eq!(got.inputs.len(), 1);
     assert_eq!(
-        table_frame_id(&msg.inputs[0]),
-        desc.inputs[0].id.component().expect("table port")
+        got.inputs[0].id().component().expect("table port"),
+        TickIn::FRAME_ID
     );
+    assert_eq!(got.inputs[0].id(), desc.inputs[0].id());
 
     // The user `out` plus the implicit health and log ports.
-    assert_eq!(msg.outputs.len(), desc.outputs.len());
-    assert_eq!(msg.outputs.len(), 3);
-    assert_eq!(table_frame_id(&msg.outputs[0]), TickOut::FRAME_ID);
-    for (m, d) in msg.outputs.iter().zip(&desc.outputs) {
-        assert_eq!(table_frame_id(m), d.id.component().expect("table port"));
+    assert_eq!(got.outputs.len(), desc.outputs.len());
+    assert_eq!(got.outputs.len(), 3);
+    assert_eq!(
+        got.outputs[0].id().component().expect("table port"),
+        TickOut::FRAME_ID
+    );
+    for (m, d) in got.outputs.iter().zip(&desc.outputs) {
+        assert_eq!(m.id(), d.id());
         assert_eq!(m.name, d.name);
         // The axes and the telemetry flag ride the wire verbatim.
         assert_eq!(m.delivery, d.delivery);
@@ -382,20 +382,12 @@ fn abi_describe_round_trips() {
     }
 
     // A static system declares no host capabilities.
-    assert!(msg.capabilities.is_empty());
+    assert!(got.capabilities.is_empty());
 
     assert_eq!(
-        msg.params_schema,
+        entry.params_schema,
         OwnedNamedType::from(<CounterParams as Schema>::SCHEMA),
         "Params schema round-trips"
-    );
-
-    // The message reconstructs a usable descriptor on the host side.
-    let rebuilt = msg.into_descriptor();
-    assert_eq!(rebuilt.name, "counter");
-    assert_eq!(
-        rebuilt.inputs[0].id.component().expect("table port"),
-        TickIn::FRAME_ID
     );
 }
 
@@ -414,16 +406,15 @@ fn realized_ids(vt: &VTable) -> Vec<ComponentId> {
 
 #[test]
 fn dl_announce_prefixes_vtable_ids() {
-    // Lower to the wire and reconstruct, exactly as a host loading the
-    // descriptor would.
+    // Round-trip the descriptor through postcard, exactly as a host loading
+    // it from a manifest would.
     let desc = <Counter as CyclicSystem>::descriptor();
-    let schema = OwnedNamedType::from(<CounterParams as Schema>::SCHEMA);
-    let msg = SystemDescriptorMsg::lower(&desc, schema, Vec::new());
-    let rebuilt = msg.into_descriptor();
+    let bytes = postcard::to_allocvec(&desc).expect("descriptor encodes");
+    let rebuilt: crate::SystemDescriptor = postcard::from_bytes(&bytes).expect("decodes");
 
     // The user output `out` (frame `tick_out`, field `count`) is outputs[0].
     let port = &rebuilt.outputs[0];
-    let (vtable, metadata) = (port.announce().expect("table port"))("inst");
+    let (vtable, metadata) = port.announce("inst").expect("table port");
 
     assert!(
         metadata
@@ -640,11 +631,207 @@ fn seq_abi_runs_to_done() {
 }
 
 // ---------------------------------------------------------------------------
-// PortDescMsg: both schema arms round-trip through postcard with their axes.
+// Announce equivalence: the data path (carried unprefixed vtable + metadata,
+// re-prefixed on the host) realizes identically to the static announce path.
+// This is the invariant the merged descriptor family rests on. The contract is
+// realized identity — same component ids, types, shapes, frames, and dynamic
+// paths — not byte identity; every consumer realizes the vtable rather than
+// comparing its serialized bytes.
+// ---------------------------------------------------------------------------
+
+/// The static announce of `F` under `prefix`: what a statically linked system
+/// bakes into its output vtable and metadata.
+fn static_announce<F: Frame>(prefix: &str) -> (VTable, Vec<metor_proto_wkt::ComponentMetadata>) {
+    crate::descriptor::announce_of::<F>(prefix)
+}
+
+/// The data announce of `F` under `prefix`: the port carries the unprefixed
+/// vtable and metadata (round-tripped through postcard, exactly as a loaded
+/// pack's port crosses the boundary), and the prefixed form is re-derived
+/// with no static frame type.
+fn data_announce<F: Frame>(prefix: &str) -> (VTable, Vec<metor_proto_wkt::ComponentMetadata>) {
+    let desc = crate::PortDesc::of::<F>();
+    let bytes = postcard::to_allocvec(&desc).expect("port desc encodes");
+    let rd: crate::PortDesc = postcard::from_bytes(&bytes).expect("port desc decodes");
+    rd.announce(prefix).expect("a Table port announces")
+}
+
+/// A frame with a nested dynamic member (`FrameMap`) beside its scalars, so
+/// the announce carries both plain leaf ids and a dynamic-member template.
+#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "probe_dyn")]
+struct ProbeDyn {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    scalar: f64,
+    counts: crate::dynamic::FrameMap<u64, 4>,
+}
+
+/// A named-axes 3-vector field, standing in for the nox spatial types: its
+/// metadata carries `element_names`, which the announce path must not drop.
+#[derive(IntoBytes, Immutable, KnownLayout, FromBytes, Default, Clone, Copy)]
+#[repr(transparent)]
+struct Axes([f64; 3]);
+
+impl crate::AsVTable for Axes {
+    fn vtable_fields(
+        path: impl crate::path::ComponentPath,
+    ) -> impl Iterator<Item = metor_proto::vtable::builder::FieldBuilder> {
+        use metor_proto::types::PrimType;
+        use metor_proto::vtable::builder::{component, raw_field, schema};
+        core::iter::once(raw_field(
+            0,
+            (3 * size_of::<f64>()) as u32,
+            schema(PrimType::F64, &[3], component(path.to_component_id())),
+        ))
+    }
+}
+
+impl crate::Metadatatize for Axes {
+    fn metadata(
+        prefix: impl crate::path::ComponentPath,
+    ) -> impl Iterator<Item = metor_proto_wkt::ComponentMetadata> {
+        core::iter::once(prefix.to_metadata().with_element_names(["x", "y", "z"]))
+    }
+}
+
+impl metor_proto::com_de::AsComponentView for Axes {
+    fn as_component_view(&self) -> metor_proto::types::ComponentView<'_> {
+        self.0.as_component_view()
+    }
+}
+
+impl metor_proto::com_de::FromComponentView for Axes {
+    fn from_component_view(
+        view: metor_proto::types::ComponentView<'_>,
+    ) -> Result<Self, metor_proto::error::Error> {
+        <[f64; 3]>::from_component_view(view).map(Axes)
+    }
+}
+
+/// A frame with an element-named vector field beside a scalar.
+#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "probe_axes")]
+struct ProbeAxes {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    omega_b: Axes,
+}
+
+/// Everything registration-mode realization surfaces about one field: the
+/// component identity, its schema, its frame tag, and whether it came through
+/// a dynamic terminal.
+#[derive(Debug, PartialEq)]
+struct RealizedShape {
+    component_id: ComponentId,
+    ty: metor_proto::types::PrimType,
+    shape: Vec<usize>,
+    frame: Option<ComponentId>,
+    dynamic: bool,
+}
+
+fn realized_shapes(vt: &VTable) -> Vec<RealizedShape> {
+    vt.realize_fields(None)
+        .map(|f| {
+            let f = f.expect("announce vtable realizes");
+            RealizedShape {
+                component_id: f.component_id,
+                ty: f.ty,
+                shape: f.shape.to_vec(),
+                frame: f.frame,
+                dynamic: f.dynamic,
+            }
+        })
+        .collect()
+}
+
+/// The resolved name strings of every dynamic terminal (`Op::List`/`Op::Map`),
+/// in op order — the strings the prefix rewrite must carry the instance name
+/// onto for top-level dynamics and leave element-relative for nested ones.
+fn dynamic_terminal_names(vt: &VTable) -> Vec<String> {
+    use metor_proto::vtable::Op;
+    vt.ops
+        .iter()
+        .filter_map(|op| {
+            let name = match op {
+                Op::List { name, .. } | Op::Map { name, .. } => *name,
+                _ => return None,
+            };
+            let Ok(Op::Data { offset, len }) = vt.get_op(name) else {
+                return None;
+            };
+            let bytes = &vt.data.as_slice()[offset.to_index()..offset.to_index() + *len as usize];
+            Some(String::from_utf8(bytes.to_vec()).expect("dynamic name is UTF-8"))
+        })
+        .collect()
+}
+
+/// Assert the data announce realizes identically to the static announce of
+/// `F`: the full realized field set, the metadata vector, and the resolved
+/// dynamic path strings.
+fn assert_announce_eq<F: Frame>(prefix: &str) {
+    let (svt, smeta) = static_announce::<F>(prefix);
+    let (dvt, dmeta) = data_announce::<F>(prefix);
+    assert_eq!(
+        realized_shapes(&svt),
+        realized_shapes(&dvt),
+        "realized field sets match for prefix {prefix:?}"
+    );
+    assert_eq!(smeta, dmeta, "metadata matches for prefix {prefix:?}");
+    assert_eq!(
+        dynamic_terminal_names(&svt),
+        dynamic_terminal_names(&dvt),
+        "dynamic paths match for prefix {prefix:?}"
+    );
+}
+
+/// For a frame of plain scalar fields, the metadata-driven leaf-id rewrite the
+/// data path performs realizes identically to the static announce.
+#[test]
+fn announce_data_path_matches_static_scalar() {
+    for prefix in ["inst", "a.b"] {
+        assert_announce_eq::<TickIn>(prefix);
+        assert_announce_eq::<TickOut>(prefix);
+        assert_announce_eq::<ProbeAxes>(prefix);
+    }
+}
+
+/// The announce metadata keeps each component's metadata map — element names,
+/// enum variants — under the instance prefix, exactly as the static
+/// `metadata(prefix)` path emits it.
+#[test]
+fn announce_preserves_element_names() {
+    let d = crate::PortDesc::of::<ProbeAxes>();
+    let (_, meta) = d.announce("inst").expect("table port announces");
+    let m = meta
+        .iter()
+        .find(|m| m.name == "inst.probe_axes.omega_b")
+        .expect("the axes component is announced");
+    assert_eq!(m.element_names(), "x,y,z");
+}
+
+/// Frames with dynamic members (`FrameList`/`FrameMap`, including every
+/// system's implicit `health` and `log` frames) realize identically too: the
+/// prefix rewrite carries the instance prefix onto the top-level dynamic path
+/// strings, so `inst.health.error_counts.<kind>` ids match the static path and
+/// two instances of one system never collide on their dynamic paths.
+#[test]
+fn announce_data_path_matches_static_dynamic() {
+    for prefix in ["inst", "a.b"] {
+        assert_announce_eq::<ProbeDyn>(prefix);
+        assert_announce_eq::<crate::SystemLog>(prefix);
+        assert_announce_eq::<crate::SystemHealth>(prefix);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PortDesc: both schema arms round-trip through postcard with their axes.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn port_desc_msg_round_trips_both_arms() {
+fn port_desc_round_trips_both_arms() {
     use metor_proto::types::Msg;
     use metor_proto_wkt::SequenceCommand;
 
@@ -653,14 +840,12 @@ fn port_desc_msg_round_trips_both_arms() {
     // Postcard arm, with a non-default telemetry flag so the override rides
     // the wire too.
     let d = PortDesc::msg::<SequenceCommand>().untelemetered();
-    let m = PortDescMsg::lower(&d);
-    let bytes = postcard::to_allocvec(&m).expect("encodes");
-    let back: PortDescMsg = postcard::from_bytes(&bytes).expect("decodes");
-    let rd = back.into_port_desc();
-    assert_eq!(rd.id, PortId::Packet(SequenceCommand::ID));
+    let bytes = postcard::to_allocvec(&d).expect("encodes");
+    let rd: PortDesc = postcard::from_bytes(&bytes).expect("decodes");
+    assert_eq!(rd.id(), PortId::Packet(SequenceCommand::ID));
     assert_eq!(rd.name, "SequenceCommand");
     assert_eq!(rd.max_size, d.max_size);
-    assert!(matches!(rd.schema, PortSchema::Postcard));
+    assert!(matches!(rd.schema, PortSchema::Postcard { .. }));
     assert!(rd.vtable().is_none(), "no vtable on a Postcard port");
     assert_eq!(rd.delivery, Delivery::Log);
     assert_eq!(rd.fan_in, FanIn::Many);
@@ -673,11 +858,9 @@ fn port_desc_msg_round_trips_both_arms() {
 
     // Table arm, axes at their frame defaults.
     let d = PortDesc::of::<TickOut>();
-    let m = PortDescMsg::lower(&d);
-    let bytes = postcard::to_allocvec(&m).expect("encodes");
-    let back: PortDescMsg = postcard::from_bytes(&bytes).expect("decodes");
-    let rd = back.into_port_desc();
-    assert_eq!(rd.id, PortId::Component(TickOut::FRAME_ID));
+    let bytes = postcard::to_allocvec(&d).expect("encodes");
+    let rd: PortDesc = postcard::from_bytes(&bytes).expect("decodes");
+    assert_eq!(rd.id(), PortId::Component(TickOut::FRAME_ID));
     assert_eq!(rd.name, "tick_out");
     assert_eq!(rd.delivery, Delivery::Snapshot);
     assert_eq!(rd.fan_in, FanIn::One);

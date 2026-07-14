@@ -241,10 +241,7 @@ async fn registry_query_view_and_read() {
     let entry = registry
         .get(ComponentId::new("producer.imu"))
         .expect("producer.imu in the registry");
-    let crate::EntrySchema::Table { frame_id, .. } = &entry.schema else {
-        panic!("frame entry carries a Table schema");
-    };
-    assert_eq!(*frame_id, ComponentId::new("imu"));
+    assert_eq!(entry.frame_id(), Some(ComponentId::new("imu")));
     assert_eq!(&*entry.instance, "producer");
     // The consumer's frame and the coordinator's own buffers are indexed too.
     assert!(registry.get(ComponentId::new("consumer.nav")).is_some());
@@ -288,7 +285,7 @@ async fn telemetry_end_to_end_all() {
         .registry()
         .entries()
         .iter()
-        .filter(|e| matches!(e.schema, crate::EntrySchema::Table { .. }))
+        .filter(|e| matches!(e.desc.schema, crate::PortSchema::Table { .. }))
         .count();
     coord.run_for(30).await;
 
@@ -365,22 +362,10 @@ fn two_instances_distinct_prefixes() {
 
     // Both entries share the unprefixed frame id, but their qualified keys differ
     // and their announced names carry distinct instance prefixes.
-    let crate::EntrySchema::Table {
-        frame_id: left_id,
-        metadata: left_meta,
-        ..
-    } = &left.schema
-    else {
-        panic!("frame entry carries a Table schema");
-    };
-    let crate::EntrySchema::Table {
-        frame_id: right_id,
-        metadata: right_meta,
-        ..
-    } = &right.schema
-    else {
-        panic!("frame entry carries a Table schema");
-    };
+    let left_id = left.frame_id().expect("frame entry carries a Table schema");
+    let right_id = right.frame_id().expect("frame entry carries a Table schema");
+    let (_, left_meta) = left.announce().expect("Table entry announces");
+    let (_, right_meta) = right.announce().expect("Table entry announces");
     assert_eq!(left_id, right_id);
     assert_ne!(left.key, right.key);
     assert!(left_meta.iter().all(|m| m.name.starts_with("imu_left.")));
@@ -556,7 +541,7 @@ async fn message_downlink_fifo_no_coalesce() {
 
     use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
     use crate::port::capacity_for;
-    use crate::registry::{EntrySchema, RegistryEntry};
+    use crate::registry::RegistryEntry;
 
     use super::{BATCH_QUEUE_CAP, Wire, append_record, run_sender};
 
@@ -569,10 +554,7 @@ async fn message_downlink_fifo_no_coalesce() {
     let entry = RegistryEntry {
         key: ComponentId::new("mode.events"),
         instance: Arc::from("mode"),
-        name: Arc::from("events"),
-        schema: EntrySchema::Postcard,
-        delivery: crate::Delivery::Log,
-        telemetered: true,
+        desc: crate::PortDesc::msg_named::<SequenceRegistry>("events"),
         ring: ring.clone(),
     };
     // Claim the tap before any write (an overwrite-ring view starts at the live edge).
@@ -1132,10 +1114,10 @@ fn uplink_minted_ports_are_untelemetered() {
         assert!(!d.telemetered, "inbound commands are never downlinked");
         assert_eq!(d.delivery, crate::Delivery::Log);
     }
-    assert_eq!(minted[0].id, crate::PortId::Packet(SequenceCommand::ID));
+    assert_eq!(minted[0].id(), crate::PortId::Packet(SequenceCommand::ID));
     assert_eq!(minted[0].name, "SequenceCommand");
-    assert_eq!(minted[1].id, crate::PortId::Packet(ReloadSequences::ID));
-    assert_eq!(minted[2].id, crate::PortId::Packet(AlarmAck::ID));
+    assert_eq!(minted[1].id(), crate::PortId::Packet(ReloadSequences::ID));
+    assert_eq!(minted[2].id(), crate::PortId::Packet(AlarmAck::ID));
 }
 
 /// A send failure drops exactly that batch, backs off, and re-enters the

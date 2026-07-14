@@ -186,7 +186,7 @@ pub struct OpRef(u32);
 
 impl OpRef {
     /// Converts the operation reference to a usable index
-    fn to_index(self) -> usize {
+    pub fn to_index(self) -> usize {
         self.0 as usize
     }
 }
