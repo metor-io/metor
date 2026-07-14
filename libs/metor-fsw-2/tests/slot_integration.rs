@@ -36,9 +36,10 @@ use metor_fsw_2::metor_proto_wkt::{
 };
 use metor_fsw_2::wiring::{LoadErrorKind, Registry, resolve};
 use metor_fsw_2::{
-    BuildSystem, ClockSpec, CommandOut, Coordinator, CoordinatorSpec, CyclicSystem, Input, NAME_CAP,
-    Out, SequenceStatus, SlotInitState, SlotStatus, System, SystemInput, SystemOutput, Timestamp,
-    WireError, Wiring, WiringBuilder, split_record,
+    AllowedOccupantSpec, BuildSystem, ClockSpec, CommandOut, Coordinator, CoordinatorSpec,
+    CyclicSystem, Input, InitialOccupantSpec, NAME_CAP, Out, ParamSource, SequenceStatus,
+    SlotInitState, SlotSpec, SlotStatus, System, SystemInput, SystemOutput, Timestamp, WireError,
+    Wiring, WiringBuilder, split_record,
 };
 
 /// The seq fixture's cargo crate name and cdylib library stem.
@@ -943,7 +944,6 @@ fn autonomy_phases(edged: bool) -> Option<Vec<u8>> {
         .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
         .system("autonomy")
         .ty("Autonomy")
-        .from_static()
         .end()
         .slot("adcs")
         .allow("waiter")
@@ -1050,13 +1050,30 @@ fn initial_occupant_outside_allowed_set_is_rejected() {
         return;
     };
 
+    // The builder's `slot(..).end()` would panic on an `initial` outside the
+    // allow set; `add_slot_spec` trusts the spec, so the invalid slot reaches
+    // resolve, where `validate` raises it.
     let mut wiring = WiringBuilder::new()
         .coordinator_spec(seq_coordinator())
         .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
-        .slot("adcs")
-        .allow("waiter")
-        .initial("nonesuch", SlotInitState::Loaded)
-        .end()
+        .add_slot_spec(SlotSpec {
+            name: "adcs".into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            allow: vec![AllowedOccupantSpec {
+                occupant: "waiter".into(),
+                artifact: None,
+                params: ParamSource::None,
+                src: None,
+            }],
+            initial: Some(InitialOccupantSpec {
+                occupant: "nonesuch".into(),
+                state: SlotInitState::Loaded,
+            }),
+            process: false,
+            src: None,
+            scope: None,
+        })
         .build();
     wiring.artifacts[0].path = Some(lib);
     let err = resolve(&wiring, &Registry::new())

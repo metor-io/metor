@@ -37,7 +37,7 @@ use crate::coordinator::init::{self, InitGraph, Node, SystemBind};
 use crate::coordinator::slot::{SlotReg, plan_slot};
 use crate::coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, OccupantBacking,
-    PortRef, SlotConfigError, SystemHandle, WireError, validate_slot_spec,
+    PortRef, SlotConfigError, SystemHandle, WireError,
 };
 use crate::descriptor::{PortId, SystemDescriptor};
 use crate::dl::DlSystem;
@@ -56,6 +56,7 @@ mod error;
 mod params;
 mod py;
 mod stubgen;
+mod validate;
 
 // The pure-data IR lives at the crate root (feature `wiring-model`) so it is
 // available without the front-end; the submodules here reach it as
@@ -63,7 +64,7 @@ mod stubgen;
 pub(crate) use crate::ir as model;
 
 pub use build_driver::{BuildError, BuildOptions, build_artifacts, build_target};
-pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
+pub use builder::{ArtifactSystemBuilder, SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use bundle::{
     BundleError, BundleMeta, METOR_EXTENSION, PackageOptions, WIRING_FILE_NAME, load_bundle,
     unpack_metor, write_bundle,
@@ -569,14 +570,10 @@ pub fn resolve_with(
     registry: &Registry,
     opts: ResolveOptions,
 ) -> Result<Coordinator, LoadError> {
-    if wiring.ir_version != IR_VERSION {
-        return Err(LoadErrorKind::IrVersionMismatch {
-            found: wiring.ir_version,
-            expected: IR_VERSION,
-        }
-        .bare());
-    }
-    check_scope_refs(wiring)?;
+    // The one structural gate: version, scope indices, name/id uniqueness, and
+    // each spec's well-formedness (`validate` module). Everything past here is
+    // registry- or filesystem-dependent.
+    validate::validate(wiring)?;
     check_manifest_hashes(wiring)?;
     let mut config = coordinator_config(&wiring.coordinator);
     // Host-environment policy overrides (see `ResolveOptions`): applied onto the
@@ -609,8 +606,8 @@ pub fn resolve_with(
     let mut instances: HashMap<String, Instance> = HashMap::new();
     // The coordinator's own bundle joins the instance namespace up front.
     // `"coordinator"` is reserved: command edges name it (`connect
-    // "coordinator" -> ...`), and a user `system "coordinator"` surfaces as a
-    // `DuplicateInstance` error instead of a silent key collision.
+    // "coordinator" -> ...`); `validate` already rejected any user spec of that
+    // name, so the inserts below never collide.
     let coord_handle = graph.coordinator_handle();
     instances.insert(
         "coordinator".to_string(),
@@ -633,12 +630,7 @@ pub fn resolve_with(
                 resolve_dl(spec, artifact_id, wiring, &mut packs, &mut graph)?
             }
             (None, true) => {
-                // A process system needs an artifact to spawn a worker; a spec
-                // that sets `process` without one lands here.
-                return Err(
-                    LoadErrorKind::ProcessNeedsArtifact { name: spec.name.clone() }
-                        .whole(system_src(spec)),
-                );
+                unreachable!("validate() rejects a process system without an artifact")
             }
             (None, false) => {
                 if registry.is_receive_all(spec.ty.as_deref()) {
@@ -648,44 +640,22 @@ pub fn resolve_with(
                 resolve_static(spec, registry, &mut graph)?
             }
         };
-        if instances
-            .insert(spec.name.clone(), Instance { handle, desc })
-            .is_some()
-        {
-            return Err(
-                LoadErrorKind::DuplicateInstance { name: spec.name.clone() }
-                    .whole(system_src(spec)),
-            );
-        }
+        // `validate` guaranteed instance-name uniqueness, so the insert is new.
+        instances.insert(spec.name.clone(), Instance { handle, desc });
     }
 
     // --- Slots pass: a slot `connect`s by name like a system, so it joins
     //     `instances` before the edges pass.
     for slot in &wiring.slots {
         let (handle, desc) = resolve_slot(slot, wiring, &mut packs, &mut graph)?;
-        if instances
-            .insert(slot.name.clone(), Instance { handle, desc })
-            .is_some()
-        {
-            return Err(
-                LoadErrorKind::DuplicateInstance { name: slot.name.clone() }.whole(slot_src(slot)),
-            );
-        }
+        instances.insert(slot.name.clone(), Instance { handle, desc });
     }
 
     // --- Deferred receive-all systems: the last cyclic registrations, still
     //     ahead of the edges pass, which only needs the finished instance map.
     for spec in deferred {
         let (handle, desc) = resolve_static(spec, registry, &mut graph)?;
-        if instances
-            .insert(spec.name.clone(), Instance { handle, desc })
-            .is_some()
-        {
-            return Err(
-                LoadErrorKind::DuplicateInstance { name: spec.name.clone() }
-                    .whole(system_src(spec)),
-            );
-        }
+        instances.insert(spec.name.clone(), Instance { handle, desc });
     }
 
     // --- Edges pass ------------------------------------------------------
@@ -740,26 +710,16 @@ fn resolve_static(
     registry: &Registry,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    // `type=` is required for a static system; only a dl system can derive it
-    // from its artifact. A builder-origin spec could omit it.
-    let ty = spec.ty.as_deref().ok_or_else(|| {
-        LoadErrorKind::MissingType { name: spec.name.clone() }.whole(system_src(spec))
-    })?;
+    // `type=` and non-postcard params are guaranteed for a static system by
+    // `validate`; only the registry lookup (`UnknownType`) is left here.
+    let ty = spec.ty.as_deref().expect("validate() requires a static system's type");
     let factory = registry.factories.get(ty).ok_or_else(|| {
         LoadErrorKind::UnknownType { ty: ty.to_string() }.whole(system_src(spec))
     })?;
     let snippet;
     let params = match &spec.params {
-        // Typed builder params ([`ParamSource::Postcard`]) are rejected: the
-        // static path deserializes a value tree, not postcard, so the bytes
-        // have no decode path and would be silently dropped, leaving the
-        // system on defaults.
         ParamSource::Postcard(_) => {
-            return Err(LoadErrorKind::StaticPostcardParams {
-                system: spec.name.clone(),
-                ty: ty.to_string(),
-            }
-            .whole(system_src(spec)));
+            unreachable!("validate() rejects postcard params on a static system")
         }
         ParamSource::Value(value) => {
             snippet = system_src(spec);
@@ -1115,27 +1075,6 @@ fn resolve_proc(
     Err(LoadErrorKind::ProcessUnsupported { name: spec.name.clone() }.whole(system_src(spec)))
 }
 
-/// Range-check every scope index in the wiring — the specs' `scope` fields
-/// and the table's own `parent` links. The table is front-end metadata, so a
-/// bad index is a front-end bug, caught before any system is built.
-fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
-    let len = wiring.scopes.len();
-    let check = |owner: String, index: Option<usize>| match index {
-        Some(index) if index >= len => Err(LoadErrorKind::BadScopeRef { owner, index, len }.bare()),
-        _ => Ok(()),
-    };
-    for scope in &wiring.scopes {
-        check(format!("scope `{}`", scope.path), scope.parent)?;
-    }
-    for spec in &wiring.systems {
-        check(format!("system `{}`", spec.name), spec.scope)?;
-    }
-    for slot in &wiring.slots {
-        check(format!("slot `{}`", slot.name), slot.scope)?;
-    }
-    Ok(())
-}
-
 /// Enforce generated-stub freshness: for each artifact whose stub module
 /// recorded a `manifest_hash`, compare it against the live pack manifest and
 /// fail with [`LoadErrorKind::StaleStubs`] on a mismatch. Artifacts with no
@@ -1289,16 +1228,9 @@ fn resolve_slot(
     let src = slot_src(slot);
     let span: SourceSpan = (0, src.len()).into();
 
-    // Pure spec validation — a non-empty allow set, and an `initial` name
-    // inside it — runs before any artifact is opened, so a typo fails
-    // without a dlopen. It checks the `initial` regardless of `state=`: even
-    // an `empty` initial names an occupant, and a name that matches nothing
-    // is always a mistake.
-    let allow_names: Vec<&str> = slot.allow.iter().map(|a| a.occupant.as_str()).collect();
-    validate_slot_spec(&allow_names, slot.initial.as_ref().map(|i| i.occupant.as_str()))
-        .map_err(|e| slot_config_error(e, slot, &src, span))?;
-
-    // Open and param-encode each allowed occupant. `occupant=` is the allow
+    // The pure-spec checks (non-empty allow set, `initial` inside it) ran in
+    // `validate` before any artifact was opened. Open and param-encode each
+    // allowed occupant. `occupant=` is the allow
     // node's only reserved key and there is no leading name argument, so both
     // line-property and child-node params reach the encoder. A process slot
     // takes the describe-worker path instead; the backing decides the slot's

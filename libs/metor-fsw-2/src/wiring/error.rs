@@ -105,6 +105,7 @@ impl LoadErrorKind {
             IrVersionMismatch { .. } => "fsw_wiring::ir_version_mismatch",
             BadScopeRef { .. } => "fsw_wiring::bad_scope_ref",
             MissingType { .. } => "fsw_wiring::missing_type",
+            DuplicateArtifact { .. } => "fsw_wiring::duplicate_artifact",
             UnknownType { .. } => "fsw_wiring::unknown_type",
             ProcessNeedsArtifact { .. } => "fsw_wiring::process_needs_artifact",
             ProcessUnsupported { .. } => "fsw_wiring::process_unsupported",
@@ -167,6 +168,7 @@ impl LoadErrorKind {
             ProcessUnsupported { .. } => "this instance cannot run cross-process here".into(),
             ProcDescribe { .. } => "describing this artifact failed".into(),
             DuplicateInstance { .. } => "instance names must be unique".into(),
+            DuplicateArtifact { .. } => "artifact ids must be unique".into(),
             MissingParam { .. } => "this node is missing the param".into(),
             InvalidParam { .. } => "invalid value here".into(),
             UnknownParam { .. } => "no params field is named this".into(),
@@ -233,6 +235,12 @@ pub enum LoadErrorKind {
     /// select a factory. Only a builder-origin spec can omit it.
     #[error("system `{name}` is missing its `type`")]
     MissingType { name: String },
+
+    /// Two [`Artifact`](super::Artifact)s share an `id`. The id is how a
+    /// system's `artifact=` and a slot's `allow` reference their pack, so a
+    /// duplicate would silently shadow.
+    #[error("duplicate artifact id `{id}`")]
+    DuplicateArtifact { id: String },
 
     #[error("unknown system type `{ty}` (not in the registry)")]
     UnknownType { ty: String },

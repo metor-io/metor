@@ -118,7 +118,6 @@ fn alarms_node_before_a_slot_still_builds_and_raises() {
         .artifact("waiter", FIXTURE_CRATE, FIXTURE_STEM)
         .system("alarms")
         .ty("Alarms")
-        .from_static()
         .params_value(serde_json::json!({
             "alarm": [{
                 "id": "SLOT_DONE",

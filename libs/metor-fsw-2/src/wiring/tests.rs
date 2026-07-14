@@ -11,7 +11,8 @@ use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::wiring::{
-    ClockSpec, IR_VERSION, LoadErrorKind, ParamSource, Registry, SlotInitState, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, IR_VERSION, InitialOccupantSpec,
+    LoadErrorKind, ParamSource, Registry, SlotInitState, SlotSpec, SystemSpec, Wiring,
     WiringBuilder, resolve,
 };
 use crate::{
@@ -375,11 +376,9 @@ fn equiv_builder() -> WiringBuilder {
         .coordinator(100.0, ClockSpec::Wall)
         .system("a")
         .ty("Src")
-        .from_static()
         .end()
         .system("b")
         .ty("Sink")
-        .from_static()
         .end()
         .connect("a", "imu", "b", "imu")
 }
@@ -463,19 +462,37 @@ fn slot_builder_mirrors_kdl() {
 fn err_static_system_with_typed_params() {
     // Typed builder (postcard) params on a static system have no decode path
     // (a static system's factory takes a value tree, not postcard bytes), so
-    // resolve rejects them instead of silently dropping onto defaults.
+    // resolve rejects them instead of silently dropping onto defaults. The
+    // builder makes this unrepresentable (postcard `params` live on the
+    // artifact path), so the invalid `Wiring` is built literally to drive the
+    // serde-path `validate` gate.
     #[derive(serde::Serialize)]
     struct Gain {
         gain: f64,
     }
-    let wiring = WiringBuilder::new()
-        .coordinator(100.0, ClockSpec::Wall)
-        .system("nav")
-        .ty("NavFilter")
-        .from_static()
-        .params(Gain { gain: 2.0 })
-        .end()
-        .build();
+    let wiring = Wiring {
+        ir_version: IR_VERSION,
+        coordinator: CoordinatorSpec {
+            cycle_rate: 100.0,
+            default_depth: None,
+            clock: ClockSpec::Wall,
+        },
+        artifacts: Vec::new(),
+        systems: vec![SystemSpec {
+            name: "nav".into(),
+            ty: Some("NavFilter".into()),
+            artifact: None,
+            params: ParamSource::Postcard(
+                postcard::to_allocvec(&Gain { gain: 2.0 }).unwrap(),
+            ),
+            process: false,
+            src: None,
+            scope: None,
+        }],
+        slots: Vec::new(),
+        edges: Vec::new(),
+        scopes: Vec::new(),
+    };
     let err = match resolve(&wiring, &registry()) {
         Ok(_) => panic!("expected a StaticPostcardParams error"),
         Err(e) => e,
@@ -1092,4 +1109,282 @@ fn resolve_rejects_out_of_range_scope_refs() {
         matches!(err.kind, LoadErrorKind::BadScopeRef { index: 3, len: 1, .. }),
         "{err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The structural gate: `validate` runs on every ingested Wiring, so the checks
+// the builder makes unrepresentable or panics on are still enforced for the
+// serde path. Driven by literal Wirings the builder would refuse to construct.
+// ---------------------------------------------------------------------------
+
+fn bare_wiring() -> Wiring {
+    Wiring {
+        ir_version: IR_VERSION,
+        coordinator: CoordinatorSpec {
+            cycle_rate: 100.0,
+            default_depth: None,
+            clock: ClockSpec::Wall,
+        },
+        artifacts: Vec::new(),
+        systems: Vec::new(),
+        slots: Vec::new(),
+        edges: Vec::new(),
+        scopes: Vec::new(),
+    }
+}
+
+fn static_system(name: &str, ty: Option<&str>) -> SystemSpec {
+    SystemSpec {
+        name: name.into(),
+        ty: ty.map(Into::into),
+        artifact: None,
+        params: ParamSource::None,
+        process: false,
+        src: None,
+        scope: None,
+    }
+}
+
+#[test]
+fn validate_accepts_a_well_formed_wiring() {
+    super::validate::validate(&equiv_builder().build()).expect("a builder-origin Wiring is valid");
+}
+
+#[test]
+fn validate_rejects_duplicate_instance_names() {
+    let mut w = bare_wiring();
+    w.systems = vec![static_system("dup", Some("Src")), static_system("dup", Some("Sink"))];
+    let err = super::validate::validate(&w).expect_err("duplicate names are rejected");
+    assert!(
+        matches!(err.kind, LoadErrorKind::DuplicateInstance { ref name } if name == "dup"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_reserved_coordinator_name() {
+    let mut w = bare_wiring();
+    w.systems = vec![static_system("coordinator", Some("Src"))];
+    let err = super::validate::validate(&w).expect_err("the reserved name is rejected");
+    assert!(
+        matches!(err.kind, LoadErrorKind::DuplicateInstance { ref name } if name == "coordinator"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_a_system_and_slot_name_collision() {
+    let mut w = bare_wiring();
+    w.systems = vec![static_system("adcs", Some("Src"))];
+    w.slots = vec![SlotSpec {
+        name: "adcs".into(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        allow: vec![AllowedOccupantSpec {
+            occupant: "ctrl".into(),
+            artifact: None,
+            params: ParamSource::None,
+            src: None,
+        }],
+        initial: None,
+        process: false,
+        src: None,
+        scope: None,
+    }];
+    let err = super::validate::validate(&w).expect_err("a system/slot collision is rejected");
+    assert!(matches!(err.kind, LoadErrorKind::DuplicateInstance { .. }), "{err:?}");
+}
+
+#[test]
+fn validate_rejects_duplicate_artifact_ids() {
+    let mut w = bare_wiring();
+    let art = |id: &str| Artifact {
+        id: id.into(),
+        crate_name: "c".into(),
+        cdylib: "libc.so".into(),
+        path: None,
+        manifest_hash: None,
+        src: None,
+    };
+    w.artifacts = vec![art("dup"), art("dup")];
+    let err = super::validate::validate(&w).expect_err("duplicate artifact ids are rejected");
+    assert!(
+        matches!(err.kind, LoadErrorKind::DuplicateArtifact { ref id } if id == "dup"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_a_static_system_without_a_type() {
+    let mut w = bare_wiring();
+    w.systems = vec![static_system("nav", None)];
+    let err = super::validate::validate(&w).expect_err("a typeless static system is rejected");
+    assert!(
+        matches!(err.kind, LoadErrorKind::MissingType { ref name } if name == "nav"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_process_without_an_artifact() {
+    let mut w = bare_wiring();
+    let mut spec = static_system("proc", Some("Src"));
+    spec.process = true;
+    w.systems = vec![spec];
+    let err = super::validate::validate(&w).expect_err("process without artifact is rejected");
+    assert!(
+        matches!(err.kind, LoadErrorKind::ProcessNeedsArtifact { ref name } if name == "proc"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_an_unknown_artifact_ref() {
+    let mut w = bare_wiring();
+    let mut spec = static_system("dl", Some("Counter"));
+    spec.artifact = Some("nope".into());
+    w.systems = vec![spec];
+    let err = super::validate::validate(&w).expect_err("a dangling artifact ref is rejected");
+    assert!(
+        matches!(
+            err.kind,
+            LoadErrorKind::UnknownArtifact { ref artifact, .. } if artifact == "nope"
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn validate_rejects_an_empty_slot() {
+    let mut w = bare_wiring();
+    w.slots = vec![SlotSpec {
+        name: "adcs".into(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        allow: Vec::new(),
+        initial: None,
+        process: false,
+        src: None,
+        scope: None,
+    }];
+    let err = super::validate::validate(&w).expect_err("an empty slot is rejected");
+    assert!(matches!(err.kind, LoadErrorKind::EmptySlot { .. }), "{err:?}");
+}
+
+#[test]
+fn validate_rejects_an_initial_outside_the_allow_set() {
+    let mut w = bare_wiring();
+    w.slots = vec![SlotSpec {
+        name: "adcs".into(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        allow: vec![AllowedOccupantSpec {
+            occupant: "ctrl".into(),
+            artifact: None,
+            params: ParamSource::None,
+            src: None,
+        }],
+        initial: Some(InitialOccupantSpec {
+            occupant: "nonesuch".into(),
+            state: SlotInitState::Loaded,
+        }),
+        process: false,
+        src: None,
+        scope: None,
+    }];
+    let err = super::validate::validate(&w).expect_err("an initial outside allow is rejected");
+    assert!(matches!(err.kind, LoadErrorKind::UnknownInitialOccupant { .. }), "{err:?}");
+}
+
+#[test]
+fn validate_rejects_an_unknown_allow_artifact_ref() {
+    let mut w = bare_wiring();
+    w.slots = vec![SlotSpec {
+        name: "adcs".into(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        allow: vec![AllowedOccupantSpec {
+            occupant: "ctrl".into(),
+            artifact: Some("nope".into()),
+            params: ParamSource::None,
+            src: None,
+        }],
+        initial: None,
+        process: false,
+        src: None,
+        scope: None,
+    }];
+    let err = super::validate::validate(&w).expect_err("a dangling allow ref is rejected");
+    assert!(
+        matches!(
+            err.kind,
+            LoadErrorKind::UnknownArtifact { ref artifact, .. } if artifact == "nope"
+        ),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Builder insert-time panics: each invalid IDL fails at the offending call, so
+// a builder-produced Wiring is valid by construction.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "duplicate instance name `a`")]
+fn builder_panics_on_duplicate_instance_name() {
+    WiringBuilder::new()
+        .system("a")
+        .ty("Src")
+        .end()
+        .system("a")
+        .ty("Sink")
+        .end();
+}
+
+#[test]
+#[should_panic(expected = "duplicate instance name `coordinator`")]
+fn builder_panics_on_reserved_instance_name() {
+    WiringBuilder::new().system("coordinator").ty("Src").end();
+}
+
+#[test]
+#[should_panic(expected = "duplicate artifact id `x`")]
+fn builder_panics_on_duplicate_artifact_id() {
+    WiringBuilder::new()
+        .artifact("x", "c", "c")
+        .artifact("x", "c2", "c2");
+}
+
+#[test]
+#[should_panic(expected = "unknown artifact `nope`")]
+fn builder_panics_on_from_artifact_undeclared() {
+    WiringBuilder::new().system("s").from_artifact("nope");
+}
+
+#[test]
+#[should_panic(expected = "unknown artifact `nope`")]
+fn builder_panics_on_allow_from_undeclared() {
+    WiringBuilder::new().slot("s").allow_from("occ", "nope");
+}
+
+#[test]
+#[should_panic(expected = "is missing its `type`")]
+fn builder_panics_on_static_system_without_type() {
+    WiringBuilder::new().system("s").end();
+}
+
+#[test]
+#[should_panic(expected = "has no `allow` occupant")]
+fn builder_panics_on_empty_slot() {
+    WiringBuilder::new().slot("s").end();
+}
+
+#[test]
+#[should_panic(expected = "not in the allowed set")]
+fn builder_panics_on_initial_outside_allow() {
+    WiringBuilder::new()
+        .slot("s")
+        .allow("a")
+        .initial("b", SlotInitState::Loaded)
+        .end();
 }
