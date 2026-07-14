@@ -14,7 +14,7 @@ use gpui::{
 };
 use metor_db::DB;
 
-use crate::graph_canvas::{hit_test_edges, paint_bezier, paint_grid};
+use crate::graph_canvas::{RoutePoints, hit_test_edges, paint_bezier, paint_grid};
 use crate::node_editor::config::{NodeEditorConfig, Viewport as ConfigViewport};
 use crate::node_editor::coordinator::GraphCoordinator;
 use crate::node_editor::graph::{BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position};
@@ -516,10 +516,10 @@ impl Render for NodeEditor {
         .absolute()
         .inset_0();
 
-        let edge_geometry: Arc<Vec<(EdgeEntry, Point<Pixels>, Point<Pixels>)>> = Arc::new(
+        let edge_geometry: Arc<Vec<(EdgeEntry, RoutePoints)>> = Arc::new(
             edge_snapshots
                 .iter()
-                .map(|(edge, s, t, _)| (edge.clone(), *s, *t))
+                .map(|(edge, s, t, _)| (edge.clone(), RoutePoints::from_slice(&[*s, *t])))
                 .collect(),
         );
 
@@ -537,7 +537,7 @@ impl Render for NodeEditor {
                         return;
                     };
                     let local = ev.position - origin;
-                    if let Some(edge) = hit_test_edges(&edges, local) {
+                    if let Some(edge) = hit_test_edges(&edges, local, gpui::Axis::Horizontal) {
                         this.selected_edge = Some(edge);
                         this.selection = None;
                         this.edge_draft = None;

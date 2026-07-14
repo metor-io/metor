@@ -66,11 +66,11 @@ pub struct LayoutEdge {
     pub to_pin: PinAnchor,
     /// Participates in layer assignment. The ranked subset must be the
     /// caller's acyclic skeleton (e.g. non-delayed frame edges); everything
-    /// else is placed by whatever layers that skeleton produces.
+    /// else — feedback edges, message channels — is placed by whatever
+    /// layers that skeleton produces and routed by where it lands: forward
+    /// wires thread the layer channels, backward wires detour around the
+    /// rows they span.
     pub ranked: bool,
-    /// Declared feedback edge: never ranked, routed around the layers it
-    /// spans rather than through them.
-    pub back: bool,
 }
 
 /// Spacing knobs, all in graph units.

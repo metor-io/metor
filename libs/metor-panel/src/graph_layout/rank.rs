@@ -9,7 +9,7 @@ use super::LayoutEdge;
 pub(super) fn assign_layers(n: usize, edges: &[LayoutEdge]) -> Vec<usize> {
     let mut skeleton: Vec<(usize, usize)> = edges
         .iter()
-        .filter(|e| e.ranked && !e.back)
+        .filter(|e| e.ranked)
         .map(|e| (e.from, e.to))
         .collect();
     skeleton.sort_unstable();

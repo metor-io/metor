@@ -21,15 +21,15 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, MouseButton, Pixels, Point, Render, SharedString,
-    Window, canvas, div, point, prelude::*, px,
+    App, Axis, Bounds, Context, FocusHandle, Focusable, MouseButton, Pixels, Point, Render,
+    SharedString, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::DB;
 use metor_fsw_2::ir::{EdgeKind, Wiring};
 
 pub use config::SystemGraphConfig;
 
-use crate::graph_canvas::{hit_test_edges, paint_bezier, paint_grid};
+use crate::graph_canvas::{RoutePoints, hit_test_edges, paint_grid, paint_route};
 use crate::theme::theme;
 use crate::tiles::PaneItem;
 use crate::views::system_graph::config::Viewport;
@@ -187,27 +187,35 @@ impl Render for SystemGraphPanel {
             });
         }
 
-        // Edge geometry in canvas-local coordinates. The engine's fanned
-        // anchors apply as long as both endpoints sit where the layout put
-        // them; a manually-dragged endpoint falls back to side-mid anchoring
-        // so wires track the card under the pointer.
+        // Edge routes in canvas-local coordinates. The engine's fanned
+        // anchors and waypoints apply as long as both endpoints sit where the
+        // layout put them; a manually-dragged endpoint falls back to a plain
+        // side-mid wire so it tracks the card under the pointer.
         let selected_edge = self.selected_edge.clone();
-        let edge_snapshots: Vec<(GraphEdge, Point<Pixels>, Point<Pixels>, gpui::Hsla, bool)> = graph
+        let edge_snapshots: Vec<(GraphEdge, RoutePoints, gpui::Hsla, bool)> = graph
             .edges
             .iter()
             .enumerate()
             .filter_map(|(i, e)| {
-                let (src, tgt) = if self.overrides.contains_key(&e.from_node)
+                let local = |p: (f32, f32)| point(px(p.0 - viewport.x), px(p.1 - viewport.y));
+                let route: RoutePoints = if self.overrides.contains_key(&e.from_node)
                     || self.overrides.contains_key(&e.to_node)
                 {
                     let (sx, sy, sh) = geom.get(&e.from_node)?;
                     let (tx, ty, th) = geom.get(&e.to_node)?;
-                    ((sx + NODE_WIDTH, sy + sh / 2.0), (*tx, ty + th / 2.0))
+                    [
+                        local((sx + NODE_WIDTH, sy + sh / 2.0)),
+                        local((*tx, ty + th / 2.0)),
+                    ]
+                    .into_iter()
+                    .collect()
                 } else {
-                    (graph.routes[i].source, graph.routes[i].target)
+                    let r = &graph.routes[i];
+                    std::iter::once(local(r.source))
+                        .chain(r.waypoints.iter().map(|&w| local(w)))
+                        .chain(std::iter::once(local(r.target)))
+                        .collect()
                 };
-                let src = point(px(src.0 - viewport.x), px(src.1 - viewport.y));
-                let tgt = point(px(tgt.0 - viewport.x), px(tgt.1 - viewport.y));
                 let mut color = match e.kind {
                     EdgeKind::Frame => theme.frame_edge_color(),
                     EdgeKind::Msg => theme.msg_edge_color(),
@@ -215,7 +223,7 @@ impl Render for SystemGraphPanel {
                 if selected_edge.as_ref() == Some(e) {
                     color = theme.line_colors[0];
                 }
-                Some((e.clone(), src, tgt, color, e.delayed))
+                Some((e.clone(), route, color, e.delayed))
             })
             .collect();
 
@@ -231,18 +239,18 @@ impl Render for SystemGraphPanel {
             },
             move |_, bounds, window, _cx| {
                 paint_grid(bounds, theme_for_paint.grid_color, window);
-                for (_e, src, tgt, color, dashed) in &edges_for_paint {
-                    paint_bezier(bounds.origin, *src, *tgt, *color, *dashed, window);
+                for (_e, route, color, dashed) in &edges_for_paint {
+                    paint_route(bounds.origin, route, Axis::Horizontal, *color, *dashed, window);
                 }
             },
         )
         .absolute()
         .inset_0();
 
-        let edge_geometry: Arc<Vec<(GraphEdge, Point<Pixels>, Point<Pixels>)>> = Arc::new(
+        let edge_geometry: Arc<Vec<(GraphEdge, RoutePoints)>> = Arc::new(
             edge_snapshots
                 .iter()
-                .map(|(e, s, t, _, _)| (e.clone(), *s, *t))
+                .map(|(e, route, _, _)| (e.clone(), route.clone()))
                 .collect(),
         );
 
@@ -259,7 +267,7 @@ impl Render for SystemGraphPanel {
                         return;
                     };
                     let local = ev.position - origin;
-                    if let Some(edge) = hit_test_edges(&edges, local) {
+                    if let Some(edge) = hit_test_edges(&edges, local, Axis::Horizontal) {
                         this.selected_edge = Some(edge);
                         this.selection = None;
                         cx.notify();
@@ -339,12 +347,15 @@ impl Render for SystemGraphPanel {
 
         // Selected-edge detail overlay near the wire's midpoint.
         if let Some(sel) = self.selected_edge.as_ref() {
-            for (edge, src, tgt, _c, _d) in &edge_snapshots {
+            for (edge, route, _c, _d) in &edge_snapshots {
                 if edge != sel {
                     continue;
                 }
-                let mid_x = (f32::from(src.x) + f32::from(tgt.x)) / 2.0;
-                let mid_y = (f32::from(src.y) + f32::from(tgt.y)) / 2.0;
+                // Anchor the label near the route's middle: the central point
+                // of an odd polyline, or the midpoint of the central pair.
+                let (a, b) = (route[route.len().div_ceil(2) - 1], route[route.len() / 2]);
+                let mid_x = (f32::from(a.x) + f32::from(b.x)) / 2.0;
+                let mid_y = (f32::from(a.y) + f32::from(b.y)) / 2.0;
                 let kind = if edge.kind == EdgeKind::Msg { "msg" } else { "frame" };
                 let delayed = if edge.delayed { " · delayed" } else { "" };
                 let label = format!("{} → {} ({kind}{delayed})", edge.from_port, edge.to_port);
