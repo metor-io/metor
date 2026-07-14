@@ -58,7 +58,7 @@ use metor_proto_wkt::{
 use serde::Deserialize;
 
 use crate::message::{MsgIn, MsgOut};
-use crate::registry::{AllOutputs, EntrySchema};
+use crate::registry::AllOutputs;
 use crate::system::{BuildSystem, CyclicSystem, Out, System};
 
 /// The set of alarms one [`AlarmSystem`] instance evaluates, one
@@ -615,7 +615,7 @@ impl AlarmSystem {
 
         let mut watches = Vec::new();
         for entry in output.all.entries() {
-            let EntrySchema::Table { vtable, .. } = &entry.schema else {
+            let Some((vtable, _)) = entry.announce() else {
                 continue;
             };
             // Walking the vtable without a record surfaces each static
@@ -654,7 +654,7 @@ impl AlarmSystem {
             }
             match entry.view() {
                 Ok(view) => watches.push(Watch {
-                    vtable: vtable.clone(),
+                    vtable,
                     view,
                     members,
                 }),
@@ -669,7 +669,8 @@ impl AlarmSystem {
                         "alarms_reader_slot",
                         format!(
                             "no reader slot left on `{}.{}` — raise CoordinatorConfig::reader_slack",
-                            entry.instance, entry.name
+                            entry.instance,
+                            entry.name()
                         ),
                     ));
                 }

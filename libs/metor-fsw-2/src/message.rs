@@ -475,7 +475,7 @@ mod tests {
     use super::{LOG_DEPTH, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, split_record};
     use crate::PortId;
     use crate::port::capacity_for;
-    use crate::registry::{EntrySchema, RegistryEntry};
+    use crate::registry::RegistryEntry;
 
     /// Two typed ports emit distinct message types onto one ring; a raw view
     /// reads the records back, `split_record` recovers each id, and the
@@ -489,16 +489,13 @@ mod tests {
         let entry = RegistryEntry {
             key: metor_proto::types::ComponentId::new("coordinator.sequences"),
             instance: std::sync::Arc::from("coordinator"),
-            name: std::sync::Arc::from("sequences"),
-            schema: EntrySchema::Postcard,
-            delivery: crate::Delivery::Log,
-            telemetered: true,
+            desc: crate::PortDesc::msg_named::<SequenceRegistry>("sequences"),
             ring: ring.clone(),
         };
 
         // The descriptor carries the port's edge key.
         assert_eq!(
-            MsgOut::<SequenceCommand>::descriptor().id,
+            MsgOut::<SequenceCommand>::descriptor().id(),
             PortId::Packet(SequenceCommand::ID)
         );
 

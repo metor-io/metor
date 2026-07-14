@@ -21,26 +21,26 @@ pub enum WireError {
     /// The producer's record shape does not satisfy the consumer's required
     /// shape (the table subset rule, postcard id equality, delivery agreement).
     Incompatible {
-        producer: &'static str,
-        consumer: &'static str,
+        producer: String,
+        consumer: String,
         port: PortId,
     },
     /// A [`FanIn::One`](crate::FanIn) input port was never connected, so nothing
     /// would ever write it. [`FanIn::Many`](crate::FanIn) inputs may be left
     /// unconnected; zero producers is legal there.
-    UnconnectedInput { system: &'static str, port: PortId },
+    UnconnectedInput { system: String, port: PortId },
     /// Two producers were connected into one [`FanIn::One`](crate::FanIn) input
     /// port. [`FanIn::Many`](crate::FanIn) inputs allow fan-in, so this never
     /// fires for them, though an exact duplicate of one edge is still a
     /// [`DuplicateEdge`](Self::DuplicateEdge).
-    DoubleConnect { system: &'static str, port: PortId },
+    DoubleConnect { system: String, port: PortId },
     /// The exact same fan-in edge, one `(producer, consumer, port)` triple, was
     /// connected twice. Fan-in of distinct producers is legal; a copy-pasted
     /// duplicate edge would deliver every record to the consumer twice (a
     /// double-applied command), so it is rejected.
     DuplicateEdge {
-        producer: &'static str,
-        consumer: &'static str,
+        producer: String,
+        consumer: String,
         port: PortId,
     },
     /// `connect_delayed` on an edge into a [`Delivery::Log`](crate::Delivery)
@@ -48,19 +48,19 @@ pub enum WireError {
     /// decoupled event/command stream with no same-cycle dependency, so the
     /// delay is meaningless and rejected instead of silently ignored.
     DelayedLogEdge {
-        producer: &'static str,
-        consumer: &'static str,
+        producer: String,
+        consumer: String,
         port: PortId,
     },
     /// An input declared [`FanIn::Many`](crate::FanIn) with
     /// [`Delivery::Snapshot`](crate::Delivery). Latest-wins across several
     /// producers is ill-defined without cross-ring ordering, so the combination
     /// is rejected.
-    SnapshotFanIn { system: &'static str, port: PortId },
+    SnapshotFanIn { system: String, port: PortId },
     /// An edge targets a host-connected input (`PortConn::Host`/`SelfTap`).
     /// Its counterpart is held by the system's runner, never an edge; a slot
     /// occupant's `slot_control` is written by `Abort`, not by another system.
-    HostPort { system: &'static str, port: PortId },
+    HostPort { system: String, port: PortId },
     /// A non-delayed snapshot edge points backward in registration order
     /// between two cyclic systems. The step loop runs in registration order,
     /// so the consumer would execute before its producer every cycle and
@@ -71,8 +71,8 @@ pub enum WireError {
     /// exempt, as are edges touching an async endpoint (async systems run off
     /// the copy-in step or their own task, not the registration-ordered loop).
     StaleFrameEdge {
-        producer: &'static str,
-        consumer: &'static str,
+        producer: String,
+        consumer: String,
         port: PortId,
     },
     /// The configured `cycle_rate` cannot pace a [`Wall`](ClockMode::Wall)
@@ -87,7 +87,7 @@ pub enum WireError {
     /// every feedback loop must break exactly one of its edges that way, so
     /// that the one-cycle-late sampling is explicit rather than an artifact of
     /// registration order. `systems` names the cycle members in loop order.
-    FeedbackCycle { systems: Vec<&'static str> },
+    FeedbackCycle { systems: Vec<String> },
     /// Two registered buffers computed the same instance-qualified registry key
     /// `"<instance>.<name>"`. Frames and channels share one keyspace, so the
     /// collision is detectable instead of silently shadowing one entry.

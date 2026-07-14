@@ -1011,9 +1011,9 @@ fn wiring_json_without_provenance_fields_deserializes() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn reloadable_is_required_for_slot_occupants_only() {
-    let meta = crate::dl::PackEntryMeta {
+    let meta = crate::abi::PackEntryDesc {
         descriptor: crate::descriptor::SystemDescriptor {
-            name: "Stateful",
+            name: "Stateful".into(),
             kind: crate::SystemKind::Cyclic,
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -1022,6 +1022,7 @@ fn reloadable_is_required_for_slot_occupants_only() {
         params_schema: postcard_schema::schema::owned::OwnedNamedType::from(
             <() as postcard_schema::Schema>::SCHEMA,
         ),
+        params_docs: Vec::new(),
         reloadable: false,
         params_default: None,
     };

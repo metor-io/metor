@@ -173,7 +173,7 @@ fn bind_coordinator(
     let out_idx = |pid: PortId| {
         desc.outputs
             .iter()
-            .position(|p| p.id == pid)
+            .position(|p| p.id() == pid)
             .expect("the coordinator #0 bundle declares this output")
     };
     let health_ring = &output_rings[id][out_idx(PortId::Component(SystemHealth::FRAME_ID))];
@@ -195,7 +195,7 @@ fn bind_coordinator(
     let reload_in_idx = desc
         .inputs
         .iter()
-        .position(|p| p.conn == PortConn::Edge && p.id == PortId::Packet(ReloadSequences::ID))
+        .position(|p| p.conn == PortConn::Edge && p.id() == PortId::Packet(ReloadSequences::ID))
         .expect("the coordinator #0 bundle declares its ReloadSequences input");
     let reload_in = MsgIn::from_views(
         cons_edges
@@ -217,7 +217,7 @@ fn bind_coordinator(
     let wiring_out = desc
         .outputs
         .iter()
-        .position(|p| p.id == PortId::Packet(WiringManifest::ID))
+        .position(|p| p.id() == PortId::Packet(WiringManifest::ID))
         .map(|idx| owned_writer::<WiringManifest>(&output_rings[id][idx]));
     CoordinatorPorts {
         health,
@@ -268,7 +268,7 @@ fn bind_dl(
     // the slot; the coordinator drops `cyclic` (this slot, whose `Drop` calls
     // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after;
     // the slot keeps its own `Arc<Library>`.
-    unsafe { dl.system.make_slot(&dl.params, inputs, outputs, desc.name, crate::Mount::Wired) }
+    unsafe { dl.system.make_slot(&dl.params, inputs, outputs, &desc.name, crate::Mount::Wired) }
 }
 
 /// The proc twin of [`bind_dl`]: gather the same per-port rings, but as
@@ -304,9 +304,6 @@ fn bind_proc(
             alloc.ring_paths[&(prod, out)].clone()
         })
         .collect();
-    // The slot's `&'static str` identity; one leak per process system, the
-    // same rate as the dl loader's name leaks.
-    let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
     let spec = SpawnSpec {
         instance: name.clone(),
         system: proc_reg.system,
@@ -321,7 +318,7 @@ fn bind_proc(
         step_timeout: ctx.step_timeout,
         max_restarts: ctx.max_restarts,
         restart_backoff: ctx.restart_backoff,
-        name: leaked,
+        name: Arc::from(name.as_str()),
     };
     ProcSlot::spawn(spec)
         .map(|slot| Box::new(slot) as Box<dyn CyclicSlot>)
@@ -434,7 +431,7 @@ fn bind_slot(
     // instance name each step.
     let cmd_in_idx = ports.commands_in_idx();
     debug_assert_eq!(
-        desc.inputs[cmd_in_idx].id,
+        desc.inputs[cmd_in_idx].id(),
         PortId::Packet(SequenceCommand::ID),
         "the port plan and the registered descriptor agree on the commands input"
     );
@@ -457,7 +454,7 @@ fn bind_slot(
     // fan-out counted at sizing): Progress plus outcome.
     let seq_out_idx = ports.seq_status_out_idx();
     debug_assert_eq!(
-        desc.outputs[seq_out_idx].id,
+        desc.outputs[seq_out_idx].id(),
         PortId::Component(SequenceStatus::FRAME_ID),
         "the port plan and the registered descriptor agree on the self-tap target"
     );
@@ -472,8 +469,17 @@ fn bind_slot(
     let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][ports.events_out_idx()]);
 
     Ok(SlotRunner::new(
-        desc.name, allowed, initial, inputs, outputs, control, status_out, events, seq_status,
-        commands, proc,
+        Arc::from(desc.name.as_str()),
+        allowed,
+        initial,
+        inputs,
+        outputs,
+        control,
+        status_out,
+        events,
+        seq_status,
+        commands,
+        proc,
     ))
 }
 

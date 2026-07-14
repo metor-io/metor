@@ -15,6 +15,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use metor_fsw_ring::RingBuffer;
@@ -65,11 +66,10 @@ pub(crate) fn resolve_worker_exe(overridden: Option<&Path>) -> Result<PathBuf, P
 }
 
 /// Run a describe-mode worker over `artifact` and return the raw postcard
-/// [`SystemDescriptorMsg`](crate::abi::SystemDescriptorMsg) bytes it wrote —
-/// the host-side twin of `fsw_describe`, with the dlopen quarantined in a
-/// short-lived child. Decode the bytes with
-/// [`SystemDescriptorMsg::into_descriptor`](crate::abi::SystemDescriptorMsg::into_descriptor)
-/// and register via
+/// [`PackManifest`](crate::abi::PackManifest) bytes it wrote — the host-side
+/// twin of `fsw_pack_describe`, with the dlopen quarantined in a short-lived
+/// child. Decode the bytes with
+/// [`decode_pack_manifest`](crate::dl) and register via
 /// [`add_proc_cyclic`](crate::CoordinatorBuilder::add_proc_cyclic);
 /// [`resolve`](crate::wiring::resolve) does exactly this. The
 /// child's stderr is captured into the failure diagnostic. `worker_exe`
@@ -153,8 +153,8 @@ pub(crate) struct SpawnSpec {
     pub max_restarts: u32,
     /// Delay before each respawn ([`CoordinatorConfig::proc_restart_backoff`](crate::CoordinatorConfig)).
     pub restart_backoff: Duration,
-    /// The slot identity, already leaked to `'static` by the caller.
-    pub name: &'static str,
+    /// The slot identity.
+    pub name: Arc<str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +342,7 @@ enum Phase {
 /// are skipped, not replayed. Restarts are counted, drained into coordinator
 /// health, and carried in the status frame's worker list.
 pub(crate) struct ProcSlot {
-    name: &'static str,
+    name: Arc<str>,
     /// The worker process behind this slot, respawned from the persisted
     /// manifest across restarts.
     handle: WorkerHandle,
@@ -525,8 +525,8 @@ impl CyclicSlot for ProcSlot {
         self.handle.shutdown_graceful();
     }
 
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn state(&self) -> &SlotState {
@@ -550,7 +550,7 @@ impl CyclicSlot for ProcSlot {
             }
         };
         Some(WorkerStatus {
-            name: self.name(),
+            name: self.name.clone(),
             pid: self.handle.pid(),
             restarts: self.restarts,
             state,

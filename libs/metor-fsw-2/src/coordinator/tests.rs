@@ -499,7 +499,7 @@ fn feedback_cycle_unbroken_is_rejected() {
         .unwrap();
     let err = b.build().err().expect("the cycle is rejected at build");
     assert!(
-        matches!(&err, WireError::FeedbackCycle { systems } if systems.contains(&"looper") && systems.contains(&"backer")),
+        matches!(&err, WireError::FeedbackCycle { systems } if systems.iter().any(|s| s == "looper") && systems.iter().any(|s| s == "backer")),
         "{err:?}"
     );
 }
@@ -619,10 +619,10 @@ fn backward_frame_edge_is_rejected() {
         matches!(
             err,
             WireError::StaleFrameEdge {
-                producer: "producer",
-                consumer: "consumer",
+                ref producer,
+                ref consumer,
                 ..
-            }
+            } if producer == "producer" && consumer == "consumer"
         ),
         "{err:?}"
     );
@@ -703,18 +703,24 @@ fn run_for_twice_panics() {
 fn stopped_set_change_detection_compares_membership() {
     use super::{StoppedSystem, stopped_set_changed};
     let a = StoppedSystem {
-        name: "a",
+        name: std::sync::Arc::from("a"),
         reason: StopReason::Panicked,
     };
     let b = StoppedSystem {
-        name: "b",
+        name: std::sync::Arc::from("b"),
         reason: StopReason::Panicked,
     };
     // Equal length but a different member, as when one slot recovers the same
     // cycle another stops. Length alone cannot distinguish these sets.
-    assert!(stopped_set_changed(&[a], &[b]));
+    assert!(stopped_set_changed(
+        std::slice::from_ref(&a),
+        std::slice::from_ref(&b)
+    ));
     // Identical sets are unchanged; length changes still register.
-    assert!(!stopped_set_changed(&[a, b], &[a, b]));
+    assert!(!stopped_set_changed(
+        &[a.clone(), b.clone()],
+        &[a.clone(), b]
+    ));
     assert!(stopped_set_changed(&[a], &[]));
     assert!(!stopped_set_changed(&[], &[]));
 }
@@ -960,10 +966,10 @@ fn msg_exact_duplicate_edge_is_rejected() {
         matches!(
             err,
             WireError::DuplicateEdge {
-                producer: "msg_producer",
-                consumer: "msg_consumer",
+                ref producer,
+                ref consumer,
                 ..
-            }
+            } if producer == "msg_producer" && consumer == "msg_consumer"
         ),
         "{err:?}"
     );
@@ -1004,10 +1010,10 @@ fn delayed_edge_into_log_input_is_rejected() {
         matches!(
             err,
             WireError::DelayedLogEdge {
-                producer: "msg_producer",
-                consumer: "msg_consumer",
+                ref producer,
+                ref consumer,
                 ..
-            }
+            } if producer == "msg_producer" && consumer == "msg_consumer"
         ),
         "{err:?}"
     );
@@ -1061,9 +1067,9 @@ fn snapshot_fan_in_is_rejected() {
         matches!(
             err,
             WireError::SnapshotFanIn {
-                system: "snapshot_fan_in",
+                ref system,
                 ..
-            }
+            } if system == "snapshot_fan_in"
         ),
         "{err:?}"
     );
@@ -1104,9 +1110,9 @@ impl System for AllTap {
     const NAME: &'static str = "all_tap";
     fn init(&mut self, o: &mut Self::Output) {
         // The registries are frozen by build time, so init observes the whole graph.
-        let (frames, msgs) = o.all.entries().fold((0, 0), |(f, m), e| match e.schema {
-            crate::EntrySchema::Table { .. } => (f + 1, m),
-            crate::EntrySchema::Postcard => (f, m + 1),
+        let (frames, msgs) = o.all.entries().fold((0, 0), |(f, m), e| match e.desc.schema {
+            crate::PortSchema::Table { .. } => (f + 1, m),
+            crate::PortSchema::Postcard { .. } => (f, m + 1),
         });
         self.frame_outs.set(frames);
         self.msg_chans.set(msgs);
@@ -1184,7 +1190,7 @@ impl CyclicSystem for MixedTap {
 fn capability_lifts_out_of_the_port_lists() {
     let d = <MixedTap as CyclicSystem>::descriptor();
     assert_eq!(d.capabilities, vec![crate::Capability::ReceiveAll]);
-    let names: Vec<&str> = d.outputs.iter().map(|p| p.name).collect();
+    let names: Vec<&str> = d.outputs.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(
         names,
         vec!["imu", "health", "log"],
@@ -1231,9 +1237,9 @@ fn command_ring_registered_but_untelemetered() {
     let registry = coord.registry();
     let key = metor_proto::types::ComponentId::new("coordinator.commands");
     let entry = registry.get(key).expect("command ring is registered");
-    assert!(!entry.telemetered, "inbound control is never downlinked");
-    assert!(matches!(entry.schema, crate::EntrySchema::Postcard));
-    assert!(matches!(entry.delivery, crate::Delivery::Log));
+    assert!(!entry.telemetered(), "inbound control is never downlinked");
+    assert!(matches!(entry.desc.schema, crate::PortSchema::Postcard { .. }));
+    assert!(matches!(entry.delivery(), crate::Delivery::Log));
 }
 
 #[test]
@@ -1255,7 +1261,7 @@ fn coordinator_bundle_registry_keys_are_golden() {
         let entry = registry
             .get(metor_proto::types::ComponentId::new(key))
             .unwrap_or_else(|| panic!("{key} is registered"));
-        assert_eq!(entry.telemetered, telemetered, "{key}");
+        assert_eq!(entry.telemetered(), telemetered, "{key}");
         assert_eq!(&*entry.instance, "coordinator", "{key}");
     }
 }
@@ -1337,7 +1343,7 @@ async fn untelemetered_frame_output_hidden_from_all_outputs() {
     let entry = registry
         .get(key)
         .expect("untelemetered frame is registered");
-    assert!(!entry.telemetered);
+    assert!(!entry.telemetered());
 
     coord.run_for(1).await;
     // The tap sees the two systems' health/log frames (4) plus the coordinator's
@@ -1382,7 +1388,7 @@ fn proc_rings_are_file_backed() {
         .desc
         .outputs
         .iter()
-        .position(|p| p.id == crate::PortId::Component(<Imu as crate::Frame>::FRAME_ID))
+        .position(|p| p.id() == crate::PortId::Component(<Imu as crate::Frame>::FRAME_ID))
         .unwrap();
     assert!(shared.contains(&(prod.id, imu_out)));
     // Every process-system output crosses.
@@ -1448,7 +1454,7 @@ fn push_slot_reg(
     process: bool,
 ) -> crate::SystemHandle {
     let base = crate::SystemDescriptor {
-        name,
+        name: name.into(),
         kind: crate::SystemKind::Cyclic,
         inputs: vec![crate::PortDesc::of::<Imu>()],
         outputs: Vec::new(),
@@ -1492,7 +1498,7 @@ fn process_slot_rings_are_file_backed() {
         .desc
         .outputs
         .iter()
-        .position(|p| p.id == crate::PortId::Component(<Imu as crate::Frame>::FRAME_ID))
+        .position(|p| p.id() == crate::PortId::Component(<Imu as crate::Frame>::FRAME_ID))
         .unwrap();
     assert!(shared.contains(&(slot.id, 0)), "occupant output crosses");
     assert!(shared.contains(&(prod.id, imu_out)), "Edge-input producer crosses");
@@ -1565,7 +1571,7 @@ fn registered_slot_descriptor_snapshot() {
         name: "seq".into(),
         params: Vec::new(),
         descriptor: crate::SystemDescriptor {
-            name: "seq",
+            name: "seq".into(),
             kind: crate::SystemKind::Cyclic,
             inputs: vec![PortDesc::of::<Imu>(), PortDesc::msg::<ReloadSequences>()],
             outputs: vec![PortDesc::of::<Nav>()],
@@ -1580,24 +1586,24 @@ fn registered_slot_descriptor_snapshot() {
 
     let seq_status_id = PortId::Component(<SequenceStatus as Frame>::FRAME_ID);
     let got: Vec<(&str, PortId, PortConn)> =
-        desc.inputs.iter().map(|p| (p.name, p.id, p.conn)).collect();
+        desc.inputs.iter().map(|p| (p.name.as_str(), p.id(), p.conn)).collect();
     assert_eq!(
         got,
         vec![
             ("imu", PortId::Component(<Imu as Frame>::FRAME_ID), PortConn::Edge),
-            ("ReloadSequences", PortDesc::msg::<ReloadSequences>().id, PortConn::Edge),
+            ("ReloadSequences", PortDesc::msg::<ReloadSequences>().id(), PortConn::Edge),
             (
                 "slot_control",
                 PortId::Component(<SlotControlIn as Frame>::FRAME_ID),
                 PortConn::Host
             ),
-            ("SequenceCommand", PortDesc::msg::<SequenceCommand>().id, PortConn::Edge),
+            ("SequenceCommand", PortDesc::msg::<SequenceCommand>().id(), PortConn::Edge),
             ("sequence", seq_status_id, PortConn::SelfTap(seq_status_id)),
         ],
         "registered input sequence: occupant user ports, mount control, runner tail"
     );
     let got: Vec<(&str, PortId, PortConn)> =
-        desc.outputs.iter().map(|p| (p.name, p.id, p.conn)).collect();
+        desc.outputs.iter().map(|p| (p.name.as_str(), p.id(), p.conn)).collect();
     assert_eq!(
         got,
         vec![
@@ -1608,7 +1614,7 @@ fn registered_slot_descriptor_snapshot() {
                 PortId::Component(<SlotStatus as Frame>::FRAME_ID),
                 PortConn::Host
             ),
-            ("sequences", PortDesc::msg::<SequenceChannelEvent>().id, PortConn::Host),
+            ("sequences", PortDesc::msg::<SequenceChannelEvent>().id(), PortConn::Host),
         ],
         "registered output sequence: occupant user ports, mount status, runner tail"
     );
@@ -1627,7 +1633,7 @@ fn add_slot_rejects_contract_violations() {
             name: name.into(),
             params: Vec::new(),
             descriptor: crate::SystemDescriptor {
-                name: "occ",
+                name: "occ".into(),
                 kind: crate::SystemKind::Cyclic,
                 inputs,
                 outputs: Vec::new(),
@@ -1709,7 +1715,7 @@ mod proc_slot {
             name: name.into(),
             params: Vec::new(),
             descriptor: crate::SystemDescriptor {
-                name: "occ",
+                name: "occ".into(),
                 kind: crate::SystemKind::Cyclic,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
@@ -1763,7 +1769,7 @@ mod proc_slot {
             })
             .collect();
         let runner = SlotRunner::new(
-            "seq-slot",
+            std::sync::Arc::from("seq-slot"),
             occupants.iter().map(|o| proc_occ(o)).collect(),
             None,
             Vec::new(),
@@ -2111,7 +2117,7 @@ async fn wiring_manifest_emitted_at_boot() {
     let entry = registry
         .get(metor_proto::types::ComponentId::new("coordinator.wiring"))
         .expect("the wiring channel is registered");
-    assert!(entry.telemetered, "the manifest is recorded telemetry");
+    assert!(entry.telemetered(), "the manifest is recorded telemetry");
     let mut view = entry.view().expect("reader slot");
 
     coord.run_for(2).await;

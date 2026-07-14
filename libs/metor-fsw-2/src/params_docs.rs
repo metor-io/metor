@@ -4,13 +4,13 @@
 //! `#[doc]` comments into a pack-crate-local [`inventory`] collection. Because
 //! a pack's manifest is built *inside* its own `.so`, [`run_pack_describe`]
 //! there can look each entry's params docs up by schema name and ship them in
-//! the manifest ([`SystemDescriptorMsg::params_docs`]) — with no doc field
+//! the manifest ([`PackEntryDesc::params_docs`]) — with no doc field
 //! crossing the ABI as anything but plain strings, and no trait bound forcing
 //! every params type to opt in. `metor-fsw stubgen` renders them as the units
 //! and prose that make params usable.
 //!
 //! [`run_pack_describe`]: crate::abi::run_pack_describe
-//! [`SystemDescriptorMsg::params_docs`]: crate::abi::SystemDescriptorMsg
+//! [`PackEntryDesc::params_docs`]: crate::abi::PackEntryDesc
 
 /// One params struct's documented fields, submitted by [`ParamsDocs`] and
 /// keyed by the struct's postcard-schema name.

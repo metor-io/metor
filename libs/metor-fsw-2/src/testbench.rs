@@ -121,7 +121,7 @@ impl TestBench {
             .descriptor
             .inputs
             .iter()
-            .position(|p| p.id == id)
+            .position(|p| p.id() == id)
             .unwrap_or_else(|| panic!("the entry declares no {what} input"));
         &self.input_rings[idx]
     }
@@ -131,7 +131,7 @@ impl TestBench {
             .descriptor
             .outputs
             .iter()
-            .position(|p| p.id == id)
+            .position(|p| p.id() == id)
             .unwrap_or_else(|| panic!("the entry declares no {what} output"));
         &mut self.output_views[idx]
     }

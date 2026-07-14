@@ -68,7 +68,7 @@ fn descriptor_orders_ports_by_signature() {
     let d = entry.descriptor();
     assert_eq!(d.kind, SystemKind::Cyclic);
     assert!(d.capabilities.is_empty());
-    let input_ids: Vec<_> = d.inputs.iter().map(|p| p.id).collect();
+    let input_ids: Vec<_> = d.inputs.iter().map(|p| p.id()).collect();
     assert_eq!(
         input_ids,
         vec![
@@ -76,7 +76,7 @@ fn descriptor_orders_ports_by_signature() {
             PortId::Packet(SequenceCommand::ID),
         ]
     );
-    let output_ids: Vec<_> = d.outputs.iter().map(|p| p.id).collect();
+    let output_ids: Vec<_> = d.outputs.iter().map(|p| p.id()).collect();
     assert_eq!(
         output_ids,
         vec![

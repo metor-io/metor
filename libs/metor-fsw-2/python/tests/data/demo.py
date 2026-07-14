@@ -15,7 +15,7 @@ ARTIFACT = Artifact(
     id="demo",
     crate="demo-systems",
     lib="demo_systems",
-    manifest_hash="sha256:15d6df2ff5519af40ba3edb5947709d0e4952378b1054c34ae4c1b56f8294a9d",
+    manifest_hash="sha256:4799f397f889dbd68ee56b1b95fd5dc212b87f1e7a0684a69797f430a8806f74",
 )
 
 

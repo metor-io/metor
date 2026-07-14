@@ -284,13 +284,13 @@ fn descriptor_and_compatibility() {
     assert_eq!(desc.kind, SystemKind::Cyclic);
     assert_eq!(desc.inputs.len(), 1);
     assert_eq!(
-        desc.inputs[0].id.component().expect("table port"),
+        desc.inputs[0].id().component().expect("table port"),
         Imu::FRAME_ID
     );
     // The user's nav port plus the two implicit health and log ports.
     assert_eq!(desc.outputs.len(), 3);
     assert_eq!(
-        desc.outputs[0].id.component().expect("table port"),
+        desc.outputs[0].id().component().expect("table port"),
         NavEstimate::FRAME_ID
     );
 
@@ -625,7 +625,7 @@ impl crate::RingSource for TestSource {
 fn system_macro_matches_hand_written() {
     // 1. Identical descriptors: name, kind, port order, ids, and sizes. They
     //    are compared through the Debug rendering because PortDesc carries a
-    //    non-Eq announce closure.
+    //    non-Eq VTable.
     let hand = <HandDoubler as CyclicSystem>::descriptor();
     let mac = <MacroDoubler as CyclicSystem>::descriptor();
     assert_eq!(format!("{hand:?}"), format!("{mac:?}"));
@@ -771,13 +771,13 @@ fn fsw_attrs_lower_onto_descriptors() {
         !outs[0].telemetered,
         "#[fsw(telemetered = false)] on a FRAME output"
     );
-    assert_eq!(outs[0].id, crate::PortId::Component(NavEstimate::FRAME_ID));
+    assert_eq!(outs[0].id(), crate::PortId::Component(NavEstimate::FRAME_ID));
     assert!(
         !outs[1].telemetered,
         "the CommandOut token is the same opt-out"
     );
     assert_eq!(
-        outs[1].id,
+        outs[1].id(),
         crate::PortId::Packet(<SequenceCommand as metor_proto::types::Msg>::ID)
     );
 }

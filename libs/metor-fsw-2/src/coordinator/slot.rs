@@ -66,6 +66,7 @@
 
 use core::mem::offset_of;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use metor_fsw_ring::RingBuffer;
@@ -289,10 +290,10 @@ impl SlotPorts {
             occupant: occupant.to_string(),
             port,
         };
-        if base.inputs.iter().any(|p| p.id == control_id) {
+        if base.inputs.iter().any(|p| p.id() == control_id) {
             return Err(reserved("SlotControlIn"));
         }
-        if base.outputs.iter().any(|p| p.id == seq_status_id) {
+        if base.outputs.iter().any(|p| p.id() == seq_status_id) {
             return Err(reserved("SequenceStatus"));
         }
         let mut occupant_inputs = base.inputs.clone();
@@ -318,7 +319,7 @@ impl SlotPorts {
     /// type docs); extend the plan, never reorder it.
     pub(crate) fn registered(&self, name: &'static str) -> SystemDescriptor {
         SystemDescriptor {
-            name,
+            name: name.into(),
             kind: SystemKind::Cyclic,
             inputs: self.occupant_inputs.iter().chain(&self.tail_inputs).cloned().collect(),
             outputs: self.occupant_outputs.iter().chain(&self.tail_outputs).cloned().collect(),
@@ -416,7 +417,7 @@ pub(crate) struct ProcParts {
 /// rejected and only a `Reset` rebuild can run the occupant again.
 pub(crate) struct SlotRunner {
     /// The slot's instance name, its identity and command address.
-    name: &'static str,
+    name: Arc<str>,
     allowed: Vec<AllowedOccupant>,
     /// Applied once at [`init`](CyclicSlot::init); `None` after.
     initial: Option<InitialOccupant>,
@@ -478,7 +479,7 @@ impl SlotRunner {
     /// that happens at `init` or on a `Load`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        name: &'static str,
+        name: Arc<str>,
         allowed: Vec<AllowedOccupant>,
         initial: Option<InitialOccupant>,
         input_regions: Vec<crate::abi::FswRing>,
@@ -537,7 +538,7 @@ impl SlotRunner {
                         &occ.params,
                         self.input_regions.clone(),
                         self.output_regions.clone(),
-                        self.name,
+                        &self.name,
                         crate::Mount::SlotOccupant,
                     )
                 };
@@ -646,7 +647,7 @@ impl SlotRunner {
     /// sees every command producer, so dispatch filters by instance name; a
     /// command naming no slot matches nothing anywhere and is dropped.
     fn apply_command(&mut self, cmd: &SequenceCommand) {
-        if cmd.channel != self.name {
+        if cmd.channel != *self.name {
             return;
         }
         match &cmd.command {
@@ -936,8 +937,8 @@ impl CyclicSlot for SlotRunner {
         self.slot = None;
     }
 
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn state(&self) -> &SlotState {
@@ -969,7 +970,7 @@ impl CyclicSlot for SlotRunner {
             WorkerRunState::Stopped
         };
         Some(WorkerStatus {
-            name: self.name(),
+            name: self.name.clone(),
             pid,
             restarts: self.deaths,
             state,

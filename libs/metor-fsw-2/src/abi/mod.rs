@@ -2,10 +2,10 @@
 //!
 //! A pack `.so` exports a small, versioned `extern "C"` surface. Both halves
 //! compile against this module, which defines the `repr(C)` handles ([`FswRing`],
-//! [`FswStatus`]), the serialized manifest mirrors ([`PackManifestMsg`],
-//! [`SystemDescriptorMsg`]), the symbol names the host resolves, and the
-//! `run_pack_*` helpers that [`export_pack!`](crate::export_pack) delegates to
-//! so the generated exports stay one-liners.
+//! [`FswStatus`]), the serialized manifest ([`PackManifest`], carrying each
+//! entry's [`SystemDescriptor`] directly), the symbol names the host resolves,
+//! and the `run_pack_*` helpers that [`export_pack!`](crate::export_pack)
+//! delegates to so the generated exports stay one-liners.
 //!
 //! The lifecycle, in call order:
 //!
@@ -48,23 +48,16 @@
 //! schedule, so every wake endpoint is `NoWake`.
 
 use core::ffi::c_void;
-use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
 
-use std::sync::Arc;
-
 use metor_fsw_ring::{RingBuffer, WakeSink, WakeSource};
-use metor_proto::types::{ComponentId, PacketId, Timestamp};
-use metor_proto::vtable::{Op, VTable};
-use metor_proto_wkt::ComponentMetadata;
+use metor_proto::types::Timestamp;
 use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
 
 use crate::binder::RingSource;
-use crate::descriptor::{
-    AnnounceFn, Delivery, FanIn, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind,
-};
+use crate::descriptor::SystemDescriptor;
 
 // ---------------------------------------------------------------------------
 // Version + identity
@@ -72,17 +65,18 @@ use crate::descriptor::{
 
 /// The ABI word a host checks for equality before any other call.
 ///
-/// Bump this on any change to the C surface or to the `*Msg` wire structs below,
-/// once per released ABI shape. A mismatch fails the load cleanly instead of
-/// risking a crash on a stale binary.
+/// Bump this on any change to the C surface or to the manifest's serialized
+/// shape, once per released ABI shape. A mismatch fails the load cleanly
+/// instead of risking a crash on a stale binary.
 ///
 /// Version 5 is the pack ABI: one cdylib exports many systems through the
 /// `fsw_pack_*` surface, replacing the one-system `fsw_describe`/`fsw_create`
 /// family entirely. Version 6 adds per-params-field doc strings to the
 /// manifest so generated stubs carry the units and prose that make params
 /// usable. Version 7 drops the never-populated per-entry and per-port doc
-/// slots.
-pub const FSW_ABI_VERSION: u32 = 7;
+/// slots. Version 8 serializes [`SystemDescriptor`] directly in the manifest,
+/// replacing the `*Msg` mirror family.
+pub const FSW_ABI_VERSION: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles
@@ -164,7 +158,7 @@ pub const SYM_ABI_VERSION: &[u8] = b"fsw_abi_version\0";
 /// `fsw_pack_open` constructs the crate's [`Pack`](crate::Pack) once and
 /// returns it as an opaque pointer (null if `pack()` panicked).
 pub const SYM_PACK_OPEN: &[u8] = b"fsw_pack_open\0";
-/// `fsw_pack_describe` sends the serialized [`PackManifestMsg`] via a
+/// `fsw_pack_describe` sends the serialized [`PackManifest`] via a
 /// [`ByteSink`].
 pub const SYM_PACK_DESCRIBE: &[u8] = b"fsw_pack_describe\0";
 /// `fsw_pack_create` runs entry `index`'s create phase (decode params, build
@@ -182,274 +176,6 @@ pub const SYM_PACK_DESTROY: &[u8] = b"fsw_pack_destroy\0";
 /// `fsw_pack_close` drops the [`Pack`](crate::Pack) itself, after every
 /// instance state has been destroyed.
 pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
-
-// ---------------------------------------------------------------------------
-// Serialized descriptor mirrors (postcard)
-// ---------------------------------------------------------------------------
-
-/// A schema message describes a port's record type in a form that crosses the
-/// boundary as postcard bytes, the wire twin of [`PortSchema`].
-///
-/// A Table port cannot cross by value because its `announce` is a closure over
-/// the static frame type, which does not exist on the host side. Its arm
-/// therefore carries the unprefixed `vtable` (exactly what wiring compatibility
-/// checks need) plus the unprefixed `metadata`, from which the host re-derives
-/// the announce closure at load. A Postcard port is self-describing, so its arm
-/// is just the packet id.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum PortSchemaMsg {
-    /// A component-frame table port.
-    Table {
-        /// `F::FRAME_ID`.
-        frame_id: ComponentId,
-        /// `F::as_vtable()`, the unprefixed frame-relative vtable used for
-        /// wiring compatibility.
-        vtable: VTable,
-        /// The unprefixed component metadata, from which the host synthesizes a
-        /// prefixed `announce` without the static frame type.
-        metadata: Vec<ComponentMetadata>,
-    },
-    /// A self-describing postcard message port.
-    Postcard {
-        /// `M::ID`.
-        id: PacketId,
-    },
-}
-
-/// A port message carries one port's declaration, its name, size, schema, and
-/// delivery axes, across the boundary as postcard bytes, the wire twin of
-/// [`PortDesc`]. A `.so` declares message ports and axis overrides exactly
-/// like a static system.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PortDescMsg {
-    /// The port name; the `&'static str` is recovered by leaking at load.
-    pub name: String,
-    /// Worst-case record size in bytes.
-    pub max_size: usize,
-    /// What a record is.
-    pub schema: PortSchemaMsg,
-    /// Latest-wins snapshot versus every-record log.
-    pub delivery: Delivery,
-    /// Producer cardinality for an input.
-    pub fan_in: FanIn,
-    /// Whether the telemetry downlink taps this port.
-    pub telemetered: bool,
-}
-
-/// A descriptor message ships a system's whole self-description, name, kind,
-/// ports, and params schema, to the host as postcard bytes, the wire twin of
-/// [`SystemDescriptor`]. It carries the `Params` schema rather than the
-/// `Params` type, so the host can encode params from configuration without
-/// linking against the system.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SystemDescriptorMsg {
-    pub name: String,
-    pub kind: SystemKind,
-    pub inputs: Vec<PortDescMsg>,
-    pub outputs: Vec<PortDescMsg>,
-    /// `<Params as postcard_schema::Schema>::SCHEMA`, in its owned form.
-    pub params_schema: OwnedNamedType,
-    /// The non-port [`Capability`](crate::Capability) set. Every capability is
-    /// currently host-only, so the loader rejects a non-empty list
-    /// ([`DlError::UnsupportedCapabilities`](crate::dl::DlError)).
-    pub capabilities: Vec<crate::Capability>,
-    /// Per-field params docs (ABI v6), `(field path, doc)`, from the `Params`
-    /// type's `#[derive(ParamsDocs)]`. Empty when nothing is documented.
-    pub params_docs: Vec<(String, String)>,
-}
-
-impl PortDescMsg {
-    /// Lower one static [`PortDesc`] into the wire mirror.
-    ///
-    /// A Table port's unprefixed metadata is re-derived from its own `announce`
-    /// factory with the empty prefix (`PathHasher` skips empty segments); a
-    /// Postcard port carries only its id.
-    fn lower(desc: &PortDesc) -> Self {
-        let schema = match &desc.schema {
-            PortSchema::Table { vtable, announce } => {
-                let (_, metadata) = announce("");
-                PortSchemaMsg::Table {
-                    frame_id: desc
-                        .id
-                        .component()
-                        .expect("a Table port keys on a frame ComponentId"),
-                    vtable: vtable.clone(),
-                    metadata,
-                }
-            }
-            PortSchema::Postcard => PortSchemaMsg::Postcard {
-                id: desc
-                    .id
-                    .packet()
-                    .expect("a Postcard port keys on a PacketId"),
-            },
-        };
-        Self {
-            name: desc.name.to_string(),
-            max_size: desc.max_size,
-            schema,
-            delivery: desc.delivery,
-            fan_in: desc.fan_in,
-            telemetered: desc.telemetered,
-        }
-    }
-
-    /// Reconstruct a [`PortDesc`] on the host side.
-    ///
-    /// The port name is `Box::leak`ed to recover the `&'static str` the wiring
-    /// path expects, a one-time leak per loaded port. A Table port's `announce`
-    /// closure is synthesized from the carried metadata; a Postcard port needs
-    /// none.
-    pub fn into_port_desc(self) -> PortDesc {
-        let name: &'static str = Box::leak(self.name.into_boxed_str());
-        let (id, schema) = match self.schema {
-            PortSchemaMsg::Table {
-                frame_id,
-                vtable,
-                metadata,
-            } => {
-                // The synthesized `announce` closes over the carried unprefixed
-                // vtable and metadata and re-prefixes both by the instance name.
-                // The metadata names are rehashed with the prefix; the vtable's
-                // baked component ids are rewritten by `prefix_announce_vtable`.
-                // The result matches what a static system's announce produces
-                // bit for bit, so telemetry keys a loaded output's components
-                // the same way.
-                let unprefixed_vtable = vtable.clone();
-                let announce: AnnounceFn = Arc::new(move |prefix: &str| {
-                    let meta = metadata
-                        .iter()
-                        .cloned()
-                        .map(|m| m.with_prefix(prefix))
-                        .collect();
-                    let vt = prefix_announce_vtable(&unprefixed_vtable, &metadata, prefix);
-                    (vt, meta)
-                });
-                (
-                    PortId::Component(frame_id),
-                    // Wiring compatibility validates against the carried
-                    // unprefixed vtable; prefixing happens only in `announce`.
-                    PortSchema::Table { vtable, announce },
-                )
-            }
-            PortSchemaMsg::Postcard { id } => (PortId::Packet(id), PortSchema::Postcard),
-        };
-        PortDesc {
-            id,
-            name,
-            max_size: self.max_size,
-            schema,
-            delivery: self.delivery,
-            fan_in: self.fan_in,
-            telemetered: self.telemetered,
-            // Not carried across the ABI: a loaded system's ports are always
-            // edge-connected. The other connection kinds are host-runner
-            // constructs applied on the host side.
-            conn: crate::descriptor::PortConn::Edge,
-        }
-    }
-}
-
-/// Rewrite a loaded port's unprefixed vtable into its instance-prefixed form
-/// for telemetry announcement.
-///
-/// A static system bakes prefixed component ids into its announce vtable, with
-/// each leaf id hashed from `"<prefix>.<frame>.<field>"`. A loaded system has
-/// no static frame type, so it carries the unprefixed vtable plus per-component
-/// metadata, and the prefixed ids are reconstructed here from that metadata.
-///
-/// Each leaf component id is baked as a standalone 8-byte `Op::Data` blob, so
-/// this builds an unprefixed-to-prefixed id map from the metadata (a leaf's
-/// unprefixed id is `ComponentId::new(meta.name)`, and its prefixed id hashes
-/// `"<prefix>.<meta.name>"`, which is exactly what `with_prefix` produces) and
-/// rewrites every 8-byte `Op::Data` whose value is a known leaf id. The frame
-/// tag id is never prefixed and the schema type/dim blobs are absent from the
-/// map, so both are left untouched; dynamic member templates compose their
-/// paths at runtime through `Op::PathComponent` and carry no baked id at all.
-fn prefix_announce_vtable(vtable: &VTable, metadata: &[ComponentMetadata], prefix: &str) -> VTable {
-    let mut vt = vtable.clone();
-    if prefix.is_empty() {
-        // An empty prefix is the unprefixed identity, since `PathHasher` skips
-        // empty segments. Every announce caller supplies a real instance name,
-        // but stay total.
-        return vt;
-    }
-    // Unprefixed leaf id to prefixed leaf id, from the carried metadata.
-    let map: HashMap<u64, u64> = metadata
-        .iter()
-        .map(|m| {
-            let unprefixed = ComponentId::new(&m.name).0;
-            let prefixed = ComponentId::new(&format!("{prefix}.{}", m.name)).0;
-            (unprefixed, prefixed)
-        })
-        .collect();
-    // Collect the rewrites first, since the `ops` borrow and the `data` read
-    // overlap on `vt`, then apply them to a fresh data buffer.
-    let data = vt.data.as_slice();
-    let mut rewrites: Vec<(usize, u64)> = Vec::new();
-    for op in vt.ops.iter() {
-        if let Op::Data { offset, len } = op
-            && *len as usize == core::mem::size_of::<u64>()
-            && let Some(slot) = data.get(offset.to_index()..offset.to_index() + 8)
-        {
-            let val = u64::from_le_bytes(slot.try_into().expect("8-byte slice"));
-            if let Some(&prefixed) = map.get(&val) {
-                rewrites.push((offset.to_index(), prefixed));
-            }
-        }
-    }
-    if !rewrites.is_empty() {
-        let mut new_data = data.to_vec();
-        for (off, prefixed) in rewrites {
-            new_data[off..off + 8].copy_from_slice(&prefixed.to_le_bytes());
-        }
-        vt.data = new_data;
-    }
-    vt
-}
-
-impl SystemDescriptorMsg {
-    /// Lower a static [`SystemDescriptor`] into the wire mirror, carrying the
-    /// per-field params docs (ABI v6) alongside.
-    pub fn lower(
-        desc: &SystemDescriptor,
-        params_schema: OwnedNamedType,
-        params_docs: Vec<(String, String)>,
-    ) -> Self {
-        Self {
-            name: desc.name.to_string(),
-            kind: desc.kind,
-            inputs: desc.inputs.iter().map(PortDescMsg::lower).collect(),
-            outputs: desc.outputs.iter().map(PortDescMsg::lower).collect(),
-            params_schema,
-            capabilities: desc.capabilities.clone(),
-            params_docs,
-        }
-    }
-
-    /// Reconstruct a [`SystemDescriptor`] on the host side, rebuilding each
-    /// port and leaking the system name to the `&'static str` the wiring path
-    /// expects.
-    pub fn into_descriptor(self) -> SystemDescriptor {
-        let name: &'static str = Box::leak(self.name.into_boxed_str());
-        SystemDescriptor {
-            name,
-            kind: self.kind,
-            inputs: self
-                .inputs
-                .into_iter()
-                .map(PortDescMsg::into_port_desc)
-                .collect(),
-            outputs: self
-                .outputs
-                .into_iter()
-                .map(PortDescMsg::into_port_desc)
-                .collect(),
-            // Carried verbatim; the loader has already rejected a non-empty list.
-            capabilities: self.capabilities,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // RawBinder
@@ -521,26 +247,31 @@ impl<'a> RingSource for RawBinder<'a> {
 // The pack manifest (postcard)
 // ---------------------------------------------------------------------------
 
-/// One pack entry's wire form: its descriptor (the same
-/// [`SystemDescriptorMsg`] a single system always shipped), whether it can be
-/// instantiated more than once, and its optional default-params blob.
+/// One pack entry's manifest form: its [`SystemDescriptor`] verbatim, plus
+/// the entry facts that live beside the descriptor rather than in it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PackSystemMsg {
-    pub descriptor: SystemDescriptorMsg,
+pub struct PackEntryDesc {
+    pub descriptor: SystemDescriptor,
+    /// `<Params as postcard_schema::Schema>::SCHEMA` in its owned form, so
+    /// the host can encode params from configuration without linking the
+    /// `Params` type.
+    pub params_schema: OwnedNamedType,
+    /// Per-field params docs, `(field path, doc)`, from the `Params` type's
+    /// `#[derive(ParamsDocs)]`. Empty when nothing is documented.
+    pub params_docs: Vec<(String, String)>,
     /// `false` for a `.state(...)` entry: one instance, never a slot occupant.
     pub reloadable: bool,
     /// Canonical postcard bytes of the entry's default params, when declared;
-    /// the params encoder overlays config onto them. Carried from day one so
-    /// adding defaults later is not another ABI version.
+    /// the params encoder overlays config onto them.
     pub params_default: Option<Vec<u8>>,
 }
 
-/// The whole pack's wire form, what `fsw_pack_describe` sends: one
-/// [`PackSystemMsg`] per entry, in registration order — the order
+/// The whole pack's manifest, what `fsw_pack_describe` sends: one
+/// [`PackEntryDesc`] per entry, in registration order — the order
 /// `fsw_pack_create` indexes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PackManifestMsg {
-    pub systems: Vec<PackSystemMsg>,
+pub struct PackManifest {
+    pub systems: Vec<PackEntryDesc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +342,7 @@ pub fn run_pack_open(pack_fn: fn() -> crate::Pack) -> *mut c_void {
     outcome.unwrap_or(core::ptr::null_mut())
 }
 
-/// `fsw_pack_describe`: lower every entry into the [`PackManifestMsg`],
+/// `fsw_pack_describe`: assemble the [`PackManifest`] off the entries,
 /// postcard-encode it, and hand the bytes to the host [`ByteSink`]. Returns
 /// `0` on success, `-1` if the pack pointer is null or anything panics.
 ///
@@ -625,7 +356,7 @@ pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_v
     // SAFETY: caller asserts `pack` is a live `PackHost` from `run_pack_open`.
     let host = unsafe { &*(pack as *mut PackHost) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let msg = PackManifestMsg {
+        let msg = PackManifest {
             systems: host
                 .pack
                 .entries()
@@ -634,8 +365,10 @@ pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_v
                     // Params docs are collected from this `.so`'s own
                     // `#[derive(ParamsDocs)]` submissions, keyed by schema name.
                     let params_docs = crate::params_docs_for(&schema.name);
-                    PackSystemMsg {
-                        descriptor: SystemDescriptorMsg::lower(e.descriptor(), schema, params_docs),
+                    PackEntryDesc {
+                        descriptor: e.descriptor().clone(),
+                        params_schema: schema,
+                        params_docs,
                         reloadable: e.reloadable(),
                         params_default: e.params_default().map(<[u8]>::to_vec),
                     }

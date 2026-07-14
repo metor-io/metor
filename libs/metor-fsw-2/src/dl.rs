@@ -49,14 +49,13 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::slice;
+use std::sync::Arc;
 
 use libloading::{Library, Symbol};
 use metor_proto::types::Timestamp;
 use postcard_schema::schema::owned::OwnedNamedType;
 
-use crate::abi::{
-    self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, PackManifestMsg, SystemDescriptorMsg,
-};
+use crate::abi::{self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, PackEntryDesc};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::SystemDescriptor;
 
@@ -116,7 +115,8 @@ pub enum DlError {
     /// `fsw_pack_describe` returned a non-zero (failure) code.
     #[error("fsw_pack_describe failed with code {0}")]
     Describe(i32),
-    /// The postcard-encoded [`PackManifestMsg`] could not be decoded.
+    /// The postcard-encoded [`PackManifest`](abi::PackManifest) could not be
+    /// decoded.
     #[error("failed to decode the pack manifest: {0}")]
     Decode(#[source] postcard::Error),
     /// An entry declares [`Capability`](crate::Capability)s. Capabilities
@@ -210,7 +210,8 @@ unsafe fn resolve<'lib, T>(
 }
 
 /// Load the object at `path`, check its ABI word, open its pack, and collect
-/// the raw postcard [`PackManifestMsg`] bytes from `fsw_pack_describe`. The
+/// the raw postcard [`PackManifest`](abi::PackManifest) bytes from
+/// `fsw_pack_describe`. The
 /// shared front of [`DlPack::open`] and [`describe_raw`].
 fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
     // SAFETY: `dlopen` runs the object's initializers; a pack `cdylib`
@@ -276,8 +277,8 @@ pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> 
 }
 
 /// The manifest sidecar path for a built pack library: `<so_path>.manifest`,
-/// the raw postcard [`PackManifestMsg`] bytes the build driver wrote next to
-/// the `.so` (`docs/wiring.md` §6.1).
+/// the raw postcard [`PackManifest`](abi::PackManifest) bytes the build
+/// driver wrote next to the `.so` (`docs/wiring.md` §6.1).
 #[cfg(feature = "wiring")]
 pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
     let mut name = so_path.as_os_str().to_owned();
@@ -293,12 +294,12 @@ pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
 // prefer a sidecar over spawning a describe worker.
 #[cfg(feature = "wiring")]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn read_manifest_sidecar(so_path: &Path) -> Option<Result<Vec<PackEntryMeta>, DlError>> {
+pub(crate) fn read_manifest_sidecar(so_path: &Path) -> Option<Result<Vec<PackEntryDesc>, DlError>> {
     let bytes = std::fs::read(manifest_sidecar_path(so_path)).ok()?;
     Some(decode_pack_manifest(&bytes))
 }
 
-/// The raw postcard [`PackManifestMsg`] bytes of the `<so>.manifest` sidecar,
+/// The raw postcard [`PackManifest`](abi::PackManifest) bytes of the `<so>.manifest` sidecar,
 /// if the build driver wrote one (sidecar-hash ≡ describe-hash). `None` when no
 /// sidecar sits next to the library, leaving the caller to describe it.
 #[cfg(feature = "wiring")]
@@ -312,66 +313,41 @@ pub(crate) fn manifest_sidecar_bytes(so_path: &Path) -> Option<Vec<u8>> {
 #[cfg(all(test, not(miri)))]
 pub(crate) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// One decoded manifest entry: the reconstructed descriptor plus the entry
-/// facts the loader and wiring consume.
-pub(crate) struct PackEntryMeta {
-    pub(crate) descriptor: SystemDescriptor,
-    pub(crate) params_schema: OwnedNamedType,
-    pub(crate) reloadable: bool,
-    pub(crate) params_default: Option<Vec<u8>>,
-}
-
-/// Decode a manifest payload into per-entry host-side descriptors — the
-/// shared tail of [`DlPack::open`] and the process path's describe-worker
-/// decode, host-capability rejection included.
-pub(crate) fn decode_pack_manifest(bytes: &[u8]) -> Result<Vec<PackEntryMeta>, DlError> {
-    let msg: PackManifestMsg = postcard::from_bytes(bytes).map_err(DlError::Decode)?;
-    msg.systems
+/// Decode a manifest payload into its per-entry descriptors — the shared
+/// tail of [`DlPack::open`] and the process path's describe-worker decode,
+/// host-capability rejection included.
+pub(crate) fn decode_pack_manifest(bytes: &[u8]) -> Result<Vec<PackEntryDesc>, DlError> {
+    let manifest: abi::PackManifest = postcard::from_bytes(bytes).map_err(DlError::Decode)?;
+    manifest
+        .systems
         .into_iter()
-        .map(|sys| {
-            let PackManifestEntry {
-                descriptor,
-                params_schema,
-            } = reject_capabilities(sys.descriptor)?;
-            Ok(PackEntryMeta {
-                descriptor,
-                params_schema,
-                reloadable: sys.reloadable,
-                params_default: sys.params_default,
-            })
-        })
+        .map(reject_capabilities)
         .collect()
 }
 
-struct PackManifestEntry {
-    descriptor: SystemDescriptor,
-    params_schema: OwnedNamedType,
-}
-
-/// Rejects a descriptor that declares any [`Capability`](crate::Capability).
-/// Capabilities are resolved against the host registry, which cannot cross the
-/// ABI, so the load fails cleanly instead of panicking at bind time.
-fn reject_capabilities(msg: SystemDescriptorMsg) -> Result<PackManifestEntry, DlError> {
-    if !msg.capabilities.is_empty() {
-        return Err(DlError::UnsupportedCapabilities(msg.capabilities));
+/// Rejects an entry whose descriptor declares any
+/// [`Capability`](crate::Capability). Capabilities are resolved against the
+/// host registry, which cannot cross the ABI, so the load fails cleanly
+/// instead of panicking at bind time.
+fn reject_capabilities(entry: PackEntryDesc) -> Result<PackEntryDesc, DlError> {
+    if !entry.descriptor.capabilities.is_empty() {
+        return Err(DlError::UnsupportedCapabilities(
+            entry.descriptor.capabilities.clone(),
+        ));
     }
-    let params_schema = msg.params_schema.clone();
-    Ok(PackManifestEntry {
-        descriptor: msg.into_descriptor(),
-        params_schema,
-    })
+    Ok(entry)
 }
 
 // ---------------------------------------------------------------------------
 // DlPack + DlSystem, the loaded handles
 // ---------------------------------------------------------------------------
 
-/// A loaded pack: the shared [`PackLib`], the decoded per-entry metadata, and
-/// the resolved lifecycle pointers. [`system`](Self::system) selects one
+/// A loaded pack: the shared [`PackLib`], the decoded per-entry descriptors,
+/// and the resolved lifecycle pointers. [`system`](Self::system) selects one
 /// entry as a [`DlSystem`], the unit the builder registers.
 pub struct DlPack {
     lib: Rc<PackLib>,
-    entries: Vec<PackEntryMeta>,
+    entries: Vec<PackEntryDesc>,
     fns: PackFns,
 }
 
@@ -417,14 +393,14 @@ impl DlPack {
 
     /// The exported entry names, in manifest order.
     pub fn system_names(&self) -> impl Iterator<Item = &str> {
-        self.entries.iter().map(|e| e.descriptor.name)
+        self.entries.iter().map(|e| e.descriptor.name.as_str())
     }
 
     /// Whether the pack exports exactly one entry, in which case a `system`
     /// node may omit `type=`.
     pub fn sole_system(&self) -> Option<&str> {
         match self.entries.as_slice() {
-            [only] => Some(only.descriptor.name),
+            [only] => Some(only.descriptor.name.as_str()),
             _ => None,
         }
     }
@@ -445,15 +421,15 @@ impl DlPack {
                     .map(|e| e.descriptor.name.to_string())
                     .collect(),
             })?;
-        let meta = &self.entries[index];
+        let entry = &self.entries[index];
         Ok(DlSystem {
             lib: self.lib.clone(),
             fns: self.fns,
             index: index as u32,
-            descriptor: meta.descriptor.clone(),
-            params_schema: meta.params_schema.clone(),
-            params_default: meta.params_default.clone(),
-            reloadable: meta.reloadable,
+            descriptor: entry.descriptor.clone(),
+            params_schema: entry.params_schema.clone(),
+            params_default: entry.params_default.clone(),
+            reloadable: entry.reloadable,
         })
     }
 }
@@ -521,7 +497,7 @@ impl DlSystem {
         params: &[u8],
         inputs: Vec<FswRing>,
         outputs: Vec<FswRing>,
-        name: &'static str,
+        name: &str,
         mount: crate::Mount,
     ) -> DlSlot {
         let (ptr, len) = if params.is_empty() {
@@ -560,7 +536,7 @@ impl DlSystem {
             state,
             inputs,
             outputs,
-            name,
+            name: Arc::from(name),
             slot_state,
         }
     }
@@ -596,7 +572,7 @@ pub(crate) struct DlSlot {
     /// (including the implicit health and log).
     outputs: Vec<FswRing>,
     /// The descriptor name, used as the slot's identity in status and health.
-    name: &'static str,
+    name: Arc<str>,
     slot_state: SlotState,
 }
 
@@ -720,8 +696,8 @@ impl CyclicSlot for DlSlot {
         unsafe { (self.shutdown)(self.state) };
     }
 
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn state(&self) -> &SlotState {
@@ -774,7 +750,7 @@ mod tests {
             state: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
             inputs: Vec::new(),
             outputs: Vec::new(),
-            name: "stub",
+            name: Arc::from("stub"),
             slot_state: SlotState::Running,
         }
     }
@@ -826,14 +802,18 @@ mod tests {
     /// never a bind-time panic; an empty list (every real export) passes.
     #[test]
     fn load_rejects_declared_capabilities() {
-        let mk = |capabilities| SystemDescriptorMsg {
-            name: "rogue".to_string(),
-            kind: crate::SystemKind::Cyclic,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
+        let mk = |capabilities| PackEntryDesc {
+            descriptor: crate::SystemDescriptor {
+                name: "rogue".to_string(),
+                kind: crate::SystemKind::Cyclic,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                capabilities,
+            },
             params_schema: OwnedNamedType::from(<() as postcard_schema::Schema>::SCHEMA),
-            capabilities,
             params_docs: Vec::new(),
+            reloadable: true,
+            params_default: None,
         };
 
         assert!(reject_capabilities(mk(Vec::new())).is_ok());
