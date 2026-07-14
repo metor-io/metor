@@ -126,7 +126,7 @@ pub enum OccupantBacking {
     Dl(Box<DlSystem>),
     /// A built cdylib the occupant's **worker process** opens
     /// (`docs/process-slots.md`); the host keeps only the path and never
-    /// loads the artifact itself. Slots mix backings never: `add_slot`
+    /// loads the artifact itself. Slots mix backings never: `plan_slot`
     /// requires the whole allowed set on one side of the seam.
     Artifact(PathBuf),
 }
@@ -183,10 +183,9 @@ impl InitialOccupant {
     }
 }
 
-/// A slot registration `add_slot` rejected. The same contract violations a
-/// wiring front-end reports as `LoadError`s, surfaced as clean errors for the
-/// direct builder path too (a mission author's typo is not a library bug, so
-/// none of these panic).
+/// A slot registration `plan_slot` rejected. The wiring front-end maps these
+/// onto its own `LoadError`s; a mission author's typo is not a library bug, so
+/// none of these panic.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum SlotConfigError {
     #[error("a slot needs at least one allowed occupant")]
@@ -218,10 +217,9 @@ pub enum SlotConfigError {
 }
 
 /// The pure-spec half of slot validation: a non-empty allowed set, and an
-/// `initial` name inside it. Front-ends run it before any occupant artifact
-/// is opened (a typo must fail without a dlopen), and `add_slot` runs it
-/// again for direct builder callers; the descriptor-level checks live in
-/// `add_slot` alone, next to the descriptors they need.
+/// `initial` name inside it. The wiring gate runs it before any occupant
+/// artifact is opened (a typo must fail without a dlopen); the descriptor-level
+/// checks live in [`plan_slot`], next to the descriptors they need.
 pub(crate) fn validate_slot_spec(
     allowed: &[&str],
     initial: Option<&str>,
@@ -240,22 +238,21 @@ pub(crate) fn validate_slot_spec(
     Ok(())
 }
 
-/// Derive a slot's registered contract from its occupant set, the one place
-/// the descriptor-level checks run: the pure-spec validation
-/// ([`validate_slot_spec`]), backing homogeneity (per-slot means all-occupants,
-/// so a mixed set is [`MixedBacking`](SlotConfigError::MixedBacking)), mutual
-/// occupant compatibility against the first occupant's contract, the
-/// [`SlotPorts`] plan, and the flattened registered [`SystemDescriptor`]. The
-/// returned `bool` is whether the slot runs process-mode (an all-`Artifact`
-/// allow set). The wiring front-end and the in-crate
-/// [`InitGraph::add_slot`](super::InitGraph::add_slot) convenience share it.
+/// Derive a slot's registered contract from its occupant set, the one place the
+/// descriptor-level checks run: backing homogeneity (per-slot means
+/// all-occupants, so a mixed set is
+/// [`MixedBacking`](SlotConfigError::MixedBacking)), mutual occupant
+/// compatibility against the first occupant's contract, the [`SlotPorts`] plan,
+/// and the flattened registered [`SystemDescriptor`]. The returned `bool` is
+/// whether the slot runs process-mode (an all-`Artifact` allow set).
+///
+/// The pure-spec checks ([`validate_slot_spec`]: a non-empty allow set, a valid
+/// `initial`) are the caller's gate, so `allowed` is trusted non-empty here.
 pub(crate) fn plan_slot(
     name: &str,
     allowed: &[AllowedOccupant],
-    initial: Option<&InitialOccupant>,
+    _initial: Option<&InitialOccupant>,
 ) -> Result<(SystemDescriptor, SlotPorts, bool), SlotConfigError> {
-    let names: Vec<&str> = allowed.iter().map(|a| a.name.as_str()).collect();
-    validate_slot_spec(&names, initial.map(|i| i.occupant.as_str()))?;
     // Per-slot means all-occupants: the isolation boundary is the slot's
     // position in the cycle, and a mixed allow set would make `Load` silently
     // change the fault domain.
@@ -297,20 +294,17 @@ pub(crate) fn plan_slot(
 /// positional lists the build pass consumes:
 ///
 /// - the occupant's **user ports**, in its descriptor's order;
-/// - the **mount-appended occupant tail** — the [`SlotControlIn`] cancel
-///   input and the [`SequenceStatus`] output the occupant binds after its
-///   own ports on the loaded side (a mount property, not descriptor
+/// - the **mount-appended occupant tail** — the [`SlotControlIn`] cancel input
+///   and the [`SequenceStatus`] output (a mount property, not descriptor
 ///   content: any entry can occupy a slot);
-/// - the **runner tail**, which never crosses to the occupant: the
-///   `commands` fan-in and [`SequenceStatus`] self-tap inputs, the
-///   [`SlotStatus`] and `"sequences"` events outputs.
+/// - the **runner tail**, which never crosses to the occupant.
 ///
-/// The first two flatten into the occupant lists here because they share a
-/// fate: both cross to the occupant, positionally, as the prefix of each
-/// registered list. [`registered`](Self::registered) flattens prefix then
-/// tail into the [`SystemDescriptor`] the build pass sees; edge resolution,
-/// registry keys, and the occupant-side positional bind ABI all consume that
-/// flattening, so its exact sequence is a compatibility surface (the
+/// The first two flatten into the occupant lists here because both cross to
+/// the occupant, positionally, as the prefix of each registered list.
+/// [`registered`](Self::registered) flattens prefix then tail into the
+/// [`SystemDescriptor`] the build pass sees; edge resolution, registry keys,
+/// and the occupant-side positional bind ABI all consume that flattening, so
+/// its exact sequence is a compatibility surface (the
 /// `registered_slot_descriptor_snapshot` test pins it).
 pub(crate) struct SlotPorts {
     /// The occupant's ABI prefix: its user inputs plus the mount-appended,
@@ -488,14 +482,13 @@ pub(crate) struct SlotRunner {
     /// emitting a [`SequenceChannelEvent`] at every lifecycle transition and
     /// one `Progress` event per occupant progress line.
     events: MsgOut<SequenceChannelEvent>,
-    /// Read view over the occupant's own [`SequenceStatus`] output, drained
-    /// every cycle while running to source `Progress` events and the terminal
-    /// outcome the raw status word cannot carry.
+    /// Read view over the occupant's own [`SequenceStatus`] output, sourcing
+    /// `Progress` events and the terminal outcome the raw status word cannot
+    /// carry.
     seq_status: Input<SequenceStatus>,
-    /// The slot's command fan-in, fed by exactly the producers explicitly
-    /// wired to it (zero edges is a legal, command-less slot). Drained at the
-    /// head of each [`step`](CyclicSlot::step) and filtered by instance name,
-    /// so an addressed command dispatches the cycle it arrives.
+    /// The slot's command fan-in, drained at the head of each
+    /// [`step`](CyclicSlot::step) and filtered by instance name, so an
+    /// addressed command dispatches the cycle it arrives.
     commands: MsgIn<SequenceCommand>,
     /// The latest occupant `run_state` drained while running, used to refine
     /// a terminal `Done` into completed, aborted, or failed.

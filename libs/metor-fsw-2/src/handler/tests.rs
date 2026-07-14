@@ -13,8 +13,11 @@ use crate::frame::Frame;
 use crate::pack::{EntryParams, MakeError};
 use crate::{
     ClockMode, CoordinatorConfig, HealthPort, Input, MsgIn, Output, Pack, PortId,
-    PortRef, SystemKind, system,
+    SystemKind, system,
 };
+
+use crate::coordinator::PortRef;
+use crate::coordinator::init::pending_node;
 
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
@@ -129,21 +132,10 @@ async fn pack_entries_flow_and_share_state() {
 
     let mut b = crate::coordinator::init::InitGraph::new(config());
     let prod = b
-        .add_pack_entry(
-            "prod",
-            pack.entry_mut("prod").expect("registered"),
-            EntryParams::Postcard(&[]),
-        )
-        .expect("create prod");
+        .push_node(pending_node("prod".into(), pack.entry_mut("prod").expect("registered"), EntryParams::Postcard(&[])).expect("create prod"));
     let cons = b
-        .add_pack_entry(
-            "cons",
-            pack.entry_mut("cons").expect("registered"),
-            EntryParams::Postcard(&[]),
-        )
-        .expect("create cons");
-    b.connect(PortRef::new::<PkImu>(prod), PortRef::new::<PkImu>(cons))
-        .unwrap();
+        .push_node(pending_node("cons".into(), pack.entry_mut("cons").expect("registered"), EntryParams::Postcard(&[])).expect("create cons"));
+    b.connect(PortRef { system: prod, port: PortId::Component(PkImu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(PkImu::FRAME_ID) });
     let mut coord = b.build().unwrap();
 
     coord.run_for(5).await;
@@ -224,21 +216,10 @@ async fn task_entry_runs_as_wired_sequence() {
         ..CoordinatorConfig::default()
     });
     let point_h = b
-        .add_pack_entry(
-            "point",
-            pack.entry_mut("point").unwrap(),
-            EntryParams::Postcard(&params),
-        )
-        .expect("create task");
+        .push_node(pending_node("point".into(), pack.entry_mut("point").unwrap(), EntryParams::Postcard(&params)).expect("create task"));
     let watch_h = b
-        .add_pack_entry(
-            "watch",
-            pack.entry_mut("watch").unwrap(),
-            EntryParams::Postcard(&[]),
-        )
-        .expect("create watcher");
-    b.connect(PortRef::new::<PkNav>(point_h), PortRef::new::<PkNav>(watch_h))
-        .unwrap();
+        .push_node(pending_node("watch".into(), pack.entry_mut("watch").unwrap(), EntryParams::Postcard(&[])).expect("create watcher"));
+    b.connect(PortRef { system: point_h, port: PortId::Component(PkNav::FRAME_ID) }, PortRef { system: watch_h, port: PortId::Component(PkNav::FRAME_ID) });
     let mut coord = b.build().unwrap();
 
     coord.run_for(10).await;
@@ -314,21 +295,10 @@ async fn task_cycles_every_cycle_and_folds_drops() {
         ..CoordinatorConfig::default()
     });
     let beat_h = b
-        .add_pack_entry(
-            "beat",
-            pack.entry_mut("beat").unwrap(),
-            EntryParams::Postcard(&[]),
-        )
-        .expect("create task");
+        .push_node(pending_node("beat".into(), pack.entry_mut("beat").unwrap(), EntryParams::Postcard(&[])).expect("create task"));
     let watch_h = b
-        .add_pack_entry(
-            "watch",
-            pack.entry_mut("watch").unwrap(),
-            EntryParams::Postcard(&[]),
-        )
-        .expect("create watcher");
-    b.connect(PortRef::new::<PkNav>(beat_h), PortRef::new::<PkNav>(watch_h))
-        .unwrap();
+        .push_node(pending_node("watch".into(), pack.entry_mut("watch").unwrap(), EntryParams::Postcard(&[])).expect("create watcher"));
+    b.connect(PortRef { system: beat_h, port: PortId::Component(PkNav::FRAME_ID) }, PortRef { system: watch_h, port: PortId::Component(PkNav::FRAME_ID) });
     let mut coord = b.build().unwrap();
 
     // A broad reader that never drains: its cursor pins the ring at the live

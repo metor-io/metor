@@ -564,13 +564,10 @@ pub(crate) struct DlSlot {
     /// and dropped by `fsw_pack_destroy`. Nulled after destroy so `Drop` is
     /// idempotent.
     state: *mut c_void,
-    /// Input ring handles in descriptor order, viewing the upstream producers'
-    /// output rings.
+    /// Input ring handles in descriptor order, viewing the producers' rings.
     inputs: Vec<FswRing>,
-    /// Output ring handles in descriptor order, this system's own writer rings
-    /// (including the implicit health and log).
+    /// Output ring handles in descriptor order, this system's own writer rings.
     outputs: Vec<FswRing>,
-    /// The descriptor name, used as the slot's identity in status and health.
     name: Arc<str>,
     slot_state: SlotState,
 }

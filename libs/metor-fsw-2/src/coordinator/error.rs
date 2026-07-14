@@ -4,20 +4,15 @@ use crate::descriptor::{Hz, PortId};
 
 use super::NAME_CAP;
 
-/// A defect in the declared graph, reported by
-/// [`connect`](super::init::InitGraph::connect) or
-/// [`build`](super::init::build) before any byte flows.
+/// A defect in the declared graph, reported by [`build`](super::init::InitGraph::build)
+/// before any byte flows.
 ///
 /// Not `Eq`: [`InvalidCycleRate`](WireError::InvalidCycleRate) carries the
 /// offending `f64` rate so the message can name it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WireError {
-    /// A `PortRef` named a system index that was never registered.
-    UnknownSystem { id: usize },
     /// A system has no port carrying the named frame or message.
     UnknownPort { system: usize, port: PortId },
-    /// `connect` named a producer and consumer port that do not share a port id.
-    PortIdMismatch { producer: PortId, consumer: PortId },
     /// The producer's record shape does not satisfy the consumer's required
     /// shape (the table subset rule, postcard id equality, delivery agreement).
     Incompatible {
@@ -120,14 +115,9 @@ pub enum WireError {
 impl std::fmt::Display for WireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WireError::UnknownSystem { id } => write!(f, "unknown system handle #{id}"),
             WireError::UnknownPort { system, port } => {
                 write!(f, "system #{system} has no port {port:?}")
             }
-            WireError::PortIdMismatch { producer, consumer } => write!(
-                f,
-                "connect port-id mismatch: producer {producer:?} vs consumer {consumer:?}"
-            ),
             WireError::Incompatible {
                 producer,
                 consumer,

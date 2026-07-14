@@ -15,8 +15,14 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
     AllOutputs, AsyncSystem, ClockMode, CoordinatorConfig, CyclicSystem, Input, MsgIn,
-    MsgOut, Out, Output, PortRef, StopReason, System, SystemInput, SystemOutput, WireError,
+    MsgOut, Out, Output, StopReason, System, SystemInput, SystemOutput, WireError,
 };
+
+use super::PortRef;
+use super::init::{async_node, cyclic_node};
+use super::slot::plan_slot;
+use crate::descriptor::PortId;
+use crate::frame::Frame as _;
 
 // ---------------------------------------------------------------------------
 // Frames under test.
@@ -159,15 +165,14 @@ fn config() -> CoordinatorConfig {
 async fn two_system_end_to_end() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
-    let cons = b.add_cyclic(Consumer {
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: seen.clone(),
         drain: true,
         init_counter: None,
         first_exec_init: None,
-    });
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
-        .unwrap();
+    }));
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
     let mut coord = b.build().unwrap();
 
     coord.run_for(5).await;
@@ -188,15 +193,14 @@ async fn two_system_end_to_end() {
 async fn idle_consumer_backpressures_producer() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
-    let cons = b.add_cyclic(Consumer {
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: seen.clone(),
         drain: false, // never reads, so its view eventually fills the ring
         init_counter: None,
         first_exec_init: None,
-    });
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
-        .unwrap();
+    }));
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
     let mut coord = b.build().unwrap();
 
     coord.run_for(60).await;
@@ -252,13 +256,12 @@ async fn async_through_copy_in() {
     producer.burst = 8; // burst past the copy-in's per-cycle mirror (latest-wins)
 
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(producer);
-    let asy = b.add_async(AsyncConsumer {
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), producer));
+    let asy = b.push_node(async_node(AsyncConsumer::NAME.into(), AsyncConsumer {
         count: count.clone(),
         last: last.clone(),
-    });
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(asy))
-        .unwrap();
+    }));
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: asy, port: PortId::Component(Imu::FRAME_ID) });
     let mut coord = b.build().unwrap();
 
     // Completes without blocking despite the burst; the copy-in mirrors only the
@@ -277,49 +280,49 @@ async fn async_through_copy_in() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn validation_incompatible_frame_id_mismatch() {
-    // connect rejects a producer/consumer pair that do not even share a frame id.
+fn validation_unknown_port() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
-    let cons = b.add_cyclic(Consumer {
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: Rc::new(RefCell::new(Vec::new())),
         drain: true,
         init_counter: None,
         first_exec_init: None,
-    });
-    let err = b
-        .connect(PortRef::new::<Nav>(prod), PortRef::new::<Imu>(cons))
-        .unwrap_err();
-    assert!(matches!(err, WireError::PortIdMismatch { .. }));
+    }));
+    // Both sides name the same frame id, so connect accepts the edge, but the
+    // producer has no `Nav` output port and build reports UnknownPort.
+    b.connect(PortRef { system: prod, port: PortId::Component(Nav::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Nav::FRAME_ID) });
+    assert!(matches!(b.build(), Err(WireError::UnknownPort { .. })));
 }
 
 #[test]
-fn validation_unknown_port() {
+fn validation_incompatible_edge() {
+    // An edge whose endpoints carry different frame ids (both ports exist) is
+    // rejected at build. This is the shape a mismatched `out=`/`in=` wiring pair
+    // lands as: resolve builds each `PortRef` from its own descriptor, so the
+    // mismatch surfaces here rather than at edge-record time.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
-    let cons = b.add_cyclic(Consumer {
+    let backer = b.push_node(cyclic_node(Backer::NAME.into(), Backer)); // Nav out
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: Rc::new(RefCell::new(Vec::new())),
         drain: true,
         init_counter: None,
         first_exec_init: None,
-    });
-    // Both sides name the same frame id, so connect accepts the edge, but the
-    // producer has no `Nav` output port and build reports UnknownPort.
-    b.connect(PortRef::new::<Nav>(prod), PortRef::new::<Nav>(cons))
-        .unwrap();
-    assert!(matches!(b.build(), Err(WireError::UnknownPort { .. })));
+    })); // Imu in
+    b.connect(PortRef { system: backer, port: PortId::Component(Nav::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
+    assert!(matches!(b.build(), Err(WireError::Incompatible { .. })));
 }
 
 #[test]
 fn validation_unconnected_input() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let _prod = b.add_cyclic(Producer::new());
-    let _cons = b.add_cyclic(Consumer {
+    let _prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let _cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: Rc::new(RefCell::new(Vec::new())),
         drain: true,
         init_counter: None,
         first_exec_init: None,
-    });
+    }));
     // With no connect call at all, the consumer's `imu` input is unconnected.
     assert!(matches!(b.build(), Err(WireError::UnconnectedInput { .. })));
 }
@@ -336,7 +339,7 @@ fn validation_invalid_cycle_rate_wall_clock() {
             clock: ClockMode::Wall,
             ..CoordinatorConfig::default()
         });
-        b.add_cyclic(Producer::new());
+        b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
         assert!(
             matches!(b.build(), Err(WireError::InvalidCycleRate { .. })),
             "rate {rate} rejected at build"
@@ -357,7 +360,7 @@ async fn simulated_clock_ignores_cycle_rate() {
         },
         ..CoordinatorConfig::default()
     });
-    b.add_cyclic(Producer::new());
+    b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     let mut coord = b
         .build()
         .expect("cycle_rate is not validated under Simulated");
@@ -367,18 +370,16 @@ async fn simulated_clock_ignores_cycle_rate() {
 #[test]
 fn validation_double_connect() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod1 = b.add_cyclic(Producer::new());
-    let prod2 = b.add_cyclic(Producer::new());
-    let cons = b.add_cyclic(Consumer {
+    let prod1 = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let prod2 = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: Rc::new(RefCell::new(Vec::new())),
         drain: true,
         init_counter: None,
         first_exec_init: None,
-    });
-    b.connect(PortRef::new::<Imu>(prod1), PortRef::new::<Imu>(cons))
-        .unwrap();
-    b.connect(PortRef::new::<Imu>(prod2), PortRef::new::<Imu>(cons))
-        .unwrap();
+    }));
+    b.connect(PortRef { system: prod1, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
+    b.connect(PortRef { system: prod2, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
     assert!(matches!(b.build(), Err(WireError::DoubleConnect { .. })));
 }
 
@@ -393,19 +394,18 @@ async fn init_barrier_holds() {
     let first_exec_init = Arc::new(AtomicUsize::new(0));
 
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer {
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer {
         n: 0.0,
         burst: 1,
         init_counter: Some(init_counter.clone()),
-    });
-    let cons = b.add_cyclic(Consumer {
+    }));
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: Rc::new(RefCell::new(Vec::new())),
         drain: true,
         init_counter: Some(init_counter.clone()),
         first_exec_init: Some(first_exec_init.clone()),
-    });
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
-        .unwrap();
+    }));
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
     let mut coord = b.build().unwrap();
 
     coord.run_for(3).await;
@@ -490,13 +490,11 @@ impl CyclicSystem for Backer {
 #[test]
 fn feedback_cycle_unbroken_is_rejected() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let looper = b.add_cyclic(Looper { n: 0.0 });
-    let backer = b.add_cyclic(Backer);
+    let looper = b.push_node(cyclic_node(Looper::NAME.into(), Looper { n: 0.0 }));
+    let backer = b.push_node(cyclic_node(Backer::NAME.into(), Backer));
     // Both directions are plain forward edges, which closes an unbroken cycle.
-    b.connect(PortRef::new::<Imu>(looper), PortRef::new::<Imu>(backer))
-        .unwrap();
-    b.connect(PortRef::new::<Nav>(backer), PortRef::new::<Nav>(looper))
-        .unwrap();
+    b.connect(PortRef { system: looper, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: backer, port: PortId::Component(Imu::FRAME_ID) });
+    b.connect(PortRef { system: backer, port: PortId::Component(Nav::FRAME_ID) }, PortRef { system: looper, port: PortId::Component(Nav::FRAME_ID) });
     let err = b.build().err().expect("the cycle is rejected at build");
     assert!(
         matches!(&err, WireError::FeedbackCycle { systems } if systems.iter().any(|s| s == "looper") && systems.iter().any(|s| s == "backer")),
@@ -508,13 +506,11 @@ fn feedback_cycle_unbroken_is_rejected() {
 #[stellarator::test]
 async fn delayed_edge_allows_feedback_loop() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let looper = b.add_cyclic(Looper { n: 0.0 });
-    let backer = b.add_cyclic(Backer);
+    let looper = b.push_node(cyclic_node(Looper::NAME.into(), Looper { n: 0.0 }));
+    let backer = b.push_node(cyclic_node(Backer::NAME.into(), Backer));
     // The forward Imu edge; the Nav back-edge is the explicit one-cycle delay.
-    b.connect(PortRef::new::<Imu>(looper), PortRef::new::<Imu>(backer))
-        .unwrap();
-    b.connect_delayed(PortRef::new::<Nav>(backer), PortRef::new::<Nav>(looper))
-        .unwrap();
+    b.connect(PortRef { system: looper, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: backer, port: PortId::Component(Imu::FRAME_ID) });
+    b.connect_delayed(PortRef { system: backer, port: PortId::Component(Nav::FRAME_ID) }, PortRef { system: looper, port: PortId::Component(Nav::FRAME_ID) });
     let mut coord = b
         .build()
         .expect("connect_delayed breaks the cycle so it builds");
@@ -565,10 +561,9 @@ impl CyclicSystem for SelfLoop {
 #[test]
 fn self_loop_plain_connect_is_rejected() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let s = b.add_cyclic(SelfLoop { n: 0.0 });
+    let s = b.push_node(cyclic_node(SelfLoop::NAME.into(), SelfLoop { n: 0.0 }));
     // A plain frame edge from a system to itself is a one-member feedback cycle.
-    b.connect(PortRef::new::<Imu>(s), PortRef::new::<Imu>(s))
-        .unwrap();
+    b.connect(PortRef { system: s, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: s, port: PortId::Component(Imu::FRAME_ID) });
     let err = b
         .build()
         .err()
@@ -583,9 +578,8 @@ fn self_loop_plain_connect_is_rejected() {
 #[stellarator::test]
 async fn self_loop_delayed_connect_builds_and_runs() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let s = b.add_cyclic(SelfLoop { n: 0.0 });
-    b.connect_delayed(PortRef::new::<Imu>(s), PortRef::new::<Imu>(s))
-        .unwrap();
+    let s = b.push_node(cyclic_node(SelfLoop::NAME.into(), SelfLoop { n: 0.0 }));
+    b.connect_delayed(PortRef { system: s, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: s, port: PortId::Component(Imu::FRAME_ID) });
     let mut coord = b
         .build()
         .expect("connect_delayed declares the self-feedback");
@@ -605,15 +599,14 @@ async fn self_loop_delayed_connect_builds_and_runs() {
 fn backward_frame_edge_is_rejected() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
     // The consumer registers, and therefore steps, before its producer.
-    let cons = b.add_cyclic(Consumer {
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: Rc::new(RefCell::new(Vec::new())),
         drain: true,
         init_counter: None,
         first_exec_init: None,
-    });
-    let prod = b.add_cyclic(Producer::new());
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
-        .unwrap();
+    }));
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
     let err = b.build().err().expect("a backward frame edge is rejected");
     assert!(
         matches!(
@@ -635,15 +628,14 @@ async fn backward_frame_edge_allowed_when_delayed() {
     // staleness is now explicit, and the consumer samples last cycle's value.
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let cons = b.add_cyclic(Consumer {
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen: seen.clone(),
         drain: true,
         init_counter: None,
         first_exec_init: None,
-    });
-    let prod = b.add_cyclic(Producer::new());
-    b.connect_delayed(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
-        .unwrap();
+    }));
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    b.connect_delayed(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
     let mut coord = b.build().expect("connect_delayed declares the staleness");
 
     coord.run_for(5).await;
@@ -661,13 +653,12 @@ async fn backward_edge_to_async_consumer_is_allowed() {
     let count = Arc::new(AtomicU64::new(0));
     let last = Arc::new(AtomicU64::new(0));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let asy = b.add_async(AsyncConsumer {
+    let asy = b.push_node(async_node(AsyncConsumer::NAME.into(), AsyncConsumer {
         count: count.clone(),
         last: last.clone(),
-    });
-    let prod = b.add_cyclic(Producer::new());
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(asy))
-        .unwrap();
+    }));
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: asy, port: PortId::Component(Imu::FRAME_ID) });
     let mut coord = b
         .build()
         .expect("async endpoints are exempt from the registration-order check");
@@ -688,7 +679,7 @@ async fn backward_edge_to_async_consumer_is_allowed() {
 fn run_for_twice_panics() {
     stellarator::run(|| async {
         let mut b = crate::coordinator::init::InitGraph::new(config());
-        b.add_cyclic(Producer::new());
+        b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
         let mut coord = b.build().unwrap();
         coord.run_for(1).await;
         coord.run_for(1).await; // the first run consumed the coordinator
@@ -757,9 +748,9 @@ async fn simulated_clock_is_deterministic_and_monotonic() {
         clock: ClockMode::Simulated { dt },
         ..CoordinatorConfig::default()
     });
-    b.add_cyclic(StampRec {
+    b.push_node(cyclic_node(StampRec::NAME.into(), StampRec {
         stamps: stamps.clone(),
-    });
+    }));
     let mut coord = b.build().unwrap();
 
     coord.run_for(10).await;
@@ -812,16 +803,8 @@ struct TestEvent {
     seq: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
-struct OtherEvent {
-    x: u32,
-}
-
 impl crate::NamedMsg for TestEvent {
     const NAME: &'static str = "TestEvent";
-}
-impl crate::NamedMsg for OtherEvent {
-    const NAME: &'static str = "OtherEvent";
 }
 
 // A cyclic producer emitting one `TestEvent` per cycle. No frame inputs.
@@ -869,38 +852,17 @@ impl CyclicSystem for MsgConsumer {
     }
 }
 
-// A consumer of a different message type, for the id-mismatch check.
-struct OtherConsumer;
-
-#[derive(SystemInput)]
-struct OtherConsIn {
-    events: MsgIn<OtherEvent>,
-}
-
-impl System for OtherConsumer {
-    type Input = OtherConsIn;
-    type Output = Out<NoOut>;
-    const NAME: &'static str = "other_consumer";
-}
-
-impl CyclicSystem for OtherConsumer {
-    fn execute(&mut self, _now: Timestamp, input: &mut OtherConsIn, _o: &mut Self::Output) {
-        input.events.drain(|_| {});
-    }
-}
-
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn msg_edge_two_cyclic_systems() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(MsgProducer { n: 0 });
-    let cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
+    let prod = b.push_node(cyclic_node(MsgProducer::NAME.into(), MsgProducer { n: 0 }));
+    let cons = b.push_node(cyclic_node(MsgConsumer::NAME.into(), MsgConsumer { seen: seen.clone() }));
     b.connect(
-        PortRef::msg::<TestEvent>(prod),
-        PortRef::msg::<TestEvent>(cons),
-    )
-    .unwrap();
+        PortRef { system: prod, port: PortId::Packet(TestEvent::ID) },
+        PortRef { system: cons, port: PortId::Packet(TestEvent::ID) },
+    );
     let mut coord = b.build().unwrap();
 
     coord.run_for(4).await;
@@ -914,20 +876,18 @@ async fn msg_edge_two_cyclic_systems() {
 async fn msg_fanin_two_emitters_one_consumer() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod_a = b.add_cyclic_named("emitter_a", MsgProducer { n: 0 });
-    let prod_b = b.add_cyclic_named("emitter_b", MsgProducer { n: 100 });
-    let cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
+    let prod_a = b.push_node(cyclic_node("emitter_a".into(), MsgProducer { n: 0 }));
+    let prod_b = b.push_node(cyclic_node("emitter_b".into(), MsgProducer { n: 100 }));
+    let cons = b.push_node(cyclic_node(MsgConsumer::NAME.into(), MsgConsumer { seen: seen.clone() }));
     // Two producers fan in to one message input without a `DoubleConnect`.
     b.connect(
-        PortRef::msg::<TestEvent>(prod_a),
-        PortRef::msg::<TestEvent>(cons),
-    )
-    .unwrap();
+        PortRef { system: prod_a, port: PortId::Packet(TestEvent::ID) },
+        PortRef { system: cons, port: PortId::Packet(TestEvent::ID) },
+    );
     b.connect(
-        PortRef::msg::<TestEvent>(prod_b),
-        PortRef::msg::<TestEvent>(cons),
-    )
-    .unwrap();
+        PortRef { system: prod_b, port: PortId::Packet(TestEvent::ID) },
+        PortRef { system: cons, port: PortId::Packet(TestEvent::ID) },
+    );
     let mut coord = b.build().unwrap();
 
     coord.run_for(2).await;
@@ -943,21 +903,19 @@ fn msg_exact_duplicate_edge_is_rejected() {
     // Fan-in of distinct producers is legal (covered above); the exact same edge
     // twice would deliver every record twice, so build() rejects the duplicate.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(MsgProducer { n: 0 });
-    let cons = b.add_cyclic(MsgConsumer {
+    let prod = b.push_node(cyclic_node(MsgProducer::NAME.into(), MsgProducer { n: 0 }));
+    let cons = b.push_node(cyclic_node(MsgConsumer::NAME.into(), MsgConsumer {
         seen: Rc::new(RefCell::new(Vec::new())),
-    });
+    }));
     b.connect(
-        PortRef::msg::<TestEvent>(prod),
-        PortRef::msg::<TestEvent>(cons),
-    )
-    .unwrap();
+        PortRef { system: prod, port: PortId::Packet(TestEvent::ID) },
+        PortRef { system: cons, port: PortId::Packet(TestEvent::ID) },
+    );
     // The copy-pasted duplicate: same producer, same consumer, same port.
     b.connect(
-        PortRef::msg::<TestEvent>(prod),
-        PortRef::msg::<TestEvent>(cons),
-    )
-    .unwrap();
+        PortRef { system: prod, port: PortId::Packet(TestEvent::ID) },
+        PortRef { system: cons, port: PortId::Packet(TestEvent::ID) },
+    );
     let err = b
         .build()
         .err()
@@ -976,35 +934,18 @@ fn msg_exact_duplicate_edge_is_rejected() {
 }
 
 #[test]
-fn msg_edge_mismatched_type_is_rejected() {
-    let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(MsgProducer { n: 0 });
-    let cons = b.add_cyclic(OtherConsumer);
-    // `MsgOut<TestEvent>` into `MsgIn<OtherEvent>` names two different ports
-    // (distinct `M::ID`), so `connect` rejects it with the same cheap id guard.
-    let err = b
-        .connect(
-            PortRef::msg::<TestEvent>(prod),
-            PortRef::msg::<OtherEvent>(cons),
-        )
-        .unwrap_err();
-    assert!(matches!(err, WireError::PortIdMismatch { .. }));
-}
-
-#[test]
 fn delayed_edge_into_log_input_is_rejected() {
     // `delayed` marks a one-cycle-late snapshot sample; on a Log input it means
     // nothing, so build rejects the edge instead of silently ignoring the flag.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(MsgProducer { n: 0 });
-    let cons = b.add_cyclic(MsgConsumer {
+    let prod = b.push_node(cyclic_node(MsgProducer::NAME.into(), MsgProducer { n: 0 }));
+    let cons = b.push_node(cyclic_node(MsgConsumer::NAME.into(), MsgConsumer {
         seen: Rc::new(RefCell::new(Vec::new())),
-    });
+    }));
     b.connect_delayed(
-        PortRef::msg::<TestEvent>(prod),
-        PortRef::msg::<TestEvent>(cons),
-    )
-    .unwrap();
+        PortRef { system: prod, port: PortId::Packet(TestEvent::ID) },
+        PortRef { system: cons, port: PortId::Packet(TestEvent::ID) },
+    );
     let err = b.build().err().expect("delayed Log edge is rejected");
     assert!(
         matches!(
@@ -1060,8 +1001,8 @@ fn snapshot_fan_in_is_rejected() {
     // Latest-wins across several producers is ill-defined, so many-producer
     // snapshot inputs are a build error even before any edge is connected.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    b.add_cyclic(Producer::new());
-    b.add_cyclic(SnapshotFanInConsumer);
+    b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    b.push_node(cyclic_node(SnapshotFanInConsumer::NAME.into(), SnapshotFanInConsumer));
     let err = b.build().err().expect("Many × Snapshot is rejected");
     assert!(
         matches!(
@@ -1082,7 +1023,7 @@ async fn msg_input_may_be_unconnected() {
     // a frame input, which would be an `UnconnectedInput` build error.
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let _cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
+    let _cons = b.push_node(cyclic_node(MsgConsumer::NAME.into(), MsgConsumer { seen: seen.clone() }));
     let mut coord = b.build().unwrap();
     coord.run_for(3).await;
     assert!(seen.borrow().is_empty());
@@ -1130,11 +1071,11 @@ async fn all_outputs_taps_the_whole_graph() {
     let msg_chans = Rc::new(std::cell::Cell::new(0));
     let mut b = crate::coordinator::init::InitGraph::new(config());
     // A producer of a telemetered message channel plus its implicit health/log frame outputs.
-    let _prod = b.add_cyclic(MsgProducer { n: 0 });
-    let _tap = b.add_cyclic(AllTap {
+    let _prod = b.push_node(cyclic_node(MsgProducer::NAME.into(), MsgProducer { n: 0 }));
+    let _tap = b.push_node(cyclic_node(AllTap::NAME.into(), AllTap {
         frame_outs: frame_outs.clone(),
         msg_chans: msg_chans.clone(),
-    });
+    }));
     let mut coord = b.build().unwrap();
     coord.run_for(1).await;
 
@@ -1205,9 +1146,9 @@ fn capability_lifts_out_of_the_port_lists() {
 #[stellarator::test]
 async fn capability_field_consumes_no_bind_cursor() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    b.add_cyclic(Producer::new());
+    b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     // Registered last: a cyclic ReceiveAll holder must step after everything else.
-    b.add_cyclic(MixedTap);
+    b.push_node(cyclic_node(MixedTap::NAME.into(), MixedTap));
     let mut coord = b.build().unwrap();
     // Claim the view before any cycle runs; a view starts at the live edge of its
     // ring, so it must exist before data flows.
@@ -1232,7 +1173,7 @@ fn command_ring_registered_but_untelemetered() {
     // by key through the full registry, but flagged untelemetered so the
     // AllOutputs and downlink surfaces never see inbound control.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    b.add_cyclic(Producer::new());
+    b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     let coord = b.build().unwrap();
     let registry = coord.registry();
     let key = metor_proto::types::ComponentId::new("coordinator.commands");
@@ -1248,7 +1189,7 @@ fn coordinator_bundle_registry_keys_are_golden() {
     // consumers address these buffers by their key strings, so the exact keys
     // are pinned here.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    b.add_cyclic(Producer::new());
+    b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     let coord = b.build().unwrap();
     let registry = coord.registry();
     for (key, telemetered) in [
@@ -1272,8 +1213,8 @@ fn duplicate_registry_key_is_rejected() {
     // `<instance>.<name>` keys for every port. Build reports the collision
     // instead of letting one entry silently shadow the other.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    b.add_cyclic_named("dup", Producer::new());
-    b.add_cyclic_named("dup", Producer::new());
+    b.push_node(cyclic_node("dup".into(), Producer::new()));
+    b.push_node(cyclic_node("dup".into(), Producer::new()));
     let err = b
         .build()
         .err()
@@ -1331,11 +1272,11 @@ async fn untelemetered_frame_output_hidden_from_all_outputs() {
     let frame_outs = Rc::new(std::cell::Cell::new(0));
     let msg_chans = Rc::new(std::cell::Cell::new(0));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    b.add_cyclic(QuietProducer);
-    b.add_cyclic(AllTap {
+    b.push_node(cyclic_node(QuietProducer::NAME.into(), QuietProducer));
+    b.push_node(cyclic_node(AllTap::NAME.into(), AllTap {
         frame_outs: frame_outs.clone(),
         msg_chans: msg_chans.clone(),
-    });
+    }));
     let mut coord = b.build().unwrap();
 
     let registry = coord.registry();
@@ -1364,8 +1305,8 @@ async fn untelemetered_frame_output_hidden_from_all_outputs() {
 #[test]
 fn proc_rings_are_file_backed() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
-    let _bystander = b.add_cyclic_named("bystander", Producer::new());
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let _bystander = b.push_node(cyclic_node("bystander".into(), Producer::new()));
     // The process system's descriptor is a real consumer's, exactly what a
     // describe worker would hand back; no worker is spawned in this test
     // (spawn happens at build(), which is never called).
@@ -1378,8 +1319,7 @@ fn proc_rings_are_file_backed() {
     .instance_descriptor();
     let n_proc_outputs = desc.outputs.len();
     let cons = b.add_proc_cyclic("proc-cons", desc, "/nonexistent.so".into(), "cons", Vec::new());
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
-        .unwrap();
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
 
     let cons_edges = b.solve_edges().unwrap();
     let shared = b.shared_outputs(&cons_edges);
@@ -1423,15 +1363,14 @@ fn proc_rings_are_file_backed() {
 fn heap_only_graph_has_no_session() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
-    let cons = b.add_cyclic(Consumer {
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer {
         seen,
         drain: true,
         init_counter: None,
         first_exec_init: None,
-    });
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
-        .unwrap();
+    }));
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
     let cons_edges = b.solve_edges().unwrap();
     let fan_out = b.count_fan_out(&cons_edges);
     let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
@@ -1452,7 +1391,7 @@ fn push_slot_reg(
     b: &mut crate::coordinator::init::InitGraph,
     name: &'static str,
     process: bool,
-) -> crate::SystemHandle {
+) -> super::SystemHandle {
     let base = crate::SystemDescriptor {
         name: name.into(),
         kind: crate::SystemKind::Cyclic,
@@ -1482,15 +1421,13 @@ fn push_slot_reg(
 fn process_slot_rings_are_file_backed() {
     use metor_proto_wkt::SequenceCommand;
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     let slot = push_slot_reg(&mut b, "seq-slot", true);
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(slot))
-        .unwrap();
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: slot, port: PortId::Component(Imu::FRAME_ID) });
     b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .unwrap();
+        PortRef { system: b.coordinator_handle(), port: PortId::Packet(SequenceCommand::ID) },
+        PortRef { system: slot, port: PortId::Packet(SequenceCommand::ID) },
+    );
 
     let cons_edges = b.solve_edges().unwrap();
     let shared = b.shared_outputs(&cons_edges);
@@ -1535,10 +1472,9 @@ fn process_slot_rings_are_file_backed() {
 #[test]
 fn in_process_slot_stays_heap() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     let slot = push_slot_reg(&mut b, "seq-slot", false);
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(slot))
-        .unwrap();
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: slot, port: PortId::Component(Imu::FRAME_ID) });
     let cons_edges = b.solve_edges().unwrap();
     let fan_out = b.count_fan_out(&cons_edges);
     let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
@@ -1580,9 +1516,7 @@ fn registered_slot_descriptor_snapshot() {
         // Never opened at registration; the path need not exist.
         backing: crate::OccupantBacking::Artifact("occ.so".into()),
     };
-    let mut b = crate::coordinator::init::InitGraph::new(config());
-    let slot = b.add_slot("snap", vec![occ], None).expect("a valid slot registers");
-    let desc = b.descriptor_of(slot);
+    let (desc, _, _) = plan_slot("snap", &[occ], None).expect("a valid slot plans");
 
     let seq_status_id = PortId::Component(<SequenceStatus as Frame>::FRAME_ID);
     let got: Vec<(&str, PortId, PortConn)> =
@@ -1620,9 +1554,11 @@ fn registered_slot_descriptor_snapshot() {
     );
 }
 
-/// Every `add_slot` contract violation is a clean [`SlotConfigError`], one
-/// variant per defect. The occupants here are artifact-backed so nothing is
-/// opened; only the registration checks run.
+/// The descriptor-level `plan_slot` violations are clean [`SlotConfigError`]s,
+/// one variant per defect. The occupants here are artifact-backed so nothing is
+/// opened; only the registration checks run. (The pure-spec defects — an empty
+/// allow set, an `initial` outside it — are gated at wiring `validate`, covered
+/// there.)
 #[test]
 fn add_slot_rejects_contract_violations() {
     use crate::sequence::SlotControlIn;
@@ -1643,20 +1579,10 @@ fn add_slot_rejects_contract_violations() {
         }
     }
 
-    let mut b = crate::coordinator::init::InitGraph::new(config());
-    assert_eq!(b.add_slot("s", Vec::new(), None), Err(SlotConfigError::Empty));
     assert!(matches!(
-        b.add_slot(
+        plan_slot(
             "s",
-            vec![art_occ("seq", Vec::new())],
-            Some(crate::InitialOccupant::loaded("nonesuch")),
-        ),
-        Err(SlotConfigError::UnknownInitial { .. })
-    ));
-    assert!(matches!(
-        b.add_slot(
-            "s",
-            vec![
+            &[
                 art_occ("first", vec![PortDesc::of::<Imu>()]),
                 art_occ("second", vec![PortDesc::of::<Nav>()]),
             ],
@@ -1665,10 +1591,9 @@ fn add_slot_rejects_contract_violations() {
         Err(SlotConfigError::OccupantMismatch { .. })
     ));
     assert!(matches!(
-        b.add_slot("s", vec![art_occ("pre-pack", vec![PortDesc::of::<SlotControlIn>()])], None),
+        plan_slot("s", &[art_occ("pre-pack", vec![PortDesc::of::<SlotControlIn>()])], None),
         Err(SlotConfigError::ReservedPort { .. })
     ));
-    assert!(b.systems.iter().all(|s| s.name != "s"), "nothing was registered");
 }
 
 // ---------------------------------------------------------------------------
@@ -2047,7 +1972,7 @@ mod proc_slot {
 #[test]
 fn proc_and_process_slot_share_a_session() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(Producer::new());
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     let desc = Consumer {
         seen: Rc::new(RefCell::new(Vec::new())),
         drain: true,
@@ -2056,11 +1981,9 @@ fn proc_and_process_slot_share_a_session() {
     }
     .instance_descriptor();
     let proc_sys = b.add_proc_cyclic("proc-cons", desc, "/nonexistent.so".into(), "cons", Vec::new());
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(proc_sys))
-        .unwrap();
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: proc_sys, port: PortId::Component(Imu::FRAME_ID) });
     let slot = push_slot_reg(&mut b, "seq-slot", true);
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(slot))
-        .unwrap();
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: slot, port: PortId::Component(Imu::FRAME_ID) });
 
     let cons_edges = b.solve_edges().unwrap();
     let fan_out = b.count_fan_out(&cons_edges);
@@ -2106,7 +2029,7 @@ fn drain_wiring(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake>) -> Vec<
 #[stellarator::test]
 async fn wiring_manifest_emitted_at_boot() {
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    b.add_cyclic(Producer::new());
+    b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     let json = r#"{"ir_version":1,"systems":["a","b"]}"#.to_string();
     b.set_wiring_manifest(WiringManifest {
         ir_version: 1,
@@ -2134,12 +2057,11 @@ async fn wiring_manifest_reemits_on_reload() {
     // A producer emits one ReloadSequences on its second cycle, edged into the
     // coordinator's reload fan-in; the manifest re-fires that cycle.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    let prod = b.add_cyclic(ReloadProducer { cycle: 0 });
+    let prod = b.push_node(cyclic_node(ReloadProducer::NAME.into(), ReloadProducer { cycle: 0 }));
     b.connect(
-        PortRef::msg::<ReloadSequences>(prod),
-        PortRef::msg::<ReloadSequences>(b.coordinator_handle()),
-    )
-    .unwrap();
+        PortRef { system: prod, port: PortId::Packet(ReloadSequences::ID) },
+        PortRef { system: b.coordinator_handle(), port: PortId::Packet(ReloadSequences::ID) },
+    );
     b.set_wiring_manifest(WiringManifest {
         ir_version: 1,
         ir_json: "{}".into(),
@@ -2190,7 +2112,7 @@ async fn wiring_manifest_emits_oversized_payload_intact() {
     // record fits and reads back byte-for-byte — proving the cap was not the
     // limit and nothing raised the global one.
     let mut b = crate::coordinator::init::InitGraph::new(config());
-    b.add_cyclic(Producer::new());
+    b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
     let big = "x".repeat(crate::message::MAX_MSG_BYTES + 4000);
     let json = format!("{{\"ir_version\":1,\"blob\":\"{big}\"}}");
     assert!(json.len() > crate::message::MAX_MSG_BYTES, "payload overruns the cap");

@@ -32,12 +32,6 @@
 //! typed postcard [`params`](ArtifactSystemBuilder::params) and
 //! [`process`](ArtifactSystemBuilder::process), so process-without-artifact and
 //! postcard-params-on-a-static-system are unrepresentable rather than checked.
-//!
-//! Typed params are postcard-encoded into [`ParamSource::Postcard`] bytes.
-//! The encoding is byte-identical to what the Python front-end's value tree
-//! schema-encodes to for the same logical value, and it is exactly what a
-//! loaded library's `fsw_create` decodes. A system without params carries
-//! [`ParamSource::None`].
 
 use std::net::SocketAddr;
 

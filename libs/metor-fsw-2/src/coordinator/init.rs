@@ -1,10 +1,10 @@
 //! The build-time init pipeline: collect systems and edges into an [`InitGraph`],
-//! then [`build`] it into a ready [`Coordinator`](super::Coordinator).
+//! then [`build`](InitGraph::build) it into a ready [`Coordinator`](super::Coordinator).
 //!
 //! An [`InitGraph`] is the wiring graph as plain data — the registered systems
 //! (each a [`Node`]: its type-erased [`SystemBind`], its descriptor, its
 //! instance name), the edges between their ports, and the run-scoped overrides.
-//! [`build`] runs the passes in order — validation, edge resolution, fan-out
+//! [`build`](InitGraph::build) runs the passes in order — validation, edge resolution, fan-out
 //! counting, ring allocation, registry freeze, copy-in planning, bind — each
 //! handing its product to the next, and assembles the `Coordinator` literal.
 //!
@@ -28,23 +28,13 @@
 //!
 //! Cyclic systems step in registration order, once per cycle. A snapshot edge
 //! only observes the current cycle's value when it points forward in that
-//! order, so [`build`] rejects a backward snapshot edge between cyclic systems
+//! order, so [`build`](InitGraph::build) rejects a backward snapshot edge between cyclic systems
 //! ([`WireError::StaleFrameEdge`]) and any feedback loop not broken by an
 //! explicit [`connect_delayed`](InitGraph::connect_delayed) edge
 //! ([`WireError::FeedbackCycle`]). One-cycle-late sampling is therefore always
 //! a declared decision, never an accident of registration order. Log edges
 //! carry decoupled event/command streams with no same-cycle dependency and are
 //! exempt from both rules, as are edges touching an async endpoint.
-//!
-//! # Port connections
-//!
-//! An input's [`PortConn`] says who feeds it. An `Edge` input is wired by
-//! [`connect`](InitGraph::connect). A `Host` input's counterpart
-//! is held by the system's runner over a dedicated ring (a slot's cancel frame,
-//! for example). A `SelfTap` input is a read view over one of the system's own
-//! outputs. Edges into `Host` or `SelfTap` inputs are rejected; `Host`
-//! *outputs* still accept consumer edges (the coordinator's own command
-//! channel is one).
 //!
 //! # Async systems and copy-ins
 //!
@@ -57,21 +47,19 @@
 //!
 //! # Reader budgets
 //!
-//! Every ring's `max_readers` is fixed at build time. The budget is the
-//! counted edge fan-out plus declared self-taps, one slot per receive-all
-//! capability in the graph, and [`CoordinatorConfig::reader_slack`] spare
-//! slots for taps claimed through the [`Registry`] after build. Exhausting the
-//! budget surfaces as an error at the claim site, not a panic.
+//! Every ring's `max_readers` is fixed at build time: the counted edge fan-out
+//! plus declared self-taps, one slot per receive-all capability, and
+//! [`CoordinatorConfig::reader_slack`] spare slots for post-build [`Registry`]
+//! taps. Exhausting the budget surfaces as an error at the claim site, not a
+//! panic.
 //!
 //! # The coordinator's own bundle
 //!
 //! The coordinator registers itself as system #0 under the reserved instance
-//! name `"coordinator"`, declaring its own channels (health, log, status, the
-//! boot sequence registry, the operator command channel) as an ordinary
-//! descriptor. They are validated, sized, allocated, and registered by the
-//! same passes as every other system's; the bind pass wraps the allocated
-//! rings into the coordinator's fields instead of a cyclic slot, because the
-//! coordinator is the loop rather than a member of it.
+//! name `"coordinator"`, so its own channels are validated, sized, allocated,
+//! and registered by the same passes as every system's; the bind pass wraps
+//! the rings into the coordinator's fields instead of a cyclic slot, because
+//! the coordinator is the loop rather than a member of it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -93,13 +81,9 @@ use crate::port::capacity_for;
 use crate::proc::session::SessionDir;
 use crate::registry::{Registry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
-#[cfg(test)]
-use crate::system::System;
 
 use super::bind::{ProcBindCtx, bind_systems};
 use super::slot::SlotReg;
-#[cfg(test)]
-use super::slot::{self, AllowedOccupant, InitialOccupant, SlotConfigError};
 use super::{
     AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, CoordChannels, Coordinator,
     CoordinatorConfig, CoordinatorStatus, CopyIn, CyclicSlot, NAME_CAP, PortRef, RingEntry,
@@ -125,9 +109,6 @@ where
     S::Input: BindPorts + 'static,
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
-        // The host binds over its own pre-allocated heap rings via the `Binder`
-        // ring source; a dlopen'd system runs the identical (backing-erased)
-        // bind on its own side of the ABI over non-owning attaches.
         let input = <S::Input as BindPorts>::bind(binder);
         let output = <Out<O> as BindPorts>::bind(binder);
         Box::new(CyclicRunner::new(self.system, input, output))
@@ -159,17 +140,12 @@ where
     }
 }
 
-/// A pack entry as a cyclic registration: the bind-phase [`Pending`](crate::pack::Pending)
-/// plus the entry's static display name. Its `bind` binds the ports over an
-/// [`AnySource::Host`], calls the pending closure with
-/// [`Mount::Wired`](crate::pack::Mount), and wraps the boxed
-/// [`Driver`](crate::pack::Driver) in a running
-/// [`DriverSlot`](crate::pack::DriverSlot), so a pack entry rides the ordinary
-/// cyclic path with no dedicated `SystemBind` variant.
+/// A pack entry as a cyclic registration: the bind-phase
+/// [`Pending`](crate::pack::Pending) plus the entry's static display name, so a
+/// pack entry rides the ordinary cyclic path with no dedicated `SystemBind`
+/// variant.
 struct PendingDriver {
     pending: crate::pack::Pending,
-    /// The entry's own name, the slot's static display name (the instance name
-    /// lives on the enclosing [`Node`], as for every kind).
     entry_name: &'static str,
 }
 
@@ -186,21 +162,16 @@ impl CyclicRegistration for PendingDriver {
 }
 
 /// A registered dlopen'd cyclic system: the loaded handle plus its postcard
-/// `Params` blob. At [`build`] it becomes a [`DlSlot`](crate::dl) instead of a
-/// typed [`CyclicRunner`]; everything before that (descriptor push, edge
-/// validation, ring sizing/allocation, registry entry) is the same as the
-/// static-system path.
+/// `Params` blob. At [`build`](InitGraph::build) it becomes a [`DlSlot`](crate::dl) instead of a
+/// typed [`CyclicRunner`].
 pub(crate) struct DlReg {
     pub(crate) system: crate::dl::DlSystem,
     pub(crate) params: Vec<u8>,
 }
 
-/// A registered process system: the artifact path a worker process will
-/// dlopen plus its postcard `Params` blob. The descriptor (on the enclosing
-/// [`Node`]) arrived as decoded describe-worker bytes — the host holds no
-/// `DlSystem` and never loads the artifact itself. At [`build`] it becomes a
-/// [`ProcSlot`](crate::proc); everything before that is the same uniform pass
-/// as every other kind.
+/// A registered process system: the artifact path a worker process will dlopen
+/// plus its postcard `Params` blob (the host never loads the artifact itself).
+/// At [`build`](InitGraph::build) it becomes a [`ProcSlot`](crate::proc).
 pub(crate) struct ProcReg {
     pub(crate) artifact: PathBuf,
     pub(crate) params: Vec<u8>,
@@ -209,41 +180,35 @@ pub(crate) struct ProcReg {
 }
 
 pub(crate) enum SystemBind {
-    /// The coordinator itself, registered as system #0 under the reserved
-    /// instance name `"coordinator"`. A marker registration: its declared
-    /// outputs are allocated and registered by the uniform passes like any
-    /// system's, but it is never pushed into `cyclic` (the coordinator is the
-    /// loop); the bind arm wraps the allocated rings into the coordinator's own
-    /// fields instead.
+    /// The coordinator itself, system #0: a marker registration whose bind arm
+    /// wraps the allocated rings into the coordinator's own fields (it is never
+    /// pushed into `cyclic` — the coordinator is the loop).
     Coordinator,
     /// A created host system, erased; binds via a [`Binder`]. A pack entry rides
     /// this path too (via [`PendingDriver`]).
     Cyclic(Box<dyn CyclicRegistration>),
     /// An async system; yields a [`PendingAsync`], not a cyclic slot.
     Async(Box<dyn AsyncRegistration>),
-    /// A dlopen'd cyclic system, bound to a [`DlSlot`](crate::dl) at [`build`].
+    /// A dlopen'd cyclic system, bound to a [`DlSlot`](crate::dl) at [`build`](InitGraph::build).
     Dl(DlReg),
     /// A cross-process cyclic system, spawned as a worker and bound to a
-    /// [`ProcSlot`](crate::proc) at [`build`].
+    /// [`ProcSlot`](crate::proc) at [`build`](InitGraph::build).
     Proc(ProcReg),
-    /// A runtime-swappable slot, bound to a [`SlotRunner`](super::slot::SlotRunner) at [`build`].
+    /// A runtime-swappable slot, bound to a [`SlotRunner`](super::slot::SlotRunner) at [`build`](InitGraph::build).
     Slot(SlotReg),
 }
 
 /// One registered system: its type-erased [`SystemBind`], its registered
-/// descriptor (what [`build`] validates, sizes, and wires), and its instance
-/// name (defaults to `System::NAME`; a wiring file supplies a distinct name
-/// per instance).
+/// descriptor, and its instance name.
 pub(crate) struct Node {
     pub(crate) name: String,
     pub(crate) desc: SystemDescriptor,
     pub(crate) bind: SystemBind,
 }
 
-/// Build a cyclic system's [`Node`] under `name`: its instance descriptor (a
-/// system whose port set depends on its config registers what this instance
-/// actually carries) and an erased [`CyclicReg`] bind. The wiring registry
-/// factory and the in-crate [`InitGraph::add_cyclic_named`] convenience share it.
+/// Build a cyclic system's [`Node`] under `name` from its instance descriptor
+/// (what this configured instance actually carries) and an erased [`CyclicReg`]
+/// bind.
 pub(crate) fn cyclic_node<S, O>(name: String, system: S) -> Node
 where
     S: CyclicSystem<Output = Out<O>> + 'static,
@@ -273,11 +238,9 @@ where
     }
 }
 
-/// Build a pack entry's [`Node`] under `name`, running its create phase (params
-/// decode + state construction) now so a bad config fails at registration, not
-/// at [`build`]. The bind phase runs at [`build`] over the entry's descriptor
-/// like any static system's, along the ordinary cyclic path (via
-/// [`PendingDriver`]).
+/// Build a pack entry's [`Node`] under `name`, running its create phase now so
+/// a bad config fails at registration rather than at [`build`](InitGraph::build). The bind phase
+/// runs at [`build`](InitGraph::build) along the ordinary cyclic path (via [`PendingDriver`]).
 pub(crate) fn pending_node(
     name: String,
     entry: &mut crate::pack::PackEntry,
@@ -301,8 +264,8 @@ pub(crate) fn pending_node(
 
 /// The wiring graph as plain data: the registered systems in registration
 /// order, the edges between their ports, and the run-scoped overrides. Built up
-/// by the wiring front-end ([`resolve`](crate::wiring::resolve)) or the in-crate
-/// `add_*`/`connect` conveniences, then consumed by [`build`].
+/// by the wiring front-end ([`resolve`](crate::wiring::resolve)), then consumed
+/// by [`build`](InitGraph::build).
 pub(crate) struct InitGraph {
     pub(crate) config: CoordinatorConfig,
     /// The registered systems; index == registration order == step order.
@@ -318,10 +281,8 @@ pub(crate) struct InitGraph {
     /// when present, else the OS temp dir.
     pub(crate) shm_dir: Option<PathBuf>,
     /// The mission IR to broadcast as a [`WiringManifest`], set by
-    /// [`set_wiring_manifest`](Self::set_wiring_manifest). `Some` means the
-    /// coordinator #0 bundle already carries a `wiring` Host output (injected at
-    /// set time), sized from the concrete payload; `None` (a graph used without
-    /// a front-end) leaves the coordinator with no wiring channel.
+    /// [`set_wiring_manifest`](Self::set_wiring_manifest), which also injects the
+    /// matching `wiring` Host output onto the coordinator #0 bundle.
     pub(crate) wiring_manifest: Option<WiringManifest>,
 }
 
@@ -335,23 +296,10 @@ impl InitGraph {
             shm_dir: None,
             wiring_manifest: None,
         };
-        // The coordinator registers itself as system #0 under the reserved
-        // instance name `"coordinator"`: an ordinary declared bundle, so its
-        // channels are wired, sized, and registered by the same passes as
-        // every system's. Every output is host-connected (the coordinator
-        // itself holds the writers; a Host OUTPUT still accepts consumer
-        // edges); the registry keys are `coordinator.health` / `.log` /
-        // `.coordinator_status` / `.sequences` / `.commands`.
-        //
-        // - `commands` is the operator channel behind the take-once
-        //   [`Coordinator::control_handle`]; commands reach a slot only over an
-        //   explicit `"coordinator" -> <slot>` edge. Untelemetered, since
-        //   inbound control is never echoed on the downlink.
-        // - `sequences` carries the boot `SequenceRegistry`, telemetered so
-        //   downstream consumers can list the channels; the `ReloadSequences`
-        //   fan-in is its request channel (an ordinary edge input, zero edges
-        //   legal), drained each cycle to re-emit the registry on demand for
-        //   consumers that missed the boot message.
+        // Register the coordinator's own channels as system #0, so they flow
+        // through the same validate/size/allocate/register passes as every
+        // system's (see the module docs). `commands` is untelemetered: inbound
+        // control is never echoed on the downlink.
         let desc = SystemDescriptor {
             name: COORDINATOR_INSTANCE.into(),
             kind: SystemKind::Cyclic,
@@ -401,12 +349,10 @@ impl InitGraph {
     }
 
     /// Store `manifest` and inject its `wiring` Host output onto the
-    /// coordinator #0 bundle immediately, so the port is sized, allocated,
-    /// registered, and bound by the ordinary passes like every other output.
-    /// Its ring is sized from the concrete payload — a full IR overruns the
-    /// default message cap — via an overridden `max_size`; nothing raises the
-    /// global cap. Called again, the latest manifest wins: the single injected
-    /// port is replaced in place, never accumulated.
+    /// coordinator #0 bundle, sized from the concrete payload (a full IR
+    /// overruns the default message cap; nothing raises the global cap).
+    /// Called again, the latest manifest wins: the single injected port is
+    /// replaced in place, never accumulated.
     pub(crate) fn set_wiring_manifest(&mut self, manifest: WiringManifest) {
         let mut port = PortDesc::msg_named::<WiringManifest>("wiring");
         port.conn = PortConn::Host;
@@ -417,70 +363,6 @@ impl InitGraph {
             None => outputs.push(port),
         }
         self.wiring_manifest = Some(manifest);
-    }
-
-    /// Register a cyclic system under its type's `System::NAME` instance name.
-    #[cfg(test)] // in-crate test convenience; wiring builds Nodes directly
-    pub(crate) fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle
-    where
-        S: CyclicSystem<Output = Out<O>> + 'static,
-        O: SystemOutput + BindPorts + 'static,
-        S::Input: BindPorts + 'static,
-    {
-        self.add_cyclic_named(<S as System>::NAME, system)
-    }
-
-    /// Register a cyclic system under an explicit instance name.
-    #[cfg(test)]
-    pub(crate) fn add_cyclic_named<S, O>(
-        &mut self,
-        name: impl Into<String>,
-        system: S,
-    ) -> SystemHandle
-    where
-        S: CyclicSystem<Output = Out<O>> + 'static,
-        O: SystemOutput + BindPorts + 'static,
-        S::Input: BindPorts + 'static,
-    {
-        self.push_node(cyclic_node(name.into(), system))
-    }
-
-    /// Register an async system under its type's `System::NAME` instance name.
-    #[cfg(test)]
-    pub(crate) fn add_async<S>(&mut self, system: S) -> SystemHandle
-    where
-        S: AsyncSystem + 'static,
-        S::Input: BindPorts + 'static,
-        S::Output: BindPorts + 'static,
-    {
-        self.add_async_named(<S as System>::NAME, system)
-    }
-
-    /// Register an async system under an explicit instance name.
-    #[cfg(test)]
-    pub(crate) fn add_async_named<S>(
-        &mut self,
-        name: impl Into<String>,
-        system: S,
-    ) -> SystemHandle
-    where
-        S: AsyncSystem + 'static,
-        S::Input: BindPorts + 'static,
-        S::Output: BindPorts + 'static,
-    {
-        self.push_node(async_node(name.into(), system))
-    }
-
-    /// Register a pack entry under an explicit instance name; see
-    /// [`pending_node`] for the create-phase contract.
-    #[cfg(test)]
-    pub(crate) fn add_pack_entry(
-        &mut self,
-        name: impl Into<String>,
-        entry: &mut crate::pack::PackEntry,
-        params: crate::pack::EntryParams<'_>,
-    ) -> Result<SystemHandle, crate::pack::MakeError> {
-        Ok(self.push_node(pending_node(name.into(), entry, params)?))
     }
 
     /// Register a dlopen'd cyclic system under an explicit instance name.
@@ -527,55 +409,18 @@ impl InitGraph {
         )
     }
 
-    /// Register a runtime-swappable slot. A thin wrapper over
-    /// [`plan_slot`](slot::plan_slot) — which derives the registered contract
-    /// and rejects a bad occupant set — plus the push; the wiring front-end
-    /// calls `plan_slot` directly so it can map the errors onto its own
-    /// diagnostics. See [`plan_slot`](slot::plan_slot) for the full contract.
-    #[cfg(test)]
-    pub(crate) fn add_slot(
-        &mut self,
-        name: impl Into<String>,
-        allowed: Vec<AllowedOccupant>,
-        initial: Option<InitialOccupant>,
-    ) -> Result<SystemHandle, SlotConfigError> {
-        let name: String = name.into();
-        let (desc, ports, process) = slot::plan_slot(&name, &allowed, initial.as_ref())?;
-        Ok(self.push_node(Node {
-            name,
-            desc,
-            bind: SystemBind::Slot(SlotReg {
-                allowed,
-                initial,
-                ports,
-                process,
-            }),
-        }))
-    }
-
-    /// Record one edge, cheap connect-time guards ([`check_edge`]) first; the
-    /// full validation runs in [`solve_edges`] at [`build`].
-    pub(crate) fn connect(
-        &mut self,
-        producer: PortRef,
-        consumer: PortRef,
-    ) -> Result<(), WireError> {
-        check_edge(&self.systems, producer, consumer)?;
+    /// Record one edge; the full validation runs in [`solve_edges`] at
+    /// [`build`](InitGraph::build). Infallible: resolve builds both [`PortRef`]s from descriptors
+    /// it just looked up, so there is nothing to guard here.
+    pub(crate) fn connect(&mut self, producer: PortRef, consumer: PortRef) {
         self.edges.push((producer, consumer, false));
-        Ok(())
     }
 
     /// Record one intentional one-cycle-delayed feedback edge (the back-edge of
     /// a control loop), excluded from cycle detection. The [`connect`](Self::connect)
     /// twin.
-    pub(crate) fn connect_delayed(
-        &mut self,
-        producer: PortRef,
-        consumer: PortRef,
-    ) -> Result<(), WireError> {
-        check_edge(&self.systems, producer, consumer)?;
+    pub(crate) fn connect_delayed(&mut self, producer: PortRef, consumer: PortRef) {
         self.edges.push((producer, consumer, true));
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -661,13 +506,10 @@ impl InitGraph {
     }
 
     /// Validate every edge and build the one connection map,
-    /// `(cons_id, in_idx) -> [(prod_id, out_idx)]`, covering every input: a
-    /// FanIn::One input holds exactly one entry (enforced here), a FanIn::Many
-    /// input zero or more. Every rule branches on a descriptor axis, never on
-    /// frame-vs-message. Also runs the graph-shape checks over the map: every
-    /// feedback loop must be broken by a `connect_delayed`, registration order
-    /// must agree with the dataflow, and every FanIn::One input must be
-    /// connected.
+    /// `(cons_id, in_idx) -> [(prod_id, out_idx)]`. Every rule branches on a
+    /// descriptor axis, never on frame-vs-message. Also runs the graph-shape
+    /// checks: every feedback loop broken by a `connect_delayed`, registration
+    /// order agreeing with the dataflow, every FanIn::One input connected.
     pub(crate) fn solve_edges(&self) -> Result<ConsEdges, WireError> {
         let n = self.systems.len();
         let mut cons_edges: ConsEdges = HashMap::new();
@@ -703,11 +545,8 @@ impl InitGraph {
                 });
             }
             let in_desc = &cons.inputs[in_idx];
-            // A host-connected input's counterpart is held by the system's
-            // runner (the slot's cancel writer, a self-tap over its own
-            // output), so an edge into it is rejected. Host *outputs* keep
-            // accepting consumer edges: the coordinator's `commands` channel is
-            // exactly a Host output slots read over explicit edges.
+            // A non-Edge input's counterpart is held by its runner, so an edge
+            // into it is rejected; Host *outputs* keep accepting consumer edges.
             if in_desc.conn != PortConn::Edge {
                 return Err(WireError::HostPort {
                     system: cons.name.clone(),
@@ -768,16 +607,12 @@ impl InitGraph {
         }
 
         // --- Registration order must agree with the dataflow ------------------
-        // The cyclic step loop runs in registration order, so a non-delayed
-        // snapshot edge between two cyclic systems whose consumer registered
-        // before its producer would read last cycle's value forever: silent
-        // staleness that must instead be declared with `connect_delayed`.
-        // Checked after cycle detection so a genuine unbroken loop (which
-        // always contains a backward edge) reports the clearer `FeedbackCycle`.
-        // Log edges are exempt (a decoupled stream); so are edges with an async
-        // endpoint (async systems run off the post-step copy-in or their own
-        // task, so their registration index carries no ordering semantics).
-        // Self-edges never reach here (rejected above as a one-member cycle).
+        // A backward non-delayed snapshot edge between cyclic systems would
+        // read last cycle's value forever: silent staleness that must be
+        // declared with `connect_delayed`. Checked after cycle detection so an
+        // unbroken loop reports the clearer `FeedbackCycle`. Log edges and
+        // async endpoints are exempt (no step-order semantics); self-edges
+        // never reach here (rejected above as a one-member cycle).
         for (p, c, delayed) in &self.edges {
             if *delayed {
                 continue;
@@ -802,10 +637,7 @@ impl InitGraph {
             }
         }
 
-        // --- Input coverage: a FanIn::One input must be connected exactly once ---
-        // Exactly-once is the edge pass above; existence is here. A FanIn::Many
-        // input may have zero producers; a non-Edge input is fed by its runner,
-        // never an edge.
+        // --- Input coverage: every FanIn::One Edge input has its one edge ---
         for (sid, sys) in self.systems.iter().enumerate() {
             for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 if port.conn == PortConn::Edge
@@ -884,18 +716,11 @@ impl InitGraph {
 
     /// Allocate one buffer per output port (health/log included) plus a
     /// dedicated ring per host-connected input, collecting the build-order
-    /// registry entries: one list over every registered buffer, frames and
-    /// message channels alike. Each receive-all capability in the graph is an
-    /// extra fan-out reader on *every* buffer, so every ring's `max_readers`
-    /// includes it, derived from the declared `ReceiveAll` capabilities with
-    /// no per-consumer bookkeeping.
-    ///
-    /// A buffer in the [`shared_outputs`](Self::shared_outputs) set is
-    /// allocated as an mmap ring file in the run's [`SessionDir`] (created
-    /// lazily on the first one) and its path recorded for the worker
-    /// manifests; the in-process handle over the same mapping is used
-    /// everywhere the heap ring would have been — a ring is backing-erased,
-    /// so nothing downstream can tell.
+    /// registry entries. Each receive-all capability counts one extra reader on
+    /// *every* buffer's `max_readers`. A buffer in the
+    /// [`shared_outputs`](Self::shared_outputs) set is allocated as an mmap
+    /// ring file in the run's [`SessionDir`], path recorded for the worker
+    /// manifests; a ring is backing-erased, so nothing downstream can tell.
     pub(crate) fn alloc_rings(
         &self,
         cons_edges: &ConsEdges,
@@ -948,10 +773,7 @@ impl InitGraph {
                     port: out_idx,
                 };
                 // One sizing path (depth by delivery, `alloc_ring`); only the
-                // registry-entry shape still splits on the schema. Command
-                // channels are ordinary outputs here: a slot reads a producer
-                // only over an explicit edge, so the edge fan-out counts its
-                // readers exactly.
+                // registry-entry shape still splits on the schema.
                 let ring = if shared.contains(&(sid, out_idx)) {
                     let session = alloc.session.as_ref().expect("proc graphs have a session");
                     let path = session.path().join(format!("{instance}.{}.ring", port.name));
@@ -978,9 +800,6 @@ impl InitGraph {
                         });
                     }
                     PortSchema::Postcard { .. } => {
-                        // Registered like any buffer; the downlink taps it
-                        // unless the port opted out via `telemetered = false`
-                        // (a command channel, for example).
                         let entry = registry_entry(&instance, port, ring.clone());
                         alloc.table.rings.push(RingEntry {
                             ring: ring.clone(),
@@ -997,13 +816,10 @@ impl InitGraph {
         }
 
         // --- Dedicated rings for host-connected inputs ---------------------
-        // A Host input's counterpart is its runner's writer (the slot's cancel
-        // frame), so it gets its own ring instead of a producer edge. The
-        // occupant attaches one read `View` per Load (released on each
-        // Stop/Reset/Unload), so 1 reader slot plus slack covers the reload
-        // cycle. No registry entry: it is inbound control, not an output.
-        // SelfTap inputs allocate nothing (they view the system's own output,
-        // already counted in `fan_out`).
+        // A Host input gets its own ring (its runner holds the writer); one
+        // reader slot plus slack covers the occupant reload cycle. No registry
+        // entry: inbound control, not an output. SelfTap inputs allocate
+        // nothing (already counted in `fan_out`).
         for (sid, sys) in self.systems.iter().enumerate() {
             for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 if port.conn != PortConn::Host {
@@ -1044,8 +860,7 @@ impl InitGraph {
     }
 
     /// The boot `SequenceRegistry` payload: one spec per slot, keyed by the
-    /// slot's instance name, the channel's wire address. There is no
-    /// build-order channel id.
+    /// slot's instance name, the channel's wire address.
     fn seq_registry_payload(&self) -> SequenceRegistry {
         let channels = self
             .systems
@@ -1061,12 +876,9 @@ impl InitGraph {
         SequenceRegistry { channels }
     }
 
-    /// Private copy-in buffers for async inputs, keyed on the delivery axis.
-    /// An async system cannot be step-gated, so an async snapshot input is
-    /// decoupled through a private latest-wins copy-in ring, which also
-    /// supplies the matched data `Notifier` the async `recv` parks on. Log
-    /// inputs use a direct fan-in multi-view, an every-record log the consumer
-    /// poll-drains, with no copy-in.
+    /// Private copy-in buffers for async snapshot inputs, each with the matched
+    /// data `Notifier` the async `recv` parks on (see the module docs); log
+    /// inputs read the producers' rings directly, with no copy-in.
     fn plan_copy_ins(&self, cons_edges: &ConsEdges, alloc: &mut RingAlloc) -> AsyncPlumbing {
         let depth = self.config.default_depth;
         let slack = self.config.reader_slack;
@@ -1088,10 +900,6 @@ impl InitGraph {
                 let (prod_id, out_idx) = cons_edges[&(sid, in_idx)][0];
                 let private = alloc_ring(port.delivery, port.max_size, depth, 1 + slack);
                 let data = Notifier::default();
-                // The matched DATA notifier wakes the parked async `recv`; the
-                // copy-in uses `try_write` and skips a full private ring. Each
-                // private copy-in ring is created here and gets this one
-                // writer, so the claim is always free.
                 let writer = private
                     .writer(data.clone())
                     .expect("private copy-in ring has exactly one writer");
@@ -1120,94 +928,80 @@ impl InitGraph {
         }
         plumbing
     }
-}
 
-/// Build the graph into a ready [`Coordinator`], the in-crate test twin of the
-/// free [`build`] the wiring resolver calls. Test-only so it never re-grows a
-/// non-test build shim.
-#[cfg(test)]
-impl InitGraph {
+    /// Validate the graph, size and allocate every ring, bind ports,
+    /// auto-provision health/log buffers, and assemble a ready coordinator.
+    ///
+    /// One orchestrator over named passes, each handing its product to the
+    /// next: validation, edge resolution, fan-out counting, ring allocation,
+    /// registry freeze, copy-in planning, bind.
     pub(crate) fn build(self) -> Result<Coordinator, WireError> {
-        build(self)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// build() and its products
-// ---------------------------------------------------------------------------
-
-/// Validate the graph, size and allocate every ring, bind ports,
-/// auto-provision health/log buffers, and assemble a ready coordinator.
-///
-/// One orchestrator over named passes, each handing its product to the
-/// next: validation, edge resolution, fan-out counting, ring allocation,
-/// registry freeze, copy-in planning, bind.
-pub(crate) fn build(graph: InitGraph) -> Result<Coordinator, WireError> {
-    graph.validate_cycle_rate()?;
-    graph.validate_receive_all_last()?;
-    graph.validate_slot_name_caps()?;
-    graph.validate_port_axes()?;
-    let cons_edges = graph.solve_edges()?;
-    let fan_out = graph.count_fan_out(&cons_edges);
-    let mut alloc = graph.alloc_rings(&cons_edges, &fan_out)?;
-    let seq_registry = graph.seq_registry_payload();
-    let registry = freeze_registry(std::mem::take(&mut alloc.reg_entries))?;
-    let mut plumbing = graph.plan_copy_ins(&cons_edges, &mut alloc);
-    let InitGraph {
-        config,
-        systems,
-        worker_exe,
-        wiring_manifest,
-        ..
-    } = graph;
-    let proc_ctx = ProcBindCtx {
-        step_timeout: config.proc_step_timeout,
-        worker_exe,
-        max_restarts: config.proc_max_restarts,
-        restart_backoff: config.proc_restart_backoff,
-    };
-    let BoundSystems {
-        cyclic,
-        pending_async,
-        coord,
-    } = bind_systems(
-        systems,
-        &cons_edges,
-        &alloc,
-        &mut plumbing,
-        &registry,
-        &proc_ctx,
-    )?;
-
-    Ok(Coordinator {
-        config,
-        cyclic,
-        pending_async,
-        copy_ins: plumbing.copy_ins,
-        coord_health: coord.health,
-        status_out: coord.status_out,
-        stopped: Vec::new(),
-        stopped_scratch: Vec::new(),
-        workers: Vec::new(),
-        workers_scratch: Vec::new(),
-        cycle: 0,
-        progress: Arc::new(AtomicU64::new(0)),
-        registry,
-        channels: CoordChannels {
-            control_out: Some(coord.control_out),
-            seq_registry_out: coord.seq_registry_out,
-            seq_registry,
-            seq_registry_emitted: false,
-            wiring_out: coord.wiring_out,
+        self.validate_cycle_rate()?;
+        self.validate_receive_all_last()?;
+        self.validate_slot_name_caps()?;
+        self.validate_port_axes()?;
+        let cons_edges = self.solve_edges()?;
+        let fan_out = self.count_fan_out(&cons_edges);
+        let mut alloc = self.alloc_rings(&cons_edges, &fan_out)?;
+        let seq_registry = self.seq_registry_payload();
+        let registry = freeze_registry(std::mem::take(&mut alloc.reg_entries))?;
+        let mut plumbing = self.plan_copy_ins(&cons_edges, &mut alloc);
+        let InitGraph {
+            config,
+            systems,
+            worker_exe,
             wiring_manifest,
-            wiring_emitted: false,
-            reload_in: coord.reload_in,
-        },
-        started: false,
-        // Declared last so the canonical ring handles drop after every port.
-        rings: alloc.table,
-        session: alloc.session,
-    })
+            ..
+        } = self;
+        let proc_ctx = ProcBindCtx {
+            step_timeout: config.proc_step_timeout,
+            worker_exe,
+            max_restarts: config.proc_max_restarts,
+            restart_backoff: config.proc_restart_backoff,
+        };
+        let BoundSystems {
+            cyclic,
+            pending_async,
+            coord,
+        } = bind_systems(
+            systems,
+            &cons_edges,
+            &alloc,
+            &mut plumbing,
+            &registry,
+            &proc_ctx,
+        )?;
+
+        Ok(Coordinator {
+            config,
+            cyclic,
+            pending_async,
+            copy_ins: plumbing.copy_ins,
+            coord_health: coord.health,
+            status_out: coord.status_out,
+            stopped: Vec::new(),
+            stopped_scratch: Vec::new(),
+            workers: Vec::new(),
+            workers_scratch: Vec::new(),
+            cycle: 0,
+            progress: Arc::new(AtomicU64::new(0)),
+            registry,
+            channels: CoordChannels {
+                control_out: Some(coord.control_out),
+                seq_registry_out: coord.seq_registry_out,
+                seq_registry,
+                seq_registry_emitted: false,
+                wiring_out: coord.wiring_out,
+                wiring_manifest,
+                wiring_emitted: false,
+                reload_in: coord.reload_in,
+            },
+            started: false,
+            // Declared last so the canonical ring handles drop after every port.
+            rings: alloc.table,
+            session: alloc.session,
+        })
+    }
 }
 
 /// The one connection map, `(consumer, input-index)` to the producer endpoints
@@ -1243,35 +1037,6 @@ pub(crate) struct AsyncPlumbing {
     pub(crate) private_inputs: HashMap<(usize, usize), (RingBuffer, Notifier)>,
     pub(crate) async_wakes: Vec<Vec<Notifier>>,
     pub(crate) copy_ins: Vec<CopyIn>,
-}
-
-/// The cheap connect-time guards: the endpoints name real systems and both
-/// halves address the same port id. The full compatibility and structural
-/// validation runs in [`InitGraph::solve_edges`]; this only catches the cheap
-/// mistakes early, so [`connect`](InitGraph::connect) can surface them at the
-/// call site.
-pub(crate) fn check_edge(
-    systems: &[Node],
-    producer: PortRef,
-    consumer: PortRef,
-) -> Result<(), WireError> {
-    if producer.system.id >= systems.len() {
-        return Err(WireError::UnknownSystem {
-            id: producer.system.id,
-        });
-    }
-    if consumer.system.id >= systems.len() {
-        return Err(WireError::UnknownSystem {
-            id: consumer.system.id,
-        });
-    }
-    if producer.port != consumer.port {
-        return Err(WireError::PortIdMismatch {
-            producer: producer.port,
-            consumer: consumer.port,
-        });
-    }
-    Ok(())
 }
 
 /// Freeze the one registry every consumer's bind pulls. Frames and channels
@@ -1397,26 +1162,21 @@ pub(crate) fn owned_writer<M: Msg>(ring: &RingBuffer) -> MsgOut<M> {
     MsgOut::new(writer)
 }
 
-/// Worst-case record bytes for a [`WiringManifest`] carrying `ir_json`, the
-/// `max_size` the coordinator sizes the `wiring` ring from. A record is the
-/// 2-byte [`Msg::ID`] plus the postcard body: the `u32` `ir_version` (≤5-byte
-/// varint), the JSON's length prefix (≤5-byte varint), and the JSON bytes.
-/// Rounded up to a 1 KiB boundary for headroom, with the default message cap
-/// as a floor so a small mission's ring is no smaller than an ordinary one.
+/// Worst-case record bytes for a [`WiringManifest`] carrying `ir_json`: the
+/// 2-byte [`Msg::ID`] plus the postcard body (two ≤5-byte varints and the JSON
+/// bytes), rounded up to 1 KiB, with the default message cap as a floor.
 fn wiring_manifest_max_size(ir_json: &str) -> usize {
     (ir_json.len() + 12)
         .next_multiple_of(1024)
         .max(MAX_MSG_BYTES)
 }
 
-/// The synthetic instance prefix coordinator-owned buffers register under:
-/// they have no system instance, so their qualified key is
-/// `coordinator.health` / `coordinator.log` / `coordinator.coordinator_status`.
+/// The reserved instance name the coordinator's own buffers register under
+/// (`coordinator.health`, `coordinator.log`, ...).
 const COORDINATOR_INSTANCE: &str = "coordinator";
 
-/// Build a [`RegistryEntry`] for one buffer: the instance-qualified key over
-/// a clone of the port's descriptor, capturing a clone of the ring as the
-/// read source. The announce form is derived from the descriptor on demand.
+/// Build a [`RegistryEntry`] for one buffer: the instance-qualified key over a
+/// clone of the port's descriptor and a clone of the ring as the read source.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer) -> RegistryEntry {
     RegistryEntry {
         key: ComponentId::new(&format!("{instance}.{}", port.name)),

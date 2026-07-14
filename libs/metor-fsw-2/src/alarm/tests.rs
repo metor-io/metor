@@ -318,9 +318,14 @@ mod system {
 
     use crate::{
         AlarmSystem, AlarmsParams, BuildSystem, ClockMode, CommandOut, Coordinator,
-        CoordinatorConfig, CyclicSystem, MsgIn, Out, Output, PortRef, System, SystemHealth,
+        CoordinatorConfig, CyclicSystem, MsgIn, Out, Output, System, SystemHealth,
         SystemInput, SystemOutput,
     };
+
+    use crate::coordinator::PortRef;
+    use crate::coordinator::init::cyclic_node;
+use crate::descriptor::PortId;
+use metor_proto::types::Msg as _;
 
     use super::super::{AlarmSpec, BandSpec, RawAlarmSpec, TargetSpec};
 
@@ -496,14 +501,14 @@ mod system {
         let mut b = crate::coordinator::init::InitGraph::new(config());
         let script = vec![0.7, 0.7, 1.5, 0.45, 0.3, 0.3];
         let cycles = script.len();
-        b.add_cyclic(Plant { script, cycle: 0 });
+        b.push_node(cyclic_node(Plant::NAME.into(), Plant { script, cycle: 0 }));
         // `[f64; 3]` flattens to per-element components (`rates.0/.1/.2`), so
         // the dotted path itself is the element address; a shaped tensor
         // component would take `element=` instead.
-        b.add_cyclic(AlarmSystem::new(params(vec![
+        b.push_node(cyclic_node(AlarmSystem::NAME.into(), AlarmSystem::new(params(vec![
             alarm("RATE_HIGH", "plant.gyro.rates.1", None),
             alarm("RATE_X", "plant.gyro.rates.0", None), // same frame, never breaches
-        ])));
+        ]))));
         let coord = b.build().unwrap();
 
         let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
@@ -563,28 +568,26 @@ mod system {
     async fn latching_clears_only_on_ack() {
         let run = |delay: usize, cycles: usize| async move {
             let mut b = crate::coordinator::init::InitGraph::new(config());
-            b.add_cyclic(Plant {
+            b.push_node(cyclic_node(Plant::NAME.into(), Plant {
                 script: vec![2.0, 0.0],
                 cycle: 0,
-            });
-            let acker = b.add_cyclic(Acker {
+            }));
+            let acker = b.push_node(cyclic_node(Acker::NAME.into(), Acker {
                 delay,
                 pending: Vec::new(),
-            });
+            }));
             let mut spec = alarm("LATCHED", "plant.gyro.rates.1", None);
             spec.debounce = Some(1);
             spec.latching = Some(true);
-            let alarms = b.add_cyclic(AlarmSystem::new(params(vec![spec])));
+            let alarms = b.push_node(cyclic_node(AlarmSystem::NAME.into(), AlarmSystem::new(params(vec![spec]))));
             b.connect(
-                PortRef::msg::<AlarmRaised>(alarms),
-                PortRef::msg::<AlarmRaised>(acker),
-            )
-            .unwrap();
+                PortRef { system: alarms, port: PortId::Packet(AlarmRaised::ID) },
+                PortRef { system: acker, port: PortId::Packet(AlarmRaised::ID) },
+            );
             b.connect(
-                PortRef::msg::<AlarmAck>(acker),
-                PortRef::msg::<AlarmAck>(alarms),
-            )
-            .unwrap();
+                PortRef { system: acker, port: PortId::Packet(AlarmAck::ID) },
+                PortRef { system: alarms, port: PortId::Packet(AlarmAck::ID) },
+            );
             let coord = b.build().unwrap();
             let mut cleared = tap::<AlarmCleared>(&coord, "alarms.AlarmCleared");
             let mut coord = coord;
@@ -605,10 +608,10 @@ mod system {
     #[stellarator::test]
     async fn flag_component_alarms() {
         let mut b = crate::coordinator::init::InitGraph::new(config());
-        b.add_cyclic(Plant {
+        b.push_node(cyclic_node(Plant::NAME.into(), Plant {
             script: vec![0.0, 20.0, 20.0], // degraded = rate > 10
             cycle: 0,
-        });
+        }));
         let mut spec = alarm("DEGRADED", "plant.status.degraded", None);
         spec.warning = None;
         spec.critical = Some(BandSpec {
@@ -617,7 +620,7 @@ mod system {
         });
         spec.debounce = Some(1);
         spec.hysteresis = None;
-        b.add_cyclic(AlarmSystem::new(params(vec![spec])));
+        b.push_node(cyclic_node(AlarmSystem::NAME.into(), AlarmSystem::new(params(vec![spec]))));
         let coord = b.build().unwrap();
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
         let mut coord = coord;
@@ -637,16 +640,16 @@ mod system {
     #[stellarator::test]
     async fn bad_targets_disable_and_report_health() {
         let mut b = crate::coordinator::init::InitGraph::new(config());
-        b.add_cyclic(Plant {
+        b.push_node(cyclic_node(Plant::NAME.into(), Plant {
             script: vec![5.0], // would breach everything, were anything enabled
             cycle: 0,
-        });
-        b.add_cyclic(AlarmSystem::new(params(vec![
+        }));
+        b.push_node(cyclic_node(AlarmSystem::NAME.into(), AlarmSystem::new(params(vec![
             alarm("GHOST", "nowhere.gyro.rates.1", None), // no such component
             alarm("OOB", "plant.gyro.rates.1", Some(9)),  // element out of bounds (scalar)
             alarm("DUP", "plant.gyro.rates.1", None),
             alarm("DUP", "plant.gyro.rates.1", None), // duplicate id
-        ])));
+        ]))));
         let coord = b.build().unwrap();
         let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");

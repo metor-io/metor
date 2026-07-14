@@ -16,8 +16,8 @@
 //! it: a [`Node`](crate::coordinator::init::Node) per system (static systems via
 //! the [`Registry`] in [`registry.rs`](registry), dl and process systems from
 //! their built [`Artifact`]s), the edges, and the coordinator config, all pushed
-//! onto an [`InitGraph`](crate::coordinator::init::InitGraph) and handed to
-//! [`init::build`](crate::coordinator::init::build). One resolver feeds both
+//! onto an [`InitGraph`](crate::coordinator::init::InitGraph) and built
+//! ([`InitGraph::build`](crate::coordinator::init::InitGraph::build)). One resolver feeds both
 //! front-ends, so every graph check runs identically for either. Every error is
 //! a [`LoadError`], a `miette` [`Diagnostic`](miette::Diagnostic) anchored on the
 //! spec's [`SourceRef`] when it has one.
