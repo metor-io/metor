@@ -1,14 +1,17 @@
 //! Load a coordinator from a [`Wiring`] mission IR.
 //!
-//! This module is a pure front-end onto [`CoordinatorBuilder`]. A [`Wiring`] —
-//! a plain data model of systems, slots, edges, and coordinator config — comes
-//! either from evaluating a `.py` mission ([`eval_python_mission`]) or from the
-//! Rust [`WiringBuilder`]. [`resolve`] walks it, instantiates each system from
-//! an app-built [`Registry`], connects the edges, and calls `build()`. Both
-//! front-ends feed the one resolver, so every graph check runs identically for
-//! either. No coordinator logic lives here; every error surfaced is a
-//! [`LoadError`], a `miette` [`Diagnostic`](miette::Diagnostic) that anchors on
-//! the spec's [`SourceRef`] when it has one.
+//! This module is a pure front-end onto the init graph. A [`Wiring`] — a plain
+//! data model of systems, slots, edges, and coordinator config — comes either
+//! from evaluating a `.py` mission ([`eval_python_mission`]) or from the Rust
+//! [`WiringBuilder`]. [`resolve`] walks it, produces a
+//! [`Node`](crate::coordinator::init::Node) per system from an app-built
+//! [`Registry`], pushes each onto an [`InitGraph`](crate::coordinator::init::InitGraph),
+//! records the edges, and hands the graph to
+//! [`init::build`](crate::coordinator::init::build). Both front-ends feed the
+//! one resolver, so every graph check runs identically for either. No
+//! coordinator logic lives here; every error surfaced is a [`LoadError`], a
+//! `miette` [`Diagnostic`](miette::Diagnostic) that anchors on the spec's
+//! [`SourceRef`] when it has one.
 //!
 //! ## Params
 //!
@@ -30,10 +33,11 @@ use miette::SourceSpan;
 use metor_proto::types::ComponentId;
 
 use crate::binder::BindPorts;
+use crate::coordinator::init::{self, InitGraph, Node, SystemBind};
+use crate::coordinator::slot::{SlotReg, plan_slot};
 use crate::coordinator::{
-    AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, OccupantBacking, PortRef, SlotConfigError, SystemHandle, WireError,
-    validate_slot_spec,
+    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, OccupantBacking,
+    PortRef, SlotConfigError, SystemHandle, WireError, validate_slot_spec,
 };
 use crate::descriptor::{PortId, SystemDescriptor};
 use crate::dl::DlSystem;
@@ -98,14 +102,13 @@ pub use crate::register_system;
 // The registry
 // ---------------------------------------------------------------------------
 
-/// Everything a factory needs and produces, erased of the concrete system type.
-pub struct LoadCtx<'a> {
+/// Everything a factory decodes to build a [`Node`], erased of the concrete
+/// system type.
+pub(crate) struct LoadCtx<'a> {
     /// Where the instance's params come from.
     pub params: StaticParams<'a>,
     /// The instance name the system registers under.
     pub name: &'a str,
-    /// The builder under construction.
-    pub builder: &'a mut CoordinatorBuilder,
     /// The registry's message table, which [`BuildSystem::configure`] resolves
     /// config name tokens against.
     pub msgs: &'a MsgTable,
@@ -113,7 +116,7 @@ pub struct LoadCtx<'a> {
 
 /// The params surface a static-path factory decodes, the typed twin of the dl
 /// path's [`ParamSource`] reduction.
-pub enum StaticParams<'a> {
+pub(crate) enum StaticParams<'a> {
     /// A params value tree. `src` is the best-available diagnostic snippet
     /// (a value tree carries no spans of its own), anchored by the spec's
     /// [`SourceRef`] when it has one.
@@ -136,49 +139,57 @@ impl StaticParams<'_> {
     }
 }
 
-/// A registered factory: decode `ctx.params`, construct the system, add it
-/// to the builder under `ctx.name`, and return its handle and descriptor for
-/// edge validation. Boxed `Fn`, not a bare `fn`: a pack entry's factory
-/// closes over the shared entry it instantiates.
-pub type SystemFactory =
-    Box<dyn Fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>>;
+/// A registered factory: decode `ctx.params`, construct the system, run its
+/// host-side configure step, and return the finished [`Node`] for the resolver
+/// to push. Boxed `Fn`, not a bare `fn`: a pack entry's factory closes over the
+/// shared entry it instantiates.
+type SystemFactory = Box<dyn Fn(&mut LoadCtx) -> Result<Node, LoadError>>;
 
-/// Marker for a cyclic system's [`AddToBuilder`] impl.
+/// Marker for a cyclic system's [`IntoNode`] impl.
 pub struct CyclicKind;
-/// Marker for an async system's [`AddToBuilder`] impl.
+/// Marker for an async system's [`IntoNode`] impl.
 pub struct AsyncKind;
 
-/// Adds a constructed system to the builder with the right `add_*_named` call
-/// and reports its descriptor. The `Kind` parameter keeps the cyclic and async
-/// blanket impls from overlapping (a type could in principle implement both
-/// system traits), so a single [`Registry::register`] covers either.
-pub trait AddToBuilder<Kind>: Sized {
-    fn add_to(self, name: &str, builder: &mut CoordinatorBuilder) -> SystemHandle;
+/// Turns a constructed system into an init-graph [`Node`] via the right
+/// erasure helper, and reports its static descriptor. The `Kind` parameter
+/// keeps the cyclic and async blanket impls from overlapping (a type could in
+/// principle implement both system traits), so a single [`Registry::register`]
+/// covers either.
+///
+/// The trait is public (it names a bound on the public
+/// [`Registry::register`]), but `into_node` yields the crate-private
+/// `Node`: a system author only ever satisfies the trait, never calls it, so
+/// the internal return type stays internal.
+#[allow(private_interfaces)]
+pub trait IntoNode<Kind>: Sized {
+    fn into_node(self, name: String) -> Node;
     fn descriptor() -> SystemDescriptor;
 }
 
-impl<S, O> AddToBuilder<CyclicKind> for S
+#[allow(private_interfaces)]
+impl<S, O> IntoNode<CyclicKind> for S
 where
     S: CyclicSystem<Output = Out<O>> + 'static,
     O: SystemOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
-    fn add_to(self, name: &str, builder: &mut CoordinatorBuilder) -> SystemHandle {
-        builder.add_cyclic_named(name, self)
+    fn into_node(self, name: String) -> Node {
+        init::cyclic_node(name, self)
     }
     fn descriptor() -> SystemDescriptor {
         <S as CyclicSystem>::descriptor()
     }
 }
 
-impl<S> AddToBuilder<AsyncKind> for S
+#[allow(private_interfaces)]
+impl<S> IntoNode<AsyncKind> for S
 where
     S: AsyncSystem + 'static,
     S::Input: BindPorts + 'static,
     S::Output: BindPorts + 'static,
 {
-    fn add_to(self, name: &str, builder: &mut CoordinatorBuilder) -> SystemHandle {
-        builder.add_async_named(name, self)
+    fn into_node(self, name: String) -> Node {
+        init::async_node(name, self)
     }
     fn descriptor() -> SystemDescriptor {
         <S as AsyncSystem>::descriptor()
@@ -187,11 +198,13 @@ where
 
 /// The factory [`Registry::register`] stores for one concrete type:
 /// deserialize params, `new` the system, run its host-side configure step, and
-/// add it to the builder, erased to a plain `fn` pointer. `()` params
-/// deserialize from a paramless surface and reject stray properties.
-fn factory<S, K>(ctx: &mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>
+/// erase it to a [`Node`] behind a plain `fn` pointer. `()` params deserialize
+/// from a paramless surface and reject stray properties. The node carries the
+/// instance descriptor, not the static one; a system whose configure step
+/// minted ports resolves edges against what this instance actually carries.
+fn factory<S, K>(ctx: &mut LoadCtx) -> Result<Node, LoadError>
 where
-    S: BuildSystem + AddToBuilder<K>,
+    S: BuildSystem + IntoNode<K>,
     S::Params: serde::de::DeserializeOwned,
 {
     let params = decode_static_params::<S::Params>(&ctx.params, ctx.name)?;
@@ -208,11 +221,7 @@ where
             }
             .whole(ctx.params.diag_src(ctx.name)),
         })?;
-    let handle = system.add_to(ctx.name, ctx.builder);
-    // Return the instance descriptor, not the static one; a system whose
-    // configure step minted ports resolves edges against what this instance
-    // actually carries.
-    Ok((handle, ctx.builder.descriptor_of(handle).clone()))
+    Ok(system.into_node(ctx.name.to_string()))
 }
 
 /// Decode a typed `Params` off a [`StaticParams`] surface: a value tree
@@ -398,10 +407,10 @@ impl Registry {
     /// `S::Params: DeserializeOwned`, the same derive the postcard contract
     /// already needs, so a statically linked system registers by implementing
     /// `BuildSystem` alone. The cyclic-versus-async branch comes from the
-    /// [`AddToBuilder`] blanket impls, inferred here.
+    /// [`IntoNode`] blanket impls, inferred here.
     pub fn register<S, K>(&mut self, type_name: &'static str) -> &mut Self
     where
-        S: BuildSystem + AddToBuilder<K> + 'static,
+        S: BuildSystem + IntoNode<K> + 'static,
         S::Params: serde::de::DeserializeOwned,
         K: 'static,
     {
@@ -409,7 +418,7 @@ impl Registry {
             type_name,
             RegistryEntry {
                 factory: Box::new(factory::<S, K>),
-                descriptor: EntryDescriptor::Fn(<S as AddToBuilder<K>>::descriptor),
+                descriptor: EntryDescriptor::Fn(<S as IntoNode<K>>::descriptor),
             },
         );
         self
@@ -447,19 +456,17 @@ impl Registry {
                     name: ctx.name,
                     msgs: ctx.msgs,
                 };
-                let handle = ctx
-                    .builder
-                    .add_pack_entry(ctx.name, &mut entry, params)
-                    .map_err(|e| match e {
-                        // The params decode already carries its span; unwrap it.
-                        crate::pack::MakeError::Params(e) => *e,
-                        other => LoadErrorKind::PackCreate {
-                            system: ctx.name.to_string(),
-                            message: other.to_string(),
-                        }
-                        .whole(ctx.params.diag_src(ctx.name)),
-                    })?;
-                Ok((handle, ctx.builder.descriptor_of(handle).clone()))
+                // The create phase runs here (a bad config fails at registration);
+                // the returned node rides the ordinary cyclic bind path.
+                init::pending_node(ctx.name.to_string(), &mut entry, params).map_err(|e| match e {
+                    // The params decode already carries its span; unwrap it.
+                    crate::pack::MakeError::Params(e) => *e,
+                    other => LoadErrorKind::PackCreate {
+                        system: ctx.name.to_string(),
+                        message: other.to_string(),
+                    }
+                    .whole(ctx.params.diag_src(ctx.name)),
+                })
             });
             self.factories.insert(
                 name,
@@ -510,11 +517,15 @@ enum Dir {
 
 /// Resolve-time overrides that a [`Wiring`] does not itself carry.
 ///
-/// A `Wiring` is a portable mission description, so host-local paths — where a
-/// process worker's executable lives, where the shared-memory session dir is
-/// rooted — are supplied here at [`resolve_with`] time rather than baked into
-/// the IR. The defaults (re-exec the host binary as the worker, `/dev/shm` or
-/// the OS temp dir for sessions) are what [`resolve`] uses.
+/// A `Wiring` is a portable mission description, so host-environment policy —
+/// where a process worker's executable lives, where the shared-memory session
+/// dir is rooted, how a worker's steps are timed and its crashes recovered — is
+/// supplied here at [`resolve_with`] time rather than baked into the IR. These
+/// are deployment decisions, not mission topology, so they stay off the
+/// serialized IR (`wiring.json` is unaffected); each override falls back to the
+/// matching [`CoordinatorConfig`] default when `None`. The defaults (re-exec
+/// the host binary as the worker, `/dev/shm` or the OS temp dir for sessions,
+/// the config's step-timeout and restart policy) are what [`resolve`] uses.
 #[derive(Default, Clone, Debug)]
 pub struct ResolveOptions {
     /// The process-worker executable, instead of re-executing the host binary.
@@ -524,6 +535,16 @@ pub struct ResolveOptions {
     /// The shared-memory session parent dir, instead of the default
     /// (`/dev/shm` when present, else the OS temp dir).
     pub shm_dir: Option<PathBuf>,
+    /// Override of [`CoordinatorConfig::proc_step_timeout`]: how long a process
+    /// system's step waits for the worker's ack before the cycle moves on.
+    pub proc_step_timeout: Option<Duration>,
+    /// Override of [`CoordinatorConfig::proc_max_restarts`]: how many times a
+    /// dead or panicked worker is respawned over the slot's life (`0` disables
+    /// restart).
+    pub proc_max_restarts: Option<u32>,
+    /// Override of [`CoordinatorConfig::proc_restart_backoff`]: how long a dead
+    /// worker's slot waits before respawning.
+    pub proc_restart_backoff: Option<Duration>,
 }
 
 /// Walk a [`Wiring`] and produce a built [`Coordinator`], the default-option
@@ -538,7 +559,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 /// validation, sizing, and telemetry passes. A static system (no `artifact`)
 /// is instantiated through the [`Registry`] factory; a dl system is opened
 /// from its built [`Artifact::path`] and registered with
-/// [`CoordinatorBuilder::add_dl_cyclic`].
+/// [`InitGraph::add_dl_cyclic`](crate::coordinator::init::InitGraph::add_dl_cyclic).
 ///
 /// A `Wiring` carries no source text (a builder-origin one never had any), so
 /// resolve-time [`LoadError`]s hold a best-effort snippet rather than original
@@ -557,14 +578,21 @@ pub fn resolve_with(
     }
     check_scope_refs(wiring)?;
     check_manifest_hashes(wiring)?;
-    let config = coordinator_config(&wiring.coordinator);
-    let mut builder = Coordinator::builder(config);
-    if let Some(exe) = opts.worker_exe {
-        builder.worker_exe(exe);
+    let mut config = coordinator_config(&wiring.coordinator);
+    // Host-environment policy overrides (see `ResolveOptions`): applied onto the
+    // config the IR derived, never onto the IR itself.
+    if let Some(timeout) = opts.proc_step_timeout {
+        config.proc_step_timeout = timeout;
     }
-    if let Some(dir) = opts.shm_dir {
-        builder.shm_dir(dir);
+    if let Some(max) = opts.proc_max_restarts {
+        config.proc_max_restarts = max;
     }
+    if let Some(backoff) = opts.proc_restart_backoff {
+        config.proc_restart_backoff = backoff;
+    }
+    let mut graph = InitGraph::new(config);
+    graph.worker_exe = opts.worker_exe;
+    graph.shm_dir = opts.shm_dir;
 
     // Broadcast the full mission IR as a `WiringManifest` at startup and on
     // reload. Serialized path-stripped so the telemetered topology matches the
@@ -572,7 +600,7 @@ pub fn resolve_with(
     // front-ends land here, so the manifest flows whatever the source language.
     let ir_json = serde_json::to_string(&wiring.path_stripped())
         .expect("a resolvable Wiring serializes to JSON");
-    builder.set_wiring_manifest(metor_proto_wkt::WiringManifest {
+    graph.set_wiring_manifest(metor_proto_wkt::WiringManifest {
         ir_version: wiring.ir_version,
         ir_json,
     });
@@ -583,12 +611,12 @@ pub fn resolve_with(
     // `"coordinator"` is reserved: command edges name it (`connect
     // "coordinator" -> ...`), and a user `system "coordinator"` surfaces as a
     // `DuplicateInstance` error instead of a silent key collision.
-    let coord_handle = builder.coordinator_handle();
+    let coord_handle = graph.coordinator_handle();
     instances.insert(
         "coordinator".to_string(),
         Instance {
             handle: coord_handle,
-            desc: builder.descriptor_of(coord_handle).clone(),
+            desc: graph.descriptor_of(coord_handle).clone(),
         },
     );
     // A static `ReceiveAll` system must be the last cyclic registration or
@@ -600,9 +628,9 @@ pub fn resolve_with(
     let mut packs = PackCache::default();
     for spec in &wiring.systems {
         let (handle, desc) = match (&spec.artifact, spec.process) {
-            (Some(artifact_id), true) => resolve_proc(spec, artifact_id, wiring, &mut builder)?,
+            (Some(artifact_id), true) => resolve_proc(spec, artifact_id, wiring, &mut graph)?,
             (Some(artifact_id), false) => {
-                resolve_dl(spec, artifact_id, wiring, &mut packs, &mut builder)?
+                resolve_dl(spec, artifact_id, wiring, &mut packs, &mut graph)?
             }
             (None, true) => {
                 // A process system needs an artifact to spawn a worker; a spec
@@ -617,7 +645,7 @@ pub fn resolve_with(
                     deferred.push(spec);
                     continue;
                 }
-                resolve_static(spec, registry, &mut builder)?
+                resolve_static(spec, registry, &mut graph)?
             }
         };
         if instances
@@ -634,7 +662,7 @@ pub fn resolve_with(
     // --- Slots pass: a slot `connect`s by name like a system, so it joins
     //     `instances` before the edges pass.
     for slot in &wiring.slots {
-        let (handle, desc) = resolve_slot(slot, wiring, &mut packs, &mut builder)?;
+        let (handle, desc) = resolve_slot(slot, wiring, &mut packs, &mut graph)?;
         if instances
             .insert(slot.name.clone(), Instance { handle, desc })
             .is_some()
@@ -648,7 +676,7 @@ pub fn resolve_with(
     // --- Deferred receive-all systems: the last cyclic registrations, still
     //     ahead of the edges pass, which only needs the finished instance map.
     for spec in deferred {
-        let (handle, desc) = resolve_static(spec, registry, &mut builder)?;
+        let (handle, desc) = resolve_static(spec, registry, &mut graph)?;
         if instances
             .insert(spec.name.clone(), Instance { handle, desc })
             .is_some()
@@ -692,14 +720,14 @@ pub fn resolve_with(
         // the name-lookup space above. `delayed=#true` into a Log input
         // surfaces `WireError::DelayedLogEdge` at build.
         let result = if edge.delayed {
-            builder.connect_delayed(producer, consumer)
+            graph.connect_delayed(producer, consumer)
         } else {
-            builder.connect(producer, consumer)
+            graph.connect(producer, consumer)
         };
         result.map_err(|source| LoadErrorKind::Wire { source }.at(src, span))?;
     }
 
-    builder.build().map_err(wire_at_build)
+    init::build(graph).map_err(wire_at_build)
 }
 
 /// Instantiate a static system through the [`Registry`] factory.
@@ -710,7 +738,7 @@ pub fn resolve_with(
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
-    builder: &mut CoordinatorBuilder,
+    graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     // `type=` is required for a static system; only a dl system can derive it
     // from its artifact. A builder-origin spec could omit it.
@@ -742,12 +770,14 @@ fn resolve_static(
         }
         ParamSource::None => StaticParams::None,
     };
-    (factory.factory)(&mut LoadCtx {
+    let node = (factory.factory)(&mut LoadCtx {
         params,
         name: &spec.name,
-        builder,
         msgs: &registry.msgs,
-    })
+    })?;
+    let desc = node.desc.clone();
+    let handle = graph.push_node(node);
+    Ok((handle, desc))
 }
 
 /// The per-resolve cache of opened packs, keyed by artifact id, so an
@@ -966,7 +996,7 @@ fn encode_occupant_params(
 }
 
 /// Load a pack entry and register it via
-/// [`CoordinatorBuilder::add_dl_cyclic`]. The artifact is opened once per
+/// [`InitGraph::add_dl_cyclic`](crate::coordinator::init::InitGraph::add_dl_cyclic). The artifact is opened once per
 /// resolve (the cache) and the reconstructed descriptor is returned for edge
 /// validation.
 fn resolve_dl(
@@ -974,7 +1004,7 @@ fn resolve_dl(
     artifact_id: &str,
     wiring: &Wiring,
     packs: &mut PackCache,
-    builder: &mut CoordinatorBuilder,
+    graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     let src = system_src(spec);
     let span: SourceSpan = (0, src.len()).into();
@@ -994,7 +1024,7 @@ fn resolve_dl(
     )?;
     let loaded = entry.opened();
     let desc = loaded.descriptor().clone();
-    let handle = builder.add_dl_cyclic(&spec.name, loaded, params);
+    let handle = graph.add_dl_cyclic(&spec.name, loaded, params);
     Ok((handle, desc))
 }
 
@@ -1030,14 +1060,14 @@ fn find_built_artifact<'w>(
 /// **describe-mode worker** over the built artifact — the host never dlopens
 /// it — decode the descriptor and `Params` schema from the worker's bytes,
 /// encode the spec's params against that schema, and register through
-/// [`CoordinatorBuilder::add_proc_cyclic`]. The run worker is spawned later,
+/// [`InitGraph::add_proc_cyclic`](crate::coordinator::init::InitGraph::add_proc_cyclic). The run worker is spawned later,
 /// at `build()`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_proc(
     spec: &SystemSpec,
     artifact_id: &str,
     wiring: &Wiring,
-    builder: &mut CoordinatorBuilder,
+    graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     let src = system_src(spec);
     let span: SourceSpan = (0, src.len()).into();
@@ -1070,7 +1100,7 @@ fn resolve_proc(
     )?;
     let desc = entry.described();
     let entry_name = desc.name.to_string();
-    let handle = builder.add_proc_cyclic(&spec.name, desc.clone(), path.clone(), entry_name, params);
+    let handle = graph.add_proc_cyclic(&spec.name, desc.clone(), path.clone(), entry_name, params);
     Ok((handle, desc))
 }
 
@@ -1080,7 +1110,7 @@ fn resolve_proc(
     spec: &SystemSpec,
     _artifact_id: &str,
     _wiring: &Wiring,
-    _builder: &mut CoordinatorBuilder,
+    _graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     Err(LoadErrorKind::ProcessUnsupported { name: spec.name.clone() }.whole(system_src(spec)))
 }
@@ -1204,7 +1234,7 @@ fn occupant_artifact(
 }
 
 /// Map a [`SlotConfigError`] — from the shared pure-spec validation or from
-/// [`CoordinatorBuilder::add_slot`] — onto this front-end's spanned slot
+/// [`plan_slot`](crate::coordinator::slot::plan_slot) — onto this front-end's spanned slot
 /// diagnostics.
 fn slot_config_error(
     err: SlotConfigError,
@@ -1246,15 +1276,15 @@ fn slot_config_error(
 /// or, for a `process=#true` slot, through [`describe_occupants`], which
 /// sources the descriptors from describe workers so the host never dlopens
 /// any occupant artifact. Every occupant must share one port contract. The
-/// descriptor returned for the edges pass is the one read back off the
-/// builder after [`CoordinatorBuilder::add_slot`], not a raw occupant
-/// descriptor, and the declared `input`/`output` contract is validated
-/// against it.
+/// descriptor returned for the edges pass is the one
+/// [`plan_slot`](crate::coordinator::slot::plan_slot) derives (the user ports
+/// plus the runner tail), not a raw occupant descriptor, and the declared
+/// `input`/`output` contract is validated against it.
 fn resolve_slot(
     slot: &SlotSpec,
     wiring: &Wiring,
     packs: &mut PackCache,
-    builder: &mut CoordinatorBuilder,
+    graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     let src = slot_src(slot);
     let span: SourceSpan = (0, src.len()).into();
@@ -1314,15 +1344,24 @@ fn resolve_slot(
         },
     };
 
-    // Register the slot, then read its registered descriptor back off the
-    // builder. `add_slot` is the one place the registered contract (user
-    // ports plus the slot's own command fan-in) is derived — and the one
+    // Derive the registered contract and reject a bad occupant set through the
+    // one shared planner. `plan_slot` is the one place the registered contract
+    // (user ports plus the slot's own command fan-in) is derived — and the one
     // place the descriptor-level checks (occupant mutual compatibility, the
     // mount-appended ports) run — so this front-end cannot drift from it.
-    let handle = builder
-        .add_slot(slot.name.clone(), allowed, initial)
+    let (registered, ports, process) = plan_slot(&slot.name, &allowed, initial.as_ref())
         .map_err(|e| slot_config_error(e, slot, &src, span))?;
-    let registered = builder.descriptor_of(handle).clone();
+    let desc = registered.clone();
+    let handle = graph.push_node(Node {
+        name: slot.name.clone(),
+        desc: registered,
+        bind: SystemBind::Slot(SlotReg {
+            allowed,
+            initial,
+            ports,
+            process,
+        }),
+    });
 
     // Every declared `input`/`output` frame must name an edge-connected
     // registered port. The runner-held tail (slot control, slot status, the
@@ -1331,7 +1370,7 @@ fn resolve_slot(
     // name but need not.
     use crate::descriptor::PortConn;
     for frame in &slot.inputs {
-        if !registered
+        if !desc
             .inputs
             .iter()
             .any(|p| p.conn == PortConn::Edge && &p.name == frame)
@@ -1345,7 +1384,7 @@ fn resolve_slot(
         }
     }
     for frame in &slot.outputs {
-        if !registered
+        if !desc
             .outputs
             .iter()
             .any(|p| p.conn == PortConn::Edge && &p.name == frame)
@@ -1359,7 +1398,7 @@ fn resolve_slot(
         }
     }
 
-    Ok((handle, registered))
+    Ok((handle, desc))
 }
 
 /// Resolve a process slot's allowed set (`docs/process-slots.md` §8): the

@@ -12,7 +12,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::frame::Frame;
 use crate::pack::{EntryParams, MakeError};
 use crate::{
-    ClockMode, Coordinator, CoordinatorConfig, HealthPort, Input, MsgIn, Output, Pack, PortId,
+    ClockMode, CoordinatorConfig, HealthPort, Input, MsgIn, Output, Pack, PortId,
     PortRef, SystemKind, system,
 };
 
@@ -127,7 +127,7 @@ async fn pack_entries_flow_and_share_state() {
         .system("prod", system(produce).init(|| ProdState { n: 0.0 }))
         .system("cons", system(consume).state(ConsState { seen: seen.clone() }));
 
-    let mut b = Coordinator::builder(config());
+    let mut b = crate::coordinator::init::InitGraph::new(config());
     let prod = b
         .add_pack_entry(
             "prod",
@@ -216,7 +216,7 @@ async fn task_entry_runs_as_wired_sequence() {
         .system("watch", system(watch).state(WatchState { seen: seen.clone() }));
 
     let params = postcard::to_allocvec(&SeqParams { target: 7.0 }).unwrap();
-    let mut b = Coordinator::builder(CoordinatorConfig {
+    let mut b = crate::coordinator::init::InitGraph::new(CoordinatorConfig {
         cycle_rate: 1000.0,
         clock: ClockMode::Simulated {
             dt: Duration::from_millis(1),
@@ -306,7 +306,7 @@ async fn task_cycles_every_cycle_and_folds_drops() {
         .task("beat", beat)
         .system("watch", system(watch).state(WatchState { seen: seen.clone() }));
 
-    let mut b = Coordinator::builder(CoordinatorConfig {
+    let mut b = crate::coordinator::init::InitGraph::new(CoordinatorConfig {
         cycle_rate: 1000.0,
         clock: ClockMode::Simulated {
             dt: Duration::from_millis(1),

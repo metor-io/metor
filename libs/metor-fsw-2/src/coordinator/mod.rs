@@ -1,11 +1,13 @@
 //! The cyclic run loop.
 //!
-//! A [`CoordinatorBuilder`] collects systems and the edges between their ports,
-//! then `build()`s them (the init pipeline lives in [`init`]) into a ready
-//! [`Coordinator`]. [`Coordinator::run_for`] drives the lifecycle: spawn the
-//! async systems, init everything behind a barrier, step the cyclic systems
-//! once per cycle, run the async copy-in mirror, publish coordinator-level
-//! health and a status frame, and tear it all down.
+//! An [`InitGraph`](init::InitGraph) collects systems and the edges between
+//! their ports, then [`init::build`]s them into a ready [`Coordinator`]. The
+//! graph is produced by the wiring front-end ([`resolve`](crate::wiring::resolve))
+//! or, in-crate, through the graph's own `add_*`/`connect` conveniences.
+//! [`Coordinator::run_for`] drives the lifecycle: spawn the async systems, init
+//! everything behind a barrier, step the cyclic systems once per cycle, run the
+//! async copy-in mirror, publish coordinator-level health and a status frame,
+//! and tear it all down.
 //!
 //! Cyclic systems step in registration order, once per cycle; the build-time
 //! passes ([`init`]) reject any wiring whose dataflow disagrees with that
@@ -14,7 +16,6 @@
 //! inputs through the post-step copy-in mirror.
 
 use core::mem::offset_of;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{
     AtomicBool, AtomicU64, AtomicUsize,
@@ -29,23 +30,21 @@ use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::binder::BindPorts;
-use crate::descriptor::{Hz, PortId, SystemDescriptor};
+use crate::descriptor::{Hz, PortId};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::message::{MsgIn, MsgOut};
 use crate::port::Output;
 use crate::proc::session::SessionDir;
 use crate::registry::Registry;
-use crate::system::{AsyncSystem, CyclicSystem, Out, SystemOutput};
+use crate::system::AsyncSystem;
 use crate::{DEFAULT_DEPTH, Frame};
 
 mod bind;
 mod error;
-mod init;
-mod slot;
+pub(crate) mod init;
+pub(crate) mod slot;
 mod status;
-use init::InitGraph;
 pub use error::WireError;
 pub(crate) use slot::validate_slot_spec;
 pub use slot::{
@@ -131,22 +130,25 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// An opaque index naming one registered system. The builder's `add_*`
-/// methods return it, and a [`PortRef`] embeds it to address that system's
+/// An opaque index naming one registered system. The graph's `add_*`
+/// conveniences return it, and a [`PortRef`] embeds it to address that system's
 /// ports.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SystemHandle {
+pub(crate) struct SystemHandle {
     id: usize,
 }
 
 /// A `(system, port)` pair addressing one port for wiring, both halves taken
 /// from the system's registered [`SystemDescriptor`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PortRef {
+pub(crate) struct PortRef {
     pub system: SystemHandle,
     pub port: PortId,
 }
 
+// `new`/`msg` are in-crate test conveniences; the wiring resolver builds
+// `PortRef`s by struct literal from descriptor-derived port ids.
+#[allow(dead_code)]
 impl PortRef {
     /// Address the port carrying frame `F` on `system`.
     pub fn new<F: Frame>(system: SystemHandle) -> Self {
@@ -347,273 +349,6 @@ struct PendingAsync {
 }
 
 // ---------------------------------------------------------------------------
-// Builder (a thin shim over the init graph)
-// ---------------------------------------------------------------------------
-
-/// Registers systems and edges, then `build`s a ready [`Coordinator`]. A thin
-/// façade over an [`InitGraph`]: every method records into the graph, and
-/// `build` hands it to [`init::build`].
-pub struct CoordinatorBuilder {
-    graph: InitGraph,
-}
-
-impl CoordinatorBuilder {
-    fn new(config: CoordinatorConfig) -> Self {
-        Self {
-            graph: InitGraph::new(config),
-        }
-    }
-
-    /// The handle addressing the coordinator's own system-#0 bundle, so a
-    /// front-end can wire the operator command edge with
-    /// `connect(PortRef::msg::<SequenceCommand>(b.coordinator_handle()), …)`.
-    pub fn coordinator_handle(&self) -> SystemHandle {
-        self.graph.coordinator_handle()
-    }
-
-    /// Broadcast `manifest` as a [`WiringManifest`] at startup and on reload.
-    ///
-    /// The front-end ([`resolve`](crate::wiring::resolve)) hands over the full,
-    /// path-stripped mission IR here; a `wiring` output is added to the
-    /// coordinator #0 bundle, sized from the concrete JSON payload (which for a
-    /// non-trivial mission exceeds `MAX_MSG_BYTES`), and the run loop emits it
-    /// on the telemetry plane — the pattern [`SequenceRegistry`] uses. Called
-    /// again, the latest manifest wins.
-    pub fn set_wiring_manifest(&mut self, manifest: WiringManifest) {
-        self.graph.set_wiring_manifest(manifest);
-    }
-
-    /// The registered descriptor of `handle`, which is what `build()`
-    /// validates, sizes, and wires. For a slot this is the derived contract
-    /// (see [`add_slot`](Self::add_slot)), which a front-end reads back
-    /// instead of re-deriving; for everything else it is the system's own
-    /// `descriptor()`.
-    pub fn descriptor_of(&self, handle: SystemHandle) -> &SystemDescriptor {
-        self.graph.descriptor_of(handle)
-    }
-
-    /// Register a cyclic system under its type's `System::NAME` instance name;
-    /// see [`add_cyclic_named`](Self::add_cyclic_named) to name the instance
-    /// explicitly.
-    pub fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle
-    where
-        S: CyclicSystem<Output = Out<O>> + 'static,
-        O: SystemOutput + BindPorts + 'static,
-        S::Input: BindPorts + 'static,
-    {
-        self.graph.add_cyclic(system)
-    }
-
-    /// Register a cyclic system under an explicit instance name; returns a
-    /// handle whose ports can be `connect`ed. The instance name disambiguates
-    /// two instances of one system type in the telemetry keyspace.
-    pub fn add_cyclic_named<S, O>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
-    where
-        S: CyclicSystem<Output = Out<O>> + 'static,
-        O: SystemOutput + BindPorts + 'static,
-        S::Input: BindPorts + 'static,
-    {
-        self.graph.add_cyclic_named(name, system)
-    }
-
-    /// Register an async system under its type's `System::NAME` instance name.
-    pub fn add_async<S>(&mut self, system: S) -> SystemHandle
-    where
-        S: AsyncSystem + 'static,
-        S::Input: BindPorts + 'static,
-        S::Output: BindPorts + 'static,
-    {
-        self.graph.add_async(system)
-    }
-
-    /// Register an async system under an explicit instance name.
-    pub fn add_async_named<S>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
-    where
-        S: AsyncSystem + 'static,
-        S::Input: BindPorts + 'static,
-        S::Output: BindPorts + 'static,
-    {
-        self.graph.add_async_named(name, system)
-    }
-
-    /// Register a pack entry under an explicit instance name, running its
-    /// create phase (params decode + state construction) now so a bad config
-    /// fails at registration, not at `build()`. The bind phase runs at
-    /// `build()` over the entry's descriptor like any static system's.
-    pub fn add_pack_entry(
-        &mut self,
-        name: impl Into<String>,
-        entry: &mut crate::pack::PackEntry,
-        params: crate::pack::EntryParams<'_>,
-    ) -> Result<SystemHandle, crate::pack::MakeError> {
-        self.graph.add_pack_entry(name, entry, params)
-    }
-
-    /// Register a dlopen'd cyclic system under an explicit instance name.
-    /// `loaded` is an opened [`DlSystem`](crate::dl); `params` is the canonical
-    /// postcard `Params` blob the `.so` decodes in `fsw_create`.
-    ///
-    /// The dl twin of [`add_cyclic_named`](Self::add_cyclic_named): it pushes
-    /// the `.so`'s reconstructed [`SystemDescriptor`] so the ordinary
-    /// `compatible()`/`WireError` validation and ring sizing run over it
-    /// unchanged, and records a registration whose bind (at `build()`) gathers
-    /// the per-port ring regions, `fsw_create`s the state, and produces a
-    /// [`DlSlot`](crate::dl) instead of a typed `CyclicRunner`. Its output
-    /// buffers land in the [`Registry`] like a static system's.
-    ///
-    /// Dl systems are cyclic-only. This is the low-level builder method; the
-    /// [`resolve`](crate::wiring::resolve) entry point drives it from a
-    /// [`Wiring`](crate::Wiring).
-    pub fn add_dl_cyclic(
-        &mut self,
-        name: impl Into<String>,
-        loaded: crate::dl::DlSystem,
-        params: Vec<u8>,
-    ) -> SystemHandle {
-        self.graph.add_dl_cyclic(name, loaded, params)
-    }
-
-    /// Register a cross-process cyclic system under an explicit instance
-    /// name: the artifact at `artifact` will be dlopen'd and driven **in a
-    /// worker process** the coordinator spawns at `build()`
-    /// (`docs/process-systems.md`).
-    ///
-    /// The process twin of [`add_dl_cyclic`](Self::add_dl_cyclic), with one
-    /// deliberate difference: the host never loads the artifact, so instead
-    /// of an opened [`DlSystem`](crate::dl::DlSystem) this takes the already
-    /// decoded `descriptor` — obtained from a describe-mode worker run (the
-    /// [`resolve`](crate::wiring::resolve) front-end does this) — and the
-    /// canonical postcard `params` blob. Validation, sizing, and registry
-    /// entries run over the descriptor unchanged; the rings this system
-    /// touches are allocated mmap-backed in the run's session directory.
-    ///
-    /// Process systems are cyclic-only and need a cross-process futex;
-    /// `build()` rejects the registration on unsupported targets.
-    pub fn add_proc_cyclic(
-        &mut self,
-        name: impl Into<String>,
-        descriptor: SystemDescriptor,
-        artifact: PathBuf,
-        system: impl Into<String>,
-        params: Vec<u8>,
-    ) -> SystemHandle {
-        self.graph
-            .add_proc_cyclic(name, descriptor, artifact, system, params)
-    }
-
-    /// Use `exe` as the worker executable for process systems instead of
-    /// re-executing the host binary. For hosts whose own binary cannot serve
-    /// as a worker (or wants a leaner one).
-    pub fn worker_exe(&mut self, exe: impl Into<PathBuf>) -> &mut Self {
-        self.graph.worker_exe = Some(exe.into());
-        self
-    }
-
-    /// Root the run's shared-memory session directory at `dir` instead of
-    /// the default (`/dev/shm` when present, else the OS temp dir).
-    pub fn shm_dir(&mut self, dir: impl Into<PathBuf>) -> &mut Self {
-        self.graph.shm_dir = Some(dir.into());
-        self
-    }
-
-    /// Register a runtime-swappable slot: a fixed position in the cyclic call
-    /// chain whose occupant the host `Load`s/`Start`s/`Stop`s/`Abort`s/
-    /// `Reset`s/`Unload`s at runtime. `allowed` is the validated candidate
-    /// set, each [`AllowedOccupant`] a sequence occupant (its `Load` name,
-    /// decoded descriptor, postcard params, and [`OccupantBacking`]);
-    /// `initial` optionally applies one at startup.
-    ///
-    /// The backing decides the slot's mode, and per-slot means all-occupants:
-    /// an all-[`Artifact`](OccupantBacking::Artifact) set makes this a
-    /// **process slot** (`docs/process-slots.md`), whose occupants run in a
-    /// worker process spawned per `Load`, with the crossing rings allocated
-    /// as session-dir files. A mixed set would let `Load` silently change
-    /// the slot's fault domain, so it is rejected.
-    ///
-    /// The registered descriptor is derived from the occupant descriptor by
-    /// extension, not surgery. The occupant's ports form the *prefix* of each
-    /// list in the occupant's own order (its trailing [`SlotControlIn`](crate::sequence::SlotControlIn)
-    /// input re-marked [`PortConn::Host`](crate::PortConn::Host) in place,
-    /// since the runner holds the cancel writer), and the runner's ports are
-    /// the *tail*: a declared `commands` `MsgIn<SequenceCommand>` fan-in (an
-    /// ordinary edge input, so command wiring is ordinary message wiring) plus
-    /// a [`SelfTap`](crate::PortConn::SelfTap) view over the occupant's own
-    /// [`SequenceStatus`](crate::sequence::SequenceStatus) output on the input
-    /// side; a [`SlotStatus`] output and the `"sequences"` events channel
-    /// (both `Host`, registry-tapped) on the output side. The bind arm maps the
-    /// occupant `FswRing` arrays as a straight prefix walk, so the
-    /// occupant-side positional bind contract (and so the dl ABI) is untouched.
-    ///
-    /// Errors with a [`SlotConfigError`] on a contract violation: `allowed`
-    /// is empty, the occupants mix backings, an allowed occupant is not
-    /// `compatible()` with the first occupant's contract, an occupant
-    /// declares a mount-appended port itself, or `initial` names an occupant
-    /// outside the allowed set. Wiring front-ends run the pure-spec half of
-    /// these checks before opening any occupant artifact and map the rest
-    /// onto their own diagnostics.
-    pub fn add_slot(
-        &mut self,
-        name: impl Into<String>,
-        allowed: Vec<AllowedOccupant>,
-        initial: Option<InitialOccupant>,
-    ) -> Result<SystemHandle, SlotConfigError> {
-        self.graph.add_slot(name, allowed, initial)
-    }
-
-    /// Connect a producer output to a consumer input, addressed by port id.
-    /// The full compatibility and structural validation runs in
-    /// [`build`](Self::build); this only catches the cheap port-id and
-    /// unknown-system/port mistakes early. One entry point for every edge: the
-    /// edge's behavior (fan-in rule, cycle-detection membership) is inferred
-    /// from the connected ports' descriptors, so a snapshot (frame) edge and a
-    /// log (message) edge spell identically.
-    ///
-    /// This declares a forward (acyclic) edge. If a `connect` happens to close
-    /// a feedback loop over snapshot edges, including a system connected to
-    /// itself, `build` rejects it as a
-    /// [`FeedbackCycle`](WireError::FeedbackCycle); the back-edge of a loop
-    /// must be declared with [`connect_delayed`](Self::connect_delayed).
-    /// Likewise a snapshot edge between two cyclic systems must point forward
-    /// in registration order (the step loop's execution order), or the
-    /// consumer would permanently read last cycle's value; `build` rejects the
-    /// backward edge as a [`StaleFrameEdge`](WireError::StaleFrameEdge) unless
-    /// it is `connect_delayed`. Log edges are exempt from both (a decoupled
-    /// event/command stream).
-    pub fn connect(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError> {
-        init::check_edge(&self.graph.systems, producer, consumer)?;
-        self.graph.push_edge(producer, consumer, false);
-        Ok(())
-    }
-
-    /// Connect a producer to a consumer, marking the edge as an intentional
-    /// one-cycle-delayed feedback edge (the back-edge of a control loop). The
-    /// runtime path is identical to [`connect`](Self::connect), a `view()`
-    /// read of the latest committed value, which is last cycle's because the
-    /// producer runs after the consumer in registration order; but the edge is
-    /// excluded from cycle detection, so the loop builds. Every feedback loop
-    /// must break exactly one edge this way; an unbroken cycle is a
-    /// [`FeedbackCycle`](WireError::FeedbackCycle). Only meaningful on a
-    /// snapshot edge; `delayed` into a log input is rejected at build as a
-    /// [`DelayedLogEdge`](WireError::DelayedLogEdge).
-    pub fn connect_delayed(
-        &mut self,
-        producer: PortRef,
-        consumer: PortRef,
-    ) -> Result<(), WireError> {
-        init::check_edge(&self.graph.systems, producer, consumer)?;
-        self.graph.push_edge(producer, consumer, true);
-        Ok(())
-    }
-
-    /// Validate the graph, size and allocate every ring, bind ports,
-    /// auto-provision health/log buffers, and return a ready coordinator. The
-    /// pass chain lives in [`init::build`].
-    pub fn build(self) -> Result<Coordinator, WireError> {
-        init::build(self.graph)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // bind() products
 // ---------------------------------------------------------------------------
 
@@ -743,11 +478,6 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Start a builder.
-    pub fn builder(config: CoordinatorConfig) -> CoordinatorBuilder {
-        CoordinatorBuilder::new(config)
-    }
-
     /// The process systems' worker facts (pid, restarts, run state) as of the
     /// last change, as also published in the coordinator status frame's
     /// worker list. Empty for a graph without process systems.

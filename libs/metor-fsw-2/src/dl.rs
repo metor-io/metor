@@ -434,9 +434,8 @@ impl DlPack {
     }
 }
 
-/// One selected pack entry, loaded and ready to register: the unit
-/// [`CoordinatorBuilder::add_dl_cyclic`](crate::CoordinatorBuilder::add_dl_cyclic)
-/// and a slot's allowed-occupant list consume.
+/// One selected pack entry, loaded and ready to register: the unit the wiring
+/// resolver's dl path and a slot's allowed-occupant list consume.
 ///
 /// The [`PackLib`] lives in an `Rc` shared with every [`DlSlot`] built from
 /// this handle, so the shared object stays loaded (and the pack open) as long

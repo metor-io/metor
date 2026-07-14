@@ -27,7 +27,7 @@ use metor_proto_wkt::{
 use stellarator::buf::{IoBuf, Slice};
 
 use crate::{
-    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, DlPack, DlSystem,
+    AllowedOccupant, ClockMode, CoordinatorConfig, CyclicSystem, DlPack, DlSystem,
     Input, MsgIn, Out, PortRef, RecvTransport, SlotStatus, System, SystemHealth, SystemInput,
     SystemOutput, Timestamp, TransportError, UplinkSystem, split_record,
 };
@@ -205,7 +205,7 @@ fn uplink_command_loads_and_starts_same_cycle() {
     };
     let loaded = open_waiter(&lib);
 
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     // The slot starts empty; the uplink alone drives it.
     let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     let uplink = b.add_async(
@@ -268,7 +268,7 @@ fn reload_request_reemits_registry() {
     };
     let loaded = open_waiter(&lib);
 
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let _slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     let uplink = b.add_async(
         UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
@@ -375,7 +375,7 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
     });
     let reload = wire_msg(&ReloadSequences {});
 
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let tap = b.add_cyclic(CmdTap);
     let uplink = b.add_async(
         UplinkSystem::new(MockRecv::from_packets(vec![

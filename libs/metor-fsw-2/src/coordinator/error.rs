@@ -5,8 +5,8 @@ use crate::descriptor::{Hz, PortId};
 use super::NAME_CAP;
 
 /// A defect in the declared graph, reported by
-/// [`connect`](CoordinatorBuilder::connect) or
-/// [`build`](CoordinatorBuilder::build) before any byte flows.
+/// [`connect`](super::init::InitGraph::connect) or
+/// [`build`](super::init::build) before any byte flows.
 ///
 /// Not `Eq`: [`InvalidCycleRate`](WireError::InvalidCycleRate) carries the
 /// offending `f64` rate so the message can name it.
@@ -65,7 +65,7 @@ pub enum WireError {
     /// between two cyclic systems. The step loop runs in registration order,
     /// so the consumer would execute before its producer every cycle and
     /// permanently read the previous cycle's value, exactly the staleness
-    /// [`connect_delayed`](CoordinatorBuilder::connect_delayed) exists to make
+    /// [`connect_delayed`](super::init::InitGraph::connect_delayed) exists to make
     /// explicit. Fix by registering the producer before the consumer, or
     /// declare the one-cycle delay with `connect_delayed`. Log edges are
     /// exempt, as are edges touching an async endpoint (async systems run off
