@@ -494,6 +494,47 @@ fn graph_with_clock_and_constant() -> NodeGraph {
     graph
 }
 
+/// Auto-layout is a pure function of the graph (the node map is a HashMap,
+/// so this guards the sort-by-flow-id determinism) and puts a producer a
+/// full layer before its consumer.
+#[test]
+fn auto_layout_deterministic_and_flow_ordered() {
+    let graph = graph_with_clock_and_constant();
+    let a = crate::node_editor::pane::auto_layout_positions(&graph);
+    let b = crate::node_editor::pane::auto_layout_positions(&graph);
+    assert_eq!(a, b);
+    let pos = |id: &str| a.iter().find(|(i, _)| i.as_ref() == id).unwrap().1;
+    assert!(pos("clk").0 < pos("k").0);
+}
+
+/// A user-created cycle can't wedge auto-layout: cycle members lay out
+/// unranked, sharing a layer without overlapping.
+#[test]
+fn auto_layout_survives_cycles() {
+    let mut graph = NodeGraph::new(1);
+    for id in ["a", "b"] {
+        graph.insert_node(
+            id.into(),
+            NodeSpec::Unary { op: UnaryOp::Abs },
+            Position { x: 0.0, y: 0.0 },
+        );
+    }
+    graph.add_edge(EdgeEntry {
+        source: "a".into(),
+        target: "b".into(),
+        target_socket: 0,
+    });
+    graph.add_edge(EdgeEntry {
+        source: "b".into(),
+        target: "a".into(),
+        target_socket: 0,
+    });
+
+    let out = crate::node_editor::pane::auto_layout_positions(&graph);
+    assert_eq!(out.len(), 2);
+    assert_ne!(out[0].1, out[1].1);
+}
+
 #[stellarator::test]
 async fn reconcile_adds_and_removes_built_nodes() {
     let mut registry = DynamicRegistry::new();

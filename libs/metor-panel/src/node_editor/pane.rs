@@ -331,6 +331,89 @@ impl NodeEditor {
     fn on_delete(&mut self, _: &DeleteSelected, _: &mut Window, cx: &mut Context<Self>) {
         self.delete_selection(cx);
     }
+
+    /// One-shot auto-layout: run the shared layered engine over the current
+    /// graph and overwrite every node's position. Manual placement stays the
+    /// primary model — this just untangles the canvas on demand.
+    pub fn auto_layout(&mut self, cx: &mut Context<Self>) {
+        let positions = auto_layout_positions(self.graph.read(cx));
+        if positions.is_empty() {
+            return;
+        }
+        self.graph.update(cx, |g, _| {
+            for (id, (x, y)) in positions {
+                if let Some(entry) = g.nodes.get_mut(&id) {
+                    entry.position = Position { x, y };
+                }
+            }
+        });
+        self.clamp_viewport(cx);
+        cx.notify();
+    }
+}
+
+/// Engine positions for every node, keyed by flow id. Deterministic despite
+/// `NodeGraph::nodes` being a `HashMap`: nodes enter the engine sorted by
+/// flow id, which also serves as the tie-break rank. Edge endpoints attach
+/// at real socket offsets, and edges touching a cycle are left unranked so a
+/// user-created loop can't inflate the layering.
+pub(super) fn auto_layout_positions(g: &NodeGraph) -> Vec<(FlowId, (f32, f32))> {
+    use crate::graph_layout::{
+        self, LayoutEdge, LayoutInput, LayoutNode, LayoutOptions, PinAnchor,
+    };
+
+    let mut ids: Vec<FlowId> = g.nodes.keys().cloned().collect();
+    ids.sort();
+    let index: HashMap<&FlowId, usize> =
+        ids.iter().enumerate().map(|(i, id)| (id, i)).collect();
+    let sockets = |id: &FlowId| {
+        let entry = &g.nodes[id];
+        (
+            input_count(entry, &g.edges, id),
+            args_count(&entry.spec),
+        )
+    };
+    let nodes: Vec<LayoutNode> = ids
+        .iter()
+        .map(|id| {
+            let (inputs, args) = sockets(id);
+            LayoutNode {
+                size: (NODE_WIDTH, node_height(inputs, args)),
+            }
+        })
+        .collect();
+    let (_, cycle_members) = g.topo_order();
+    let edges: Vec<LayoutEdge> = g
+        .edges
+        .iter()
+        .filter_map(|e| {
+            let (from, to) = (*index.get(&e.source)?, *index.get(&e.target)?);
+            let (inputs, args) = sockets(&e.source);
+            Some(LayoutEdge {
+                from,
+                to,
+                from_pin: PinAnchor::Offset(output_socket_local_y(inputs, args)),
+                to_pin: PinAnchor::Offset(input_socket_local_y(e.target_socket)),
+                ranked: !cycle_members.contains(&e.source) && !cycle_members.contains(&e.target),
+            })
+        })
+        .collect();
+    let tie_break: Vec<usize> = (0..ids.len()).collect();
+    let out = graph_layout::compute(&LayoutInput {
+        nodes: &nodes,
+        edges: &edges,
+        tie_break: &tie_break,
+        options: LayoutOptions {
+            layer_gap: 80.0,
+            node_gap: 24.0,
+            margin: 24.0,
+            ..LayoutOptions::default()
+        },
+    });
+    ids.into_iter()
+        .enumerate()
+        .map(|(i, id)| (id, out.positions[i]))
+        .collect()
 }
 
 impl Focusable for NodeEditor {

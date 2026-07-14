@@ -149,7 +149,7 @@ impl NodeGraph {
     /// Topological order over the graph using Kahn's algorithm. Returns
     /// `(order, cycle_members)` — anything in `cycle_members` couldn't be
     /// reached because it's in or downstream of a cycle.
-    fn topo_order(&self) -> (Vec<FlowId>, HashSet<FlowId>) {
+    pub(crate) fn topo_order(&self) -> (Vec<FlowId>, HashSet<FlowId>) {
         // Build in-degree from the parent map.
         let mut indeg: HashMap<FlowId, usize> = self.nodes.keys().map(|k| (k.clone(), 0)).collect();
         let mut children: HashMap<FlowId, Vec<FlowId>> = HashMap::new();
