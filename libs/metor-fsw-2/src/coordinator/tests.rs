@@ -1381,10 +1381,10 @@ fn proc_rings_are_file_backed() {
     b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
         .unwrap();
 
-    let cons_edges = b.resolve_edges().unwrap();
-    let shared = b.shared_outputs(&cons_edges);
+    let cons_edges = b.graph.solve_edges().unwrap();
+    let shared = b.graph.shared_outputs(&cons_edges);
     // The producer's imu output crosses; its health/log do not.
-    let imu_out = b.systems[prod.id]
+    let imu_out = b.graph.systems[prod.id]
         .desc
         .outputs
         .iter()
@@ -1401,8 +1401,8 @@ fn proc_rings_are_file_backed() {
         "nothing else crosses (bystander and coordinator rings stay heap)"
     );
 
-    let fan_out = b.count_fan_out(&cons_edges);
-    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    let fan_out = b.graph.count_fan_out(&cons_edges);
+    let alloc = b.graph.alloc_rings(&cons_edges, &fan_out).unwrap();
     assert_eq!(
         alloc.ring_paths.keys().copied().collect::<std::collections::HashSet<_>>(),
         shared,
@@ -1432,9 +1432,9 @@ fn heap_only_graph_has_no_session() {
     });
     b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
         .unwrap();
-    let cons_edges = b.resolve_edges().unwrap();
-    let fan_out = b.count_fan_out(&cons_edges);
-    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    let cons_edges = b.graph.solve_edges().unwrap();
+    let fan_out = b.graph.count_fan_out(&cons_edges);
+    let alloc = b.graph.alloc_rings(&cons_edges, &fan_out).unwrap();
     assert!(alloc.session.is_none());
     assert!(alloc.ring_paths.is_empty());
 }
@@ -1461,10 +1461,10 @@ fn push_slot_reg(
         capabilities: Vec::new(),
     };
     let ports = super::slot::SlotPorts::for_occupant(&base, "occ").unwrap();
-    b.push_system(
+    b.graph.push_system(
         ports.registered(name),
         name.to_string(),
-        super::Reg::Slot(super::slot::SlotReg {
+        super::init::SystemBind::Slot(super::slot::SlotReg {
             allowed: Vec::new(),
             initial: None,
             ports,
@@ -1492,9 +1492,9 @@ fn process_slot_rings_are_file_backed() {
     )
     .unwrap();
 
-    let cons_edges = b.resolve_edges().unwrap();
-    let shared = b.shared_outputs(&cons_edges);
-    let imu_out = b.systems[prod.id]
+    let cons_edges = b.graph.solve_edges().unwrap();
+    let shared = b.graph.shared_outputs(&cons_edges);
+    let imu_out = b.graph.systems[prod.id]
         .desc
         .outputs
         .iter()
@@ -1508,8 +1508,8 @@ fn process_slot_rings_are_file_backed() {
         "nothing else crosses: not the tail outputs, not the command producer"
     );
 
-    let fan_out = b.count_fan_out(&cons_edges);
-    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    let fan_out = b.graph.count_fan_out(&cons_edges);
+    let alloc = b.graph.alloc_rings(&cons_edges, &fan_out).unwrap();
     assert_eq!(
         alloc.ring_paths.keys().copied().collect::<std::collections::HashSet<_>>(),
         shared,
@@ -1539,9 +1539,9 @@ fn in_process_slot_stays_heap() {
     let slot = push_slot_reg(&mut b, "seq-slot", false);
     b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(slot))
         .unwrap();
-    let cons_edges = b.resolve_edges().unwrap();
-    let fan_out = b.count_fan_out(&cons_edges);
-    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    let cons_edges = b.graph.solve_edges().unwrap();
+    let fan_out = b.graph.count_fan_out(&cons_edges);
+    let alloc = b.graph.alloc_rings(&cons_edges, &fan_out).unwrap();
     assert!(alloc.session.is_none());
     assert!(alloc.ring_paths.is_empty());
     assert!(alloc.host_input_paths.is_empty());
@@ -1668,7 +1668,7 @@ fn add_slot_rejects_contract_violations() {
         b.add_slot("s", vec![art_occ("pre-pack", vec![PortDesc::of::<SlotControlIn>()])], None),
         Err(SlotConfigError::ReservedPort { .. })
     ));
-    assert!(b.systems.iter().all(|s| s.name != "s"), "nothing was registered");
+    assert!(b.graph.systems.iter().all(|s| s.name != "s"), "nothing was registered");
 }
 
 // ---------------------------------------------------------------------------
@@ -1741,18 +1741,18 @@ mod proc_slot {
 
     fn harness(dir: &tempfile::TempDir, occupants: &[&str]) -> Harness {
         let frame_ring = |desc: crate::PortDesc| {
-            super::super::alloc_ring(desc.delivery, desc.max_size, DEPTH, READERS)
+            super::super::init::alloc_ring(desc.delivery, desc.max_size, DEPTH, READERS)
         };
         let control_ring = frame_ring(crate::PortDesc::of::<SlotControlIn>());
         let status_ring = frame_ring(crate::PortDesc::of::<SlotStatus>());
         let seq_ring = frame_ring(crate::PortDesc::of::<SequenceStatus>());
-        let events_ring = super::super::alloc_ring(
+        let events_ring = super::super::init::alloc_ring(
             Delivery::Log,
             crate::PortDesc::msg::<SequenceChannelEvent>().max_size,
             DEPTH,
             READERS,
         );
-        let cmd_ring = super::super::alloc_ring(
+        let cmd_ring = super::super::init::alloc_ring(
             Delivery::Log,
             crate::PortDesc::msg::<SequenceCommand>().max_size,
             DEPTH,
@@ -1776,7 +1776,7 @@ mod proc_slot {
             Vec::new(),
             slot_writer::<SlotControlIn>(&control_ring),
             slot_writer::<SlotStatus>(&status_ring),
-            super::super::owned_writer::<SequenceChannelEvent>(&events_ring),
+            super::super::init::owned_writer::<SequenceChannelEvent>(&events_ring),
             Input::new(seq_ring.view(NoWake).unwrap()),
             MsgIn::from_views(vec![cmd_ring.view(NoWake).unwrap()]),
             Some(ProcParts {
@@ -1789,7 +1789,7 @@ mod proc_slot {
         );
         Harness {
             runner,
-            cmds: super::super::owned_writer::<SequenceCommand>(&cmd_ring),
+            cmds: super::super::init::owned_writer::<SequenceCommand>(&cmd_ring),
             events: MsgIn::from_views(vec![events_ring.view(NoWake).unwrap()]),
             status: Input::new(status_ring.view(NoWake).unwrap()),
             seq_out: slot_writer::<SequenceStatus>(&seq_ring),
@@ -2062,9 +2062,9 @@ fn proc_and_process_slot_share_a_session() {
     b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(slot))
         .unwrap();
 
-    let cons_edges = b.resolve_edges().unwrap();
-    let fan_out = b.count_fan_out(&cons_edges);
-    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    let cons_edges = b.graph.solve_edges().unwrap();
+    let fan_out = b.graph.count_fan_out(&cons_edges);
+    let alloc = b.graph.alloc_rings(&cons_edges, &fan_out).unwrap();
     let session_path = alloc
         .session
         .as_ref()
