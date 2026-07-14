@@ -28,7 +28,8 @@
 #![cfg(all(feature = "wiring", not(miri)))]
 
 use std::path::PathBuf;
-use std::process::Command;
+
+mod common;
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
 use metor_fsw_2::metor_proto_wkt::{
@@ -68,49 +69,9 @@ fn cmd(ch: &str, command: SequenceCommandKind) -> SequenceCommand {
 // Building and locating the fixture cdylib
 // ---------------------------------------------------------------------------
 
-fn fixture_lib_name() -> String {
-    let stem = FIXTURE_STEM;
-    if cfg!(target_os = "macos") {
-        format!("lib{stem}.dylib")
-    } else if cfg!(target_os = "windows") {
-        format!("{stem}.dll")
-    } else {
-        format!("lib{stem}.so")
-    }
-}
-
-/// Build the fixture cdylib and return the shared object's path, parsed from
-/// cargo's JSON artifact output. Returns `None` after printing a skip note when
-/// the build plumbing is unavailable, so the caller skips instead of failing.
+/// Build the seq fixture cdylib and locate it, skipping on failure.
 fn locate_fixture() -> Option<PathBuf> {
-    let output = Command::new(env!("CARGO"))
-        .args(["build", "-p", FIXTURE_CRATE, "--message-format=json"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        eprintln!(
-            "skipping: fixture build failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let want = fixture_lib_name();
-    for line in stdout.lines() {
-        if !line.contains("compiler-artifact") || !line.contains(&want) {
-            continue;
-        }
-        for tok in line.split('"') {
-            if tok.ends_with(&want) {
-                let path = PathBuf::from(tok);
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    eprintln!("skipping: built the fixture but could not locate {want} in cargo output");
-    None
+    common::locate_fixture(FIXTURE_CRATE, FIXTURE_STEM)
 }
 
 /// A 1000 Hz, depth-8 simulated mission whose 2µs-per-cycle clock elapses the

@@ -535,23 +535,6 @@ impl Coordinator {
         self.registry.clone()
     }
 
-    /// Emit the boot [`SequenceRegistry`] on the coordinator's message
-    /// channel: the slots and their allowed occupants. Called once at the head
-    /// of [`run_for`](Self::run_for); exposed as the re-emit hook for a
-    /// rebuilt payload.
-    pub fn emit_sequence_registry(&mut self) {
-        self.channels.emit_sequence_registry();
-    }
-
-    /// Emit the full mission IR on the coordinator's `wiring` channel — the
-    /// live/historical topology the panel graph tile consumes. A no-op when no
-    /// front-end set a manifest. Called once at the head of
-    /// [`run_for`](Self::run_for) and re-fired on a [`ReloadSequences`]
-    /// request, so a consumer that connected after boot resyncs on demand.
-    pub fn emit_wiring_manifest(&mut self) {
-        self.channels.emit_wiring_manifest();
-    }
-
     /// The writer over the coordinator's command channel: the in-proc
     /// convenience for driving slots `Load`/`Start`/`Stop`/`Abort`/`Reset`.
     /// The host or a test [`emit`](MsgOut::emit)s [`SequenceCommand`]s the
@@ -605,9 +588,6 @@ impl Coordinator {
         );
         self.started = true;
         let tasks = self.start().await;
-        // Emit the boot `SequenceRegistry` and wiring manifest once, before the
-        // first cycle's events flow, so a tap claimed after `build()` observes
-        // them ahead of any live edge activity.
         self.channels.emit_boot();
         // The Wall pacing budget. Only computed under a `Wall` clock, since
         // `cycle_rate` is documented ignored under `Simulated` and an unusable
@@ -634,10 +614,8 @@ impl Coordinator {
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.
             self.channels.service_reload();
-            // Commands are drained per-slot at the head of each `step`: a
-            // slot's declared `commands` fan-in reads exactly the producers
-            // explicitly edged into it and filters by its instance name, so a
-            // command dispatches the *same* cycle it lands, with no
+            // Each slot drains its own `commands` fan-in at the head of `step`,
+            // so a command dispatches the same cycle it lands — no
             // coordinator-side command stage.
             for slot in &mut self.cyclic {
                 slot.step(now);
@@ -654,9 +632,8 @@ impl Coordinator {
                         self.telemeter_overrun(now, elapsed, budget);
                     }
                 }
-                // Simulated: no pacing, run as fast as possible. Still yield
-                // once so any spawned async consumer (driven by the copy-in
-                // above) gets to run on this cooperative runtime.
+                // Simulated: no pacing, but still yield once so any spawned
+                // async consumer gets to run on this cooperative runtime.
                 ClockMode::Simulated { .. } => stellarator::yield_now().await,
             }
         }

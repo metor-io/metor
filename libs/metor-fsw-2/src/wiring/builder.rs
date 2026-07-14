@@ -141,39 +141,41 @@ impl WiringBuilder {
     /// Adds a forward frame edge from `from`'s `out` port to `to`'s `in_`
     /// port. Forward edges must form an acyclic graph.
     pub fn connect(
-        mut self,
+        self,
         from: impl Into<String>,
         out: impl Into<String>,
         to: impl Into<String>,
         in_: impl Into<String>,
     ) -> Self {
-        self.wiring.edges.push(EdgeSpec {
-            from: from.into(),
-            out: out.into(),
-            to: to.into(),
-            in_: in_.into(),
-            delayed: false,
-            kind: EdgeKind::Frame,
-            src: None,
-        });
-        self
+        self.push_frame_edge(from, out, to, in_, false)
     }
 
     /// Adds a frame edge whose value arrives one cycle late. Delayed edges
     /// close feedback loops and are excluded from cycle detection.
     pub fn connect_delayed(
+        self,
+        from: impl Into<String>,
+        out: impl Into<String>,
+        to: impl Into<String>,
+        in_: impl Into<String>,
+    ) -> Self {
+        self.push_frame_edge(from, out, to, in_, true)
+    }
+
+    fn push_frame_edge(
         mut self,
         from: impl Into<String>,
         out: impl Into<String>,
         to: impl Into<String>,
         in_: impl Into<String>,
+        delayed: bool,
     ) -> Self {
         self.wiring.edges.push(EdgeSpec {
             from: from.into(),
             out: out.into(),
             to: to.into(),
             in_: in_.into(),
-            delayed: true,
+            delayed,
             kind: EdgeKind::Frame,
             src: None,
         });

@@ -166,23 +166,6 @@ pub struct InitialOccupant {
     pub start: bool,
 }
 
-impl InitialOccupant {
-    /// An initial occupant that is loaded but not started.
-    pub fn loaded(occupant: impl Into<String>) -> Self {
-        Self {
-            occupant: occupant.into(),
-            start: false,
-        }
-    }
-    /// An initial occupant that is loaded and started.
-    pub fn running(occupant: impl Into<String>) -> Self {
-        Self {
-            occupant: occupant.into(),
-            start: true,
-        }
-    }
-}
-
 /// A slot registration `plan_slot` rejected. The wiring front-end maps these
 /// onto its own `LoadError`s; a mission author's typo is not a library bug, so
 /// none of these panic.
@@ -251,7 +234,6 @@ pub(crate) fn validate_slot_spec(
 pub(crate) fn plan_slot(
     name: &str,
     allowed: &[AllowedOccupant],
-    _initial: Option<&InitialOccupant>,
 ) -> Result<(SystemDescriptor, SlotPorts, bool), SlotConfigError> {
     // Per-slot means all-occupants: the isolation boundary is the slot's
     // position in the cycle, and a mixed allow set would make `Load` silently

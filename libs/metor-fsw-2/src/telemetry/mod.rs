@@ -174,28 +174,6 @@ impl TcpTransport {
         Ok(&self.conn.as_ref().expect("just connected").tx)
     }
 
-    /// [`announce`](Transport::announce)'s writes, without the on-error
-    /// connection drop the trait method wraps around them.
-    async fn try_announce(
-        &mut self,
-        msg: &VTableMsg,
-        meta: &[ComponentMetadata],
-    ) -> Result<(), TransportError> {
-        let tx = self.ensure().await?;
-        let pkt = msg.into_len_packet();
-        tx.write_all(pkt.inner)
-            .await
-            .0
-            .map_err(TransportError::io)?;
-        for m in meta {
-            let pkt = (&SetComponentMetadata(m.clone())).into_len_packet();
-            tx.write_all(pkt.inner)
-                .await
-                .0
-                .map_err(TransportError::io)?;
-        }
-        Ok(())
-    }
 }
 
 impl Transport for TcpTransport {
@@ -204,7 +182,17 @@ impl Transport for TcpTransport {
         msg: &VTableMsg,
         meta: &[ComponentMetadata],
     ) -> Result<(), TransportError> {
-        let res = self.try_announce(msg, meta).await;
+        let res: Result<(), TransportError> = async {
+            let tx = self.ensure().await?;
+            let pkt = msg.into_len_packet();
+            tx.write_all(pkt.inner).await.0.map_err(TransportError::io)?;
+            for m in meta {
+                let pkt = (&SetComponentMetadata(m.clone())).into_len_packet();
+                tx.write_all(pkt.inner).await.0.map_err(TransportError::io)?;
+            }
+            Ok(())
+        }
+        .await;
         // A failed write leaves the socket in an unknown state; drop it so
         // the next call redials.
         if res.is_err() {

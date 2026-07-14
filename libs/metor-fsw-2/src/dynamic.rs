@@ -138,23 +138,14 @@ impl<T, const MAX: usize> FrameList<T, MAX> {
 
 impl<T: AsVTable, const MAX: usize> AsVTable for FrameList<T, MAX> {
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
-        // Reached statically, so the list op takes the full dotted prefix
-        // (the naming rule in the module doc). The slot sits at offset 0;
-        // the enclosing frame `offset_by`s it into place.
-        let prefix = path.to_name();
-        core::iter::once(raw_field(
-            0,
-            size_of::<Slot>() as u32,
-            list(
-                &prefix,
-                T::element_fields(String::new()),
-                size_of::<T>() as u32,
-            ),
-        ))
+        // Reached statically, so the list op takes the full dotted prefix (the
+        // naming rule in the module doc); as a member template it is the
+        // relative field name only. The slot sits at offset 0; the enclosing
+        // frame `offset_by`s it into place.
+        Self::element_fields(path.to_name())
     }
 
     fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
-        // Reached as a member template, so the relative field name only.
         core::iter::once(raw_field(
             0,
             size_of::<Slot>() as u32,
@@ -231,17 +222,7 @@ impl<V, const MAX: usize, const MAX_KEY: usize> FrameMap<V, MAX, MAX_KEY> {
 
 impl<V: AsVTable, const MAX: usize, const MAX_KEY: usize> AsVTable for FrameMap<V, MAX, MAX_KEY> {
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
-        let prefix = path.to_name();
-        core::iter::once(raw_field(
-            0,
-            size_of::<Slot>() as u32,
-            map(
-                &prefix,
-                V::element_fields(String::new()),
-                map_stride::<V>(),
-                map_value_offset::<V>(),
-            ),
-        ))
+        Self::element_fields(path.to_name())
     }
 
     fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {

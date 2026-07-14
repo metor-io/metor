@@ -40,7 +40,7 @@
 //! 0x40 ├───────────────────────────┤
 //!      │ Control (all atomics)     │ committed, high-water mark, writer claim
 //! 0x80 ├───────────────────────────┤
-//!      │ ReaderSlot × max_readers  │ one cache line each: cursor + epoch + owner
+//!      │ ReaderSlot × max_readers  │ one cache line each: cursor + owner
 //!      ├───────────────────────────┤
 //!      │ data (capacity bytes)     │ the records
 //!      └───────────────────────────┘
@@ -130,8 +130,8 @@ const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 /// IPC state rather than archives, so a stale region is recreated, never
 /// migrated. v3 added the reader-slot `owner` tag and made the writer claim
 /// carry the claimant's process id. v4 dropped the reserved cross-process wake
-/// word from the control block.
-const VERSION: u16 = 4;
+/// word from the control block. v5 dropped the reader-slot `epoch` word.
+const VERSION: u16 = 5;
 
 /// The identifying metadata at the start of every region, occupying cache
 /// line 0. `init_region` writes it once before the region is published and
@@ -168,8 +168,8 @@ struct Control {
     writer: AtomicU64,
 }
 
-/// One reader's shared cursor, epoch, and owner tag, padded out to a cache
-/// line to avoid false sharing.
+/// One reader's shared cursor and owner tag, padded out to a cache line to
+/// avoid false sharing.
 ///
 /// `owner` is the claiming process's id, stamped by [`RingBuffer::view`] so
 /// [`RingBuffer::reclaim_owner`] can free what a dead process left behind. It
@@ -182,9 +182,8 @@ struct Control {
 #[repr(C)]
 struct ReaderSlot {
     cursor: AtomicU64,
-    epoch: AtomicU64,
     owner: AtomicU64,
-    _pad: [u8; 40],
+    _pad: [u8; 48],
 }
 
 /// Byte offset of the control block.
@@ -665,11 +664,6 @@ impl Inner {
     }
 
     #[inline]
-    fn slot_epoch(&self, slot: u32) -> &AtomicU64 {
-        &self.slot(slot).epoch
-    }
-
-    #[inline]
     fn slot_owner(&self, slot: u32) -> &AtomicU64 {
         &self.slot(slot).owner
     }
@@ -962,10 +956,7 @@ impl RingBuffer {
             if self.inner.slot_cursor(slot).load(Acquire) != FREE_SLOT
                 && self.inner.slot_owner(slot).load(Acquire) == pid
             {
-                // Bump the generation before freeing, per the epoch's
-                // reclamation discipline, then free the cursor. Release
-                // pairs with the claim CAS in `view`.
-                self.inner.slot_epoch(slot).fetch_add(1, Release);
+                // Free the cursor. Release pairs with the claim CAS in `view`.
                 self.inner.slot_cursor(slot).store(FREE_SLOT, Release);
             }
         }
@@ -998,14 +989,6 @@ impl RingBuffer {
                 // the window in which a crash leaves the slot claimed but
                 // unattributed (unreclaimable) as small as possible.
                 self.inner.slot_owner(slot).store(owner_tag(), Release);
-                // The epoch is a generation counter for reclamation, bumped
-                // on every claim and by `reclaim_owner` before it frees a
-                // dead owner's cursor. A dead owner makes no more stores, so
-                // nothing checks it yet; a future *live* reclaimer would need
-                // `View` cursor stores to verify the epoch first, since a
-                // plain store on a reclaimed slot would corrupt the new
-                // owner.
-                self.inner.slot_epoch(slot).fetch_add(1, Release);
                 // The registration handshake described in the crate docs. The
                 // fence pairs with the one in `slowest_active_cursor`. Loop
                 // until `committed` is stable across the fence, which proves
@@ -1111,9 +1094,8 @@ unsafe fn init_region(
                 .cast::<ReaderSlot>()
                 .write(ReaderSlot {
                     cursor: AtomicU64::new(FREE_SLOT),
-                    epoch: AtomicU64::new(0),
                     owner: AtomicU64::new(0),
-                    _pad: [0; 40],
+                    _pad: [0; 48],
                 });
         }
     }

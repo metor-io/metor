@@ -27,7 +27,7 @@ use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
 
 use crate::binder::RingSource;
-use crate::descriptor::{Capability, Delivery, PortDecl, PortDesc, PortSchema};
+use crate::descriptor::{Capability, Delivery, PortDecl, PortDesc};
 
 /// One tappable buffer, indexed by its instance-qualified id.
 pub struct RegistryEntry {
@@ -67,16 +67,6 @@ impl RegistryEntry {
     /// but are filtered out of every [`AllOutputs`] surface.
     pub fn telemetered(&self) -> bool {
         self.desc.telemetered
-    }
-
-    /// The unprefixed frame id of a Table entry (`ComponentId::new("imu")`,
-    /// shared across instances of the same system), or `None` for a
-    /// self-describing Postcard entry.
-    pub fn frame_id(&self) -> Option<ComponentId> {
-        match &self.desc.schema {
-            PortSchema::Table { frame_id, .. } => Some(*frame_id),
-            PortSchema::Postcard { .. } => None,
-        }
     }
 
     /// The announce form of a Table entry: the vtable and metadata with
@@ -137,16 +127,6 @@ impl Registry {
     pub fn view(&self, key: ComponentId) -> Option<Result<View<NoWake>, FullReaderTable>> {
         self.get(key).map(RegistryEntry::view)
     }
-
-    /// Number of registered buffers.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether the graph produced no registered buffers.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,12 +178,6 @@ impl AllOutputs {
     /// surface.
     pub fn entries(&self) -> impl Iterator<Item = &RegistryEntry> {
         self.registry.entries().iter().filter(|e| e.telemetered())
-    }
-
-    /// Look up one telemetered entry by its instance-qualified id. An
-    /// untelemetered entry returns `None`.
-    pub fn get(&self, key: ComponentId) -> Option<&RegistryEntry> {
-        self.registry.get(key).filter(|e| e.telemetered())
     }
 
     /// Always zero, since a tap only reads. Present so the generated

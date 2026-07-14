@@ -302,14 +302,9 @@ fn run_system(
 
         let mut last = 0u32;
         while let WorkerCmd::Step { seq, now } = ctl.next(last) {
-            // Both modes implement the panic policy inside the slot: a caught
-            // panic destroys the foreign state (releasing its ring roles) and
-            // latches the stopped slot state, and further steps early-return.
-            // The worker keeps serving terminal acks until told to shut down,
-            // so teardown stays symmetric with the healthy path — a `Done`
-            // occupant likewise holds its ring roles until shutdown, and
-            // `step_seq`'s latch guarantees its `Ready` future is never
-            // polled again however long the host keeps ringing.
+            // A panicked or `Done` occupant keeps serving terminal acks (and
+            // holding its ring roles) until shutdown; its latched slot state
+            // early-returns every further step.
             let status = match mode {
                 RunMode::Cyclic => {
                     slot.step(now);

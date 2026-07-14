@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::abi::FSW_ABI_VERSION;
@@ -188,17 +187,6 @@ fn wiring_json(wiring: &Wiring) -> String {
     serde_json::to_string(&wiring.path_stripped()).expect("a built Wiring serializes to JSON")
 }
 
-/// The `sha256:<hex>` of `bytes`, the same format the manifest-hash check uses.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(7 + digest.len() * 2);
-    hex.push_str("sha256:");
-    for b in digest {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    hex
-}
-
 /// Write a bundle to `dir`, creating the directory if needed.
 ///
 /// Copies each artifact's built `.so` (and its manifest sidecar when present)
@@ -246,7 +234,7 @@ fn bundle_members(
         profile: if opts.release { "release" } else { "debug" }.to_string(),
         built_at_unix,
         // Hash the exact wiring.json bytes, excluding the timestamp above.
-        ir_sha256: sha256_hex(json.as_bytes()),
+        ir_sha256: super::stubgen::manifest_hash(json.as_bytes()),
     };
     let meta_json = serde_json::to_string_pretty(&meta).expect("BundleMeta serializes to JSON");
 
@@ -372,7 +360,7 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
     // absent either, it cannot render a verdict and is skipped (the dlopen
     // path stays the backstop, as before Phase 3).
     if let (Some(found), Some(expected)) =
-        (&meta.target, super::build_driver::current_host_triple())
+        (&meta.target, super::build_driver::host_triple())
         && found != &expected
     {
         return Err(BundleError::TargetMismatch {

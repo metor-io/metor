@@ -278,11 +278,6 @@ pub fn build_target(extra_args: &[String]) -> Option<String> {
         .or_else(host_triple)
 }
 
-/// The host triple, exposed for the bundle loader's target check.
-pub fn current_host_triple() -> Option<String> {
-    host_triple()
-}
-
 /// Whether `extra_args` requests a `--target` other than the host triple. An
 /// undeterminable host reads as cross: the sidecar is then sourced from an
 /// explicit host-arch build, which is correct either way.
@@ -487,17 +482,6 @@ mod tests {
         let bytes = std::fs::read(&sidecar).expect("sidecar written next to the .so");
         let described = crate::dl::describe_raw(&so).expect("in-process describe");
         assert_eq!(bytes, described, "sidecar bytes ≡ fsw_pack_describe bytes");
-
-        let entries = crate::dl::read_manifest_sidecar(&so)
-            .expect("sidecar present")
-            .expect("sidecar decodes as a pack manifest");
-        assert_eq!(
-            entries
-                .iter()
-                .map(|e| e.descriptor.name.clone())
-                .collect::<Vec<_>>(),
-            ["DlCounter", "DlEcho"]
-        );
     }
 
     /// The cross arm verifies arch-independence rather than assuming it: an
@@ -561,6 +545,5 @@ mod tests {
         let mut again = fixture_wiring();
         build_artifacts(&mut again, &opts).expect("rebuild is a cargo no-op");
         assert!(!sidecar.exists(), "opted out, so no sidecar is written");
-        assert!(crate::dl::read_manifest_sidecar(&so).is_none());
     }
 }

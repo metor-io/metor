@@ -15,7 +15,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::descriptor::compatible;
 use crate::{
     AsyncSystem, CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, Out, Output,
-    PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemLog, SystemOutput,
+    PortDecl, PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemLog, SystemOutput,
     buffer_capacity,
 };
 
@@ -756,7 +756,10 @@ fn cmd(channel: &str) -> SequenceCommand {
 /// defaults.
 #[test]
 fn fsw_attrs_lower_onto_descriptors() {
-    let ins = <GuardIn as SystemInput>::port_descs();
+    let ins: Vec<PortDesc> = <GuardIn as SystemInput>::decls()
+        .into_iter()
+        .filter_map(PortDecl::into_port)
+        .collect();
     assert_eq!(ins.len(), 1);
     assert_eq!(
         ins[0].delivery,
@@ -765,7 +768,10 @@ fn fsw_attrs_lower_onto_descriptors() {
     );
     assert_eq!(ins[0].fan_in, crate::FanIn::Many);
 
-    let outs = <QuietOut as SystemOutput>::port_descs();
+    let outs: Vec<PortDesc> = <QuietOut as SystemOutput>::decls()
+        .into_iter()
+        .filter_map(PortDecl::into_port)
+        .collect();
     assert_eq!(outs.len(), 2);
     assert!(
         !outs[0].telemetered,
