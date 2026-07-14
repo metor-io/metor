@@ -69,9 +69,8 @@ pub(crate) fn resolve_worker_exe(overridden: Option<&Path>) -> Result<PathBuf, P
 /// [`PackManifest`](crate::abi::PackManifest) bytes it wrote — the host-side
 /// twin of `fsw_pack_describe`, with the dlopen quarantined in a short-lived
 /// child. Decode the bytes with
-/// [`decode_pack_manifest`](crate::dl) and register via
-/// [`add_proc_cyclic`](crate::CoordinatorBuilder::add_proc_cyclic);
-/// [`resolve`](crate::wiring::resolve) does exactly this. The
+/// [`decode_pack_manifest`](crate::dl) and register via the wiring resolver's
+/// process path; [`resolve`](crate::wiring::resolve) does exactly this. The
 /// child's stderr is captured into the failure diagnostic. `worker_exe`
 /// `None` re-executes this binary (whose `main` must call [`worker_entry`]).
 ///

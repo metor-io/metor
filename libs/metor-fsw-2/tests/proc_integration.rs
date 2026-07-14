@@ -32,9 +32,8 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use metor_fsw_2::{
-    BuildSystem, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Frame, Input, MsgIn, Out,
-    Output, PortRef, SequenceStatus, SlotStatus, StopReason, System, SystemHealth, SystemInput,
-    SystemOutput, WorkerRunState, split_record,
+    BuildSystem, CyclicSystem, Frame, Input, MsgIn, Out, Output, SequenceStatus, SlotStatus,
+    StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState, split_record,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -232,14 +231,6 @@ fn proc_descriptor(lib_path: &Path, system: &str) -> metor_fsw_2::SystemDescript
         .descriptor
 }
 
-fn counter_params() -> Vec<u8> {
-    postcard::to_allocvec(&CounterParams {
-        start: 1000,
-        scale: 1.0,
-    })
-    .unwrap()
-}
-
 /// Pids of this process's direct *worker* children, via `ps` (the worker
 /// `Child` is private to the coordinator, so the test finds it the
 /// operator's way). A worker is a re-exec of this very binary, so children
@@ -410,38 +401,48 @@ fn lockstep_end_to_end(lib_path: &Path) {
 // Test 2: SIGKILL the worker mid-run
 // ---------------------------------------------------------------------------
 //
-// Tests 2 and 3 stay on `Coordinator::builder`: they pin the worker
-// restart/timeout policy (`proc_max_restarts`, `proc_step_timeout`,
-// `proc_restart_backoff`), which lives on `CoordinatorConfig` but has no mirror
-// on the `Wiring` IR's `CoordinatorSpec`, so the resolve path cannot set it.
-// They can only move off the builder once the IR carries that policy (a WP4
-// concern); see the WP3 report.
+// The worker restart/timeout policy (`proc_step_timeout`, `proc_max_restarts`,
+// `proc_restart_backoff`) is host-environment policy, not mission topology, so
+// it rides `ResolveOptions` rather than the `Wiring` IR — the resolve path sets
+// it as overrides onto the derived `CoordinatorConfig`.
 
 fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
-    let desc = proc_descriptor(lib_path, "DlCounter");
-    let mut b = Coordinator::builder(CoordinatorConfig {
-        cycle_rate: 200.0,
-        default_depth: 8,
-        clock: ClockMode::Wall,
-        proc_step_timeout: std::time::Duration::from_millis(50),
-        // Restart opted out: this test pins the permanent-stop semantics.
-        proc_max_restarts: 0,
-        ..CoordinatorConfig::default()
-    });
-    let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
-    let proc_sys = b.add_proc_cyclic(
-        "proc_counter",
-        desc,
-        lib_path.to_path_buf(),
-        "DlCounter",
-        counter_params(),
-    );
-    b.connect(
-        PortRef::new::<TickIn>(ticker),
-        PortRef::new::<TickIn>(proc_sys),
-    )
-    .expect("ticker -> proc edge");
-    let mut coord = b.build().expect("build spawns and attaches the worker");
+    use metor_fsw_2::wiring::{Registry, ResolveOptions, resolve_with};
+    use metor_fsw_2::{ClockSpec, CoordinatorSpec, WiringBuilder};
+
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(CoordinatorSpec {
+            cycle_rate: 200.0,
+            default_depth: Some(8),
+            clock: ClockSpec::Wall,
+        })
+        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .system("ticker")
+        .ty("Ticker")
+        .from_static()
+        .end()
+        .system("proc_counter")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .process()
+        .params(CounterParams {
+            start: 1000,
+            scale: 1.0,
+        })
+        .end()
+        .connect("ticker", "tick_in", "proc_counter", "tick_in")
+        .build();
+    wiring.artifacts[0].path = Some(lib_path.to_path_buf());
+    let mut registry = Registry::new();
+    registry.register::<Ticker, _>("Ticker");
+    // Restart opted out: this test pins the permanent-stop semantics.
+    let opts = ResolveOptions {
+        proc_step_timeout: Some(Duration::from_millis(50)),
+        proc_max_restarts: Some(0),
+        ..Default::default()
+    };
+    let mut coord =
+        resolve_with(&wiring, &registry, opts).expect("build spawns and attaches the worker");
 
     // The just-spawned worker is our only child; kill -9 it mid-run.
     let workers = child_pids();
@@ -502,30 +503,42 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
 // ---------------------------------------------------------------------------
 
 fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
-    let desc = proc_descriptor(lib_path, "DlCounter");
-    let mut b = Coordinator::builder(CoordinatorConfig {
-        cycle_rate: 200.0,
-        default_depth: 8,
-        clock: ClockMode::Wall,
-        proc_step_timeout: std::time::Duration::from_millis(50),
-        proc_max_restarts: 1,
-        proc_restart_backoff: std::time::Duration::from_millis(50),
-        ..CoordinatorConfig::default()
-    });
-    let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
-    let proc_sys = b.add_proc_cyclic(
-        "proc_counter",
-        desc,
-        lib_path.to_path_buf(),
-        "DlCounter",
-        counter_params(),
-    );
-    b.connect(
-        PortRef::new::<TickIn>(ticker),
-        PortRef::new::<TickIn>(proc_sys),
-    )
-    .expect("ticker -> proc edge");
-    let mut coord = b.build().expect("build spawns and attaches the worker");
+    use metor_fsw_2::wiring::{Registry, ResolveOptions, resolve_with};
+    use metor_fsw_2::{ClockSpec, CoordinatorSpec, WiringBuilder};
+
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(CoordinatorSpec {
+            cycle_rate: 200.0,
+            default_depth: Some(8),
+            clock: ClockSpec::Wall,
+        })
+        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .system("ticker")
+        .ty("Ticker")
+        .from_static()
+        .end()
+        .system("proc_counter")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .process()
+        .params(CounterParams {
+            start: 1000,
+            scale: 1.0,
+        })
+        .end()
+        .connect("ticker", "tick_in", "proc_counter", "tick_in")
+        .build();
+    wiring.artifacts[0].path = Some(lib_path.to_path_buf());
+    let mut registry = Registry::new();
+    registry.register::<Ticker, _>("Ticker");
+    let opts = ResolveOptions {
+        proc_step_timeout: Some(Duration::from_millis(50)),
+        proc_max_restarts: Some(1),
+        proc_restart_backoff: Some(Duration::from_millis(50)),
+        ..Default::default()
+    };
+    let mut coord =
+        resolve_with(&wiring, &registry, opts).expect("build spawns and attaches the worker");
     let first = child_pids();
     assert_eq!(first.len(), 1, "exactly one worker child: {first:?}");
     let first_pid = first[0];

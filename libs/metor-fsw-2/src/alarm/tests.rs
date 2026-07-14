@@ -493,7 +493,7 @@ mod system {
     /// silent.
     #[stellarator::test]
     async fn end_to_end_raise_escalate_clear() {
-        let mut b = Coordinator::builder(config());
+        let mut b = crate::coordinator::init::InitGraph::new(config());
         let script = vec![0.7, 0.7, 1.5, 0.45, 0.3, 0.3];
         let cycles = script.len();
         b.add_cyclic(Plant { script, cycle: 0 });
@@ -562,7 +562,7 @@ mod system {
     #[stellarator::test]
     async fn latching_clears_only_on_ack() {
         let run = |delay: usize, cycles: usize| async move {
-            let mut b = Coordinator::builder(config());
+            let mut b = crate::coordinator::init::InitGraph::new(config());
             b.add_cyclic(Plant {
                 script: vec![2.0, 0.0],
                 cycle: 0,
@@ -604,7 +604,7 @@ mod system {
     /// as 1.0, breaching `above = 0.5`).
     #[stellarator::test]
     async fn flag_component_alarms() {
-        let mut b = Coordinator::builder(config());
+        let mut b = crate::coordinator::init::InitGraph::new(config());
         b.add_cyclic(Plant {
             script: vec![0.0, 20.0, 20.0], // degraded = rate > 10
             cycle: 0,
@@ -636,7 +636,7 @@ mod system {
     /// The def still broadcasts and nothing ever raises.
     #[stellarator::test]
     async fn bad_targets_disable_and_report_health() {
-        let mut b = Coordinator::builder(config());
+        let mut b = crate::coordinator::init::InitGraph::new(config());
         b.add_cyclic(Plant {
             script: vec![5.0], // would breach everything, were anything enabled
             cycle: 0,

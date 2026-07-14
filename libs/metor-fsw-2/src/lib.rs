@@ -83,9 +83,9 @@
 //! The [`Coordinator`] reads each system's static [`SystemDescriptor`] before
 //! constructing anything, validates the connection graph, allocates and sizes
 //! every ring, binds the ports, and then drives the cycle on a wall or simulated
-//! clock. Graphs are wired in Rust through [`CoordinatorBuilder`], or from a
-//! `mission.py` evaluated into the [`Wiring`](wiring::Wiring) IR through the
-//! [`wiring`] module (the `wiring` feature).
+//! clock. Graphs are wired from a [`WiringBuilder`](wiring::WiringBuilder) in
+//! Rust or a `mission.py`, both evaluated into the [`Wiring`](wiring::Wiring) IR
+//! and resolved through the [`wiring`] module (the `wiring` feature).
 //!
 //! A crate's systems can also be compiled as a **pack** `cdylib` exporting
 //! the C ABI in [`abi`] (one [`export_pack!`] per crate over its `pack()` fn)
@@ -160,11 +160,15 @@ pub use handler::{
 pub use pack::{Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus};
 pub use testbench::TestBench;
 pub use coordinator::{
-    AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, NAME_CAP, OccupantBacking, PortRef, SlotConfigError,
-    SlotState, SlotStatus, StopReason, StoppedSystem, SystemHandle, WireError, WorkerRunState,
-    WorkerStatus,
+    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, NAME_CAP,
+    OccupantBacking, SlotConfigError, SlotState, SlotStatus, StopReason, StoppedSystem, WireError,
+    WorkerRunState, WorkerStatus,
 };
+// Port/handle addressing is crate-internal wiring (the public construction path
+// is `WiringBuilder`/`resolve`); re-exported at the root only so in-crate tests
+// can name them as `crate::PortRef` / `crate::SystemHandle`.
+#[cfg(test)]
+pub(crate) use coordinator::{PortRef, SystemHandle};
 
 pub use registry::{AllOutputs, Registry, RegistryEntry};
 pub use telemetry::{

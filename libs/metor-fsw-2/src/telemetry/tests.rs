@@ -16,7 +16,7 @@ use metor_proto_wkt::{ComponentMetadata, VTableMsg};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
+    ClockMode, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
     SystemHealth, SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, TelemetrySystem,
     Transport, TransportError, UplinkSystem,
 };
@@ -229,7 +229,7 @@ fn drain_latest(
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn registry_query_view_and_read() {
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
     let c = b.add_cyclic_named("consumer", Consumer);
     b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
@@ -269,7 +269,7 @@ async fn telemetry_end_to_end_all() {
     let mock = MockTransport::new(false);
     let rec = mock.inner.clone();
 
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
     let c = b.add_cyclic_named("consumer", Consumer);
     b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
@@ -346,7 +346,7 @@ async fn telemetry_end_to_end_all() {
 
 #[test]
 fn two_instances_distinct_prefixes() {
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     // Two producers of the same type; neither has inputs, so the graph builds.
     b.add_cyclic_named("imu_left", Producer { n: 0.0 });
     b.add_cyclic_named("imu_right", Producer { n: 0.0 });
@@ -384,7 +384,7 @@ async fn subset_mode_filters() {
     let mock = MockTransport::new(false);
     let rec = mock.inner.clone();
 
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
     let c = b.add_cyclic_named("consumer", Consumer);
     b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
@@ -430,7 +430,7 @@ async fn drop_policy_never_blocks_and_counts() {
     // queue stays full, and every later cycle's batch is dropped and counted.
     let mock = MockTransport::new(true);
 
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let prod = b.add_cyclic_named("producer", Producer { n: 0.0 });
     // A downstream consumer of the same output telemetry taps: the saturated
     // link must not starve it (regression: an undrained tap view stalls the
@@ -504,7 +504,7 @@ async fn drop_policy_never_blocks_and_counts() {
 #[stellarator::test]
 async fn dead_downlink_coordinator_teardown_is_clean() {
     for round in 0..2 {
-        let mut b = Coordinator::builder(sim_config());
+        let mut b = crate::coordinator::init::InitGraph::new(sim_config());
         b.add_cyclic_named("producer", Producer { n: 0.0 });
         b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
             transport: DeadTransport,
@@ -726,7 +726,7 @@ async fn table_log_entry_downlinks_every_record() {
     let mock = MockTransport::new(false);
     let rec = mock.inner.clone();
 
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     b.add_cyclic(BurstLogProducer { n: 0.0 });
     b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
         transport: mock,
@@ -810,7 +810,7 @@ async fn uplink_subscribes_to_its_configured_ids() {
 
     // Configured, so the subscription is exactly the two ids, in config order.
     let subscribed = Rc::new(RefCell::new(None));
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     b.add_async(
         UplinkSystem::new(SubRecv {
             subscribed: subscribed.clone(),
@@ -829,7 +829,7 @@ async fn uplink_subscribes_to_its_configured_ids() {
     // Unconfigured means an empty subscription; the uplink warns rather than
     // guessing an id.
     let subscribed = Rc::new(RefCell::new(None));
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     b.add_async(UplinkSystem::new(SubRecv {
         subscribed: subscribed.clone(),
     }));
@@ -920,7 +920,7 @@ async fn uplink_routes_alarm_acks() {
     let garbage = garbage.inner[4..].to_vec();
 
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let sink = b.add_cyclic(AckSink { seen: seen.clone() });
     let uplink = b.add_async(
         UplinkSystem::new(MockRecv {
@@ -1024,7 +1024,7 @@ async fn uplink_relays_arbitrary_user_msgs() {
     let wire = SetGain { gain: 7 }.into_len_packet().inner[4..].to_vec();
 
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let sink = b.add_cyclic(GainSink { seen: seen.clone() });
     let uplink = b.add_async(
         UplinkSystem::new(MockRecv {
@@ -1053,7 +1053,7 @@ async fn uplink_relays_arbitrary_user_msgs() {
 /// telemeter one cycle stale, so `build()` rejects it by name.
 #[test]
 fn cyclic_after_receive_all_is_a_build_error() {
-    let mut b = Coordinator::builder(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     b.add_cyclic_named("producer", Producer { n: 0.0 });
     b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
         transport: MockTransport::new(false),
@@ -1279,7 +1279,7 @@ async fn uplink_survives_a_recv_error() {
     // A wall clock (not simulated), so cycles keep coming in real time while
     // the uplink sleeps out its backoff after the scripted failure.
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let mut b = Coordinator::builder(CoordinatorConfig {
+    let mut b = crate::coordinator::init::InitGraph::new(CoordinatorConfig {
         cycle_rate: 100.0,
         default_depth: 8,
         ..CoordinatorConfig::default()

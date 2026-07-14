@@ -14,7 +14,7 @@
 //! only observes the current cycle's value when it points forward in that
 //! order, so [`build`] rejects a backward snapshot edge between cyclic systems
 //! ([`WireError::StaleFrameEdge`]) and any feedback loop not broken by an
-//! explicit [`connect_delayed`](super::CoordinatorBuilder::connect_delayed) edge
+//! explicit [`connect_delayed`](InitGraph::connect_delayed) edge
 //! ([`WireError::FeedbackCycle`]). One-cycle-late sampling is therefore always
 //! a declared decision, never an accident of registration order. Log edges
 //! carry decoupled event/command streams with no same-cycle dependency and are
@@ -23,7 +23,7 @@
 //! # Port connections
 //!
 //! An input's [`PortConn`] says who feeds it. An `Edge` input is wired by
-//! [`connect`](super::CoordinatorBuilder::connect). A `Host` input's counterpart
+//! [`connect`](InitGraph::connect). A `Host` input's counterpart
 //! is held by the system's runner over a dedicated ring (a slot's cancel frame,
 //! for example). A `SelfTap` input is a read view over one of the system's own
 //! outputs. Edges into `Host` or `SelfTap` inputs are rejected; `Host`
@@ -79,10 +79,7 @@ use crate::registry::{Registry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
 
 use super::bind::{ProcBindCtx, bind_systems};
-use super::slot::{
-    self, AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError, SlotReg,
-    validate_slot_spec,
-};
+use super::slot::{self, AllowedOccupant, InitialOccupant, SlotConfigError, SlotReg};
 use super::{
     AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, Coordinator, CoordinatorConfig,
     CoordinatorStatus, CopyIn, CyclicSlot, NAME_CAP, PortRef, RingEntry, RingTable, SlotState,
@@ -223,14 +220,69 @@ pub(crate) struct Node {
     pub(crate) bind: SystemBind,
 }
 
+/// Build a cyclic system's [`Node`] under `name`: its instance descriptor (a
+/// system whose port set depends on its config registers what this instance
+/// actually carries) and an erased [`CyclicReg`] bind. The wiring registry
+/// factory and the in-crate [`InitGraph::add_cyclic_named`] convenience share it.
+pub(crate) fn cyclic_node<S, O>(name: String, system: S) -> Node
+where
+    S: CyclicSystem<Output = Out<O>> + 'static,
+    O: SystemOutput + BindPorts + 'static,
+    S::Input: BindPorts + 'static,
+{
+    let desc = system.instance_descriptor();
+    Node {
+        name,
+        desc,
+        bind: SystemBind::Cyclic(Box::new(CyclicReg { system })),
+    }
+}
+
+/// Build an async system's [`Node`] under `name`, the [`cyclic_node`] twin.
+pub(crate) fn async_node<S>(name: String, system: S) -> Node
+where
+    S: AsyncSystem + 'static,
+    S::Input: BindPorts + 'static,
+    S::Output: BindPorts + 'static,
+{
+    let desc = system.instance_descriptor();
+    Node {
+        name,
+        desc,
+        bind: SystemBind::Async(Box::new(AsyncReg { system })),
+    }
+}
+
+/// Build a pack entry's [`Node`] under `name`, running its create phase (params
+/// decode + state construction) now so a bad config fails at registration, not
+/// at [`build`]. The bind phase runs at [`build`] over the entry's descriptor
+/// like any static system's, along the ordinary cyclic path (via
+/// [`PendingDriver`]).
+pub(crate) fn pending_node(
+    name: String,
+    entry: &mut crate::pack::PackEntry,
+    params: crate::pack::EntryParams<'_>,
+) -> Result<Node, crate::pack::MakeError> {
+    let pending = entry.create(params)?;
+    let driver = PendingDriver {
+        pending,
+        entry_name: entry.name(),
+    };
+    Ok(Node {
+        name,
+        desc: entry.descriptor().clone(),
+        bind: SystemBind::Cyclic(Box::new(driver)),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The init graph
 // ---------------------------------------------------------------------------
 
 /// The wiring graph as plain data: the registered systems in registration
 /// order, the edges between their ports, and the run-scoped overrides. Built up
-/// through the [`CoordinatorBuilder`](super::CoordinatorBuilder) shim, then
-/// consumed by [`build`].
+/// by the wiring front-end ([`resolve`](crate::wiring::resolve)) or the in-crate
+/// `add_*`/`connect` conveniences, then consumed by [`build`].
 pub(crate) struct InitGraph {
     pub(crate) config: CoordinatorConfig,
     /// The registered systems; index == registration order == step order.
@@ -306,8 +358,15 @@ impl InitGraph {
         name: String,
         bind: SystemBind,
     ) -> SystemHandle {
+        self.push_node(Node { bind, desc, name })
+    }
+
+    /// Record one pre-built [`Node`]; the returned handle indexes `systems`.
+    /// Registration order is step order, so a front-end pushes in the order it
+    /// wants the systems to run.
+    pub(crate) fn push_node(&mut self, node: Node) -> SystemHandle {
         let id = self.systems.len();
-        self.systems.push(Node { bind, desc, name });
+        self.systems.push(node);
         SystemHandle { id }
     }
 
@@ -341,6 +400,7 @@ impl InitGraph {
     }
 
     /// Register a cyclic system under its type's `System::NAME` instance name.
+    #[allow(dead_code)] // in-crate test convenience; wiring builds Nodes directly
     pub(crate) fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
@@ -351,6 +411,7 @@ impl InitGraph {
     }
 
     /// Register a cyclic system under an explicit instance name.
+    #[allow(dead_code)]
     pub(crate) fn add_cyclic_named<S, O>(
         &mut self,
         name: impl Into<String>,
@@ -361,13 +422,11 @@ impl InitGraph {
         O: SystemOutput + BindPorts + 'static,
         S::Input: BindPorts + 'static,
     {
-        // The instance descriptor, not the static one: a system whose port set
-        // depends on its config registers what this instance actually carries.
-        let desc = system.instance_descriptor();
-        self.push_system(desc, name.into(), SystemBind::Cyclic(Box::new(CyclicReg { system })))
+        self.push_node(cyclic_node(name.into(), system))
     }
 
     /// Register an async system under its type's `System::NAME` instance name.
+    #[allow(dead_code)]
     pub(crate) fn add_async<S>(&mut self, system: S) -> SystemHandle
     where
         S: AsyncSystem + 'static,
@@ -378,6 +437,7 @@ impl InitGraph {
     }
 
     /// Register an async system under an explicit instance name.
+    #[allow(dead_code)]
     pub(crate) fn add_async_named<S>(
         &mut self,
         name: impl Into<String>,
@@ -388,32 +448,19 @@ impl InitGraph {
         S::Input: BindPorts + 'static,
         S::Output: BindPorts + 'static,
     {
-        // The instance descriptor, not the static one (see `add_cyclic_named`).
-        let desc = system.instance_descriptor();
-        self.push_system(desc, name.into(), SystemBind::Async(Box::new(AsyncReg { system })))
+        self.push_node(async_node(name.into(), system))
     }
 
-    /// Register a pack entry under an explicit instance name, running its
-    /// create phase (params decode + state construction) now so a bad config
-    /// fails at registration, not at [`build`]. The bind phase runs at
-    /// [`build`] over the entry's descriptor like any static system's, along
-    /// the ordinary cyclic path (via [`PendingDriver`]).
+    /// Register a pack entry under an explicit instance name; see
+    /// [`pending_node`] for the create-phase contract.
+    #[allow(dead_code)]
     pub(crate) fn add_pack_entry(
         &mut self,
         name: impl Into<String>,
         entry: &mut crate::pack::PackEntry,
         params: crate::pack::EntryParams<'_>,
     ) -> Result<SystemHandle, crate::pack::MakeError> {
-        let pending = entry.create(params)?;
-        let driver = PendingDriver {
-            pending,
-            entry_name: entry.name(),
-        };
-        Ok(self.push_system(
-            entry.descriptor().clone(),
-            name.into(),
-            SystemBind::Cyclic(Box::new(driver)),
-        ))
+        Ok(self.push_node(pending_node(name.into(), entry, params)?))
     }
 
     /// Register a dlopen'd cyclic system under an explicit instance name.
@@ -460,64 +507,55 @@ impl InitGraph {
         )
     }
 
-    /// Register a runtime-swappable slot. See
-    /// [`CoordinatorBuilder::add_slot`](super::CoordinatorBuilder::add_slot) for
-    /// the full contract.
+    /// Register a runtime-swappable slot. A thin wrapper over
+    /// [`plan_slot`](slot::plan_slot) — which derives the registered contract
+    /// and rejects a bad occupant set — plus the push; the wiring front-end
+    /// calls `plan_slot` directly so it can map the errors onto its own
+    /// diagnostics. See [`plan_slot`](slot::plan_slot) for the full contract.
+    #[allow(dead_code)]
     pub(crate) fn add_slot(
         &mut self,
         name: impl Into<String>,
         allowed: Vec<AllowedOccupant>,
         initial: Option<InitialOccupant>,
     ) -> Result<SystemHandle, SlotConfigError> {
-        let names: Vec<&str> = allowed.iter().map(|a| a.name.as_str()).collect();
-        validate_slot_spec(&names, initial.as_ref().map(|i| i.occupant.as_str()))?;
-        // Per-slot means all-occupants: the isolation boundary is the slot's
-        // position in the cycle, and a mixed allow set would make `Load`
-        // silently change the fault domain.
-        let n_proc = allowed
-            .iter()
-            .filter(|a| matches!(a.backing, OccupantBacking::Artifact(_)))
-            .count();
-        if n_proc != 0 && n_proc != allowed.len() {
-            return Err(SlotConfigError::MixedBacking);
-        }
-        let process = n_proc == allowed.len();
-        // Every allowed occupant must share the contract; the slot sizes and
-        // validates to the first occupant's descriptor (mutual subset).
-        let base = &allowed[0].descriptor;
-        for occ in &allowed[1..] {
-            let d = &occ.descriptor;
-            let ports_match = |a: &[PortDesc], b: &[PortDesc]| {
-                a.len() == b.len()
-                    && a.iter()
-                        .zip(b)
-                        .all(|(x, y)| compatible(x, y) && compatible(y, x))
-            };
-            if !(ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs)) {
-                return Err(SlotConfigError::OccupantMismatch {
-                    occupant: occ.name.clone(),
-                    base: allowed[0].name.clone(),
-                });
-            }
-        }
-        let ports = slot::SlotPorts::for_occupant(base, &allowed[0].name)?;
-
         let name: String = name.into();
-        // The registered descriptor name is the slot's instance name (a leaked
-        // `&'static str` for the descriptor field and the `SlotRunner` identity).
-        let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
-        let registered = ports.registered(leaked);
-
-        Ok(self.push_system(
-            registered,
+        let (desc, ports, process) = slot::plan_slot(&name, &allowed, initial.as_ref())?;
+        Ok(self.push_node(Node {
             name,
-            SystemBind::Slot(SlotReg {
+            desc,
+            bind: SystemBind::Slot(SlotReg {
                 allowed,
                 initial,
                 ports,
                 process,
             }),
-        ))
+        }))
+    }
+
+    /// Record one edge, cheap connect-time guards ([`check_edge`]) first; the
+    /// full validation runs in [`solve_edges`] at [`build`].
+    pub(crate) fn connect(
+        &mut self,
+        producer: PortRef,
+        consumer: PortRef,
+    ) -> Result<(), WireError> {
+        check_edge(&self.systems, producer, consumer)?;
+        self.push_edge(producer, consumer, false);
+        Ok(())
+    }
+
+    /// Record one intentional one-cycle-delayed feedback edge (the back-edge of
+    /// a control loop), excluded from cycle detection. The [`connect`](Self::connect)
+    /// twin.
+    pub(crate) fn connect_delayed(
+        &mut self,
+        producer: PortRef,
+        consumer: PortRef,
+    ) -> Result<(), WireError> {
+        check_edge(&self.systems, producer, consumer)?;
+        self.push_edge(producer, consumer, true);
+        Ok(())
     }
 
     /// Record one edge; the cheap connect-time guards run in [`check_edge`],
@@ -1067,6 +1105,16 @@ impl InitGraph {
             }
         }
         plumbing
+    }
+}
+
+/// Build the graph into a ready [`Coordinator`], the in-crate test twin of the
+/// free [`build`] the wiring resolver calls. Test-only so it never re-grows a
+/// non-test build shim.
+#[cfg(test)]
+impl InitGraph {
+    pub(crate) fn build(self) -> Result<Coordinator, WireError> {
+        build(self)
     }
 }
 

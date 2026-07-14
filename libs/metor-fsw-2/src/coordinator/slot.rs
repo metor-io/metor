@@ -81,7 +81,7 @@ use metor_fsw_ring::NoWake;
 
 use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus, pack_name};
 use crate::abi::FswStatus;
-use crate::descriptor::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind};
+use crate::descriptor::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind, compatible};
 use crate::dl::{DlSlot, DlSystem};
 use crate::message::{MsgIn, MsgOut};
 use crate::port::{Input, Output, frame_list_iter};
@@ -238,6 +238,59 @@ pub(crate) fn validate_slot_spec(
         });
     }
     Ok(())
+}
+
+/// Derive a slot's registered contract from its occupant set, the one place
+/// the descriptor-level checks run: the pure-spec validation
+/// ([`validate_slot_spec`]), backing homogeneity (per-slot means all-occupants,
+/// so a mixed set is [`MixedBacking`](SlotConfigError::MixedBacking)), mutual
+/// occupant compatibility against the first occupant's contract, the
+/// [`SlotPorts`] plan, and the flattened registered [`SystemDescriptor`]. The
+/// returned `bool` is whether the slot runs process-mode (an all-`Artifact`
+/// allow set). The wiring front-end and the in-crate
+/// [`InitGraph::add_slot`](super::InitGraph::add_slot) convenience share it.
+pub(crate) fn plan_slot(
+    name: &str,
+    allowed: &[AllowedOccupant],
+    initial: Option<&InitialOccupant>,
+) -> Result<(SystemDescriptor, SlotPorts, bool), SlotConfigError> {
+    let names: Vec<&str> = allowed.iter().map(|a| a.name.as_str()).collect();
+    validate_slot_spec(&names, initial.map(|i| i.occupant.as_str()))?;
+    // Per-slot means all-occupants: the isolation boundary is the slot's
+    // position in the cycle, and a mixed allow set would make `Load` silently
+    // change the fault domain.
+    let n_proc = allowed
+        .iter()
+        .filter(|a| matches!(a.backing, OccupantBacking::Artifact(_)))
+        .count();
+    if n_proc != 0 && n_proc != allowed.len() {
+        return Err(SlotConfigError::MixedBacking);
+    }
+    let process = n_proc == allowed.len();
+    // Every allowed occupant must share the contract; the slot sizes and
+    // validates to the first occupant's descriptor (mutual subset).
+    let base = &allowed[0].descriptor;
+    for occ in &allowed[1..] {
+        let d = &occ.descriptor;
+        let ports_match = |a: &[PortDesc], b: &[PortDesc]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| compatible(x, y) && compatible(y, x))
+        };
+        if !(ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs)) {
+            return Err(SlotConfigError::OccupantMismatch {
+                occupant: occ.name.clone(),
+                base: allowed[0].name.clone(),
+            });
+        }
+    }
+    let ports = SlotPorts::for_occupant(base, &allowed[0].name)?;
+    // The registered descriptor name is the slot's instance name (a leaked
+    // `&'static str` for the descriptor field and the `SlotRunner` identity).
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let registered = ports.registered(leaked);
+    Ok((registered, ports, process))
 }
 
 /// A slot's registered ports as the three concepts they are, not the flat

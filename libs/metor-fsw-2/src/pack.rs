@@ -370,8 +370,8 @@ impl Pack {
         self
     }
 
-    /// The entry named `name`, for direct
-    /// [`add_pack_entry`](crate::CoordinatorBuilder::add_pack_entry) use.
+    /// The entry named `name`, for direct [`TestBench`](crate::TestBench) or
+    /// pack-entry registration use.
     pub fn entry_mut(&mut self, name: &str) -> Option<&mut PackEntry> {
         self.entries.iter_mut().find(|e| e.name == name)
     }
