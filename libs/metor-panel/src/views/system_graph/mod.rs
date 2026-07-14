@@ -33,7 +33,10 @@ use crate::graph_canvas::{hit_test_edges, paint_bezier, paint_grid};
 use crate::theme::theme;
 use crate::tiles::PaneItem;
 use crate::views::system_graph::config::Viewport;
-use crate::views::system_graph::layout::{GraphEdge, GraphNode, GraphNodeKind, NODE_WIDTH, layout};
+use crate::graph_layout::Direction;
+use crate::views::system_graph::layout::{
+    GraphEdge, GraphNode, GraphNodeKind, NODE_WIDTH, card_size, layout,
+};
 
 const HEADER_HEIGHT: f32 = 24.0;
 
@@ -147,18 +150,6 @@ impl Focusable for SystemGraphPanel {
     }
 }
 
-/// Nominal card height per node kind. Fixed so wires anchor at a card's
-/// vertical center regardless of content, and so the card renders at exactly
-/// the height the layout assumes.
-fn card_height(kind: GraphNodeKind) -> f32 {
-    match kind {
-        GraphNodeKind::System => 62.0,
-        GraphNodeKind::Slot => 84.0,
-        GraphNodeKind::Coordinator => 44.0,
-        GraphNodeKind::ScopeGroup => 48.0,
-    }
-}
-
 impl Render for SystemGraphPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
@@ -179,7 +170,7 @@ impl Render for SystemGraphPanel {
                 .child(msg);
         };
 
-        let graph = layout(&wiring, &self.collapsed);
+        let graph = layout(&wiring, &self.collapsed, Direction::LeftRight);
         let viewport = self.viewport.clone();
 
         // Resolve each node's graph-space and screen geometry once.
@@ -187,7 +178,7 @@ impl Render for SystemGraphPanel {
         let mut geom: HashMap<SharedString, (f32, f32, f32)> = HashMap::new();
         for node in &graph.nodes {
             let gp = self.graph_pos(node);
-            let h = card_height(node.kind);
+            let h = card_size(node.kind).1;
             geom.insert(node.id.clone(), (gp.0, gp.1, h));
             views.push(NodeView {
                 node: node.clone(),
@@ -196,17 +187,27 @@ impl Render for SystemGraphPanel {
             });
         }
 
-        // Edge geometry in canvas-local coordinates: right-mid of source to
-        // left-mid of target.
+        // Edge geometry in canvas-local coordinates. The engine's fanned
+        // anchors apply as long as both endpoints sit where the layout put
+        // them; a manually-dragged endpoint falls back to side-mid anchoring
+        // so wires track the card under the pointer.
         let selected_edge = self.selected_edge.clone();
         let edge_snapshots: Vec<(GraphEdge, Point<Pixels>, Point<Pixels>, gpui::Hsla, bool)> = graph
             .edges
             .iter()
-            .filter_map(|e| {
-                let (sx, sy, sh) = geom.get(&e.from_node)?;
-                let (tx, ty, th) = geom.get(&e.to_node)?;
-                let src = point(px(sx + NODE_WIDTH - viewport.x), px(sy + sh / 2.0 - viewport.y));
-                let tgt = point(px(tx - viewport.x), px(ty + th / 2.0 - viewport.y));
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let (src, tgt) = if self.overrides.contains_key(&e.from_node)
+                    || self.overrides.contains_key(&e.to_node)
+                {
+                    let (sx, sy, sh) = geom.get(&e.from_node)?;
+                    let (tx, ty, th) = geom.get(&e.to_node)?;
+                    ((sx + NODE_WIDTH, sy + sh / 2.0), (*tx, ty + th / 2.0))
+                } else {
+                    (graph.routes[i].source, graph.routes[i].target)
+                };
+                let src = point(px(src.0 - viewport.x), px(src.1 - viewport.y));
+                let tgt = point(px(tgt.0 - viewport.x), px(tgt.1 - viewport.y));
                 let mut color = match e.kind {
                     EdgeKind::Frame => theme.frame_edge_color(),
                     EdgeKind::Msg => theme.msg_edge_color(),

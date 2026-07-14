@@ -18,6 +18,7 @@ pub mod config;
 pub mod dynamic;
 pub mod gpu_context;
 pub(crate) mod graph_canvas;
+pub(crate) mod graph_layout;
 pub mod hydration;
 pub mod icons;
 pub mod inspect;

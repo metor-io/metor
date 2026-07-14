@@ -1,18 +1,24 @@
-//! Deterministic layered auto-layout for the system graph.
+//! Wiring-IR → laid-out graph for the system graph tile.
 //!
-//! The layout is a pure function of the [`Wiring`] IR and the set of collapsed
-//! scopes, so it is unit-tested without any gpui state. Nodes are one card per
-//! system, per slot, per collapsed-scope group, plus the reserved coordinator
-//! when an edge references it. Layers run left→right over the *non-delayed
-//! frame* edges only — delayed feedback edges and message edges are excluded
-//! from layering (and drawn as back/side edges) so the acyclic skeleton drives
-//! the columns. Within a layer, a barycenter pass orders nodes to reduce
-//! obvious crossings; ties break by id so the result is stable.
+//! This module owns the *domain* half of layout: which nodes exist (one card
+//! per system, per slot, per collapsed-scope group, plus the reserved
+//! coordinator when an edge references it), and which drawable edges connect
+//! them after collapsed scopes swallow their members. The *geometry* half —
+//! layers, ordering, positions, wire routes — is delegated to the shared
+//! [`graph_layout`](crate::graph_layout) engine, driven by the non-delayed
+//! frame edges (the mission's acyclic execution-dependency DAG) with
+//! declaration order as the tie-break. The result is a pure function of the
+//! [`Wiring`] IR, the collapsed set, and the flow direction, so it is
+//! unit-tested without any gpui state.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use gpui::SharedString;
 use metor_fsw_2::ir::{EdgeKind, Wiring};
+
+use crate::graph_layout::{
+    self, Direction, EdgeRoute, LayoutEdge, LayoutInput, LayoutNode, LayoutOptions, PinAnchor,
+};
 
 /// Reserved instance name the coordinator registers under. It never appears in
 /// [`Wiring::systems`] (it is registered at runtime), so an edge naming it is
@@ -20,14 +26,8 @@ use metor_fsw_2::ir::{EdgeKind, Wiring};
 /// from `metor-fsw-2`'s coordinator, which does not export it.
 pub const COORDINATOR_INSTANCE: &str = "coordinator";
 
-/// Card width; also the layout's horizontal unit.
+/// Card width, shared by every node kind.
 pub const NODE_WIDTH: f32 = 188.0;
-/// Horizontal gap between adjacent layers.
-const LAYER_GAP: f32 = 104.0;
-/// Vertical pitch between nodes within a layer.
-const NODE_PITCH: f32 = 104.0;
-/// Margin from the canvas origin to the first node.
-const MARGIN: f32 = 32.0;
 
 /// What a laid-out node stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +37,18 @@ pub enum GraphNodeKind {
     Coordinator,
     /// A collapsed scope aggregating its members into one card.
     ScopeGroup,
+}
+
+/// Card footprint per node kind. Fixed per kind so the card renders at
+/// exactly the size the layout and wire anchors assume.
+pub fn card_size(kind: GraphNodeKind) -> (f32, f32) {
+    let height = match kind {
+        GraphNodeKind::System => 62.0,
+        GraphNodeKind::Slot => 84.0,
+        GraphNodeKind::Coordinator => 44.0,
+        GraphNodeKind::ScopeGroup => 48.0,
+    };
+    (NODE_WIDTH, height)
 }
 
 /// One positioned node in the laid-out graph.
@@ -66,11 +78,13 @@ pub struct GraphEdge {
     pub delayed: bool,
 }
 
-/// The laid-out graph: positioned nodes and rerouted edges.
+/// The laid-out graph: positioned nodes, rerouted edges, and a wire route per
+/// edge (indexed like `edges`).
 #[derive(Debug)]
 pub struct GraphLayout {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+    pub routes: Vec<EdgeRoute>,
 }
 
 impl GraphLayout {
@@ -114,12 +128,13 @@ fn representative(
 }
 
 /// Compute the full layout for `wiring` with the given collapsed scopes.
-pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>) -> GraphLayout {
+pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Direction) -> GraphLayout {
     // Instance name -> the visible node that represents it.
     let mut rep: HashMap<String, SharedString> = HashMap::new();
     // Ordered, de-duplicated node builders keyed by id.
     let mut node_kind: BTreeMap<SharedString, (GraphNodeKind, Option<usize>)> = BTreeMap::new();
-    // First-seen order so a flat mission keeps declaration order as a tiebreak.
+    // First-seen order: declaration order for a flat mission, and the layout
+    // engine's tie-break rank.
     let mut first_seen: Vec<SharedString> = Vec::new();
 
     let see = |id: &SharedString,
@@ -211,134 +226,54 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>) -> GraphLayout {
     let index: HashMap<SharedString, usize> =
         ids.iter().cloned().enumerate().map(|(i, id)| (id, i)).collect();
 
-    // Layered skeleton: non-delayed frame edges only.
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
-    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
-    let mut skeleton: Vec<(usize, usize)> = Vec::new();
-    for e in &edges {
-        if e.kind != EdgeKind::Frame || e.delayed {
-            continue;
-        }
-        let (u, v) = (index[&e.from_node], index[&e.to_node]);
-        succ[u].push(v);
-        pred[v].push(u);
-        skeleton.push((u, v));
-    }
-    skeleton.sort_unstable();
-
-    let layers = assign_layers(ids.len(), &skeleton);
-    let orders = order_within_layers(&ids, &layers, &pred, &succ);
+    let layout_nodes: Vec<LayoutNode> = ids
+        .iter()
+        .map(|id| LayoutNode {
+            size: card_size(node_kind[id].0),
+        })
+        .collect();
+    // The non-delayed frame edges are the mission's execution-dependency DAG;
+    // they alone drive layering. Delayed edges are declared feedback.
+    let layout_edges: Vec<LayoutEdge> = edges
+        .iter()
+        .map(|e| LayoutEdge {
+            from: index[&e.from_node],
+            to: index[&e.to_node],
+            from_pin: PinAnchor::Auto,
+            to_pin: PinAnchor::Auto,
+            ranked: e.kind == EdgeKind::Frame && !e.delayed,
+            back: e.delayed,
+        })
+        .collect();
+    let tie_break: Vec<usize> = (0..ids.len()).collect();
+    let out = graph_layout::compute(&LayoutInput {
+        nodes: &layout_nodes,
+        edges: &layout_edges,
+        tie_break: &tie_break,
+        options: LayoutOptions {
+            direction,
+            ..LayoutOptions::default()
+        },
+    });
 
     let nodes: Vec<GraphNode> = ids
         .iter()
         .enumerate()
         .map(|(i, id)| {
             let (kind, src) = node_kind[id];
-            let layer = layers[i];
-            let order = orders[i];
             GraphNode {
                 id: id.clone(),
                 kind,
                 source_index: src,
-                layer,
-                pos: (
-                    MARGIN + layer as f32 * (NODE_WIDTH + LAYER_GAP),
-                    MARGIN + order as f32 * NODE_PITCH,
-                ),
+                layer: out.layers[i],
+                pos: out.positions[i],
             }
         })
         .collect();
 
-    GraphLayout { nodes, edges }
-}
-
-/// Longest-path layering over the acyclic skeleton. Relaxation is capped at
-/// `n` passes so an unexpected residual cycle terminates deterministically
-/// instead of looping (the delayed edges that would form real cycles are
-/// already excluded).
-fn assign_layers(n: usize, skeleton: &[(usize, usize)]) -> Vec<usize> {
-    let mut layer = vec![0usize; n];
-    for _ in 0..n.max(1) {
-        let mut changed = false;
-        for &(u, v) in skeleton {
-            if layer[v] < layer[u] + 1 {
-                layer[v] = layer[u] + 1;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
+    GraphLayout {
+        nodes,
+        edges,
+        routes: out.routes,
     }
-    layer
-}
-
-/// Assign a within-layer order to every node, minimizing crossings with a
-/// barycenter heuristic. Initial order is by id (via first-seen index already
-/// baked into `pred`/`succ` adjacency); a few forward/back sweeps refine it.
-/// Ties break by id so the output is deterministic.
-fn order_within_layers(
-    ids: &[SharedString],
-    layers: &[usize],
-    pred: &[Vec<usize>],
-    succ: &[Vec<usize>],
-) -> Vec<usize> {
-    let max_layer = layers.iter().copied().max().unwrap_or(0);
-    // Nodes grouped by layer, initialized in id order for determinism.
-    let mut by_layer: Vec<Vec<usize>> = vec![Vec::new(); max_layer + 1];
-    let mut node_ix: Vec<usize> = (0..ids.len()).collect();
-    node_ix.sort_by(|&a, &b| ids[a].cmp(&ids[b]));
-    for &n in &node_ix {
-        by_layer[layers[n]].push(n);
-    }
-
-    // Current order index of each node within its layer.
-    let mut order: Vec<usize> = vec![0; ids.len()];
-    let refresh = |by_layer: &[Vec<usize>], order: &mut [usize]| {
-        for layer_nodes in by_layer {
-            for (pos, &n) in layer_nodes.iter().enumerate() {
-                order[n] = pos;
-            }
-        }
-    };
-    refresh(&by_layer, &mut order);
-
-    let barycenter = |n: usize, neighbors: &[usize], order: &[usize]| -> f32 {
-        if neighbors.is_empty() {
-            return order[n] as f32;
-        }
-        let sum: usize = neighbors.iter().map(|&m| order[m]).sum();
-        sum as f32 / neighbors.len() as f32
-    };
-
-    for _ in 0..4 {
-        // Forward: order each layer by the barycenter of its predecessors.
-        for l in 1..=max_layer {
-            let mut layer_nodes = std::mem::take(&mut by_layer[l]);
-            layer_nodes.sort_by(|&a, &b| {
-                let ba = barycenter(a, &pred[a], &order);
-                let bb = barycenter(b, &pred[b], &order);
-                ba.partial_cmp(&bb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| ids[a].cmp(&ids[b]))
-            });
-            by_layer[l] = layer_nodes;
-            refresh(&by_layer, &mut order);
-        }
-        // Backward: order by the barycenter of successors.
-        for l in (0..max_layer).rev() {
-            let mut layer_nodes = std::mem::take(&mut by_layer[l]);
-            layer_nodes.sort_by(|&a, &b| {
-                let ba = barycenter(a, &succ[a], &order);
-                let bb = barycenter(b, &succ[b], &order);
-                ba.partial_cmp(&bb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| ids[a].cmp(&ids[b]))
-            });
-            by_layer[l] = layer_nodes;
-            refresh(&by_layer, &mut order);
-        }
-    }
-
-    order
 }
