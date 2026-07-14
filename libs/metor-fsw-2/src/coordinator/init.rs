@@ -8,6 +8,22 @@
 //! counting, ring allocation, registry freeze, copy-in planning, bind — each
 //! handing its product to the next, and assembles the `Coordinator` literal.
 //!
+//! # Ordering invariants
+//!
+//! The whole model rests on one index. A [`Node`]'s position in `systems` is
+//! its registration order *and* its cyclic step order, so a front-end pushes
+//! systems in the order it wants them to run and nothing reorders them.
+//!
+//! - **Node #0 is the coordinator.** [`InitGraph::new`] registers the
+//!   coordinator's own bundle at index 0 under the reserved name
+//!   `"coordinator"`, before any user system.
+//! - **Receive-all last.** A cyclic `ReceiveAll` (telemetry) system must be the
+//!   last cyclic registration, so its end-of-cycle snapshot observes every
+//!   system that stepped before it ([`WireError::ReceiveAllNotLast`]).
+//! - **Positional bind.** The bind pass hands each system its rings by walking
+//!   its descriptor's port lists in order, so a descriptor's port order is a
+//!   fixed contract between sizing and binding.
+//!
 //! # Execution order
 //!
 //! Cyclic systems step in registration order, once per cycle. A snapshot edge
@@ -76,14 +92,18 @@ use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
 use crate::port::capacity_for;
 use crate::proc::session::SessionDir;
 use crate::registry::{Registry, RegistryEntry};
-use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
+use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
+#[cfg(test)]
+use crate::system::System;
 
 use super::bind::{ProcBindCtx, bind_systems};
-use super::slot::{self, AllowedOccupant, InitialOccupant, SlotConfigError, SlotReg};
+use super::slot::SlotReg;
+#[cfg(test)]
+use super::slot::{self, AllowedOccupant, InitialOccupant, SlotConfigError};
 use super::{
-    AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, Coordinator, CoordinatorConfig,
-    CoordinatorStatus, CopyIn, CyclicSlot, NAME_CAP, PortRef, RingEntry, RingTable, SlotState,
-    SystemHandle, WireError,
+    AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, CoordChannels, Coordinator,
+    CoordinatorConfig, CoordinatorStatus, CopyIn, CyclicSlot, NAME_CAP, PortRef, RingEntry,
+    RingTable, SlotState, SystemHandle, WireError,
 };
 
 // ---------------------------------------------------------------------------
@@ -206,7 +226,7 @@ pub(crate) enum SystemBind {
     /// A cross-process cyclic system, spawned as a worker and bound to a
     /// [`ProcSlot`](crate::proc) at [`build`].
     Proc(ProcReg),
-    /// A runtime-swappable slot, bound to a [`SlotRunner`](slot::SlotRunner) at [`build`].
+    /// A runtime-swappable slot, bound to a [`SlotRunner`](super::slot::SlotRunner) at [`build`].
     Slot(SlotReg),
 }
 
@@ -400,7 +420,7 @@ impl InitGraph {
     }
 
     /// Register a cyclic system under its type's `System::NAME` instance name.
-    #[allow(dead_code)] // in-crate test convenience; wiring builds Nodes directly
+    #[cfg(test)] // in-crate test convenience; wiring builds Nodes directly
     pub(crate) fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
@@ -411,7 +431,7 @@ impl InitGraph {
     }
 
     /// Register a cyclic system under an explicit instance name.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn add_cyclic_named<S, O>(
         &mut self,
         name: impl Into<String>,
@@ -426,7 +446,7 @@ impl InitGraph {
     }
 
     /// Register an async system under its type's `System::NAME` instance name.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn add_async<S>(&mut self, system: S) -> SystemHandle
     where
         S: AsyncSystem + 'static,
@@ -437,7 +457,7 @@ impl InitGraph {
     }
 
     /// Register an async system under an explicit instance name.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn add_async_named<S>(
         &mut self,
         name: impl Into<String>,
@@ -453,7 +473,7 @@ impl InitGraph {
 
     /// Register a pack entry under an explicit instance name; see
     /// [`pending_node`] for the create-phase contract.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn add_pack_entry(
         &mut self,
         name: impl Into<String>,
@@ -512,7 +532,7 @@ impl InitGraph {
     /// and rejects a bad occupant set — plus the push; the wiring front-end
     /// calls `plan_slot` directly so it can map the errors onto its own
     /// diagnostics. See [`plan_slot`](slot::plan_slot) for the full contract.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn add_slot(
         &mut self,
         name: impl Into<String>,
@@ -541,7 +561,7 @@ impl InitGraph {
         consumer: PortRef,
     ) -> Result<(), WireError> {
         check_edge(&self.systems, producer, consumer)?;
-        self.push_edge(producer, consumer, false);
+        self.edges.push((producer, consumer, false));
         Ok(())
     }
 
@@ -554,14 +574,8 @@ impl InitGraph {
         consumer: PortRef,
     ) -> Result<(), WireError> {
         check_edge(&self.systems, producer, consumer)?;
-        self.push_edge(producer, consumer, true);
+        self.edges.push((producer, consumer, true));
         Ok(())
-    }
-
-    /// Record one edge; the cheap connect-time guards run in [`check_edge`],
-    /// the full validation in [`solve_edges`].
-    pub(crate) fn push_edge(&mut self, producer: PortRef, consumer: PortRef, delayed: bool) {
-        self.edges.push((producer, consumer, delayed));
     }
 
     // -----------------------------------------------------------------------
@@ -1179,14 +1193,16 @@ pub(crate) fn build(graph: InitGraph) -> Result<Coordinator, WireError> {
         cycle: 0,
         progress: Arc::new(AtomicU64::new(0)),
         registry,
-        control_out: Some(coord.control_out),
-        seq_registry_out: coord.seq_registry_out,
-        seq_registry,
-        seq_registry_emitted: false,
-        wiring_out: coord.wiring_out,
-        wiring_manifest,
-        wiring_emitted: false,
-        reload_in: coord.reload_in,
+        channels: CoordChannels {
+            control_out: Some(coord.control_out),
+            seq_registry_out: coord.seq_registry_out,
+            seq_registry,
+            seq_registry_emitted: false,
+            wiring_out: coord.wiring_out,
+            wiring_manifest,
+            wiring_emitted: false,
+            reload_in: coord.reload_in,
+        },
         started: false,
         // Declared last so the canonical ring handles drop after every port.
         rings: alloc.table,
@@ -1232,8 +1248,8 @@ pub(crate) struct AsyncPlumbing {
 /// The cheap connect-time guards: the endpoints name real systems and both
 /// halves address the same port id. The full compatibility and structural
 /// validation runs in [`InitGraph::solve_edges`]; this only catches the cheap
-/// mistakes early, so the shim's fallible `connect` can surface them at the
-/// call site while [`InitGraph::push_edge`] stays infallible.
+/// mistakes early, so [`connect`](InitGraph::connect) can surface them at the
+/// call site.
 pub(crate) fn check_edge(
     systems: &[Node],
     producer: PortRef,
@@ -1323,23 +1339,33 @@ fn find_cycle(adj: &[Vec<usize>]) -> Option<Vec<usize>> {
     None
 }
 
-/// The one ring-sizing helper. A snapshot port is sized at the configured
+/// The `Config` for one ring. A snapshot port is sized at the configured
 /// default depth (a latest-wins sample needs little history), a log port at
 /// [`LOG_DEPTH`] (an every-record stream must absorb a slow tap).
+fn ring_config(
+    delivery: Delivery,
+    max_size: usize,
+    default_depth: usize,
+    max_readers: usize,
+) -> Config {
+    let depth = match delivery {
+        Delivery::Snapshot => default_depth,
+        Delivery::Log => LOG_DEPTH,
+    };
+    Config {
+        capacity: capacity_for(max_size, depth),
+        max_readers,
+    }
+}
+
+/// Allocate a heap ring.
 pub(crate) fn alloc_ring(
     delivery: Delivery,
     max_size: usize,
     default_depth: usize,
     max_readers: usize,
 ) -> RingBuffer {
-    let depth = match delivery {
-        Delivery::Snapshot => default_depth,
-        Delivery::Log => LOG_DEPTH,
-    };
-    RingBuffer::create_in_memory(Config {
-        capacity: capacity_for(max_size, depth),
-        max_readers,
-    })
+    RingBuffer::create_in_memory(ring_config(delivery, max_size, default_depth, max_readers))
 }
 
 /// The mmap sibling of [`alloc_ring`]: identical sizing, but the region is a
@@ -1352,16 +1378,9 @@ fn alloc_ring_at(
     default_depth: usize,
     max_readers: usize,
 ) -> Result<RingBuffer, WireError> {
-    let depth = match delivery {
-        Delivery::Snapshot => default_depth,
-        Delivery::Log => LOG_DEPTH,
-    };
     RingBuffer::create_mmap(
         path,
-        Config {
-            capacity: capacity_for(max_size, depth),
-            max_readers,
-        },
+        ring_config(delivery, max_size, default_depth, max_readers),
     )
     .map_err(|e| WireError::Shm {
         detail: format!("ring `{}`: {e}", path.display()),
@@ -1369,11 +1388,9 @@ fn alloc_ring_at(
 }
 
 /// Mint the single [`MsgOut`] writer over a coordinator-owned ring, the
-/// [`slot_writer`](slot::slot_writer) analogue for a message channel. Called
+/// [`slot_writer`](super::slot::slot_writer) analogue for a message channel. Called
 /// exactly once per ring at build; the region's writer claim enforces it.
 pub(crate) fn owned_writer<M: Msg>(ring: &RingBuffer) -> MsgOut<M> {
-    // Each coordinator-owned message ring gets its single writer minted
-    // exactly once at build, so the claim is always free here.
     let writer = ring
         .writer(NoWake)
         .expect("coordinator message ring has exactly one writer");

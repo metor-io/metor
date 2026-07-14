@@ -1,9 +1,10 @@
 //! The cyclic run loop.
 //!
-//! An [`InitGraph`](init::InitGraph) collects systems and the edges between
-//! their ports, then [`init::build`]s them into a ready [`Coordinator`]. The
-//! graph is produced by the wiring front-end ([`resolve`](crate::wiring::resolve))
-//! or, in-crate, through the graph's own `add_*`/`connect` conveniences.
+//! This module is the runtime: a ready [`Coordinator`] and the supervision it
+//! runs. The graph construction that produces one — collecting systems and
+//! edges, validating, sizing, binding — lives in [`init`]; a `Coordinator`
+//! arrives already wired, from the wiring front-end
+//! ([`resolve`](crate::wiring::resolve)) via [`init::build`].
 //! [`Coordinator::run_for`] drives the lifecycle: spawn the async systems, init
 //! everything behind a barrier, step the cyclic systems once per cycle, run the
 //! async copy-in mirror, publish coordinator-level health and a status frame,
@@ -254,7 +255,7 @@ struct RingEntry {
 
 /// Owns every `RingBuffer`. Holding the canonical handle here keeps a buffer
 /// alive longer than any port over it, regardless of teardown order.
-struct RingTable {
+pub(crate) struct RingTable {
     rings: Vec<RingEntry>,
 }
 
@@ -266,7 +267,7 @@ struct RingTable {
 /// system's private buffer, at most once per new upstream commit. It exists
 /// only for snapshot inputs; the record is borrowed in place off the upstream
 /// ring and written through, with no intermediate buffer.
-struct CopyIn {
+pub(crate) struct CopyIn {
     upstream: View<NoWake>,
     /// The private ring's sole writer. The matched data `Notifier` wakes the
     /// parked async `recv`; a full private ring (the consumer is behind) drops
@@ -281,7 +282,7 @@ struct CopyIn {
 /// Per-task signals the coordinator hands a spawned async system: a stop flag,
 /// an init-readiness barrier, and a go-gate that holds the first `run` pass
 /// until every system's `init` has completed.
-struct LaunchCtx {
+pub(crate) struct LaunchCtx {
     stop: Arc<AtomicBool>,
     ready: Arc<WaitQueue>,
     ready_count: Arc<AtomicUsize>,
@@ -291,7 +292,7 @@ struct LaunchCtx {
 
 /// Spawns a bound async system onto its own task, exactly once. Erased so the
 /// coordinator can hold a heterogeneous set.
-trait AsyncLauncher {
+pub(crate) trait AsyncLauncher {
     fn launch(self: Box<Self>, ctx: LaunchCtx) -> JoinHandle<()>;
 }
 
@@ -401,6 +402,94 @@ fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
 // Coordinator
 // ---------------------------------------------------------------------------
 
+/// The coordinator's own announce/control channels on its #0 bundle: the boot
+/// [`SequenceRegistry`] and [`WiringManifest`] broadcast once at the head of a
+/// run (and re-fired on a [`ReloadSequences`] request so a late consumer
+/// resyncs), the take-once operator command writer, and the reload request
+/// fan-in drained each cycle. The two `_emitted` latches make the boot
+/// emission idempotent; the manifest channel is absent unless a front-end set
+/// one.
+struct CoordChannels {
+    /// The single writer over the coordinator's declared `commands` output (its
+    /// #0 bundle): the in-proc `SequenceCommand` producer. A slot reads it only
+    /// over an explicit `"coordinator" -> <slot>` edge, the same wiring surface
+    /// an uplink uses; with no edge the handle is inert but visible in the
+    /// graph. Minted once at `build()` (the ring's writer claim enforces one
+    /// live writer) and handed out by [`take_control`](Self::take_control),
+    /// which takes it, `None` afterwards.
+    control_out: Option<MsgOut<SequenceCommand>>,
+    /// The sole writer of the coordinator's boot-`SequenceRegistry` channel.
+    seq_registry_out: MsgOut<SequenceRegistry>,
+    /// The prebuilt boot [`SequenceRegistry`] payload (the slots plus their
+    /// allowed occupants), emitted once at the head of a run.
+    seq_registry: SequenceRegistry,
+    /// Whether the boot `SequenceRegistry` has been emitted (emit-once).
+    seq_registry_emitted: bool,
+    /// The sole writer of the coordinator's `wiring` channel, present only when
+    /// a front-end supplied a manifest.
+    wiring_out: Option<MsgOut<WiringManifest>>,
+    /// The full mission IR to broadcast on the `wiring` channel, emitted once
+    /// at the head of a run and re-fired on a [`ReloadSequences`] request.
+    /// `None` mirrors `wiring_out`.
+    wiring_manifest: Option<WiringManifest>,
+    /// Whether the [`WiringManifest`] has been emitted (emit-once; re-emitted
+    /// on reload alongside the `SequenceRegistry`).
+    wiring_emitted: bool,
+    /// The [`ReloadSequences`] fan-in on the coordinator's #0 bundle, drained
+    /// each cycle: any request re-emits the registry and manifest, so a
+    /// consumer that connected after boot (a late-started panel) can recover
+    /// the channel list on demand.
+    reload_in: MsgIn<ReloadSequences>,
+}
+
+impl CoordChannels {
+    /// Emit the boot [`SequenceRegistry`] on the coordinator's message channel:
+    /// the slots and their allowed occupants.
+    fn emit_sequence_registry(&mut self) {
+        let _ = self.seq_registry_out.emit(&self.seq_registry);
+    }
+
+    /// Emit the full mission IR on the `wiring` channel — the live/historical
+    /// topology the panel graph tile consumes. A no-op when no front-end set a
+    /// manifest.
+    fn emit_wiring_manifest(&mut self) {
+        if let (Some(out), Some(manifest)) = (&mut self.wiring_out, &self.wiring_manifest) {
+            let _ = out.emit(manifest);
+        }
+    }
+
+    /// Emit the boot registry and manifest exactly once, at the head of the
+    /// run, so a tap claimed after `build()` observes them ahead of any live
+    /// edge activity. Idempotent: the `_emitted` latches gate re-entry.
+    fn emit_boot(&mut self) {
+        if !self.seq_registry_emitted {
+            self.emit_sequence_registry();
+            self.seq_registry_emitted = true;
+        }
+        if !self.wiring_emitted {
+            self.emit_wiring_manifest();
+            self.wiring_emitted = true;
+        }
+    }
+
+    /// Drain the cycle's reload requests; on any request re-emit the registry
+    /// and (unchanged) manifest so a consumer that missed boot resyncs off one
+    /// message. The drain coalesces a burst into a single re-emission.
+    fn service_reload(&mut self) {
+        let mut reload = false;
+        self.reload_in.drain(|ReloadSequences {}| reload = true);
+        if reload {
+            self.emit_sequence_registry();
+            self.emit_wiring_manifest();
+        }
+    }
+
+    /// Take the single command writer; `None` after the first take.
+    fn take_control(&mut self) -> Option<MsgOut<SequenceCommand>> {
+        self.control_out.take()
+    }
+}
+
 /// The wired, ready flight-software graph. Drives cyclic systems once per
 /// cycle, runs the async copy-in step, spawns and tears down async systems,
 /// and emits coordinator-level health plus a status frame.
@@ -428,39 +517,10 @@ pub struct Coordinator {
     /// The one broad registry over every registered buffer, frames and message
     /// channels alike, untelemetered entries included.
     registry: Arc<Registry>,
-    /// The single writer over the coordinator's declared `commands` output
-    /// (its #0 bundle): the in-proc `SequenceCommand` producer. A slot reads
-    /// it only over an explicit `"coordinator" -> <slot>` edge, the same
-    /// wiring surface an uplink uses; with no edge the handle is inert but
-    /// visible in the graph. Minted once at `build()` (the ring's writer claim
-    /// enforces one live writer) and handed out by
-    /// [`control_handle`](Coordinator::control_handle), which takes it, `None`
-    /// afterwards.
-    control_out: Option<MsgOut<SequenceCommand>>,
-    /// The sole writer of the coordinator's boot-`SequenceRegistry` message channel.
-    seq_registry_out: MsgOut<SequenceRegistry>,
-    /// The prebuilt boot [`SequenceRegistry`] payload (the slots plus their
-    /// allowed occupants), emitted once at the head of
-    /// [`run_for`](Coordinator::run_for).
-    seq_registry: SequenceRegistry,
-    /// Whether the boot `SequenceRegistry` has been emitted (emit-once; the
-    /// re-emit hook is [`emit_sequence_registry`](Coordinator::emit_sequence_registry)).
-    seq_registry_emitted: bool,
-    /// The sole writer of the coordinator's `wiring` channel, present only when
-    /// a front-end supplied a manifest.
-    wiring_out: Option<MsgOut<WiringManifest>>,
-    /// The full mission IR to broadcast on the `wiring` channel, emitted once
-    /// at the head of [`run_for`](Coordinator::run_for) and re-fired on a
-    /// [`ReloadSequences`] request. `None` mirrors `wiring_out`.
-    wiring_manifest: Option<WiringManifest>,
-    /// Whether the [`WiringManifest`] has been emitted (emit-once; re-emitted
-    /// on reload alongside the `SequenceRegistry`).
-    wiring_emitted: bool,
-    /// The [`ReloadSequences`] fan-in on the coordinator's #0 bundle, drained
-    /// each cycle: any request re-emits the `SequenceRegistry`, so a consumer
-    /// that connected after boot (a late-started panel) can recover the
-    /// channel list on demand.
-    reload_in: MsgIn<ReloadSequences>,
+    /// The coordinator's own announce/control channels on its #0 bundle: the
+    /// boot sequence registry and wiring manifest, the take-once command
+    /// writer, and the reload request fan-in.
+    channels: CoordChannels,
     /// Latched by the first [`run_for`](Coordinator::run_for): a run consumes
     /// the coordinator (spawned async systems and their transports are gone
     /// after shutdown), so a second run would silently re-init everything over
@@ -513,7 +573,7 @@ impl Coordinator {
     /// of [`run_for`](Self::run_for); exposed as the re-emit hook for a
     /// rebuilt payload.
     pub fn emit_sequence_registry(&mut self) {
-        let _ = self.seq_registry_out.emit(&self.seq_registry);
+        self.channels.emit_sequence_registry();
     }
 
     /// Emit the full mission IR on the coordinator's `wiring` channel — the
@@ -522,9 +582,7 @@ impl Coordinator {
     /// [`run_for`](Self::run_for) and re-fired on a [`ReloadSequences`]
     /// request, so a consumer that connected after boot resyncs on demand.
     pub fn emit_wiring_manifest(&mut self) {
-        if let (Some(out), Some(manifest)) = (&mut self.wiring_out, &self.wiring_manifest) {
-            let _ = out.emit(manifest);
-        }
+        self.channels.emit_wiring_manifest();
     }
 
     /// The writer over the coordinator's command channel: the in-proc
@@ -544,7 +602,7 @@ impl Coordinator {
     /// edge; with no edge the handle is inert but the wiring shows it, so the
     /// gap is diagnosable from the graph.
     pub fn control_handle(&mut self) -> Option<MsgOut<SequenceCommand>> {
-        self.control_out.take()
+        self.channels.take_control()
     }
 
     /// Every owned output buffer as `(instance-name, frame-id)`. The instance
@@ -580,20 +638,10 @@ impl Coordinator {
         );
         self.started = true;
         let tasks = self.start().await;
-        // Emit the boot `SequenceRegistry` once, before the first cycle's
-        // events flow, so a tap claimed after `build()` observes it ahead of
-        // any `SequenceChannelEvent`.
-        if !self.seq_registry_emitted {
-            self.emit_sequence_registry();
-            self.seq_registry_emitted = true;
-        }
-        // The wiring manifest rides the same boot path: emit once before the
-        // first cycle so a tap claimed after `build()` sees the topology ahead
-        // of any live edge activity.
-        if !self.wiring_emitted {
-            self.emit_wiring_manifest();
-            self.wiring_emitted = true;
-        }
+        // Emit the boot `SequenceRegistry` and wiring manifest once, before the
+        // first cycle's events flow, so a tap claimed after `build()` observes
+        // them ahead of any live edge activity.
+        self.channels.emit_boot();
         // The Wall pacing budget. Only computed under a `Wall` clock, since
         // `cycle_rate` is documented ignored under `Simulated` and an unusable
         // rate must not panic there; under `Wall` the rate was validated at
@@ -615,17 +663,10 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => simulated_now(epoch, dt, k as u64),
             };
-            // A reload request re-emits the SequenceRegistry for consumers
+            // A reload request re-emits the registry and manifest for consumers
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.
-            let mut reload = false;
-            self.reload_in.drain(|ReloadSequences {}| reload = true);
-            if reload {
-                self.emit_sequence_registry();
-                // Topology does not change on reload today, but a slot-occupancy
-                // consumer that missed boot resyncs off the same one message.
-                self.emit_wiring_manifest();
-            }
+            self.channels.service_reload();
             // Commands are drained per-slot at the head of each `step`: a
             // slot's declared `commands` fan-in reads exactly the producers
             // explicitly edged into it and filters by its instance name, so a
