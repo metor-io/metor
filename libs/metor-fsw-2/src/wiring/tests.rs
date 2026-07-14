@@ -1044,12 +1044,12 @@ fn reloadable_is_required_for_slot_occupants_only() {
         params_default: None,
     };
     let entries = [meta];
-    let source = super::EntrySource::Described {
+    let source = super::resolve::EntrySource::Described {
         entries: &entries,
         artifact: "art",
     };
     let resolve_one = |owner: &str, require_reloadable: bool| {
-        super::resolve_occupant(
+        super::resolve::resolve_occupant(
             &source,
             Some("Stateful"),
             &ParamSource::None,

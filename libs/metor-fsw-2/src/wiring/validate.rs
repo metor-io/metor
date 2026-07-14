@@ -18,7 +18,8 @@ use miette::SourceSpan;
 
 use super::model::{Artifact, ParamSource, SlotSpec, SystemSpec, Wiring};
 use super::model::IR_VERSION;
-use super::{LoadError, LoadErrorKind, slot_config_error, slot_src, src_anchor, system_src};
+use super::resolve::{slot_config_error, slot_src, src_anchor, system_src};
+use super::{LoadError, LoadErrorKind};
 use crate::coordinator::validate_slot_spec;
 
 /// The instance name the coordinator itself occupies. A user spec of this name
