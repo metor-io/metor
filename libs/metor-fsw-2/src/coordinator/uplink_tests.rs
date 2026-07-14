@@ -28,9 +28,14 @@ use stellarator::buf::{IoBuf, Slice};
 
 use crate::{
     AllowedOccupant, ClockMode, CoordinatorConfig, CyclicSystem, DlPack, DlSystem,
-    Input, MsgIn, Out, PortRef, RecvTransport, SlotStatus, System, SystemHealth, SystemInput,
+    Input, MsgIn, Out, RecvTransport, SlotStatus, System, SystemHealth, SystemInput,
     SystemOutput, Timestamp, TransportError, UplinkSystem, split_record,
 };
+
+use super::PortRef;
+use super::init::{Node, SystemBind, async_node, cyclic_node};
+use super::slot::{SlotReg, plan_slot};
+use crate::descriptor::PortId;
 
 // ---------------------------------------------------------------------------
 // Fixture build/locate and shared config
@@ -207,22 +212,25 @@ fn uplink_command_loads_and_starts_same_cycle() {
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     // The slot starts empty; the uplink alone drives it.
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    let uplink = b.add_async(
-        UplinkSystem::new(MockRecv::new(vec![
+    let allowed = vec![occ("waiter", loaded)];
+    let (desc, ports, process) = plan_slot("adcs", &allowed, None).unwrap();
+    let slot = b.push_node(Node {
+        name: "adcs".into(),
+        desc,
+        bind: SystemBind::Slot(SlotReg { allowed, initial: None, ports, process }),
+    });
+    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv::new(vec![
             load("adcs", "waiter"),
             SequenceCommand {
                 channel: "adcs".to_string(),
                 command: SequenceCommandKind::Start,
             },
         ]))
-        .with_msg::<SequenceCommand>(),
-    );
+        .with_msg::<SequenceCommand>(),));
     b.connect(
-        PortRef::msg::<SequenceCommand>(uplink),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the uplink command edge connects");
+        PortRef { system: uplink, port: PortId::Packet(SequenceCommand::ID) },
+        PortRef { system: slot, port: PortId::Packet(SequenceCommand::ID) },
+    );
     let mut coord = b.build().expect("the slot + uplink graph builds");
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -269,16 +277,19 @@ fn reload_request_reemits_registry() {
     let loaded = open_waiter(&lib);
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let _slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
-    let uplink = b.add_async(
-        UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
-            .with_msg::<ReloadSequences>(),
-    );
+    let allowed = vec![occ("waiter", loaded)];
+    let (desc, ports, process) = plan_slot("adcs", &allowed, None).unwrap();
+    let _slot = b.push_node(Node {
+        name: "adcs".into(),
+        desc,
+        bind: SystemBind::Slot(SlotReg { allowed, initial: None, ports, process }),
+    });
+    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
+            .with_msg::<ReloadSequences>(),));
     b.connect(
-        PortRef::msg::<ReloadSequences>(uplink),
-        PortRef::msg::<ReloadSequences>(b.coordinator_handle()),
-    )
-    .expect("the reload edge connects to the coordinator bundle");
+        PortRef { system: uplink, port: PortId::Packet(ReloadSequences::ID) },
+        PortRef { system: b.coordinator_handle(), port: PortId::Packet(ReloadSequences::ID) },
+    );
     let mut coord = b.build().expect("the slot + uplink graph builds");
 
     let mut boot_view = coord
@@ -376,24 +387,20 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
     let reload = wire_msg(&ReloadSequences {});
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let tap = b.add_cyclic(CmdTap);
-    let uplink = b.add_async(
-        UplinkSystem::new(MockRecv::from_packets(vec![
+    let tap = b.push_node(cyclic_node(CmdTap::NAME.into(), CmdTap));
+    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv::from_packets(vec![
             reload, unroutable, malformed, valid,
         ]))
         .with_msg::<ReloadSequences>()
-        .with_msg::<SequenceCommand>(),
+        .with_msg::<SequenceCommand>(),));
+    b.connect(
+        PortRef { system: uplink, port: PortId::Packet(ReloadSequences::ID) },
+        PortRef { system: tap, port: PortId::Packet(ReloadSequences::ID) },
     );
     b.connect(
-        PortRef::msg::<ReloadSequences>(uplink),
-        PortRef::msg::<ReloadSequences>(tap),
-    )
-    .expect("the reloads edge connects");
-    b.connect(
-        PortRef::msg::<SequenceCommand>(uplink),
-        PortRef::msg::<SequenceCommand>(tap),
-    )
-    .expect("the commands edge connects");
+        PortRef { system: uplink, port: PortId::Packet(SequenceCommand::ID) },
+        PortRef { system: tap, port: PortId::Packet(SequenceCommand::ID) },
+    );
     let mut coord = b.build().expect("the uplink + tap graph builds");
 
     let mut health: Input<SystemHealth> = Input::new(

@@ -4,7 +4,7 @@
 //! runs. The graph construction that produces one — collecting systems and
 //! edges, validating, sizing, binding — lives in [`init`]; a `Coordinator`
 //! arrives already wired, from the wiring front-end
-//! ([`resolve`](crate::wiring::resolve)) via [`init::build`].
+//! ([`resolve`](crate::wiring::resolve)) via [`init::InitGraph::build`].
 //! [`Coordinator::run_for`] drives the lifecycle: spawn the async systems, init
 //! everything behind a barrier, step the cyclic systems once per cycle, run the
 //! async copy-in mirror, publish coordinator-level health and a status frame,
@@ -25,7 +25,7 @@ use std::sync::atomic::{
 use std::time::{Duration, Instant};
 
 use metor_fsw_ring::{NoWake, Notifier, RingBuffer, View, WakeSource, Writer};
-use metor_proto::types::{ComponentId, Msg, Timestamp};
+use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto_wkt::{ReloadSequences, SequenceCommand, SequenceRegistry, WiringManifest};
 use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
@@ -39,13 +39,14 @@ use crate::port::Output;
 use crate::proc::session::SessionDir;
 use crate::registry::Registry;
 use crate::system::AsyncSystem;
-use crate::{DEFAULT_DEPTH, Frame};
+use crate::DEFAULT_DEPTH;
 
 mod bind;
 mod error;
 pub(crate) mod init;
 pub(crate) mod slot;
 mod status;
+
 pub use error::WireError;
 pub(crate) use slot::validate_slot_spec;
 pub use slot::{
@@ -145,27 +146,6 @@ pub(crate) struct SystemHandle {
 pub(crate) struct PortRef {
     pub system: SystemHandle,
     pub port: PortId,
-}
-
-// `new`/`msg` are in-crate test conveniences; the wiring resolver builds
-// `PortRef`s by struct literal from descriptor-derived port ids.
-#[allow(dead_code)]
-impl PortRef {
-    /// Address the port carrying frame `F` on `system`.
-    pub fn new<F: Frame>(system: SystemHandle) -> Self {
-        Self {
-            system,
-            port: PortId::Component(F::FRAME_ID),
-        }
-    }
-
-    /// Address the port carrying message `M` on `system`.
-    pub fn msg<M: Msg>(system: SystemHandle) -> Self {
-        Self {
-            system,
-            port: PortId::Packet(M::ID),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,35 +390,26 @@ fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
 /// emission idempotent; the manifest channel is absent unless a front-end set
 /// one.
 struct CoordChannels {
-    /// The single writer over the coordinator's declared `commands` output (its
-    /// #0 bundle): the in-proc `SequenceCommand` producer. A slot reads it only
-    /// over an explicit `"coordinator" -> <slot>` edge, the same wiring surface
-    /// an uplink uses; with no edge the handle is inert but visible in the
-    /// graph. Minted once at `build()` (the ring's writer claim enforces one
-    /// live writer) and handed out by [`take_control`](Self::take_control),
-    /// which takes it, `None` afterwards.
+    /// The single writer over the coordinator's `commands` output, handed out
+    /// once by [`take_control`](Self::take_control) (see
+    /// [`Coordinator::control_handle`] for the take-once contract).
     control_out: Option<MsgOut<SequenceCommand>>,
     /// The sole writer of the coordinator's boot-`SequenceRegistry` channel.
     seq_registry_out: MsgOut<SequenceRegistry>,
     /// The prebuilt boot [`SequenceRegistry`] payload (the slots plus their
     /// allowed occupants), emitted once at the head of a run.
     seq_registry: SequenceRegistry,
-    /// Whether the boot `SequenceRegistry` has been emitted (emit-once).
     seq_registry_emitted: bool,
     /// The sole writer of the coordinator's `wiring` channel, present only when
     /// a front-end supplied a manifest.
     wiring_out: Option<MsgOut<WiringManifest>>,
-    /// The full mission IR to broadcast on the `wiring` channel, emitted once
-    /// at the head of a run and re-fired on a [`ReloadSequences`] request.
-    /// `None` mirrors `wiring_out`.
+    /// The full mission IR to broadcast on the `wiring` channel; `None` mirrors
+    /// `wiring_out`.
     wiring_manifest: Option<WiringManifest>,
-    /// Whether the [`WiringManifest`] has been emitted (emit-once; re-emitted
-    /// on reload alongside the `SequenceRegistry`).
     wiring_emitted: bool,
-    /// The [`ReloadSequences`] fan-in on the coordinator's #0 bundle, drained
-    /// each cycle: any request re-emits the registry and manifest, so a
-    /// consumer that connected after boot (a late-started panel) can recover
-    /// the channel list on demand.
+    /// The [`ReloadSequences`] fan-in, drained each cycle: any request re-emits
+    /// the registry and manifest, so a consumer that connected after boot can
+    /// recover the channel list on demand.
     reload_in: MsgIn<ReloadSequences>,
 }
 
@@ -511,15 +482,11 @@ pub struct Coordinator {
     workers_scratch: Vec<WorkerStatus>,
     cycle: u64,
     /// A shared, lock-free mirror of `cycle` that an observer outside the loop
-    /// can read while `run_for` holds `&mut self`, published each cycle.
-    /// Purely observational; nothing in the loop reads it back.
+    /// can read while `run_for` holds `&mut self`. Purely observational.
     progress: Arc<AtomicU64>,
-    /// The one broad registry over every registered buffer, frames and message
-    /// channels alike, untelemetered entries included.
+    /// The one broad registry over every registered buffer, untelemetered
+    /// entries included.
     registry: Arc<Registry>,
-    /// The coordinator's own announce/control channels on its #0 bundle: the
-    /// boot sequence registry and wiring manifest, the take-once command
-    /// writer, and the reload request fan-in.
     channels: CoordChannels,
     /// Latched by the first [`run_for`](Coordinator::run_for): a run consumes
     /// the coordinator (spawned async systems and their transports are gone

@@ -4,9 +4,9 @@
 //! the IR ([`validate`](super::validate)), broadcast it as a [`WiringManifest`](metor_proto_wkt::WiringManifest),
 //! then run the systems, slots, deferred receive-all, and edges passes onto an
 //! [`InitGraph`](crate::coordinator::init::InitGraph) before handing it to
-//! [`init::build`](crate::coordinator::init::build). Both front-ends (Python
-//! eval and the Rust [`WiringBuilder`](super::WiringBuilder)) land here, so
-//! every graph check runs identically for either.
+//! [`InitGraph::build`](crate::coordinator::init::InitGraph::build). Both
+//! front-ends (Python eval and the Rust [`WiringBuilder`](super::WiringBuilder))
+//! land here, so every graph check runs identically for either.
 //!
 //! A static system is instantiated through the [`Registry`] factory; a dl
 //! system is opened from its built [`Artifact`] and a `process=#true` system is
@@ -23,7 +23,7 @@ use miette::SourceSpan;
 
 use metor_proto::types::ComponentId;
 
-use crate::coordinator::init::{self, InitGraph, Node, SystemBind};
+use crate::coordinator::init::{InitGraph, Node, SystemBind};
 use crate::coordinator::slot::{SlotReg, plan_slot};
 use crate::coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, OccupantBacking,
@@ -128,10 +128,8 @@ pub fn resolve_with(
     graph.worker_exe = opts.worker_exe;
     graph.shm_dir = opts.shm_dir;
 
-    // Broadcast the full mission IR as a `WiringManifest` at startup and on
-    // reload. Serialized path-stripped so the telemetered topology matches the
-    // bundle's `wiring.json` byte-for-byte regardless of the build tree. Both
-    // front-ends land here, so the manifest flows whatever the source language.
+    // Serialized path-stripped so the telemetered topology matches the
+    // bundle's `wiring.json` byte-for-byte regardless of the build tree.
     let ir_json = serde_json::to_string(&wiring.path_stripped())
         .expect("a resolvable Wiring serializes to JSON");
     graph.set_wiring_manifest(metor_proto_wkt::WiringManifest {
@@ -141,10 +139,8 @@ pub fn resolve_with(
 
     // --- Systems pass: static via the Registry, dl via the loader --------
     let mut instances: HashMap<String, Instance> = HashMap::new();
-    // The coordinator's own bundle joins the instance namespace up front.
-    // `"coordinator"` is reserved: command edges name it (`connect
-    // "coordinator" -> ...`); `validate` already rejected any user spec of that
-    // name, so the inserts below never collide.
+    // The coordinator joins the instance namespace up front so command edges
+    // can name it; `validate` already rejected any user spec of that name.
     let coord_handle = graph.coordinator_handle();
     instances.insert(
         "coordinator".to_string(),
@@ -232,19 +228,19 @@ pub fn resolve_with(
         };
         // One `connect` entry point for every edge; its behavior is inferred
         // from the connected ports' descriptors, and `EdgeKind` only picked
-        // the name-lookup space above. `delayed=#true` into a Log input
-        // surfaces `WireError::DelayedLogEdge` at build.
-        let result = if edge.delayed {
-            graph.connect_delayed(producer, consumer)
+        // the name-lookup space above. The edge is validated at build, where a
+        // defect (`delayed=#true` into a Log input, an incompatible pair) is a
+        // `WireError`.
+        if edge.delayed {
+            graph.connect_delayed(producer, consumer);
         } else {
-            graph.connect(producer, consumer)
-        };
-        result.map_err(|source| LoadErrorKind::Wire { source }.at(src, span))?;
+            graph.connect(producer, consumer);
+        }
     }
 
     // A `Wiring` is format-independent, so a build-time `WireError` uses its own
     // rendered message as the diagnostic snippet, not original document spans.
-    init::build(graph).map_err(|err| {
+    graph.build().map_err(|err| {
         let src = err.to_string();
         LoadErrorKind::Wire { source: err }.whole(src)
     })
@@ -759,16 +755,11 @@ pub(super) fn slot_config_error(
     }
 }
 
-/// Resolve a [`SlotSpec`] into a registered slot.
-///
-/// Each allowed occupant goes through [`resolve_occupant`] like a dl system —
-/// or, for a `process=#true` slot, through [`describe_occupants`], which
-/// sources the descriptors from describe workers so the host never dlopens
-/// any occupant artifact. Every occupant must share one port contract. The
-/// descriptor returned for the edges pass is the one
-/// [`plan_slot`](crate::coordinator::slot::plan_slot) derives (the user ports
-/// plus the runner tail), not a raw occupant descriptor, and the declared
-/// `input`/`output` contract is validated against it.
+/// Resolve a [`SlotSpec`] into a registered slot: each allowed occupant goes
+/// through [`resolve_occupant`] (or, for a `process=#true` slot,
+/// [`describe_occupants`]), and the descriptor returned for the edges pass is
+/// the one [`plan_slot`](crate::coordinator::slot::plan_slot) derives, not a
+/// raw occupant descriptor.
 fn resolve_slot(
     slot: &SlotSpec,
     wiring: &Wiring,
@@ -780,11 +771,8 @@ fn resolve_slot(
 
     // The pure-spec checks (non-empty allow set, `initial` inside it) ran in
     // `validate` before any artifact was opened. Open and param-encode each
-    // allowed occupant. `occupant=` is the allow
-    // node's only reserved key and there is no leading name argument, so both
-    // line-property and child-node params reach the encoder. A process slot
-    // takes the describe-worker path instead; the backing decides the slot's
-    // mode in `add_slot`, so the two arms may not mix.
+    // allowed occupant; a process slot takes the describe-worker path instead,
+    // and the backing decides the slot's mode in `plan_slot`.
     let allowed: Vec<AllowedOccupant> = if slot.process {
         describe_occupants(slot, wiring, &src, span)?
     } else {
@@ -826,11 +814,8 @@ fn resolve_slot(
         },
     };
 
-    // Derive the registered contract and reject a bad occupant set through the
-    // one shared planner. `plan_slot` is the one place the registered contract
-    // (user ports plus the slot's own command fan-in) is derived — and the one
-    // place the descriptor-level checks (occupant mutual compatibility, the
-    // mount-appended ports) run — so this front-end cannot drift from it.
+    // `plan_slot` is the one place the registered contract is derived and the
+    // descriptor-level checks run, so this front-end cannot drift from it.
     let (registered, ports, process) = plan_slot(&slot.name, &allowed, initial.as_ref())
         .map_err(|e| slot_config_error(e, slot, &src, span))?;
     let desc = registered.clone();
@@ -884,13 +869,9 @@ fn resolve_slot(
 }
 
 /// Resolve a process slot's allowed set (`docs/process-slots.md` §8): the
-/// [`resolve_proc`] recipe once per allowed occupant. Each occupant's built
-/// artifact is described by a short-lived **describe worker** — the host
-/// never dlopens it, at resolve or at any later `Load` — the descriptor and
-/// `Params` schema are decoded from the worker's bytes, and the occupant's
-/// params are encoded against that schema exactly as the dl path
-/// encodes them. The resulting [`AllowedOccupant`]s carry
-/// [`OccupantBacking::Artifact`], which is what makes `add_slot` register
+/// [`resolve_proc`] recipe once per allowed occupant, so the host never
+/// dlopens any occupant artifact. The resulting [`AllowedOccupant`]s carry
+/// [`OccupantBacking::Artifact`], which is what makes [`plan_slot`] register
 /// the slot process-mode.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn describe_occupants(

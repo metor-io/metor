@@ -38,13 +38,9 @@ pub(super) struct ProcBindCtx {
 }
 
 /// Build the typed `BoundPort`s a static (host-side) registration binds over:
-/// the system's own output buffers, and its inputs in `descriptors()` order
-/// chosen by the fan-in axis. A `One` input views the producer's output
-/// directly, or the private copy-in buffer (matched data wake) the async
-/// copy-in pass decoupled; a `Many` input is a direct NoWake multi-view over
-/// every producer ring wired to it. Capabilities never appear here — they
-/// live on `desc.capabilities`, so the positional cursor covers exactly the
-/// wired ports.
+/// the system's own output buffers, and its inputs in `descriptors()` order. A
+/// `One` input views its producer's output (or its private copy-in buffer); a
+/// `Many` input is a multi-view over every wired producer ring.
 fn bind_static_io(
     id: usize,
     desc: &SystemDescriptor,
@@ -220,11 +216,9 @@ fn bind_coordinator(
 }
 
 /// A dlopen'd system binds over raw `FswRing` regions, not typed `BoundPort`s:
-/// gather the same per-port rings the coordinator allocated (outputs are this
-/// system's own buffers; inputs are views into the upstream producers'
-/// outputs, the cyclic-consumer path), as `(base, len, role)` handles in
-/// `descriptors()` order, and hand them to a `DlSlot`. Sizing, allocation,
-/// validation, and the registry entry are identical to a static system's.
+/// gather the same per-port rings the coordinator allocated as
+/// `(base, len, role)` handles in `descriptors()` order and hand them to a
+/// `DlSlot`.
 fn bind_dl(
     id: usize,
     dl: DlReg,
@@ -416,9 +410,7 @@ fn bind_slot(
     );
     let control = slot_writer::<SlotControlIn>(&alloc.host_input_rings[&(id, control_in_idx)]);
     // The slot's command fan-in: one view per producer explicitly edged into
-    // the declared `commands` input (no type-keyed broadcast; zero edges is a
-    // legal, command-less slot). The `SlotRunner` drains and filters by its
-    // instance name each step.
+    // the declared `commands` input (zero edges is a legal, command-less slot).
     let cmd_in_idx = ports.commands_in_idx();
     debug_assert_eq!(
         desc.inputs[cmd_in_idx].id(),

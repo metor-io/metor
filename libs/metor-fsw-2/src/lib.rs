@@ -164,12 +164,6 @@ pub use coordinator::{
     OccupantBacking, SlotConfigError, SlotState, SlotStatus, StopReason, StoppedSystem, WireError,
     WorkerRunState, WorkerStatus,
 };
-// Port/handle addressing is crate-internal wiring (the public construction path
-// is `WiringBuilder`/`resolve`); re-exported at the root only so in-crate tests
-// can name them as `crate::PortRef` / `crate::SystemHandle`.
-#[cfg(test)]
-pub(crate) use coordinator::{PortRef, SystemHandle};
-
 pub use registry::{AllOutputs, Registry, RegistryEntry};
 pub use telemetry::{
     DownlinkParams, RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,

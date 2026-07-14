@@ -16,10 +16,16 @@ use metor_proto_wkt::{ComponentMetadata, VTableMsg};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    ClockMode, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
+    ClockMode, CoordinatorConfig, CyclicSystem, Input, Out, Output, System,
     SystemHealth, SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, TelemetrySystem,
     Transport, TransportError, UplinkSystem,
 };
+
+use crate::coordinator::PortRef;
+use crate::coordinator::init::{async_node, cyclic_node};
+use crate::descriptor::PortId;
+use crate::frame::Frame as _;
+use metor_proto::types::Msg as _;
 
 // ---------------------------------------------------------------------------
 // Frames and systems under test (a producer -> consumer chain).
@@ -230,10 +236,9 @@ fn drain_latest(
 #[stellarator::test]
 async fn registry_query_view_and_read() {
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
-    let c = b.add_cyclic_named("consumer", Consumer);
-    b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
-        .unwrap();
+    let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+    let c = b.push_node(cyclic_node("consumer".into(), Consumer));
+    b.connect(PortRef { system: p, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: c, port: PortId::Component(Imu::FRAME_ID) });
     let mut coord = b.build().unwrap();
 
     // The registry indexes every output by `ComponentId::new("<instance>.<frame>")`.
@@ -270,14 +275,13 @@ async fn telemetry_end_to_end_all() {
     let rec = mock.inner.clone();
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
-    let c = b.add_cyclic_named("consumer", Consumer);
-    b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
-        .unwrap();
-    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
+    let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+    let c = b.push_node(cyclic_node("consumer".into(), Consumer));
+    b.connect(PortRef { system: p, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: c, port: PortId::Component(Imu::FRAME_ID) });
+    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::All,
-    }));
+    })));
     let mut coord = b.build().unwrap();
     // Only Table entries are announced; Postcard entries (the coordinator's
     // `sequences` and `commands` channels) are self-describing and carry no announce.
@@ -348,8 +352,8 @@ async fn telemetry_end_to_end_all() {
 fn two_instances_distinct_prefixes() {
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     // Two producers of the same type; neither has inputs, so the graph builds.
-    b.add_cyclic_named("imu_left", Producer { n: 0.0 });
-    b.add_cyclic_named("imu_right", Producer { n: 0.0 });
+    b.push_node(cyclic_node("imu_left".into(), Producer { n: 0.0 }));
+    b.push_node(cyclic_node("imu_right".into(), Producer { n: 0.0 }));
     let coord = b.build().unwrap();
     let registry = coord.registry();
 
@@ -385,17 +389,16 @@ async fn subset_mode_filters() {
     let rec = mock.inner.clone();
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
-    let c = b.add_cyclic_named("consumer", Consumer);
-    b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
-        .unwrap();
-    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
+    let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+    let c = b.push_node(cyclic_node("consumer".into(), Consumer));
+    b.connect(PortRef { system: p, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: c, port: PortId::Component(Imu::FRAME_ID) });
+    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::Subset {
             instances: vec!["producer".to_string()],
             frames: Vec::new(),
         },
-    }));
+    })));
     let mut coord = b.build().unwrap();
     coord.run_for(20).await;
 
@@ -431,17 +434,16 @@ async fn drop_policy_never_blocks_and_counts() {
     let mock = MockTransport::new(true);
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let prod = b.add_cyclic_named("producer", Producer { n: 0.0 });
+    let prod = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     // A downstream consumer of the same output telemetry taps: the saturated
     // link must not starve it (regression: an undrained tap view stalls the
     // producer's ring for EVERY consumer, freezing the whole mission).
-    let cons = b.add_cyclic(Consumer);
-    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
-        .unwrap();
-    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
+    let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer));
+    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
+    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::All,
-    }));
+    })));
     let mut coord = b.build().unwrap();
 
     // Tap the telemetry system's own health frame to observe its error counter,
@@ -505,11 +507,11 @@ async fn drop_policy_never_blocks_and_counts() {
 async fn dead_downlink_coordinator_teardown_is_clean() {
     for round in 0..2 {
         let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-        b.add_cyclic_named("producer", Producer { n: 0.0 });
-        b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
+        b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+        b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
             transport: DeadTransport,
             mode: TelemetryMode::All,
-        }));
+        })));
         let mut coord = b.build().unwrap();
         coord.run_for(20).await;
         assert!(coord.stopped().is_empty(), "round {round}: no system stopped");
@@ -727,14 +729,14 @@ async fn table_log_entry_downlinks_every_record() {
     let rec = mock.inner.clone();
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.add_cyclic(BurstLogProducer { n: 0.0 });
-    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
+    b.push_node(cyclic_node(BurstLogProducer::NAME.into(), BurstLogProducer { n: 0.0 }));
+    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::Subset {
             instances: Vec::new(),
             frames: vec!["imu".to_string()],
         },
-    }));
+    })));
     let mut coord = b.build().unwrap();
     let cycles = 4;
     coord.run_for(cycles).await;
@@ -811,13 +813,11 @@ async fn uplink_subscribes_to_its_configured_ids() {
     // Configured, so the subscription is exactly the two ids, in config order.
     let subscribed = Rc::new(RefCell::new(None));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.add_async(
-        UplinkSystem::new(SubRecv {
+    b.push_node(async_node("uplink".into(), UplinkSystem::new(SubRecv {
             subscribed: subscribed.clone(),
         })
         .with_msg::<ReloadSequences>()
-        .with_msg::<AlarmAck>(),
-    );
+        .with_msg::<AlarmAck>(),));
     let mut coord = b.build().unwrap();
     coord.run_for(20).await;
     assert_eq!(
@@ -830,9 +830,9 @@ async fn uplink_subscribes_to_its_configured_ids() {
     // guessing an id.
     let subscribed = Rc::new(RefCell::new(None));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.add_async(UplinkSystem::new(SubRecv {
+    b.push_node(async_node("uplink".into(), UplinkSystem::new(SubRecv {
         subscribed: subscribed.clone(),
-    }));
+    })));
     let mut coord = b.build().unwrap();
     coord.run_for(20).await;
     assert_eq!(
@@ -921,18 +921,15 @@ async fn uplink_routes_alarm_acks() {
 
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let sink = b.add_cyclic(AckSink { seen: seen.clone() });
-    let uplink = b.add_async(
-        UplinkSystem::new(MockRecv {
+    let sink = b.push_node(cyclic_node(AckSink::NAME.into(), AckSink { seen: seen.clone() }));
+    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv {
             queue: vec![garbage, good].into(),
         })
-        .with_msg::<AlarmAck>(),
-    );
+        .with_msg::<AlarmAck>(),));
     b.connect(
-        PortRef::msg::<AlarmAck>(uplink),
-        PortRef::msg::<AlarmAck>(sink),
-    )
-    .unwrap();
+        PortRef { system: uplink, port: PortId::Packet(AlarmAck::ID) },
+        PortRef { system: sink, port: PortId::Packet(AlarmAck::ID) },
+    );
     let mut coord = b.build().unwrap();
 
     coord.run_for(20).await;
@@ -1025,18 +1022,15 @@ async fn uplink_relays_arbitrary_user_msgs() {
 
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let sink = b.add_cyclic(GainSink { seen: seen.clone() });
-    let uplink = b.add_async(
-        UplinkSystem::new(MockRecv {
+    let sink = b.push_node(cyclic_node(GainSink::NAME.into(), GainSink { seen: seen.clone() }));
+    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv {
             queue: vec![wire].into(),
         })
-        .with_msg::<SetGain>(),
-    );
+        .with_msg::<SetGain>(),));
     b.connect(
-        PortRef::msg::<SetGain>(uplink),
-        PortRef::msg::<SetGain>(sink),
-    )
-    .unwrap();
+        PortRef { system: uplink, port: PortId::Packet(SetGain::ID) },
+        PortRef { system: sink, port: PortId::Packet(SetGain::ID) },
+    );
     let mut coord = b.build().unwrap();
 
     coord.run_for(20).await;
@@ -1054,13 +1048,13 @@ async fn uplink_relays_arbitrary_user_msgs() {
 #[test]
 fn cyclic_after_receive_all_is_a_build_error() {
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.add_cyclic_named("producer", Producer { n: 0.0 });
-    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
+    b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
         transport: MockTransport::new(false),
         mode: TelemetryMode::All,
-    }));
+    })));
     // A second producer (no inputs, so nothing else can fail first) after the downlink.
-    b.add_cyclic_named("late", Producer { n: 0.0 });
+    b.push_node(cyclic_node("late".into(), Producer { n: 0.0 }));
     let err = b
         .build()
         .err()
@@ -1284,18 +1278,15 @@ async fn uplink_survives_a_recv_error() {
         default_depth: 8,
         ..CoordinatorConfig::default()
     });
-    let sink = b.add_cyclic(AckSink { seen: seen.clone() });
-    let uplink = b.add_async(
-        UplinkSystem::new(ScriptedRecv {
+    let sink = b.push_node(cyclic_node(AckSink::NAME.into(), AckSink { seen: seen.clone() }));
+    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(ScriptedRecv {
             script: vec![None, Some(wire)].into(),
         })
-        .with_msg::<AlarmAck>(),
-    );
+        .with_msg::<AlarmAck>(),));
     b.connect(
-        PortRef::msg::<AlarmAck>(uplink),
-        PortRef::msg::<AlarmAck>(sink),
-    )
-    .unwrap();
+        PortRef { system: uplink, port: PortId::Packet(AlarmAck::ID) },
+        PortRef { system: sink, port: PortId::Packet(AlarmAck::ID) },
+    );
     let mut coord = b.build().unwrap();
 
     // ~600ms of cycles, several times the 100ms first-retry backoff.
