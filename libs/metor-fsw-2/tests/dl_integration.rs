@@ -19,7 +19,8 @@
 #![cfg(all(feature = "wiring", not(miri)))]
 
 use std::path::PathBuf;
-use std::process::Command;
+
+mod common;
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_fsw_2::{
@@ -118,59 +119,9 @@ impl BuildSystem for Ticker {
 // Build and locate the fixture cdylib
 // ---------------------------------------------------------------------------
 
-/// The platform file name of the fixture crate's `cdylib`.
-fn fixture_lib_name() -> String {
-    let stem = "metor_fsw_2_dl_fixture";
-    if cfg!(target_os = "macos") {
-        format!("lib{stem}.dylib")
-    } else if cfg!(target_os = "windows") {
-        format!("{stem}.dll")
-    } else {
-        format!("lib{stem}.so")
-    }
-}
-
-/// Builds the fixture crate and returns the shared object's path, parsed from
-/// cargo's JSON artifact messages so a custom target dir or profile still
-/// resolves. Returns `None`, after explaining on stderr, when the build
-/// plumbing is unavailable, letting the caller skip rather than fail.
+/// Build the fixture crate and locate its `cdylib`, skipping on failure.
 fn locate_fixture() -> Option<PathBuf> {
-    let output = Command::new(env!("CARGO"))
-        .args([
-            "build",
-            "-p",
-            "metor-fsw-2-dl-fixture",
-            "--message-format=json",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        eprintln!(
-            "skipping: fixture build failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-    // Each compiled artifact's JSON line carries a `"filenames"` array; the
-    // cdylib is the entry ending in the platform extension. Scanning quoted
-    // tokens avoids pulling in a JSON dependency.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let want = fixture_lib_name();
-    for line in stdout.lines() {
-        if !line.contains("compiler-artifact") || !line.contains(&want) {
-            continue;
-        }
-        for tok in line.split('"') {
-            if tok.ends_with(&want) {
-                let path = PathBuf::from(tok);
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    eprintln!("skipping: built the fixture but could not locate {want} in cargo output");
-    None
+    common::locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
 }
 
 /// A 200 Hz, depth-8, 5 ms-per-step simulated mission, the shared coordinator

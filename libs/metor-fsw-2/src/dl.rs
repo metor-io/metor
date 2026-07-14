@@ -286,19 +286,6 @@ pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Read and decode the manifest sidecar next to `so_path`: `None` when no
-/// sidecar exists, otherwise the decode outcome of its bytes.
-///
-/// Phase 0 verifies sidecars without consuming them.
-// TODO(python-config phase 2): switch `resolve_proc`/`describe_occupants` to
-// prefer a sidecar over spawning a describe worker.
-#[cfg(feature = "wiring")]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn read_manifest_sidecar(so_path: &Path) -> Option<Result<Vec<PackEntryDesc>, DlError>> {
-    let bytes = std::fs::read(manifest_sidecar_path(so_path)).ok()?;
-    Some(decode_pack_manifest(&bytes))
-}
-
 /// The raw postcard [`PackManifest`](abi::PackManifest) bytes of the `<so>.manifest` sidecar,
 /// if the build driver wrote one (sidecar-hash ≡ describe-hash). `None` when no
 /// sidecar sits next to the library, leaving the caller to describe it.

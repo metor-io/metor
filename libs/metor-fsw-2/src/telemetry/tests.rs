@@ -246,7 +246,10 @@ async fn registry_query_view_and_read() {
     let entry = registry
         .get(ComponentId::new("producer.imu"))
         .expect("producer.imu in the registry");
-    assert_eq!(entry.frame_id(), Some(ComponentId::new("imu")));
+    assert!(matches!(
+        entry.desc.schema,
+        crate::PortSchema::Table { frame_id, .. } if frame_id == ComponentId::new("imu")
+    ));
     assert_eq!(&*entry.instance, "producer");
     // The consumer's frame and the coordinator's own buffers are indexed too.
     assert!(registry.get(ComponentId::new("consumer.nav")).is_some());
@@ -366,8 +369,12 @@ fn two_instances_distinct_prefixes() {
 
     // Both entries share the unprefixed frame id, but their qualified keys differ
     // and their announced names carry distinct instance prefixes.
-    let left_id = left.frame_id().expect("frame entry carries a Table schema");
-    let right_id = right.frame_id().expect("frame entry carries a Table schema");
+    let crate::PortSchema::Table { frame_id: left_id, .. } = &left.desc.schema else {
+        panic!("frame entry carries a Table schema");
+    };
+    let crate::PortSchema::Table { frame_id: right_id, .. } = &right.desc.schema else {
+        panic!("frame entry carries a Table schema");
+    };
     let (_, left_meta) = left.announce().expect("Table entry announces");
     let (_, right_meta) = right.announce().expect("Table entry announces");
     assert_eq!(left_id, right_id);
@@ -842,6 +849,66 @@ async fn uplink_subscribes_to_its_configured_ids() {
     );
 }
 
+/// A script of receive outcomes for the uplink tests: `Some(bytes)` yields the
+/// framed packet, `None` fails the call, and an exhausted script fails every
+/// later call — all failures surface as `Disconnected`.
+struct ScriptedRecv {
+    script: std::collections::VecDeque<Option<Vec<u8>>>,
+}
+
+impl ScriptedRecv {
+    /// A script that yields each packet in turn, then disconnects.
+    fn packets(items: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            script: items.into_iter().map(Some).collect(),
+        }
+    }
+}
+
+impl crate::RecvTransport for ScriptedRecv {
+    async fn recv(
+        &mut self,
+        _buf: Vec<u8>,
+    ) -> Result<metor_proto::types::OwnedPacket<stellarator::buf::Slice<Vec<u8>>>, TransportError>
+    {
+        use stellarator::buf::IoBuf;
+        match self.script.pop_front() {
+            Some(Some(bytes)) => {
+                let slice = bytes.try_slice(..).expect("non-empty packet");
+                metor_proto::types::OwnedPacket::parse(slice)
+                    .map_err(|e| TransportError::Io(Box::new(e)))
+            }
+            _ => Err(TransportError::Disconnected),
+        }
+    }
+}
+
+/// A cyclic sink that captures every `AlarmAck` reaching it over a wired edge.
+struct AckSink {
+    seen: Rc<RefCell<Vec<metor_proto_wkt::AlarmAck>>>,
+}
+
+#[derive(SystemInput)]
+struct AckSinkIn {
+    acks: crate::MsgIn<metor_proto_wkt::AlarmAck>,
+}
+
+#[derive(SystemOutput)]
+struct AckSinkOut {}
+
+impl System for AckSink {
+    type Input = AckSinkIn;
+    type Output = Out<AckSinkOut>;
+    const NAME: &'static str = "ack_sink";
+}
+
+impl CyclicSystem for AckSink {
+    fn execute(&mut self, _now: Timestamp, input: &mut AckSinkIn, _o: &mut Self::Output) {
+        let seen = &self.seen;
+        input.acks.drain(|a| seen.borrow_mut().push(a));
+    }
+}
+
 /// A wire `AlarmAck` fed through the uplink routes onto its `acks` port and
 /// reaches a consumer over an ordinary message edge, while a malformed postcard
 /// payload under the same id is dropped without killing the link (the next
@@ -854,57 +921,6 @@ async fn uplink_routes_alarm_acks() {
 
     use metor_proto::types::{IntoLenPacket, Msg};
     use metor_proto_wkt::AlarmAck;
-    use stellarator::buf::Slice;
-
-    use crate::{MsgIn, RecvTransport};
-
-    /// A fixed script of pre-framed wire packets, then `Disconnected`.
-    struct MockRecv {
-        queue: std::collections::VecDeque<Vec<u8>>,
-    }
-
-    impl RecvTransport for MockRecv {
-        async fn recv(
-            &mut self,
-            _buf: Vec<u8>,
-        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-            use stellarator::buf::IoBuf;
-            match self.queue.pop_front() {
-                Some(bytes) => {
-                    let slice = bytes.try_slice(..).expect("non-empty packet");
-                    metor_proto::types::OwnedPacket::parse(slice)
-                        .map_err(|e| TransportError::Io(Box::new(e)))
-                }
-                None => Err(TransportError::Disconnected),
-            }
-        }
-    }
-
-    /// Captures every ack that reaches it over the wired edge.
-    struct AckSink {
-        seen: Rc<RefCell<Vec<AlarmAck>>>,
-    }
-
-    #[derive(SystemInput)]
-    struct AckSinkIn {
-        acks: MsgIn<AlarmAck>,
-    }
-
-    #[derive(SystemOutput)]
-    struct AckSinkOut {}
-
-    impl System for AckSink {
-        type Input = AckSinkIn;
-        type Output = Out<AckSinkOut>;
-        const NAME: &'static str = "ack_sink";
-    }
-
-    impl CyclicSystem for AckSink {
-        fn execute(&mut self, _now: Timestamp, input: &mut AckSinkIn, _o: &mut Self::Output) {
-            let seen = &self.seen;
-            input.acks.drain(|a| seen.borrow_mut().push(a));
-        }
-    }
 
     let ack = AlarmAck {
         def_id: "RATE_HIGH".to_string(),
@@ -922,9 +938,7 @@ async fn uplink_routes_alarm_acks() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let sink = b.push_node(cyclic_node(AckSink::NAME.into(), AckSink { seen: seen.clone() }));
-    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv {
-            queue: vec![garbage, good].into(),
-        })
+    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(ScriptedRecv::packets([garbage, good]))
         .with_msg::<AlarmAck>(),));
     b.connect(
         PortRef { system: uplink, port: PortId::Packet(AlarmAck::ID) },
@@ -956,9 +970,8 @@ async fn uplink_relays_arbitrary_user_msgs() {
     use std::rc::Rc;
 
     use metor_proto::types::IntoLenPacket;
-    use stellarator::buf::Slice;
 
-    use crate::{MsgIn, RecvTransport};
+    use crate::MsgIn;
 
     /// A mission-local command type, unknown to the framework.
     #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema, Debug)]
@@ -967,28 +980,6 @@ async fn uplink_relays_arbitrary_user_msgs() {
     }
     impl crate::NamedMsg for SetGain {
         const NAME: &'static str = "SetGain";
-    }
-
-    /// A fixed script of pre-framed wire packets, then `Disconnected`.
-    struct MockRecv {
-        queue: std::collections::VecDeque<Vec<u8>>,
-    }
-
-    impl RecvTransport for MockRecv {
-        async fn recv(
-            &mut self,
-            _buf: Vec<u8>,
-        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-            use stellarator::buf::IoBuf;
-            match self.queue.pop_front() {
-                Some(bytes) => {
-                    let slice = bytes.try_slice(..).expect("non-empty packet");
-                    metor_proto::types::OwnedPacket::parse(slice)
-                        .map_err(|e| TransportError::Io(Box::new(e)))
-                }
-                None => Err(TransportError::Disconnected),
-            }
-        }
     }
 
     struct GainSink {
@@ -1023,9 +1014,7 @@ async fn uplink_relays_arbitrary_user_msgs() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let sink = b.push_node(cyclic_node(GainSink::NAME.into(), GainSink { seen: seen.clone() }));
-    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv {
-            queue: vec![wire].into(),
-        })
+    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(ScriptedRecv::packets([wire]))
         .with_msg::<SetGain>(),));
     b.connect(
         PortRef { system: uplink, port: PortId::Packet(SetGain::ID) },
@@ -1210,57 +1199,6 @@ async fn uplink_survives_a_recv_error() {
 
     use metor_proto::types::IntoLenPacket;
     use metor_proto_wkt::AlarmAck;
-    use stellarator::buf::Slice;
-
-    use crate::{MsgIn, RecvTransport};
-
-    /// A script of receive outcomes: `None` fails the call, `Some` yields the
-    /// framed packet; an exhausted script fails every later call.
-    struct ScriptedRecv {
-        script: std::collections::VecDeque<Option<Vec<u8>>>,
-    }
-
-    impl RecvTransport for ScriptedRecv {
-        async fn recv(
-            &mut self,
-            _buf: Vec<u8>,
-        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-            use stellarator::buf::IoBuf;
-            match self.script.pop_front() {
-                Some(Some(bytes)) => {
-                    let slice = bytes.try_slice(..).expect("non-empty packet");
-                    metor_proto::types::OwnedPacket::parse(slice)
-                        .map_err(|e| TransportError::Io(Box::new(e)))
-                }
-                _ => Err(TransportError::Disconnected),
-            }
-        }
-    }
-
-    struct AckSink {
-        seen: Rc<RefCell<Vec<AlarmAck>>>,
-    }
-
-    #[derive(SystemInput)]
-    struct AckSinkIn {
-        acks: MsgIn<AlarmAck>,
-    }
-
-    #[derive(SystemOutput)]
-    struct AckSinkOut {}
-
-    impl System for AckSink {
-        type Input = AckSinkIn;
-        type Output = Out<AckSinkOut>;
-        const NAME: &'static str = "ack_sink";
-    }
-
-    impl CyclicSystem for AckSink {
-        fn execute(&mut self, _now: Timestamp, input: &mut AckSinkIn, _o: &mut Self::Output) {
-            let seen = &self.seen;
-            input.acks.drain(|a| seen.borrow_mut().push(a));
-        }
-    }
 
     let ack = AlarmAck {
         def_id: "RATE_HIGH".to_string(),

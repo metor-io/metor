@@ -205,24 +205,8 @@ pub fn resolve_with(
         let span: SourceSpan = (0, src.len()).into();
         let (producer, consumer) = match edge.kind {
             EdgeKind::Frame => (
-                resolve_endpoint(
-                    &instances,
-                    &src,
-                    &edge.from,
-                    &edge.out,
-                    edge.kind,
-                    Dir::Out,
-                    span,
-                )?,
-                resolve_endpoint(
-                    &instances,
-                    &src,
-                    &edge.to,
-                    &edge.in_,
-                    edge.kind,
-                    Dir::In,
-                    span,
-                )?,
+                resolve_endpoint(&instances, &src, &edge.from, &edge.out, Dir::Out, span)?,
+                resolve_endpoint(&instances, &src, &edge.to, &edge.in_, Dir::In, span)?,
             ),
             EdgeKind::Msg => resolve_msg_edge(&instances, &src, edge, span)?,
         };
@@ -816,7 +800,7 @@ fn resolve_slot(
 
     // `plan_slot` is the one place the registered contract is derived and the
     // descriptor-level checks run, so this front-end cannot drift from it.
-    let (registered, ports, process) = plan_slot(&slot.name, &allowed, initial.as_ref())
+    let (registered, ports, process) = plan_slot(&slot.name, &allowed)
         .map_err(|e| slot_config_error(e, slot, &src, span))?;
     let desc = registered.clone();
     let handle = graph.push_node(Node {
@@ -1072,7 +1056,6 @@ fn resolve_endpoint(
     src: &str,
     name: &str,
     port_name: &str,
-    kind: EdgeKind,
     dir: Dir,
     span: SourceSpan,
 ) -> Result<PortRef, LoadError> {
@@ -1083,40 +1066,17 @@ fn resolve_endpoint(
         Dir::Out => &inst.desc.outputs,
         Dir::In => &inst.desc.inputs,
     };
-    let port = match kind {
-        EdgeKind::Frame => {
-            let id = PortId::Component(ComponentId::new(port_name));
-            if !ports.iter().any(|p| p.id() == id) {
-                return Err(LoadErrorKind::UnknownFrame {
-                    instance: name.to_string(),
-                    frame: port_name.to_string(),
-                }
-                .at(src, span));
-            }
-            id
+    let id = PortId::Component(ComponentId::new(port_name));
+    if !ports.iter().any(|p| p.id() == id) {
+        return Err(LoadErrorKind::UnknownFrame {
+            instance: name.to_string(),
+            frame: port_name.to_string(),
         }
-        // A message port is matched by its display name (the message type
-        // name); the packet id comes from the matched port, not a name hash,
-        // because some message types hand-assign their ids.
-        EdgeKind::Msg => {
-            let found = ports
-                .iter()
-                .find(|p| matches!(p.id(), PortId::Packet(_)) && p.name == port_name);
-            match found {
-                Some(p) => p.id(),
-                None => {
-                    return Err(LoadErrorKind::UnknownMsg {
-                        instance: name.to_string(),
-                        msg: port_name.to_string(),
-                    }
-                    .at(src, span));
-                }
-            }
-        }
-    };
+        .at(src, span));
+    }
     Ok(PortRef {
         system: inst.handle,
-        port,
+        port: id,
     })
 }
 

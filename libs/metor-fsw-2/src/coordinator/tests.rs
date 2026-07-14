@@ -1516,7 +1516,7 @@ fn registered_slot_descriptor_snapshot() {
         // Never opened at registration; the path need not exist.
         backing: crate::OccupantBacking::Artifact("occ.so".into()),
     };
-    let (desc, _, _) = plan_slot("snap", &[occ], None).expect("a valid slot plans");
+    let (desc, _, _) = plan_slot("snap", &[occ]).expect("a valid slot plans");
 
     let seq_status_id = PortId::Component(<SequenceStatus as Frame>::FRAME_ID);
     let got: Vec<(&str, PortId, PortConn)> =
@@ -1586,12 +1586,11 @@ fn add_slot_rejects_contract_violations() {
                 art_occ("first", vec![PortDesc::of::<Imu>()]),
                 art_occ("second", vec![PortDesc::of::<Nav>()]),
             ],
-            None,
         ),
         Err(SlotConfigError::OccupantMismatch { .. })
     ));
     assert!(matches!(
-        plan_slot("s", &[art_occ("pre-pack", vec![PortDesc::of::<SlotControlIn>()])], None),
+        plan_slot("s", &[art_occ("pre-pack", vec![PortDesc::of::<SlotControlIn>()])]),
         Err(SlotConfigError::ReservedPort { .. })
     ));
 }

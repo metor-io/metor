@@ -277,13 +277,6 @@ pub enum ParamSource {
     Value(serde_json::Value),
 }
 
-impl ParamSource {
-    /// `true` for a paramless system.
-    pub fn is_none(&self) -> bool {
-        matches!(self, ParamSource::None)
-    }
-}
-
 /// A runtime-loadable slot, a fixed position in the cyclic chain whose
 /// occupant the host swaps at runtime.
 ///

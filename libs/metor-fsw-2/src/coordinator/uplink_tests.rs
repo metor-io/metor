@@ -213,7 +213,7 @@ fn uplink_command_loads_and_starts_same_cycle() {
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     // The slot starts empty; the uplink alone drives it.
     let allowed = vec![occ("waiter", loaded)];
-    let (desc, ports, process) = plan_slot("adcs", &allowed, None).unwrap();
+    let (desc, ports, process) = plan_slot("adcs", &allowed).unwrap();
     let slot = b.push_node(Node {
         name: "adcs".into(),
         desc,
@@ -278,7 +278,7 @@ fn reload_request_reemits_registry() {
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let allowed = vec![occ("waiter", loaded)];
-    let (desc, ports, process) = plan_slot("adcs", &allowed, None).unwrap();
+    let (desc, ports, process) = plan_slot("adcs", &allowed).unwrap();
     let _slot = b.push_node(Node {
         name: "adcs".into(),
         desc,

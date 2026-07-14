@@ -23,9 +23,12 @@
 //! in `dl_integration.rs`; if one cannot be produced the tests skip with a
 //! message rather than fail.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+mod common;
+use common::locate_fixture;
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_fsw_2::metor_proto_wkt::{
@@ -163,51 +166,6 @@ impl BuildSystem for Ticker {
     fn new(_params: ()) -> Self {
         Ticker { n: 0 }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Fixture build/locate (as in dl_integration.rs)
-// ---------------------------------------------------------------------------
-
-fn fixture_lib_name(stem: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("lib{stem}.dylib")
-    } else if cfg!(target_os = "windows") {
-        format!("{stem}.dll")
-    } else {
-        format!("lib{stem}.so")
-    }
-}
-
-fn locate_fixture(package: &str, stem: &str) -> Option<PathBuf> {
-    let output = Command::new(env!("CARGO"))
-        .args(["build", "-p", package, "--message-format=json"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        eprintln!(
-            "skipping: fixture build failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let want = fixture_lib_name(stem);
-    for line in stdout.lines() {
-        if !line.contains("compiler-artifact") || !line.contains(&want) {
-            continue;
-        }
-        for tok in line.split('"') {
-            if tok.ends_with(&want) {
-                let path = PathBuf::from(tok);
-                if path.exists() {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    eprintln!("skipping: built the fixture but could not locate {want} in cargo output");
-    None
 }
 
 // ---------------------------------------------------------------------------

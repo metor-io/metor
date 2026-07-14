@@ -44,15 +44,6 @@ pub trait SystemInput {
     /// wired port requires, or a bind-time [`Capability`]. Read before any
     /// port exists.
     fn decls() -> Vec<PortDecl>;
-
-    /// [`decls`](Self::decls) with the capabilities filtered out, leaving the
-    /// wired ports that edge validation and ring sizing consume.
-    fn port_descs() -> Vec<PortDesc> {
-        Self::decls()
-            .into_iter()
-            .filter_map(PortDecl::into_port)
-            .collect()
-    }
 }
 
 /// A system's output bundle: a struct of [`Output<F>`](crate::Output) ports.
@@ -63,14 +54,6 @@ pub trait SystemOutput {
     /// each wired port, or a bind-time [`Capability`] such as the `ReceiveAll`
     /// an [`AllOutputs`](crate::AllOutputs) field requests.
     fn decls() -> Vec<PortDecl>;
-
-    /// [`decls`](Self::decls) with the capabilities filtered out.
-    fn port_descs() -> Vec<PortDesc> {
-        Self::decls()
-            .into_iter()
-            .filter_map(PortDecl::into_port)
-            .collect()
-    }
 
     /// Sum and clear the ports' [`publish`](crate::Output::publish) drop
     /// counters. Derive-generated; the runner folds a nonzero sum into a
