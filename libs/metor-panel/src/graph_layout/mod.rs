@@ -39,6 +39,15 @@ pub enum Direction {
     TopBottom,
 }
 
+impl Direction {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::LeftRight => Self::TopBottom,
+            Self::TopBottom => Self::LeftRight,
+        }
+    }
+}
+
 /// Where an edge endpoint attaches to its node.
 #[derive(Clone, Copy, Debug)]
 pub enum PinAnchor {

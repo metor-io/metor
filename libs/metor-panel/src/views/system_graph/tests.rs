@@ -169,6 +169,28 @@ fn coordinator_node_only_when_referenced() {
     assert_eq!(coord.kind, GraphNodeKind::Coordinator);
 }
 
+/// Top→bottom direction advances the chain in +y instead of +x.
+#[test]
+fn top_bottom_flows_down() {
+    let mut w = base_wiring();
+    w.systems = vec![system("a", None), system("b", None), system("c", None)];
+    w.edges = vec![frame_edge("a", "b", false), frame_edge("b", "c", false)];
+
+    let g = layout(&w, &no_collapse(), Direction::TopBottom);
+    assert!(g.node("a").unwrap().pos.1 < g.node("b").unwrap().pos.1);
+    assert!(g.node("b").unwrap().pos.1 < g.node("c").unwrap().pos.1);
+}
+
+/// A config document saved before the direction field existed still loads,
+/// defaulting to left→right.
+#[test]
+fn config_without_direction_defaults() {
+    let json = r#"{"viewport":{"x":1.0,"y":2.0},"overrides":[],"collapsed":[]}"#;
+    let cfg: super::config::SystemGraphConfig = facet_json::from_str(json).expect("deserialize");
+    assert_eq!(cfg.direction, Direction::LeftRight);
+    assert_eq!(cfg.viewport.x, 1.0);
+}
+
 /// Message edges do not drive layering (excluded from the skeleton) but are
 /// still drawn.
 #[test]

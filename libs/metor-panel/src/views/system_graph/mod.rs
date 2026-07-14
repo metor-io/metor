@@ -64,6 +64,7 @@ pub struct SystemGraphPanel {
     viewport: Viewport,
     overrides: HashMap<SharedString, (f32, f32)>,
     collapsed: BTreeSet<String>,
+    direction: Direction,
     selection: Option<SharedString>,
     selected_edge: Option<GraphEdge>,
     node_drag: Option<NodeDrag>,
@@ -90,11 +91,31 @@ impl SystemGraphPanel {
             viewport: cfg.viewport.clone(),
             overrides: cfg.overrides_map(),
             collapsed: cfg.collapsed_set(),
+            direction: cfg.direction,
             selection: None,
             selected_edge: None,
             node_drag: None,
             pan_drag: None,
             canvas_origin: None,
+        }
+    }
+
+    pub fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    pub fn set_direction(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        if self.direction != direction {
+            self.direction = direction;
+            cx.notify();
+        }
+    }
+
+    /// The gpui paint axis matching the current flow direction.
+    fn flow_axis(&self) -> Axis {
+        match self.direction {
+            Direction::LeftRight => Axis::Horizontal,
+            Direction::TopBottom => Axis::Vertical,
         }
     }
 
@@ -170,8 +191,9 @@ impl Render for SystemGraphPanel {
                 .child(msg);
         };
 
-        let graph = layout(&wiring, &self.collapsed, Direction::LeftRight);
+        let graph = layout(&wiring, &self.collapsed, self.direction);
         let viewport = self.viewport.clone();
+        let axis = self.flow_axis();
 
         // Resolve each node's graph-space and screen geometry once.
         let mut views: Vec<NodeView> = Vec::with_capacity(graph.nodes.len());
@@ -203,12 +225,15 @@ impl Render for SystemGraphPanel {
                 {
                     let (sx, sy, sh) = geom.get(&e.from_node)?;
                     let (tx, ty, th) = geom.get(&e.to_node)?;
-                    [
-                        local((sx + NODE_WIDTH, sy + sh / 2.0)),
-                        local((*tx, ty + th / 2.0)),
-                    ]
-                    .into_iter()
-                    .collect()
+                    let (src, tgt) = match self.direction {
+                        Direction::LeftRight => {
+                            ((sx + NODE_WIDTH, sy + sh / 2.0), (*tx, ty + th / 2.0))
+                        }
+                        Direction::TopBottom => {
+                            ((sx + NODE_WIDTH / 2.0, sy + sh), (tx + NODE_WIDTH / 2.0, *ty))
+                        }
+                    };
+                    [local(src), local(tgt)].into_iter().collect()
                 } else {
                     let r = &graph.routes[i];
                     std::iter::once(local(r.source))
@@ -240,7 +265,7 @@ impl Render for SystemGraphPanel {
             move |_, bounds, window, _cx| {
                 paint_grid(bounds, theme_for_paint.grid_color, window);
                 for (_e, route, color, dashed) in &edges_for_paint {
-                    paint_route(bounds.origin, route, Axis::Horizontal, *color, *dashed, window);
+                    paint_route(bounds.origin, route, axis, *color, *dashed, window);
                 }
             },
         )
@@ -267,7 +292,7 @@ impl Render for SystemGraphPanel {
                         return;
                     };
                     let local = ev.position - origin;
-                    if let Some(edge) = hit_test_edges(&edges, local, Axis::Horizontal) {
+                    if let Some(edge) = hit_test_edges(&edges, local, this.flow_axis()) {
                         this.selected_edge = Some(edge);
                         this.selection = None;
                         cx.notify();
@@ -595,6 +620,28 @@ impl SystemGraphPanel {
                         }),
                     ),
             )
+            .child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(theme.bg_elevated)
+                    .border_1()
+                    .border_color(theme.border_primary)
+                    .text_size(px(10.0))
+                    .text_color(theme.text_primary)
+                    .child(SharedString::new_static(match self.direction {
+                        Direction::LeftRight => "Flow →",
+                        Direction::TopBottom => "Flow ↓",
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &gpui::MouseDownEvent, _w, cx| {
+                            this.set_direction(this.direction.cycle(), cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            )
     }
 
     /// One bordered container per expanded scope that has at least one visible
@@ -708,6 +755,11 @@ impl PaneItem for SystemGraphPanel {
     }
 
     fn to_config(&self, _cx: &App) -> SystemGraphConfig {
-        SystemGraphConfig::from_state(self.viewport.clone(), &self.overrides, &self.collapsed)
+        SystemGraphConfig::from_state(
+            self.viewport.clone(),
+            &self.overrides,
+            &self.collapsed,
+            self.direction,
+        )
     }
 }

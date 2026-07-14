@@ -7,8 +7,11 @@ use std::collections::{BTreeSet, HashMap};
 
 use gpui::SharedString;
 
+use crate::graph_layout::Direction;
+
 /// View state the tile persists: the pan offset, any manually-dragged node
-/// positions, and which scopes the operator has collapsed.
+/// positions, which scopes the operator has collapsed, and the flow
+/// direction.
 #[derive(Clone, Debug, Default, facet::Facet)]
 pub struct SystemGraphConfig {
     pub viewport: Viewport,
@@ -17,6 +20,10 @@ pub struct SystemGraphConfig {
     pub overrides: Vec<NodeOverride>,
     /// Scope paths the operator has collapsed into aggregate group nodes.
     pub collapsed: Vec<String>,
+    /// Flow direction of the auto-layout. Defaulted so documents saved
+    /// before the field existed still load.
+    #[facet(default)]
+    pub direction: Direction,
 }
 
 /// Pan offset in graph space (`screen = graph - viewport`).
@@ -50,6 +57,7 @@ impl SystemGraphConfig {
         viewport: Viewport,
         overrides: &HashMap<SharedString, (f32, f32)>,
         collapsed: &BTreeSet<String>,
+        direction: Direction,
     ) -> Self {
         let mut overrides: Vec<NodeOverride> = overrides
             .iter()
@@ -65,6 +73,7 @@ impl SystemGraphConfig {
             viewport,
             overrides,
             collapsed: collapsed.iter().cloned().collect(),
+            direction,
         }
     }
 }
