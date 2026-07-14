@@ -11,7 +11,6 @@ fn edge(from: usize, to: usize) -> LayoutEdge {
         from_pin: PinAnchor::Auto,
         to_pin: PinAnchor::Auto,
         ranked: true,
-        back: false,
     }
 }
 
@@ -152,13 +151,73 @@ fn offset_pins_bypass_fanning() {
         from_pin: PinAnchor::Offset(50.0),
         to_pin: PinAnchor::Offset(36.0),
         ranked: true,
-        back: false,
     }];
     let out = lr(&nodes, &edges);
     assert_eq!(out.routes[0].source.1, out.positions[0].1 + 50.0);
     assert_eq!(out.routes[0].target.1, out.positions[1].1 + 36.0);
     assert_eq!(out.routes[0].source.0, out.positions[0].0 + 168.0);
     assert_eq!(out.routes[0].target.0, out.positions[1].0);
+}
+
+fn unranked(from: usize, to: usize) -> LayoutEdge {
+    LayoutEdge {
+        ranked: false,
+        ..edge(from, to)
+    }
+}
+
+/// A feedback edge detours through a channel clear of every card: both
+/// elbows share a cross position that no node's extent contains.
+#[test]
+fn back_edge_detours_around_rows() {
+    let nodes = vec![node(188.0, 62.0); 3];
+    let edges = vec![edge(0, 1), edge(1, 2), unranked(2, 0)];
+    let out = lr(&nodes, &edges);
+    let wps = &out.routes[2].waypoints;
+    assert_eq!(wps.len(), 2);
+    assert_eq!(wps[0].1, wps[1].1);
+    let channel = wps[0].1;
+    for i in 0..nodes.len() {
+        let (_, y, _, h) = rect(&out, &nodes, i);
+        assert!(
+            channel < y || channel > y + h,
+            "channel {channel} cuts through node {i} ({y}..{})",
+            y + h
+        );
+    }
+}
+
+/// Two feedback edges on the same side take parallel lanes instead of
+/// overprinting.
+#[test]
+fn back_edges_take_separate_lanes() {
+    let nodes = vec![node(188.0, 62.0); 4];
+    let edges = vec![
+        edge(0, 1),
+        edge(1, 2),
+        edge(2, 3),
+        unranked(3, 0),
+        unranked(2, 0),
+    ];
+    let out = lr(&nodes, &edges);
+    let (a, b) = (&out.routes[3].waypoints, &out.routes[4].waypoints);
+    assert_eq!(a.len(), 2);
+    assert_eq!(b.len(), 2);
+    assert!(a[0].1 != b[0].1, "feedback lanes overlap at {}", a[0].1);
+}
+
+/// A same-layer wire brackets beside its layer and enters the target from
+/// the outgoing side.
+#[test]
+fn flat_edge_brackets_beside_layer() {
+    let nodes = vec![node(188.0, 62.0); 2];
+    let edges = vec![unranked(0, 1)];
+    let out = lr(&nodes, &edges);
+    assert_eq!(out.layers, vec![0, 0]);
+    let wps = &out.routes[0].waypoints;
+    assert_eq!(wps.len(), 1);
+    assert!(wps[0].0 > out.positions[0].0 + 188.0);
+    assert_eq!(out.routes[0].target.0, out.positions[1].0 + 188.0);
 }
 
 /// Identical input yields bit-identical output.

@@ -56,7 +56,7 @@ impl Arena {
 
         for (ei, e) in edges.iter().enumerate() {
             let (lu, lv) = (layers[e.from], layers[e.to]);
-            let c = if e.back || lv < lu {
+            let c = if lv < lu {
                 EdgeClass::Back
             } else if lv == lu {
                 EdgeClass::Flat

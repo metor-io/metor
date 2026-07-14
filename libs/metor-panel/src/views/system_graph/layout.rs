@@ -233,7 +233,8 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
         })
         .collect();
     // The non-delayed frame edges are the mission's execution-dependency DAG;
-    // they alone drive layering. Delayed edges are declared feedback.
+    // they alone drive layering. Delayed feedback and message edges route by
+    // wherever those layers put their endpoints.
     let layout_edges: Vec<LayoutEdge> = edges
         .iter()
         .map(|e| LayoutEdge {
@@ -242,7 +243,6 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
             from_pin: PinAnchor::Auto,
             to_pin: PinAnchor::Auto,
             ranked: e.kind == EdgeKind::Frame && !e.delayed,
-            back: e.delayed,
         })
         .collect();
     let tie_break: Vec<usize> = (0..ids.len()).collect();

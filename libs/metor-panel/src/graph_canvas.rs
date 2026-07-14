@@ -7,8 +7,27 @@
 //! the caller's colors and edge-id type. Both panes share the same `screen =
 //! graph - viewport` convention and drive these functions from their own
 //! render pass.
+//!
+//! A wire is a *route*: two or more canvas-local points (boundary anchors
+//! plus any interior waypoints from the layout engine), rendered as a chain
+//! of cubic beziers. Painting and hit-testing both derive their curves from
+//! [`route_segments`], so what the pointer feels always matches what the eye
+//! sees.
 
-use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
+use gpui::{Axis, Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
+use smallvec::SmallVec;
+
+/// A wire's canvas-local polyline: source anchor, interior waypoints, target
+/// anchor.
+pub(crate) type RoutePoints = SmallVec<[Point<Pixels>; 6]>;
+
+/// One cubic bezier piece of a route, in canvas-local f32 coordinates.
+struct Segment {
+    p0: (f32, f32),
+    c1: (f32, f32),
+    c2: (f32, f32),
+    p1: (f32, f32),
+}
 
 /// Paint the 24px background grid across `bounds`. The grid is fixed to the
 /// canvas (it doesn't scroll) so it reads as a static backdrop rather than a
@@ -37,33 +56,168 @@ pub(crate) fn paint_grid(bounds: Bounds<Pixels>, grid_color: Hsla, window: &mut 
     }
 }
 
-/// Find the first edge whose bezier passes within `HIT_RADIUS` pixels of
-/// `pointer` (pointer is in canvas-local coordinates). Samples each curve at
-/// 16 points and uses point-to-segment distance. Generic over the caller's
-/// edge id so both panes can recover their own selection key.
+/// The cubic chain for a route. Endpoint tangents run along the flow axis
+/// with the classic outward pull, so a plain two-point route is exactly the
+/// familiar S-curve. Interior tangents are Catmull-Rom (parallel to the line
+/// between the surrounding points), clamped so a sharp detour elbow can't
+/// overshoot its segment.
+fn route_segments(points: &[(f32, f32)], flow: Axis) -> SmallVec<[Segment; 4]> {
+    let mut segments = SmallVec::new();
+    let n = points.len();
+    if n < 2 {
+        return segments;
+    }
+
+    let along_flow = |mag: f32| -> (f32, f32) {
+        match flow {
+            Axis::Horizontal => (mag, 0.0),
+            Axis::Vertical => (0.0, mag),
+        }
+    };
+    let flow_delta = |a: (f32, f32), b: (f32, f32)| -> f32 {
+        match flow {
+            Axis::Horizontal => b.0 - a.0,
+            Axis::Vertical => b.1 - a.1,
+        }
+    };
+    let clamp_len = |v: (f32, f32), max: f32| -> (f32, f32) {
+        let len = (v.0 * v.0 + v.1 * v.1).sqrt();
+        if len > max && len > f32::EPSILON {
+            let s = max / len;
+            (v.0 * s, v.1 * s)
+        } else {
+            v
+        }
+    };
+
+    for i in 0..n - 1 {
+        let (p0, p1) = (points[i], points[i + 1]);
+        let seg_len = ((p1.0 - p0.0).powi(2) + (p1.1 - p0.1).powi(2)).sqrt();
+        let start = if i == 0 {
+            along_flow(flow_delta(p0, p1).abs().max(40.0) * 0.5)
+        } else {
+            let t = (
+                (p1.0 - points[i - 1].0) / 6.0,
+                (p1.1 - points[i - 1].1) / 6.0,
+            );
+            clamp_len(t, seg_len * 0.4)
+        };
+        let end = if i == n - 2 {
+            along_flow(flow_delta(p0, p1).abs().max(40.0) * 0.5)
+        } else {
+            let t = (
+                (points[i + 2].0 - p0.0) / 6.0,
+                (points[i + 2].1 - p0.1) / 6.0,
+            );
+            clamp_len(t, seg_len * 0.4)
+        };
+        segments.push(Segment {
+            p0,
+            c1: (p0.0 + start.0, p0.1 + start.1),
+            c2: (p1.0 - end.0, p1.1 - end.1),
+            p1,
+        });
+    }
+    segments
+}
+
+fn to_f32(route: &[Point<Pixels>]) -> SmallVec<[(f32, f32); 6]> {
+    route
+        .iter()
+        .map(|p| (f32::from(p.x), f32::from(p.y)))
+        .collect()
+}
+
+/// Paint a route (canvas-local points) as a smooth cubic chain, shifted by
+/// `canvas_origin` into window space. `dashed` selects the thinner stroke
+/// used for drafts and delayed edges.
+pub(crate) fn paint_route(
+    canvas_origin: Point<Pixels>,
+    route: &[Point<Pixels>],
+    flow: Axis,
+    color: Hsla,
+    dashed: bool,
+    window: &mut Window,
+) {
+    let (ox, oy) = (f32::from(canvas_origin.x), f32::from(canvas_origin.y));
+    let segments = route_segments(&to_f32(route), flow);
+    if segments.is_empty() {
+        return;
+    }
+    let stroke = if dashed { px(1.0) } else { px(1.5) };
+    let mut path = PathBuilder::stroke(stroke);
+    path.move_to(point(px(ox + segments[0].p0.0), px(oy + segments[0].p0.1)));
+    for s in &segments {
+        path.cubic_bezier_to(
+            point(px(ox + s.p1.0), px(oy + s.p1.1)),
+            point(px(ox + s.c1.0), px(oy + s.c1.1)),
+            point(px(ox + s.c2.0), px(oy + s.c2.1)),
+        );
+    }
+    if let Ok(p) = path.build() {
+        window.paint_path(p, color);
+    }
+}
+
+/// Paint a plain two-point wire — the drag-draft and fallback shape.
+pub(crate) fn paint_bezier(
+    canvas_origin: Point<Pixels>,
+    source: Point<Pixels>,
+    target: Point<Pixels>,
+    color: Hsla,
+    dashed: bool,
+    window: &mut Window,
+) {
+    let route: RoutePoints = SmallVec::from_slice(&[source, target]);
+    paint_route(canvas_origin, &route, Axis::Horizontal, color, dashed, window);
+}
+
+/// Find the first edge whose route passes within `HIT_RADIUS` pixels of
+/// `pointer` (pointer is in canvas-local coordinates). Each edge gets a cheap
+/// bounding-box precheck, then its curve — the same one [`paint_route`]
+/// draws — is sampled per segment. Generic over the caller's edge id so both
+/// panes can recover their own selection key.
 pub(crate) fn hit_test_edges<E: Clone>(
-    edges: &[(E, Point<Pixels>, Point<Pixels>)],
+    edges: &[(E, RoutePoints)],
     pointer: Point<Pixels>,
+    flow: Axis,
 ) -> Option<E> {
-    const SAMPLES: usize = 16;
+    const SAMPLES_PER_SEGMENT: usize = 8;
     const HIT_RADIUS: f32 = 6.0;
-    let px_pointer = (f32::from(pointer.x), f32::from(pointer.y));
+    let p = (f32::from(pointer.x), f32::from(pointer.y));
     let mut best: Option<(f32, E)> = None;
-    for (edge, s, t) in edges {
-        let sx = f32::from(s.x);
-        let sy = f32::from(s.y);
-        let tx = f32::from(t.x);
-        let ty = f32::from(t.y);
-        let dx = (tx - sx).abs().max(40.0) * 0.5;
-        let c1 = (sx + dx, sy);
-        let c2 = (tx - dx, ty);
-        let mut prev = (sx, sy);
+    for (edge, route) in edges {
+        let segments = route_segments(&to_f32(route), flow);
+        if segments.is_empty() {
+            continue;
+        }
+        // The curve is contained in the convex hull of its control points, so
+        // an inflated box over all of them is a safe reject.
+        let mut min = (f32::INFINITY, f32::INFINITY);
+        let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for s in &segments {
+            for q in [s.p0, s.c1, s.c2, s.p1] {
+                min = (min.0.min(q.0), min.1.min(q.1));
+                max = (max.0.max(q.0), max.1.max(q.1));
+            }
+        }
+        if p.0 < min.0 - HIT_RADIUS
+            || p.0 > max.0 + HIT_RADIUS
+            || p.1 < min.1 - HIT_RADIUS
+            || p.1 > max.1 + HIT_RADIUS
+        {
+            continue;
+        }
+
         let mut min_dist = f32::INFINITY;
-        for i in 1..=SAMPLES {
-            let t = i as f32 / SAMPLES as f32;
-            let p = cubic_bezier_point(t, (sx, sy), c1, c2, (tx, ty));
-            min_dist = min_dist.min(point_segment_distance(px_pointer, prev, p));
-            prev = p;
+        for s in &segments {
+            let mut prev = s.p0;
+            for k in 1..=SAMPLES_PER_SEGMENT {
+                let t = k as f32 / SAMPLES_PER_SEGMENT as f32;
+                let q = cubic_bezier_point(t, s.p0, s.c1, s.c2, s.p1);
+                min_dist = min_dist.min(point_segment_distance(p, prev, q));
+                prev = q;
+            }
         }
         if min_dist <= HIT_RADIUS {
             match &best {
@@ -109,36 +263,4 @@ pub(crate) fn point_segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)
     let dx = p.0 - cx;
     let dy = p.1 - cy;
     (dx * dx + dy * dy).sqrt()
-}
-
-/// Paint a smooth horizontal cubic bezier from `source` to `target` (both in
-/// canvas-local coordinates), shifted by `canvas_origin` into window space.
-/// `dashed` selects the thinner, dashed stroke used for drafts and delayed
-/// edges.
-pub(crate) fn paint_bezier(
-    canvas_origin: Point<Pixels>,
-    source: Point<Pixels>,
-    target: Point<Pixels>,
-    color: Hsla,
-    dashed: bool,
-    window: &mut Window,
-) {
-    // `source` and `target` are in canvas-local coordinates; shift to window.
-    let s = point(canvas_origin.x + source.x, canvas_origin.y + source.y);
-    let t = point(canvas_origin.x + target.x, canvas_origin.y + target.y);
-
-    // Smooth horizontal cubic with control points pulled outward.
-    let sx = f32::from(s.x);
-    let tx = f32::from(t.x);
-    let dx = (tx - sx).abs().max(40.0) * 0.5;
-    let c1 = point(px(sx + dx), s.y);
-    let c2 = point(px(tx - dx), t.y);
-
-    let stroke = if dashed { px(1.0) } else { px(1.5) };
-    let mut path = PathBuilder::stroke(stroke);
-    path.move_to(s);
-    path.cubic_bezier_to(t, c1, c2);
-    if let Ok(p) = path.build() {
-        window.paint_path(p, color);
-    }
 }
