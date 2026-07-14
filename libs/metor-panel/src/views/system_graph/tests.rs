@@ -5,6 +5,8 @@ use metor_fsw_2::ir::{
     SystemSpec, Wiring,
 };
 
+use crate::graph_layout::Direction;
+
 use super::layout::{GraphNodeKind, layout};
 
 fn base_wiring() -> Wiring {
@@ -58,7 +60,7 @@ fn frame_chain_layers_left_to_right() {
     w.systems = vec![system("a", None), system("b", None), system("c", None)];
     w.edges = vec![frame_edge("a", "b", false), frame_edge("b", "c", false)];
 
-    let g = layout(&w, &no_collapse());
+    let g = layout(&w, &no_collapse(), Direction::LeftRight);
     assert_eq!(g.node("a").unwrap().layer, 0);
     assert_eq!(g.node("b").unwrap().layer, 1);
     assert_eq!(g.node("c").unwrap().layer, 2);
@@ -76,11 +78,11 @@ fn cycle_broken_by_delayed_edge_is_deterministic() {
     w.systems = vec![system("a", None), system("b", None)];
     w.edges = vec![frame_edge("a", "b", false), frame_edge("b", "a", true)];
 
-    let g1 = layout(&w, &no_collapse());
+    let g1 = layout(&w, &no_collapse(), Direction::LeftRight);
     assert_eq!(g1.node("a").unwrap().layer, 0);
     assert_eq!(g1.node("b").unwrap().layer, 1);
 
-    let g2 = layout(&w, &no_collapse());
+    let g2 = layout(&w, &no_collapse(), Direction::LeftRight);
     for id in ["a", "b"] {
         assert_eq!(g1.node(id).unwrap().layer, g2.node(id).unwrap().layer);
         assert_eq!(g1.node(id).unwrap().pos, g2.node(id).unwrap().pos);
@@ -113,14 +115,14 @@ fn collapsing_scope_aggregates_members_and_reroutes_edges() {
     ];
 
     // Expanded: three real nodes, both edges.
-    let expanded = layout(&w, &no_collapse());
+    let expanded = layout(&w, &no_collapse(), Direction::LeftRight);
     assert_eq!(expanded.nodes.len(), 3);
     assert_eq!(expanded.edges.len(), 2);
 
     // Collapsed: one group node ("adcs") + "outside".
     let mut collapsed = BTreeSet::new();
     collapsed.insert("adcs".to_string());
-    let g = layout(&w, &collapsed);
+    let g = layout(&w, &collapsed, Direction::LeftRight);
 
     assert!(g.node("inner_a").is_none());
     assert!(g.node("inner_b").is_none());
@@ -140,7 +142,7 @@ fn collapsing_scope_aggregates_members_and_reroutes_edges() {
 fn coordinator_node_only_when_referenced() {
     let mut w = base_wiring();
     w.systems = vec![system("slotless", None)];
-    let without = layout(&w, &no_collapse());
+    let without = layout(&w, &no_collapse(), Direction::LeftRight);
     assert!(without.node("coordinator").is_none());
 
     w.slots = vec![SlotSpec {
@@ -162,7 +164,7 @@ fn coordinator_node_only_when_referenced() {
         kind: EdgeKind::Frame,
         src: None,
     }];
-    let with = layout(&w, &no_collapse());
+    let with = layout(&w, &no_collapse(), Direction::LeftRight);
     let coord = with.node("coordinator").expect("coordinator referenced");
     assert_eq!(coord.kind, GraphNodeKind::Coordinator);
 }
@@ -182,7 +184,7 @@ fn msg_edges_excluded_from_layering() {
         kind: EdgeKind::Msg,
         src: None,
     }];
-    let g = layout(&w, &no_collapse());
+    let g = layout(&w, &no_collapse(), Direction::LeftRight);
     // No frame skeleton edge, so both stay at layer 0.
     assert_eq!(g.node("a").unwrap().layer, 0);
     assert_eq!(g.node("b").unwrap().layer, 0);
