@@ -15,7 +15,7 @@ ARTIFACT = Artifact(
     id="seqs",
     crate="adcs-sequences",
     lib="adcs_sequences",
-    manifest_hash="sha256:e966cd494cb3b565f1140fcdf834422e213d41d647a85ed33e046351c82112ed",
+    manifest_hash="sha256:c31b3836e4d9c512d1d99caeede8dca410d0c118083b7b58fdae84bb3ff6360d",
 )
 
 
