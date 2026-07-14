@@ -32,10 +32,9 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use metor_fsw_2::{
-    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Frame,
-    InitialOccupant, Input, MsgIn, OccupantBacking, Out, Output, PortRef, SequenceStatus,
-    SlotStatus, StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState,
-    split_record,
+    BuildSystem, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Frame, Input, MsgIn, Out,
+    Output, PortRef, SequenceStatus, SlotStatus, StopReason, System, SystemHealth, SystemInput,
+    SystemOutput, WorkerRunState, split_record,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -160,6 +159,13 @@ impl CyclicSystem for Ticker {
     }
 }
 
+impl BuildSystem for Ticker {
+    type Params = ();
+    fn new(_params: ()) -> Self {
+        Ticker { n: 0 }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixture build/locate (as in dl_integration.rs)
 // ---------------------------------------------------------------------------
@@ -268,47 +274,57 @@ fn kill9(pid: u32) {
 // ---------------------------------------------------------------------------
 
 fn lockstep_end_to_end(lib_path: &Path) {
+    use metor_fsw_2::wiring::{Registry, resolve};
+    use metor_fsw_2::{ClockSpec, CoordinatorSpec, WiringBuilder};
+
     let desc = proc_descriptor(lib_path, "DlCounter");
     assert_eq!(desc.name, "DlCounter");
     assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
     assert_eq!(desc.outputs.len(), 4, "out + events + health + log");
 
-    let mut b = Coordinator::builder(CoordinatorConfig {
-        cycle_rate: 200.0,
-        default_depth: 8,
-        clock: ClockMode::Simulated {
-            dt: std::time::Duration::from_millis(5),
-        },
-        ..CoordinatorConfig::default()
-    });
-    let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
-    // The process system, plus the same fixture dlopen'd in-process: all
-    // three loading modes coexist in one graph over one producer.
-    let proc_sys = b.add_proc_cyclic(
-        "proc_counter",
-        desc,
-        lib_path.to_path_buf(),
-        "DlCounter",
-        counter_params(),
-    );
-    let dl_twin = metor_fsw_2::DlPack::open(lib_path)
-        .expect("dlopen the fixture in-process")
-        .system("DlCounter")
-        .expect("select the counter entry");
-    let dl_sys = b.add_dl_cyclic("dl_obs", dl_twin, counter_params());
-    b.connect(
-        PortRef::new::<TickIn>(ticker),
-        PortRef::new::<TickIn>(proc_sys),
-    )
-    .expect("ticker -> proc edge");
-    b.connect(
-        PortRef::new::<TickIn>(ticker),
-        PortRef::new::<TickIn>(dl_sys),
-    )
-    .expect("ticker -> dl edge");
+    // A static producer, the same fixture entry run as a process system, and
+    // the same entry dlopen'd in-process: all three loading modes coexist in
+    // one graph over one producer. Resolve describes the process system via a
+    // worker (never dlopening it here) and opens the in-process one directly.
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(CoordinatorSpec {
+            cycle_rate: 200.0,
+            default_depth: Some(8),
+            clock: ClockSpec::Simulated { dt_secs: 0.005 },
+        })
+        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .system("ticker")
+        .ty("Ticker")
+        .from_static()
+        .end()
+        .system("proc_counter")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .process()
+        .params(CounterParams {
+            start: 1000,
+            scale: 1.0,
+        })
+        .end()
+        .system("dl_obs")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .params(CounterParams {
+            start: 1000,
+            scale: 1.0,
+        })
+        .end()
+        .connect("ticker", "tick_in", "proc_counter", "tick_in")
+        .connect("ticker", "tick_in", "dl_obs", "tick_in")
+        .build();
+    // `main` already built and located the fixture; fill the path in place of
+    // the build driver.
+    wiring.artifacts[0].path = Some(lib_path.to_path_buf());
+    let mut registry = Registry::new();
+    registry.register::<Ticker, _>("Ticker");
 
-    // build() spawns the worker and waits for it to attach.
-    let mut coord = b.build().expect("build spawns and attaches the worker");
+    // resolve's `build()` spawns the worker and waits for it to attach.
+    let mut coord = resolve(&wiring, &registry).expect("resolve spawns and attaches the worker");
     let spawned = child_pids();
     assert_eq!(spawned.len(), 1, "exactly one worker child: {spawned:?}");
 
@@ -393,6 +409,13 @@ fn lockstep_end_to_end(lib_path: &Path) {
 // ---------------------------------------------------------------------------
 // Test 2: SIGKILL the worker mid-run
 // ---------------------------------------------------------------------------
+//
+// Tests 2 and 3 stay on `Coordinator::builder`: they pin the worker
+// restart/timeout policy (`proc_max_restarts`, `proc_step_timeout`,
+// `proc_restart_backoff`), which lives on `CoordinatorConfig` but has no mirror
+// on the `Wiring` IR's `CoordinatorSpec`, so the resolve path cannot set it.
+// They can only move off the builder once the IR carries that policy (a WP4
+// concern); see the WP3 report.
 
 fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     let desc = proc_descriptor(lib_path, "DlCounter");
@@ -676,33 +699,16 @@ fn event_token(kind: &SequenceEventKind) -> String {
     }
 }
 
-/// One allowed occupant behind an artifact backing, its descriptor sourced
-/// exactly as `resolve` sources it: a describe worker, never a host dlopen.
-/// The occupant name is the pack entry name; a Load spawns a worker that
-/// instantiates exactly that entry.
-fn artifact_occ(name: &str, seq_lib: &Path) -> AllowedOccupant {
-    let descriptor = proc_descriptor(seq_lib, name);
-    assert_eq!(descriptor.name, name);
-    AllowedOccupant {
-        name: name.to_string(),
-        params: Vec::new(),
-        descriptor,
-        backing: OccupantBacking::Artifact(seq_lib.to_path_buf()),
-    }
-}
-
 /// A simulated clock advancing 1 ns per cycle, so the waiter fixture's 2 µs
 /// wait spans ~2000 cycles — a wide mid-run window to kill or abort into
-/// (under a wall clock it elapses within one cycle).
-fn slow_sim_config() -> CoordinatorConfig {
-    CoordinatorConfig {
+/// (under a wall clock it elapses within one cycle). The `Wiring` IR carries
+/// no `proc_step_timeout`, so the process-slot tests run on the coordinator
+/// default; death detection is a touch slower but well inside their deadlines.
+fn slow_sim_coordinator() -> metor_fsw_2::CoordinatorSpec {
+    metor_fsw_2::CoordinatorSpec {
         cycle_rate: 1000.0,
-        default_depth: 8,
-        clock: ClockMode::Simulated {
-            dt: Duration::from_nanos(1),
-        },
-        proc_step_timeout: Duration::from_millis(50),
-        ..CoordinatorConfig::default()
+        default_depth: Some(8),
+        clock: metor_fsw_2::ClockSpec::Simulated { dt_secs: 1e-9 },
     }
 }
 
@@ -857,18 +863,21 @@ fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
 // ---------------------------------------------------------------------------
 
 fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
-    let mut b = Coordinator::builder(slow_sim_config());
-    let slot = b.add_slot(
-        "adcs",
-        vec![artifact_occ("waiter", seq_lib)],
-        Some(InitialOccupant::loaded("waiter")),
-    ).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the process-slot graph builds");
+    use metor_fsw_2::wiring::{Registry, resolve};
+    use metor_fsw_2::{SlotInitState, WiringBuilder};
+
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(slow_sim_coordinator())
+        .artifact("seqs", "metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture")
+        .slot("adcs")
+        .process()
+        .allow("waiter")
+        .initial("waiter", SlotInitState::Loaded)
+        .end()
+        .connect_msg("coordinator", "adcs", "SequenceCommand")
+        .build();
+    wiring.artifacts[0].path = Some(seq_lib.to_path_buf());
+    let mut coord = resolve(&wiring, &Registry::new()).expect("the process-slot graph resolves");
     // The initial occupant loads at init (inside the barrier), not at build.
     assert!(child_pids().is_empty(), "a process slot spawns per Load, not at build");
 
@@ -985,18 +994,21 @@ fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
 // ---------------------------------------------------------------------------
 
 fn proc_slot_abort_crosses_the_boundary(seq_lib: &Path) {
-    let mut b = Coordinator::builder(slow_sim_config());
-    let slot = b.add_slot(
-        "adcs",
-        vec![artifact_occ("waiter", seq_lib)],
-        Some(InitialOccupant::running("waiter")),
-    ).unwrap();
-    b.connect(
-        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
-        PortRef::msg::<SequenceCommand>(slot),
-    )
-    .expect("the coordinator command edge connects");
-    let mut coord = b.build().expect("the process-slot graph builds");
+    use metor_fsw_2::wiring::{Registry, resolve};
+    use metor_fsw_2::{SlotInitState, WiringBuilder};
+
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(slow_sim_coordinator())
+        .artifact("seqs", "metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture")
+        .slot("adcs")
+        .process()
+        .allow("waiter")
+        .initial("waiter", SlotInitState::Running)
+        .end()
+        .connect_msg("coordinator", "adcs", "SequenceCommand")
+        .build();
+    wiring.artifacts[0].path = Some(seq_lib.to_path_buf());
+    let mut coord = resolve(&wiring, &Registry::new()).expect("the process-slot graph resolves");
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
