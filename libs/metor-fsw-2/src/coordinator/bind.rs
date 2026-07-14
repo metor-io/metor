@@ -20,13 +20,13 @@ use crate::port::Input;
 use crate::registry::Registry;
 use crate::sequence::{SequenceStatus, SlotControlIn};
 
+use super::init::{
+    AsyncPlumbing, ConsEdges, DlReg, Node, ProcReg, RingAlloc, SystemBind, owned_writer,
+};
 use super::slot::{
     self, AllowedOccupant, OccupantBacking, SlotReg, SlotRunner, SlotStatus, slot_writer,
 };
-use super::{
-    AsyncPlumbing, BoundSystems, ConsEdges, CoordinatorPorts, CoordinatorStatus, CyclicSlot, DlReg,
-    PendingAsync, ProcReg, Reg, Registration, RingAlloc, SlotState, WireError, owned_writer,
-};
+use super::{BoundSystems, CoordinatorPorts, CoordinatorStatus, CyclicSlot, PendingAsync, WireError};
 
 /// What the proc bind arm needs beyond the shared alloc products: the step
 /// deadline and the worker-executable override, both builder-scoped.
@@ -92,7 +92,7 @@ fn bind_static_io(
 /// and walk them with a [`Binder`]. Only the proc arm can fail (its worker
 /// spawn is the one bind-time step that leaves the process).
 pub(super) fn bind_systems(
-    systems: Vec<Registration>,
+    systems: Vec<Node>,
     cons_edges: &ConsEdges,
     alloc: &RingAlloc,
     plumbing: &mut AsyncPlumbing,
@@ -102,35 +102,36 @@ pub(super) fn bind_systems(
     let mut cyclic: Vec<Box<dyn CyclicSlot>> = Vec::new();
     let mut pending_async: Vec<PendingAsync> = Vec::new();
     // The coordinator's own (#0) ports, wrapped by its bind arm below and
-    // unwrapped after the loop (`Reg::Coordinator` is always registered first).
+    // unwrapped after the loop (`SystemBind::Coordinator` is always registered first).
     let mut coord: Option<CoordinatorPorts> = None;
-    for (id, registration) in systems.into_iter().enumerate() {
-        let Registration { reg, desc, name } = registration;
-        match reg {
-            Reg::Coordinator => {
+    for (id, node) in systems.into_iter().enumerate() {
+        let Node { bind, desc, name } = node;
+        match bind {
+            SystemBind::Coordinator => {
                 coord = Some(bind_coordinator(id, &desc, cons_edges, &alloc.output_rings))
             }
-            Reg::Dl(dl) => cyclic.push(Box::new(bind_dl(
+            SystemBind::Dl(dl) => cyclic.push(Box::new(bind_dl(
                 id,
                 dl,
                 &desc,
                 cons_edges,
                 &alloc.output_rings,
             ))),
-            Reg::Proc(proc_reg) => cyclic.push(bind_proc(
+            SystemBind::Proc(proc_reg) => cyclic.push(bind_proc(
                 id, proc_reg, &desc, name, cons_edges, alloc, proc_ctx,
             )?),
-            Reg::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
+            SystemBind::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
                 id, slot_reg, &desc, cons_edges, alloc, proc_ctx,
             )?)),
             // The static (host-side) kinds: build typed `BoundPort`s
-            // (`bind_static_io`) and walk them with a `Binder`.
-            Reg::Cyclic(r) => {
+            // (`bind_static_io`) and walk them with a `Binder`. A pack entry
+            // rides this arm too (via `PendingDriver`).
+            SystemBind::Cyclic(r) => {
                 let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
                 let mut binder = Binder::new(&outs, &ins, registry.clone());
                 cyclic.push(r.bind(&mut binder));
             }
-            Reg::Async(r) => {
+            SystemBind::Async(r) => {
                 let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
                 let mut binder = Binder::new(&outs, &ins, registry.clone());
                 pending_async.push(PendingAsync {
@@ -138,24 +139,13 @@ pub(super) fn bind_systems(
                     wake_on_stop: std::mem::take(&mut plumbing.async_wakes[id]),
                 });
             }
-            Reg::Pack(p) => {
-                let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
-                let mut binder = Binder::new(&outs, &ins, registry.clone());
-                let mut src = crate::binder::AnySource::Host(&mut binder);
-                let driver = (p.pending)(&mut src, crate::pack::Mount::Wired);
-                cyclic.push(Box::new(crate::pack::DriverSlot {
-                    driver,
-                    name: p.entry_name,
-                    state: SlotState::Running,
-                }));
-            }
         }
     }
 
     Ok(BoundSystems {
         cyclic,
         pending_async,
-        // Always registered by CoordinatorBuilder::new, so the unwrap is structural.
+        // Always registered by InitGraph::new, so the unwrap is structural.
         coord: coord.expect("coordinator #0 bound its ports"),
     })
 }
