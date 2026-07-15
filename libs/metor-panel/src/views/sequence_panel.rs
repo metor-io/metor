@@ -158,17 +158,18 @@ pub(crate) fn channel_control_rows(
             }),
         )));
     }
-    rows.push(Box::new(CommandRow::new(
-        "Start",
-        Arc::new({
+    if let SequenceRunState::Idle = run_state {
+        rows.push(Box::new(CommandRow::new(
+            "Start",
+            Arc::new({
             let channel = channel.clone();
-            move |_window, cx| {
+move |_window, cx| {
                 if let Some(store) = sequences::try_global(cx) {
                     store.read(cx).start(&channel);
                 }
-            }
-        }),
-    )));
+            }}),
+        )));
+    }
     rows.push(Box::new(CommandRow::new(
         "Abort",
         Arc::new({
@@ -404,6 +405,7 @@ impl SequenceView {
             }
         }));
 
+        let startable = matches!(ch.run_state, SequenceRunState::Idle);
         let start_btn = pill_button(theme, ("seq-start", ix), "Start").on_click(cx.listener({
             let name = name.clone();
             move |this, _, _, cx| {
@@ -429,7 +431,9 @@ impl SequenceView {
         let stop_label = if arming { "Confirm stop" } else { "Stop" };
         let stop_btn = pill_button(theme, ("seq-stop", ix), stop_label)
             .text_color(theme.error_accent)
-            .when(arming, |el| el.bg(theme.run_state_tint(run_state_index(SequenceRunState::Failed))))
+            .when(arming, |el| {
+                el.bg(theme.run_state_tint(run_state_index(SequenceRunState::Failed)))
+            })
             .on_click(cx.listener({
                 let name = name.clone();
                 move |this, _, _, cx| {
@@ -499,7 +503,7 @@ impl SequenceView {
                     .gap_1()
                     .child(load_btn)
                     .when(resettable, |el| el.child(reset_btn))
-                    .child(start_btn)
+                    .when(startable, |el| el.child(start_btn))
                     .child(abort_btn)
                     .child(stop_btn),
             )

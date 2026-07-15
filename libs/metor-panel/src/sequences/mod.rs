@@ -21,8 +21,8 @@ use gpui::{App, Context, Entity, Global, SharedString, Task, prelude::*};
 use metor_db::DB;
 use metor_proto::types::{Msg, Timestamp};
 use metor_proto_wkt::{
-    ReloadSequences, SequenceChannelEvent, SequenceCommand, SequenceCommandKind,
-    SequenceEventKind, SequenceRegistry, SequenceRunState,
+    ReloadSequences, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+    SequenceRegistry, SequenceRunState,
 };
 
 use crate::msg_ingest::{IngestSource, ingest_all};
@@ -223,12 +223,14 @@ pub fn run_state_index(run_state: SequenceRunState) -> usize {
     }
 }
 
-/// Whether a channel in this run state may be reset to the beginning. Reset is only offered
-/// from a terminal `Completed`/`Aborted` state (the control system enforces the same guard).
+/// Whether a channel in this run state may be reset to the beginning.
 pub fn is_resettable(run_state: SequenceRunState) -> bool {
     matches!(
         run_state,
-        SequenceRunState::Completed | SequenceRunState::Aborted
+        SequenceRunState::Completed
+            | SequenceRunState::Aborted
+            | SequenceRunState::Stopped
+            | SequenceRunState::Failed
     )
 }
 
@@ -277,10 +279,9 @@ impl SequenceStore {
                     IngestSource::new(SequenceRegistry::ID, |store: &mut Self, ts, reg| {
                         store.state.apply_registry(ts, reg)
                     }),
-                    IngestSource::new(
-                        SequenceChannelEvent::ID,
-                        |store: &mut Self, ts, ev| store.state.apply_event(ts, ev),
-                    ),
+                    IngestSource::new(SequenceChannelEvent::ID, |store: &mut Self, ts, ev| {
+                        store.state.apply_event(ts, ev)
+                    }),
                 ];
                 ingest_all(db, sources, this, cx).await
             }
@@ -303,7 +304,9 @@ impl SequenceStore {
             command,
         };
         if let Ok(bytes) = postcard::to_allocvec(&cmd) {
-            let _ = self.db.push_msg(Timestamp::now(), SequenceCommand::ID, &bytes);
+            let _ = self
+                .db
+                .push_msg(Timestamp::now(), SequenceCommand::ID, &bytes);
         }
     }
 

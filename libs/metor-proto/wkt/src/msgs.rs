@@ -552,6 +552,16 @@ pub struct UpdateComponent {
 }
 
 #[cfg(feature = "nox")]
+impl UpdateComponent {
+    pub fn new(id: impl Into<ComponentId>, value: impl Into<crate::ComponentValue>) -> Self {
+        Self {
+            id: id.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[cfg(feature = "nox")]
 impl Msg for UpdateComponent {
     const ID: PacketId = [224, 36];
 }
@@ -714,32 +724,42 @@ pub enum SequenceRunState {
 /// A single transition in a channel's lifecycle. Events arrive in order through one log,
 /// so the per-channel state machine (`Loaded` → `Started` → `Progress`* → terminal) is
 /// totally ordered.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceEventKind {
     /// A sequence was loaded into the channel.
-    Loaded { name: SequenceName },
+    Loaded {
+        name: SequenceName,
+    },
     /// The channel's loaded sequence was cleared.
     Unloaded,
     Started,
     /// The sequence made progress — sent a message, advanced a step, etc. The `detail`
     /// becomes the channel's latest status line.
-    Progress { detail: String },
+    Progress {
+        detail: String,
+    },
     /// Hard-stopped (dropped). May have left the system in an unsafe state.
     Stopped,
     /// Commanded safe-termination ran to completion.
     Aborted,
     Completed,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     /// An occupant load began; the matching `Loaded` reports its completion. Emitted only
     /// when the load has a real window (a process occupant's spawn + bind); in-process
     /// loads complete synchronously, so consumers may see a `Loaded` with no preceding
     /// `Loading`.
-    Loading { name: SequenceName },
+    Loading {
+        name: SequenceName,
+    },
     /// A command was rejected by the channel's state machine and changed nothing —
     /// e.g. `Load` while running, or `Start` with no live occupant. Unlike `Failed`
     /// this is not a run-state transition; the channel stays where it was.
-    Refused { reason: String },
+    Refused {
+        reason: String,
+    },
 }
 
 /// A granular per-channel state update, broadcast by the control system (control → panel).
@@ -760,7 +780,9 @@ impl Msg for SequenceChannelEvent {
 #[serde(rename_all = "snake_case")]
 pub enum SequenceCommandKind {
     /// Load the named sequence into the channel.
-    Load { name: SequenceName },
+    Load {
+        name: SequenceName,
+    },
     Start,
     /// Commanded safe-termination.
     Abort,
@@ -1213,8 +1235,7 @@ mod sequence_tests {
             postcard::to_allocvec(&registry).unwrap(),
             // 1 channel; name "adcs" (len 4); 1 available; "detumble" (len 8).
             [
-                1, 4, b'a', b'd', b'c', b's', 1, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l',
-                b'e'
+                1, 4, b'a', b'd', b'c', b's', 1, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l', b'e'
             ]
         );
 
@@ -1239,8 +1260,7 @@ mod sequence_tests {
             // channel "adcs"; kind variant 8 (Loading, appended after Failed so the
             // earlier variants keep their wire form); name "detumble" (len 8).
             [
-                4, b'a', b'd', b'c', b's', 8, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l',
-                b'e'
+                4, b'a', b'd', b'c', b's', 8, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l', b'e'
             ]
         );
 

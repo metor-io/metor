@@ -10,7 +10,6 @@ use crate::inspector::edits::{
 use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegistry};
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
-use crate::views::time_series::time_range::GlobalTimeRange;
 use crate::tiles::panels::{
     AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, SequenceGridPanel,
     SequencePanel, TablePanel, TextPanel, TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel,
@@ -18,6 +17,7 @@ use crate::tiles::panels::{
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
+use crate::views::time_series::time_range::GlobalTimeRange;
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
     Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
@@ -163,7 +163,8 @@ impl AppRoot {
             .leader
             .clone()
             .into();
-        let nodes = crate::transient::menu::default_menu(self.db.clone(), self.tiles.clone(), on_open);
+        let nodes =
+            crate::transient::menu::default_menu(self.db.clone(), self.tiles.clone(), on_open);
         let parent_focus = self.focus_handle.clone();
         let transient = cx.new(|cx| {
             let mut t = crate::transient::Transient::new(leader, nodes, cx);
@@ -461,9 +462,25 @@ impl Render for AppRoot {
             root = root.child(preview.inspector.clone());
         }
 
+        // Consumer-supplied overlays, mounted last so they draw over everything.
+        // Each is an opaque view the consumer built at startup (e.g. a modal that
+        // renders nothing until its own state says otherwise).
+        if let Some(overlays) = cx.try_global::<OverlayViews>() {
+            for view in &overlays.0 {
+                root = root.child(view.clone());
+            }
+        }
+
         crate::window_controls::client_side_decorations(root, window, cx)
     }
 }
+
+/// Consumer-supplied root overlays, installed via [`PanelApp::overlay`] and read
+/// by [`AppRoot::render`]. Held in a global because overlays are built before the
+/// window (and thus `AppRoot`) exists.
+struct OverlayViews(Vec<gpui::AnyView>);
+
+impl gpui::Global for OverlayViews {}
 
 impl AppRoot {
     /// Active-alarm summary shown on the left of the title bar; clicking opens the alarm
@@ -736,6 +753,7 @@ pub struct PanelApp {
     remote_addr: Option<SocketAddr>,
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
+    overlays: Vec<Box<dyn FnOnce(&mut App) -> gpui::AnyView>>,
 }
 
 impl PanelApp {
@@ -747,7 +765,23 @@ impl PanelApp {
             remote_addr: None,
             command_providers: Vec::new(),
             init_hooks: Vec::new(),
+            overlays: Vec::new(),
         }
+    }
+
+    /// Mount a consumer-built view over the window root. `build` runs at startup
+    /// (with `&mut App`, after the built-in registries exist) and returns any
+    /// [`Render`] entity as an [`AnyView`](gpui::AnyView); it is drawn above the
+    /// tile tree and inspector every frame. The consumer owns the view's state
+    /// and updates — a modal that renders nothing until shown, say. Call more
+    /// than once to stack overlays in insertion order.
+    pub fn overlay<V, F>(mut self, build: F) -> Self
+    where
+        V: Render,
+        F: FnOnce(&mut App) -> Entity<V> + 'static,
+    {
+        self.overlays.push(Box::new(move |cx| build(cx).into()));
+        self
     }
 
     /// Boot the metor-db wire-protocol server on `addr` in a background task
@@ -811,6 +845,7 @@ impl PanelApp {
             remote_addr,
             command_providers,
             init_hooks,
+            overlays,
         } = self;
 
         if let Some(addr) = server_addr {
@@ -852,6 +887,7 @@ impl PanelApp {
 
         let mut command_providers = Some(command_providers);
         let mut init_hooks = Some(init_hooks);
+        let mut overlays = Some(overlays);
         Application::new()
             .with_assets(crate::icons::IconAssets)
             .run(move |cx: &mut App| {
@@ -885,15 +921,23 @@ impl PanelApp {
                 crate::wiring::WiringStore::init(db.clone(), cx);
                 register_pane_item_deserializers(db.clone(), cx);
 
-                // Consumer extensions: register custom palette providers, then
-                // run init hooks. Both happen after the built-in registries
-                // exist so hooks can call into any of them.
+                // Consumer extensions: register custom palette providers, run
+                // init hooks, then build overlays. All happen after the built-in
+                // registries exist so they can call into any of them; overlays
+                // run last so they can rely on anything a hook installed.
                 for (category, provider) in command_providers.take().unwrap_or_default() {
                     ItemRegistry::register(cx, category, provider);
                 }
                 for hook in init_hooks.take().unwrap_or_default() {
                     hook(cx);
                 }
+                let built: Vec<gpui::AnyView> = overlays
+                    .take()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|build| build(cx))
+                    .collect();
+                cx.set_global(OverlayViews(built));
 
                 set_dock_icon();
                 // `secondary-` resolves to cmd on macOS and ctrl elsewhere
