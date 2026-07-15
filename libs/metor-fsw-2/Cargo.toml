@@ -26,6 +26,7 @@ metor-fsw-ring = { path = "ring", default-features = false, features = ["async",
 memmap2 = "0.9"
 
 # async
+futures-lite = "2.5.0"
 stellarator = { path = "../stellarator" }
 thingbuf = "0.1.6"
 

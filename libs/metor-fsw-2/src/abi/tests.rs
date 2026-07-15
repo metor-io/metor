@@ -89,7 +89,7 @@ impl System for Counter {
 impl CyclicSystem for Counter {
     fn execute(&mut self, now: Timestamp, input: &mut CounterIn, output: &mut Out<CounterOut>) {
         let value = match input.tick.latest() {
-            Some(t) => t.get().value,
+            Ok(Some(t)) => t.get().value,
             _ => {
                 output.health().error("no_tick");
                 return;
@@ -267,7 +267,10 @@ fn abi_lifecycle_end_to_end() {
     // The grant borrows the view, so read inside a scope that ends before the
     // final drop.
     {
-        let out = out_view.latest().expect("system produced an output");
+        let out = out_view
+            .latest()
+            .expect("ring readable")
+            .expect("system produced an output");
         assert_eq!(out.get().count, 105, "start(100) + value(5)");
         assert_eq!(out.get().timestamp, Timestamp(1000), "stamped with `now`");
     }
@@ -321,7 +324,13 @@ fn abi_describe_round_trips() {
     let pack = OpenPack::new();
     let mut buf: Vec<u8> = Vec::new();
     // SAFETY: live pack; the sink/ctx pair matches.
-    let rc = unsafe { run_pack_describe(pack.0, collect_bytes, &mut buf as *mut Vec<u8> as *mut c_void) };
+    let rc = unsafe {
+        run_pack_describe(
+            pack.0,
+            collect_bytes,
+            &mut buf as *mut Vec<u8> as *mut c_void,
+        )
+    };
     assert_eq!(rc, 0, "fsw_pack_describe succeeded");
 
     let manifest: PackManifest = postcard::from_bytes(&buf).expect("manifest decodes");
@@ -609,6 +618,7 @@ fn seq_abi_runs_to_done() {
     {
         let rec = status_view
             .latest()
+            .expect("status ring readable")
             .expect("a SequenceStatus record was written");
         assert_eq!(rec.run_state, Outcome::Completed.run_state());
         assert_eq!(rec.timestamp, Timestamp(2));

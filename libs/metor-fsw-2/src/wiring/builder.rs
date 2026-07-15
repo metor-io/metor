@@ -26,12 +26,9 @@
 //! `Wiring` therefore always passes [`validate`](super::validate::validate);
 //! the serde-ingested Python IR is validated instead at resolve.
 //!
-//! The static and dl system paths are two types. [`system`](WiringBuilder::system)
-//! opens a static [`SystemSpecBuilder`]; [`from_artifact`](SystemSpecBuilder::from_artifact)
-//! crosses to an [`ArtifactSystemBuilder`]. Only the artifact path exposes
-//! typed postcard [`params`](ArtifactSystemBuilder::params) and
-//! [`process`](ArtifactSystemBuilder::process), so process-without-artifact and
-//! postcard-params-on-a-static-system are unrepresentable rather than checked.
+//! [`system`](WiringBuilder::system) builds a [`SystemSpec`] directly. The same
+//! builder covers static and artifact-backed systems; the shared validator
+//! rejects invalid combinations when [`SystemSpecBuilder::end`] is called.
 
 use std::net::SocketAddr;
 
@@ -45,9 +42,8 @@ use super::validate;
 
 /// Wraps the [`Wiring`] under construction, exposing a fluent surface over its
 /// coordinator, artifacts, systems, slots, and edges. Systems and slots are
-/// declared through the [`SystemSpecBuilder`]/[`ArtifactSystemBuilder`] and
-/// [`SlotSpecBuilder`] sub-builders; everything else chains directly on this
-/// type. [`build`](Self::build) is a field move.
+/// declared through [`SystemSpecBuilder`] and [`SlotSpecBuilder`] sub-builders;
+/// everything else chains directly on this type.
 pub struct WiringBuilder {
     wiring: Wiring,
 }
@@ -113,8 +109,7 @@ impl WiringBuilder {
         lib_stem: impl AsRef<str>,
     ) -> Self {
         let id = id.into();
-        validate::check_artifact_id_available(&self.wiring, &id)
-            .unwrap_or_else(|e| panic!("{e}"));
+        validate::check_artifact_id_available(&self.wiring, &id).unwrap_or_else(|e| panic!("{e}"));
         self.wiring.artifacts.push(Artifact {
             id,
             crate_name: crate_name.into(),
@@ -126,15 +121,19 @@ impl WiringBuilder {
         self
     }
 
-    /// Begins a static system instance named `name`, returning a
-    /// [`SystemSpecBuilder`]; cross to [`from_artifact`](SystemSpecBuilder::from_artifact)
-    /// for a loaded one. Either flows back through `end`.
+    /// Begins a system instance named `name`.
     pub fn system(self, name: impl Into<String>) -> SystemSpecBuilder {
         SystemSpecBuilder {
             parent: self,
-            name: name.into(),
-            ty: None,
-            params: ParamSource::None,
+            spec: SystemSpec {
+                name: name.into(),
+                ty: None,
+                artifact: None,
+                params: ParamSource::None,
+                process: false,
+                src: None,
+                scope: None,
+            },
         }
     }
 
@@ -281,68 +280,29 @@ impl SlotSpecBuilder {
     /// name. Use [`allow_from`](Self::allow_from) to name the artifact and
     /// [`allow_with_params`](Self::allow_with_params) to attach typed
     /// defaults.
-    pub fn allow(mut self, occupant: impl Into<String>) -> Self {
-        self.spec.allow.push(AllowedOccupantSpec {
-            occupant: occupant.into(),
-            artifact: None,
-            params: ParamSource::None,
-            src: None,
-        });
-        self
+    pub fn allow(self, occupant: impl Into<String>) -> Self {
+        self.push_allowed(occupant.into(), None, ParamSource::None)
     }
 
     /// Allows the named pack entry from a specific artifact. Panics if
     /// `artifact` names no declared artifact.
-    pub fn allow_from(
-        mut self,
-        occupant: impl Into<String>,
-        artifact: impl Into<String>,
-    ) -> Self {
+    pub fn allow_from(self, occupant: impl Into<String>, artifact: impl Into<String>) -> Self {
         let artifact = artifact.into();
         validate::check_artifact_declared(&self.parent.wiring, &self.spec.name, &artifact)
             .unwrap_or_else(|e| panic!("{e}"));
-        self.spec.allow.push(AllowedOccupantSpec {
-            occupant: occupant.into(),
-            artifact: Some(artifact),
-            params: ParamSource::None,
-            src: None,
-        });
-        self
+        self.push_allowed(occupant.into(), Some(artifact), ParamSource::None)
     }
 
-    /// Allows the named occupant with typed default params, postcard-encoded
-    /// the same way as [`ArtifactSystemBuilder::params`].
-    pub fn allow_with_params<P: Serialize>(
-        mut self,
-        occupant: impl Into<String>,
-        params: P,
-    ) -> Self {
+    /// Allows the named occupant with postcard-encoded typed default params.
+    pub fn allow_with_params<P: Serialize>(self, occupant: impl Into<String>, params: P) -> Self {
         let bytes = postcard::to_allocvec(&params)
             .expect("params postcard-encode (Serialize is infallible)");
-        self.spec.allow.push(AllowedOccupantSpec {
-            occupant: occupant.into(),
-            artifact: None,
-            params: ParamSource::Postcard(bytes),
-            src: None,
-        });
-        self
+        self.push_allowed(occupant.into(), None, ParamSource::Postcard(bytes))
     }
 
-    /// Allows the named occupant with default params as a value tree, the
-    /// [`ArtifactSystemBuilder::params_value`] twin of
-    /// [`allow_with_params`](Self::allow_with_params).
-    pub fn allow_with_value(
-        mut self,
-        occupant: impl Into<String>,
-        value: serde_json::Value,
-    ) -> Self {
-        self.spec.allow.push(AllowedOccupantSpec {
-            occupant: occupant.into(),
-            artifact: None,
-            params: ParamSource::Value(value),
-            src: None,
-        });
-        self
+    /// Allows the named occupant with default params as a value tree.
+    pub fn allow_with_value(self, occupant: impl Into<String>, value: serde_json::Value) -> Self {
+        self.push_allowed(occupant.into(), None, ParamSource::Value(value))
     }
 
     /// Declares an input frame in the slot's port contract. Every occupant is
@@ -359,9 +319,8 @@ impl SlotSpecBuilder {
     }
 
     /// Runs every occupant of this slot in its own worker process, spawned
-    /// per `Load`, instead of dlopen'ing occupants into the coordinator — the
-    /// builder twin of `process=#true` on a `slot` node
-    /// (`docs/process-slots.md`). Per-slot means all-occupants; resolve
+    /// per `Load`, instead of dlopen'ing occupants into the coordinator.
+    /// Per-slot means all-occupants; resolve
     /// describes each allowed occupant through a worker, so the host never
     /// loads their artifacts.
     pub fn process(mut self) -> Self {
@@ -388,139 +347,75 @@ impl SlotSpecBuilder {
         self.parent.wiring.slots.push(self.spec);
         self.parent
     }
+
+    fn push_allowed(
+        mut self,
+        occupant: String,
+        artifact: Option<String>,
+        params: ParamSource,
+    ) -> Self {
+        self.spec.allow.push(AllowedOccupantSpec {
+            occupant,
+            artifact,
+            params,
+            src: None,
+        });
+        self
+    }
 }
 
-/// Declares one static system instance as a [`SystemSpec`]. Returned by
-/// [`WiringBuilder::system`]; cross to a loaded system with
-/// [`from_artifact`](Self::from_artifact). It owns the parent builder, so the
-/// chain flows back through [`end`](Self::end).
+/// Builds one static or artifact-backed [`SystemSpec`].
 pub struct SystemSpecBuilder {
     parent: WiringBuilder,
-    name: String,
-    ty: Option<String>,
-    params: ParamSource,
+    spec: SystemSpec,
 }
 
 impl SystemSpecBuilder {
-    /// Sets the system type, the registry key a static system resolves under.
+    /// Sets the registry type or pack entry name.
     pub fn ty(mut self, ty: impl Into<String>) -> Self {
-        self.ty = Some(ty.into());
+        self.spec.ty = Some(ty.into());
         self
     }
 
-    /// Sets the params as a value tree ([`ParamSource::Value`]): the static
-    /// path serde-deserializes it (field defaults honored). A static system
-    /// has no postcard decode path, which is why typed
-    /// [`params`](ArtifactSystemBuilder::params) live only on the artifact
-    /// builder.
+    /// Sets params as a value tree.
     pub fn params_value(mut self, value: serde_json::Value) -> Self {
-        self.params = ParamSource::Value(value);
+        self.spec.params = ParamSource::Value(value);
         self
     }
 
-    /// Resolves this system by loading the named [`Artifact`] at run time,
-    /// crossing to the [`ArtifactSystemBuilder`]. Panics if `artifact_id`
-    /// names no declared artifact.
-    pub fn from_artifact(self, artifact_id: impl Into<String>) -> ArtifactSystemBuilder {
+    /// Loads this system from the named [`Artifact`].
+    pub fn from_artifact(mut self, artifact_id: impl Into<String>) -> Self {
         let artifact = artifact_id.into();
-        validate::check_artifact_declared(&self.parent.wiring, &self.name, &artifact)
+        validate::check_artifact_declared(&self.parent.wiring, &self.spec.name, &artifact)
             .unwrap_or_else(|e| panic!("{e}"));
-        ArtifactSystemBuilder {
-            parent: self.parent,
-            name: self.name,
-            ty: self.ty,
-            artifact,
-            params: self.params,
-            process: false,
-        }
-    }
-
-    /// Pushes this static system onto the [`Wiring`] and returns the parent
-    /// builder. Panics on a name collision or a missing `type`.
-    pub fn end(self) -> WiringBuilder {
-        let spec = SystemSpec {
-            name: self.name,
-            ty: self.ty,
-            artifact: None,
-            params: self.params,
-            process: false,
-            src: None,
-            scope: None,
-        };
-        let mut parent = self.parent;
-        validate::check_instance_available(&parent.wiring, &spec.name)
-            .unwrap_or_else(|e| panic!("{e}"));
-        validate::check_system(&spec, &parent.wiring).unwrap_or_else(|e| panic!("{e}"));
-        parent.wiring.systems.push(spec);
-        parent
-    }
-}
-
-/// Declares one loaded system instance as a [`SystemSpec`], covering its type,
-/// params, and process toggle. Reached from [`SystemSpecBuilder::from_artifact`];
-/// it owns the parent builder, so the chain flows back through
-/// [`end`](Self::end).
-pub struct ArtifactSystemBuilder {
-    parent: WiringBuilder,
-    name: String,
-    ty: Option<String>,
-    artifact: String,
-    params: ParamSource,
-    process: bool,
-}
-
-impl ArtifactSystemBuilder {
-    /// Sets the pack entry name. Optional: the artifact's `system_type` is
-    /// authoritative, so a single-entry pack needs none, and when given
-    /// resolve checks the two agree.
-    pub fn ty(mut self, ty: impl Into<String>) -> Self {
-        self.ty = Some(ty.into());
+        self.spec.artifact = Some(artifact);
         self
     }
 
-    /// Runs this system in its own worker process instead of dlopen'ing it
-    /// in-process — the builder twin of `process=#true`
-    /// (`docs/process-systems.md`).
+    /// Runs an artifact-backed system in a worker process.
     pub fn process(mut self) -> Self {
-        self.process = true;
+        self.spec.process = true;
         self
     }
 
-    /// Sets the typed params, postcard-encoded into [`ParamSource::Postcard`]
-    /// bytes. These are exactly the bytes the loaded library's `fsw_create`
-    /// decodes, and match what the Python front-end's value tree encodes to
-    /// for the same value.
+    /// Sets postcard-encoded typed params for an artifact-backed system.
     pub fn params<P: Serialize>(mut self, params: P) -> Self {
         let bytes = postcard::to_allocvec(&params)
             .expect("params postcard-encode (Serialize is infallible)");
-        self.params = ParamSource::Postcard(bytes);
+        self.spec.params = ParamSource::Postcard(bytes);
         self
     }
 
-    /// Sets the params as a value tree ([`ParamSource::Value`]), schema-encoded
-    /// against the loaded object to the same postcard bytes
-    /// [`params`](Self::params) carries.
-    pub fn params_value(mut self, value: serde_json::Value) -> Self {
-        self.params = ParamSource::Value(value);
-        self
-    }
-
-    /// Pushes this loaded system onto the [`Wiring`] and returns the parent
-    /// builder. Panics on a name collision.
+    /// Validates and adds the system, returning the parent builder.
     pub fn end(self) -> WiringBuilder {
-        let spec = SystemSpec {
-            name: self.name,
-            ty: self.ty,
-            artifact: Some(self.artifact),
-            params: self.params,
-            process: self.process,
-            src: None,
-            scope: None,
-        };
         let mut parent = self.parent;
-        validate::check_instance_available(&parent.wiring, &spec.name)
+        validate::check_instance_available(&parent.wiring, &self.spec.name)
             .unwrap_or_else(|e| panic!("{e}"));
-        parent.wiring.systems.push(spec);
+        validate::check_system(&self.spec, &parent.wiring).unwrap_or_else(|e| panic!("{e}"));
+        parent.wiring.systems.push(self.spec);
         parent
     }
 }
+
+/// Compatibility name for the artifact-backed phase of [`SystemSpecBuilder`].
+pub type ArtifactSystemBuilder = SystemSpecBuilder;

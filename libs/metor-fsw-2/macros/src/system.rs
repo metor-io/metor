@@ -10,8 +10,8 @@
 //! positional binding work, since the ring source hands out rings by cursor
 //! and each `bind(src)` call lands on the ring reserved for the matching
 //! declaration. Capability fields ride the same walk without disturbing it;
-//! their `decl()` is a `PortDecl::Capability` and their `bind` consumes no
-//! ring.
+//! their `decl()` contributes to `Declarations::capabilities` and their `bind`
+//! consumes no ring.
 //!
 //! A `PhantomData` field is skipped by both walks and default-constructed by
 //! `bind`, so a hand-written bundle can carry one for its own generics.
@@ -121,21 +121,20 @@ impl Bundle {
 
 /// Emits the `decls()` body: each field type's `decl()` in field order, with
 /// the telemetry override chained on where the attribute or the `CommandOut`
-/// sugar asks for it. The override is applied at the `PortDecl` level so the
-/// walk stays type-blind.
-fn decls_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
+/// sugar asks for it.
+fn decls_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
     let calls = bundle.ports().into_iter().map(|f| {
         let ty = &f.ty;
         let mut decl = quote! { <#ty>::decl() };
         if f.is_command_out() || f.telemetered == Some(false) {
             decl = quote! { #decl.untelemetered() };
         }
-        quote! { decls.push(#decl); }
+        quote! { declarations.push(#decl); }
     });
     quote! {
-        let mut decls = ::std::vec::Vec::new();
+        let mut declarations = #fsw2::Declarations::default();
         #(#calls)*
-        decls
+        declarations
     }
 }
 
@@ -199,7 +198,7 @@ fn expand_input(parsed: DeriveInput) -> TokenStream2 {
 
     quote! {
         impl #impl_generics #fsw2::SystemInput for #ident #ty_generics #where_clause {
-            fn decls() -> ::std::vec::Vec<#fsw2::PortDecl> {
+            fn decls() -> #fsw2::Declarations {
                 #decls
             }
         }
@@ -238,7 +237,7 @@ fn expand_output(parsed: DeriveInput) -> TokenStream2 {
 
     quote! {
         impl #impl_generics #fsw2::SystemOutput for #ident #ty_generics #where_clause {
-            fn decls() -> ::std::vec::Vec<#fsw2::PortDecl> {
+            fn decls() -> #fsw2::Declarations {
                 #decls
             }
             fn take_dropped(&mut self) -> u64 {
@@ -284,10 +283,13 @@ mod tests {
             }
         });
         assert!(
-            out.contains("decls.push(<MsgIn<GuardCmd>>::decl());"),
+            out.contains("declarations.push(<MsgIn<GuardCmd>>::decl());"),
             "{out}"
         );
-        assert!(out.contains("decls.push(<Input<Imu>>::decl());"), "{out}");
+        assert!(
+            out.contains("declarations.push(<Input<Imu>>::decl());"),
+            "{out}"
+        );
         assert!(out.contains("cmds: <MsgIn<GuardCmd>>::bind(src)"), "{out}");
         assert!(out.contains("imu: <Input<Imu>>::bind(src)"), "{out}");
     }
@@ -314,7 +316,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("decls.push(<Output<Heartbeat>>::decl());"),
+            out.contains("declarations.push(<Output<Heartbeat>>::decl());"),
             "{out}"
         );
         // Bind never chains a telemetry override.

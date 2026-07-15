@@ -16,9 +16,9 @@ use metor_proto_wkt::{ComponentMetadata, VTableMsg};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    ClockMode, CoordinatorConfig, CyclicSystem, Input, Out, Output, System,
-    SystemHealth, SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, TelemetrySystem,
-    Transport, TransportError, UplinkSystem,
+    ClockMode, CoordinatorConfig, CyclicSystem, Input, Out, Output, System, SystemHealth,
+    SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, TelemetrySystem, Transport,
+    TransportError, UplinkSystem,
 };
 
 use crate::coordinator::PortRef;
@@ -99,7 +99,7 @@ impl System for Consumer {
 
 impl CyclicSystem for Consumer {
     fn execute(&mut self, now: Timestamp, input: &mut ConsIn, o: &mut Self::Output) {
-        if let Some(imu) = input.imu.latest() {
+        if let Ok(Some(imu)) = input.imu.latest() {
             let _ = o.nav.write(&Nav {
                 timestamp: now,
                 angle: imu.get().omega,
@@ -162,7 +162,9 @@ impl Transport for MockTransport {
         while !rest.is_empty() {
             let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
             let (pkt, tail) = rest.split_at(4 + len);
-            packets.push(LenPacket { inner: pkt.to_vec() });
+            packets.push(LenPacket {
+                inner: pkt.to_vec(),
+            });
             rest = tail;
         }
         drop(packets);
@@ -217,9 +219,7 @@ fn packet_payload(pkt: &LenPacket) -> &[u8] {
 }
 
 /// Drain a view to its newest record and return a copy of the bytes, if any.
-fn drain_latest(
-    view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake>,
-) -> Option<Vec<u8>> {
+fn drain_latest(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake>) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     let mut last = None;
     while let Ok(true) = view.try_read_into(&mut buf) {
@@ -238,7 +238,16 @@ async fn registry_query_view_and_read() {
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     let c = b.push_node(cyclic_node("consumer".into(), Consumer));
-    b.connect(PortRef { system: p, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: c, port: PortId::Component(Imu::FRAME_ID) });
+    b.connect(
+        PortRef {
+            system: p,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+        PortRef {
+            system: c,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+    );
     let mut coord = b.build().unwrap();
 
     // The registry indexes every output by `ComponentId::new("<instance>.<frame>")`.
@@ -280,11 +289,23 @@ async fn telemetry_end_to_end_all() {
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     let c = b.push_node(cyclic_node("consumer".into(), Consumer));
-    b.connect(PortRef { system: p, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: c, port: PortId::Component(Imu::FRAME_ID) });
-    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
-        transport: mock,
-        mode: TelemetryMode::All,
-    })));
+    b.connect(
+        PortRef {
+            system: p,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+        PortRef {
+            system: c,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+    );
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        TelemetrySystem::new(TelemetryConfig {
+            transport: mock,
+            mode: TelemetryMode::All,
+        }),
+    ));
     let mut coord = b.build().unwrap();
     // Only Table entries are announced; Postcard entries (the coordinator's
     // `sequences` and `commands` channels) are self-describing and carry no announce.
@@ -369,10 +390,16 @@ fn two_instances_distinct_prefixes() {
 
     // Both entries share the unprefixed frame id, but their qualified keys differ
     // and their announced names carry distinct instance prefixes.
-    let crate::PortSchema::Table { frame_id: left_id, .. } = &left.desc.schema else {
+    let crate::PortSchema::Table {
+        frame_id: left_id, ..
+    } = &left.desc.schema
+    else {
         panic!("frame entry carries a Table schema");
     };
-    let crate::PortSchema::Table { frame_id: right_id, .. } = &right.desc.schema else {
+    let crate::PortSchema::Table {
+        frame_id: right_id, ..
+    } = &right.desc.schema
+    else {
         panic!("frame entry carries a Table schema");
     };
     let (_, left_meta) = left.announce().expect("Table entry announces");
@@ -398,14 +425,26 @@ async fn subset_mode_filters() {
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     let c = b.push_node(cyclic_node("consumer".into(), Consumer));
-    b.connect(PortRef { system: p, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: c, port: PortId::Component(Imu::FRAME_ID) });
-    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
-        transport: mock,
-        mode: TelemetryMode::Subset {
-            instances: vec!["producer".to_string()],
-            frames: Vec::new(),
+    b.connect(
+        PortRef {
+            system: p,
+            port: PortId::Component(Imu::FRAME_ID),
         },
-    })));
+        PortRef {
+            system: c,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+    );
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        TelemetrySystem::new(TelemetryConfig {
+            transport: mock,
+            mode: TelemetryMode::Subset {
+                instances: vec!["producer".to_string()],
+                frames: Vec::new(),
+            },
+        }),
+    ));
     let mut coord = b.build().unwrap();
     coord.run_for(20).await;
 
@@ -446,11 +485,23 @@ async fn drop_policy_never_blocks_and_counts() {
     // link must not starve it (regression: an undrained tap view stalls the
     // producer's ring for EVERY consumer, freezing the whole mission).
     let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer));
-    b.connect(PortRef { system: prod, port: PortId::Component(Imu::FRAME_ID) }, PortRef { system: cons, port: PortId::Component(Imu::FRAME_ID) });
-    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
-        transport: mock,
-        mode: TelemetryMode::All,
-    })));
+    b.connect(
+        PortRef {
+            system: prod,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+        PortRef {
+            system: cons,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+    );
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        TelemetrySystem::new(TelemetryConfig {
+            transport: mock,
+            mode: TelemetryMode::All,
+        }),
+    ));
     let mut coord = b.build().unwrap();
 
     // Tap the telemetry system's own health frame to observe its error counter,
@@ -475,7 +526,7 @@ async fn drop_policy_never_blocks_and_counts() {
         let mut nav: crate::port::Input<Nav> = crate::port::Input::new(nav_view);
         loop {
             stellarator::yield_now().await;
-            if let Some(n) = nav.latest() {
+            if let Ok(Some(n)) = nav.latest() {
                 *captured.borrow_mut() = n.get().angle;
             }
         }
@@ -515,13 +566,19 @@ async fn dead_downlink_coordinator_teardown_is_clean() {
     for round in 0..2 {
         let mut b = crate::coordinator::init::InitGraph::new(sim_config());
         b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
-        b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
-            transport: DeadTransport,
-            mode: TelemetryMode::All,
-        })));
+        b.push_node(cyclic_node(
+            "telemetry".into(),
+            TelemetrySystem::new(TelemetryConfig {
+                transport: DeadTransport,
+                mode: TelemetryMode::All,
+            }),
+        ));
         let mut coord = b.build().unwrap();
         coord.run_for(20).await;
-        assert!(coord.stopped().is_empty(), "round {round}: no system stopped");
+        assert!(
+            coord.stopped().is_empty(),
+            "round {round}: no system stopped"
+        );
         // `coord` drops here with the sender mid-backoff; the next round must
         // build and run untouched.
     }
@@ -606,7 +663,11 @@ async fn message_downlink_fifo_no_coalesce() {
     // Frame one cycle's batch exactly as the in-cycle stage does: a component
     // snapshot as a `Table`, then every drained message record in order.
     let mut batch = Vec::new();
-    append_record(&mut batch, &Wire::Table { packet_id: [9, 9] }, &[1, 2, 3, 4]);
+    append_record(
+        &mut batch,
+        &Wire::Table { packet_id: [9, 9] },
+        &[1, 2, 3, 4],
+    );
     let mut scratch = Vec::new();
     while let Ok(true) = view.try_read_into(&mut scratch) {
         append_record(&mut batch, &Wire::Msg, &scratch);
@@ -696,10 +757,8 @@ struct BurstLogOut {
 }
 
 impl SystemOutput for BurstLogOut {
-    fn decls() -> Vec<crate::PortDecl> {
-        vec![crate::PortDecl::Port(
-            crate::PortDesc::of::<Imu>().with_delivery(crate::Delivery::Log),
-        )]
+    fn decls() -> crate::Declarations {
+        vec![crate::PortDesc::of::<Imu>().with_delivery(crate::Delivery::Log)].into()
     }
 }
 
@@ -736,14 +795,20 @@ async fn table_log_entry_downlinks_every_record() {
     let rec = mock.inner.clone();
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.push_node(cyclic_node(BurstLogProducer::NAME.into(), BurstLogProducer { n: 0.0 }));
-    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
-        transport: mock,
-        mode: TelemetryMode::Subset {
-            instances: Vec::new(),
-            frames: vec!["imu".to_string()],
-        },
-    })));
+    b.push_node(cyclic_node(
+        BurstLogProducer::NAME.into(),
+        BurstLogProducer { n: 0.0 },
+    ));
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        TelemetrySystem::new(TelemetryConfig {
+            transport: mock,
+            mode: TelemetryMode::Subset {
+                instances: Vec::new(),
+                frames: vec!["imu".to_string()],
+            },
+        }),
+    ));
     let mut coord = b.build().unwrap();
     let cycles = 4;
     coord.run_for(cycles).await;
@@ -820,11 +885,14 @@ async fn uplink_subscribes_to_its_configured_ids() {
     // Configured, so the subscription is exactly the two ids, in config order.
     let subscribed = Rc::new(RefCell::new(None));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.push_node(async_node("uplink".into(), UplinkSystem::new(SubRecv {
+    b.push_node(async_node(
+        "uplink".into(),
+        UplinkSystem::new(SubRecv {
             subscribed: subscribed.clone(),
         })
         .with_msg::<ReloadSequences>()
-        .with_msg::<AlarmAck>(),));
+        .with_msg::<AlarmAck>(),
+    ));
     let mut coord = b.build().unwrap();
     coord.run_for(20).await;
     assert_eq!(
@@ -837,9 +905,12 @@ async fn uplink_subscribes_to_its_configured_ids() {
     // guessing an id.
     let subscribed = Rc::new(RefCell::new(None));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.push_node(async_node("uplink".into(), UplinkSystem::new(SubRecv {
-        subscribed: subscribed.clone(),
-    })));
+    b.push_node(async_node(
+        "uplink".into(),
+        UplinkSystem::new(SubRecv {
+            subscribed: subscribed.clone(),
+        }),
+    ));
     let mut coord = b.build().unwrap();
     coord.run_for(20).await;
     assert_eq!(
@@ -905,7 +976,7 @@ impl System for AckSink {
 impl CyclicSystem for AckSink {
     fn execute(&mut self, _now: Timestamp, input: &mut AckSinkIn, _o: &mut Self::Output) {
         let seen = &self.seen;
-        input.acks.drain(|a| seen.borrow_mut().push(a));
+        input.acks.drain(|a| seen.borrow_mut().push(a)).unwrap();
     }
 }
 
@@ -937,12 +1008,23 @@ async fn uplink_routes_alarm_acks() {
 
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let sink = b.push_node(cyclic_node(AckSink::NAME.into(), AckSink { seen: seen.clone() }));
-    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(ScriptedRecv::packets([garbage, good]))
-        .with_msg::<AlarmAck>(),));
+    let sink = b.push_node(cyclic_node(
+        AckSink::NAME.into(),
+        AckSink { seen: seen.clone() },
+    ));
+    let uplink = b.push_node(async_node(
+        "uplink".into(),
+        UplinkSystem::new(ScriptedRecv::packets([garbage, good])).with_msg::<AlarmAck>(),
+    ));
     b.connect(
-        PortRef { system: uplink, port: PortId::Packet(AlarmAck::ID) },
-        PortRef { system: sink, port: PortId::Packet(AlarmAck::ID) },
+        PortRef {
+            system: uplink,
+            port: PortId::Packet(AlarmAck::ID),
+        },
+        PortRef {
+            system: sink,
+            port: PortId::Packet(AlarmAck::ID),
+        },
     );
     let mut coord = b.build().unwrap();
 
@@ -1003,7 +1085,10 @@ async fn uplink_relays_arbitrary_user_msgs() {
     impl CyclicSystem for GainSink {
         fn execute(&mut self, _now: Timestamp, input: &mut GainSinkIn, _o: &mut Self::Output) {
             let seen = &self.seen;
-            input.cmds.drain(|c| seen.borrow_mut().push(c.gain));
+            input
+                .cmds
+                .drain(|c| seen.borrow_mut().push(c.gain))
+                .unwrap();
         }
     }
 
@@ -1013,12 +1098,23 @@ async fn uplink_relays_arbitrary_user_msgs() {
 
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let sink = b.push_node(cyclic_node(GainSink::NAME.into(), GainSink { seen: seen.clone() }));
-    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(ScriptedRecv::packets([wire]))
-        .with_msg::<SetGain>(),));
+    let sink = b.push_node(cyclic_node(
+        GainSink::NAME.into(),
+        GainSink { seen: seen.clone() },
+    ));
+    let uplink = b.push_node(async_node(
+        "uplink".into(),
+        UplinkSystem::new(ScriptedRecv::packets([wire])).with_msg::<SetGain>(),
+    ));
     b.connect(
-        PortRef { system: uplink, port: PortId::Packet(SetGain::ID) },
-        PortRef { system: sink, port: PortId::Packet(SetGain::ID) },
+        PortRef {
+            system: uplink,
+            port: PortId::Packet(SetGain::ID),
+        },
+        PortRef {
+            system: sink,
+            port: PortId::Packet(SetGain::ID),
+        },
     );
     let mut coord = b.build().unwrap();
 
@@ -1038,10 +1134,13 @@ async fn uplink_relays_arbitrary_user_msgs() {
 fn cyclic_after_receive_all_is_a_build_error() {
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
-    b.push_node(cyclic_node("telemetry".into(), TelemetrySystem::new(TelemetryConfig {
-        transport: MockTransport::new(false),
-        mode: TelemetryMode::All,
-    })));
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        TelemetrySystem::new(TelemetryConfig {
+            transport: MockTransport::new(false),
+            mode: TelemetryMode::All,
+        }),
+    ));
     // A second producer (no inputs, so nothing else can fail first) after the downlink.
     b.push_node(cyclic_node("late".into(), Producer { n: 0.0 }));
     let err = b
@@ -1216,14 +1315,26 @@ async fn uplink_survives_a_recv_error() {
         default_depth: 8,
         ..CoordinatorConfig::default()
     });
-    let sink = b.push_node(cyclic_node(AckSink::NAME.into(), AckSink { seen: seen.clone() }));
-    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(ScriptedRecv {
+    let sink = b.push_node(cyclic_node(
+        AckSink::NAME.into(),
+        AckSink { seen: seen.clone() },
+    ));
+    let uplink = b.push_node(async_node(
+        "uplink".into(),
+        UplinkSystem::new(ScriptedRecv {
             script: vec![None, Some(wire)].into(),
         })
-        .with_msg::<AlarmAck>(),));
+        .with_msg::<AlarmAck>(),
+    ));
     b.connect(
-        PortRef { system: uplink, port: PortId::Packet(AlarmAck::ID) },
-        PortRef { system: sink, port: PortId::Packet(AlarmAck::ID) },
+        PortRef {
+            system: uplink,
+            port: PortId::Packet(AlarmAck::ID),
+        },
+        PortRef {
+            system: sink,
+            port: PortId::Packet(AlarmAck::ID),
+        },
     );
     let mut coord = b.build().unwrap();
 

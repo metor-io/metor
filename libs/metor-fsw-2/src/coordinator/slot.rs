@@ -350,8 +350,18 @@ impl SlotPorts {
         SystemDescriptor {
             name: name.into(),
             kind: SystemKind::Cyclic,
-            inputs: self.occupant_inputs.iter().chain(&self.tail_inputs).cloned().collect(),
-            outputs: self.occupant_outputs.iter().chain(&self.tail_outputs).cloned().collect(),
+            inputs: self
+                .occupant_inputs
+                .iter()
+                .chain(&self.tail_inputs)
+                .cloned()
+                .collect(),
+            outputs: self
+                .occupant_outputs
+                .iter()
+                .chain(&self.tail_outputs)
+                .cloned()
+                .collect(),
             // Sequence occupants declare wired ports only (ReceiveAll is host-only).
             capabilities: Vec::new(),
         }
@@ -578,7 +588,10 @@ impl SlotRunner {
             }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             OccupantBacking::Artifact(_) => {
-                let parts = self.proc.as_ref().expect("a process slot binds its ProcParts");
+                let parts = self
+                    .proc
+                    .as_ref()
+                    .expect("a process slot binds its ProcParts");
                 match SeqWorker::spawn(
                     &parts.exe,
                     &parts.ctl_path,
@@ -696,9 +709,8 @@ impl SlotRunner {
     fn do_load(&mut self, occupant: &str) {
         match self.state {
             SlotState::Running => {
-                let reason = format!(
-                    "load `{occupant}` refused: an occupant is running; stop it first"
-                );
+                let reason =
+                    format!("load `{occupant}` refused: an occupant is running; stop it first");
                 self.emit_event(SequenceEventKind::Refused { reason });
                 return;
             }
@@ -785,7 +797,10 @@ impl SlotRunner {
             return;
         };
         if matches!(self.state, SlotState::Running | SlotState::Loading) {
-            let reason = format!("reset refused: slot is {}; stop it first", self.state.name());
+            let reason = format!(
+                "reset refused: slot is {}; stop it first",
+                self.state.name()
+            );
             self.emit_event(SequenceEventKind::Refused { reason });
             return;
         }
@@ -804,15 +819,23 @@ impl SlotRunner {
     fn drain_progress(&mut self) {
         let mut details = core::mem::take(&mut self.detail_scratch);
         let mut state = self.last_run_state;
-        let _ = self.seq_status.drain(|f| {
+        let result = self.seq_status.drain(|f| {
             state = f.get().run_state;
-            for line in frame_list_iter::<ProgressLine>(f.table(), offset_of!(SequenceStatus, progress)) {
+            for line in
+                frame_list_iter::<ProgressLine>(f.table(), offset_of!(SequenceStatus, progress))
+            {
                 let n = (line.len as usize).min(PROGRESS_MSG_CAP);
                 if let Ok(s) = core::str::from_utf8(&line.msg[..n]) {
                     details.push(s.to_string());
                 }
             }
         });
+        if result.is_err() {
+            self.fail_occupant("corrupt sequence status ring".to_string());
+            details.clear();
+            self.detail_scratch = details;
+            return;
+        }
         self.last_run_state = state;
         for detail in details.drain(..) {
             self.emit_event(SequenceEventKind::Progress { detail });
@@ -885,7 +908,11 @@ impl SlotRunner {
             _pad: [0; 6],
             occupant,
         };
-        let _ = self.status_out.write(&frame);
+        if self.status_out.write(&frame).is_err()
+            && !matches!(self.state, SlotState::Stopped { .. })
+        {
+            self.fail_occupant("slot status output blocked".to_string());
+        }
     }
 }
 
@@ -910,7 +937,12 @@ impl CyclicSlot for SlotRunner {
         // because apply_command needs `&mut self`, and retained across steps
         // so the steady state allocates nothing.
         let mut cmds = core::mem::take(&mut self.cmd_scratch);
-        self.commands.drain(|c| cmds.push(c));
+        if self.commands.drain(|c| cmds.push(c)).is_err() {
+            cmds.clear();
+            self.cmd_scratch = cmds;
+            self.fail_occupant("corrupt sequence command ring".to_string());
+            return;
+        }
         for cmd in &cmds {
             self.apply_command(cmd);
         }

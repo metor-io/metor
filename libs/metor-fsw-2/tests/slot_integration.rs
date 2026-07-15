@@ -27,7 +27,7 @@
 
 #![cfg(all(feature = "wiring", not(miri)))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod common;
 
@@ -38,7 +38,7 @@ use metor_fsw_2::metor_proto_wkt::{
 use metor_fsw_2::wiring::{LoadErrorKind, Registry, resolve};
 use metor_fsw_2::{
     AllowedOccupantSpec, BuildSystem, ClockSpec, CommandOut, Coordinator, CoordinatorSpec,
-    CyclicSystem, Input, InitialOccupantSpec, NAME_CAP, Out, ParamSource, SequenceStatus,
+    CyclicSystem, InitialOccupantSpec, Input, NAME_CAP, Out, ParamSource, SequenceStatus,
     SlotInitState, SlotSpec, SlotStatus, System, SystemInput, SystemOutput, Timestamp, WireError,
     Wiring, WiringBuilder, split_record,
 };
@@ -86,8 +86,8 @@ fn seq_coordinator() -> CoordinatorSpec {
 
 /// Point the mission's single artifact at the located fixture (in place of the
 /// build driver) and resolve it through the empty registry into a coordinator.
-fn resolve_slot(mut wiring: Wiring, lib: &PathBuf) -> Coordinator {
-    wiring.artifacts[0].path = Some(lib.clone());
+fn resolve_slot(mut wiring: Wiring, lib: &Path) -> Coordinator {
+    wiring.artifacts[0].path = Some(lib.to_path_buf());
     resolve(&wiring, &Registry::new()).expect("resolve the slot Wiring")
 }
 
@@ -794,11 +794,11 @@ fn drive_adcs_of_two_slots(adcs_first: bool) {
     } else {
         ["recovery", "adcs"]
     } {
-        builder = builder
-            .slot(name)
-            .allow("waiter")
-            .end()
-            .connect_msg("coordinator", name, "SequenceCommand");
+        builder = builder.slot(name).allow("waiter").end().connect_msg(
+            "coordinator",
+            name,
+            "SequenceCommand",
+        );
     }
     let mut coord = resolve_slot(builder.build(), &lib);
 

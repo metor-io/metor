@@ -13,16 +13,15 @@
 //! - one `System` subclass per entry with a typed keyword-only `__init__`
 //!   (real kwarg defaults split out of the manifest's whole-struct defaults
 //!   blob), plus class-level port annotations;
-//! - a module-level occupant callable for each snake_case entry (sequence
-//!   tasks), the same calling convention Phase 1's `seqs.commissioning(...)`
-//!   used.
+//! - a module-level occupant callable for each snake_case entry.
 //!
 //! The generated text is deterministic — stable ordering, no timestamps, no
 //! absolute paths — so `--check` is a byte diff and a bundle stays
-//! reproducible. The runtime behavior is identical to Phase 1's untyped path;
-//! the generics are erased annotations for the checker.
+//! reproducible. Type parameters are annotations for the checker and are
+//! erased at runtime.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -159,14 +158,17 @@ impl ArtifactEntry {
 /// triples, in the table's declaration order made deterministic by sorting on
 /// the id.
 fn read_artifacts(pyproject: &Path) -> Result<Vec<(String, ArtifactEntry)>, StubgenError> {
-    let text = std::fs::read_to_string(pyproject).map_err(|source| StubgenError::PyprojectRead {
-        path: pyproject.to_path_buf(),
-        source,
-    })?;
-    let doc: toml::Value = text.parse().map_err(|source| StubgenError::PyprojectParse {
-        path: pyproject.to_path_buf(),
-        source,
-    })?;
+    let text =
+        std::fs::read_to_string(pyproject).map_err(|source| StubgenError::PyprojectRead {
+            path: pyproject.to_path_buf(),
+            source,
+        })?;
+    let doc: toml::Value = text
+        .parse()
+        .map_err(|source| StubgenError::PyprojectParse {
+            path: pyproject.to_path_buf(),
+            source,
+        })?;
     let table = doc
         .get("tool")
         .and_then(|t| t.get("metor"))
@@ -214,19 +216,22 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
             },
         )?;
         for ((id, e), art) in artifacts.into_iter().zip(wiring.artifacts.into_iter()) {
-            let path = art.path.expect("build_artifacts fills every path or errors");
+            let path = art
+                .path
+                .expect("build_artifacts fills every path or errors");
             located.push((id, e, path));
         }
     } else {
         for (id, e) in artifacts {
             let cdylib = super::cdylib_file_name(&e.lib);
-            let path = locate_prebuilt(&opts.mission_dir, &cdylib, opts.release).ok_or_else(|| {
-                StubgenError::NotBuilt {
-                    id: id.clone(),
-                    crate_name: e.crate_name_field.clone(),
-                    cdylib: cdylib.clone(),
-                }
-            })?;
+            let path =
+                locate_prebuilt(&opts.mission_dir, &cdylib, opts.release).ok_or_else(|| {
+                    StubgenError::NotBuilt {
+                        id: id.clone(),
+                        crate_name: e.crate_name_field.clone(),
+                        cdylib: cdylib.clone(),
+                    }
+                })?;
             located.push((id, e, path));
         }
     }
@@ -242,7 +247,12 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
     for (id, entry, so) in &located {
         let bytes = manifest_bytes(id, so)?;
         let module = render_module(id, &entry.crate_name_field, &entry.lib, &bytes)?;
-        reconcile(&packs_dir.join(format!("{id}.py")), &module, opts.check, &mut report)?;
+        reconcile(
+            &packs_dir.join(format!("{id}.py")),
+            &module,
+            opts.check,
+            &mut report,
+        )?;
     }
 
     if opts.check && !report.stale.is_empty() {
@@ -364,7 +374,9 @@ pub fn render_module(
     ));
 
     for (name, base) in &cg.frames {
-        out.push_str(&format!("\n\nclass {name}({base}):\n    \"\"\"Frame marker (checker-only).\"\"\"\n"));
+        out.push_str(&format!(
+            "\n\nclass {name}({base}):\n    \"\"\"Frame marker (checker-only).\"\"\"\n"
+        ));
     }
     for body in &cg.dataclasses {
         out.push_str("\n\n");
@@ -478,11 +490,7 @@ impl Codegen {
         for port in desc.inputs.iter().chain(desc.outputs.iter()) {
             self.marker_name(port);
         }
-        let is_class = desc
-            .name
-            .chars()
-            .next()
-            .is_some_and(char::is_uppercase);
+        let is_class = desc.name.chars().next().is_some_and(char::is_uppercase);
         let params = self.params(&entry.params_schema, entry.params_default.as_deref());
         if is_class {
             self.render_class(entry, &params)
@@ -556,7 +564,11 @@ impl Codegen {
             "OutPort"
         };
         let mut notes: Vec<String> = Vec::new();
-        notes.push(if input { "input".into() } else { "output".into() });
+        notes.push(if input {
+            "input".into()
+        } else {
+            "output".into()
+        });
         notes.push(match port.delivery {
             Delivery::Snapshot => "latest-wins".into(),
             Delivery::Log => "log".into(),
@@ -615,7 +627,10 @@ impl Codegen {
         if !self.taken_names.contains(&base) {
             return base;
         }
-        (2..).map(|n| format!("{base}{n}")).find(|c| !self.taken_names.contains(c)).unwrap()
+        (2..)
+            .map(|n| format!("{base}{n}"))
+            .find(|c| !self.taken_names.contains(c))
+            .unwrap()
     }
 
     /// The typed `Param` list for an entry's params schema, splitting the
@@ -656,8 +671,18 @@ impl Codegen {
         use OwnedDataModelType as T;
         match &nt.ty {
             T::Bool => "bool".into(),
-            T::I8 | T::I16 | T::I32 | T::I64 | T::I128 | T::U8 | T::U16 | T::U32 | T::U64
-            | T::U128 | T::Usize | T::Isize => "int".into(),
+            T::I8
+            | T::I16
+            | T::I32
+            | T::I64
+            | T::I128
+            | T::U8
+            | T::U16
+            | T::U32
+            | T::U64
+            | T::U128
+            | T::Usize
+            | T::Isize => "int".into(),
             T::F32 | T::F64 => "float".into(),
             T::Char | T::String => "str".into(),
             T::ByteArray => "bytes".into(),
@@ -706,9 +731,7 @@ impl Codegen {
         if lines.is_empty() {
             lines.push_str("    pass\n");
         }
-        let body = format!(
-            "@dataclass(frozen=True, kw_only=True)\nclass {name}:\n{lines}"
-        );
+        let body = format!("@dataclass(frozen=True, kw_only=True)\nclass {name}:\n{lines}");
         self.dataclasses.push(body);
         name
     }
@@ -759,8 +782,9 @@ impl Codegen {
             if lines.is_empty() {
                 lines.push_str("    pass\n");
             }
-            self.dataclasses
-                .push(format!("@dataclass(frozen=True, kw_only=True)\nclass {vname}:\n{lines}"));
+            self.dataclasses.push(format!(
+                "@dataclass(frozen=True, kw_only=True)\nclass {vname}:\n{lines}"
+            ));
         }
         union.join(" | ")
     }
@@ -779,13 +803,7 @@ fn init_signature(params: &[Param]) -> String {
         return "    def __init__(self) -> None:\n".to_string();
     }
     let mut out = String::from("    def __init__(\n        self,\n        *,\n");
-    for p in params {
-        out.push_str(&format!("        {}: {}", p.name, p.annotation));
-        if let Some(d) = &p.default {
-            out.push_str(&format!(" = {d}"));
-        }
-        out.push_str(",\n");
-    }
+    write_keyword_params(&mut out, params, 8);
     out.push_str("    ) -> None:\n");
     out
 }
@@ -795,10 +813,9 @@ fn super_init(entry: &str, params: &[Param]) -> String {
     if params.is_empty() {
         return format!("        super().__init__(\"{entry}\", ARTIFACT)\n");
     }
-    let mut out = format!("        super().__init__(\n            \"{entry}\",\n            ARTIFACT,\n");
-    for p in params {
-        out.push_str(&format!("            {}={},\n", p.name, p.name));
-    }
+    let mut out =
+        format!("        super().__init__(\n            \"{entry}\",\n            ARTIFACT,\n");
+    write_keyword_args(&mut out, params, 12);
     out.push_str("        )\n");
     out
 }
@@ -809,13 +826,7 @@ fn occupant_signature(name: &str, params: &[Param]) -> String {
         return format!("def {name}() -> System:\n");
     }
     let mut out = format!("def {name}(\n    *,\n");
-    for p in params {
-        out.push_str(&format!("    {}: {}", p.name, p.annotation));
-        if let Some(d) = &p.default {
-            out.push_str(&format!(" = {d}"));
-        }
-        out.push_str(",\n");
-    }
+    write_keyword_params(&mut out, params, 4);
     out.push_str(") -> System:\n");
     out
 }
@@ -826,11 +837,27 @@ fn occupant_body(name: &str, params: &[Param]) -> String {
         return format!("    return System(\"{name}\", ARTIFACT)\n");
     }
     let mut out = format!("    return System(\n        \"{name}\",\n        ARTIFACT,\n");
-    for p in params {
-        out.push_str(&format!("        {}={},\n", p.name, p.name));
-    }
+    write_keyword_args(&mut out, params, 8);
     out.push_str("    )\n");
     out
+}
+
+fn write_keyword_params(out: &mut String, params: &[Param], indent: usize) {
+    let pad = " ".repeat(indent);
+    for p in params {
+        write!(out, "{pad}{}: {}", p.name, p.annotation).unwrap();
+        if let Some(default) = &p.default {
+            write!(out, " = {default}").unwrap();
+        }
+        out.push_str(",\n");
+    }
+}
+
+fn write_keyword_args(out: &mut String, params: &[Param], indent: usize) {
+    let pad = " ".repeat(indent);
+    for p in params {
+        writeln!(out, "{pad}{}={},", p.name, p.name).unwrap();
+    }
 }
 
 /// A `"""..."""` docstring at `indent` levels (4 spaces each): a summary line,
@@ -897,8 +924,8 @@ fn frame_name(metadata: &[metor_proto_wkt::ComponentMetadata]) -> Option<String>
 /// Render a JSON default value as a Python literal, tuple-vs-list decided by the
 /// field's schema type.
 fn py_literal(value: &serde_json::Value, ty: &OwnedDataModelType) -> String {
-    use serde_json::Value as J;
     use OwnedDataModelType as T;
+    use serde_json::Value as J;
     match (value, ty) {
         (J::Null, _) => "None".into(),
         (J::Bool(b), _) => if *b { "True" } else { "False" }.into(),
@@ -944,7 +971,16 @@ fn render_seq<'a>(
     items
         .iter()
         .enumerate()
-        .map(|(i, v)| py_literal(v, types.get(i).or_else(|| types.first()).copied().unwrap_or(&OwnedDataModelType::F64)))
+        .map(|(i, v)| {
+            py_literal(
+                v,
+                types
+                    .get(i)
+                    .or_else(|| types.first())
+                    .copied()
+                    .unwrap_or(&OwnedDataModelType::F64),
+            )
+        })
         .collect()
 }
 
@@ -955,7 +991,12 @@ fn py_float(f: f64) -> String {
         return "float(\"nan\")".into();
     }
     if f.is_infinite() {
-        return if f < 0.0 { "float(\"-inf\")" } else { "float(\"inf\")" }.into();
+        return if f < 0.0 {
+            "float(\"-inf\")"
+        } else {
+            "float(\"inf\")"
+        }
+        .into();
     }
     let s = format!("{f}");
     if s.contains(['.', 'e', 'E']) {
@@ -1065,7 +1106,10 @@ mod tests {
     fn no_blob_makes_non_option_fields_required() {
         let params = Codegen::default().params(&demo_schema(), None);
         let by = |n: &str| params.iter().find(|p| p.name == n).unwrap();
-        assert!(by("count").default.is_none(), "no defaults blob => required");
+        assert!(
+            by("count").default.is_none(),
+            "no defaults blob => required"
+        );
         // Even without a blob an Option field is optional.
         assert_eq!(by("limit").default.as_deref(), Some("None"));
     }
@@ -1123,7 +1167,10 @@ mod tests {
         let blob = postcard::to_allocvec(&Demo::default()).unwrap();
         let widget_docs = vec![
             ("count".to_string(), "How many widgets to make.".to_string()),
-            ("gain".to_string(), "Loop gain (1/s), ~3e-12 at 400 km.".to_string()),
+            (
+                "gain".to_string(),
+                "Loop gain (1/s), ~3e-12 at 400 km.".to_string(),
+            ),
         ];
         let msg = PackManifest {
             systems: vec![
@@ -1138,7 +1185,12 @@ mod tests {
                 },
                 PackEntryDesc {
                     params_schema: OwnedNamedType::from(<() as Schema>::SCHEMA),
-                    ..entry_desc("startup", Vec::new(), vec![table_port("mode_cmd", "mode_cmd", true)], Vec::new())
+                    ..entry_desc(
+                        "startup",
+                        Vec::new(),
+                        vec![table_port("mode_cmd", "mode_cmd", true)],
+                        Vec::new(),
+                    )
                 },
             ],
         };
@@ -1227,7 +1279,9 @@ mod integration {
     use crate::dl::FIXTURE_LOCK;
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        FIXTURE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn mission_dir() -> tempfile::TempDir {
@@ -1280,7 +1334,11 @@ mod integration {
     fn stale_manifest_hash_is_rejected_at_resolve() {
         let _guard = lock();
         let mut wiring = WiringBuilder::new()
-            .artifact("fixture", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+            .artifact(
+                "fixture",
+                "metor-fsw-2-dl-fixture",
+                "metor_fsw_2_dl_fixture",
+            )
             .build();
         if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
             eprintln!("skipping: build failed: {e}");
@@ -1327,7 +1385,8 @@ mod fixture_dump {
     #[test]
     #[ignore = "regenerates the checked-in Python fixture; run on codegen changes"]
     fn write_demo_fixture() {
-        let text = super::render_module("demo", "demo-systems", "demo_systems", &demo_manifest()).unwrap();
+        let text =
+            super::render_module("demo", "demo-systems", "demo_systems", &demo_manifest()).unwrap();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/python/tests/data/demo.py");
         std::fs::write(path, text).unwrap();
     }

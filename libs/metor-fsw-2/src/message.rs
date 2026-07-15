@@ -204,8 +204,8 @@ impl<M: NamedMsg, WD: WakeSource> MsgOut<M, WD> {
 
     /// The port declaration this field contributes to a bundle's `decls`
     /// walk, an ordinary wired port.
-    pub fn decl() -> crate::PortDecl {
-        crate::PortDecl::Port(Self::descriptor())
+    pub fn decl() -> crate::PortDesc {
+        Self::descriptor()
     }
 }
 
@@ -219,8 +219,6 @@ where
     /// `MsgOut<M>` field in a `SystemOutput` bundle.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
         let (ring, data) = src.next_output::<WD>();
-        // The coordinator allocates one ring per message output and binds it
-        // exactly once, so the region's writer claim is always free here.
         let writer = ring
             .writer(data)
             .expect("message ring is bound to exactly one writer at build");
@@ -271,8 +269,6 @@ impl MsgFanOut {
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
         let mut writers = Vec::new();
         while let Some((ring, data)) = src.try_next_output::<NoWake>() {
-            // The coordinator allocates one ring per message output and binds
-            // it exactly once, so the region's writer claim is always free here.
             let writer = ring
                 .writer(data)
                 .expect("message ring is bound to exactly one writer at build");
@@ -360,21 +356,20 @@ where
     /// with a different id and records that fail to decode are skipped. Each
     /// record is borrowed in place and freed for the writer as soon as `f`
     /// returns, and a full ring backpressures the emitter rather than
-    /// dropping. A corrupt view, unreachable from in-crate behavior, stops
-    /// draining that view.
-    pub fn drain(&mut self, mut f: impl FnMut(M)) {
+    /// dropping. Ring corruption is returned to the caller.
+    pub fn drain(&mut self, mut f: impl FnMut(M)) -> Result<(), crate::ReadError> {
         for view in &mut self.views {
-            let _ = crate::port::drain_view(view, |rec| {
+            crate::port::drain_view(view, |rec| {
                 if let Some((id, payload)) = split_record(rec)
                     && id == M::ID
                     && let Ok(msg) = postcard::from_bytes::<M>(payload)
                 {
                     f(msg);
                 }
-            });
+            })?;
         }
+        Ok(())
     }
-
 }
 
 impl<M, RD> MsgIn<M, RD>
@@ -390,8 +385,8 @@ where
 
     /// The port declaration this field contributes to a bundle's `decls`
     /// walk, an ordinary wired port.
-    pub fn decl() -> crate::PortDecl {
-        crate::PortDecl::Port(Self::descriptor())
+    pub fn decl() -> crate::PortDesc {
+        Self::descriptor()
     }
 }
 
@@ -542,8 +537,7 @@ mod tests {
             max_readers: 4,
         });
         // Claim the read view before any write (a view starts at the live edge).
-        let mut inbox: MsgIn<SequenceCommand> =
-            MsgIn::new(ring.view(NoWake).expect("slot"));
+        let mut inbox: MsgIn<SequenceCommand> = MsgIn::new(ring.view(NoWake).expect("slot"));
 
         // Two typed ports take the ring's single writer in turn (drop frees
         // the claim), so the drained view sees a mixed stream. A different
@@ -576,7 +570,7 @@ mod tests {
             .expect("emit stop");
 
         let mut got: Vec<SequenceCommand> = Vec::new();
-        inbox.drain(|c| got.push(c));
+        inbox.drain(|c| got.push(c)).unwrap();
         assert_eq!(got.len(), 2, "the SequenceRegistry record is filtered out");
         assert_eq!(got[0].channel, "adcs");
         assert!(matches!(got[0].command, SequenceCommandKind::Start));
@@ -585,7 +579,7 @@ mod tests {
 
         // Drained dry, so a second drain yields nothing.
         let mut again = 0;
-        inbox.drain(|_| again += 1);
+        inbox.drain(|_| again += 1).unwrap();
         assert_eq!(again, 0);
     }
 
@@ -598,8 +592,7 @@ mod tests {
             capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
             max_readers: 4,
         });
-        let mut inbox: MsgIn<SequenceCommand> =
-            MsgIn::new(ring.view(NoWake).expect("slot"));
+        let mut inbox: MsgIn<SequenceCommand> = MsgIn::new(ring.view(NoWake).expect("slot"));
         let mut fan = MsgFanOut {
             writers: vec![ring.writer(NoWake).expect("one writer")],
             scratch: Vec::new(),
@@ -615,7 +608,7 @@ mod tests {
             .expect("relay");
 
         let mut got: Vec<SequenceCommand> = Vec::new();
-        inbox.drain(|c| got.push(c));
+        inbox.drain(|c| got.push(c)).unwrap();
         assert_eq!(
             got.len(),
             1,
@@ -662,7 +655,7 @@ mod tests {
             .expect("emit b");
 
         let mut got: Vec<String> = Vec::new();
-        inbox.drain(|c| got.push(c.channel));
+        inbox.drain(|c| got.push(c.channel)).unwrap();
         got.sort_unstable();
         assert_eq!(
             got,
@@ -673,7 +666,7 @@ mod tests {
         // An empty fan-in (unconnected input) drains nothing.
         let mut empty: MsgIn<SequenceCommand> = MsgIn::from_views(vec![]);
         let mut n = 0;
-        empty.drain(|_| n += 1);
+        empty.drain(|_| n += 1).unwrap();
         assert_eq!(n, 0);
     }
 

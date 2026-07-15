@@ -161,47 +161,47 @@ pub enum Capability {
     ReceiveAll,
 }
 
-/// What one bundle field contributes to a descriptor, either a wired port or
-/// a bind-time [`Capability`]. Collecting one decl per field lets a single
-/// walk cover both; the bind cursor skips capability decls since they consume
-/// no ring.
-#[derive(Clone, Debug)]
-pub enum PortDecl {
-    Port(PortDesc),
-    Capability(Capability),
+/// The ports and bind-time capabilities contributed by a bundle.
+#[derive(Clone, Debug, Default)]
+pub struct Declarations {
+    pub ports: Vec<PortDesc>,
+    pub capabilities: Vec<Capability>,
 }
 
-impl PortDecl {
-    /// Applies [`PortDesc::untelemetered`] to a port decl; a capability has
-    /// no axes and passes through unchanged.
-    pub fn untelemetered(self) -> Self {
-        match self {
-            PortDecl::Port(p) => PortDecl::Port(p.untelemetered()),
-            cap => cap,
-        }
+impl Declarations {
+    /// Adds either a port or a capability declaration.
+    pub fn push(&mut self, declaration: impl Into<Self>) {
+        let mut declaration = declaration.into();
+        self.ports.append(&mut declaration.ports);
+        self.capabilities.append(&mut declaration.capabilities);
     }
+}
 
-    /// The port of a [`Port`](PortDecl::Port) decl, or `None` for a capability.
-    pub fn into_port(self) -> Option<PortDesc> {
-        match self {
-            PortDecl::Port(p) => Some(p),
-            PortDecl::Capability(_) => None,
+impl From<PortDesc> for Declarations {
+    fn from(port: PortDesc) -> Self {
+        Self {
+            ports: vec![port],
+            capabilities: Vec::new(),
         }
     }
 }
 
-/// Splits one direction's decls into its wired ports and its capabilities,
-/// preserving port order for the bind cursor.
-pub fn split_decls(decls: Vec<PortDecl>) -> (Vec<PortDesc>, Vec<Capability>) {
-    let mut ports = Vec::with_capacity(decls.len());
-    let mut caps = Vec::new();
-    for d in decls {
-        match d {
-            PortDecl::Port(p) => ports.push(p),
-            PortDecl::Capability(c) => caps.push(c),
+impl From<Vec<PortDesc>> for Declarations {
+    fn from(ports: Vec<PortDesc>) -> Self {
+        Self {
+            ports,
+            capabilities: Vec::new(),
         }
     }
-    (ports, caps)
+}
+
+impl From<Capability> for Declarations {
+    fn from(capability: Capability) -> Self {
+        Self {
+            ports: Vec::new(),
+            capabilities: vec![capability],
+        }
+    }
 }
 
 /// The static shape of one port, everything the coordinator needs to size a

@@ -31,10 +31,19 @@ use metor_proto::error::Error as ProtoError;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::RingSource;
-use crate::descriptor::{PortDecl, PortDesc};
+use crate::descriptor::PortDesc;
 use crate::dynamic::Slot;
 use crate::frame::Frame;
 use crate::writer::{FrameScratch, FrameWriter};
+
+/// A dynamic frame could not be built or written to its ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FrameWriteError {
+    #[error(transparent)]
+    Dynamic(#[from] crate::writer::DynamicWriteError),
+    #[error(transparent)]
+    Ring(#[from] metor_fsw_ring::WriteError),
+}
 
 /// Default in-flight record depth for a port. Must be at least 2, since a
 /// latest-wins consumer permanently pins the newest record (see
@@ -56,10 +65,7 @@ pub fn buffer_capacity<F: Frame>(depth: usize) -> usize {
 /// drain, in order. Each grant drops, freeing its record for the writer,
 /// before the next is taken. [`ReadError::Corrupt`] stops the drain and
 /// propagates.
-pub(crate) fn drain_view<RD>(
-    view: &mut View<RD>,
-    mut f: impl FnMut(&[u8]),
-) -> Result<(), ReadError>
+pub(crate) fn drain_view<RD>(view: &mut View<RD>, mut f: impl FnMut(&[u8])) -> Result<(), ReadError>
 where
     RD: WakeSink,
 {
@@ -183,8 +189,8 @@ impl<F: Frame, WD: WakeSource> Output<F, WD> {
 
     /// This field's entry in the bundle's [`decls`](crate::SystemOutput::decls)
     /// walk, an ordinary wired port.
-    pub fn decl() -> PortDecl {
-        PortDecl::Port(Self::descriptor())
+    pub fn decl() -> PortDesc {
+        Self::descriptor()
     }
 
     /// Take and clear the [`publish`](Self::publish) drop counter.
@@ -250,15 +256,17 @@ where
         &mut self,
         fixed: &F,
         build: impl FnOnce(&mut FrameWriter<F>),
-    ) -> Result<(), metor_fsw_ring::WriteError> {
+    ) -> Result<(), FrameWriteError> {
         let scratch = self
             .scratch
             .take()
             .unwrap_or_else(|| FrameScratch::new(F::MAX_SIZE.min(1 << 16)));
         let mut fw = FrameWriter::from_scratch(scratch, fixed);
         build(&mut fw);
-        let res = self.writer.try_write(fw.table());
-        // Retain the (grown) backing for the next publish.
+        let res = match fw.error() {
+            Some(error) => Err(error.into()),
+            None => self.writer.try_write(fw.table()).map_err(Into::into),
+        };
         self.scratch = Some(fw.finish());
         res
     }
@@ -296,8 +304,8 @@ impl<F: Frame, RD: WakeSink> Input<F, RD> {
 
     /// This field's entry in the bundle's [`decls`](crate::SystemInput::decls)
     /// walk, an ordinary wired port.
-    pub fn decl() -> PortDecl {
-        PortDecl::Port(Self::descriptor())
+    pub fn decl() -> PortDesc {
+        Self::descriptor()
     }
 }
 
@@ -330,9 +338,11 @@ where
     /// pinned on the ring with the view's cursor parked at its start. A later
     /// call with no new data is served the same record again, and the writer
     /// waits for space rather than overwrite it, which is why every ring
-    /// holds at least two records. A corrupt region reads as `None`.
-    pub fn latest(&mut self) -> Option<FrameGrant<'_, F>> {
-        self.view.try_latest().ok().flatten().map(FrameGrant::new)
+    /// holds at least two records. Ring corruption is returned to the caller.
+    pub fn latest(&mut self) -> Result<Option<FrameGrant<'_, F>>, ReadError> {
+        self.view
+            .try_latest()
+            .map(|grant| grant.map(FrameGrant::new))
     }
 
     /// Hand every record since the last drain to `f` in order, freeing each

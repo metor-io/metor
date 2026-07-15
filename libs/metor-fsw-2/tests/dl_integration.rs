@@ -198,7 +198,11 @@ fn dlopen_cyclic_system_end_to_end() {
     //    One opened pack mints any number of independent instances.
     let mut wiring = WiringBuilder::new()
         .coordinator_spec(dl_coordinator())
-        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
         .system("ticker")
         .ty("Ticker")
         .end()
@@ -227,8 +231,8 @@ fn dlopen_cyclic_system_end_to_end() {
     // place of the build driver.
     wiring.artifacts[0].path = Some(lib_path);
 
-    let mut coord = resolve(&wiring, &ticker_registry())
-        .expect("graph resolves (validation + sizing + bind)");
+    let mut coord =
+        resolve(&wiring, &ticker_registry()).expect("graph resolves (validation + sizing + bind)");
 
     // 3. Tap the loaded system's output through the telemetry registry before
     //    running; a fresh view only sees records committed from now on.
@@ -270,6 +274,7 @@ fn dlopen_cyclic_system_end_to_end() {
     {
         let out = out_view
             .latest()
+            .expect("tick_out ring readable")
             .expect("the dl system produced a tick_out");
         assert_eq!(
             out.get().count,
@@ -283,6 +288,7 @@ fn dlopen_cyclic_system_end_to_end() {
     {
         let out = twin_view
             .latest()
+            .expect("tick_out ring readable")
             .expect("the second dl instance produced a tick_out");
         assert_eq!(
             out.get().count,
@@ -294,7 +300,9 @@ fn dlopen_cyclic_system_end_to_end() {
     // 5b. The Postcard port carried every cycle's event, in order, decoded
     //     purely from the self-describing id.
     let mut counts: Vec<u64> = Vec::new();
-    events_in.drain(|e| counts.push(e.count));
+    events_in
+        .drain(|e| counts.push(e.count))
+        .expect("events ring readable");
     assert_eq!(
         counts,
         (1..=CYCLES as u64).map(|v| 1000 + v).collect::<Vec<_>>(),
@@ -386,7 +394,11 @@ fn dlopen_null_create_reports_stopped() {
     // spec's `ParamSource::Postcard`, which the dl path passes through verbatim.
     let mut wiring = WiringBuilder::new()
         .coordinator_spec(dl_coordinator())
-        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
         .system("ticker")
         .ty("Ticker")
         .end()

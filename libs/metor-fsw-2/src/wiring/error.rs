@@ -103,6 +103,7 @@ impl LoadErrorKind {
         use LoadErrorKind::*;
         match self {
             IrVersionMismatch { .. } => "fsw_wiring::ir_version_mismatch",
+            InvalidSimulatedStep { .. } => "fsw_wiring::invalid_simulated_step",
             BadScopeRef { .. } => "fsw_wiring::bad_scope_ref",
             MissingType { .. } => "fsw_wiring::missing_type",
             DuplicateArtifact { .. } => "fsw_wiring::duplicate_artifact",
@@ -153,7 +154,9 @@ impl LoadErrorKind {
                 "the worker dlopens the artifact and reports its descriptor; its captured \
                  stderr is in the message above"
             }
-            UnknownMsgName { .. } => "register the message type via `Registry::register_msg::<M>()`",
+            UnknownMsgName { .. } => {
+                "register the message type via `Registry::register_msg::<M>()`"
+            }
             _ => return None,
         })
     }
@@ -188,7 +191,9 @@ impl LoadErrorKind {
                 "these params could not be encoded against the `Params` schema".into()
             }
             ValueParams { .. } => "these params".into(),
-            StaticPostcardParams { .. } => "typed `params(...)` cannot reach a static system".into(),
+            StaticPostcardParams { .. } => {
+                "typed `params(...)` cannot reach a static system".into()
+            }
             PackCreate { .. } => "this system".into(),
             PackSystem { .. } => "this instance".into(),
             PackTypeRequired { .. } => "add `type=\"…\"`".into(),
@@ -202,7 +207,10 @@ impl LoadErrorKind {
             SlotOccupantMismatch { .. } => {
                 "this occupant's ports differ from the first allowed occupant's".into()
             }
-            IrVersionMismatch { .. } | BadScopeRef { .. } | StaleStubs { .. } => return None,
+            IrVersionMismatch { .. }
+            | InvalidSimulatedStep { .. }
+            | BadScopeRef { .. }
+            | StaleStubs { .. } => return None,
         })
     }
 }
@@ -220,6 +228,13 @@ pub enum LoadErrorKind {
          (regenerate the wiring)"
     )]
     IrVersionMismatch { found: u32, expected: u32 },
+
+    /// A serialized simulated-clock step cannot be represented as a positive
+    /// [`Duration`](std::time::Duration).
+    #[error(
+        "invalid simulated clock step {dt_secs}: dt_secs must be finite, positive, and representable"
+    )]
+    InvalidSimulatedStep { dt_secs: f64 },
 
     /// A scope index (a spec's `scope` or a scope's `parent`) outside the
     /// wiring's scope table. The table is front-end metadata, so a bad index

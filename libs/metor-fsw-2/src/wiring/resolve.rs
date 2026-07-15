@@ -112,7 +112,7 @@ pub fn resolve_with(
     // registry- or filesystem-dependent.
     validate::validate(wiring)?;
     check_manifest_hashes(wiring)?;
-    let mut config = coordinator_config(&wiring.coordinator);
+    let mut config = coordinator_config(&wiring.coordinator)?;
     // Host-environment policy overrides (see `ResolveOptions`): applied onto the
     // config the IR derived, never onto the IR itself.
     if let Some(timeout) = opts.proc_step_timeout {
@@ -242,10 +242,14 @@ fn resolve_static(
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     // `type=` and non-postcard params are guaranteed for a static system by
     // `validate`; only the registry lookup (`UnknownType`) is left here.
-    let ty = spec.ty.as_deref().expect("validate() requires a static system's type");
-    let factory = registry.factories.get(ty).ok_or_else(|| {
-        LoadErrorKind::UnknownType { ty: ty.to_string() }.whole(system_src(spec))
-    })?;
+    let ty = spec
+        .ty
+        .as_deref()
+        .expect("validate() requires a static system's type");
+    let factory = registry
+        .factories
+        .get(ty)
+        .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.whole(system_src(spec)))?;
     let snippet;
     let params = match &spec.params {
         ParamSource::Postcard(_) => {
@@ -290,7 +294,10 @@ impl PackCache {
     ) -> Result<&crate::dl::DlPack, LoadError> {
         if !self.packs.contains_key(artifact_id) {
             let artifact = find_built_artifact(wiring, artifact_id, owner, src, span)?;
-            let path = artifact.path.as_ref().expect("checked by find_built_artifact");
+            let path = artifact
+                .path
+                .as_ref()
+                .expect("checked by find_built_artifact");
             let pack = crate::dl::DlPack::open(path).map_err(|source| {
                 LoadErrorKind::DlOpen {
                     system: owner.to_string(),
@@ -539,9 +546,10 @@ fn find_built_artifact<'w>(
             .at(src, span)
         })?;
     if artifact.path.is_none() {
-        return Err(
-            LoadErrorKind::ArtifactNotBuilt { artifact: artifact_id.to_string() }.at(src, span),
-        );
+        return Err(LoadErrorKind::ArtifactNotBuilt {
+            artifact: artifact_id.to_string(),
+        }
+        .at(src, span));
     }
     Ok(artifact)
 }
@@ -562,7 +570,10 @@ fn resolve_proc(
     let src = system_src(spec);
     let span: SourceSpan = (0, src.len()).into();
     let artifact = find_built_artifact(wiring, artifact_id, &spec.name, &src, span)?;
-    let path = artifact.path.as_ref().expect("checked by find_built_artifact");
+    let path = artifact
+        .path
+        .as_ref()
+        .expect("checked by find_built_artifact");
     let proc_describe = |detail: String| {
         LoadErrorKind::ProcDescribe {
             system: spec.name.clone(),
@@ -602,7 +613,10 @@ fn resolve_proc(
     _wiring: &Wiring,
     _graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    Err(LoadErrorKind::ProcessUnsupported { name: spec.name.clone() }.whole(system_src(spec)))
+    Err(LoadErrorKind::ProcessUnsupported {
+        name: spec.name.clone(),
+    }
+    .whole(system_src(spec)))
 }
 
 /// Enforce generated-stub freshness: for each artifact whose stub module
@@ -631,7 +645,10 @@ fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
             },
         };
         if stubgen::manifest_hash(&bytes) != recorded {
-            return Err(LoadErrorKind::StaleStubs { artifact: artifact.id.clone() }.bare());
+            return Err(LoadErrorKind::StaleStubs {
+                artifact: artifact.id.clone(),
+            }
+            .bare());
         }
     }
     Ok(())
@@ -726,13 +743,11 @@ pub(super) fn slot_config_error(
         // A mount-reserved port is an occupant-contract defect too: the
         // artifact predates the pack ABI and must be rebuilt.
         SlotConfigError::OccupantMismatch { occupant, .. }
-        | SlotConfigError::ReservedPort { occupant, .. } => {
-            LoadErrorKind::SlotOccupantMismatch {
-                slot: name,
-                occupant,
-            }
-            .at(src, span)
+        | SlotConfigError::ReservedPort { occupant, .. } => LoadErrorKind::SlotOccupantMismatch {
+            slot: name,
+            occupant,
         }
+        .at(src, span),
         SlotConfigError::MixedBacking => {
             unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
         }
@@ -762,8 +777,7 @@ fn resolve_slot(
     } else {
         let mut allowed = Vec::with_capacity(slot.allow.len());
         for occ in &slot.allow {
-            let artifact_id =
-                occupant_artifact(wiring, packs, occ, &slot.name, &src, span)?;
+            let artifact_id = occupant_artifact(wiring, packs, occ, &slot.name, &src, span)?;
             let pack = packs.open(wiring, &artifact_id, &slot.name, &src, span)?;
             let source = EntrySource::Opened {
                 pack,
@@ -778,7 +792,11 @@ fn resolve_slot(
                 &src,
                 span,
             )?;
-            allowed.push(AllowedOccupant::dl(occ.occupant.clone(), entry.opened(), params));
+            allowed.push(AllowedOccupant::dl(
+                occ.occupant.clone(),
+                entry.opened(),
+                params,
+            ));
         }
         allowed
     };
@@ -800,8 +818,8 @@ fn resolve_slot(
 
     // `plan_slot` is the one place the registered contract is derived and the
     // descriptor-level checks run, so this front-end cannot drift from it.
-    let (registered, ports, process) = plan_slot(&slot.name, &allowed)
-        .map_err(|e| slot_config_error(e, slot, &src, span))?;
+    let (registered, ports, process) =
+        plan_slot(&slot.name, &allowed).map_err(|e| slot_config_error(e, slot, &src, span))?;
     let desc = registered.clone();
     let handle = graph.push_node(Node {
         name: slot.name.clone(),
@@ -879,7 +897,10 @@ fn describe_occupants(
             return Ok(());
         }
         let artifact = find_built_artifact(wiring, artifact_id, &slot.name, src, span)?;
-        let path = artifact.path.as_ref().expect("checked by find_built_artifact");
+        let path = artifact
+            .path
+            .as_ref()
+            .expect("checked by find_built_artifact");
         let proc_describe = |detail: String| {
             LoadErrorKind::ProcDescribe {
                 system: slot.name.clone(),
@@ -942,7 +963,10 @@ fn describe_occupants(
             span,
         )?;
         let artifact = find_built_artifact(wiring, &artifact_id, &slot.name, src, span)?;
-        let path = artifact.path.as_ref().expect("checked by find_built_artifact");
+        let path = artifact
+            .path
+            .as_ref()
+            .expect("checked by find_built_artifact");
         allowed.push(AllowedOccupant {
             name: occ.occupant.clone(),
             params,
@@ -962,12 +986,15 @@ fn describe_occupants(
     src: &str,
     span: SourceSpan,
 ) -> Result<Vec<AllowedOccupant>, LoadError> {
-    Err(LoadErrorKind::ProcessUnsupported { name: slot.name.clone() }.at(src, span))
+    Err(LoadErrorKind::ProcessUnsupported {
+        name: slot.name.clone(),
+    }
+    .at(src, span))
 }
 
 /// Convert the serializable [`CoordinatorSpec`] into the runtime
 /// [`CoordinatorConfig`].
-fn coordinator_config(spec: &CoordinatorSpec) -> CoordinatorConfig {
+fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadError> {
     let mut config = CoordinatorConfig {
         cycle_rate: spec.cycle_rate,
         ..CoordinatorConfig::default()
@@ -977,11 +1004,16 @@ fn coordinator_config(spec: &CoordinatorSpec) -> CoordinatorConfig {
     }
     config.clock = match spec.clock {
         ClockSpec::Wall => ClockMode::Wall,
-        ClockSpec::Simulated { dt_secs } => ClockMode::Simulated {
-            dt: Duration::from_secs_f64(dt_secs),
-        },
+        ClockSpec::Simulated { dt_secs } => {
+            let dt = Duration::try_from_secs_f64(dt_secs)
+                .map_err(|_| LoadErrorKind::InvalidSimulatedStep { dt_secs }.bare())?;
+            if dt.is_zero() {
+                return Err(LoadErrorKind::InvalidSimulatedStep { dt_secs }.bare());
+            }
+            ClockMode::Simulated { dt }
+        }
     };
-    config
+    Ok(config)
 }
 
 /// Resolve a `msg=` edge's two endpoints jointly.
@@ -999,9 +1031,12 @@ fn resolve_msg_edge(
     span: SourceSpan,
 ) -> Result<(PortRef, PortRef), LoadError> {
     let inst = |name: &str| {
-        instances
-            .get(name)
-            .ok_or_else(|| LoadErrorKind::UnknownInstance { name: name.to_string() }.at(src, span))
+        instances.get(name).ok_or_else(|| {
+            LoadErrorKind::UnknownInstance {
+                name: name.to_string(),
+            }
+            .at(src, span)
+        })
     };
     let prod = inst(&edge.from)?;
     let cons = inst(&edge.to)?;
@@ -1059,9 +1094,12 @@ fn resolve_endpoint(
     dir: Dir,
     span: SourceSpan,
 ) -> Result<PortRef, LoadError> {
-    let inst = instances
-        .get(name)
-        .ok_or_else(|| LoadErrorKind::UnknownInstance { name: name.to_string() }.at(src, span))?;
+    let inst = instances.get(name).ok_or_else(|| {
+        LoadErrorKind::UnknownInstance {
+            name: name.to_string(),
+        }
+        .at(src, span)
+    })?;
     let ports = match dir {
         Dir::Out => &inst.desc.outputs,
         Dir::In => &inst.desc.inputs,
@@ -1079,4 +1117,3 @@ fn resolve_endpoint(
         port: id,
     })
 }
-

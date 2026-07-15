@@ -85,7 +85,7 @@ use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 use super::bind::{ProcBindCtx, bind_systems};
 use super::slot::SlotReg;
 use super::{
-    AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, CoordChannels, Coordinator,
+    AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, ClockMode, CoordChannels, Coordinator,
     CoordinatorConfig, CoordinatorStatus, CopyIn, CyclicSlot, NAME_CAP, PortRef, RingEntry,
     RingTable, SlotState, SystemHandle, WireError,
 };
@@ -315,7 +315,11 @@ impl InitGraph {
             ],
             capabilities: Vec::new(),
         };
-        g.push_system(desc, COORDINATOR_INSTANCE.to_string(), SystemBind::Coordinator);
+        g.push_system(
+            desc,
+            COORDINATOR_INSTANCE.to_string(),
+            SystemBind::Coordinator,
+        );
         g
     }
 
@@ -443,6 +447,15 @@ impl InitGraph {
         Ok(())
     }
 
+    fn validate_simulated_step(&self) -> Result<(), WireError> {
+        if let ClockMode::Simulated { dt } = self.config.clock
+            && dt.is_zero()
+        {
+            return Err(WireError::InvalidSimulatedStep { dt });
+        }
+        Ok(())
+    }
+
     /// Receive-all (telemetry) systems must register last. The downlink's
     /// end-of-cycle snapshot only observes systems stepping before it, so a
     /// cyclic system registered after it would telemeter one cycle stale.
@@ -521,22 +534,18 @@ impl InitGraph {
         for (p, c, delayed) in &self.edges {
             let prod = &self.systems[p.system.id].desc;
             let cons = &self.systems[c.system.id].desc;
-            let out_idx =
-                prod.outputs
-                    .iter()
-                    .position(|d| d.id() == p.port)
-                    .ok_or(WireError::UnknownPort {
-                        system: p.system.id,
-                        port: p.port,
-                    })?;
-            let in_idx =
-                cons.inputs
-                    .iter()
-                    .position(|d| d.id() == c.port)
-                    .ok_or(WireError::UnknownPort {
-                        system: c.system.id,
-                        port: c.port,
-                    })?;
+            let out_idx = prod.outputs.iter().position(|d| d.id() == p.port).ok_or(
+                WireError::UnknownPort {
+                    system: p.system.id,
+                    port: p.port,
+                },
+            )?;
+            let in_idx = cons.inputs.iter().position(|d| d.id() == c.port).ok_or(
+                WireError::UnknownPort {
+                    system: c.system.id,
+                    port: c.port,
+                },
+            )?;
             if !compatible(&prod.outputs[out_idx], &cons.inputs[in_idx]) {
                 return Err(WireError::Incompatible {
                     producer: prod.name.clone(),
@@ -776,9 +785,10 @@ impl InitGraph {
                 // registry-entry shape still splits on the schema.
                 let ring = if shared.contains(&(sid, out_idx)) {
                     let session = alloc.session.as_ref().expect("proc graphs have a session");
-                    let path = session.path().join(format!("{instance}.{}.ring", port.name));
-                    let ring =
-                        alloc_ring_at(&path, port.delivery, port.max_size, depth, readers)?;
+                    let path = session
+                        .path()
+                        .join(format!("{instance}.{}.ring", port.name));
+                    let ring = alloc_ring_at(&path, port.delivery, port.max_size, depth, readers)?;
                     alloc.ring_paths.insert((sid, out_idx), path);
                     ring
                 } else {
@@ -832,7 +842,9 @@ impl InitGraph {
                 // output, path recorded for the worker manifests.
                 let ring = if matches!(&sys.bind, SystemBind::Slot(slot_reg) if slot_reg.process) {
                     let session = alloc.session.as_ref().expect("proc graphs have a session");
-                    let path = session.path().join(format!("{}.{}.ring", sys.name, port.name));
+                    let path = session
+                        .path()
+                        .join(format!("{}.{}.ring", sys.name, port.name));
                     let ring =
                         alloc_ring_at(&path, port.delivery, port.max_size, depth, 1 + slack)?;
                     alloc.host_input_paths.insert((sid, in_idx), path);
@@ -884,7 +896,6 @@ impl InitGraph {
         let slack = self.config.reader_slack;
         let mut plumbing = AsyncPlumbing {
             private_inputs: HashMap::new(),
-            async_wakes: vec![Vec::new(); self.systems.len()],
             copy_ins: Vec::new(),
         };
         for (sid, sys) in self.systems.iter().enumerate() {
@@ -914,10 +925,12 @@ impl InitGraph {
                 plumbing
                     .private_inputs
                     .insert((sid, in_idx), (private.clone(), data.clone()));
-                plumbing.async_wakes[sid].push(data);
                 alloc.table.rings.push(RingEntry {
                     ring: private,
-                    frame_id: port.id().component().expect("copy-in inputs are table ports"),
+                    frame_id: port
+                        .id()
+                        .component()
+                        .expect("copy-in inputs are table ports"),
                     role: BufferRole::Private {
                         system: sid,
                         input: in_idx,
@@ -937,6 +950,7 @@ impl InitGraph {
     /// registry freeze, copy-in planning, bind.
     pub(crate) fn build(self) -> Result<Coordinator, WireError> {
         self.validate_cycle_rate()?;
+        self.validate_simulated_step()?;
         self.validate_receive_all_last()?;
         self.validate_slot_name_caps()?;
         self.validate_port_axes()?;
@@ -1031,11 +1045,9 @@ pub(crate) struct RingAlloc {
 }
 
 /// The copy-in planning product: each async snapshot input's private ring plus
-/// matched data notifier, the per-system wake lists (for teardown), and the
-/// copy-in jobs.
+/// matched data notifier and the copy-in jobs.
 pub(crate) struct AsyncPlumbing {
     pub(crate) private_inputs: HashMap<(usize, usize), (RingBuffer, Notifier)>,
-    pub(crate) async_wakes: Vec<Vec<Notifier>>,
     pub(crate) copy_ins: Vec<CopyIn>,
 }
 

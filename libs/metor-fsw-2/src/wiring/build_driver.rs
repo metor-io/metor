@@ -471,7 +471,9 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn sidecar_matches_describe() {
-        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut wiring = fixture_wiring();
         if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
             eprintln!("skipping: build_artifacts failed: {e}");
@@ -493,7 +495,9 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn cross_divergence_is_a_hard_error() {
-        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut wiring = fixture_wiring();
         if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
             eprintln!("skipping: build_artifacts failed: {e}");
@@ -527,7 +531,9 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn sidecar_opt_out_writes_nothing() {
-        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let opts = BuildOptions {
             manifest_sidecar: false,
             ..BuildOptions::default()

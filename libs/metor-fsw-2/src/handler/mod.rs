@@ -41,7 +41,7 @@ pub use tuples::{ExecParamSet, ExecuteFn};
 pub(crate) use driver::{FnDriver, FutureDriver, OccupantFuture, bind_health_tail, mount_driver};
 pub(crate) use task::TaskParamsSpec;
 
-use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind, split_decls};
+use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind};
 use crate::health::{SystemHealth, SystemLog};
 use crate::pack::{EntryParams, MakeError, PackEntry, Pending, decode_params};
 
@@ -175,8 +175,8 @@ pub trait IntoPackEntry {
 fn descriptor_for<P: ExecParamSet>(name: &'static str) -> SystemDescriptor {
     let mut sink = DeclSink::default();
     P::decls(&mut sink);
-    let (inputs, _) = split_decls(sink.inputs);
-    let (mut outputs, _) = split_decls(sink.outputs);
+    let inputs = sink.inputs;
+    let mut outputs = sink.outputs;
     outputs.push(PortDesc::of::<SystemHealth>());
     outputs.push(PortDesc::of::<SystemLog>());
     SystemDescriptor {

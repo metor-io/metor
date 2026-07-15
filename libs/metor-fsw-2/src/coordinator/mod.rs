@@ -24,13 +24,14 @@ use std::sync::atomic::{
 };
 use std::time::{Duration, Instant};
 
-use metor_fsw_ring::{NoWake, Notifier, RingBuffer, View, WakeSource, Writer};
+use metor_fsw_ring::{NoWake, Notifier, RingBuffer, View, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto_wkt::{ReloadSequences, SequenceCommand, SequenceRegistry, WiringManifest};
+use stellarator::JoinHandle;
 use stellarator::sync::WaitQueue;
-use stellarator::{JoinHandle, JoinHandleDropGuard};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::DEFAULT_DEPTH;
 use crate::descriptor::{Hz, PortId};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
@@ -38,8 +39,7 @@ use crate::message::{MsgIn, MsgOut};
 use crate::port::Output;
 use crate::proc::session::SessionDir;
 use crate::registry::Registry;
-use crate::system::AsyncSystem;
-use crate::DEFAULT_DEPTH;
+use crate::system::{AsyncContext, AsyncSystem};
 
 mod bind;
 mod error;
@@ -49,11 +49,9 @@ mod status;
 
 pub use error::WireError;
 pub(crate) use slot::validate_slot_spec;
-pub use slot::{
-    AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError, SlotStatus,
-};
-pub use status::{NAME_CAP, SlotState, StopReason, StoppedSystem, WorkerRunState, WorkerStatus};
+pub use slot::{AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError, SlotStatus};
 pub(crate) use status::{CyclicSlot, pack_name};
+pub use status::{NAME_CAP, SlotState, StopReason, StoppedSystem, WorkerRunState, WorkerStatus};
 
 /// The default [`CoordinatorConfig::reader_slack`].
 const READER_SLACK: usize = 4;
@@ -263,7 +261,7 @@ pub(crate) struct CopyIn {
 /// an init-readiness barrier, and a go-gate that holds the first `run` pass
 /// until every system's `init` has completed.
 pub(crate) struct LaunchCtx {
-    stop: Arc<AtomicBool>,
+    cancel: stellarator::util::CancelToken,
     ready: Arc<WaitQueue>,
     ready_count: Arc<AtomicUsize>,
     go: Arc<WaitQueue>,
@@ -300,12 +298,8 @@ where
             ctx.ready_count.fetch_add(1, Release);
             ctx.ready.wake_all();
             let _ = ctx.go.wait_for(|| ctx.go_flag.load(Acquire)).await;
-            loop {
-                if ctx.stop.load(Acquire) {
-                    break;
-                }
-                me.system.run(&mut me.input, &mut me.output).await;
-            }
+            let context = AsyncContext { cancel: ctx.cancel };
+            me.system.run(&context, &mut me.input, &mut me.output).await;
             me.system.shutdown(&mut me.output);
         })
     }
@@ -315,18 +309,24 @@ where
 /// with. The `drop_guard` cancels the task if it does not exit cooperatively
 /// (and when a `Coordinator` is dropped mid-run).
 struct AsyncTask {
-    /// Held for its `Drop`: cancels the task on teardown (or coordinator drop).
-    #[allow(dead_code)]
-    handle: JoinHandleDropGuard<()>,
-    stop: Arc<AtomicBool>,
-    /// The input data-notifiers to wake so a task parked in `recv` re-polls.
-    wake_on_stop: Vec<Notifier>,
+    name: String,
+    handle: Option<JoinHandle<()>>,
+    cancel: stellarator::util::CancelToken,
+}
+
+impl Drop for AsyncTask {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(handle) = &self.handle {
+            let _ = handle.0.cancel();
+        }
+    }
 }
 
 /// A bound async system awaiting `run` (built at `build`, spawned at `run`).
 struct PendingAsync {
+    name: String,
     launcher: Box<dyn AsyncLauncher>,
-    wake_on_stop: Vec<Notifier>,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,10 +357,20 @@ struct BoundSystems {
 /// integer nanoseconds so the cycle index is never truncated (a narrower
 /// `dt * k as u32` would wrap the timeline back to `epoch` every 2³² cycles,
 /// breaking monotonicity and stalling in-flight `Wait`s). The u128 product
-/// cannot overflow for any realistic run; the final i64-microsecond cast holds
-/// roughly 292k years of simulated time.
+/// is checked and the timestamp saturates rather than wrapping if the run
+/// exceeds the representable timestamp range.
 fn simulated_now(epoch: Timestamp, dt: Duration, k: u64) -> Timestamp {
-    Timestamp(epoch.0 + (dt.as_nanos() * k as u128 / 1_000) as i64)
+    let delta = dt
+        .as_nanos()
+        .checked_mul(k as u128)
+        .map(|nanos| nanos / 1_000)
+        .unwrap_or(u128::MAX);
+    let room = (i128::from(i64::MAX) - i128::from(epoch.0)) as u128;
+    if delta > room {
+        Timestamp(i64::MAX)
+    } else {
+        Timestamp(epoch.0 + delta as i64)
+    }
 }
 
 /// Whether the freshly scanned stopped set differs from the previously
@@ -446,13 +456,14 @@ impl CoordChannels {
     /// Drain the cycle's reload requests; on any request re-emit the registry
     /// and (unchanged) manifest so a consumer that missed boot resyncs off one
     /// message. The drain coalesces a burst into a single re-emission.
-    fn service_reload(&mut self) {
+    fn service_reload(&mut self) -> Result<(), metor_fsw_ring::ReadError> {
         let mut reload = false;
-        self.reload_in.drain(|ReloadSequences {}| reload = true);
+        self.reload_in.drain(|ReloadSequences {}| reload = true)?;
         if reload {
             self.emit_sequence_registry();
             self.emit_wiring_manifest();
         }
+        Ok(())
     }
 
     /// Take the single command writer; `None` after the first take.
@@ -613,7 +624,9 @@ impl Coordinator {
             // A reload request re-emits the registry and manifest for consumers
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.
-            self.channels.service_reload();
+            if self.channels.service_reload().is_err() {
+                self.coord_health.error("reload_input_corrupt");
+            }
             // Each slot drains its own `commands` fan-in at the head of `step`,
             // so a command dispatches the same cycle it lands — no
             // coordinator-side command stage.
@@ -653,9 +666,9 @@ impl Coordinator {
 
         let mut tasks = Vec::with_capacity(n_async);
         for pending in std::mem::take(&mut self.pending_async) {
-            let stop = Arc::new(AtomicBool::new(false));
+            let cancel = stellarator::util::CancelToken::new();
             let ctx = LaunchCtx {
-                stop: stop.clone(),
+                cancel: cancel.clone(),
                 ready: ready.clone(),
                 ready_count: ready_count.clone(),
                 go: go.clone(),
@@ -663,9 +676,9 @@ impl Coordinator {
             };
             let handle = pending.launcher.launch(ctx);
             tasks.push(AsyncTask {
-                handle: handle.drop_guard(),
-                stop,
-                wake_on_stop: pending.wake_on_stop,
+                name: pending.name,
+                handle: Some(handle),
+                cancel,
             });
         }
 
@@ -781,32 +794,43 @@ impl Coordinator {
         // Split borrows: the writer takes `status_out`, the closure reads
         // `stopped`/`workers`, so no intermediate entries Vec is needed.
         let (stopped, workers) = (&self.stopped, &self.workers);
-        let _ = self.status_out.write_with(&frame, |fw| {
-            fw.list(offset_of!(CoordinatorStatus, stopped), |l| {
-                for sys in stopped {
-                    let (name, len) = pack_name(&sys.name);
-                    l.push(StoppedEntry {
-                        reason: sys.reason.code(),
-                        len,
-                        _pad: [0; 6],
-                        name,
-                    });
-                }
-            });
-            fw.list(offset_of!(CoordinatorStatus, workers), |l| {
-                for w in workers {
-                    let (name, len) = pack_name(&w.name);
-                    l.push(WorkerEntry {
-                        pid: w.pid,
-                        restarts: w.restarts,
-                        state: w.state.code(),
-                        len,
-                        _pad: [0; 6],
-                        name,
-                    });
-                }
-            });
+        let result = self.status_out.write_with(&frame, |fw| {
+            let _ = fw.list(
+                &frame.stopped,
+                offset_of!(CoordinatorStatus, stopped),
+                |l| {
+                    for sys in stopped.iter().take(MAX_STOPPED) {
+                        let (name, len) = pack_name(&sys.name);
+                        l.push(StoppedEntry {
+                            reason: sys.reason.code(),
+                            len,
+                            _pad: [0; 6],
+                            name,
+                        });
+                    }
+                },
+            );
+            let _ = fw.list(
+                &frame.workers,
+                offset_of!(CoordinatorStatus, workers),
+                |l| {
+                    for w in workers.iter().take(MAX_WORKERS) {
+                        let (name, len) = pack_name(&w.name);
+                        l.push(WorkerEntry {
+                            pid: w.pid,
+                            restarts: w.restarts,
+                            state: w.state.code(),
+                            len,
+                            _pad: [0; 6],
+                            name,
+                        });
+                    }
+                },
+            );
         });
+        if result.is_err() {
+            self.coord_health.error("status_publish_failed");
+        }
     }
 
     fn telemeter_overrun(&mut self, now: Timestamp, elapsed: Duration, budget: Duration) {
@@ -822,25 +846,32 @@ impl Coordinator {
         self.coord_health.end_cycle(now, elapsed.as_micros() as u64);
     }
 
-    /// Cooperative teardown: signal every async task, wake any parked `recv`,
-    /// give the tasks a brief window to finish their current pass and run
-    /// their own `shutdown`, then drop the tasks, whose `drop_guard` cancels
-    /// any still parked. Finally `shutdown` the cyclic systems in reverse
-    /// registration order. The `RingTable` drops last (struct field order).
+    /// Cooperative teardown: cancel waits, join tasks that run their shutdown
+    /// hook, then report and force-cancel deadline offenders.
     async fn shutdown(&mut self, tasks: Vec<AsyncTask>) {
         for t in &tasks {
-            t.stop.store(true, Release);
-            for n in &t.wake_on_stop {
-                n.notify();
-            }
+            t.cancel.cancel();
         }
-        // A task parked in `Input::recv` cannot be woken without data (the
-        // wait re-checks for a committed record), so a recv-driven loop only
-        // exits on the next datum; the bounded window lets timer- and
-        // data-paced tasks observe `stop` and flush in `System::shutdown`
-        // before we cancel.
-        stellarator::sleep(JOIN_TIMEOUT).await;
-        drop(tasks);
+        let deadline = Instant::now() + JOIN_TIMEOUT;
+        while tasks
+            .iter()
+            .any(|task| !task.handle.as_ref().expect("task handle").0.is_complete())
+            && Instant::now() < deadline
+        {
+            stellarator::yield_now().await;
+        }
+        for mut task in tasks {
+            let handle = task.handle.take().expect("task handle");
+            if !handle.0.is_complete() {
+                self.coord_health.error("async_shutdown_timeout");
+                self.coord_health.log(
+                    Level::Error,
+                    &format!("async system '{}' exceeded shutdown deadline", task.name),
+                );
+                let _ = handle.0.cancel();
+            }
+            let _ = handle.await;
+        }
         for slot in self.cyclic.iter_mut().rev() {
             slot.shutdown();
         }

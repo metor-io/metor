@@ -75,7 +75,7 @@ use stellarator::net::TcpStream;
 use thingbuf::mpsc;
 
 use crate::binder::{BindPorts, RingSource};
-use crate::descriptor::{Delivery, PortDecl, PortDesc, SystemDescriptor};
+use crate::descriptor::{Declarations, Delivery, PortDesc, SystemDescriptor};
 use crate::health::HealthPort;
 use crate::message::{MsgFanOut, NamedMsg, split_record};
 use crate::registry::{AllOutputs, RegistryEntry};
@@ -173,7 +173,6 @@ impl TcpTransport {
         }
         Ok(&self.conn.as_ref().expect("just connected").tx)
     }
-
 }
 
 impl Transport for TcpTransport {
@@ -185,10 +184,16 @@ impl Transport for TcpTransport {
         let res: Result<(), TransportError> = async {
             let tx = self.ensure().await?;
             let pkt = msg.into_len_packet();
-            tx.write_all(pkt.inner).await.0.map_err(TransportError::io)?;
+            tx.write_all(pkt.inner)
+                .await
+                .0
+                .map_err(TransportError::io)?;
             for m in meta {
                 let pkt = (&SetComponentMetadata(m.clone())).into_len_packet();
-                tx.write_all(pkt.inner).await.0.map_err(TransportError::io)?;
+                tx.write_all(pkt.inner)
+                    .await
+                    .0
+                    .map_err(TransportError::io)?;
             }
             Ok(())
         }
@@ -475,11 +480,12 @@ impl UplinkOut {
 }
 
 impl SystemOutput for UplinkOut {
-    fn decls() -> Vec<PortDecl> {
+    fn decls() -> Declarations {
         vec![
-            PortDecl::Port(PortDesc::of::<crate::SystemHealth>()),
-            PortDecl::Port(PortDesc::of::<crate::SystemLog>()),
+            PortDesc::of::<crate::SystemHealth>(),
+            PortDesc::of::<crate::SystemLog>(),
         ]
+        .into()
     }
 }
 
@@ -500,8 +506,8 @@ impl BindPorts for UplinkOut {
 pub struct UplinkIn;
 
 impl SystemInput for UplinkIn {
-    fn decls() -> Vec<PortDecl> {
-        Vec::new()
+    fn decls() -> Declarations {
+        Declarations::default()
     }
 }
 
@@ -587,8 +593,7 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
         desc
     }
 
-    /// One ingest pass, called repeatedly by the coordinator's async-run loop:
-    /// receive the next packet into the recycled buffer and forward it
+    /// Receive packets until shutdown and forward each one
     /// verbatim on the minted output whose id matches, then recover the
     /// buffer from the packet for the next pass. A msg outside the configured
     /// set bumps `uplink_unroutable` (the broker should only relay subscribed
@@ -596,7 +601,12 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
     /// `uplink_dropped`, and `Table` packets are silently ignored. A receive
     /// error bumps `uplink_disconnect` and backs the pass off; the transport
     /// redials on the next receive, so a dropped link recovers on its own.
-    async fn run(&mut self, _input: &mut Self::Input, output: &mut Self::Output) {
+    async fn run(
+        &mut self,
+        context: &crate::AsyncContext,
+        _input: &mut Self::Input,
+        output: &mut Self::Output,
+    ) {
         // Subscribe once, before the first read, to exactly the configured ids.
         if !self.subscribed {
             let (fan, health) = output.split();
@@ -620,38 +630,52 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
             self.recv.subscribe(&ids);
             self.subscribed = true;
         }
-        match self.recv.recv(std::mem::take(&mut self.recv_buf)).await {
-            Ok(pkt) => {
-                self.backoff = RECONNECT_MIN;
-                // Msgs are routed; tables are ignored (the uplink is commands
-                // only). Either way the packet's backing buffer is recovered
-                // for the next receive.
-                if let OwnedPacket::Msg(m) = &pkt {
-                    let (fan, health) = output.split();
-                    match self.msgs.iter().position(|&(_, id)| id == m.id) {
-                        Some(idx) => {
-                            if fan.write_raw(idx, m.id, &m.buf).is_err() {
-                                health.error("uplink_dropped");
+        loop {
+            let Some(received) = context
+                .until_cancelled(self.recv.recv(std::mem::take(&mut self.recv_buf)))
+                .await
+            else {
+                break;
+            };
+            match received {
+                Ok(pkt) => {
+                    self.backoff = RECONNECT_MIN;
+                    // Msgs are routed; tables are ignored (the uplink is commands
+                    // only). Either way the packet's backing buffer is recovered
+                    // for the next receive.
+                    if let OwnedPacket::Msg(m) = &pkt {
+                        let (fan, health) = output.split();
+                        match self.msgs.iter().position(|&(_, id)| id == m.id) {
+                            Some(idx) => {
+                                if fan.write_raw(idx, m.id, &m.buf).is_err() {
+                                    health.error("uplink_dropped");
+                                    health.end_cycle(Timestamp::now(), 0);
+                                }
+                            }
+                            None => {
+                                health.error("uplink_unroutable");
                                 health.end_cycle(Timestamp::now(), 0);
                             }
                         }
-                        None => {
-                            health.error("uplink_unroutable");
-                            health.end_cycle(Timestamp::now(), 0);
-                        }
                     }
+                    self.recv_buf = pkt.into_buf().into_inner();
                 }
-                self.recv_buf = pkt.into_buf().into_inner();
-            }
-            // A dropped link: count it, back off, and let the next pass
-            // redial. An async system has no per-cycle driver flushing its
-            // health, so publish immediately.
-            Err(_) => {
-                let (_, health) = output.split();
-                health.error("uplink_disconnect");
-                health.end_cycle(Timestamp::now(), 0);
-                stellarator::sleep(self.backoff).await;
-                self.backoff = (self.backoff * 2).min(RECONNECT_MAX);
+                // A dropped link: count it, back off, and let the next pass
+                // redial. An async system has no per-cycle driver flushing its
+                // health, so publish immediately.
+                Err(_) => {
+                    let (_, health) = output.split();
+                    health.error("uplink_disconnect");
+                    health.end_cycle(Timestamp::now(), 0);
+                    if context
+                        .until_cancelled(stellarator::sleep(self.backoff))
+                        .await
+                        .is_none()
+                    {
+                        break;
+                    }
+                    self.backoff = (self.backoff * 2).min(RECONNECT_MAX);
+                }
             }
         }
     }
@@ -739,8 +763,8 @@ pub struct TelemetryPorts {
 pub struct TelemetryIn;
 
 impl SystemInput for TelemetryIn {
-    fn decls() -> Vec<PortDecl> {
-        Vec::new()
+    fn decls() -> Declarations {
+        Declarations::default()
     }
 }
 
@@ -964,23 +988,28 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
                         continue;
                     }
                     tap.last_committed = committed;
-                    // A corrupt read (unreachable in practice) counts as
-                    // nothing new.
-                    if let Ok(Some(grant)) = tap.view.try_latest() {
-                        if let Some(batch) = &mut batch {
-                            append_record(batch, &tap.wire, &grant);
+                    match tap.view.try_latest() {
+                        Ok(Some(grant)) => {
+                            if let Some(batch) = &mut batch {
+                                append_record(batch, &tap.wire, &grant);
+                            }
                         }
+                        Ok(None) => {}
+                        Err(_) => output.health().error("telemetry_input_corrupt"),
                     }
                 }
                 // Every record, in order.
                 Delivery::Log => {
                     let wire = &tap.wire;
                     let batch = &mut batch;
-                    let _ = crate::port::drain_view(&mut tap.view, |rec| {
+                    let result = crate::port::drain_view(&mut tap.view, |rec| {
                         if let Some(batch) = batch.as_mut() {
                             append_record(batch, wire, rec);
                         }
                     });
+                    if result.is_err() {
+                        output.health().error("telemetry_input_corrupt");
+                    }
                 }
             }
         }

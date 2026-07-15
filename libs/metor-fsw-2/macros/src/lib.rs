@@ -129,7 +129,7 @@ pub fn frame(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// everything from the method signatures.
 ///
 /// - `fn execute(&mut self, now: Timestamp, …ports)` produces a
-///   `CyclicSystem`; `async fn run(&mut self, …ports)` produces an
+///   `CyclicSystem`; `async fn run(&mut self, context: &AsyncContext, …ports)` produces an
 ///   `AsyncSystem`. Exactly one of the two must be present.
 /// - Port parameters are `&mut Input<T>`, `&mut MsgIn<M>`, `&mut Output<T>`,
 ///   `&mut MsgOut<M>`, or `&mut CommandOut<M>`, plus at most one

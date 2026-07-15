@@ -16,8 +16,8 @@
 
 use miette::SourceSpan;
 
-use super::model::{Artifact, ParamSource, SlotSpec, SystemSpec, Wiring};
 use super::model::IR_VERSION;
+use super::model::{Artifact, ParamSource, SlotSpec, SystemSpec, Wiring};
 use super::resolve::{slot_config_error, slot_src, src_anchor, system_src};
 use super::{LoadError, LoadErrorKind};
 use crate::coordinator::validate_slot_spec;
@@ -82,16 +82,19 @@ fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
     let mut seen: Vec<&str> = vec![RESERVED_INSTANCE];
     for spec in &wiring.systems {
         if seen.contains(&spec.name.as_str()) {
-            return Err(LoadErrorKind::DuplicateInstance { name: spec.name.clone() }
-                .whole(system_src(spec)));
+            return Err(LoadErrorKind::DuplicateInstance {
+                name: spec.name.clone(),
+            }
+            .whole(system_src(spec)));
         }
         seen.push(&spec.name);
     }
     for slot in &wiring.slots {
         if seen.contains(&slot.name.as_str()) {
-            return Err(
-                LoadErrorKind::DuplicateInstance { name: slot.name.clone() }.whole(slot_src(slot))
-            );
+            return Err(LoadErrorKind::DuplicateInstance {
+                name: slot.name.clone(),
+            }
+            .whole(slot_src(slot)));
         }
         seen.push(&slot.name);
     }
@@ -104,8 +107,10 @@ fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
     let mut seen: Vec<&str> = Vec::new();
     for artifact in &wiring.artifacts {
         if seen.contains(&artifact.id.as_str()) {
-            return Err(LoadErrorKind::DuplicateArtifact { id: artifact.id.clone() }
-                .whole(artifact_src(artifact)));
+            return Err(LoadErrorKind::DuplicateArtifact {
+                id: artifact.id.clone(),
+            }
+            .whole(artifact_src(artifact)));
         }
         seen.push(&artifact.id);
     }
@@ -127,16 +132,17 @@ pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), Loa
             }
         }
         (None, true) => {
-            return Err(
-                LoadErrorKind::ProcessNeedsArtifact { name: spec.name.clone() }
-                    .whole(system_src(spec)),
-            );
+            return Err(LoadErrorKind::ProcessNeedsArtifact {
+                name: spec.name.clone(),
+            }
+            .whole(system_src(spec)));
         }
         (None, false) => {
             let Some(ty) = spec.ty.as_deref() else {
-                return Err(
-                    LoadErrorKind::MissingType { name: spec.name.clone() }.whole(system_src(spec))
-                );
+                return Err(LoadErrorKind::MissingType {
+                    name: spec.name.clone(),
+                }
+                .whole(system_src(spec)));
             };
             if matches!(spec.params, ParamSource::Postcard(_)) {
                 return Err(LoadErrorKind::StaticPostcardParams {
@@ -182,7 +188,10 @@ pub(crate) fn check_instance_available(wiring: &Wiring, name: &str) -> Result<()
         || wiring.systems.iter().any(|s| s.name == name)
         || wiring.slots.iter().any(|s| s.name == name)
     {
-        return Err(LoadErrorKind::DuplicateInstance { name: name.to_string() }.bare());
+        return Err(LoadErrorKind::DuplicateInstance {
+            name: name.to_string(),
+        }
+        .bare());
     }
     Ok(())
 }
@@ -230,5 +239,9 @@ fn artifact_exists(wiring: &Wiring, id: &str) -> bool {
 
 /// A best-effort source snippet for an artifact's structural errors.
 fn artifact_src(artifact: &Artifact) -> String {
-    format!("artifact \"{}\"{}", artifact.id, src_anchor(artifact.src.as_ref()))
+    format!(
+        "artifact \"{}\"{}",
+        artifact.id,
+        src_anchor(artifact.src.as_ref())
+    )
 }

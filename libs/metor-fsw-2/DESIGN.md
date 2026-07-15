@@ -76,7 +76,7 @@ frame tag op and `List`/`Map`/`PathComponent` ops; see `docs/vtable-dynamic.md`.
 ## Dynamic components
 
 Frames support a bounded form of runtime dynamism through two member types,
-`FrameList<T, MAX>` and `FrameMap<K, V, MAX, MAX_KEY>` (`src/dynamic.rs`). Consider a system
+`FrameList<T, MAX>` and `FrameMap<V, MAX, MAX_KEY>` (`src/dynamic.rs`). Consider a system
 reporting per-process telemetry, where the number of processes is unknown at compile time
 and changes at runtime:
 
@@ -88,7 +88,7 @@ struct ProcMon {
     #[metor_fsw(timestamp)]
     timestamp: Timestamp,
     // name-keyed: processes.htop.cpu_usage
-    processes: FrameMap<Name<'static>, Process, 64>,
+    processes: FrameMap<Process, 64>,
     // or positionally indexed: processes.0.cpu_usage
     // processes: FrameList<Process, 64>,
 }
@@ -104,7 +104,7 @@ Each dynamic element is addressed by a **fully-qualified component name** formed
 field's path prefix plus its key or index — `processes.htop.pid` for a name-keyed map,
 `processes.0.pid` for a list. The `ComponentId` is the hash of that full name, so even
 deeply nested dynamic data yields ordinary, fully-qualified components that metor-db and UIs
-store and query without special cases. Map keys are validated `Name`s: they may not contain
+store and query without special cases. Map keys are validated strings: they may not contain
 `.` (it would alias the path separator) or be empty (an empty segment vanishes under the
 path hasher).
 
@@ -112,9 +112,9 @@ In the `#[repr(C)]` layout, a list/map field **is** an 8-byte `Slot { trailer_of
 — nothing more. The element data lives in a padded **trailer** after the fixed portion of
 the frame (a layout cribbed from rkyv / flatbuffers); the slot points into it. With purely
 fixed data the trailer is empty and unused. The producer builds the trailer with a
-`FrameWriter` (`src/writer.rs`, with its `ListWriter`/`MapWriter` builders); a consumer reads
-it with a `ListReader`/`MapReader` (`src/reader.rs`) or through the VTable `apply` escape
-hatch. See `docs/frames.md`.
+`FrameWriter` (`src/writer.rs`, with its bounded `ListWriter`/`MapWriter` builders). A consumer
+reads the fixed region with `FrameRef::get`, accesses the raw table with `FrameRef::table`, or
+walks dynamic members through the VTable `apply` path. See `docs/frames.md`.
 
 ## Systems
 
@@ -184,9 +184,10 @@ exactly one of two leaf traits expressing how the system is driven:
   a mutating operation even though the *data* it exposes is a zero-copy, read-only borrow
   straight off the upstream producer's ring — the system cannot write through it, only
   advance past it.
-- **`AsyncSystem`** owns its own loop. The coordinator spawns `run(input, output)` once and
-  never ticks it; the system paces itself on a timer or by awaiting its inputs. Its inputs
-  read from private buffers the coordinator mirrors upstream records into (see below).
+- **`AsyncSystem`** owns its own loop. The coordinator spawns
+  `run(context, input, output)` once and never ticks it; the system paces itself on a timer or
+  by awaiting inputs through `context.until_cancelled(...)`. Its inputs read from private
+  buffers the coordinator mirrors upstream records into (see below).
 
 ```rust
 pub trait CyclicSystem: System {

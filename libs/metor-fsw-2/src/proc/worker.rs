@@ -137,9 +137,8 @@ pub fn worker_entry() {
 fn run_worker(manifest_path: &Path) -> i32 {
     let manifest = match std::fs::read(manifest_path)
         .map_err(|e| e.to_string())
-        .and_then(|bytes| {
-            postcard::from_bytes::<WorkerManifest>(&bytes).map_err(|e| e.to_string())
-        }) {
+        .and_then(|bytes| postcard::from_bytes::<WorkerManifest>(&bytes).map_err(|e| e.to_string()))
+    {
         Ok(m) => m,
         Err(e) => {
             eprintln!(
@@ -267,14 +266,21 @@ fn run_system(
         FswRing { base, len, role }
     };
     let inputs: Vec<FswRing> = input_rings.iter().map(|r| handle(r, ROLE_INPUT)).collect();
-    let outputs: Vec<FswRing> = output_rings.iter().map(|r| handle(r, ROLE_OUTPUT)).collect();
+    let outputs: Vec<FswRing> = output_rings
+        .iter()
+        .map(|r| handle(r, ROLE_OUTPUT))
+        .collect();
 
     let dl = match crate::dl::DlPack::open(artifact).and_then(|pack| pack.system(system)) {
         Ok(dl) => dl,
         Err(e) => {
             return fail(
                 fail_code::ARTIFACT,
-                format!("cannot load `{}` from `{}`: {e}", system, artifact.display()),
+                format!(
+                    "cannot load `{}` from `{}`: {e}",
+                    system,
+                    artifact.display()
+                ),
             );
         }
     };
@@ -290,7 +296,10 @@ fn run_system(
     };
     let mut slot = unsafe { dl.make_slot(params, inputs, outputs, name, mount) };
     if slot.state().is_stopped() {
-        return fail(fail_code::CREATE, "fsw_create panicked in the artifact".into());
+        return fail(
+            fail_code::CREATE,
+            "fsw_create panicked in the artifact".into(),
+        );
     }
 
     ctl.report(WorkerState::Attached);

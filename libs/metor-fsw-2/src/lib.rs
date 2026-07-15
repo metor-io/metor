@@ -145,7 +145,7 @@ pub mod proc;
 
 pub use dynamic::{FrameList, FrameMap, Slot};
 pub use frame::Frame;
-pub use writer::{FrameScratch, FrameWriter, KeyError, ListWriter, MapWriter};
+pub use writer::{DynamicWriteError, FrameScratch, FrameWriter, KeyError, ListWriter, MapWriter};
 
 pub use metor_fsw_ring::{ReadError, WriteError};
 
@@ -153,31 +153,33 @@ pub use binder::{AnySource, BindPorts, Binder, BoundInput, BoundPort, RingSource
 // `system` the fn (value namespace) coexists with `system` the attribute
 // macro (macro namespace) at the root: `system(nav_execute)` and
 // `#[metor_fsw_2::system]` resolve independently.
-pub use handler::{
-    AsyncSystemFn, BindCx, CycleCx, DeclSink, ExecParam, ExecParamSet, ExecuteFn, InitFn,
-    IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
-};
-pub use pack::{Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus};
-pub use testbench::TestBench;
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, NAME_CAP,
     OccupantBacking, SlotConfigError, SlotState, SlotStatus, StopReason, StoppedSystem, WireError,
     WorkerRunState, WorkerStatus,
 };
+pub use handler::{
+    AsyncSystemFn, BindCx, CycleCx, DeclSink, ExecParam, ExecParamSet, ExecuteFn, InitFn,
+    IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
+};
+pub use pack::{Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus};
 pub use registry::{AllOutputs, Registry, RegistryEntry};
 pub use telemetry::{
     DownlinkParams, RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
     TelemetrySystem, Transport, TransportError, UplinkParams, UplinkSystem,
 };
+pub use testbench::TestBench;
 
 pub use descriptor::{
-    Capability, Delivery, FanIn, Hz, PortConn, PortDecl, PortDesc, PortId, PortSchema,
-    SystemDescriptor, SystemKind, split_decls,
+    Capability, Declarations, Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema,
+    SystemDescriptor, SystemKind,
 };
 pub use health::{
     HealthPort, LOG_MSG_CAP, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };
-pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity_for};
+pub use port::{
+    DEFAULT_DEPTH, FrameRef, FrameWriteError, Input, Output, buffer_capacity, capacity_for,
+};
 
 pub use alarm::{AlarmIn, AlarmOut, AlarmSpec, AlarmSystem, AlarmsParams, BandSpec, TargetSpec};
 
@@ -185,8 +187,8 @@ pub use message::{
     CommandOut, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, MsgTable, NamedMsg, split_record,
 };
 pub use system::{
-    AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicRunner, CyclicSystem, Out, System,
-    SystemInput, SystemOutput,
+    AsyncContext, AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicRunner, CyclicSystem,
+    Out, System, SystemInput, SystemOutput,
 };
 #[doc(hidden)]
 pub use system::{NoParamsDefault, ParamsDefaultProbe};

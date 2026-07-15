@@ -27,9 +27,9 @@ use metor_proto_wkt::{
 use stellarator::buf::{IoBuf, Slice};
 
 use crate::{
-    AllowedOccupant, ClockMode, CoordinatorConfig, CyclicSystem, DlPack, DlSystem,
-    Input, MsgIn, Out, RecvTransport, SlotStatus, System, SystemHealth, SystemInput,
-    SystemOutput, Timestamp, TransportError, UplinkSystem, split_record,
+    AllowedOccupant, ClockMode, CoordinatorConfig, CyclicSystem, DlPack, DlSystem, Input, MsgIn,
+    Out, RecvTransport, SlotStatus, System, SystemHealth, SystemInput, SystemOutput, Timestamp,
+    TransportError, UplinkSystem, split_record,
 };
 
 use super::PortRef;
@@ -217,19 +217,33 @@ fn uplink_command_loads_and_starts_same_cycle() {
     let slot = b.push_node(Node {
         name: "adcs".into(),
         desc,
-        bind: SystemBind::Slot(SlotReg { allowed, initial: None, ports, process }),
+        bind: SystemBind::Slot(SlotReg {
+            allowed,
+            initial: None,
+            ports,
+            process,
+        }),
     });
-    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv::new(vec![
+    let uplink = b.push_node(async_node(
+        "uplink".into(),
+        UplinkSystem::new(MockRecv::new(vec![
             load("adcs", "waiter"),
             SequenceCommand {
                 channel: "adcs".to_string(),
                 command: SequenceCommandKind::Start,
             },
         ]))
-        .with_msg::<SequenceCommand>(),));
+        .with_msg::<SequenceCommand>(),
+    ));
     b.connect(
-        PortRef { system: uplink, port: PortId::Packet(SequenceCommand::ID) },
-        PortRef { system: slot, port: PortId::Packet(SequenceCommand::ID) },
+        PortRef {
+            system: uplink,
+            port: PortId::Packet(SequenceCommand::ID),
+        },
+        PortRef {
+            system: slot,
+            port: PortId::Packet(SequenceCommand::ID),
+        },
     );
     let mut coord = b.build().expect("the slot + uplink graph builds");
 
@@ -282,13 +296,27 @@ fn reload_request_reemits_registry() {
     let _slot = b.push_node(Node {
         name: "adcs".into(),
         desc,
-        bind: SystemBind::Slot(SlotReg { allowed, initial: None, ports, process }),
+        bind: SystemBind::Slot(SlotReg {
+            allowed,
+            initial: None,
+            ports,
+            process,
+        }),
     });
-    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
-            .with_msg::<ReloadSequences>(),));
+    let uplink = b.push_node(async_node(
+        "uplink".into(),
+        UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
+            .with_msg::<ReloadSequences>(),
+    ));
     b.connect(
-        PortRef { system: uplink, port: PortId::Packet(ReloadSequences::ID) },
-        PortRef { system: b.coordinator_handle(), port: PortId::Packet(ReloadSequences::ID) },
+        PortRef {
+            system: uplink,
+            port: PortId::Packet(ReloadSequences::ID),
+        },
+        PortRef {
+            system: b.coordinator_handle(),
+            port: PortId::Packet(ReloadSequences::ID),
+        },
     );
     let mut coord = b.build().expect("the slot + uplink graph builds");
 
@@ -345,12 +373,18 @@ impl System for CmdTap {
 
 impl CyclicSystem for CmdTap {
     fn execute(&mut self, _now: Timestamp, input: &mut CmdTapIn, _o: &mut Self::Output) {
-        input.reloads.drain(|_| {
-            RELOADS_SEEN.fetch_add(1, Relaxed);
-        });
-        input.commands.drain(|_| {
-            CMDS_SEEN.fetch_add(1, Relaxed);
-        });
+        input
+            .reloads
+            .drain(|_| {
+                RELOADS_SEEN.fetch_add(1, Relaxed);
+            })
+            .unwrap();
+        input
+            .commands
+            .drain(|_| {
+                CMDS_SEEN.fetch_add(1, Relaxed);
+            })
+            .unwrap();
     }
 }
 
@@ -388,18 +422,33 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let tap = b.push_node(cyclic_node(CmdTap::NAME.into(), CmdTap));
-    let uplink = b.push_node(async_node("uplink".into(), UplinkSystem::new(MockRecv::from_packets(vec![
+    let uplink = b.push_node(async_node(
+        "uplink".into(),
+        UplinkSystem::new(MockRecv::from_packets(vec![
             reload, unroutable, malformed, valid,
         ]))
         .with_msg::<ReloadSequences>()
-        .with_msg::<SequenceCommand>(),));
+        .with_msg::<SequenceCommand>(),
+    ));
     b.connect(
-        PortRef { system: uplink, port: PortId::Packet(ReloadSequences::ID) },
-        PortRef { system: tap, port: PortId::Packet(ReloadSequences::ID) },
+        PortRef {
+            system: uplink,
+            port: PortId::Packet(ReloadSequences::ID),
+        },
+        PortRef {
+            system: tap,
+            port: PortId::Packet(ReloadSequences::ID),
+        },
     );
     b.connect(
-        PortRef { system: uplink, port: PortId::Packet(SequenceCommand::ID) },
-        PortRef { system: tap, port: PortId::Packet(SequenceCommand::ID) },
+        PortRef {
+            system: uplink,
+            port: PortId::Packet(SequenceCommand::ID),
+        },
+        PortRef {
+            system: tap,
+            port: PortId::Packet(SequenceCommand::ID),
+        },
     );
     let mut coord = b.build().expect("the uplink + tap graph builds");
 
@@ -429,7 +478,9 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
          and the garbage payload was dropped"
     );
     let mut errors = 0;
-    let _ = health.drain(|f| errors = errors.max(f.get().errors));
+    health
+        .drain(|f| errors = errors.max(f.get().errors))
+        .unwrap();
     assert!(
         errors >= 1,
         "the unknown-id Msg bumped the uplink's unroutable counter: {errors}"

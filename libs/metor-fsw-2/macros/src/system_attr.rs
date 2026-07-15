@@ -146,6 +146,8 @@ impl PortKind {
 enum ParamKind {
     /// `now: Timestamp`, the cycle timestamp.
     Now,
+    /// `context: &AsyncContext`, the async cancellation context.
+    Context,
     /// `x: &mut <Port><T>`, a wired port.
     Port { kind: PortKind, elem: Box<Type> },
     /// `health: &mut HealthPort`, the opt-in health handle.
@@ -167,7 +169,8 @@ fn unrecognized(ty: &Type) -> syn::Error {
         ty,
         format!(
             "expected a port (`&mut Input<T>`, `&mut Output<T>`, `&mut MsgIn<T>`, \
-             `&mut MsgOut<T>`), `&mut HealthPort`, or `now: Timestamp`; found `{found}` \
+             `&mut MsgOut<T>`), `&mut HealthPort`, `&AsyncContext`, or `now: Timestamp`; \
+             found `{found}` \
              — non-port state belongs in fields of the system struct"
         ),
     )
@@ -230,7 +233,26 @@ fn classify_params(
                 let head = sig::type_head(&r.elem)
                     .map(|i| i.to_string())
                     .unwrap_or_default();
-                if head == "HealthPort" {
+                if head == "AsyncContext" {
+                    if r.mutability.is_some() {
+                        errors.push(syn::Error::new_spanned(
+                            &pt.ty,
+                            "the async context is read-only: write `&AsyncContext`",
+                        ));
+                        continue;
+                    }
+                    if !sig::type_args(&r.elem).is_empty() {
+                        errors.push(syn::Error::new_spanned(
+                            &r.elem,
+                            "`AsyncContext` takes no type parameters",
+                        ));
+                        continue;
+                    }
+                    out.push(ExecParam {
+                        ident,
+                        kind: ParamKind::Context,
+                    });
+                } else if head == "HealthPort" {
                     if r.mutability.is_none() {
                         errors.push(syn::Error::new_spanned(
                             &pt.ty,
@@ -433,20 +455,38 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         // `now: Timestamp` is required exactly once on execute and rejected
         // on run.
         let mut now_seen = false;
+        let mut context_seen = false;
         for (p, arg) in params.iter().zip(non_receiver_args(&f.sig)) {
-            if matches!(p.kind, ParamKind::Now) {
-                if !is_cyclic {
-                    errors.push(syn::Error::new_spanned(
-                        arg,
-                        "async systems have no coordinator `now`; remove this parameter",
-                    ));
-                } else if now_seen {
-                    errors.push(syn::Error::new_spanned(
-                        arg,
-                        "at most one `now: Timestamp` parameter",
-                    ));
+            match p.kind {
+                ParamKind::Now => {
+                    if !is_cyclic {
+                        errors.push(syn::Error::new_spanned(
+                            arg,
+                            "async systems have no coordinator `now`; remove this parameter",
+                        ));
+                    } else if now_seen {
+                        errors.push(syn::Error::new_spanned(
+                            arg,
+                            "at most one `now: Timestamp` parameter",
+                        ));
+                    }
+                    now_seen = true;
                 }
-                now_seen = true;
+                ParamKind::Context => {
+                    if is_cyclic {
+                        errors.push(syn::Error::new_spanned(
+                            arg,
+                            "cyclic systems have no async context; remove this parameter",
+                        ));
+                    } else if context_seen {
+                        errors.push(syn::Error::new_spanned(
+                            arg,
+                            "at most one `context: &AsyncContext` parameter",
+                        ));
+                    }
+                    context_seen = true;
+                }
+                _ => {}
             }
         }
         if is_cyclic && !now_seen {
@@ -552,6 +592,7 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
                 let id = &p.ident;
                 match &p.kind {
                     ParamKind::Now => quote! { __now },
+                    ParamKind::Context => quote! { __context },
                     ParamKind::Health => quote! { __health },
                     ParamKind::Port { kind, .. } if kind.is_input() => {
                         quote! { &mut __input.#id }
@@ -612,9 +653,14 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     } else {
         quote! {
             impl #fsw2::AsyncSystem for #self_ty {
-                async fn run(&mut self, __input: &mut Self::Input, __output: &mut Self::Output) {
+                async fn run(
+                    &mut self,
+                    __context: &#fsw2::AsyncContext,
+                    __input: &mut Self::Input,
+                    __output: &mut Self::Output,
+                ) {
                     let (__ports, __health) = #fsw2::Out::split(__output);
-                    let _ = (&__input, &__ports, &__health);
+                    let _ = (&__context, &__input, &__ports, &__health);
                     self.#main_hidden(#(#main_args),*).await
                 }
             }
@@ -705,6 +751,13 @@ fn validate_lifecycle(
     for p in params {
         match &p.kind {
             ParamKind::Health => {}
+            ParamKind::Context => errors.push(syn::Error::new(
+                p.ident.span(),
+                format!(
+                    "`{method}` may only take execute's output ports (by name) and \
+                     `&mut HealthPort`; it has no async context"
+                ),
+            )),
             ParamKind::Now => errors.push(syn::Error::new(
                 p.ident.span(),
                 format!(
@@ -920,12 +973,18 @@ mod tests {
             quote!(),
             quote! {
                 impl Radio {
-                    async fn run(&mut self, cmds: &mut MsgIn<GroundCmd>, tm: &mut MsgOut<RadioTm>) {}
+                    async fn run(
+                        &mut self,
+                        context: &AsyncContext,
+                        cmds: &mut MsgIn<GroundCmd>,
+                        tm: &mut MsgOut<RadioTm>,
+                    ) {}
                 }
             },
         );
         assert!(out.contains("AsyncSystem for Radio"), "{out}");
         assert!(out.contains("__fsw_run"), "{out}");
+        assert!(out.contains("__fsw_run(__context"), "{out}");
         assert!(
             out.contains(r#"const NAME: &'static str = "radio";"#),
             "{out}"

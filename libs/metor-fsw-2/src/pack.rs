@@ -21,9 +21,9 @@ use serde::de::DeserializeOwned;
 
 use crate::binder::AnySource;
 use crate::coordinator::{CyclicSlot, SlotState};
+use crate::descriptor::SystemDescriptor;
 use crate::handler::IntoPackEntry;
 use crate::sequence::Outcome;
-use crate::descriptor::SystemDescriptor;
 
 /// One runnable system instance, whatever style authored it. The pack-side
 /// convergence of [`CyclicRunner`](crate::CyclicRunner) and the sequence
@@ -130,7 +130,8 @@ pub(crate) fn resolve_defaults(
 
 /// The bind-phase half of a created entry: bind ports over the ring source
 /// (positionally, in descriptor order) and yield the runnable driver.
-pub type Pending = Box<dyn for<'a, 'b, 'c> FnOnce(&'a mut AnySource<'b, 'c>, Mount) -> Box<dyn Driver>>;
+pub type Pending =
+    Box<dyn for<'a, 'b, 'c> FnOnce(&'a mut AnySource<'b, 'c>, Mount) -> Box<dyn Driver>>;
 
 pub(crate) type CreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<Pending, MakeError>>;
 
@@ -291,8 +292,8 @@ impl Pack {
         F::decls(&mut sink);
         let spec = sink.task_params.take().unwrap_or_else(TaskParamsSpec::unit);
         let params_schema = spec.schema;
-        let (inputs, _) = crate::descriptor::split_decls(std::mem::take(&mut sink.inputs));
-        let (mut outputs, _) = crate::descriptor::split_decls(std::mem::take(&mut sink.outputs));
+        let inputs = std::mem::take(&mut sink.inputs);
+        let mut outputs = std::mem::take(&mut sink.outputs);
         outputs.push(crate::PortDesc::of::<crate::SystemHealth>());
         outputs.push(crate::PortDesc::of::<crate::SystemLog>());
         let descriptor = SystemDescriptor {

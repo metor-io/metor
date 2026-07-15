@@ -207,16 +207,15 @@ subscription behind it) starts at whatever the ring's live edge is at attach tim
 start, so a one-shot init-time record is equally invisible to a late-joining consumer. Not yet fixed;
 noted here as the honest limit of "the downlink taps every output," not solved by a backlog replay.
 
-It then builds the hand-off (§4) sized to the tap count, an `AtomicBool` stop flag, and spawns
-`run_sender`, retaining the join handle as a `JoinHandleDropGuard` (its `Drop` cancels the task at
-teardown).
+It then creates a bounded `thingbuf` channel of reusable `Vec<u8>` batch slots and spawns
+`run_sender`, retaining its cancellation guard for teardown.
 
-**`execute(now)`** (end-of-cycle) drains each tap per its **lane** (§4) — `Coalesce` taps to their
-newest record, `Fifo` taps every record in order — and surfaces any drops from either lane as
-health (`telemetry_dropped` for coalesced snapshots, `telemetry_msg_dropped` for FIFO records).
+**`execute(now)`** (end-of-cycle) acquires one batch slot without blocking, then drains Snapshot
+taps to their newest record and Log taps in order into that batch. If no slot is free, it still
+drains every tap to avoid backpressuring the mission and reports `telemetry_dropped`.
 
-**`shutdown()`** sets the stop flag and wakes the sender so it exits cooperatively; the drop guard
-cancels it regardless when the system is dropped.
+**`shutdown()`** drops the channel sender. The async sender exits after the queue is drained; its
+task guard remains the cancellation backstop.
 
 No telemetry-specific coordinator hook exists: the only coordinator surface is the general registry
 (§2) plus the fact that any last-registered cyclic system observes end-of-cycle state. A recorder or
@@ -225,6 +224,16 @@ logger would be written identically.
 ---
 
 ## 4. Cycle / sender split — never block control on the network
+
+> **Current implementation (normative):** `execute` uses `try_send_ref` on one bounded
+> `thingbuf` queue of reusable `Vec<u8>` batches. Snapshot taps append their newest record and Log
+> taps append every record to the current cycle's batch. When no queue slot is available, all taps
+> are still drained to avoid pinning mission rings, the records are discarded, and
+> `telemetry_dropped` is reported. `run_sender` consumes one batch at a time, returns its emptied
+> vector to the queue slot, and reconnects with announcement replay after transport errors.
+>
+> The two-lane `HandOff` design below is historical design context. It is not the implemented
+> queue or drop policy.
 
 The cycle is single-threaded and synchronous; `PacketSink::send` is async TCP. `execute` must not
 await the socket — a slow or stalled link must never delay control. The work is split between the
@@ -258,7 +267,7 @@ A buffer with no new record this cycle is simply skipped. Each record is one cop
 ring bytes into the freshly built `LenPacket`. It is a `memcpy`; there are no syscalls and no
 `.await` in the cycle.
 
-### Hand-off (`HandOff`) — one struct, two lanes
+### Historical hand-off proposal (`HandOff`)
 
 ```text
 HandOff
@@ -294,7 +303,7 @@ connection is counted and folded into the system's health as `link_reconnect`; t
 unaffected throughout (while the sender backs off, the queue fills and the cycle side counts
 `telemetry_dropped`).
 
-### Drop policy
+### Historical two-lane drop policy
 
 The rings themselves are lossless — a writer backpressures rather than overwrite unread data — so
 the hand-off is where the "never let a slow link touch the cycle" trade is made explicitly:
@@ -455,9 +464,9 @@ system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
   `PortSchema::Table`.
 - `max_readers = fan_out + n_reg + READER_SLACK` sizing, `n_reg` self-derived by counting
   `ReceiveAll` capabilities across every registered descriptor.
-- `TelemetrySystem`, the two-lane (Coalesce/Fifo) drain → hand-off → async-sender split, the
-  per-lane drop policy with its `telemetry_dropped`/`telemetry_msg_dropped`/`telemetry_reader_slot`
-  health counters, and the `Transport` trait with `TcpTransport`.
+- `TelemetrySystem`, the bounded per-cycle batch queue and async-sender split, its
+  `telemetry_dropped`/`telemetry_reader_slot` health counters, and the `Transport` trait with
+  `TcpTransport`.
 
 ---
 

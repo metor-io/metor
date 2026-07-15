@@ -103,9 +103,13 @@ impl System for DlCounter {
 impl CyclicSystem for DlCounter {
     fn execute(&mut self, now: Timestamp, input: &mut DlCounterIn, output: &mut Out<DlCounterOut>) {
         let value = match input.tick.latest() {
-            Some(t) => t.get().value,
-            None => {
+            Ok(Some(t)) => t.get().value,
+            Ok(None) => {
                 output.health().error("no_tick");
+                return;
+            }
+            Err(_) => {
+                output.health().error("tick_corrupt");
                 return;
             }
         };
@@ -160,7 +164,7 @@ impl System for DlEcho {
 
 impl CyclicSystem for DlEcho {
     fn execute(&mut self, now: Timestamp, input: &mut DlEchoIn, output: &mut Out<DlEchoOut>) {
-        if let Some(t) = input.tick.latest() {
+        if let Ok(Some(t)) = input.tick.latest() {
             let _ = output.out.write(&EchoOut {
                 timestamp: now,
                 value: t.get().value,

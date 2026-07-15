@@ -104,7 +104,12 @@ descriptors, and `SystemKind::Cyclic`.
 ```rust
 pub trait AsyncSystem: System {
     /// The system's own loop. Returns when shutting down.
-    async fn run(&mut self, input: &mut Self::Input, output: &mut Self::Output);
+    async fn run(
+        &mut self,
+        context: &AsyncContext,
+        input: &mut Self::Input,
+        output: &mut Self::Output,
+    );
 
     /// This system's self-description for wiring (§5).
     fn descriptor() -> SystemDescriptor { /* SystemKind::Async */ }
@@ -113,10 +118,11 @@ pub trait AsyncSystem: System {
 
 An async system owns its own loop. The coordinator spawns `run` **once** and does not tick
 the system. Inside `run`, an event-driven system awaits its input ports with
-`Input::recv` (backed by the ring's `Notifier` wake) and does its work on each wake; a
-rate-driven system sleeps on its own timer and works on each tick. Either way it uses the
-async output path (`Output::write_async`) so a full output can suspend for space. The
-input and output references are `&mut` for the same reasons as `CyclicSystem::execute`.
+`context.until_cancelled(Input::recv(...))` and does its work on each wake; a rate-driven
+system wraps its timer with the same method. Cancellation returns `None`, at which point the
+loop returns and the coordinator runs `System::shutdown`. Outputs remain non-blocking; a full
+ring is returned as `WriteError`. The input and output references are `&mut` for the same
+reasons as `CyclicSystem::execute`.
 
 ### 1.4 The leaf trait is the structural distinction
 
@@ -191,7 +197,7 @@ pub fn write(&mut self, frame: &F) -> Result<(), WriteError>;
 /// `FrameWriter<F>` (its `list`/`map` builders) to append the trailer, then the
 /// finished table bytes are written as one record.
 pub fn write_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>))
-    -> Result<(), WriteError>;
+    -> Result<(), FrameWriteError>;
 
 /// **Infallible (E6)** publish of a fixed frame: a failed `try_write` is either
 /// `InsufficientCapacity` (a sizing bug) or `WouldBlock` (a slow reader
@@ -203,8 +209,6 @@ pub fn publish(&mut self, frame: &F);
 /// The `write_with` twin of `publish` — same infallible/counted-drop contract.
 pub fn publish_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>));
 
-/// Async publish of a fixed frame: suspends until a reader frees room.
-pub async fn write_async(&mut self, frame: &F) -> Result<(), WriteError>;
 ```
 
 `write`/`write_with` stay for sizing-aware callers that want the `Result`; `publish`/`publish_with`
@@ -337,10 +341,6 @@ impl<'a, F: Frame + FromBytes + KnownLayout + Immutable> FrameRef<'a, F> {
     pub fn get(&self) -> &'a F;
     /// The raw table bytes (fixed region + trailer).
     pub fn table(&self) -> &'a [u8];
-    /// A reader over the `FrameList<T, _>` member whose slot sits at `slot_off`.
-    pub fn list<T: FromBytes>(&self, slot_off: usize) -> ListReader<'a, T>;
-    /// A reader over the `FrameMap<_, V, _>` member whose slot sits at `slot_off`.
-    pub fn map<V: FromBytes>(&self, slot_off: usize) -> MapReader<'a, V>;
     /// Drive any `Decomponentize` sink via the frame's vtable — the uniform escape hatch.
     pub fn apply<D: Decomponentize>(&self, sink: &mut D) -> Result<Result<(), D::Error>, ProtoError>;
 }
@@ -348,8 +348,8 @@ impl<'a, F: Frame + FromBytes + KnownLayout + Immutable> FrameRef<'a, F> {
 
 1. **Fixed region — zerocopy.** Because the producer wrote `fixed.as_bytes()` at table
    offset 0, `get()` reads `F` directly via `ref_from_prefix` with no per-field decode.
-2. **Dynamic members — typed readers.** `FrameList`/`FrameMap` members are read with
-   `list(offset_of!(F, member))` / `map(...)` over the same table bytes.
+2. **Dynamic members.** They are currently consumed through `apply` or by parsing the raw
+   `table()` bytes; typed dynamic-member grant accessors are not implemented.
 3. **VTable apply — the escape hatch.** `apply` drives any `Decomponentize` sink (the same
    path metor-db uses) where a system wants components rather than a typed struct.
 
@@ -453,8 +453,8 @@ everything else is shared.
   upstream producer ever blocks on the async consumer.
 - **Triggering:** the system runs its own `run` loop. An event-driven system awaits inputs
   with `Input::recv` (backed by a `Notifier` `WakeSink`); a rate-driven system sleeps on its
-  own timer. Either way it uses `Output::write_async` so a full output can suspend for
-  space. The coordinator spawns `run` as a task and does not tick the system.
+  own timer. Writes remain non-blocking, so the system explicitly handles a full output
+  ring. The coordinator spawns `run` as a task and does not tick the system.
 - **Output side is uniform.** An async system's outputs are ordinary ring buffers a
   downstream consumer (cyclic or async) reads like any other output. The async-ness is
   entirely on the input side (private copy-in) and in who calls the loop.
@@ -849,7 +849,7 @@ into the pack via `Pack::system_type::<T, _>("name")`.
 |---------|-----------------------|-----------------------------|
 | Transport | `RingBuffer`, `Writer`/`try_write`/`write`, `View`/`try_read`/`read`/`try_latest`, `ReadGrant`, `Config` | `Output<F>`/`Input<F>` port wrappers binding a frame type to one ring handle |
 | Wake | `WakeSource`/`WakeSink`/`NoWake`/`Notifier` | cyclic = `NoWake`, async = `Notifier`, threaded as `WD`/`WS`/`RD`/`RS` |
-| Serialization | `FrameWriter` (`new`/`list`/`map`/`table`/`finish`), `ListReader`/`MapReader`, table bytes == ring payload | `Output::write`/`write_with`/`publish`/`write_async`, `Input::latest`/`drain`/`recv`, `FrameRef`/`FrameGrant` accessors |
+| Serialization | `FrameWriter` (`new`/bounded `list`/`map`/`table`/`finish`), table bytes == ring payload | `Output::write`/`write_with`/`publish`, `Input::latest`/`drain`/`recv`, `FrameRef`/`FrameGrant` fixed-region and vtable access |
 | Frame identity / shape | `Frame` (`FRAME_ID`, `NAME`, `timestamp`), `AsVTable::as_vtable`, `Componentize::MAX_SIZE`, `Metadatatize` | `PortDesc`/`SystemDescriptor` self-description |
 | Sizing | `round_up8`, `frame_len`, `MAX_SIZE`, `Config.capacity` pow2 | `buffer_capacity`/`capacity_for`, `DEFAULT_DEPTH` |
 | Wiring validation | `VTable::realize_fields(None)` registration mode, `RealizedField` | `compatible` subset / ty / shape check |

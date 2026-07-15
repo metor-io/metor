@@ -15,7 +15,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::descriptor::compatible;
 use crate::{
     AsyncSystem, CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, Out, Output,
-    PortDecl, PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemLog, SystemOutput,
+    PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemLog, SystemOutput,
     buffer_capacity,
 };
 
@@ -115,7 +115,7 @@ impl CyclicSystem for Filter {
     fn execute(&mut self, _now: Timestamp, input: &mut FilterIn, output: &mut Out<FilterOut>) {
         // Read the freshest IMU sample; report a health error when starved.
         let (timestamp, angle, accel) = match input.imu.latest() {
-            Some(imu) => {
+            Ok(Some(imu)) => {
                 let s = imu.get();
                 (s.timestamp, s.omega * self.gain, s.accel)
             }
@@ -125,19 +125,18 @@ impl CyclicSystem for Filter {
             }
         };
         // Produce a NavEstimate with a dynamic `residuals` trailer.
-        let _ = output.nav.write_with(
-            &NavEstimate {
-                timestamp,
-                angle,
-                residuals: FrameList::EMPTY,
-            },
-            |fw| {
-                fw.list(offset_of!(NavEstimate, residuals), |l| {
-                    l.push(Residual { value: angle });
-                    l.push(Residual { value: accel });
-                });
-            },
-        );
+        let frame = NavEstimate {
+            timestamp,
+            angle,
+            residuals: FrameList::EMPTY,
+        };
+        let _ = output.nav.write_with(&frame, |fw| {
+            fw.list(&frame.residuals, offset_of!(NavEstimate, residuals), |l| {
+                l.push(Residual { value: angle });
+                l.push(Residual { value: accel });
+            })
+            .unwrap();
+        });
     }
 }
 
@@ -180,7 +179,10 @@ fn cyclic_filter_end_to_end() {
 
     // The consumer reads the produced frame, both the fixed region and the
     // dynamic member.
-    let nav = nav_in.latest().expect("nav produced");
+    let nav = nav_in
+        .latest()
+        .expect("ring readable")
+        .expect("nav produced");
     let est = nav.get();
     assert_eq!(est.angle, 3.0, "omega * gain");
     assert_eq!(est.timestamp, Timestamp(42), "timestamp carried through");
@@ -222,7 +224,13 @@ fn idle_input_backpressures_writer_and_latest_frees() {
 
     // `latest()` serves the newest committed record, consuming the older ones...
     assert_eq!(
-        input.imu.latest().expect("newest").get().omega,
+        input
+            .imu
+            .latest()
+            .expect("ring readable")
+            .expect("newest")
+            .get()
+            .omega,
         (wrote - 1) as f64
     );
     // ...which frees room for the writer, but only up to the pinned newest
@@ -238,7 +246,13 @@ fn idle_input_backpressures_writer_and_latest_frees() {
     assert!(wrote2 >= 1, "the freed records admitted new writes");
     assert!(wrote2 < wrote, "the pinned record still holds its slot");
     assert_eq!(
-        input.imu.latest().expect("follow the edge").get().omega,
+        input
+            .imu
+            .latest()
+            .expect("ring readable")
+            .expect("follow the edge")
+            .get()
+            .omega,
         100.0 + (wrote2 - 1) as f64
     );
 }
@@ -341,7 +355,10 @@ fn health_counters_published() {
     }
 
     // Read the freshest health record and apply its vtable.
-    let record = health_in.latest().expect("health published");
+    let record = health_in
+        .latest()
+        .expect("ring readable")
+        .expect("health published");
     let mut sink = RecSink::default();
     record.apply(&mut sink).unwrap().unwrap();
 
@@ -377,20 +394,24 @@ impl System for AsyncFilter {
 }
 
 impl AsyncSystem for AsyncFilter {
-    async fn run(&mut self, input: &mut Self::Input, output: &mut Self::Output) {
-        // One end-to-end cycle: await the next IMU, then publish a nav estimate.
-        let nav = {
-            let Ok(imu) = input.imu.recv().await else {
+    async fn run(
+        &mut self,
+        context: &crate::AsyncContext,
+        input: &mut Self::Input,
+        output: &mut Self::Output,
+    ) {
+        loop {
+            let Some(Ok(imu)) = context.until_cancelled(input.imu.recv()).await else {
                 return;
             };
             let s = imu.get();
-            NavEstimate {
+            let nav = NavEstimate {
                 timestamp: s.timestamp,
                 angle: s.omega,
                 residuals: FrameList::EMPTY,
-            }
-        };
-        let _ = output.nav.write(&nav);
+            };
+            let _ = output.nav.write(&nav);
+        }
     }
 }
 
@@ -438,11 +459,22 @@ async fn async_filter_one_cycle() {
         })
     };
 
+    let cancel = stellarator::util::CancelToken::new();
+    let cancel_after_one = cancel.clone();
+    let canceller = stellarator::spawn(async move {
+        stellarator::yield_now().await;
+        cancel_after_one.cancel();
+    });
+    let context = crate::AsyncContext { cancel };
     let mut sys = AsyncFilter;
-    sys.run(&mut input, &mut output).await;
+    sys.run(&context, &mut input, &mut output).await;
+    let _ = canceller.await;
     let _ = writer.await;
 
-    let nav = nav_in.latest().expect("async system produced a nav");
+    let nav = nav_in
+        .latest()
+        .expect("ring readable")
+        .expect("async system produced a nav");
     assert_eq!(nav.get().angle, 2.0);
     assert_eq!(nav.get().timestamp, Timestamp(7));
 }
@@ -477,7 +509,7 @@ impl System for HandDoubler {
 impl CyclicSystem for HandDoubler {
     fn execute(&mut self, now: Timestamp, input: &mut HandDoublerIn, output: &mut Self::Output) {
         match input.imu.latest() {
-            Some(imu) => {
+            Ok(Some(imu)) => {
                 let angle = imu.get().omega * self.gain;
                 output.nav.publish(&NavEstimate {
                     timestamp: now,
@@ -485,7 +517,7 @@ impl CyclicSystem for HandDoubler {
                     residuals: FrameList::EMPTY,
                 });
             }
-            None => output.health().error("imu_missing"),
+            _ => output.health().error("imu_missing"),
         }
     }
 }
@@ -518,7 +550,7 @@ impl MacroDoubler {
         health: &mut HealthPort,
     ) {
         match imu.latest() {
-            Some(imu) => {
+            Ok(Some(imu)) => {
                 let angle = imu.get().omega * self.gain;
                 nav.publish(&NavEstimate {
                     timestamp: now,
@@ -526,7 +558,7 @@ impl MacroDoubler {
                     residuals: FrameList::EMPTY,
                 });
             }
-            None => health.error("imu_missing"),
+            _ => health.error("imu_missing"),
         }
     }
 }
@@ -571,12 +603,15 @@ where
                 .unwrap();
         }
         runner.step(Timestamp(i as i64));
-        if let Some(nav) = nav_in.latest() {
+        if let Ok(Some(nav)) = nav_in.latest() {
             angles.push(nav.get().angle);
         }
     }
 
-    let record = health_in.latest().expect("health published");
+    let record = health_in
+        .latest()
+        .expect("ring readable")
+        .expect("health published");
     let mut sink = RecSink::default();
     record.apply(&mut sink).unwrap().unwrap();
     (angles, sink.values)
@@ -697,7 +732,10 @@ fn publish_drop_folds_to_health() {
     let mut runner = CyclicRunner::new(Chatter, input, output);
     runner.step(Timestamp(1));
 
-    let record = health_in.latest().expect("health published");
+    let record = health_in
+        .latest()
+        .expect("ring readable")
+        .expect("health published");
     let mut sink = RecSink::default();
     record.apply(&mut sink).unwrap().unwrap();
     assert_eq!(sink.values[&ComponentId::new("health.errors")], 1.0);
@@ -756,10 +794,7 @@ fn cmd(channel: &str) -> SequenceCommand {
 /// defaults.
 #[test]
 fn fsw_attrs_lower_onto_descriptors() {
-    let ins: Vec<PortDesc> = <GuardIn as SystemInput>::decls()
-        .into_iter()
-        .filter_map(PortDecl::into_port)
-        .collect();
+    let ins = <GuardIn as SystemInput>::decls().ports;
     assert_eq!(ins.len(), 1);
     assert_eq!(
         ins[0].delivery,
@@ -768,16 +803,16 @@ fn fsw_attrs_lower_onto_descriptors() {
     );
     assert_eq!(ins[0].fan_in, crate::FanIn::Many);
 
-    let outs: Vec<PortDesc> = <QuietOut as SystemOutput>::decls()
-        .into_iter()
-        .filter_map(PortDecl::into_port)
-        .collect();
+    let outs = <QuietOut as SystemOutput>::decls().ports;
     assert_eq!(outs.len(), 2);
     assert!(
         !outs[0].telemetered,
         "#[fsw(telemetered = false)] on a FRAME output"
     );
-    assert_eq!(outs[0].id(), crate::PortId::Component(NavEstimate::FRAME_ID));
+    assert_eq!(
+        outs[0].id(),
+        crate::PortId::Component(NavEstimate::FRAME_ID)
+    );
     assert!(
         !outs[1].telemetered,
         "the CommandOut token is the same opt-out"
@@ -793,10 +828,8 @@ fn fsw_attrs_lower_onto_descriptors() {
 #[test]
 fn msg_log_never_loses_records() {
     let ring = msg_ring(1);
-    let mut inbox: crate::MsgIn<SequenceCommand> =
-        crate::MsgIn::new(ring.view(NoWake).unwrap());
-    let mut w: crate::MsgOut<SequenceCommand> =
-        crate::MsgOut::new(ring.writer(NoWake).unwrap());
+    let mut inbox: crate::MsgIn<SequenceCommand> = crate::MsgIn::new(ring.view(NoWake).unwrap());
+    let mut w: crate::MsgOut<SequenceCommand> = crate::MsgOut::new(ring.writer(NoWake).unwrap());
 
     // Fill until the idle inbox stalls the emitter.
     let mut sent = 0u32;
@@ -811,14 +844,14 @@ fn msg_log_never_loses_records() {
 
     // Every accepted record arrives in order; nothing was overwritten.
     let mut got = Vec::new();
-    inbox.drain(|c| got.push(c.channel));
+    inbox.drain(|c| got.push(c.channel)).unwrap();
     let expected: Vec<String> = (0..sent).map(|i| format!("c{i}")).collect();
     assert_eq!(got, expected, "the log lost or reordered records");
 
     // The drain freed space, so the emitter proceeds.
     w.emit(&cmd("after")).unwrap();
     let mut got = 0;
-    inbox.drain(|_| got += 1);
+    inbox.drain(|_| got += 1).unwrap();
     assert_eq!(got, 1);
 }
 
@@ -842,7 +875,7 @@ fn log_input_guaranteed_delivery_through_runner() {
     impl CyclicSystem for Guard {
         fn execute(&mut self, _now: Timestamp, input: &mut GuardIn, _o: &mut Self::Output) {
             let seen = self.seen.clone();
-            input.cmds.drain(|_| seen.set(seen.get() + 1));
+            input.cmds.drain(|_| seen.set(seen.get() + 1)).unwrap();
         }
     }
 
@@ -861,8 +894,7 @@ fn log_input_guaranteed_delivery_through_runner() {
             Output::new(log_ring.writer(NoWake).unwrap()),
         ),
     );
-    let mut w: crate::MsgOut<SequenceCommand> =
-        crate::MsgOut::new(ring.writer(NoWake).unwrap());
+    let mut w: crate::MsgOut<SequenceCommand> = crate::MsgOut::new(ring.writer(NoWake).unwrap());
     let seen = std::rc::Rc::new(core::cell::Cell::new(0));
     let mut runner = CyclicRunner::new(Guard { seen: seen.clone() }, input, output);
 

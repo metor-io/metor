@@ -323,7 +323,10 @@ pub struct CtlWorker {
 impl CtlWorker {
     /// Map the control file and validate its header.
     pub fn attach(path: &Path) -> Result<Self, CtlError> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
         // SAFETY: the host created and sized this file before spawning us;
         // the header check below rejects anything else.
         let map = unsafe { memmap2::MmapMut::map_mut(&file)? };

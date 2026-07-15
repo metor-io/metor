@@ -521,7 +521,7 @@ impl CyclicSystem for AlarmSystem {
         // Operator acks first, so a latched, already-recovered occurrence
         // clears the same cycle its ack lands.
         let alarms = &mut self.alarms;
-        input.acks.drain(|ack| {
+        let ack_result = input.acks.drain(|ack| {
             for rt in alarms.iter_mut().filter(|rt| rt.spec.id == ack.def_id) {
                 if let Some(EvalEvent::Clear { occurrence }) = rt.eval.ack(ack.occurrence) {
                     output.cleared.publish(&AlarmCleared {
@@ -531,6 +531,9 @@ impl CyclicSystem for AlarmSystem {
                 }
             }
         });
+        if ack_result.is_err() {
+            output.health().error("alarm_ack_corrupt");
+        }
 
         // Evaluate each watch off its newest record. `try_latest` re-serves
         // the pinned record, so a silent producer keeps being evaluated at
@@ -543,8 +546,13 @@ impl CyclicSystem for AlarmSystem {
             ..
         } = self;
         for watch in watches.iter_mut() {
-            let Ok(Some(record)) = watch.view.try_latest() else {
-                continue;
+            let record = match watch.view.try_latest() {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(_) => {
+                    output.health().error("alarm_input_corrupt");
+                    continue;
+                }
             };
             scratch.clear();
             let members = &watch.members;

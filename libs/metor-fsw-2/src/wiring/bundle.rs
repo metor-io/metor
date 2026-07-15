@@ -19,9 +19,9 @@
 //! evaluated with. [`load_bundle`] refuses any bundle whose ABI, IR, or
 //! target does not match this host — a triple mismatch is a clean
 //! [`BundleError::TargetMismatch`] before any dlopen, where an arch mismatch
-//! used to surface as a dlopen mystery — and verifies each artifact's recorded
-//! manifest hash against its copied sidecar, so a tampered bundle fails before
-//! resolve.
+//! used to surface as a dlopen mystery. It verifies the frozen IR digest and
+//! each recorded manifest hash. A manifest hash checks interface compatibility;
+//! it is not a digest of the shared-object bytes.
 //!
 //! [`write_bundle`] produces a bundle from a built [`Wiring`] plus a
 //! [`PackageOptions`]. [`load_bundle`] reads one back into a [`Wiring`] whose
@@ -29,7 +29,7 @@
 //! cargo.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -152,12 +152,37 @@ pub enum BundleError {
         /// The deserialize failure.
         reason: String,
     },
+    /// A bundle member is not a single, portable file name.
+    #[error("invalid bundle member name `{name}`: {reason}")]
+    InvalidMemberName {
+        /// The rejected name.
+        name: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+    /// An archive contains the same member more than once.
+    #[error("bundle archive contains duplicate member `{name}`")]
+    DuplicateMember {
+        /// The repeated name.
+        name: String,
+    },
+    /// The frozen wiring bytes do not match `meta.json`.
+    #[error("bundle wiring fails its ir_sha256 integrity check")]
+    IrHashMismatch,
     /// A `.so` named by the wiring is absent from the bundle directory.
     #[error("bundle is missing the `.so` for artifact `{artifact}` (expected {path})")]
     MissingSo {
         /// The artifact id.
         artifact: String,
         /// The `.so` path that was expected inside the bundle.
+        path: PathBuf,
+    },
+    /// A recorded manifest hash requires a sidecar to verify it against.
+    #[error("bundle is missing the manifest sidecar for artifact `{artifact}` (expected {path})")]
+    MissingManifest {
+        /// The artifact id.
+        artifact: String,
+        /// The sidecar path expected inside the bundle.
         path: PathBuf,
     },
     /// An artifact's recorded manifest hash does not match the sidecar copied
@@ -177,6 +202,38 @@ pub enum BundleError {
 fn io_at(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> BundleError {
     let path = path.into();
     move |source| BundleError::Io { path, source }
+}
+
+fn validate_member_name(name: &str) -> Result<(), BundleError> {
+    let mut components = Path::new(name).components();
+    let one_normal =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    if name.is_empty() || name.contains(['/', '\\']) || !one_normal {
+        return Err(BundleError::InvalidMemberName {
+            name: name.to_string(),
+            reason: "expected one normal path component".to_string(),
+        });
+    }
+    if name.len() > tar::NAME_CAP {
+        return Err(BundleError::InvalidMemberName {
+            name: name.to_string(),
+            reason: format!("name exceeds the {}-byte archive limit", tar::NAME_CAP),
+        });
+    }
+    Ok(())
+}
+
+fn validate_member_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), BundleError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        validate_member_name(name)?;
+        if !seen.insert(name) {
+            return Err(BundleError::DuplicateMember {
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Serialize `wiring` path-stripped to the canonical `wiring.json` bytes. The
@@ -239,8 +296,14 @@ fn bundle_members(
     let meta_json = serde_json::to_string_pretty(&meta).expect("BundleMeta serializes to JSON");
 
     let mut members = vec![
-        (META_FILE.to_string(), MemberSource::Inline(meta_json.into_bytes())),
-        (WIRING_FILE.to_string(), MemberSource::Inline(json.into_bytes())),
+        (
+            META_FILE.to_string(),
+            MemberSource::Inline(meta_json.into_bytes()),
+        ),
+        (
+            WIRING_FILE.to_string(),
+            MemberSource::Inline(json.into_bytes()),
+        ),
     ];
 
     // Artifacts sorted by id so entry order is stable regardless of the order
@@ -248,9 +311,12 @@ fn bundle_members(
     let mut artifacts: Vec<&super::model::Artifact> = wiring.artifacts.iter().collect();
     artifacts.sort_by(|a, b| a.id.cmp(&b.id));
     for artifact in artifacts {
-        let src = artifact.path.as_ref().ok_or_else(|| BundleError::NotBuilt {
-            artifact: artifact.id.clone(),
-        })?;
+        let src = artifact
+            .path
+            .as_ref()
+            .ok_or_else(|| BundleError::NotBuilt {
+                artifact: artifact.id.clone(),
+            })?;
         members.push((artifact.cdylib.clone(), MemberSource::Path(src.clone())));
         // The manifest sidecar rides along when the build driver wrote one; a
         // bundle without it stays valid (the manifest-hash check is skipped).
@@ -264,6 +330,7 @@ fn bundle_members(
     if let Some(source) = &opts.provenance {
         members.push((provenance_name(source), MemberSource::Path(source.clone())));
     }
+    validate_member_names(members.iter().map(|(name, _)| name.as_str()))?;
     Ok(members)
 }
 
@@ -359,8 +426,7 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
     // The triple check needs both a recorded target and a determinable host;
     // absent either, it cannot render a verdict and is skipped (the dlopen
     // path stays the backstop, as before Phase 3).
-    if let (Some(found), Some(expected)) =
-        (&meta.target, super::build_driver::host_triple())
+    if let (Some(found), Some(expected)) = (&meta.target, super::build_driver::host_triple())
         && found != &expected
     {
         return Err(BundleError::TargetMismatch {
@@ -370,13 +436,17 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
     }
 
     let wiring_path = dir.join(WIRING_FILE);
-    let wiring_text = fs::read_to_string(&wiring_path).map_err(io_at(&wiring_path))?;
+    let wiring_bytes = fs::read(&wiring_path).map_err(io_at(&wiring_path))?;
+    if super::stubgen::manifest_hash(&wiring_bytes) != meta.ir_sha256 {
+        return Err(BundleError::IrHashMismatch);
+    }
     let mut wiring: Wiring =
-        serde_json::from_str(&wiring_text).map_err(|e| BundleError::BadWiring {
+        serde_json::from_slice(&wiring_bytes).map_err(|e| BundleError::BadWiring {
             reason: e.to_string(),
         })?;
 
     for artifact in &mut wiring.artifacts {
+        validate_member_name(&artifact.cdylib)?;
         let so = dir.join(&artifact.cdylib);
         if !so.exists() {
             return Err(BundleError::MissingSo {
@@ -384,16 +454,23 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
                 path: so,
             });
         }
-        // Verify the frozen manifest hash against the copied sidecar (the same
-        // hash function stubgen and resolve use) before filling the path, so a
-        // tampered `.so`/sidecar fails here rather than at dlopen.
-        if let Some(recorded) = artifact.manifest_hash.as_deref()
-            && let Some(bytes) = crate::dl::manifest_sidecar_bytes(&so)
-            && super::stubgen::manifest_hash(&bytes) != recorded
-        {
-            return Err(BundleError::ManifestHashMismatch {
-                artifact: artifact.id.clone(),
-            });
+        if let Some(recorded) = artifact.manifest_hash.as_deref() {
+            let sidecar = crate::dl::manifest_sidecar_path(&so);
+            let bytes = match fs::read(&sidecar) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BundleError::MissingManifest {
+                        artifact: artifact.id.clone(),
+                        path: sidecar,
+                    });
+                }
+                Err(e) => return Err(io_at(&sidecar)(e)),
+            };
+            if super::stubgen::manifest_hash(&bytes) != recorded {
+                return Err(BundleError::ManifestHashMismatch {
+                    artifact: artifact.id.clone(),
+                });
+            }
         }
         artifact.path = Some(so);
     }
@@ -423,6 +500,7 @@ fn unpack_archive(path: &Path) -> Result<tempfile::TempDir, BundleError> {
     let members = tar::read(&bytes).map_err(|reason| BundleError::BadMeta {
         reason: format!("malformed `.{METOR_EXTENSION}` archive: {reason}"),
     })?;
+    validate_member_names(members.iter().map(|(name, _)| name.as_str()))?;
     for (name, content) in members {
         let dst = dir.path().join(&name);
         fs::write(&dst, content).map_err(io_at(&dst))?;
@@ -437,6 +515,8 @@ fn unpack_archive(path: &Path) -> Result<tempfile::TempDir, BundleError> {
 mod tar {
     /// The tar block size; headers and padded payloads are multiples of it.
     pub(super) const BLOCK: usize = 512;
+    /// Maximum name bytes in the ustar header's name field.
+    pub(super) const NAME_CAP: usize = 100;
 
     /// Append one regular-file entry (`name` header + padded `data`) to `out`.
     pub(super) fn write_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) {
@@ -465,24 +545,63 @@ mod tar {
     /// Parse every regular-file entry into `(name, bytes)`, in archive order.
     pub(super) fn read(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         let mut out = Vec::new();
-        let mut off = 0;
-        while off + BLOCK <= bytes.len() {
-            let header = &bytes[off..off + BLOCK];
+        let mut off = 0usize;
+        loop {
+            let header_end = off
+                .checked_add(BLOCK)
+                .ok_or_else(|| "archive header offset overflow".to_string())?;
+            if header_end > bytes.len() {
+                if off == bytes.len() {
+                    break;
+                }
+                return Err("truncated archive header".to_string());
+            }
+            let header = &bytes[off..header_end];
             // A zeroed header block ends the archive.
             if header.iter().all(|&b| b == 0) {
                 break;
             }
-            let name = cstr(&header[..100]);
-            let size = parse_octal(&header[124..136])? as usize;
-            off += BLOCK;
-            if off + size > bytes.len() {
+            verify_checksum(header)?;
+            if !matches!(header[156], 0 | b'0') {
+                return Err(format!("unsupported tar entry type {:#x}", header[156]));
+            }
+            let name = cstr(&header[..NAME_CAP])?;
+            let size = usize::try_from(parse_octal(&header[124..136])?)
+                .map_err(|_| format!("entry `{name}` size does not fit this platform"))?;
+            let data_start = header_end;
+            let data_end = data_start
+                .checked_add(size)
+                .ok_or_else(|| format!("entry `{name}` size overflows the archive"))?;
+            if data_end > bytes.len() {
                 return Err(format!("entry `{name}` runs past the archive"));
             }
-            out.push((name, bytes[off..off + size].to_vec()));
+            out.push((name, bytes[data_start..data_end].to_vec()));
             // Advance past the payload, rounded up to a block boundary.
-            off += size.div_ceil(BLOCK) * BLOCK;
+            let padded = size
+                .checked_add(BLOCK - 1)
+                .ok_or_else(|| "archive entry padding overflow".to_string())?
+                / BLOCK
+                * BLOCK;
+            off = data_start
+                .checked_add(padded)
+                .ok_or_else(|| "archive entry offset overflow".to_string())?;
         }
         Ok(out)
+    }
+
+    fn verify_checksum(header: &[u8]) -> Result<(), String> {
+        let recorded = parse_octal(&header[148..156])?;
+        let actual: u64 = header
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| if (148..156).contains(&i) { b' ' } else { b } as u64)
+            .sum();
+        if recorded != actual {
+            return Err(format!(
+                "tar header checksum mismatch: recorded {recorded}, computed {actual}"
+            ));
+        }
+        Ok(())
     }
 
     /// Write `value` as a right-justified `len-1`-digit octal field with a
@@ -496,7 +615,7 @@ mod tar {
     /// Fill the checksum field (offset 148, 8 bytes): the unsigned sum of every
     /// header byte with the field itself read as spaces, stored as 6 octal
     /// digits, a NUL, then a space (the ustar convention).
-    fn checksum(header: &mut [u8; BLOCK]) {
+    pub(super) fn checksum(header: &mut [u8; BLOCK]) {
         for b in &mut header[148..156] {
             *b = b' ';
         }
@@ -508,18 +627,91 @@ mod tar {
     }
 
     /// A NUL-terminated (or full-width) string field as an owned `String`.
-    fn cstr(field: &[u8]) -> String {
+    fn cstr(field: &[u8]) -> Result<String, String> {
         let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-        String::from_utf8_lossy(&field[..end]).into_owned()
+        std::str::from_utf8(&field[..end])
+            .map(str::to_owned)
+            .map_err(|_| "tar member name is not UTF-8".to_string())
     }
 
     /// Parse a NUL/space-padded octal field.
     fn parse_octal(field: &[u8]) -> Result<u64, String> {
-        let text = cstr(field);
+        let text = cstr(field)?;
         let trimmed = text.trim_matches(|c: char| c == ' ' || c == '\0');
         if trimmed.is_empty() {
             return Ok(0);
         }
         u64::from_str_radix(trimmed, 8).map_err(|_| format!("bad octal field `{trimmed}`"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (name, content) in entries {
+            tar::write_entry(&mut bytes, name, content);
+        }
+        bytes.extend_from_slice(&[0; tar::BLOCK * 2]);
+        bytes
+    }
+
+    #[test]
+    fn member_names_are_single_portable_components() {
+        for name in ["../escape", "/absolute", "a/b", r"a\b", ".", "..", ""] {
+            assert!(
+                matches!(
+                    validate_member_name(name),
+                    Err(BundleError::InvalidMemberName { .. })
+                ),
+                "accepted {name:?}"
+            );
+        }
+        validate_member_name("libflight.so").unwrap();
+    }
+
+    #[test]
+    fn archive_rejects_duplicate_and_escaping_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("escape.metor", archive(&[("../escape", b"bad")])),
+            (
+                "duplicate.metor",
+                archive(&[("wiring.json", b"one"), ("wiring.json", b"two")]),
+            ),
+        ] {
+            let path = tmp.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            assert!(unpack_archive(&path).is_err(), "accepted {name}");
+        }
+        assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[test]
+    fn tar_rejects_bad_checksum_and_non_file_entries() {
+        let mut bad_checksum = archive(&[("file", b"data")]);
+        bad_checksum[0] ^= 1;
+        assert!(tar::read(&bad_checksum).unwrap_err().contains("checksum"));
+
+        let mut directory = archive(&[("directory", b"")]);
+        directory[156] = b'5';
+        let header: &mut [u8; tar::BLOCK] = (&mut directory[..tar::BLOCK]).try_into().unwrap();
+        tar::checksum(header);
+        assert!(tar::read(&directory).unwrap_err().contains("entry type"));
+    }
+
+    #[test]
+    fn tar_rejects_truncated_and_oversized_entries_without_panicking() {
+        let truncated = vec![1; tar::BLOCK - 1];
+        assert!(tar::read(&truncated).is_err());
+
+        let mut oversized = archive(&[("file", b"")]);
+        // Maximum eleven-digit octal size, far beyond this small archive.
+        oversized[124..136].copy_from_slice(b"77777777777\0");
+        let header: &mut [u8; tar::BLOCK] = (&mut oversized[..tar::BLOCK]).try_into().unwrap();
+        tar::checksum(header);
+        assert!(tar::read(&oversized).is_err());
     }
 }

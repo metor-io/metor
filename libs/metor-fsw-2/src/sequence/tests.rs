@@ -12,7 +12,7 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 
 use crate::sequence::{
-    CycleClock, Step, Wait, aborted, current, cycle, progress, wait, with_clock,
+    CycleClock, MAX_PROGRESS, Step, Wait, aborted, current, cycle, progress, wait, with_clock,
 };
 
 /// Poll a [`Wait`] once with a no-op waker.
@@ -80,6 +80,17 @@ fn progress_and_aborted_free_fns() {
 }
 
 #[test]
+fn progress_is_bounded_to_the_status_frame_capacity() {
+    let clock = Rc::new(CycleClock::default());
+    with_clock(&clock, || {
+        for i in 0..=MAX_PROGRESS {
+            progress(format!("line {i}"));
+        }
+    });
+    assert_eq!(clock.drain_progress().len(), MAX_PROGRESS);
+}
+
+#[test]
 fn now_reads_the_stepped_ambient_clock() {
     // `now()` is the cycle time the clock was last refreshed with, never wall
     // time, so a sequence stamps its emitted frames deterministically.
@@ -103,7 +114,6 @@ fn clock_is_cleared_after_with_clock() {
     assert!(current().is_none(), "ambient clock cleared on the way out");
 }
 
-
 /// `cycle()` arms at the current clock and resolves only once a LATER cycle
 /// polls it — never the same cycle, so a `loop { cycle().await; … }` body
 /// runs exactly once per coordinator cycle, deterministically.
@@ -114,9 +124,7 @@ fn cycle_resolves_on_the_next_cycle() {
     let mut fut = with_clock(&clock, cycle);
     let mut cx = Context::from_waker(Waker::noop());
     let mut poll = |clock: &Rc<CycleClock>, fut: &mut super::NextCycle| {
-        with_clock(clock, || {
-            core::future::Future::poll(Pin::new(fut), &mut cx)
-        })
+        with_clock(clock, || core::future::Future::poll(Pin::new(fut), &mut cx))
     };
     assert_eq!(poll(&clock, &mut fut), Poll::Pending, "same cycle: pending");
     clock.now.set(Timestamp(11));

@@ -11,7 +11,7 @@ use metor_fsw_ring::NoWake;
 use metor_proto::types::Timestamp;
 
 use crate::binder::AnySource;
-use crate::descriptor::PortDecl;
+use crate::descriptor::PortDesc;
 use crate::frame::Frame;
 use crate::health::HealthPort;
 use crate::message::{MsgIn, MsgOut, NamedMsg};
@@ -24,8 +24,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// produces: the wired ports per direction, in parameter order.
 #[derive(Default)]
 pub struct DeclSink {
-    pub inputs: Vec<PortDecl>,
-    pub outputs: Vec<PortDecl>,
+    pub inputs: Vec<PortDesc>,
+    pub outputs: Vec<PortDesc>,
     health_params: u8,
     /// The typed-params spec a task fn's `Params<P>` parameter records.
     pub(crate) task_params: Option<super::task::TaskParamsSpec>,

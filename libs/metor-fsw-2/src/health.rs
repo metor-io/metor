@@ -182,16 +182,23 @@ where
             error_counts: FrameMap::EMPTY,
         };
         let counts = &self.error_counts;
-        let _ = self.health.write_with(&frame, |fw| {
-            let res = fw.map(offset_of!(SystemHealth, error_counts), |m| {
-                for (kind, n) in counts {
-                    m.insert(kind, *n);
-                }
-            });
+        let result = self.health.write_with(&frame, |fw| {
+            let res = fw.map(
+                &frame.error_counts,
+                offset_of!(SystemHealth, error_counts),
+                |m| {
+                    for (kind, n) in counts {
+                        m.insert(kind, *n);
+                    }
+                },
+            );
             // `error` asserts every kind is a valid path segment, so the map
             // cannot reject a key here.
             debug_assert!(res.is_ok(), "error kind rejected as a map key: {res:?}");
         });
+        if result.is_err() {
+            self.error("health_publish_failed");
+        }
     }
 
     fn flush_logs(&mut self, timestamp: Timestamp) {
@@ -203,13 +210,16 @@ where
             lines: FrameList::EMPTY,
         };
         let pending = core::mem::take(&mut self.pending);
-        let _ = self.log.write_with(&frame, |fw| {
-            fw.list(offset_of!(SystemLog, lines), |l| {
+        let result = self.log.write_with(&frame, |fw| {
+            let _ = fw.list(&frame.lines, offset_of!(SystemLog, lines), |l| {
                 for line in &pending {
                     l.push(*line);
                 }
             });
         });
+        if result.is_err() {
+            self.error("log_publish_failed");
+        }
     }
 }
 
@@ -220,8 +230,8 @@ mod tests {
     use super::*;
     use crate::port::{Input, buffer_capacity, frame_list_iter};
     use metor_fsw::Decomponentize;
-    use metor_proto::types::{ComponentId, ComponentView};
     use metor_fsw_ring::{Config, RingBuffer};
+    use metor_proto::types::{ComponentId, ComponentView};
 
     /// Collects the `error_counts.<kind>` map members published on a health
     /// record, keyed by their component id, off the vtable `apply` path.
@@ -276,7 +286,10 @@ mod tests {
         port.end_cycle(Timestamp(7), 12);
 
         // Field access derefs through the grant; no `.get()` needed.
-        let grant = health_in.latest().expect("health published");
+        let grant = health_in
+            .latest()
+            .expect("ring readable")
+            .expect("health published");
         assert_eq!(grant.timestamp, Timestamp(7));
         assert_eq!(grant.cycles, 1);
         assert_eq!(grant.errors, 3);
@@ -298,7 +311,10 @@ mod tests {
         port.error("kind_0");
         port.end_cycle(Timestamp(1), 0);
 
-        let grant = health_in.latest().expect("health published");
+        let grant = health_in
+            .latest()
+            .expect("ring readable")
+            .expect("health published");
         assert_eq!(grant.get().errors, (MAX_ERR_KINDS + 3) as u64);
         let mut counts = CountSink::default();
         grant.apply(&mut counts).unwrap().unwrap();
@@ -331,7 +347,10 @@ mod tests {
         }
         port.end_cycle(Timestamp(3), 0);
 
-        let grant = log_in.latest().expect("log published");
+        let grant = log_in
+            .latest()
+            .expect("ring readable")
+            .expect("log published");
         let lines: Vec<LogLine> =
             frame_list_iter(grant.table(), offset_of!(SystemLog, lines)).collect();
         assert_eq!(lines.len(), MAX_LINES);
@@ -345,7 +364,7 @@ mod tests {
     fn quiet_cycle_publishes_health_but_no_log() {
         let (mut port, mut health_in, mut log_in) = port_with_readers();
         port.end_cycle(Timestamp(1), 0);
-        assert!(health_in.latest().is_some());
-        assert!(log_in.latest().is_none());
+        assert!(health_in.latest().unwrap().is_some());
+        assert!(log_in.latest().unwrap().is_none());
     }
 }

@@ -127,7 +127,9 @@ impl FutureDriver {
         self.clock.now.set(now);
         let start = std::time::Instant::now();
         let poll = crate::sequence::with_clock(&self.clock, || {
-            self.future.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            self.future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
         });
         let micros = start.elapsed().as_micros() as u64;
         if self.drops.swap(0, core::sync::atomic::Ordering::Relaxed) > 0 {
@@ -200,22 +202,42 @@ impl Driver for OccupantFuture {
         }
         // A cancel stays latched once seen, even if later control frames
         // clear it.
-        if let Some(f) = self.control.latest()
-            && f.cancel != 0
-        {
-            self.inner.clock.cancel.set(true);
+        match self.control.latest() {
+            Ok(Some(f)) if f.cancel != 0 => self.inner.clock.cancel.set(true),
+            Err(_) => {
+                let outcome = crate::sequence::Outcome::Failed;
+                self.inner.done = Some(outcome);
+                return StepStatus::Done(outcome);
+            }
+            _ => {}
         }
         let poll = self.inner.poll_once(now);
         let lines = self.inner.clock.drain_progress();
         match poll {
             Poll::Ready(outcome) => {
-                crate::sequence::publish_status(&mut self.status, now, outcome.run_state(), &lines);
+                let outcome = if crate::sequence::publish_status(
+                    &mut self.status,
+                    now,
+                    outcome.run_state(),
+                    &lines,
+                )
+                .is_err()
+                {
+                    crate::sequence::Outcome::Failed
+                } else {
+                    outcome
+                };
                 self.inner.done = Some(outcome);
                 StepStatus::Done(outcome)
             }
             Poll::Pending => {
-                crate::sequence::publish_status(&mut self.status, now, 0, &lines);
-                StepStatus::Running
+                if crate::sequence::publish_status(&mut self.status, now, 0, &lines).is_err() {
+                    let outcome = crate::sequence::Outcome::Failed;
+                    self.inner.done = Some(outcome);
+                    StepStatus::Done(outcome)
+                } else {
+                    StepStatus::Running
+                }
             }
         }
     }
@@ -245,22 +267,48 @@ impl Driver for OccupantCyclic {
         if let Some(outcome) = self.done {
             return StepStatus::Done(outcome);
         }
-        if let Some(f) = self.control.latest()
-            && f.cancel != 0
-        {
-            let outcome = Outcome::Aborted;
-            crate::sequence::publish_status(&mut self.status, now, outcome.run_state(), &[]);
-            self.done = Some(outcome);
-            return StepStatus::Done(outcome);
+        match self.control.latest() {
+            Err(_) => {
+                let outcome = Outcome::Failed;
+                self.done = Some(outcome);
+                return StepStatus::Done(outcome);
+            }
+            Ok(Some(f)) if f.cancel != 0 => {
+                let mut outcome = Outcome::Aborted;
+                if crate::sequence::publish_status(&mut self.status, now, outcome.run_state(), &[])
+                    .is_err()
+                {
+                    outcome = Outcome::Failed;
+                }
+                self.done = Some(outcome);
+                return StepStatus::Done(outcome);
+            }
+            _ => {}
         }
         let status = self.inner.step(now);
         match status {
             StepStatus::Done(outcome) => {
-                crate::sequence::publish_status(&mut self.status, now, outcome.run_state(), &[]);
+                let outcome = if crate::sequence::publish_status(
+                    &mut self.status,
+                    now,
+                    outcome.run_state(),
+                    &[],
+                )
+                .is_err()
+                {
+                    Outcome::Failed
+                } else {
+                    outcome
+                };
                 self.done = Some(outcome);
+                return StepStatus::Done(outcome);
             }
             StepStatus::Running => {
-                crate::sequence::publish_status(&mut self.status, now, 0, &[]);
+                if crate::sequence::publish_status(&mut self.status, now, 0, &[]).is_err() {
+                    let outcome = Outcome::Failed;
+                    self.done = Some(outcome);
+                    return StepStatus::Done(outcome);
+                }
             }
         }
         status

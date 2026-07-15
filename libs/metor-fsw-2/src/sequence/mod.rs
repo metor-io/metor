@@ -189,11 +189,11 @@ pub fn now() -> Timestamp {
 
 /// Record a progress line for the next [`SequenceStatus`] publish.
 pub fn progress(msg: impl Into<String>) {
-    current()
-        .expect("progress() called outside a sequence poll")
-        .progress
-        .borrow_mut()
-        .push(msg.into());
+    let clock = current().expect("progress() called outside a sequence poll");
+    let mut progress = clock.progress.borrow_mut();
+    if progress.len() < MAX_PROGRESS {
+        progress.push(msg.into());
+    }
 }
 
 /// Whether the sequence has been cancelled, for bodies that want to branch on
@@ -315,18 +315,18 @@ pub fn publish_status(
     now: Timestamp,
     run_state: u8,
     lines: &[String],
-) {
+) -> Result<(), crate::FrameWriteError> {
     let frame = SequenceStatus {
         timestamp: now,
         run_state,
         _pad: [0; 7],
         progress: FrameList::EMPTY,
     };
-    let _ = out.write_with(&frame, |fw| {
-        fw.list(offset_of!(SequenceStatus, progress), |l| {
-            for line in lines {
+    out.write_with(&frame, |fw| {
+        let _ = fw.list(&frame.progress, offset_of!(SequenceStatus, progress), |l| {
+            for line in lines.iter().take(MAX_PROGRESS) {
                 l.push(ProgressLine::new(line));
             }
         });
-    });
+    })
 }

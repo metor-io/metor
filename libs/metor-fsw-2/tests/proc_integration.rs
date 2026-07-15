@@ -48,8 +48,7 @@ fn main() {
         eprintln!("skipping proc_integration: fixture build unavailable");
         return;
     };
-    let Some(seq_lib) = locate_fixture("metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture")
-    else {
+    let Some(seq_lib) = locate_fixture("metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture") else {
         eprintln!("skipping proc_integration: seq fixture build unavailable");
         return;
     };
@@ -241,7 +240,11 @@ fn lockstep_end_to_end(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Simulated { dt_secs: 0.005 },
         })
-        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
         .system("ticker")
         .ty("Ticker")
         .end()
@@ -311,36 +314,61 @@ fn lockstep_end_to_end(lib_path: &Path) {
         coord
     });
 
-    assert!(coord.stopped().is_empty(), "nothing stopped: {:?}", coord.stopped());
+    assert!(
+        coord.stopped().is_empty(),
+        "nothing stopped: {:?}",
+        coord.stopped()
+    );
     // The status surface names the worker process: the coordinator's worker
     // list carries the process system's pid and run state (its in-process
     // dl twin appears nowhere here).
     let workers = coord.workers();
     assert_eq!(workers.len(), 1, "one process system: {workers:?}");
     assert_eq!(&*workers[0].name, "proc_counter");
-    assert_eq!(workers[0].pid, spawned[0], "the telemetered pid is the child's");
+    assert_eq!(
+        workers[0].pid, spawned[0],
+        "the telemetered pid is the child's"
+    );
     assert_eq!(workers[0].restarts, 0);
     assert_eq!(workers[0].state, WorkerRunState::Running);
     // The worker consumed each cycle's fresh tick in lockstep, exactly like
     // its in-process dl twin.
-    let out = out_view.latest().expect("worker produced tick_out");
-    assert_eq!(out.get().count, 1000 + CYCLES as u64, "start + latest value");
+    let out = out_view
+        .latest()
+        .expect("ring readable")
+        .expect("worker produced tick_out");
+    assert_eq!(
+        out.get().count,
+        1000 + CYCLES as u64,
+        "start + latest value"
+    );
     drop(out);
-    let dl_out = dl_out_view.latest().expect("dl twin produced tick_out");
+    let dl_out = dl_out_view
+        .latest()
+        .expect("ring readable")
+        .expect("dl twin produced tick_out");
     assert_eq!(dl_out.get().count, 1000 + CYCLES as u64, "dl twin agrees");
     drop(dl_out);
     // Every cycle's event crossed the process boundary, in order.
     let mut counts: Vec<u64> = Vec::new();
-    events_in.drain(|e| counts.push(e.count));
+    events_in
+        .drain(|e| counts.push(e.count))
+        .expect("events ring readable");
     assert_eq!(
         counts,
         (1..=CYCLES as u64).map(|v| 1000 + v).collect::<Vec<_>>(),
         "every-record log semantics across the process boundary"
     );
     // The implicit health frame flowed from the worker process.
-    let health = health_view.latest().expect("worker health flowed");
+    let health = health_view
+        .latest()
+        .expect("ring readable")
+        .expect("worker health flowed");
     assert_eq!(health.get().errors, 0, "no worker-side errors");
-    assert!(health.get().cycles >= CYCLES as u64, "worker counted its cycles");
+    assert!(
+        health.get().cycles >= CYCLES as u64,
+        "worker counted its cycles"
+    );
     drop(health);
 
     // Teardown: shutdown reaps the worker; dropping the coordinator unmaps
@@ -373,7 +401,11 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Wall,
         })
-        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
         .system("ticker")
         .ty("Ticker")
         .end()
@@ -429,7 +461,11 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
 
     // The death is a permanent, telemetered stop...
     let stopped = coord.stopped();
-    assert_eq!(stopped.len(), 1, "the killed worker is reported: {stopped:?}");
+    assert_eq!(
+        stopped.len(),
+        1,
+        "the killed worker is reported: {stopped:?}"
+    );
     assert_eq!(&*stopped[0].name, "proc_counter");
     assert_eq!(stopped[0].reason, StopReason::ProcessDied);
     // ...and the worker list reflects it: no live pid, no restarts granted.
@@ -441,7 +477,10 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     // ...whose reader cursors were reclaimed: the producer never saw a full
     // ring (a dead pinned cursor would have surfaced as publish_dropped
     // errors on the ticker's health well within ~100 post-kill cycles).
-    let health = ticker_health.latest().expect("ticker health flowed");
+    let health = ticker_health
+        .latest()
+        .expect("ring readable")
+        .expect("ticker health flowed");
     assert_eq!(
         health.get().errors,
         0,
@@ -468,7 +507,11 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Wall,
         })
-        .artifact("counter", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
         .system("ticker")
         .ty("Ticker")
         .end()
@@ -548,17 +591,29 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
     assert_eq!(stopped[0].reason, StopReason::ProcessDied);
     let workers = coord.workers();
     assert_eq!(workers.len(), 1);
-    assert_eq!(workers[0].restarts, 1, "exactly one restart was granted: {workers:?}");
+    assert_eq!(
+        workers[0].restarts, 1,
+        "exactly one restart was granted: {workers:?}"
+    );
     assert_eq!(workers[0].state, WorkerRunState::Stopped);
     assert_eq!(workers[0].pid, 0, "no live worker behind the slot");
     // The replacement produced (any output at all proves the restarted
     // worker re-attached the same rings and resumed the lockstep)...
     assert!(
-        out_view.latest().expect("output flowed").get().count > 1000,
+        out_view
+            .latest()
+            .expect("ring readable")
+            .expect("output flowed")
+            .get()
+            .count
+            > 1000,
         "the restarted worker produced"
     );
     // ...and both reclaims kept the producer flowing: no publish errors.
-    let health = ticker_health.latest().expect("ticker health flowed");
+    let health = ticker_health
+        .latest()
+        .expect("ring readable")
+        .expect("ticker health flowed");
     assert_eq!(health.get().errors, 0, "producer never backpressured");
     drop(health);
 
@@ -712,7 +767,10 @@ fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
         resolve(&wiring, &Registry::new()).expect("resolve describes each occupant via a worker");
     // Resolve ran short-lived describe workers only, and `build()` spawned
     // nothing either: a process slot spawns one worker per Load.
-    assert!(child_pids().is_empty(), "no worker child before the first Load");
+    assert!(
+        child_pids().is_empty(),
+        "no worker child before the first Load"
+    );
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -742,7 +800,9 @@ fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
                 "waiter's pipeline reached Loaded: {phases:?}"
             );
             let pid_a = *child_pids().first().expect("waiter's worker is live");
-            control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
+            control
+                .emit(&seq_cmd("adcs", SequenceCommandKind::Start))
+                .unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
                 "waiter ran to Done: {phases:?}"
@@ -753,7 +813,9 @@ fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
                 "napper's pipeline reached Loaded: {phases:?}"
             );
             let pid_b = *child_pids().first().expect("napper's worker is live");
-            control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
+            control
+                .emit(&seq_cmd("adcs", SequenceCommandKind::Start))
+                .unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
                 "napper ran to Done: {phases:?}"
@@ -771,7 +833,9 @@ fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
     assert!(
         is_subsequence(
             &phases,
-            &[LOADING, LOADED, RUNNING, DONE, LOADING, LOADED, RUNNING, DONE]
+            &[
+                LOADING, LOADED, RUNNING, DONE, LOADING, LOADED, RUNNING, DONE
+            ]
         ),
         "two Load/run cycles through the pipeline: {phases:?}"
     );
@@ -793,14 +857,20 @@ fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
             "completed".to_string(),
         ]
     };
-    let expected: Vec<String> = expect("waiter").into_iter().chain(expect("napper")).collect();
+    let expected: Vec<String> = expect("waiter")
+        .into_iter()
+        .chain(expect("napper"))
+        .collect();
     assert_eq!(kinds, expected, "the full ordered event stream");
     // The worker list names the slot's live process: napper's worker holds
     // its roles through Done, and no unplanned death was counted.
     let workers = coord.workers();
     assert_eq!(workers.len(), 1, "{workers:?}");
     assert_eq!(&*workers[0].name, "adcs");
-    assert_eq!(workers[0].pid, pid_b, "the telemetered pid is napper's worker");
+    assert_eq!(
+        workers[0].pid, pid_b,
+        "the telemetered pid is napper's worker"
+    );
     assert_eq!(workers[0].restarts, 0, "Loads are commanded, not deaths");
     assert_eq!(workers[0].state, WorkerRunState::Running);
     assert!(coord.stopped().is_empty(), "Done is not a hard-stop");
@@ -815,7 +885,10 @@ fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
     // host process must not.
     let canary = std::env::var("SEQ_FIXTURE_CANARY").expect("main set the canary path");
     let logged = std::fs::read_to_string(&canary).expect("the canary file exists");
-    let pids: Vec<u32> = logged.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    let pids: Vec<u32> = logged
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
     assert!(
         !pids.contains(&std::process::id()),
         "the host never mapped the occupant artifact: {pids:?}"
@@ -847,7 +920,10 @@ fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
     wiring.artifacts[0].path = Some(seq_lib.to_path_buf());
     let mut coord = resolve(&wiring, &Registry::new()).expect("the process-slot graph resolves");
     // The initial occupant loads at init (inside the barrier), not at build.
-    assert!(child_pids().is_empty(), "a process slot spawns per Load, not at build");
+    assert!(
+        child_pids().is_empty(),
+        "a process slot spawns per Load, not at build"
+    );
 
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
@@ -873,7 +949,9 @@ fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
                 "the initial occupant is Loaded: {phases:?}"
             );
             let pid = *child_pids().first().expect("the initial worker is live");
-            control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
+            control
+                .emit(&seq_cmd("adcs", SequenceCommandKind::Start))
+                .unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, RUNNING, deadline).await,
                 "the occupant is Running: {phases:?}"
@@ -893,13 +971,17 @@ fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
                 child_pids().is_empty(),
                 "a dead occupant worker is reaped, never respawned"
             );
-            control.emit(&seq_cmd("adcs", SequenceCommandKind::Reset)).unwrap();
+            control
+                .emit(&seq_cmd("adcs", SequenceCommandKind::Reset))
+                .unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, LOADED, deadline).await,
                 "Reset brought a fresh worker to Loaded: {phases:?}"
             );
             let pid2 = *child_pids().first().expect("the reset worker is live");
-            control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
+            control
+                .emit(&seq_cmd("adcs", SequenceCommandKind::Start))
+                .unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
                 "the rerun completed: {phases:?}"
@@ -914,7 +996,15 @@ fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
     assert!(
         is_subsequence(
             &phases,
-            &[LOADED, RUNNING, SLOT_STOPPED, LOADING, LOADED, RUNNING, DONE]
+            &[
+                LOADED,
+                RUNNING,
+                SLOT_STOPPED,
+                LOADING,
+                LOADED,
+                RUNNING,
+                DONE
+            ]
         ),
         "death is terminal, Reset re-runs the pipeline: {phases:?}"
     );
@@ -926,14 +1016,20 @@ fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
     let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
     let failed_at = kinds
         .iter()
-        .position(|k| matches!(k, SequenceEventKind::Failed { reason } if reason.contains("worker")))
+        .position(
+            |k| matches!(k, SequenceEventKind::Failed { reason } if reason.contains("worker")),
+        )
         .unwrap_or_else(|| panic!("a Failed event names the worker death: {kinds:?}"));
     let loads: Vec<usize> = kinds
         .iter()
         .enumerate()
         .filter_map(|(i, k)| matches!(k, SequenceEventKind::Loaded { .. }).then_some(i))
         .collect();
-    assert_eq!(loads.len(), 2, "the initial load and the Reset reload: {kinds:?}");
+    assert_eq!(
+        loads.len(),
+        2,
+        "the initial load and the Reset reload: {kinds:?}"
+    );
     assert!(
         loads[0] < failed_at && failed_at < loads[1],
         "Failed sits between the two loads: {kinds:?}"
@@ -946,7 +1042,10 @@ fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
     // the live one.
     let workers = coord.workers();
     assert_eq!(workers.len(), 1, "{workers:?}");
-    assert_eq!(workers[0].restarts, 1, "one unplanned death counted: {workers:?}");
+    assert_eq!(
+        workers[0].restarts, 1,
+        "one unplanned death counted: {workers:?}"
+    );
     assert_eq!(workers[0].pid, pid2);
     assert_eq!(workers[0].state, WorkerRunState::Running);
     // The stopped list reflects current states: the recovered slot left it.
@@ -1010,7 +1109,9 @@ fn proc_slot_abort_crosses_the_boundary(seq_lib: &Path) {
             // The cancel frame is written by the host-side control writer and
             // crosses on the mmap ring; the occupant folds it at its next
             // wait, deep inside its ~2000-cycle window.
-            control.emit(&seq_cmd("adcs", SequenceCommandKind::Abort)).unwrap();
+            control
+                .emit(&seq_cmd("adcs", SequenceCommandKind::Abort))
+                .unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
                 "the abort went terminal: {phases:?}"

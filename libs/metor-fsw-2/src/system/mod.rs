@@ -24,6 +24,7 @@
 //! cyclic system. It owns the bundles between cycles, times each `execute`,
 //! and publishes the standard health record per cycle.
 
+use core::future::Future;
 use core::ops::{Deref, DerefMut};
 
 use metor_fsw_ring::{NoWake, WakeSource};
@@ -31,29 +32,50 @@ use metor_proto::types::Timestamp;
 
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState};
-use crate::descriptor::{PortDecl, PortDesc, SystemDescriptor, SystemKind, split_decls};
+use crate::descriptor::{Declarations, PortDesc, SystemDescriptor, SystemKind};
 use crate::health::{HealthPort, SystemHealth, SystemLog};
 use crate::message::MsgTable;
 use crate::port::Output;
+
+/// Cancellation-aware waits for an [`AsyncSystem`]'s run loop.
+pub struct AsyncContext {
+    pub(crate) cancel: stellarator::util::CancelToken,
+}
+
+impl AsyncContext {
+    /// Runs `future` until it completes or coordinator shutdown begins.
+    /// `None` means the future was cancelled and the run loop should return.
+    pub async fn until_cancelled<F: Future>(&self, future: F) -> Option<F::Output> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        futures_lite::future::race(async { Some(future.await) }, async {
+            self.cancel.wait().await;
+            None
+        })
+        .await
+    }
+
+    /// Whether coordinator shutdown has begun.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+}
 
 /// The read side of a system, a struct whose fields are
 /// [`Input<F>`](crate::Input) ports. Derive with `#[derive(SystemInput)]` to
 /// generate `decls` from the fields.
 pub trait SystemInput {
-    /// What every field contributes, in field order: the producer shape a
-    /// wired port requires, or a bind-time [`Capability`]. Read before any
-    /// port exists.
-    fn decls() -> Vec<PortDecl>;
+    /// The ports and bind-time capabilities required by this bundle.
+    fn decls() -> Declarations;
 }
 
 /// A system's output bundle: a struct of [`Output<F>`](crate::Output) ports.
 /// Derive with `#[derive(SystemOutput)]`. The framework wraps it in [`Out`]
 /// to add the implicit health/log ports.
 pub trait SystemOutput {
-    /// What every field contributes, in field order: the produced shape of
-    /// each wired port, or a bind-time [`Capability`] such as the `ReceiveAll`
-    /// an [`AllOutputs`](crate::AllOutputs) field requests.
-    fn decls() -> Vec<PortDecl>;
+    /// The ports and bind-time capabilities produced by this bundle.
+    fn decls() -> Declarations;
 
     /// Sum and clear the ports' [`publish`](crate::Output::publish) drop
     /// counters. Derive-generated; the runner folds a nonzero sum into a
@@ -124,11 +146,10 @@ where
     O: SystemOutput,
     WD: WakeSource,
 {
-    fn decls() -> Vec<PortDecl> {
-        // The user's decls, then the implicit health/log ports every system gets.
+    fn decls() -> Declarations {
         let mut decls = O::decls();
-        decls.push(PortDecl::Port(PortDesc::of::<SystemHealth>()));
-        decls.push(PortDecl::Port(PortDesc::of::<SystemLog>()));
+        decls.push(PortDesc::of::<SystemHealth>());
+        decls.push(PortDesc::of::<SystemLog>());
         decls
     }
 
@@ -282,14 +303,15 @@ fn descriptor_for<I: SystemInput, O: SystemOutput>(
     name: &'static str,
     kind: SystemKind,
 ) -> SystemDescriptor {
-    let (inputs, mut capabilities) = split_decls(<I as SystemInput>::decls());
-    let (outputs, out_caps) = split_decls(<O as SystemOutput>::decls());
-    capabilities.extend(out_caps);
+    let inputs = <I as SystemInput>::decls();
+    let outputs = <O as SystemOutput>::decls();
+    let mut capabilities = inputs.capabilities;
+    capabilities.extend(outputs.capabilities);
     SystemDescriptor {
         name: name.into(),
         kind,
-        inputs,
-        outputs,
+        inputs: inputs.ports,
+        outputs: outputs.ports,
         capabilities,
     }
 }
@@ -336,7 +358,12 @@ pub trait AsyncSystem: System {
     /// publishes through the non-blocking output path (a full ring drops the
     /// record rather than suspending the loop).
     /// `input` is `&mut` for the same reason as [`CyclicSystem::execute`].
-    async fn run(&mut self, input: &mut Self::Input, output: &mut Self::Output);
+    async fn run(
+        &mut self,
+        context: &AsyncContext,
+        input: &mut Self::Input,
+        output: &mut Self::Output,
+    );
 
     /// This system's self-description for wiring: the wired ports per
     /// direction, plus the merged capability set of both bundles.

@@ -26,7 +26,9 @@ use super::init::{
 use super::slot::{
     self, AllowedOccupant, OccupantBacking, SlotReg, SlotRunner, SlotStatus, slot_writer,
 };
-use super::{BoundSystems, CoordinatorPorts, CoordinatorStatus, CyclicSlot, PendingAsync, WireError};
+use super::{
+    BoundSystems, CoordinatorPorts, CoordinatorStatus, CyclicSlot, PendingAsync, WireError,
+};
 
 /// What the proc bind arm needs beyond the shared alloc products: the step
 /// deadline and the worker-executable override, both builder-scoped.
@@ -56,9 +58,7 @@ fn bind_static_io(
             FanIn::One => {
                 let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
                 let port = match plumbing.private_inputs.get(&(id, in_idx)) {
-                    Some((ring, data)) => {
-                        BoundPort::matched(ring.clone(), Box::new(data.clone()))
-                    }
+                    Some((ring, data)) => BoundPort::matched(ring.clone(), Box::new(data.clone())),
                     None => BoundPort::new(alloc.output_rings[prod_id][out_idx].clone()),
                 };
                 BoundInput::One(port)
@@ -131,8 +131,8 @@ pub(super) fn bind_systems(
                 let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
                 let mut binder = Binder::new(&outs, &ins, registry.clone());
                 pending_async.push(PendingAsync {
+                    name,
                     launcher: r.bind(&mut binder),
-                    wake_on_stop: std::mem::take(&mut plumbing.async_wakes[id]),
                 });
             }
         }
@@ -252,7 +252,10 @@ fn bind_dl(
     // the slot; the coordinator drops `cyclic` (this slot, whose `Drop` calls
     // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after;
     // the slot keeps its own `Arc<Library>`.
-    unsafe { dl.system.make_slot(&dl.params, inputs, outputs, &desc.name, crate::Mount::Wired) }
+    unsafe {
+        dl.system
+            .make_slot(&dl.params, inputs, outputs, &desc.name, crate::Mount::Wired)
+    }
 }
 
 /// The proc twin of [`bind_dl`]: gather the same per-port rings, but as
@@ -488,7 +491,10 @@ fn slot_proc_parts(
         system: desc.name.to_string(),
         detail,
     };
-    let session = alloc.session.as_ref().expect("process-slot graphs have a session");
+    let session = alloc
+        .session
+        .as_ref()
+        .expect("process-slot graphs have a session");
     // Every ring an occupant worker attaches, as (host handle, file path):
     // the occupant prefix's own outputs, then the ring behind each prefix
     // input (an Edge input's producer, the Host control ring's own file).
@@ -515,7 +521,8 @@ fn slot_proc_parts(
             }
         })
         .collect();
-    let exe = resolve_worker_exe(ctx.worker_exe.as_deref()).map_err(|e| spawn_err(e.to_string()))?;
+    let exe =
+        resolve_worker_exe(ctx.worker_exe.as_deref()).map_err(|e| spawn_err(e.to_string()))?;
     let ctl_path = session.path().join(format!("{}.ctl", desc.name));
     let manifests = allowed
         .iter()
@@ -536,7 +543,9 @@ fn slot_proc_parts(
                 inputs: input_paths.clone(),
                 outputs: output_paths.clone(),
             };
-            let path = session.path().join(format!("{}.{}.manifest", desc.name, occ.name));
+            let path = session
+                .path()
+                .join(format!("{}.{}.manifest", desc.name, occ.name));
             std::fs::write(
                 &path,
                 postcard::to_allocvec(&manifest).expect("manifest encodes (postcard)"),

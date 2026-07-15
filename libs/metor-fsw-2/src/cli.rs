@@ -5,8 +5,8 @@ use miette::IntoDiagnostic;
 
 use crate::wiring::{
     BuildOptions, ClockSpec, METOR_EXTENSION, PackageOptions, Registry, StubgenOptions,
-    WIRING_FILE_NAME, Wiring, build_artifacts, build_target, eval_python_mission, is_python_mission,
-    load_bundle, resolve, stubgen, unpack_metor, write_bundle,
+    WIRING_FILE_NAME, Wiring, build_artifacts, build_target, eval_python_mission,
+    is_python_mission, load_bundle, resolve, stubgen, unpack_metor, write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -155,7 +155,10 @@ fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
     };
     let report = stubgen(&opts).into_diagnostic()?;
     if opts.check {
-        println!("stubgen --check: {} module(s) up to date", report.modules.len());
+        println!(
+            "stubgen --check: {} module(s) up to date",
+            report.modules.len()
+        );
     } else {
         for path in &report.modules {
             println!("  wrote {}", path.display());
@@ -262,8 +265,12 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
     };
 
     let frozen_text = read_file(&dir.join(WIRING_FILE_NAME))?;
-    let frozen: Wiring = serde_json::from_str(&frozen_text)
-        .map_err(|e| miette::miette!("bundle `{}` has an unreadable wiring.json: {e}", bundle.display()))?;
+    let frozen: Wiring = serde_json::from_str(&frozen_text).map_err(|e| {
+        miette::miette!(
+            "bundle `{}` has an unreadable wiring.json: {e}",
+            bundle.display()
+        )
+    })?;
 
     let source = find_provenance(&dir).ok_or_else(|| {
         miette::miette!(
@@ -382,7 +389,10 @@ fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
 /// A `<TARGET>` is a bundle if it is a directory (the bundle layout), ends in
 /// `.bundle`, or is a single-file `.metor` archive.
 fn is_bundle(path: &Path) -> bool {
-    path.is_dir() || path.extension().is_some_and(|e| e == "bundle" || e == "metor")
+    path.is_dir()
+        || path
+            .extension()
+            .is_some_and(|e| e == "bundle" || e == "metor")
 }
 
 /// Apply `run`'s override flags onto the loaded [`Wiring`] before [`resolve`].
@@ -434,7 +444,13 @@ mod tests {
                 .end()
                 .build()
         };
-        let anchor = |file: &str| Some(SourceRef { file: Some(file.into()), line: 1, col: 1 });
+        let anchor = |file: &str| {
+            Some(SourceRef {
+                file: Some(file.into()),
+                line: 1,
+                col: 1,
+            })
+        };
 
         let mut frozen = base();
         frozen.systems[0].src = anchor("/build/mission.py");
@@ -463,6 +479,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(find_provenance(dir.path()).is_none(), "no provenance yet");
         std::fs::write(dir.path().join("mission.py"), "").unwrap();
-        assert_eq!(find_provenance(dir.path()), Some(dir.path().join("mission.py")));
+        assert_eq!(
+            find_provenance(dir.path()),
+            Some(dir.path().join("mission.py"))
+        );
     }
 }

@@ -253,13 +253,18 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
 
     // --- Describe --------------------------------------------------------
     // SAFETY: the export is `fsw_pack_describe(pack, sink, ctx) -> i32`.
-    let describe: Symbol<PackDescribeFn> = unsafe {
-        resolve(&pack_lib.lib, abi::SYM_PACK_DESCRIBE, "fsw_pack_describe")?
-    };
+    let describe: Symbol<PackDescribeFn> =
+        unsafe { resolve(&pack_lib.lib, abi::SYM_PACK_DESCRIBE, "fsw_pack_describe")? };
     let mut buf: Vec<u8> = Vec::new();
     // SAFETY: `collect_sink` and `&mut buf` form a matching callback pair;
     // the shared object calls the sink with a buffer it owns for the call.
-    let rc = unsafe { describe(pack_lib.pack_ptr(), collect_sink, &mut buf as *mut Vec<u8> as *mut c_void) };
+    let rc = unsafe {
+        describe(
+            pack_lib.pack_ptr(),
+            collect_sink,
+            &mut buf as *mut Vec<u8> as *mut c_void,
+        )
+    };
     if rc != 0 {
         return Err(DlError::Describe(rc));
     }
@@ -355,9 +360,8 @@ impl DlPack {
         // SAFETY: each export matches its generated signature.
         let create =
             *unsafe { resolve::<PackCreateFn>(lib, abi::SYM_PACK_CREATE, "fsw_pack_create")? };
-        let bind_init = *unsafe {
-            resolve::<BindInitFn>(lib, abi::SYM_PACK_BIND_INIT, "fsw_pack_bind_init")?
-        };
+        let bind_init =
+            *unsafe { resolve::<BindInitFn>(lib, abi::SYM_PACK_BIND_INIT, "fsw_pack_bind_init")? };
         let execute =
             *unsafe { resolve::<ExecuteFn>(lib, abi::SYM_PACK_EXECUTE, "fsw_pack_execute")? };
         let shutdown =
@@ -497,9 +501,8 @@ impl DlSystem {
         };
         // SAFETY: `ptr`/`len` name a readable byte range (or null/0); the
         // export decodes them immediately, so they need not outlive the call.
-        let state = unsafe {
-            (self.fns.create)(self.lib.pack_ptr(), self.index, mount_word, ptr, len)
-        };
+        let state =
+            unsafe { (self.fns.create)(self.lib.pack_ptr(), self.index, mount_word, ptr, len) };
         // A null state means creation failed inside the shared object (bad
         // params, a non-reloadable entry re-created, or a panic; the ABI shim
         // catches the unwind and returns null). Latch the failure now: `step`
@@ -778,7 +781,11 @@ mod tests {
         assert_eq!(slot.step_seq(Timestamp(2)), FswStatus::Panicked);
         assert_eq!(POLLS.load(Relaxed), 1);
         drop(slot);
-        assert_eq!(DESTROYS.load(Relaxed), 1, "destroyed at the panic, not at Drop");
+        assert_eq!(
+            DESTROYS.load(Relaxed),
+            1,
+            "destroyed at the panic, not at Drop"
+        );
     }
 
     /// An entry declaring a host capability is a clean load rejection,

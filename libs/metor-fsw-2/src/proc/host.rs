@@ -400,7 +400,11 @@ impl ProcSlot {
         slot.handle
             .spawn_child()
             .map_err(|e| format!("spawn `{}`: {e}", slot.handle.exe.display()))?;
-        if let Err(e) = slot.handle.ctl.wait_state(WorkerState::Attached, SPAWN_TIMEOUT) {
+        if let Err(e) = slot
+            .handle
+            .ctl
+            .wait_state(WorkerState::Attached, SPAWN_TIMEOUT)
+        {
             slot.handle.kill_reap_reclaim();
             return Err(format!("worker never attached ({e}); {GUARD_HINT}"));
         }
@@ -832,7 +836,10 @@ mod tests {
         let ctl = CtlWorker::attach(&dir.path().join("slot.ctl")).unwrap();
 
         ctl.fail(fail_code::ARTIFACT);
-        assert!(matches!(w.poll_load(), LoadPoll::Failed { stage: "attach" }));
+        assert!(matches!(
+            w.poll_load(),
+            LoadPoll::Failed { stage: "attach" }
+        ));
         assert_eq!(w.pid(), 0, "the half-born worker was ended");
         assert!(
             matches!(w.poll_load(), LoadPoll::Failed { stage: "attach" }),
@@ -889,7 +896,10 @@ mod tests {
         w.phase = LoadPhase::Attaching {
             deadline: Instant::now(),
         };
-        assert!(matches!(w.poll_load(), LoadPoll::Failed { stage: "attach" }));
+        assert!(matches!(
+            w.poll_load(),
+            LoadPoll::Failed { stage: "attach" }
+        ));
         w.end();
     }
 }

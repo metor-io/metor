@@ -30,7 +30,7 @@ use core::mem::size_of;
 use metor_proto::types::LenPacket;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::dynamic::{MapEntryHeader, Slot, map_stride, map_value_offset};
+use crate::dynamic::{FrameList, FrameMap, MapEntryHeader, Slot, map_stride, map_value_offset};
 use crate::frame::Frame;
 
 /// Byte offset of the table within `LenPacket::inner`, past the packet header
@@ -49,6 +49,20 @@ pub enum KeyError {
     /// The key was empty, which would vanish from the path entirely.
     #[error("map key is empty (an empty segment vanishes per the PathHasher rule)")]
     EmptyKey,
+}
+
+/// A dynamic member exceeded the bounds used to compute its frame's
+/// [`Frame::MAX_SIZE`]. The member is rolled back before this is returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DynamicWriteError {
+    #[error("frame list exceeds its {max}-element bound")]
+    ListFull { max: usize },
+    #[error("frame map exceeds its {max}-entry bound")]
+    MapFull { max: usize },
+    #[error("frame map key is {len} bytes, exceeding its {max}-byte bound")]
+    KeyTooLong { len: usize, max: usize },
+    #[error(transparent)]
+    Key(#[from] KeyError),
 }
 
 /// The recycled backing a [`FrameWriter`] builds into: the table packet plus
@@ -81,6 +95,7 @@ pub struct FrameWriter<F> {
     /// the trailer when the member finishes, so it holds bytes only while a
     /// [`map`](Self::map) call runs.
     keys: Vec<u8>,
+    error: Option<DynamicWriteError>,
     _f: PhantomData<F>,
 }
 
@@ -100,7 +115,10 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     /// The packet is cleared back to its header first, leaving it
     /// byte-equivalent to a newly constructed table packet.
     pub fn from_scratch(scratch: FrameScratch, fixed: &F) -> Self {
-        let FrameScratch { mut packet, mut keys } = scratch;
+        let FrameScratch {
+            mut packet,
+            mut keys,
+        } = scratch;
         packet.clear();
         keys.clear();
         debug_assert_eq!(packet.inner.len(), TABLE_BASE);
@@ -110,6 +128,7 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
             packet,
             base,
             keys,
+            error: None,
             _f: PhantomData,
         }
     }
@@ -117,21 +136,29 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     /// Appends a list to the trailer and patches the slot at `slot_off`
     /// (obtain it with `core::mem::offset_of!`). Elements land in the trailer
     /// as they are pushed.
-    pub fn list<T: IntoBytes + Immutable>(
+    pub fn list<T: IntoBytes + Immutable, const MAX: usize>(
         &mut self,
+        _field: &FrameList<T, MAX>,
         slot_off: usize,
-        build: impl FnOnce(&mut ListWriter<'_, T>),
-    ) {
+        build: impl FnOnce(&mut ListWriter<'_, T, MAX>),
+    ) -> Result<(), DynamicWriteError> {
         self.align8();
         let trailer_off = self.table_len();
         let mut lw = ListWriter {
             packet: &mut self.packet,
             count: 0,
+            error: None,
             _t: PhantomData,
         };
         build(&mut lw);
+        if let Some(error) = lw.error {
+            self.truncate_table(trailer_off);
+            self.error.get_or_insert(error);
+            return Err(error);
+        }
         let byte_len = self.table_len() - trailer_off;
         self.patch_slot(slot_off, trailer_off as u32, byte_len as u32);
+        Ok(())
     }
 
     /// Appends a map to the trailer as a fixed-stride entry array followed by
@@ -139,11 +166,12 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     ///
     /// Errors if any key inserted during `build` was rejected, rolling the
     /// whole member back so the slot stays empty.
-    pub fn map<V: IntoBytes + Immutable>(
+    pub fn map<V: IntoBytes + Immutable, const MAX: usize, const MAX_KEY: usize>(
         &mut self,
+        _field: &FrameMap<V, MAX, MAX_KEY>,
         slot_off: usize,
-        build: impl FnOnce(&mut MapWriter<'_, V>),
-    ) -> Result<(), KeyError> {
+        build: impl FnOnce(&mut MapWriter<'_, V, MAX, MAX_KEY>),
+    ) -> Result<(), DynamicWriteError> {
         self.align8();
         let entry_array_off = self.table_len();
         let keys_mark = self.keys.len();
@@ -163,6 +191,7 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
             // never ran.
             self.truncate_table(entry_array_off);
             self.keys.truncate(keys_mark);
+            self.error.get_or_insert(err);
             return Err(err);
         }
 
@@ -185,6 +214,11 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
         self.packet.extend_from_slice(keys);
         self.keys.truncate(keys_mark);
         Ok(())
+    }
+
+    /// The first dynamic-member error raised while building this frame.
+    pub fn error(&self) -> Option<DynamicWriteError> {
+        self.error
     }
 
     /// Finishes the frame, handing the pooled backing back to the caller.
@@ -243,15 +277,23 @@ fn pad_zero(packet: &mut LenPacket, mut n: usize) {
 /// Appends a list's elements straight into the trailer;
 /// [`FrameWriter::list`] measures the block around the build closure and
 /// patches the slot afterwards.
-pub struct ListWriter<'a, T> {
+pub struct ListWriter<'a, T, const MAX: usize> {
     packet: &'a mut LenPacket,
     count: usize,
+    error: Option<DynamicWriteError>,
     _t: PhantomData<T>,
 }
 
-impl<T: IntoBytes + Immutable> ListWriter<'_, T> {
+impl<T: IntoBytes + Immutable, const MAX: usize> ListWriter<'_, T, MAX> {
     /// Appends one element.
     pub fn push(&mut self, elem: T) {
+        if self.error.is_some() {
+            return;
+        }
+        if self.count == MAX {
+            self.error = Some(DynamicWriteError::ListFull { max: MAX });
+            return;
+        }
         debug_assert_eq!(size_of::<T>(), elem.as_bytes().len());
         self.packet.extend_from_slice(elem.as_bytes());
         self.count += 1;
@@ -273,25 +315,41 @@ impl<T: IntoBytes + Immutable> ListWriter<'_, T> {
 ///
 /// Keys are validated on insert and the first rejection is surfaced by
 /// [`FrameWriter::map`], which rolls the whole member back.
-pub struct MapWriter<'a, V> {
+pub struct MapWriter<'a, V, const MAX: usize, const MAX_KEY: usize> {
     packet: &'a mut LenPacket,
     keys: &'a mut Vec<u8>,
     /// The staging length at member start; header key offsets are stored
     /// relative to it until the member's pool position is known.
     keys_mark: usize,
     count: usize,
-    error: Option<KeyError>,
+    error: Option<DynamicWriteError>,
     _v: PhantomData<V>,
 }
 
-impl<V: IntoBytes + Immutable> MapWriter<'_, V> {
+impl<V: IntoBytes + Immutable, const MAX: usize, const MAX_KEY: usize>
+    MapWriter<'_, V, MAX, MAX_KEY>
+{
     /// Inserts a `(key, value)` entry, rejecting empty or `.`-containing keys.
     pub fn insert(&mut self, key: &str, value: V) {
+        if self.error.is_some() {
+            return;
+        }
         if let Err(e) = validate_key(key) {
-            self.error.get_or_insert(e);
+            self.error = Some(e.into());
+            return;
+        }
+        if self.count == MAX {
+            self.error = Some(DynamicWriteError::MapFull { max: MAX });
             return;
         }
         let kb = key.as_bytes();
+        if kb.len() > MAX_KEY {
+            self.error = Some(DynamicWriteError::KeyTooLong {
+                len: kb.len(),
+                max: MAX_KEY,
+            });
+            return;
+        }
         let value_offset = map_value_offset::<V>() as usize;
         let stride = map_stride::<V>() as usize;
         // One fixed-stride entry: the header (with its key offset still

@@ -138,7 +138,7 @@ impl System for NavFilter {
 
 impl CyclicSystem for NavFilter {
     fn execute(&mut self, now: Timestamp, input: &mut NavIn, o: &mut Self::Output) {
-        if let Some(imu) = input.imu.latest() {
+        if let Ok(Some(imu)) = input.imu.latest() {
             let omega = imu.get().omega;
             let _ = o.nav.write(&Nav {
                 timestamp: now,
@@ -180,9 +180,13 @@ impl System for NavLogger {
 }
 
 impl AsyncSystem for NavLogger {
-    async fn run(&mut self, input: &mut Self::Input, _o: &mut Self::Output) {
-        // The only recv error is a corrupt record, which cannot happen here.
-        if let Ok(nav) = input.nav.recv().await {
+    async fn run(
+        &mut self,
+        context: &crate::AsyncContext,
+        input: &mut Self::Input,
+        _o: &mut Self::Output,
+    ) {
+        while let Some(Ok(nav)) = context.until_cancelled(input.nav.recv()).await {
             LOG_COUNT.fetch_add(1, Relaxed);
             LOG_LAST_ANGLE_BITS.store(nav.get().angle.to_bits(), Relaxed);
         }
@@ -252,7 +256,7 @@ impl System for Closer {
 impl CyclicSystem for Closer {
     fn execute(&mut self, now: Timestamp, input: &mut CloserIn, o: &mut Self::Output) {
         let omega = match input.nav.latest() {
-            Some(nav) => nav.get().angle,
+            Ok(Some(nav)) => nav.get().angle,
             _ => 0.0,
         };
         let _ = o.imu.write(&Imu {
@@ -415,7 +419,10 @@ async fn resolve_broadcasts_the_wiring_manifest() {
     coord.run_for(2).await;
 
     let mut buf = Vec::new();
-    assert!(view.try_read_into(&mut buf).expect("readable ring"), "boot manifest present");
+    assert!(
+        view.try_read_into(&mut buf).expect("readable ring"),
+        "boot manifest present"
+    );
     let (id, payload) = crate::message::split_record(&buf).expect("id-prefixed record");
     assert_eq!(id, WiringManifest::ID);
     let manifest: WiringManifest = postcard::from_bytes(payload).expect("decode manifest");
@@ -482,9 +489,7 @@ fn err_static_system_with_typed_params() {
             name: "nav".into(),
             ty: Some("NavFilter".into()),
             artifact: None,
-            params: ParamSource::Postcard(
-                postcard::to_allocvec(&Gain { gain: 2.0 }).unwrap(),
-            ),
+            params: ParamSource::Postcard(postcard::to_allocvec(&Gain { gain: 2.0 }).unwrap()),
             process: false,
             src: None,
             scope: None,
@@ -566,10 +571,13 @@ impl System for MsgSink {
 
 impl CyclicSystem for MsgSink {
     fn execute(&mut self, _now: Timestamp, input: &mut MsgSinkIn, _o: &mut Self::Output) {
-        input.events.drain(|e| {
-            WIRE_SINK_COUNT.fetch_add(1, Relaxed);
-            WIRE_SINK_LAST.store(e.seq, Relaxed);
-        });
+        input
+            .events
+            .drain(|e| {
+                WIRE_SINK_COUNT.fetch_add(1, Relaxed);
+                WIRE_SINK_LAST.store(e.seq, Relaxed);
+            })
+            .unwrap();
     }
 }
 
@@ -801,18 +809,20 @@ async fn pack_entry_defaults_overlay_value_overrides() {
     }
 
     let mut r = Registry::new();
-    r.register_pack(crate::Pack::new().system(
-        "TrimV",
-        crate::system(emit)
-            .init(|p: TrimParams| St {
-                gain: p.gain,
-                bias: p.bias,
-            })
-            .defaults(TrimParams {
-                gain: 10.0,
-                bias: 0.5,
-            }),
-    ));
+    r.register_pack(
+        crate::Pack::new().system(
+            "TrimV",
+            crate::system(emit)
+                .init(|p: TrimParams| St {
+                    gain: p.gain,
+                    bias: p.bias,
+                })
+                .defaults(TrimParams {
+                    gain: 10.0,
+                    bias: 0.5,
+                }),
+        ),
+    );
 
     let wiring = WiringBuilder::new()
         .coordinator(1000.0, ClockSpec::Wall)
@@ -901,6 +911,23 @@ fn resolve_rejects_ir_version_mismatch() {
     }
 }
 
+#[test]
+fn resolve_rejects_invalid_simulated_steps_without_panicking() {
+    for dt_secs in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+        let wiring = WiringBuilder::new()
+            .coordinator(100.0, ClockSpec::Simulated { dt_secs })
+            .build();
+        let err = match resolve(&wiring, &Registry::new()) {
+            Ok(_) => panic!("invalid dt must fail: {dt_secs:?}"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err.kind, LoadErrorKind::InvalidSimulatedStep { .. }),
+            "{dt_secs:?}: {err:?}"
+        );
+    }
+}
+
 /// A bundle whose artifact records a `manifest_hash` verifies it against the
 /// copied sidecar at load: a matching bundle loads, a tampered sidecar fails
 /// with [`BundleError::ManifestHashMismatch`] before any dlopen. Built over the
@@ -914,7 +941,11 @@ fn bundle_manifest_hash_checked_at_load() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut wiring = WiringBuilder::new()
-        .artifact("fixture", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .artifact(
+            "fixture",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
         .build();
     if let Err(e) = crate::wiring::build_artifacts(&mut wiring, &crate::BuildOptions::default()) {
         eprintln!("skipping: build_artifacts failed: {e}");
@@ -931,12 +962,30 @@ fn bundle_manifest_hash_checked_at_load() {
     write_bundle(&wiring, &PackageOptions::default(), &dir).expect("write the bundle");
     load_bundle(&dir).expect("a matching bundle loads (hash verified)");
 
+    let wiring_path = dir.join(crate::wiring::WIRING_FILE_NAME);
+    let wiring_bytes = std::fs::read(&wiring_path).unwrap();
+    let mut changed = wiring_bytes.clone();
+    changed.push(b' ');
+    std::fs::write(&wiring_path, changed).unwrap();
+    assert!(matches!(
+        load_bundle(&dir),
+        Err(BundleError::IrHashMismatch)
+    ));
+    std::fs::write(&wiring_path, wiring_bytes).unwrap();
+
     // Tamper the copied sidecar: the load-time hash check now refuses it.
     let copied_sidecar = crate::dl::manifest_sidecar_path(&dir.join(&wiring.artifacts[0].cdylib));
     std::fs::write(&copied_sidecar, b"tampered").expect("overwrite the sidecar");
     let err = load_bundle(&dir).expect_err("a tampered sidecar is refused");
     assert!(
         matches!(&err, BundleError::ManifestHashMismatch { artifact } if artifact == "fixture"),
+        "{err:?}"
+    );
+
+    std::fs::remove_file(&copied_sidecar).expect("remove the sidecar");
+    let err = load_bundle(&dir).expect_err("a missing required sidecar is refused");
+    assert!(
+        matches!(&err, BundleError::MissingManifest { artifact, .. } if artifact == "fixture"),
         "{err:?}"
     );
 }
@@ -954,7 +1003,11 @@ fn metor_archive_round_trips_and_is_reproducible() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut wiring = WiringBuilder::new()
-        .artifact("fixture", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .artifact(
+            "fixture",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
         .build();
     if let Err(e) = crate::wiring::build_artifacts(&mut wiring, &crate::BuildOptions::default()) {
         eprintln!("skipping: build_artifacts failed: {e}");
@@ -980,7 +1033,10 @@ fn metor_archive_round_trips_and_is_reproducible() {
     // Unpack and load: artifact paths point into the unpacked temp dir.
     let loaded = load_bundle(&a).expect("the .metor bundle loads");
     assert_eq!(loaded.artifacts.len(), 1);
-    let path = loaded.artifacts[0].path.as_deref().expect("artifact path filled");
+    let path = loaded.artifacts[0]
+        .path
+        .as_deref()
+        .expect("artifact path filled");
     assert!(path.exists(), "the unpacked .so is a real file for dlopen");
     assert!(
         path.file_name().and_then(|n| n.to_str()) == Some(&wiring.artifacts[0].cdylib),
@@ -1106,7 +1162,14 @@ fn resolve_rejects_out_of_range_scope_refs() {
         Err(e) => e,
     };
     assert!(
-        matches!(err.kind, LoadErrorKind::BadScopeRef { index: 3, len: 1, .. }),
+        matches!(
+            err.kind,
+            LoadErrorKind::BadScopeRef {
+                index: 3,
+                len: 1,
+                ..
+            }
+        ),
         "{err:?}"
     );
 }
@@ -1153,7 +1216,10 @@ fn validate_accepts_a_well_formed_wiring() {
 #[test]
 fn validate_rejects_duplicate_instance_names() {
     let mut w = bare_wiring();
-    w.systems = vec![static_system("dup", Some("Src")), static_system("dup", Some("Sink"))];
+    w.systems = vec![
+        static_system("dup", Some("Src")),
+        static_system("dup", Some("Sink")),
+    ];
     let err = super::validate::validate(&w).expect_err("duplicate names are rejected");
     assert!(
         matches!(err.kind, LoadErrorKind::DuplicateInstance { ref name } if name == "dup"),
@@ -1192,7 +1258,10 @@ fn validate_rejects_a_system_and_slot_name_collision() {
         scope: None,
     }];
     let err = super::validate::validate(&w).expect_err("a system/slot collision is rejected");
-    assert!(matches!(err.kind, LoadErrorKind::DuplicateInstance { .. }), "{err:?}");
+    assert!(
+        matches!(err.kind, LoadErrorKind::DuplicateInstance { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -1268,7 +1337,10 @@ fn validate_rejects_an_empty_slot() {
         scope: None,
     }];
     let err = super::validate::validate(&w).expect_err("an empty slot is rejected");
-    assert!(matches!(err.kind, LoadErrorKind::EmptySlot { .. }), "{err:?}");
+    assert!(
+        matches!(err.kind, LoadErrorKind::EmptySlot { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -1293,7 +1365,10 @@ fn validate_rejects_an_initial_outside_the_allow_set() {
         scope: None,
     }];
     let err = super::validate::validate(&w).expect_err("an initial outside allow is rejected");
-    assert!(matches!(err.kind, LoadErrorKind::UnknownInitialOccupant { .. }), "{err:?}");
+    assert!(
+        matches!(err.kind, LoadErrorKind::UnknownInitialOccupant { .. }),
+        "{err:?}"
+    );
 }
 
 #[test]

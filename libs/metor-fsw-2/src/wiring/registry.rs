@@ -181,9 +181,10 @@ impl<'de> serde::Deserializer<'de> for NoParams {
 
     fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
         // Default to an empty map, so a struct with defaulted fields decodes.
-        v.visit_map(serde::de::value::MapDeserializer::new(
-            std::iter::empty::<(&str, &str)>(),
-        ))
+        v.visit_map(serde::de::value::MapDeserializer::new(std::iter::empty::<(
+            &str,
+            &str,
+        )>()))
     }
 
     fn deserialize_unit<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
@@ -409,8 +410,10 @@ impl Registry {
     /// `false`; the systems pass reports them as [`LoadErrorKind::UnknownType`] in
     /// document order.
     pub(super) fn is_receive_all(&self, ty: Option<&str>) -> bool {
-        ty.and_then(|ty| self.factories.get(ty))
-            .is_some_and(|e| e.descriptor.capabilities_contain(crate::Capability::ReceiveAll))
+        ty.and_then(|ty| self.factories.get(ty)).is_some_and(|e| {
+            e.descriptor
+                .capabilities_contain(crate::Capability::ReceiveAll)
+        })
     }
 }
 

@@ -497,7 +497,8 @@ systems and the copy-in step share the same executor cooperatively.
 ### 4.1 Spawn once
 
 For each async system the coordinator spawns its `run` loop exactly once. Because
-`AsyncSystem::run(&mut self, &mut Input, &mut Output)` borrows all three for the loop's lifetime, the
+`AsyncSystem::run(&mut self, &AsyncContext, &mut Input, &mut Output)` borrows the system and both
+port bundles for the loop's lifetime, so the
 system, its `Input` bundle, and its `Out<Output>` move **into** the spawned task (`AsyncSlot`):
 
 ```rust
@@ -506,17 +507,16 @@ stellarator::spawn(async move {
     ctx.ready_count.fetch_add(1, Release);      // signal the init barrier (§6)
     ctx.ready.wake_all();
     ctx.go.wait_for(|| ctx.go_flag.load(Acquire)).await;   // hold at the go-gate
-    loop {
-        if ctx.stop.load(Acquire) { break; }
-        me.system.run(&mut me.input, &mut me.output).await;  // one pass; system paces itself
-    }
+    let context = AsyncContext { cancel: ctx.cancel };
+    me.system.run(&context, &mut me.input, &mut me.output).await;
     me.system.shutdown(&mut me.output);         // shutdown inside the task, after the loop
 });
 ```
 
-The system's own `run` decides pacing — await an input via `Input::recv` (backed by a `Notifier`
-sink) or `stellarator::sleep` on a timer. The coordinator only spawns the task and later signals
-teardown. The `JoinHandleDropGuard` cancels the task if a `Coordinator` is dropped mid-run.
+The system's own `run` decides pacing. It wraps `Input::recv` (backed by a `Notifier` sink) or a
+timer with `AsyncContext::until_cancelled`, and returns when that method yields `None`. The
+coordinator calls `run` once, signals cancellation during teardown, and force-cancels a task only
+if it exceeds the shutdown deadline.
 
 `init`/`shutdown` for an async system run **inside its task** (the only owner of the bundle). The
 init barrier (§6) ensures every system's `init` has completed before any first `run` pass or cycle.
@@ -572,9 +572,8 @@ straight through, with no scratch copy. The `try_write` notifies the private buf
 
 There is nothing async-specific on the **output** side: an async system writes its output ring at
 its own pace, and a cyclic consumer holds an ordinary `View` it reads with `Input::latest()` each
-cycle — latest-wins, same as any edge. A fast async producer that fills the ring is backpressured
-like any writer: its `write_async` suspends until the consumer frees room (§3.3). No special
-handling.
+cycle — latest-wins, same as any edge. Writes are non-blocking; a full ring returns
+`WriteError::WouldBlock`, so the async system owns its retry or drop policy.
 
 ---
 
@@ -662,7 +661,7 @@ The hard timeout is the only non-cooperative path.
 | Validation | `compatible(producer, consumer)` | per-edge driving; single-connect / unconnected-input / unbroken-cycle (`find_cycle`) |
 | Wake | `NoWake` (cyclic), `Notifier` (async), `WaitQueue` | matched wake endpoints on the copy-in private buffer |
 | Health | `SystemHealth`/`SystemLog`, `HealthPort` | auto-provisioned buffers; instance prefix at the sink; coordinator health + `CoordinatorStatus` |
-| Async | `AsyncSystem::run`, `Input::recv`, `Output::write_async` | spawn-once task + in-task `init`/`shutdown`; private copy-in buffers + newest-record mirror |
+| Async | `AsyncSystem::run`, `AsyncContext`, `Input::recv` | spawn-once task + cooperative cancellation + in-task `init`/`shutdown`; private copy-in buffers + newest-record mirror |
 | Telemetry | — | the `OutputRegistry`, registry-consumer sizing (the downlink is an ordinary `add_cyclic` system) |
 | dlopen | `DlSystem`/`DlSlot`/`FswRing` ABI (`dl.rs`/`abi.rs`) | `add_dl_cyclic`, raw-region bind, teardown ordering |
 | Runtime | `stellarator::{run,spawn,sleep,yield_now,JoinHandle::drop_guard}` | the run-fast-then-wait `run_for` loop; cooperative teardown |

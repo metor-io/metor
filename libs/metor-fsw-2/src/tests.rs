@@ -4,10 +4,13 @@ use core::mem::offset_of;
 use std::collections::HashMap;
 
 use metor_fsw::{AsVTable, Componentize};
+use metor_fsw_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::{Frame, FrameList, FrameMap, FrameWriter, KeyError};
+use crate::{
+    DynamicWriteError, Frame, FrameList, FrameMap, FrameWriteError, FrameWriter, KeyError, Output,
+};
 
 // --- Shared recording sink ---
 
@@ -201,7 +204,7 @@ fn frame_list_build_and_apply() {
         processes: FrameList::EMPTY,
     };
     let mut w = FrameWriter::new(&frame);
-    w.list(offset_of!(SysList, processes), |l| {
+    w.list(&frame.processes, offset_of!(SysList, processes), |l| {
         l.push(Process {
             pid: 1001,
             cpu_usage: 0.5,
@@ -210,7 +213,8 @@ fn frame_list_build_and_apply() {
             pid: 1002,
             cpu_usage: 0.25,
         });
-    });
+    })
+    .unwrap();
 
     let mut sink = RecSink::default();
     SysList::as_vtable()
@@ -247,7 +251,7 @@ fn frame_map_build_and_apply() {
         processes: FrameMap::EMPTY,
     };
     let mut w = FrameWriter::new(&frame);
-    w.map(offset_of!(SysMap, processes), |m| {
+    w.map(&frame.processes, offset_of!(SysMap, processes), |m| {
         m.insert(
             "htop",
             Process {
@@ -290,7 +294,7 @@ fn frame_map_rejects_dot_key_at_write_time() {
         processes: FrameMap::EMPTY,
     };
     let mut w = FrameWriter::new(&frame);
-    let res = w.map(offset_of!(SysMap, processes), |m| {
+    let res = w.map(&frame.processes, offset_of!(SysMap, processes), |m| {
         m.insert(
             "a.b",
             Process {
@@ -299,7 +303,92 @@ fn frame_map_rejects_dot_key_at_write_time() {
             },
         );
     });
-    assert_eq!(res, Err(KeyError::DotInKey));
+    assert_eq!(res, Err(DynamicWriteError::Key(KeyError::DotInKey)));
+}
+
+#[test]
+fn dynamic_writers_enforce_declared_bounds_and_roll_back() {
+    let list = SysList {
+        timestamp: Timestamp(0),
+        processes: FrameList::EMPTY,
+    };
+    let mut writer = FrameWriter::new(&list);
+    let fixed_len = writer.table().len();
+    let err = writer
+        .list(&list.processes, offset_of!(SysList, processes), |items| {
+            for pid in 0..=8 {
+                items.push(Process {
+                    pid,
+                    cpu_usage: 0.0,
+                });
+            }
+        })
+        .unwrap_err();
+    assert_eq!(err, DynamicWriteError::ListFull { max: 8 });
+    assert_eq!(writer.table().len(), fixed_len);
+
+    let map = SysMap {
+        timestamp: Timestamp(0),
+        processes: FrameMap::EMPTY,
+    };
+    let mut writer = FrameWriter::new(&map);
+    let err = writer
+        .map(&map.processes, offset_of!(SysMap, processes), |entries| {
+            entries.insert(
+                &"x".repeat(33),
+                Process {
+                    pid: 1,
+                    cpu_usage: 0.0,
+                },
+            );
+        })
+        .unwrap_err();
+    assert_eq!(err, DynamicWriteError::KeyTooLong { len: 33, max: 32 });
+
+    let mut writer = FrameWriter::new(&map);
+    let err = writer
+        .map(&map.processes, offset_of!(SysMap, processes), |entries| {
+            for pid in 0..=8 {
+                entries.insert(
+                    &format!("p{pid}"),
+                    Process {
+                        pid,
+                        cpu_usage: 0.0,
+                    },
+                );
+            }
+        })
+        .unwrap_err();
+    assert_eq!(err, DynamicWriteError::MapFull { max: 8 });
+}
+
+#[test]
+fn output_rejects_dynamic_overflow_before_ring_write() {
+    let ring = RingBuffer::create_in_memory(Config {
+        capacity: crate::buffer_capacity::<SysList>(2),
+        max_readers: 1,
+    });
+    let mut output = Output::<SysList>::new(ring.writer(NoWake).unwrap());
+    let frame = SysList {
+        timestamp: Timestamp(0),
+        processes: FrameList::EMPTY,
+    };
+    let err = output
+        .write_with(&frame, |writer| {
+            let _ = writer.list(&frame.processes, offset_of!(SysList, processes), |items| {
+                for pid in 0..=8 {
+                    items.push(Process {
+                        pid,
+                        cpu_usage: 0.0,
+                    });
+                }
+            });
+        })
+        .unwrap_err();
+    assert_eq!(
+        err,
+        FrameWriteError::Dynamic(DynamicWriteError::ListFull { max: 8 })
+    );
 }
 
 /// Locks the exact trailer layout of a map member: the fixed region, an
@@ -314,7 +403,7 @@ fn frame_map_exact_byte_layout() {
         processes: FrameMap::EMPTY,
     };
     let mut w = FrameWriter::new(&frame);
-    w.map(offset_of!(SysMap, processes), |m| {
+    w.map(&frame.processes, offset_of!(SysMap, processes), |m| {
         m.insert(
             "htop",
             Process {
@@ -368,15 +457,16 @@ fn frame_map_key_error_rolls_the_member_back() {
         hosts: FrameMap::EMPTY,
     };
     let mut w = FrameWriter::new(&frame);
-    w.list(offset_of!(SysBoth, procs), |l| {
+    w.list(&frame.procs, offset_of!(SysBoth, procs), |l| {
         l.push(Process {
             pid: 1,
             cpu_usage: 1.0,
         });
-    });
+    })
+    .unwrap();
     let len_after_list = w.table().len();
 
-    let res = w.map(offset_of!(SysBoth, hosts), |m| {
+    let res = w.map(&frame.hosts, offset_of!(SysBoth, hosts), |m| {
         m.insert(
             "ok",
             Process {
@@ -392,7 +482,7 @@ fn frame_map_key_error_rolls_the_member_back() {
             },
         );
     });
-    assert_eq!(res, Err(KeyError::DotInKey));
+    assert_eq!(res, Err(DynamicWriteError::Key(KeyError::DotInKey)));
     assert_eq!(
         w.table().len(),
         len_after_list,
@@ -400,7 +490,7 @@ fn frame_map_key_error_rolls_the_member_back() {
     );
 
     // A retry with valid keys lands at the same trailer position.
-    w.map(offset_of!(SysBoth, hosts), |m| {
+    w.map(&frame.hosts, offset_of!(SysBoth, hosts), |m| {
         m.insert(
             "ok",
             Process {
@@ -418,7 +508,10 @@ fn frame_map_key_error_rolls_the_member_back() {
         .unwrap();
     assert_eq!(sink.values[&ComponentId::new("procs.0.pid")], 1.0);
     assert_eq!(sink.values[&ComponentId::new("hosts.ok.pid")], 2.0);
-    assert_eq!(sink.values.get(&ComponentId::new("hosts.bad.key.pid")), None);
+    assert_eq!(
+        sink.values.get(&ComponentId::new("hosts.bad.key.pid")),
+        None
+    );
 }
 
 /// Recycling the backing through `finish`/`from_scratch` produces tables
@@ -431,7 +524,7 @@ fn frame_scratch_reuse_is_byte_identical() {
         processes: FrameMap::EMPTY,
     };
     let build = |w: &mut FrameWriter<SysMap>| {
-        w.map(offset_of!(SysMap, processes), |m| {
+        w.map(&frame.processes, offset_of!(SysMap, processes), |m| {
             m.insert(
                 "htop",
                 Process {
@@ -450,7 +543,7 @@ fn frame_scratch_reuse_is_byte_identical() {
     // Grow the recycled backing with a bigger table first, then rebuild the
     // small one from the same scratch.
     let mut big = FrameWriter::from_scratch(fresh.finish(), &frame);
-    big.map(offset_of!(SysMap, processes), |m| {
+    big.map(&frame.processes, offset_of!(SysMap, processes), |m| {
         for i in 0..8 {
             m.insert(
                 &format!("proc_{i}"),

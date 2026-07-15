@@ -134,7 +134,10 @@ fn alarms_node_before_a_slot_still_builds_and_raises() {
         .build();
     // The alarm system is declared first on purpose: its receive-all input must
     // register last, so resolve defers it behind the slot's cyclic registration.
-    assert_eq!(wiring.systems[0].name, "alarms", "the alarm node comes first");
+    assert_eq!(
+        wiring.systems[0].name, "alarms",
+        "the alarm node comes first"
+    );
     if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
         eprintln!("skipping: build_artifacts failed: {e}");
         return;
@@ -159,7 +162,9 @@ fn alarms_node_before_a_slot_still_builds_and_raises() {
     });
 
     let mut got = Vec::new();
-    raised.drain(|r| got.push(r.def_id));
+    raised
+        .drain(|r| got.push(r.def_id))
+        .expect("raised ring readable");
     assert_eq!(got, vec!["SLOT_DONE"], "the slot-phase alarm raised once");
     drop(coord);
 }
@@ -185,7 +190,10 @@ fn slot_declared_contract_mismatch_is_a_clean_error() {
         Err(e) => e,
     };
     assert!(
-        matches!(err.kind, LoadErrorKind::SlotContractMismatch { dir: "input", .. }),
+        matches!(
+            err.kind,
+            LoadErrorKind::SlotContractMismatch { dir: "input", .. }
+        ),
         "{err:?}"
     );
 }
@@ -342,6 +350,7 @@ fn slot_allow_params_resolve_and_run_b1() {
     {
         let out = gain_view
             .latest()
+            .expect("gain ring readable")
             .expect("the occupant published its configured gain");
         assert_eq!(
             out.get().gain,

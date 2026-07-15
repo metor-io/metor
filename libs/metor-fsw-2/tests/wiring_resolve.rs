@@ -160,6 +160,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
     {
         let out = out_view
             .latest()
+            .expect("tick_out ring readable")
             .expect("the dl system produced a tick_out");
         assert_eq!(
             out.get().count,
@@ -173,8 +174,8 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
 
     // A fresh open of the recorded path yields the fixture's pack, so the
     // located artifact is real.
-    let pack = DlPack::open(wiring.artifacts[0].path.as_ref().unwrap())
-        .expect("open the located .so");
+    let pack =
+        DlPack::open(wiring.artifacts[0].path.as_ref().unwrap()).expect("open the located .so");
     assert_eq!(
         pack.system_names().collect::<Vec<_>>(),
         ["DlCounter", "DlEcho"]

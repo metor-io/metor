@@ -36,15 +36,10 @@ fn lifecycle_and_lockstep_steps() {
             assert!(worker.wait_init(), "init requested before shutdown");
             worker.report(WorkerState::Ready);
             let mut last = 0;
-            loop {
-                match worker.next(last) {
-                    WorkerCmd::Step { seq, now } => {
-                        seen_tx.send((seq, now)).unwrap();
-                        worker.done(seq, FswStatus::Running);
-                        last = seq;
-                    }
-                    WorkerCmd::Shutdown => break,
-                }
+            while let WorkerCmd::Step { seq, now } = worker.next(last) {
+                seen_tx.send((seq, now)).unwrap();
+                worker.done(seq, FswStatus::Running);
+                last = seq;
             }
             worker.report(WorkerState::Done);
         });
@@ -54,8 +49,15 @@ fn lifecycle_and_lockstep_steps() {
         host.wait_state(WorkerState::Ready, GENEROUS).unwrap();
         for k in 1..=STEPS {
             let now = Timestamp(1000 + k as i64);
-            assert_eq!(host.step(now, GENEROUS), StepOutcome::Acked(FswStatus::Running));
-            assert_eq!(seen_rx.recv().unwrap(), (k, now), "step {k} delivered verbatim");
+            assert_eq!(
+                host.step(now, GENEROUS),
+                StepOutcome::Acked(FswStatus::Running)
+            );
+            assert_eq!(
+                seen_rx.recv().unwrap(),
+                (k, now),
+                "step {k} delivered verbatim"
+            );
         }
         host.request(WorkerState::ShutdownReq);
         host.wait_state(WorkerState::Done, GENEROUS).unwrap();

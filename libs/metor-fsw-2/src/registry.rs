@@ -27,7 +27,7 @@ use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
 
 use crate::binder::RingSource;
-use crate::descriptor::{Capability, Delivery, PortDecl, PortDesc};
+use crate::descriptor::{Capability, Delivery, PortDesc};
 
 /// One tappable buffer, indexed by its instance-qualified id.
 pub struct RegistryEntry {
@@ -162,8 +162,8 @@ impl AllOutputs {
     /// The bundle declaration for this field, a [`Capability::ReceiveAll`]
     /// grant rather than a port. It creates no ring, no edge, and no registry
     /// entry, and the bind cursor skips it.
-    pub fn decl() -> PortDecl {
-        PortDecl::Capability(Capability::ReceiveAll)
+    pub fn decl() -> Capability {
+        Capability::ReceiveAll
     }
 
     /// Pull the one registry the host [`Binder`](crate::Binder) carries.

@@ -145,8 +145,7 @@ impl TestBench {
         let ring = self.input_ring(PortId::Component(F::FRAME_ID), F::NAME);
         // The writer claim frees on drop, so a per-call writer keeps the
         // bench simple; the entry only ever holds views on its inputs.
-        let mut out: Output<F> =
-            Output::new(ring.writer(NoWake).expect("bench input writer"));
+        let mut out: Output<F> = Output::new(ring.writer(NoWake).expect("bench input writer"));
         out.write(frame).expect("bench input ring has room");
     }
 
@@ -173,8 +172,7 @@ impl TestBench {
         M: NamedMsg + Serialize,
     {
         let ring = self.input_ring(PortId::Packet(M::ID), M::NAME);
-        let mut out: MsgOut<M> =
-            MsgOut::new(ring.writer(NoWake).expect("bench msg writer"));
+        let mut out: MsgOut<M> = MsgOut::new(ring.writer(NoWake).expect("bench msg writer"));
         out.emit(msg).expect("bench msg ring has room");
     }
 
@@ -223,7 +221,7 @@ mod tests {
     }
 
     fn double(_s: &mut (), now: Timestamp, i: &mut Input<TbIn>, o: &mut Output<TbOut>) {
-        if let Some(r) = i.latest() {
+        if let Ok(Some(r)) = i.latest() {
             o.publish(&TbOut {
                 timestamp: now,
                 doubled: r.value * 2.0,

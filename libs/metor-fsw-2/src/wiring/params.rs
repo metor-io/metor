@@ -83,11 +83,12 @@ fn conform_and_encode(
         }
         _ => value,
     };
-    let value =
-        conform_to_schema(&schema.ty, value, spans, system, src, node_span).map_err(|e| match e {
+    let value = conform_to_schema(&schema.ty, value, spans, system, src, node_span).map_err(
+        |e| match e {
             Conform::Load(err) => *err,
             Conform::Shape(reason) => encode_err(reason),
-        })?;
+        },
+    )?;
 
     postcard_dyn::to_stdvec_dyn(schema, &value)
         .map_err(|e| encode_err(format!("dynamic postcard encode failed: {e:?}")))

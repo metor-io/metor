@@ -318,14 +318,14 @@ mod system {
 
     use crate::{
         AlarmSystem, AlarmsParams, BuildSystem, ClockMode, CommandOut, Coordinator,
-        CoordinatorConfig, CyclicSystem, MsgIn, Out, Output, System, SystemHealth,
-        SystemInput, SystemOutput,
+        CoordinatorConfig, CyclicSystem, MsgIn, Out, Output, System, SystemHealth, SystemInput,
+        SystemOutput,
     };
 
     use crate::coordinator::PortRef;
     use crate::coordinator::init::cyclic_node;
-use crate::descriptor::PortId;
-use metor_proto::types::Msg as _;
+    use crate::descriptor::PortId;
+    use metor_proto::types::Msg as _;
 
     use super::super::{AlarmSpec, BandSpec, RawAlarmSpec, TargetSpec};
 
@@ -416,7 +416,7 @@ use metor_proto::types::Msg as _;
     impl CyclicSystem for Acker {
         fn execute(&mut self, _now: Timestamp, input: &mut AckerIn, o: &mut Self::Output) {
             let pending = &mut self.pending;
-            input.raised.drain(|r| pending.push((r, 0)));
+            input.raised.drain(|r| pending.push((r, 0))).unwrap();
             for (raised, age) in &mut self.pending {
                 *age += 1;
                 if *age == self.delay {
@@ -505,10 +505,13 @@ use metor_proto::types::Msg as _;
         // `[f64; 3]` flattens to per-element components (`rates.0/.1/.2`), so
         // the dotted path itself is the element address; a shaped tensor
         // component would take `element=` instead.
-        b.push_node(cyclic_node(AlarmSystem::NAME.into(), AlarmSystem::new(params(vec![
-            alarm("RATE_HIGH", "plant.gyro.rates.1", None),
-            alarm("RATE_X", "plant.gyro.rates.0", None), // same frame, never breaches
-        ]))));
+        b.push_node(cyclic_node(
+            AlarmSystem::NAME.into(),
+            AlarmSystem::new(params(vec![
+                alarm("RATE_HIGH", "plant.gyro.rates.1", None),
+                alarm("RATE_X", "plant.gyro.rates.0", None), // same frame, never breaches
+            ])),
+        ));
         let coord = b.build().unwrap();
 
         let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
@@ -520,7 +523,7 @@ use metor_proto::types::Msg as _;
 
         // Both defs broadcast; thresholds are the display limits.
         let mut got_defs = Vec::new();
-        defs.drain(|d| got_defs.push(d));
+        defs.drain(|d| got_defs.push(d)).unwrap();
         assert_eq!(got_defs.len(), 2);
         let def = got_defs.iter().find(|d| d.id == "RATE_HIGH").unwrap();
         assert_eq!(def.default_severity, Severity::Warning);
@@ -542,7 +545,7 @@ use metor_proto::types::Msg as _;
 
         // Cycle 2 raises at warning (debounce 2), cycle 3 escalates in place.
         let mut got_raised = Vec::new();
-        raised.drain(|r| got_raised.push(r));
+        raised.drain(|r| got_raised.push(r)).unwrap();
         assert_eq!(got_raised.len(), 2, "{got_raised:?}");
         assert!(got_raised.iter().all(|r| r.def_id == "RATE_HIGH"));
         assert_eq!(got_raised[0].severity, Severity::Warning);
@@ -557,7 +560,7 @@ use metor_proto::types::Msg as _;
 
         // Cycle 4 is the dead zone (needs <= 0.4 to count); 5-6 clear (debounce 2).
         let mut got_cleared = Vec::new();
-        cleared.drain(|c| got_cleared.push(c));
+        cleared.drain(|c| got_cleared.push(c)).unwrap();
         assert_eq!(got_cleared.len(), 1);
         assert_eq!(got_cleared[0].occurrence, got_raised[0].occurrence);
     }
@@ -568,32 +571,53 @@ use metor_proto::types::Msg as _;
     async fn latching_clears_only_on_ack() {
         let run = |delay: usize, cycles: usize| async move {
             let mut b = crate::coordinator::init::InitGraph::new(config());
-            b.push_node(cyclic_node(Plant::NAME.into(), Plant {
-                script: vec![2.0, 0.0],
-                cycle: 0,
-            }));
-            let acker = b.push_node(cyclic_node(Acker::NAME.into(), Acker {
-                delay,
-                pending: Vec::new(),
-            }));
+            b.push_node(cyclic_node(
+                Plant::NAME.into(),
+                Plant {
+                    script: vec![2.0, 0.0],
+                    cycle: 0,
+                },
+            ));
+            let acker = b.push_node(cyclic_node(
+                Acker::NAME.into(),
+                Acker {
+                    delay,
+                    pending: Vec::new(),
+                },
+            ));
             let mut spec = alarm("LATCHED", "plant.gyro.rates.1", None);
             spec.debounce = Some(1);
             spec.latching = Some(true);
-            let alarms = b.push_node(cyclic_node(AlarmSystem::NAME.into(), AlarmSystem::new(params(vec![spec]))));
+            let alarms = b.push_node(cyclic_node(
+                AlarmSystem::NAME.into(),
+                AlarmSystem::new(params(vec![spec])),
+            ));
             b.connect(
-                PortRef { system: alarms, port: PortId::Packet(AlarmRaised::ID) },
-                PortRef { system: acker, port: PortId::Packet(AlarmRaised::ID) },
+                PortRef {
+                    system: alarms,
+                    port: PortId::Packet(AlarmRaised::ID),
+                },
+                PortRef {
+                    system: acker,
+                    port: PortId::Packet(AlarmRaised::ID),
+                },
             );
             b.connect(
-                PortRef { system: acker, port: PortId::Packet(AlarmAck::ID) },
-                PortRef { system: alarms, port: PortId::Packet(AlarmAck::ID) },
+                PortRef {
+                    system: acker,
+                    port: PortId::Packet(AlarmAck::ID),
+                },
+                PortRef {
+                    system: alarms,
+                    port: PortId::Packet(AlarmAck::ID),
+                },
             );
             let coord = b.build().unwrap();
             let mut cleared = tap::<AlarmCleared>(&coord, "alarms.AlarmCleared");
             let mut coord = coord;
             coord.run_for(cycles).await;
             let mut got = Vec::new();
-            cleared.drain(|c| got.push(c));
+            cleared.drain(|c| got.push(c)).unwrap();
             got.len()
         };
 
@@ -608,10 +632,13 @@ use metor_proto::types::Msg as _;
     #[stellarator::test]
     async fn flag_component_alarms() {
         let mut b = crate::coordinator::init::InitGraph::new(config());
-        b.push_node(cyclic_node(Plant::NAME.into(), Plant {
-            script: vec![0.0, 20.0, 20.0], // degraded = rate > 10
-            cycle: 0,
-        }));
+        b.push_node(cyclic_node(
+            Plant::NAME.into(),
+            Plant {
+                script: vec![0.0, 20.0, 20.0], // degraded = rate > 10
+                cycle: 0,
+            },
+        ));
         let mut spec = alarm("DEGRADED", "plant.status.degraded", None);
         spec.warning = None;
         spec.critical = Some(BandSpec {
@@ -620,14 +647,17 @@ use metor_proto::types::Msg as _;
         });
         spec.debounce = Some(1);
         spec.hysteresis = None;
-        b.push_node(cyclic_node(AlarmSystem::NAME.into(), AlarmSystem::new(params(vec![spec]))));
+        b.push_node(cyclic_node(
+            AlarmSystem::NAME.into(),
+            AlarmSystem::new(params(vec![spec])),
+        ));
         let coord = b.build().unwrap();
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
         let mut coord = coord;
         coord.run_for(3).await;
 
         let mut got = Vec::new();
-        raised.drain(|r| got.push(r));
+        raised.drain(|r| got.push(r)).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].def_id, "DEGRADED");
         assert_eq!(got[0].severity, Severity::Critical);
@@ -640,16 +670,22 @@ use metor_proto::types::Msg as _;
     #[stellarator::test]
     async fn bad_targets_disable_and_report_health() {
         let mut b = crate::coordinator::init::InitGraph::new(config());
-        b.push_node(cyclic_node(Plant::NAME.into(), Plant {
-            script: vec![5.0], // would breach everything, were anything enabled
-            cycle: 0,
-        }));
-        b.push_node(cyclic_node(AlarmSystem::NAME.into(), AlarmSystem::new(params(vec![
-            alarm("GHOST", "nowhere.gyro.rates.1", None), // no such component
-            alarm("OOB", "plant.gyro.rates.1", Some(9)),  // element out of bounds (scalar)
-            alarm("DUP", "plant.gyro.rates.1", None),
-            alarm("DUP", "plant.gyro.rates.1", None), // duplicate id
-        ]))));
+        b.push_node(cyclic_node(
+            Plant::NAME.into(),
+            Plant {
+                script: vec![5.0], // would breach everything, were anything enabled
+                cycle: 0,
+            },
+        ));
+        b.push_node(cyclic_node(
+            AlarmSystem::NAME.into(),
+            AlarmSystem::new(params(vec![
+                alarm("GHOST", "nowhere.gyro.rates.1", None), // no such component
+                alarm("OOB", "plant.gyro.rates.1", Some(9)),  // element out of bounds (scalar)
+                alarm("DUP", "plant.gyro.rates.1", None),
+                alarm("DUP", "plant.gyro.rates.1", None), // duplicate id
+            ])),
+        ));
         let coord = b.build().unwrap();
         let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
@@ -662,12 +698,12 @@ use metor_proto::types::Msg as _;
         coord.run_for(4).await;
 
         let mut n_defs = 0;
-        defs.drain(|_| n_defs += 1);
+        defs.drain(|_| n_defs += 1).unwrap();
         assert_eq!(n_defs, 4, "defs broadcast even for disabled alarms");
 
         // Only the first DUP survives resolution, and it raises; the rest stay dark.
         let mut got = Vec::new();
-        raised.drain(|r| got.push(r));
+        raised.drain(|r| got.push(r)).unwrap();
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].def_id, "DUP");
 
