@@ -56,20 +56,20 @@ impl CtrlSystem {
         torque: &mut Output<TorqueCmd>,
         mtq: &mut Output<MtqCmd>,
     ) {
-        let Some(e) = estimate.latest() else {
+        let Ok(Some(e)) = estimate.latest() else {
             return;
         };
         let q_hat_b_eci = e.q_hat_b_eci;
 
         // Latch the commanded pointing law (the slot may not have written one yet).
-        if let Some(m) = mode.latest() {
+        if let Ok(Some(m)) = mode.latest() {
             self.law = Some(m.law);
         }
 
         // What the magnetorquer laws run on: the measured field (Tesla) and the telemetered
         // wheel momentum. Either not yet arrived ⇒ zero dipole.
-        let mag_b = sensors.latest().map(|s| s.mag_b);
-        let h_w_b = wheels.latest().map(|w| {
+        let mag_b = sensors.latest().ok().flatten().map(|s| s.mag_b);
+        let h_w_b = wheels.latest().ok().flatten().map(|w| {
             w.wheels
                 .iter()
                 .fold(V3::zeros(), |acc, wheel| acc + wheel.ang_momentum)
@@ -90,7 +90,7 @@ impl CtrlSystem {
 
         // Select the target attitude from the law + the current GPS orbit measurement; identity
         // until a law and a GPS fix are both available.
-        let target = match (self.law, gps.latest()) {
+        let target = match (self.law, gps.latest().ok().flatten()) {
             (Some(law), Some(gps)) => target_for(law, &gps.pos_eci, &gps.vel_eci),
             _ => Quaternion::identity(),
         };

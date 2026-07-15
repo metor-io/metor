@@ -114,6 +114,10 @@ struct StubgenArgs {
     /// (default: the current directory). Stubs land in its `packs/`.
     #[arg(default_value = ".")]
     dir: PathBuf,
+    /// Write the generated `packs` package here instead of `<dir>/packs`
+    /// (for build front-ends that generate stubs into a build directory).
+    #[arg(long, value_name = "DIR")]
+    out_dir: Option<PathBuf>,
     /// Verify the checked-in stubs are byte-identical instead of writing them
     /// (the CI gate); exits non-zero if any are stale.
     #[arg(long)]
@@ -148,6 +152,7 @@ pub async fn run() -> miette::Result<()> {
 fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
     let opts = StubgenOptions {
         mission_dir: args.dir,
+        out_dir: args.out_dir,
         check: args.check,
         build: !args.no_build,
         release: args.release,

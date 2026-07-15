@@ -73,10 +73,30 @@ cdylib, off when the test links the rlib) so the rlib carries no `fsw_pack_*` ex
 The mission is described in `mission.py` through the `metor_config` Python front-end
 (`libs/metor-fsw-2/python`): `metor-fsw build|run|package mission.py` spawns a subprocess
 CPython that evaluates the file against the recorder and emits the versioned `Wiring` IR that
-`resolve` consumes. Systems and occupants come from generated, `py.typed` pack modules under
-`packs/` (`metor-fsw stubgen`), so params, ports, and frames are pyright-checked. `mission.py`
-needs only a stock `python3` (≥ 3.10) — no `pip install`, since the `metor-fsw` binary embeds
-the recorder. The CLI runner and every tracked test read this one file.
+`resolve` consumes. Systems and occupants come from generated, `py.typed` pack modules
+(`metor-fsw stubgen`), so params, ports, and frames are pyright-checked. The CLI runner and
+every tracked test read this one file.
+
+The stubs are **venv-only build artifacts**: the in-tree PEP 517 backend in `_backend/`
+(wired up by this directory's `pyproject.toml`) runs stubgen into `.metor/packs` and exposes
+it — plus the `metor_config` checkout — to the venv through the editable install's `.pth`.
+Nothing generated is checked in.
+
+```sh
+cd examples/adcs-fsw2
+uv sync            # builds the packs, regenerates .metor/packs, installs the .pth
+uv run pyright     # type-checks mission.py against the fresh stubs
+```
+
+`[tool.uv] cache-keys` covers the pack crates' sources, so `uv sync` regenerates the stubs
+whenever a system's params, ports, or frames change; a stub that is stale anyway (generated,
+then the pack edited without a re-sync) is refused at load by the resolve-time manifest-hash
+check. The first sync compiles `metor-fsw` and both packs, so it takes a few minutes and uv
+shows no progress unless run as `uv sync -v`; point `METOR_FSW_BIN` at a prebuilt `metor-fsw`
+to skip the framework compile. The evaluator also puts a mission-adjacent `.metor` on
+`PYTHONPATH`, so a bare `cargo run`/`cargo test` works once stubs exist (the tracked suites
+regenerate them themselves); prefixing run commands with `uv run --` additionally keeps the
+stubs fresh via uv's implicit sync.
 
 ## Watch it live in metor-panel
 
@@ -91,13 +111,14 @@ ingests.
    ```
 2. In another terminal, run the mission — telemetry **down**, command **up**:
    ```sh
-   cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.py --build --wall \
-       --telemetry 127.0.0.1:2240 --uplink 127.0.0.1:2240
+   cd examples/adcs-fsw2 && uv run -- cargo run -p metor-fsw-2 --bin metor-fsw -- \
+       run mission.py --build --wall
    ```
-   `--telemetry` streams every frame to the panel; `--uplink` opens a **second** connection
-   that ingests the panel's `SequenceCommand`s so you can drive the `mode` slot live
-   (Load/Start/Abort `commissioning` or `safe_mode`). Uplink and downlink use separate
-   connections (docs/messages.md §4.5) — both point at the same metor-db endpoint.
+   The links are systems in `mission.py`: its `downlink` (`TcpDownlink`) streams every frame
+   to the panel, and its `uplink` (`TcpUplink`) opens a **second** connection that ingests
+   the panel's `SequenceCommand`s so you can drive the `mode` slot live (Load/Start/Abort
+   `commissioning` or `safe_mode`). Uplink and downlink use separate connections
+   (docs/messages.md §4.5) — both point at the same metor-db endpoint, `127.0.0.1:2240`.
 3. In the panel, the `plant` / `nav` / `ctrl` / `mode` (and `coordinator`) instances appear
    in the component tree. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against
    `plant.body.q_b_eci` and watch the estimate track truth as the controller slews the

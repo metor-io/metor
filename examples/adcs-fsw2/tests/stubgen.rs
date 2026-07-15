@@ -1,10 +1,13 @@
 //! The generated pack stubs stay in sync with the packs, and a stale stub is
 //! refused at resolve.
 //!
-//! `stubgen --check` is the CI gate: it rebuilds the packs, re-renders their
-//! `packs/<id>.py`, and byte-compares against the checked-in modules. The
-//! staleness test then tampers the recorded manifest hash and confirms
-//! `resolve` fails before any dlopen with the regen hint.
+//! Stubs are venv-only build artifacts here: the mission's PEP 517 backend
+//! (`_backend/metor_build`) regenerates them into `.metor/packs` on every
+//! `uv sync`, so there is no checked-in copy to byte-diff. The round-trip test
+//! keeps the contract stubgen's `--check` relies on — generation into an
+//! `--out-dir` is deterministic and immediately check-clean — and the
+//! staleness test tampers the recorded manifest hash and confirms `resolve`
+//! fails before any dlopen with the regen hint.
 //!
 //! Both build the pack cdylibs through cargo, so they skip (with a note) where
 //! that is unavailable — the same convention as the other tracked suites — and
@@ -23,24 +26,38 @@ fn mission_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The checked-in `packs/adcs.py` and `packs/seqs.py` are exactly what
-/// `metor-fsw stubgen` regenerates — the acceptance idempotence gate.
+/// Generating into an `--out-dir` and re-running with `--check` against the
+/// same directory is clean: the backend's regenerate-on-sync flow is
+/// deterministic, and `--check` still functions against a build directory.
 #[test]
-fn stubgen_check_is_clean() {
-    let opts = StubgenOptions {
+fn stubgen_out_dir_roundtrips() {
+    let out = tempfile::tempdir().unwrap();
+    let opts = |check| StubgenOptions {
         mission_dir: mission_dir(),
-        check: true,
+        out_dir: Some(out.path().join("packs")),
+        check,
         build: true,
         release: false,
         cargo_args: Vec::new(),
     };
-    match stubgen(&opts) {
-        Ok(_) => {}
+    match stubgen(&opts(false)) {
+        Ok(report) => {
+            let expected = ["__init__.py", "py.typed", "adcs.py", "seqs.py"];
+            for name in expected {
+                assert!(
+                    out.path().join("packs").join(name).exists(),
+                    "missing generated {name}"
+                );
+            }
+            assert_eq!(report.modules.len(), expected.len());
+        }
         Err(StubgenError::Build(e)) => {
             eprintln!("skipping: building the packs failed: {e}");
+            return;
         }
-        Err(e) => panic!("checked-in stubs are stale (regenerate with `metor-fsw stubgen`): {e}"),
+        Err(e) => panic!("stubgen into out-dir failed: {e}"),
     }
+    stubgen(&opts(true)).expect("check clean immediately after generate");
 }
 
 /// A recorded manifest hash that no longer matches the built pack is a stale

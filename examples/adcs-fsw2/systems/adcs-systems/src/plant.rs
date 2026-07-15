@@ -347,12 +347,12 @@ pub fn execute(
     // set point, then step them; the wheel `torque` fields come back as the reaction
     // delivered to the body.
     let torque_b: V3 = match torque.latest() {
-        Some(cmd) => cmd.torque_b,
-        None => V3::zeros(),
+        Ok(Some(cmd)) => cmd.torque_b,
+        _ => V3::zeros(),
     };
     let dipole_b: V3 = match mtq.latest() {
-        Some(cmd) => cmd.dipole_b,
-        None => V3::zeros(),
+        Ok(Some(cmd)) => cmd.dipole_b,
+        _ => V3::zeros(),
     };
     for wheel in &mut state.wheels {
         wheel.torque_set_point = wheel.axis.dot(&torque_b) * wheel.axis;

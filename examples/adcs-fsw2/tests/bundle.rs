@@ -19,6 +19,8 @@ use metor_fsw_2::wiring::{
 };
 use metor_fsw_2::{BuildOptions, PackageOptions};
 
+mod common;
+
 fn mission(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
@@ -32,6 +34,9 @@ fn temp_bundle_dir(tag: &str) -> PathBuf {
 /// `process=#true` worker). `None` — skip, not fail — when Python or the build plumbing is
 /// unavailable (offline/sandboxed cargo, no CPython ≥ 3.10).
 fn eval_and_build() -> Option<Wiring> {
+    if !common::ensure_stubs() {
+        return None;
+    }
     let mut wiring = match eval_python_mission(&mission("mission.py")) {
         Ok(w) => w,
         Err(e) => {

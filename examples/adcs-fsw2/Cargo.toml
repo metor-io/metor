@@ -28,5 +28,8 @@ stellarator.path = "../../libs/stellarator"
 # `(PacketId, postcard)` tap the telemetry downlink performs (docs/messages.md §3).
 postcard = { version = "1.1", features = ["alloc"] }
 serde = { version = "1.0", features = ["derive"] }
+# The stubgen round-trip test generates into a temp `--out-dir` (stubs are
+# venv-only build artifacts; there is no checked-in copy to byte-diff).
+tempfile = "3.13"
 # The eclipse/momentum/sequences tests patch the evaluated mission's params value trees.
 serde_json = "1.0"

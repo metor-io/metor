@@ -1,8 +1,42 @@
 # Build metadata for the adcs-fsw2 mission (not wiring).
 #
-# `metor-fsw stubgen` reads this table to know which pack cdylibs to build and
-# describe, and writes a typed `packs/<id>.py` module per entry. `crate` is the
-# cargo package that produces the cdylib; `lib` is its library stem.
+# `uv sync` (or `pip install -e .`) drives the in-tree backend in `_backend/`,
+# which runs `metor-fsw stubgen` and exposes the generated `.metor/packs`
+# stubs — plus the `metor_config` checkout — to the venv via a `.pth`.
+
+[project]
+name = "adcs-fsw2"
+version = "0.1.0"
+description = "adcs-fsw2 mission config: venv-generated pack stubs"
+requires-python = ">=3.11"
+
+[build-system]
+requires = []
+build-backend = "metor_build"
+backend-path = ["_backend"]
+
+# `metor-fsw stubgen` (invoked by the backend) reads this table to know which
+# pack cdylibs to build and describe, and renders a typed `packs/<id>.py`
+# module per entry. `crate` is the cargo package that produces the cdylib;
+# `lib` is its library stem.
 [tool.metor.artifacts]
 adcs = { crate = "adcs-systems", lib = "adcs_systems" }
 seqs = { crate = "adcs-sequences", lib = "adcs_sequences" }
+
+[tool.metor.build]
+out-dir = ".metor"
+extra-pth = ["../../libs/metor-fsw-2/python"]
+# stubgen-command = [...] overrides the invocation; the default is
+#   cargo run -q -p metor-fsw-2 --bin metor-fsw -- stubgen . --out-dir .metor/packs
+# or set METOR_FSW_BIN to a prebuilt metor-fsw binary.
+
+# Rebuild (and so regenerate stubs) when the pack sources change, not just
+# this file — the uv-specific half of the "stubs are always fresh" story.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "systems/**/*.rs" },
+    { file = "systems/**/Cargo.toml" },
+    { file = "contracts/**/*.rs" },
+    { file = "contracts/**/Cargo.toml" },
+]

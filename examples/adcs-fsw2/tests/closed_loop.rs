@@ -31,6 +31,8 @@ use metor_fsw_2::wiring::Registry;
 use metor_fsw_2::wiring::{build_artifacts, eval_python_mission, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
+mod common;
+
 /// The mission file — the same one the CLI runner and the other tests read.
 fn mission_py() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
@@ -105,7 +107,7 @@ async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
         let mut body = body_view;
         loop {
             stellarator::yield_now().await;
-            if let Some(b) = body.latest() {
+            if let Ok(Some(b)) = body.latest() {
                 captured
                     .borrow_mut()
                     .push(tracking_sample(b.get(), CONVERGED_LAW));
@@ -156,6 +158,9 @@ fn assert_converged(label: &str, m: &Measure) {
 
 #[stellarator::test]
 async fn closed_loop_converges_static_and_dlopen() {
+    // This suite hard-requires the build plumbing, stubs included.
+    assert!(common::ensure_stubs(), "generate the mission's pack stubs");
+
     // Path 1 — plant/nav/ctrl statically linked (slot/sequences still dlopen).
     let static_run = run_and_measure(build_static(), CYCLES).await;
     assert_converged("static", &static_run);

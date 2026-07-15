@@ -31,6 +31,8 @@ fn mission_py() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
 }
 
+mod common;
+
 /// The first lit→dark orbit phase at the mission epoch, by scanning the shadow function
 /// around the boot orbit (equatorial, radius `EARTH_RADIUS + ALTITUDE`) in 0.1° steps.
 fn shadow_entry_phase() -> f64 {
@@ -50,6 +52,9 @@ fn shadow_entry_phase() -> f64 {
 
 /// The patched mission: boot at `phase` radians of orbit, slot empty (no commissioning).
 fn build_static(phase: f64) -> Option<Coordinator> {
+    if !common::ensure_stubs() {
+        return None;
+    }
     let mut wiring = match eval_python_mission(&mission_py()) {
         Ok(w) => w,
         Err(e) => {
@@ -113,7 +118,7 @@ async fn run_and_sample(mut coord: Coordinator, cycles: usize) -> Vec<Sample> {
             (world_view, sensors_view, disturb_view, est_view, body_view);
         loop {
             stellarator::yield_now().await;
-            let (Some(w), Some(s), Some(d), Some(b)) =
+            let (Ok(Some(w)), Ok(Some(s)), Ok(Some(d)), Ok(Some(b))) =
                 (world.latest(), sensors.latest(), disturb.latest(), body.latest())
             else {
                 continue;
@@ -122,6 +127,8 @@ async fn run_and_sample(mut coord: Coordinator, cycles: usize) -> Vec<Sample> {
             // init — still meaningful (it is what ctrl flies on).
             let q_hat = est
                 .latest()
+                .ok()
+                .flatten()
                 .map(|e| e.get().q_hat_b_eci)
                 .unwrap_or_else(Quat::identity);
             let est_err: f64 = q_hat.angular_distance(&b.get().q_b_eci).into_buf().abs();

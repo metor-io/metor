@@ -4,14 +4,16 @@ This is the mission: the coordinator config, artifacts, systems, `mode` slot,
 and edges the CLI runner and the tracked tests read, evaluated once at
 build/package time into the `Wiring` IR.
 
-Systems and occupants come from generated, `py.typed` pack modules
-(`metor-fsw stubgen`): importing `Plant`/`Nav`/`Ctrl` and
+Systems and occupants come from generated, `py.typed` pack modules the build
+backend regenerates into `.metor/packs` on `uv sync` (venv-only — nothing
+generated is checked in): importing `Plant`/`Nav`/`Ctrl` and
 `commissioning`/`safe_mode` gives pyright-checked params, ports, and frames,
 and each module's `ARTIFACT` is registered implicitly — no `m.artifact(...)`.
 Alarms and links stay on the `metor_config` builtins.
 
-    metor-fsw stubgen                                            # regenerate packs/
-    metor-fsw run examples/adcs-fsw2/mission.py --build          # headless sim
+    uv sync                                        # regenerate stubs into the venv
+    uv run -- cargo run -p metor-fsw-2 --bin metor-fsw -- \
+        run mission.py --build                     # headless sim
 """
 
 from metor_config import Alarm, Alarms, Mission, Target, TcpDownlink, TcpUplink, band

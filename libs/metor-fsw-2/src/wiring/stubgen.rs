@@ -3,7 +3,9 @@
 //! A mission's `pyproject.toml` lists its loadable artifacts under
 //! `[tool.metor.artifacts]`; for each, `stubgen` reads the pack's manifest
 //! (the `<cdylib>.manifest` sidecar the build driver writes, so nothing is
-//! `dlopen`ed into this process) and emits a checked-in `packs/<id>.py`:
+//! `dlopen`ed into this process) and emits a `packs/<id>.py` — into the
+//! mission tree by default, or into a build directory via `--out-dir` (how
+//! a mission's PEP 517 backend keeps stubs venv-only):
 //!
 //! - an `ARTIFACT` constant carrying the artifact id, crate, lib stem, and a
 //!   `sha256:<hex>` hash of the manifest bytes (the staleness anchor
@@ -41,6 +43,10 @@ use super::{BuildOptions, WiringBuilder, build_artifacts};
 pub struct StubgenOptions {
     /// The mission directory (holds `pyproject.toml`; stubs land in `packs/`).
     pub mission_dir: PathBuf,
+    /// Where to write the `packs` package (default: `<mission_dir>/packs`).
+    /// A build front-end (e.g. a PEP 517 backend) points this at its own
+    /// build directory instead of the source tree.
+    pub out_dir: Option<PathBuf>,
     /// Verify the checked-in stubs are byte-identical instead of writing them.
     pub check: bool,
     /// Build the listed crates first (the default). `false` requires them
@@ -239,7 +245,10 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
     // The package files that never vary: an empty `__init__.py` and the
     // `py.typed` marker, written once so `from packs.<id> import ...` and
     // pyright both work.
-    let packs_dir = opts.mission_dir.join("packs");
+    let packs_dir = opts
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| opts.mission_dir.join("packs"));
     let mut report = StubgenReport::default();
     reconcile(&packs_dir.join("__init__.py"), "", opts.check, &mut report)?;
     reconcile(&packs_dir.join("py.typed"), "", opts.check, &mut report)?;
@@ -1298,6 +1307,7 @@ mod integration {
     fn opts(dir: &std::path::Path, check: bool) -> StubgenOptions {
         StubgenOptions {
             mission_dir: dir.to_path_buf(),
+            out_dir: None,
             check,
             build: true,
             release: false,

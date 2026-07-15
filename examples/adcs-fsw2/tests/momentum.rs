@@ -28,6 +28,8 @@ fn mission_py() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
 }
 
+mod common;
+
 /// The value-tree params of the named system, for in-place patching of the evaluated IR.
 fn params_of<'a>(
     wiring: &'a mut Wiring,
@@ -63,6 +65,9 @@ const PRELOAD: f64 = 0.01;
 /// test's subject). Plant/nav/ctrl link statically. `None` if the build plumbing is
 /// unavailable (offline/sandboxed cargo), so callers skip rather than fail spuriously.
 fn build_static(k_desat: f64) -> Option<Coordinator> {
+    if !common::ensure_stubs() {
+        return None;
+    }
     let mut wiring = match eval_python_mission(&mission_py()) {
         Ok(w) => w,
         Err(e) => {
@@ -142,7 +147,7 @@ async fn run_and_measure(mut coord: Coordinator) -> Measure {
         loop {
             stellarator::yield_now().await;
             let mut s = captured.borrow_mut();
-            if let Some(w) = wheels.latest() {
+            if let Ok(Some(w)) = wheels.latest() {
                 let h: V3 = w
                     .get()
                     .wheels
@@ -151,7 +156,7 @@ async fn run_and_measure(mut coord: Coordinator) -> Measure {
                 let h: f64 = h.norm().into_buf();
                 s.0.push(h);
             }
-            if let Some(b) = body.latest() {
+            if let Ok(Some(b)) = body.latest() {
                 s.1 = b.get().omega_b.norm().into_buf();
             }
         }

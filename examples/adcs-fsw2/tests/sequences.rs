@@ -41,6 +41,8 @@ fn mission_py() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
 }
 
+mod common;
+
 // `SequenceStatus::run_state` codes (sequence/mod.rs): 0 running, then `Outcome::run_state`.
 const RUNNING: u8 = 0;
 const COMPLETED: u8 = 1;
@@ -52,6 +54,9 @@ const FAILED: u8 = 3;
 /// hand); otherwise the mission's `initial ... state="running"` stands. `None` if the build
 /// plumbing is unavailable (so the caller skips rather than fails spuriously, like `bundle`).
 fn build_mission(auto_run: bool) -> Option<Coordinator> {
+    if !common::ensure_stubs() {
+        return None;
+    }
     let mut wiring = match eval_python_mission(&mission_py()) {
         Ok(w) => w,
         Err(e) => {
@@ -109,7 +114,7 @@ fn spawn_sampler(seq: Input<SequenceStatus>, mode: Input<ModeCmd>) -> (Captured,
         let (mut seq, mut mode) = (seq, mode);
         loop {
             stellarator::yield_now().await;
-            if let Some(r) = seq.latest() {
+            if let Ok(Some(r)) = seq.latest() {
                 rs.borrow_mut().push(r.get().run_state);
             }
             let _ = mode.drain(|f| ms.borrow_mut().push(f.get().mode));
@@ -349,6 +354,9 @@ fn detumble_times_out_to_failed_with_wheels_idle() {
     // Enter far below the ~0.1 rad/s the warm-up identity-hold leaves; time out after 2 s
     // of sim (B-cross barely dents the rate in that window). Patch the `commissioning`
     // occupant's allow-line params on the evaluated IR's value tree.
+    if !common::ensure_stubs() {
+        return;
+    }
     let Some(mut wiring) = eval_python_mission(&mission_py())
         .map_err(|e| eprintln!("skipping: mission.py did not evaluate: {e}"))
         .ok()
@@ -403,7 +411,7 @@ fn detumble_times_out_to_failed_with_wheels_idle() {
             let mut cycles_in_mode = 0u32;
             loop {
                 stellarator::yield_now().await;
-                if let Some(m) = mode.latest() {
+                if let Ok(Some(m)) = mode.latest() {
                     let m = m.get().mode;
                     if m == current_mode {
                         cycles_in_mode += 1;

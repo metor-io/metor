@@ -58,7 +58,7 @@ pub(crate) async fn commissioning(
             progress("timeout in warm-up");
             return Outcome::Failed;
         }
-        let Some(e) = att.latest() else { continue };
+        let Ok(Some(e)) = att.latest() else { continue };
         let q = e.q_hat_b_eci;
         rate = e.omega_b.norm().into_buf();
         if let Some(prev) = last_q {
@@ -90,7 +90,7 @@ pub(crate) async fn commissioning(
                 progress("timeout in detumble");
                 return Outcome::Failed;
             }
-            let Some(e) = att.latest() else { continue };
+            let Ok(Some(e)) = att.latest() else { continue };
             let rate: f64 = e.omega_b.norm().into_buf();
             if rate < params.rate_detumble_exit {
                 break;
@@ -161,8 +161,8 @@ pub(crate) async fn commissioning(
 /// `target_for(LAW_HIL, gps)`, the same law/guard ctrl steers by. `None` until both an
 /// estimate and a GPS fix have arrived.
 fn tracking_error(att: &mut Input<AttitudeEstimate>, gps: &mut Input<Gps>) -> Option<f64> {
-    let q_hat = att.latest()?.q_hat_b_eci;
-    let g = gps.latest()?;
+    let q_hat = att.latest().ok().flatten()?.q_hat_b_eci;
+    let g = gps.latest().ok().flatten()?;
     let target = target_for(ModeCmd::LAW_HIL, &g.pos_eci, &g.vel_eci);
     Some(q_hat.angular_distance(&target).into_buf().abs())
 }

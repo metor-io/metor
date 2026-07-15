@@ -97,6 +97,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stellarator",
+ "tempfile",
 ]
 
 [[package]]
@@ -9169,6 +9170,7 @@ name = "metor-fsw-2"
 version = "0.14.2"
 dependencies = [
  "clap 4.6.0",
+ "futures-lite 2.6.1",
  "inventory",
  "libloading",
  "memmap2",

@@ -335,7 +335,7 @@ pub enum LoadErrorKind {
     /// artifact records no hash and skips the check.
     #[error(
         "generated stubs for artifact `{artifact}` are stale (the pack manifest changed since \
-         they were generated); regenerate with `metor-fsw stubgen`"
+         they were generated); regenerate with `uv sync` (or `metor-fsw stubgen`)"
     )]
     StaleStubs {
         /// The artifact whose recorded and live manifest hashes disagree.

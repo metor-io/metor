@@ -75,11 +75,11 @@ impl NavState {
         let epoch = epoch_at(state.t_sim);
         state.t_sim += DT;
 
-        let Some(s) = sensors.latest() else {
+        let Ok(Some(s)) = sensors.latest() else {
             return; // no sensor sample yet
         };
         let s = s.clone();
-        let Some(g) = gps.latest() else {
+        let Ok(Some(g)) = gps.latest() else {
             return; // no GPS fix yet
         };
         let gps_pos: V3 = g.pos_eci;

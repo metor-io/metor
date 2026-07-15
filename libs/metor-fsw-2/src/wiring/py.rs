@@ -67,9 +67,20 @@ pub fn eval_python_mission(path: &Path) -> miette::Result<Wiring> {
         .tempfile()
         .into_diagnostic()?;
 
+    // A mission whose stubs are venv-only build artifacts keeps them in
+    // `.metor/packs` beside the mission file; putting that build dir on the
+    // path lets a bare `metor-fsw run` (or a Rust test) evaluate the mission
+    // without the venv active.
+    let mut roots = vec![pythonpath_root];
+    if let Some(stubs) = path.parent().map(|d| d.join(".metor"))
+        && stubs.is_dir()
+    {
+        roots.push(stubs);
+    }
+
     let status = Command::new(&python)
         .arg(path)
-        .env("PYTHONPATH", prepend_pythonpath(&pythonpath_root))
+        .env("PYTHONPATH", prepend_pythonpath(&roots))
         .env("METOR_IR_OUT", ir_file.path())
         .status()
         .map_err(|e| miette!("failed to run `{}`: {e}", python.display()))?;
@@ -163,14 +174,12 @@ fn materialize_recorder() -> miette::Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-/// `root` prepended to any inherited `PYTHONPATH`, so the recorder wins.
-fn prepend_pythonpath(root: &Path) -> std::ffi::OsString {
-    match std::env::var_os("PYTHONPATH") {
-        Some(existing) => {
-            let mut paths = vec![root.to_path_buf()];
-            paths.extend(std::env::split_paths(&existing));
-            std::env::join_paths(paths).expect("valid PYTHONPATH")
-        }
-        None => root.as_os_str().to_owned(),
+/// `roots` prepended (in order) to any inherited `PYTHONPATH`, so the
+/// recorder wins.
+fn prepend_pythonpath(roots: &[PathBuf]) -> std::ffi::OsString {
+    let mut paths = roots.to_vec();
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        paths.extend(std::env::split_paths(&existing));
     }
+    std::env::join_paths(paths).expect("valid PYTHONPATH")
 }
