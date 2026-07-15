@@ -1,0 +1,8 @@
+# Build metadata for the adcs-fsw2 mission (not wiring).
+#
+# `metor-fsw stubgen` reads this table to know which pack cdylibs to build and
+# describe, and writes a typed `packs/<id>.py` module per entry. `crate` is the
+# cargo package that produces the cdylib; `lib` is its library stem.
+[tool.metor.artifacts]
+adcs = { crate = "adcs-systems", lib = "adcs_systems" }
+seqs = { crate = "adcs-sequences", lib = "adcs_sequences" }

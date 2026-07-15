@@ -99,8 +99,13 @@ impl AlarmPanel {
         Self { inner }
     }
 
-    pub fn from_config(_cfg: AlarmPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::new(db, cx)
+    pub fn from_config(cfg: AlarmPanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| {
+            let mut view = AlarmView::new(cx);
+            view.set_history(cfg.show_history);
+            view
+        });
+        Self { inner }
     }
 }
 
@@ -121,8 +126,10 @@ impl PaneItem for AlarmPanel {
         "alarm"
     }
 
-    fn to_config(&self, _cx: &App) -> AlarmPanelConfig {
-        AlarmPanelConfig::default()
+    fn to_config(&self, cx: &App) -> AlarmPanelConfig {
+        AlarmPanelConfig {
+            show_history: self.inner.read(cx).is_history(),
+        }
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -148,8 +155,13 @@ impl SequencePanel {
         Self { inner }
     }
 
-    pub fn from_config(_cfg: SequencePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::new(db, cx)
+    pub fn from_config(cfg: SequencePanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| {
+            let mut view = SequenceView::new(cx);
+            view.set_history(cfg.show_history);
+            view
+        });
+        Self { inner }
     }
 }
 
@@ -170,8 +182,10 @@ impl PaneItem for SequencePanel {
         "sequence"
     }
 
-    fn to_config(&self, _cx: &App) -> SequencePanelConfig {
-        SequencePanelConfig::default()
+    fn to_config(&self, cx: &App) -> SequencePanelConfig {
+        SequencePanelConfig {
+            show_history: self.inner.read(cx).is_history(),
+        }
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -610,10 +624,6 @@ pub struct PlotPanelConfig {
     /// X-axis tick rendering: relative offsets (default) or absolute
     /// UTC/local wall-clock. Additive — old layouts default to `Relative`.
     pub x_time_format: TimeFormat,
-    /// Measurement kinds new cursors start with. Editing only affects
-    /// cursors created after the change; existing cursors keep their own
-    /// `enabled` set.
-    pub default_measurements: Vec<MeasurementKind>,
     /// Locked measurement cursors that survive panel close/reopen. Unlocked
     /// cursors are transient and never written here.
     pub cursors: Vec<MeasurementCursorConfig>,
@@ -896,7 +906,6 @@ impl PaneItem for PlotPanel {
                 .map(|a| YAxisConfig::from(a.read(cx)))
                 .collect(),
             x_time_format: lp.x_time_format,
-            default_measurements: Vec::new(),
             cursors,
             measurement_panel,
             hide_alarm_limits: !lp.show_alarm_limits,
@@ -1696,6 +1705,20 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
+    rows.push(Box::new(CommandRow::new("System Graph", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> = Box::new(
+                    cx.new(|cx| crate::views::system_graph::SystemGraphPanel::new(db, cx)),
+                );
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
     rows
 }
 
@@ -1779,7 +1802,6 @@ mod tests {
                 },
             ],
             x_time_format: TimeFormat::Utc,
-            default_measurements: Vec::new(),
             cursors: Vec::new(),
             measurement_panel: Default::default(),
             hide_alarm_limits: false,

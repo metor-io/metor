@@ -169,14 +169,11 @@ impl ColumnBrowserDelegate for DataTableDelegate {
         self.push_group_to_grid(cx);
     }
 
-    fn set_root_override(
-        &mut self,
-        _ancestors: SmallVec<[Self::Item; 8]>,
-        _cx: &mut Context<DataTable>,
-    ) {
+    // The group/instance tree is fixed at two levels, so rerooting has
+    // nothing to offer.
+    fn supports_reroot(&self) -> bool {
+        false
     }
-
-    fn clear_root_override(&mut self, _cx: &mut Context<DataTable>) {}
 
     fn render_detail(
         &mut self,

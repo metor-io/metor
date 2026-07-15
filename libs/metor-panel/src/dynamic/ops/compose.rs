@@ -34,15 +34,20 @@ fn require_same_clock(nodes: &[Arc<dyn DynamicNode>]) -> Result<NodeId, BuildErr
     Ok(clock)
 }
 
-/// Align N co-clocked byte streams. For each aligned tuple, calls `encode`
-/// with the per-input `&[u8]` slices (in input order) and a `&mut [u8]` slot
-/// of `out_value_size` bytes carved out of the output ring's `WriteGrant`.
+/// Align N co-clocked byte streams by timestamp. For each aligned tuple, calls
+/// `encode` with the per-input `&[u8]` slices (in input order) and a
+/// `&mut [u8]` slot of `out_value_size` bytes carved out of the output ring's
+/// `WriteGrant`.
 ///
-/// Inputs share a clock so grant lengths match in steady state. When they
-/// don't (after a stall, slow consumer, etc.) we process `min(grant_lens)`
-/// tuples and let the leftover samples in longer grants drop when the grants
-/// release — lossy by design, no buffering.
-async fn run_aligned_emit(
+/// Inputs share a clock, so in steady state their heads carry equal
+/// timestamps. A skew — one reader subscribing a sample late, a stall, a slow
+/// consumer — must not wedge the composer: positional pairing would then
+/// mismatch every future tuple and emit nothing forever. Instead we hold a
+/// per-input cursor and, whenever the heads disagree, advance only the
+/// stream(s) whose head is *older* than the newest, discarding the stale
+/// sample and re-comparing until the heads line up. Leftover samples past the
+/// end of the shorter grant drop on release — lossy by design, no buffering.
+pub(crate) async fn run_aligned_emit(
     mut readers: Vec<NodeReader>,
     output: Disruptor,
     out_value_size: usize,
@@ -57,34 +62,38 @@ async fn run_aligned_emit(
         for r in readers.iter_mut() {
             grants.push(r.next().await);
         }
-        let min_count = grants.iter().map(|g| g.sample_count()).min().unwrap_or(0);
+        let counts: SmallVec<[usize; 4]> = grants.iter().map(|g| g.sample_count()).collect();
+        let mut cursors: SmallVec<[usize; 4]> = SmallVec::from_elem(0usize, n);
         // `tuple` holds refs into `grants`; both live for this outer iteration.
         let mut tuple: SmallVec<[&[u8]; 4]> = SmallVec::with_capacity(n);
-        for i in 0..min_count {
-            let mut ts0: Option<Timestamp> = None;
-            tuple.clear();
-            let mut aligned = true;
-            for g in &grants {
-                let (ts, v) = g.sample_at(i);
-                match ts0 {
-                    None => ts0 = Some(ts),
-                    Some(t0) if t0 != ts => {
-                        tracing::warn!(?t0, ?ts, "compose: timestamps drifted; dropping tuple");
-                        aligned = false;
-                        break;
-                    }
-                    Some(_) => {}
-                }
-                tuple.push(v);
+        loop {
+            if cursors.iter().zip(&counts).any(|(cur, count)| cur >= count) {
+                break;
             }
-            if !aligned {
+            let newest = (0..n)
+                .map(|k| grants[k].sample_at(cursors[k]).0)
+                .max_by_key(|ts| ts.0)
+                .expect("at least one input");
+            // Drop any head that predates `newest` and re-compare next pass.
+            let mut advanced = false;
+            for k in 0..n {
+                if grants[k].sample_at(cursors[k]).0.0 < newest.0 {
+                    cursors[k] += 1;
+                    advanced = true;
+                }
+            }
+            if advanced {
                 continue;
             }
-            let ts = ts0.expect("at least one input");
+            tuple.clear();
+            for k in 0..n {
+                tuple.push(grants[k].sample_at(cursors[k]).1);
+                cursors[k] += 1;
+            }
             let Ok(mut wg) = output.try_grant(out_msg_size) else {
                 continue;
             };
-            wg[..size_of::<Timestamp>()].copy_from_slice(&ts.to_le_bytes());
+            wg[..size_of::<Timestamp>()].copy_from_slice(&newest.to_le_bytes());
             encode(&tuple, &mut wg[size_of::<Timestamp>()..]);
         }
         // Grants drop here; their full ranges are consumed.

@@ -7,7 +7,6 @@ use metor_proto::vtable::builder::{
 };
 use metor_proto::vtable::{RealizedField, builder};
 use metor_proto::{
-    com_de::Decomponentize,
     registry,
     schema::Schema,
     types::{
@@ -94,6 +93,13 @@ pub struct State {
 
     vtable_registry: registry::HashMapRegistry,
     streams: HashMap<StreamId, Arc<FixedRateStreamState>>,
+
+    /// Raw bytes of the most recently ingested table for each dynamic vtable
+    /// (keyed by vtable / [`PacketId`]). The dynamic stream forwards exactly
+    /// these bytes each tick, so the producer's latest table is authoritative:
+    /// a key absent from the newest table simply drops out of the next streamed
+    /// packet (authoritative-latest liveness, vtable-dynamic.md §8.6).
+    latest_dynamic_tables: HashMap<PacketId, Vec<u8>>,
 
     udp_vtable_streams: HashSet<(SocketAddr, [u8; 2])>,
 
@@ -247,21 +253,129 @@ impl DB {
     pub fn insert_vtable(&self, vtable: VTableMsg) -> Result<(), Error> {
         info!(id = ?vtable.id, "inserting vtable");
         self.with_state_mut(|state| {
+            // For static fields this registers the concrete component. For dynamic
+            // frames (`List`/`Map`), `realize_fields(None)` yields each member *template*
+            // (e.g. `processes.pid`) so its ty/shape is registered up front; the concrete
+            // keyed/indexed components (`processes.0.pid`) are created lazily on first
+            // sample by [`DB::ingest_table`].
             for res in vtable.vtable.realize_fields(None) {
                 let RealizedField {
                     component_id,
                     shape,
                     ty,
+                    dynamic,
                     ..
                 } = res?;
                 let component_schema = ComponentSchema::new(ty, shape);
                 state.insert_component(component_id, component_schema, &self.path)?;
+                if dynamic {
+                    // A member template never receives samples (the concrete keyed
+                    // components do), so hide it from listings / live streams.
+                    let metadata = ComponentMetadata {
+                        component_id,
+                        name: component_id.to_string(),
+                        metadata: Default::default(),
+                    }
+                    .with_hidden();
+                    state.set_component_metadata(metadata, &self.path)?;
+                }
                 self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
             }
             state.vtable_registry.map.insert(vtable.id, vtable.vtable);
             Ok::<_, Error>(())
         })?;
         Ok(())
+    }
+
+    /// Sinks a table `buf` described by the registered vtable `id`, creating any
+    /// concrete component lazily on first sample.
+    ///
+    /// Unlike the old `Table::sink` path (which drove `Decomponentize` under a
+    /// read lock and dropped `frame`/`element`), this drives
+    /// [`VTable::for_each_field`] directly under [`DB::with_state_mut`]: the
+    /// vtable is cloned out of the registry to free the `state` borrow, then each
+    /// realized field get-or-creates its component (idempotent schema check) and
+    /// pushes the sample. A newly created component (or first sample into an empty
+    /// series) bumps `vtable_gen` so subscribers re-derive membership. For dynamic
+    /// vtables the raw table bytes are cached as the authoritative latest table the
+    /// dynamic stream forwards (see [`State::latest_dynamic_tables`]).
+    pub fn ingest_table(&self, id: PacketId, buf: &[u8]) -> Result<(), Error> {
+        let received = Timestamp::now();
+        let mut max_ts = Timestamp(i64::MIN);
+        self.with_state_mut(|state| {
+            // Clone the vtable out so the closure can hold `&mut state`.
+            let vtable = state
+                .vtable_registry
+                .get(&id)
+                .ok_or(Error::Impeller(metor_proto::error::Error::VTableNotFound))?
+                .clone();
+            let dynamic = vtable.is_dynamic();
+            let mut new_series = false;
+            let mut db_err: Option<Error> = None;
+            let res = vtable.for_each_field(Some(buf), &mut |rf| {
+                let mut sink = || -> Result<(), Error> {
+                    let view = rf.view.expect("table provided to for_each_field");
+                    let ts = rf.timestamp.unwrap_or(received);
+                    if !state.components.contains_key(&rf.component_id) {
+                        // Static fields must be pre-registered (via `insert_vtable`);
+                        // only dynamic element-members are created lazily on first
+                        // sample. This keeps static ingest behaviorally identical.
+                        if !rf.dynamic {
+                            return Err(Error::ComponentNotFound(rf.component_id));
+                        }
+                        let schema = ComponentSchema::new(rf.ty, rf.shape);
+                        state.insert_component(rf.component_id, schema, &self.path)?;
+                        new_series = true;
+                    }
+                    let component = state
+                        .components
+                        .get(&rf.component_id)
+                        .expect("component just inserted");
+                    if component.time_series.is_empty() {
+                        new_series = true;
+                    }
+                    component.push_buf(ts, view.as_bytes())?;
+                    if ts > max_ts {
+                        max_ts = ts;
+                    }
+                    Ok(())
+                };
+                match sink() {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        db_err = Some(err);
+                        // Sentinel to stop iteration; the real error is surfaced below.
+                        Err(metor_proto::error::Error::InvalidOp)
+                    }
+                }
+            });
+            if let Some(err) = db_err {
+                return Err(err);
+            }
+            res?;
+            if dynamic {
+                state.latest_dynamic_tables.insert(id, buf.to_vec());
+            }
+            if new_series {
+                self.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
+            }
+            Ok::<_, Error>(())
+        })?;
+        if max_ts > Timestamp(i64::MIN) {
+            self.last_updated.update_max(max_ts);
+        }
+        Ok(())
+    }
+
+    /// Builds one streamed `Table` packet for a dynamic vtable subscription from
+    /// the cached latest table bytes (see [`State::latest_dynamic_tables`]),
+    /// re-headed with the subscriber's stream `id`. Returns `None` when no table
+    /// has been ingested for `id` yet.
+    fn dynamic_stream_packet(&self, id: PacketId) -> Option<LenPacket> {
+        let cached = self.with_state(|s| s.latest_dynamic_tables.get(&id).cloned())?;
+        let mut pkt = LenPacket::table(id, cached.len());
+        pkt.extend_from_slice(&cached);
+        Some(pkt)
     }
 
     pub fn push_msg(&self, timestamp: Timestamp, id: PacketId, msg: &[u8]) -> Result<(), Error> {
@@ -740,40 +854,6 @@ impl Component {
     }
 }
 
-struct DBSink<'a> {
-    components: &'a HashMap<ComponentId, Component>,
-    last_updated: &'a AtomicCell<Timestamp>,
-    sunk_new_time_series: bool,
-    table_received: Timestamp,
-}
-
-impl Decomponentize for DBSink<'_> {
-    type Error = Error;
-    fn apply_value(
-        &mut self,
-        component_id: ComponentId,
-        value: metor_proto::types::ComponentView<'_>,
-        timestamp: Option<Timestamp>,
-    ) -> Result<(), Error> {
-        let timestamp = timestamp.unwrap_or(self.table_received);
-        let value_buf = value.as_bytes();
-        let Some(component) = self.components.get(&component_id) else {
-            return Err(Error::ComponentNotFound(component_id));
-        };
-
-        let time_series_empty = component.time_series.is_empty();
-        component.push_buf(timestamp, value_buf)?;
-
-        if time_series_empty {
-            debug!("sunk new time series for component {}", component_id);
-            self.sunk_new_time_series = true;
-        }
-        self.last_updated.update_max(timestamp);
-
-        Ok(())
-    }
-}
-
 pub struct Server {
     pub listener: TcpListener,
     pub db: Arc<DB>,
@@ -1208,19 +1288,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         }
         Packet::Table(table) => {
             trace!(table.len = table.buf.len(), "sinking table");
-            db.with_state(|state| {
-                let mut sink = DBSink {
-                    components: &state.components,
-                    last_updated: &db.last_updated,
-                    sunk_new_time_series: false,
-                    table_received: Timestamp::now(),
-                };
-                table.sink(&state.vtable_registry, &mut sink)??;
-                if sink.sunk_new_time_series {
-                    db.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
-                }
-                Ok::<_, Error>(())
-            })?;
+            db.ingest_table(table.id, stellarator::buf::deref(&table.buf))?;
         }
 
         Packet::Msg(m) if m.id == GetDbSettings::ID => {
@@ -2041,5 +2109,218 @@ impl AtomicTimestampExt for AtomicCell<Timestamp> {
     fn update_min(&self, val: Timestamp) {
         self.value.fetch_min(val.0, atomic::Ordering::AcqRel);
         self.wait_queue.wake_all();
+    }
+}
+
+#[cfg(test)]
+mod dynamic_ingest_tests {
+    use super::*;
+    use core::convert::Infallible;
+    use metor_proto::com_de::Decomponentize;
+    use metor_proto::vtable::builder::{
+        list, map, path_component, raw_field, raw_table, schema, timestamp, vtable,
+    };
+    use metor_proto::vtable::builder::FieldBuilder;
+    use metor_proto::types::PACKET_HEADER_LEN;
+    use std::collections::HashMap;
+
+    /// Records every scalar component it sees as an `f64` (mirrors
+    /// `metor-proto`'s `test_dynamic_list` sink).
+    #[derive(Default)]
+    struct DynSink {
+        values: HashMap<ComponentId, f64>,
+    }
+
+    impl Decomponentize for DynSink {
+        type Error = Infallible;
+        fn apply_value(
+            &mut self,
+            component_id: ComponentId,
+            value: ComponentView<'_>,
+            _timestamp: Option<Timestamp>,
+        ) -> Result<(), Infallible> {
+            self.values.insert(component_id, value.to_f64());
+            Ok(())
+        }
+    }
+
+    fn put_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_u64(buf: &mut Vec<u8>, v: u64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_f64(buf: &mut Vec<u8>, v: f64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_i64(buf: &mut Vec<u8>, v: i64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn process_members() -> Vec<FieldBuilder> {
+        vec![
+            raw_field(0, 8, schema(PrimType::U64, &[], path_component("pid"))),
+            raw_field(8, 8, schema(PrimType::F64, &[], path_component("cpu_usage"))),
+        ]
+    }
+
+    /// Builds a `processes` list table with `pids[i]` / `cpus[i]` elements.
+    fn list_table(pids: &[u64], cpus: &[f64]) -> Vec<u8> {
+        assert_eq!(pids.len(), cpus.len());
+        let mut t = Vec::new();
+        put_i64(&mut t, 1000); // timestamp @0
+        put_u32(&mut t, 16); // slot.trailer_off @8
+        put_u32(&mut t, (pids.len() * 16) as u32); // slot.byte_len @12
+        for (pid, cpu) in pids.iter().zip(cpus) {
+            put_u64(&mut t, *pid);
+            put_f64(&mut t, *cpu);
+        }
+        t
+    }
+
+    /// Parses a `dynamic_stream_packet` `LenPacket` and applies it through the
+    /// subscriber `vtable` to a fresh `DynSink`, returning the realized values.
+    fn round_trip(pkt: LenPacket, id: PacketId, vtable: &VTable) -> DynSink {
+        // Parse with offset so the table body keeps the same 8-byte alignment it
+        // has on the wire (the 4-byte length prefix stays in the allocation, like
+        // `LengthDelReader` leaves it), avoiding an `Alignment` error in `apply`.
+        let owned = Packet::parse_with_offset(pkt.inner, PACKET_HEADER_LEN).unwrap();
+        let Packet::Table(table) = owned else {
+            panic!("expected a table packet");
+        };
+        assert_eq!(table.id, id);
+        let mut sink = DynSink::default();
+        vtable
+            .apply(stellarator::buf::deref(&table.buf), &mut sink)
+            .unwrap()
+            .unwrap();
+        sink
+    }
+
+    #[stellarator::test]
+    async fn dynamic_list_ingest_and_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::create(dir.path().to_path_buf()).unwrap();
+        let id: PacketId = [7, 0];
+        let v = vtable([raw_field(
+            8,
+            8,
+            timestamp(raw_table(0, 8), list("processes", process_members(), 16)),
+        )]);
+
+        // 1. insert_vtable registers the member templates (hidden), no concrete yet.
+        db.insert_vtable(VTableMsg {
+            vtable: v.clone(),
+            id,
+        })
+        .unwrap();
+        db.with_state(|s| {
+            assert!(s.get_component(ComponentId::new("processes.pid")).is_some());
+            assert!(s.get_component(ComponentId::new("processes.cpu_usage")).is_some());
+            assert!(s.is_component_hidden(&ComponentId::new("processes.pid")));
+            assert!(s.is_component_hidden(&ComponentId::new("processes.cpu_usage")));
+            assert!(s.get_component(ComponentId::new("processes.0.pid")).is_none());
+        });
+
+        // 2. ingest a 2-element table -> concrete components, cache, gen bump.
+        let gen_before = db.vtable_gen.latest();
+        db.ingest_table(id, &list_table(&[1001, 1002], &[0.5, 0.25]))
+            .unwrap();
+        assert!(db.vtable_gen.latest() > gen_before, "gen must bump on new series");
+        db.with_state(|s| {
+            for id in [
+                "processes.0.pid",
+                "processes.0.cpu_usage",
+                "processes.1.pid",
+                "processes.1.cpu_usage",
+            ] {
+                assert!(
+                    s.get_component(ComponentId::new(id)).is_some(),
+                    "missing concrete component {id}"
+                );
+                assert!(!s.is_component_hidden(&ComponentId::new(id)));
+            }
+            assert!(s.latest_dynamic_tables.contains_key(&id));
+        });
+
+        // values landed in the concrete time series
+        stellarator::sleep(std::time::Duration::from_millis(100)).await;
+        let pid0 = db
+            .with_state(|s| s.get_component(ComponentId::new("processes.0.pid")).cloned())
+            .unwrap();
+        let latest = pid0.time_series.latest().expect("pid0 sample persisted");
+        assert_eq!(u64::from_le_bytes(latest.data().try_into().unwrap()), 1001);
+
+        // 3. streamed packet round-trips to the same concrete ids/values.
+        let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
+        assert_eq!(sink.values[&ComponentId::new("processes.0.pid")], 1001.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.0.cpu_usage")], 0.5);
+        assert_eq!(sink.values[&ComponentId::new("processes.1.pid")], 1002.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.1.cpu_usage")], 0.25);
+
+        // 4. a NEW element appears -> gen bumps, next packet includes it.
+        let gen_before = db.vtable_gen.latest();
+        db.ingest_table(id, &list_table(&[1001, 1002, 1003], &[0.5, 0.25, 0.75]))
+            .unwrap();
+        assert!(db.vtable_gen.latest() > gen_before, "gen must bump for the new element");
+        let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
+        assert_eq!(sink.values[&ComponentId::new("processes.2.pid")], 1003.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.2.cpu_usage")], 0.75);
+
+        // 5. LIVENESS: fewer elements -> dropped element absent next packet.
+        db.ingest_table(id, &list_table(&[1001], &[0.5])).unwrap();
+        let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
+        assert_eq!(sink.values[&ComponentId::new("processes.0.pid")], 1001.0);
+        assert!(
+            !sink.values.contains_key(&ComponentId::new("processes.1.pid")),
+            "vanished element must drop out (authoritative-latest)"
+        );
+        assert!(!sink.values.contains_key(&ComponentId::new("processes.2.pid")));
+    }
+
+    #[stellarator::test]
+    async fn dynamic_map_ingest_and_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::create(dir.path().to_path_buf()).unwrap();
+        let id: PacketId = [9, 0];
+        let v = vtable([raw_field(
+            8,
+            8,
+            timestamp(raw_table(0, 8), map("processes", process_members(), 24, 8)),
+        )]);
+        db.insert_vtable(VTableMsg {
+            vtable: v.clone(),
+            id,
+        })
+        .unwrap();
+
+        // hand-built map table with two keyed entries (mirrors test_dynamic_map).
+        let mut t = Vec::new();
+        put_i64(&mut t, 1000); // timestamp @0
+        put_u32(&mut t, 16); // slot.trailer_off @8
+        put_u32(&mut t, 48); // slot.byte_len @12
+        put_u32(&mut t, 64); // entry[0].key_off -> "htop"
+        put_u32(&mut t, 4); // entry[0].key_len
+        put_u64(&mut t, 1001); // entry[0].value.pid
+        put_f64(&mut t, 0.5); // entry[0].value.cpu
+        put_u32(&mut t, 68); // entry[1].key_off -> "init"
+        put_u32(&mut t, 4); // entry[1].key_len
+        put_u64(&mut t, 1002); // entry[1].value.pid
+        put_f64(&mut t, 0.25); // entry[1].value.cpu
+        t.extend_from_slice(b"htop"); // @64
+        t.extend_from_slice(b"init"); // @68
+
+        db.ingest_table(id, &t).unwrap();
+        db.with_state(|s| {
+            assert!(s.get_component(ComponentId::new("processes.htop.pid")).is_some());
+            assert!(s.get_component(ComponentId::new("processes.init.cpu_usage")).is_some());
+            assert!(s.latest_dynamic_tables.contains_key(&id));
+        });
+
+        let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
+        assert_eq!(sink.values[&ComponentId::new("processes.htop.pid")], 1001.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.htop.cpu_usage")], 0.5);
+        assert_eq!(sink.values[&ComponentId::new("processes.init.pid")], 1002.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.init.cpu_usage")], 0.25);
     }
 }

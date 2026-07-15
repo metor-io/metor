@@ -8,8 +8,8 @@ use super::node::{DynamicNode, NodeId};
 /// Owns live nodes by [`NodeId`]. Reconciliation is set-diff: pass the alive
 /// id set; everything else is dropped (cancelling its task).
 ///
-/// In Phase 1 this is exercised programmatically. The future node editor
-/// will compute the alive set from its graph and call [`reconcile`].
+/// The node editor computes each pane's alive set from its graph; the
+/// `GraphCoordinator` unions those sets and calls [`reconcile`](Self::reconcile).
 #[derive(Default)]
 pub struct DynamicRegistry {
     nodes: HashMap<NodeId, Arc<dyn DynamicNode>>,
@@ -32,24 +32,6 @@ impl DynamicRegistry {
 
     pub fn insert(&mut self, node: Arc<dyn DynamicNode>) {
         self.nodes.insert(node.id(), node);
-    }
-
-    pub fn get_or_build(
-        &mut self,
-        id: NodeId,
-        build: impl FnOnce() -> Arc<dyn DynamicNode>,
-    ) -> Arc<dyn DynamicNode> {
-        if let Some(existing) = self.nodes.get(&id) {
-            return existing.clone();
-        }
-        let node = build();
-        debug_assert_eq!(
-            node.id(),
-            id,
-            "build closure produced a node with a different id"
-        );
-        self.nodes.insert(id, node.clone());
-        node
     }
 
     /// Drop every node whose id is not in `alive`. Returns the removed

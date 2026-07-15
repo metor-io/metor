@@ -17,7 +17,9 @@ use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::time_series::Override;
-use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
+use super::value_strip::{
+    ComponentValueStrip, StripBehavior, StripClick, StripStyle, strip_row_width,
+};
 use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
@@ -557,6 +559,23 @@ fn element_count(db: &DB, component_id: ComponentId) -> usize {
     })
 }
 
+/// Number of boxes the detail strip renders for a component: strings and
+/// enums collapse into a single cell, everything else gets one per element.
+/// Mirrors `format_cells` so [`strip_row_width`] sizing stays in step.
+fn strip_cell_count(db: &DB, component_id: ComponentId) -> usize {
+    let collapses = db.with_state(|state| {
+        state
+            .get_component_metadata(component_id)
+            .map(|m| m.is_string() || m.enum_variants().is_some())
+            .unwrap_or(false)
+    });
+    if collapses {
+        1
+    } else {
+        element_count(db, component_id)
+    }
+}
+
 impl ColumnBrowserDelegate for ComponentBrowserDelegate {
     type Item = Arc<ComponentNode>;
 
@@ -1007,6 +1026,27 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
     let db = row.db.clone();
     let component_id = row.component_id;
     let icon_id = row.component_id.0 as usize;
+
+    // The strip lays its element boxes out with `flex_wrap`, and this row is
+    // a fixed-height `uniform_list` item — wrapped lines would be clipped
+    // invisibly. Hold the strip at its single-line width (`flex_shrink = 0`
+    // keeps the auto basis at max-content; `min_w` backstops it with the
+    // computed box-row width) so overflow scrolls sideways instead of
+    // wrapping out of view. Axis-restricted so vertical wheel deltas still
+    // scroll the detail list underneath.
+    let n_cells = strip_cell_count(&row.db, component_id);
+    let mut strip_line = div().child(row.strip.clone());
+    if n_cells > 1 {
+        strip_line = strip_line.min_w(px(strip_row_width(n_cells)));
+    }
+    strip_line.style().flex_shrink = Some(0.0);
+    let mut strip_scroll = div()
+        .id(("detail-strip", icon_id))
+        .w_full()
+        .overflow_x_scroll()
+        .child(strip_line);
+    strip_scroll.style().restrict_scroll_to_axis = Some(true);
+
     let plot_icon = div()
         .id(("detail-plot", icon_id))
         .flex()
@@ -1052,6 +1092,8 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
                         .id(("detail-name", icon_id))
                         .flex_1()
                         .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .text_size(px(12.0))
                         .text_color(theme.text_secondary)
                         .on_mouse_move(crate::inspector::plot_preview::shift_hover_listener(
@@ -1062,6 +1104,6 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
                 )
                 .child(plot_icon),
         )
-        .child(row.strip.clone())
+        .child(strip_scroll)
         .into_any_element()
 }

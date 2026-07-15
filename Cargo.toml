@@ -31,8 +31,13 @@ members = [
     "libs/db/eql",
     "libs/metor-proto/kdl",
     "examples/cube-sat"
-, "libs/metor-panel"]
+, "libs/metor-panel", "libs/metor-fsw-2/ring", "libs/metor-fsw-2", "libs/metor-fsw-2/macros", "examples/adcs-fsw2", "examples/adcs-fsw2/contracts", "examples/adcs-fsw2/systems/adcs-systems", "examples/adcs-fsw2/systems/adcs-sequences", "libs/metor-fsw-2/tests/fixtures/dl-fixture", "libs/metor-fsw-2/tests/fixtures/seq-fixture", "libs/metor-fsw-2/tests/fixtures/seq-param-fixture"]
 exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve", "apps/metor"]
+
+# Shared lint pins. Opt-in per crate via `[lints] workspace = true` — the fsw-2
+# crates use it (review S5); other crates are unaffected until they opt in.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
 
 [workspace.package]
 version = "0.14.2"

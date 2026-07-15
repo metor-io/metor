@@ -64,6 +64,21 @@ impl_componentize!(
     T1, T2, T3, T4, T5, T6, T7, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18
 );
 
+/// A fixed-size array sinks each element in order — the array analogue of the tuple impl
+/// above (and the sink twin of the `AsVTable`/`Metadatatize` array impls that let a
+/// `[Struct; N]` group be a frame field). Element component-ids are not index-scoped, so as
+/// with a same-typed tuple this is lossy on the columnar path; the frame's `VTable` (which
+/// indexes `field.i.*`) is the addressed view.
+impl<const N: usize, T: Componentize> Componentize for [T; N] {
+    fn sink_columns(&self, output: &mut impl Decomponentize) {
+        for item in self {
+            item.sink_columns(output);
+        }
+    }
+
+    const MAX_SIZE: usize = T::MAX_SIZE.saturating_mul(N);
+}
+
 pub trait Decomponentize {
     type Error;
     fn apply_value(
@@ -150,6 +165,23 @@ impl_decomponentize!(
     T1, T2, T3, T4, T5, T6, T7, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18
 );
 
+/// A fixed-size array applies each incoming value to every element (each self-filters by its
+/// own component ids) — the array analogue of the same-typed tuple impl above.
+impl<const N: usize, E, T: Decomponentize<Error = E>> Decomponentize for [T; N] {
+    type Error = E;
+    fn apply_value(
+        &mut self,
+        component_id: ComponentId,
+        value: ComponentView<'_>,
+        timestamp: Option<Timestamp>,
+    ) -> Result<(), Self::Error> {
+        for item in self {
+            item.apply_value(component_id, value.clone(), timestamp)?;
+        }
+        Ok(())
+    }
+}
+
 pub trait FromComponentView: Sized {
     fn from_component_view(view: ComponentView<'_>) -> Result<Self, Error>;
 }
@@ -193,3 +225,63 @@ impl_component_view!(i8, I8);
 impl_component_view!(f64, F64);
 impl_component_view!(f32, F32);
 impl_component_view!(bool, Bool);
+
+// A fixed-size array `[T; N]` is one component of prim type `T` and shape `[N]`,
+// matching how `AsVTable`/`schema(ty, &[N], ..)` already represents arrays. This is
+// what lets a `#[derive(Frame)]` field of type `[f64; 3]` (and friends) round-trip
+// the same way nox `Vector`/`Quaternion` do (see `nox_impls.rs`).
+macro_rules! impl_array_component_view {
+    ($ty:tt, $prim:tt) => {
+        impl<const N: usize> FromComponentView for [$ty; N] {
+            fn from_component_view(view: ComponentView<'_>) -> Result<Self, Error> {
+                match view {
+                    ComponentView::$prim(view) => {
+                        <[$ty; N]>::try_from(view.buf()).map_err(|_| Error::InvalidComponentData)
+                    }
+                    _ => Err(Error::InvalidComponentData),
+                }
+            }
+        }
+
+        impl<const N: usize> AsComponentView for [$ty; N] {
+            fn as_component_view(&self) -> ComponentView<'_> {
+                // `&[N]` is rvalue-static-promoted, so the shape outlives the view.
+                ComponentView::$prim(ArrayView::from_buf_shape_unchecked(self.as_slice(), &[N]))
+            }
+        }
+    };
+}
+
+impl_array_component_view!(u64, U64);
+impl_array_component_view!(u32, U32);
+impl_array_component_view!(u16, U16);
+impl_array_component_view!(u8, U8);
+impl_array_component_view!(i64, I64);
+impl_array_component_view!(i32, I32);
+impl_array_component_view!(i16, I16);
+impl_array_component_view!(i8, I8);
+impl_array_component_view!(f64, F64);
+impl_array_component_view!(f32, F32);
+impl_array_component_view!(bool, Bool);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_component_view_round_trip() {
+        let src: [f64; 3] = [1.5, -2.5, 3.25];
+        let view = src.as_component_view();
+        assert!(matches!(view, ComponentView::F64(_)));
+        assert_eq!(view.shape(), &[3]);
+        let dst = <[f64; 3]>::from_component_view(view).unwrap();
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn array_component_view_wrong_prim_type_errors() {
+        let src: [f64; 3] = [0.0; 3];
+        let view = src.as_component_view();
+        assert!(<[i32; 3]>::from_component_view(view).is_err());
+    }
+}

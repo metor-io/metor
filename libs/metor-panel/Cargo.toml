@@ -14,6 +14,9 @@ metor-proto.path = "../metor-proto"
 metor-proto.features = ["std", "facet"]
 metor-proto-wkt.path = "../metor-proto/wkt"
 metor-proto-wkt.features = ["nox"]
+# The mission wiring IR (Wiring) plus its serde_json codec, without the KDL
+# front-end: the System Graph tile decodes a WiringManifest's ir_json into it.
+metor-fsw-2 = { path = "../metor-fsw-2", default-features = false, features = ["wiring-model"] }
 nox.path = "../nox"
 facet = { version = "0.44.3", features = ["reflect", "smallvec", "gpui"] }
 # Pin the facet-format chain to the last 0.44.x set that still depends on
@@ -24,6 +27,7 @@ facet-format = "=0.44.5"
 facet-dessert = "=0.44.5"
 postcard = "1"
 serde = "1"
+serde_json = "1"
 smallvec = "1"
 peg = "0.8.5"
 rustfft = "6"
@@ -40,6 +44,7 @@ futures-lite = "2.5.0"
 thingbuf = "0.1"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 dirs.workspace = true
 bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea98c97ded72e44ca336c74", default-features = false, features = [
     "std",
@@ -86,3 +91,4 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 
 [dev-dependencies]
 tempfile = "3.13.0"
+gpui = { version = "*", features = ["test-support"] }

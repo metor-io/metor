@@ -89,6 +89,26 @@ pub struct Pane {
     locked_size: Option<gpui::Size<f32>>,
 }
 
+/// New active-tab index after removing the tab at `removed_ix`, given the
+/// `remaining` count (must be non-zero). Keeps the selection on the same tab
+/// where possible, shifting left when the removed tab sat before it.
+fn active_after_remove(active: usize, removed_ix: usize, remaining: usize) -> usize {
+    if active >= remaining {
+        remaining - 1
+    } else if active > removed_ix {
+        active - 1
+    } else {
+        active
+    }
+}
+
+/// Insertion index when reordering a tab within one pane, after the tab has
+/// been pulled out of slot `from`. Dragging rightward (`to > from`) shifts the
+/// target left by one to account for the now-vacant slot.
+fn reorder_insert_index(from: usize, to: usize) -> usize {
+    if to > from { to - 1 } else { to }
+}
+
 impl Pane {
     pub fn new(items: Vec<Box<dyn PaneItemHandle>>, _cx: &mut Context<Self>) -> Self {
         Self {
@@ -167,10 +187,8 @@ impl Pane {
         self.items.remove(ix);
         if self.items.is_empty() {
             cx.emit(PaneEvent::Empty);
-        } else if self.active_index >= self.items.len() {
-            self.active_index = self.items.len() - 1;
-        } else if self.active_index > ix {
-            self.active_index -= 1;
+        } else {
+            self.active_index = active_after_remove(self.active_index, ix, self.items.len());
         }
         cx.notify();
     }
@@ -218,27 +236,44 @@ impl Pane {
     ) {
         self.drag_split_direction = None;
 
-        if let Some(direction) = detect_split_zone(window.mouse_position(), self.content_bounds) {
-            let same_pane = cx.entity().entity_id() == dragged.pane.entity_id();
-            if same_pane {
-                // Re-entrant update on the same entity is forbidden; remove
-                // the tab locally before asking the tile group to split.
-                let item = dragged.item.clone_handle();
-                self.remove_item(dragged.ix, cx);
-                cx.emit(PaneEvent::Split { direction, item });
-            } else {
-                cx.emit(PaneEvent::Split {
-                    direction,
-                    item: dragged.item.clone_handle(),
-                });
-                dragged.pane.update(cx, |source, cx| {
-                    source.remove_item(dragged.ix, cx);
-                });
-            }
-            return;
+        match detect_split_zone(window.mouse_position(), self.content_bounds) {
+            Some(direction) => self.split_or_move(dragged, direction, cx),
+            None => self.drop_tab(dragged, self.items.len(), cx),
         }
+    }
 
-        self.drop_tab(dragged, self.items.len(), cx);
+    /// Peel `dragged` into a new sibling pane along `direction`.
+    ///
+    /// A same-pane edge drop of the *only* tab is a no-op: splitting it into a
+    /// sibling and removing it here would empty this pane and collapse straight
+    /// back to a single pane. Bailing early also dodges the ordering hazard
+    /// where [`Pane::remove_item`] emits [`PaneEvent::Empty`] — dropping this
+    /// pane from the tree — before the [`PaneEvent::Split`] targeting it runs.
+    fn split_or_move(
+        &mut self,
+        dragged: &DraggedTab,
+        direction: SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
+        let same_pane = cx.entity().entity_id() == dragged.pane.entity_id();
+        if same_pane {
+            if self.items.len() == 1 {
+                return;
+            }
+            // Re-entrant update on the same entity is forbidden; remove the tab
+            // locally before asking the tile group to split.
+            let item = dragged.item.clone_handle();
+            self.remove_item(dragged.ix, cx);
+            cx.emit(PaneEvent::Split { direction, item });
+        } else {
+            cx.emit(PaneEvent::Split {
+                direction,
+                item: dragged.item.clone_handle(),
+            });
+            dragged.pane.update(cx, |source, cx| {
+                source.remove_item(dragged.ix, cx);
+            });
+        }
     }
 
     fn drop_tab(&mut self, dragged: &DraggedTab, target_ix: usize, cx: &mut Context<Self>) {
@@ -248,7 +283,7 @@ impl Pane {
             let to = target_ix.min(self.items.len().saturating_sub(1));
             if from != to && from < self.items.len() {
                 let item = self.items.remove(from);
-                let insert_at = if to > from { to - 1 } else { to };
+                let insert_at = reorder_insert_index(from, to);
                 self.items.insert(insert_at.min(self.items.len()), item);
                 self.active_index = insert_at.min(self.items.len().saturating_sub(1));
                 cx.notify();
@@ -528,5 +563,183 @@ impl Render for Pane {
             outer = outer.child(tab_bar);
         }
         outer.child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tiles::{PaneItem, TileGroup};
+    use gpui::{App, SharedString};
+
+    #[derive(facet::Facet, Default)]
+    struct TestItemConfig {}
+
+    struct TestItem;
+
+    impl Render for TestItem {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl PaneItem for TestItem {
+        type Config = TestItemConfig;
+
+        fn tab_title(&self, _: &App) -> SharedString {
+            SharedString::new_static("test")
+        }
+
+        fn serialization_key() -> &'static str {
+            "test_item"
+        }
+
+        fn to_config(&self, _: &App) -> TestItemConfig {
+            TestItemConfig {}
+        }
+    }
+
+    fn item(cx: &mut App) -> Box<dyn PaneItemHandle> {
+        Box::new(cx.new(|_| TestItem))
+    }
+
+    #[derive(facet::Facet, Default)]
+    struct OtherItemConfig {}
+
+    struct OtherItem;
+
+    impl Render for OtherItem {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl PaneItem for OtherItem {
+        type Config = OtherItemConfig;
+
+        fn tab_title(&self, _: &App) -> SharedString {
+            SharedString::new_static("other")
+        }
+
+        fn serialization_key() -> &'static str {
+            "other_item"
+        }
+
+        fn to_config(&self, _: &App) -> OtherItemConfig {
+            OtherItemConfig {}
+        }
+    }
+
+    fn other_item(cx: &mut App) -> Box<dyn PaneItemHandle> {
+        Box::new(cx.new(|_| OtherItem))
+    }
+
+    #[test]
+    fn reorder_insert_index_shifts_left_when_moving_right() {
+        assert_eq!(reorder_insert_index(0, 3), 2);
+        assert_eq!(reorder_insert_index(1, 2), 1);
+        // Moving leftward keeps the target as-is.
+        assert_eq!(reorder_insert_index(3, 1), 1);
+        assert_eq!(reorder_insert_index(2, 0), 0);
+    }
+
+    #[test]
+    fn active_after_remove_tracks_selection() {
+        // Removing a tab before the active one shifts the selection left.
+        assert_eq!(active_after_remove(2, 0, 3), 1);
+        // Removing a tab after the active one leaves it put.
+        assert_eq!(active_after_remove(1, 2, 3), 1);
+        // Removing the active tab when it was last clamps to the new end.
+        assert_eq!(active_after_remove(3, 3, 3), 2);
+        // Removing the active tab mid-list keeps the index (now the next tab).
+        assert_eq!(active_after_remove(1, 1, 3), 1);
+    }
+
+    #[gpui::test]
+    fn focus_or_open_activates_existing_tab(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx), other_item(cx)], cx)));
+        let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
+        cx.update(|cx| {
+            tg.update(cx, |tg, cx| {
+                tg.focus_or_open("other_item", |cx| other_item(cx), cx);
+            });
+        });
+        cx.read(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.items().len(), 2, "no new tab when one already exists");
+            assert_eq!(pane.active_index(), 1, "existing tab becomes active");
+        });
+    }
+
+    #[gpui::test]
+    fn focus_or_open_adds_missing_panel(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx)], cx)));
+        let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
+        cx.update(|cx| {
+            tg.update(cx, |tg, cx| {
+                tg.focus_or_open("other_item", |cx| other_item(cx), cx);
+            });
+        });
+        cx.read(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.items().len(), 2);
+            assert_eq!(pane.items()[1].serialization_key(), "other_item");
+            assert_eq!(pane.active_index(), 1, "new tab becomes active");
+        });
+    }
+
+    #[gpui::test]
+    fn split_pane_ignores_missing_target(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx)], cx)));
+        let stray = cx.update(|cx| cx.new(|cx| Pane::new(vec![item(cx)], cx)));
+        cx.update(|cx| {
+            let new_pane = cx.new(|cx| Pane::new(vec![item(cx)], cx));
+            tg.update(cx, |tg, cx| {
+                tg.split_pane(&stray, new_pane, SplitDirection::Right, cx);
+            });
+        });
+        cx.read(|cx| assert_eq!(tg.read(cx).panes().len(), 1));
+    }
+
+    #[gpui::test]
+    fn single_item_same_pane_edge_drop_is_noop(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx)], cx)));
+        let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
+        cx.update(|cx| {
+            let handle = pane.read(cx).items()[0].clone_handle();
+            let dragged = DraggedTab {
+                pane: pane.clone(),
+                item: handle,
+                ix: 0,
+            };
+            pane.update(cx, |p, cx| {
+                p.split_or_move(&dragged, SplitDirection::Right, cx)
+            });
+        });
+        cx.read(|cx| {
+            assert_eq!(tg.read(cx).panes().len(), 1);
+            assert_eq!(pane.read(cx).items().len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn multi_item_same_pane_edge_drop_splits(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx), item(cx)], cx)));
+        let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
+        cx.update(|cx| {
+            let handle = pane.read(cx).items()[1].clone_handle();
+            let dragged = DraggedTab {
+                pane: pane.clone(),
+                item: handle,
+                ix: 1,
+            };
+            pane.update(cx, |p, cx| {
+                p.split_or_move(&dragged, SplitDirection::Right, cx)
+            });
+        });
+        cx.read(|cx| {
+            assert_eq!(pane.read(cx).items().len(), 1);
+            assert_eq!(tg.read(cx).panes().len(), 2);
+        });
     }
 }

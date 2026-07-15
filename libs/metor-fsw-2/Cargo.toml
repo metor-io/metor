@@ -1,0 +1,84 @@
+[package]
+name = "metor-fsw-2"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+description = "Frames & component derives for the metor-fsw-2 flight-software framework"
+authors = ["sascha@metor.io"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# metor-proto
+metor-proto = { path = "../metor-proto", features = ["std"] }
+metor-proto-wkt = { path = "../metor-proto/wkt", features = ["nox", "std"] }
+metor-proto-stellar = { path = "../metor-proto/stellar" }
+
+# fsw
+metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"] }
+metor-fsw-2-macros = { path = "macros" }
+
+# channels
+metor-fsw-ring = { path = "ring", default-features = false, features = ["async", "mmap", "futex"] }
+memmap2 = "0.9"
+
+# async
+futures-lite = "2.5.0"
+stellarator = { path = "../stellarator" }
+thingbuf = "0.1.6"
+
+# serialization
+postcard = { version = "1.1", features = ["alloc"] }
+postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
+serde = { version = "1.0", features = ["derive"] }
+postcard-dyn = { version = "0.2", optional = true }
+serde_json = { version = "1.0", optional = true }
+serde_ignored = { version = "0.1", optional = true }
+toml = { version = "0.8", optional = true }
+sha2 = { version = "0.10", optional = true }
+zerocopy = { version = "0.8.2", features = ["derive"] }
+
+libloading = { version = "0.8" }
+
+# Pack-crate-local collection of per-field params docs (ABI v6): a
+# `#[derive(ParamsDocs)]` submits entries the in-`.so` describe path collects.
+inventory = "0.3"
+
+# errors
+miette = { version = "7.0", features = ["fancy"], optional = true }
+thiserror = { version = "2.0" }
+
+# cli
+clap = { version = "4", features = ["derive"], optional = true }
+tempfile = { version = "3.13", optional = true }
+
+[features]
+default = ["wiring"]
+# The pure-data `Wiring` IR (`src/ir.rs`) plus its serde/serde_json codec, with
+# none of the runtime front-end. A consumer that only reads/writes the IR — the
+# panel graph tile, a diffing tool — depends on the crate with just this feature
+# and skips miette, the value-encoder, and the CLI.
+wiring-model = ["dep:serde_json"]
+# The full wiring front-end: the Python-eval path, the Rust `WiringBuilder`, the
+# resolver, bundles, stubgen, and the `metor-fsw` CLI. Pulls `wiring-model` for
+# the IR it produces and consumes.
+wiring = ["wiring-model", "dep:miette", "dep:postcard-dyn", "dep:serde_ignored", "dep:clap", "dep:tempfile", "dep:toml", "dep:sha2"]
+
+[[bin]]
+name = "metor-fsw"
+path = "src/bin/metor-fsw.rs"
+required-features = ["wiring"]
+
+[dev-dependencies]
+tempfile = "3.13"
+trybuild = "1"
+serde_json = "1.0"
+
+# Its own main calls `proc::worker_entry()` first, so the test binary can be
+# re-executed as the worker for process systems (a libtest main cannot).
+[[test]]
+name = "proc_integration"
+harness = false

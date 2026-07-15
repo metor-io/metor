@@ -542,12 +542,16 @@ pub struct MeanOp {
     pub window: u16,
 }
 
+// `ComponentValue` lives in the `nox`-gated `value` module, so the message that
+// carries one is gated with it (a no-default-features build has no such type).
+#[cfg(feature = "nox")]
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct UpdateComponent {
     pub id: ComponentId,
     pub value: crate::ComponentValue,
 }
 
+#[cfg(feature = "nox")]
 impl Msg for UpdateComponent {
     const ID: PacketId = [224, 36];
 }
@@ -657,20 +661,27 @@ impl Msg for AlarmAck {
     const ID: PacketId = [224, 40];
 }
 
-/// Stable identity for a sequence channel, assigned by the control system. A channel is
-/// a slot that holds at most one loaded sequence at a time.
-pub type ChannelId = u64;
+/// Human-readable, unique channel (slot instance) name, e.g. `"adcs"` — the stable
+/// address of a sequence channel. A channel is a slot that holds at most one loaded
+/// sequence at a time. Names are capped at [`SEQUENCE_CHANNEL_NAME_CAP`] bytes so they
+/// round-trip losslessly into the fixed-size telemetry frames that also carry them; the
+/// control system validates the cap at build, and an inbound command whose channel
+/// exceeds it simply matches no slot.
+pub type SequenceChannelName = String;
+
+/// Byte cap on a [`SequenceChannelName`] — the validation invariant, not a wire
+/// encoding (the name is an ordinary postcard `String` on the wire).
+pub const SEQUENCE_CHANNEL_NAME_CAP: usize = 48;
 
 /// Human-readable name of a sequence, e.g. `"deploy_solar_array"`. Sequences are
 /// referenced by name when loaded into a channel.
 pub type SequenceName = String;
 
-/// One channel slot declared by the control system: its identity, display name, and the
-/// set of sequence names that may be loaded into it.
+/// One channel slot declared by the control system: its name (the channel's stable
+/// address) and the set of sequence names that may be loaded into it.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SequenceChannelSpec {
-    pub id: ChannelId,
-    pub name: String,
+    pub name: SequenceChannelName,
     pub available: Vec<SequenceName>,
 }
 
@@ -683,7 +694,9 @@ pub struct SequenceRegistry {
 }
 
 impl Msg for SequenceRegistry {
-    const ID: PacketId = [224, 41];
+    // Fresh id: the u64-`channel_id` protocol retired [224,41] (see the note above
+    // [`SequenceCommand`]); [224,45..57] belong to the sealed-node transfer protocol.
+    const ID: PacketId = [224, 58];
 }
 
 /// Run state of a channel's loaded sequence, as reported by the control system.
@@ -718,17 +731,27 @@ pub enum SequenceEventKind {
     Aborted,
     Completed,
     Failed { reason: String },
+    /// An occupant load began; the matching `Loaded` reports its completion. Emitted only
+    /// when the load has a real window (a process occupant's spawn + bind); in-process
+    /// loads complete synchronously, so consumers may see a `Loaded` with no preceding
+    /// `Loading`.
+    Loading { name: SequenceName },
+    /// A command was rejected by the channel's state machine and changed nothing —
+    /// e.g. `Load` while running, or `Start` with no live occupant. Unlike `Failed`
+    /// this is not a run-state transition; the channel stays where it was.
+    Refused { reason: String },
 }
 
 /// A granular per-channel state update, broadcast by the control system (control → panel).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SequenceChannelEvent {
-    pub channel_id: ChannelId,
+    pub channel: SequenceChannelName,
     pub kind: SequenceEventKind,
 }
 
 impl Msg for SequenceChannelEvent {
-    const ID: PacketId = [224, 42];
+    // Fresh id — see the retirement note above [`SequenceCommand`].
+    const ID: PacketId = [224, 59];
 }
 
 /// An operator command on a channel, published by the panel (panel → control). The
@@ -748,15 +771,24 @@ pub enum SequenceCommandKind {
     Reset,
 }
 
-/// A command targeting one channel, published by the panel.
+/// A command targeting one channel by name, published by the panel.
+///
+/// **Retired ids [224,41], [224,42], [224,43]:** the original
+/// `SequenceRegistry`/`SequenceChannelEvent`/`SequenceCommand` addressed channels by a
+/// `channel_id: u64` (the slot's build-order index — reordering a mission file silently
+/// re-addressed commands). The name-addressed types changed the postcard layout, so they
+/// took **fresh** `PacketId`s ([224,58..60]) rather than mis-decoding every historical
+/// recording persisted under the old ids. The retired ids are reserved forever: an old
+/// recording's records must stay cleanly *unmatched*, never reinterpreted.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SequenceCommand {
-    pub channel_id: ChannelId,
+    pub channel: SequenceChannelName,
     pub command: SequenceCommandKind,
 }
 
 impl Msg for SequenceCommand {
-    const ID: PacketId = [224, 43];
+    // Fresh id — see the retirement note on the struct.
+    const ID: PacketId = [224, 60];
 }
 
 /// Asks the control system to re-read its sequence source(s) (disk, etc.) and re-publish
@@ -766,6 +798,30 @@ pub struct ReloadSequences {}
 
 impl Msg for ReloadSequences {
     const ID: PacketId = [224, 44];
+}
+
+/// The complete mission wiring IR, broadcast by the control system at startup
+/// and re-broadcast on a [`ReloadSequences`] request — the same telemetry
+/// pub/sub pattern [`SequenceRegistry`] uses. The payload is the versioned
+/// `Wiring` serialized as JSON (the self-describing §6 wire format), so a
+/// consumer decodes the whole topology — systems, slots, edges, scopes, and
+/// source anchors — with `serde_json` and never needs bundle access. The JSON
+/// crosses the ring as a plain postcard `String`; `ir_version` rides alongside
+/// it so a consumer can gate before parsing. Because the payload carries the
+/// full graph it can exceed the default message-ring cap, so the control
+/// system sizes its `wiring` channel from the concrete payload at build.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WiringManifest {
+    /// The IR schema version the `ir_json` was produced against.
+    pub ir_version: u32,
+    /// The full `Wiring` IR as JSON.
+    pub ir_json: String,
+}
+
+impl Msg for WiringManifest {
+    // Next free id after the name-addressed sequence types ([224,58..60]); the
+    // sealed-node protocol owns [224,45..57] and the alarm types [224,37..40].
+    const ID: PacketId = [224, 61];
 }
 
 /// Version of the sealed-node transfer protocol ([224,45]..[224,57]).
@@ -1056,9 +1112,10 @@ mod alarm_tests {
                 assert_ne!(a, b, "alarm packet ids must be unique");
             }
         }
-        // Distinct from the previously highest assigned id (UpdateComponent).
+        // Distinct from the previously highest assigned id (UpdateComponent, [224,36] —
+        // spelled literally: the type is `nox`-gated, its id is reserved regardless).
         for id in ids {
-            assert_ne!(id, UpdateComponent::ID);
+            assert_ne!(id, [224, 36]);
         }
     }
 
@@ -1086,34 +1143,33 @@ mod sequence_tests {
         let registry = SequenceRegistry {
             channels: vec![
                 SequenceChannelSpec {
-                    id: 1,
-                    name: "Deploy".into(),
+                    name: "deploy".into(),
                     available: vec!["deploy_solar_array".into(), "deploy_antenna".into()],
                 },
                 SequenceChannelSpec {
-                    id: 2,
-                    name: "Attitude".into(),
+                    name: "attitude".into(),
                     available: vec!["detumble".into()],
                 },
             ],
         };
         let registry2 = roundtrip(&registry);
         assert_eq!(registry.channels.len(), registry2.channels.len());
+        assert_eq!(registry.channels[0].name, registry2.channels[0].name);
         assert_eq!(
             registry.channels[0].available,
             registry2.channels[0].available
         );
 
         let event = SequenceChannelEvent {
-            channel_id: 1,
+            channel: "deploy".into(),
             kind: SequenceEventKind::Loaded {
                 name: "deploy_solar_array".into(),
             },
         };
-        assert_eq!(event.channel_id, roundtrip(&event).channel_id);
+        assert_eq!(event.channel, roundtrip(&event).channel);
 
         let progress = SequenceChannelEvent {
-            channel_id: 1,
+            channel: "deploy".into(),
             kind: SequenceEventKind::Progress {
                 detail: "panel 1 latched".into(),
             },
@@ -1124,15 +1180,15 @@ mod sequence_tests {
         ));
 
         let command = SequenceCommand {
-            channel_id: 2,
+            channel: "attitude".into(),
             command: SequenceCommandKind::Load {
                 name: "detumble".into(),
             },
         };
-        assert_eq!(command.channel_id, roundtrip(&command).channel_id);
+        assert_eq!(command.channel, roundtrip(&command).channel);
 
         let reset = SequenceCommand {
-            channel_id: 2,
+            channel: "attitude".into(),
             command: SequenceCommandKind::Reset,
         };
         assert!(matches!(
@@ -1141,6 +1197,62 @@ mod sequence_tests {
         ));
 
         let _ = roundtrip(&ReloadSequences {});
+    }
+
+    /// Postcard goldens: the exact wire bytes of the three name-addressed Msgs, so the
+    /// encoding cannot drift silently (a name is a varint-length postcard `String`).
+    #[test]
+    fn sequence_messages_pinned_bytes() {
+        let registry = SequenceRegistry {
+            channels: vec![SequenceChannelSpec {
+                name: "adcs".into(),
+                available: vec!["detumble".into()],
+            }],
+        };
+        assert_eq!(
+            postcard::to_allocvec(&registry).unwrap(),
+            // 1 channel; name "adcs" (len 4); 1 available; "detumble" (len 8).
+            [
+                1, 4, b'a', b'd', b'c', b's', 1, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l',
+                b'e'
+            ]
+        );
+
+        let event = SequenceChannelEvent {
+            channel: "adcs".into(),
+            kind: SequenceEventKind::Started,
+        };
+        assert_eq!(
+            postcard::to_allocvec(&event).unwrap(),
+            // channel "adcs"; kind variant 2 (Started).
+            [4, b'a', b'd', b'c', b's', 2]
+        );
+
+        let loading = SequenceChannelEvent {
+            channel: "adcs".into(),
+            kind: SequenceEventKind::Loading {
+                name: "detumble".into(),
+            },
+        };
+        assert_eq!(
+            postcard::to_allocvec(&loading).unwrap(),
+            // channel "adcs"; kind variant 8 (Loading, appended after Failed so the
+            // earlier variants keep their wire form); name "detumble" (len 8).
+            [
+                4, b'a', b'd', b'c', b's', 8, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l',
+                b'e'
+            ]
+        );
+
+        let command = SequenceCommand {
+            channel: "adcs".into(),
+            command: SequenceCommandKind::Start,
+        };
+        assert_eq!(
+            postcard::to_allocvec(&command).unwrap(),
+            // channel "adcs"; command variant 1 (Start).
+            [4, b'a', b'd', b'c', b's', 1]
+        );
     }
 
     #[test]
@@ -1160,5 +1272,68 @@ mod sequence_tests {
         for id in ids {
             assert_ne!(id, AlarmAck::ID);
         }
+        // The fresh name-addressed ids must not collide with the sealed-node transfer
+        // protocol ([224,45..57], incl. the retired envelope pair) nor resurrect the
+        // retired u64-`channel_id` ids [224,41..43].
+        for id in [
+            SequenceRegistry::ID,
+            SequenceChannelEvent::ID,
+            SequenceCommand::ID,
+        ] {
+            assert!(
+                !NODE_PROTOCOL_MESSAGES.contains(&id),
+                "{id:?} collides with the node protocol"
+            );
+            assert!(
+                ![[224u8, 41], [224, 42], [224, 43]].contains(&id),
+                "{id:?} resurrects a retired sequence id"
+            );
+        }
+    }
+
+    /// The pinned ids themselves — moving one silently re-keys every persisted recording.
+    #[test]
+    fn sequence_packet_ids_are_pinned() {
+        assert_eq!(SequenceRegistry::ID, [224, 58]);
+        assert_eq!(SequenceChannelEvent::ID, [224, 59]);
+        assert_eq!(SequenceCommand::ID, [224, 60]);
+        assert_eq!(ReloadSequences::ID, [224, 44]);
+    }
+}
+
+#[cfg(test)]
+mod wiring_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn wiring_manifest_roundtrips() {
+        let manifest = WiringManifest {
+            ir_version: 1,
+            ir_json: r#"{"ir_version":1,"systems":[]}"#.into(),
+        };
+        let bytes = postcard::to_allocvec(&manifest).expect("encode");
+        let back: WiringManifest = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.ir_version, manifest.ir_version);
+        assert_eq!(back.ir_json, manifest.ir_json);
+    }
+
+    /// The pinned id — moving it silently re-keys every persisted recording —
+    /// and its distinctness from every other assigned id in this module.
+    #[test]
+    fn wiring_manifest_id_is_pinned_and_unique() {
+        assert_eq!(WiringManifest::ID, [224, 61]);
+        for id in [
+            SequenceRegistry::ID,
+            SequenceChannelEvent::ID,
+            SequenceCommand::ID,
+            ReloadSequences::ID,
+            AlarmDef::ID,
+            AlarmRaised::ID,
+            AlarmCleared::ID,
+            AlarmAck::ID,
+        ] {
+            assert_ne!(id, WiringManifest::ID);
+        }
+        assert!(!NODE_PROTOCOL_MESSAGES.contains(&WiringManifest::ID));
     }
 }

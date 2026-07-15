@@ -1,0 +1,27 @@
+[package]
+name = "metor-fsw-2-macros"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+description = "Proc macros for the metor-fsw-2 flight-software framework"
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+darling = "0.20.3"
+proc-macro2 = "1.0.66"
+quote = "1.0.33"
+# `full` for the `ItemImpl`/`ItemFn` surfaces `#[system]`/`#[sequence]` parse.
+syn = { version = "2.0.31", features = ["full"] }
+convert_case = "0.6.0"
+proc-macro-crate = "3.0.0"
+
+[dev-dependencies]
+# Pretty-print expansions in the in-crate diagnostics tests.
+prettyplease = "0.2"

@@ -63,19 +63,31 @@ pub trait ColumnBrowserDelegate: Sized + 'static {
         cx: &mut Context<ColumnBrowser<Self>>,
     );
 
+    /// Whether the browser offers rerooting (double-click on a header or a
+    /// non-leaf row). Delegates whose tree is fixed and shallow return
+    /// `false` so the gesture never silently no-ops.
+    fn supports_reroot(&self) -> bool {
+        true
+    }
+
     /// Set a virtual root so the browser behaves as though a sub-node were
     /// the top of the tree.
     ///
     /// `ancestors` is the chain from the original root down to the new
     /// root; `ancestors.last()` is the node whose children become column 0.
+    /// Only called when [`supports_reroot`](Self::supports_reroot) is `true`.
     fn set_root_override(
         &mut self,
         ancestors: SmallVec<[Self::Item; 8]>,
         cx: &mut Context<ColumnBrowser<Self>>,
-    );
+    ) {
+        let _ = (ancestors, cx);
+    }
 
     /// Undo a [`set_root_override`](Self::set_root_override).
-    fn clear_root_override(&mut self, cx: &mut Context<ColumnBrowser<Self>>);
+    fn clear_root_override(&mut self, cx: &mut Context<ColumnBrowser<Self>>) {
+        let _ = cx;
+    }
 
     /// Optional trailing detail column.
     ///
@@ -278,6 +290,9 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
     }
 
     pub fn apply_root_override(&mut self, column_ix: usize, cx: &mut Context<Self>) {
+        if !self.delegate.supports_reroot() {
+            return;
+        }
         if column_ix == 0 {
             self.delegate.clear_root_override(cx);
         } else {
@@ -440,7 +455,14 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
                     cx.stop_propagation();
                 }),
             )
-            .child(div().flex_1().overflow_hidden().child(label));
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(label),
+            );
 
         if !is_leaf {
             row = row.child(Icon::ChevronRight.svg(8.0));

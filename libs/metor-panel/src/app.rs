@@ -61,6 +61,10 @@ struct AppRoot {
     /// The transient chord menu, present only while open. Dropped (and focus
     /// returned to the root) once it dismisses, mirroring `inspector`.
     transient: Option<Entity<crate::transient::Transient>>,
+    /// Armed by mouse-down on the titlebar; the next mouse-move hands the
+    /// drag to the compositor via `start_window_move` (Linux — macOS and
+    /// Windows drag natively through the transparent titlebar / HTCAPTION).
+    should_move: bool,
     focus_handle: FocusHandle,
 }
 
@@ -100,6 +104,7 @@ impl AppRoot {
             pending_pane_inspector_request: None,
             pending_inspector_open: None,
             transient: None,
+            should_move: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -239,8 +244,40 @@ impl AppRoot {
             self.inspector = Some(inspector);
             cx.notify();
         } else {
-            println!("no rows for entity");
+            tracing::debug!("no inspector rows for entity");
         }
+    }
+
+    /// Anchored inspector for a tab-bar right-click: the pane's own settings
+    /// plus a "New Tab" submenu reusing the palette's new-panel rows, so both
+    /// entry points create tabs through the same wizards.
+    fn open_pane_inspector(
+        &mut self,
+        pane: Entity<crate::tiles::Pane>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut rows = crate::inspector::reflect::rows_for_any_entity(
+            &pane.clone().into_any(),
+            &self.db,
+            cx,
+        )
+        .unwrap_or_default();
+        let db = self.db.clone();
+        let on_open_inspector = crate::inspector::open_inspector(cx);
+        rows.push(Box::new(crate::inspector::rows::NavRow::new(
+            "New Tab",
+            SharedString::new_static(""),
+            Box::new(move |_cx| {
+                crate::tiles::panels::new_panel_rows(
+                    db.clone(),
+                    pane.clone(),
+                    on_open_inspector.clone(),
+                )
+            }),
+        )));
+        self.open_inspector_with(rows, InspectorMode::Anchored(position), window, cx);
     }
 
     fn handle_inspect_entity(
@@ -352,7 +389,7 @@ impl Render for AppRoot {
         }
 
         if let Some((pane, position)) = self.pending_pane_inspector_request.take() {
-            self.open_entity_inspector(&pane.into_any(), position, window, cx);
+            self.open_pane_inspector(pane, position, window, cx);
         }
 
         if let Some(request) = self.pending_inspector_open.take() {
@@ -376,7 +413,7 @@ impl Render for AppRoot {
 
         let theme = crate::theme::theme(cx);
         let font_family = crate::theme::font_family(cx);
-        let titlebar = self.render_titlebar(&theme, cx);
+        let titlebar = self.render_titlebar(&theme, window, cx);
 
         let mut root = div()
             .id("app-root")
@@ -406,6 +443,9 @@ impl Render for AppRoot {
             .flex()
             .flex_col()
             .size_full()
+            // Linux client-side decorations render into a transparent surface,
+            // so the root must paint its own opaque background.
+            .bg(theme.bg_primary)
             .child(titlebar)
             .child(div().flex_1().min_h_0().child(self.tiles.clone()));
 
@@ -421,7 +461,7 @@ impl Render for AppRoot {
             root = root.child(preview.inspector.clone());
         }
 
-        root
+        crate::window_controls::client_side_decorations(root, window, cx)
     }
 }
 
@@ -482,32 +522,24 @@ impl AppRoot {
         bar.into_any_element()
     }
 
-    /// Open the alarm panel in the first pane, unless one is already open.
+    /// Reveal the alarm panel: focus the existing alarms tab wherever it lives
+    /// in the layout, opening a fresh one in the active pane only when none is
+    /// open.
     fn open_alarms(&mut self, cx: &mut Context<Self>) {
-        let panes = self.tiles.read(cx).panes().to_vec();
-        let already_open = panes.iter().any(|pane| {
-            pane.read(cx)
-                .items()
-                .iter()
-                .any(|item| item.serialization_key() == "alarm")
-        });
-        if already_open {
-            return;
-        }
-        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
-            return;
-        };
         let db = self.db.clone();
-        pane.update(cx, |pane, cx| {
-            let item: Box<dyn crate::tiles::PaneItemHandle> =
-                Box::new(cx.new(|cx| AlarmPanel::new(db, cx)));
-            pane.add_item(item, cx);
+        self.tiles.update(cx, |tiles, cx| {
+            tiles.focus_or_open(
+                <AlarmPanel as crate::tiles::PaneItem>::serialization_key(),
+                |cx| Box::new(cx.new(|cx| AlarmPanel::new(db, cx))),
+                cx,
+            );
         });
     }
 
     fn render_titlebar(
         &self,
         theme: &crate::theme::Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let pending = pending_edits(cx);
@@ -541,7 +573,11 @@ impl AppRoot {
                 cx.refresh_windows();
             });
 
+        // Occluded so these controls win the non-client hit-test: without it,
+        // Windows resolves clicks over the pills to the surrounding titlebar
+        // drag area (HTCAPTION) and drags the window instead of clicking.
         let mut right = div()
+            .occlude()
             .flex()
             .flex_row()
             .items_center()
@@ -606,6 +642,14 @@ impl AppRoot {
         right = right.child(lock_button);
 
         div()
+            .id("titlebar")
+            .window_control_area(gpui::WindowControlArea::Drag)
+            // Occluded so a titlebar press never hovers the root's
+            // `track_focus` hitbox: gpui's focus-transfer listener calls
+            // `prevent_default()`, and the Windows backend treats a
+            // default-prevented mouse-down as handled — swallowing the
+            // WM_NCLBUTTONDOWN that starts the native caption drag.
+            .occlude()
             .bg(theme.bg_secondary)
             .border_b_1()
             .border_color(theme.border_primary)
@@ -616,7 +660,50 @@ impl AppRoot {
             .flex_row()
             .items_center()
             .justify_end()
+            // Drag gesture for compositors that need an explicit hand-off:
+            // mouse-down arms, the first mouse-move starts the compositor
+            // drag. macOS drags natively via the transparent titlebar and
+            // Windows via the HTCAPTION hit-test, so these never fire there.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.should_move = true),
+            )
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.should_move {
+                    this.should_move = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.should_move = false),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    if cfg!(target_os = "macos") {
+                        window.titlebar_double_click();
+                    } else {
+                        window.zoom_window();
+                    }
+                }
+            })
+            .when(
+                matches!(
+                    window.window_decorations(),
+                    gpui::Decorations::Client { .. }
+                ) && window.window_controls().window_menu,
+                |bar| {
+                    bar.on_mouse_down(gpui::MouseButton::Right, |event, window, _| {
+                        window.show_window_menu(event.position);
+                    })
+                },
+            )
             .child(right)
+            .when(
+                crate::window_controls::needs_window_controls(window),
+                |bar| bar.child(crate::window_controls::window_controls(theme, window)),
+            )
             .into_any_element()
     }
 }
@@ -792,8 +879,10 @@ impl PanelApp {
                 crate::node_editor::GraphCoordinator::init(cx);
                 crate::node_editor::DynamicWorker::init(cx);
                 crate::node_editor::inspector_rows::register_inspector_rows(cx);
+                crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
+                crate::wiring::WiringStore::init(db.clone(), cx);
                 register_pane_item_deserializers(db.clone(), cx);
 
                 // Consumer extensions: register custom palette providers, then
@@ -807,8 +896,10 @@ impl PanelApp {
                 }
 
                 set_dock_icon();
+                // `secondary-` resolves to cmd on macOS and ctrl elsewhere
+                // (`cmd-` would be the Win/Super key off-macOS).
                 cx.bind_keys([
-                    KeyBinding::new("cmd-p", OpenPalette, None),
+                    KeyBinding::new("secondary-p", OpenPalette, None),
                     // The leader opens the transient chord menu. Suppressed while
                     // a text field (Inspector search, node-editor inline edit via
                     // RowList) or the menu itself holds focus, so the key still
@@ -820,8 +911,8 @@ impl PanelApp {
                     ),
                     KeyBinding::new("ctrl-tab", CycleTabForward, None),
                     KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-                    KeyBinding::new("cmd-l", ToggleCmdLock, None),
-                    KeyBinding::new("cmd-shift-e", OpenReviewEdits, None),
+                    KeyBinding::new("secondary-l", ToggleCmdLock, None),
+                    KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
                     // Excluded when a `RowList` is focused so editing a node's
                     // inline arg field (typing Backspace, hitting Delete) doesn't
                     // also delete the surrounding node.
@@ -842,11 +933,19 @@ impl PanelApp {
                 cx.open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        // `appears_transparent` hides the native titlebar on
+                        // macOS (leaving the traffic lights) and on Windows
+                        // (leaving nothing — the app draws its own controls).
                         titlebar: Some(TitlebarOptions {
                             appears_transparent: true,
                             traffic_light_position: Some(point(px(12.0), px(8.0))),
                             ..Default::default()
                         }),
+                        // Linux-only: request client-side decorations; the
+                        // window root wraps itself in resize borders and a
+                        // shadow via `window_controls::client_side_decorations`.
+                        window_decorations: Some(gpui::WindowDecorations::Client),
+                        app_id: Some("metor-panel".into()),
                         ..Default::default()
                     },
                     move |_window, cx| cx.new(|cx| AppRoot::new(db, cx)),
@@ -887,6 +986,11 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         &mut reg,
         db.clone(),
         crate::node_editor::pane::NodeEditor::from_config,
+    );
+    register_panel::<crate::views::system_graph::SystemGraphPanel>(
+        &mut reg,
+        db.clone(),
+        crate::views::system_graph::SystemGraphPanel::from_config,
     );
 
     // Dashboard's deserializer returns a fully-constructed entity rather

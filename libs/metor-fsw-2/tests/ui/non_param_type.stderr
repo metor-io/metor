@@ -1,0 +1,58 @@
+error[E0277]: `for<'a> fn(&'a mut u64, String) {bad}` is not a system execute fn
+ --> tests/ui/non_param_type.rs:7:72
+  |
+7 |     let _ = metor_fsw_2::Pack::new().system("bad", metor_fsw_2::system(bad));
+  |                                                    ------------------- ^^^ the trait `ExecuteFn<_, _>` is not implemented for fn item `for<'a> fn(&'a mut u64, String) {bad}`
+  |                                                    |
+  |                                                    required by a bound introduced by this call
+  |
+  = note: an execute fn takes a leading `&mut State` and then only system parameters: `fn(&mut S, now: Timestamp, sensors: &mut Input<A>, out: &mut Output<B>, ...)`. Closures may need their parameter types spelled out.
+note: required by a bound in `system`
+ --> src/handler/mod.rs
+  |
+  | pub fn system<S, M, F>(execute: F) -> SystemDef<S, M, F, NoInit>
+  |        ------ required by a bound in this function
+  | where
+  |     F: ExecuteFn<S, M>,
+  |        ^^^^^^^^^^^^^^^ required by this bound in `system`
+
+error[E0277]: `for<'a> fn(&'a mut u64, String) {bad}` is not a system execute fn
+ --> tests/ui/non_param_type.rs:7:52
+  |
+7 |     let _ = metor_fsw_2::Pack::new().system("bad", metor_fsw_2::system(bad));
+  |                                      ------        ^^^^^^^^^^^^^^^^^^^^^^^^ the trait `ExecuteFn<_, _>` is not implemented for fn item `for<'a> fn(&'a mut u64, String) {bad}`
+  |                                      |
+  |                                      required by a bound introduced by this call
+  |
+  = note: an execute fn takes a leading `&mut State` and then only system parameters: `fn(&mut S, now: Timestamp, sensors: &mut Input<A>, out: &mut Output<B>, ...)`. Closures may need their parameter types spelled out.
+help: the following other types implement trait `IntoPackEntry`
+ --> src/handler/mod.rs
+  |
+  | / impl<S, M, F> IntoPackEntry for SystemDef<S, M, F, NoInit>
+  | | where
+  | |     S: Default + 'static,
+  | |     M: 'static,
+  | |     F: ExecuteFn<S, M> + Clone,
+  | |_______________________________^ `SystemDef<S, M, F, metor_fsw_2::handler::NoInit>`
+...
+  | / impl<S, M, F, G, M2> IntoPackEntry for SystemDef<S, M, F, InitWith<G, M2>>
+  | | where
+  | |     S: 'static,
+  | |     M: 'static,
+  | |     M2: 'static,
+  | |     F: ExecuteFn<S, M> + Clone,
+  | |     G: InitFn<S, M2> + Clone,
+  | |_____________________________^ `SystemDef<S, M, F, metor_fsw_2::handler::InitWith<G, M2>>`
+...
+  | / impl<S, M, F> IntoPackEntry for SystemDef<S, M, F, Prebuilt<S>>
+  | | where
+  | |     S: 'static,
+  | |     M: 'static,
+  | |     F: ExecuteFn<S, M> + Clone,
+  | |_______________________________^ `SystemDef<S, M, F, metor_fsw_2::handler::Prebuilt<S>>`
+  = note: required for `SystemDef<_, _, for<'a> fn(&'a mut u64, String) {bad}, metor_fsw_2::handler::NoInit>` to implement `IntoPackEntry`
+note: required by a bound in `Pack::system`
+ --> src/pack.rs
+  |
+  |     pub fn system(mut self, name: &'static str, def: impl IntoPackEntry) -> Self {
+  |                                                           ^^^^^^^^^^^^^ required by this bound in `Pack::system`

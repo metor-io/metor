@@ -164,10 +164,19 @@ pub struct ImageWidgetConfig {
     pub path: String,
 }
 
-/// Persisted shape of a monitor widget — the source component to monitor.
+/// Persisted shape of a monitor widget — the source component to monitor
+/// plus the inspector-editable display fields.
+///
+/// `unit` and `show_sparkline` are `Option` (with `#[facet(default)]` for
+/// pre-existing blobs): `None` means "never edited", so restore keeps the
+/// constructor's metadata-derived defaults instead of clobbering them.
 #[derive(facet::Facet, Default)]
 pub struct MonitorWidgetConfig {
     pub component: String,
+    #[facet(default)]
+    pub unit: Option<String>,
+    #[facet(default)]
+    pub show_sparkline: Option<bool>,
 }
 
 /// Persisted shape of a traffic-light widget.
@@ -225,16 +234,19 @@ fn placeholder_spec(kind: &WidgetKind) -> Arc<WidgetSpec> {
 /// Snapshot a live widget's editable state into a fresh facet-json blob.
 ///
 /// Returns `None` for widget kinds whose persisted config never changes
-/// after construction (text, image, monitor, table, viewer3d) — the cached
-/// blob on `DashboardWidget.config` already reflects everything they own,
-/// so the dashboard's `to_config` keeps it as-is.
+/// after construction (text, image, table, viewer3d) — the cached blob on
+/// `DashboardWidget.config` already reflects everything they own, so the
+/// dashboard's `to_config` keeps it as-is.
 ///
-/// `plot` is the only kind whose state diverges over time: the user adds
-/// or removes traces, edits overrides, etc. — so we re-serialize from the
-/// inspectable [`LinePlot`] entity at save time.
+/// Kinds with inspector-editable state (plot traces and overrides,
+/// traffic-light colors, monitor unit/sparkline) re-serialize from the live
+/// entity at save time. `config` is the widget's cached blob, used to carry
+/// forward fields the entity doesn't own (e.g. the monitor's component
+/// name, which the entity only holds as a resolved id).
 pub fn serialize_widget_state(
     kind: &WidgetKind,
     entity: &gpui::AnyEntity,
+    config: &str,
     cx: &App,
 ) -> Option<String> {
     if *kind == WidgetKind::plot() {
@@ -269,7 +281,6 @@ pub fn serialize_widget_state(
                 .map(|a| crate::tiles::panels::YAxisConfig::from(a.read(cx)))
                 .collect(),
             x_time_format: lp.x_time_format,
-            default_measurements: Vec::new(),
             cursors: Vec::new(),
             measurement_panel: Default::default(),
             hide_alarm_limits: !lp.show_alarm_limits,
@@ -293,6 +304,14 @@ pub fn serialize_widget_state(
             pattern: v.pattern().to_string(),
             color: Some(v.color()),
         };
+        return facet_json::to_string(&cfg).ok();
+    }
+    if *kind == WidgetKind::monitor() {
+        let m = entity.clone().downcast::<Monitor>().ok()?;
+        let v = m.read(cx);
+        let mut cfg = parse_or_default::<MonitorWidgetConfig>(config);
+        cfg.unit = Some(v.unit.to_string());
+        cfg.show_sparkline = Some(v.show_sparkline);
         return facet_json::to_string(&cfg).ok();
     }
     None
@@ -372,7 +391,19 @@ fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::An
         }));
     }
     let id = metor_proto::types::ComponentId::new(&cfg.component);
-    as_view_and_entity(cx.new(|cx| Monitor::new(db.clone(), id, cx)))
+    let entity = cx.new(|cx| Monitor::new(db.clone(), id, cx));
+    if cfg.unit.is_some() || cfg.show_sparkline.is_some() {
+        entity.update(cx, |m, cx| {
+            if let Some(unit) = cfg.unit {
+                m.unit = SharedString::from(unit);
+            }
+            if let Some(show) = cfg.show_sparkline {
+                m.show_sparkline = show;
+            }
+            cx.notify();
+        });
+    }
+    as_view_and_entity(entity)
 }
 
 fn build_viewer3d(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
@@ -472,6 +503,33 @@ impl Render for ImageWidget {
 /// Grey "missing content" tile used whenever a widget can't instantiate.
 struct PlaceholderWidget {
     label: SharedString,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_config_tolerates_pre_display_field_blobs() {
+        let cfg: MonitorWidgetConfig = facet_json::from_str(r#"{"component":"a.b"}"#).unwrap();
+        assert_eq!(cfg.component, "a.b");
+        assert_eq!(cfg.unit, None);
+        assert_eq!(cfg.show_sparkline, None);
+    }
+
+    #[test]
+    fn monitor_config_round_trips_display_fields() {
+        let cfg = MonitorWidgetConfig {
+            component: "a.b".to_string(),
+            unit: Some("V".to_string()),
+            show_sparkline: Some(false),
+        };
+        let blob = facet_json::to_string(&cfg).unwrap();
+        let back: MonitorWidgetConfig = facet_json::from_str(&blob).unwrap();
+        assert_eq!(back.component, "a.b");
+        assert_eq!(back.unit.as_deref(), Some("V"));
+        assert_eq!(back.show_sparkline, Some(false));
+    }
 }
 
 impl Render for PlaceholderWidget {

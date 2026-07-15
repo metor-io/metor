@@ -111,6 +111,18 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// Drop shadow behind the window when Linux client-side decorations are
+    /// active. Derived rather than per-palette: translucent black reads
+    /// correctly over any compositor wallpaper.
+    pub fn window_shadow(&self) -> Hsla {
+        Hsla {
+            h: 0.,
+            s: 0.,
+            l: 0.,
+            a: 0.4,
+        }
+    }
+
     /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
     /// background and the axis fills that mask GPU-frame edges straying into
     /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.
@@ -128,6 +140,18 @@ impl Theme {
             a: 0.4,
             ..self.text_tertiary
         }
+    }
+
+    /// Tint for a component-frame edge in the system graph — the blue family,
+    /// the calmer of the two edge kinds since frame edges dominate a mission.
+    pub fn frame_edge_color(&self) -> Hsla {
+        self.line_colors[1]
+    }
+
+    /// Tint for a message edge in the system graph — the purple family, set
+    /// apart from the frame-edge blue so the two kinds read at a glance.
+    pub fn msg_edge_color(&self) -> Hsla {
+        self.line_colors[4]
     }
 
     /// Solid color for an alarm severity (`severity_index`: 0 = info, 1 = warning,
@@ -813,7 +837,7 @@ pub fn resolve_font_family(cx: &App, cfg: &PanelConfig) -> SharedString {
             if has(name) {
                 SharedString::from(name.clone())
             } else {
-                eprintln!("font '{name}' not found; using bundled {BUNDLED_FAMILY}");
+                tracing::warn!("font '{name}' not found; using bundled {BUNDLED_FAMILY}");
                 SharedString::new_static(BUNDLED_FAMILY)
             }
         }
@@ -846,7 +870,7 @@ pub fn set_font(cx: &mut App, font: FontConfig) {
     config.font = font;
     let family = resolve_font_family(cx, &config);
     if let Err(e) = config::save(&config) {
-        eprintln!("save config: {e}");
+        tracing::error!(%e, "save config failed");
     }
     cx.set_global(FontSettings { family, config });
 }

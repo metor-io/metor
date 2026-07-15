@@ -99,6 +99,9 @@ async fn main() -> miette::Result<()> {
                     metor_proto_wkt::Stream::to_cpp()?,
                     metor_proto_wkt::MsgStream::to_cpp()?,
                     vtable::Field::to_cpp()?,
+                    // `ElementFields` is referenced by the new dynamic `Op` variants
+                    // (`List`/`Map`), so it must be generated before `Op`.
+                    vtable::ElementFields::to_cpp()?,
                     vtable::Op::to_cpp()?,
                     vtable::OpRef::to_cpp()?,
                     metor_proto::types::PrimType::to_cpp()?,

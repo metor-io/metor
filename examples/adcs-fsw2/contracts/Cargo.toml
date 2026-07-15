@@ -1,0 +1,29 @@
+[package]
+name = "adcs-contracts"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "Shared compile-time contracts (frames + per-system Params) for the adcs-fsw2 dlopen mission"
+
+[dependencies]
+# The frame derives (`Frame`/`AsVTable`/…) are self-contained — they expand to
+# `::metor_fsw_2::…` paths, so this crate needs only metor-fsw-2 (no direct metor-fsw).
+metor-fsw-2 = { path = "../../../libs/metor-fsw-2" }
+# The standalone component sub-derives (AsVTable/Componentize/… on the nested `ReactionWheel`,
+# which is not a top-level `Frame`) expand to `::metor_fsw` paths, so the derive needs
+# metor-fsw in scope (metor-fsw-2 re-bundles these only inside `#[derive(Frame)]`).
+metor-fsw = { path = "../../../libs/metor-fsw" }
+nox = { workspace = true }
+# Real-world environment models: the ECI sun direction (Vallado) at an epoch, plus the
+# ECI↔ECEF↔NED frame chain the WMM magnetic field is evaluated through.
+nox-frames = { path = "../../../libs/nox-frames", features = ["earth"] }
+# The NOAA World Magnetic Model (a bindgen wrapper over the WMM C library) — the true +
+# reference Earth magnetic field, replacing the crude tilted-dipole model.
+wmm = { path = "../../../libs/wmm" }
+hifitime = "4.0"
+zerocopy = { version = "0.8.2", features = ["derive"] }
+# `Params` cross the dlopen boundary as canonical postcard bytes, schema-guided from the
+# `.so`'s exported `Schema` (dl-open.md §6.3) — hence the Serialize/Deserialize/Schema triple.
+serde = { version = "1.0", features = ["derive"] }
+postcard-schema = { version = "0.2", features = ["derive", "use-std"] }

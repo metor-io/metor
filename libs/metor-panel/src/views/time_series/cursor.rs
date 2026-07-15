@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui::{Context, Entity, EntityId, WeakEntity};
+use gpui::{Bounds, Context, Entity, EntityId, Pixels, Point, Size, WeakEntity, point, px};
 use metor_proto::types::Timestamp;
 
 use super::measurements::{MeasurementKind, MeasurementKindList};
@@ -136,26 +136,40 @@ pub fn nearest_sample_timestamp(
     component: &metor_db::Component,
     target: Timestamp,
 ) -> Option<Timestamp> {
-    let mut best: Option<Timestamp> = None;
-    let mut best_dist = i64::MAX;
+    let mut best: Option<(i64, Timestamp)> = None;
     for node in component.time_series.list.iter() {
         let timestamps = node.timestamps();
-        if timestamps.is_empty() {
+        let Some((idx, d)) = nearest_in_node(timestamps, target) else {
             continue;
-        }
-        let idx = match timestamps.binary_search_by_key(&target.0, |t| t.0) {
-            Ok(i) => i,
-            Err(i) => i,
         };
-        for cand_idx in [idx.saturating_sub(1), idx, idx + 1] {
-            let Some(cand) = timestamps.get(cand_idx) else {
-                continue;
-            };
-            let d = (cand.0 - target.0).abs();
-            if d < best_dist {
-                best_dist = d;
-                best = Some(*cand);
-            }
+        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, timestamps[idx]));
+        }
+    }
+    best.map(|(_, ts)| ts)
+}
+
+/// Index of the timestamp in one node's slice nearest `target`, with its
+/// absolute distance. The per-node half of the global nearest-sample scan:
+/// [`nearest_sample_timestamp`] and [`LinePlot::trace_value_at`] both fold
+/// it across a component's live nodes so the winner is the closest sample
+/// anywhere, not just in the newest node.
+pub(crate) fn nearest_in_node(timestamps: &[Timestamp], target: Timestamp) -> Option<(usize, i64)> {
+    if timestamps.is_empty() {
+        return None;
+    }
+    let idx = match timestamps.binary_search_by_key(&target.0, |t| t.0) {
+        Ok(i) => i,
+        Err(i) => i,
+    };
+    let mut best: Option<(usize, i64)> = None;
+    for cand_idx in [idx.saturating_sub(1), idx, idx + 1] {
+        let Some(cand) = timestamps.get(cand_idx) else {
+            continue;
+        };
+        let d = (cand.0 - target.0).abs();
+        if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+            best = Some((cand_idx, d));
         }
     }
     best
@@ -252,4 +266,163 @@ pub fn pixel_to_data_x(
     let pa_w = f32::from(plot_area.size.width).max(1.0) as f64;
     let norm = (f32::from(pixel_x) as f64 - pa_x) / pa_w;
     view.min_x + norm.clamp(0.0, 1.0) * (view.max_x - view.min_x)
+}
+
+/// Nominal per-character advance for the monospaced UI font at
+/// [`LABEL_FONT_SIZE`](super::LABEL_FONT_SIZE). Used only to size the hover
+/// readout box before layout runs, so an approximation is fine.
+const READOUT_CHAR_W: f32 = 6.6;
+/// Line height for one readout row (font size plus leading).
+const READOUT_ROW_H: f32 = 15.0;
+/// Inner padding on the readout box, per side.
+const READOUT_PAD_X: f32 = 6.0;
+const READOUT_PAD_Y: f32 = 4.0;
+/// Width the color swatch plus its trailing gap reserves ahead of a trace
+/// row's label.
+const READOUT_SWATCH_W: f32 = 14.0;
+
+/// Approximate pixel footprint of the hover readout box for a `header_len`
+/// character header above `rows` of `(label_len, value_len)` character
+/// counts.
+///
+/// The box is a native div tree whose real size only settles after layout,
+/// but placement ([`readout_origin`]) has to run first — this estimate is
+/// close enough for edge clamping given the monospaced UI font.
+pub(crate) fn estimate_readout_size(header_len: usize, rows: &[(usize, usize)]) -> Size<Pixels> {
+    let mut content_w = header_len as f32 * READOUT_CHAR_W;
+    for (label_len, value_len) in rows {
+        // label + a space + value, offset by the swatch column.
+        let row_w =
+            READOUT_SWATCH_W + (*label_len + 1 + *value_len) as f32 * READOUT_CHAR_W;
+        content_w = content_w.max(row_w);
+    }
+    let width = content_w + READOUT_PAD_X * 2.0;
+    let height = (1 + rows.len()) as f32 * READOUT_ROW_H + READOUT_PAD_Y * 2.0;
+    Size {
+        width: px(width),
+        height: px(height),
+    }
+}
+
+/// Top-left origin for the hover readout box.
+///
+/// Places the box down-and-right of the pointer by `offset` so it never
+/// sits under the cursor, flips to the opposite side of the pointer when it
+/// would overflow the plot's right or bottom edge, then clamps the result
+/// inside `plot_area` so it can't spill past a pane border.
+pub(crate) fn readout_origin(
+    pointer: Point<Pixels>,
+    box_size: Size<Pixels>,
+    plot_area: Bounds<Pixels>,
+    offset: Pixels,
+) -> Point<Pixels> {
+    let off = f32::from(offset);
+    let (bw, bh) = (f32::from(box_size.width), f32::from(box_size.height));
+    let left = f32::from(plot_area.origin.x);
+    let top = f32::from(plot_area.origin.y);
+    let right = left + f32::from(plot_area.size.width);
+    let bottom = top + f32::from(plot_area.size.height);
+    let (ptx, pty) = (f32::from(pointer.x), f32::from(pointer.y));
+
+    let mut x = ptx + off;
+    if x + bw > right {
+        x = ptx - off - bw;
+    }
+    x = x.clamp(left, (right - bw).max(left));
+
+    let mut y = pty + off;
+    if y + bh > bottom {
+        y = pty - off - bh;
+    }
+    y = y.clamp(top, (bottom - bh).max(top));
+
+    point(px(x), px(y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(x), px(y)),
+            size: Size {
+                width: px(w),
+                height: px(h),
+            },
+        }
+    }
+
+    fn ts(values: &[i64]) -> Vec<Timestamp> {
+        values.iter().map(|&t| Timestamp(t)).collect()
+    }
+
+    #[test]
+    fn nearest_in_node_empty_slice() {
+        assert_eq!(nearest_in_node(&[], Timestamp(5)), None);
+    }
+
+    #[test]
+    fn nearest_in_node_exact_hit() {
+        let t = ts(&[10, 20, 30]);
+        assert_eq!(nearest_in_node(&t, Timestamp(20)), Some((1, 0)));
+    }
+
+    #[test]
+    fn nearest_in_node_between_samples_picks_closer() {
+        let t = ts(&[10, 20, 30]);
+        assert_eq!(nearest_in_node(&t, Timestamp(24)), Some((1, 4)));
+        assert_eq!(nearest_in_node(&t, Timestamp(26)), Some((2, 4)));
+    }
+
+    #[test]
+    fn nearest_in_node_clamps_to_ends() {
+        let t = ts(&[10, 20, 30]);
+        assert_eq!(nearest_in_node(&t, Timestamp(-5)), Some((0, 15)));
+        assert_eq!(nearest_in_node(&t, Timestamp(99)), Some((2, 69)));
+    }
+
+    #[test]
+    fn readout_sits_down_and_right_when_it_fits() {
+        let pa = bounds(0.0, 0.0, 400.0, 300.0);
+        let size = Size {
+            width: px(80.0),
+            height: px(50.0),
+        };
+        let origin = readout_origin(point(px(100.0), px(100.0)), size, pa, px(12.0));
+        assert_eq!(origin, point(px(112.0), px(112.0)));
+    }
+
+    #[test]
+    fn readout_flips_left_and_up_near_the_far_edges() {
+        let pa = bounds(0.0, 0.0, 400.0, 300.0);
+        let size = Size {
+            width: px(80.0),
+            height: px(50.0),
+        };
+        // Pointer near the bottom-right corner: box flips to the pointer's
+        // upper-left so it stays inside the plot.
+        let origin = readout_origin(point(px(390.0), px(290.0)), size, pa, px(12.0));
+        assert_eq!(origin, point(px(298.0), px(228.0)));
+    }
+
+    #[test]
+    fn readout_clamps_into_plot_area() {
+        let pa = bounds(50.0, 20.0, 100.0, 60.0);
+        // Box wider/taller than the plot: origin pins to the top-left corner.
+        let size = Size {
+            width: px(200.0),
+            height: px(120.0),
+        };
+        let origin = readout_origin(point(px(60.0), px(30.0)), size, pa, px(12.0));
+        assert_eq!(origin, point(px(50.0), px(20.0)));
+    }
+
+    #[test]
+    fn readout_size_grows_with_row_count_and_width() {
+        let one = estimate_readout_size(4, &[(3, 4)]);
+        let two = estimate_readout_size(4, &[(3, 4), (10, 6)]);
+        assert!(two.height > one.height);
+        assert!(two.width > one.width);
+    }
 }

@@ -64,8 +64,9 @@ pub struct NodeEntry {
 pub struct EdgeEntry {
     pub source: FlowId,
     pub target: FlowId,
-    /// Slot on the target node. For variadic ops (`Mean`) this is ignored
-    /// during build — sources are sorted by `(y, x)` of their position.
+    /// Slot on the target node. Determines build-time input order for both
+    /// exact and variadic ops — [`NodeGraph::parents_of`] sorts incoming
+    /// edges by this index.
     pub target_socket: usize,
 }
 
@@ -148,7 +149,7 @@ impl NodeGraph {
     /// Topological order over the graph using Kahn's algorithm. Returns
     /// `(order, cycle_members)` — anything in `cycle_members` couldn't be
     /// reached because it's in or downstream of a cycle.
-    fn topo_order(&self) -> (Vec<FlowId>, HashSet<FlowId>) {
+    pub(crate) fn topo_order(&self) -> (Vec<FlowId>, HashSet<FlowId>) {
         // Build in-degree from the parent map.
         let mut indeg: HashMap<FlowId, usize> = self.nodes.keys().map(|k| (k.clone(), 0)).collect();
         let mut children: HashMap<FlowId, Vec<FlowId>> = HashMap::new();

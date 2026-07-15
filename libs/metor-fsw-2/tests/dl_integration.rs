@@ -1,0 +1,439 @@
+//! End-to-end test of the shared-object loader, driven through [`Wiring`].
+//!
+//! The `tests_abi` suite calls the generated `fsw_*` symbols inside the test
+//! binary itself; this test crosses a real shared-object boundary. It builds
+//! the `metor-fsw-2-dl-fixture` crate as a `cdylib`, describes the mission as a
+//! [`Wiring`] (a static producer plus one or two dlopen'd consumers), points
+//! the artifact at the freshly built `.so`, and [`resolve`]s it into a live
+//! [`Coordinator`]. Running a few cycles exercises the loader, the manifest
+//! round-trip, the ring-region hand-off, the per-cycle drive, the telemetry
+//! tap, and teardown.
+//!
+//! The fixture is built by a nested `cargo build` inside the test, which is
+//! safe because the outer `cargo test` lock is released before the test binary
+//! runs. If the build cannot produce a usable shared object,
+//! [`locate_fixture`] returns `None` and the test skips with a message on
+//! stderr instead of failing; `tests_abi` keeps the loader logic covered
+//! regardless.
+
+#![cfg(all(feature = "wiring", not(miri)))]
+
+use std::path::PathBuf;
+
+mod common;
+
+use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
+use metor_fsw_2::{
+    BuildSystem, ClockSpec, CoordinatorSpec, CyclicSystem, Delivery, DlPack, FanIn, Frame, Input,
+    MsgIn, Out, Output, ParamSource, StopReason, System, SystemInput, SystemKind, SystemOutput,
+    WiringBuilder,
+    wiring::{Registry, resolve},
+};
+use postcard_schema::Schema;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+// ---------------------------------------------------------------------------
+// Host-side frames
+// ---------------------------------------------------------------------------
+
+// These must stay byte-for-byte identical to the fixture's frames; that layout
+// agreement is the contract `compatible()` checks against the descriptor
+// reconstructed from the shared object.
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "tick_in")]
+struct TickIn {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    value: u64,
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "tick_out")]
+struct TickOut {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    count: u64,
+}
+
+/// Mirror of the fixture's `CounterParams`. The same fields in the same order
+/// encode to the same postcard bytes.
+#[derive(serde::Serialize, Default)]
+struct CounterParams {
+    start: u64,
+    scale: f64,
+}
+
+/// Mirror of the fixture's `TickEvent` message. The shared schema name hashes
+/// to the same `PacketId`, so the host decodes the loaded system's Postcard
+/// records from the id alone, with no vtable and no announce step.
+#[derive(serde::Serialize, serde::Deserialize, Schema, Debug)]
+struct TickEvent {
+    count: u64,
+}
+
+// ---------------------------------------------------------------------------
+// A statically linked producer feeding the loaded consumer
+// ---------------------------------------------------------------------------
+
+/// Emits `tick_in.value = 1, 2, 3, ...`, incrementing before each write, so
+/// after `n` cycles the freshest value is `n`.
+struct Ticker {
+    n: u64,
+}
+
+#[derive(SystemInput)]
+struct TickerIn {}
+
+#[derive(SystemOutput)]
+struct TickerOut {
+    tick: Output<TickIn>,
+}
+
+impl System for Ticker {
+    type Input = TickerIn;
+    type Output = Out<TickerOut>;
+    const NAME: &'static str = "ticker";
+}
+
+impl CyclicSystem for Ticker {
+    fn execute(&mut self, now: Timestamp, _input: &mut TickerIn, output: &mut Out<TickerOut>) {
+        self.n += 1;
+        let _ = output.tick.write(&TickIn {
+            timestamp: now,
+            value: self.n,
+        });
+    }
+}
+
+impl BuildSystem for Ticker {
+    type Params = ();
+    fn new(_params: ()) -> Self {
+        Ticker { n: 0 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build and locate the fixture cdylib
+// ---------------------------------------------------------------------------
+
+/// Build the fixture crate and locate its `cdylib`, skipping on failure.
+fn locate_fixture() -> Option<PathBuf> {
+    common::locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+}
+
+/// A 200 Hz, depth-8, 5 ms-per-step simulated mission, the shared coordinator
+/// config across the dl tests.
+fn dl_coordinator() -> CoordinatorSpec {
+    CoordinatorSpec {
+        cycle_rate: 200.0,
+        default_depth: Some(8),
+        clock: ClockSpec::Simulated { dt_secs: 0.005 },
+    }
+}
+
+/// A registry with `Ticker` registered as the static producer.
+fn ticker_registry() -> Registry {
+    let mut registry = Registry::new();
+    registry.register::<Ticker, _>("Ticker");
+    registry
+}
+
+// ---------------------------------------------------------------------------
+// The tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dlopen_cyclic_system_end_to_end() {
+    let Some(lib_path) = locate_fixture() else {
+        // Build plumbing unavailable; tests_abi covers the loader in-binary.
+        return;
+    };
+
+    // 1. Open the shared object directly to check the pack's exported entry
+    //    names and validate the selected entry's reconstructed descriptor —
+    //    the same manifest `resolve` reads back through its own open.
+    let pack = DlPack::open(&lib_path).expect("DlPack::open the fixture .so");
+    assert_eq!(
+        pack.system_names().collect::<Vec<_>>(),
+        ["DlCounter", "DlEcho"],
+        "the pack manifest lists both entries in registration order"
+    );
+    let loaded = pack.system("DlCounter").expect("select the counter entry");
+    let desc = loaded.descriptor();
+    assert_eq!(desc.name, "DlCounter");
+    assert_eq!(desc.kind, SystemKind::Cyclic);
+    assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
+    assert_eq!(
+        desc.inputs[0].id().component().expect("table port"),
+        TickIn::FRAME_ID
+    );
+    // User `out`, user `events` (the Postcard port), implicit health, implicit log.
+    assert_eq!(desc.outputs.len(), 4);
+    assert_eq!(
+        desc.outputs[0].id().component().expect("table port"),
+        TickOut::FRAME_ID
+    );
+    // The message port crossed the ABI schema-tagged with its axes intact; a
+    // shared object declares a Postcard port exactly like a static system.
+    let events = &desc.outputs[1];
+    assert_eq!(events.id().packet().expect("postcard port"), TickEvent::ID);
+    assert_eq!(
+        events.name, "TickEvent",
+        "the NamedMsg token survives the wire"
+    );
+    assert_eq!(events.delivery, Delivery::Log);
+    assert_eq!(events.fan_in, FanIn::Many);
+    assert!(events.telemetered);
+    assert!(
+        desc.capabilities.is_empty(),
+        "a .so can hold no host capabilities"
+    );
+    drop((loaded, pack));
+
+    // 2. Describe the mission: a static producer into two instances of the
+    //    same loaded entry, each with its own params (start=1000, start=2000).
+    //    One opened pack mints any number of independent instances.
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(dl_coordinator())
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
+        .system("ticker")
+        .ty("Ticker")
+        .end()
+        .system("dl_counter")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .params(CounterParams {
+            start: 1000,
+            scale: 1.0,
+        })
+        .end()
+        .system("dl_counter_b")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .params(CounterParams {
+            start: 2000,
+            scale: 1.0,
+        })
+        .end()
+        // Each `connect` runs `compatible()` over the loaded descriptor's
+        // `tick_in` input, the same wiring validation a static system gets.
+        .connect("ticker", "tick_in", "dl_counter", "tick_in")
+        .connect("ticker", "tick_in", "dl_counter_b", "tick_in")
+        .build();
+    // `main`'s helper already built and located the fixture; fill the path in
+    // place of the build driver.
+    wiring.artifacts[0].path = Some(lib_path);
+
+    let mut coord =
+        resolve(&wiring, &ticker_registry()).expect("graph resolves (validation + sizing + bind)");
+
+    // 3. Tap the loaded system's output through the telemetry registry before
+    //    running; a fresh view only sees records committed from now on.
+    let mut out_view: Input<TickOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("dl_counter.tick_out"))
+            .expect("dl output is registered for telemetry `All`")
+            .expect("a reader slot is available"),
+    );
+    // The Postcard port is a registered message channel like any static
+    // system's, keyed `<instance>.<NAME>` and drained with a host-side MsgIn.
+    let mut events_in: MsgIn<TickEvent> = MsgIn::new(
+        coord
+            .registry()
+            .view(ComponentId::new("dl_counter.TickEvent"))
+            .expect("dl message channel is registered")
+            .expect("a reader slot is available"),
+    );
+    let mut twin_view: Input<TickOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("dl_counter_b.tick_out"))
+            .expect("second instance's output is registered")
+            .expect("a reader slot is available"),
+    );
+
+    // 4. Run several cycles. The producer runs before the consumer each cycle,
+    //    so the consumer samples that cycle's fresh value. `run_for` performs
+    //    init (fsw_pack_bind_init), the cycles (fsw_pack_execute), and shutdown
+    //    (fsw_pack_shutdown); `coord` is handed back so it outlives the reads below.
+    const CYCLES: usize = 6;
+    let coord = stellarator::run(|| async move {
+        coord.run_for(CYCLES).await;
+        coord
+    });
+
+    // 5. The loaded system produced correct output: count = start + value.
+    {
+        let out = out_view
+            .latest()
+            .expect("tick_out ring readable")
+            .expect("the dl system produced a tick_out");
+        assert_eq!(
+            out.get().count,
+            1000 + CYCLES as u64,
+            "start + latest value"
+        );
+    }
+
+    // 5a. The second instance of the same entry ran independently, with its
+    //     own params.
+    {
+        let out = twin_view
+            .latest()
+            .expect("tick_out ring readable")
+            .expect("the second dl instance produced a tick_out");
+        assert_eq!(
+            out.get().count,
+            2000 + CYCLES as u64,
+            "the twin's own start + latest value"
+        );
+    }
+
+    // 5b. The Postcard port carried every cycle's event, in order, decoded
+    //     purely from the self-describing id.
+    let mut counts: Vec<u64> = Vec::new();
+    events_in
+        .drain(|e| counts.push(e.count))
+        .expect("events ring readable");
+    assert_eq!(
+        counts,
+        (1..=CYCLES as u64).map(|v| 1000 + v).collect::<Vec<_>>(),
+        "every-record log semantics across the dl boundary"
+    );
+
+    // 6. Teardown ordering: dropping the coordinator runs `fsw_pack_destroy` before
+    //    the `Library` unloads and before the `RingTable` frees the regions.
+    //    Not crashing here is the assertion.
+    drop(coord);
+    drop((out_view, events_in, twin_view));
+}
+
+/// Building through the driver ([`build_artifacts`]) leaves a
+/// `<cdylib>.manifest` sidecar next to the `.so` — raw postcard
+/// [`PackManifest`] bytes naming the same entries the opened pack reports
+/// — and `manifest_sidecar: false` opts out. Byte-level sidecar ≡ describe
+/// equality is asserted in the driver's own unit tests
+/// (`wiring::build_driver`), where the raw describe bytes are reachable.
+///
+/// [`build_artifacts`]: metor_fsw_2::wiring::build_artifacts
+/// [`PackManifest`]: metor_fsw_2::abi::PackManifest
+#[test]
+fn build_driver_writes_manifest_sidecar() {
+    use metor_fsw_2::wiring::{BuildOptions, WiringBuilder, build_artifacts};
+
+    let fixture = || {
+        WiringBuilder::new()
+            .artifact(
+                "fixture",
+                "metor-fsw-2-dl-fixture",
+                "metor_fsw_2_dl_fixture",
+            )
+            .build()
+    };
+    let mut wiring = fixture();
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    let so = wiring.artifacts[0].path.clone().expect("path filled");
+    let mut sidecar = so.clone().into_os_string();
+    sidecar.push(".manifest");
+    let sidecar = PathBuf::from(sidecar);
+
+    let bytes = std::fs::read(&sidecar).expect("sidecar written next to the built .so");
+    let manifest: metor_fsw_2::abi::PackManifest =
+        postcard::from_bytes(&bytes).expect("sidecar bytes decode as the pack manifest");
+    let pack = DlPack::open(&so).expect("DlPack::open the fixture .so");
+    assert_eq!(
+        manifest
+            .systems
+            .iter()
+            .map(|s| s.descriptor.name.as_str())
+            .collect::<Vec<_>>(),
+        pack.system_names().collect::<Vec<_>>(),
+        "the sidecar names the entries the opened pack reports"
+    );
+    drop(pack);
+
+    // Opting out builds the library but writes no sidecar.
+    std::fs::remove_file(&sidecar).expect("clear the sidecar for the opt-out check");
+    let opts = BuildOptions {
+        manifest_sidecar: false,
+        ..BuildOptions::default()
+    };
+    let mut wiring = fixture();
+    build_artifacts(&mut wiring, &opts).expect("rebuild is a cargo no-op");
+    assert!(!sidecar.exists(), "opted out, so no sidecar is written");
+}
+
+/// A failing `fsw_pack_create` must not leave the slot looking permanently
+/// `Running`. Here the params do not postcard-decode as `CounterParams`, so
+/// the fixture's `catch_unwind` inside `fsw_pack_create` returns a null state. The
+/// coordinator's stopped-systems telemetry must report the system from the
+/// first cycle, exactly like a lapped input or an in-cycle panic would.
+#[test]
+fn dlopen_null_create_reports_stopped() {
+    let Some(lib_path) = locate_fixture() else {
+        // Build plumbing unavailable; tests_abi covers the loader in-binary.
+        return;
+    };
+
+    // `CounterParams` is `{ start: u64, scale: f64 }`; three bytes cannot
+    // decode as either field, so the fixture's `fsw_pack_create` panics inside its
+    // own `catch_unwind` and returns a null state rather than crashing across
+    // the `extern "C"` boundary (`abi_panic_is_contained` tests that
+    // containment directly, in-binary). The raw bytes are set straight on the
+    // spec's `ParamSource::Postcard`, which the dl path passes through verbatim.
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(dl_coordinator())
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
+        .system("ticker")
+        .ty("Ticker")
+        .end()
+        .system("dl_counter")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .end()
+        .connect("ticker", "tick_in", "dl_counter", "tick_in")
+        .build();
+    wiring.artifacts[0].path = Some(lib_path);
+    wiring.systems[1].params = ParamSource::Postcard(vec![0xFF, 0xFF, 0xFF]);
+
+    // `resolve` calls `fsw_pack_create` at bind time, so the null state is
+    // latched into the slot before any cycle runs.
+    let mut coord = resolve(&wiring, &ticker_registry())
+        .expect("graph resolves even though fsw_pack_create failed inside it");
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(3).await;
+        coord
+    });
+
+    // A null-state slot never executes, so nothing later would update its
+    // state; `make_slot` latches `Stopped(Panicked)` up front and `stopped()`
+    // reports it here.
+    let stopped = coord.stopped();
+    assert_eq!(
+        stopped.len(),
+        1,
+        "the failed-create dl system is reported stopped"
+    );
+    // Stopped systems are named type-level, like a static system's
+    // `System::NAME`: for a dl system that is the pack entry name.
+    assert_eq!(&*stopped[0].name, "DlCounter");
+    assert_eq!(stopped[0].reason, StopReason::Panicked);
+
+    drop(coord);
+}

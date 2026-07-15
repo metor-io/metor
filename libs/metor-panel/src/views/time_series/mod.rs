@@ -44,32 +44,35 @@ pub use measurement_panel::PanelPosition;
 /// Iterator of tick values for any value axis on a `[min, max)` range.
 ///
 /// Ticks are anchored at zero whenever the range crosses it so the origin
-/// stays on a labeled line. Near-zero values are snapped to exact zero to
-/// avoid the `-5.6e-17` artifacts that show up with floating arithmetic.
-/// Used for both Y axes on time-series plots and both axes on XY plots.
+/// stays on a labeled line, and are generated as `start + i * step` rather
+/// than by accumulation so float drift can't drop the top tick. Near-zero
+/// values are snapped to exact zero to avoid the `-5.6e-17` artifacts that
+/// show up with floating arithmetic. Used for both Y axes on time-series
+/// plots and both axes on XY plots.
 pub(crate) fn value_ticks(min: f64, max: f64, target_count: usize) -> impl Iterator<Item = f64> {
     let step = pretty_round((max - min) / target_count as f64);
-    let (start, end) = if !step.is_normal() || step <= 0.0 {
-        (0.0, -1.0) // empty range — iterator yields nothing
-    } else if min <= 0.0 && max >= 0.0 {
-        // Anchor at 0: find the lowest tick by stepping down from 0
-        let neg_steps = (-min / step).floor() as i64;
-        let start = -step * neg_steps as f64;
-        (start, max)
+    let (start, count) = if !step.is_normal() || step <= 0.0 {
+        (0.0, 0)
     } else {
-        let start = (min / step).ceil() * step;
-        (start, max + step * 0.01)
-    };
-
-    let mut v = start;
-    std::iter::from_fn(move || {
-        if v <= end {
-            let tick = if v.abs() < step * 1e-10 { 0.0 } else { v };
-            v += step;
-            Some(tick)
+        let (start, end) = if min <= 0.0 && max >= 0.0 {
+            // Anchor at 0: find the lowest tick by stepping down from 0
+            let neg_steps = (-min / step).floor() as i64;
+            (-step * neg_steps as f64, max)
         } else {
-            None
+            ((min / step).ceil() * step, max + step * 0.01)
+        };
+        // The epsilon rescues a top tick whose quotient lands barely under
+        // an integer through division rounding alone.
+        let steps = ((end - start) / step + 1e-9).floor();
+        if steps < 0.0 {
+            (start, 0)
+        } else {
+            (start, steps as usize + 1)
         }
+    };
+    (0..count).map(move |i| {
+        let v = start + i as f64 * step;
+        if v.abs() < step * 1e-10 { 0.0 } else { v }
     })
 }
 
@@ -143,48 +146,46 @@ fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
 /// crawl during pan) and Unix epoch `0` for absolute labels (so ticks land
 /// on wall-clock boundaries like `:00`/`:30`).
 fn x_ticks(view: &PlotBounds, target_count: usize, anchor: f64) -> impl Iterator<Item = i64> {
+    // Backstop: `segment_round` keeps the count near `target_count`, but a
+    // paint pass must never be able to loop unbounded if it degenerates.
+    const MAX_TICKS: usize = 1024;
     let range = view.width();
     let target = (target_count as f64).max(1.0);
     let raw_step_us = range / target;
     let step_dur = segment_round(hifitime::Duration::from_microseconds(raw_step_us));
-    let step_i = (step_dur.total_nanoseconds() / 1_000) as i64;
+    // Sub-microsecond windows round to a zero-microsecond step; clamp to
+    // one so the iterator always advances.
+    let step_i = ((step_dur.total_nanoseconds() / 1_000) as i64).max(1);
 
     let t_min = view.min_x as i64;
     let t_max = view.max_x as i64;
     let ds = anchor as i64;
-    let valid = range > 0.0 && step_i > 0;
 
-    // Ticks are snapped to multiples of `step_i` measured from `data_start`
+    // Ticks are snapped to multiples of `step_i` measured from the anchor
     // so scrubbing doesn't make labels crawl across the axis.
-    let offset_from_start = t_min - ds;
-    let aligned = if valid {
-        ds + (offset_from_start / step_i) * step_i
-    } else {
-        t_min
-    };
-    let start = if aligned < t_min {
+    let aligned = ds + ((t_min - ds) / step_i) * step_i;
+    let first = if aligned < t_min {
         aligned + step_i
     } else {
         aligned
     };
-    let end = if valid { t_max } else { t_min };
+    // A degenerate window still labels its position: yield `t_min` once.
+    let (start, end) = if range > 0.0 {
+        (first, t_max)
+    } else {
+        (t_min, t_min)
+    };
 
     let mut t = start;
-    let mut done = false;
+    let mut yielded = 0;
     std::iter::from_fn(move || {
-        if done {
+        if t > end || yielded >= MAX_TICKS {
             return None;
         }
-        if t <= end {
-            let tick = t;
-            t += step_i;
-            Some(tick)
-        } else if !valid && !done {
-            done = true;
-            Some(t_min)
-        } else {
-            None
-        }
+        let tick = t;
+        t = t.saturating_add(step_i);
+        yielded += 1;
+        Some(tick)
     })
 }
 
@@ -255,6 +256,31 @@ pub(crate) const Y_LABEL_WIDTH: f32 = 50.0;
 pub(crate) const X_LABEL_HEIGHT: f32 = 10.0;
 pub(crate) const PADDING: f32 = 8.0;
 pub(crate) const LABEL_FONT_SIZE: f32 = 11.0;
+
+/// Gap between the pointer and the hover readout box so the box never sits
+/// under the cursor.
+const HOVER_READOUT_OFFSET: f32 = 14.0;
+/// Inner padding on the hover readout box; mirrors the estimate in
+/// [`cursor::estimate_readout_size`] so placement matches the painted box.
+const READOUT_PAD_X: f32 = 6.0;
+const READOUT_PAD_Y: f32 = 4.0;
+
+/// One readout line: the trace's color, its label, and the formatted value
+/// at the crosshair timestamp.
+type HoverRows = smallvec::SmallVec<[(Hsla, SharedString, SharedString); 4]>;
+
+/// One visible trace's nearest sample to the hover crosshair — everything
+/// the readout rows and the on-plot sample markers need, produced by the
+/// single lookup in [`TimeSeriesPlot::hover_samples`].
+struct HoverSample {
+    color: Hsla,
+    label: SharedString,
+    /// The sample's actual timestamp (not the pointer's), so the marker
+    /// lands on the data point rather than on the crosshair.
+    ts: Timestamp,
+    value: f64,
+    axis_index: usize,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AxisZone {
@@ -685,7 +711,12 @@ fn paint_overlay(
                 &[run],
                 None,
             );
-            let origin = point(col_right - shaped.width - px(4.0), y - label_font_size / 2.0);
+            // Right-aligned 4px clear of the axis rule; a label wider than
+            // its column pins to the pane edge instead of painting over the
+            // tile border (this canvas draws above the tile chrome).
+            let label_x =
+                (col_right - shaped.width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
+            let origin = point(label_x, y - label_font_size / 2.0);
             let _ = shaped.paint(origin, label_font_size, window, cx);
         }
     }
@@ -708,7 +739,14 @@ fn paint_overlay(
             &[run],
             None,
         );
-        let origin = point(x - shaped.width / 2.0, pb.origin.y + pb.size.height + px(4.0));
+        // Centered on the tick, but a label near an edge tick is pulled
+        // inside the pane so it can't run over the tile border — the right
+        // chrome is only PADDING wide, far narrower than a time label.
+        let label_x = (x - shaped.width / 2.0).clamp(
+            outer_bounds.origin.x + px(2.0),
+            outer_bounds.origin.x + outer_bounds.size.width - shaped.width - px(2.0),
+        );
+        let origin = point(label_x, pb.origin.y + pb.size.height + px(4.0));
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 
@@ -894,6 +932,81 @@ fn paint_cursors(
     }
 }
 
+/// Snapshot of the hover overlay's visible state, captured during canvas
+/// prepare (mirrors [`CursorPaint`]) so the paint closure stays free of
+/// entity access.
+struct HoverPaint {
+    pointer_x: Pixels,
+    /// `(ts_us, norm_y, color)` per visible trace: the nearest sample's
+    /// timestamp with its value pre-normalized to `[0,1]` against the
+    /// trace's axis, so paint maps it with a fixed `0..1` Y view.
+    markers: Vec<(f64, f64, Hsla)>,
+}
+
+/// Paint the plain-hover crosshair: one thin vertical rule at the pointer's
+/// X, clipped to the plot area.
+///
+/// Deliberately thinner and more muted than the measurement cursors — it is
+/// transient chrome, never a persisted selection line.
+fn paint_hover_crosshair(
+    outer_bounds: Bounds<Pixels>,
+    view: &PlotView,
+    pointer_x: Pixels,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let pb = plot_area(outer_bounds, view.axis_count());
+    if pointer_x < pb.origin.x || pointer_x > pb.origin.x + pb.size.width {
+        return;
+    }
+    let color = Hsla {
+        a: 0.6,
+        ..crate::theme::theme(cx).text_secondary
+    };
+    let mut line = PathBuilder::stroke(px(0.5));
+    line.move_to(point(pointer_x, pb.origin.y));
+    line.line_to(point(pointer_x, pb.origin.y + pb.size.height));
+    if let Ok(path) = line.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// Paint one dot per visible trace at the sample the hover readout reports,
+/// pinning the readout's values to the data points they describe. Same dot
+/// idiom as the measurement cursors' endpoint markers in [`paint_cursors`].
+fn paint_hover_markers(
+    outer_bounds: Bounds<Pixels>,
+    view: &PlotView,
+    markers: &[(f64, f64, Hsla)],
+    window: &mut Window,
+) {
+    if markers.is_empty() {
+        return;
+    }
+    let pb = plot_area(outer_bounds, view.axis_count());
+    // Markers carry normalized [0,1] Y, so a 0..1 Y view maps them straight
+    // to screen.
+    let view = view.x_bounds();
+    for &(ts, norm_y, color) in markers {
+        let screen = view.to_screen(pb, ts, norm_y);
+        if screen.x < pb.origin.x
+            || screen.x > pb.origin.x + pb.size.width
+            || screen.y < pb.origin.y
+            || screen.y > pb.origin.y + pb.size.height
+        {
+            continue;
+        }
+        let dot = Bounds {
+            origin: point(screen.x - px(3.0), screen.y - px(3.0)),
+            size: gpui::Size {
+                width: px(6.0),
+                height: px(6.0),
+            },
+        };
+        window.paint_quad(gpui::fill(dot, color));
+    }
+}
+
 /// Rendering mode for a single [`Trace`].
 #[derive(Clone, Copy, Default, PartialEq, facet::Facet)]
 #[repr(u8)]
@@ -1010,6 +1123,10 @@ pub struct TimeSeriesPlot {
     /// Pointer-to-panel-origin offset captured at drag start, in window
     /// coordinates. `Some` while a panel drag is in flight.
     panel_drag: Option<Point<Pixels>>,
+    /// Window-local pointer position while plain-hovering over the plot,
+    /// driving the crosshair and value readout. `None` unless a bare hover
+    /// (no modifier, no drag) is over the plot area.
+    hover: Option<Point<Pixels>>,
 }
 
 /// Build traces for `component_id` × `indices`, cycling theme colors and
@@ -1077,6 +1194,7 @@ impl TimeSeriesPlot {
             cursor_drag: None,
             panel_position: PanelPosition::default(),
             panel_drag: None,
+            hover: None,
         }
     }
 
@@ -1429,6 +1547,167 @@ impl TimeSeriesPlot {
             cx.notify();
         });
     }
+
+    /// Drop the hover crosshair/readout, repainting if it was showing.
+    /// Called whenever a gesture that owns the pointer (pan, zoom, cursor
+    /// drag, inspector) begins, and on mouse-leave.
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        if self.hover.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Track the bare-hover pointer for the crosshair and value readout.
+    ///
+    /// Mutually exclusive with every other pointer gesture: a held modifier
+    /// (measurement), an in-flight drag, or a pointer over the axis chrome
+    /// all suppress it, so hover never fights pan/zoom/measure.
+    fn update_hover(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if event.modifiers.alt
+            || self.cursor_drag.is_some()
+            || self.drag_start.is_some()
+            || self.panel_drag.is_some()
+        {
+            self.clear_hover(cx);
+            return;
+        }
+        let Some(pa) = self.last_plot_area else {
+            self.clear_hover(cx);
+            return;
+        };
+        let axis_count = self.line_plot.read(cx).axes.len();
+        if axis_zone(event.position, pa, axis_count) != AxisZone::Plot {
+            self.clear_hover(cx);
+            return;
+        }
+        self.hover = Some(event.position);
+        cx.notify();
+    }
+
+    /// Resolve the hover crosshair against every visible trace: the pointer's
+    /// data-space X plus each trace's nearest sample (via the shared
+    /// [`LinePlot::trace_sample_at`]). The readout rows and the on-plot
+    /// sample markers are both derived from this one lookup, so the
+    /// highlighted point is always the sample the readout reports.
+    fn hover_samples(&self, cx: &gpui::App) -> Option<(f64, Vec<HoverSample>)> {
+        let pointer = self.hover?;
+        let pa = self.last_plot_area?;
+        let lp = self.line_plot.read(cx);
+        let view = lp.effective_view(cx)?;
+        let x_data = cursor::pixel_to_data_x(pointer.x, pa, view.x_bounds());
+        let ts = Timestamp(x_data as i64);
+        let mut samples = Vec::new();
+        for trace in lp.traces() {
+            let cfg = trace.read(cx);
+            if !cfg.visible {
+                continue;
+            }
+            let Some((sample_ts, value)) = lp.trace_sample_at(trace.entity_id(), ts, cx) else {
+                continue;
+            };
+            samples.push(HoverSample {
+                color: cfg.color,
+                label: cfg.label.clone(),
+                ts: sample_ts,
+                value,
+                axis_index: cfg.axis_index,
+            });
+        }
+        Some((x_data, samples))
+    }
+
+    /// Build the hover readout: a native div listing each visible trace's
+    /// value at the crosshair timestamp (via [`Self::hover_samples`]) under
+    /// a formatted time header, offset and clamped clear of the pointer and
+    /// pane edges.
+    fn hover_readout(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        let pointer = self.hover?;
+        let pa = self.last_plot_area?;
+        let lp = self.line_plot.read(cx);
+        let view = lp.effective_view(cx)?;
+        let theme = crate::theme::theme(cx);
+
+        let (x_data, samples) = self.hover_samples(cx)?;
+        let header = format_time_label(
+            x_data as i64,
+            lp.data_start().unwrap_or(0.0) as i64,
+            lp.x_time_format,
+            view.x_bounds().width(),
+        );
+
+        let rows: HoverRows = samples
+            .into_iter()
+            .map(|s| {
+                (
+                    s.color,
+                    s.label,
+                    SharedString::from(format_value_label(s.value)),
+                )
+            })
+            .collect();
+
+        let lens: smallvec::SmallVec<[(usize, usize); 4]> = rows
+            .iter()
+            .map(|(_, label, value)| (label.chars().count(), value.chars().count()))
+            .collect();
+        let size = cursor::estimate_readout_size(header.chars().count(), &lens);
+        let origin = cursor::readout_origin(pointer, size, pa, px(HOVER_READOUT_OFFSET));
+        // Position within the wrapper div, whose origin is inset from the
+        // plot area by the left chrome and top padding.
+        let inner_origin = point(
+            pa.origin.x - px(left_margin(view.axis_count())),
+            pa.origin.y - px(PADDING),
+        );
+
+        let mut boxed = div()
+            .flex()
+            .flex_col()
+            .gap_y_0()
+            .px(px(READOUT_PAD_X))
+            .py(px(READOUT_PAD_Y))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_primary)
+            .rounded(px(3.0))
+            .child(
+                div()
+                    .text_size(px(LABEL_FONT_SIZE))
+                    .text_color(theme.text_secondary)
+                    .child(SharedString::from(header)),
+            );
+        for (color, label, value) in rows {
+            boxed = boxed.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(LABEL_FONT_SIZE))
+                            .text_color(theme.text_secondary)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(LABEL_FONT_SIZE))
+                            .text_color(color)
+                            .child(value),
+                    ),
+            );
+        }
+
+        Some(
+            div()
+                .absolute()
+                .left(origin.x - inner_origin.x)
+                .top(origin.y - inner_origin.y)
+                .child(boxed)
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for TimeSeriesPlot {
@@ -1444,16 +1723,24 @@ impl Render for TimeSeriesPlot {
         let overlay_lp = self.line_plot.clone();
         let cursors_lp = self.line_plot.clone();
         let cursors_weak = cx.entity().downgrade();
+        let hover_weak = cx.entity().downgrade();
 
         let mut root = div().flex().flex_col().size_full().bg(theme.bg_secondary);
 
         let mut inner = div()
+            .id(("time-series-plot", cx.entity().entity_id().as_u64() as usize))
             .flex_1()
             .min_h_0()
             .relative()
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    this.clear_hover(cx);
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.clear_hover(cx);
                     if event.click_count == 2 {
                         this.reset_view(cx);
                         return;
@@ -1493,12 +1780,14 @@ impl Render for TimeSeriesPlot {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.clear_hover(cx);
                     this.open_cursor_inspector_at(event.position, window, cx);
                 }),
             )
             .on_mouse_move(
                 cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
                     if !event.dragging() {
+                        this.update_hover(event, cx);
                         return;
                     }
                     if this.advance_panel_drag(event.position, cx) {
@@ -1530,6 +1819,7 @@ impl Render for TimeSeriesPlot {
             )
             .on_scroll_wheel(
                 cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    this.clear_hover(cx);
                     let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
                         return;
                     };
@@ -1690,6 +1980,56 @@ impl Render for TimeSeriesPlot {
                 )
                 .absolute()
                 .inset_0(),
+            )
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        let mut out = None;
+                        let _ = hover_weak.update(cx, |this, cx| {
+                            let Some(pointer) = this.hover else {
+                                return;
+                            };
+                            let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
+                                return;
+                            };
+                            // Same lookup as the readout box, pre-normalized
+                            // per axis the way `CursorPaint` markers are.
+                            let markers = this
+                                .hover_samples(cx)
+                                .map(|(_, samples)| {
+                                    samples
+                                        .into_iter()
+                                        .map(|s| {
+                                            let b = view.axis_bounds(s.axis_index);
+                                            let h = (b.max_y - b.min_y).max(1e-12);
+                                            (
+                                                s.ts.0 as f64,
+                                                (s.value - b.min_y) / h,
+                                                s.color,
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            out = Some((
+                                view,
+                                HoverPaint {
+                                    pointer_x: pointer.x,
+                                    markers,
+                                },
+                            ));
+                        });
+                        (bounds, out)
+                    },
+                    move |_, (bounds, data), window, cx| {
+                        if let Some((view, hover)) = data {
+                            paint_hover_crosshair(bounds, &view, hover.pointer_x, window, cx);
+                            paint_hover_markers(bounds, &view, &hover.markers, window);
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
             );
 
         // Measurement panels: a native div tree positioned on top of
@@ -1702,6 +2042,10 @@ impl Render for TimeSeriesPlot {
             let left = panel.origin.x + chrome_left;
             let top = panel.origin.y + px(PADDING);
             inner = inner.child(div().absolute().left(left).top(top).child(panel.element));
+        }
+
+        if let Some(readout) = self.hover_readout(cx) {
+            inner = inner.child(readout);
         }
 
         root = root.child(inner);
@@ -1777,5 +2121,78 @@ impl Render for TimeSeriesPlot {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x_ticks_terminates_on_sub_microsecond_window() {
+        // Width under 5us used to truncate the step to zero and loop forever.
+        let view = PlotBounds::new(1_000.2, 0.0, 1_003.8, 1.0);
+        let ticks: Vec<i64> = x_ticks(&view, 5, 1_000.2).take(2_000).collect();
+        assert!(!ticks.is_empty());
+        assert!(ticks.len() < 2_000);
+        for pair in ticks.windows(2) {
+            assert!(pair[1] > pair[0]);
+        }
+    }
+
+    #[test]
+    fn x_ticks_zero_width_range_yields_position_once() {
+        let view = PlotBounds::new(5_000.0, 0.0, 5_000.0, 1.0);
+        let ticks: Vec<i64> = x_ticks(&view, 5, 5_000.0).take(10).collect();
+        assert_eq!(ticks, vec![5_000]);
+    }
+
+    #[test]
+    fn x_ticks_snap_to_anchor_multiples() {
+        let anchor = 1_000_003.0;
+        let view = PlotBounds::new(anchor, 0.0, 10_000_000.0, 1.0);
+        let ticks: Vec<i64> = x_ticks(&view, 5, anchor).collect();
+        assert!(ticks.len() >= 2);
+        let step = ticks[1] - ticks[0];
+        assert!(step > 0);
+        for &tick in &ticks {
+            assert_eq!((tick - anchor as i64) % step, 0);
+            assert!(tick >= view.min_x as i64 && tick <= view.max_x as i64);
+        }
+    }
+
+    #[test]
+    fn value_ticks_uses_nice_step() {
+        let ticks: Vec<f64> = value_ticks(0.0, 1234.0, 5).collect();
+        assert_eq!(ticks, vec![0.0, 250.0, 500.0, 750.0, 1000.0]);
+    }
+
+    #[test]
+    fn value_ticks_zero_crossing_anchors_at_zero() {
+        let ticks: Vec<f64> = value_ticks(-1.0, 1.0, 5).collect();
+        assert!(ticks.contains(&0.0));
+        assert_eq!(ticks.first(), Some(&-1.0));
+        assert_eq!(ticks.last(), Some(&1.0));
+    }
+
+    #[test]
+    fn value_ticks_tiny_fractional_range() {
+        let (min, max) = (0.001, 0.002);
+        let ticks: Vec<f64> = value_ticks(min, max, 5).collect();
+        assert!(ticks.len() >= 5);
+        let step = ticks[1] - ticks[0];
+        assert!((step - 0.000_2).abs() < 1e-12);
+        for pair in ticks.windows(2) {
+            assert!((pair[1] - pair[0] - step).abs() < 1e-12);
+        }
+        for &tick in &ticks {
+            assert!(tick >= min - 1e-12 && tick <= max + step * 0.02);
+        }
+    }
+
+    #[test]
+    fn value_ticks_empty_on_degenerate_range() {
+        assert_eq!(value_ticks(1.0, 1.0, 5).count(), 0);
+        assert_eq!(value_ticks(2.0, 1.0, 5).count(), 0);
     }
 }

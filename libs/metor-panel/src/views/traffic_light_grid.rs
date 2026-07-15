@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     App, Context, FocusHandle, Focusable, Hsla, IntoElement, MouseButton, SharedString, Window,
@@ -123,7 +124,13 @@ impl TrafficLightGrid {
             .retain(|c| matches.iter().any(|(id, _)| *id == c.id));
 
         for (id, name) in matches {
-            if self.cells.iter().any(|c| c.id == id) {
+            if let Some(cell) = self.cells.iter_mut().find(|c| c.id == id) {
+                // A kept cell may have been built before its component
+                // registered; re-read metadata so is_bool/element_names
+                // catch up without tearing down the stream task.
+                let meta = component_meta(&self.db, id);
+                cell.is_bool = meta.is_bool;
+                cell.element_names = meta.element_names;
                 continue;
             }
             let cell = build_cell(self.db.clone(), id, SharedString::from(name), cx);
@@ -231,9 +238,16 @@ fn spawn_watcher(db: Arc<DB>, cx: &mut Context<TrafficLightGrid>) -> gpui::Task<
                 break;
             }
             db.vtable_gen.wait().await;
+            // vtable_gen bumps once per registered component, so a startup
+            // burst would run the O(components) regex reconcile N times.
+            // Debounce so a burst collapses into one pass (reconcile reads
+            // the latest full state regardless).
+            cx.background_executor().timer(VTABLE_DEBOUNCE).await;
         }
     })
 }
+
+const VTABLE_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// Single-question wizard row for "give me a glob pattern, build a
 /// `TrafficLightGrid` from it". Empty input is a no-op so a stray Enter

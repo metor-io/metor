@@ -494,6 +494,47 @@ fn graph_with_clock_and_constant() -> NodeGraph {
     graph
 }
 
+/// Auto-layout is a pure function of the graph (the node map is a HashMap,
+/// so this guards the sort-by-flow-id determinism) and puts a producer a
+/// full layer before its consumer.
+#[test]
+fn auto_layout_deterministic_and_flow_ordered() {
+    let graph = graph_with_clock_and_constant();
+    let a = crate::node_editor::pane::auto_layout_positions(&graph);
+    let b = crate::node_editor::pane::auto_layout_positions(&graph);
+    assert_eq!(a, b);
+    let pos = |id: &str| a.iter().find(|(i, _)| i.as_ref() == id).unwrap().1;
+    assert!(pos("clk").0 < pos("k").0);
+}
+
+/// A user-created cycle can't wedge auto-layout: cycle members lay out
+/// unranked, sharing a layer without overlapping.
+#[test]
+fn auto_layout_survives_cycles() {
+    let mut graph = NodeGraph::new(1);
+    for id in ["a", "b"] {
+        graph.insert_node(
+            id.into(),
+            NodeSpec::Unary { op: UnaryOp::Abs },
+            Position { x: 0.0, y: 0.0 },
+        );
+    }
+    graph.add_edge(EdgeEntry {
+        source: "a".into(),
+        target: "b".into(),
+        target_socket: 0,
+    });
+    graph.add_edge(EdgeEntry {
+        source: "b".into(),
+        target: "a".into(),
+        target_socket: 0,
+    });
+
+    let out = crate::node_editor::pane::auto_layout_positions(&graph);
+    assert_eq!(out.len(), 2);
+    assert_ne!(out[0].1, out[1].1);
+}
+
 #[stellarator::test]
 async fn reconcile_adds_and_removes_built_nodes() {
     let mut registry = DynamicRegistry::new();
@@ -558,9 +599,24 @@ async fn dedup_across_two_graphs_share_node() {
 }
 
 #[stellarator::test]
+async fn persist_rejects_empty_name() {
+    let db_path = unique_db_path("persist-empty-name");
+    let db = Arc::new(metor_db::DB::create(db_path.clone()).unwrap());
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = const_f64(clock, 1.5).unwrap();
+    // A blank name aliases every empty-named persist onto one WAL, so it must
+    // be rejected rather than silently accepted.
+    let err = match ops::persist::persist(&db, "   ".into(), src) {
+        Ok(_) => panic!("blank name must be rejected"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, BuildError::InvalidArg { op: "persist", .. }));
+    let _ = std::fs::remove_dir_all(&db_path);
+}
+
+#[stellarator::test]
 async fn rebuild_propagates_parent_failure_downstream() {
-    // A `Persist` with an empty name still works (db inserts use the id, not
-    // the name). To force a clock mismatch we use Mul of two different clocks.
+    // To force a clock mismatch we use Mul of two different clocks.
     let mut registry = DynamicRegistry::new();
     let db_path = unique_db_path("pf");
     let db = Arc::new(metor_db::DB::create(db_path.clone()).unwrap());
@@ -1043,21 +1099,17 @@ fn config_round_trips_through_facet_json() {
         target_socket: 0,
     });
 
-    let viewport = Viewport {
-        x: -50.0,
-        y: 75.0,
-        zoom: 1.5,
-    };
+    let viewport = Viewport { x: -50.0, y: 75.0 };
     let cfg = NodeEditorConfig::from_graph(&g, viewport.clone());
     let json = facet_json::to_string(&cfg).expect("serialize");
     let parsed: NodeEditorConfig = facet_json::from_str(&json).expect("parse");
 
-    assert_eq!(parsed.owner_uuid, 0xDEAD_BEEF);
-    assert_eq!(parsed.viewport.zoom, viewport.zoom);
+    assert_eq!(parsed.viewport.x, viewport.x);
+    assert_eq!(parsed.viewport.y, viewport.y);
     assert_eq!(parsed.nodes.len(), 4);
     assert_eq!(parsed.edges.len(), 3);
 
-    let g2 = parsed.into_graph();
+    let g2 = parsed.into_graph(0xDEAD_BEEF);
     assert_eq!(g2.nodes.len(), 4);
     assert_eq!(g2.edges.len(), 3);
 
@@ -1104,6 +1156,17 @@ fn config_round_trips_through_facet_json() {
         })
         .collect();
     assert_eq!(original_ids, new_ids);
+}
+
+#[test]
+fn config_ignores_removed_legacy_fields() {
+    // Presets saved before `owner_uuid` and `viewport.zoom` were removed
+    // still carry them; hydration must skip the unknown keys, not fail.
+    let json =
+        r#"{"owner_uuid":123,"viewport":{"x":1.0,"y":2.0,"zoom":1.5},"nodes":[],"edges":[]}"#;
+    let parsed: NodeEditorConfig = facet_json::from_str(json).expect("legacy keys tolerated");
+    assert_eq!(parsed.viewport.x, 1.0);
+    assert_eq!(parsed.viewport.y, 2.0);
 }
 
 #[stellarator::test]

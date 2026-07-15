@@ -2,6 +2,7 @@ use darling::FromDeriveInput;
 use darling::ast;
 use darling::util::Override;
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
@@ -12,6 +13,7 @@ pub struct Metadatatize {
     generics: Generics,
     data: ast::Data<Ident, crate::Field>,
     parent: Option<String>,
+    name: Option<String>,
     /// `#[metor_fsw(group)]` emits a metadata-only parent entry with
     /// `group_name = <Ident>`. `#[metor_fsw(group = "Custom")]` overrides.
     #[darling(default)]
@@ -19,15 +21,22 @@ pub struct Metadatatize {
 }
 
 pub fn metadatatize(input: TokenStream) -> TokenStream {
-    let crate_name = crate::metor_fsw_crate_name();
     let input = parse_macro_input!(input as DeriveInput);
+    metadatatize_impl(&input, &crate::metor_fsw_crate_name()).into()
+}
+
+/// See [`componentize_impl`](crate::componentize::componentize_impl) for the
+/// `crate_name` root-path contract.
+pub fn metadatatize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> TokenStream2 {
     let Metadatatize {
         ident,
         generics,
         data,
         parent,
+        name,
         group,
-    } = Metadatatize::from_derive_input(&input).unwrap();
+    } = Metadatatize::from_derive_input(input).unwrap();
+    let parent = parent.or(name);
     let where_clause = &generics.where_clause;
     let impeller_wkt = quote! { #crate_name::metor_proto_wkt };
     match data {
@@ -43,10 +52,9 @@ pub fn metadatatize(input: TokenStream) -> TokenStream {
                     }
                 }
             }
-            .into()
         }
         ast::Data::Struct(fields) => {
-            let metadata_items = fields.fields.iter().map(|field| {
+            let metadata_items = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
                 let ty = &field.ty;
 
                 let name = field.component_name();
@@ -92,7 +100,6 @@ pub fn metadatatize(input: TokenStream) -> TokenStream {
                     }
                 }
             }
-            .into()
         }
     }
 }

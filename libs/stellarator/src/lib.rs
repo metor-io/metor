@@ -275,6 +275,20 @@ mod tests {
         assert!(delta <= 10, "Δt ({}) > 10ms", delta)
     }
 
+    /// Canceling a task parked in `sleep`, then outliving its timer deadline:
+    /// the wheel entry must not fire a waker into the freed task (regression —
+    /// the stale entry's wake underflowed the dead task's ref count).
+    #[stellarator_macros::test]
+    async fn test_cancel_while_sleeping() {
+        let handle = crate::spawn(async {
+            crate::sleep(Duration::from_millis(100)).await;
+        })
+        .drop_guard();
+        crate::yield_now().await; // let the task park in the timer wheel
+        drop(handle); // cancel it mid-sleep
+        crate::sleep(Duration::from_millis(300)).await; // outlive its deadline
+    }
+
     #[stellarator_macros::test]
     async fn test_cross_thread_wake() {
         let a = Arc::new(WaitCell::new());

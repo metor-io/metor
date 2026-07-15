@@ -309,21 +309,146 @@ impl ScreenTransform {
     }
 }
 
-/// Round `num` to the nearest `0.5 * 10^k` so axis steps land on
-/// human-friendly values (1, 1.5, 2, 5, 10, 20, 50, …).
+/// Fraction of the Y span added past an auto-fit extreme so a trace riding
+/// its own min or max clears the axis rule (a few pixels at typical plot
+/// heights) instead of being painted over by it.
+const AUTO_EDGE_PAD: f64 = 0.03;
+
+/// Resolve a Y range for display: pad the auto-fit ends so data extremes
+/// never land exactly on the plot border, while explicit overrides pass
+/// through untouched.
+///
+/// `lo_is_auto` / `hi_is_auto` mark ends that came from bounds tracking
+/// rather than a user override — the axis rules paint on top of the GPU
+/// lines, so an unpadded auto fit hides any trace sitting at the bound. A
+/// degenerate span (constant trace, or inverted overrides) defers to
+/// [`pad_degenerate_range`] regardless, since a zero-height view can't
+/// render at all.
+pub fn pad_auto_range(lo: f64, hi: f64, lo_is_auto: bool, hi_is_auto: bool) -> (f64, f64) {
+    if lo >= hi {
+        return pad_degenerate_range(lo, hi);
+    }
+    let pad = (hi - lo) * AUTO_EDGE_PAD;
+    (
+        if lo_is_auto { lo - pad } else { lo },
+        if hi_is_auto { hi + pad } else { hi },
+    )
+}
+
+/// Widen a degenerate `[lo, hi]` Y span so the data renders vertically
+/// centered instead of pinned to the bottom edge.
+///
+/// A constant-valued trace auto-fits to `min == max`; padding symmetrically
+/// (5% of the magnitude, floored so a constant zero still gets a usable
+/// range) keeps the flat line in the middle of the plot. Non-degenerate
+/// spans pass through untouched.
+pub fn pad_degenerate_range(lo: f64, hi: f64) -> (f64, f64) {
+    if lo < hi {
+        return (lo, hi);
+    }
+    let mid = (lo + hi) / 2.0;
+    let pad = (mid.abs() * 0.05).max(0.5);
+    (mid - pad, mid + pad)
+}
+
+/// Snap `num` to the nearest "nice" value — 1, 2, 2.5, or 5 times a power
+/// of ten — so axis tick steps land on human-friendly intervals at any
+/// scale (…, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, …).
 pub fn pretty_round(num: f64) -> f64 {
     if num == 0.0 || !num.is_finite() {
         return num;
     }
-    let mut multiplier = 1.0;
-    let mut n = num.abs();
+    let abs = num.abs();
+    let magnitude = 10f64.powi(abs.log10().floor() as i32);
+    let mantissa = abs / magnitude;
+    let nice = if mantissa < 1.5 {
+        1.0
+    } else if mantissa < 2.25 {
+        2.0
+    } else if mantissa < 3.75 {
+        2.5
+    } else if mantissa < 7.5 {
+        5.0
+    } else {
+        10.0
+    };
+    let result = nice * magnitude;
+    if num < 0.0 { -result } else { result }
+}
 
-    while n < 1.0 {
-        n *= 10.0;
-        multiplier *= 10.0;
+#[cfg(test)]
+mod tests {
+    use super::{pad_auto_range, pad_degenerate_range, pretty_round};
+
+    #[test]
+    fn auto_range_strictly_contains_the_data() {
+        // Data spanning [-1, 1]: neither extreme may land on the border.
+        let (lo, hi) = pad_auto_range(-1.0, 1.0, true, true);
+        assert!(lo < -1.0 && hi > 1.0);
+        assert!(
+            (-1.0 - lo - (hi - 1.0)).abs() < 1e-12,
+            "edge padding not symmetric"
+        );
     }
 
-    let rounded = (n * 2.0).round() / 2.0;
-    let result = rounded / multiplier;
-    if num < 0.0 { -result } else { result }
+    #[test]
+    fn explicit_overrides_are_respected_exactly() {
+        assert_eq!(pad_auto_range(-1.0, 1.0, false, false), (-1.0, 1.0));
+
+        // Mixed: only the auto end gets padded.
+        let (lo, hi) = pad_auto_range(-1.0, 1.0, false, true);
+        assert_eq!(lo, -1.0);
+        assert!(hi > 1.0);
+
+        let (lo, hi) = pad_auto_range(-1.0, 1.0, true, false);
+        assert!(lo < -1.0);
+        assert_eq!(hi, 1.0);
+    }
+
+    #[test]
+    fn auto_range_centers_degenerate_spans() {
+        // A constant trace stays centered rather than edge-padded.
+        let (lo, hi) = pad_auto_range(3.0, 3.0, true, true);
+        assert!(lo < 3.0 && hi > 3.0);
+        assert!((3.0 - lo - (hi - 3.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn degenerate_range_centers_the_value() {
+        let (lo, hi) = pad_degenerate_range(42.0, 42.0);
+        assert!(lo < 42.0 && hi > 42.0);
+        assert!((42.0 - lo - (hi - 42.0)).abs() < 1e-12, "padding not symmetric");
+
+        // A constant zero still needs a non-empty span.
+        let (lo, hi) = pad_degenerate_range(0.0, 0.0);
+        assert!(lo < 0.0 && hi > 0.0);
+    }
+
+    #[test]
+    fn real_range_passes_through() {
+        assert_eq!(pad_degenerate_range(-1.0, 2.0), (-1.0, 2.0));
+    }
+
+    #[test]
+    fn snaps_to_nice_mantissas() {
+        assert_eq!(pretty_round(246.8), 250.0);
+        assert_eq!(pretty_round(1.4), 1.0);
+        assert_eq!(pretty_round(1.6), 2.0);
+        assert_eq!(pretty_round(4.0), 5.0);
+        assert_eq!(pretty_round(9.0), 10.0);
+    }
+
+    #[test]
+    fn preserves_sign_and_scale() {
+        assert_eq!(pretty_round(-246.8), -250.0);
+        assert!((pretty_round(0.2) - 0.2).abs() < 1e-12);
+        assert!((pretty_round(0.000_23) - 0.000_25).abs() < 1e-15);
+    }
+
+    #[test]
+    fn passes_through_degenerate_inputs() {
+        assert_eq!(pretty_round(0.0), 0.0);
+        assert!(pretty_round(f64::INFINITY).is_infinite());
+        assert!(pretty_round(f64::NAN).is_nan());
+    }
 }

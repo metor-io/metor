@@ -75,14 +75,14 @@ pub fn load() -> PanelConfig {
         // A first-run user has no file yet; that's the common case, not an error.
         Err(e) if e.kind() == io::ErrorKind::NotFound => return PanelConfig::default(),
         Err(e) => {
-            eprintln!("read config {}: {e}", path.display());
+            tracing::error!(path = %path.display(), %e, "read config failed");
             return PanelConfig::default();
         }
     };
     match facet_json::from_str(&json) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("parse config {}: {e}", path.display());
+            tracing::error!(path = %path.display(), %e, "parse config failed");
             PanelConfig::default()
         }
     }

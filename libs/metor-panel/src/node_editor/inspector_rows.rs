@@ -38,8 +38,7 @@ use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{
-    BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow,
-    TextRow,
+    BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow, TextRow,
 };
 use crate::node_editor::graph::{BuildState, FlowId, NodeGraph};
 use crate::node_editor::pane::NodeEditor;
@@ -78,6 +77,16 @@ fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
         })
         .with_tag(SharedString::new_static("editor")),
     ));
+
+    rows.push(Box::new(CommandRow::new(
+        SharedString::new_static("Auto-layout"),
+        {
+            let editor = editor.clone();
+            Arc::new(move |_window, cx| {
+                editor.update(cx, |ed, cx| ed.auto_layout(cx));
+            })
+        },
+    )));
 
     // "Nodes" — drill into a specific node's rows so palette-driven edits
     // reach the same `rows_for_node` set used inline.

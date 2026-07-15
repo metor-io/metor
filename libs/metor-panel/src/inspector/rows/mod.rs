@@ -78,6 +78,13 @@ pub trait InspectorRow: 'static {
     fn consumes_search(&self) -> bool {
         false
     }
+
+    /// Non-interactive section headers return `true` so the inspector skips
+    /// them during arrow-key selection and drops them from filtered results
+    /// (an empty header is more confusing than none).
+    fn is_header(&self) -> bool {
+        false
+    }
 }
 
 /// A view-hosting inspector page: arbitrary gpui widget, the panel size
@@ -143,6 +150,9 @@ pub fn render_label_row(
 ) -> AnyElement {
     let mut row = row_base(row_ix, selected, cx).child(
         div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
             .text_size(px(12.0))
             .text_color(color)
             .child(label),

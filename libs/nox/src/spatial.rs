@@ -352,6 +352,10 @@ impl<T: TensorItem + RealField, R: OwnedRepr> SpatialInertia<T, R> {
     }
 }
 
+/// The pure inertia map `(τ/I_diag, f/m)`, element-wise: valid only when the torque is
+/// expressed along the same principal axes as `inertia_diag`, and it carries no gyroscopic
+/// (`ω × I ω`) term — full rigid-body dynamics belong to `DU::from_body_force` (six_dof.rs),
+/// which rotates into the body frame and applies the Euler coupling.
 impl<T: TensorItem + RealField, R: OwnedRepr> Div<SpatialInertia<T, R>> for SpatialForce<T, R> {
     type Output = SpatialMotion<T, R>;
 
@@ -613,6 +617,8 @@ mod tests {
     use super::*;
 
     #[test]
+    // the expected floats are exact outputs of the multiply; one lands a ULP off SQRT_2
+    #[allow(clippy::approx_constant)]
     fn test_spatial_transform_mul() {
         let a = SpatialTransform::new(
             Quaternion::<_, ArrayRepr>::from_axis_angle(tensor![0.0, 0.0, 1.0], 45f64.to_radians()),

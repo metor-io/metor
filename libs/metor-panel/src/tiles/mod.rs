@@ -49,8 +49,8 @@ const RESIZE_HANDLE_SIZE: f32 = 1.0;
 ///
 /// Version history:
 /// - 1: initial.
-/// - 2: `PlotPanelConfig` gains `default_measurements` and `cursors` for
-///   right-click-drag measurement cursors.
+/// - 2: `PlotPanelConfig` gains measurement `cursors` for right-click-drag
+///   measurement cursors.
 /// - 3: `PlotPanelConfig` gains `measurement_panel` (track/pinned position
 ///   for the native measurement readout panel).
 const SUPPORTED_LAYOUT_VERSION: u32 = 3;
@@ -60,8 +60,9 @@ const SUPPORTED_LAYOUT_VERSION: u32 = 3;
 pub enum LoadError {
     /// `facet-json` couldn't parse the document.
     Parse(facet_json::DeserializeError),
-    /// The document parsed but claims a layout version this binary doesn't
-    /// understand. The number is whatever the document carried.
+    /// The document claims a layout version newer than this build knows how to
+    /// read. Older versions load fine — the format is field-additive with
+    /// facet defaults — so only a forward version gap is rejected.
     UnsupportedVersion(u32),
 }
 
@@ -71,7 +72,7 @@ impl std::fmt::Display for LoadError {
             Self::Parse(e) => write!(f, "parse: {e}"),
             Self::UnsupportedVersion(v) => write!(
                 f,
-                "unsupported layout version {v}; this build understands {SUPPORTED_LAYOUT_VERSION}"
+                "unsupported layout version {v}; this build reads layouts up to version {SUPPORTED_LAYOUT_VERSION}"
             ),
         }
     }
@@ -485,6 +486,44 @@ impl TileGroup {
             .or_else(|| self.panes.first().cloned())
     }
 
+    /// Reveal the panel of `kind` (a [`PaneItem::serialization_key`]): when one
+    /// is already open anywhere in the layout, activate its tab and make its
+    /// pane current; otherwise build a fresh item with `make` and add it as a
+    /// new tab in the active pane.
+    ///
+    /// This is the entry point for "jump to X" affordances (the titlebar alarm
+    /// summary, and any future status-bar shortcut) — unlike the palette's
+    /// explicit "New Panel" commands, revealing must not multiply tabs.
+    pub fn focus_or_open(
+        &mut self,
+        kind: &str,
+        make: impl FnOnce(&mut Context<Pane>) -> Box<dyn PaneItemHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.panes.iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .iter()
+                .position(|item| item.serialization_key() == kind)
+                .map(|ix| (pane.clone(), ix))
+        });
+        match existing {
+            Some((pane, ix)) => {
+                pane.update(cx, |pane, cx| pane.activate_item(ix, cx));
+                self.focused_pane = Some(pane);
+                cx.notify();
+            }
+            None => {
+                if let Some(pane) = self.active_pane(cx) {
+                    pane.update(cx, |pane, cx| {
+                        let item = make(cx);
+                        pane.add_item(item, cx);
+                    });
+                }
+            }
+        }
+    }
+
     /// Split `target` along `direction`, placing `new_pane` beside it.
     pub fn split_pane(
         &mut self,
@@ -493,8 +532,13 @@ impl TileGroup {
         direction: SplitDirection,
         cx: &mut Context<Self>,
     ) {
+        // A missing `target` makes the split a no-op; tracking `new_pane`
+        // anyway would leave a pane that's counted but never rendered — and
+        // swallow whatever item it was carrying.
+        if !self.root.split(target, &new_pane, direction) {
+            return;
+        }
         cx.subscribe(&new_pane, Self::handle_pane_event).detach();
-        self.root.split(target, &new_pane, direction);
         // A freshly-split pane becomes the current one so a follow-up chord
         // (e.g. "new tile") lands in the pane the user just created.
         self.focused_pane = Some(new_pane.clone());
@@ -540,7 +584,9 @@ impl TileGroup {
         cx: &mut Context<Self>,
     ) -> Result<Self, LoadError> {
         let serialized: SerializedTileGroup = facet_json::from_str(json)?;
-        if serialized.version != SUPPORTED_LAYOUT_VERSION {
+        // Older layouts load fine — the document is field-additive with facet
+        // defaults — so only reject versions this build predates.
+        if serialized.version > SUPPORTED_LAYOUT_VERSION {
             return Err(LoadError::UnsupportedVersion(serialized.version));
         }
         Ok(Self::deserialize(serialized, registry, cx))
@@ -744,5 +790,55 @@ impl Render for TileGroup {
             .size_full()
             .bg(theme.bg_secondary)
             .child(self.root.render(SplitPath::new(), &tile_group, window, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tiles::pane::TabOrientation;
+
+    fn empty_pane_layout(version: u32) -> String {
+        let layout = SerializedTileGroup {
+            version,
+            global_time_range: String::new(),
+            root: SerializedMember::Pane(SerializedPane {
+                active_index: 0,
+                tab_orientation: TabOrientation::Horizontal,
+                hide_tab_bar: false,
+                locked_size: None,
+                items: vec![],
+            }),
+        };
+        facet_json::to_string(&layout).expect("serialize")
+    }
+
+    #[gpui::test]
+    fn from_json_accepts_older_version(cx: &mut gpui::TestAppContext) {
+        let json = empty_pane_layout(1);
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
+        let ok = cx.update(|cx| {
+            tg.update(cx, |_this, cx| {
+                let registry = ItemRegistry::default();
+                TileGroup::from_json(&json, &registry, cx).is_ok()
+            })
+        });
+        assert!(ok, "a version below the supported ceiling must load");
+    }
+
+    #[gpui::test]
+    fn from_json_rejects_newer_version(cx: &mut gpui::TestAppContext) {
+        let json = empty_pane_layout(SUPPORTED_LAYOUT_VERSION + 1);
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
+        let rejected = cx.update(|cx| {
+            tg.update(cx, |_this, cx| {
+                let registry = ItemRegistry::default();
+                matches!(
+                    TileGroup::from_json(&json, &registry, cx),
+                    Err(LoadError::UnsupportedVersion(v)) if v == SUPPORTED_LAYOUT_VERSION + 1
+                )
+            })
+        });
+        assert!(rejected, "a version above the ceiling must be rejected");
     }
 }

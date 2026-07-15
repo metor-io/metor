@@ -1,0 +1,160 @@
+{
+  "ir_version": 2,
+  "coordinator": {
+    "cycle_rate": 120.0,
+    "default_depth": null,
+    "clock": { "Simulated": { "dt_secs": 0.5 } }
+  },
+  "artifacts": [
+    {
+      "id": "adcs",
+      "crate_name": "adcs-systems",
+      "cdylib": "libadcs_systems.dylib",
+      "path": null,
+      "manifest_hash": null,
+      "src": null
+    },
+    {
+      "id": "seqs",
+      "crate_name": "adcs-sequences",
+      "cdylib": "libadcs_sequences.dylib",
+      "path": null,
+      "manifest_hash": null,
+      "src": null
+    }
+  ],
+  "systems": [
+    {
+      "name": "block.plant",
+      "ty": "Plant",
+      "artifact": "adcs",
+      "params": {
+        "Value": {
+          "init_angle": 0.5,
+          "init_rate": 0.15,
+          "seed": 42,
+          "disarmed": false,
+          "cp_offset_b": [0.02, 0.0, 0.0]
+        }
+      },
+      "process": true,
+      "src": null,
+      "scope": 0
+    },
+    {
+      "name": "block.nav",
+      "ty": "Nav",
+      "artifact": "adcs",
+      "params": "None",
+      "process": false,
+      "src": null,
+      "scope": 0
+    },
+    {
+      "name": "alarms",
+      "ty": "Alarms",
+      "artifact": null,
+      "params": {
+        "Value": {
+          "alarm": [
+            {
+              "id": "ADCS_RATE_HIGH",
+              "name": "Body Rate High",
+              "description": "Measured body-Y rate exceeds the detumbled envelope",
+              "target": { "component": "block.plant.sensors.gyro_b", "element": 1 },
+              "warning": { "above": 0.05, "below": -0.05 },
+              "critical": { "above": 0.15, "below": -0.15 },
+              "debounce": 2,
+              "hysteresis": 0.005
+            }
+          ]
+        }
+      },
+      "process": false,
+      "src": null,
+      "scope": null
+    },
+    {
+      "name": "uplink",
+      "ty": "TcpUplink",
+      "artifact": null,
+      "params": { "Value": { "addr": "127.0.0.1:2240", "msgs": ["SequenceCommand"] } },
+      "process": false,
+      "src": null,
+      "scope": null
+    }
+  ],
+  "slots": [
+    {
+      "name": "mode",
+      "inputs": ["attitude_estimate", "gps"],
+      "outputs": ["mode_cmd"],
+      "allow": [
+        {
+          "occupant": "commissioning",
+          "artifact": "seqs",
+          "params": { "Value": { "rate_detumble_enter": 1.0 } },
+          "src": null
+        },
+        {
+          "occupant": "safe_mode",
+          "artifact": "seqs",
+          "params": "None",
+          "src": null
+        }
+      ],
+      "initial": { "occupant": "commissioning", "state": "Running" },
+      "process": false,
+      "src": null,
+      "scope": null
+    }
+  ],
+  "edges": [
+    {
+      "from": "block.plant",
+      "out": "sensors",
+      "to": "block.nav",
+      "in_": "sensors",
+      "delayed": false,
+      "kind": "Frame",
+      "src": null
+    },
+    {
+      "from": "block.nav",
+      "out": "attitude_estimate",
+      "to": "mode",
+      "in_": "attitude_estimate",
+      "delayed": false,
+      "kind": "Frame",
+      "src": null
+    },
+    {
+      "from": "mode",
+      "out": "mode_cmd",
+      "to": "block.plant",
+      "in_": "torque_cmd",
+      "delayed": true,
+      "kind": "Frame",
+      "src": null
+    },
+    {
+      "from": "uplink",
+      "out": "SequenceCommand",
+      "to": "mode",
+      "in_": "SequenceCommand",
+      "delayed": false,
+      "kind": "Msg",
+      "src": null
+    },
+    {
+      "from": "coordinator",
+      "out": "SequenceCommand",
+      "to": "mode",
+      "in_": "SequenceCommand",
+      "delayed": false,
+      "kind": "Msg",
+      "src": null
+    }
+  ],
+  "scopes": [{ "path": "block", "parent": null, "src": null }]
+}

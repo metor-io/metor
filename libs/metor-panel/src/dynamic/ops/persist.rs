@@ -33,6 +33,12 @@ pub fn persist(
     name: String,
     input: Arc<dyn DynamicNode>,
 ) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    if name.trim().is_empty() {
+        return Err(BuildError::InvalidArg {
+            op: "persist",
+            reason: "name must not be empty",
+        });
+    }
     let schema = input
         .value_type()
         .schema()
@@ -45,24 +51,18 @@ pub fn persist(
     // Component survives upstream edits.
     let component_id = ComponentId(component_id_for_name(&name));
 
-    // Detect whether `insert_component` actually adds a new entry — it
-    // returns `Ok(())` for both "newly inserted" and "already existed
-    // with matching schema". We need this distinction so we only bump
-    // `vtable_gen` (which wakes view watchers) on actual additions.
-    let was_new = db.with_state(|s| s.get_component(component_id).is_none());
+    // The existing on-disk schema (if any). Doubles as the "was this a new
+    // insert?" signal: we only bump `vtable_gen` (which wakes view watchers)
+    // on actual additions, and we report it as the incumbent side of a
+    // schema mismatch.
+    let existing_schema = db.with_state(|s| s.get_component(component_id).map(|c| c.schema.clone()));
+    let was_new = existing_schema.is_none();
     db.with_state_mut(|s| s.insert_component(component_id, schema.clone(), &db.path))
         .map_err(|err| match err {
-            metor_db::Error::SchemaMismatch => {
-                // The existing on-disk component has a different schema
-                // than what we're trying to register. We don't have its
-                // schema readily available here, so we report both sides
-                // as the *new* schema; the inspector still surfaces a
-                // clear "schema mismatch" label.
-                BuildError::SchemaMismatch {
-                    a: schema.clone(),
-                    b: schema.clone(),
-                }
-            }
+            metor_db::Error::SchemaMismatch => BuildError::SchemaMismatch {
+                a: existing_schema.clone().unwrap_or_else(|| schema.clone()),
+                b: schema.clone(),
+            },
             other => {
                 tracing::error!(?other, "persist: insert_component failed");
                 BuildError::DbError(other.to_string())
@@ -114,10 +114,20 @@ pub fn persist(
     ))
 }
 
-/// Hash a component name into a stable `ComponentId` raw value. Distinct
-/// from any node id hash so persist names don't collide with NodeId-derived
-/// stream component ids.
+/// Hash a component name into a stable `ComponentId` raw value.
+///
+/// Uses FNV-1a with pinned constants rather than [`hash_id`]'s
+/// `DefaultHasher` (SipHash): this id is written to disk as the durable
+/// identity of a persisted component, and `DefaultHasher`'s algorithm is
+/// unspecified across Rust releases, so a toolchain bump could orphan every
+/// persisted component. FNV-1a is fixed forever.
 pub fn component_id_for_name(name: &str) -> u64 {
-    let id = hash_id(b"persist.component_name", &[], |h| name.hash(h));
-    id.0
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in name.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }

@@ -6,7 +6,29 @@ use metor_proto::vtable::{
 use crate::path::ComponentPath;
 
 pub trait AsVTable {
+    /// *Static* form: leaves are absolute `component(path.chain(name).id)` ops,
+    /// used when the type is reached through compile-time struct nesting.
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder>;
+
+    /// *Dynamic member-template* form (frames.md §4): leaves are
+    /// `path_component(name)` ops with offsets relative to the element base and no
+    /// absolute path baked in — the runtime path is composed by the enclosing
+    /// `list`/`map` at realize time. Used when the type is the element of a
+    /// `FrameList`/`FrameMap`.
+    ///
+    /// `prefix` is the dotted name of this value *relative to the element base*
+    /// (empty for the element root). A scalar leaf emits `path_component(prefix)`;
+    /// a derived struct recurses with `prefix.field`; a nested dynamic member emits
+    /// `list`/`map` named by its relative `prefix.field`. Taken by value so the
+    /// returned iterator need not borrow a caller temporary.
+    ///
+    /// Defaulted to empty so existing hand-written `AsVTable` impls (e.g. the nox
+    /// spatial types) keep compiling — only types actually used as dynamic elements
+    /// (scalars, frames, `FrameList`/`FrameMap`) override it.
+    fn element_fields(_prefix: String) -> impl Iterator<Item = FieldBuilder> {
+        core::iter::empty()
+    }
+
     fn as_vtable() -> VTable {
         vtable(Self::vtable_fields(()))
     }
@@ -80,13 +102,16 @@ mod tests {
             .apply(telemetry.as_bytes(), &mut sink)
             .unwrap()
             .unwrap();
-        for component in ["nested.inner", "value", "time"] {
+        for component in ["nested.inner", "value"] {
             assert_eq!(
                 sink.timestamps.get(&ComponentId::new(component)),
                 Some(&Some(Timestamp(1234))),
                 "{component} should carry the marked timestamp"
             );
         }
+        // The `#[metor_fsw(timestamp)]` field is the timestamp *source* only; it is
+        // not emitted as a standalone `time` component (frames.md Q1 → suppress).
+        assert_eq!(sink.timestamps.get(&ComponentId::new("time")), None);
     }
 
     #[derive(crate::AsVTable, IntoBytes, Immutable)]

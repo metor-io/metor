@@ -77,7 +77,12 @@ impl InspectorRow for NavRow {
         }
         right = right
             .child(
+                // Cap the summary so long descriptions (e.g. a comma-joined
+                // component list) ellipsize instead of spilling past the
+                // row's rounded highlight.
                 div()
+                    .max_w(px(260.0))
+                    .truncate()
                     .text_size(px(12.0))
                     .text_color(theme.text_secondary)
                     .child(summary),
