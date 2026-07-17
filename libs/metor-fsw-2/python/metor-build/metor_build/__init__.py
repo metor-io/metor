@@ -19,8 +19,10 @@ Configuration, all from the pack's ``pyproject.toml``:
   on the venv path.
 - ``[tool.metor.build] pack-dev-command`` — full override of the layout
   invocation. The default resolves ``metor-fsw`` from ``$METOR_FSW_BIN``,
-  then ``PATH``, then a ``cargo run`` of the workspace (monorepo
-  development).
+  then an installed ``metor-fsw`` dist (``metor_fsw.find()`` — present
+  exactly when the pack's ``build-system.requires`` names it, the
+  resolver-pinned path), then ``PATH``, then a ``cargo run`` of the
+  workspace (monorepo development).
 """
 
 import os
@@ -54,6 +56,18 @@ def _supports_pack(fsw):
     return probe.returncode == 0
 
 
+def _packaged_fsw():
+    """The `metor-fsw` binary of an installed `metor-fsw` dist, present
+    exactly when the pack declared it in `build-system.requires` and the
+    frontend installed it into this (isolated) build env — the
+    resolver-pinned path, immune to whatever is on `PATH`."""
+    try:
+        from metor_fsw import find
+    except ImportError:
+        return None
+    return find()
+
+
 def _run_pack_dev(root, override):
     if override is not None:
         cmd = list(override)
@@ -64,6 +78,8 @@ def _run_pack_dev(root, override):
                 f"$METOR_FSW_BIN ({fsw}) does not support `pack dev`; "
                 "point it at a newer metor-fsw"
             )
+        cmd = [fsw, "pack", "dev", root]
+    elif fsw := _packaged_fsw():
         cmd = [fsw, "pack", "dev", root]
     elif (fsw := shutil.which("metor-fsw")) and _supports_pack(fsw):
         cmd = [fsw, "pack", "dev", root]
