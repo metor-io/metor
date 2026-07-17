@@ -1,6 +1,6 @@
 # Phase 0 plan — the toolchain dists exist
 
-> **Status: IN PROGRESS.** Implements Phase 0 of `docs/design-packaging.md`
+> **Status: LANDED.** Implements Phase 0 of `docs/design-packaging.md`
 > (§4 published distributions, §12 phasing), executed after Phase 1
 > (`packaging-phase1-plan.md`) — the local prebuilt loop exists; this phase
 > gives the toolchain itself distribution form and closes the remaining
@@ -82,6 +82,37 @@ Build the four wheels into a scratch `dist/` and, from a consumer project
    packs drop the `_backend` shim). Document the verdict either way.
 
 Findings land in this doc; the design doc's §11 ledger gets updated.
+
+## Findings (all on uv 0.11.29, macOS)
+
+1. **Pinned-binary proof: PASS.** A toy pack outside the workspace with
+   `requires = ["metor-build", "metor-fsw"]` (both from a flat find-links
+   index, no shim, no `backend-path`) built through the packaged binary via
+   `metor_fsw.find()`. A decoy stale `metor-fsw` first on `PATH` — crafted
+   to *pass* the capability handshake and record any invocation — was never
+   touched. The wheel's package-data binary keeps its exec bit (zip external
+   attrs honored by uv), and the console script runs it.
+2. **ABI conflict ergonomics: PASS.** With both marker versions on the
+   index, `uv lock` fails with: *"Because all versions of metor-fsw depend
+   on metor-fsw-abi==8 and toy-abi7 depends on metor-fsw-abi==7, we can
+   conclude that all versions of metor-fsw and toy-abi7 are incompatible."*
+   Legible, names both parties and both pins, fails before anything runs.
+   (With only one version published the message degrades to "no version of
+   metor-fsw-abi==7" — publish the marker for every ABI that shipped.)
+3. **Build-requires + sources: SUPPORTED.** uv applies the pack's own
+   `[tool.uv.sources]` to its `build-system.requires`, so in-repo packs
+   declare `requires = ["metor-build"]` with a path source — the
+   `_backend/metor_build_shim.py` is deleted. Caveat: build-requirement
+   wheels are cached; after editing `metor_build` itself, heal with
+   `uv cache clean metor-build`.
+4. The generated module imports `metor_config`, so a pack wheel without a
+   `metor-config` runtime pin fails at import in a fresh consumer — the
+   phase-2 assembly's pin injection is load-bearing, not cosmetic (the toy
+   pack had to declare it by hand).
+5. In-repo packs deliberately do **not** put `metor-fsw` in `requires`: the
+   binary wheel is release-built and cached against the dist's pyproject
+   only, so it would go stale against the checkout; the backend's cargo
+   fallback stays the monorepo path.
 
 ## Non-goals
 

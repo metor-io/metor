@@ -11,13 +11,21 @@ version = "0.1.0"
 description = "The plant, nav, and ctrl systems of the adcs-fsw2 mission"
 requires-python = ">=3.11"
 
+# While this pack lives in the metor repo, the backend resolves from the
+# checkout (uv ≥ 0.11 applies `[tool.uv.sources]` to `build-system.requires`)
+# and `metor-fsw` deliberately stays out of `requires`: the backend's cargo
+# fallback always builds the checkout's binary fresh, where a path-source
+# binary wheel would go stale. A published pack instead declares
+# `requires = ["metor-build", "metor-fsw"]` and drops the sources entry.
 [build-system]
-requires = []
-build-backend = "metor_build_shim"
-backend-path = ["_backend"]
+requires = ["metor-build"]
+build-backend = "metor_build"
 
 [tool.metor.pack]
 id = "adcs"
+
+[tool.uv.sources]
+metor-build = { path = "../../../../libs/metor-fsw-2/python/metor-build" }
 
 # Rebuild (and so regenerate the module + lib) when the pack sources change,
 # including the sibling contracts crate. Out-of-dir (`../`) globs need

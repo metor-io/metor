@@ -453,14 +453,21 @@ prototype observed it live on uv 0.5.28); pyright does not merge namespace
 portions across roots (pyright #2882, pylance-release #3002); the whole
 editable loop end to end (prototype findings doc).
 
-Assumed, to be spiked in Phase 0:
+Resolved by the Phase 0 spikes (`packaging-phase0-plan.md` findings; all on
+uv 0.11.29):
 
-- Binary-wheel scripts exposure: `metor-fsw` from `.data/scripts/` resolving
-  on the backend subprocess `PATH` (mechanism is standard; the exact
-  interaction is unexercised).
-- Marker-dist conflict ergonomics: the `uv lock` error text mentioning
-  `metor-fsw-abi` needs a docs entry translating it; if PyPI-public, register
-  the dist names early.
+- ~~Binary exposure to the backend~~ — superseded by a stronger mechanism:
+  the binary ships as package data with an importable locator
+  (`metor_fsw.find()`), so the backend resolves it through the import
+  machinery of the isolated build env — pinned by the resolver, immune to
+  stale `PATH` copies (proven against a deliberate decoy). The
+  console-script shim covers human use.
+- ~~Marker-dist conflict ergonomics~~ — verified legible: `uv lock` names
+  both parties and both pins. Publish the marker for every ABI that has
+  shipped, or the message degrades to "no version of metor-fsw-abi==N".
+  If PyPI-public, register the dist names early.
+- New: uv applies a pack's own `[tool.uv.sources]` to its
+  `build-system.requires`, so in-repo packs need no `backend-path` shim.
 - ~~`cache-keys` globs escaping the package dir~~ — **resolved (phase 1):
   works on uv ≥ 0.11 (verified 0.11.29: a `../contracts` edit re-runs the
   editable build, and a no-change sync stays quiet). On 0.5.x only in-dir
