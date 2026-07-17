@@ -1,6 +1,6 @@
 # Phase 2 plan — the publish pipeline
 
-> **Status: IN PROGRESS.** Implements Phase 2 of `docs/design-packaging.md`
+> **Status: LANDED.** Implements Phase 2 of `docs/design-packaging.md`
 > (§5 the pack wheel, §7 publishing), after phases 0 and 1
 > (`packaging-phase0-plan.md`, `packaging-phase1-plan.md`): the local
 > prebuilt loop and the toolchain dists exist; this phase makes a pack
@@ -82,3 +82,27 @@ Findings recorded here.
   integration over the fixture, divergence error shapes).
 - The M4 scratch-venv flow, reproduced from this doc.
 - Example suites stay green (no example changes this phase).
+
+## Findings
+
+- The fixture wheel is byte-reproducible, and the one-shot
+  (`--wheel-out`) and staged-then-assembled (`--libs-out` +
+  `pack assemble`) flows produce identical bytes. Python's `zipfile`
+  verifies integrity, entry order, modes, DOS-epoch timestamps, and RECORD
+  digests.
+- The real `adcs-pack` wheel (host triple) installed into a scratch
+  consumer from `--find-links`: the injected `metor-config>=0.3,<0.4` pin
+  pulled the recorder transitively (the consumer declared only
+  `adcs-pack`), `ARTIFACT.prebuilt` pointed into the venv's `_libs`, and
+  `metor-fsw build`/`run` provisioned, manifest-checked, dlopened, and
+  described the wheel's payload with no cargo for the pack. The toy
+  mission then failed graph validation on an unconnected `mode_cmd` —
+  correct, its producer lives in the seqs slot — which is *past* every
+  packaging layer; full run-parity is covered by the example suites, whose
+  `pack dev` layout is byte-identical in shape to the wheel install.
+- `uv publish` exposure is `pack publish --dry-run`-verified only; a real
+  upload needs an index and credentials (phase 4's registry playbooks).
+- Cross builds (zigbuild, command/Nix) are wired but not exercised here —
+  no cross toolchains on this machine; the CI matrix + `pack assemble`
+  path is the intended venue, with the N-way sidecar gate as the
+  correctness backstop (unit-tested via fabricated skew).
