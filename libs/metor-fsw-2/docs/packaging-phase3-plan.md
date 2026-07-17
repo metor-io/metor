@@ -1,6 +1,6 @@
 # Phase 3 plan — consumption, bundle provenance, full conversion
 
-> **Status: IN PROGRESS.** Implements Phase 3 of `docs/design-packaging.md`
+> **Status: LANDED.** Implements Phase 3 of `docs/design-packaging.md`
 > (§8.2 provisioning, §9.2 flight provenance, §10 migration), after phases
 > 0–2: packs build, publish, and provision; this phase finishes the
 > consumer story — first-class cross-target packaging, a self-describing
@@ -58,3 +58,16 @@ longer has an artifacts table to exercise it).
 - `package -o … --target <host>` over the converted mission: bundle loads,
   `meta.json` carries both packs' provenance with `source: Prebuilt`.
 - `cargo test -p metor-fsw-2` green; old-bundle compatibility test.
+
+## Findings
+
+- All of the above verified. `package --target <host>` over the converted
+  mission ran **cargo-free for both artifacts** (prebuilt selection from
+  the venv payloads) and recorded `Prebuilt` + dist identity + cdylib
+  sha256 for each.
+- `run` deliberately did not gain `--target`: a foreign-triple bundle
+  cannot execute on this host, and `build`/`package` cover every cross
+  use.
+- The mission uninstalling itself on the conversion sync (`- adcs-fsw2`)
+  is uv confirming the virtual-project shape — the design's intended
+  consumer state.
