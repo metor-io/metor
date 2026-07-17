@@ -32,7 +32,10 @@ __version__ = "0.3.0"
 
 # The IR model version this recorder emits; must match `ir::IR_VERSION`.
 # v2 dropped the KDL front-end's `ParamSource::Kdl` variant (phase 4).
-IR_VERSION = 2
+# v3 replaced the artifact's recorded shared-object file name with the bare
+# `lib` stem (the file name is derived per target triple by the host) and
+# added the prebuilt-artifact fields.
+IR_VERSION = 3
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -89,15 +92,6 @@ def _handle_name(handle: Any) -> str:
     is one), but a generated entry's handle is *typed* as its spec class, so
     the name is read dynamically."""
     return handle.name
-
-
-def _cdylib_file_name(stem: str) -> str:
-    """The platform shared-object file name, matching `wiring::cdylib_file_name`."""
-    if sys.platform == "darwin":
-        return f"lib{stem}.dylib"
-    if sys.platform == "win32":
-        return f"{stem}.dll"
-    return f"lib{stem}.so"
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +199,21 @@ class Artifact:
     """A loadable pack, as a generated module declares it in its ``ARTIFACT``
     constant. Using an entry from the module auto-registers this on the mission
     (:meth:`Mission.add`); ``manifest_hash`` is the staleness anchor the host
-    checks at resolve."""
+    checks at resolve.
+
+    A prebuilt pack's module (``metor-fsw pack dev``, or an installed pack
+    wheel) also carries ``prebuilt`` — the directory of per-triple libraries
+    the host provisions from instead of running cargo — plus the generating
+    ABI version and, for a published pack, its distribution name/version."""
 
     id: str
     crate: str
     lib: str
     manifest_hash: str | None = None
+    prebuilt: str | None = None
+    abi_version: int | None = None
+    dist: str | None = None
+    dist_version: str | None = None
 
 
 class System(Spec):
@@ -387,8 +390,10 @@ class Mission:
             {
                 "id": id,
                 "crate_name": crate,
-                "cdylib": _cdylib_file_name(lib),
+                "lib": lib,
                 "path": None,
+                "prebuilt_dir": None,
+                "dist": None,
                 # A hand-declared artifact carries no generated-stub hash, so
                 # the host's staleness check skips it (as it does for KDL).
                 "manifest_hash": None,
@@ -437,23 +442,29 @@ class Mission:
         the same id must agree on crate and lib (conflicting definitions are an
         eval-time error); a later declaration may supply the manifest hash an
         earlier one lacked."""
-        cdylib = _cdylib_file_name(decl.lib)
         for existing in self._artifacts:
             if existing["id"] != decl.id:
                 continue
-            if existing["crate_name"] != decl.crate or existing["cdylib"] != cdylib:
+            if existing["crate_name"] != decl.crate or existing["lib"] != decl.lib:
                 raise ValueError(
                     f"artifact {decl.id!r} is declared twice with different crate/lib"
                 )
             if existing["manifest_hash"] is None:
                 existing["manifest_hash"] = decl.manifest_hash
             return
+        dist = (
+            {"name": decl.dist, "version": decl.dist_version}
+            if decl.dist is not None and decl.dist_version is not None
+            else None
+        )
         self._artifacts.append(
             {
                 "id": decl.id,
                 "crate_name": decl.crate,
-                "cdylib": cdylib,
+                "lib": decl.lib,
                 "path": None,
+                "prebuilt_dir": decl.prebuilt,
+                "dist": dist,
                 "manifest_hash": decl.manifest_hash,
                 "src": _source_ref(),
             }

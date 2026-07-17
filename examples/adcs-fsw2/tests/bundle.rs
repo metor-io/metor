@@ -77,10 +77,10 @@ fn python_mission_packages_and_runs() {
     assert!(dir.join("meta.json").exists(), "JSON sidecar written");
     assert!(dir.join("mission.py").exists(), "python provenance rides along");
     for artifact in &wiring.artifacts {
+        let cdylib = metor_fsw_2::wiring::cdylib_file_name(&artifact.lib);
         assert!(
-            dir.join(&artifact.cdylib).exists(),
-            "cdylib `{}` copied into the bundle",
-            artifact.cdylib
+            dir.join(&cdylib).exists(),
+            "cdylib `{cdylib}` copied into the bundle"
         );
     }
 

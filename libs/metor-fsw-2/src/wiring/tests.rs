@@ -974,7 +974,8 @@ fn bundle_manifest_hash_checked_at_load() {
     std::fs::write(&wiring_path, wiring_bytes).unwrap();
 
     // Tamper the copied sidecar: the load-time hash check now refuses it.
-    let copied_sidecar = crate::dl::manifest_sidecar_path(&dir.join(&wiring.artifacts[0].cdylib));
+    let member = crate::wiring::cdylib_file_name(&wiring.artifacts[0].lib);
+    let copied_sidecar = crate::dl::manifest_sidecar_path(&dir.join(member));
     std::fs::write(&copied_sidecar, b"tampered").expect("overwrite the sidecar");
     let err = load_bundle(&dir).expect_err("a tampered sidecar is refused");
     assert!(
@@ -1039,7 +1040,8 @@ fn metor_archive_round_trips_and_is_reproducible() {
         .expect("artifact path filled");
     assert!(path.exists(), "the unpacked .so is a real file for dlopen");
     assert!(
-        path.file_name().and_then(|n| n.to_str()) == Some(&wiring.artifacts[0].cdylib),
+        path.file_name().and_then(|n| n.to_str())
+            == Some(crate::wiring::cdylib_file_name(&wiring.artifacts[0].lib).as_str()),
         "unpacked under the cdylib name"
     );
 }
@@ -1057,7 +1059,7 @@ fn wiring_json_without_provenance_fields_deserializes() {
         r#"{{
         "ir_version": {IR_VERSION},
         "coordinator": {{ "cycle_rate": 100.0, "default_depth": null, "clock": "Wall" }},
-        "artifacts": [{{ "id": "plant", "crate_name": "adcs-plant", "cdylib": "libadcs_plant.so", "path": null }}],
+        "artifacts": [{{ "id": "plant", "crate_name": "adcs-plant", "lib": "adcs_plant", "path": null }}],
         "systems": [{{ "name": "a", "ty": "Src", "artifact": null, "params": "None" }}],
         "slots": [{{ "name": "adcs", "inputs": [], "outputs": [],
                      "allow": [{{ "occupant": "ctrl", "params": "None" }}], "initial": null }}],
@@ -1270,8 +1272,10 @@ fn validate_rejects_duplicate_artifact_ids() {
     let art = |id: &str| Artifact {
         id: id.into(),
         crate_name: "c".into(),
-        cdylib: "libc.so".into(),
+        lib: "c".into(),
         path: None,
+        prebuilt_dir: None,
+        dist: None,
         manifest_hash: None,
         src: None,
     };

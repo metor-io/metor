@@ -94,12 +94,12 @@ impl WiringBuilder {
     /// Declares a loadable [`Artifact`], one pack (any number of system
     /// types) per cdylib.
     ///
-    /// `lib_stem` is the bare library stem (`adcs_plant`), decorated into the
-    /// platform's file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
-    /// `adcs_plant.dll`) via [`cdylib_file_name`](super::cdylib_file_name).
-    /// A `system` spec's `ty` selects the pack entry. The artifact's `path`
-    /// starts out unset; the build driver
-    /// ([`build_artifacts`](super::build_artifacts)) fills it in.
+    /// `lib_stem` is the bare library stem (`adcs_plant`), decorated into a
+    /// per-triple file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
+    /// `adcs_plant.dll`) when the artifact is provisioned. A `system` spec's
+    /// `ty` selects the pack entry. The artifact's `path` starts out unset;
+    /// the build driver ([`build_artifacts`](super::build_artifacts)) fills it
+    /// in.
     ///
     /// Panics on a duplicate `id`.
     pub fn artifact(
@@ -113,8 +113,10 @@ impl WiringBuilder {
         self.wiring.artifacts.push(Artifact {
             id,
             crate_name: crate_name.into(),
-            cdylib: super::cdylib_file_name(lib_stem.as_ref()),
+            lib: lib_stem.as_ref().to_string(),
             path: None,
+            prebuilt_dir: None,
+            dist: None,
             manifest_hash: None,
             src: None,
         });

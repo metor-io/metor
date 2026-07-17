@@ -80,12 +80,26 @@ pub use stubgen::{StubgenError, StubgenOptions, StubgenReport, stubgen};
 pub(crate) use registry::decode_value_params;
 
 /// The shared-object file name for a library `stem` on the host platform
-/// (`libfoo.so`, `libfoo.dylib`, `foo.dll`), used by the build driver, the
-/// stub generator, and the [`WiringBuilder`] to name an [`Artifact::cdylib`].
+/// (`libfoo.so`, `libfoo.dylib`, `foo.dll`), used by the build driver and the
+/// stub generator to locate an [`Artifact::lib`]'s output.
 pub fn cdylib_file_name(stem: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("lib{stem}.dylib")
     } else if cfg!(target_os = "windows") {
+        format!("{stem}.dll")
+    } else {
+        format!("lib{stem}.so")
+    }
+}
+
+/// The shared-object file name for a library `stem` on a `triple`, the
+/// arch-parameterized sibling of [`cdylib_file_name`]. The IR carries the bare
+/// stem ([`Artifact::lib`]); this is where a target triple turns it into a
+/// file name — at provision, bundle, and `pack dev` time.
+pub fn cdylib_file_name_for(triple: &str, stem: &str) -> String {
+    if triple.contains("-apple-") {
+        format!("lib{stem}.dylib")
+    } else if triple.contains("-windows-") {
         format!("{stem}.dll")
     } else {
         format!("lib{stem}.so")

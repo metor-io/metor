@@ -10,7 +10,8 @@
 //! only supplies the list of crates and reads back where their outputs landed.
 //!
 //! The library is located by scanning `compiler-artifact` JSON lines for a
-//! `filenames` entry ending in the artifact's `cdylib` name, which stays correct
+//! `filenames` entry ending in the cdylib file name derived from the
+//! artifact's `lib` stem and the build's target triple, which stays correct
 //! under a custom target directory or profile.
 //!
 //! ## The manifest sidecar
@@ -141,10 +142,15 @@ pub enum BuildError {
 /// considers stale.
 pub fn build_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), BuildError> {
     let cross = opts.manifest_sidecar && is_cross(&opts.extra_args);
+    let target = requested_target(&opts.extra_args).map(str::to_string);
     for artifact in &mut wiring.artifacts {
-        let path = build_one(&artifact.crate_name, &artifact.cdylib, opts)?;
+        let cdylib = match &target {
+            Some(triple) => super::cdylib_file_name_for(triple, &artifact.lib),
+            None => super::cdylib_file_name(&artifact.lib),
+        };
+        let path = build_one(&artifact.crate_name, &cdylib, opts)?;
         if opts.manifest_sidecar {
-            write_manifest_sidecar(&artifact.crate_name, &artifact.cdylib, &path, opts, cross)?;
+            write_manifest_sidecar(&artifact.crate_name, &artifact.lib, &path, opts, cross)?;
         }
         artifact.path = Some(path);
     }
@@ -213,7 +219,7 @@ fn build_one(crate_name: &str, cdylib: &str, opts: &BuildOptions) -> Result<Path
 /// compared and divergence is an error.
 fn write_manifest_sidecar(
     crate_name: &str,
-    cdylib: &str,
+    lib: &str,
     so: &Path,
     opts: &BuildOptions,
     cross: bool,
@@ -223,7 +229,9 @@ fn write_manifest_sidecar(
             extra_args: strip_target_args(&opts.extra_args),
             ..opts.clone()
         };
-        build_one(crate_name, cdylib, &host_opts).map_err(|source| BuildError::HostBuild {
+        // The host twin's output carries the *host* platform's file name.
+        let cdylib = super::cdylib_file_name(lib);
+        build_one(crate_name, &cdylib, &host_opts).map_err(|source| BuildError::HostBuild {
             crate_name: crate_name.to_string(),
             source: Box::new(source),
         })?
@@ -511,7 +519,7 @@ mod tests {
         // Plant a fresh-but-divergent "target" sidecar; the host-described
         // bytes must refuse to replace it.
         std::fs::write(&sidecar, b"divergent").unwrap();
-        let err = write_manifest_sidecar(&artifact.crate_name, &artifact.cdylib, &so, &opts, true)
+        let err = write_manifest_sidecar(&artifact.crate_name, &artifact.lib, &so, &opts, true)
             .expect_err("a fresh divergent sidecar is refused");
         assert!(
             matches!(err, BuildError::ManifestDivergence { .. }),
@@ -521,7 +529,7 @@ mod tests {
         // Identical bytes pass the comparison and are rewritten in place.
         let described = crate::dl::describe_raw(&so).expect("in-process describe");
         std::fs::write(&sidecar, &described).unwrap();
-        write_manifest_sidecar(&artifact.crate_name, &artifact.cdylib, &so, &opts, true)
+        write_manifest_sidecar(&artifact.crate_name, &artifact.lib, &so, &opts, true)
             .expect("a matching sidecar is accepted");
         assert_eq!(std::fs::read(&sidecar).unwrap(), described);
     }

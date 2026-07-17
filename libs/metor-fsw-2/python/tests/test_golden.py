@@ -1,7 +1,7 @@
 """The cross-language contract: the recorder must emit exactly the shared
 ``tests/golden/mission.json`` fixture the Rust round-trip test also consumes,
-modulo the fields both sides normalize away (``src`` anchors, the platform
-``cdylib`` and located ``path``, and the emitter-only ``metor_config_version``
+modulo the fields both sides normalize away (``src`` anchors, the located
+``path``/``prebuilt_dir``, and the emitter-only ``metor_config_version``
 envelope field)."""
 
 import json
@@ -72,13 +72,13 @@ def build_mission() -> Mission:
 def normalize(v):
     """Drop the fields the cross-language comparison ignores: every ``src``
     anchor, the top-level ``metor_config_version`` envelope, and each artifact's
-    platform ``cdylib`` and located ``path``."""
+    located ``path``/``prebuilt_dir``."""
     if isinstance(v, dict):
         v = {k: normalize(x) for k, x in v.items() if k != "src"}
         v.pop("metor_config_version", None)
         for a in v.get("artifacts", []):
-            a.pop("cdylib", None)
             a.pop("path", None)
+            a.pop("prebuilt_dir", None)
         return v
     if isinstance(v, list):
         return [normalize(x) for x in v]

@@ -57,7 +57,7 @@ class RecorderTest(unittest.TestCase):
         ir = m.to_ir()
         self.assertEqual(ir["artifacts"][0]["id"], "adcs")
         self.assertEqual(ir["artifacts"][0]["crate_name"], "adcs-systems")
-        self.assertTrue(ir["artifacts"][0]["cdylib"].endswith(("adcs_systems.dylib", "adcs_systems.so", "adcs_systems.dll")))
+        self.assertEqual(ir["artifacts"][0]["lib"], "adcs_systems")
         self.assertIsNone(ir["artifacts"][0]["path"])
         plant = ir["systems"][0]
         self.assertEqual(plant["ty"], "Plant")

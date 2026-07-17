@@ -317,12 +317,13 @@ fn bundle_members(
             .ok_or_else(|| BundleError::NotBuilt {
                 artifact: artifact.id.clone(),
             })?;
-        members.push((artifact.cdylib.clone(), MemberSource::Path(src.clone())));
+        let cdylib = member_cdylib_name(opts.target.as_deref(), &artifact.lib);
+        members.push((cdylib.clone(), MemberSource::Path(src.clone())));
         // The manifest sidecar rides along when the build driver wrote one; a
         // bundle without it stays valid (the manifest-hash check is skipped).
         let sidecar = crate::dl::manifest_sidecar_path(src);
         if sidecar.exists() {
-            let name = format!("{}.manifest", artifact.cdylib);
+            let name = format!("{cdylib}.manifest");
             members.push((name, MemberSource::Path(sidecar)));
         }
     }
@@ -332,6 +333,17 @@ fn bundle_members(
     }
     validate_member_names(members.iter().map(|(name, _)| name.as_str()))?;
     Ok(members)
+}
+
+/// The member file name of an artifact's shared object: derived from the
+/// bundle's recorded target triple, or the host's convention when the bundle
+/// records none (in which case the load-time triple check is skipped too, so
+/// writer and reader agree by the same fallback).
+fn member_cdylib_name(target: Option<&str>, lib: &str) -> String {
+    match target {
+        Some(triple) => super::cdylib_file_name_for(triple, lib),
+        None => super::cdylib_file_name(lib),
+    }
 }
 
 /// Read a member's bytes, inline or copied from its source file.
@@ -446,8 +458,9 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
         })?;
 
     for artifact in &mut wiring.artifacts {
-        validate_member_name(&artifact.cdylib)?;
-        let so = dir.join(&artifact.cdylib);
+        let cdylib = member_cdylib_name(meta.target.as_deref(), &artifact.lib);
+        validate_member_name(&cdylib)?;
+        let so = dir.join(&cdylib);
         if !so.exists() {
             return Err(BundleError::MissingSo {
                 artifact: artifact.id.clone(),

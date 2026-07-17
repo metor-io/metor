@@ -29,7 +29,13 @@ use serde::{Deserialize, Serialize};
 /// v2 dropped the `ParamSource::Kdl` variant with the KDL front-end (phase 4):
 /// a wire-shape change, so a v1 bundle fails the version check and must be
 /// rebuilt.
-pub const IR_VERSION: u32 = 2;
+///
+/// v3 replaced [`Artifact`]'s serialized shared-object file name with the bare
+/// library stem ([`Artifact::lib`]) and added the prebuilt-artifact fields
+/// (`prebuilt_dir`, `dist`). The file name is derived per target triple at
+/// provision time — recording it froze the *recording* host's platform into
+/// the IR, which broke cross-target packaging.
+pub const IR_VERSION: u32 = 3;
 
 /// A plain-data description of a complete mission, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
@@ -65,16 +71,18 @@ pub struct Wiring {
 }
 
 impl Wiring {
-    /// A clone with every [`Artifact::path`] cleared: the relocatable,
-    /// reproducible form of the IR. Paths point into a build tree, so they are
-    /// provenance rather than identity — [`resolve`](crate::wiring::resolve)
-    /// re-derives them on load. Stripping them is what lets the bundle's
-    /// `wiring.json` stay byte-reproducible and a `WiringManifest` describe the
-    /// same topology regardless of where it was built.
+    /// A clone with every [`Artifact::path`] and [`Artifact::prebuilt_dir`]
+    /// cleared: the relocatable, reproducible form of the IR. Both point into
+    /// a build tree or an installed environment, so they are provenance rather
+    /// than identity — [`resolve`](crate::wiring::resolve) re-derives them on
+    /// load. Stripping them is what lets the bundle's `wiring.json` stay
+    /// byte-reproducible and a `WiringManifest` describe the same topology
+    /// regardless of where it was built.
     pub fn path_stripped(&self) -> Wiring {
         let mut w = self.clone();
         for artifact in &mut w.artifacts {
             artifact.path = None;
+            artifact.prebuilt_dir = None;
         }
         w
     }
@@ -162,13 +170,28 @@ pub struct Artifact {
     /// The cargo package name, used by the build driver as
     /// `cargo build -p <crate_name>`.
     pub crate_name: String,
-    /// The produced shared-object file name (`libfoo.so`, `libfoo.dylib`,
-    /// `foo.dll`).
-    pub cdylib: String,
+    /// The bare library stem (`foo` for `libfoo.so`/`libfoo.dylib`/`foo.dll`).
+    /// The file name is derived per target triple at provision time
+    /// ([`cdylib_file_name_for`](crate::wiring::cdylib_file_name_for)); the IR
+    /// stays arch-neutral.
+    pub lib: String,
     /// The resolved artifact location, filled in by
     /// [`build_artifacts`](crate::wiring::build_artifacts). `None` until built or
     /// located.
     pub path: Option<PathBuf>,
+    /// Where a prebuilt artifact's per-triple libraries live: a directory
+    /// with one `<triple>/` subdirectory per shipped target, each holding the
+    /// cdylib and its `.manifest` sidecar — an installed pack wheel's `_libs`
+    /// dir, or a local pack's `.metor/libs`. `None` for a crate-built
+    /// artifact, which the build driver compiles instead
+    /// (`docs/design-packaging.md` §8). Provenance like `path`: stripped by
+    /// [`Wiring::path_stripped`].
+    #[serde(default)]
+    pub prebuilt_dir: Option<PathBuf>,
+    /// The published distribution this artifact came from, if any. Pure
+    /// provenance, carried into the bundle's `meta.json`.
+    #[serde(default)]
+    pub dist: Option<DistRef>,
     /// The `sha256:<hex>` hash of the pack manifest the generated stub module
     /// (`metor-fsw stubgen`) was produced against, carried through from the
     /// module's `ARTIFACT` constant. [`resolve`](crate::wiring::resolve)
@@ -181,6 +204,17 @@ pub struct Artifact {
     /// Where this artifact was declared.
     #[serde(default)]
     pub src: Option<SourceRef>,
+}
+
+/// The published distribution an [`Artifact`] was installed from, as the
+/// generated stub module recorded it (`dist="adcs-pack"`,
+/// `dist_version="1.2.0"`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DistRef {
+    /// The distribution name.
+    pub name: String,
+    /// The distribution version string.
+    pub version: String,
 }
 
 /// One system instance. With `artifact = None` the type is resolved in the

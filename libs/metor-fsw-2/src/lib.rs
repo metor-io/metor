@@ -217,8 +217,9 @@ pub use dl::{DlError, DlPack, DlSystem};
 
 #[cfg(feature = "wiring-model")]
 pub use ir::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, InitialOccupantSpec,
-    ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE,
+    TCP_UPLINK_TYPE, Wiring,
 };
 
 #[cfg(feature = "wiring")]
