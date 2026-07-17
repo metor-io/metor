@@ -316,18 +316,18 @@ fn dlopen_cyclic_system_end_to_end() {
     drop((out_view, events_in, twin_view));
 }
 
-/// Building through the driver ([`build_artifacts`]) leaves a
+/// Building through the driver ([`provision_artifacts`]) leaves a
 /// `<cdylib>.manifest` sidecar next to the `.so` — raw postcard
 /// [`PackManifest`] bytes naming the same entries the opened pack reports
 /// — and `manifest_sidecar: false` opts out. Byte-level sidecar ≡ describe
 /// equality is asserted in the driver's own unit tests
 /// (`wiring::build_driver`), where the raw describe bytes are reachable.
 ///
-/// [`build_artifacts`]: metor_fsw_2::wiring::build_artifacts
+/// [`provision_artifacts`]: metor_fsw_2::wiring::provision_artifacts
 /// [`PackManifest`]: metor_fsw_2::abi::PackManifest
 #[test]
 fn build_driver_writes_manifest_sidecar() {
-    use metor_fsw_2::wiring::{BuildOptions, WiringBuilder, build_artifacts};
+    use metor_fsw_2::wiring::{BuildOptions, WiringBuilder, provision_artifacts};
 
     let fixture = || {
         WiringBuilder::new()
@@ -339,8 +339,8 @@ fn build_driver_writes_manifest_sidecar() {
             .build()
     };
     let mut wiring = fixture();
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     let so = wiring.artifacts[0].path.clone().expect("path filled");
@@ -370,7 +370,7 @@ fn build_driver_writes_manifest_sidecar() {
         ..BuildOptions::default()
     };
     let mut wiring = fixture();
-    build_artifacts(&mut wiring, &opts).expect("rebuild is a cargo no-op");
+    provision_artifacts(&mut wiring, &opts).expect("rebuild is a cargo no-op");
     assert!(!sidecar.exists(), "opted out, so no sidecar is written");
 }
 

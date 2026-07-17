@@ -98,7 +98,7 @@ impl WiringBuilder {
     /// per-triple file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
     /// `adcs_plant.dll`) when the artifact is provisioned. A `system` spec's
     /// `ty` selects the pack entry. The artifact's `path` starts out unset;
-    /// the build driver ([`build_artifacts`](super::build_artifacts)) fills it
+    /// the build driver ([`provision_artifacts`](super::provision_artifacts)) fills it
     /// in.
     ///
     /// Panics on a duplicate `id`.

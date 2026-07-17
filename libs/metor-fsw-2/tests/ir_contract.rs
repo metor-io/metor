@@ -204,7 +204,10 @@ fn representation_is_externally_tagged() {
     assert_eq!(v["artifacts"][0]["lib"], json!("adcs_systems"));
     assert_eq!(v["artifacts"][0]["prebuilt_dir"], Value::Null);
     assert_eq!(v["artifacts"][0]["dist"], Value::Null);
-    assert_eq!(v["artifacts"][1]["prebuilt_dir"], json!("/venv/gnc_pack/_libs"));
+    assert_eq!(
+        v["artifacts"][1]["prebuilt_dir"],
+        json!("/venv/gnc_pack/_libs")
+    );
     assert_eq!(
         v["artifacts"][1]["dist"],
         json!({ "name": "gnc-pack", "version": "1.2.0" })

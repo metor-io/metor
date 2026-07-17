@@ -48,15 +48,27 @@ fn rate_alarm_raises_on_boot_tumble_and_clears() {
     // The def broadcast: the panel's plot limit lines are the firing thresholds.
     let mut got_defs = Vec::new();
     defs.drain(|d| got_defs.push(d));
-    assert_eq!(got_defs.len(), 2, "both mission alarms broadcast defs: {got_defs:?}");
+    assert_eq!(
+        got_defs.len(),
+        2,
+        "both mission alarms broadcast defs: {got_defs:?}"
+    );
     let def = got_defs
         .iter()
         .find(|d| d.id == "ADCS_RATE_HIGH")
         .expect("the rate alarm's def");
     let target = def.target.as_ref().expect("targeted alarm");
-    assert_eq!(target.component_id, ComponentId::new("plant.sensors.gyro_b"));
+    assert_eq!(
+        target.component_id,
+        ComponentId::new("plant.sensors.gyro_b")
+    );
     assert_eq!(target.element_index, Some(1));
-    assert_eq!(def.limits.len(), 4, "warn/crit × upper/lower: {:?}", def.limits);
+    assert_eq!(
+        def.limits.len(),
+        4,
+        "warn/crit × upper/lower: {:?}",
+        def.limits
+    );
     // The wheel-momentum alarm's nested-array component path (instance `plant` + frame
     // `wheels` + field `wheels` — the name doubles) round-trips into the def. Its live
     // firing is exercised by `tests/momentum.rs`, which preloads the wheels into a

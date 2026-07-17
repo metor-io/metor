@@ -947,8 +947,9 @@ fn bundle_manifest_hash_checked_at_load() {
             "metor_fsw_2_dl_fixture",
         )
         .build();
-    if let Err(e) = crate::wiring::build_artifacts(&mut wiring, &crate::BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = crate::wiring::provision_artifacts(&mut wiring, &crate::BuildOptions::default())
+    {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     let so = wiring.artifacts[0].path.clone().expect("path filled");
@@ -1010,8 +1011,9 @@ fn metor_archive_round_trips_and_is_reproducible() {
             "metor_fsw_2_dl_fixture",
         )
         .build();
-    if let Err(e) = crate::wiring::build_artifacts(&mut wiring, &crate::BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = crate::wiring::provision_artifacts(&mut wiring, &crate::BuildOptions::default())
+    {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
 

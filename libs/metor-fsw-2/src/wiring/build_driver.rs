@@ -1,13 +1,22 @@
-//! Builds a [`Wiring`]'s [`Artifact`](super::Artifact)s and records where the
-//! resulting `.so`s live.
+//! Provisions a [`Wiring`]'s [`Artifact`](super::Artifact)s: records where
+//! each `.so` lives, building it when the artifact is crate-shaped.
 //!
-//! Each artifact names a cargo package that produces a `cdylib`. The driver runs
-//! `cargo build -p <crate_name>` for each one, finds the produced library in
-//! cargo's `--message-format=json` output, and writes its path into
+//! A **crate** artifact names a cargo package that produces a `cdylib`. The
+//! driver runs `cargo build -p <crate_name>` for each one, finds the produced
+//! library in cargo's `--message-format=json` output, and writes its path into
 //! [`Artifact::path`](super::Artifact::path) so the resolver
 //! ([`resolve`](super::resolve)) can `dlopen` it. Since every system cdylib is its
 //! own package, cargo decides what is stale and what can be skipped; the driver
 //! only supplies the list of crates and reads back where their outputs landed.
+//!
+//! A **prebuilt** artifact instead names a directory of per-triple libraries
+//! ([`Artifact::prebuilt_dir`](super::Artifact::prebuilt_dir) — an installed
+//! pack wheel's `_libs`, or a local pack's `.metor/libs`). Provisioning is a
+//! selection, never a compile: the requested target triple (or the host's)
+//! picks `<dir>/<triple>/<cdylib>`, and a triple the directory does not ship
+//! is a clean error listing the ones it does. The manifest sidecar sits next
+//! to the selected library, so the resolve-time staleness gate
+//! (`check_manifest_hashes`) covers prebuilt artifacts unchanged.
 //!
 //! The library is located by scanning `compiler-artifact` JSON lines for a
 //! `filenames` entry ending in the cdylib file name derived from the
@@ -32,7 +41,7 @@ use std::process::Command;
 use super::model::Wiring;
 
 /// Knobs applied to every `cargo build` invocation run by
-/// [`build_artifacts`].
+/// [`provision_artifacts`].
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
     /// Build the `--release` profile instead of the default debug profile.
@@ -62,7 +71,7 @@ impl Default for BuildOptions {
     }
 }
 
-/// Why [`build_artifacts`] could not produce a library path for an artifact.
+/// Why [`provision_artifacts`] could not produce a library path for an artifact.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
     /// `cargo` could not be spawned.
@@ -135,15 +144,46 @@ pub enum BuildError {
         /// The existing sidecar next to the target library.
         path: PathBuf,
     },
+    /// A prebuilt artifact does not ship a library for the requested triple.
+    #[error(
+        "prebuilt artifact `{artifact}` ships no library for `{triple}` under `{dir}`\
+        {}", if .available.is_empty() { String::new() } else { format!(" (available: {})", .available.join(", ")) }
+    )]
+    PrebuiltMissing {
+        /// The artifact id.
+        artifact: String,
+        /// The triple that was requested.
+        triple: String,
+        /// The prebuilt directory that was searched.
+        dir: PathBuf,
+        /// The triples the directory does ship.
+        available: Vec<String>,
+    },
+    /// A prebuilt artifact needs a target triple to select by, and neither a
+    /// `--target` nor the host triple could be determined.
+    #[error(
+        "cannot select a prebuilt library for artifact `{artifact}`: no `--target` given and \
+         the host triple is unknown"
+    )]
+    HostTripleUnknown {
+        /// The artifact id.
+        artifact: String,
+    },
 }
 
-/// Builds every [`Artifact`](super::Artifact) in `wiring` and fills in its
-/// [`path`](super::Artifact::path). Safe to re-run; cargo rebuilds only what it
+/// Provisions every [`Artifact`](super::Artifact) in `wiring`, filling in its
+/// [`path`](super::Artifact::path): a prebuilt artifact selects the requested
+/// triple's library from its `prebuilt_dir`, a crate artifact is cargo-built.
+/// Safe to re-run; selection is idempotent and cargo rebuilds only what it
 /// considers stale.
-pub fn build_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), BuildError> {
+pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), BuildError> {
     let cross = opts.manifest_sidecar && is_cross(&opts.extra_args);
     let target = requested_target(&opts.extra_args).map(str::to_string);
     for artifact in &mut wiring.artifacts {
+        if let Some(dir) = artifact.prebuilt_dir.clone() {
+            artifact.path = Some(select_prebuilt(artifact, &dir, target.as_deref())?);
+            continue;
+        }
         let cdylib = match &target {
             Some(triple) => super::cdylib_file_name_for(triple, &artifact.lib),
             None => super::cdylib_file_name(&artifact.lib),
@@ -155,6 +195,51 @@ pub fn build_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), B
         artifact.path = Some(path);
     }
     Ok(())
+}
+
+/// Select a prebuilt artifact's library for `target` (or the host): the
+/// `<dir>/<triple>/<cdylib>` the pack shipped. No compile, no sidecar work —
+/// the shipped sidecar sits next to the library and resolve verifies it.
+fn select_prebuilt(
+    artifact: &super::model::Artifact,
+    dir: &Path,
+    target: Option<&str>,
+) -> Result<PathBuf, BuildError> {
+    let triple = match target.map(str::to_string).or_else(host_triple) {
+        Some(triple) => triple,
+        None => {
+            return Err(BuildError::HostTripleUnknown {
+                artifact: artifact.id.clone(),
+            });
+        }
+    };
+    let so = dir
+        .join(&triple)
+        .join(super::cdylib_file_name_for(&triple, &artifact.lib));
+    if !so.exists() {
+        return Err(BuildError::PrebuiltMissing {
+            artifact: artifact.id.clone(),
+            triple,
+            dir: dir.to_path_buf(),
+            available: shipped_triples(dir),
+        });
+    }
+    Ok(so)
+}
+
+/// The triple subdirectories a prebuilt dir ships, for the
+/// [`BuildError::PrebuiltMissing`] message.
+fn shipped_triples(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut triples: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    triples.sort();
+    triples
 }
 
 /// Runs `cargo build -p <crate_name>` and returns the located cdylib path.
@@ -327,10 +412,65 @@ fn strip_target_args(extra_args: &[String]) -> Vec<String> {
     out
 }
 
-/// The host target triple, from `cargo -vV`'s `host:` line. Shared with
-/// [`bundle`](super::bundle): packaging records it as the built triple (absent
-/// a cross `--target`) and loading compares it against the bundle's.
+/// The host target triple. Shared with [`bundle`](super::bundle): packaging
+/// records it as the built triple (absent a cross `--target`) and loading
+/// compares it against the bundle's; prebuilt selection uses it absent a
+/// `--target`.
+///
+/// The compile-time triple of this binary answers first — the running host is
+/// its own witness, and a prebuilt-only consumer has no cargo to ask. An
+/// unlisted platform falls back to `cargo -vV`'s `host:` line.
 pub(super) fn host_triple() -> Option<String> {
+    compiled_triple()
+        .map(str::to_string)
+        .or_else(cargo_host_triple)
+}
+
+/// The triple this binary was compiled for, for the platforms metor-fsw
+/// ships on. `None` on an unlisted platform.
+fn compiled_triple() -> Option<&'static str> {
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        Some("aarch64-apple-darwin")
+    } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+        Some("x86_64-apple-darwin")
+    } else if cfg!(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        Some("aarch64-unknown-linux-gnu")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_env = "musl"
+    )) {
+        Some("aarch64-unknown-linux-musl")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "musl"
+    )) {
+        Some("x86_64-unknown-linux-musl")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        target_env = "msvc"
+    )) {
+        Some("x86_64-pc-windows-msvc")
+    } else {
+        None
+    }
+}
+
+/// `cargo -vV`'s `host:` line, the fallback witness on platforms
+/// [`compiled_triple`] does not list.
+fn cargo_host_triple() -> Option<String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let output = Command::new(cargo).arg("-vV").output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -483,8 +623,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut wiring = fixture_wiring();
-        if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-            eprintln!("skipping: build_artifacts failed: {e}");
+        if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+            eprintln!("skipping: provision_artifacts failed: {e}");
             return;
         }
         let so = wiring.artifacts[0].path.clone().expect("path filled");
@@ -507,8 +647,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut wiring = fixture_wiring();
-        if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-            eprintln!("skipping: build_artifacts failed: {e}");
+        if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+            eprintln!("skipping: provision_artifacts failed: {e}");
             return;
         }
         let artifact = &wiring.artifacts[0];
@@ -547,8 +687,8 @@ mod tests {
             ..BuildOptions::default()
         };
         let mut wiring = fixture_wiring();
-        if let Err(e) = build_artifacts(&mut wiring, &opts) {
-            eprintln!("skipping: build_artifacts failed: {e}");
+        if let Err(e) = provision_artifacts(&mut wiring, &opts) {
+            eprintln!("skipping: provision_artifacts failed: {e}");
             return;
         }
         let so = wiring.artifacts[0].path.clone().expect("path filled");
@@ -557,7 +697,81 @@ mod tests {
         // is that *this* build does not produce it.
         let _ = std::fs::remove_file(&sidecar);
         let mut again = fixture_wiring();
-        build_artifacts(&mut again, &opts).expect("rebuild is a cargo no-op");
+        provision_artifacts(&mut again, &opts).expect("rebuild is a cargo no-op");
         assert!(!sidecar.exists(), "opted out, so no sidecar is written");
+    }
+
+    /// A prebuilt artifact is a selection, not a build: the host triple picks
+    /// `<dir>/<triple>/<cdylib>`, the sidecar rides adjacent for the resolve
+    /// gate, and a triple the directory does not ship errors naming the ones
+    /// it does. Laid out from the fixture's host build — exactly the shape
+    /// `pack dev` and an installed pack wheel produce.
+    #[test]
+    #[cfg(not(miri))]
+    fn prebuilt_selects_by_triple() {
+        let _guard = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut built = fixture_wiring();
+        if let Err(e) = provision_artifacts(&mut built, &BuildOptions::default()) {
+            eprintln!("skipping: provision_artifacts failed: {e}");
+            return;
+        }
+        let so = built.artifacts[0].path.clone().expect("path filled");
+        let host = host_triple().expect("host triple determinable");
+
+        // Lay out `<libs>/<host-triple>/{cdylib, sidecar}`.
+        let tmp = tempfile::tempdir().unwrap();
+        let libs = tmp.path().join("libs");
+        let triple_dir = libs.join(&host);
+        std::fs::create_dir_all(&triple_dir).unwrap();
+        let dst = triple_dir.join(so.file_name().unwrap());
+        std::fs::copy(&so, &dst).unwrap();
+        std::fs::copy(
+            crate::dl::manifest_sidecar_path(&so),
+            crate::dl::manifest_sidecar_path(&dst),
+        )
+        .unwrap();
+
+        let mut wiring = fixture_wiring();
+        wiring.artifacts[0].prebuilt_dir = Some(libs.clone());
+        provision_artifacts(&mut wiring, &BuildOptions::default())
+            .expect("prebuilt selection needs no cargo");
+        assert_eq!(wiring.artifacts[0].path.as_deref(), Some(dst.as_path()));
+
+        // A triple the directory does not ship is a clean error listing the
+        // triples it does.
+        let mut cross = fixture_wiring();
+        cross.artifacts[0].prebuilt_dir = Some(libs);
+        let opts = BuildOptions {
+            extra_args: vec!["--target".into(), "riscv64gc-unknown-linux-gnu".into()],
+            ..BuildOptions::default()
+        };
+        let err = provision_artifacts(&mut cross, &opts).expect_err("missing triple is refused");
+        match err {
+            BuildError::PrebuiltMissing {
+                artifact,
+                triple,
+                available,
+                ..
+            } => {
+                assert_eq!(artifact, "fixture");
+                assert_eq!(triple, "riscv64gc-unknown-linux-gnu");
+                assert_eq!(available, vec![host]);
+            }
+            other => panic!("expected PrebuiltMissing, got {other}"),
+        }
+    }
+
+    /// The compile-time triple and cargo's own view of the host agree, so the
+    /// cargo-free fallback never changes what a bundle records or a prebuilt
+    /// selection picks.
+    #[test]
+    fn compiled_triple_matches_cargo() {
+        let (Some(compiled), Some(cargo)) = (compiled_triple(), cargo_host_triple()) else {
+            eprintln!("skipping: platform unlisted or cargo unavailable");
+            return;
+        };
+        assert_eq!(compiled, cargo);
     }
 }

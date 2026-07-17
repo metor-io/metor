@@ -9,7 +9,7 @@
 //! Both runs use the static path (plant/nav/ctrl as rlibs, like `closed_loop.rs`'s parity
 //! reference) off a patched `mission.py`: the wheel preload set to a controllable level,
 //! the alarm band scaled around it, and `k_desat` set per run. Gated off `miri`
-//! (build_artifacts still builds the sequence cdylibs the `mode` slot loads).
+//! (provision_artifacts still builds the sequence cdylibs the `mode` slot loads).
 
 #![cfg(not(miri))]
 
@@ -21,7 +21,7 @@ use adcs_contracts::{BodyState, V3, Wheels};
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::AlarmRaised;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{ParamSource, Wiring, build_artifacts, eval_python_mission, resolve};
+use metor_fsw_2::wiring::{ParamSource, Wiring, eval_python_mission, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, MsgIn};
 
 fn mission_py() -> std::path::PathBuf {
@@ -91,8 +91,8 @@ fn build_static(k_desat: f64) -> Option<Coordinator> {
         .expect("the RW_MOMENTUM_HIGH alarm");
     band["warning"] = serde_json::json!({ "above": 0.008, "below": -0.008 });
     band["critical"] = serde_json::json!({ "above": 0.012, "below": -0.012 });
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return None;
     }
     for spec in &mut wiring.systems {
@@ -204,10 +204,19 @@ async fn desat_dumps_preloaded_momentum() {
     // of the `plant.wheels.wheels.0.ang_momentum` path.
     assert!(a.momentum_alarm, "RW_MOMENTUM_HIGH raised on the preload");
     // Desat rides along without destabilizing the mission: the boot tumble still damps.
-    assert!(a.rate_f < 0.05, "mission still converges under desat: {}", a.rate_f);
+    assert!(
+        a.rate_f < 0.05,
+        "mission still converges under desat: {}",
+        a.rate_f
+    );
     // The torquers dumped a measurable slice of the preload relative to the no-desat
     // baseline (only the field-perpendicular component is reachable in the window).
-    assert!(a.hf < a.h0, "stored momentum decreased: {} -> {}", a.h0, a.hf);
+    assert!(
+        a.hf < a.h0,
+        "stored momentum decreased: {} -> {}",
+        a.h0,
+        a.hf
+    );
     let dumped = b.hf - a.hf;
     assert!(
         dumped > 2e-4,

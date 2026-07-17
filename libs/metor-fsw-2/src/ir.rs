@@ -176,7 +176,7 @@ pub struct Artifact {
     /// stays arch-neutral.
     pub lib: String,
     /// The resolved artifact location, filled in by
-    /// [`build_artifacts`](crate::wiring::build_artifacts). `None` until built or
+    /// [`provision_artifacts`](crate::wiring::provision_artifacts). `None` until built or
     /// located.
     pub path: Option<PathBuf>,
     /// Where a prebuilt artifact's per-triple libraries live: a directory

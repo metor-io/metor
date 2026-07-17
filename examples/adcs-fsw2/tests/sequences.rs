@@ -3,8 +3,8 @@
 //! untouched plant/nav/ctrl loop.
 //!
 //! Two scenarios, both built from the SAME `mission.py` the CLI runner consumes (evaluate →
-//! `build_artifacts` → `resolve` with an empty `Registry`, exactly as `closed_loop.rs` /
-//! `bundle.rs` set up — the sequence cdylibs are built by `build_artifacts` like any
+//! `provision_artifacts` → `resolve` with an empty `Registry`, exactly as `closed_loop.rs` /
+//! `bundle.rs` set up — the sequence cdylibs are built by `provision_artifacts` like any
 //! artifact):
 //!
 //! 1. **Auto-run** — the slot's `initial state="running"` `commissioning` occupant runs from
@@ -33,7 +33,7 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{ParamSource, build_artifacts, eval_python_mission, resolve};
+use metor_fsw_2::wiring::{ParamSource, eval_python_mission, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, SequenceStatus, split_record};
 
 /// The mission file — the same one the CLI runner and the other tests read.
@@ -69,8 +69,8 @@ fn build_mission(auto_run: bool) -> Option<Coordinator> {
     for spec in &mut wiring.systems {
         spec.process = false;
     }
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return None;
     }
     if !auto_run {
@@ -106,7 +106,10 @@ fn tap_slot(coord: &mut Coordinator) -> (Input<SequenceStatus>, Input<ModeCmd>) 
 /// it never laps) and every distinct `ModeCmd.mode` published (`drain`, 1:1 with the cycle).
 /// Returns `(run_states, modes)` captured over the run.
 type Captured = (Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>);
-fn spawn_sampler(seq: Input<SequenceStatus>, mode: Input<ModeCmd>) -> (Captured, stellarator::JoinHandle<()>) {
+fn spawn_sampler(
+    seq: Input<SequenceStatus>,
+    mode: Input<ModeCmd>,
+) -> (Captured, stellarator::JoinHandle<()>) {
     let run_states = Rc::new(RefCell::new(Vec::<u8>::new()));
     let modes = Rc::new(RefCell::new(Vec::<u8>::new()));
     let (rs, ms) = (run_states.clone(), modes.clone());
@@ -254,7 +257,10 @@ fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
 ) -> Vec<M> {
     let mut out = Vec::new();
     let mut buf = Vec::new();
-    while view.try_read_into(&mut buf).expect("no lap on the message tap") {
+    while view
+        .try_read_into(&mut buf)
+        .expect("no lap on the message tap")
+    {
         let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
         assert_eq!(id, M::ID, "every record on this channel carries M::ID");
         out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
@@ -291,7 +297,9 @@ fn commissioning_emits_ordered_sequence_messages() {
 
     // (a) The boot `SequenceRegistry` lists the `mode` channel with both allowed occupants.
     let registries = drain_msgs::<SequenceRegistry>(&mut boot_view);
-    let registry = registries.last().expect("a boot SequenceRegistry was emitted");
+    let registry = registries
+        .last()
+        .expect("a boot SequenceRegistry was emitted");
     let channel = registry
         .channels
         .iter()
@@ -314,7 +322,12 @@ fn commissioning_emits_ordered_sequence_messages() {
     let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
     // The full lifecycle, every-record (no coalescing). The progress detail strings match
     // `systems/commissioning/src/lib.rs`, enumerated once here.
-    let expected_progress = ["estimator warm-up", "coarse pointing", "pointing", "commissioned"];
+    let expected_progress = [
+        "estimator warm-up",
+        "coarse pointing",
+        "pointing",
+        "commissioned",
+    ];
     assert_eq!(
         kinds.len(),
         3 + expected_progress.len(),
@@ -324,7 +337,10 @@ fn commissioning_emits_ordered_sequence_messages() {
         matches!(kinds[0], SequenceEventKind::Loaded { name } if name == "commissioning"),
         "[0] Loaded {{ commissioning }}: {kinds:?}"
     );
-    assert!(matches!(kinds[1], SequenceEventKind::Started), "[1] Started: {kinds:?}");
+    assert!(
+        matches!(kinds[1], SequenceEventKind::Started),
+        "[1] Started: {kinds:?}"
+    );
     for (i, expected) in expected_progress.iter().enumerate() {
         assert!(
             matches!(kinds[2 + i], SequenceEventKind::Progress { detail } if detail == expected),
@@ -377,8 +393,8 @@ fn detumble_times_out_to_failed_with_wheels_idle() {
     for spec in &mut wiring.systems {
         spec.process = false;
     }
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     let mut coord =

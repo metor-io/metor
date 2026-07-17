@@ -34,7 +34,7 @@ use crate::abi::{PackEntryDesc, PackManifest};
 use crate::descriptor::{Delivery, FanIn, PortDesc, PortSchema};
 
 use super::model::Wiring;
-use super::{BuildOptions, WiringBuilder, build_artifacts};
+use super::{BuildOptions, WiringBuilder, provision_artifacts};
 
 /// Everything a `stubgen` invocation needs: the mission directory whose
 /// `pyproject.toml` lists the artifacts, whether to build them first, and
@@ -213,7 +213,7 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
             }
             b.build()
         };
-        build_artifacts(
+        provision_artifacts(
             &mut wiring,
             &BuildOptions {
                 release: opts.release,
@@ -224,7 +224,7 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
         for ((id, e), art) in artifacts.into_iter().zip(wiring.artifacts.into_iter()) {
             let path = art
                 .path
-                .expect("build_artifacts fills every path or errors");
+                .expect("provision_artifacts fills every path or errors");
             located.push((id, e, path));
         }
     } else {
@@ -1350,7 +1350,7 @@ mod integration {
                 "metor_fsw_2_dl_fixture",
             )
             .build();
-        if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
             eprintln!("skipping: build failed: {e}");
             return;
         }

@@ -1,7 +1,7 @@
 //! Runtime slots driven through the [`WiringBuilder`] front end.
 //!
 //! Each test builds a `slot` mission with [`WiringBuilder`] rather than a
-//! hand-built coordinator. The build driver ([`build_artifacts`]) compiles and
+//! hand-built coordinator. The build driver ([`provision_artifacts`]) compiles and
 //! locates the occupant shared library, and [`resolve`] turns the whole thing
 //! into a live [`Coordinator`]. The tests then observe the slot from the
 //! outside, through its host `SlotStatus` frames, its events channel, and its
@@ -19,7 +19,7 @@ use metor_fsw_2::metor_proto_wkt::{
 };
 use metor_fsw_2::{
     ClockSpec, Frame, Input, SlotInitState, SlotStatus, WiringBuilder, split_record,
-    wiring::{BuildOptions, LoadErrorKind, Registry, build_artifacts, resolve},
+    wiring::{BuildOptions, LoadErrorKind, Registry, provision_artifacts, resolve},
 };
 
 /// The seq fixture's cargo crate name and cdylib library stem.
@@ -56,8 +56,8 @@ fn slot_via_wiring_resolves_and_runs_to_done() {
     let mut wiring = slot_wiring();
     assert_eq!(wiring.slots.len(), 1, "the slot is declared");
 
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     assert!(
@@ -138,8 +138,8 @@ fn alarms_node_before_a_slot_still_builds_and_raises() {
         wiring.systems[0].name, "alarms",
         "the alarm node comes first"
     );
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
 
@@ -181,8 +181,8 @@ fn slot_declared_contract_mismatch_is_a_clean_error() {
         .allow("waiter")
         .end()
         .build();
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     let err = match resolve(&wiring, &Registry::new()) {
@@ -232,8 +232,8 @@ fn unknown_runtime_load_is_rejected_with_a_failed_event() {
         .end()
         .connect_msg("coordinator", "adcs", "SequenceCommand")
         .build();
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     let mut coord = resolve(&wiring, &Registry::new()).expect("resolve the slot Wiring");
@@ -328,8 +328,8 @@ fn param_slot_wiring() -> metor_fsw_2::Wiring {
 #[test]
 fn slot_allow_params_resolve_and_run_b1() {
     let mut wiring = param_slot_wiring();
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
 
@@ -376,8 +376,8 @@ fn slot_allow_unknown_param_is_a_clean_error() {
         .initial("gainer", SlotInitState::Running)
         .end()
         .build();
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     let err = match resolve(&wiring, &Registry::new()) {

@@ -5,8 +5,8 @@ use miette::IntoDiagnostic;
 
 use crate::wiring::{
     BuildOptions, ClockSpec, METOR_EXTENSION, PackageOptions, Registry, StubgenOptions,
-    WIRING_FILE_NAME, Wiring, build_artifacts, build_target, eval_python_mission,
-    is_python_mission, load_bundle, resolve, stubgen, unpack_metor, write_bundle,
+    WIRING_FILE_NAME, Wiring, build_target, eval_python_mission, is_python_mission, load_bundle,
+    provision_artifacts, resolve, stubgen, unpack_metor, write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -195,7 +195,7 @@ fn load_source(path: &Path) -> miette::Result<Wiring> {
 /// `build`: load the wiring, compile and locate every artifact's `.so`, print them.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
     let mut wiring = load_source(&args.mission)?;
-    build_artifacts(
+    provision_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
     )
@@ -225,7 +225,7 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
         .as_deref()
         .ok_or_else(|| miette::miette!("`package` needs an output path (`-o <out>`)"))?;
     let mut wiring = load_source(mission)?;
-    build_artifacts(
+    provision_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
     )
@@ -383,7 +383,7 @@ fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
         ));
     }
     let mut wiring = load_source(&args.target)?;
-    build_artifacts(
+    provision_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
     )

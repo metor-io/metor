@@ -45,10 +45,11 @@ Four milestones, one commit each, in order.
 
 1. `build_driver`: `build_artifacts` → `provision_artifacts(wiring, opts)`.
    Per artifact: `prebuilt_dir` set → select
-   `<dir>/<triple>/<cdylib_file_name_for(triple, lib)>`, verify the adjacent
-   `.manifest` sidecar hash against `manifest_hash`, fill `path`, no cargo;
-   a missing triple errors listing the triples present. Else the cargo path
-   unchanged.
+   `<dir>/<triple>/<cdylib_file_name_for(triple, lib)>`, fill `path`, no
+   cargo; a missing triple errors listing the triples present. Else the cargo
+   path unchanged. No hash check at selection: the sidecar sits next to the
+   selected library, so resolve's existing `check_manifest_hashes` gate
+   already covers prebuilt artifacts — one validation gate, not two.
 2. `host_triple()` compile-time fallback (`env!`-style per-platform constant)
    so prebuilt-only consumers need no cargo on PATH.
 3. Bundle member naming derives from `lib` + build target (was

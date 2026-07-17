@@ -184,7 +184,7 @@ impl LoadErrorKind {
                 format!("declare an `artifact \"{artifact}\" ...` node, or fix the `artifact=` ref")
             }
             ArtifactNotBuilt { .. } => {
-                "`build_artifacts` must set this artifact's `path` before `resolve`".into()
+                "`provision_artifacts` must set this artifact's `path` before `resolve`".into()
             }
             DlOpen { .. } => "this dl system failed to load".into(),
             DlParamEncode { .. } => {

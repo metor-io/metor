@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use metor_fsw_2::wiring::{
     BuildOptions, LoadErrorKind, Registry, StubgenError, StubgenOptions, WiringBuilder,
-    build_artifacts, resolve, stubgen,
+    provision_artifacts, resolve, stubgen,
 };
 
 fn mission_dir() -> PathBuf {
@@ -68,7 +68,7 @@ fn tampered_hash_is_refused_at_resolve() {
     let mut wiring = WiringBuilder::new()
         .artifact("adcs", "adcs-systems", "adcs_systems")
         .build();
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
         eprintln!("skipping: building the pack failed: {e}");
         return;
     }

@@ -58,7 +58,7 @@ mod validate;
 // `super::model`.
 pub(crate) use crate::ir as model;
 
-pub use build_driver::{BuildError, BuildOptions, build_artifacts, build_target};
+pub use build_driver::{BuildError, BuildOptions, build_target, provision_artifacts};
 pub use builder::{ArtifactSystemBuilder, SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use bundle::{
     BundleError, BundleMeta, METOR_EXTENSION, PackageOptions, WIRING_FILE_NAME, load_bundle,
