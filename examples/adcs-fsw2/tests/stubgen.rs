@@ -27,15 +27,20 @@ fn mission_dir() -> PathBuf {
 }
 
 /// Generating into an `--out-dir` and re-running with `--check` against the
-/// same directory is clean: the backend's regenerate-on-sync flow is
-/// deterministic, and `--check` still functions against a build directory.
-/// Mission-level stubgen covers the legacy `seqs` artifact only; `adcs` is a
-/// path-source pack (see `pack_dev_module_is_deterministic`).
+/// same directory is clean: generation is deterministic, and `--check` still
+/// functions against a build directory. The converted mission has no
+/// `[tool.metor.artifacts]` anymore (both packs are dependencies), so the
+/// deprecated mission-level path is exercised over a fabricated mission dir.
 #[test]
 fn stubgen_out_dir_roundtrips() {
     let out = tempfile::tempdir().unwrap();
+    std::fs::write(
+        out.path().join("pyproject.toml"),
+        "[tool.metor.artifacts]\nseqs = { crate = \"adcs-sequences\", lib = \"adcs_sequences\" }\n",
+    )
+    .unwrap();
     let opts = |check| StubgenOptions {
-        mission_dir: mission_dir(),
+        mission_dir: out.path().to_path_buf(),
         out_dir: Some(out.path().join("packs")),
         check,
         build: true,

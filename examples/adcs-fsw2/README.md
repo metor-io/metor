@@ -77,20 +77,15 @@ CPython that evaluates the file against the recorder and emits the versioned `Wi
 params, ports, and frames are pyright-checked. The CLI runner and every tracked test read
 this one file.
 
-The generated modules are **venv-only build artifacts**, deliberately arriving two ways
-(packaging phase 1, `libs/metor-fsw-2/docs/design-packaging.md`):
-
-- The `adcs` pack is an ordinary dependency of the mission — a `[tool.uv.sources]` path
-  entry pointing at `systems/adcs-systems`, whose own backend runs `metor-fsw pack dev` on
-  `uv sync`: it builds the host triple and lays out `.metor/adcs_pack/` (typed module +
-  `_libs/<triple>/` payload), the exact shape a published pack wheel installs as. Hence
-  `from adcs_pack import Plant`.
-- The `seqs` pack stays on the legacy mission-level path: the in-tree PEP 517 backend in
-  `_backend/` runs `metor-fsw stubgen` into `.metor/packs` and exposes it — plus the
-  `metor_config` checkout — through the editable install's `.pth`. Hence
-  `from packs.seqs import commissioning`.
-
-Nothing generated is checked in.
+The generated modules are **venv-only build artifacts**
+(`libs/metor-fsw-2/docs/design-packaging.md`): the mission is a virtual uv project whose
+packs are ordinary dependencies — `[tool.uv.sources]` path entries pointing at
+`systems/adcs-systems` and `systems/adcs-sequences` while they live in this repo. Each
+pack's own PEP 517 backend runs `metor-fsw pack dev` on `uv sync`, building the host triple
+and laying out `.metor/<module>/` (typed module + `_libs/<triple>/` payload) — the exact
+shape a published pack wheel installs as. Hence `from adcs_pack import Plant` and
+`from adcs_seqs import commissioning`; deleting a source line switches that pack to an
+index build with the same import. Nothing generated is checked in.
 
 ```sh
 cd examples/adcs-fsw2

@@ -319,8 +319,13 @@ fn cmd_pack_dev(args: PackDevArgs) -> miette::Result<()> {
 
 /// `stubgen`: read the mission's `pyproject.toml`, (build and) describe each
 /// listed artifact, and write — or, with `--check`, verify — its typed pack
-/// module.
+/// module. Deprecated in favor of per-pack `pack dev`
+/// (`docs/design-packaging.md` §10); kept working for one release.
 fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
+    eprintln!(
+        "warning: mission-level `stubgen` is deprecated; give each pack crate a \
+         `pyproject.toml` and use `metor-fsw pack dev` (docs/design-packaging.md §10)"
+    );
     let opts = StubgenOptions {
         mission_dir: args.dir,
         out_dir: args.out_dir,

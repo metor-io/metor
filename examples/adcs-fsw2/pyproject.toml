@@ -1,52 +1,18 @@
-# Build metadata for the adcs-fsw2 mission (not wiring).
-#
-# Mixed mode, deliberately (docs/packaging-phase1-plan.md): the `adcs` pack
-# is an ordinary dependency (a path source while it lives in this repo — its
-# own backend runs `metor-fsw pack dev` on `uv sync`), while `seqs` stays on
-# the legacy mission-level path: `uv sync` drives the in-tree backend in
-# `_backend/`, which runs `metor-fsw stubgen` and exposes the generated
-# `.metor/packs` stubs — plus the `metor_config` checkout — to the venv via
-# a `.pth`.
+# The adcs-fsw2 mission as a consumer (docs/design-packaging.md §6.2): a
+# virtual uv project — no build system of its own — whose packs and the
+# recorder are ordinary dependencies. Both packs are path sources while they
+# live in this repo; `uv sync` runs each pack's backend (`metor-fsw pack
+# dev`), and deleting a source line switches that pack to an index build
+# with the same import name.
 
 [project]
 name = "adcs-fsw2"
 version = "0.1.0"
-description = "adcs-fsw2 mission config: venv-generated pack stubs"
+description = "adcs-fsw2 mission config"
 requires-python = ">=3.11"
-dependencies = ["adcs-pack", "metor-config"]
+dependencies = ["adcs-pack", "adcs-seqs", "metor-config"]
 
 [tool.uv.sources]
 adcs-pack = { path = "systems/adcs-systems", editable = true }
+adcs-seqs = { path = "systems/adcs-sequences", editable = true }
 metor-config = { path = "../../libs/metor-fsw-2/python/metor-config", editable = true }
-
-[build-system]
-requires = []
-build-backend = "metor_build"
-backend-path = ["_backend"]
-
-# `metor-fsw stubgen` (invoked by the backend) reads this table to know which
-# pack cdylibs to build and describe, and renders a typed `packs/<id>.py`
-# module per entry. `crate` is the cargo package that produces the cdylib;
-# `lib` is its library stem.
-[tool.metor.artifacts]
-seqs = { crate = "adcs-sequences", lib = "adcs_sequences" }
-
-[tool.metor.build]
-out-dir = ".metor"
-# metor_config arrives as a real (editable path-source) dependency now, so
-# no extra-pth: the venv copy wins and the embedded copy is the no-venv
-# fallback.
-# stubgen-command = [...] overrides the invocation; the default is
-#   cargo run -q -p metor-fsw-2 --bin metor-fsw -- stubgen . --out-dir .metor/packs
-# or set METOR_FSW_BIN to a prebuilt metor-fsw binary.
-
-# Rebuild (and so regenerate stubs) when the pack sources change, not just
-# this file — the uv-specific half of the "stubs are always fresh" story.
-[tool.uv]
-cache-keys = [
-    { file = "pyproject.toml" },
-    { file = "systems/**/*.rs" },
-    { file = "systems/**/Cargo.toml" },
-    { file = "contracts/**/*.rs" },
-    { file = "contracts/**/Cargo.toml" },
-]

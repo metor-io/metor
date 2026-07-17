@@ -1,0 +1,27 @@
+# The sequences pack as a Python distribution — same shape as its sibling
+# `adcs-systems` (see that pyproject for the monorepo-vs-published notes).
+
+[project]
+name = "adcs-seqs"
+version = "0.1.0"
+description = "The commissioning and safe-mode sequences of the adcs-fsw2 mission"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["metor-build"]
+build-backend = "metor_build"
+
+[tool.metor.pack]
+id = "seqs"
+
+[tool.uv.sources]
+metor-build = { path = "../../../../libs/metor-fsw-2/python/metor-build" }
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../../contracts/src/**/*.rs" },
+    { file = "../../contracts/Cargo.toml" },
+]
