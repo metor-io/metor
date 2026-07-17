@@ -4,9 +4,9 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, ClockSpec, METOR_EXTENSION, PackageOptions, Registry, StubgenOptions,
-    WIRING_FILE_NAME, Wiring, build_target, eval_python_mission, is_python_mission, load_bundle,
-    provision_artifacts, resolve, stubgen, unpack_metor, write_bundle,
+    BuildOptions, ClockSpec, METOR_EXTENSION, PackDevOptions, PackageOptions, Registry,
+    StubgenOptions, WIRING_FILE_NAME, Wiring, build_target, eval_python_mission, is_python_mission,
+    load_bundle, pack_dev, provision_artifacts, resolve, stubgen, unpack_metor, write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -32,6 +32,30 @@ enum Command {
     Run(RunArgs),
     /// Generate the typed Python pack modules (`packs/<id>.py`) for a mission.
     Stubgen(StubgenArgs),
+    /// Pack-crate packaging (`docs/design-packaging.md`).
+    #[command(subcommand)]
+    Pack(PackCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum PackCmd {
+    /// Build the host triple and lay out the pack's editable `.metor/`
+    /// payload (typed module + `_libs/<triple>/`); what a pack's PEP 517
+    /// backend runs on `uv sync`.
+    Dev(PackDevArgs),
+}
+
+#[derive(Args, Debug)]
+struct PackDevArgs {
+    /// The pack crate directory (holds `pyproject.toml` + `Cargo.toml`).
+    #[arg(default_value = ".")]
+    dir: PathBuf,
+    /// Build the `--release` profile.
+    #[arg(long)]
+    release: bool,
+    /// An extra arg appended to the `cargo build` (repeatable).
+    #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
+    cargo_arg: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -143,7 +167,28 @@ pub async fn run() -> miette::Result<()> {
         Command::Package(a) => cmd_package(a),
         Command::Run(a) => cmd_run(a).await,
         Command::Stubgen(a) => cmd_stubgen(a),
+        Command::Pack(PackCmd::Dev(a)) => cmd_pack_dev(a),
     }
+}
+
+/// `pack dev`: build the pack crate for the host and lay out its editable
+/// `.metor/` payload (typed module + per-triple lib).
+fn cmd_pack_dev(args: PackDevArgs) -> miette::Result<()> {
+    let report = pack_dev(
+        &args.dir,
+        &PackDevOptions {
+            release: args.release,
+            cargo_args: args.cargo_arg,
+        },
+    )
+    .into_diagnostic()?;
+    println!(
+        "  {} ({})\n  wrote {}",
+        report.lib_path.display(),
+        report.triple,
+        report.module_dir.join("__init__.py").display()
+    );
+    Ok(())
 }
 
 /// `stubgen`: read the mission's `pyproject.toml`, (build and) describe each

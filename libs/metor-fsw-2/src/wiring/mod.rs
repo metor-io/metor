@@ -46,6 +46,7 @@ mod build_driver;
 mod builder;
 mod bundle;
 mod error;
+mod pack_dist;
 mod params;
 mod py;
 mod registry;
@@ -69,6 +70,10 @@ pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
     InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef, SystemSpec,
     TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
+};
+pub use pack_dist::{
+    DEFAULT_TARGETS, PackConfig, PackDevOptions, PackDevReport, PackError, pack_dev,
+    read_pack_config,
 };
 pub use params::encode_value_params;
 pub use py::{eval_python_mission, is_python_mission};
