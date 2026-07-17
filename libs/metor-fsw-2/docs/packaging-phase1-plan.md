@@ -1,6 +1,6 @@
 # Phase 1 plan — IR v3 + the local prebuilt loop
 
-> **Status: IN PROGRESS.** Implements Phase 1 of `docs/design-packaging.md`
+> **Status: LANDED.** Implements Phase 1 of `docs/design-packaging.md`
 > (§8 IR v3, §5.2/§5.3 stub flavor and naming, §6.3 the editable loop, §12
 > phasing). The `sphw/py-backend` prototype (`findings-python-build-backend.md`)
 > is cherry-picked onto this branch and is the starting state: mission-level
@@ -75,10 +75,16 @@ Four milestones, one commit each, in order.
 
 ### M4 — backend promotion + mixed-mode example
 
-1. Promote `examples/adcs-fsw2/_backend/metor_build/` →
-   `python/metor_build/` as a real (path-installable) dist; `build_editable`
-   calls `metor-fsw pack dev`; binary resolution PATH → `METOR_FSW_BIN` →
-   cargo, with a `--version` handshake.
+1. Promote the pack-oriented backend to `python/metor_build/` (the mission's
+   in-tree `_backend` stays for the legacy `seqs` path until phase 3);
+   `build_editable` calls `metor-fsw pack dev`; binary resolution
+   `METOR_FSW_BIN` → PATH → cargo, with a `pack --help` capability handshake
+   (a stale PATH binary predating the subcommand falls through to cargo; an
+   explicit `METOR_FSW_BIN` that cannot serve errors loudly — hit for real
+   during verification). The dist `pyproject.toml` for `metor-build` is
+   deferred to phase 0 with publishing; in-repo packs reach the backend via
+   a one-file `_backend/metor_build_shim.py` (PEP 517 `backend-path` must
+   stay inside the source tree).
 2. `py.rs`: prefer the venv's `metor_config` over the embedded copy (embedded
    stays the no-venv fallback); pass the expected ABI version into the eval
    env; recorder checks `ARTIFACT.abi_version` against it at record time.
@@ -89,6 +95,19 @@ Four milestones, one commit each, in order.
    stubgen (mixed mode is the acceptance test).
 4. Tests: example suites pass hermetically (no venv) and via `uv sync` +
    `uv run`; pyright clean on `mission.py`.
+
+## Findings (phase 1 verification)
+
+- uv 0.5.28 `cache-keys`: in-dir globs invalidate the pack's editable build;
+  `../` globs do **not** (phase-0 spike question answered early). A
+  contracts-only change leaves a path-source pack consistently stale —
+  module and lib regenerate together, so `StaleStubs` correctly stays
+  quiet — healed by `uv sync --reinstall-package <pack>` or any in-pack
+  edit.
+- `metor-fsw run mission.py --build` no longer cargo-rebuilds a prebuilt
+  artifact (provisioning selects from `.metor`); `uv run`'s implicit sync is
+  the blessed refresh. Revisit in phase 3 whether provisioning should re-run
+  `pack dev` for path-source packs itself.
 
 ## Verification
 

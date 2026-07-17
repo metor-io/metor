@@ -5,3 +5,14 @@ requires-python = ">=3.11"
 name = "adcs-fsw2"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "adcs-pack" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "adcs-pack", editable = "systems/adcs-systems" }]
+
+[[package]]
+name = "adcs-pack"
+version = "0.1.0"
+source = { editable = "systems/adcs-systems" }

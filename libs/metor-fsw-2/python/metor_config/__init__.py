@@ -441,7 +441,21 @@ class Mission:
         """Record an :class:`Artifact`, deduped by id. A second declaration of
         the same id must agree on crate and lib (conflicting definitions are an
         eval-time error); a later declaration may supply the manifest hash an
-        earlier one lacked."""
+        earlier one lacked. A prebuilt pack built against a different FSW ABI
+        than the evaluating host expects is refused here, naming the pack —
+        the record-time tier of the three-layer ABI gate
+        (``docs/design-packaging.md`` §9.1)."""
+        expected = os.environ.get("METOR_EXPECTED_ABI")
+        if (
+            expected is not None
+            and decl.abi_version is not None
+            and decl.abi_version != int(expected)
+        ):
+            raise ValueError(
+                f"pack {decl.dist or decl.id!r} was built for FSW ABI "
+                f"{decl.abi_version}, but this metor-fsw expects ABI {expected}; "
+                "rebuild the pack or match the metor-fsw version"
+            )
         for existing in self._artifacts:
             if existing["id"] != decl.id:
                 continue

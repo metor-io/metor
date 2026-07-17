@@ -1,14 +1,22 @@
 # Build metadata for the adcs-fsw2 mission (not wiring).
 #
-# `uv sync` (or `pip install -e .`) drives the in-tree backend in `_backend/`,
-# which runs `metor-fsw stubgen` and exposes the generated `.metor/packs`
-# stubs — plus the `metor_config` checkout — to the venv via a `.pth`.
+# Mixed mode, deliberately (docs/packaging-phase1-plan.md): the `adcs` pack
+# is an ordinary dependency (a path source while it lives in this repo — its
+# own backend runs `metor-fsw pack dev` on `uv sync`), while `seqs` stays on
+# the legacy mission-level path: `uv sync` drives the in-tree backend in
+# `_backend/`, which runs `metor-fsw stubgen` and exposes the generated
+# `.metor/packs` stubs — plus the `metor_config` checkout — to the venv via
+# a `.pth`.
 
 [project]
 name = "adcs-fsw2"
 version = "0.1.0"
 description = "adcs-fsw2 mission config: venv-generated pack stubs"
 requires-python = ">=3.11"
+dependencies = ["adcs-pack"]
+
+[tool.uv.sources]
+adcs-pack = { path = "systems/adcs-systems", editable = true }
 
 [build-system]
 requires = []
@@ -20,7 +28,6 @@ backend-path = ["_backend"]
 # module per entry. `crate` is the cargo package that produces the cdylib;
 # `lib` is its library stem.
 [tool.metor.artifacts]
-adcs = { crate = "adcs-systems", lib = "adcs_systems" }
 seqs = { crate = "adcs-sequences", lib = "adcs_sequences" }
 
 [tool.metor.build]

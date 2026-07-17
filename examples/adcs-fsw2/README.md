@@ -73,13 +73,23 @@ cdylib, off when the test links the rlib) so the rlib carries no `fsw_pack_*` ex
 The mission is described in `mission.py` through the `metor_config` Python front-end
 (`libs/metor-fsw-2/python`): `metor-fsw build|run|package mission.py` spawns a subprocess
 CPython that evaluates the file against the recorder and emits the versioned `Wiring` IR that
-`resolve` consumes. Systems and occupants come from generated, `py.typed` pack modules
-(`metor-fsw stubgen`), so params, ports, and frames are pyright-checked. The CLI runner and
-every tracked test read this one file.
+`resolve` consumes. Systems and occupants come from generated, `py.typed` pack modules, so
+params, ports, and frames are pyright-checked. The CLI runner and every tracked test read
+this one file.
 
-The stubs are **venv-only build artifacts**: the in-tree PEP 517 backend in `_backend/`
-(wired up by this directory's `pyproject.toml`) runs stubgen into `.metor/packs` and exposes
-it — plus the `metor_config` checkout — to the venv through the editable install's `.pth`.
+The generated modules are **venv-only build artifacts**, deliberately arriving two ways
+(packaging phase 1, `libs/metor-fsw-2/docs/design-packaging.md`):
+
+- The `adcs` pack is an ordinary dependency of the mission — a `[tool.uv.sources]` path
+  entry pointing at `systems/adcs-systems`, whose own backend runs `metor-fsw pack dev` on
+  `uv sync`: it builds the host triple and lays out `.metor/adcs_pack/` (typed module +
+  `_libs/<triple>/` payload), the exact shape a published pack wheel installs as. Hence
+  `from adcs_pack import Plant`.
+- The `seqs` pack stays on the legacy mission-level path: the in-tree PEP 517 backend in
+  `_backend/` runs `metor-fsw stubgen` into `.metor/packs` and exposes it — plus the
+  `metor_config` checkout — through the editable install's `.pth`. Hence
+  `from packs.seqs import commissioning`.
+
 Nothing generated is checked in.
 
 ```sh

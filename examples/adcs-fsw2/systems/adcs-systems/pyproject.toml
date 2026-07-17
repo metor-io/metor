@@ -1,0 +1,36 @@
+# The adcs pack as a Python distribution (docs/design-packaging.md §6.1).
+#
+# A mission consumes it as an ordinary dependency; while it lives in this
+# repo, a `[tool.uv.sources]` path entry points here and `uv sync` runs the
+# backend, which lays out `.metor/adcs_pack/` (typed module + host-triple
+# lib) via `metor-fsw pack dev` and exposes it to the venv.
+
+[project]
+name = "adcs-pack"
+version = "0.1.0"
+description = "The plant, nav, and ctrl systems of the adcs-fsw2 mission"
+requires-python = ">=3.11"
+
+[build-system]
+requires = []
+build-backend = "metor_build_shim"
+backend-path = ["_backend"]
+
+[tool.metor.pack]
+id = "adcs"
+
+# Rebuild (and so regenerate the module + lib) when the pack sources change.
+#
+# Verified on uv 0.5.28: globs inside this directory invalidate the editable
+# build; the `../../contracts` globs below do NOT (uv resolves cache keys
+# within the package dir only). After a contracts-only change, heal with
+# `uv sync --reinstall-package adcs-pack` — kept here anyway as documentation
+# and in case uv grows support.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../../contracts/src/**/*.rs" },
+    { file = "../../contracts/Cargo.toml" },
+]

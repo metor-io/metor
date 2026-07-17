@@ -50,16 +50,22 @@ pub fn is_python_mission(path: &Path) -> bool {
 pub fn eval_python_mission(path: &Path) -> miette::Result<Wiring> {
     let python = resolve_interpreter()?;
 
-    // Recorder source: a live checkout via $METOR_CONFIG_PY, else the embedded
-    // copy materialized to a per-run temp dir (dropped when this returns).
+    // Recorder source, in preference order: a live checkout via
+    // `$METOR_CONFIG_PY`; the interpreter's own environment (a venv that
+    // installed `metor_config` — anything on `PYTHONPATH` would shadow
+    // site-packages, so the embedded copy must stay off the path); else the
+    // embedded copy materialized to a per-run temp dir (dropped when this
+    // returns) so a bare `metor-fsw run` needs no venv.
     let materialized;
-    let pythonpath_root: PathBuf = match std::env::var_os("METOR_CONFIG_PY") {
-        Some(dir) => PathBuf::from(dir),
+    let mut roots: Vec<PathBuf> = Vec::new();
+    match std::env::var_os("METOR_CONFIG_PY") {
+        Some(dir) => roots.push(PathBuf::from(dir)),
+        None if imports_metor_config(&python) => {}
         None => {
             materialized = materialize_recorder()?;
-            materialized.path().to_path_buf()
+            roots.push(materialized.path().to_path_buf());
         }
-    };
+    }
 
     let ir_file = tempfile::Builder::new()
         .prefix("metor-ir-")
@@ -68,20 +74,27 @@ pub fn eval_python_mission(path: &Path) -> miette::Result<Wiring> {
         .into_diagnostic()?;
 
     // A mission whose stubs are venv-only build artifacts keeps them in
-    // `.metor/packs` beside the mission file; putting that build dir on the
-    // path lets a bare `metor-fsw run` (or a Rust test) evaluate the mission
-    // without the venv active.
-    let mut roots = vec![pythonpath_root];
-    if let Some(stubs) = path.parent().map(|d| d.join(".metor"))
-        && stubs.is_dir()
-    {
-        roots.push(stubs);
+    // `.metor/packs` beside the mission file, and each path-source pack
+    // dependency keeps its module in `<pack>/.metor`; putting those build
+    // dirs on the path lets a bare `metor-fsw run` (or a Rust test) evaluate
+    // the mission without the venv active. In a venv they resolve there
+    // first-equal — the contents are the same artifacts the backends expose.
+    if let Some(mission_dir) = path.parent() {
+        let stubs = mission_dir.join(".metor");
+        if stubs.is_dir() {
+            roots.push(stubs);
+        }
+        roots.extend(pack_stub_roots(mission_dir));
     }
 
     let status = Command::new(&python)
         .arg(path)
         .env("PYTHONPATH", prepend_pythonpath(&roots))
         .env("METOR_IR_OUT", ir_file.path())
+        .env(
+            "METOR_EXPECTED_ABI",
+            crate::abi::FSW_ABI_VERSION.to_string(),
+        )
         .status()
         .map_err(|e| miette!("failed to run `{}`: {e}", python.display()))?;
 
@@ -155,6 +168,51 @@ fn resolve_interpreter() -> miette::Result<PathBuf> {
         ));
     }
     Ok(candidate)
+}
+
+/// `true` if `python` can already import `metor_config` from its own
+/// environment (a venv install), in which case the embedded copy stays off
+/// `PYTHONPATH` so the environment's version wins.
+fn imports_metor_config(python: &Path) -> bool {
+    Command::new(python)
+        .args(["-c", "import metor_config"])
+        // The probe asks about the interpreter's own environment; an
+        // inherited PYTHONPATH would answer for someone else.
+        .env_remove("PYTHONPATH")
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The `.metor` build dirs of the mission's path-source pack dependencies:
+/// each `[tool.uv.sources] <dist> = {{ path = … }}` entry in the
+/// mission-adjacent `pyproject.toml` whose target carries one. Best-effort by
+/// design — no pyproject, no sources, or no `.metor` all mean "no roots", and
+/// a real dependency problem surfaces as Python's own `ModuleNotFoundError`
+/// with the mission traceback.
+fn pack_stub_roots(mission_dir: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(mission_dir.join("pyproject.toml")) else {
+        return Vec::new();
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let Some(sources) = doc
+        .get("tool")
+        .and_then(|t| t.get("uv"))
+        .and_then(|u| u.get("sources"))
+        .and_then(|s| s.as_table())
+    else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = sources
+        .values()
+        .filter_map(|entry| entry.get("path")?.as_str())
+        .map(|rel| mission_dir.join(rel).join(".metor"))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    roots.sort();
+    roots
 }
 
 /// Write the embedded recorder into a fresh temp dir.

@@ -17,7 +17,7 @@ Alarms and links stay on the `metor_config` builtins.
 """
 
 from metor_config import Alarm, Alarms, Mission, Target, TcpDownlink, TcpUplink, band
-from packs.adcs import Ctrl, Nav, Plant
+from adcs_pack import Ctrl, Nav, Plant
 from packs.seqs import commissioning, safe_mode
 
 m = Mission(cycle_rate=120.0, sim_dt=1 / 120)
