@@ -461,14 +461,14 @@ Assumed, to be spiked in Phase 0:
 - Marker-dist conflict ergonomics: the `uv lock` error text mentioning
   `metor-fsw-abi` needs a docs entry translating it; if PyPI-public, register
   the dist names early.
-- ~~`cache-keys` globs escaping the package dir~~ — **resolved (phase 1,
-  uv 0.5.28): unsupported.** In-dir globs invalidate the editable build;
-  `../contracts/**/*.rs` does not. A contracts-only change leaves a
-  path-source pack consistently stale (module and lib regenerate together,
-  so `StaleStubs` correctly stays quiet); heal with
-  `uv sync --reinstall-package <pack>` or any in-pack-dir edit. Watch uv for
-  out-of-dir key support; `{ git = { commit = true } }` keys remain the
-  coarse alternative.
+- ~~`cache-keys` globs escaping the package dir~~ — **resolved (phase 1):
+  works on uv ≥ 0.11 (verified 0.11.29: a `../contracts` edit re-runs the
+  editable build, and a no-change sync stays quiet). On 0.5.x only in-dir
+  globs invalidate — there a contracts-only change leaves a path-source pack
+  consistently stale (module and lib regenerate together, so `StaleStubs`
+  correctly stays quiet), healed by `uv sync --reinstall-package <pack>`.
+  Document uv ≥ 0.11 as the supported floor for packs with out-of-dir
+  dependencies.
 - `cargo-zigbuild` → `aarch64-apple-darwin`. Fallbacks: mac runner, Nix cross
   shell — the builder abstraction exists precisely so this cannot block.
 

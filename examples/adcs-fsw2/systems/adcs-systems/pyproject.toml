@@ -19,13 +19,11 @@ backend-path = ["_backend"]
 [tool.metor.pack]
 id = "adcs"
 
-# Rebuild (and so regenerate the module + lib) when the pack sources change.
-#
-# Verified on uv 0.5.28: globs inside this directory invalidate the editable
-# build; the `../../contracts` globs below do NOT (uv resolves cache keys
-# within the package dir only). After a contracts-only change, heal with
-# `uv sync --reinstall-package adcs-pack` — kept here anyway as documentation
-# and in case uv grows support.
+# Rebuild (and so regenerate the module + lib) when the pack sources change,
+# including the sibling contracts crate. Out-of-dir (`../`) globs need
+# uv ≥ 0.11 — on 0.5.x only the in-dir globs invalidate, and a
+# contracts-only change must be healed with
+# `uv sync --reinstall-package adcs-pack`.
 [tool.uv]
 cache-keys = [
     { file = "pyproject.toml" },

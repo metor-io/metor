@@ -98,12 +98,13 @@ Four milestones, one commit each, in order.
 
 ## Findings (phase 1 verification)
 
-- uv 0.5.28 `cache-keys`: in-dir globs invalidate the pack's editable build;
-  `../` globs do **not** (phase-0 spike question answered early). A
-  contracts-only change leaves a path-source pack consistently stale —
-  module and lib regenerate together, so `StaleStubs` correctly stays
-  quiet — healed by `uv sync --reinstall-package <pack>` or any in-pack
-  edit.
+- `cache-keys` out-of-dir (`../`) globs invalidate correctly on uv ≥ 0.11
+  (verified 0.11.29, incl. a quiet no-change sync) but **not** on 0.5.x,
+  where only in-dir globs work and a contracts-only change leaves a
+  path-source pack consistently stale — module and lib regenerate together,
+  so `StaleStubs` correctly stays quiet — healed by
+  `uv sync --reinstall-package <pack>`. uv ≥ 0.11 is the supported floor
+  for packs depending on sibling crates.
 - `metor-fsw run mission.py --build` no longer cargo-rebuilds a prebuilt
   artifact (provisioning selects from `.metor`); `uv run`'s implicit sync is
   the blessed refresh. Revisit in phase 3 whether provisioning should re-run
