@@ -9,7 +9,7 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "metor-config"))
 
 import metor_config as mc
 from metor_config import Alarm, Alarms, Mission, Target, TcpUplink, band

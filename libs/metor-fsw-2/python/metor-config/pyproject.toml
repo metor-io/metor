@@ -1,0 +1,19 @@
+# The mission-config recorder as a distribution (docs/design-packaging.md §4).
+#
+# Missions depend on it like any package (a path source while in this repo).
+# The `metor-fsw` binary still embeds a copy as the no-venv fallback; the
+# evaluator prefers a venv-installed `metor_config` over the embedded one.
+
+[project]
+name = "metor-config"
+version = "0.3.0"
+description = "Typed mission-config recorder for metor-fsw: build a Mission, emit Wiring IR"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "metor_config"
+module-root = ""

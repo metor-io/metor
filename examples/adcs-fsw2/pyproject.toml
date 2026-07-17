@@ -13,10 +13,11 @@ name = "adcs-fsw2"
 version = "0.1.0"
 description = "adcs-fsw2 mission config: venv-generated pack stubs"
 requires-python = ">=3.11"
-dependencies = ["adcs-pack"]
+dependencies = ["adcs-pack", "metor-config"]
 
 [tool.uv.sources]
 adcs-pack = { path = "systems/adcs-systems", editable = true }
+metor-config = { path = "../../libs/metor-fsw-2/python/metor-config", editable = true }
 
 [build-system]
 requires = []
@@ -32,7 +33,9 @@ seqs = { crate = "adcs-sequences", lib = "adcs_sequences" }
 
 [tool.metor.build]
 out-dir = ".metor"
-extra-pth = ["../../libs/metor-fsw-2/python"]
+# metor_config arrives as a real (editable path-source) dependency now, so
+# no extra-pth: the venv copy wins and the embedded copy is the no-venv
+# fallback.
 # stubgen-command = [...] overrides the invocation; the default is
 #   cargo run -q -p metor-fsw-2 --bin metor-fsw -- stubgen . --out-dir .metor/packs
 # or set METOR_FSW_BIN to a prebuilt metor-fsw binary.

@@ -26,13 +26,13 @@ use super::model::Wiring;
 const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
     (
         "metor_config/__init__.py",
-        include_str!("../../python/metor_config/__init__.py"),
+        include_str!("../../python/metor-config/metor_config/__init__.py"),
     ),
     // The `py.typed` marker travels too, so a materialized recorder is a typed
     // package pyright checks against.
     (
         "metor_config/py.typed",
-        include_str!("../../python/metor_config/py.typed"),
+        include_str!("../../python/metor-config/metor_config/py.typed"),
     ),
 ];
 

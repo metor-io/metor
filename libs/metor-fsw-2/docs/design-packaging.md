@@ -101,7 +101,7 @@ Python module that gives autocomplete. Candidates surveyed:
 | dist | contents | tags |
 |---|---|---|
 | `metor-fsw` | the `metor-fsw` binary in `.data/scripts/` | one wheel per host platform |
-| `metor-config` | the recorder library (`python/metor_config/`) | `py3-none-any` |
+| `metor-config` | the recorder library (`python/metor-config/`) | `py3-none-any` |
 | `metor-build` | the PEP 517/660 backend | `py3-none-any` |
 | `metor-fsw-abi` | empty marker; version == `FSW_ABI_VERSION` | `py3-none-any`, one release per ABI bump |
 | `<pack>-pack` | typed stub module + manifest + per-triple cdylibs | `py3-none-any` (fat, §5) |

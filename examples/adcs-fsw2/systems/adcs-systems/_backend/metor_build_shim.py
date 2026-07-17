@@ -12,7 +12,13 @@ import sys
 
 sys.path.insert(
     0,
-    str(pathlib.Path(__file__).resolve().parents[5] / "libs" / "metor-fsw-2" / "python"),
+    str(
+        pathlib.Path(__file__).resolve().parents[5]
+        / "libs"
+        / "metor-fsw-2"
+        / "python"
+        / "metor-build"
+    ),
 )
 
 from metor_build import *  # noqa: E402,F401,F403
