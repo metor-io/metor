@@ -73,6 +73,40 @@ pub struct BundleMeta {
     /// `sha256:<hex>` of the `wiring.json` bytes — the determinism backstop CI
     /// re-evaluates and diffs (`metor-fsw package --check-ir`).
     pub ir_sha256: String,
+    /// Per-artifact provenance: what was actually packaged, hashed from the
+    /// exact bytes copied into the bundle. The flight record that outlives
+    /// the packaging venv (`docs/design-packaging.md` §9.2); recording only —
+    /// the load gates (ABI, IR hash, triple, manifest hash) cover integrity.
+    /// Serde-defaulted so pre-provenance bundles load unchanged.
+    #[serde(default)]
+    pub packs: Vec<PackProvenance>,
+}
+
+/// One artifact's `meta.json` provenance entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PackProvenance {
+    /// The [`Artifact::id`](super::model::Artifact::id).
+    pub artifact_id: String,
+    /// The publishing distribution, when the artifact came from one.
+    pub dist: Option<super::model::DistRef>,
+    /// How the artifact was provisioned.
+    pub source: PackSourceKind,
+    /// `sha256:<hex>` of the shared-object bytes copied into the bundle —
+    /// a digest of the code itself, where `manifest_hash` digests only the
+    /// interface.
+    pub cdylib_sha256: String,
+    /// The recorded pack-manifest hash, when the artifact carried one.
+    pub manifest_hash: Option<String>,
+}
+
+/// Where a packaged artifact's shared object came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PackSourceKind {
+    /// Selected from a prebuilt per-triple payload (an installed pack wheel,
+    /// or a local pack's `pack dev` layout).
+    Prebuilt,
+    /// Compiled from the crate by the build driver at package time.
+    CrateBuilt,
 }
 
 /// Caller-supplied inputs [`write_bundle`] records in `meta.json` and uses to
@@ -285,6 +319,44 @@ fn bundle_members(
             .map(|d| d.as_secs())
             .unwrap_or(0)
     });
+
+    // Artifacts sorted by id so entry order is stable regardless of the order
+    // the front-end recorded them in. Provenance is hashed from the exact
+    // bytes being copied, so `meta.json` describes this bundle's members.
+    let mut artifacts: Vec<&super::model::Artifact> = wiring.artifacts.iter().collect();
+    artifacts.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut artifact_members: Vec<(String, MemberSource)> = Vec::new();
+    let mut packs: Vec<PackProvenance> = Vec::new();
+    for artifact in artifacts {
+        let src = artifact
+            .path
+            .as_ref()
+            .ok_or_else(|| BundleError::NotBuilt {
+                artifact: artifact.id.clone(),
+            })?;
+        let cdylib = member_cdylib_name(opts.target.as_deref(), &artifact.lib);
+        let so_bytes = fs::read(src).map_err(io_at(src))?;
+        packs.push(PackProvenance {
+            artifact_id: artifact.id.clone(),
+            dist: artifact.dist.clone(),
+            source: if artifact.prebuilt_dir.is_some() {
+                PackSourceKind::Prebuilt
+            } else {
+                PackSourceKind::CrateBuilt
+            },
+            cdylib_sha256: super::stubgen::manifest_hash(&so_bytes),
+            manifest_hash: artifact.manifest_hash.clone(),
+        });
+        artifact_members.push((cdylib.clone(), MemberSource::Inline(so_bytes)));
+        // The manifest sidecar rides along when the build driver wrote one; a
+        // bundle without it stays valid (the manifest-hash check is skipped).
+        let sidecar = crate::dl::manifest_sidecar_path(src);
+        if sidecar.exists() {
+            let name = format!("{cdylib}.manifest");
+            artifact_members.push((name, MemberSource::Path(sidecar)));
+        }
+    }
+
     let meta = BundleMeta {
         abi_version: FSW_ABI_VERSION,
         target: opts.target.clone(),
@@ -292,6 +364,7 @@ fn bundle_members(
         built_at_unix,
         // Hash the exact wiring.json bytes, excluding the timestamp above.
         ir_sha256: super::stubgen::manifest_hash(json.as_bytes()),
+        packs,
     };
     let meta_json = serde_json::to_string_pretty(&meta).expect("BundleMeta serializes to JSON");
 
@@ -305,28 +378,7 @@ fn bundle_members(
             MemberSource::Inline(json.into_bytes()),
         ),
     ];
-
-    // Artifacts sorted by id so entry order is stable regardless of the order
-    // the front-end recorded them in.
-    let mut artifacts: Vec<&super::model::Artifact> = wiring.artifacts.iter().collect();
-    artifacts.sort_by(|a, b| a.id.cmp(&b.id));
-    for artifact in artifacts {
-        let src = artifact
-            .path
-            .as_ref()
-            .ok_or_else(|| BundleError::NotBuilt {
-                artifact: artifact.id.clone(),
-            })?;
-        let cdylib = member_cdylib_name(opts.target.as_deref(), &artifact.lib);
-        members.push((cdylib.clone(), MemberSource::Path(src.clone())));
-        // The manifest sidecar rides along when the build driver wrote one; a
-        // bundle without it stays valid (the manifest-hash check is skipped).
-        let sidecar = crate::dl::manifest_sidecar_path(src);
-        if sidecar.exists() {
-            let name = format!("{cdylib}.manifest");
-            members.push((name, MemberSource::Path(sidecar)));
-        }
-    }
+    members.extend(artifact_members);
 
     if let Some(source) = &opts.provenance {
         members.push((provenance_name(source), MemberSource::Path(source.clone())));

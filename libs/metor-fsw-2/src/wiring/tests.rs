@@ -963,6 +963,24 @@ fn bundle_manifest_hash_checked_at_load() {
     write_bundle(&wiring, &PackageOptions::default(), &dir).expect("write the bundle");
     load_bundle(&dir).expect("a matching bundle loads (hash verified)");
 
+    // meta.json records the flight provenance: source kind, the exact copied
+    // bytes' sha256, and the recorded manifest hash.
+    let meta: crate::wiring::BundleMeta =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap())
+            .expect("meta.json parses");
+    assert_eq!(meta.packs.len(), 1);
+    let pack = &meta.packs[0];
+    assert_eq!(pack.artifact_id, "fixture");
+    assert_eq!(pack.source, crate::wiring::PackSourceKind::CrateBuilt);
+    assert_eq!(pack.manifest_hash, wiring.artifacts[0].manifest_hash);
+    let member = crate::wiring::cdylib_file_name(&wiring.artifacts[0].lib);
+    let copied = std::fs::read(dir.join(member)).unwrap();
+    assert_eq!(
+        pack.cdylib_sha256,
+        super::stubgen::manifest_hash(&copied),
+        "provenance digests the bytes actually in the bundle"
+    );
+
     let wiring_path = dir.join(crate::wiring::WIRING_FILE_NAME);
     let wiring_bytes = std::fs::read(&wiring_path).unwrap();
     let mut changed = wiring_bytes.clone();
@@ -1046,6 +1064,18 @@ fn metor_archive_round_trips_and_is_reproducible() {
             == Some(crate::wiring::cdylib_file_name(&wiring.artifacts[0].lib).as_str()),
         "unpacked under the cdylib name"
     );
+}
+
+/// A pre-provenance `meta.json` (no `packs` field) still deserializes — old
+/// bundles keep loading.
+#[test]
+fn bundle_meta_without_packs_deserializes() {
+    let meta: crate::wiring::BundleMeta = serde_json::from_str(
+        r#"{ "abi_version": 8, "target": null, "profile": "debug",
+             "built_at_unix": 0, "ir_sha256": "sha256:00" }"#,
+    )
+    .expect("old meta.json deserializes");
+    assert!(meta.packs.is_empty());
 }
 
 // ---------------------------------------------------------------------------

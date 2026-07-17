@@ -124,8 +124,11 @@ struct BuildArgs {
     /// Build the `--release` profile (default: debug).
     #[arg(long)]
     release: bool,
-    /// An extra arg appended to every `cargo build` (repeatable), e.g.
-    /// `--cargo-arg --target --cargo-arg aarch64-unknown-linux-gnu`.
+    /// Provision for this target triple: prebuilt artifacts select their
+    /// `<triple>/` payload, crate artifacts cross-compile.
+    #[arg(long, value_name = "TRIPLE")]
+    target: Option<String>,
+    /// An extra arg appended to every `cargo build` (repeatable).
     #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
     cargo_arg: Vec<String>,
     /// Skip the `<cdylib>.manifest` sidecars, for pack crates that cannot
@@ -142,6 +145,11 @@ struct PackageArgs {
     /// single-file `*.metor` archive (dispatched by the `.metor` extension).
     #[arg(short = 'o', long = "out", value_name = "OUT")]
     out: Option<PathBuf>,
+    /// Package for this target triple: prebuilt artifacts select their
+    /// `<triple>/` payload (no cargo), crate artifacts cross-compile, and the
+    /// bundle records the triple. Defaults to the host.
+    #[arg(long, value_name = "TRIPLE")]
+    target: Option<String>,
     /// Instead of packaging, re-evaluate the given bundle's provenance source
     /// and diff the produced IR against its frozen `wiring.json`; exit non-zero
     /// on drift (the determinism gate, runnable in CI).
@@ -335,6 +343,16 @@ fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
     Ok(())
 }
 
+/// `--target` is sugar for the `--cargo-arg --target …` spelling: one flag
+/// drives prebuilt selection, crate cross-builds, and the recorded triple.
+fn merge_target(cargo_args: &[String], target: Option<&str>) -> Vec<String> {
+    let mut merged = cargo_args.to_vec();
+    if let Some(triple) = target {
+        merged.extend(["--target".to_string(), triple.to_string()]);
+    }
+    merged
+}
+
 /// Load a source mission into a [`Wiring`]. Missions are Python: a `.py` file
 /// is evaluated by a subprocess CPython. A `.kdl` file gets a clear
 /// removed-feature error; any other extension is unrecognized.
@@ -355,12 +373,13 @@ fn load_source(path: &Path) -> miette::Result<Wiring> {
     ))
 }
 
-/// `build`: load the wiring, compile and locate every artifact's `.so`, print them.
+/// `build`: load the wiring, provision every artifact's `.so`, print them.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
+    let cargo_args = merge_target(&args.cargo_arg, args.target.as_deref());
     let mut wiring = load_source(&args.mission)?;
     provision_artifacts(
         &mut wiring,
-        &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
+        &build_opts(args.release, &cargo_args, args.no_manifest_sidecar),
     )
     .into_diagnostic()?;
     for a in &wiring.artifacts {
@@ -387,15 +406,16 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
         .out
         .as_deref()
         .ok_or_else(|| miette::miette!("`package` needs an output path (`-o <out>`)"))?;
+    let cargo_args = merge_target(&args.cargo_arg, args.target.as_deref());
     let mut wiring = load_source(mission)?;
     provision_artifacts(
         &mut wiring,
-        &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
+        &build_opts(args.release, &cargo_args, args.no_manifest_sidecar),
     )
     .into_diagnostic()?;
     let opts = PackageOptions {
         release: args.release,
-        target: build_target(&args.cargo_arg),
+        target: build_target(&cargo_args),
         provenance: Some(mission.to_path_buf()),
         // Current time; a reproducible build pins this.
         built_at_unix: None,

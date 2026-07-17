@@ -63,8 +63,8 @@ pub(crate) use crate::ir as model;
 pub use build_driver::{BuildError, BuildOptions, build_target, provision_artifacts};
 pub use builder::{ArtifactSystemBuilder, SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use bundle::{
-    BundleError, BundleMeta, METOR_EXTENSION, PackageOptions, WIRING_FILE_NAME, load_bundle,
-    unpack_metor, write_bundle,
+    BundleError, BundleMeta, METOR_EXTENSION, PackProvenance, PackSourceKind, PackageOptions,
+    WIRING_FILE_NAME, load_bundle, unpack_metor, write_bundle,
 };
 pub use error::{Anchor, LoadError, LoadErrorKind};
 pub use model::{
