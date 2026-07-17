@@ -1,9 +1,8 @@
-"""Minimal editable-wheel writer (stdlib only).
+"""Minimal wheel writer (stdlib only).
 
-The backend's whole payload is one ``.pth`` of absolute path lines plus the
-required ``dist-info``, so the archive is written by hand rather than pulling
-in a packaging dependency: ``build-system.requires`` stays empty and builds
-work offline.
+Writes editable wheels (one ``.pth`` payload) and real wheels (arbitrary
+files with modes, entry points, dependency metadata, a platform tag) by
+hand, so ``build-system.requires`` stays empty and builds work offline.
 """
 
 import base64
@@ -22,8 +21,18 @@ def _dist(name: str) -> str:
     return re.sub(r"[-_.]+", "_", name).lower()
 
 
-def metadata_contents(name: str, version: str) -> str:
-    return f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+def metadata_contents(
+    name: str,
+    version: str,
+    requires: list[str] | None = None,
+    requires_python: str | None = None,
+) -> str:
+    lines = [f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"]
+    if requires_python:
+        lines.append(f"Requires-Python: {requires_python}\n")
+    for req in requires or []:
+        lines.append(f"Requires-Dist: {req}\n")
+    return "".join(lines)
 
 
 def write_metadata(metadata_directory: str, name: str, version: str) -> str:
@@ -36,42 +45,78 @@ def write_metadata(metadata_directory: str, name: str, version: str) -> str:
     return dist_info
 
 
+def write_wheel(
+    wheel_directory: str,
+    name: str,
+    version: str,
+    files: list[tuple[str, bytes, int]],
+    *,
+    tag: str = "py3-none-any",
+    requires: list[str] | None = None,
+    requires_python: str | None = None,
+    entry_points: str | None = None,
+) -> str:
+    """Write ``<dist>-<ver>-<tag>.whl`` from ``(arcname, data, mode)`` files.
+
+    Modes ride the zip entries' external attributes, which installers
+    preserve — how a packaged binary stays executable. Returns the wheel
+    file name.
+    """
+    dist = _dist(name)
+    dist_info = f"{dist}-{version}.dist-info"
+    records: list[tuple[str, str, str]] = []
+    payload: list[tuple[str, bytes, int]] = []
+
+    def entry(path: str, data: bytes, mode: int = 0o644) -> None:
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=")
+        records.append((path, f"sha256={digest.decode()}", str(len(data))))
+        payload.append((path, data, mode))
+
+    for path, data, mode in files:
+        entry(path, data, mode)
+    entry(
+        f"{dist_info}/METADATA",
+        metadata_contents(name, version, requires, requires_python).encode(),
+    )
+    entry(
+        f"{dist_info}/WHEEL",
+        (
+            "Wheel-Version: 1.0\n"
+            f"Generator: {_GENERATOR}\n"
+            f"Root-Is-Purelib: {'true' if tag.endswith('-any') else 'false'}\n"
+            f"Tag: {tag}\n"
+        ).encode(),
+    )
+    if entry_points is not None:
+        entry(f"{dist_info}/entry_points.txt", entry_points.encode())
+
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    writer.writerows(records)
+    writer.writerow((f"{dist_info}/RECORD", "", ""))
+    payload.append((f"{dist_info}/RECORD", record.getvalue().encode(), 0o644))
+
+    wheel_name = f"{dist}-{version}-{tag}.whl"
+    with zipfile.ZipFile(
+        os.path.join(wheel_directory, wheel_name), "w", zipfile.ZIP_DEFLATED
+    ) as zf:
+        for path, data, mode in payload:
+            info = zipfile.ZipInfo(path)
+            info.external_attr = (0o100000 | mode) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, data)
+    return wheel_name
+
+
 def write_editable_wheel(wheel_directory: str, name: str, version: str, pth_content: str) -> str:
     """Write ``<dist>-<ver>-py3-none-any.whl`` whose payload is one ``.pth``.
 
     The ``.pth`` carries absolute path lines, which both the interpreter and
     pyright follow — no import hooks. Returns the wheel file name.
     """
-    dist = _dist(name)
-    dist_info = f"{dist}-{version}.dist-info"
-    records: list[tuple[str, str, str]] = []
-
-    def entry(path: str, data: bytes) -> tuple[str, bytes]:
-        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=")
-        records.append((path, f"sha256={digest.decode()}", str(len(data))))
-        return path, data
-
-    wheel_file = (
-        "Wheel-Version: 1.0\n"
-        f"Generator: {_GENERATOR}\n"
-        "Root-Is-Purelib: true\n"
-        "Tag: py3-none-any\n"
+    return write_wheel(
+        wheel_directory,
+        name,
+        version,
+        [(f"_{_dist(name)}_editable.pth", pth_content.encode(), 0o644)],
     )
-    files = [
-        entry(f"_{dist}_editable.pth", pth_content.encode()),
-        entry(f"{dist_info}/METADATA", metadata_contents(name, version).encode()),
-        entry(f"{dist_info}/WHEEL", wheel_file.encode()),
-    ]
-    record = io.StringIO()
-    writer = csv.writer(record, lineterminator="\n")
-    writer.writerows(records)
-    writer.writerow((f"{dist_info}/RECORD", "", ""))
-    files.append((f"{dist_info}/RECORD", record.getvalue().encode()))
-
-    wheel_name = f"{dist}-{version}-py3-none-any.whl"
-    with zipfile.ZipFile(
-        os.path.join(wheel_directory, wheel_name), "w", zipfile.ZIP_DEFLATED
-    ) as zf:
-        for path, data in files:
-            zf.writestr(path, data)
-    return wheel_name
