@@ -53,6 +53,7 @@ mod registry;
 mod resolve;
 mod stubgen;
 mod validate;
+mod wheel;
 
 // The pure-data IR lives at the crate root (feature `wiring-model`) so it is
 // available without the front-end; the submodules here reach it as

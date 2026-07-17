@@ -9169,7 +9169,9 @@ dependencies = [
 name = "metor-fsw-2"
 version = "0.14.2"
 dependencies = [
+ "base64 0.22.1",
  "clap 4.6.0",
+ "crc32fast",
  "futures-lite 2.6.1",
  "inventory",
  "libloading",
