@@ -41,6 +41,18 @@ pub fn is_python_mission(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "py")
 }
 
+/// The embedded recorder's `__version__`, scanned from the embedded source —
+/// the version this binary pairs with, used to derive the `metor-config`
+/// compatible-range pin stamped into pack wheels.
+pub(super) fn metor_config_version() -> &'static str {
+    let source = EMBEDDED_PACKAGE[0].1;
+    source
+        .lines()
+        .find_map(|line| line.strip_prefix("__version__ = \""))
+        .and_then(|rest| rest.split('"').next())
+        .expect("embedded metor_config declares __version__")
+}
+
 /// Evaluate a `.py` mission into a [`Wiring`].
 ///
 /// Resolves an interpreter (`$METOR_PYTHON` → `$VIRTUAL_ENV/bin/python` →

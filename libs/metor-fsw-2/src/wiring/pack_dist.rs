@@ -44,8 +44,33 @@ pub struct PackConfig {
     /// package name with `-` → `_`.
     pub lib: String,
     /// The target triples a published wheel ships. Unused by `pack dev`
-    /// (host-only); the phase-2 `pack build` matrix reads it.
+    /// (host-only); [`pack_build`] builds one payload per entry.
     pub targets: Vec<String>,
+    /// The pack's own `[project] dependencies`, carried into the wheel's
+    /// `Requires-Dist` lines after the injected pins.
+    pub dependencies: Vec<String>,
+    /// The `[project] requires-python` specifier, if any.
+    pub requires_python: Option<String>,
+    /// How [`pack_build`] compiles a target (`[tool.metor.pack.builder]`).
+    pub builder: Builder,
+}
+
+/// How a pack target is compiled (`[tool.metor.pack.builder]`,
+/// `docs/design-packaging.md` §7.2). Wheel builds always force `--release`
+/// and, for the cargo-family builders, `--config profile.release.strip=true`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Builder {
+    /// Native `cargo build --target <triple>`; assumes installed toolchains.
+    #[default]
+    Cargo,
+    /// `cargo zigbuild --target <triple>`, covering the linux-gnu triples
+    /// from any host with a zig on `PATH`.
+    Zigbuild,
+    /// An argv template run in the pack dir, with `{triple}` and `{crate}`
+    /// substituted — the Nix-cross-devshell (and any bespoke toolchain)
+    /// hook. The command must leave the cdylib at cargo's conventional
+    /// `<target-dir>/<triple>/release/` location.
+    Command(Vec<String>),
 }
 
 /// The triples a pack wheel ships when `[tool.metor.pack] targets` is not
@@ -116,6 +141,59 @@ pub enum PackError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// `[tool.metor.pack.builder] kind` names no known builder.
+    #[error("`{path}` names unknown builder kind `{kind}` (cargo, zigbuild, command)")]
+    UnknownBuilder {
+        /// The pyproject path.
+        path: PathBuf,
+        /// The unrecognized kind.
+        kind: String,
+    },
+    /// A command-template build ran but its output could not be located.
+    #[error(
+        "builder command succeeded but no `{cdylib}` was found under a \
+         `<target-dir>/{triple}/release/`; the command must leave the cdylib at \
+         cargo's conventional location"
+    )]
+    CommandOutputMissing {
+        /// The expected cdylib file name.
+        cdylib: String,
+        /// The triple that was built.
+        triple: String,
+    },
+    /// A builder command could not be run or exited non-zero.
+    #[error("builder command for `{triple}` failed: {detail}")]
+    BuilderCommand {
+        /// The triple being built.
+        triple: String,
+        /// What went wrong.
+        detail: String,
+    },
+    /// Staged sidecars disagree across triples. Pack manifests must be
+    /// architecture-independent; skew means the stagings came from different
+    /// pack revisions (or a manifest genuinely diverged by arch).
+    #[error(
+        "manifest sidecar for `{triple}` differs from `{reference}`'s: staged payloads \
+         must come from one pack revision, and manifests must not depend on the target"
+    )]
+    ManifestSkew {
+        /// The divergent triple.
+        triple: String,
+        /// The triple whose sidecar was taken as reference.
+        reference: String,
+    },
+    /// No staged triple payloads were found to assemble.
+    #[error("no `<triple>/` payloads staged under {}", .dirs.iter().map(|d| format!("`{}`", d.display())).collect::<Vec<_>>().join(", "))]
+    NothingStaged {
+        /// The staging directories that were searched.
+        dirs: Vec<PathBuf>,
+    },
+    /// `uv publish` could not be run or exited non-zero.
+    #[error("`uv publish` failed: {detail}")]
+    Publish {
+        /// What went wrong.
+        detail: String,
+    },
 }
 
 /// Read a pack crate's [`PackConfig`] from `<dir>/pyproject.toml`, defaulting
@@ -166,6 +244,18 @@ pub fn read_pack_config(dir: &Path) -> Result<PackConfig, PackError> {
                 .collect()
         })
         .unwrap_or_else(|| DEFAULT_TARGETS.iter().map(|s| s.to_string()).collect());
+    let dependencies = project
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let requires_python = get_str(project, "requires-python");
+    let builder = read_builder(&pyproject, pack)?;
 
     Ok(PackConfig {
         dist_name,
@@ -175,7 +265,45 @@ pub fn read_pack_config(dir: &Path) -> Result<PackConfig, PackError> {
         crate_name,
         lib,
         targets,
+        dependencies,
+        requires_python,
+        builder,
     })
+}
+
+/// Parse `[tool.metor.pack.builder]`: `kind = "cargo" | "zigbuild" |
+/// "command"`, the latter with a `command = [...]` argv template.
+fn read_builder(pyproject: &Path, pack: Option<&toml::Value>) -> Result<Builder, PackError> {
+    let Some(builder) = pack.and_then(|p| p.get("builder")) else {
+        return Ok(Builder::Cargo);
+    };
+    match builder.get("kind").and_then(|k| k.as_str()) {
+        Some("cargo") | None => Ok(Builder::Cargo),
+        Some("zigbuild") => Ok(Builder::Zigbuild),
+        Some("command") => {
+            let argv: Vec<String> = builder
+                .get("command")
+                .and_then(|c| c.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if argv.is_empty() {
+                return Err(PackError::MissingField {
+                    path: pyproject.to_path_buf(),
+                    field: "tool.metor.pack.builder.command",
+                });
+            }
+            Ok(Builder::Command(argv))
+        }
+        Some(other) => Err(PackError::UnknownBuilder {
+            path: pyproject.to_path_buf(),
+            kind: other.to_string(),
+        }),
+    }
 }
 
 /// The generated module name for a distribution: PEP 503 normalization, then
@@ -287,6 +415,407 @@ pub fn pack_dev(dir: &Path, opts: &PackDevOptions) -> Result<PackDevReport, Pack
     })
 }
 
+// ---------------------------------------------------------------------------
+// pack build / assemble / publish (docs/design-packaging.md §7)
+// ---------------------------------------------------------------------------
+
+/// Knobs for [`pack_build`].
+#[derive(Clone, Debug, Default)]
+pub struct PackBuildOptions {
+    /// Build these triples instead of the config's `targets`.
+    pub targets: Vec<String>,
+    /// Stage `<triple>/{cdylib, sidecar}` payloads here and stop — the
+    /// CI-matrix half; [`pack_assemble`] joins the stagings.
+    pub libs_out: Option<PathBuf>,
+    /// Assemble the wheel here (the single-machine flow). Ignored when
+    /// `libs_out` is set.
+    pub wheel_out: Option<PathBuf>,
+    /// Override the config's builder.
+    pub builder: Option<Builder>,
+}
+
+/// What [`pack_build`] / [`pack_assemble`] produced.
+#[derive(Debug)]
+pub struct PackBuildReport {
+    /// The triples staged or assembled.
+    pub triples: Vec<String>,
+    /// The staging directory (`libs_out`, or the wheel flow's temp staging).
+    pub staged: PathBuf,
+    /// The wheel, when one was assembled.
+    pub wheel: Option<PathBuf>,
+}
+
+/// Build a pack's wheel payloads for every configured target and, unless
+/// staging for a CI matrix (`libs_out`), assemble the fat wheel.
+///
+/// Every triple's cdylib is release-built and stripped; the manifest sidecar
+/// comes from one host describe (`pack dev`'s machinery), staged next to
+/// each payload so [`pack_assemble`]'s N-way identity gate — and, after
+/// install, resolve's staleness gate — read it in place.
+pub fn pack_build(dir: &Path, opts: &PackBuildOptions) -> Result<PackBuildReport, PackError> {
+    let mut config = read_pack_config(dir)?;
+    if let Some(builder) = &opts.builder {
+        config.builder = builder.clone();
+    }
+    let targets = if opts.targets.is_empty() {
+        config.targets.clone()
+    } else {
+        opts.targets.clone()
+    };
+
+    // One host build supplies the manifest for every triple (verified
+    // arch-independent by the host-twin machinery on native runners, and by
+    // the assemble gate across runners).
+    let mut wiring = WiringBuilder::new()
+        .artifact(&config.id, &config.crate_name, &config.lib)
+        .build();
+    provision_artifacts(
+        &mut wiring,
+        &BuildOptions {
+            release: true,
+            extra_args: Vec::new(),
+            manifest_sidecar: true,
+        },
+    )?;
+    let host_so = wiring.artifacts[0]
+        .path
+        .clone()
+        .expect("provision_artifacts fills every path or errors");
+    let manifest = std::fs::read(crate::dl::manifest_sidecar_path(&host_so))
+        .map_err(|_| PackError::MissingSidecar { so: host_so })?;
+
+    let held;
+    let staging = match &opts.libs_out {
+        Some(dir) => dir.clone(),
+        None => {
+            held = tempfile::tempdir().map_err(|source| PackError::Write {
+                path: PathBuf::from("<staging tempdir>"),
+                source,
+            })?;
+            held.path().to_path_buf()
+        }
+    };
+
+    for triple in &targets {
+        let so = build_target_cdylib(dir, &config, triple)?;
+        let triple_dir = staging.join(triple);
+        std::fs::create_dir_all(&triple_dir).map_err(|source| PackError::Write {
+            path: triple_dir.clone(),
+            source,
+        })?;
+        let staged = triple_dir.join(super::cdylib_file_name_for(triple, &config.lib));
+        copy(&so, &staged)?;
+        write(&crate::dl::manifest_sidecar_path(&staged), &manifest)?;
+    }
+
+    let wheel = match (&opts.libs_out, &opts.wheel_out) {
+        (Some(_), _) => None,
+        (None, Some(out)) => Some(assemble_wheel(&config, &[staging.clone()], out)?),
+        (None, None) => Some(assemble_wheel(
+            &config,
+            &[staging.clone()],
+            &dir.join("dist"),
+        )?),
+    };
+    Ok(PackBuildReport {
+        triples: targets,
+        staged: staging,
+        wheel,
+    })
+}
+
+/// Compile one target triple via the configured [`Builder`] and return the
+/// built cdylib's path.
+fn build_target_cdylib(
+    dir: &Path,
+    config: &PackConfig,
+    triple: &str,
+) -> Result<PathBuf, PackError> {
+    let cdylib = super::cdylib_file_name_for(triple, &config.lib);
+    let cargo_family = |subcommand: &str| {
+        let opts = BuildOptions {
+            release: true,
+            extra_args: vec![
+                "--target".into(),
+                triple.to_string(),
+                // Wheels ship stripped release objects; a debug fat wheel
+                // would balloon silently (design §7.1).
+                "--config".into(),
+                "profile.release.strip=true".into(),
+            ],
+            manifest_sidecar: false,
+        };
+        super::build_driver::build_cdylib(subcommand, &config.crate_name, &cdylib, &opts)
+    };
+    match &config.builder {
+        Builder::Cargo => cargo_family("build").map_err(PackError::Build),
+        Builder::Zigbuild => cargo_family("zigbuild").map_err(PackError::Build),
+        Builder::Command(template) => {
+            let argv: Vec<String> = template
+                .iter()
+                .map(|arg| {
+                    arg.replace("{triple}", triple)
+                        .replace("{crate}", &config.crate_name)
+                })
+                .collect();
+            let status = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(dir)
+                .status()
+                .map_err(|e| PackError::BuilderCommand {
+                    triple: triple.to_string(),
+                    detail: e.to_string(),
+                })?;
+            if !status.success() {
+                return Err(PackError::BuilderCommand {
+                    triple: triple.to_string(),
+                    detail: format!("exit {status}"),
+                });
+            }
+            locate_conventional(dir, triple, &cdylib).ok_or_else(|| {
+                PackError::CommandOutputMissing {
+                    cdylib,
+                    triple: triple.to_string(),
+                }
+            })
+        }
+    }
+}
+
+/// Find a command-builder's output at cargo's conventional
+/// `<target-dir>/<triple>/release/<cdylib>`, honoring `CARGO_TARGET_DIR` and
+/// walking up from the pack dir for a workspace `target/`.
+fn locate_conventional(dir: &Path, triple: &str, cdylib: &str) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(root) = std::env::var_os("CARGO_TARGET_DIR") {
+        roots.push(PathBuf::from(root));
+    }
+    let mut walk = dir.canonicalize().ok();
+    while let Some(d) = walk {
+        roots.push(d.join("target"));
+        walk = d.parent().map(Path::to_path_buf);
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join(triple).join("release").join(cdylib))
+        .find(|p| p.exists())
+}
+
+/// Join staged `<triple>/` payloads into the fat wheel: verify every
+/// sidecar is byte-identical (the N-way `ManifestDivergence` gate — a skewed
+/// CI matrix is caught here), render the prebuilt module from the one
+/// manifest, and write the wheel with the injected pins.
+pub fn pack_assemble(
+    dir: &Path,
+    libs: &[PathBuf],
+    wheel_out: &Path,
+) -> Result<PackBuildReport, PackError> {
+    let config = read_pack_config(dir)?;
+    let wheel = assemble_wheel(&config, libs, wheel_out)?;
+    Ok(PackBuildReport {
+        triples: staged_triples(libs),
+        staged: libs.first().cloned().unwrap_or_default(),
+        wheel: Some(wheel),
+    })
+}
+
+/// The `<triple>/` subdirectories staged across `libs` dirs, sorted.
+fn staged_triples(libs: &[PathBuf]) -> Vec<String> {
+    let mut triples: Vec<String> = libs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    triples.sort();
+    triples.dedup();
+    triples
+}
+
+fn assemble_wheel(
+    config: &PackConfig,
+    libs: &[PathBuf],
+    wheel_out: &Path,
+) -> Result<PathBuf, PackError> {
+    let triples = staged_triples(libs);
+    if triples.is_empty() {
+        return Err(PackError::NothingStaged {
+            dirs: libs.to_vec(),
+        });
+    }
+
+    // Collect per-triple payloads and run the N-way identity gate.
+    let mut manifest: Option<(String, Vec<u8>)> = None;
+    let mut files: Vec<super::wheel::WheelFile> = Vec::new();
+    for triple in &triples {
+        let cdylib = super::cdylib_file_name_for(triple, &config.lib);
+        let triple_dir = libs
+            .iter()
+            .map(|d| d.join(triple))
+            .find(|d| d.join(&cdylib).exists())
+            .ok_or_else(|| PackError::CommandOutputMissing {
+                cdylib: cdylib.clone(),
+                triple: triple.clone(),
+            })?;
+        let so = triple_dir.join(&cdylib);
+        let sidecar_path = crate::dl::manifest_sidecar_path(&so);
+        let sidecar = std::fs::read(&sidecar_path)
+            .map_err(|_| PackError::MissingSidecar { so: so.clone() })?;
+        match &manifest {
+            None => manifest = Some((triple.clone(), sidecar.clone())),
+            Some((reference, bytes)) if *bytes != sidecar => {
+                return Err(PackError::ManifestSkew {
+                    triple: triple.clone(),
+                    reference: reference.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+        let so_bytes = std::fs::read(&so).map_err(|source| PackError::Read {
+            path: so.clone(),
+            source,
+        })?;
+        files.push(super::wheel::WheelFile {
+            arcname: format!("{}/_libs/{triple}/{cdylib}", config.module),
+            bytes: so_bytes,
+            mode: 0o755,
+        });
+        files.push(super::wheel::WheelFile {
+            arcname: format!("{}/_libs/{triple}/{cdylib}.manifest", config.module),
+            bytes: sidecar,
+            mode: 0o644,
+        });
+    }
+    let (_, manifest) = manifest.expect("at least one staged triple");
+
+    let module = render_module(
+        &config.id,
+        &config.crate_name,
+        &config.lib,
+        &manifest,
+        &StubFlavor::Prebuilt {
+            abi_version: crate::abi::FSW_ABI_VERSION,
+            dist: Some((config.dist_name.clone(), config.dist_version.clone())),
+        },
+    )?;
+    files.push(super::wheel::WheelFile {
+        arcname: format!("{}/__init__.py", config.module),
+        bytes: module.into_bytes(),
+        mode: 0o644,
+    });
+    files.push(super::wheel::WheelFile {
+        arcname: format!("{}/py.typed", config.module),
+        bytes: Vec::new(),
+        mode: 0o644,
+    });
+
+    std::fs::create_dir_all(wheel_out).map_err(|source| PackError::Write {
+        path: wheel_out.to_path_buf(),
+        source,
+    })?;
+    super::wheel::write_wheel(
+        wheel_out,
+        &super::wheel::WheelMeta {
+            dist_name: config.dist_name.clone(),
+            version: config.dist_version.clone(),
+            tag: "py3-none-any".into(),
+            requires_python: config.requires_python.clone(),
+            requires: injected_requires(config),
+        },
+        files,
+    )
+    .map_err(|source| PackError::Write {
+        path: wheel_out.to_path_buf(),
+        source,
+    })
+}
+
+/// The wheel's `Requires-Dist` lines: the ABI marker pin and the
+/// `metor-config` compatible range (phase 0 found the latter load-bearing —
+/// the generated module imports it), then the pack's own dependencies.
+/// A pin the pack already declares itself is not injected twice.
+fn injected_requires(config: &PackConfig) -> Vec<String> {
+    let mut requires = Vec::new();
+    let declares = |name: &str| {
+        config
+            .dependencies
+            .iter()
+            .any(|dep| dep.trim_start().starts_with(name))
+    };
+    if !declares("metor-fsw-abi") {
+        requires.push(format!("metor-fsw-abi=={}", crate::abi::FSW_ABI_VERSION));
+    }
+    if !declares("metor-config") {
+        let version = super::py::metor_config_version();
+        let mut parts = version.split('.');
+        let (major, minor) = (
+            parts.next().unwrap_or("0"),
+            parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0),
+        );
+        requires.push(format!(
+            "metor-config>={major}.{minor},<{major}.{}",
+            minor + 1
+        ));
+    }
+    requires.extend(config.dependencies.iter().cloned());
+    requires
+}
+
+/// Build (or take) the pack's wheel and hand it to `uv publish`.
+pub fn pack_publish(
+    dir: &Path,
+    index: Option<&str>,
+    wheel: Option<&Path>,
+    dry_run: bool,
+) -> Result<PathBuf, PackError> {
+    let built;
+    let wheel = match wheel {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let out = dir.join("dist");
+            let report = pack_build(
+                dir,
+                &PackBuildOptions {
+                    wheel_out: Some(out),
+                    ..PackBuildOptions::default()
+                },
+            )?;
+            built = report.wheel.expect("wheel_out set, so a wheel was built");
+            built
+        }
+    };
+
+    let mut argv: Vec<String> = vec!["publish".into()];
+    if let Some(index) = index {
+        // A URL publishes directly; a name selects a configured index.
+        if index.contains("://") {
+            argv.extend(["--publish-url".into(), index.to_string()]);
+        } else {
+            argv.extend(["--index".into(), index.to_string()]);
+        }
+    }
+    argv.push(wheel.display().to_string());
+
+    if dry_run {
+        println!("would run: uv {}", argv.join(" "));
+        return Ok(wheel);
+    }
+    let status = std::process::Command::new("uv")
+        .args(&argv)
+        .status()
+        .map_err(|e| PackError::Publish {
+            detail: e.to_string(),
+        })?;
+    if !status.success() {
+        return Err(PackError::Publish {
+            detail: format!("exit {status}"),
+        });
+    }
+    Ok(wheel)
+}
+
 fn copy(src: &Path, dst: &Path) -> Result<(), PackError> {
     std::fs::copy(src, dst)
         .map(|_| ())
@@ -382,6 +911,133 @@ mod tests {
         let err = pack_dev(tmp.path(), &PackDevOptions::default()).unwrap_err();
         assert!(matches!(err, PackError::LegacyPacks { .. }), "{err}");
     }
+
+    /// Builder parsing: the three kinds, a command template requirement, and
+    /// a clean error for an unknown kind.
+    #[test]
+    fn builder_kinds_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_builder = |body: &str| {
+            write_files(
+                tmp.path(),
+                &[(
+                    "pyproject.toml",
+                    &format!(
+                        "[project]\nname = \"p\"\nversion = \"0.0.0\"\n\
+                         [tool.metor.pack]\ncrate = \"p\"\n\
+                         [tool.metor.pack.builder]\n{body}"
+                    ),
+                )],
+            );
+            read_pack_config(tmp.path())
+        };
+        assert_eq!(
+            with_builder("kind = \"cargo\"\n").unwrap().builder,
+            Builder::Cargo
+        );
+        assert_eq!(
+            with_builder("kind = \"zigbuild\"\n").unwrap().builder,
+            Builder::Zigbuild
+        );
+        assert_eq!(
+            with_builder("kind = \"command\"\ncommand = [\"nix\", \"{triple}\"]\n")
+                .unwrap()
+                .builder,
+            Builder::Command(vec!["nix".into(), "{triple}".into()])
+        );
+        assert!(matches!(
+            with_builder("kind = \"command\"\n").unwrap_err(),
+            PackError::MissingField { field, .. } if field.contains("builder.command")
+        ));
+        assert!(matches!(
+            with_builder("kind = \"bazel\"\n").unwrap_err(),
+            PackError::UnknownBuilder { kind, .. } if kind == "bazel"
+        ));
+    }
+
+    /// The injected pins: the ABI marker and the metor-config compatible
+    /// range, skipped when the pack declares its own, followed by the pack's
+    /// dependencies.
+    #[test]
+    fn requires_injection_and_dedupe() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_files(
+            tmp.path(),
+            &[(
+                "pyproject.toml",
+                "[project]\nname = \"p\"\nversion = \"0.0.0\"\n\
+                 dependencies = [\"numpy>=2\"]\n[tool.metor.pack]\ncrate = \"p\"\n",
+            )],
+        );
+        let config = read_pack_config(tmp.path()).unwrap();
+        let requires = injected_requires(&config);
+        assert_eq!(
+            requires[0],
+            format!("metor-fsw-abi=={}", crate::abi::FSW_ABI_VERSION)
+        );
+        assert!(
+            requires[1].starts_with("metor-config>=") && requires[1].contains(",<"),
+            "{requires:?}"
+        );
+        assert_eq!(requires[2], "numpy>=2");
+
+        write_files(
+            tmp.path(),
+            &[(
+                "pyproject.toml",
+                "[project]\nname = \"p\"\nversion = \"0.0.0\"\n\
+                 dependencies = [\"metor-config==0.3.0\", \"metor-fsw-abi==7\"]\n\
+                 [tool.metor.pack]\ncrate = \"p\"\n",
+            )],
+        );
+        let config = read_pack_config(tmp.path()).unwrap();
+        let requires = injected_requires(&config);
+        assert_eq!(
+            requires,
+            vec!["metor-config==0.3.0".to_string(), "metor-fsw-abi==7".into()],
+            "explicit pins are not doubled"
+        );
+    }
+
+    /// Assembling with a skewed sidecar is a hard error naming both triples;
+    /// nothing staged is its own clean error.
+    #[test]
+    fn assemble_gates_on_manifest_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_files(
+            tmp.path(),
+            &[(
+                "pyproject.toml",
+                "[project]\nname = \"toy-pack\"\nversion = \"0.1.0\"\n\
+                 [tool.metor.pack]\ncrate = \"toy\"\nlib = \"toy\"\n",
+            )],
+        );
+        let libs = tmp.path().join("libs");
+        let out = tmp.path().join("dist");
+
+        let err = pack_assemble(tmp.path(), &[libs.clone()], &out).unwrap_err();
+        assert!(matches!(err, PackError::NothingStaged { .. }), "{err}");
+
+        for (triple, manifest) in [
+            ("aarch64-unknown-linux-gnu", b"manifest".as_slice()),
+            ("x86_64-unknown-linux-gnu", b"DIVERGENT".as_slice()),
+        ] {
+            let dir = libs.join(triple);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("libtoy.so"), b"elf").unwrap();
+            std::fs::write(dir.join("libtoy.so.manifest"), manifest).unwrap();
+        }
+        let err = pack_assemble(tmp.path(), &[libs], &out).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                PackError::ManifestSkew { triple, reference }
+                    if triple == "x86_64-unknown-linux-gnu"
+                        && reference == "aarch64-unknown-linux-gnu"
+            ),
+            "{err}"
+        );
+    }
 }
 
 #[cfg(all(test, not(miri)))]
@@ -448,5 +1104,110 @@ mod integration {
         {
             panic!("fresh pack dev layout wrongly read as stale");
         }
+    }
+
+    /// `pack build` over the fixture (host triple): the wheel is
+    /// byte-reproducible, carries the module + `_libs/<triple>/` payload and
+    /// the injected pins, and `pack assemble` over the same staging produces
+    /// the identical wheel.
+    #[test]
+    fn pack_build_wheel_is_reproducible() {
+        let _guard = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let host = match super::super::build_driver::build_target(&[]) {
+            Some(host) => host,
+            None => {
+                eprintln!("skipping: host triple undeterminable");
+                return;
+            }
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            format!(
+                "[project]\nname = \"fixture-pack\"\nversion = \"0.1.0\"\n\
+                 requires-python = \">=3.11\"\n\
+                 [tool.metor.pack]\nid = \"fixture\"\ncrate = \"metor-fsw-2-dl-fixture\"\n\
+                 lib = \"metor_fsw_2_dl_fixture\"\ntargets = [\"{host}\"]\n"
+            ),
+        )
+        .unwrap();
+
+        let build = |out: &str| {
+            pack_build(
+                tmp.path(),
+                &PackBuildOptions {
+                    wheel_out: Some(tmp.path().join(out)),
+                    ..PackBuildOptions::default()
+                },
+            )
+        };
+        let a = match build("a") {
+            Ok(report) => report.wheel.expect("wheel assembled"),
+            Err(e) => {
+                eprintln!("skipping: pack_build failed: {e}");
+                return;
+            }
+        };
+        assert_eq!(
+            a.file_name().and_then(|n| n.to_str()),
+            Some("fixture_pack-0.1.0-py3-none-any.whl")
+        );
+        let b = build("b").expect("rebuild").wheel.unwrap();
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "identical inputs produce byte-identical wheels"
+        );
+
+        // Staging + assemble produces the same wheel as the one-shot flow.
+        let staged = build_staged(tmp.path(), &host);
+        let joined = pack_assemble(tmp.path(), &[staged], &tmp.path().join("c"))
+            .expect("assemble from staging")
+            .wheel
+            .unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&joined).unwrap());
+
+        // The payload: module, marker, per-triple lib + sidecar, pins.
+        let listing = std::process::Command::new("python3")
+            .args(["-m", "zipfile", "-l"])
+            .arg(&a)
+            .output()
+            .expect("python3 runs");
+        let listing = String::from_utf8_lossy(&listing.stdout).to_string();
+        for expected in [
+            "fixture_pack/__init__.py".to_string(),
+            "fixture_pack/py.typed".to_string(),
+            format!("fixture_pack/_libs/{host}/"),
+            "fixture_pack-0.1.0.dist-info/METADATA".to_string(),
+        ] {
+            assert!(
+                listing.contains(&expected),
+                "missing {expected}:\n{listing}"
+            );
+        }
+    }
+
+    fn build_staged(dir: &Path, host: &str) -> PathBuf {
+        let staged = dir.join("staged");
+        pack_build(
+            dir,
+            &PackBuildOptions {
+                libs_out: Some(staged.clone()),
+                ..PackBuildOptions::default()
+            },
+        )
+        .expect("staging build");
+        assert!(
+            staged
+                .join(host)
+                .join(super::super::cdylib_file_name_for(
+                    host,
+                    "metor_fsw_2_dl_fixture"
+                ))
+                .exists()
+        );
+        staged
     }
 }

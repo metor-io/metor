@@ -8,9 +8,10 @@ its ``_libs`` payload) — and installs a wheel whose only payload is a
 module from the venv. ``[tool.uv] cache-keys`` in the pack's ``pyproject``
 re-runs this build whenever the pack sources change.
 
-Editable-only this phase: the non-editable ``build_wheel`` (the published
-fat wheel) lands with the phase-2 publish pipeline
-(``docs/design-packaging.md`` §7).
+``build_wheel`` produces the published form: ``metor-fsw pack build``
+compiles every configured target and assembles the fat, deterministic
+``py3-none-any`` wheel (``docs/design-packaging.md`` §7). sdists stay
+refused — packs are binary-only by design.
 
 Configuration, all from the pack's ``pyproject.toml``:
 
@@ -68,24 +69,25 @@ def _packaged_fsw():
     return find()
 
 
-def _run_pack_dev(root, override):
+def _run_fsw(root, args, override):
+    """Run `metor-fsw <args>` (or the `pack-dev-command` override) in the
+    pack dir, resolving the binary as the module docstring describes."""
     if override is not None:
         cmd = list(override)
     elif fsw := os.environ.get("METOR_FSW_BIN"):
         # An explicit override that cannot serve is an error, not a fallback.
         if not _supports_pack(fsw):
             raise RuntimeError(
-                f"$METOR_FSW_BIN ({fsw}) does not support `pack dev`; "
+                f"$METOR_FSW_BIN ({fsw}) does not support `pack`; "
                 "point it at a newer metor-fsw"
             )
-        cmd = [fsw, "pack", "dev", root]
+        cmd = [fsw, *args]
     elif fsw := _packaged_fsw():
-        cmd = [fsw, "pack", "dev", root]
+        cmd = [fsw, *args]
     elif (fsw := shutil.which("metor-fsw")) and _supports_pack(fsw):
-        cmd = [fsw, "pack", "dev", root]
+        cmd = [fsw, *args]
     else:
-        cmd = ["cargo", "run", "-q", "-p", "metor-fsw-2", "--bin", "metor-fsw", "--",
-               "pack", "dev", root]
+        cmd = ["cargo", "run", "-q", "-p", "metor-fsw-2", "--bin", "metor-fsw", "--", *args]
     # Output passes through to the frontend, which shows it on failure (or -v).
     subprocess.run(cmd, cwd=root, check=True)
 
@@ -94,7 +96,7 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
     # PEP 517 runs hooks with the source tree (the pack crate) as cwd.
     root = os.getcwd()
     name, version, extra, override = _config(root)
-    _run_pack_dev(root, override)
+    _run_fsw(root, ["pack", "dev", root], override)
     pth = "\n".join([os.path.join(root, ".metor"), *extra]) + "\n"
     return _wheel.write_editable_wheel(wheel_directory, name, version, pth)
 
@@ -117,10 +119,13 @@ def get_requires_for_build_sdist(config_settings=None):
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
-    raise NotImplementedError(
-        "metor-build is editable-only until the phase-2 publish pipeline; "
-        "use `uv sync` or `pip install -e .`"
-    )
+    # The real (fat, multi-triple) wheel: `metor-fsw pack build` compiles
+    # every configured target, gates the manifests, injects the pins, and
+    # writes the deterministic wheel straight into the requested directory.
+    root = os.getcwd()
+    name, version, _, _ = _config(root)
+    _run_fsw(root, ["pack", "build", root, "--wheel-out", wheel_directory], None)
+    return f"{_wheel._dist(name)}-{version}-py3-none-any.whl"
 
 
 def build_sdist(sdist_directory, config_settings=None):

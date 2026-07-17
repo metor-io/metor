@@ -73,8 +73,8 @@ pub use model::{
     TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
 pub use pack_dist::{
-    DEFAULT_TARGETS, PackConfig, PackDevOptions, PackDevReport, PackError, pack_dev,
-    read_pack_config,
+    Builder, DEFAULT_TARGETS, PackBuildOptions, PackBuildReport, PackConfig, PackDevOptions,
+    PackDevReport, PackError, pack_assemble, pack_build, pack_dev, pack_publish, read_pack_config,
 };
 pub use params::encode_value_params;
 pub use py::{eval_python_mission, is_python_mission};

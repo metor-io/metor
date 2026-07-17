@@ -244,10 +244,21 @@ fn shipped_triples(dir: &Path) -> Vec<String> {
 
 /// Runs `cargo build -p <crate_name>` and returns the located cdylib path.
 fn build_one(crate_name: &str, cdylib: &str, opts: &BuildOptions) -> Result<PathBuf, BuildError> {
+    build_cdylib("build", crate_name, cdylib, opts)
+}
+
+/// [`build_one`] with the cargo subcommand parameterized — `"zigbuild"` runs
+/// the `cargo-zigbuild` cross builder with the same output-location scan.
+pub(super) fn build_cdylib(
+    subcommand: &str,
+    crate_name: &str,
+    cdylib: &str,
+    opts: &BuildOptions,
+) -> Result<PathBuf, BuildError> {
     // Prefer the cargo that invoked this process, falling back to PATH.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(cargo);
-    cmd.args(["build", "-p", crate_name, "--message-format=json"]);
+    cmd.args([subcommand, "-p", crate_name, "--message-format=json"]);
     if opts.release {
         cmd.arg("--release");
     }
