@@ -243,6 +243,9 @@ pub struct PlantState {
     /// The full plant config — the sensor sigmas and the disturbance/actuator environment
     /// ([`disturbance_torques`] reads it every cycle).
     params: PlantParams,
+    /// Whether the spacecraft was illuminated last cycle (`None` before the first), so the
+    /// shadow entry/exit transitions log once per edge.
+    was_illuminated: Option<bool>,
 }
 
 impl PlantState {
@@ -311,6 +314,12 @@ impl PlantState {
             force: SpatialForce::zero(),
         };
         let arm = !p.disarmed;
+        tracing::info!(
+            wheels_armed = arm,
+            init_rate = p.init_rate,
+            orbit_phase = p.init_orbit_phase,
+            "plant booted"
+        );
         PlantState {
             body,
             wheels: [
@@ -324,6 +333,7 @@ impl PlantState {
             mag_model: MagneticModel::default(),
             gps_pos_err: V3::zeros(),
             params: p,
+            was_illuminated: None,
         }
     }
 }
@@ -383,6 +393,13 @@ pub fn execute(
     let sun_eci = sun_dir_eci(epoch);
     let mag_eci = mag_field_eci(&mut state.mag_model, epoch, &pos_eci);
     let illuminated = !in_earth_shadow(&pos_eci, &sun_eci);
+    // Log the eclipse edges only: entering shadow darkens the CSS heads and drops SRP.
+    match (state.was_illuminated, illuminated) {
+        (Some(true), false) => tracing::info!(t_sim = state.t_sim, "entering Earth shadow"),
+        (Some(false), true) => tracing::info!(t_sim = state.t_sim, "leaving Earth shadow"),
+        _ => {}
+    }
+    state.was_illuminated = Some(illuminated);
     // The six CSS heads (cosine response, FOV-clamped, dark in eclipse) each read their
     // noise floor on top; the magnetometer reads the physical field (Tesla) — real
     // magnetometers measure magnitude, and the desat law downstream needs |B|.

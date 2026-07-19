@@ -31,6 +31,16 @@ pub struct CtrlSystem {
     k_detumble: f64,
 }
 
+/// Display name of a [`ModeCmd`] pointing-law word, for the transition log line.
+fn law_name(law: u8) -> &'static str {
+    match law {
+        ModeCmd::LAW_NADIR => "nadir",
+        ModeCmd::LAW_HIL => "velocity-vector",
+        ModeCmd::LAW_DETUMBLE => "detumble",
+        _ => "unknown",
+    }
+}
+
 #[system(name = "ctrl")]
 impl CtrlSystem {
     pub fn new(p: CtrlParams) -> Self {
@@ -61,8 +71,16 @@ impl CtrlSystem {
         };
         let q_hat_b_eci = e.q_hat_b_eci;
 
-        // Latch the commanded pointing law (the slot may not have written one yet).
-        if let Ok(Some(m)) = mode.latest() {
+        // Latch the commanded pointing law (the slot may not have written one yet),
+        // logging each transition — the moments the actuator strategy changes.
+        if let Ok(Some(m)) = mode.latest()
+            && self.law != Some(m.law)
+        {
+            tracing::info!(
+                from = self.law.map(law_name).unwrap_or("none"),
+                to = law_name(m.law),
+                "pointing law changed"
+            );
             self.law = Some(m.law);
         }
 

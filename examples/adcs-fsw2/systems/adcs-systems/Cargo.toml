@@ -24,6 +24,7 @@ export = []
 [dependencies]
 adcs-contracts = { path = "../../contracts" }
 metor-fsw-2 = { path = "../../../../libs/metor-fsw-2" }
+tracing = "0.1"
 metor-fsw-adcs = { workspace = true }
 nox = { workspace = true }
 rand = "0.9"
