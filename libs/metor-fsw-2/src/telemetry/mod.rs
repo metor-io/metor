@@ -67,7 +67,9 @@ use metor_proto::types::{
 };
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{PacketSink, PacketStream};
-use metor_proto_wkt::{ComponentMetadata, MsgStream, SetComponentMetadata, VTableMsg};
+use metor_proto_wkt::{
+    ComponentMetadata, MsgMetadata, MsgStream, SetComponentMetadata, SetMsgMetadata, VTableMsg,
+};
 use stellarator::JoinHandleDropGuard;
 use stellarator::buf::Slice;
 use stellarator::io::{AsyncWrite, OwnedReader, OwnedWriter, SplitExt};
@@ -117,6 +119,11 @@ pub trait Transport {
         msg: &VTableMsg,
         meta: &[ComponentMetadata],
     ) -> Result<(), TransportError>;
+
+    /// Announce one message channel's payload schema, a [`SetMsgMetadata`]
+    /// the db persists so ground tools decode the channel's records
+    /// generically. Sent once per distinct packet id on every connect.
+    async fn announce_msg(&mut self, msg: &SetMsgMetadata) -> Result<(), TransportError>;
 
     /// Send one batch of concatenated length-prefixed packets. The buffer is
     /// returned alongside the result — on failure too — so its allocation can
@@ -196,6 +203,25 @@ impl Transport for TcpTransport {
                     .0
                     .map_err(TransportError::io)?;
             }
+            Ok(())
+        }
+        .await;
+        // A failed write leaves the socket in an unknown state; drop it so
+        // the next call redials.
+        if res.is_err() {
+            self.conn = None;
+        }
+        res
+    }
+
+    async fn announce_msg(&mut self, msg: &SetMsgMetadata) -> Result<(), TransportError> {
+        let res: Result<(), TransportError> = async {
+            let tx = self.ensure().await?;
+            let pkt = msg.into_len_packet();
+            tx.write_all(pkt.inner)
+                .await
+                .0
+                .map_err(TransportError::io)?;
             Ok(())
         }
         .await;
@@ -691,11 +717,15 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
 }
 
 /// One announced tap's wire schema, moved into the sender task to replay on
-/// connect.
-struct Announce {
-    packet_id: PacketId,
-    vtable: VTable,
-    metadata: Vec<ComponentMetadata>,
+/// connect: a table tap's vtable + component metadata, or a message channel's
+/// payload schema.
+enum Announce {
+    Table {
+        packet_id: PacketId,
+        vtable: VTable,
+        metadata: Vec<ComponentMetadata>,
+    },
+    Msg(SetMsgMetadata),
 }
 
 /// The async sender task: announce every table tap, then send each queued
@@ -719,11 +749,21 @@ async fn run_sender<T: Transport>(
     let mut was_up = false;
     'link: loop {
         for a in &announces {
-            let msg = VTableMsg {
-                id: a.packet_id,
-                vtable: a.vtable.clone(),
+            let sent = match a {
+                Announce::Table {
+                    packet_id,
+                    vtable,
+                    metadata,
+                } => {
+                    let msg = VTableMsg {
+                        id: *packet_id,
+                        vtable: vtable.clone(),
+                    };
+                    transport.announce(&msg, metadata).await
+                }
+                Announce::Msg(msg) => transport.announce_msg(msg).await,
             };
-            if transport.announce(&msg, &a.metadata).await.is_err() {
+            if sent.is_err() {
                 back_off(&drops, &mut was_up, &mut backoff).await;
                 continue 'link;
             }
@@ -867,6 +907,8 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         // so a command channel or an opted-out frame never reaches the matcher.
         let mut taps = Vec::new();
         let mut announces = Vec::new();
+        let mut n_tables = 0usize;
+        let mut announced_msgs = std::collections::HashSet::new();
         // Deferred health reports: iterating `output.all` borrows the output
         // bundle, so `output.health()` (a `&mut` borrow) runs after the loop.
         let mut exhausted: Vec<String> = Vec::new();
@@ -891,15 +933,36 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             // the framing.
             let wire = match entry.announce() {
                 Some((vtable, metadata)) => {
-                    let packet_id = (announces.len() as u16).to_le_bytes();
-                    announces.push(Announce {
+                    let packet_id = (n_tables as u16).to_le_bytes();
+                    n_tables += 1;
+                    announces.push(Announce::Table {
                         packet_id,
                         vtable,
                         metadata,
                     });
                     Wire::Table { packet_id }
                 }
-                None => Wire::Msg,
+                None => {
+                    // A message channel: announce its payload schema once per
+                    // distinct packet id (every system's `log` port shares
+                    // `LogEvent::ID`, so the dedup is load-bearing).
+                    if let crate::PortSchema::Postcard {
+                        id,
+                        schema: Some(schema),
+                    } = &entry.desc.schema
+                        && announced_msgs.insert(*id)
+                    {
+                        announces.push(Announce::Msg(SetMsgMetadata {
+                            id: *id,
+                            metadata: MsgMetadata {
+                                name: schema.name.clone(),
+                                schema: (**schema).clone(),
+                                metadata: Default::default(),
+                            },
+                        }));
+                    }
+                    Wire::Msg
+                }
             };
             taps.push(Tap {
                 view,

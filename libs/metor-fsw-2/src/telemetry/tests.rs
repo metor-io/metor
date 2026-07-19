@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metor_proto::types::{ComponentId, LenPacket, PacketId, Timestamp};
-use metor_proto_wkt::{ComponentMetadata, VTableMsg};
+use metor_proto_wkt::{ComponentMetadata, SetMsgMetadata, VTableMsg};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
@@ -114,6 +114,7 @@ impl CyclicSystem for Consumer {
 
 struct MockInner {
     announces: Mutex<Vec<(PacketId, Vec<ComponentMetadata>)>>,
+    msg_announces: Mutex<Vec<SetMsgMetadata>>,
     /// Each sent batch, split back into its individual length-prefixed packets
     /// so assertions can address one packet at a time.
     packets: Mutex<Vec<LenPacket>>,
@@ -131,6 +132,7 @@ impl MockTransport {
         Self {
             inner: Arc::new(MockInner {
                 announces: Mutex::new(Vec::new()),
+                msg_announces: Mutex::new(Vec::new()),
                 packets: Mutex::new(Vec::new()),
                 block,
             }),
@@ -149,6 +151,11 @@ impl Transport for MockTransport {
             .lock()
             .unwrap()
             .push((msg.id, meta.to_vec()));
+        Ok(())
+    }
+
+    async fn announce_msg(&mut self, msg: &SetMsgMetadata) -> Result<(), TransportError> {
+        self.inner.msg_announces.lock().unwrap().push(msg.clone());
         Ok(())
     }
 
@@ -183,6 +190,10 @@ impl Transport for DeadTransport {
         _msg: &VTableMsg,
         _meta: &[ComponentMetadata],
     ) -> Result<(), TransportError> {
+        Err(TransportError::Disconnected)
+    }
+
+    async fn announce_msg(&mut self, _msg: &SetMsgMetadata) -> Result<(), TransportError> {
         Err(TransportError::Disconnected)
     }
 
@@ -366,6 +377,52 @@ async fn telemetry_end_to_end_all() {
         .expect("packet payload is the imu table")
         .0;
     assert!(imu.omega > 0.0, "streamed a real omega: {}", imu.omega);
+}
+
+// ---------------------------------------------------------------------------
+// 2a. Message channels announce their payload schema, deduped by packet id.
+// ---------------------------------------------------------------------------
+
+/// Every tapped Postcard port carries its payload schema; the downlink
+/// announces one `SetMsgMetadata` per DISTINCT packet id (both systems' `log`
+/// ports share `LogEvent::ID`), named by the schema's type name.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn msg_schemas_announce_once_per_id() {
+    use metor_proto_wkt::{LogEvent, SequenceRegistry};
+
+    let mock = MockTransport::new(false);
+    let rec = mock.inner.clone();
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+    b.push_node(cyclic_node("producer_b".into(), Producer { n: 0.0 }));
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        TelemetrySystem::new(TelemetryConfig {
+            transport: mock,
+            mode: TelemetryMode::All,
+        }),
+    ));
+    let mut coord = b.build().unwrap();
+    coord.run_for(2).await;
+
+    let msgs = rec.msg_announces.lock().unwrap();
+    let log_events: Vec<_> = msgs.iter().filter(|m| m.id == LogEvent::ID).collect();
+    assert_eq!(
+        log_events.len(),
+        1,
+        "one announce for the shared LogEvent id, not one per system"
+    );
+    assert_eq!(log_events[0].metadata.name, "LogEvent");
+    assert_eq!(log_events[0].metadata.schema.name, "LogEvent");
+    // The coordinator's own telemetered message channels announce too; its
+    // untelemetered `commands` channel must not.
+    assert!(msgs.iter().any(|m| m.id == SequenceRegistry::ID));
+    assert!(
+        msgs.iter()
+            .all(|m| m.id != metor_proto_wkt::SequenceCommand::ID),
+        "untelemetered channels are never announced"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,6 +1340,10 @@ async fn sender_reannounces_after_a_send_failure() {
         inner: Arc<FlakyInner>,
     }
     impl Transport for FlakyTransport {
+        async fn announce_msg(&mut self, _msg: &SetMsgMetadata) -> Result<(), TransportError> {
+            Ok(())
+        }
+
         async fn announce(
             &mut self,
             _msg: &VTableMsg,
@@ -1307,7 +1368,7 @@ async fn sender_reannounces_after_a_send_failure() {
     let crate::PortSchema::Table { vtable, .. } = crate::PortDesc::of::<Imu>().schema else {
         panic!("a frame port carries a Table schema");
     };
-    let announces = vec![Announce {
+    let announces = vec![Announce::Table {
         packet_id: [7, 7],
         vtable,
         metadata: Vec::new(),

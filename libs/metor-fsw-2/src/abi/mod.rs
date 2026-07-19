@@ -78,10 +78,12 @@ use crate::descriptor::SystemDescriptor;
 /// replacing the `*Msg` mirror family. Version 9 passes the instance name to
 /// `fsw_pack_bind_init` (stamped into the entry's [`LogEvent`] records as
 /// their `source`) and carries the implicit log port as a message channel
-/// instead of a frame.
+/// instead of a frame. Version 10 carries each Postcard port's payload
+/// schema in the descriptor, so the downlink can announce message schemas
+/// to the ground.
 ///
 /// [`LogEvent`]: crate::LogEvent
-pub const FSW_ABI_VERSION: u32 = 9;
+pub const FSW_ABI_VERSION: u32 = 10;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles

@@ -1171,7 +1171,10 @@ mod tests {
         PortDesc {
             name: name.to_string(),
             max_size: 8,
-            schema: PortSchema::Postcard { id: [7, 0] },
+            schema: PortSchema::Postcard {
+                id: [7, 0],
+                schema: None,
+            },
             delivery: Delivery::Log,
             fan_in: FanIn::One,
             telemetered: false,

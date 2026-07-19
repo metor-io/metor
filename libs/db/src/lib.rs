@@ -521,6 +521,12 @@ impl State {
         Ok(())
     }
 
+    /// Every recorded message log's id with its announced metadata, for
+    /// pickers that enumerate the channels present in the db.
+    pub fn msg_log_iter(&self) -> impl Iterator<Item = (PacketId, Option<&MsgMetadata>)> {
+        self.msg_logs.iter().map(|(id, log)| (*id, log.metadata()))
+    }
+
     pub fn get_or_insert_msg_log(
         &mut self,
         id: PacketId,

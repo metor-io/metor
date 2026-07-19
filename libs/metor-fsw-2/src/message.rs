@@ -39,7 +39,7 @@ use crate::descriptor::PortDesc;
 /// explicitly rather than derived from the Rust type name so that renaming
 /// the type cannot silently change the wire token. Resolution from token to
 /// type happens through a [`MsgTable`].
-pub trait NamedMsg: Msg {
+pub trait NamedMsg: Msg + postcard_schema::Schema {
     /// The stable wire, config, and registry token for this message type.
     const NAME: &'static str;
 }

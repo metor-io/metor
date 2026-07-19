@@ -106,6 +106,7 @@ version = "0.14.2"
 dependencies = [
  "adcs-contracts",
  "metor-fsw-2",
+ "tracing",
 ]
 
 [[package]]
@@ -118,6 +119,7 @@ dependencies = [
  "nox",
  "rand 0.9.2",
  "rand_distr 0.5.1",
+ "tracing",
 ]
 
 [[package]]

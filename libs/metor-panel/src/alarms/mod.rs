@@ -183,7 +183,7 @@ impl AlarmState {
     fn targets(def: &AlarmDef, component_id: ComponentId, element: usize) -> bool {
         def.target.as_ref().is_some_and(|target| {
             target.component_id == component_id
-                && target.element_index.map(|i| i == element).unwrap_or(true)
+                && target.element_index.map(|i| i as usize == element).unwrap_or(true)
         })
     }
 

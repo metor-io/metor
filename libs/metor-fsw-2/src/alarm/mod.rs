@@ -243,7 +243,7 @@ impl AlarmSpec {
             description: self.description.clone(),
             target: Some(AlarmTarget {
                 component_id: ComponentId::new(&self.target.component),
-                element_index: self.target.element,
+                element_index: self.target.element.map(|e| e as u64),
             }),
             limits,
             default_severity: self.severity,
