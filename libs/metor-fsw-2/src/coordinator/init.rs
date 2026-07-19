@@ -80,7 +80,7 @@ use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
 use crate::port::capacity_for;
 use crate::proc::session::SessionDir;
 use crate::registry::{Registry, RegistryEntry};
-use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
+use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, HealthOutput};
 
 use super::bind::{ProcBindCtx, bind_systems};
 use super::slot::SlotReg;
@@ -102,15 +102,15 @@ struct CyclicReg<S> {
     system: S,
 }
 
-impl<S, O> CyclicRegistration for CyclicReg<S>
+impl<S> CyclicRegistration for CyclicReg<S>
 where
-    S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts + 'static,
+    S: CyclicSystem + 'static,
+    S::Output: HealthOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
         let input = <S::Input as BindPorts>::bind(binder);
-        let output = <Out<O> as BindPorts>::bind(binder);
+        let output = <S::Output as BindPorts>::bind(binder);
         Box::new(CyclicRunner::new(self.system, input, output))
     }
 }
@@ -209,10 +209,10 @@ pub(crate) struct Node {
 /// Build a cyclic system's [`Node`] under `name` from its instance descriptor
 /// (what this configured instance actually carries) and an erased [`CyclicReg`]
 /// bind.
-pub(crate) fn cyclic_node<S, O>(name: String, system: S) -> Node
+pub(crate) fn cyclic_node<S>(name: String, system: S) -> Node
 where
-    S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts + 'static,
+    S: CyclicSystem + 'static,
+    S::Output: HealthOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     let desc = system.instance_descriptor();

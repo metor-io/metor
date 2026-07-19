@@ -151,10 +151,10 @@ impl Trim {
 /// reference it.
 fn test_pack() -> Pack {
     Pack::new()
-        .system_type::<Counter, _>("counter")
-        .system_type::<Boom, _>("boom")
+        .system_type::<Counter>("counter")
+        .system_type::<Boom>("boom")
         .task("wait_seq", wait_seq)
-        .system_type::<Trim, _>("trim")
+        .system_type::<Trim>("trim")
 }
 
 /// Entry indices in [`test_pack`]'s manifest order.

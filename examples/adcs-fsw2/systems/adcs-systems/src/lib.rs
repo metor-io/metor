@@ -28,7 +28,7 @@ pub fn pack() -> Pack {
         .system("Plant", system(plant::execute).init(PlantState::new))
         .system("Nav", system(NavState::execute).init(NavState::new))
         // Deliberately struct-authored (`#[system]`), so the pack exercises both styles.
-        .system_type::<CtrlSystem, _>("Ctrl")
+        .system_type::<CtrlSystem>("Ctrl")
 }
 metor_fsw_2::export_pack!(pack, feature = "export");
 

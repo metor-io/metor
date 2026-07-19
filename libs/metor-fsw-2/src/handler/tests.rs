@@ -592,7 +592,7 @@ fn system_type_shared_registers_instance_descriptor() {
     let tally = pack.shared_state("Tally", |(): ()| {
         Ok::<_, std::convert::Infallible>(Tally::default())
     });
-    let mut pack = pack.system_type_shared::<MintSys, MintOut, _>("Mint", &tally, <MintSys as crate::BuildSystem>::new);
+    let mut pack = pack.system_type_shared::<MintSys, _>("Mint", &tally, <MintSys as crate::BuildSystem>::new);
     pack.state_entry_mut("Tally")
         .unwrap()
         .create(EntryParams::Postcard(&[]))
@@ -612,7 +612,7 @@ fn system_type_shared_registers_instance_descriptor() {
     let tally = pack.shared_state("Tally", |(): ()| {
         Ok::<_, std::convert::Infallible>(Tally::default())
     });
-    let mut pack = pack.system_type_shared::<MintSys, MintOut, _>("Mint", &tally, <MintSys as crate::BuildSystem>::new);
+    let mut pack = pack.system_type_shared::<MintSys, _>("Mint", &tally, <MintSys as crate::BuildSystem>::new);
     pack.state_entry_mut("Tally")
         .unwrap()
         .create(EntryParams::Postcard(&[]))

@@ -14,7 +14,7 @@
 //!         .params(PlantParams { init_angle: 0.5 }).end()
 //!     .system("nav").ty("Nav").end()
 //!     .connect("plant", "sensors", "nav", "sensors")
-//!     .telemetry("127.0.0.1:2240".parse().unwrap())
+//!     .serve("127.0.0.1:2240".parse().unwrap())
 //!     .build();
 //! ```
 //!
@@ -210,7 +210,7 @@ impl WiringBuilder {
     /// pack declared via [`Pack::shared_state`](crate::Pack::shared_state),
     /// and `params` is its construction value tree. Panics on a duplicate
     /// state name or type, the builder's insert-time twin of validate.
-    pub fn state(mut self, name: impl Into<String>, ty: impl Into<String>) -> Self {
+    pub fn state(self, name: impl Into<String>, ty: impl Into<String>) -> Self {
         self.state_value(name, ty, serde_json::Value::Object(serde_json::Map::new()))
     }
 
@@ -240,22 +240,26 @@ impl WiringBuilder {
         self
     }
 
-    /// Adds the built-in TCP telemetry downlink under the instance name
-    /// `"telemetry"`, tapping every output. For a subset tap or a second
-    /// downlink, declare an ordinary system with the `TcpDownlink` type
-    /// instead. Resolving either requires a registry seeded from
+    /// Serves the telemetry link: declares the built-in `TcpServer` state
+    /// under the name `"link"` listening on `addr`, plus an all-taps
+    /// downlink under the instance name `"telemetry"`. For a subset tap,
+    /// declare an ordinary system with the `Downlink` type instead.
+    /// Resolving requires a registry seeded from
     /// [`Registry::with_builtins`](super::Registry::with_builtins).
-    pub fn telemetry(mut self, addr: SocketAddr) -> Self {
-        self.push_system(SystemSpec::tcp_downlink("telemetry", addr));
+    pub fn serve(mut self, addr: SocketAddr) -> Self {
+        self.wiring.states.push(StateSpec::tcp_server("link", addr));
+        self.push_system(SystemSpec::downlink("telemetry"));
         self
     }
 
-    /// Adds the built-in TCP command uplink under the instance name
-    /// `"uplink"`. It reads command messages off its own connection to
-    /// `addr`, separate from the downlink's; route its commands onward with
-    /// explicit message edges.
-    pub fn uplink(mut self, addr: SocketAddr) -> Self {
-        self.push_system(SystemSpec::tcp_uplink("uplink", addr));
+    /// Adds the built-in command uplink under the instance name `"uplink"`,
+    /// relaying the named msgs off the [`serve`](Self::serve) link. Declare
+    /// it before its consumers and a command is consumed the same cycle it
+    /// is republished; route its commands onward with explicit message
+    /// edges.
+    pub fn uplink<'a>(mut self, msgs: impl IntoIterator<Item = &'a str>) -> Self {
+        let msgs: Vec<&str> = msgs.into_iter().collect();
+        self.push_system(SystemSpec::uplink("uplink", &msgs));
         self
     }
 

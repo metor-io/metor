@@ -1,26 +1,12 @@
-"""The adcs-fsw2 mission, expressed with the `metor_config` Python front-end.
-
-This is the mission: the coordinator config, artifacts, systems, `mode` slot,
-and edges the CLI runner and the tracked tests read, evaluated once at
-build/package time into the `Wiring` IR.
-
-Systems and occupants come from generated, `py.typed` pack modules the build
-backend regenerates into `.metor/packs` on `uv sync` (venv-only — nothing
-generated is checked in): importing `Plant`/`Nav`/`Ctrl` and
-`commissioning`/`safe_mode` gives pyright-checked params, ports, and frames,
-and each module's `ARTIFACT` is registered implicitly — no `m.artifact(...)`.
-Alarms and links stay on the `metor_config` builtins.
-
-    uv sync                                        # regenerate stubs into the venv
-    uv run -- cargo run -p metor-fsw-2 --bin metor-fsw -- \
-        run mission.py --build                     # headless sim
-"""
-
-from metor_config import Alarm, Alarms, Mission, Target, TcpDownlink, TcpUplink, band
+from metor_config import Alarm, Alarms, Downlink, Mission, Target, TcpServer, Uplink, band
 from adcs_pack import Ctrl, Nav, Plant
 from adcs_seqs import commissioning, safe_mode
 
 m = Mission(cycle_rate=120.0, sim_dt=1 / 120)
+
+# The link server: the FSW listens here; the panel (or any ground tool)
+# connects for the downlink stream and command ingest alike.
+m.state("link", TcpServer(addr="127.0.0.1:2240"))
 
 # The plant's disturbance/actuator environment is spelled out in full, physically
 # honest for a ~3 kg spacecraft at 400 km. `process=True` runs it in its own worker.
@@ -76,6 +62,10 @@ alarms = m.add(
     ]),
 )
 
+# The uplink is declared before its consumers, so a ground command is
+# consumed the same cycle it is republished.
+uplink = m.add("uplink", Uplink(msgs=["SequenceCommand", "AlarmAck", "ReloadSequences"]))
+
 # Detumble enters only above 1.0 rad/s; the gates/budgets ride the allow line.
 mode = m.slot(
     "mode",
@@ -114,11 +104,7 @@ m.connect(mode.mode_cmd, ctrl.mode_cmd, delayed=True)
 m.connect(ctrl.torque_cmd, plant.torque_cmd, delayed=True)
 m.connect(ctrl.mtq_cmd, plant.mtq_cmd, delayed=True)
 
-uplink = m.add(
-    "uplink",
-    TcpUplink(addr="127.0.0.1:2240", msgs=["SequenceCommand", "AlarmAck", "ReloadSequences"]),
-)
-downlink = m.add("downlink", TcpDownlink(addr="127.0.0.1:2240"))
+downlink = m.add("downlink", Downlink())
 
 m.route(uplink, mode, msg="SequenceCommand")  # ground commands
 m.route(m.coordinator, mode, msg="SequenceCommand")  # in-proc control_handle

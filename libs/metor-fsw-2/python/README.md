@@ -13,7 +13,7 @@ One directory per distribution (`docs/design-packaging.md` §4):
 - `tests/` — the recorder test suite.
 
 ```python
-from metor_config import Mission, Alarms, Alarm, Target, band, TcpUplink, TcpDownlink
+from metor_config import Mission, Alarms, Alarm, Target, band, TcpServer, Uplink, Downlink
 
 m = Mission(cycle_rate=120.0, sim_dt=1 / 120)
 adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")

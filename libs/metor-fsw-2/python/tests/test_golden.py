@@ -12,7 +12,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "metor-config"))
 
 import metor_config as mc
-from metor_config import Alarm, Alarms, Mission, Target, TcpUplink, band
+from metor_config import Alarm, Alarms, Mission, Target, TcpServer, Uplink, band
 
 GOLDEN = os.path.join(
     os.path.dirname(__file__), "..", "..", "tests", "golden", "mission.json"
@@ -52,7 +52,8 @@ def build_mission() -> Mission:
             )
         ]),
     )
-    uplink = m.add("uplink", TcpUplink(addr="127.0.0.1:2240", msgs=["SequenceCommand"]))
+    m.state("link", TcpServer(addr="127.0.0.1:2240"))
+    uplink = m.add("uplink", Uplink(msgs=["SequenceCommand"]))
     mode = m.slot(
         "mode",
         inputs=["attitude_estimate", "gps"],

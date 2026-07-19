@@ -113,7 +113,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
         })
         .end()
         .connect("ticker", "tick_in", "counter", "tick_in")
-        .telemetry("127.0.0.1:2240".parse().unwrap())
+        .serve("127.0.0.1:0".parse().unwrap())
         .build();
 
     // Build the fixture crate and record where its shared library landed.

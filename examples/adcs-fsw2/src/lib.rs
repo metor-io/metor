@@ -15,8 +15,8 @@
 //!
 //! ```text
 //! cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.py --build            # headless sim
-//! cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.py --build --wall \
-//!     --telemetry 127.0.0.1:2240                                                 # live → panel
+//! cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.py --build --wall     # live → panel
+//! # the mission's TcpServer state listens on 127.0.0.1:2240; connect the panel to it
 //! ```
 //!
 //! This crate links **none** of the system crates and **not** `adcs-contracts`: the runner

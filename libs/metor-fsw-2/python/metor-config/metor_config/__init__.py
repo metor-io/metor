@@ -35,7 +35,10 @@ __version__ = "0.3.0"
 # v3 replaced the artifact's recorded shared-object file name with the bare
 # `lib` stem (the file name is derived per target triple by the host) and
 # added the prebuilt-artifact fields.
-IR_VERSION = 3
+# v4 added the `states` list and replaced the outbound TcpDownlink/TcpUplink
+# built-ins with the in-FSW link server (a `TcpServer` state the `Downlink`/
+# `Uplink` systems attach to).
+IR_VERSION = 4
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -329,21 +332,30 @@ def Alarms(alarms: list[Alarm]) -> Spec:  # noqa: N802 - a system-type wrapper
     return static_system("Alarms", alarm=[a.to_json() for a in alarms])
 
 
-def TcpUplink(addr: str, msgs: list[str] | None = None) -> Spec:  # noqa: N802
-    """The built-in TCP command uplink (``UplinkParams``)."""
-    return static_system("TcpUplink", **_drop_none({"addr": addr, "msgs": msgs}))
+def TcpServer(addr: str) -> Spec:  # noqa: N802
+    """The built-in link server state (``LinkParams``): the FSW listens on
+    ``addr``; ground tools connect to it for the downlink stream and command
+    ingest alike. Declare it with :meth:`Mission.state`."""
+    return static_system("TcpServer", addr=addr)
 
 
-def TcpDownlink(  # noqa: N802
-    addr: str,
+def Uplink(msgs: list[str] | None = None) -> Spec:  # noqa: N802
+    """The built-in command uplink (``UplinkParams``), attached to the
+    mission's ``TcpServer`` state. Add it before its consumers and a command
+    is consumed the same cycle it arrives."""
+    return static_system("Uplink", **_drop_none({"msgs": msgs}))
+
+
+def Downlink(  # noqa: N802
     instances: list[str] | None = None,
     frames: list[str] | None = None,
 ) -> Spec:
-    """The built-in TCP telemetry downlink (``DownlinkParams``); omitting both
-    subset lists taps everything."""
+    """The built-in telemetry downlink (``DownlinkParams``), attached to the
+    mission's ``TcpServer`` state; omitting both subset lists taps
+    everything."""
     return static_system(
-        "TcpDownlink",
-        **_drop_none({"addr": addr, "instances": instances, "frames": frames}),
+        "Downlink",
+        **_drop_none({"instances": instances, "frames": frames}),
     )
 
 
@@ -486,6 +498,22 @@ class Mission:
         )
 
     # -- systems and slots --------------------------------------------------
+
+    def state(self, name: str, spec: Spec) -> None:
+        """Declare a pack-shared state instance (``m.state("link",
+        TcpServer(addr="0.0.0.0:2240"))``): constructed once, before any
+        system, from its own params. States live in their own namespace and
+        take no edges."""
+        if any(s["name"] == name or s["ty"] == spec.ty for s in self._states):
+            raise ValueError(f"state {name!r} (type {spec.ty!r}) is already declared")
+        self._states.append(
+            {
+                "name": name,
+                "ty": spec.ty,
+                "params": spec._param_source(),
+                "src": _source_ref(),
+            }
+        )
 
     def add(self, name: str, spec: H, process: bool = False) -> H:
         """Register ``spec`` under ``name`` (scope-prefixed) and return its handle.

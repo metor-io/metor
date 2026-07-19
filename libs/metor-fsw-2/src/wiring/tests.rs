@@ -841,37 +841,49 @@ async fn pack_entry_defaults_overlay_value_overrides() {
     );
 }
 
-/// The TCP built-ins' specs carry their `addr` as a `Value` tree, and the
-/// variant survives a serde round-trip of the spec.
+/// The link built-ins' specs carry their params as `Value` trees, and the
+/// variant survives a serde round-trip of each spec.
 #[test]
 fn builtin_link_specs_carry_value_params() {
-    let spec =
-        crate::wiring::SystemSpec::tcp_downlink("telemetry", "127.0.0.1:2240".parse().unwrap());
-    match &spec.params {
+    let state =
+        crate::wiring::StateSpec::tcp_server("link", "127.0.0.1:2240".parse().unwrap());
+    match &state.params {
         ParamSource::Value(v) => {
             assert_eq!(v, &serde_json::json!({ "addr": "127.0.0.1:2240" }))
         }
         other => panic!("expected ParamSource::Value, got {other:?}"),
     }
+    let json = serde_json::to_string(&state).expect("serialize");
+    let back: crate::wiring::StateSpec = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, state, "state Value params round-trip");
+
+    let spec = crate::wiring::SystemSpec::uplink("uplink", &["SequenceCommand"]);
+    match &spec.params {
+        ParamSource::Value(v) => {
+            assert_eq!(v, &serde_json::json!({ "msgs": ["SequenceCommand"] }))
+        }
+        other => panic!("expected ParamSource::Value, got {other:?}"),
+    }
     let json = serde_json::to_string(&spec).expect("serialize");
     let back: crate::wiring::SystemSpec = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back, spec, "Value params round-trip");
+    assert_eq!(back, spec, "system Value params round-trip");
 }
 
-/// Both built-ins resolve and run from their `Value` params: the
-/// `SocketAddr` reads from the JSON string and the subset/msgs fields fall
-/// back to their serde defaults.
+/// The whole link pack resolves and runs from its `Value` params: the state
+/// constructs from the JSON `addr` string (an ephemeral port here), the
+/// attached systems find it, and the subset/msgs fields fall back to their
+/// serde defaults.
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn builder_telemetry_and_uplink_resolve_from_value_params() {
+async fn builder_serve_and_uplink_resolve_from_value_params() {
     let wiring = WiringBuilder::new()
         .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.001 })
         .system("imu")
         .ty("ImuDriver")
         .params_value(serde_json::json!({ "i2c_bus": 1, "sample_hz": 200.0 }))
         .end()
-        .telemetry("127.0.0.1:59422".parse().unwrap())
-        .uplink("127.0.0.1:59423".parse().unwrap())
+        .uplink(["SequenceCommand"])
+        .serve("127.0.0.1:0".parse().unwrap())
         .build();
     let mut coord = resolve(&wiring, &registry()).expect("builtins resolve from Value params");
     coord.run_for(5).await;

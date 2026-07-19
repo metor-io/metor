@@ -202,6 +202,11 @@ struct RunArgs {
     /// Run this many cycles, then stop (default: run until interrupted).
     #[arg(long, value_name = "N")]
     cycles: Option<usize>,
+    /// Serve the telemetry link on this address, overriding the mission's
+    /// `TcpServer` state (or declaring one, with an all-taps downlink, when
+    /// the mission has none).
+    #[arg(long, value_name = "ADDR")]
+    serve: Option<std::net::SocketAddr>,
 }
 
 #[derive(Args, Debug)]
@@ -677,6 +682,23 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     if let Some(rate) = args.cycle_rate {
         wiring.coordinator.cycle_rate = rate;
     }
+    if let Some(addr) = args.serve {
+        use crate::ir::{StateSpec, SystemSpec, TCP_SERVER_TYPE};
+        match wiring
+            .states
+            .iter_mut()
+            .find(|s| s.ty == TCP_SERVER_TYPE)
+        {
+            Some(state) => {
+                state.params =
+                    crate::ir::ParamSource::Value(serde_json::json!({ "addr": addr.to_string() }));
+            }
+            None => {
+                wiring.states.push(StateSpec::tcp_server("link", addr));
+                wiring.systems.push(SystemSpec::downlink("telemetry"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -769,6 +791,7 @@ mod tests {
             cargo_arg: Vec::new(),
             no_manifest_sidecar: false,
             wall: false,
+            serve: None,
             sim_dt: None,
             cycle_rate: None,
             cycles: None,

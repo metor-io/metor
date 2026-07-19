@@ -35,15 +35,21 @@ use serde::{Deserialize, Serialize};
 /// (`prebuilt_dir`, `dist`). The file name is derived per target triple at
 /// provision time — recording it froze the *recording* host's platform into
 /// the IR, which broke cross-target packaging.
-pub const IR_VERSION: u32 = 3;
+///
+/// v4 added [`Wiring::states`] and replaced the outbound `TcpDownlink`/
+/// `TcpUplink` built-ins with the in-FSW link server: a [`TCP_SERVER_TYPE`]
+/// state the [`DOWNLINK_TYPE`]/[`UPLINK_TYPE`] systems attach to. A
+/// vocabulary change — a v3 bundle's link specs would resolve to types that
+/// no longer exist — so old bundles fail the version check and rebuild.
+pub const IR_VERSION: u32 = 4;
 
 /// A plain-data description of a complete mission, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
 ///
 /// Produced by [`parse`](crate::wiring::parse) or [`WiringBuilder`](crate::wiring::WiringBuilder),
-/// consumed by [`resolve`](crate::wiring::resolve). The telemetry downlink and the
-/// command uplink appear here as ordinary systems with the built-in registry
-/// types [`TCP_DOWNLINK_TYPE`] and [`TCP_UPLINK_TYPE`], not as dedicated fields.
+/// consumed by [`resolve`](crate::wiring::resolve). The telemetry link appears
+/// here as an ordinary [`TCP_SERVER_TYPE`] state plus [`DOWNLINK_TYPE`]/
+/// [`UPLINK_TYPE`] systems, not as dedicated fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Wiring {
     /// The [`IR_VERSION`] this value was produced against. Deliberately not
@@ -121,17 +127,23 @@ pub struct ScopeSpec {
     pub src: Option<SourceRef>,
 }
 
-/// Registry `type=` of the built-in TCP telemetry downlink, a
-/// [`TelemetrySystem`](crate::TelemetrySystem) over a
-/// [`TcpTransport`](crate::TcpTransport) configured by
-/// [`DownlinkParams`](crate::DownlinkParams).
-pub const TCP_DOWNLINK_TYPE: &str = "TcpDownlink";
+/// State `type=` of the built-in link server, a
+/// [`LinkState`](crate::LinkState) configured by
+/// [`LinkParams`](crate::LinkParams). The FSW listens on its `addr`; ground
+/// tools connect to it for the downlink stream and command ingest alike.
+pub const TCP_SERVER_TYPE: &str = "TcpServer";
 
-/// Registry `type=` of the built-in TCP command uplink, an
-/// [`UplinkSystem`](crate::UplinkSystem) over a
-/// [`TcpRecvTransport`](crate::TcpRecvTransport) configured by
+/// Registry `type=` of the built-in telemetry downlink, a
+/// [`TelemetrySystem`](crate::TelemetrySystem) attached to the mission's
+/// [`TCP_SERVER_TYPE`] state, configured by
+/// [`DownlinkParams`](crate::DownlinkParams).
+pub const DOWNLINK_TYPE: &str = "Downlink";
+
+/// Registry `type=` of the built-in command uplink, an
+/// [`UplinkSystem`](crate::UplinkSystem) attached to the mission's
+/// [`TCP_SERVER_TYPE`] state, configured by
 /// [`UplinkParams`](crate::UplinkParams).
-pub const TCP_UPLINK_TYPE: &str = "TcpUplink";
+pub const UPLINK_TYPE: &str = "Uplink";
 
 /// Coordinator-wide configuration, the serializable mirror of
 /// [`CoordinatorConfig`](crate::CoordinatorConfig).
@@ -274,33 +286,42 @@ pub struct SystemSpec {
     pub scope: Option<usize>,
 }
 
+impl StateSpec {
+    /// The built-in link server state, the spec pushed by
+    /// [`WiringBuilder::serve`](crate::wiring::WiringBuilder::serve) and the
+    /// CLI `--serve` flag. The `addr` rides as a [`ParamSource::Value`]
+    /// tree: the state's factory deserializes it with serde, so the
+    /// `SocketAddr` reads from the JSON string.
+    pub fn tcp_server(name: &str, addr: SocketAddr) -> Self {
+        Self {
+            name: name.to_string(),
+            ty: TCP_SERVER_TYPE.to_string(),
+            params: ParamSource::Value(serde_json::json!({ "addr": addr.to_string() })),
+            src: None,
+        }
+    }
+}
+
 impl SystemSpec {
-    /// A built-in TCP telemetry downlink instance that taps every output, the
-    /// spec pushed by [`WiringBuilder::telemetry`](crate::wiring::WiringBuilder::telemetry)
-    /// and the CLI `--telemetry` flag. A subset tap instead declares
-    /// `instances`/`frames` children on an ordinary `system` node.
-    pub fn tcp_downlink(name: &str, addr: SocketAddr) -> Self {
-        Self::tcp_builtin(name, TCP_DOWNLINK_TYPE, addr)
+    /// A built-in downlink instance that taps every output. A subset tap
+    /// instead declares `instances`/`frames` params on an ordinary `system`
+    /// node of the [`DOWNLINK_TYPE`].
+    pub fn downlink(name: &str) -> Self {
+        Self::link_builtin(name, DOWNLINK_TYPE, serde_json::json!({}))
     }
 
-    /// A built-in TCP command uplink instance, the spec pushed by
-    /// [`WiringBuilder::uplink`](crate::wiring::WiringBuilder::uplink) and the CLI
-    /// `--uplink` flag. Its commands are routed by explicit edges
-    /// (`connect "<name>" -> … msg="…"`).
-    pub fn tcp_uplink(name: &str, addr: SocketAddr) -> Self {
-        Self::tcp_builtin(name, TCP_UPLINK_TYPE, addr)
+    /// A built-in uplink instance relaying the named msgs. Its commands are
+    /// routed by explicit edges (`connect "<name>" -> … msg="…"`).
+    pub fn uplink(name: &str, msgs: &[&str]) -> Self {
+        Self::link_builtin(name, UPLINK_TYPE, serde_json::json!({ "msgs": msgs }))
     }
 
-    /// Both built-ins take a single `addr=` param, carried as a
-    /// [`ParamSource::Value`] tree: the static path deserializes it with
-    /// serde, so the `SocketAddr` reads from the JSON string and the params'
-    /// `#[serde(default)]` fields are honored.
-    fn tcp_builtin(name: &str, ty: &str, addr: SocketAddr) -> Self {
+    fn link_builtin(name: &str, ty: &str, params: serde_json::Value) -> Self {
         Self {
             name: name.to_string(),
             ty: Some(ty.to_string()),
             artifact: None,
-            params: ParamSource::Value(serde_json::json!({ "addr": addr.to_string() })),
+            params: ParamSource::Value(params),
             process: false,
             src: None,
             scope: None,

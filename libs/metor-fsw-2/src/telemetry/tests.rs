@@ -1,31 +1,31 @@
-//! Acceptance tests for the downlink and uplink. They cover the output registry
-//! queried by instance-qualified id, the end-to-end downlink against a deterministic
-//! in-memory transport (one announce per tapped entry, then batched `Table`
-//! packets), prefix disambiguation between two instances of one system type,
-//! subset filtering, the non-blocking drop-on-full policy and its health
-//! counter, non-coalescing message batching, and uplink subscription and
-//! routing.
+//! Acceptance tests for the downlink and uplink over the shared link server.
+//! They cover the output registry queried by instance-qualified id, the
+//! end-to-end downlink over a real loopback connection (per-connection
+//! announce replay, then batched `Table` packets), prefix disambiguation
+//! between two instances of one system type, subset filtering, the
+//! stalled-consumer drop policy and its health counter, non-coalescing
+//! message batching, and uplink routing off the server's inbound queue.
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use metor_proto::types::{ComponentId, LenPacket, PacketId, Timestamp};
-use metor_proto_wkt::{ComponentMetadata, SetMsgMetadata, VTableMsg};
+use metor_proto::types::{ComponentId, Msg as _, OwnedPacket, PacketId, Timestamp};
+use metor_proto_stellar::PacketStream;
+use metor_proto_wkt::{ComponentMetadata, SetComponentMetadata, SetMsgMetadata, VTableMsg};
+use stellarator::net::TcpStream;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    ClockMode, CoordinatorConfig, CyclicSystem, Input, Out, Output, System, SystemHealth,
-    SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, TelemetrySystem, Transport,
-    TransportError, UplinkSystem,
+    ClockMode, CoordinatorConfig, CyclicSystem, Input, Out, Output, Shared, System, SystemHealth,
+    SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, TelemetrySystem, UplinkSystem,
 };
 
+use super::LinkState;
 use crate::coordinator::PortRef;
-use crate::coordinator::init::{async_node, cyclic_node};
+use crate::coordinator::init::cyclic_node;
 use crate::descriptor::PortId;
 use crate::frame::Frame as _;
-use metor_proto::types::Msg as _;
 
 // ---------------------------------------------------------------------------
 // Frames and systems under test (a producer -> consumer chain).
@@ -109,105 +109,11 @@ impl CyclicSystem for Consumer {
 }
 
 // ---------------------------------------------------------------------------
-// A deterministic in-memory mock transport for the end-to-end tests.
+// Helpers: a bound link, a real loopback wire tap, and announce decoding.
 // ---------------------------------------------------------------------------
 
-struct MockInner {
-    announces: Mutex<Vec<(PacketId, Vec<ComponentMetadata>)>>,
-    msg_announces: Mutex<Vec<SetMsgMetadata>>,
-    /// Each sent batch, split back into its individual length-prefixed packets
-    /// so assertions can address one packet at a time.
-    packets: Mutex<Vec<LenPacket>>,
-    /// When set, `send` never completes, so the drop test can saturate the queue.
-    block: bool,
-}
-
-#[derive(Clone)]
-struct MockTransport {
-    inner: Arc<MockInner>,
-}
-
-impl MockTransport {
-    fn new(block: bool) -> Self {
-        Self {
-            inner: Arc::new(MockInner {
-                announces: Mutex::new(Vec::new()),
-                msg_announces: Mutex::new(Vec::new()),
-                packets: Mutex::new(Vec::new()),
-                block,
-            }),
-        }
-    }
-}
-
-impl Transport for MockTransport {
-    async fn announce(
-        &mut self,
-        msg: &VTableMsg,
-        meta: &[ComponentMetadata],
-    ) -> Result<(), TransportError> {
-        self.inner
-            .announces
-            .lock()
-            .unwrap()
-            .push((msg.id, meta.to_vec()));
-        Ok(())
-    }
-
-    async fn announce_msg(&mut self, msg: &SetMsgMetadata) -> Result<(), TransportError> {
-        self.inner.msg_announces.lock().unwrap().push(msg.clone());
-        Ok(())
-    }
-
-    async fn send(&mut self, buf: Vec<u8>) -> (Result<(), TransportError>, Vec<u8>) {
-        if self.inner.block {
-            // Park forever; the cycle keeps running and the batch queue fills.
-            std::future::pending::<()>().await;
-        }
-        let mut packets = self.inner.packets.lock().unwrap();
-        let mut rest = &buf[..];
-        while !rest.is_empty() {
-            let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
-            let (pkt, tail) = rest.split_at(4 + len);
-            packets.push(LenPacket {
-                inner: pkt.to_vec(),
-            });
-            rest = tail;
-        }
-        drop(packets);
-        (Ok(()), buf)
-    }
-}
-
-/// A transport that never connects: every `announce` fails, so the sender task
-/// lives in its redial-backoff loop (parked in `stellarator::sleep`) for the
-/// coordinator's whole life — the no-ground-station-listening state.
-struct DeadTransport;
-
-impl Transport for DeadTransport {
-    async fn announce(
-        &mut self,
-        _msg: &VTableMsg,
-        _meta: &[ComponentMetadata],
-    ) -> Result<(), TransportError> {
-        Err(TransportError::Disconnected)
-    }
-
-    async fn announce_msg(&mut self, _msg: &SetMsgMetadata) -> Result<(), TransportError> {
-        Err(TransportError::Disconnected)
-    }
-
-    async fn send(&mut self, buf: Vec<u8>) -> (Result<(), TransportError>, Vec<u8>) {
-        (Err(TransportError::Disconnected), buf)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers.
-// ---------------------------------------------------------------------------
-
-/// A free-running simulated clock. `run_for` yields each cycle, so the spawned
-/// sender task is scheduled deterministically.
+/// A free-running simulated clock. `run_for` yields each cycle, so the
+/// server's tasks are scheduled deterministically alongside it.
 fn sim_config() -> CoordinatorConfig {
     CoordinatorConfig {
         cycle_rate: 1000.0,
@@ -219,14 +125,154 @@ fn sim_config() -> CoordinatorConfig {
     }
 }
 
-/// A `Table` packet's id is the 2 bytes after the 4-byte length and 1 ty byte.
-fn packet_id_of(pkt: &LenPacket) -> PacketId {
-    [pkt.inner[5], pkt.inner[6]]
+/// A wall clock paced fast: the loopback tests need the cycle loop to sleep
+/// out its budget, because only a parked loop lets the io reactor poll — a
+/// simulated clock never sleeps, so socket io would starve until the run
+/// ends (the same starvation a live sim run accepts).
+fn wall_config() -> CoordinatorConfig {
+    CoordinatorConfig {
+        cycle_rate: 1000.0,
+        default_depth: 8,
+        clock: ClockMode::Wall,
+        ..CoordinatorConfig::default()
+    }
 }
 
-/// A `Table` packet's payload (the table bytes) begins after the 8-byte packet header.
-fn packet_payload(pkt: &LenPacket) -> &[u8] {
-    &pkt.inner[8..]
+/// A constructed link state on an ephemeral port. `start` spawns its accept
+/// loop by hand — these tests register the systems directly (no pack), so no
+/// attached lifecycle runs it.
+fn test_link(start: bool) -> Shared<LinkState> {
+    let link = Shared::new("TcpServer");
+    link.set(LinkState::bind("127.0.0.1:0".parse().unwrap()).expect("bind"))
+        .ok();
+    if start {
+        crate::SharedLifecycle::start(&mut *link.get());
+    }
+    link
+}
+
+fn downlink(link: &Shared<LinkState>, mode: TelemetryMode) -> TelemetrySystem {
+    TelemetrySystem::new(TelemetryConfig {
+        link: link.clone(),
+        mode,
+    })
+}
+
+/// One packet off the wire, owned.
+#[derive(Debug)]
+enum WirePkt {
+    Table { id: PacketId, payload: Vec<u8> },
+    Msg { id: PacketId, payload: Vec<u8> },
+}
+
+/// A real loopback client: connects to the link, reads packets forever, and
+/// accumulates them for assertions.
+struct WireTap {
+    pkts: Rc<RefCell<Vec<WirePkt>>>,
+    _reader: stellarator::JoinHandleDropGuard<()>,
+}
+
+impl WireTap {
+    async fn connect(link: &Shared<LinkState>) -> Self {
+        use stellarator::io::SplitExt;
+        let addr = link.get().local_addr();
+        let stream = TcpStream::connect(addr).await.expect("connect the tap");
+        let (rx, tx) = stream.split();
+        let pkts: Rc<RefCell<Vec<WirePkt>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = pkts.clone();
+        let reader = stellarator::spawn(async move {
+            // The write half rides in the task so the socket stays fully open.
+            let _tx = tx;
+            let mut stream = PacketStream::new(rx);
+            let mut buf = vec![0u8; 1024];
+            loop {
+                match stream.next_grow(buf).await {
+                    Ok(pkt) => {
+                        match &pkt {
+                            OwnedPacket::Table(t) => sink.borrow_mut().push(WirePkt::Table {
+                                id: t.id,
+                                payload: t.buf[..].to_vec(),
+                            }),
+                            OwnedPacket::Msg(m) => sink.borrow_mut().push(WirePkt::Msg {
+                                id: m.id,
+                                payload: m.buf[..].to_vec(),
+                            }),
+                            _ => {}
+                        }
+                        buf = pkt.into_buf().into_inner();
+                    }
+                    Err(_) => return,
+                }
+            }
+        })
+        .drop_guard();
+        Self {
+            pkts,
+            _reader: reader,
+        }
+    }
+
+    /// Wait (bounded) until `pred` holds over the received packets.
+    async fn settle(&self, pred: impl Fn(&[WirePkt]) -> bool) {
+        for _ in 0..500 {
+            if pred(&self.pkts.borrow()) {
+                return;
+            }
+            stellarator::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("wire tap never settled; got {:?}", self.pkts.borrow());
+    }
+
+    /// The table announces received, reconstructed from the replay stream:
+    /// one `(packet id, component metadata)` group per `VTableMsg`.
+    fn announces(&self) -> Vec<(PacketId, Vec<ComponentMetadata>)> {
+        let mut groups: Vec<(PacketId, Vec<ComponentMetadata>)> = Vec::new();
+        for pkt in self.pkts.borrow().iter() {
+            if let WirePkt::Msg { id, payload } = pkt {
+                if *id == VTableMsg::ID {
+                    let vt: VTableMsg = postcard::from_bytes(payload).expect("VTableMsg decodes");
+                    groups.push((vt.id, Vec::new()));
+                } else if *id == SetMsgMetadata::ID {
+                    continue;
+                } else if *id == SetComponentMetadata::ID {
+                    let meta: SetComponentMetadata =
+                        postcard::from_bytes(payload).expect("SetComponentMetadata decodes");
+                    groups
+                        .last_mut()
+                        .expect("component metadata follows its VTableMsg")
+                        .1
+                        .push(meta.0);
+                }
+            }
+        }
+        groups
+    }
+
+    /// The message-channel schema announces received.
+    fn msg_announces(&self) -> Vec<SetMsgMetadata> {
+        self.pkts
+            .borrow()
+            .iter()
+            .filter_map(|pkt| match pkt {
+                WirePkt::Msg { id, payload } if *id == SetMsgMetadata::ID => {
+                    Some(postcard::from_bytes(payload).expect("SetMsgMetadata decodes"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The data `Table` packets under `id`, in arrival order.
+    fn tables(&self, id: PacketId) -> Vec<Vec<u8>> {
+        self.pkts
+            .borrow()
+            .iter()
+            .filter_map(|pkt| match pkt {
+                WirePkt::Table { id: pid, payload } if *pid == id => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Drain a view to its newest record and return a copy of the bytes, if any.
@@ -288,16 +334,17 @@ async fn registry_query_view_and_read() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. End-to-end in All mode. Announced prefixed schema, then per-cycle Table packets.
+// 2. End-to-end in All mode over a real connection: the announce replay
+//    first, then per-cycle Table packets.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn telemetry_end_to_end_all() {
-    let mock = MockTransport::new(false);
-    let rec = mock.inner.clone();
+    let link = test_link(true);
+    let tap = WireTap::connect(&link).await;
 
-    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(wall_config());
     let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     let c = b.push_node(cyclic_node("consumer".into(), Consumer));
     b.connect(
@@ -312,14 +359,11 @@ async fn telemetry_end_to_end_all() {
     );
     b.push_node(cyclic_node(
         "telemetry".into(),
-        TelemetrySystem::new(TelemetryConfig {
-            transport: mock,
-            mode: TelemetryMode::All,
-        }),
+        downlink(&link, TelemetryMode::All),
     ));
     let mut coord = b.build().unwrap();
     // Only Table entries are announced; Postcard entries (the coordinator's
-    // `sequences` and `commands` channels) are self-describing and carry no announce.
+    // `sequences` channel) are self-describing and carry no announce.
     let n_taps = coord
         .registry()
         .entries()
@@ -327,14 +371,20 @@ async fn telemetry_end_to_end_all() {
         .filter(|e| matches!(e.desc.schema, crate::PortSchema::Table { .. }))
         .count();
     coord.run_for(30).await;
+    tap.settle(|pkts| {
+        pkts.iter()
+            .any(|p| matches!(p, WirePkt::Table { .. }))
+    })
+    .await;
 
-    let announces = rec.announces.lock().unwrap();
+    let announces = tap.announces();
 
-    // Every output is announced exactly once. That includes the user frames, every
-    // system's implicit health/log, and the coordinator-owned buffers. The `log`
-    // frames carry only a dynamic `FrameList`, so their announce has an empty
-    // metadata set (the count proves they were announced); the scalar-bearing
-    // frames carry their prefixed component names.
+    // Every output is announced exactly once, ahead of any data. That
+    // includes the user frames, every system's implicit health/log, and the
+    // coordinator-owned buffers. The `log` frames carry only a dynamic
+    // `FrameList`, so their announce has an empty metadata set (the count
+    // proves they were announced); the scalar-bearing frames carry their
+    // prefixed component names.
     assert_eq!(announces.len(), n_taps, "one announce per registry entry");
     let has_name = |name: &str| {
         announces
@@ -354,6 +404,8 @@ async fn telemetry_end_to_end_all() {
         has_prefix("coordinator.health"),
         "coordinator buffers announced"
     );
+    // The downlink's own link gauge is a frame like any other.
+    assert!(has_prefix("telemetry.link_status"), "gauge announced");
 
     // The producer.imu tap's `Table` packets carry the committed frame bytes verbatim.
     let imu_pid = announces
@@ -361,19 +413,12 @@ async fn telemetry_end_to_end_all() {
         .find(|(_, meta)| meta.iter().any(|m| m.name == "producer.imu.omega"))
         .map(|(id, _)| *id)
         .expect("producer.imu announced with an id");
-    drop(announces);
-
-    let packets = rec.packets.lock().unwrap();
-    let imu_pkts: Vec<&LenPacket> = packets
-        .iter()
-        .filter(|pkt| packet_id_of(pkt) == imu_pid)
-        .collect();
+    let imu_pkts = tap.tables(imu_pid);
     assert!(
         !imu_pkts.is_empty(),
         "received Table packets for producer.imu"
     );
-    let last = imu_pkts.last().unwrap();
-    let imu = Imu::read_from_prefix(packet_payload(last))
+    let imu = Imu::read_from_prefix(imu_pkts.last().unwrap())
         .expect("packet payload is the imu table")
         .0;
     assert!(imu.omega > 0.0, "streamed a real omega: {}", imu.omega);
@@ -391,22 +436,20 @@ async fn telemetry_end_to_end_all() {
 async fn msg_schemas_announce_once_per_id() {
     use metor_proto_wkt::{LogEvent, SequenceRegistry};
 
-    let mock = MockTransport::new(false);
-    let rec = mock.inner.clone();
-    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    let link = test_link(true);
+    let tap = WireTap::connect(&link).await;
+    let mut b = crate::coordinator::init::InitGraph::new(wall_config());
     b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     b.push_node(cyclic_node("producer_b".into(), Producer { n: 0.0 }));
     b.push_node(cyclic_node(
         "telemetry".into(),
-        TelemetrySystem::new(TelemetryConfig {
-            transport: mock,
-            mode: TelemetryMode::All,
-        }),
+        downlink(&link, TelemetryMode::All),
     ));
     let mut coord = b.build().unwrap();
     coord.run_for(2).await;
+    tap.settle(|pkts| !pkts.is_empty()).await;
 
-    let msgs = rec.msg_announces.lock().unwrap();
+    let msgs = tap.msg_announces();
     let log_events: Vec<_> = msgs.iter().filter(|m| m.id == LogEvent::ID).collect();
     assert_eq!(
         log_events.len(),
@@ -453,31 +496,37 @@ impl CyclicSystem for Chatty {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn health_log_lines_downlink_as_log_events() {
-    use metor_proto::types::PacketTy;
     use metor_proto_wkt::{LogEvent, LogLevel};
 
-    let mock = MockTransport::new(false);
-    let rec = mock.inner.clone();
-    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    let link = test_link(true);
+    let tap = WireTap::connect(&link).await;
+    let mut b = crate::coordinator::init::InitGraph::new(wall_config());
     b.push_node(cyclic_node("chatty".into(), Chatty));
     b.push_node(cyclic_node(
         "telemetry".into(),
-        TelemetrySystem::new(TelemetryConfig {
-            transport: mock,
-            mode: TelemetryMode::All,
-        }),
+        downlink(&link, TelemetryMode::All),
     ));
     let mut coord = b.build().unwrap();
     coord.run_for(10).await;
 
-    let packets = rec.packets.lock().unwrap();
-    let events: Vec<LogEvent> = packets
+    let is_chatty_event = |pkts: &[WirePkt]| {
+        pkts.iter().any(|p| {
+            matches!(p, WirePkt::Msg { id, payload } if *id == LogEvent::ID
+                && postcard::from_bytes::<LogEvent>(payload)
+                    .is_ok_and(|ev| ev.source == "chatty"))
+        })
+    };
+    tap.settle(is_chatty_event).await;
+
+    let pkts = tap.pkts.borrow();
+    let ev = pkts
         .iter()
-        .filter(|pkt| pkt.inner[4] == PacketTy::Msg as u8 && packet_id_of(pkt) == LogEvent::ID)
-        .map(|pkt| postcard::from_bytes(packet_payload(pkt)).expect("LogEvent payload decodes"))
-        .collect();
-    let ev = events
-        .iter()
+        .filter_map(|p| match p {
+            WirePkt::Msg { id, payload } if *id == LogEvent::ID => {
+                postcard::from_bytes::<LogEvent>(payload).ok()
+            }
+            _ => None,
+        })
         .find(|ev| ev.source == "chatty")
         .expect("chatty's line arrives keyed to its instance name");
     assert_eq!(ev.level, LogLevel::Warn);
@@ -537,10 +586,10 @@ fn two_instances_distinct_prefixes() {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn subset_mode_filters() {
-    let mock = MockTransport::new(false);
-    let rec = mock.inner.clone();
+    let link = test_link(true);
+    let tap = WireTap::connect(&link).await;
 
-    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(wall_config());
     let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     let c = b.push_node(cyclic_node("consumer".into(), Consumer));
     b.connect(
@@ -555,18 +604,20 @@ async fn subset_mode_filters() {
     );
     b.push_node(cyclic_node(
         "telemetry".into(),
-        TelemetrySystem::new(TelemetryConfig {
-            transport: mock,
-            mode: TelemetryMode::Subset {
+        downlink(
+            &link,
+            TelemetryMode::Subset {
                 instances: vec!["producer".to_string()],
                 frames: Vec::new(),
             },
-        }),
+        ),
     ));
     let mut coord = b.build().unwrap();
     coord.run_for(20).await;
+    tap.settle(|pkts| pkts.iter().any(|p| matches!(p, WirePkt::Table { .. })))
+        .await;
 
-    let announces = rec.announces.lock().unwrap();
+    let announces = tap.announces();
     assert!(!announces.is_empty(), "producer was tapped");
     // Only producer.* was tapped; no consumer, coordinator, or telemetry frames leaked.
     for (_, meta) in announces.iter() {
@@ -587,19 +638,21 @@ async fn subset_mode_filters() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Drop policy. A saturated transport never blocks the cycle; drops are surfaced.
+// 5. Drop policy. A stalled consumer never blocks the cycle; drops surface.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn drop_policy_never_blocks_and_counts() {
-    // A transport whose `send` never completes. After the first take the batch
-    // queue stays full, and every later cycle's batch is dropped and counted.
-    let mock = MockTransport::new(true);
+    // A connection whose pending buffer sits at its cap: every broadcast to
+    // it drops and is counted, while the cycle and its sibling consumers run on.
+    let link = test_link(false);
+    let stalled = link.get().push_test_conn();
+    stalled.stall();
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let prod = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
-    // A downstream consumer of the same output telemetry taps: the saturated
+    // A downstream consumer of the same output telemetry taps: the stalled
     // link must not starve it (regression: an undrained tap view stalls the
     // producer's ring for EVERY consumer, freezing the whole mission).
     let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer));
@@ -615,10 +668,7 @@ async fn drop_policy_never_blocks_and_counts() {
     );
     b.push_node(cyclic_node(
         "telemetry".into(),
-        TelemetrySystem::new(TelemetryConfig {
-            transport: mock,
-            mode: TelemetryMode::All,
-        }),
+        downlink(&link, TelemetryMode::All),
     ));
     let mut coord = b.build().unwrap();
 
@@ -651,7 +701,7 @@ async fn drop_policy_never_blocks_and_counts() {
     })
     .drop_guard();
 
-    // The cycle never blocks on the stalled link, so `run_for` completes all cycles.
+    // The cycle never blocks on the stalled connection, so `run_for` completes.
     coord.run_for(50).await;
     drop(sampler);
 
@@ -661,35 +711,32 @@ async fn drop_policy_never_blocks_and_counts() {
         .0;
     assert!(
         h.errors > 0,
-        "saturated transport should have surfaced telemetry_dropped (errors={})",
+        "stalled connection should have surfaced link_conn_dropped (errors={})",
         h.errors
     );
     // The consumer kept receiving fresh records through the stalled link: its
     // final output carries the producer's last value, not an early frozen one
-    // (regression: the queue-full path once returned without draining the
+    // (regression: the no-room path once returned without draining the
     // taps, freezing every ring at depth).
     let angle = *last_angle.borrow();
     assert!(
         angle >= 49.0,
-        "consumer starved by the saturated downlink: last angle {angle}"
+        "consumer starved by the stalled downlink: last angle {angle}"
     );
 }
 
-// A coordinator whose downlink never connects tears down cleanly while its
-// sender task is parked in redial backoff, and a second coordinator builds and
-// runs on the same runtime afterwards (regression: aborting the parked sender
-// at teardown corrupted the task and panicked the next run's scheduler).
+/// A coordinator whose link has no listener started and no connections tears
+/// down cleanly, twice on one runtime — the no-ground-station state must
+/// leave nothing behind that poisons the next run.
 #[stellarator::test]
-async fn dead_downlink_coordinator_teardown_is_clean() {
+async fn idle_link_coordinator_teardown_is_clean() {
     for round in 0..2 {
+        let link = test_link(false);
         let mut b = crate::coordinator::init::InitGraph::new(sim_config());
         b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
         b.push_node(cyclic_node(
             "telemetry".into(),
-            TelemetrySystem::new(TelemetryConfig {
-                transport: DeadTransport,
-                mode: TelemetryMode::All,
-            }),
+            downlink(&link, TelemetryMode::All),
         ));
         let mut coord = b.build().unwrap();
         coord.run_for(20).await;
@@ -697,12 +744,7 @@ async fn dead_downlink_coordinator_teardown_is_clean() {
             coord.stopped().is_empty(),
             "round {round}: no system stopped"
         );
-        // `coord` drops here with the sender mid-backoff; the next round must
-        // build and run untouched.
     }
-    // Outlive the aborted senders' pending backoff timers (RECONNECT_MIN and its
-    // doublings): a stale timer waking a freed task is exactly the regression.
-    stellarator::sleep(Duration::from_millis(700)).await;
     for _ in 0..10 {
         stellarator::yield_now().await;
     }
@@ -711,23 +753,23 @@ async fn dead_downlink_coordinator_teardown_is_clean() {
 // ---------------------------------------------------------------------------
 // 6. Message downlink. Every record is framed as a self-describing `Msg`
 //    packet in FIFO order, never coalesced and never announced, and tables and
-//    messages ride the one batch through the one sender.
+//    messages ride the one batch.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn message_downlink_fifo_no_coalesce() {
     use metor_fsw_ring::{Config, NoWake, RingBuffer};
-    use metor_proto::types::{Msg, OwnedPacket};
     use metor_proto_wkt::{
         SequenceChannelSpec, SequenceCommand, SequenceCommandKind, SequenceRegistry,
     };
+    use std::sync::Arc;
 
     use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
     use crate::port::capacity_for;
     use crate::registry::RegistryEntry;
 
-    use super::{BATCH_QUEUE_CAP, Wire, append_record, run_sender};
+    use super::{Wire, append_record};
 
     // A by-hand message channel with the same shape the coordinator registers and
     // the telemetry message tap drains.
@@ -791,31 +833,25 @@ async fn message_downlink_fifo_no_coalesce() {
         append_record(&mut batch, &Wire::Msg, &scratch);
     }
 
-    // Queue the batch and close the channel; the sender drains what is queued,
-    // then exits, so the join below is deterministic. With no component taps
-    // there are no announces.
-    let (tx, rx) = thingbuf::mpsc::channel::<Vec<u8>>(BATCH_QUEUE_CAP);
-    tx.try_send(batch).expect("queue has room");
-    drop(tx);
-    let mock = MockTransport::new(false);
-    let rec = mock.inner.clone();
-    let drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let _ = stellarator::spawn(run_sender(mock, Vec::new(), rx, drops)).await;
-
-    // No message is announced (self-describing); only the component tap would
-    // announce, and we passed none.
-    assert!(
-        rec.announces.lock().unwrap().is_empty(),
-        "messages carry no announce"
-    );
-
-    let packets = rec.packets.lock().unwrap();
-    // A `LenPacket`'s bytes carry a 4-byte length prefix the wire reader strips
-    // before `OwnedPacket::parse` sees the packet header; skip it here too.
-    let parsed: Vec<OwnedPacket<Vec<u8>>> = packets
-        .iter()
-        .map(|p| OwnedPacket::parse(p.inner[4..].to_vec()).expect("parse packet"))
-        .collect();
+    // Broadcast the batch to a test connection and read its buffered bytes
+    // back as packets.
+    let link = test_link(false);
+    let conn = {
+        let state = link.get();
+        state.set_announces(&[]).ok();
+        let conn = state.push_test_conn();
+        state.broadcast(&batch);
+        conn
+    };
+    let bytes = conn.pending_bytes();
+    let mut parsed: Vec<OwnedPacket<Vec<u8>>> = Vec::new();
+    let mut rest = &bytes[..];
+    while !rest.is_empty() {
+        let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        let (pkt, tail) = rest.split_at(4 + len);
+        parsed.push(OwnedPacket::parse(pkt[4..].to_vec()).expect("parse packet"));
+        rest = tail;
+    }
 
     // The component snapshot came through as a `Table`, proving tables and
     // messages ride the one batch.
@@ -909,32 +945,35 @@ impl CyclicSystem for BurstLogProducer {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn table_log_entry_downlinks_every_record() {
-    let mock = MockTransport::new(false);
-    let rec = mock.inner.clone();
+    let link = test_link(true);
+    let tap = WireTap::connect(&link).await;
 
-    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    let mut b = crate::coordinator::init::InitGraph::new(wall_config());
     b.push_node(cyclic_node(
         BurstLogProducer::NAME.into(),
         BurstLogProducer { n: 0.0 },
     ));
     b.push_node(cyclic_node(
         "telemetry".into(),
-        TelemetrySystem::new(TelemetryConfig {
-            transport: mock,
-            mode: TelemetryMode::Subset {
+        downlink(
+            &link,
+            TelemetryMode::Subset {
                 instances: Vec::new(),
                 frames: vec!["imu".to_string()],
             },
-        }),
+        ),
     ));
     let mut coord = b.build().unwrap();
     let cycles = 4;
     coord.run_for(cycles).await;
-    // Let the parked sender drain the FIFO tail.
-    stellarator::sleep(Duration::from_millis(20)).await;
 
     // The Log frame entry is announced exactly once, as a valid Table announce...
-    let announces = rec.announces.lock().unwrap();
+    tap.settle(|pkts| {
+        pkts.iter().any(|p| matches!(p, WirePkt::Table { payload, .. }
+            if Imu::read_from_prefix(payload).is_ok_and(|(imu, _)| imu.omega == (3 * cycles) as f64)))
+    })
+    .await;
+    let announces = tap.announces();
     assert_eq!(announces.len(), 1, "one announce for the one tapped entry");
     assert!(
         announces[0]
@@ -947,130 +986,33 @@ async fn table_log_entry_downlinks_every_record() {
 
     // ...and every record arrives as its own Table packet under that id. The FIFO
     // lane never coalesces (3 records x N cycles), and each omega is distinct.
-    let packets = rec.packets.lock().unwrap();
-    let omegas: Vec<f64> = packets
+    let omegas: Vec<f64> = tap
+        .tables(packet_id)
         .iter()
-        .filter(|p| packet_id_of(p) == packet_id)
-        .map(|p| {
-            Imu::read_from_prefix(packet_payload(p))
+        .map(|payload| {
+            Imu::read_from_prefix(payload)
                 .expect("imu bytes")
                 .0
                 .omega
         })
         .collect();
-    assert_eq!(
-        omegas.len(),
-        3 * cycles,
-        "every record downlinked, none coalesced: {omegas:?}"
+    // The connection joins a cycle or two into the run (batches are only
+    // framed for live connections), so the stream is a contiguous tail:
+    // whole leading cycles may be absent, but nothing within it may be
+    // coalesced or reordered, and it ends at the final record.
+    assert!(
+        omegas.len() >= 3,
+        "at least one full cycle downlinked: {omegas:?}"
     );
-    let want: Vec<f64> = (1..=(3 * cycles)).map(|i| i as f64).collect();
-    assert_eq!(omegas, want, "in order");
-}
-
-/// The uplink subscribes to exactly its configured msg set. Subscription,
-/// dispatch, and the minted ports all derive from the one `msgs` list, and there
-/// is no fallback id, so an empty config subscribes to nothing.
-#[cfg(not(miri))]
-#[stellarator::test]
-async fn uplink_subscribes_to_its_configured_ids() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use metor_proto::types::Msg;
-    use metor_proto_wkt::{AlarmAck, ReloadSequences};
-    use stellarator::buf::Slice;
-
-    use crate::RecvTransport;
-
-    /// Records the subscription and yields nothing, so the reader stops immediately.
-    struct SubRecv {
-        subscribed: Rc<RefCell<Option<Vec<PacketId>>>>,
+    for pair in omegas.windows(2) {
+        assert_eq!(pair[1] - pair[0], 1.0, "no coalescing within the tail: {omegas:?}");
     }
-
-    impl RecvTransport for SubRecv {
-        async fn recv(
-            &mut self,
-            _buf: Vec<u8>,
-        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-            Err(TransportError::Disconnected)
-        }
-
-        fn subscribe(&mut self, ids: &[PacketId]) {
-            *self.subscribed.borrow_mut() = Some(ids.to_vec());
-        }
-    }
-
-    // Configured, so the subscription is exactly the two ids, in config order.
-    let subscribed = Rc::new(RefCell::new(None));
-    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.push_node(async_node(
-        "uplink".into(),
-        UplinkSystem::new(SubRecv {
-            subscribed: subscribed.clone(),
-        })
-        .with_msg::<ReloadSequences>()
-        .with_msg::<AlarmAck>(),
-    ));
-    let mut coord = b.build().unwrap();
-    coord.run_for(20).await;
-    assert_eq!(
-        subscribed.borrow().clone(),
-        Some(vec![ReloadSequences::ID, AlarmAck::ID]),
-        "the subscription is the configured set, nothing more"
-    );
-
-    // Unconfigured means an empty subscription; the uplink warns rather than
-    // guessing an id.
-    let subscribed = Rc::new(RefCell::new(None));
-    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    b.push_node(async_node(
-        "uplink".into(),
-        UplinkSystem::new(SubRecv {
-            subscribed: subscribed.clone(),
-        }),
-    ));
-    let mut coord = b.build().unwrap();
-    coord.run_for(20).await;
-    assert_eq!(
-        subscribed.borrow().clone(),
-        Some(Vec::new()),
-        "no msgs configured subscribes to nothing"
-    );
+    assert_eq!(*omegas.last().unwrap(), (3 * cycles) as f64, "runs to the last record");
 }
 
-/// A script of receive outcomes for the uplink tests: `Some(bytes)` yields the
-/// framed packet, `None` fails the call, and an exhausted script fails every
-/// later call — all failures surface as `Disconnected`.
-struct ScriptedRecv {
-    script: std::collections::VecDeque<Option<Vec<u8>>>,
-}
-
-impl ScriptedRecv {
-    /// A script that yields each packet in turn, then disconnects.
-    fn packets(items: impl IntoIterator<Item = Vec<u8>>) -> Self {
-        Self {
-            script: items.into_iter().map(Some).collect(),
-        }
-    }
-}
-
-impl crate::RecvTransport for ScriptedRecv {
-    async fn recv(
-        &mut self,
-        _buf: Vec<u8>,
-    ) -> Result<metor_proto::types::OwnedPacket<stellarator::buf::Slice<Vec<u8>>>, TransportError>
-    {
-        use stellarator::buf::IoBuf;
-        match self.script.pop_front() {
-            Some(Some(bytes)) => {
-                let slice = bytes.try_slice(..).expect("non-empty packet");
-                metor_proto::types::OwnedPacket::parse(slice)
-                    .map_err(|e| TransportError::Io(Box::new(e)))
-            }
-            _ => Err(TransportError::Disconnected),
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// 7. Uplink routing off the server's inbound queue.
+// ---------------------------------------------------------------------------
 
 /// A cyclic sink that captures every `AlarmAck` reaching it over a wired edge.
 struct AckSink {
@@ -1098,17 +1040,14 @@ impl CyclicSystem for AckSink {
     }
 }
 
-/// A wire `AlarmAck` fed through the uplink routes onto its `acks` port and
-/// reaches a consumer over an ordinary message edge, while a malformed postcard
-/// payload under the same id is dropped without killing the link (the next
-/// packet still arrives).
+/// A queued `AlarmAck` routes onto the uplink's `acks` port and reaches a
+/// consumer over an ordinary message edge; a malformed postcard payload
+/// under the same id is dropped by the consumer's own drain without wedging
+/// anything (the next msg still arrives), and an id outside the configured
+/// set bumps `uplink_unroutable` instead of vanishing silently.
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn uplink_routes_alarm_acks() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use metor_proto::types::{IntoLenPacket, Msg};
+async fn uplink_routes_and_survives_garbage() {
     use metor_proto_wkt::AlarmAck;
 
     let ack = AlarmAck {
@@ -1117,22 +1056,25 @@ async fn uplink_routes_alarm_acks() {
         operator: "op".to_string(),
         note: None,
     };
-    // Frame one good ack around a malformed payload under the same id, stripping
-    // the LenPacket 4-byte length prefix so the bytes match what arrives on the wire.
-    let good = ack.into_len_packet().inner[4..].to_vec();
-    let mut garbage = LenPacket::msg(AlarmAck::ID, 3);
-    garbage.extend_from_slice(&[0xff, 0xff, 0xff]);
-    let garbage = garbage.inner[4..].to_vec();
+    let link = test_link(false);
+    {
+        let state = link.get();
+        state.push_inbound(AlarmAck::ID, &[0xff, 0xff, 0xff]);
+        state.push_inbound(AlarmAck::ID, &postcard::to_allocvec(&ack).unwrap());
+        state.push_inbound([0x7f, 0x7f], b"lost");
+    }
 
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    // The uplink steps before its consumer, so the queued msgs land the same
+    // cycle they are republished.
+    let uplink = b.push_node(cyclic_node(
+        "uplink".into(),
+        UplinkSystem::new().attach(link.clone()).with_msg::<AlarmAck>(),
+    ));
     let sink = b.push_node(cyclic_node(
         AckSink::NAME.into(),
         AckSink { seen: seen.clone() },
-    ));
-    let uplink = b.push_node(async_node(
-        "uplink".into(),
-        UplinkSystem::new(ScriptedRecv::packets([garbage, good])).with_msg::<AlarmAck>(),
     ));
     b.connect(
         PortRef {
@@ -1146,7 +1088,14 @@ async fn uplink_routes_alarm_acks() {
     );
     let mut coord = b.build().unwrap();
 
-    coord.run_for(20).await;
+    let mut uplink_health = coord
+        .registry()
+        .get(ComponentId::new("uplink.health"))
+        .expect("uplink.health")
+        .view()
+        .expect("reader slot");
+
+    coord.run_for(5).await;
 
     let got = seen.borrow();
     assert_eq!(
@@ -1157,20 +1106,19 @@ async fn uplink_routes_alarm_acks() {
     assert_eq!(got[0].def_id, "RATE_HIGH");
     assert_eq!(got[0].occurrence, 42);
     assert_eq!(got[0].operator, "op");
+
+    let bytes = drain_latest(&mut uplink_health).expect("uplink health published");
+    let h = SystemHealth::read_from_prefix(&bytes).expect("health").0;
+    assert!(h.errors > 0, "the unroutable id was counted");
 }
 
 /// A user-defined Msg type the framework has never seen (its id comes from the
-/// blanket hash, with no registered entry anywhere) flows from the wire through
+/// blanket hash, with no registered entry anywhere) flows off the link through
 /// the uplink to a typed consumer with nothing but a `with_msg` entry and an
 /// ordinary message edge.
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn uplink_relays_arbitrary_user_msgs() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use metor_proto::types::IntoLenPacket;
-
     use crate::MsgIn;
 
     /// A mission-local command type, unknown to the framework.
@@ -1210,19 +1158,19 @@ async fn uplink_relays_arbitrary_user_msgs() {
         }
     }
 
-    // Strip the LenPacket 4-byte length prefix so the bytes match what arrives
-    // on the wire.
-    let wire = SetGain { gain: 7 }.into_len_packet().inner[4..].to_vec();
+    let link = test_link(false);
+    link.get()
+        .push_inbound(SetGain::ID, &postcard::to_allocvec(&SetGain { gain: 7 }).unwrap());
 
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    let uplink = b.push_node(cyclic_node(
+        "uplink".into(),
+        UplinkSystem::new().attach(link.clone()).with_msg::<SetGain>(),
+    ));
     let sink = b.push_node(cyclic_node(
         GainSink::NAME.into(),
         GainSink { seen: seen.clone() },
-    ));
-    let uplink = b.push_node(async_node(
-        "uplink".into(),
-        UplinkSystem::new(ScriptedRecv::packets([wire])).with_msg::<SetGain>(),
     ));
     b.connect(
         PortRef {
@@ -1236,7 +1184,7 @@ async fn uplink_relays_arbitrary_user_msgs() {
     );
     let mut coord = b.build().unwrap();
 
-    coord.run_for(20).await;
+    coord.run_for(5).await;
 
     assert_eq!(
         *seen.borrow(),
@@ -1250,14 +1198,12 @@ async fn uplink_relays_arbitrary_user_msgs() {
 /// telemeter one cycle stale, so `build()` rejects it by name.
 #[test]
 fn cyclic_after_receive_all_is_a_build_error() {
+    let link = test_link(false);
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     b.push_node(cyclic_node(
         "telemetry".into(),
-        TelemetrySystem::new(TelemetryConfig {
-            transport: MockTransport::new(false),
-            mode: TelemetryMode::All,
-        }),
+        downlink(&link, TelemetryMode::All),
     ));
     // A second producer (no inputs, so nothing else can fail first) after the downlink.
     b.push_node(cyclic_node("late".into(), Producer { n: 0.0 }));
@@ -1283,29 +1229,15 @@ fn cyclic_after_receive_all_is_a_build_error() {
 /// pair in config order, the same order [`MsgFanOut::bind`] pops rings.
 #[test]
 fn uplink_minted_ports_are_untelemetered() {
-    use metor_proto::types::Msg;
     use metor_proto_wkt::{AlarmAck, ReloadSequences, SequenceCommand};
-    use stellarator::buf::Slice;
 
-    use crate::RecvTransport;
-
-    struct NoRecv;
-    impl RecvTransport for NoRecv {
-        async fn recv(
-            &mut self,
-            _buf: Vec<u8>,
-        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-            Err(TransportError::Disconnected)
-        }
-    }
-
-    let uplink = UplinkSystem::new(NoRecv)
+    let uplink = UplinkSystem::new()
         .with_msg::<SequenceCommand>()
         .with_msg::<ReloadSequences>()
         .with_msg::<AlarmAck>()
         // Idempotent, so a repeat is one port, not a duplicate registry key.
         .with_msg::<AlarmAck>();
-    let desc = crate::AsyncSystem::instance_descriptor(&uplink);
+    let desc = crate::CyclicSystem::instance_descriptor(&uplink);
 
     // The static shape (health, log) first, then one port per configured msg.
     assert_eq!(desc.outputs.len(), 5);
@@ -1320,176 +1252,38 @@ fn uplink_minted_ports_are_untelemetered() {
     assert_eq!(minted[2].id(), crate::PortId::Packet(AlarmAck::ID));
 }
 
-/// A send failure drops exactly that batch, backs off, and re-enters the
-/// announce phase — the replay is what lets a restarted consumer decode
-/// tables again. The failed batch's buffer is recycled and the drop is
-/// counted once for `link_reconnect`.
+/// A late connection gets its own announce replay before data: the second
+/// tap decodes the stream from its own connect onward, no restart needed.
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn sender_reannounces_after_a_send_failure() {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+async fn late_connection_gets_the_announce_replay() {
+    let link = test_link(true);
 
-    use super::{Announce, BATCH_QUEUE_CAP, run_sender};
-
-    struct FlakyInner {
-        announces: AtomicU64,
-        sends: AtomicU64,
-        sent: Mutex<Vec<Vec<u8>>>,
-    }
-    struct FlakyTransport {
-        inner: Arc<FlakyInner>,
-    }
-    impl Transport for FlakyTransport {
-        async fn announce_msg(&mut self, _msg: &SetMsgMetadata) -> Result<(), TransportError> {
-            Ok(())
-        }
-
-        async fn announce(
-            &mut self,
-            _msg: &VTableMsg,
-            _meta: &[ComponentMetadata],
-        ) -> Result<(), TransportError> {
-            self.inner.announces.fetch_add(1, Relaxed);
-            Ok(())
-        }
-
-        async fn send(&mut self, buf: Vec<u8>) -> (Result<(), TransportError>, Vec<u8>) {
-            // The first send fails (the link dropped mid-stream); later
-            // sends land.
-            if self.inner.sends.fetch_add(1, Relaxed) == 0 {
-                return (Err(TransportError::Disconnected), buf);
-            }
-            self.inner.sent.lock().unwrap().push(buf.clone());
-            (Ok(()), buf)
-        }
-    }
-
-    // One announced tap, so the replay is observable as a second announce.
-    let crate::PortSchema::Table { vtable, .. } = crate::PortDesc::of::<Imu>().schema else {
-        panic!("a frame port carries a Table schema");
-    };
-    let announces = vec![Announce::Table {
-        packet_id: [7, 7],
-        vtable,
-        metadata: Vec::new(),
-    }];
-
-    // Two queued batches, then shutdown: the first is consumed by the failed
-    // send (dropped, buffer recycled), the second lands after the redial.
-    let (tx, rx) = thingbuf::mpsc::channel::<Vec<u8>>(BATCH_QUEUE_CAP);
-    tx.try_send(vec![1]).expect("queue has room");
-    tx.try_send(vec![2]).expect("queue has room");
-    drop(tx);
-
-    let inner = Arc::new(FlakyInner {
-        announces: AtomicU64::new(0),
-        sends: AtomicU64::new(0),
-        sent: Mutex::new(Vec::new()),
-    });
-    let drops = Arc::new(AtomicU64::new(0));
-    let _ = stellarator::spawn(run_sender(
-        FlakyTransport {
-            inner: inner.clone(),
-        },
-        announces,
-        rx,
-        drops.clone(),
-    ))
-    .await;
-
-    assert_eq!(
-        inner.announces.load(Relaxed),
-        2,
-        "the announce set is replayed once per connect"
-    );
-    assert_eq!(
-        *inner.sent.lock().unwrap(),
-        vec![vec![2]],
-        "the failed batch is dropped, the next one lands"
-    );
-    assert_eq!(drops.load(Relaxed), 1, "one established-connection loss");
-}
-
-/// A receive error no longer kills the uplink: the pass backs off, retries,
-/// and the next inbound msg still lands at its consumer over the wired edge.
-#[cfg(not(miri))]
-#[stellarator::test]
-async fn uplink_survives_a_recv_error() {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use metor_proto::types::IntoLenPacket;
-    use metor_proto_wkt::AlarmAck;
-
-    let ack = AlarmAck {
-        def_id: "RATE_HIGH".to_string(),
-        occurrence: 1,
-        operator: "op".to_string(),
-        note: None,
-    };
-    let wire = ack.into_len_packet().inner[4..].to_vec();
-
-    // A wall clock (not simulated), so cycles keep coming in real time while
-    // the uplink sleeps out its backoff after the scripted failure.
-    let seen = Rc::new(RefCell::new(Vec::new()));
-    let mut b = crate::coordinator::init::InitGraph::new(CoordinatorConfig {
-        cycle_rate: 100.0,
-        default_depth: 8,
-        ..CoordinatorConfig::default()
-    });
-    let sink = b.push_node(cyclic_node(
-        AckSink::NAME.into(),
-        AckSink { seen: seen.clone() },
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        downlink(
+            &link,
+            TelemetryMode::Subset {
+                instances: vec!["producer".to_string()],
+                frames: Vec::new(),
+            },
+        ),
     ));
-    let uplink = b.push_node(async_node(
-        "uplink".into(),
-        UplinkSystem::new(ScriptedRecv {
-            script: vec![None, Some(wire)].into(),
-        })
-        .with_msg::<AlarmAck>(),
-    ));
-    b.connect(
-        PortRef {
-            system: uplink,
-            port: PortId::Packet(AlarmAck::ID),
-        },
-        PortRef {
-            system: sink,
-            port: PortId::Packet(AlarmAck::ID),
-        },
-    );
     let mut coord = b.build().unwrap();
+    coord.run_for(10).await;
 
-    // ~600ms of cycles, several times the 100ms first-retry backoff.
-    coord.run_for(60).await;
-
-    let got = seen.borrow();
-    assert_eq!(got.len(), 1, "the msg after the failure still landed");
-    assert_eq!(got[0].def_id, "RATE_HIGH");
-}
-
-/// `DownlinkParams`' two optional subset lists project onto `TelemetryMode` as
-/// documented. Both absent taps everything; either present selects a subset
-/// with the missing list empty.
-#[test]
-fn downlink_params_mode_projection() {
-    let all = super::DownlinkParams {
-        addr: "127.0.0.1:2240".parse().unwrap(),
-        instances: None,
-        frames: None,
-    };
-    assert!(matches!(all.mode(), TelemetryMode::All));
-
-    let subset = super::DownlinkParams {
-        addr: "127.0.0.1:2240".parse().unwrap(),
-        instances: Some(vec!["nav".to_string()]),
-        frames: None,
-    };
-    match subset.mode() {
-        TelemetryMode::Subset { instances, frames } => {
-            assert_eq!(instances, vec!["nav".to_string()]);
-            assert!(frames.is_empty());
-        }
-        other => panic!("expected Subset, got {other:?}"),
-    }
+    // Connect only now, mid-mission (the coordinator has already run).
+    let tap = WireTap::connect(&link).await;
+    // The server still fans out nothing new (no cycles run), but the replay
+    // arrives immediately on accept.
+    tap.settle(|pkts| !pkts.is_empty()).await;
+    let announces = tap.announces();
+    assert!(
+        announces
+            .iter()
+            .any(|(_, meta)| meta.iter().any(|m| m.name == "producer.imu.omega")),
+        "the late connection decoded the replay"
+    );
 }

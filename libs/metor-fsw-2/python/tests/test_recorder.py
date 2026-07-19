@@ -12,8 +12,9 @@ from metor_config import (
     Alarms,
     Mission,
     Target,
-    TcpDownlink,
-    TcpUplink,
+    Downlink,
+    TcpServer,
+    Uplink,
     band,
     static_system,
 )
@@ -37,7 +38,7 @@ class RecorderTest(unittest.TestCase):
     def test_add_records_system_and_ports(self):
         m = Mission(cycle_rate=100.0)
         a = m.add("a", static_system("Alarms"))
-        b = m.add("b", TcpDownlink(addr="127.0.0.1:2240"))
+        b = m.add("b", Downlink())
         m.connect(a.out, b.feed)
         ir = m.to_ir()
         self.assertEqual([s["name"] for s in ir["systems"]], ["a", "b"])
@@ -69,7 +70,7 @@ class RecorderTest(unittest.TestCase):
         m = Mission(cycle_rate=100.0)
         ctrl = m.add("ctrl", static_system("Ctrl"))
         plant = m.add("plant", static_system("Plant"))
-        uplink = m.add("uplink", TcpUplink(addr="127.0.0.1:2240", msgs=["Cmd"]))
+        uplink = m.add("uplink", Uplink(msgs=["Cmd"]))
         m.connect(ctrl.torque_cmd, plant.torque_cmd, delayed=True)
         m.route(uplink, plant, msg="Cmd")
         m.route(m.coordinator, plant, msg="Cmd")
@@ -144,9 +145,9 @@ class RecorderTest(unittest.TestCase):
         self.assertNotIn("severity", a)
 
     def test_uplink_downlink_shapes(self):
-        up = TcpUplink(addr="127.0.0.1:2240", msgs=["Cmd"])._param_source()["Value"]
-        self.assertEqual(up, {"addr": "127.0.0.1:2240", "msgs": ["Cmd"]})
-        self.assertEqual(TcpDownlink(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
+        up = Uplink(msgs=["Cmd"])._param_source()["Value"]
+        self.assertEqual(up, {"msgs": ["Cmd"]})
+        self.assertEqual(TcpServer(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
 
     # -- error cases --------------------------------------------------------
 

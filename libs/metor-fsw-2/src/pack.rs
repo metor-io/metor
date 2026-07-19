@@ -333,7 +333,7 @@ impl Pack {
     /// all attached entries. Attached entries are cyclic-only (see the
     /// [`shared`](crate::shared) module doc), instantiable once, and never
     /// slot occupants.
-    pub fn system_type_shared<T, O, St>(
+    pub fn system_type_shared<T, St>(
         mut self,
         name: &'static str,
         state: &crate::Shared<St>,
@@ -341,10 +341,10 @@ impl Pack {
     ) -> Self
     where
         St: crate::SharedLifecycle,
-        T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
         T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
         T::Input: crate::BindPorts + 'static,
-        O: crate::SystemOutput + crate::BindPorts + 'static,
+        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
     {
         let mut descriptor = <T as crate::CyclicSystem>::descriptor();
         descriptor.name = name.into();
@@ -377,7 +377,7 @@ impl Pack {
             let pending: Pending = Box::new(move |src, mount| {
                 crate::handler::mount_driver(src, mount, move |src| {
                     let input = <T::Input as crate::BindPorts>::bind(src);
-                    let output = <crate::Out<O> as crate::BindPorts>::bind(src);
+                    let output = <T::Output as crate::BindPorts>::bind(src);
                     let inner = RunnerDriver(crate::CyclicRunner::new(system, input, output));
                     Box::new(AttachedDriver::new(Box::new(inner), cell))
                 })
@@ -423,14 +423,14 @@ impl Pack {
     /// so a dl/pack config need spell only its overrides. A hand-written
     /// `BuildSystem` impl declares none this way; use
     /// [`system_type_with_defaults`](Self::system_type_with_defaults).
-    pub fn system_type<T, O>(mut self, name: &'static str) -> Self
+    pub fn system_type<T>(mut self, name: &'static str) -> Self
     where
-        T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
         T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
         T::Input: crate::BindPorts + 'static,
-        O: crate::SystemOutput + crate::BindPorts + 'static,
+        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
     {
-        let mut entry = system_type_entry::<T, O>(name);
+        let mut entry = system_type_entry::<T>(name);
         // An empty blob (unit-like params) declares no defaults, matching
         // the empty-params guards on the decode paths.
         if let Some(blob) =
@@ -449,18 +449,18 @@ impl Pack {
     /// see through — hand-written [`BuildSystem`](crate::BuildSystem) impls
     /// and generic systems. The typed `defaults` argument is the schema
     /// check: a defaults value of the wrong type does not compile.
-    pub fn system_type_with_defaults<T, O>(
+    pub fn system_type_with_defaults<T>(
         mut self,
         name: &'static str,
         defaults: T::Params,
     ) -> Self
     where
-        T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
         T::Params: serde::Serialize + DeserializeOwned + postcard_schema::Schema + 'static,
         T::Input: crate::BindPorts + 'static,
-        O: crate::SystemOutput + crate::BindPorts + 'static,
+        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
     {
-        let mut entry = system_type_entry::<T, O>(name);
+        let mut entry = system_type_entry::<T>(name);
         entry.params_default = Some(
             postcard::to_allocvec(&defaults)
                 .expect("params postcard-encode (Serialize is infallible)"),
@@ -603,12 +603,12 @@ impl Pack {
 
 /// The [`Pack::system_type`] entry body, shared with the explicit-defaults
 /// variant so the two differ only in where the defaults blob comes from.
-fn system_type_entry<T, O>(name: &'static str) -> PackEntry
+fn system_type_entry<T>(name: &'static str) -> PackEntry
 where
-    T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+    T: crate::CyclicSystem + crate::BuildSystem + 'static,
     T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
     T::Input: crate::BindPorts + 'static,
-    O: crate::SystemOutput + crate::BindPorts + 'static,
+    T::Output: crate::HealthOutput + crate::BindPorts + 'static,
 {
     let mut descriptor = <T as crate::CyclicSystem>::descriptor();
     descriptor.name = name.into();
@@ -633,7 +633,7 @@ where
         let pending: Pending = Box::new(move |src, mount| {
             crate::handler::mount_driver(src, mount, move |src| {
                 let input = <T::Input as crate::BindPorts>::bind(src);
-                let output = <crate::Out<O> as crate::BindPorts>::bind(src);
+                let output = <T::Output as crate::BindPorts>::bind(src);
                 Box::new(RunnerDriver(crate::CyclicRunner::new(
                     system, input, output,
                 )))
@@ -672,15 +672,15 @@ fn instance_desc_if_minted<S: crate::CyclicSystem>(
 
 /// A [`CyclicRunner`](crate::CyclicRunner) driven behind the pack seam, for
 /// struct-authored entries.
-struct RunnerDriver<S, O>(crate::CyclicRunner<S, O>)
+struct RunnerDriver<S>(crate::CyclicRunner<S>)
 where
-    S: crate::CyclicSystem<Output = crate::Out<O>>,
-    O: crate::SystemOutput;
+    S: crate::CyclicSystem,
+    S::Output: crate::HealthOutput;
 
-impl<S, O> Driver for RunnerDriver<S, O>
+impl<S> Driver for RunnerDriver<S>
 where
-    S: crate::CyclicSystem<Output = crate::Out<O>>,
-    O: crate::SystemOutput,
+    S: crate::CyclicSystem,
+    S::Output: crate::HealthOutput,
 {
     fn init(&mut self) {
         self.0.init()

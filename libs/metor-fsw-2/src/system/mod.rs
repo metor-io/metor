@@ -384,28 +384,42 @@ pub trait AsyncSystem: System {
     }
 }
 
+/// The framework tail every cyclic output bundle carries: the health port
+/// the runner times and publishes through. [`Out`] is the standard carrier;
+/// a hand-written bundle (one whose config-minted ports must trail the
+/// health pair, like the uplink's fan-out) implements it directly.
+pub trait HealthOutput: SystemOutput {
+    fn health(&mut self) -> &mut HealthPort;
+}
+
+impl<O: SystemOutput> HealthOutput for Out<O> {
+    fn health(&mut self) -> &mut HealthPort {
+        Out::health(self)
+    }
+}
+
 /// Drives a [`CyclicSystem`] on behalf of the coordinator. It owns the port
 /// bundles between cycles, times each `execute`, and publishes a health
 /// record per cycle.
-pub struct CyclicRunner<S, O>
+pub struct CyclicRunner<S>
 where
-    S: CyclicSystem<Output = Out<O>>,
-    O: SystemOutput,
+    S: CyclicSystem,
+    S::Output: HealthOutput,
 {
     system: S,
     input: S::Input,
-    output: Out<O>,
+    output: S::Output,
     state: SlotState,
 }
 
-impl<S, O> CyclicRunner<S, O>
+impl<S> CyclicRunner<S>
 where
-    S: CyclicSystem<Output = Out<O>>,
-    O: SystemOutput,
+    S: CyclicSystem,
+    S::Output: HealthOutput,
 {
     /// Assemble a runner from a constructed system and its bound port
     /// bundles.
-    pub fn new(system: S, input: S::Input, output: Out<O>) -> Self {
+    pub fn new(system: S, input: S::Input, output: S::Output) -> Self {
         Self {
             system,
             input,
@@ -448,17 +462,17 @@ where
     }
 
     /// Borrow the output bundle, e.g. for a test to read a produced port back.
-    pub fn output(&mut self) -> &mut Out<O> {
+    pub fn output(&mut self) -> &mut S::Output {
         &mut self.output
     }
 }
 
 /// Type-erased entry points, so the coordinator can hold a heterogeneous
 /// `Vec<Box<dyn CyclicSlot>>`. Everything delegates to the inherent methods.
-impl<S, O> CyclicSlot for CyclicRunner<S, O>
+impl<S> CyclicSlot for CyclicRunner<S>
 where
-    S: CyclicSystem<Output = Out<O>>,
-    O: SystemOutput,
+    S: CyclicSystem,
+    S::Output: HealthOutput,
 {
     fn init(&mut self) {
         CyclicRunner::init(self)

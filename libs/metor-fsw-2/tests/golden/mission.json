@@ -1,5 +1,5 @@
 {
-  "ir_version": 3,
+  "ir_version": 4,
   "coordinator": {
     "cycle_rate": 120.0,
     "default_depth": null,
@@ -27,7 +27,14 @@
       "src": null
     }
   ],
-  "states": [],
+  "states": [
+    {
+      "name": "link",
+      "ty": "TcpServer",
+      "params": { "Value": { "addr": "127.0.0.1:2240" } },
+      "src": null
+    }
+  ],
   "systems": [
     {
       "name": "block.plant",
@@ -81,9 +88,9 @@
     },
     {
       "name": "uplink",
-      "ty": "TcpUplink",
+      "ty": "Uplink",
       "artifact": null,
-      "params": { "Value": { "addr": "127.0.0.1:2240", "msgs": ["SequenceCommand"] } },
+      "params": { "Value": { "msgs": ["SequenceCommand"] } },
       "process": false,
       "src": null,
       "scope": null

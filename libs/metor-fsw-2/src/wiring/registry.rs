@@ -21,10 +21,7 @@ use crate::binder::BindPorts;
 use crate::coordinator::init::{self, Node};
 use crate::descriptor::SystemDescriptor;
 use crate::message::MsgTable;
-use crate::system::{
-    AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, SystemOutput,
-};
-use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetrySystem, UplinkSystem};
+use crate::system::{AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput};
 
 use super::error::{LoadError, LoadErrorKind};
 
@@ -93,10 +90,10 @@ pub trait IntoNode<Kind>: Sized {
 }
 
 #[allow(private_interfaces)]
-impl<S, O> IntoNode<CyclicKind> for S
+impl<S> IntoNode<CyclicKind> for S
 where
-    S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts + 'static,
+    S: CyclicSystem + 'static,
+    S::Output: HealthOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     fn into_node(self, name: String) -> Node {
@@ -296,20 +293,32 @@ impl Registry {
     }
 
     /// A registry pre-loaded with the built-in systems under their `type=`
-    /// names: the alarm engine (`"Alarms"`), the TCP telemetry downlink
-    /// (`"TcpDownlink"`), and the TCP command uplink (`"TcpUplink"`), plus the
-    /// well-known message set in the message table so a mission's `msgs` list
-    /// can name any of them out of the box. An app-built registry starts here
-    /// and adds its own systems.
+    /// names — the alarm engine (`"Alarms"`) and the link pack: one shared
+    /// `"TcpServer"` state serving the `"Downlink"` and `"Uplink"` systems
+    /// attached to it — plus the well-known message set in the message table
+    /// so a mission's `msgs` list can name any of them out of the box. An
+    /// app-built registry starts here and adds its own systems.
     pub fn with_builtins() -> Self {
         use metor_proto_wkt::{
             AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, ReloadSequences, SequenceChannelEvent,
             SequenceCommand, SequenceRegistry,
         };
+        use crate::telemetry::{LinkParams, LinkState, TelemetrySystem, UplinkSystem};
+
         let mut r = Self::new();
         r.register::<crate::AlarmSystem, _>("Alarms");
-        r.register::<TelemetrySystem<TcpTransport>, _>("TcpDownlink");
-        r.register::<UplinkSystem<TcpRecvTransport>, _>("TcpUplink");
+        let mut link_pack = crate::Pack::new();
+        let link = link_pack.shared_state("TcpServer", |p: LinkParams| LinkState::bind(p.addr));
+        let link_pack = link_pack
+            .system_type_shared::<TelemetrySystem, _>("Downlink", &link, {
+                let link = link.clone();
+                move |p| <TelemetrySystem as BuildSystem>::new(p).attach(link.clone())
+            })
+            .system_type_shared::<UplinkSystem, _>("Uplink", &link, {
+                let link = link.clone();
+                move |p| <UplinkSystem as BuildSystem>::new(p).attach(link.clone())
+            });
+        r.register_pack(link_pack);
         r.register_msg::<SequenceCommand>()
             .register_msg::<SequenceRegistry>()
             .register_msg::<SequenceChannelEvent>()

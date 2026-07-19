@@ -100,7 +100,7 @@ struct ServerShared {
 /// One live connection: the double-buffered outbound bytes and the writer's
 /// wake. `broadcast` appends into `pending`; the writer swaps it against its
 /// own spare and writes.
-struct Conn {
+pub(crate) struct Conn {
     pending: RefCell<Vec<u8>>,
     wake: WaitQueue,
     closed: Cell<bool>,
@@ -221,10 +221,12 @@ impl LinkState {
 
     /// Drain the inbound command queue in arrival order.
     pub fn drain_inbound(&mut self, mut f: impl FnMut(PacketId, &[u8])) {
-        while let Some(msg) = {
-            let popped = self.shared.inbound.borrow_mut().pop_front();
-            popped
-        } {
+        loop {
+            // The borrow must not span `f` (a connection reader pushing
+            // mid-callback would collide), so pop and release per item.
+            let Some(msg) = self.shared.inbound.borrow_mut().pop_front() else {
+                return;
+            };
             f(msg.id, &msg.payload);
         }
     }
@@ -266,6 +268,14 @@ impl Conn {
 
     pub(crate) fn close(&self) {
         self.closed.set(true);
+    }
+
+    /// Fill the pending buffer to the cap, so the next broadcast drops — the
+    /// stalled-consumer state without a stalled socket.
+    pub(crate) fn stall(&self) {
+        let mut pending = self.pending.borrow_mut();
+        let len = pending.len();
+        pending.resize(len.max(PENDING_CAP), 0);
     }
 }
 

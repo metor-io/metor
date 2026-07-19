@@ -70,9 +70,9 @@ pub use bundle::{
 };
 pub use error::{Anchor, LoadError, LoadErrorKind};
 pub use model::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
-    InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef, StateSpec,
-    SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, EdgeKind, EdgeSpec,
+    IR_VERSION, InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef,
+    StateSpec, SystemSpec, TCP_SERVER_TYPE, UPLINK_TYPE, Wiring,
 };
 pub use pack_dist::{
     Builder, DEFAULT_TARGETS, PackBuildOptions, PackBuildReport, PackConfig, PackDevOptions,

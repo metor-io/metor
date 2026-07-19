@@ -172,9 +172,8 @@ pub use pack::{
 pub use shared::{Shared, SharedGuard, SharedLifecycle};
 pub use registry::{AllOutputs, Registry, RegistryEntry};
 pub use telemetry::{
-    DownlinkParams, LinkParams, LinkState, LinkStats, RecvTransport, TcpRecvTransport,
-    TcpTransport, TelemetryConfig, TelemetryMode, TelemetrySystem, Transport, TransportError,
-    UplinkParams, UplinkSystem,
+    DownlinkParams, LinkParams, LinkState, LinkStats, TelemetryConfig, TelemetryMode,
+    TelemetrySystem, UplinkParams, UplinkSystem,
 };
 pub use testbench::TestBench;
 
@@ -194,7 +193,7 @@ pub use message::{
 };
 pub use system::{
     AsyncContext, AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicRunner, CyclicSystem,
-    Out, System, SystemInput, SystemOutput,
+    HealthOutput, Out, System, SystemInput, SystemOutput,
 };
 #[doc(hidden)]
 pub use system::{NoParamsDefault, ParamsDefaultProbe};
@@ -223,9 +222,9 @@ pub use dl::{DlError, DlPack, DlSystem};
 
 #[cfg(feature = "wiring-model")]
 pub use ir::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE,
-    TCP_UPLINK_TYPE, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, DistRef, EdgeSpec,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, StateSpec, SystemSpec,
+    TCP_SERVER_TYPE, UPLINK_TYPE, Wiring,
 };
 
 #[cfg(feature = "wiring")]
