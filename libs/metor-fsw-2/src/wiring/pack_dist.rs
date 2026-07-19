@@ -363,7 +363,15 @@ pub fn pack_dev(dir: &Path, opts: &PackDevOptions) -> Result<PackDevReport, Pack
     }
 
     // Build (host by default; an explicit `--target` lays out that triple,
-    // with the sidecar sourced from the usual host twin).
+    // with the sidecar sourced from the usual host twin). The pack's own
+    // manifest anchors the build when it has one, so the workspace resolves
+    // from the pack rather than the process cwd — `run` invokes this from
+    // the mission dir, which need not be a cargo workspace at all.
+    let mut cargo_args = opts.cargo_args.clone();
+    let manifest = dir.join("Cargo.toml");
+    if manifest.is_file() {
+        cargo_args.extend(["--manifest-path".into(), manifest.display().to_string()]);
+    }
     let mut wiring = WiringBuilder::new()
         .artifact(&config.id, &config.crate_name, &config.lib)
         .build();
@@ -371,7 +379,7 @@ pub fn pack_dev(dir: &Path, opts: &PackDevOptions) -> Result<PackDevReport, Pack
         &mut wiring,
         &BuildOptions {
             release: opts.release,
-            extra_args: opts.cargo_args.clone(),
+            extra_args: cargo_args,
             manifest_sidecar: true,
         },
     )?;
@@ -414,6 +422,48 @@ pub fn pack_dev(dir: &Path, opts: &PackDevOptions) -> Result<PackDevReport, Pack
         lib_path,
         triple,
     })
+}
+
+/// `true` if `dir` is a rebuildable dev pack: its own `Cargo.toml` plus an
+/// explicit `[tool.metor.pack]` table in its `pyproject.toml`. Path sources
+/// that are plain Python dists (e.g. the in-repo `metor-config`) fail both
+/// gates. The table is required rather than "[`read_pack_config`] succeeds":
+/// the config deliberately defaults everything from `Cargo.toml`, which
+/// would claim any path source that merely contains a crate.
+fn is_dev_pack(dir: &Path) -> bool {
+    if !dir.join("Cargo.toml").is_file() {
+        return false;
+    }
+    read_toml(&dir.join("pyproject.toml")).is_ok_and(|doc| {
+        doc.get("tool")
+            .and_then(|t| t.get("metor"))
+            .and_then(|m| m.get("pack"))
+            .is_some_and(|p| p.is_table())
+    })
+}
+
+/// The mission's dev-pack roots: its pyproject's path sources filtered to
+/// the rebuildable packs ([`is_dev_pack`]).
+pub fn dev_pack_roots(mission_dir: &Path) -> Vec<PathBuf> {
+    super::py::path_source_roots(mission_dir)
+        .into_iter()
+        .filter(|dir| is_dev_pack(dir))
+        .collect()
+}
+
+/// Re-run [`pack_dev`] for every dev pack `mission_dir`'s pyproject
+/// references, so their `.metor/` payloads (module + lib) are current before
+/// the mission is evaluated. Cheap when nothing changed — cargo's build is
+/// incremental and the layout rewrite is byte-identical. The first failing
+/// pack aborts.
+pub fn refresh_dev_packs(
+    mission_dir: &Path,
+    opts: &PackDevOptions,
+) -> Result<Vec<PackDevReport>, PackError> {
+    dev_pack_roots(mission_dir)
+        .iter()
+        .map(|dir| pack_dev(dir, opts))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +1054,77 @@ mod tests {
             with_builder("kind = \"bazel\"\n").unwrap_err(),
             PackError::UnknownBuilder { kind, .. } if kind == "bazel"
         ));
+    }
+
+    /// A dev pack needs both its own `Cargo.toml` and an explicit
+    /// `[tool.metor.pack]` table — a plain Python dist (the `metor-config`
+    /// shape) and a bare crate both fail the filter.
+    #[test]
+    fn dev_pack_needs_crate_and_pack_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pyproject_plain = "[project]\nname = \"p\"\nversion = \"0.0.0\"\n";
+        let pyproject_pack =
+            "[project]\nname = \"p\"\nversion = \"0.0.0\"\n[tool.metor.pack]\nid = \"p\"\n";
+
+        write_files(tmp.path(), &[("pyproject.toml", pyproject_pack)]);
+        assert!(!is_dev_pack(tmp.path()), "no Cargo.toml");
+
+        write_files(tmp.path(), &[("Cargo.toml", "[package]\nname = \"p\"\n")]);
+        assert!(is_dev_pack(tmp.path()));
+
+        write_files(tmp.path(), &[("pyproject.toml", pyproject_plain)]);
+        assert!(!is_dev_pack(tmp.path()), "crate without a pack table");
+    }
+
+    /// `dev_pack_roots` keeps exactly the path sources that are dev packs,
+    /// and a mission with none refreshes to nothing (no cargo spawned).
+    #[test]
+    fn dev_pack_roots_filter_path_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = |name: &str, files: &[(&str, &str)]| {
+            let d = tmp.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            write_files(&d, files);
+        };
+        dir(
+            "pack",
+            &[
+                (
+                    "pyproject.toml",
+                    "[project]\nname = \"pack\"\nversion = \"0.0.0\"\n[tool.metor.pack]\nid = \"p\"\n",
+                ),
+                ("Cargo.toml", "[package]\nname = \"pack\"\n"),
+            ],
+        );
+        dir(
+            "plain",
+            &[(
+                "pyproject.toml",
+                "[project]\nname = \"plain\"\nversion = \"0.0.0\"\n",
+            )],
+        );
+        write_files(
+            tmp.path(),
+            &[(
+                "pyproject.toml",
+                "[project]\nname = \"m\"\nversion = \"0.0.0\"\n\
+                 [tool.uv.sources]\npack = { path = \"pack\" }\n\
+                 plain = { path = \"plain\" }\npinned = { version = \"1.0\" }\n",
+            )],
+        );
+        assert_eq!(dev_pack_roots(tmp.path()), vec![tmp.path().join("pack")]);
+
+        // Drop the dev pack's source line: nothing left to refresh.
+        write_files(
+            tmp.path(),
+            &[(
+                "pyproject.toml",
+                "[project]\nname = \"m\"\nversion = \"0.0.0\"\n\
+                 [tool.uv.sources]\nplain = { path = \"plain\" }\n",
+            )],
+        );
+        let reports = refresh_dev_packs(tmp.path(), &PackDevOptions::default()).unwrap();
+        assert!(reports.is_empty(), "{reports:?}");
     }
 
     /// The injected pins: the ABI marker and the metor-config compatible

@@ -19,7 +19,8 @@ use std::path::PathBuf;
 
 use metor_fsw_2::wiring::{
     BuildOptions, LoadErrorKind, PackDevOptions, Registry, StubgenError, StubgenOptions,
-    WiringBuilder, pack_dev, provision_artifacts, resolve, stubgen,
+    WiringBuilder, dev_pack_roots, pack_dev, provision_artifacts, refresh_dev_packs, resolve,
+    stubgen,
 };
 
 fn mission_dir() -> PathBuf {
@@ -87,6 +88,50 @@ fn pack_dev_module_is_deterministic() {
         std::fs::read(&module).unwrap(),
         "pack dev regenerates the module byte-identically"
     );
+}
+
+/// `run`'s pre-eval refresh covers exactly this mission's two system packs —
+/// the `metor-config` path source is not a pack and stays untouched — and a
+/// refresh lays out module, lib, and sidecar for each, byte-stable on rerun.
+#[test]
+fn refresh_covers_exactly_the_dev_packs() {
+    let dir = mission_dir();
+    let systems = dir.join("systems");
+    assert_eq!(
+        dev_pack_roots(&dir),
+        vec![systems.join("adcs-sequences"), systems.join("adcs-systems")]
+    );
+
+    let reports = match refresh_dev_packs(&dir, &PackDevOptions::default()) {
+        Ok(reports) => reports,
+        Err(e) => {
+            eprintln!("skipping: building the packs failed: {e}");
+            return;
+        }
+    };
+    assert_eq!(reports.len(), 2);
+    let modules: Vec<Vec<u8>> = reports
+        .iter()
+        .map(|r| {
+            assert!(r.lib_path.is_file(), "lib laid out for {}", r.triple);
+            let mut sidecar = r.lib_path.as_os_str().to_owned();
+            sidecar.push(".manifest");
+            assert!(PathBuf::from(sidecar).is_file(), "sidecar beside the lib");
+            assert!(r.module_dir.join("py.typed").is_file());
+            std::fs::read(r.module_dir.join("__init__.py")).expect("module written")
+        })
+        .collect();
+
+    // The `uv run` shape invokes the backend's `pack dev` and then this
+    // refresh; the second pass must be a benign no-op.
+    let again = refresh_dev_packs(&dir, &PackDevOptions::default()).expect("rerun is a no-op");
+    for (report, module) in again.iter().zip(&modules) {
+        assert_eq!(
+            &std::fs::read(report.module_dir.join("__init__.py")).unwrap(),
+            module,
+            "refresh regenerates modules byte-identically"
+        );
+    }
 }
 
 /// A recorded manifest hash that no longer matches the built pack is a stale

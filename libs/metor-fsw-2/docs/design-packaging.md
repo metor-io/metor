@@ -283,10 +283,22 @@ editable wheel's payload is a `.pth` naming `<dir>/.metor`. The pack's own
 as per-package and governing rebuilds of local directory dependencies — so
 `uv run` self-heals, as proven by the prototype.
 
+The CLI's source commands (`run`, `build`, `package`) perform the same
+refresh themselves before evaluating the mission: every path-source
+dependency of the mission's pyproject that is a dev pack — its own
+`Cargo.toml` plus an explicit `[tool.metor.pack]` table — gets a `pack dev`
+relayout first. Cargo's incremental build makes a clean tree a no-op, so a
+bare `metor-fsw run mission.py` (no uv, no venv) self-heals too, and the
+`uv run` shape just repeats a benign no-op. Direct sources only —
+transitively-reached packs rely on their own consumers, matching the
+`PYTHONPATH` scan. `run --no-build` extends its "locate, never build"
+promise to the packs, and bundles stay cargo-free.
+
 After `uv sync` the venv holds host-arch libs for local packs, all-arch libs
 for published packs, typed modules for both, and `metor-fsw` on the venv
-PATH. `uv run metor-fsw run mission.py` needs no cargo unless a local pack
-must be cross-built at package time.
+PATH. `uv run metor-fsw run mission.py` runs no cargo beyond the packs'
+incremental freshness check unless a local pack must be cross-built at
+package time.
 
 ## 7. Publishing
 

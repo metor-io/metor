@@ -196,13 +196,13 @@ fn imports_metor_config(python: &Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// The `.metor` build dirs of the mission's path-source pack dependencies:
-/// each `[tool.uv.sources] <dist> = {{ path = … }}` entry in the
-/// mission-adjacent `pyproject.toml` whose target carries one. Best-effort by
-/// design — no pyproject, no sources, or no `.metor` all mean "no roots", and
-/// a real dependency problem surfaces as Python's own `ModuleNotFoundError`
-/// with the mission traceback.
-fn pack_stub_roots(mission_dir: &Path) -> Vec<PathBuf> {
+/// The path-source dependency roots of the mission-adjacent
+/// `pyproject.toml`: each `[tool.uv.sources] <dist> = {{ path = … }}` entry,
+/// mission-relative, sorted. Direct sources only — a pack's own path-source
+/// dependencies are not chased, the same limitation as the `PYTHONPATH` scan,
+/// so refresh and import visibility stay symmetric. Best-effort by design —
+/// no pyproject or no sources means "no roots".
+pub(super) fn path_source_roots(mission_dir: &Path) -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(mission_dir.join("pyproject.toml")) else {
         return Vec::new();
     };
@@ -220,11 +220,22 @@ fn pack_stub_roots(mission_dir: &Path) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = sources
         .values()
         .filter_map(|entry| entry.get("path")?.as_str())
-        .map(|rel| mission_dir.join(rel).join(".metor"))
-        .filter(|dir| dir.is_dir())
+        .map(|rel| mission_dir.join(rel))
         .collect();
     roots.sort();
     roots
+}
+
+/// The `.metor` build dirs of the mission's path-source pack dependencies:
+/// each [`path_source_roots`] entry whose target carries one. Best-effort by
+/// design — a real dependency problem surfaces as Python's own
+/// `ModuleNotFoundError` with the mission traceback.
+fn pack_stub_roots(mission_dir: &Path) -> Vec<PathBuf> {
+    path_source_roots(mission_dir)
+        .into_iter()
+        .map(|root| root.join(".metor"))
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 /// Write the embedded recorder into a fresh temp dir.
@@ -252,4 +263,54 @@ fn prepend_pythonpath(roots: &[PathBuf]) -> std::ffi::OsString {
         paths.extend(std::env::split_paths(&existing));
     }
     std::env::join_paths(paths).expect("valid PYTHONPATH")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The path-source scan keeps exactly the `path = …` entries, sorted, and
+    /// degrades to empty on a missing or garbled pyproject.
+    #[test]
+    fn path_source_roots_reads_uv_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(path_source_roots(tmp.path()).is_empty(), "no pyproject");
+
+        let pyproject = tmp.path().join("pyproject.toml");
+        std::fs::write(&pyproject, "[project\n").unwrap();
+        assert!(
+            path_source_roots(tmp.path()).is_empty(),
+            "garbled pyproject"
+        );
+
+        std::fs::write(
+            &pyproject,
+            "[project]\nname = \"m\"\nversion = \"0.0.0\"\n\
+             [tool.uv.sources]\nb-pack = { path = \"systems/b\" }\n\
+             a-pack = { path = \"systems/a\" }\npinned = { version = \"1.0\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            path_source_roots(tmp.path()),
+            vec![tmp.path().join("systems/a"), tmp.path().join("systems/b"),]
+        );
+    }
+
+    /// The stub roots are the path sources' `.metor` dirs, existing ones only.
+    #[test]
+    fn pack_stub_roots_wants_metor_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"m\"\nversion = \"0.0.0\"\n\
+             [tool.uv.sources]\na = { path = \"a\" }\nb = { path = \"b\" }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("a/.metor")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b")).unwrap();
+        assert_eq!(
+            pack_stub_roots(tmp.path()),
+            vec![tmp.path().join("a/.metor")]
+        );
+    }
 }

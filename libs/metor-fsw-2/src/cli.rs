@@ -7,8 +7,8 @@ use crate::wiring::{
     BuildOptions, Builder, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions,
     PackageOptions, Registry, StubgenOptions, WIRING_FILE_NAME, Wiring, build_target,
     eval_python_mission, is_python_mission, load_bundle, locate_artifacts, pack_assemble,
-    pack_build, pack_dev, pack_publish, provision_artifacts, resolve, stubgen, unpack_metor,
-    write_bundle,
+    pack_build, pack_dev, pack_publish, provision_artifacts, refresh_dev_packs, resolve, stubgen,
+    unpack_metor, write_bundle,
 };
 
 mod ui;
@@ -384,9 +384,35 @@ fn load_source(path: &Path) -> miette::Result<Wiring> {
     ))
 }
 
+/// Refresh a source mission's dev packs — the path-source pack dependencies
+/// its pyproject names — so the generated modules (manifest hashes, params)
+/// the mission imports are current before it is evaluated. Prebuilt pack
+/// artifacts are only *selected* at provisioning, so this is where their
+/// sources get rebuilt; cargo's incremental build makes a clean tree a no-op.
+fn refresh_source_packs(
+    mission: &Path,
+    release: bool,
+    cargo_args: &[String],
+) -> miette::Result<()> {
+    let dir = match mission.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    refresh_dev_packs(
+        dir,
+        &PackDevOptions {
+            release,
+            cargo_args: cargo_args.to_vec(),
+        },
+    )
+    .into_diagnostic()?;
+    Ok(())
+}
+
 /// `build`: load the wiring, provision every artifact's `.so`, print them.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
     let cargo_args = merge_target(&args.cargo_arg, args.target.as_deref());
+    refresh_source_packs(&args.mission, args.release, &cargo_args)?;
     let mut wiring = load_source(&args.mission)?;
     provision_artifacts(
         &mut wiring,
@@ -418,6 +444,7 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
         .as_deref()
         .ok_or_else(|| miette::miette!("`package` needs an output path (`-o <out>`)"))?;
     let cargo_args = merge_target(&args.cargo_arg, args.target.as_deref());
+    refresh_source_packs(mission, args.release, &cargo_args)?;
     let mut wiring = load_source(mission)?;
     provision_artifacts(
         &mut wiring,
@@ -533,6 +560,7 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
         Some(target) => target.clone(),
         None => detect_mission()?,
     };
+    refresh_run_packs(&target, &args)?;
     let mut wiring = load_run_wiring(&target)?;
     apply_overrides(&mut wiring, &args)?;
     ui::print_preflight(&wiring, &target);
@@ -580,11 +608,22 @@ fn detect_mission_in(dir: &Path) -> miette::Result<PathBuf> {
     ))
 }
 
+/// Refresh a source mission's dev packs before evaluation
+/// ([`refresh_source_packs`]). Skipped for bundles, which are cargo-free by
+/// contract, and under `--no-build`, which extends its "locate, never build"
+/// promise to the packs.
+fn refresh_run_packs(target: &Path, args: &RunArgs) -> miette::Result<()> {
+    if is_bundle(target) || args.no_build {
+        return Ok(());
+    }
+    refresh_source_packs(target, args.release, &args.cargo_arg)
+}
+
 /// Load `run`'s `<TARGET>` into a [`Wiring`]: a bundle directory loads
 /// cargo-free via [`load_bundle`] with its artifact paths already recorded, a
-/// source `.py` is evaluated and its artifacts provisioned separately by
-/// [`provision_run_artifacts`] — after the pre-flight listing, so the systems
-/// print while the builds churn.
+/// source `.py` is evaluated (with its dev packs already refreshed by
+/// [`refresh_run_packs`]) and its artifacts provisioned separately by
+/// [`provision_run_artifacts`].
 fn load_run_wiring(target: &Path) -> miette::Result<Wiring> {
     if is_bundle(target) {
         return load_bundle(target).into_diagnostic();
@@ -716,6 +755,31 @@ mod tests {
             detect_mission_in(dir.path()).unwrap(),
             dir.path().join("mission.py")
         );
+    }
+
+    /// The pre-eval pack refresh leaves bundles alone (cargo-free by
+    /// contract), honors `--no-build`, and is a clean no-op for a mission
+    /// with no path-source packs.
+    #[test]
+    fn refresh_run_packs_skips_and_noops() {
+        let args = |no_build| RunArgs {
+            target: None,
+            no_build,
+            release: false,
+            cargo_arg: Vec::new(),
+            no_manifest_sidecar: false,
+            wall: false,
+            sim_dt: None,
+            cycle_rate: None,
+            cycles: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        refresh_run_packs(dir.path(), &args(false)).expect("bundle dir: skipped");
+
+        let mission = dir.path().join("mission.py");
+        std::fs::write(&mission, "").unwrap();
+        refresh_run_packs(&mission, &args(true)).expect("--no-build: skipped");
+        refresh_run_packs(&mission, &args(false)).expect("no pyproject: nothing to refresh");
     }
 
     /// Provenance discovery finds `mission.py`, and is `None` when a bundle

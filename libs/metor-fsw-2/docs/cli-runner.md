@@ -12,6 +12,13 @@
 > `DlPack::open`. The CLI verbs, the bundle format, and the flow below are otherwise
 > unchanged; §6's mission.kdl snapshot predates the example's merge into one
 > `adcs-systems` pack.
+>
+> **Python/packaging update (2026-07-18, `docs/design-python-config.md`,
+> `docs/design-packaging.md`):** missions are Python (`.py`), KDL was removed, and the
+> `--build` flag is gone — a source `run`/`build`/`package` builds automatically, first
+> refreshing any path-source dev packs (`pack dev` relayout, cargo-incremental) and then
+> provisioning crate artifacts; `run --no-build` opts out and locates instead. The
+> KDL invocations and the `--build` contract below are historical.
 
 `metor-fsw-2` ships its own runner: a `metor-fsw` binary and a reusable `cli` library
 module that turn a wiring KDL into a running mission. The three mission operations —
