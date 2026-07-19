@@ -53,20 +53,20 @@ pub(super) fn init_tracing() {
         .init();
 }
 
-/// One two-line entry in the pre-flight listing, with the bar color that
+/// One two-line entry in the pre-flight listing, with the dot color that
 /// signifies its kind.
 struct Entry {
     name: String,
     ty: String,
     detail: String,
-    bar: owo_colors::Style,
+    dot: owo_colors::Style,
 }
 
 /// Print the ordered list of systems and slots `run` is about to start, to
 /// stderr: a header with the effective clock, then one two-line entry each —
 /// instance name and type, with the source (pack distribution, crate, or
 /// builtin; a slot's allowed occupants) dimmed underneath. Each entry carries
-/// a colored bar keying its kind: magenta for pack-loaded systems, yellow
+/// a colored dot keying its kind: magenta for pack-loaded systems, yellow
 /// for worker-process systems, cyan for builtins, green for slots. The order
 /// is [`Wiring::systems`] then [`Wiring::slots`], which is also resolve's
 /// registration order.
@@ -97,7 +97,7 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
         .systems
         .iter()
         .map(|sys| {
-            let bar = if sys.process {
+            let dot = if sys.process {
                 owo_colors::Style::new().bright_yellow()
             } else if sys.artifact.is_some() {
                 owo_colors::Style::new().bright_magenta()
@@ -115,7 +115,7 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
                     .clone()
                     .unwrap_or_else(|| "(sole pack entry)".to_string()),
                 detail,
-                bar,
+                dot,
             }
         })
         .collect();
@@ -144,22 +144,22 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
             name: slot.name.clone(),
             ty: "slot".to_string(),
             detail,
-            bar: owo_colors::Style::new().bright_green(),
+            dot: owo_colors::Style::new().bright_green(),
         });
     }
 
     let width = entries.iter().map(|e| e.name.len()).max().unwrap_or(0);
     for e in &entries {
-        let bar = "┃".if_supports_color(Stream::Stderr, |t| t.style(e.bar));
+        let dot = "•".if_supports_color(Stream::Stderr, |t| t.style(e.dot));
         // Pad before styling: ANSI escapes would defeat a format width.
         let pad = " ".repeat(width - e.name.len());
         eprintln!(
-            "  {bar} {}{pad}  {}",
+            "  {dot} {}{pad}  {}",
             e.name.if_supports_color(Stream::Stderr, |t| t.bold()),
             e.ty,
         );
         eprintln!(
-            "  {bar} {:width$}  {}",
+            "    {:width$}  {}",
             "",
             e.detail.if_supports_color(Stream::Stderr, |t| t.dimmed()),
         );
