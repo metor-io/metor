@@ -109,6 +109,7 @@ impl AppRoot {
         let mut pending_connection_picker = None;
         if let Some(store) = crate::connections::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
+            store.update(cx, |store, _| store.set_tiles(tiles.downgrade()));
             if store.read(cx).active().is_empty() {
                 pending_connection_picker = Some(true);
             }

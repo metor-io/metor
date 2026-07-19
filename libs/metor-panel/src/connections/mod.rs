@@ -14,6 +14,7 @@
 //! threads upsert targets through; the store drains it on the gpui thread
 //! and repaints observers.
 
+pub mod persist;
 mod picker;
 mod target;
 
@@ -27,7 +28,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use gpui::{App, AppContext as _, Context, Entity, Global, Task};
+use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task, WeakEntity};
 use metor_db::DB;
 use metor_db::remote::Hydrator;
 use stellarator::util::CancelToken;
@@ -36,6 +37,8 @@ use crate::hydration::Hydrators;
 
 /// How often the store drains registry ops and polls backend status.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How often the layout autosave snapshot runs while connected.
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A registry mutation from a discovery producer.
 pub enum RegistryOp {
@@ -77,12 +80,36 @@ impl ActiveConnection {
     }
 }
 
-/// Pure fold of the target registry; kept free of gpui and IO so ordering
-/// and dedup rules are unit-testable.
+/// One picker line: a target when it's live (registered or re-materialized
+/// from a TCP recent), or display fields alone for a custom-backend recent
+/// whose discoverer hasn't re-produced it yet.
+pub struct PickerEntry {
+    pub id: TargetId,
+    pub name: SharedString,
+    pub detail: SharedString,
+    pub target: Option<ConnectionTarget>,
+    pub favorite: bool,
+}
+
+/// The picker's section ordering: pinned targets, then recently connected
+/// ones not already pinned, then the rest of the registry in discovery
+/// order.
+#[derive(Default)]
+pub struct PickerSections {
+    pub favorites: Vec<PickerEntry>,
+    pub recents: Vec<PickerEntry>,
+    pub discovered: Vec<PickerEntry>,
+}
+
+/// Pure fold of the target registry plus the persisted index; kept free of
+/// gpui and IO so ordering and dedup rules are unit-testable.
 #[derive(Default)]
 pub struct ConnectionsState {
     /// Discovery order; upserts update display fields in place.
     targets: Vec<ConnectionTarget>,
+    favorites: Vec<TargetId>,
+    /// Most-recent first, capped at [`persist::RECENTS_CAP`].
+    recents: Vec<persist::RecentEntry>,
 }
 
 impl ConnectionsState {
@@ -99,6 +126,114 @@ impl ConnectionsState {
 
     pub fn targets(&self) -> &[ConnectionTarget] {
         &self.targets
+    }
+
+    pub fn is_favorite(&self, id: &TargetId) -> bool {
+        self.favorites.contains(id)
+    }
+
+    pub fn toggle_favorite(&mut self, id: &TargetId) {
+        if let Some(ix) = self.favorites.iter().position(|f| f == id) {
+            self.favorites.remove(ix);
+        } else {
+            self.favorites.push(id.clone());
+        }
+    }
+
+    pub fn record_connected(&mut self, target: &ConnectionTarget, at_unix: i64) {
+        self.recents.retain(|r| r.id != target.id.as_str());
+        self.recents.insert(
+            0,
+            persist::RecentEntry {
+                id: target.id.as_str().to_string(),
+                name: target.name.to_string(),
+                detail: target.detail.to_string(),
+                tcp_addr: target.tcp_addr.map(|a| a.to_string()),
+                last_connected_unix: at_unix,
+            },
+        );
+        self.recents.truncate(persist::RECENTS_CAP);
+    }
+
+    pub fn load_index(&mut self, index: persist::ConnectionsIndex) {
+        self.favorites = index
+            .favorites
+            .into_iter()
+            .map(|id| TargetId(id.into()))
+            .collect();
+        self.recents = index.recents;
+    }
+
+    pub fn index(&self) -> persist::ConnectionsIndex {
+        persist::ConnectionsIndex {
+            favorites: self.favorites.iter().map(|f| f.as_str().to_string()).collect(),
+            recents: self.recents.clone(),
+        }
+    }
+
+    /// Resolve `id` to something connectable: the live registry first, then
+    /// a TCP recent re-materialized from its saved address.
+    fn resolve(&self, id: &TargetId) -> Option<ConnectionTarget> {
+        if let Some(target) = self.targets.iter().find(|t| &t.id == id) {
+            return Some(target.clone());
+        }
+        let recent = self.recents.iter().find(|r| r.id == id.as_str())?;
+        let addr = recent.tcp_addr.as_ref()?.parse().ok()?;
+        Some(ConnectionTarget::tcp(recent.name.clone(), addr))
+    }
+
+    fn entry(&self, id: &TargetId) -> Option<PickerEntry> {
+        let target = self.resolve(id);
+        let (name, detail) = if let Some(target) = &target {
+            (target.name.clone(), target.detail.clone())
+        } else {
+            let recent = self.recents.iter().find(|r| r.id == id.as_str())?;
+            (
+                SharedString::from(recent.name.clone()),
+                SharedString::from(recent.detail.clone()),
+            )
+        };
+        Some(PickerEntry {
+            id: id.clone(),
+            name,
+            detail,
+            target,
+            favorite: self.is_favorite(id),
+        })
+    }
+
+    pub fn sections(&self) -> PickerSections {
+        let mut sections = PickerSections::default();
+        let mut seen: Vec<TargetId> = Vec::new();
+        for id in &self.favorites {
+            if let Some(entry) = self.entry(id) {
+                seen.push(id.clone());
+                sections.favorites.push(entry);
+            }
+        }
+        for recent in &self.recents {
+            let id = TargetId(SharedString::from(recent.id.clone()));
+            if seen.contains(&id) {
+                continue;
+            }
+            if let Some(entry) = self.entry(&id) {
+                seen.push(id);
+                sections.recents.push(entry);
+            }
+        }
+        for target in &self.targets {
+            if seen.contains(&target.id) {
+                continue;
+            }
+            sections.discovered.push(PickerEntry {
+                id: target.id.clone(),
+                name: target.name.clone(),
+                detail: target.detail.clone(),
+                target: Some(target.clone()),
+                favorite: false,
+            });
+        }
+        sections
     }
 
     fn apply(&mut self, op: RegistryOp) {
@@ -119,6 +254,13 @@ pub struct ConnectionsStore {
     /// The LoD companion task is DB-wide and never stopped, so it spawns at
     /// most once — on the first local-authority connection.
     lod_spawned: bool,
+    /// The window's tile tree, handed over by the app root; the autosave
+    /// tick snapshots it while anything is connected.
+    tiles: Option<WeakEntity<crate::tiles::TileGroup>>,
+    /// Last layout JSON written to disk; skips rewrites while idle. Pane and
+    /// item mutations don't notify the tile group, so autosave poll-compares
+    /// instead of observing.
+    last_saved_layout: Option<String>,
     registry_rx: mpsc::Receiver<RegistryOp>,
     _poll: Task<()>,
 }
@@ -136,14 +278,24 @@ impl ConnectionsStore {
     pub fn init(db: Arc<DB>, cx: &mut App) -> RegistryHandle {
         let (tx, rx) = mpsc::channel();
         let entity = cx.new(|cx| ConnectionsStore::new(db, rx, cx));
-        cx.set_global(GlobalConnections(entity));
+        cx.set_global(GlobalConnections(entity.clone()));
+        cx.on_app_quit(move |cx| {
+            entity.update(cx, |store, cx| store.flush_layout(cx));
+            async {}
+        })
+        .detach();
         RegistryHandle { tx }
     }
 
     fn new(db: Arc<DB>, registry_rx: mpsc::Receiver<RegistryOp>, cx: &mut Context<Self>) -> Self {
         let poll = cx.spawn(async move |this, cx| {
+            let ticks_per_autosave = (AUTOSAVE_INTERVAL.as_millis() / POLL_INTERVAL.as_millis())
+                .max(1) as u32;
+            let mut tick = 0u32;
             loop {
                 cx.background_executor().timer(POLL_INTERVAL).await;
+                tick = tick.wrapping_add(1);
+                let autosave = tick.is_multiple_of(ticks_per_autosave);
                 let alive = this.update(cx, |store, cx| {
                     let mut changed = false;
                     while let Ok(op) = store.registry_rx.try_recv() {
@@ -157,6 +309,9 @@ impl ConnectionsStore {
                             changed = true;
                         }
                     }
+                    if autosave {
+                        store.flush_layout(cx);
+                    }
                     if changed {
                         cx.notify();
                     }
@@ -166,14 +321,63 @@ impl ConnectionsStore {
                 }
             }
         });
+        let mut state = ConnectionsState::default();
+        state.load_index(persist::load_index());
         Self {
-            state: ConnectionsState::default(),
+            state,
             active: Vec::new(),
             db,
             lod_spawned: false,
+            tiles: None,
+            last_saved_layout: None,
             registry_rx,
             _poll: poll,
         }
+    }
+
+    /// Hand over the window's tile tree for layout autosave and restore.
+    pub fn set_tiles(&mut self, tiles: WeakEntity<crate::tiles::TileGroup>) {
+        self.tiles = Some(tiles);
+    }
+
+    pub fn tiles(&self) -> Option<Entity<crate::tiles::TileGroup>> {
+        self.tiles.as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// Snapshot the layout to every active connection's file when it moved
+    /// since the last write. The layout is "what the user ran while
+    /// connected to X" — on reconnect to any X it is offered back.
+    fn flush_layout(&mut self, cx: &mut Context<Self>) {
+        if self.active.is_empty() {
+            return;
+        }
+        let Some(tiles) = self.tiles() else {
+            return;
+        };
+        let json = tiles.read(cx).to_json(cx);
+        if self.last_saved_layout.as_deref() == Some(json.as_str()) {
+            return;
+        }
+        for conn in &self.active {
+            if let Err(err) = persist::save_layout(&conn.target.id, &json) {
+                tracing::error!(%err, id = %conn.target.id, "layout autosave failed");
+            }
+        }
+        self.last_saved_layout = Some(json);
+    }
+
+    /// Note a layout the picker just loaded, so the next autosave tick
+    /// doesn't immediately rewrite every file with it.
+    pub(crate) fn note_loaded_layout(&mut self, json: String) {
+        self.last_saved_layout = Some(json);
+    }
+
+    pub fn toggle_favorite(&mut self, id: &TargetId, cx: &mut Context<Self>) {
+        self.state.toggle_favorite(id);
+        if let Err(err) = persist::save_index(&self.state.index()) {
+            tracing::error!(%err, "save connections index failed");
+        }
+        cx.notify();
     }
 
     pub fn state(&self) -> &ConnectionsState {
@@ -219,6 +423,14 @@ impl ConnectionsStore {
                 std::future::pending::<()>().await
             }));
         }
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        self.state.record_connected(&target, now_unix);
+        if let Err(err) = persist::save_index(&self.state.index()) {
+            tracing::error!(%err, "save connections index failed");
+        }
         self.active.push(ActiveConnection {
             target,
             cancel,
@@ -235,6 +447,7 @@ impl ConnectionsStore {
         let Some(index) = self.active.iter().position(|c| &c.target.id == id) else {
             return;
         };
+        self.flush_layout(cx);
         let conn = self.active.remove(index);
         conn.cancel.cancel();
         conn.status.set(ConnectionStatus::Disconnected);

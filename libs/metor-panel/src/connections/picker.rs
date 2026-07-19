@@ -14,31 +14,36 @@ use gpui::{
     uniform_list,
 };
 
-use super::{ConnectionStatus, ConnectionTarget, ConnectionsStore};
+use super::{ConnectionStatus, ConnectionTarget, ConnectionsStore, PickerEntry, TargetId, persist};
 use crate::inspector::rows::text_field::TextField;
 use crate::theme::{Theme, theme};
 
 const ROW_HEIGHT: f32 = 28.0;
 const MAX_LIST_HEIGHT: f32 = 360.0;
 
-/// What the list is currently showing: the target list, or the inline
-/// address form the footer row switches to.
+/// What the list is currently showing: the target list, the inline address
+/// form the footer row switches to, or the load-saved-layout consent step
+/// shown right after connecting.
 enum Phase {
     Browse,
     ManualAddress { error: Option<SharedString> },
+    LayoutChoice { layout: String, choice: usize },
 }
 
 /// One visible row, rebuilt from the store on every render so discovery
 /// upserts and status changes appear without bookkeeping.
 enum PickerRow {
     Header(SharedString),
-    Target(ConnectionTarget),
+    Target(PickerEntry),
+    /// A recent whose custom backend isn't currently registered; shown for
+    /// continuity but not connectable until discovery re-produces it.
+    Unavailable { name: SharedString, detail: SharedString },
     ManualAddress,
 }
 
 impl PickerRow {
     fn selectable(&self) -> bool {
-        !matches!(self, PickerRow::Header(_))
+        matches!(self, PickerRow::Target(_) | PickerRow::ManualAddress)
     }
 }
 
@@ -94,31 +99,49 @@ impl ConnectionPicker {
         }
     }
 
-    /// The visible rows for the current filter. Targets keep discovery
-    /// order; the manual-address entry is always last so it never shuffles.
+    /// The visible rows: Favorites / Recents / Discovered sections from the
+    /// store, fuzzy-filtered, with the manual-address entry always last so
+    /// it never shuffles.
     fn rows(&self, cx: &App) -> Vec<PickerRow> {
         let store = self.store.read(cx);
         let query = self.search.text.trim().to_string();
-        let mut targets: Vec<ConnectionTarget> = store.state().targets().to_vec();
-        if !query.is_empty() {
-            let scored = fuzzy_scores(
-                &query,
-                targets
-                    .iter()
-                    .map(|t| format!("{} {}", t.name, t.detail))
-                    .collect(),
-            );
-            targets = targets
-                .into_iter()
-                .zip(scored)
-                .filter_map(|(t, score)| score.map(|_| t))
-                .collect();
+        let sections = store.state().sections();
+        let mut rows = Vec::new();
+        for (label, entries) in [
+            ("Favorites", sections.favorites),
+            ("Recent", sections.recents),
+            ("Discovered", sections.discovered),
+        ] {
+            let mut entries = entries;
+            if !query.is_empty() {
+                let scored = fuzzy_scores(
+                    &query,
+                    entries
+                        .iter()
+                        .map(|e| format!("{} {}", e.name, e.detail))
+                        .collect(),
+                );
+                entries = entries
+                    .into_iter()
+                    .zip(scored)
+                    .filter_map(|(e, score)| score.map(|_| e))
+                    .collect();
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            rows.push(PickerRow::Header(SharedString::new_static(label)));
+            rows.extend(entries.into_iter().map(|entry| {
+                if entry.target.is_some() {
+                    PickerRow::Target(entry)
+                } else {
+                    PickerRow::Unavailable {
+                        name: entry.name,
+                        detail: entry.detail,
+                    }
+                }
+            }));
         }
-        let mut rows = Vec::with_capacity(targets.len() + 2);
-        if !targets.is_empty() {
-            rows.push(PickerRow::Header(SharedString::new_static("Systems")));
-        }
-        rows.extend(targets.into_iter().map(PickerRow::Target));
         rows.push(PickerRow::ManualAddress);
         rows
     }
@@ -162,7 +185,11 @@ impl ConnectionPicker {
     fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.rows(cx);
         match rows.get(self.selected) {
-            Some(PickerRow::Target(target)) => self.toggle_connection(target.clone(), window, cx),
+            Some(PickerRow::Target(entry)) => {
+                if let Some(target) = entry.target.clone() {
+                    self.toggle_connection(target, window, cx);
+                }
+            }
             Some(PickerRow::ManualAddress) => {
                 self.phase = Phase::ManualAddress { error: None };
                 self.search.clear();
@@ -179,17 +206,46 @@ impl ConnectionPicker {
         cx: &mut Context<Self>,
     ) {
         let connected = self.store.read(cx).is_connected(&target.id);
+        let id = target.id.clone();
         self.store.update(cx, |store, cx| {
             if connected {
-                store.disconnect(&target.id.clone(), cx);
+                store.disconnect(&id, cx);
             } else {
                 store.connect(target, cx);
             }
         });
         if !connected {
             self.require_connection = false;
-            self.dismiss(window, cx);
+            self.offer_saved_layout(&id, window, cx);
         }
+    }
+
+    /// Right after connecting: restore the target's saved layout — silently
+    /// into an untouched tile tree, or with consent when the user has
+    /// something on screen the load would replace.
+    fn offer_saved_layout(&mut self, id: &TargetId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(layout) = persist::load_layout(id) else {
+            self.dismiss(window, cx);
+            return;
+        };
+        let Some(tiles) = self.store.read(cx).tiles() else {
+            self.dismiss(window, cx);
+            return;
+        };
+        if tiles.read(cx).has_items(cx) {
+            self.phase = Phase::LayoutChoice { layout, choice: 0 };
+        } else {
+            self.load_layout(layout, window, cx);
+        }
+    }
+
+    fn load_layout(&mut self, layout: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tiles) = self.store.read(cx).tiles() {
+            crate::presets::load_into_tiles(&layout, &tiles, cx);
+            self.store
+                .update(cx, |store, _| store.note_loaded_layout(layout));
+        }
+        self.dismiss(window, cx);
     }
 
     fn submit_manual_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -235,6 +291,29 @@ impl ConnectionPicker {
             cx.notify();
             return;
         }
+        if let Phase::LayoutChoice { layout, choice } = &self.phase {
+            let layout = layout.clone();
+            let choice = *choice;
+            match key {
+                "up" | "down" => {
+                    self.phase = Phase::LayoutChoice {
+                        layout,
+                        choice: 1 - choice,
+                    };
+                }
+                "enter" | "return" => {
+                    if choice == 0 {
+                        self.load_layout(layout, window, cx);
+                    } else {
+                        self.dismiss(window, cx);
+                    }
+                }
+                "escape" => self.dismiss(window, cx),
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
 
         match key {
             "escape" => self.dismiss(window, cx),
@@ -270,17 +349,17 @@ impl ConnectionPicker {
 
     fn render_target_row(
         &self,
-        target: &ConnectionTarget,
+        entry: &PickerEntry,
         row_ix: usize,
         selected: bool,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = theme(cx);
         let store = self.store.read(cx);
         let status = store
             .active()
             .iter()
-            .find(|c| c.target.id == target.id)
+            .find(|c| c.target.id == entry.id)
             .map(|c| c.status());
         let connected = status.is_some();
 
@@ -290,7 +369,7 @@ impl ConnectionPicker {
                 div()
                     .text_size(px(12.0))
                     .text_color(theme.text_primary)
-                    .child(target.name.clone()),
+                    .child(entry.name.clone()),
             )
             .child(
                 div()
@@ -299,7 +378,7 @@ impl ConnectionPicker {
                     .overflow_hidden()
                     .text_size(px(11.0))
                     .text_color(theme.text_secondary)
-                    .child(target.detail.clone()),
+                    .child(entry.detail.clone()),
             );
 
         if let Some(ConnectionStatus::Failed(reason)) = &status {
@@ -321,6 +400,37 @@ impl ConnectionPicker {
                         theme.control_active
                     })
                     .child(SharedString::new_static(label)),
+            );
+        }
+
+        // Favorite star: filled when pinned, hollow as an affordance on the
+        // selected row. Click toggles without connecting.
+        if entry.favorite || selected {
+            let id = entry.id.clone();
+            row = row.child(
+                div()
+                    .id(("favorite", row_ix))
+                    .flex_shrink_0()
+                    .text_size(px(12.0))
+                    .text_color(if entry.favorite {
+                        theme.text_primary
+                    } else {
+                        theme.text_tertiary
+                    })
+                    .child(SharedString::new_static(if entry.favorite {
+                        "\u{2605}"
+                    } else {
+                        "\u{2606}"
+                    }))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _window, cx| {
+                            cx.stop_propagation();
+                            this.store
+                                .update(cx, |store, cx| store.toggle_favorite(&id, cx));
+                            cx.notify();
+                        }),
+                    ),
             );
         }
         row.into_any_element()
@@ -362,24 +472,38 @@ impl ConnectionPicker {
                                 .text_color(theme.text_tertiary)
                                 .child(label.clone())
                                 .into_any_element(),
-                            PickerRow::Target(target) => {
-                                let target_click = target.clone();
+                            PickerRow::Target(entry) => {
+                                let target_click = entry.target.clone();
                                 div()
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
                                         cx.listener(move |this, _, window, cx| {
                                             this.selected = ix;
-                                            this.toggle_connection(
-                                                target_click.clone(),
-                                                window,
-                                                cx,
-                                            );
+                                            if let Some(target) = target_click.clone() {
+                                                this.toggle_connection(target, window, cx);
+                                            }
                                             cx.notify();
                                         }),
                                     )
-                                    .child(this.render_target_row(target, ix, selected, cx))
+                                    .child(this.render_target_row(entry, ix, selected, cx))
                                     .into_any_element()
                             }
+                            PickerRow::Unavailable { name, detail } => div()
+                                .px(px(12.0))
+                                .h(px(ROW_HEIGHT))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .text_color(theme.text_tertiary)
+                                .child(div().text_size(px(12.0)).child(name.clone()))
+                                .child(div().text_size(px(11.0)).child(detail.clone()))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .child(SharedString::new_static("not available")),
+                                )
+                                .into_any_element(),
                             PickerRow::ManualAddress => div()
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
@@ -480,6 +604,50 @@ impl Render for ConnectionPicker {
 
         let body: gpui::AnyElement = match &self.phase {
             Phase::Browse => self.render_rows(cx),
+            Phase::LayoutChoice { layout, choice } => {
+                let layout = layout.clone();
+                let choice = *choice;
+                let mut body = div().flex().flex_col().py(px(2.0));
+                body = body.child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::new_static(
+                            "This system has a saved layout.",
+                        )),
+                );
+                for (ix, label) in ["Load saved layout", "Keep current layout"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let layout = layout.clone();
+                    body = body.child(
+                        div()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    if ix == 0 {
+                                        this.load_layout(layout.clone(), window, cx);
+                                    } else {
+                                        this.dismiss(window, cx);
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                crate::inspector::rows::row_base(ix, ix == choice, cx).child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_primary)
+                                        .child(SharedString::new_static(label)),
+                                ),
+                            ),
+                    );
+                }
+                body.into_any_element()
+            }
             Phase::ManualAddress { error } => {
                 let mut body = div().py(px(6.0)).px(px(12.0)).flex().flex_col();
                 body = body.child(
@@ -517,9 +685,11 @@ impl Render for ConnectionPicker {
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(6.0))
-            .child(self.render_header(cx))
-            .child(self.render_input_bar(cx))
-            .child(div().py(px(2.0)).child(body));
+            .child(self.render_header(cx));
+        if !matches!(self.phase, Phase::LayoutChoice { .. }) {
+            panel = panel.child(self.render_input_bar(cx));
+        }
+        panel = panel.child(div().py(px(2.0)).child(body));
 
         if self.dismissable(cx) {
             panel = panel.on_mouse_down_out(cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {

@@ -144,6 +144,10 @@ pub struct ConnectionTarget {
     /// Subtitle column: address, serial number, discovery origin.
     pub detail: SharedString,
     pub backend: Arc<dyn ConnectionBackend>,
+    /// Set by [`tcp`](Self::tcp): lets the recents index re-materialize the
+    /// target across restarts without its discoverer. Custom backends are
+    /// closures and deliberately don't persist.
+    pub(crate) tcp_addr: Option<SocketAddr>,
 }
 
 impl ConnectionTarget {
@@ -156,6 +160,7 @@ impl ConnectionTarget {
             name: name.into(),
             detail: SharedString::from(addr.to_string()),
             backend: Arc::new(TcpBackend { addr }),
+            tcp_addr: Some(addr),
         }
     }
 
@@ -170,6 +175,7 @@ impl ConnectionTarget {
             name: name.into(),
             detail: detail.into(),
             backend: Arc::new(backend),
+            tcp_addr: None,
         }
     }
 }
