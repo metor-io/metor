@@ -3,10 +3,10 @@
 //!
 //! Two artifacts, both facet-json with the same tolerant-read conventions
 //! as [`config`](crate::config):
-//! - `index.json` — favorites and the recents list. TCP recents carry
-//!   their address so they stay connectable across restarts; custom-backend
-//!   recents only carry display fields, reappearing as connectable once
-//!   their discovery source re-produces the target.
+//! - `index.json` — favorites and the recents list. Address-carrying
+//!   recents stay connectable across restarts through the installed
+//!   address resolver; discovery-only recents carry display fields alone,
+//!   reappearing as connectable once their source re-produces the target.
 //! - `layouts/<sanitized-id>.json` — one tile-layout document per target,
 //!   in the same format as named presets so the preset load path applies
 //!   unchanged.
@@ -34,10 +34,11 @@ pub struct RecentEntry {
     pub name: String,
     #[facet(default)]
     pub detail: String,
-    /// `Some` only for the built-in TCP kind, so the entry can be
-    /// re-materialized as a connectable target without its discoverer.
+    /// The string the installed address resolver can rebuild the target
+    /// from, so the entry stays connectable across restarts without its
+    /// discoverer. Absent for discovery-only targets.
     #[facet(default)]
-    pub tcp_addr: Option<String>,
+    pub address: Option<String>,
     #[facet(default)]
     pub last_connected_unix: i64,
 }

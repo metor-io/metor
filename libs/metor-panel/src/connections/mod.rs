@@ -20,8 +20,8 @@ mod target;
 
 pub use picker::ConnectionPicker;
 pub use target::{
-    ConnectContext, Connected, ConnectionBackend, ConnectionStatus, ConnectionTarget,
-    StatusHandle, TargetId,
+    AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionStatus,
+    ConnectionTarget, StatusHandle, TargetId,
 };
 
 use std::sync::Arc;
@@ -110,6 +110,9 @@ pub struct ConnectionsState {
     favorites: Vec<TargetId>,
     /// Most-recent first, capped at [`persist::RECENTS_CAP`].
     recents: Vec<persist::RecentEntry>,
+    /// Re-materializes address-carrying recents; also drives the dialog's
+    /// address input. Defaults to the built-in `host:port` TCP kind.
+    resolver: AddressResolver,
 }
 
 impl ConnectionsState {
@@ -148,11 +151,19 @@ impl ConnectionsState {
                 id: target.id.as_str().to_string(),
                 name: target.name.to_string(),
                 detail: target.detail.to_string(),
-                tcp_addr: target.tcp_addr.map(|a| a.to_string()),
+                address: target.address.as_ref().map(|a| a.to_string()),
                 last_connected_unix: at_unix,
             },
         );
         self.recents.truncate(persist::RECENTS_CAP);
+    }
+
+    pub fn set_resolver(&mut self, resolver: AddressResolver) {
+        self.resolver = resolver;
+    }
+
+    pub fn resolver(&self) -> &AddressResolver {
+        &self.resolver
     }
 
     pub fn load_index(&mut self, index: persist::ConnectionsIndex) {
@@ -172,14 +183,21 @@ impl ConnectionsState {
     }
 
     /// Resolve `id` to something connectable: the live registry first, then
-    /// a TCP recent re-materialized from its saved address.
+    /// an address-carrying recent re-materialized through the resolver.
     fn resolve(&self, id: &TargetId) -> Option<ConnectionTarget> {
         if let Some(target) = self.targets.iter().find(|t| &t.id == id) {
             return Some(target.clone());
         }
         let recent = self.recents.iter().find(|r| r.id == id.as_str())?;
-        let addr = recent.tcp_addr.as_ref()?.parse().ok()?;
-        Some(ConnectionTarget::tcp(recent.name.clone(), addr))
+        let address = recent.address.as_ref()?;
+        let mut target = (self.resolver.resolve)(address).ok()?;
+        // The resolver only saw the address; the recent remembers what the
+        // user actually called this system.
+        target.name = SharedString::from(recent.name.clone());
+        if !recent.detail.is_empty() {
+            target.detail = SharedString::from(recent.detail.clone());
+        }
+        Some(target)
     }
 
     fn entry(&self, id: &TargetId) -> Option<PickerEntry> {
@@ -370,6 +388,10 @@ impl ConnectionsStore {
     /// doesn't immediately rewrite every file with it.
     pub(crate) fn note_loaded_layout(&mut self, json: String) {
         self.last_saved_layout = Some(json);
+    }
+
+    pub fn set_resolver(&mut self, resolver: AddressResolver) {
+        self.state.set_resolver(resolver);
     }
 
     pub fn toggle_favorite(&mut self, id: &TargetId, cx: &mut Context<Self>) {

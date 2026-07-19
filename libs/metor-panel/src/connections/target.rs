@@ -136,6 +136,35 @@ where
     }
 }
 
+/// How the dialog's "Connect to address…" input turns a typed string into
+/// a target. The built-in resolver parses `host:port` into the TCP mirror
+/// kind; a wrapper author installs their own to speak another protocol
+/// (`serial:/dev/ttyUSB0`, a vehicle URL, …). The same resolver
+/// re-materializes address-carrying recents across restarts, so custom
+/// protocols get history for free.
+#[derive(Clone)]
+pub struct AddressResolver {
+    /// Placeholder shown in the address input, e.g. `host:port`.
+    pub placeholder: SharedString,
+    /// Parse user input into a target, or explain why not — the error
+    /// string renders inline under the input.
+    pub resolve: Arc<dyn Fn(&str) -> Result<ConnectionTarget, SharedString> + Send + Sync>,
+}
+
+impl Default for AddressResolver {
+    fn default() -> Self {
+        Self {
+            placeholder: SharedString::new_static("host:port"),
+            resolve: Arc::new(|input| {
+                let addr: SocketAddr = input.trim().parse().map_err(|_| {
+                    SharedString::new_static("expected host:port, e.g. 127.0.0.1:2240")
+                })?;
+                Ok(ConnectionTarget::tcp(input.trim().to_string(), addr))
+            }),
+        }
+    }
+}
+
 /// One row in the picker: identity, display fields, and how to connect.
 #[derive(Clone)]
 pub struct ConnectionTarget {
@@ -144,10 +173,12 @@ pub struct ConnectionTarget {
     /// Subtitle column: address, serial number, discovery origin.
     pub detail: SharedString,
     pub backend: Arc<dyn ConnectionBackend>,
-    /// Set by [`tcp`](Self::tcp): lets the recents index re-materialize the
-    /// target across restarts without its discoverer. Custom backends are
-    /// closures and deliberately don't persist.
-    pub(crate) tcp_addr: Option<SocketAddr>,
+    /// The string the installed [`AddressResolver`] can rebuild this target
+    /// from; lets the recents index re-materialize it across restarts
+    /// without its discoverer. Set by [`tcp`](Self::tcp) and by
+    /// [`with_address`](Self::with_address) for resolver-produced kinds;
+    /// discovery-only targets leave it unset and don't persist.
+    pub(crate) address: Option<SharedString>,
 }
 
 impl ConnectionTarget {
@@ -160,7 +191,7 @@ impl ConnectionTarget {
             name: name.into(),
             detail: SharedString::from(addr.to_string()),
             backend: Arc::new(TcpBackend { addr }),
-            tcp_addr: Some(addr),
+            address: Some(SharedString::from(addr.to_string())),
         }
     }
 
@@ -175,8 +206,16 @@ impl ConnectionTarget {
             name: name.into(),
             detail: detail.into(),
             backend: Arc::new(backend),
-            tcp_addr: None,
+            address: None,
         }
+    }
+
+    /// Mark this target as rebuildable from `address` by the installed
+    /// [`AddressResolver`], so recents survive restarts. Resolvers should
+    /// set this on every target they produce.
+    pub fn with_address(mut self, address: impl Into<SharedString>) -> Self {
+        self.address = Some(address.into());
+        self
     }
 }
 

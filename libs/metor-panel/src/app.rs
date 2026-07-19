@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::connections::{ConnectionTarget, RegistryHandle, TargetId};
+use crate::connections::{AddressResolver, ConnectionTarget, RegistryHandle, TargetId};
 use crate::inspector::Inspector;
 use crate::inspector::edits::{
     self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
@@ -895,6 +895,7 @@ pub struct PanelApp {
     targets: Vec<ConnectionTarget>,
     connection_sources: Vec<Box<dyn FnOnce(RegistryHandle)>>,
     auto_connect: Vec<TargetId>,
+    address_resolver: Option<AddressResolver>,
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
     overlays: Vec<Box<dyn FnOnce(&mut App) -> gpui::AnyView>>,
@@ -909,6 +910,7 @@ impl PanelApp {
             targets: Vec::new(),
             connection_sources: Vec::new(),
             auto_connect: Vec::new(),
+            address_resolver: None,
             command_providers: Vec::new(),
             init_hooks: Vec::new(),
             overlays: Vec::new(),
@@ -934,6 +936,23 @@ impl PanelApp {
     /// [`connection`](PanelApp::connection).
     pub fn auto_connect(mut self, id: impl Into<SharedString>) -> Self {
         self.auto_connect.push(TargetId(id.into()));
+        self
+    }
+
+    /// Replace how the dialog's "Connect to address…" input is interpreted.
+    /// The default parses `host:port` into the built-in TCP mirror; a
+    /// wrapper speaking its own protocol supplies a placeholder and a parse
+    /// function producing any [`ConnectionTarget`]. The same resolver
+    /// revives address-carrying recents across restarts.
+    pub fn address_resolver(
+        mut self,
+        placeholder: impl Into<SharedString>,
+        resolve: impl Fn(&str) -> Result<ConnectionTarget, SharedString> + Send + Sync + 'static,
+    ) -> Self {
+        self.address_resolver = Some(AddressResolver {
+            placeholder: placeholder.into(),
+            resolve: Arc::new(resolve),
+        });
         self
     }
 
@@ -1017,6 +1036,7 @@ impl PanelApp {
             targets,
             connection_sources,
             auto_connect,
+            address_resolver,
             command_providers,
             init_hooks,
             overlays,
@@ -1036,6 +1056,7 @@ impl PanelApp {
         let mut targets = Some(targets);
         let mut connection_sources = Some(connection_sources);
         let mut auto_connect = Some(auto_connect);
+        let mut address_resolver = Some(address_resolver);
         let mut command_providers = Some(command_providers);
         let mut init_hooks = Some(init_hooks);
         let mut overlays = Some(overlays);
@@ -1078,6 +1099,9 @@ impl PanelApp {
                 let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
                 if let Some(store) = crate::connections::try_global(cx) {
                     store.update(cx, |store, cx| {
+                        if let Some(resolver) = address_resolver.take().flatten() {
+                            store.set_resolver(resolver);
+                        }
                         for target in targets.take().unwrap_or_default() {
                             store.upsert_target(target, cx);
                         }

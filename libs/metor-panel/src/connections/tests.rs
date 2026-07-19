@@ -119,6 +119,40 @@ fn tcp_recent_rematerializes_without_registry() {
 }
 
 #[test]
+fn custom_resolver_revives_addressed_recents() {
+    let mut state = ConnectionsState::default();
+    state.set_resolver(AddressResolver {
+        placeholder: "vehicle-url".into(),
+        resolve: std::sync::Arc::new(|input| {
+            let serial = input
+                .strip_prefix("veh://")
+                .ok_or_else(|| gpui::SharedString::new_static("expected veh://<serial>"))?;
+            Ok(
+                target(&format!("veh-{serial}"), serial).with_address(input.to_string()),
+            )
+        }),
+    });
+    // A protocol-addressed target connects once, then its discoverer is
+    // gone after restart — the resolver brings it back, and the recent's
+    // display name wins over the resolver's generic one.
+    let veh = (state.resolver().resolve)("veh://0042").unwrap();
+    state.record_connected(&veh, 7);
+    state.remove_target(&veh.id);
+
+    let sections = state.sections();
+    let entry = &sections.recents[0];
+    let revived = entry.target.as_ref().expect("resolver revives the recent");
+    assert_eq!(revived.id.as_str(), "veh-0042");
+    assert_eq!(revived.name.as_ref(), "0042");
+
+    // Garbage input surfaces the resolver's own error message.
+    let Err(err) = (state.resolver().resolve)("127.0.0.1:2240") else {
+        panic!("resolver accepted non-veh input");
+    };
+    assert_eq!(err.as_ref(), "expected veh://<serial>");
+}
+
+#[test]
 fn index_round_trips_and_tolerates_empty_object() {
     let mut state = ConnectionsState::default();
     state.toggle_favorite(&TargetId("a/b c".into()));
@@ -129,7 +163,7 @@ fn index_round_trips_and_tolerates_empty_object() {
     let json = facet_json::to_string(&state.index()).unwrap();
     let parsed: persist::ConnectionsIndex = facet_json::from_str(&json).unwrap();
     assert_eq!(parsed.favorites, vec!["a/b c".to_string()]);
-    assert_eq!(parsed.recents[0].tcp_addr.as_deref(), Some("127.0.0.1:1"));
+    assert_eq!(parsed.recents[0].address.as_deref(), Some("127.0.0.1:1"));
     assert_eq!(parsed.recents[0].last_connected_unix, 42);
 
     let empty: persist::ConnectionsIndex = facet_json::from_str("{}").unwrap();

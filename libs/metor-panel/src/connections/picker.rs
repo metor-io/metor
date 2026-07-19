@@ -165,15 +165,16 @@ impl ConnectionPicker {
                     self.toggle_connection(target, window, cx);
                 }
             }
-            Some(Slot::ManualAddress) => self.enter_manual_address(),
+            Some(Slot::ManualAddress) => self.enter_manual_address(cx),
             None => {}
         }
     }
 
-    fn enter_manual_address(&mut self) {
+    fn enter_manual_address(&mut self, cx: &App) {
         self.phase = Phase::ManualAddress { error: None };
         self.search.clear();
-        self.search.set_placeholder("host:port");
+        let placeholder = self.store.read(cx).state().resolver().placeholder.clone();
+        self.search.set_placeholder(placeholder.to_string());
     }
 
     fn toggle_connection(
@@ -227,20 +228,16 @@ impl ConnectionPicker {
 
     fn submit_manual_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.search.text.trim().to_string();
-        match text.parse::<std::net::SocketAddr>() {
-            Ok(addr) => {
-                let target = ConnectionTarget::tcp(text, addr);
+        let resolved = (self.store.read(cx).state().resolver().resolve)(&text);
+        match resolved {
+            Ok(target) => {
                 self.store
                     .update(cx, |store, cx| store.upsert_target(target.clone(), cx));
                 self.leave_manual_address();
                 self.toggle_connection(target, window, cx);
             }
-            Err(_) => {
-                self.phase = Phase::ManualAddress {
-                    error: Some(SharedString::new_static(
-                        "expected host:port, e.g. 127.0.0.1:2240",
-                    )),
-                };
+            Err(error) => {
+                self.phase = Phase::ManualAddress { error: Some(error) };
             }
         }
     }
@@ -671,7 +668,7 @@ impl ConnectionPicker {
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(|this, _, _window, cx| {
-                        this.enter_manual_address();
+                        this.enter_manual_address(cx);
                         cx.notify();
                     }),
                 )
@@ -710,7 +707,7 @@ impl ConnectionPicker {
                     .text_size(px(12.0))
                     .text_color(theme.text_secondary)
                     .child(SharedString::new_static(
-                        "The address of a metor-db instance, then enter.",
+                        "Type an address and press enter to connect.",
                     )),
             )
             .child(
