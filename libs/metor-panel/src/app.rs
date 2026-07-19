@@ -919,6 +919,7 @@ impl PanelApp {
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::logs::LogStore::init(db.clone(), cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
+                crate::plot_events::EventSourceRegistry::init(cx);
                 crate::wiring::WiringStore::init(db.clone(), cx);
                 register_pane_item_deserializers(db.clone(), cx);
 

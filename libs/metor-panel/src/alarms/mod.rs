@@ -66,6 +66,9 @@ pub struct AlarmState {
     active: HashMap<OccurrenceId, ActiveAlarm>,
     acked: HashSet<OccurrenceId>,
     history: VecDeque<AlarmEvent>,
+    /// Total events ever pushed; a monotonic staleness stamp for observers
+    /// (the plot's event overlay) that stays valid as the ring evicts.
+    history_pushed: u64,
 }
 
 impl AlarmState {
@@ -128,9 +131,15 @@ impl AlarmState {
 
     fn push_event(&mut self, event: AlarmEvent) {
         self.history.push_back(event);
+        self.history_pushed += 1;
         while self.history.len() > MAX_HISTORY {
             self.history.pop_front();
         }
+    }
+
+    /// Total events ever pushed; a cheap change stamp for the plot's event overlay.
+    pub fn history_pushed(&self) -> u64 {
+        self.history_pushed
     }
 
     /// Active alarms, highest severity first then most recently raised.

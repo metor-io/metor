@@ -40,6 +40,19 @@ impl<S> IngestSource<S> {
             }),
         }
     }
+
+    /// A source that folds the raw record bytes without a static decode step,
+    /// for stores that decode dynamically (an unknown message id resolved
+    /// against a schema announced at runtime).
+    pub(crate) fn new_raw<F>(id: PacketId, apply: F) -> Self
+    where
+        F: FnMut(&mut S, Timestamp, &[u8]) + 'static,
+    {
+        Self {
+            id,
+            apply: Box::new(apply),
+        }
+    }
 }
 
 /// Backfill the persisted history of every source as one timestamp-sorted merge,
