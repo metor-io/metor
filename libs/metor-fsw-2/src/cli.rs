@@ -6,9 +6,12 @@ use miette::IntoDiagnostic;
 use crate::wiring::{
     BuildOptions, Builder, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions,
     PackageOptions, Registry, StubgenOptions, WIRING_FILE_NAME, Wiring, build_target,
-    eval_python_mission, is_python_mission, load_bundle, pack_assemble, pack_build, pack_dev,
-    pack_publish, provision_artifacts, resolve, stubgen, unpack_metor, write_bundle,
+    eval_python_mission, is_python_mission, load_bundle, locate_artifacts, pack_assemble,
+    pack_build, pack_dev, pack_publish, provision_artifacts, resolve, stubgen, unpack_metor,
+    write_bundle,
 };
+
+mod ui;
 
 /// The fully parsed command line, produced from argv by [`run`].
 #[derive(Parser, Debug)]
@@ -29,7 +32,7 @@ enum Command {
     Build(BuildArgs),
     /// Produce a relocatable bundle directory (the cdylibs plus a manifest).
     Package(PackageArgs),
-    /// Load a mission (a source `.py` with `--build`, or a bundle dir) and run it.
+    /// Run a mission: a source `.py` (built automatically) or a bundle dir.
     Run(RunArgs),
     /// Generate the typed Python pack modules (`packs/<id>.py`) for a mission.
     Stubgen(StubgenArgs),
@@ -169,15 +172,17 @@ struct PackageArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// A source `.py` mission (requires `--build`) or a bundle directory (cargo-free).
-    target: PathBuf,
-    /// Build the cdylibs first; required when the target is a source `.py`.
+    /// A source `.py` mission (built automatically) or a bundle directory
+    /// (cargo-free). Defaults to `mission.py` in the current directory.
+    target: Option<PathBuf>,
+    /// Locate previously built cdylibs without running cargo; errors when one
+    /// is missing. A no-op for bundles, which are always cargo-free.
     #[arg(long)]
-    build: bool,
-    /// Build the `--release` profile when `--build` is set.
+    no_build: bool,
+    /// Build (or with `--no-build`, locate) the `--release` profile.
     #[arg(long)]
     release: bool,
-    /// An extra arg appended to every `cargo build` (repeatable), with `--build`.
+    /// An extra arg appended to every `cargo build` (repeatable).
     #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
     cargo_arg: Vec<String>,
     /// Skip the `<cdylib>.manifest` sidecars, for pack crates that cannot
@@ -228,6 +233,7 @@ pub async fn run() -> miette::Result<()> {
     // Route a re-executed worker child before anything else (process
     // systems; a no-op read of one env var otherwise).
     crate::proc::worker_entry();
+    ui::init_tracing();
     let cli = Cli::parse();
     match cli.command {
         Command::Build(a) => cmd_build(a),
@@ -523,8 +529,14 @@ fn normalized_ir(wiring: &Wiring) -> String {
 }
 
 async fn cmd_run(args: RunArgs) -> miette::Result<()> {
-    let mut wiring = load_run_wiring(&args)?;
+    let target = match &args.target {
+        Some(target) => target.clone(),
+        None => detect_mission()?,
+    };
+    let mut wiring = load_run_wiring(&target)?;
     apply_overrides(&mut wiring, &args)?;
+    ui::print_preflight(&wiring, &target);
+    provision_run_artifacts(&mut wiring, &target, &args)?;
 
     let cycles = args.cycles.unwrap_or(usize::MAX);
     let mut coord = resolve(&wiring, &Registry::with_builtins())?;
@@ -549,34 +561,61 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     ))
 }
 
-/// Resolve `run`'s `<TARGET>` into a located [`Wiring`]. A bundle directory
-/// loads cargo-free via [`load_bundle`]. A source `.py` requires `--build`,
-/// because the cargo build driver is the only artifact locator and `.so` paths
-/// are not persisted between a `build` and a later `run`.
-fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
-    if is_bundle(&args.target) {
-        if args.build {
-            return Err(miette::miette!(
-                "`--build` is not valid for a bundle (nothing to build); run the bundle \
-                 directly, or `--build` a source `.py`"
-            ));
-        }
-        return load_bundle(&args.target).into_diagnostic();
+/// `run` with no target uses `mission.py` in the current directory.
+fn detect_mission() -> miette::Result<PathBuf> {
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    detect_mission_in(&cwd)
+}
+
+/// [`detect_mission`] against an explicit directory (the current directory is
+/// process-global, so tests probe this).
+fn detect_mission_in(dir: &Path) -> miette::Result<PathBuf> {
+    let mission = dir.join("mission.py");
+    if mission.exists() {
+        return Ok(mission);
     }
-    if !args.build {
-        return Err(miette::miette!(
-            "running a source `.py` requires `--build` (to compile and locate the cdylibs); \
-             or `metor-fsw package {} -o <dir>` and run the bundle",
-            args.target.display()
-        ));
+    Err(miette::miette!(
+        "no `mission.py` in `{}`; pass a mission `.py` or a bundle: `metor-fsw run <target>`",
+        dir.display()
+    ))
+}
+
+/// Load `run`'s `<TARGET>` into a [`Wiring`]: a bundle directory loads
+/// cargo-free via [`load_bundle`] with its artifact paths already recorded, a
+/// source `.py` is evaluated and its artifacts provisioned separately by
+/// [`provision_run_artifacts`] — after the pre-flight listing, so the systems
+/// print while the builds churn.
+fn load_run_wiring(target: &Path) -> miette::Result<Wiring> {
+    if is_bundle(target) {
+        return load_bundle(target).into_diagnostic();
     }
-    let mut wiring = load_source(&args.target)?;
+    load_source(target)
+}
+
+/// Fill a source mission's artifact paths: the cargo build driver by default
+/// (incremental, so a fresh tree is a no-op), or a cargo-free search of the
+/// workspace target dir with `--no-build`. A bundle's paths are already
+/// recorded, so this is a no-op for it.
+fn provision_run_artifacts(
+    wiring: &mut Wiring,
+    target: &Path,
+    args: &RunArgs,
+) -> miette::Result<()> {
+    if is_bundle(target) {
+        return Ok(());
+    }
+    if args.no_build {
+        let dir = match target.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        return locate_artifacts(wiring, dir, args.release).into_diagnostic();
+    }
     provision_artifacts(
-        &mut wiring,
+        wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
     )
-    .into_diagnostic()?;
-    Ok(wiring)
+    .into_diagnostic()
 }
 
 /// A `<TARGET>` is a bundle if it is a directory (the bundle layout), ends in
@@ -662,6 +701,20 @@ mod tests {
             normalized_ir(&frozen),
             normalized_ir(&changed),
             "a real emission change is drift"
+        );
+    }
+
+    /// `run` with no target accepts exactly `mission.py` in the directory and
+    /// errors helpfully otherwise.
+    #[test]
+    fn detect_mission_wants_mission_py() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = detect_mission_in(dir.path()).expect_err("nothing to detect yet");
+        assert!(err.to_string().contains("mission.py"), "{err}");
+        std::fs::write(dir.path().join("mission.py"), "").unwrap();
+        assert_eq!(
+            detect_mission_in(dir.path()).unwrap(),
+            dir.path().join("mission.py")
         );
     }
 

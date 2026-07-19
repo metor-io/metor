@@ -59,6 +59,13 @@ thiserror = { version = "2.0" }
 clap = { version = "4", features = ["derive"], optional = true }
 tempfile = { version = "3.13", optional = true }
 
+# cli progress UI: build spans render as a pinned status block (via
+# tracing-indicatif); library consumers without a subscriber get silence.
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tracing-indicatif = { version = "0.3", optional = true }
+owo-colors = { version = "4.3", features = ["supports-colors"], optional = true }
+
 [features]
 default = ["wiring"]
 # The pure-data `Wiring` IR (`src/ir.rs`) plus its serde/serde_json codec, with
@@ -69,7 +76,7 @@ wiring-model = ["dep:serde_json"]
 # The full wiring front-end: the Python-eval path, the Rust `WiringBuilder`, the
 # resolver, bundles, stubgen, and the `metor-fsw` CLI. Pulls `wiring-model` for
 # the IR it produces and consumes.
-wiring = ["wiring-model", "dep:miette", "dep:postcard-dyn", "dep:serde_ignored", "dep:clap", "dep:tempfile", "dep:toml", "dep:sha2", "dep:base64", "dep:crc32fast"]
+wiring = ["wiring-model", "dep:miette", "dep:postcard-dyn", "dep:serde_ignored", "dep:clap", "dep:tempfile", "dep:toml", "dep:sha2", "dep:base64", "dep:crc32fast", "dep:tracing", "dep:tracing-subscriber", "dep:tracing-indicatif", "dep:owo-colors"]
 
 [[bin]]
 name = "metor-fsw"

@@ -230,13 +230,11 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
     } else {
         for (id, e) in artifacts {
             let cdylib = super::cdylib_file_name(&e.lib);
-            let path =
-                locate_prebuilt(&opts.mission_dir, &cdylib, opts.release).ok_or_else(|| {
-                    StubgenError::NotBuilt {
-                        id: id.clone(),
-                        crate_name: e.crate_name_field.clone(),
-                        cdylib: cdylib.clone(),
-                    }
+            let path = super::build_driver::locate_built(&opts.mission_dir, &cdylib, opts.release)
+                .ok_or_else(|| StubgenError::NotBuilt {
+                    id: id.clone(),
+                    crate_name: e.crate_name_field.clone(),
+                    cdylib: cdylib.clone(),
                 })?;
             located.push((id, e, path));
         }
@@ -324,30 +322,6 @@ fn reconcile(
     })?;
     report.modules.push(path.to_path_buf());
     Ok(())
-}
-
-/// Search the workspace target directory for a prebuilt cdylib, respecting
-/// `CARGO_TARGET_DIR` and the profile, without running cargo (`--no-build`).
-fn locate_prebuilt(mission_dir: &Path, cdylib: &str, release: bool) -> Option<PathBuf> {
-    let profile = if release { "release" } else { "debug" };
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        roots.push(PathBuf::from(dir));
-    }
-    // Walk up from the mission dir looking for a `target/` sibling of a
-    // workspace `Cargo.toml`.
-    let mut dir = mission_dir.canonicalize().ok();
-    while let Some(d) = dir {
-        roots.push(d.join("target"));
-        dir = d.parent().map(Path::to_path_buf);
-    }
-    for root in roots {
-        let candidate = root.join(profile).join(cdylib);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------

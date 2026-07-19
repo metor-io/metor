@@ -60,7 +60,9 @@ mod wheel;
 // `super::model`.
 pub(crate) use crate::ir as model;
 
-pub use build_driver::{BuildError, BuildOptions, build_target, provision_artifacts};
+pub use build_driver::{
+    BuildError, BuildOptions, build_target, locate_artifacts, provision_artifacts,
+};
 pub use builder::{ArtifactSystemBuilder, SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use bundle::{
     BundleError, BundleMeta, METOR_EXTENSION, PackProvenance, PackSourceKind, PackageOptions,

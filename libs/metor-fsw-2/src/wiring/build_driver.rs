@@ -35,8 +35,11 @@
 //! run its own output, so the crate is additionally built for the host and
 //! that twin is described instead.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use super::model::Wiring;
 
@@ -159,6 +162,18 @@ pub enum BuildError {
         /// The triples the directory does ship.
         available: Vec<String>,
     },
+    /// `--no-build` was requested but a crate artifact's library has not
+    /// been built yet.
+    #[error(
+        "no built `{cdylib}` found for `{crate_name}`; build it first, or drop `--no-build` to \
+         let cargo provision it"
+    )]
+    NotBuilt {
+        /// The crate whose library is missing.
+        crate_name: String,
+        /// The cdylib file name that was searched for.
+        cdylib: String,
+    },
     /// A prebuilt artifact needs a target triple to select by, and neither a
     /// `--target` nor the host triple could be determined.
     #[error(
@@ -244,16 +259,27 @@ fn shipped_triples(dir: &Path) -> Vec<String> {
 
 /// Runs `cargo build -p <crate_name>` and returns the located cdylib path.
 fn build_one(crate_name: &str, cdylib: &str, opts: &BuildOptions) -> Result<PathBuf, BuildError> {
-    build_cdylib("build", crate_name, cdylib, opts)
+    let label = match requested_target(&opts.extra_args) {
+        Some(triple) => format!("{crate_name} ({triple})"),
+        None => crate_name.to_string(),
+    };
+    build_cdylib("build", crate_name, cdylib, opts, &label)
 }
 
 /// [`build_one`] with the cargo subcommand parameterized — `"zigbuild"` runs
 /// the `cargo-zigbuild` cross builder with the same output-location scan.
+///
+/// The build reports through tracing: a `build`-target span for its whole
+/// duration (the CLI renders active spans as a pinned progress line, keyed on
+/// `label`), each cargo stderr line as a `cargo`-target event as it arrives,
+/// and a `build`-target completion event. Without a subscriber all of it is
+/// silent, so library callers see no output.
 pub(super) fn build_cdylib(
     subcommand: &str,
     crate_name: &str,
     cdylib: &str,
     opts: &BuildOptions,
+    label: &str,
 ) -> Result<PathBuf, BuildError> {
     // Prefer the cargo that invoked this process, falling back to PATH.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
@@ -265,22 +291,68 @@ pub(super) fn build_cdylib(
     for arg in &opts.extra_args {
         cmd.arg(arg);
     }
-    let output = cmd.output().map_err(|source| BuildError::Spawn {
-        crate_name: crate_name.to_string(),
-        source,
-    })?;
-    if !output.status.success() {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let span = tracing::info_span!(target: "build", "build", %label);
+    span.pb_set_message(label);
+    let started = std::time::Instant::now();
+    let mut json = String::new();
+    let (stderr, status) = {
+        let _entered = span.enter();
+        let mut child = cmd.spawn().map_err(|source| BuildError::Spawn {
+            crate_name: crate_name.to_string(),
+            source,
+        })?;
+        let child_stderr = child.stderr.take().expect("stderr piped");
+        let mut child_stdout = child.stdout.take().expect("stdout piped");
+
+        // Stream cargo's stderr through tracing as it arrives — keeping a
+        // copy for the failure diagnostic — while this thread drains the JSON
+        // stdout. Both pipes are consumed concurrently, so neither can fill
+        // and stall cargo. A side benefit of the pipe: cargo emits plain
+        // `Compiling` lines instead of its own progress bar.
+        let stderr = std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut buf = String::new();
+                let lines = std::io::BufReader::new(child_stderr).lines();
+                for line in lines.map_while(Result::ok) {
+                    tracing::info!(target: "cargo", "{line}");
+                    if let Some(unit) = line.trim_start().strip_prefix("Compiling ") {
+                        // `Compiling <name> <version> (<path>)` — drop the path.
+                        let unit = unit.split(" (").next().unwrap_or(unit);
+                        span.pb_set_message(&format!("{label} · {unit}"));
+                    }
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                buf
+            });
+            std::io::Read::read_to_string(&mut child_stdout, &mut json).ok();
+            reader.join().expect("stderr reader does not panic")
+        });
+        let status = child.wait().map_err(|source| BuildError::Spawn {
+            crate_name: crate_name.to_string(),
+            source,
+        })?;
+        (stderr, status)
+    };
+    drop(span);
+    if !status.success() {
         return Err(BuildError::CargoFailed {
             crate_name: crate_name.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr,
         });
     }
+    tracing::info!(
+        target: "build",
+        "✓ {label} ({:.1}s)",
+        started.elapsed().as_secs_f32()
+    );
 
     // Each `compiler-artifact` line carries a `"filenames":[...]` array whose
     // entries are quoted paths, so splitting on `"` yields each path as one token.
     // That is enough to find the cdylib without pulling in a JSON parser.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
+    for line in json.lines() {
         if !line.contains("compiler-artifact") || !line.contains(cdylib) {
             continue;
         }
@@ -297,6 +369,57 @@ pub(super) fn build_cdylib(
         crate_name: crate_name.to_string(),
         cdylib: cdylib.to_string(),
     })
+}
+
+/// Fill every artifact path without running cargo (`--no-build`): a prebuilt
+/// artifact selects by triple as always, a crate artifact is searched for
+/// under the workspace target directory via [`locate_built`]. A missing
+/// library is a hard [`BuildError::NotBuilt`]. No sidecar work — a previously
+/// built library has its sidecar adjacent, and resolve's staleness gate
+/// covers it.
+pub fn locate_artifacts(
+    wiring: &mut Wiring,
+    mission_dir: &Path,
+    release: bool,
+) -> Result<(), BuildError> {
+    for artifact in &mut wiring.artifacts {
+        if let Some(dir) = artifact.prebuilt_dir.clone() {
+            artifact.path = Some(select_prebuilt(artifact, &dir, None)?);
+            continue;
+        }
+        let cdylib = super::cdylib_file_name(&artifact.lib);
+        let path =
+            locate_built(mission_dir, &cdylib, release).ok_or_else(|| BuildError::NotBuilt {
+                crate_name: artifact.crate_name.clone(),
+                cdylib: cdylib.clone(),
+            })?;
+        artifact.path = Some(path);
+    }
+    Ok(())
+}
+
+/// Search the workspace target directory for an already-built cdylib,
+/// respecting `CARGO_TARGET_DIR` and the profile, without running cargo.
+pub(super) fn locate_built(search_root: &Path, cdylib: &str, release: bool) -> Option<PathBuf> {
+    let profile = if release { "release" } else { "debug" };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        roots.push(PathBuf::from(dir));
+    }
+    // Walk up from the search root looking for a `target/` sibling of a
+    // workspace `Cargo.toml`.
+    let mut dir = search_root.canonicalize().ok();
+    while let Some(d) = dir {
+        roots.push(d.join("target"));
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    for root in roots {
+        let candidate = root.join(profile).join(cdylib);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -327,9 +450,12 @@ fn write_manifest_sidecar(
         };
         // The host twin's output carries the *host* platform's file name.
         let cdylib = super::cdylib_file_name(lib);
-        build_one(crate_name, &cdylib, &host_opts).map_err(|source| BuildError::HostBuild {
-            crate_name: crate_name.to_string(),
-            source: Box::new(source),
+        let label = format!("{crate_name} (host sidecar twin)");
+        build_cdylib("build", crate_name, &cdylib, &host_opts, &label).map_err(|source| {
+            BuildError::HostBuild {
+                crate_name: crate_name.to_string(),
+                source: Box::new(source),
+            }
         })?
     } else {
         so.to_path_buf()
@@ -511,6 +637,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+/// Copy via a temp file + rename. Replacing the destination at a fresh inode
+/// is load-bearing for dylib payloads on macOS: the kernel kill-caches code
+/// signatures by inode, so a process that `dlopen`s an in-place-overwritten
+/// dylib is SIGKILLed even though the new signature is valid.
+pub(super) fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut tmp = dst.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::copy(src, &tmp)?;
+    std::fs::rename(&tmp, dst)
 }
 
 #[cfg(test)]
@@ -772,6 +910,39 @@ mod tests {
             }
             other => panic!("expected PrebuiltMissing, got {other}"),
         }
+    }
+
+    /// `locate_artifacts` finds an already-built library without cargo, and a
+    /// never-built one is a hard `NotBuilt` — the `run --no-build` contract.
+    #[test]
+    #[cfg(not(miri))]
+    fn locate_artifacts_finds_built_and_refuses_missing() {
+        let _guard = FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut built = fixture_wiring();
+        if let Err(e) = provision_artifacts(&mut built, &BuildOptions::default()) {
+            eprintln!("skipping: provision_artifacts failed: {e}");
+            return;
+        }
+        let so = built.artifacts[0].path.clone().expect("path filled");
+
+        // Locating from the crate dir walks up to the same workspace target
+        // dir the build wrote into.
+        let mut wiring = fixture_wiring();
+        locate_artifacts(&mut wiring, Path::new("."), false).expect("built library is found");
+        assert_eq!(
+            wiring.artifacts[0].path.as_ref().unwrap().file_name(),
+            so.file_name()
+        );
+
+        // A library that was never built is a hard error naming the crate.
+        let mut missing = super::super::WiringBuilder::new()
+            .artifact("missing", "no-such-crate", "metor_fsw_2_never_built")
+            .build();
+        let err = locate_artifacts(&mut missing, Path::new("."), false)
+            .expect_err("a never-built library is refused");
+        assert!(matches!(err, BuildError::NotBuilt { .. }), "{err}");
     }
 
     /// The compile-time triple and cargo's own view of the host agree, so the

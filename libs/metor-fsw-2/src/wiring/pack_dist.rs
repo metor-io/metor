@@ -20,6 +20,7 @@
 //! published one. A pack's PEP 517 backend runs this on `uv sync`; the
 //! multi-triple `pack build`/`publish` flow lands in phase 2.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use super::stubgen::{StubFlavor, render_module};
@@ -545,7 +546,8 @@ fn build_target_cdylib(
             ],
             manifest_sidecar: false,
         };
-        super::build_driver::build_cdylib(subcommand, &config.crate_name, &cdylib, &opts)
+        let label = format!("{} ({triple})", config.crate_name);
+        super::build_driver::build_cdylib(subcommand, &config.crate_name, &cdylib, &opts, &label)
     };
     match &config.builder {
         Builder::Cargo => cargo_family("build").map_err(PackError::Build),
@@ -558,20 +560,8 @@ fn build_target_cdylib(
                         .replace("{crate}", &config.crate_name)
                 })
                 .collect();
-            let status = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .current_dir(dir)
-                .status()
-                .map_err(|e| PackError::BuilderCommand {
-                    triple: triple.to_string(),
-                    detail: e.to_string(),
-                })?;
-            if !status.success() {
-                return Err(PackError::BuilderCommand {
-                    triple: triple.to_string(),
-                    detail: format!("exit {status}"),
-                });
-            }
+            let label = format!("{} ({triple})", config.crate_name);
+            run_streamed(&argv, dir, triple, &label)?;
             locate_conventional(dir, triple, &cdylib).ok_or_else(|| {
                 PackError::CommandOutputMissing {
                     cdylib,
@@ -580,6 +570,68 @@ fn build_target_cdylib(
             })
         }
     }
+}
+
+/// Run a builder command template with its output streamed through tracing —
+/// the same `build` span / `cargo` event shape as the cargo drivers, so a
+/// template builder shares the CLI's pinned progress line.
+fn run_streamed(argv: &[String], dir: &Path, triple: &str, label: &str) -> Result<(), PackError> {
+    use tracing_indicatif::span_ext::IndicatifSpanExt;
+
+    let command_err = |detail: String| PackError::BuilderCommand {
+        triple: triple.to_string(),
+        detail,
+    };
+    let span = tracing::info_span!(target: "build", "build", %label);
+    span.pb_set_message(label);
+    let started = std::time::Instant::now();
+    let (tail, status) = {
+        let _entered = span.enter();
+        let mut child = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| command_err(e.to_string()))?;
+        let child_stdout = child.stdout.take().expect("stdout piped");
+        let child_stderr = child.stderr.take().expect("stderr piped");
+
+        // Both pipes stream as they arrive; stderr additionally keeps a short
+        // tail for the failure diagnostic (a subscriber-less library caller
+        // would otherwise see only the exit code).
+        let tail = std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut tail: Vec<String> = Vec::new();
+                let lines = std::io::BufReader::new(child_stderr).lines();
+                for line in lines.map_while(Result::ok) {
+                    tracing::info!(target: "cargo", "{line}");
+                    if tail.len() == 8 {
+                        tail.remove(0);
+                    }
+                    tail.push(line);
+                }
+                tail
+            });
+            let lines = std::io::BufReader::new(child_stdout).lines();
+            for line in lines.map_while(Result::ok) {
+                tracing::info!(target: "cargo", "{line}");
+            }
+            reader.join().expect("stderr reader does not panic")
+        });
+        let status = child.wait().map_err(|e| command_err(e.to_string()))?;
+        (tail, status)
+    };
+    drop(span);
+    if !status.success() {
+        return Err(command_err(format!("exit {status}:\n{}", tail.join("\n"))));
+    }
+    tracing::info!(
+        target: "build",
+        "✓ {label} ({:.1}s)",
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
 }
 
 /// Find a command-builder's output at cargo's conventional
@@ -639,6 +691,7 @@ fn assemble_wheel(
     libs: &[PathBuf],
     wheel_out: &Path,
 ) -> Result<PathBuf, PackError> {
+    let _span = tracing::info_span!(target: "build", "wheel", label = %config.dist_name).entered();
     let triples = staged_triples(libs);
     if triples.is_empty() {
         return Err(PackError::NothingStaged {
@@ -817,12 +870,10 @@ pub fn pack_publish(
 }
 
 fn copy(src: &Path, dst: &Path) -> Result<(), PackError> {
-    std::fs::copy(src, dst)
-        .map(|_| ())
-        .map_err(|source| PackError::Write {
-            path: dst.to_path_buf(),
-            source,
-        })
+    super::build_driver::copy_atomic(src, dst).map_err(|source| PackError::Write {
+        path: dst.to_path_buf(),
+        source,
+    })
 }
 
 fn write(path: &Path, bytes: &[u8]) -> Result<(), PackError> {

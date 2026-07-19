@@ -414,7 +414,9 @@ fn write_dir(members: &[(String, MemberSource)], dir: &Path) -> Result<(), Bundl
         match source {
             MemberSource::Inline(bytes) => fs::write(&dst, bytes).map_err(io_at(&dst))?,
             MemberSource::Path(src) => {
-                fs::copy(src, &dst).map_err(io_at(&dst))?;
+                // Fresh-inode replacement: macOS kill-caches dylib signatures
+                // by inode, and bundles are repackaged over themselves.
+                super::build_driver::copy_atomic(src, &dst).map_err(io_at(&dst))?;
             }
         }
     }
