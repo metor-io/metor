@@ -9,7 +9,7 @@
 //! popovers. Chips truncate to the gap before the next flag and collapse to a
 //! bare nub when even a couple of characters won't fit.
 
-use gpui::{Bounds, Hsla, PathBuilder, Pixels, SharedString, TextRun, Window, point, px};
+use gpui::{Bounds, Hsla, PathBuilder, Pixels, Rgba, SharedString, TextRun, Window, point, px};
 use metor_proto::types::Timestamp;
 
 use super::{PlotView, plot_area};
@@ -41,6 +41,22 @@ const CLUSTER_PX: f32 = 6.0;
 /// Pointer-to-flag distance treated as a hit left of the rule; to the right
 /// the whole estimated chip width hits.
 pub(super) const FLAG_HIT_PX: f32 = 8.0;
+
+/// Opaque blend of `fg` into `bg` by `t` — the chip background: the same
+/// dimmed shade a translucent tint would show over the plot, but occluding
+/// the traces beneath so the label stays readable.
+fn mix(bg: Hsla, fg: Hsla, t: f32) -> Hsla {
+    let b = Rgba::from(bg);
+    let f = Rgba::from(fg);
+    let lerp = |a: f32, c: f32| a + (c - a) * t;
+    Rgba {
+        r: lerp(b.r, f.r),
+        g: lerp(b.g, f.g),
+        b: lerp(b.b, f.b),
+        a: 1.0,
+    }
+    .into()
+}
 
 /// Exact-equality check for two colors — [`Hsla`] has no `PartialEq`, and a
 /// cluster only needs to know whether every event shares one resolved color.
@@ -158,6 +174,7 @@ pub(super) fn paint_event_flags(
         return;
     }
     let pb = plot_area(outer_bounds, view.axis_count());
+    let plot_bg = crate::theme::theme(cx).bg_primary;
     let chip_font_size = px(CHIP_FONT_SIZE);
     let font = window.text_style().font();
     let top = pb.origin.y;
@@ -174,7 +191,7 @@ pub(super) fn paint_event_flags(
             a: 0.5,
             ..cluster.color
         };
-        let mut rule = PathBuilder::stroke(px(1.0));
+        let mut rule = PathBuilder::stroke(px(2.0));
         rule.move_to(point(x, top));
         rule.line_to(point(x, bottom));
         if let Ok(path) = rule.build() {
@@ -213,10 +230,7 @@ pub(super) fn paint_event_flags(
                 window.paint_quad(gpui::quad(
                     chip,
                     px(CHIP_RADIUS),
-                    Hsla {
-                        a: 0.16,
-                        ..cluster.color
-                    },
+                    mix(plot_bg, cluster.color, 0.18),
                     px(1.0),
                     Hsla {
                         a: 0.55,
