@@ -246,14 +246,17 @@ pub(crate) fn pending_node(
     entry: &mut crate::pack::PackEntry,
     params: crate::pack::EntryParams<'_>,
 ) -> Result<Node, crate::pack::MakeError> {
-    let pending = entry.create(params)?;
+    let created = entry.create(params)?;
+    let desc = created
+        .instance_desc
+        .unwrap_or_else(|| entry.descriptor().clone());
     let driver = PendingDriver {
-        pending,
+        pending: created.pending,
         entry_name: entry.name(),
     };
     Ok(Node {
         name,
-        desc: entry.descriptor().clone(),
+        desc,
         bind: SystemBind::Cyclic(Box::new(driver)),
     })
 }

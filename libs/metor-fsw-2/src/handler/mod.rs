@@ -81,6 +81,9 @@ pub struct InitWith<G, M2> {
 /// A prebuilt state moved into the entry (instantiable once).
 pub struct Prebuilt<S>(Option<S>);
 
+/// An attachment to a pack-shared state (instantiable once).
+pub struct Attached<S>(crate::Shared<S>);
+
 impl<S, M, F> SystemDef<S, M, F, NoInit>
 where
     F: ExecuteFn<S, M>,
@@ -109,6 +112,22 @@ where
         SystemDef {
             execute: self.execute,
             init: Prebuilt(Some(state)),
+            _m: PhantomData,
+        }
+    }
+
+    /// Attach to a pack-shared state: the execute fn's `&mut S` is the
+    /// *same* instance every entry attached to `token` sees, granted one
+    /// scoped borrow per step (see the [`shared`](crate::shared) module
+    /// doc). Like [`state`](Self::state), the entry is instantiable once
+    /// and never a slot occupant.
+    pub fn shared(self, token: &crate::Shared<S>) -> SystemDef<S, M, F, Attached<S>>
+    where
+        S: crate::SharedLifecycle,
+    {
+        SystemDef {
+            execute: self.execute,
+            init: Attached(token.clone()),
             _m: PhantomData,
         }
     }
@@ -207,10 +226,14 @@ where
                 let execute = execute.clone();
                 let pending: Pending = Box::new(move |src, mount| {
                     mount_driver(src, mount, move |src| {
-                        Box::new(FnDriver::bind(S::default(), execute, src))
+                        Box::new(FnDriver::bind(
+                            driver::StateAccess::Owned(S::default()),
+                            execute,
+                            src,
+                        ))
                     })
                 });
-                Ok(pending)
+                Ok(pending.into())
             }),
         }
     }
@@ -240,10 +263,14 @@ where
                 let execute = execute.clone();
                 let pending: Pending = Box::new(move |src, mount| {
                     mount_driver(src, mount, move |src| {
-                        Box::new(FnDriver::bind(state, execute, src))
+                        Box::new(FnDriver::bind(
+                            driver::StateAccess::Owned(state),
+                            execute,
+                            src,
+                        ))
                     })
                 });
-                Ok(pending)
+                Ok(pending.into())
             }),
         };
         if entry.params_default.is_some() {
@@ -274,10 +301,58 @@ where
                 let execute = execute.clone();
                 let pending: Pending = Box::new(move |src, mount| {
                     mount_driver(src, mount, move |src| {
-                        Box::new(FnDriver::bind(state, execute, src))
+                        Box::new(FnDriver::bind(
+                            driver::StateAccess::Owned(state),
+                            execute,
+                            src,
+                        ))
                     })
                 });
-                Ok(pending)
+                Ok(pending.into())
+            }),
+        }
+    }
+}
+
+impl<S, M, F> IntoPackEntry for SystemDef<S, M, F, Attached<S>>
+where
+    S: crate::SharedLifecycle,
+    M: 'static,
+    F: ExecuteFn<S, M> + Clone,
+{
+    fn into_entry(self, name: &'static str) -> PackEntry {
+        let execute = self.execute;
+        let token = self.init.0;
+        let mut taken = false;
+        PackEntry {
+            name,
+            descriptor: descriptor_for::<F::Params>(name),
+            params_schema: <() as Schema>::SCHEMA,
+            params_default: None,
+            reloadable: false,
+            create: Box::new(move |params: EntryParams<'_>| {
+                decode_params::<()>(params)?;
+                if taken {
+                    return Err(MakeError::SharedEntryReinstantiated);
+                }
+                let cell = token.erased();
+                if !cell.is_constructed() {
+                    return Err(MakeError::StateNotConstructed { state: cell.name() });
+                }
+                taken = true;
+                let token = token.clone();
+                let execute = execute.clone();
+                let pending: Pending = Box::new(move |src, mount| {
+                    mount_driver(src, mount, move |src| {
+                        let inner = FnDriver::bind(
+                            driver::StateAccess::Shared(token.clone()),
+                            execute,
+                            src,
+                        );
+                        Box::new(crate::pack::AttachedDriver::new(Box::new(inner), cell))
+                    })
+                });
+                Ok(pending.into())
             }),
         }
     }

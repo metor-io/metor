@@ -197,6 +197,11 @@ pub enum SlotConfigError {
         occupant: String,
         port: &'static str,
     },
+    #[error(
+        "allowed occupant `{occupant}` declares a capability; capability \
+         systems are wired for the whole run, never slot occupants"
+    )]
+    CapabilityOccupant { occupant: String },
 }
 
 /// The pure-spec half of slot validation: a non-empty allowed set, and an
@@ -244,6 +249,14 @@ pub(crate) fn plan_slot(
         .count();
     if n_proc != 0 && n_proc != allowed.len() {
         return Err(SlotConfigError::MixedBacking);
+    }
+    if let Some(occ) = allowed
+        .iter()
+        .find(|a| !a.descriptor.capabilities.is_empty())
+    {
+        return Err(SlotConfigError::CapabilityOccupant {
+            occupant: occ.name.clone(),
+        });
     }
     let process = n_proc == allowed.len();
     // Every allowed occupant must share the contract; the slot sizes and

@@ -371,11 +371,24 @@ pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_v
     // SAFETY: caller asserts `pack` is a live `PackHost` from `run_pack_open`.
     let host = unsafe { &*(pack as *mut PackHost) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // Shared state and capabilities stay on the static registry: a
+        // loaded artifact gets neither a cross-FFI state-construction call
+        // nor a read grant over every ring.
+        assert!(
+            host.pack.state_entries().next().is_none(),
+            "packs with shared state cannot export over the pack ABI"
+        );
         let msg = PackManifest {
             systems: host
                 .pack
                 .entries()
                 .map(|e| {
+                    assert!(
+                        e.descriptor().capabilities.is_empty(),
+                        "entry `{}` declares a capability; capability entries \
+                         cannot export over the pack ABI",
+                        e.name(),
+                    );
                     let schema = OwnedNamedType::from(e.params_schema());
                     // Params docs are collected from this `.so`'s own
                     // `#[derive(ParamsDocs)]` submissions, keyed by schema name.
@@ -432,11 +445,19 @@ pub unsafe fn run_pack_create(
             .pack
             .entry_at_mut(index as usize)
             .expect("entry index in range (host resolved it from this pack's manifest)");
-        let pending = entry
+        let created = entry
             .create(crate::EntryParams::Postcard(bytes))
             .expect("entry create (params decode + state construction)");
+        // The host binds positionally against the exported static manifest;
+        // an instance that minted ports would misbind silently, so it is
+        // rejected here instead.
+        assert!(
+            created.instance_desc.is_none(),
+            "entry `{}` minted ports at create; config-minted ports cannot cross the pack ABI",
+            entry.name(),
+        );
         Box::into_raw(Box::new(PackAbiState {
-            pending: Some(pending),
+            pending: Some(created.pending),
             mount: mount_from_raw(mount),
             driver: None,
             poisoned: false,

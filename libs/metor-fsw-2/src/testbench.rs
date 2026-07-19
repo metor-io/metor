@@ -62,8 +62,11 @@ impl TestBench {
     /// `&[]` for a paramless entry), allocate a ring per declared port, and
     /// bind it exactly as the coordinator would.
     pub fn new(entry: &mut PackEntry, params: &[u8]) -> Result<Self, MakeError> {
-        let pending = entry.create(EntryParams::Postcard(params))?;
-        let descriptor = entry.descriptor().clone();
+        let crate::Created {
+            pending,
+            instance_desc,
+        } = entry.create(EntryParams::Postcard(params))?;
+        let descriptor = instance_desc.unwrap_or_else(|| entry.descriptor().clone());
         let input_rings: Vec<RingBuffer> = descriptor.inputs.iter().map(ring_for).collect();
         let output_rings: Vec<RingBuffer> = descriptor.outputs.iter().map(ring_for).collect();
         // Claim the bench's read views before the entry binds or inits, so

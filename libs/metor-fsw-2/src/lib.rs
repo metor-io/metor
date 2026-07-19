@@ -115,6 +115,7 @@ mod message;
 mod pack;
 mod port;
 mod registry;
+mod shared;
 mod system;
 mod telemetry;
 mod testbench;
@@ -164,7 +165,11 @@ pub use handler::{
     AsyncSystemFn, BindCx, CycleCx, DeclSink, ExecParam, ExecParamSet, ExecuteFn, InitFn,
     IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
 };
-pub use pack::{Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus};
+pub use pack::{
+    Created, Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StateEntry,
+    StepStatus,
+};
+pub use shared::{Shared, SharedGuard, SharedLifecycle};
 pub use registry::{AllOutputs, Registry, RegistryEntry};
 pub use telemetry::{
     DownlinkParams, RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,

@@ -740,14 +740,18 @@ pub(super) fn slot_config_error(
             }
             .at(src, span)
         }
-        // A mount-reserved port is an occupant-contract defect too: the
-        // artifact predates the pack ABI and must be rebuilt.
+        // A mount-reserved port and a declared capability are
+        // occupant-contract defects too: the occupant cannot honor the
+        // slot's contract as declared.
         SlotConfigError::OccupantMismatch { occupant, .. }
-        | SlotConfigError::ReservedPort { occupant, .. } => LoadErrorKind::SlotOccupantMismatch {
-            slot: name,
-            occupant,
+        | SlotConfigError::ReservedPort { occupant, .. }
+        | SlotConfigError::CapabilityOccupant { occupant } => {
+            LoadErrorKind::SlotOccupantMismatch {
+                slot: name,
+                occupant,
+            }
+            .at(src, span)
         }
-        .at(src, span),
         SlotConfigError::MixedBacking => {
             unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
         }
