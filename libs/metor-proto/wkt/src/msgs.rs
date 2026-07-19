@@ -821,9 +821,10 @@ pub enum LogLevel {
 /// log call) and host `tracing` events routed through the forwarding layer.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct LogEvent {
-    /// Source-side event time: the cycle timestamp for health-port lines, wall
-    /// clock for tracing events. The two clocks diverge under a simulated
-    /// clock, so consumers must not merge-sort across them.
+    /// Source-side event time on the mission clock: health-port lines and
+    /// forwarded tracing events are both stamped with the cycle timestamp of
+    /// the cycle that flushed them (wall time equals it only under a wall
+    /// clock).
     pub timestamp: Timestamp,
     pub level: LogLevel,
     /// Filter key: the emitting system's instance name for health-port lines,

@@ -152,7 +152,9 @@ where
             names.join(":")
         });
         let ev = LogEvent {
-            timestamp: Timestamp::now(),
+            // Mission time at the instant the event fired; wall only before
+            // the first cycle (build/init), which coincides with the epoch.
+            timestamp: crate::clock::mission_now_or_wall(),
             level: level_of(meta.level()),
             source: meta.target().to_string(),
             target: meta.target().to_string(),

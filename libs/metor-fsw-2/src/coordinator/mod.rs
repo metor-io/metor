@@ -633,6 +633,10 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => simulated_now(epoch, dt, k as u64),
             };
+            // Publish to the ambient mission clock before anything steps, so
+            // out-of-port stamps (tracing events, async health) land on the
+            // cycle timeline.
+            crate::clock::set_mission_now(now);
             // A reload request re-emits the registry and manifest for consumers
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.

@@ -278,6 +278,7 @@ fn dlopen_cyclic_system_end_to_end() {
     });
 
     // 5. The loaded system produced correct output: count = start + value.
+    let mut last_out_ts = Timestamp(0);
     {
         let out = out_view
             .latest()
@@ -288,6 +289,7 @@ fn dlopen_cyclic_system_end_to_end() {
             1000 + CYCLES as u64,
             "start + latest value"
         );
+        last_out_ts = out.get().timestamp;
     }
 
     // 5a. The second instance of the same entry ran independently, with its
@@ -329,6 +331,13 @@ fn dlopen_cyclic_system_end_to_end() {
         .find(|ev| ev.message == "tick counted")
         .expect("the pack's tracing event reached its log port");
     assert_eq!(ev.source, "dl_counter", "attributed to the instance");
+    // Born on the mission clock: the ABI shim republishes each step's `now`
+    // inside the dylib, so the last cycle's event carries exactly the cycle
+    // timestamp the last tick_out frame does.
+    assert!(
+        traced.iter().any(|ev| ev.timestamp == last_out_ts),
+        "traced events live on the simulated cycle clock, not wall time"
+    );
     assert_eq!(ev.level, metor_fsw_2::LogLevel::Info);
     assert!(
         ev.fields.iter().any(|(k, _)| k == "count"),

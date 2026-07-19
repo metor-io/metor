@@ -120,6 +120,7 @@ mod telemetry;
 mod testbench;
 mod writer;
 
+pub mod clock;
 pub mod health;
 pub mod logfwd;
 

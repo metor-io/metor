@@ -9341,6 +9341,8 @@ dependencies = [
  "peg",
  "pollster 0.4.0",
  "postcard",
+ "postcard-dyn",
+ "postcard-schema",
  "regex",
  "rustfft",
  "serde",

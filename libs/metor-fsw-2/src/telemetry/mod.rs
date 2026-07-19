@@ -649,13 +649,13 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                     crate::health::LogLevel::Warn,
                     "uplink has no msgs configured; it will receive nothing",
                 );
-                health.end_cycle(Timestamp::now(), 0);
+                health.end_cycle(crate::clock::mission_now_or_wall(), 0);
             } else if fan.len() != self.msgs.len() {
                 // One writer per configured msg is the bind contract; a
                 // mismatch means the registered descriptor and this instance
                 // diverged.
                 health.error("uplink_bind_mismatch");
-                health.end_cycle(Timestamp::now(), 0);
+                health.end_cycle(crate::clock::mission_now_or_wall(), 0);
             }
             let ids: Vec<PacketId> = self.msgs.iter().map(|&(_, id)| id).collect();
             self.recv.subscribe(&ids);
@@ -680,12 +680,12 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                             Some(idx) => {
                                 if fan.write_raw(idx, m.id, &m.buf).is_err() {
                                     health.error("uplink_dropped");
-                                    health.end_cycle(Timestamp::now(), 0);
+                                    health.end_cycle(crate::clock::mission_now_or_wall(), 0);
                                 }
                             }
                             None => {
                                 health.error("uplink_unroutable");
-                                health.end_cycle(Timestamp::now(), 0);
+                                health.end_cycle(crate::clock::mission_now_or_wall(), 0);
                             }
                         }
                     }
@@ -697,7 +697,7 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                 Err(_) => {
                     let (_, health) = output.split();
                     health.error("uplink_disconnect");
-                    health.end_cycle(Timestamp::now(), 0);
+                    health.end_cycle(crate::clock::mission_now_or_wall(), 0);
                     if self.backoff == RECONNECT_MIN {
                         // Only on the up→down edge, matching the downlink.
                         tracing::warn!("uplink connection lost; redialing with backoff");
