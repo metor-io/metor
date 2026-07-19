@@ -128,6 +128,10 @@ impl LoadErrorKind {
             ValueParams { .. } => "fsw_wiring::value_params",
             StaticPostcardParams { .. } => "fsw_wiring::static_postcard_params",
             PackCreate { .. } => "fsw_wiring::pack_create",
+            UnknownStateType { .. } => "fsw_wiring::unknown_state_type",
+            DuplicateState { .. } => "fsw_wiring::duplicate_state",
+            StateInit { .. } => "fsw_wiring::state_init",
+            StateUnused { .. } => "fsw_wiring::state_unused",
             PackSystem { .. } => "fsw_wiring::pack_system",
             PackTypeRequired { .. } => "fsw_wiring::pack_type_required",
             OccupantAmbiguous { .. } => "fsw_wiring::occupant_ambiguous",
@@ -195,6 +199,10 @@ impl LoadErrorKind {
                 "typed `params(...)` cannot reach a static system".into()
             }
             PackCreate { .. } => "this system".into(),
+            UnknownStateType { .. } => "no registered pack declares this state type".into(),
+            DuplicateState { .. } => "state names must be unique".into(),
+            StateInit { .. } => "this state's construction failed".into(),
+            StateUnused { .. } => "declared here, attached nowhere".into(),
             PackSystem { .. } => "this instance".into(),
             PackTypeRequired { .. } => "add `type=\"…\"`".into(),
             OccupantAmbiguous { .. } => "this slot".into(),
@@ -384,6 +392,39 @@ pub enum LoadErrorKind {
     /// failure surfaces as its own spanned error instead.
     #[error("system `{system}` failed to create: {message}")]
     PackCreate { system: String, message: String },
+
+    /// A `state` spec's `type=` matches no shared state a registered pack
+    /// declared.
+    #[error(
+        "state `{name}`: no registered pack declares shared state type `{ty}`{}",
+        if available.is_empty() { String::new() } else { format!(" (declared: {available})") }
+    )]
+    UnknownStateType {
+        name: String,
+        ty: String,
+        /// The comma-joined declared state types, for the message.
+        available: String,
+    },
+
+    /// Two `state` specs share one instance name (or one state type, which
+    /// has exactly one instance).
+    #[error("state `{name}` is declared more than once")]
+    DuplicateState { name: String },
+
+    /// A shared state's own init fn failed — resource acquisition, like a
+    /// listener bind — or its params did not decode.
+    #[error("state `{name}` (type `{ty}`) failed to construct: {message}")]
+    StateInit {
+        name: String,
+        ty: String,
+        message: String,
+    },
+
+    /// A declared state no created system attached to: the state would run
+    /// (its lifecycle serves attached systems only) for nobody, which is a
+    /// config defect, not a quiet default.
+    #[error("state `{name}` (type `{ty}`) is declared but no system in this wiring attaches to it")]
+    StateUnused { name: String, ty: String },
 
     /// A loaded pack has no entry under the requested name, or the entry
     /// selection failed (the wrapped [`DlError`](crate::dl::DlError) says

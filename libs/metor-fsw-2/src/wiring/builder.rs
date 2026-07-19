@@ -36,7 +36,7 @@ use serde::Serialize;
 
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, StateSpec, SystemSpec, Wiring,
 };
 use super::validate;
 
@@ -66,6 +66,7 @@ impl WiringBuilder {
                     clock: ClockSpec::Wall,
                 },
                 artifacts: Vec::new(),
+                states: Vec::new(),
                 systems: Vec::new(),
                 slots: Vec::new(),
                 edges: Vec::new(),
@@ -200,6 +201,40 @@ impl WiringBuilder {
             in_: msg,
             delayed: false,
             kind: EdgeKind::Msg,
+            src: None,
+        });
+        self
+    }
+
+    /// Declares a pack-shared state instance: `ty` is the key a registered
+    /// pack declared via [`Pack::shared_state`](crate::Pack::shared_state),
+    /// and `params` is its construction value tree. Panics on a duplicate
+    /// state name or type, the builder's insert-time twin of validate.
+    pub fn state(mut self, name: impl Into<String>, ty: impl Into<String>) -> Self {
+        self.state_value(name, ty, serde_json::Value::Object(serde_json::Map::new()))
+    }
+
+    /// [`state`](Self::state) with an explicit params value tree.
+    pub fn state_value(
+        mut self,
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        params: serde_json::Value,
+    ) -> Self {
+        let name = name.into();
+        let ty = ty.into();
+        assert!(
+            !self
+                .wiring
+                .states
+                .iter()
+                .any(|s| s.name == name || s.ty == ty),
+            "state `{name}` (type `{ty}`) is already declared"
+        );
+        self.wiring.states.push(StateSpec {
+            name,
+            ty,
+            params: ParamSource::Value(params),
             src: None,
         });
         self

@@ -112,8 +112,20 @@ pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Res
         #[cfg(feature = "wiring")]
         EntryParams::Value {
             value, src, name, ..
-        } => crate::wiring::decode_value_params(value, name, src)
-            .map_err(|e| MakeError::Params(Box::new(e))),
+        } => {
+            // The empty surface serves unit and all-defaults params alike:
+            // `{}` cannot deserialize as `()` through serde_json, so route it
+            // through the same dual-shape deserializer the static registry
+            // path uses. A required field still falls through to the spanned
+            // value decode for its missing-field error.
+            if value.as_object().is_some_and(|m| m.is_empty())
+                && let Ok(p) = P::deserialize(crate::wiring::NoParams)
+            {
+                return Ok(p);
+            }
+            crate::wiring::decode_value_params(value, name, src)
+                .map_err(|e| MakeError::Params(Box::new(e)))
+        }
     }
 }
 
@@ -359,6 +371,7 @@ impl Pack {
                 system.configure(&crate::BuildCtx { msgs })?;
             }
             taken = true;
+            cell.attach();
             let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
             let cell = cell.clone();
             let pending: Pending = Box::new(move |src, mount| {
@@ -691,11 +704,12 @@ pub(crate) struct AttachedDriver {
 }
 
 impl AttachedDriver {
+    /// The attach count was taken at entry create (where the wiring's
+    /// unused-state check reads it); this pairs the release with it.
     pub(crate) fn new(
         inner: Box<dyn Driver>,
         cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
     ) -> Self {
-        cell.attach();
         Self { inner, cell }
     }
 }

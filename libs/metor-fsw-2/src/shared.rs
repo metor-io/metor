@@ -132,11 +132,14 @@ impl<S> DerefMut for SharedGuard<'_, S> {
 pub(crate) trait ErasedShared {
     fn name(&self) -> &'static str;
     fn is_constructed(&self) -> bool;
-    /// Count an attached driver in; pairs with [`release`](Self::release).
+    /// Count an attached entry in (at entry create, so the wiring's
+    /// unused-state check sees it); pairs with [`release`](Self::release).
     fn attach(&self);
+    /// Live attachments, for the unused-state check.
+    fn attached(&self) -> usize;
     /// Run `start` once, on the first attached init.
     fn ensure_started(&self);
-    /// Count an attached driver out; the last release runs `shutdown`.
+    /// Count an attached entry out; the last release runs `shutdown`.
     fn release(&self);
 }
 
@@ -151,6 +154,10 @@ impl<S: SharedLifecycle> ErasedShared for SharedCell<S> {
 
     fn attach(&self) {
         self.attached_live.set(self.attached_live.get() + 1);
+    }
+
+    fn attached(&self) -> usize {
+        self.attached_live.get()
     }
 
     fn ensure_started(&self) {

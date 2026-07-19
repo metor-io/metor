@@ -27,6 +27,7 @@
       "src": null
     }
   ],
+  "states": [],
   "systems": [
     {
       "name": "block.plant",

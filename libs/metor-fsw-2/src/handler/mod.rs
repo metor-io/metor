@@ -340,6 +340,7 @@ where
                     return Err(MakeError::StateNotConstructed { state: cell.name() });
                 }
                 taken = true;
+                cell.attach();
                 let token = token.clone();
                 let execute = execute.clone();
                 let pending: Pending = Box::new(move |src, mount| {

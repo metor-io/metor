@@ -71,8 +71,8 @@ pub use bundle::{
 pub use error::{Anchor, LoadError, LoadErrorKind};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
-    InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef, SystemSpec,
-    TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
+    InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef, StateSpec,
+    SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
 pub use pack_dist::{
     Builder, DEFAULT_TARGETS, PackBuildOptions, PackBuildReport, PackConfig, PackDevOptions,
@@ -82,6 +82,7 @@ pub use pack_dist::{
 pub use params::encode_value_params;
 pub use py::{eval_python_mission, is_python_mission};
 pub use registry::{AsyncKind, CyclicKind, IntoNode, Registry};
+pub(crate) use registry::NoParams;
 pub use resolve::{ResolveOptions, resolve, resolve_with};
 pub use stubgen::{StubgenError, StubgenOptions, StubgenReport, stubgen};
 

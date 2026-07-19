@@ -54,6 +54,11 @@ pub struct Wiring {
     pub coordinator: CoordinatorSpec,
     /// The shared objects this mission loads, one pack per cdylib.
     pub artifacts: Vec<Artifact>,
+    /// The pack-shared state instances, constructed before any system (see
+    /// [`Pack::shared_state`](crate::Pack::shared_state)). A document that
+    /// omits the field declares none.
+    #[serde(default)]
+    pub states: Vec<StateSpec>,
     /// The system instances, either static (resolved in the
     /// [`Registry`](crate::wiring::Registry)) or loaded from an [`Artifact`].
     pub systems: Vec<SystemSpec>,
@@ -215,6 +220,26 @@ pub struct DistRef {
     pub name: String,
     /// The distribution version string.
     pub version: String,
+}
+
+/// One pack-shared state instance: a `type=` declared by a statically
+/// registered pack via [`Pack::shared_state`](crate::Pack::shared_state),
+/// constructed once from `params` before any system. Systems attach to it
+/// structurally — inside the declaring `pack()` — so a spec carries no
+/// reference field; the declaration exists so the state's own params
+/// (a listen address) live in the mission document like everything else.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StateSpec {
+    /// The instance name, for diagnostics and host lookups.
+    pub name: String,
+    /// The pack-declared state key.
+    pub ty: String,
+    /// Where the state's params come from. [`ParamSource::Postcard`] is
+    /// rejected: states construct on the static path only.
+    pub params: ParamSource,
+    /// Where this state was declared.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
 }
 
 /// One system instance. With `artifact = None` the type is resolved in the

@@ -17,8 +17,8 @@
 use miette::SourceSpan;
 
 use super::model::IR_VERSION;
-use super::model::{Artifact, ParamSource, SlotSpec, SystemSpec, Wiring};
-use super::resolve::{slot_config_error, slot_src, src_anchor, system_src};
+use super::model::{Artifact, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
+use super::resolve::{slot_config_error, slot_src, src_anchor, state_src, system_src};
 use super::{LoadError, LoadErrorKind};
 use crate::coordinator::validate_slot_spec;
 
@@ -32,6 +32,10 @@ pub(crate) fn validate(wiring: &Wiring) -> Result<(), LoadError> {
     check_scope_refs(wiring)?;
     check_instance_names(wiring)?;
     check_artifact_ids(wiring)?;
+    check_state_names(wiring)?;
+    for state in &wiring.states {
+        check_state(state)?;
+    }
     for spec in &wiring.systems {
         check_system(spec, wiring)?;
     }
@@ -113,6 +117,40 @@ fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
             .whole(artifact_src(artifact)));
         }
         seen.push(&artifact.id);
+    }
+    Ok(())
+}
+
+/// State names and types are each unique: a state type has exactly one
+/// instance (the pack declared one cell), so a second spec of either kind
+/// could only shadow or double-construct.
+fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut types: Vec<&str> = Vec::new();
+    for state in &wiring.states {
+        if names.contains(&state.name.as_str()) || types.contains(&state.ty.as_str()) {
+            return Err(LoadErrorKind::DuplicateState {
+                name: state.name.clone(),
+            }
+            .whole(state_src(state)));
+        }
+        names.push(&state.name);
+        types.push(&state.ty);
+    }
+    Ok(())
+}
+
+/// One state spec's structural rules: states construct on the static value
+/// path only, so typed postcard params cannot reach one.
+pub(crate) fn check_state(state: &StateSpec) -> Result<(), LoadError> {
+    if matches!(state.params, ParamSource::Postcard(_)) {
+        return Err(LoadErrorKind::StateInit {
+            name: state.name.clone(),
+            ty: state.ty.clone(),
+            message: "typed postcard params cannot construct a state (states decode value trees)"
+                .into(),
+        }
+        .whole(state_src(state)));
     }
     Ok(())
 }

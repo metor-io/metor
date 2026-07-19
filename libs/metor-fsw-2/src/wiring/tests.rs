@@ -485,6 +485,7 @@ fn err_static_system_with_typed_params() {
             clock: ClockSpec::Wall,
         },
         artifacts: Vec::new(),
+        states: Vec::new(),
         systems: vec![SystemSpec {
             name: "nav".into(),
             ty: Some("NavFilter".into()),
@@ -1223,6 +1224,7 @@ fn bare_wiring() -> Wiring {
             clock: ClockSpec::Wall,
         },
         artifacts: Vec::new(),
+        states: Vec::new(),
         systems: Vec::new(),
         slots: Vec::new(),
         edges: Vec::new(),
@@ -1498,4 +1500,187 @@ fn builder_panics_on_initial_outside_allow() {
         .allow("a")
         .initial("b", SlotInitState::Loaded)
         .end();
+}
+
+// ---------------------------------------------------------------------------
+// Pack-shared states through the wiring: the states pass, its failure
+// modes, and the unused-state gate.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+struct TestLinkParams {
+    tag: f64,
+}
+
+#[derive(Default)]
+struct TestLink {
+    tag: f64,
+}
+
+impl crate::SharedLifecycle for TestLink {}
+
+static STATE_TAG_SEEN: AtomicU64 = AtomicU64::new(0);
+
+fn observe(s: &mut TestLink, _now: Timestamp) {
+    STATE_TAG_SEEN.store(s.tag.to_bits(), Relaxed);
+}
+
+/// A registry whose one pack declares a shared state and an attached entry;
+/// `fail_init` makes the state's init report a construction failure.
+fn link_registry(fail_init: bool) -> Registry {
+    let mut pack = crate::Pack::new();
+    let link = pack.shared_state("TestLink", move |p: TestLinkParams| {
+        if fail_init {
+            Err("address in use".to_string())
+        } else {
+            Ok(TestLink { tag: p.tag })
+        }
+    });
+    let pack = pack.system("Watcher", crate::system(observe).shared(&link));
+    let mut r = Registry::new();
+    r.register_pack(pack);
+    r
+}
+
+/// The happy path: the states pass constructs the instance from its own
+/// value params, the attached system resolves, and the run observes the
+/// constructed state.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn state_constructs_and_attached_system_runs() {
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Wall)
+        .state_value("link", "TestLink", serde_json::json!({ "tag": 3.5 }))
+        .system("watch")
+        .ty("Watcher")
+        .end()
+        .build();
+    let mut coord = resolve(&wiring, &link_registry(false)).expect("states resolve");
+    coord.run_for(2).await;
+    assert_eq!(f64::from_bits(STATE_TAG_SEEN.load(Relaxed)), 3.5);
+    assert!(coord.stopped().is_empty());
+}
+
+#[test]
+fn err_unknown_state_type() {
+    let wiring = WiringBuilder::new()
+        .state_value("link", "Nope", serde_json::json!({}))
+        .build();
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected UnknownStateType"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::UnknownStateType { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_state_init_failure_is_a_load_error() {
+    let wiring = WiringBuilder::new()
+        .state_value("link", "TestLink", serde_json::json!({ "tag": 1.0 }))
+        .system("watch")
+        .ty("Watcher")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &link_registry(true)) {
+        Ok(_) => panic!("expected StateInit"),
+        Err(e) => e,
+    };
+    match &err.kind {
+        LoadErrorKind::StateInit { message, .. } => {
+            assert!(message.contains("address in use"), "{message}")
+        }
+        other => panic!("expected StateInit, got {other:?}"),
+    }
+}
+
+#[test]
+fn err_state_declared_but_unattached() {
+    let wiring = WiringBuilder::new()
+        .state_value("link", "TestLink", serde_json::json!({ "tag": 1.0 }))
+        .build();
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected StateUnused"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::StateUnused { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_attached_system_without_state_declaration() {
+    let wiring = WiringBuilder::new()
+        .system("watch")
+        .ty("Watcher")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected PackCreate"),
+        Err(e) => e,
+    };
+    match &err.kind {
+        LoadErrorKind::PackCreate { message, .. } => assert!(
+            message.contains("no wiring declaration constructs"),
+            "{message}"
+        ),
+        other => panic!("expected PackCreate, got {other:?}"),
+    }
+}
+
+#[test]
+fn err_duplicate_state_declaration() {
+    let mut wiring = bare_wiring();
+    for name in ["link", "link"] {
+        wiring.states.push(crate::wiring::StateSpec {
+            name: name.into(),
+            ty: "TestLink".into(),
+            params: ParamSource::None,
+            src: None,
+        });
+    }
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected DuplicateState"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::DuplicateState { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_state_with_postcard_params() {
+    let mut wiring = bare_wiring();
+    wiring.states.push(crate::wiring::StateSpec {
+        name: "link".into(),
+        ty: "TestLink".into(),
+        params: ParamSource::Postcard(vec![1, 2, 3]),
+        src: None,
+    });
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected StateInit"),
+        Err(e) => e,
+    };
+    assert!(matches!(err.kind, LoadErrorKind::StateInit { .. }), "{err:?}");
+}
+
+/// A serialized `Wiring` predating the `states` field deserializes with an
+/// empty list, and a declared state round-trips through JSON.
+#[test]
+fn states_field_serde_defaults_and_round_trips() {
+    let mut json = serde_json::to_value(bare_wiring()).expect("serialize");
+    json.as_object_mut().expect("object").remove("states");
+    let back: Wiring = serde_json::from_value(json).expect("deserialize without states");
+    assert!(back.states.is_empty());
+
+    let wiring = WiringBuilder::new()
+        .state_value("link", "TestLink", serde_json::json!({ "tag": 2.0 }))
+        .build();
+    let json = serde_json::to_string(&wiring).expect("serialize");
+    let back: Wiring = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, wiring, "state specs round-trip");
 }

@@ -61,6 +61,7 @@ fn maximal() -> Wiring {
                 src: None,
             },
         ],
+        states: Vec::new(),
         systems: vec![
             SystemSpec {
                 name: "block.plant".into(),

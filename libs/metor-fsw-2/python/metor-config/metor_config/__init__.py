@@ -374,6 +374,7 @@ class Mission:
         self.default_depth = default_depth
         self.coordinator = SystemHandle(COORDINATOR)
         self._artifacts: list[dict[str, Any]] = []
+        self._states: list[dict[str, Any]] = []
         self._systems: list[dict[str, Any]] = []
         self._slots: list[dict[str, Any]] = []
         self._edges: list[dict[str, Any]] = []
@@ -615,6 +616,7 @@ class Mission:
                 "clock": self._clock(),
             },
             "artifacts": self._artifacts,
+            "states": self._states,
             "systems": self._systems,
             "slots": self._slots,
             "edges": self._edges,

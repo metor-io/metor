@@ -174,7 +174,7 @@ fn decode_static_params<P: serde::de::DeserializeOwned>(
 /// fields fill in and a required field is a clean missing-field error). A
 /// `serde_json::Value` alone cannot serve both, since `()` needs `Null` and a
 /// defaulted struct needs `{}`.
-struct NoParams;
+pub(crate) struct NoParams;
 
 impl<'de> serde::Deserializer<'de> for NoParams {
     type Error = serde::de::value::Error;
@@ -284,6 +284,9 @@ pub struct Registry {
     /// [`NamedMsg::NAME`](crate::NamedMsg). Config name tokens (an uplink's
     /// `msgs` list) resolve against this table in [`BuildSystem::configure`].
     pub(super) msgs: MsgTable,
+    /// Pack-declared shared states, keyed by their declaration name — the
+    /// `type=` a [`StateSpec`](super::StateSpec) constructs through.
+    pub(super) states: HashMap<&'static str, std::cell::RefCell<crate::pack::StateEntry>>,
 }
 
 impl Registry {
@@ -359,7 +362,11 @@ impl Registry {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        for entry in pack.into_entries() {
+        let (entries, states) = pack.into_parts();
+        for state in states {
+            self.states.insert(state.name(), RefCell::new(state));
+        }
+        for entry in entries {
             let name = entry.name();
             let descriptor = Box::new(entry.descriptor().clone());
             let entry = Rc::new(RefCell::new(entry));

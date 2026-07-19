@@ -35,7 +35,7 @@ use crate::dl::DlSystem;
 use super::error::{LoadError, LoadErrorKind};
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, ParamSource,
-    SlotInitState, SlotSpec, SourceRef, SystemSpec, Wiring,
+    SlotInitState, SlotSpec, SourceRef, StateSpec, SystemSpec, Wiring,
 };
 use super::registry::{LoadCtx, Registry, StaticParams};
 use super::{encode_value_params, stubgen, validate};
@@ -137,6 +137,12 @@ pub fn resolve_with(
         ir_json,
     });
 
+    // --- States pass: pack-shared states construct before any system, so
+    //     an attached entry's create finds its instance in place.
+    for spec in &wiring.states {
+        resolve_state(spec, registry)?;
+    }
+
     // --- Systems pass: static via the Registry, dl via the loader --------
     let mut instances: HashMap<String, Instance> = HashMap::new();
     // The coordinator joins the instance namespace up front so command edges
@@ -191,6 +197,24 @@ pub fn resolve_with(
         instances.insert(spec.name.clone(), Instance { handle, desc });
     }
 
+    // Every declared state must have gained an attachment by now (attach
+    // counts at entry create): a state serving nobody is a config defect —
+    // a link server with no downlink serves silence — so it fails like any
+    // other wiring mistake.
+    for spec in &wiring.states {
+        let entry = registry
+            .states
+            .get(spec.ty.as_str())
+            .expect("the states pass resolved this type");
+        if entry.borrow().cell.attached() == 0 {
+            return Err(LoadErrorKind::StateUnused {
+                name: spec.name.clone(),
+                ty: spec.ty.clone(),
+            }
+            .whole(state_src(spec)));
+        }
+    }
+
     // --- Edges pass ------------------------------------------------------
     for edge in &wiring.edges {
         let arrow = if edge.delayed { "~>" } else { "->" };
@@ -228,6 +252,59 @@ pub fn resolve_with(
         let src = err.to_string();
         LoadErrorKind::Wire { source: err }.whole(src)
     })
+}
+
+/// Construct one pack-shared state through its registered
+/// [`StateEntry`](crate::StateEntry): decode the spec's params off the value
+/// surface and run the state's init fn. Construction failure (a listener
+/// bind) is a spanned load error, not a runtime one.
+fn resolve_state(spec: &StateSpec, registry: &Registry) -> Result<(), LoadError> {
+    let Some(entry) = registry.states.get(spec.ty.as_str()) else {
+        let mut available: Vec<&str> = registry.states.keys().copied().collect();
+        available.sort_unstable();
+        return Err(LoadErrorKind::UnknownStateType {
+            name: spec.name.clone(),
+            ty: spec.ty.clone(),
+            available: available.join(", "),
+        }
+        .whole(state_src(spec)));
+    };
+    let snippet = state_src(spec);
+    // A paramless spec conforms an empty object against the state's schema,
+    // the same all-defaults decode a paramless pack entry gets.
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let value = match &spec.params {
+        ParamSource::Postcard(_) => {
+            unreachable!("validate() rejects postcard params on a state")
+        }
+        ParamSource::Value(value) => value,
+        ParamSource::None => &empty,
+    };
+    let params = crate::pack::EntryParams::Value {
+        value,
+        src: &snippet,
+        name: &spec.name,
+        msgs: &registry.msgs,
+    };
+    entry.borrow_mut().create(params).map_err(|e| match e {
+        crate::pack::MakeError::Params(e) => *e,
+        other => LoadErrorKind::StateInit {
+            name: spec.name.clone(),
+            ty: spec.ty.clone(),
+            message: other.to_string(),
+        }
+        .whole(snippet.clone()),
+    })
+}
+
+/// A best-effort source snippet for a state spec's errors.
+pub(super) fn state_src(spec: &StateSpec) -> String {
+    format!(
+        "state \"{}\" type=\"{}\"{}",
+        spec.name,
+        spec.ty,
+        src_anchor(spec.src.as_ref())
+    )
 }
 
 /// Instantiate a static system through the [`Registry`] factory.
