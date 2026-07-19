@@ -172,8 +172,9 @@ pub use pack::{
 pub use shared::{Shared, SharedGuard, SharedLifecycle};
 pub use registry::{AllOutputs, Registry, RegistryEntry};
 pub use telemetry::{
-    DownlinkParams, RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
-    TelemetrySystem, Transport, TransportError, UplinkParams, UplinkSystem,
+    DownlinkParams, LinkParams, LinkState, LinkStats, RecvTransport, TcpRecvTransport,
+    TcpTransport, TelemetryConfig, TelemetryMode, TelemetrySystem, Transport, TransportError,
+    UplinkParams, UplinkSystem,
 };
 pub use testbench::TestBench;
 

@@ -57,6 +57,10 @@
 //! `link_reconnect`; an uplink receive error is counted as
 //! `uplink_disconnect`.
 
+mod link;
+
+pub use link::{LinkParams, LinkState, LinkStats};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
