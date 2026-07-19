@@ -4,8 +4,8 @@
 //! pipeline's tracing output into a live display — active `build`-target
 //! spans render as a pinned progress line (spinner, label, the crate cargo is
 //! currently compiling, elapsed time) while `cargo`-target events stream
-//! above it — and [`print_preflight`] lists the systems a mission will run
-//! before it starts. Both degrade to plain text when stderr is not a
+//! above it — and [`print_preflight`] lists the systems and slots a mission
+//! will run before it starts. Both degrade to plain text when stderr is not a
 //! terminal: indicatif hides its bars and events print as ordinary lines,
 //! and the pre-flight colors are gated on stream support.
 
@@ -53,11 +53,22 @@ pub(super) fn init_tracing() {
         .init();
 }
 
-/// Print the ordered list of systems `run` is about to start, to stderr:
-/// a header with the effective clock, then one entry per system — instance
-/// name and type on the first line, its source (pack distribution, crate, or
-/// builtin) dimmed underneath, with a `process` tag on worker-process
-/// systems. The order is [`Wiring::systems`], which is also resolve's
+/// One two-line entry in the pre-flight listing, with the bar color that
+/// signifies its kind.
+struct Entry {
+    name: String,
+    ty: String,
+    detail: String,
+    bar: owo_colors::Style,
+}
+
+/// Print the ordered list of systems and slots `run` is about to start, to
+/// stderr: a header with the effective clock, then one two-line entry each —
+/// instance name and type, with the source (pack distribution, crate, or
+/// builtin; a slot's allowed occupants) dimmed underneath. Each entry carries
+/// a colored bar keying its kind: magenta for pack-loaded systems, yellow
+/// for worker-process systems, cyan for builtins, green for slots. The order
+/// is [`Wiring::systems`] then [`Wiring::slots`], which is also resolve's
 /// registration order.
 pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
     let name = target
@@ -68,9 +79,13 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
         ClockSpec::Wall => "wall clock".to_string(),
         ClockSpec::Simulated { dt_secs } => format!("sim dt {} ms", trim(dt_secs * 1e3)),
     };
+    let slots = match wiring.slots.len() {
+        0 => String::new(),
+        n => format!(" · {n} slot(s)"),
+    };
     eprintln!();
     eprintln!(
-        "  {} · {} system(s) · {} Hz · {}",
+        "  {} · {} system(s){slots} · {} Hz · {}",
         name.if_supports_color(Stream::Stderr, |t| t.bold()),
         wiring.systems.len(),
         trim(wiring.coordinator.cycle_rate),
@@ -78,28 +93,75 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
     );
     eprintln!();
 
-    let width = wiring
+    let mut entries: Vec<Entry> = wiring
         .systems
         .iter()
-        .map(|s| s.name.len())
-        .max()
-        .unwrap_or(0);
-    for sys in &wiring.systems {
-        // Pad before styling: ANSI escapes would defeat a format width.
-        let pad = " ".repeat(width - sys.name.len());
-        eprintln!(
-            "  {}{pad}  {}",
-            sys.name.if_supports_color(Stream::Stderr, |t| t.bold()),
-            sys.ty.as_deref().unwrap_or("(sole pack entry)"),
-        );
-        let mut source = source_of(wiring, sys.artifact.as_deref());
-        if sys.process {
-            source.push_str(" · process");
+        .map(|sys| {
+            let bar = if sys.process {
+                owo_colors::Style::new().bright_yellow()
+            } else if sys.artifact.is_some() {
+                owo_colors::Style::new().bright_magenta()
+            } else {
+                owo_colors::Style::new().bright_cyan()
+            };
+            let mut detail = source_of(wiring, sys.artifact.as_deref());
+            if sys.process {
+                detail.push_str(" · process");
+            }
+            Entry {
+                name: sys.name.clone(),
+                ty: sys
+                    .ty
+                    .clone()
+                    .unwrap_or_else(|| "(sole pack entry)".to_string()),
+                detail,
+                bar,
+            }
+        })
+        .collect();
+    for slot in &wiring.slots {
+        // The allowed occupants, the initial one (if any) marked.
+        let occupants: Vec<String> = slot
+            .allow
+            .iter()
+            .map(|a| {
+                let initial = slot
+                    .initial
+                    .as_ref()
+                    .is_some_and(|i| i.occupant == a.occupant);
+                if initial {
+                    format!("▸{}", a.occupant)
+                } else {
+                    a.occupant.clone()
+                }
+            })
+            .collect();
+        let mut detail = format!("allow {}", occupants.join(", "));
+        if slot.process {
+            detail.push_str(" · process");
         }
+        entries.push(Entry {
+            name: slot.name.clone(),
+            ty: "slot".to_string(),
+            detail,
+            bar: owo_colors::Style::new().bright_green(),
+        });
+    }
+
+    let width = entries.iter().map(|e| e.name.len()).max().unwrap_or(0);
+    for e in &entries {
+        let bar = "┃".if_supports_color(Stream::Stderr, |t| t.style(e.bar));
+        // Pad before styling: ANSI escapes would defeat a format width.
+        let pad = " ".repeat(width - e.name.len());
         eprintln!(
-            "  {:width$}  {}",
+            "  {bar} {}{pad}  {}",
+            e.name.if_supports_color(Stream::Stderr, |t| t.bold()),
+            e.ty,
+        );
+        eprintln!(
+            "  {bar} {:width$}  {}",
             "",
-            source.if_supports_color(Stream::Stderr, |t| t.dimmed()),
+            e.detail.if_supports_color(Stream::Stderr, |t| t.dimmed()),
         );
     }
     eprintln!();
