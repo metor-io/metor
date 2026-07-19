@@ -135,8 +135,7 @@ $ metor-fsw package --check-ir dist/adcs.bundle
 metor-fsw run <TARGET>
     [--build] [--release] [--cargo-arg <ARG>]...
     [--wall | --sim-dt <SECS>] [--cycle-rate <HZ>]
-    [--telemetry <ADDR> [--telemetry-mode all]] [--no-telemetry]
-    [--uplink <ADDR>]
+    [--serve <ADDR>]
     [--cycles <N>]
 ```
 
@@ -160,14 +159,10 @@ metor-fsw run <TARGET>
 | `--wall` | `coordinator.clock = ClockSpec::Wall` |
 | `--sim-dt <SECS>` | `coordinator.clock = ClockSpec::Simulated { dt_secs }` |
 | `--cycle-rate <HZ>` | `coordinator.cycle_rate = HZ` |
-| `--telemetry <ADDR>` | replaces any `TcpDownlink` spec with `SystemSpec::tcp_downlink("telemetry", addr)` (enables it) |
-| `--telemetry-mode all` | sets the mode of `--telemetry` (v1: `all`; `subset` stays KDL-only) |
-| `--no-telemetry` | removes every `TcpDownlink` spec (disable even if the KDL declares one) |
-| `--uplink <ADDR>` | replaces any `TcpUplink` spec with `SystemSpec::tcp_uplink("uplink", addr)` — enables the command uplink (its own connection, reading panel `SequenceCommand`s, `docs/messages.md` §4.4) even if the KDL doesn't declare one |
+| `--serve <ADDR>` | overrides the mission's `TcpServer` state's `addr`, or — when the mission declares none — declares one (`"link"`) plus an all-taps `Downlink` (`"telemetry"`) |
 | `--cycles <N>` | `run_for(N)`; default `usize::MAX` (run until interrupted) |
 
-`--wall`/`--sim-dt` are mutually exclusive (clap group). `--telemetry`/`--no-telemetry` are
-mutually exclusive.
+`--wall`/`--sim-dt` are mutually exclusive (clap group).
 
 **Run output.** `run` is not silent: before the runtime starts it prints a banner (the
 systems, the active clock, the telemetry target, the duration), and while running it emits a
@@ -175,19 +170,14 @@ cycle-progress heartbeat (read from a shared `Coordinator::progress()` counter) 
 of seconds, then a completion/`hard-stopped` summary. So a long mission visibly advances and
 the active config is never a guess.
 
-**Telemetry operational notes** (surfaced in the banner):
-- The downlink **connects once and does not auto-reconnect** (v1; telemetry.md). So **metor-panel
-  must be listening before the mission starts** — `run` does a one-shot reachability probe and
-  warns (`⚠ not reachable …`) when it is not, before any cycle runs.
-- Under the **simulated** clock the loop free-runs (no pacing), so a live downlink races far
-  ahead of real time; the banner suggests `--wall` whenever telemetry is on with a sim clock.
-  For live panel viewing use `--wall --telemetry <addr>`.
-- The uplink gets the same one-shot reachability probe as telemetry, reported on its own banner
-  line; with no `--uplink`/KDL `TcpUplink` system the banner says `uplink: off — pass
-  \`--uplink <addr>\` to receive panel commands` (`src/cli/mod.rs`). The link flags/banner key
-  on the built-in **types** (`TCP_DOWNLINK_TYPE`/`TCP_UPLINK_TYPE`), never on instance names,
-  so a user-written downlink/uplink system is untouched by them; several instances get one
-  banner line each.
+**Telemetry operational notes:**
+- The FSW **serves** its link: the mission's `TcpServer` state listens on its `addr`, and
+  ground tools (metor-panel, `nc`) connect to it whenever they like — each connection gets
+  the announce replay first, then the live stream, and its writes are the command ingest.
+  Nothing needs to be listening before the mission starts.
+- Under the **simulated** clock the loop free-runs without sleeping, so the io reactor —
+  and with it the link's sockets — is starved until the run ends; for live viewing use
+  `--wall`.
 
 ### 2.4 The build→run shortcut
 

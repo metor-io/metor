@@ -1696,3 +1696,140 @@ fn states_field_serde_defaults_and_round_trips() {
     let back: Wiring = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, wiring, "state specs round-trip");
 }
+
+// ---------------------------------------------------------------------------
+// The link server end to end through the wiring: resolve from the builder,
+// stream to a real client, and take a command back — the full round trip a
+// ground tool makes.
+// ---------------------------------------------------------------------------
+
+static E2E_CMDS: AtomicU64 = AtomicU64::new(0);
+
+struct SeqSink;
+
+#[derive(SystemInput)]
+struct SeqSinkIn {
+    commands: crate::MsgIn<metor_proto_wkt::SequenceCommand>,
+}
+
+impl System for SeqSink {
+    type Input = SeqSinkIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "seq_sink";
+}
+
+impl CyclicSystem for SeqSink {
+    fn execute(&mut self, _now: Timestamp, input: &mut SeqSinkIn, _o: &mut Self::Output) {
+        input
+            .commands
+            .drain(|_| {
+                E2E_CMDS.fetch_add(1, Relaxed);
+            })
+            .unwrap();
+    }
+}
+
+impl BuildSystem for SeqSink {
+    type Params = ();
+    fn new(_params: Self::Params) -> Self {
+        SeqSink
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn link_server_end_to_end_through_the_wiring() {
+    use metor_proto::types::IntoLenPacket;
+    use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    E2E_CMDS.store(0, Relaxed);
+
+    // The builtin link pack, assembled here rather than via `with_builtins`
+    // so the test keeps the token (the resolved state's bound port is only
+    // reachable through it).
+    let mut r = Registry::new();
+    let mut pack = crate::Pack::new();
+    let link = pack.shared_state("TcpServer", |p: crate::LinkParams| {
+        crate::LinkState::bind(p.addr)
+    });
+    let pack = pack
+        .system_type_shared::<crate::TelemetrySystem, _>("Downlink", &link, {
+            let link = link.clone();
+            move |p| <crate::TelemetrySystem as BuildSystem>::new(p).attach(link.clone())
+        })
+        .system_type_shared::<crate::UplinkSystem, _>("Uplink", &link, {
+            let link = link.clone();
+            move |p| <crate::UplinkSystem as BuildSystem>::new(p).attach(link.clone())
+        });
+    r.register_pack(pack);
+    r.register::<MsgSrc, _>("MsgSrc");
+    r.register::<SeqSink, _>("SeqSink");
+    r.register_msg::<SequenceCommand>();
+
+    // Wall clock: the loop's inter-cycle sleeps are what let the io reactor
+    // serve the sockets during the run.
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Wall)
+        .uplink(["SequenceCommand"])
+        .system("src")
+        .ty("MsgSrc")
+        .end()
+        .system("sink")
+        .ty("SeqSink")
+        .end()
+        .connect_msg("uplink", "sink", "SequenceCommand")
+        .serve("127.0.0.1:0".parse().unwrap())
+        .build();
+    let mut coord = resolve(&wiring, &r).expect("the link mission resolves");
+    let addr = link.get().local_addr();
+
+    // A real ground client: read the stream, and answer the first packet
+    // (the announce replay's head) with one uplinked command.
+    let received = Rc::new(Cell::new(0u64));
+    let counted = received.clone();
+    let client = stellarator::spawn(async move {
+        use stellarator::io::{AsyncWrite, SplitExt};
+        let stream = stellarator::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+        let (rx, tx) = stream.split();
+        let mut packets = metor_proto_stellar::PacketStream::new(rx);
+        let mut buf = vec![0u8; 1024];
+        let mut sent = false;
+        loop {
+            let Ok(pkt) = packets.next_grow(buf).await else {
+                return;
+            };
+            counted.set(counted.get() + 1);
+            if !sent {
+                let cmd = SequenceCommand {
+                    channel: "adcs".to_string(),
+                    command: SequenceCommandKind::Start,
+                };
+                tx.write_all(cmd.into_len_packet().inner)
+                    .await
+                    .0
+                    .expect("send the command");
+                sent = true;
+            }
+            buf = pkt.into_buf().into_inner();
+        }
+    })
+    .drop_guard();
+
+    coord.run_for(300).await;
+    drop(client);
+
+    assert!(
+        E2E_CMDS.load(Relaxed) >= 1,
+        "the client's command crossed the link into the sink"
+    );
+    assert!(
+        received.get() > 10,
+        "the client received the replay and a live stream: {} packets",
+        received.get()
+    );
+    assert!(coord.stopped().is_empty());
+}

@@ -10,6 +10,17 @@
 > `Arc<AtomicU64>`, not `Rc<Cell>`; `SeqClock` survives as a type alias for `CycleClock`;
 > `#[sequence]` is a passthrough shim slated for deletion; sync occupants get
 > stop-on-cancel → terminal `Aborted`; `PackLib` is shared behind `Rc`, not `Arc`.
+>
+> **Later (2026-07-19, link-server arc):** the "no shared state between systems"
+> limitation fell — `Pack::shared_state` declares one pack-scoped state instance
+> (constructed from its own wiring `state` spec) that several cyclic entries attach to
+> via `SystemDef::shared`/`Pack::system_type_shared`, each granted the same `&mut` per
+> step, with once-per-instance `SharedLifecycle` start/shutdown. See the `shared`
+> module doc; the builtin telemetry link (`TcpServer` + `Downlink`/`Uplink`) is its
+> first user. Attached entries also made two general pack fixes: entry create returns
+> the *instance* descriptor (config-minted ports register correctly on the static
+> path; the positional ABI rejects them), and the capability prohibition moved from
+> all packs to the ABI-export and slot paths.
 
 Status when written: **design** (2026-07-11). The approved authoring-ergonomics overhaul:
 multi-system crates (**packs**), an axum-style functional author surface as the primary
