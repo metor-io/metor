@@ -285,6 +285,18 @@ pub fn serialize_widget_state(
             measurement_panel: Default::default(),
             hide_alarm_limits: !lp.show_alarm_limits,
             hide_alarm_color: !lp.show_alarm_color,
+            event_overlays: lp
+                .event_overlays
+                .iter()
+                .map(|o| {
+                    let o = o.read(cx);
+                    crate::tiles::panels::EventOverlayConfig {
+                        kind: crate::plot_events::kind_key_to_string(o.key),
+                        label: o.label.to_string(),
+                        visible: o.visible,
+                    }
+                })
+                .collect(),
         };
         return facet_json::to_string(&cfg).ok();
     }

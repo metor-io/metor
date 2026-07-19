@@ -59,6 +59,36 @@ pub enum EventKindKey {
     Msg(PacketId),
 }
 
+/// Serialize an [`EventKindKey`] to the stable string used in saved layouts:
+/// `"logs"`, `"alarms"`, `"sequences"`, or `"msg:e03c"` (lowercase hex id).
+pub fn kind_key_to_string(key: EventKindKey) -> String {
+    match key {
+        EventKindKey::Logs => "logs".to_string(),
+        EventKindKey::Alarms => "alarms".to_string(),
+        EventKindKey::Sequences => "sequences".to_string(),
+        EventKindKey::Msg(id) => format!("msg:{:02x}{:02x}", id[0], id[1]),
+    }
+}
+
+/// Parse a [`kind_key_to_string`] string back to a key. `None` for an unknown
+/// tag or a malformed message id, so stale layouts drop the overlay silently.
+pub fn kind_key_from_string(s: &str) -> Option<EventKindKey> {
+    match s {
+        "logs" => Some(EventKindKey::Logs),
+        "alarms" => Some(EventKindKey::Alarms),
+        "sequences" => Some(EventKindKey::Sequences),
+        _ => {
+            let hex = s.strip_prefix("msg:")?;
+            if hex.len() != 4 {
+                return None;
+            }
+            let hi = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let lo = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            Some(EventKindKey::Msg([hi, lo]))
+        }
+    }
+}
+
 /// One annotation the plot can draw: when it happened, how to tint it, a one-line
 /// header for the flag/popover, and the typed payload behind it.
 #[derive(Clone, Debug)]

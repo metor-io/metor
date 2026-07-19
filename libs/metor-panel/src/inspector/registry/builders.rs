@@ -4,17 +4,18 @@
 //! trace wizards — in one place so `defaults.rs` stays a flat list of
 //! registrations rather than a dumping ground of closures.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use facet::Facet;
 use gpui::{AnyEntity, App, AppContext, Entity, SharedString};
 use metor_db::DB;
-use metor_proto::types::ComponentId;
+use metor_proto::types::{ComponentId, PacketId};
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
-use crate::views::time_series::LinePlot;
-use crate::views::time_series::Override;
+use crate::plot_events::EventKindKey;
 use crate::views::time_series::time_range::TimeRangeBehavior;
+use crate::views::time_series::{EventOverlay, LinePlot, Override};
 
 use super::FieldBuildCtx;
 
@@ -288,4 +289,84 @@ pub(super) fn build_list_trace_add_wizard(
         color_basis,
         on_select,
     )
+}
+
+/// Event-overlay wizard for the "Add" button on a `LinePlot`'s event-overlay
+/// list. Lists the built-in kinds not yet on the plot, then the recorded
+/// message channels the built-ins don't claim (and that aren't already added).
+pub(super) fn build_event_overlay_wizard(
+    parent: gpui::AnyEntity,
+    db: &Arc<DB>,
+    cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    let Ok(plot) = parent.clone().downcast::<LinePlot>() else {
+        return Vec::new();
+    };
+    // Keys already on the plot, hidden or not, so a kind isn't offered twice.
+    let existing: HashSet<EventKindKey> = plot
+        .read(cx)
+        .event_overlays
+        .iter()
+        .map(|o| o.read(cx).key)
+        .collect();
+
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+
+    // Built-in sources not yet added, in registry order.
+    if let Some(registry) = crate::plot_events::try_global(cx) {
+        for source in registry.builtins() {
+            let key = source.key();
+            if existing.contains(&key) {
+                continue;
+            }
+            rows.push(overlay_command_row(parent.clone(), source.name(cx), key));
+        }
+    }
+
+    // Recorded message channels the built-ins don't claim.
+    let claimed = crate::plot_events::try_global(cx)
+        .map(|r| r.claimed().clone())
+        .unwrap_or_default();
+    let mut msgs: Vec<(PacketId, SharedString)> = db.with_state(|state| {
+        state
+            .msg_log_iter()
+            .filter_map(|(id, meta)| {
+                if claimed.contains(&id) || existing.contains(&EventKindKey::Msg(id)) {
+                    return None;
+                }
+                let label = match meta {
+                    Some(meta) if !meta.name.is_empty() => SharedString::from(meta.name.clone()),
+                    _ => SharedString::from(format!("msg {:02x}:{:02x}", id[0], id[1])),
+                };
+                Some((id, label))
+            })
+            .collect()
+    });
+    msgs.sort_by(|a, b| a.1.cmp(&b.1));
+    for (id, label) in msgs {
+        rows.push(overlay_command_row(parent.clone(), label, EventKindKey::Msg(id)));
+    }
+
+    rows
+}
+
+/// One picker row that appends an [`EventOverlay`] for `key` to the plot.
+fn overlay_command_row(
+    parent: AnyEntity,
+    label: SharedString,
+    key: EventKindKey,
+) -> Box<dyn InspectorRow> {
+    Box::new(CommandRow::new(
+        label.clone(),
+        Arc::new(move |_w, cx| {
+            let Ok(plot) = parent.clone().downcast::<LinePlot>() else {
+                return;
+            };
+            let overlay = cx.new(|_| EventOverlay::new(label.clone(), key));
+            plot.update(cx, |lp, cx| {
+                lp.event_overlays.push(overlay);
+                cx.notify();
+            });
+        }),
+    ))
 }

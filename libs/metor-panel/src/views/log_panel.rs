@@ -282,7 +282,7 @@ fn level_tint(level: LogLevel, theme: &Theme) -> gpui::Hsla {
 }
 
 /// `HH:MM:SS.mmm` local time from a payload timestamp (microseconds).
-fn format_time(t_us: i64) -> String {
+pub(crate) fn format_time(t_us: i64) -> String {
     let Ok(ts) = jiff::Timestamp::from_microsecond(t_us) else {
         return t_us.to_string();
     };

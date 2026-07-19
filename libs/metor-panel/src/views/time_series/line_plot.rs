@@ -126,6 +126,9 @@ pub struct LinePlot {
     /// Y axes, stacked left-to-right outward from the plot. Always holds at
     /// least one (axis 0, the primary). Each trace names its axis by index.
     pub axes: Vec<Entity<YAxis>>,
+    /// Event-flag overlays drawn in the plot's top gutter. Each names an
+    /// event source by key; a visible overlay is queried and flagged per frame.
+    pub event_overlays: Vec<Entity<super::EventOverlay>>,
     /// `Auto` follows the app-wide [`GlobalTimeRange`]; `Custom` pins this
     /// plot to its own window.
     pub x_range: Override<TimeRangeBehavior>,
@@ -163,6 +166,7 @@ impl LinePlot {
         Self {
             traces: Vec::new(),
             axes: vec![primary_axis],
+            event_overlays: Vec::new(),
             x_range: Override::Auto,
             x_time_format: TimeFormat::default(),
             custom_title: Override::Auto,

@@ -11,7 +11,8 @@ use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
 use crate::views::time_series::{
-    LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, TimeFormat, Trace, YAxis,
+    EventOverlay, LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, TimeFormat, Trace,
+    YAxis,
 };
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
@@ -706,6 +707,20 @@ pub struct PlotPanelConfig {
     /// Suppress the alarm out-of-bounds background tint on this plot. Stored
     /// inverted so the default (and old layouts) show it.
     pub hide_alarm_color: bool,
+    /// Event-flag overlays drawn in the plot's top gutter. Additive — old
+    /// layouts deserialize to empty (the feature is simply off).
+    pub event_overlays: Vec<EventOverlayConfig>,
+}
+
+/// Persisted shape of one [`EventOverlay`]. The live overlay is held as an
+/// `Entity<EventOverlay>`, and its `key` isn't `Facet`-serializable, so the
+/// key is stored as its stable string tag.
+#[derive(facet::Facet, Default, Clone)]
+pub struct EventOverlayConfig {
+    /// `"logs" | "alarms" | "sequences" | "msg:e03c"` (lowercase hex, no sep).
+    pub kind: String,
+    pub label: String,
+    pub visible: bool,
 }
 
 /// Serializable shape of [`PanelPosition`].
@@ -895,6 +910,16 @@ impl PlotPanel {
                     .map(|a| cx.new(|_| YAxis::from(a.clone())))
                     .collect();
             }
+            // Unparseable kinds are dropped silently (a removed built-in, or a
+            // corrupt hex id).
+            lp.event_overlays = cfg
+                .event_overlays
+                .iter()
+                .filter_map(|o| {
+                    let key = crate::plot_events::kind_key_from_string(&o.kind)?;
+                    Some(cx.new(|_| EventOverlay::new(o.label.clone(), key)))
+                })
+                .collect();
             cx.notify();
         });
         if !cfg.cursors.is_empty() {
@@ -980,6 +1005,18 @@ impl PaneItem for PlotPanel {
             measurement_panel,
             hide_alarm_limits: !lp.show_alarm_limits,
             hide_alarm_color: !lp.show_alarm_color,
+            event_overlays: lp
+                .event_overlays
+                .iter()
+                .map(|o| {
+                    let o = o.read(cx);
+                    EventOverlayConfig {
+                        kind: crate::plot_events::kind_key_to_string(o.key),
+                        label: o.label.to_string(),
+                        visible: o.visible,
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1888,10 +1925,30 @@ mod tests {
             measurement_panel: Default::default(),
             hide_alarm_limits: false,
             hide_alarm_color: false,
+            event_overlays: vec![
+                EventOverlayConfig {
+                    kind: "alarms".into(),
+                    label: "Alarms".into(),
+                    visible: true,
+                },
+                EventOverlayConfig {
+                    kind: "msg:e03c".into(),
+                    label: "Widget".into(),
+                    visible: false,
+                },
+            ],
         };
         let s = facet_json::to_string(&plot).unwrap();
         let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
         assert_eq!(back.label, "speed");
+        assert_eq!(back.event_overlays.len(), 2);
+        assert_eq!(back.event_overlays[1].kind, "msg:e03c");
+        assert!(!back.event_overlays[1].visible);
+        // The stored kind parses back to the same key.
+        assert_eq!(
+            crate::plot_events::kind_key_from_string(&back.event_overlays[1].kind),
+            Some(crate::plot_events::EventKindKey::Msg([0xe0, 0x3c]))
+        );
         assert_eq!(back.traces[0].axis_index, 1);
         assert_eq!(back.axes.len(), 2);
         assert_eq!(back.axes[1].label, "rpm");

@@ -39,6 +39,31 @@ fn in_range_caps_to_newest() {
     assert!(kept.windows(2).all(|w| w[0].0 <= w[1].0));
 }
 
+/// Kind keys round-trip through their saved-layout string form, and message
+/// ids survive as lowercase hex.
+#[test]
+fn kind_key_string_round_trip() {
+    for key in [
+        EventKindKey::Logs,
+        EventKindKey::Alarms,
+        EventKindKey::Sequences,
+        EventKindKey::Msg([0xe0, 0x3c]),
+    ] {
+        let s = kind_key_to_string(key);
+        assert_eq!(kind_key_from_string(&s), Some(key));
+    }
+    // Exact wire form for a message id.
+    assert_eq!(kind_key_to_string(EventKindKey::Msg([0xe0, 0x3c])), "msg:e03c");
+    assert_eq!(
+        kind_key_from_string("msg:e03c"),
+        Some(EventKindKey::Msg([0xe0, 0x3c]))
+    );
+    // Malformed ids and unknown tags drop.
+    assert_eq!(kind_key_from_string("msg:zz"), None);
+    assert_eq!(kind_key_from_string("msg:e03"), None);
+    assert_eq!(kind_key_from_string("bogus"), None);
+}
+
 /// With a schema present, a record decodes to JSON; without one, or on a decode
 /// failure, it falls back to the raw byte length.
 #[test]
