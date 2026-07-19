@@ -4,11 +4,11 @@
 //!
 //! Deliberately unlike the command palette: no selection pills, no
 //! filter-first chrome. The shape follows hardware-discovery dialogs — a
-//! quiet caption bar, a centered hero (heading, purpose line, favorite
-//! cards), then a full-width table with hairline dividers and a
-//! connect-by-address footer. Opened from the palette's "Connect…"
-//! command, the titlebar identity segment, or automatically on first open
-//! when nothing is connected.
+//! compact caption bar that says what's streaming, favorite cards up
+//! top, then a full-width table with hairline dividers where rows select
+//! and explicit buttons act, and a connect-by-address footer. Opened from
+//! the palette's "Connect…" command, the titlebar identity segment, or
+//! automatically on first open when nothing is connected.
 
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
@@ -332,22 +332,28 @@ impl ConnectionPicker {
         }
     }
 
-    /// The star that pins a target. Filled and bright when pinned; hollow
-    /// and quiet otherwise. Clicking never connects.
+    /// The star that pins a target: a real toggle with its own hit area,
+    /// visibly separate from the row so it never reads as part of a
+    /// row-wide click. Clicking never connects.
     fn star(&self, id: &TargetId, favorite: bool, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let id = id.clone();
         div()
             .id(SharedString::from(format!("star-{id}")))
             .flex_shrink_0()
-            .px(px(4.0))
-            .text_size(px(13.0))
+            .w(px(26.0))
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.0))
+            .text_size(px(16.0))
             .text_color(if favorite {
-                theme.text_primary
+                theme.alarm_color(1)
             } else {
                 theme.text_tertiary
             })
             .cursor_pointer()
-            .hover(|s| s.text_color(theme.text_primary))
+            .hover(|s| s.bg(theme.bg_primary).text_color(theme.alarm_color(1)))
             .child(SharedString::new_static(if favorite {
                 "\u{2605}"
             } else {
@@ -359,6 +365,51 @@ impl ConnectionPicker {
                     cx.stop_propagation();
                     this.store
                         .update(cx, |store, cx| store.toggle_favorite(&id, cx));
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// A real connect/disconnect button: bordered, padded, unmistakably
+    /// clickable — the row itself only selects.
+    fn action_button(
+        &self,
+        target: ConnectionTarget,
+        connected: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (label, text, border) = if connected {
+            (
+                SharedString::new_static("Disconnect"),
+                theme.text_secondary,
+                theme.border_primary,
+            )
+        } else {
+            (
+                SharedString::new_static("Connect"),
+                theme.control_active,
+                theme.control_active,
+            )
+        };
+        div()
+            .id(SharedString::from(format!("action-{}", target.id)))
+            .flex_shrink_0()
+            .px(px(12.0))
+            .py(px(3.0))
+            .border_1()
+            .border_color(border)
+            .rounded(px(4.0))
+            .text_size(px(12.0))
+            .text_color(text)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.bg_primary))
+            .child(label)
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_connection(target.clone(), window, cx);
                     cx.notify();
                 }),
             )
@@ -383,8 +434,8 @@ impl ConnectionPicker {
         };
         div()
             .id(SharedString::from(format!("fav-{}", entry.id)))
-            .w(px(180.0))
-            .p(px(12.0))
+            .w(px(170.0))
+            .p(px(10.0))
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -440,11 +491,13 @@ impl ConnectionPicker {
             .into_any_element()
     }
 
-    /// One table row: hairline-divided columns — dot, name, detail, status
-    /// or action, star. Selection is a quiet background, not a pill.
+    /// One table row: star toggle, status dot, then name with its detail
+    /// right beside it, and an explicit action button on the right. The
+    /// row itself only selects — the button and star each own their click.
     fn render_table_row(
         &self,
         entry: &PickerEntry,
+        row_ix: usize,
         selected: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -452,34 +505,26 @@ impl ConnectionPicker {
         let available = entry.target.is_some();
         let status = self.status_of(&entry.id, cx);
         let connected = status.is_some();
-        let target = entry.target.clone();
-
-        let action: SharedString = if !available {
-            SharedString::new_static("not available")
-        } else if connected {
-            SharedString::new_static("disconnect")
-        } else {
-            SharedString::new_static("connect")
-        };
-        let action_color = if !available {
-            theme.text_tertiary
-        } else if connected {
-            theme.text_secondary
-        } else {
-            theme.control_active
-        };
 
         let mut row = div()
             .id(SharedString::from(format!("row-{}", entry.id)))
             .h(px(ROW_HEIGHT))
-            .px(px(20.0))
+            .px(px(10.0))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(12.0))
+            .gap(px(8.0))
             .border_b_1()
             .border_color(theme.border_primary)
-            .when(selected, |r| r.bg(theme.bg_secondary))
+            .when(selected, |r| r.bg(theme.bg_secondary));
+
+        if available {
+            row = row.child(self.star(&entry.id, entry.favorite, theme, cx));
+        } else {
+            row = row.child(div().w(px(26.0)).flex_shrink_0());
+        }
+
+        row = row
             .child(
                 div()
                     .w(px(10.0))
@@ -490,9 +535,7 @@ impl ConnectionPicker {
             )
             .child(
                 div()
-                    .w(px(180.0))
                     .flex_shrink_0()
-                    .overflow_hidden()
                     .text_size(px(13.0))
                     .text_color(if available {
                         theme.text_primary
@@ -514,34 +557,31 @@ impl ConnectionPicker {
         if let Some(ConnectionStatus::Failed(reason)) = &status {
             row = row.child(
                 div()
+                    .flex_shrink_0()
                     .text_size(px(11.0))
                     .text_color(theme.error_accent)
                     .child(reason.clone()),
             );
         }
-        row = row.child(
-            div()
-                .flex_shrink_0()
-                .text_size(px(11.0))
-                .text_color(action_color)
-                .child(action),
-        );
-        if available {
-            row = row.child(self.star(&entry.id, entry.favorite, theme, cx));
+        if let Some(target) = entry.target.clone() {
+            row = row.child(self.action_button(target, connected, theme, cx));
+        } else {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_tertiary)
+                    .child(SharedString::new_static("not available")),
+            );
         }
         if available {
-            row = row
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.bg_secondary))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        if let Some(target) = target.clone() {
-                            this.toggle_connection(target, window, cx);
-                        }
-                        cx.notify();
-                    }),
-                );
+            row = row.on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _window, cx| {
+                    this.selected = row_ix;
+                    cx.notify();
+                }),
+            );
         }
         row.into_any_element()
     }
@@ -555,40 +595,7 @@ impl ConnectionPicker {
 
         let mut body = div().flex().flex_col().min_h_0();
 
-        // Hero: what this dialog does, then the pinned systems.
-        let active = self.store.read(cx).active().len();
-        let subtitle: SharedString = if active == 0 {
-            SharedString::new_static(
-                "Pick a system to stream live telemetry into this panel.",
-            )
-        } else {
-            SharedString::from(format!(
-                "{active} system{} streaming into this panel.",
-                if active == 1 { "" } else { "s" }
-            ))
-        };
-        body = body.child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(6.0))
-                .pt(px(28.0))
-                .pb(px(20.0))
-                .child(
-                    div()
-                        .text_size(px(18.0))
-                        .text_color(theme.text_primary)
-                        .child(SharedString::new_static("Connect to a system")),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_secondary)
-                        .child(subtitle),
-                ),
-        );
-
+        // Pinned systems first — the fast path sits right under the caption.
         if !favorites.is_empty() {
             let mut card_ix = 0usize;
             let mut cards = div()
@@ -596,9 +603,10 @@ impl ConnectionPicker {
                 .flex_row()
                 .flex_wrap()
                 .justify_center()
-                .gap(px(12.0))
-                .px(px(20.0))
-                .pb(px(24.0));
+                .gap(px(10.0))
+                .px(px(16.0))
+                .pt(px(14.0))
+                .pb(px(14.0));
             for entry in &favorites {
                 if entry.target.is_some() {
                     let selected = card_ix == self.selected;
@@ -612,7 +620,8 @@ impl ConnectionPicker {
         // The searchable remainder, Revel-table style.
         body = body.child(
             div()
-                .px(px(20.0))
+                .px(px(16.0))
+                .pt(px(if favorites.is_empty() { 10.0 } else { 0.0 }))
                 .pb(px(8.0))
                 .flex()
                 .flex_row()
@@ -644,13 +653,13 @@ impl ConnectionPicker {
             .flex_col()
             .min_h_0()
             .overflow_y_scroll()
-            .max_h(px(240.0))
+            .max_h(px(252.0))
             .border_t_1()
             .border_color(theme.border_primary);
         if table.is_empty() {
             list = list.child(
                 div()
-                    .px(px(20.0))
+                    .px(px(16.0))
                     .py(px(10.0))
                     .text_size(px(12.0))
                     .text_color(theme.text_tertiary)
@@ -660,7 +669,7 @@ impl ConnectionPicker {
         let mut row_ix = selectable_favorites;
         for entry in &table {
             let selected = entry.target.is_some() && row_ix == self.selected;
-            list = list.child(self.render_table_row(entry, selected, theme, cx));
+            list = list.child(self.render_table_row(entry, row_ix, selected, theme, cx));
             if entry.target.is_some() {
                 row_ix += 1;
             }
@@ -673,7 +682,7 @@ impl ConnectionPicker {
             div()
                 .id("manual-address")
                 .h(px(ROW_HEIGHT))
-                .px(px(20.0))
+                .px(px(16.0))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -710,8 +719,8 @@ impl ConnectionPicker {
             .flex_col()
             .items_center()
             .gap(px(10.0))
-            .pt(px(36.0))
-            .pb(px(40.0))
+            .pt(px(24.0))
+            .pb(px(28.0))
             .child(
                 div()
                     .text_size(px(18.0))
@@ -778,8 +787,8 @@ impl ConnectionPicker {
             .flex_col()
             .items_center()
             .gap(px(10.0))
-            .pt(px(36.0))
-            .pb(px(40.0))
+            .pt(px(24.0))
+            .pb(px(28.0))
             .child(
                 div()
                     .text_size(px(18.0))
@@ -850,22 +859,42 @@ impl Render for ConnectionPicker {
         }
         let theme = theme(cx);
 
-        // Caption bar: quiet title, close affordance only when leaving is
-        // allowed.
+        // Caption bar: sized like the app's other bars — title, a live
+        // summary of what's streaming, and a close affordance only when
+        // leaving is allowed.
+        let active = self.store.read(cx).active().len();
+        let summary: SharedString = match active {
+            0 => SharedString::new_static("nothing connected"),
+            1 => SharedString::new_static("1 system streaming into this panel"),
+            n => SharedString::from(format!("{n} systems streaming into this panel")),
+        };
         let mut caption = div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
-            .px(px(20.0))
-            .py(px(12.0))
+            .px(px(16.0))
+            .py(px(6.0))
             .border_b_1()
             .border_color(theme.border_primary)
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_secondary)
-                    .child(SharedString::new_static("Connections")),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_primary)
+                            .child(SharedString::new_static("Connections")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_tertiary)
+                            .child(summary),
+                    ),
             );
         if self.dismissable(cx) {
             caption = caption.child(
