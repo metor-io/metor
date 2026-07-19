@@ -1,7 +1,8 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use metor_db::DB;
+use metor_db::{DB, Server};
+use metor_panel::{ConnectContext, Connected, ConnectionTarget};
+use stellarator::net::TcpListener;
 
 fn main() {
     // GPU init failures render as blank views, not crashes; the tracing
@@ -19,7 +20,41 @@ fn main() {
 
     let tmp = std::env::temp_dir().join("metor_panel");
     let db = Arc::new(DB::create(tmp).unwrap());
-    metor_panel::PanelApp::new(db)
-        .serve(SocketAddr::new([127, 0, 0, 1].into(), 2240))
-        .run();
+
+    // The sandbox target reproduces the classic standalone setup: this
+    // panel's DB serves the wire protocol on 2240 and flight software
+    // dials in. Connecting boots the server; disconnecting stops it.
+    let sandbox = ConnectionTarget::custom(
+        "local-sandbox",
+        "Local sandbox",
+        "serve 127.0.0.1:2240",
+        |ctx: ConnectContext| {
+            let db = ctx.db.clone();
+            let status = ctx.status.clone();
+            ctx.spawn(move || async move {
+                let listener = match TcpListener::bind("127.0.0.1:2240") {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        status.set(metor_panel::ConnectionStatus::Failed(
+                            format!("bind 127.0.0.1:2240: {err}").into(),
+                        ));
+                        return;
+                    }
+                };
+                status.set(metor_panel::ConnectionStatus::Connected);
+                let server = Server { listener, db };
+                if let Err(err) = server.run().await {
+                    status.set(metor_panel::ConnectionStatus::Failed(
+                        format!("server: {err}").into(),
+                    ));
+                }
+            });
+            Connected {
+                hydrator: None,
+                local_authority: true,
+            }
+        },
+    );
+
+    metor_panel::PanelApp::new(db).connection(sandbox).run();
 }

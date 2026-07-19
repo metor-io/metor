@@ -14,8 +14,10 @@
 //! threads upsert targets through; the store drains it on the gpui thread
 //! and repaints observers.
 
+mod picker;
 mod target;
 
+pub use picker::ConnectionPicker;
 pub use target::{
     ConnectContext, Connected, ConnectionBackend, ConnectionStatus, ConnectionTarget,
     StatusHandle, TargetId,

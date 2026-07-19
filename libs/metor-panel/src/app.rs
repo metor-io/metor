@@ -36,6 +36,7 @@ actions!(
         CycleTabBackward,
         ToggleCmdLock,
         OpenReviewEdits,
+        OpenConnections,
     ]
 );
 
@@ -62,6 +63,12 @@ struct AppRoot {
     /// The transient chord menu, present only while open. Dropped (and focus
     /// returned to the root) once it dismisses, mirroring `inspector`.
     transient: Option<Entity<crate::transient::Transient>>,
+    /// The connection picker, present only while open, mirroring `inspector`.
+    connection_picker: Option<Entity<crate::connections::ConnectionPicker>>,
+    /// Queued picker open; `true` means the picker must stay up until
+    /// something connects (the first-open case). Drained in `render` like
+    /// the other pending requests so focus transfer has a `Window`.
+    pending_connection_picker: Option<bool>,
     /// Armed by mouse-down on the titlebar; the next mouse-move hands the
     /// drag to the compositor via `start_window_move` (Linux — macOS and
     /// Windows drag natively through the transparent titlebar / HTCAPTION).
@@ -96,6 +103,16 @@ impl AppRoot {
         if let Some(store) = crate::alarms::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
         }
+        // Repaint the titlebar chip when connections change, and greet a
+        // fresh session (nothing connected, nothing auto-connected) with
+        // the picker instead of an empty tile tree.
+        let mut pending_connection_picker = None;
+        if let Some(store) = crate::connections::try_global(cx) {
+            cx.observe(&store, |_, _, cx| cx.notify()).detach();
+            if store.read(cx).active().is_empty() {
+                pending_connection_picker = Some(true);
+            }
+        }
         Self {
             db,
             tiles,
@@ -105,6 +122,8 @@ impl AppRoot {
             pending_pane_inspector_request: None,
             pending_inspector_open: None,
             transient: None,
+            connection_picker: None,
+            pending_connection_picker,
             should_move: false,
             focus_handle: cx.focus_handle(),
         }
@@ -174,6 +193,37 @@ impl AppRoot {
         });
         transient.focus_handle(cx).focus(window);
         self.transient = Some(transient);
+        cx.notify();
+    }
+
+    fn open_connections(&mut self, _: &OpenConnections, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = &self.connection_picker
+            && !picker.read(cx).dismissed
+        {
+            return;
+        }
+        self.pending_connection_picker = Some(false);
+        cx.notify();
+    }
+
+    fn open_connection_picker(
+        &mut self,
+        require_connection: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = crate::connections::try_global(cx) else {
+            return;
+        };
+        let parent_focus = self.focus_handle.clone();
+        let picker = cx.new(|cx| {
+            let mut picker =
+                crate::connections::ConnectionPicker::new(store, require_connection, cx);
+            picker.set_parent_focus(parent_focus);
+            picker
+        });
+        picker.focus_handle(cx).focus(window);
+        self.connection_picker = Some(picker);
         cx.notify();
     }
 
@@ -386,6 +436,17 @@ impl Render for AppRoot {
             self.focus_handle.focus(window);
         }
 
+        if let Some(picker) = &self.connection_picker
+            && picker.read(cx).dismissed
+        {
+            self.connection_picker = None;
+            self.focus_handle.focus(window);
+        }
+
+        if let Some(require_connection) = self.pending_connection_picker.take() {
+            self.open_connection_picker(require_connection, window, cx);
+        }
+
         if let Some((item, position)) = self.pending_inspector_request.take() {
             self.open_inspector(&*item, position, window, cx);
         }
@@ -434,6 +495,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::handle_plot_component_action))
             .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))
+            .on_action(cx.listener(Self::open_connections))
             .on_modifiers_changed(cx.listener(
                 |this, event: &gpui::ModifiersChangedEvent, _window, cx| {
                     if !event.modifiers.shift && this.hover_preview.take().is_some() {
@@ -457,6 +519,10 @@ impl Render for AppRoot {
 
         if let Some(transient) = &self.transient {
             root = root.child(transient.clone());
+        }
+
+        if let Some(picker) = &self.connection_picker {
+            root = root.child(picker.clone());
         }
 
         if let Some(preview) = &self.hover_preview {
@@ -554,6 +620,73 @@ impl AppRoot {
         });
     }
 
+    /// Titlebar chip summarizing the connection set: a status dot plus
+    /// "offline", the single connection's name, or a count. Clicking opens
+    /// the picker.
+    fn render_connection_chip(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::connections::ConnectionStatus;
+
+        let summary = crate::connections::try_global(cx).map(|store| {
+            let store = store.read(cx);
+            let active = store.active();
+            let label: SharedString = match active {
+                [] => SharedString::new_static("offline"),
+                [only] => only.target.name.clone(),
+                many => SharedString::from(format!("{} connections", many.len())),
+            };
+            // The dot shows the worst status so a degraded mirror is
+            // visible even while other connections are healthy.
+            let worst = active
+                .iter()
+                .map(|c| match c.status() {
+                    ConnectionStatus::Failed(_) => 2,
+                    ConnectionStatus::Connecting | ConnectionStatus::Reconnecting => 1,
+                    _ => 0,
+                })
+                .max();
+            let dot = match worst {
+                None => theme.text_tertiary,
+                Some(2) => theme.error_accent,
+                Some(1) => theme.text_secondary,
+                Some(_) => theme.control_active,
+            };
+            (label, dot)
+        });
+        let Some((label, dot)) = summary else {
+            return div().into_any_element();
+        };
+
+        div()
+            .id("connection-chip")
+            .px(px(8.0))
+            .py(px(2.0))
+            .bg(theme.pill_bg)
+            .border_1()
+            .border_color(theme.pill_border)
+            .rounded(px(4.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(12.0))
+            .text_color(theme.text_primary)
+            .child(div().text_color(dot).child("\u{25cf}"))
+            .child(label)
+            .cursor_pointer()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _window, cx| {
+                    this.pending_connection_picker = Some(false);
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
     fn render_titlebar(
         &self,
         theme: &crate::theme::Theme,
@@ -633,6 +766,7 @@ impl AppRoot {
                 }),
         );
 
+        right = right.child(self.render_connection_chip(theme, cx));
         right = right.child(self.render_alarm_summary(theme, cx));
 
         if edit_count > 0 {
@@ -958,6 +1092,7 @@ impl PanelApp {
                 for source in connection_sources.take().unwrap_or_default() {
                     source(registry.clone());
                 }
+                register_connection_commands(cx);
 
                 // Consumer extensions: register custom palette providers, run
                 // init hooks, then build overlays. All happen after the built-in
@@ -1035,6 +1170,38 @@ impl PanelApp {
                 .unwrap();
             });
     }
+}
+
+/// Palette entries for the connection system: "Connect…" opens the picker,
+/// and each active connection contributes a "Disconnect <name>" command.
+/// Pull-based like every provider, so the disconnect list always matches
+/// the live set.
+fn register_connection_commands(cx: &mut App) {
+    ItemRegistry::register(
+        cx,
+        Category::Command,
+        Arc::new(|cx| {
+            let mut items = vec![InspectionItem::Command {
+                label: SharedString::new_static("Connect\u{2026}"),
+                callback: Arc::new(|window, cx| {
+                    window.dispatch_action(Box::new(OpenConnections), cx);
+                }),
+            }];
+            if let Some(store) = crate::connections::try_global(cx) {
+                for conn in store.read(cx).active() {
+                    let id = conn.target.id.clone();
+                    let store = store.clone();
+                    items.push(InspectionItem::Command {
+                        label: SharedString::from(format!("Disconnect {}", conn.target.name)),
+                        callback: Arc::new(move |_window, cx| {
+                            store.update(cx, |store, cx| store.disconnect(&id, cx));
+                        }),
+                    });
+                }
+            }
+            items
+        }),
+    );
 }
 
 /// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
