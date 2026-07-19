@@ -8,8 +8,9 @@ use core::marker::PhantomData;
 
 use metor_proto::types::Timestamp;
 
-use crate::binder::AnySource;
-use crate::health::{HealthPort, SystemHealth, SystemLog};
+use crate::binder::{AnySource, RingSource};
+use crate::health::{HealthPort, LogEvent, SystemHealth};
+use crate::message::MsgOut;
 use crate::pack::{Driver, StepStatus};
 use crate::port::Output;
 
@@ -57,8 +58,10 @@ where
 /// appends, after the user ports.
 pub(crate) fn bind_health_tail(src: &mut AnySource) -> HealthPort {
     let health: Output<SystemHealth> = Output::bind(src);
-    let log: Output<SystemLog> = Output::bind(src);
-    HealthPort::new(health, log)
+    let log: MsgOut<LogEvent> = MsgOut::bind(src);
+    let mut port = HealthPort::new(health, log);
+    port.set_instance(src.instance_name());
+    port
 }
 
 impl<S, M, F> Driver for FnDriver<S, M, F>
@@ -152,7 +155,7 @@ impl Driver for FutureDriver {
         // A wired task has no SequenceStatus output; progress lines land on
         // the entry's ordinary log so they still flow off-board.
         for line in self.clock.drain_progress() {
-            self.health.log(crate::health::Level::Info, &line);
+            self.health.log(crate::health::LogLevel::Info, &line);
         }
         match poll {
             Poll::Ready(outcome) => {

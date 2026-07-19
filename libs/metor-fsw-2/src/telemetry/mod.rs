@@ -170,6 +170,7 @@ impl TcpTransport {
                 .map_err(TransportError::io)?;
             let (rx, tx) = stream.split();
             self.conn = Some(TcpConn { tx, rx });
+            tracing::info!(addr = %self.addr, "downlink connected");
         }
         Ok(&self.conn.as_ref().expect("just connected").tx)
     }
@@ -276,6 +277,11 @@ impl TcpRecvTransport {
             }
             self.sink = Some(sink);
             self.stream = Some(PacketStream::new(rx));
+            tracing::info!(
+                addr = %self.addr,
+                subscriptions = self.subscribe_ids.len(),
+                "uplink connected and subscribed"
+            );
         }
         Ok(self.stream.as_mut().expect("just connected"))
     }
@@ -483,7 +489,7 @@ impl SystemOutput for UplinkOut {
     fn decls() -> Declarations {
         vec![
             PortDesc::of::<crate::SystemHealth>(),
-            PortDesc::of::<crate::SystemLog>(),
+            PortDesc::msg_named::<crate::LogEvent>("log"),
         ]
         .into()
     }
@@ -492,12 +498,11 @@ impl SystemOutput for UplinkOut {
 impl BindPorts for UplinkOut {
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let health = crate::Output::bind(src);
-        let log = crate::Output::bind(src);
+        let log = crate::message::MsgOut::bind(src);
         let fan = MsgFanOut::bind(src);
-        Self {
-            fan,
-            health: HealthPort::new(health, log),
-        }
+        let mut health = HealthPort::new(health, log);
+        health.set_instance(src.instance_name());
+        Self { fan, health }
     }
 }
 
@@ -615,7 +620,7 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
             // resolve, so warn on the first run pass and publish immediately.
             if self.msgs.is_empty() {
                 health.log(
-                    crate::health::Level::Warn,
+                    crate::health::LogLevel::Warn,
                     "uplink has no msgs configured; it will receive nothing",
                 );
                 health.end_cycle(Timestamp::now(), 0);
@@ -667,6 +672,10 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                     let (_, health) = output.split();
                     health.error("uplink_disconnect");
                     health.end_cycle(Timestamp::now(), 0);
+                    if self.backoff == RECONNECT_MIN {
+                        // Only on the up→down edge, matching the downlink.
+                        tracing::warn!("uplink connection lost; redialing with backoff");
+                    }
                     if context
                         .until_cancelled(stellarator::sleep(self.backoff))
                         .await
@@ -743,6 +752,8 @@ async fn back_off(drops: &AtomicU64, was_up: &mut bool, backoff: &mut Duration) 
     if *was_up {
         drops.fetch_add(1, Relaxed);
         *was_up = false;
+        // Only on the up→down edge, so a long outage logs once, not per retry.
+        tracing::warn!("downlink connection lost; redialing with backoff");
     }
     stellarator::sleep(*backoff).await;
     *backoff = (*backoff * 2).min(RECONNECT_MAX);
@@ -902,7 +913,7 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             let health = output.health();
             health.error("telemetry_reader_slot");
             health.log(
-                crate::health::Level::Warn,
+                crate::health::LogLevel::Warn,
                 &format!("no reader slot left on `{key}` — raise CoordinatorConfig::reader_slack"),
             );
         }

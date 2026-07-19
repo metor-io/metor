@@ -42,7 +42,7 @@ pub(crate) use driver::{FnDriver, FutureDriver, OccupantFuture, bind_health_tail
 pub(crate) use task::TaskParamsSpec;
 
 use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind};
-use crate::health::{SystemHealth, SystemLog};
+use crate::health::SystemHealth;
 use crate::pack::{EntryParams, MakeError, PackEntry, Pending, decode_params};
 
 /// Start a fn-authored system from its per-cycle execute fn. The fn takes a
@@ -178,7 +178,7 @@ fn descriptor_for<P: ExecParamSet>(name: &'static str) -> SystemDescriptor {
     let inputs = sink.inputs;
     let mut outputs = sink.outputs;
     outputs.push(PortDesc::of::<SystemHealth>());
-    outputs.push(PortDesc::of::<SystemLog>());
+    outputs.push(PortDesc::msg_named::<crate::LogEvent>("log"));
     SystemDescriptor {
         name: name.into(),
         kind: SystemKind::Cyclic,

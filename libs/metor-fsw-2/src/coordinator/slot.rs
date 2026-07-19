@@ -678,6 +678,15 @@ impl SlotRunner {
     /// Emit a [`SequenceChannelEvent`] tagged with this slot's instance name.
     /// Best effort; a full ring drops the event rather than blocking the cycle.
     fn emit_event(&mut self, kind: SequenceEventKind) {
+        match &kind {
+            SequenceEventKind::Failed { reason } => {
+                tracing::error!(slot = %self.name, %reason, "slot occupant failed")
+            }
+            SequenceEventKind::Refused { reason } => {
+                tracing::warn!(slot = %self.name, %reason, "slot command refused")
+            }
+            kind => tracing::info!(slot = %self.name, event = ?kind, "slot event"),
+        }
         let _ = self.events.emit(&SequenceChannelEvent {
             channel: self.name.to_string(),
             kind,

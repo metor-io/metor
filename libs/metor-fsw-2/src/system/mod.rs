@@ -33,7 +33,8 @@ use metor_proto::types::Timestamp;
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState};
 use crate::descriptor::{Declarations, PortDesc, SystemDescriptor, SystemKind};
-use crate::health::{HealthPort, SystemHealth, SystemLog};
+use crate::health::{HealthPort, LogEvent, SystemHealth};
+use crate::message::MsgOut;
 use crate::message::MsgTable;
 use crate::port::Output;
 
@@ -149,12 +150,13 @@ where
     fn decls() -> Declarations {
         let mut decls = O::decls();
         decls.push(PortDesc::of::<SystemHealth>());
-        decls.push(PortDesc::of::<SystemLog>());
+        decls.push(PortDesc::msg_named::<LogEvent>("log"));
         decls
     }
 
-    /// Only the user bundle counts drops; the framework's own health/log
-    /// ports publish through the sizing-aware path and never drop.
+    /// Only the user bundle counts drops here; the health port publishes
+    /// through the sizing-aware path, and the log port folds its own drops
+    /// into health as `log_dropped`.
     fn take_dropped(&mut self) -> u64 {
         self.ports.take_dropped()
     }
@@ -170,8 +172,10 @@ where
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let ports = O::bind(src);
         let health: Output<SystemHealth, WD> = Output::bind(src);
-        let log: Output<SystemLog, WD> = Output::bind(src);
-        Out::new(ports, HealthPort::new(health, log))
+        let log: MsgOut<LogEvent, WD> = MsgOut::bind(src);
+        let mut health = HealthPort::new(health, log);
+        health.set_instance(src.instance_name());
+        Out::new(ports, health)
     }
 }
 

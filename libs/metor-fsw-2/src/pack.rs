@@ -295,7 +295,7 @@ impl Pack {
         let inputs = std::mem::take(&mut sink.inputs);
         let mut outputs = std::mem::take(&mut sink.outputs);
         outputs.push(crate::PortDesc::of::<crate::SystemHealth>());
-        outputs.push(crate::PortDesc::of::<crate::SystemLog>());
+        outputs.push(crate::PortDesc::msg_named::<crate::LogEvent>("log"));
         let descriptor = SystemDescriptor {
             name: name.into(),
             kind: crate::SystemKind::Cyclic,

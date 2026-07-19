@@ -306,7 +306,7 @@ impl InitGraph {
             inputs: vec![PortDesc::msg::<ReloadSequences>()],
             outputs: vec![
                 PortDesc::of::<crate::SystemHealth>().with_conn(PortConn::Host),
-                PortDesc::of::<crate::SystemLog>().with_conn(PortConn::Host),
+                PortDesc::msg_named::<crate::LogEvent>("log").with_conn(PortConn::Host),
                 PortDesc::of::<CoordinatorStatus>().with_conn(PortConn::Host),
                 PortDesc::msg_named::<SequenceRegistry>("sequences").with_conn(PortConn::Host),
                 PortDesc::msg_named::<SequenceCommand>("commands")
@@ -949,14 +949,19 @@ impl InitGraph {
     /// next: validation, edge resolution, fan-out counting, ring allocation,
     /// registry freeze, copy-in planning, bind.
     pub(crate) fn build(self) -> Result<Coordinator, WireError> {
+        let init_span = tracing::info_span!("init");
+        let _init_span = init_span.enter();
+        tracing::debug!(systems = self.systems.len(), "validating graph");
         self.validate_cycle_rate()?;
         self.validate_simulated_step()?;
         self.validate_receive_all_last()?;
         self.validate_slot_name_caps()?;
         self.validate_port_axes()?;
         let cons_edges = self.solve_edges()?;
+        tracing::debug!(edges = cons_edges.len(), "edges solved");
         let fan_out = self.count_fan_out(&cons_edges);
         let mut alloc = self.alloc_rings(&cons_edges, &fan_out)?;
+        tracing::debug!(rings = alloc.reg_entries.len(), "rings allocated");
         let seq_registry = self.seq_registry_payload();
         let registry = freeze_registry(std::mem::take(&mut alloc.reg_entries))?;
         let mut plumbing = self.plan_copy_ins(&cons_edges, &mut alloc);
@@ -985,6 +990,11 @@ impl InitGraph {
             &registry,
             &proc_ctx,
         )?;
+        tracing::info!(
+            cyclic = cyclic.len(),
+            r#async = pending_async.len(),
+            "graph bound"
+        );
 
         Ok(Coordinator {
             config,

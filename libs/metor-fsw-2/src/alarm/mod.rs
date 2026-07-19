@@ -579,14 +579,20 @@ impl CyclicSystem for AlarmSystem {
                     Some(EvalEvent::Raise {
                         occurrence,
                         severity,
-                    }) => output.raised.publish(&AlarmRaised {
-                        def_id: rt.spec.id.clone(),
-                        occurrence,
-                        severity,
-                        value: Some(value),
-                        message: raise_message(&rt.spec.target, value),
-                    }),
+                    }) => {
+                        // Debug, not info: the raise already broadcasts as its
+                        // own message, so the log stream need not double it.
+                        tracing::debug!(alarm = %rt.spec.id, ?severity, value, "alarm raised");
+                        output.raised.publish(&AlarmRaised {
+                            def_id: rt.spec.id.clone(),
+                            occurrence,
+                            severity,
+                            value: Some(value),
+                            message: raise_message(&rt.spec.target, value),
+                        })
+                    }
                     Some(EvalEvent::Clear { occurrence }) => {
+                        tracing::debug!(alarm = %rt.spec.id, "alarm cleared");
                         output.cleared.publish(&AlarmCleared {
                             def_id: rt.spec.id.clone(),
                             occurrence,
@@ -707,7 +713,7 @@ impl AlarmSystem {
         for (kind, line) in failures {
             let health = output.health();
             health.error(kind);
-            health.log(crate::health::Level::Warn, &line);
+            health.log(crate::health::LogLevel::Warn, &line);
         }
     }
 }

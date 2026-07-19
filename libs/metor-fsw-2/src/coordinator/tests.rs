@@ -1575,10 +1575,10 @@ async fn untelemetered_frame_output_hidden_from_all_outputs() {
     assert!(!entry.telemetered());
 
     coord.run_for(1).await;
-    // The tap sees the two systems' health/log frames (4) plus the coordinator's
-    // health, log, and status (3), but not quiet.imu. The exact count keeps a
-    // filter regression loud.
-    assert_eq!(frame_outs.get(), 7, "quiet.imu is filtered at the source");
+    // The tap sees the two systems' health frames (2) plus the coordinator's
+    // health and status (2), but not quiet.imu; the log ports are message
+    // channels. The exact count keeps a filter regression loud.
+    assert_eq!(frame_outs.get(), 4, "quiet.imu is filtered at the source");
 }
 
 // ---------------------------------------------------------------------------

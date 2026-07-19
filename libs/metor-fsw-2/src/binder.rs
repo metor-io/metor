@@ -86,6 +86,7 @@ pub struct Binder<'a> {
     outputs: slice::Iter<'a, BoundPort>,
     inputs: slice::Iter<'a, BoundInput>,
     registry: Arc<Registry>,
+    instance: &'a str,
 }
 
 impl<'a> Binder<'a> {
@@ -93,11 +94,13 @@ impl<'a> Binder<'a> {
         outputs: &'a [BoundPort],
         inputs: &'a [BoundInput],
         registry: Arc<Registry>,
+        instance: &'a str,
     ) -> Self {
         Self {
             outputs: outputs.iter(),
             inputs: inputs.iter(),
             registry,
+            instance,
         }
     }
 }
@@ -158,6 +161,13 @@ pub trait RingSource {
     /// than fabricate an empty registry.
     fn registry(&self) -> Arc<Registry> {
         panic!("this ring source carries no registry (host-only capability)")
+    }
+
+    /// The bound system's instance name, stamped into its implicit log port's
+    /// [`LogEvent`](crate::LogEvent)s as their `source`. Empty when the
+    /// supplier carries none.
+    fn instance_name(&self) -> &str {
+        ""
     }
 }
 
@@ -222,6 +232,13 @@ impl RingSource for AnySource<'_, '_> {
             Self::Raw(_) => panic!("a loaded pack entry carries no registry"),
         }
     }
+
+    fn instance_name(&self) -> &str {
+        match self {
+            Self::Host(b) => b.instance_name(),
+            Self::Raw(b) => b.instance_name(),
+        }
+    }
 }
 
 impl<'a> RingSource for Binder<'a> {
@@ -281,6 +298,10 @@ impl<'a> RingSource for Binder<'a> {
 
     fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
+    }
+
+    fn instance_name(&self) -> &str {
+        self.instance
     }
 }
 

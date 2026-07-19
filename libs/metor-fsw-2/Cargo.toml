@@ -59,10 +59,12 @@ thiserror = { version = "2.0" }
 clap = { version = "4", features = ["derive"], optional = true }
 tempfile = { version = "3.13", optional = true }
 
-# cli progress UI: build spans render as a pinned status block (via
-# tracing-indicatif); library consumers without a subscriber get silence.
-tracing = { version = "0.1", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+# Runtime instrumentation: lifecycle events across the coordinator, slots,
+# and links, plus the forwarding layer that downlinks them as `LogEvent`
+# messages. The minimal `registry` base is enough for the layer; the CLI's
+# fmt/env-filter/indicatif extras stay behind `wiring`.
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 tracing-indicatif = { version = "0.3", optional = true }
 owo-colors = { version = "4.3", features = ["supports-colors"], optional = true }
 
@@ -76,7 +78,7 @@ wiring-model = ["dep:serde_json"]
 # The full wiring front-end: the Python-eval path, the Rust `WiringBuilder`, the
 # resolver, bundles, stubgen, and the `metor-fsw` CLI. Pulls `wiring-model` for
 # the IR it produces and consumes.
-wiring = ["wiring-model", "dep:miette", "dep:postcard-dyn", "dep:serde_ignored", "dep:clap", "dep:tempfile", "dep:toml", "dep:sha2", "dep:base64", "dep:crc32fast", "dep:tracing", "dep:tracing-subscriber", "dep:tracing-indicatif", "dep:owo-colors"]
+wiring = ["wiring-model", "dep:miette", "dep:postcard-dyn", "dep:serde_ignored", "dep:clap", "dep:tempfile", "dep:toml", "dep:sha2", "dep:base64", "dep:crc32fast", "tracing-subscriber/env-filter", "tracing-subscriber/fmt", "tracing-subscriber/ansi", "dep:tracing-indicatif", "dep:owo-colors"]
 
 [[bin]]
 name = "metor-fsw"

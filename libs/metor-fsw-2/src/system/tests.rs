@@ -15,7 +15,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::descriptor::compatible;
 use crate::{
     AsyncSystem, CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, Out, Output,
-    PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemLog, SystemOutput,
+    LogEvent, MsgOut, PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemOutput,
     buffer_capacity,
 };
 
@@ -72,6 +72,14 @@ impl Decomponentize for RecSink {
 fn ring_for<F: crate::Frame>(depth: usize, readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
+        max_readers: readers,
+    })
+}
+
+/// A byte ring for the implicit `LogEvent` message tail.
+fn log_ring_for(readers: usize) -> RingBuffer {
+    RingBuffer::create_in_memory(Config {
+        capacity: crate::capacity_for(crate::MAX_MSG_BYTES, 16),
         max_readers: readers,
     })
 }
@@ -145,7 +153,7 @@ fn cyclic_filter_end_to_end() {
     let imu_ring = ring_for::<Imu>(8, 2);
     let nav_ring = ring_for::<NavEstimate>(8, 2);
     let health_ring = ring_for::<SystemHealth>(8, 1);
-    let log_ring = ring_for::<SystemLog>(8, 1);
+    let log_ring = log_ring_for(1);
 
     // Upstream producer and downstream consumer, both built by hand.
     let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake).unwrap());
@@ -156,7 +164,7 @@ fn cyclic_filter_end_to_end() {
     };
     let health = HealthPort::new(
         Output::new(health_ring.writer(NoWake).unwrap()),
-        Output::new(log_ring.writer(NoWake).unwrap()),
+        MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap()),
     );
     let output = Out::new(
         FilterOut {
@@ -330,7 +338,7 @@ fn health_counters_published() {
     let imu_ring = ring_for::<Imu>(8, 1);
     let nav_ring = ring_for::<NavEstimate>(8, 1);
     let health_ring = ring_for::<SystemHealth>(8, 1);
-    let log_ring = ring_for::<SystemLog>(8, 1);
+    let log_ring = log_ring_for(1);
 
     let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
 
@@ -339,7 +347,7 @@ fn health_counters_published() {
     };
     let health = HealthPort::new(
         Output::new(health_ring.writer(NoWake).unwrap()),
-        Output::new(log_ring.writer(NoWake).unwrap()),
+        MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap()),
     );
     let output = Out::new(
         FilterOut {
@@ -421,7 +429,7 @@ async fn async_filter_one_cycle() {
     let imu_ring = ring_for::<Imu>(8, 2);
     let nav_ring = ring_for::<NavEstimate>(8, 2);
     let health_ring = ring_for::<SystemHealth>(8, 1);
-    let log_ring = ring_for::<SystemLog>(8, 1);
+    let log_ring = log_ring_for(1);
 
     let imu_data = Notifier::default();
     let nav_data = Notifier::default();
@@ -432,7 +440,7 @@ async fn async_filter_one_cycle() {
     let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake).unwrap());
     let health = HealthPort::new(
         Output::new(health_ring.writer(Notifier::default()).unwrap()),
-        Output::new(log_ring.writer(Notifier::default()).unwrap()),
+        MsgOut::<LogEvent, Notifier>::new(log_ring.writer(Notifier::default()).unwrap()),
     );
     let mut output = Out::new(
         AsyncOut {
@@ -575,7 +583,7 @@ where
     let imu_ring = ring_for::<Imu>(8, 2);
     let nav_ring = ring_for::<NavEstimate>(8, 2);
     let health_ring = ring_for::<SystemHealth>(8, 1);
-    let log_ring = ring_for::<SystemLog>(8, 1);
+    let log_ring = log_ring_for(1);
 
     let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake).unwrap());
     let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake).unwrap());
@@ -718,7 +726,7 @@ fn publish_drop_folds_to_health() {
         max_readers: 1,
     });
     let health_ring = ring_for::<SystemHealth>(8, 1);
-    let log_ring = ring_for::<SystemLog>(8, 1);
+    let log_ring = log_ring_for(1);
     let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
 
     let input = crate::BindPorts::bind(&mut TestSource {
@@ -881,7 +889,7 @@ fn log_input_guaranteed_delivery_through_runner() {
 
     let ring = msg_ring(1);
     let health_ring = ring_for::<SystemHealth>(8, 1);
-    let log_ring = ring_for::<SystemLog>(8, 1);
+    let log_ring = log_ring_for(1);
 
     let input: GuardIn = crate::BindPorts::bind(&mut TestSource {
         rings: vec![ring.clone()],
@@ -891,7 +899,7 @@ fn log_input_guaranteed_delivery_through_runner() {
         NothingOut {},
         HealthPort::new(
             Output::new(health_ring.writer(NoWake).unwrap()),
-            Output::new(log_ring.writer(NoWake).unwrap()),
+            MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap()),
         ),
     );
     let mut w: crate::MsgOut<SequenceCommand> = crate::MsgOut::new(ring.writer(NoWake).unwrap());

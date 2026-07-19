@@ -85,7 +85,7 @@ fn descriptor_orders_ports_by_signature() {
         vec![
             PortId::Component(PkNav::FRAME_ID),
             PortId::Component(crate::SystemHealth::FRAME_ID),
-            PortId::Component(crate::SystemLog::FRAME_ID),
+            PortId::Packet(metor_proto_wkt::LogEvent::ID),
         ]
     );
 }

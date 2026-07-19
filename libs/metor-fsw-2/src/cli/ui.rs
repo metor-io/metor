@@ -23,7 +23,9 @@ use crate::wiring::{ClockSpec, Wiring};
 
 /// Install the CLI's tracing subscriber. `build`-target spans get the pinned
 /// progress line; `cargo` and `build` events pass the default filter, which
-/// `RUST_LOG` overrides for debugging.
+/// `RUST_LOG` overrides for debugging. Runtime events at `INFO` and up are
+/// additionally forwarded onto the downlink as `LogEvent`s
+/// ([`crate::logfwd`]); the build/cargo UI streams stay terminal-only.
 pub(super) fn init_tracing() {
     let indicatif_layer = IndicatifLayer::new().with_progress_style(
         ProgressStyle::with_template("{span_child_prefix}{spinner} {msg} {elapsed}")
@@ -39,6 +41,10 @@ pub(super) fn init_tracing() {
                 .with_target("build", tracing::Level::INFO)
                 .with_default(tracing::Level::WARN)
         });
+    let forward = Targets::new()
+        .with_target("build", tracing::level_filters::LevelFilter::OFF)
+        .with_target("cargo", tracing::level_filters::LevelFilter::OFF)
+        .with_default(tracing::Level::INFO);
     tracing_subscriber::registry()
         .with(indicatif_layer.with_filter(filter_fn(|meta| meta.target() == "build")))
         .with(
@@ -50,6 +56,7 @@ pub(super) fn init_tracing() {
                 .with_ansi(std::io::stderr().is_terminal())
                 .with_filter(events),
         )
+        .with(crate::logfwd::forward_layer().with_filter(forward))
         .init();
 }
 

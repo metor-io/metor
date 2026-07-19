@@ -75,8 +75,8 @@
 //!
 //! Systems never return errors. Every output bundle carries an implicit
 //! health/log port pair (the [`health`] module), and the framework publishes
-//! per-system [`SystemHealth`] and [`SystemLog`] frames each cycle, so a
-//! system's troubles flow off-board like any other telemetry.
+//! a per-system [`SystemHealth`] frame and any queued [`LogEvent`] messages
+//! each cycle, so a system's troubles flow off-board like any other telemetry.
 //!
 //! # The coordinator and wiring
 //!
@@ -121,6 +121,7 @@ mod testbench;
 mod writer;
 
 pub mod health;
+pub mod logfwd;
 
 // Not gated on `wiring`; sequences are an ABI/runtime feature.
 pub mod sequence;
@@ -174,9 +175,7 @@ pub use descriptor::{
     Capability, Declarations, Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema,
     SystemDescriptor, SystemKind,
 };
-pub use health::{
-    HealthPort, LOG_MSG_CAP, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
-};
+pub use health::{HealthPort, LogEvent, LogLevel, MAX_ERR_KINDS, MAX_LINES, SystemHealth};
 pub use port::{
     DEFAULT_DEPTH, FrameRef, FrameWriteError, Input, Output, buffer_capacity, capacity_for,
 };

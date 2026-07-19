@@ -14,7 +14,7 @@ use metor_proto_wkt::{
 use crate::Frame;
 use crate::binder::{Binder, BoundInput, BoundPort};
 use crate::descriptor::{FanIn, PortConn, PortId, SystemDescriptor};
-use crate::health::{HealthPort, SystemHealth, SystemLog};
+use crate::health::{HealthPort, LogEvent, SystemHealth};
 use crate::message::MsgIn;
 use crate::port::Input;
 use crate::registry::Registry;
@@ -124,16 +124,16 @@ pub(super) fn bind_systems(
             // rides this arm too (via `PendingDriver`).
             SystemBind::Cyclic(r) => {
                 let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
-                let mut binder = Binder::new(&outs, &ins, registry.clone());
+                let mut binder = Binder::new(&outs, &ins, registry.clone(), &name);
                 cyclic.push(r.bind(&mut binder));
             }
             SystemBind::Async(r) => {
                 let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
-                let mut binder = Binder::new(&outs, &ins, registry.clone());
-                pending_async.push(PendingAsync {
-                    name,
-                    launcher: r.bind(&mut binder),
-                });
+                let launcher = {
+                    let mut binder = Binder::new(&outs, &ins, registry.clone(), &name);
+                    r.bind(&mut binder)
+                };
+                pending_async.push(PendingAsync { name, launcher });
             }
         }
     }
@@ -163,11 +163,12 @@ fn bind_coordinator(
             .expect("the coordinator #0 bundle declares this output")
     };
     let health_ring = &output_rings[id][out_idx(PortId::Component(SystemHealth::FRAME_ID))];
-    let log_ring = &output_rings[id][out_idx(PortId::Component(SystemLog::FRAME_ID))];
-    let health = HealthPort::new(
+    let log_ring = &output_rings[id][out_idx(PortId::Packet(LogEvent::ID))];
+    let mut health = HealthPort::new(
         slot_writer::<SystemHealth>(health_ring),
-        slot_writer::<SystemLog>(log_ring),
+        owned_writer::<LogEvent>(log_ring),
     );
+    health.set_instance(&desc.name);
     let status_idx = out_idx(PortId::Component(CoordinatorStatus::FRAME_ID));
     let status_out = slot_writer::<CoordinatorStatus>(&output_rings[id][status_idx]);
     let seq_registry_out = owned_writer::<SequenceRegistry>(

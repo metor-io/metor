@@ -314,7 +314,8 @@ impl Registry {
             .register_msg::<AlarmDef>()
             .register_msg::<AlarmRaised>()
             .register_msg::<AlarmCleared>()
-            .register_msg::<AlarmAck>();
+            .register_msg::<AlarmAck>()
+            .register_msg::<metor_proto_wkt::LogEvent>();
         r
     }
 

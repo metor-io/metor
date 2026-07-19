@@ -67,7 +67,15 @@ type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type PackOpenFn = unsafe extern "C" fn() -> *mut c_void;
 type PackDescribeFn = unsafe extern "C" fn(*mut c_void, ByteSink, *mut c_void) -> i32;
 type PackCreateFn = unsafe extern "C" fn(*mut c_void, u32, u32, *const u8, usize) -> *mut c_void;
-type BindInitFn = unsafe extern "C" fn(*mut c_void, *const FswRing, usize, *const FswRing, usize);
+type BindInitFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const FswRing,
+    usize,
+    *const FswRing,
+    usize,
+    *const u8,
+    usize,
+);
 // Returns the raw status word, not `FswStatus`; see the trust boundary note in
 // the module docs.
 type ExecuteFn = unsafe extern "C" fn(*mut c_void, u64) -> u32;
@@ -150,6 +158,7 @@ impl Drop for PackGuard {
         if let Some(close) = self.close
             && !self.ptr.is_null()
         {
+            tracing::info!("pack closing");
             // SAFETY: `ptr` came from this library's `fsw_pack_open`, every
             // instance state was destroyed by the slots dropped before this
             // `Rc` reached zero, and the `Library` field outlives this guard
@@ -228,6 +237,12 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
         unsafe { f() }
     };
     if found != FSW_ABI_VERSION {
+        tracing::error!(
+            path = %Path::new(path).display(),
+            found,
+            expected = FSW_ABI_VERSION,
+            "pack rejected: ABI version mismatch"
+        );
         return Err(DlError::VersionMismatch {
             found,
             expected: FSW_ABI_VERSION,
@@ -352,6 +367,11 @@ impl DlPack {
     pub fn open(path: impl AsRef<OsStr>) -> Result<Self, DlError> {
         let (pack_lib, buf) = open_and_describe(path.as_ref())?;
         let entries = decode_pack_manifest(&buf)?;
+        tracing::info!(
+            path = %Path::new(path.as_ref()).display(),
+            entries = entries.len(),
+            "pack opened"
+        );
 
         // --- Resolve the per-instance lifecycle surface. Each `Symbol` is
         // dereferenced to a bare fn pointer, valid as long as the
@@ -640,6 +660,8 @@ impl CyclicSlot for DlSlot {
                 self.inputs.len(),
                 self.outputs.as_ptr(),
                 self.outputs.len(),
+                self.name.as_ptr(),
+                self.name.len(),
             );
         }
     }
@@ -717,6 +739,8 @@ mod tests {
             _: *const FswRing,
             _: usize,
             _: *const FswRing,
+            _: usize,
+            _: *const u8,
             _: usize,
         ) {
         }

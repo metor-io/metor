@@ -84,7 +84,7 @@ impl TestBench {
             .map(|r| BoundInput::One(BoundPort::new(r.clone())))
             .collect();
         let registry = std::sync::Arc::new(Registry::new(Vec::new()));
-        let mut binder = Binder::new(&outs, &ins, registry);
+        let mut binder = Binder::new(&outs, &ins, registry, &descriptor.name);
         let mut src = AnySource::Host(&mut binder);
         let mut driver = pending(&mut src, Mount::Wired);
         driver.init();

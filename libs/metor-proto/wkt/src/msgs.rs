@@ -846,6 +846,49 @@ impl Msg for WiringManifest {
     const ID: PacketId = [224, 61];
 }
 
+/// Log severity, ordered low → high so consumers can filter by minimum level.
+/// Mirrors the `tracing` level set.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// One log line from the flight software, broadcast on the downlink
+/// (control → panel). Carries both hand-written lines (a system's health-port
+/// log call) and host `tracing` events routed through the forwarding layer.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LogEvent {
+    /// Source-side event time: the cycle timestamp for health-port lines, wall
+    /// clock for tracing events. The two clocks diverge under a simulated
+    /// clock, so consumers must not merge-sort across them.
+    pub timestamp: Timestamp,
+    pub level: LogLevel,
+    /// Filter key: the emitting system's instance name for health-port lines,
+    /// the tracing target for forwarded events.
+    pub source: String,
+    /// The tracing target (module path); empty for health-port lines.
+    pub target: String,
+    pub message: String,
+    /// Active tracing span scope, root → leaf joined with `:` (e.g.
+    /// `"run:load_slot"`). `None` for health-port lines.
+    pub span: Option<String>,
+    /// Event key-values beyond the message, Debug-formatted.
+    pub fields: Vec<(String, String)>,
+    /// Source location of the emitting tracing event, when known.
+    pub file: Option<String>,
+    pub line: Option<u32>,
+}
+
+impl Msg for LogEvent {
+    // Next free id after `WiringManifest`.
+    const ID: PacketId = [224, 62];
+}
+
 /// Version of the sealed-node transfer protocol ([224,45]..[224,57]).
 /// Clients MUST handshake with [`GetDbInfo`] before sending any of these:
 /// servers that predate the handshake record unknown request messages as
@@ -1355,5 +1398,55 @@ mod wiring_manifest_tests {
             assert_ne!(id, WiringManifest::ID);
         }
         assert!(!NODE_PROTOCOL_MESSAGES.contains(&WiringManifest::ID));
+    }
+}
+
+#[cfg(test)]
+mod log_event_tests {
+    use super::*;
+
+    #[test]
+    fn log_event_roundtrips() {
+        let ev = LogEvent {
+            timestamp: Timestamp(42),
+            level: LogLevel::Warn,
+            source: "nav".into(),
+            target: "metor_fsw2::coordinator".into(),
+            message: "slot load failed".into(),
+            span: Some("run:load_slot".into()),
+            fields: vec![("slot".into(), "nav".into())],
+            file: Some("src/coordinator/slot.rs".into()),
+            line: Some(690),
+        };
+        let bytes = postcard::to_allocvec(&ev).expect("encode");
+        let back: LogEvent = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.level, ev.level);
+        assert_eq!(back.source, ev.source);
+        assert_eq!(back.message, ev.message);
+        assert_eq!(back.span, ev.span);
+        assert_eq!(back.fields, ev.fields);
+    }
+
+    /// The pinned id — moving it silently re-keys every persisted recording —
+    /// and its distinctness from every other assigned id in this module.
+    #[test]
+    fn log_event_id_is_pinned_and_unique() {
+        assert_eq!(LogEvent::ID, [224, 62]);
+        for id in [
+            SequenceRegistry::ID,
+            SequenceChannelEvent::ID,
+            SequenceCommand::ID,
+            ReloadSequences::ID,
+            WiringManifest::ID,
+            AlarmDef::ID,
+            AlarmRaised::ID,
+            AlarmCleared::ID,
+            AlarmAck::ID,
+        ] {
+            assert_ne!(id, LogEvent::ID);
+        }
+        assert!(!NODE_PROTOCOL_MESSAGES.contains(&LogEvent::ID));
+        // Levels order low → high for min-level filtering.
+        assert!(LogLevel::Trace < LogLevel::Debug && LogLevel::Warn < LogLevel::Error);
     }
 }
