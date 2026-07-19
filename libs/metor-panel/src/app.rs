@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::connections::{ConnectionTarget, RegistryHandle, TargetId};
 use crate::inspector::Inspector;
 use crate::inspector::edits::{
     self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
@@ -750,7 +751,9 @@ fn global_time_range_rows(cx: &gpui::App) -> Vec<Box<dyn InspectorRow>> {
 pub struct PanelApp {
     db: Arc<DB>,
     server_addr: Option<SocketAddr>,
-    remote_addr: Option<SocketAddr>,
+    targets: Vec<ConnectionTarget>,
+    connection_sources: Vec<Box<dyn FnOnce(RegistryHandle)>>,
+    auto_connect: Vec<TargetId>,
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
     overlays: Vec<Box<dyn FnOnce(&mut App) -> gpui::AnyView>>,
@@ -762,11 +765,35 @@ impl PanelApp {
         Self {
             db,
             server_addr: None,
-            remote_addr: None,
+            targets: Vec::new(),
+            connection_sources: Vec::new(),
+            auto_connect: Vec::new(),
             command_providers: Vec::new(),
             init_hooks: Vec::new(),
             overlays: Vec::new(),
         }
+    }
+
+    /// Pre-register a connectable target in the picker.
+    pub fn connection(mut self, target: ConnectionTarget) -> Self {
+        self.targets.push(target);
+        self
+    }
+
+    /// Hand a [`RegistryHandle`] to a discovery source at startup. The
+    /// source owns its own threads (an mDNS scan, a cloud poll) and upserts
+    /// targets as it finds them; they appear in the picker reactively.
+    pub fn connection_source(mut self, source: impl FnOnce(RegistryHandle) + 'static) -> Self {
+        self.connection_sources.push(Box::new(source));
+        self
+    }
+
+    /// Connect to a registered target immediately at startup, skipping the
+    /// picker. The id must match a target registered via
+    /// [`connection`](PanelApp::connection).
+    pub fn auto_connect(mut self, id: impl Into<SharedString>) -> Self {
+        self.auto_connect.push(TargetId(id.into()));
+        self
     }
 
     /// Mount a consumer-built view over the window root. `build` runs at startup
@@ -794,9 +821,13 @@ impl PanelApp {
     /// Mirror a long-running remote metor-db at `addr`: live telemetry
     /// streams into the local DB, and plots hydrate remote-only history on
     /// demand (gaps render as translucent bands until their nodes land).
-    pub fn remote(mut self, addr: SocketAddr) -> Self {
-        self.remote_addr = Some(addr);
-        self
+    ///
+    /// Sugar over [`connection`](PanelApp::connection) +
+    /// [`auto_connect`](PanelApp::auto_connect) with the built-in TCP target.
+    pub fn remote(self, addr: SocketAddr) -> Self {
+        let target = ConnectionTarget::tcp("Remote", addr);
+        let id = target.id.0.clone();
+        self.connection(target).auto_connect(id)
     }
 
     /// Register a custom palette category with a pull-based provider. The
@@ -842,7 +873,9 @@ impl PanelApp {
         let PanelApp {
             db,
             server_addr,
-            remote_addr,
+            targets,
+            connection_sources,
+            auto_connect,
             command_providers,
             init_hooks,
             overlays,
@@ -859,32 +892,9 @@ impl PanelApp {
             });
         }
 
-        let remote_handles = remote_addr.map(|addr| {
-            let remote = metor_db::remote::RemoteDb::new(addr);
-            let hydrator = remote.hydrator();
-            let remote_db = db.clone();
-            stellar(move || async move {
-                remote.spawn(remote_db);
-                // The mirror and hydrator tasks own this thread's runtime;
-                // park so it never winds down.
-                std::future::pending::<()>().await
-            });
-            hydrator
-        });
-
-        // This panel is the system of record when it isn't mirroring
-        // someone else; it computes the min/max LoD companions wide plot
-        // views render from. Mirrors receive them via manifest seeding +
-        // hydration instead — locally computed buckets would disagree
-        // with the origin's.
-        if remote_addr.is_none() {
-            let lod_db = db.clone();
-            stellar(move || async move {
-                metor_db::lod::spawn(lod_db);
-                std::future::pending::<()>().await
-            });
-        }
-
+        let mut targets = Some(targets);
+        let mut connection_sources = Some(connection_sources);
+        let mut auto_connect = Some(auto_connect);
         let mut command_providers = Some(command_providers);
         let mut init_hooks = Some(init_hooks);
         let mut overlays = Some(overlays);
@@ -904,9 +914,6 @@ impl PanelApp {
                 cx.set_global(crate::theme::ActiveTheme(Arc::new(
                     crate::theme::DARK.clone(),
                 )));
-                if let Some(hydrator) = remote_handles.clone() {
-                    cx.set_global(crate::hydration::HydratorGlobal(hydrator));
-                }
                 edits::init(cx);
                 ItemRegistry::init(cx);
                 crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
@@ -922,6 +929,35 @@ impl PanelApp {
                 crate::plot_events::EventSourceRegistry::init(cx);
                 crate::wiring::WiringStore::init(db.clone(), cx);
                 register_pane_item_deserializers(db.clone(), cx);
+
+                // Connections: seed builder-registered targets, hand the
+                // registry to discovery sources, then fire auto-connects.
+                // LoD spawning is a store concern — it starts with the first
+                // local-authority connection rather than at boot.
+                let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
+                if let Some(store) = crate::connections::try_global(cx) {
+                    store.update(cx, |store, cx| {
+                        for target in targets.take().unwrap_or_default() {
+                            store.upsert_target(target, cx);
+                        }
+                        for id in auto_connect.take().unwrap_or_default() {
+                            let Some(target) = store
+                                .state()
+                                .targets()
+                                .iter()
+                                .find(|t| t.id == id)
+                                .cloned()
+                            else {
+                                tracing::warn!(%id, "auto-connect target not registered");
+                                continue;
+                            };
+                            store.connect(target, cx);
+                        }
+                    });
+                }
+                for source in connection_sources.take().unwrap_or_default() {
+                    source(registry.clone());
+                }
 
                 // Consumer extensions: register custom palette providers, run
                 // init hooks, then build overlays. All happen after the built-in

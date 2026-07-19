@@ -8,7 +8,7 @@ mod db;
 mod hydrate;
 mod offload;
 
-pub use db::RemoteDb;
+pub use db::{MirrorEvent, RemoteDb};
 pub use hydrate::Hydrator;
 pub use hydrate::hydrate_span;
 pub use offload::offload_span;

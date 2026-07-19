@@ -163,3 +163,34 @@ impl ThreadBuilder {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Cancelling a token-bearing stellar thread joins promptly even when
+    /// its future spawned subtasks and parked forever — the executor drops
+    /// spawned tasks and pending IO once the raced main future resolves.
+    /// The panel's connection system leans on exactly this for disconnect.
+    #[test]
+    fn cancel_tears_down_parked_stellar_thread() {
+        let token = CancelToken::new();
+        let thread = ThreadBuilder::default()
+            .cancel_token(token.clone())
+            .stellar(|| async {
+                let _ = crate::spawn(async {
+                    std::future::pending::<()>().await;
+                });
+                std::future::pending::<()>().await
+            });
+        std::thread::sleep(Duration::from_millis(50));
+        token.cancel();
+        let start = std::time::Instant::now();
+        let _ = thread.handle.join();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancelled stellar thread failed to wind down"
+        );
+    }
+}

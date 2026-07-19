@@ -17,6 +17,23 @@ use crate::{
 
 use super::Hydrator;
 
+/// Lifecycle notification from the mirror supervisor, so an embedding UI
+/// can surface connection health. Plain values through a plain callback —
+/// this crate stays free of any UI machinery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorEvent {
+    /// A connection attempt is starting (also fires before each reconnect).
+    Connecting,
+    /// The handshake completed; live telemetry is flowing.
+    Connected,
+    /// The peer closed the stream; the supervisor will reconnect.
+    Disconnected,
+    /// The attempt failed with an error; the supervisor will retry.
+    Failed,
+}
+
+type EventFn = Arc<dyn Fn(MirrorEvent) + Send + Sync>;
+
 /// Mirror of a long-running remote metor-db: a live-tail connection feeds
 /// the local DB exactly like a directly-attached producer would, while a
 /// separate bulk connection ([`PeerStore`]) serves on-demand hydration of
@@ -30,6 +47,7 @@ pub struct RemoteDb {
     addr: SocketAddr,
     store: Arc<PeerStore>,
     hydrator: Hydrator,
+    on_event: Option<EventFn>,
 }
 
 impl RemoteDb {
@@ -38,7 +56,16 @@ impl RemoteDb {
             addr,
             store: Arc::new(PeerStore::new(addr)),
             hydrator: Hydrator::new(),
+            on_event: None,
         }
+    }
+
+    /// Observe supervisor lifecycle transitions. The callback fires from the
+    /// mirror's runtime thread, so it must hand off to the observer's own
+    /// scheduling rather than block.
+    pub fn on_event(mut self, f: impl Fn(MirrorEvent) + Send + Sync + 'static) -> Self {
+        self.on_event = Some(Arc::new(f));
+        self
     }
 
     /// The handle render loops use to request remote-only ranges.
@@ -58,7 +85,13 @@ impl RemoteDb {
             addr,
             store,
             hydrator,
+            on_event,
         } = self;
+        let emit = move |event| {
+            if let Some(f) = &on_event {
+                f(event);
+            }
+        };
         stellarator::spawn(hydrator.clone().run(db.clone(), store.clone()));
         stellarator::spawn(seed_loop(db.clone(), store.clone()));
         stellarator::spawn(async move {
@@ -67,13 +100,16 @@ impl RemoteDb {
             let mut backoff = INITIAL_BACKOFF;
             loop {
                 let connected_at = std::time::Instant::now();
-                match mirror(&db, addr).await {
-                    Ok(()) => {}
+                emit(MirrorEvent::Connecting);
+                match mirror(&db, addr, &emit).await {
+                    Ok(()) => emit(MirrorEvent::Disconnected),
                     Err(err) if err.is_stream_closed() => {
                         info!(?addr, "remote db disconnected; reconnecting");
+                        emit(MirrorEvent::Disconnected);
                     }
                     Err(err) => {
                         warn!(?err, ?addr, "remote db mirror failed; reconnecting");
+                        emit(MirrorEvent::Failed);
                     }
                 }
                 if connected_at.elapsed() >= HEALTHY_CONNECTION {
@@ -103,10 +139,11 @@ async fn handshake_request<T>(
 
 /// One connection lifetime: handshake, metadata sync, then ingest the
 /// real-time stream until the connection drops.
-async fn mirror(db: &Arc<DB>, addr: SocketAddr) -> Result<(), Error> {
+async fn mirror(db: &Arc<DB>, addr: SocketAddr, emit: &impl Fn(MirrorEvent)) -> Result<(), Error> {
     let mut client = Client::connect(addr).await?;
     let info: DbInfoResp = handshake_request(client.request(&GetDbInfo)).await?;
     info!(?addr, peer_version = info.protocol_version, "mirroring remote db");
+    emit(MirrorEvent::Connected);
 
     let metadata: DumpMetadataResp = handshake_request(client.request(&DumpMetadata)).await?;
     db.with_state_mut(|state| {
@@ -164,6 +201,61 @@ async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>) {
             }
         }
         stellarator::sleep(RESEED_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn event_log() -> (Arc<StdMutex<Vec<MirrorEvent>>>, impl Fn(MirrorEvent) + Send + Sync) {
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let sink = log.clone();
+        (log, move |event| sink.lock().unwrap().push(event))
+    }
+
+    async fn wait_for(log: &StdMutex<Vec<MirrorEvent>>, wanted: MirrorEvent) {
+        for _ in 0..100 {
+            if log.lock().unwrap().contains(&wanted) {
+                return;
+            }
+            stellarator::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("never saw {wanted:?}; log: {:?}", log.lock().unwrap());
+    }
+
+    #[stellarator::test]
+    async fn unreachable_peer_emits_connecting_then_failed() {
+        let (log, sink) = event_log();
+        // A port nothing listens on: bind, note the addr, drop the listener.
+        let addr = {
+            let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::DB::create(dir.path().join("db")).unwrap());
+        RemoteDb::new(addr).on_event(sink).spawn(db);
+        wait_for(&log, MirrorEvent::Failed).await;
+        assert_eq!(log.lock().unwrap().first(), Some(&MirrorEvent::Connecting));
+    }
+
+    #[stellarator::test]
+    async fn live_peer_emits_connected() {
+        let (log, sink) = event_log();
+        let dir = tempfile::tempdir().unwrap();
+        let server_db = Arc::new(crate::DB::create(dir.path().join("server")).unwrap());
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = crate::Server {
+            listener,
+            db: server_db,
+        };
+        stellarator::struc_con::stellar(move || server.run());
+        let mirror_db = Arc::new(crate::DB::create(dir.path().join("mirror")).unwrap());
+        RemoteDb::new(addr).on_event(sink).spawn(mirror_db);
+        wait_for(&log, MirrorEvent::Connected).await;
+        assert_eq!(log.lock().unwrap().first(), Some(&MirrorEvent::Connecting));
     }
 }
 
