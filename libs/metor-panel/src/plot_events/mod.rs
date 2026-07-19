@@ -101,6 +101,9 @@ pub struct PlotEvent {
     pub color: Hsla,
     /// One-line popover header, e.g. `"WARN nav: sun lost"`.
     pub label: SharedString,
+    /// Compact name for the flag chip on the plot gutter, e.g. "WARN nav" or
+    /// an alarm's def id; `label` stays the popover header.
+    pub short: SharedString,
     pub detail: EventDetail,
 }
 
@@ -187,6 +190,15 @@ fn log_level_color(level: LogLevel, theme: &Theme) -> Hsla {
     }
 }
 
+fn log_short(ev: &LogEvent) -> SharedString {
+    let level = log_level_abbrev(ev.level);
+    if ev.source.is_empty() {
+        level.into()
+    } else {
+        format!("{level} {}", ev.source).into()
+    }
+}
+
 fn log_label(ev: &LogEvent) -> SharedString {
     let level = log_level_abbrev(ev.level);
     let message = truncate(&ev.message, LABEL_MAX);
@@ -231,6 +243,7 @@ impl EventSource for LogEventSource {
                 ts,
                 color: log_level_color(ev.level, &theme),
                 label: log_label(ev),
+                short: log_short(ev),
                 detail: EventDetail::Log(ev.clone()),
             })
             .collect()
@@ -252,6 +265,14 @@ fn alarm_color(ev: &AlarmEvent, theme: &Theme) -> Hsla {
     match ev.kind {
         AlarmEventKind::Raised => theme.alarm_color(ev.severity.map_or(0, severity_index)),
         AlarmEventKind::Cleared | AlarmEventKind::Acked => theme.text_secondary,
+    }
+}
+
+fn alarm_short(ev: &AlarmEvent) -> SharedString {
+    match ev.kind {
+        AlarmEventKind::Raised => ev.def_id.clone().into(),
+        AlarmEventKind::Cleared => format!("{} clr", ev.def_id).into(),
+        AlarmEventKind::Acked => format!("{} ack", ev.def_id).into(),
     }
 }
 
@@ -298,6 +319,7 @@ impl EventSource for AlarmEventSource {
                 ts,
                 color: alarm_color(ev, &theme),
                 label: alarm_label(ev),
+                short: alarm_short(ev),
                 detail: EventDetail::Alarm(ev.clone()),
             })
             .collect()
@@ -349,6 +371,8 @@ impl EventSource for SequenceEventSource {
                 // Each step takes the color of the run state it moved the channel to.
                 color: theme.run_state_color(run_state_index(entry.run_state)),
                 label: sequence_label(entry),
+                // The step label alone ("Started", "Loaded x") chips well.
+                short: entry.label.clone().into(),
                 detail: EventDetail::Sequence(entry.clone()),
             })
             .collect()
@@ -506,6 +530,7 @@ impl EventSource for MsgEventSource {
                     ts,
                     color,
                     label,
+                    short: name.clone(),
                     detail,
                 }
             })

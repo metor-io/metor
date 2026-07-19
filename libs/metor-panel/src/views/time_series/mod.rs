@@ -1852,9 +1852,10 @@ impl TimeSeriesPlot {
         cluster_events(positioned)
     }
 
-    /// Index of the flag nearest `pos`, when the pointer is inside the top
-    /// gutter band and within [`FLAG_HIT_PX`]. Confined to the gutter so trace
-    /// hover/pan/zoom below is untouched.
+    /// Index of the flag whose chip is under `pos`, when the pointer is
+    /// inside the top gutter band: the estimated chip extent to the right of
+    /// the rule hits, plus [`FLAG_HIT_PX`] of slack to its left. Confined to
+    /// the gutter so trace hover/pan/zoom below is untouched.
     fn event_cluster_at(&self, pos: Point<Pixels>, pa: Bounds<Pixels>) -> Option<usize> {
         let top = pa.origin.y;
         if pos.y < top || pos.y > top + px(GUTTER_H) {
@@ -1865,8 +1866,15 @@ impl TimeSeriesPlot {
         }
         let mut best: Option<(usize, f32)> = None;
         for (i, cluster) in self.event_clusters.iter().enumerate().rev() {
-            let dist = f32::from(cluster.x - pos.x).abs();
-            if dist <= FLAG_HIT_PX && best.map(|(_, d)| dist < d).unwrap_or(true) {
+            let offset = f32::from(pos.x - cluster.x);
+            let chip_w = f32::from(EventCluster::chip_width(
+                cluster.chip_label().chars().count(),
+            ));
+            let hit = (-FLAG_HIT_PX..=chip_w).contains(&offset);
+            // Prefer the flag whose rule is nearest, so a chip overdrawn by a
+            // truncated neighbor still resolves to the closer rule.
+            let dist = offset.abs();
+            if hit && best.map(|(_, d)| dist < d).unwrap_or(true) {
                 best = Some((i, dist));
             }
         }
@@ -2424,7 +2432,7 @@ impl Render for TimeSeriesPlot {
                                 .map(|c| ClusterPaint {
                                     x: c.x,
                                     color: c.color(&theme),
-                                    count: c.events.len(),
+                                    label: c.chip_label(),
                                 })
                                 .collect();
                             this.event_clusters = clusters;
