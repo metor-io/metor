@@ -371,8 +371,9 @@ impl ConnectionPicker {
     }
 
     /// The connect/disconnect action: a full-height segment at the row's
-    /// right edge — `| info | button |` — solid green to connect, solid red
-    /// to disconnect. The row itself only selects.
+    /// right edge — `| info | button |` — split off by a dimmed green/red
+    /// left border, with a faint matching tint and accent text. Width
+    /// follows the label. The row itself only selects.
     fn action_button(
         &self,
         target: ConnectionTarget,
@@ -380,7 +381,7 @@ impl ConnectionPicker {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let (label, bg) = if connected {
+        let (label, accent) = if connected {
             (SharedString::new_static("Disconnect"), theme.error_accent)
         } else {
             (SharedString::new_static("Connect"), theme.control_active)
@@ -389,15 +390,17 @@ impl ConnectionPicker {
             .id(SharedString::from(format!("action-{}", target.id)))
             .flex_shrink_0()
             .h_full()
-            .w(px(100.0))
+            .px(px(14.0))
             .flex()
             .items_center()
             .justify_center()
-            .bg(bg)
+            .border_l_1()
+            .border_color(Theme::dim(accent, 0.45))
+            .bg(Theme::dim(accent, 0.08))
             .text_size(px(12.0))
-            .text_color(theme.bg_primary)
+            .text_color(accent)
             .cursor_pointer()
-            .hover(|s| s.opacity(0.85))
+            .hover(|s| s.bg(Theme::dim(accent, 0.18)))
             .child(label)
             .on_mouse_down(
                 gpui::MouseButton::Left,
