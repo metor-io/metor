@@ -621,10 +621,32 @@ impl AppRoot {
         });
     }
 
-    /// Titlebar chip summarizing the connection set: a status dot plus
-    /// "offline", the single connection's name, or a count. Clicking opens
-    /// the picker.
-    fn render_connection_chip(
+    /// A flat, borderless titlebar control: quiet at rest, background on
+    /// hover. The titlebar reads as one surface instead of a row of pills.
+    fn titlebar_segment(theme: &crate::theme::Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .px(px(8.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(12.0))
+            .text_color(theme.text_primary)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.bg_primary))
+    }
+
+    fn titlebar_separator(theme: &crate::theme::Theme) -> gpui::Div {
+        div().w(px(1.0)).h(px(14.0)).bg(theme.border_primary)
+    }
+
+    /// The titlebar's identity: which system(s) this panel is looking at.
+    /// Sits on the left like an editor's project breadcrumb; clicking opens
+    /// the connection dialog.
+    fn render_connection_segment(
         &self,
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
@@ -635,9 +657,9 @@ impl AppRoot {
             let store = store.read(cx);
             let active = store.active();
             let label: SharedString = match active {
-                [] => SharedString::new_static("offline"),
+                [] => SharedString::new_static("not connected"),
                 [only] => only.target.name.clone(),
-                many => SharedString::from(format!("{} connections", many.len())),
+                many => SharedString::from(format!("{} systems", many.len())),
             };
             // The dot shows the worst status so a degraded mirror is
             // visible even while other connections are healthy.
@@ -661,23 +683,9 @@ impl AppRoot {
             return div().into_any_element();
         };
 
-        div()
-            .id("connection-chip")
-            .px(px(8.0))
-            .py(px(2.0))
-            .bg(theme.pill_bg)
-            .border_1()
-            .border_color(theme.pill_border)
-            .rounded(px(4.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .text_size(px(12.0))
-            .text_color(theme.text_primary)
-            .child(div().text_color(dot).child("\u{25cf}"))
+        Self::titlebar_segment(theme, "connection-segment")
+            .child(div().text_size(px(10.0)).text_color(dot).child("\u{25cf}"))
             .child(label)
-            .cursor_pointer()
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _window, cx| {
@@ -726,32 +734,36 @@ impl AppRoot {
             });
 
         // Occluded so these controls win the non-client hit-test: without it,
-        // Windows resolves clicks over the pills to the surrounding titlebar
-        // drag area (HTCAPTION) and drags the window instead of clicking.
+        // Windows resolves clicks over the segments to the surrounding
+        // titlebar drag area (HTCAPTION) and drags the window instead of
+        // clicking. Left: the panel's identity — what it's connected to.
+        let left = div()
+            .occlude()
+            .flex()
+            .flex_row()
+            .items_center()
+            .pl(px(if cfg!(target_os = "macos") { 78.0 } else { 8.0 }))
+            .child(self.render_connection_segment(theme, cx));
+
+        // Right: quiet controls, grouped by hairlines instead of per-pill
+        // borders.
         let mut right = div()
             .occlude()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
+            .gap(px(6.0))
             .pr(px(8.0));
 
-        // Global time-range pill: shows the window every Auto-range plot
-        // follows; clicking opens a preset/custom picker.
+        // Global time range: the window every Auto-range plot follows;
+        // clicking opens a preset/custom picker.
         let range_label = SharedString::from(format!("{}", GlobalTimeRange::get(cx)));
         right = right.child(
-            div()
-                .id("global-time-range")
-                .px(px(8.0))
-                .py(px(2.0))
-                .bg(theme.pill_bg)
-                .border_1()
-                .border_color(theme.pill_border)
-                .rounded(px(4.0))
-                .text_size(px(12.0))
-                .text_color(theme.text_primary)
+            Self::titlebar_segment(theme, "global-time-range")
                 .child(range_label)
-                .cursor_pointer()
+                .child(
+                    crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary),
+                )
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
                     let Some(open) = crate::inspector::open_inspector(cx) else {
                         return;
@@ -767,24 +779,16 @@ impl AppRoot {
                 }),
         );
 
-        right = right.child(self.render_connection_chip(theme, cx));
+        right = right.child(Self::titlebar_separator(theme));
         right = right.child(self.render_alarm_summary(theme, cx));
 
         if edit_count > 0 {
             let label = SharedString::from(format!("{} pending", edit_count));
+            right = right.child(Self::titlebar_separator(theme));
             right = right.child(
-                div()
-                    .id("pending-pill")
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .bg(theme.pill_bg)
-                    .border_1()
-                    .border_color(theme.pill_border)
-                    .rounded(px(4.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
+                Self::titlebar_segment(theme, "pending-edits")
+                    .text_color(theme.text_secondary)
                     .child(label)
-                    .cursor_pointer()
                     .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
                         pending_edits_mut(cx).open_review_requested = true;
                         cx.refresh_windows();
@@ -792,6 +796,7 @@ impl AppRoot {
             );
         }
 
+        right = right.child(Self::titlebar_separator(theme));
         right = right.child(lock_button);
 
         div()
@@ -812,7 +817,7 @@ impl AppRoot {
             .flex()
             .flex_row()
             .items_center()
-            .justify_end()
+            .justify_between()
             // Drag gesture for compositors that need an explicit hand-off:
             // mouse-down arms, the first mouse-move starts the compositor
             // drag. macOS drags natively via the transparent titlebar and
@@ -852,6 +857,7 @@ impl AppRoot {
                     })
                 },
             )
+            .child(left)
             .child(right)
             .when(
                 crate::window_controls::needs_window_controls(window),
