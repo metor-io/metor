@@ -19,10 +19,11 @@
 //! ring, so the downlink forwards them like any other message and a line is
 //! never truncated to fit a frame slot.
 //!
-//! Note for pack authors: `tracing` macros silently no-op inside a dlopen'd
-//! pack (each dylib links its own, never-initialized copy of the global
-//! dispatcher). [`HealthPort::log`] is the pack-facing log API; its records
-//! land on the same downlinked stream as the host's tracing events.
+//! Pack authors can use either [`HealthPort::log`] or `tracing` macros: the
+//! `export_pack!` shim installs a per-dylib forwarding subscriber
+//! ([`crate::logfwd::init_pack_tracing`], `INFO` and up), and `end_cycle`
+//! drains the dylib's queue onto the instance's own log port, so both paths
+//! land on the same downlinked stream attributed to the instance.
 
 use core::mem::offset_of;
 use std::sync::Arc;
@@ -155,6 +156,21 @@ where
         self.last_execute_micros = execute_micros;
         self.publish_health(timestamp);
         self.flush_logs(timestamp);
+        // Inside a pack dylib the tracing forward queue is per-dylib and the
+        // loop is single-threaded, so everything queued since the last drain
+        // was fired by this instance's own execute — drain it here, restamped
+        // with this instance as the source. False everywhere else (the host
+        // coordinator owns the host queue).
+        if crate::logfwd::pack_mode() {
+            let instance = self.instance.clone();
+            let dropped = crate::logfwd::drain(|mut ev| {
+                ev.source = instance.to_string();
+                self.emit_event(&ev);
+            });
+            for _ in 0..dropped {
+                self.error("log_dropped");
+            }
+        }
     }
 
     fn publish_health(&mut self, timestamp: Timestamp) {

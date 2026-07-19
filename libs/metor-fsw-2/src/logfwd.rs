@@ -18,7 +18,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
@@ -32,6 +32,36 @@ const QUEUE_CAP: usize = 1024;
 
 static QUEUE: Mutex<VecDeque<LogEvent>> = Mutex::new(VecDeque::new());
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Set inside a pack dylib by [`init_pack_tracing`]. These statics are
+/// per-dylib (each pack links its own copy of this crate), so the flag is
+/// only ever true in a shared object — the host keeps the coordinator as the
+/// single drain and this flag false.
+static PACK_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Whether this linkage unit is a pack dylib draining its own queue.
+pub(crate) fn pack_mode() -> bool {
+    PACK_MODE.load(Relaxed)
+}
+
+/// Install the pack-side tracing pipeline: a per-dylib global subscriber
+/// whose only layer is a [`ForwardLayer`] capped at `INFO`, plus the flag
+/// that makes every instance's `end_cycle` drain the dylib's queue onto its
+/// own log port.
+///
+/// Called by the `export_pack!` shim from `fsw_pack_open`, once per load. A
+/// dylib links its own copy of `tracing`'s dispatcher, so without this the
+/// macros silently no-op inside a pack. Attribution is exact for events fired
+/// during `execute` (the loop is single-threaded and the dylib runs no other
+/// code); events fired during create/bind drain into the first instance that
+/// completes a cycle.
+pub fn init_pack_tracing() {
+    PACK_MODE.store(true, Relaxed);
+    use tracing_subscriber::layer::SubscriberExt;
+    let subscriber = tracing_subscriber::registry()
+        .with(ForwardLayer::new().with_max_level(tracing::Level::INFO));
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
 
 /// Convert a `tracing::Level` to the wire enum.
 fn level_of(level: &tracing::Level) -> LogLevel {
@@ -74,20 +104,44 @@ impl Visit for FieldVisitor {
 /// The forwarding layer. Compose it onto a `tracing_subscriber::registry()`
 /// stack; [`forward_layer`] builds one for embedders.
 pub struct ForwardLayer {
-    _priv: (),
+    /// Least-severe level forwarded; `TRACE` passes everything through to an
+    /// external `with_filter`.
+    max_level: tracing::Level,
+}
+
+impl ForwardLayer {
+    fn new() -> Self {
+        Self {
+            max_level: tracing::Level::TRACE,
+        }
+    }
+
+    /// Cap the forwarded verbosity, for stacks with no external filter.
+    pub fn with_max_level(mut self, max_level: tracing::Level) -> Self {
+        self.max_level = max_level;
+        self
+    }
 }
 
 /// A [`ForwardLayer`] for a host's subscriber stack. Filter it externally
 /// (`with_filter`) to choose what reaches the downlink; the CLI forwards
 /// `INFO` and up by default.
 pub fn forward_layer() -> ForwardLayer {
-    ForwardLayer { _priv: () }
+    ForwardLayer::new()
 }
 
 impl<S> Layer<S> for ForwardLayer
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _ctx: Context<'_, S>,
+    ) -> bool {
+        *metadata.level() <= self.max_level
+    }
+
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let meta = event.metadata();
         let mut visitor = FieldVisitor::default();

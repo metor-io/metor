@@ -9242,6 +9242,7 @@ dependencies = [
  "metor-fsw-2",
  "postcard-schema",
  "serde",
+ "tracing",
  "zerocopy",
 ]
 

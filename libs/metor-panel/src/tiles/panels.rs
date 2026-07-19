@@ -16,9 +16,9 @@ use crate::views::time_series::{
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, SequenceGrid,
-    SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_browser,
-    new_component_table, new_data_table,
+    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, LevelFilter, LogView,
+    SequenceGrid, SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
+    new_component_browser, new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -129,6 +129,76 @@ impl PaneItem for AlarmPanel {
     fn to_config(&self, cx: &App) -> AlarmPanelConfig {
         AlarmPanelConfig {
             show_history: self.inner.read(cx).is_history(),
+        }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into())
+    }
+}
+
+/// Persisted shape of a [`LogPanel`]: the view's filters and follow mode.
+#[derive(facet::Facet)]
+pub struct LogPanelConfig {
+    pub min_level: LevelFilter,
+    pub source: String,
+    pub follow: bool,
+}
+
+impl Default for LogPanelConfig {
+    fn default() -> Self {
+        Self {
+            min_level: LevelFilter::default(),
+            source: String::new(),
+            follow: true,
+        }
+    }
+}
+
+/// Pane item streaming the flight software's log lines.
+pub struct LogPanel {
+    inner: Entity<LogView>,
+}
+
+impl LogPanel {
+    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(LogView::new);
+        Self { inner }
+    }
+
+    pub fn from_config(cfg: LogPanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| {
+            let mut view = LogView::new(cx);
+            view.set_filters(cfg.min_level, cfg.source, cfg.follow);
+            view
+        });
+        Self { inner }
+    }
+}
+
+impl Render for LogPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for LogPanel {
+    type Config = LogPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("Logs")
+    }
+
+    fn serialization_key() -> &'static str {
+        "logs"
+    }
+
+    fn to_config(&self, cx: &App) -> LogPanelConfig {
+        let view = self.inner.read(cx);
+        LogPanelConfig {
+            min_level: view.min_level,
+            source: view.source.clone(),
+            follow: view.follow,
         }
     }
 
@@ -1662,6 +1732,18 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             pane.update(cx, |pane, cx| {
                 let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| AlarmPanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
+    rows.push(Box::new(CommandRow::new("Logs", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| LogPanel::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })

@@ -11,9 +11,9 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, SequenceGridPanel,
-    SequencePanel, TablePanel, TextPanel, TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel,
-    XyPlotPanel,
+    AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, LogPanel, PlotPanel,
+    SequenceGridPanel, SequencePanel, TablePanel, TextPanel, TrafficLightGridPanel,
+    TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -917,6 +917,7 @@ impl PanelApp {
                 crate::node_editor::inspector_rows::register_inspector_rows(cx);
                 crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
+                crate::logs::LogStore::init(db.clone(), cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
                 crate::wiring::WiringStore::init(db.clone(), cx);
                 register_pane_item_deserializers(db.clone(), cx);
@@ -1011,6 +1012,7 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
 
     register_panel::<TextPanel>(&mut reg, db.clone(), TextPanel::from_config);
     register_panel::<AlarmPanel>(&mut reg, db.clone(), AlarmPanel::from_config);
+    register_panel::<LogPanel>(&mut reg, db.clone(), LogPanel::from_config);
     register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
     register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
     register_panel::<TablePanel>(&mut reg, db.clone(), TablePanel::from_config);

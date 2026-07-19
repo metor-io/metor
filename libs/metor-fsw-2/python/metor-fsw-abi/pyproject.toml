@@ -9,7 +9,7 @@
 
 [project]
 name = "metor-fsw-abi"
-version = "8"
+version = "9"
 description = "Version marker for the metor-fsw pack ABI; depended on, never imported"
 requires-python = ">=3.10"
 

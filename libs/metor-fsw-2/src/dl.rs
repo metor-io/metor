@@ -45,8 +45,9 @@
 
 use core::ffi::c_void;
 use std::ffi::OsStr;
+use std::path::Path;
 #[cfg(feature = "wiring")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::slice;
 use std::sync::Arc;
@@ -508,6 +509,7 @@ impl DlSystem {
         inputs: Vec<FswRing>,
         outputs: Vec<FswRing>,
         name: &str,
+        instance: &str,
         mount: crate::Mount,
     ) -> DlSlot {
         let (ptr, len) = if params.is_empty() {
@@ -546,6 +548,7 @@ impl DlSystem {
             inputs,
             outputs,
             name: Arc::from(name),
+            instance: Arc::from(instance),
             slot_state,
         }
     }
@@ -578,7 +581,11 @@ pub(crate) struct DlSlot {
     inputs: Vec<FswRing>,
     /// Output ring handles in descriptor order, this system's own writer rings.
     outputs: Vec<FswRing>,
+    /// Status identity, type-level like a static system's `System::NAME`.
     name: Arc<str>,
+    /// Instance name passed to `fsw_pack_bind_init`, the `source` stamped on
+    /// the entry's log events.
+    instance: Arc<str>,
     slot_state: SlotState,
 }
 
@@ -660,8 +667,8 @@ impl CyclicSlot for DlSlot {
                 self.inputs.len(),
                 self.outputs.as_ptr(),
                 self.outputs.len(),
-                self.name.as_ptr(),
-                self.name.len(),
+                self.instance.as_ptr(),
+                self.instance.len(),
             );
         }
     }
@@ -761,6 +768,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             name: Arc::from("stub"),
+            instance: Arc::from("stub"),
             slot_state: SlotState::Running,
         }
     }

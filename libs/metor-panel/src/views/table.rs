@@ -162,6 +162,13 @@ impl<D: TableDelegate> Table<D> {
         &mut self.delegate
     }
 
+    /// Scroll the body so row `ix` sits at the bottom of the viewport; the
+    /// log viewer's follow-tail.
+    pub fn scroll_to_row(&mut self, ix: usize) {
+        self.scroll_handle
+            .scroll_to_item(ix, gpui::ScrollStrategy::Bottom);
+    }
+
     fn sync_col_states(&mut self) {
         let columns = self.delegate.columns();
         if self.col_states.len() != columns.len() {

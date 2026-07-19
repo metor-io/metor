@@ -110,6 +110,7 @@ pub(super) fn bind_systems(
                 id,
                 dl,
                 &desc,
+                &name,
                 cons_edges,
                 &alloc.output_rings,
             ))),
@@ -224,6 +225,7 @@ fn bind_dl(
     id: usize,
     dl: DlReg,
     desc: &SystemDescriptor,
+    name: &str,
     cons_edges: &ConsEdges,
     output_rings: &[Vec<RingBuffer>],
 ) -> crate::dl::DlSlot {
@@ -253,9 +255,17 @@ fn bind_dl(
     // the slot; the coordinator drops `cyclic` (this slot, whose `Drop` calls
     // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after;
     // the slot keeps its own `Arc<Library>`.
+    // Status identity stays type-level (`desc.name`, like a static system's
+    // `System::NAME`); the instance name rides separately for log attribution.
     unsafe {
-        dl.system
-            .make_slot(&dl.params, inputs, outputs, &desc.name, crate::Mount::Wired)
+        dl.system.make_slot(
+            &dl.params,
+            inputs,
+            outputs,
+            &desc.name,
+            name,
+            crate::Mount::Wired,
+        )
     }
 }
 

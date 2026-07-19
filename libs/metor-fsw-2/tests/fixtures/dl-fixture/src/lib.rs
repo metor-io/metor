@@ -114,6 +114,9 @@ impl CyclicSystem for DlCounter {
             }
         };
         let count = self.start + (value as f64 * self.scale).round() as u64;
+        // Exercises the pack-side tracing pipeline: the export shim installed
+        // a per-dylib subscriber, so this lands on the instance's log port.
+        tracing::info!(count, "tick counted");
         let _ = output.out.write(&TickOut {
             timestamp: now,
             count,

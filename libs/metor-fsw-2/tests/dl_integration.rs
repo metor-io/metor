@@ -259,6 +259,13 @@ fn dlopen_cyclic_system_end_to_end() {
             .expect("second instance's output is registered")
             .expect("a reader slot is available"),
     );
+    let mut log_in: MsgIn<metor_fsw_2::LogEvent> = MsgIn::new(
+        coord
+            .registry()
+            .view(ComponentId::new("dl_counter.log"))
+            .expect("the implicit log channel is registered")
+            .expect("a reader slot is available"),
+    );
 
     // 4. Run several cycles. The producer runs before the consumer each cycle,
     //    so the consumer samples that cycle's fresh value. `run_for` performs
@@ -309,11 +316,31 @@ fn dlopen_cyclic_system_end_to_end() {
         "every-record log semantics across the dl boundary"
     );
 
+    // 5c. The fixture's `tracing::info!` inside execute crossed the boundary
+    //     too: the export shim installs a per-dylib subscriber, and each
+    //     instance's end_cycle drains the dylib's queue onto its own log
+    //     port, re-stamped with the instance name.
+    let mut traced: Vec<metor_fsw_2::LogEvent> = Vec::new();
+    log_in
+        .drain(|ev| traced.push(ev))
+        .expect("log ring readable");
+    let ev = traced
+        .iter()
+        .find(|ev| ev.message == "tick counted")
+        .expect("the pack's tracing event reached its log port");
+    assert_eq!(ev.source, "dl_counter", "attributed to the instance");
+    assert_eq!(ev.level, metor_fsw_2::LogLevel::Info);
+    assert!(
+        ev.fields.iter().any(|(k, _)| k == "count"),
+        "the event's fields survive: {:?}",
+        ev.fields
+    );
+
     // 6. Teardown ordering: dropping the coordinator runs `fsw_pack_destroy` before
     //    the `Library` unloads and before the `RingTable` frees the regions.
     //    Not crashing here is the assertion.
     drop(coord);
-    drop((out_view, events_in, twin_view));
+    drop((out_view, events_in, twin_view, log_in));
 }
 
 /// Building through the driver ([`provision_artifacts`]) leaves a

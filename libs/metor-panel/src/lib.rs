@@ -13,6 +13,7 @@ use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod alarms;
+pub mod logs;
 pub mod app;
 pub mod config;
 pub mod dynamic;

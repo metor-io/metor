@@ -369,6 +369,67 @@ async fn telemetry_end_to_end_all() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. Health-port log lines downlink as self-describing LogEvent Msg packets.
+// ---------------------------------------------------------------------------
+
+/// A system that logs one line through its health port each cycle.
+struct Chatty;
+
+#[derive(SystemOutput)]
+struct ChattyOut {}
+
+impl System for Chatty {
+    type Input = NoIn;
+    type Output = Out<ChattyOut>;
+    const NAME: &'static str = "chatty";
+}
+
+impl CyclicSystem for Chatty {
+    fn execute(&mut self, _now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        o.health().log(crate::LogLevel::Warn, "thruster hiccup");
+    }
+}
+
+/// The implicit log port is an ordinary message channel, so the downlink's
+/// receive-all tap forwards each queued line as a `Msg` packet keyed
+/// `LogEvent::ID`, stamped with the emitting instance's name.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn health_log_lines_downlink_as_log_events() {
+    use metor_proto::types::PacketTy;
+    use metor_proto_wkt::{LogEvent, LogLevel};
+
+    let mock = MockTransport::new(false);
+    let rec = mock.inner.clone();
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    b.push_node(cyclic_node("chatty".into(), Chatty));
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        TelemetrySystem::new(TelemetryConfig {
+            transport: mock,
+            mode: TelemetryMode::All,
+        }),
+    ));
+    let mut coord = b.build().unwrap();
+    coord.run_for(10).await;
+
+    let packets = rec.packets.lock().unwrap();
+    let events: Vec<LogEvent> = packets
+        .iter()
+        .filter(|pkt| pkt.inner[4] == PacketTy::Msg as u8 && packet_id_of(pkt) == LogEvent::ID)
+        .map(|pkt| postcard::from_bytes(packet_payload(pkt)).expect("LogEvent payload decodes"))
+        .collect();
+    let ev = events
+        .iter()
+        .find(|ev| ev.source == "chatty")
+        .expect("chatty's line arrives keyed to its instance name");
+    assert_eq!(ev.level, LogLevel::Warn);
+    assert_eq!(ev.message, "thruster hiccup");
+    assert_eq!(ev.target, "", "health-port lines carry no tracing target");
+    assert_eq!(ev.span, None);
+}
+
+// ---------------------------------------------------------------------------
 // 3. Two instances of one type get distinct qualified ids and prefixed names.
 // ---------------------------------------------------------------------------
 

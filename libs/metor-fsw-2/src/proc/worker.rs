@@ -294,7 +294,7 @@ fn run_system(
         RunMode::Cyclic => crate::Mount::Wired,
         RunMode::Sequence => crate::Mount::SlotOccupant,
     };
-    let mut slot = unsafe { dl.make_slot(params, inputs, outputs, name, mount) };
+    let mut slot = unsafe { dl.make_slot(params, inputs, outputs, name, name, mount) };
     if slot.state().is_stopped() {
         return fail(
             fail_code::CREATE,

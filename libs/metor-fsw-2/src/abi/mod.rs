@@ -608,6 +608,10 @@ macro_rules! export_pack {
 
             #[unsafe(no_mangle)]
             pub extern "C" fn fsw_pack_open() -> *mut c_void {
+                // The dylib links its own copy of tracing's dispatcher, so
+                // install the pack-side forwarding subscriber here; without
+                // it, tracing macros inside the pack silently no-op.
+                $crate::logfwd::init_pack_tracing();
                 abi::run_pack_open($pack_fn)
             }
 
