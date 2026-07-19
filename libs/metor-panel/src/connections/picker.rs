@@ -394,7 +394,7 @@ impl ConnectionPicker {
             .flex()
             .items_center()
             .justify_center()
-            .border_l_1()
+            .border_l_2()
             .border_color(Theme::dim(accent, 0.45))
             .bg(Theme::dim(accent, 0.08))
             .text_size(px(12.0))
