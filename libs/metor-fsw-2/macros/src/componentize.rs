@@ -21,7 +21,7 @@ pub fn componentize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> TokenSt
     // recurse through their own `sink_columns`; a `FrameList`/`FrameMap` slot
     // holds no in-struct value, so its call is a no-op. The timestamp field
     // supplies the frame's time and is never emitted as a component.
-    let sink_calls = fields.iter().filter(|f| !f.timestamp).map(|field| {
+    let sink_calls = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
         let ident = field.ident.as_ref().expect("only named fields allowed");
         if field.is_nested() {
             quote! { self.#ident.sink_columns(output); }

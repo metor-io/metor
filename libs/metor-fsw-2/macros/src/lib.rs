@@ -50,6 +50,11 @@ struct Field {
     /// treating the field as a leaf scalar.
     #[darling(default)]
     nest: bool,
+    /// `#[fsw(skip)]` force-hides a field from telemetry; `#[fsw(skip = false)]`
+    /// opts a `_`-prefixed field back in. Absent, a field is skipped iff its
+    /// name starts with `_` — the convention for `#[repr(C)]` padding.
+    #[darling(default)]
+    skip: Option<bool>,
 }
 
 impl Field {
@@ -62,6 +67,17 @@ impl Field {
                 ident.to_string()
             }
         }
+    }
+
+    /// Whether the field is omitted from telemetry: never becomes a component
+    /// and never round-trips through encode/decode. `_`-prefixed fields skip by
+    /// default (padding), overridable in either direction with `#[fsw(skip)]`.
+    pub fn skipped(&self) -> bool {
+        self.skip.unwrap_or_else(|| {
+            self.ident
+                .as_ref()
+                .is_some_and(|i| i.to_string().starts_with('_'))
+        })
     }
 
     /// Whether the field recurses through the component traits rather than
