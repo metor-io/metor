@@ -1026,7 +1026,32 @@ impl Msg for NodeAck {
     const ID: PacketId = [224, 55];
 }
 
-/// Every message of the sealed-node transfer protocol. Servers consult
+/// Version of the fsw link identity protocol ([`LinkInfo`]), independent
+/// of [`NODE_PROTOCOL_VERSION`].
+pub const LINK_PROTOCOL_VERSION: u32 = 1;
+
+/// Identity push from an fsw link server: the FIRST packet on every
+/// accepted connection, ahead of the schema announce replay. A metor-db
+/// server never sends it, and an fsw link server never answers
+/// [`GetDbInfo`] — the pair is how one address form serves both peers: a
+/// client probes with `GetDbInfo` and lets the first packet's id decide
+/// the mode.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LinkInfo {
+    pub protocol_version: u32,
+    /// Capability bits, reserved (0 for now).
+    pub features: u64,
+    /// The uplink's configured command set: the msg ids a ground client
+    /// should forward up the link. The uplink's minted ports are
+    /// untelemetered, so forwarding these can never echo back down.
+    pub command_ids: Vec<PacketId>,
+}
+
+impl Msg for LinkInfo {
+    const ID: PacketId = [224, 61];
+}
+
+/// Every message of the node/link control protocols. Servers consult
 /// this to keep stray protocol messages out of recorded telemetry; other
 /// unmatched messages (alarms, sequences, …) are telemetry by design —
 /// the msg log is their pub/sub channel.
@@ -1047,6 +1072,7 @@ pub const NODE_PROTOCOL_MESSAGES: &[PacketId] = &[
     // get recorded as telemetry.
     [224, 56],
     [224, 57],
+    LinkInfo::ID,
 ];
 
 #[cfg(test)]
@@ -1426,5 +1452,31 @@ mod log_event_tests {
         assert!(!NODE_PROTOCOL_MESSAGES.contains(&LogEvent::ID));
         // Levels order low → high for min-level filtering.
         assert!(LogLevel::Trace < LogLevel::Debug && LogLevel::Warn < LogLevel::Error);
+    }
+}
+
+#[cfg(test)]
+mod link_info_tests {
+    use super::*;
+
+    /// The pinned id — hand-allocated past the retired [224,58..=60] range —
+    /// and its stray-drop membership: both servers key their
+    /// never-record-as-telemetry hygiene off [`NODE_PROTOCOL_MESSAGES`].
+    #[test]
+    fn link_info_id_is_pinned_and_protocol_member() {
+        assert_eq!(LinkInfo::ID, [224, 61]);
+        assert!(NODE_PROTOCOL_MESSAGES.contains(&LinkInfo::ID));
+    }
+
+    #[test]
+    fn link_info_round_trips() {
+        let info = LinkInfo {
+            protocol_version: LINK_PROTOCOL_VERSION,
+            features: 0,
+            command_ids: vec![SequenceCommand::ID, AlarmAck::ID],
+        };
+        let bytes = postcard::to_allocvec(&info).expect("encode");
+        let back: LinkInfo = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back, info);
     }
 }
