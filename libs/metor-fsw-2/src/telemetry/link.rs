@@ -32,7 +32,10 @@ use std::rc::Rc;
 
 use metor_proto::types::{IntoLenPacket, Msg as _, OwnedPacket, PacketId};
 use metor_proto_stellar::PacketStream;
-use metor_proto_wkt::{MsgStream, SetComponentMetadata, VTableMsg};
+use metor_proto_wkt::{
+    LINK_PROTOCOL_VERSION, LinkInfo, MsgStream, NODE_PROTOCOL_MESSAGES, SetComponentMetadata,
+    VTableMsg,
+};
 use stellarator::JoinHandleDropGuard;
 use stellarator::io::{AsyncWrite, OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::{TcpListener, TcpStream};
@@ -81,9 +84,14 @@ pub struct LinkStats {
 /// The task-visible interior: connection set, announce replay blob, inbound
 /// queue, counters.
 struct ServerShared {
-    /// The pre-encoded announce packets every new connection receives first.
-    /// `None` until the downlink's init supplies them; accepted connections
-    /// park on [`announce_ready`](Self::announce_ready) meanwhile.
+    /// The uplink's advertised command set, installed by its init ahead of
+    /// the downlink's [`set_announces`](LinkState::set_announces) freezing
+    /// it into the identity packet.
+    uplink_msgs: RefCell<Vec<PacketId>>,
+    /// The pre-encoded identity + announce packets every new connection
+    /// receives first. `None` until the downlink's init supplies them;
+    /// accepted connections park on
+    /// [`announce_ready`](Self::announce_ready) meanwhile.
     announce_blob: RefCell<Option<Rc<Vec<u8>>>>,
     announce_ready: WaitQueue,
     conns: RefCell<Vec<Rc<Conn>>>,
@@ -125,6 +133,7 @@ impl LinkState {
             listener: Some(listener),
             local_addr,
             shared: Rc::new(ServerShared {
+                uplink_msgs: RefCell::new(Vec::new()),
                 announce_blob: RefCell::new(None),
                 announce_ready: WaitQueue::new(),
                 conns: RefCell::new(Vec::new()),
@@ -144,14 +153,43 @@ impl LinkState {
         self.local_addr
     }
 
-    /// Encode and install the announce replay every connection receives
-    /// before any data. Called once, by the downlink's init; a second
-    /// downlink on one server is a config defect its health reports.
+    /// Advertise the uplink's command set for the identity packet. Runs
+    /// from the uplink's init, before the downlink's
+    /// [`set_announces`](Self::set_announces) freezes the replay (init
+    /// order guarantees it: the downlink's `ReceiveAll` capability defers
+    /// it last). Errors when the replay is already frozen — an uplink
+    /// registered after the downlink, a config defect the caller reports
+    /// through its health. Appends with id-dedup, so a second uplink's set
+    /// unions in.
+    pub(crate) fn add_uplink_msgs(&self, ids: &[PacketId]) -> Result<(), AnnouncesAlreadySet> {
+        if self.shared.announce_blob.borrow().is_some() {
+            return Err(AnnouncesAlreadySet);
+        }
+        let mut msgs = self.shared.uplink_msgs.borrow_mut();
+        for id in ids {
+            if !msgs.contains(id) {
+                msgs.push(*id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode and install the identity + announce replay every connection
+    /// receives before any data: the [`LinkInfo`] identity packet first —
+    /// its position is what lets a probing client decide the peer's mode
+    /// from the first packet — then the schema announces. Called once, by
+    /// the downlink's init; a second downlink on one server is a config
+    /// defect its health reports.
     pub(crate) fn set_announces(&self, announces: &[Announce]) -> Result<(), AnnouncesAlreadySet> {
         if self.shared.announce_blob.borrow().is_some() {
             return Err(AnnouncesAlreadySet);
         }
-        let mut blob = Vec::new();
+        let info = LinkInfo {
+            protocol_version: LINK_PROTOCOL_VERSION,
+            features: 0,
+            command_ids: self.shared.uplink_msgs.borrow().clone(),
+        };
+        let mut blob = (&info).into_len_packet().inner;
         for a in announces {
             match a {
                 Announce::Table {
@@ -256,8 +294,10 @@ impl LinkState {
     }
 }
 
-/// A second `set_announces` on one server: two downlinks share it, which
-/// the caller reports through its health rather than clobbering the replay.
+/// A second `set_announces` (or an `add_uplink_msgs` past the freeze) on
+/// one server: a mis-ordered link pack, which the caller reports through
+/// its health rather than clobbering the replay.
+#[derive(Debug)]
 pub(crate) struct AnnouncesAlreadySet;
 
 #[cfg(test)]
@@ -377,8 +417,10 @@ async fn write_half(conn: Rc<Conn>, tx: OwnedWriter<TcpStream>) {
 }
 
 /// Read packets until error or EOF: inbound `Msg` packets queue for the
-/// uplink; legacy [`MsgStream`] subscriptions are accepted and ignored
-/// (every connection gets the full stream); `Table` packets are ignored.
+/// uplink; legacy [`MsgStream`] subscriptions and stray node/link protocol
+/// messages (a client's `GetDbInfo` identity probe) are accepted and
+/// ignored — the same hygiene the db server applies, so probing never
+/// pollutes the command queue; `Table` packets are ignored.
 async fn read_half(shared: Rc<ServerShared>, rx: OwnedReader<TcpStream>) {
     let mut stream = PacketStream::new(rx);
     let mut buf = vec![0u8; RECV_BUF];
@@ -387,6 +429,7 @@ async fn read_half(shared: Rc<ServerShared>, rx: OwnedReader<TcpStream>) {
             Ok(pkt) => {
                 if let OwnedPacket::Msg(m) = &pkt
                     && m.id != MsgStream::ID
+                    && !NODE_PROTOCOL_MESSAGES.contains(&m.id)
                 {
                     push_inbound(&shared, m.id, &m.buf);
                 }

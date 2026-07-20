@@ -836,14 +836,15 @@ async fn message_downlink_fifo_no_coalesce() {
     // Broadcast the batch to a test connection and read its buffered bytes
     // back as packets.
     let link = test_link(false);
-    let conn = {
+    let (conn, seeded) = {
         let state = link.get();
         state.set_announces(&[]).ok();
         let conn = state.push_test_conn();
+        let seeded = conn.pending_bytes().len();
         state.broadcast(&batch);
-        conn
+        (conn, seeded)
     };
-    let bytes = conn.pending_bytes();
+    let bytes = conn.pending_bytes()[seeded..].to_vec();
     let mut parsed: Vec<OwnedPacket<Vec<u8>>> = Vec::new();
     let mut rest = &bytes[..];
     while !rest.is_empty() {
@@ -1286,4 +1287,70 @@ async fn late_connection_gets_the_announce_replay() {
             .any(|(_, meta)| meta.iter().any(|m| m.name == "producer.imu.omega")),
         "the late connection decoded the replay"
     );
+}
+
+/// The identity packet leads every connection and advertises the uplink's
+/// configured command set; a client's `GetDbInfo` probe is dropped at the
+/// server's read side and never surfaces as `uplink_unroutable`.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn identity_advertises_uplink_msgs_and_tolerates_probes() {
+    use metor_proto::types::IntoLenPacket;
+    use metor_proto_wkt::{AlarmAck, GetDbInfo, LinkInfo, SequenceCommand};
+    use stellarator::io::{AsyncWrite, SplitExt};
+
+    let link = test_link(true);
+    let mut b = crate::coordinator::init::InitGraph::new(wall_config());
+    b.push_node(cyclic_node(
+        "uplink".into(),
+        UplinkSystem::new()
+            .attach(link.clone())
+            .with_msg::<SequenceCommand>()
+            .with_msg::<AlarmAck>(),
+    ));
+    b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+    b.push_node(cyclic_node(
+        "telemetry".into(),
+        downlink(&link, TelemetryMode::All),
+    ));
+    let mut coord = b.build().unwrap();
+
+    let mut uplink_health = coord
+        .registry()
+        .get(ComponentId::new("uplink.health"))
+        .expect("uplink.health")
+        .view()
+        .expect("reader slot");
+
+    // Connect mid-run setup, read the identity, and probe like a unified
+    // ground client would.
+    let addr = link.get().local_addr();
+    let probe = stellarator::spawn(async move {
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let (rx, tx) = stream.split();
+        let mut packets = PacketStream::new(rx);
+        let pkt = packets.next_grow(vec![0u8; 1024]).await.expect("identity");
+        let OwnedPacket::Msg(m) = &pkt else {
+            panic!("expected the identity push")
+        };
+        assert_eq!(m.id, LinkInfo::ID, "identity precedes the replay");
+        let info: LinkInfo = postcard::from_bytes(&m.buf).expect("decodes");
+        assert_eq!(
+            info.command_ids,
+            vec![SequenceCommand::ID, AlarmAck::ID],
+            "the uplink's configured set, in config order"
+        );
+        tx.write_all((&GetDbInfo).into_len_packet().inner)
+            .await
+            .0
+            .expect("probe");
+    })
+    .drop_guard();
+
+    coord.run_for(100).await;
+    drop(probe);
+
+    let bytes = drain_latest(&mut uplink_health).expect("uplink health published");
+    let h = SystemHealth::read_from_prefix(&bytes).expect("health").0;
+    assert_eq!(h.errors, 0, "the probe never counted as unroutable");
 }

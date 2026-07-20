@@ -331,6 +331,27 @@ impl System for UplinkSystem {
     type Input = UplinkIn;
     type Output = UplinkOut;
     const NAME: &'static str = "uplink";
+
+    /// Advertise the forward set in the link's identity packet, so a ground
+    /// client knows which msg ids to send up. Init order makes this land
+    /// before the downlink freezes the replay (the downlink is deferred
+    /// last by its `ReceiveAll` capability); a late registration is a
+    /// config defect reported here rather than silently unadvertised.
+    fn init(&mut self, output: &mut UplinkOut) {
+        let link = self
+            .link
+            .as_ref()
+            .expect("uplink attached to a TcpServer state (the builtin link pack's ctor)");
+        let ids: Vec<PacketId> = self.msgs.iter().map(|&(_, id)| id).collect();
+        if link.get().add_uplink_msgs(&ids).is_err() {
+            let health = output.health();
+            health.error("uplink_announced_late");
+            health.log(
+                crate::health::LogLevel::Warn,
+                "uplink registered after the downlink; its command set is not advertised to clients",
+            );
+        }
+    }
 }
 
 impl CyclicSystem for UplinkSystem {
