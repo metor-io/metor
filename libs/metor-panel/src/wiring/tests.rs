@@ -17,6 +17,7 @@ fn wiring_with_system(name: &str) -> Wiring {
             clock: ClockSpec::Wall,
         },
         artifacts: Vec::new(),
+        states: Vec::new(),
         systems: vec![SystemSpec {
             name: name.to_string(),
             ty: Some("Demo".to_string()),

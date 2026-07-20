@@ -52,6 +52,7 @@ fn main() {
             Connected {
                 hydrator: None,
                 local_authority: true,
+                resolved: None,
             }
         },
     );

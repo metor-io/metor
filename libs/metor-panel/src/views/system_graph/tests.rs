@@ -18,6 +18,7 @@ fn base_wiring() -> Wiring {
             clock: ClockSpec::Wall,
         },
         artifacts: Vec::new(),
+        states: Vec::new(),
         systems: Vec::new(),
         slots: Vec::new(),
         edges: Vec::new(),

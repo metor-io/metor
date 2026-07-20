@@ -11,11 +11,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use gpui::SharedString;
 use metor_db::DB;
-use metor_db::remote::{Hydrator, MirrorEvent, RemoteDb};
+use metor_db::remote::{Hydrator, MirrorEvent, Peer, RemoteDb, fsw_stream, identify};
 use stellarator::struc_con::ThreadBuilder;
 use stellarator::util::CancelToken;
 
@@ -118,6 +119,17 @@ pub struct Connected {
     /// feeds; drives the LoD-companion spawn policy. The TCP mirror reports
     /// false — it receives LoD series from the origin via manifest seeding.
     pub local_authority: bool,
+    /// A discovery backend learns its shape only once the peer identifies;
+    /// it sends the real resources here (one-shot) and the store applies
+    /// them on its poll. Backends that know their shape synchronously leave
+    /// this `None`.
+    pub resolved: Option<std::sync::mpsc::Receiver<Resolved>>,
+}
+
+/// The late-bound half of [`Connected`], for identity-discovery backends.
+pub struct Resolved {
+    pub hydrator: Option<Hydrator>,
+    pub local_authority: bool,
 }
 
 /// Spawns whatever feeds the shared DB for one target. Called on the gpui
@@ -152,14 +164,32 @@ pub struct AddressResolver {
 }
 
 impl Default for AddressResolver {
+    /// The built-in grammar: a bare `host:port` connects with identity
+    /// discovery (metor-db or fsw link, whichever answers), while a
+    /// `db://` or `fsw://` prefix pins the protocol.
     fn default() -> Self {
         Self {
             placeholder: SharedString::new_static("host:port"),
             resolve: Arc::new(|input| {
-                let addr: SocketAddr = input.trim().parse().map_err(|_| {
-                    SharedString::new_static("expected host:port, e.g. 127.0.0.1:2240")
+                let input = input.trim();
+                let (scheme, rest) = match input.split_once("://") {
+                    Some((scheme, rest)) => (Some(scheme), rest),
+                    None => (None, input),
+                };
+                let addr: SocketAddr = rest.parse().map_err(|_| {
+                    SharedString::new_static(
+                        "expected host:port, db://host:port, or fsw://host:port",
+                    )
                 })?;
-                Ok(ConnectionTarget::tcp(input.trim().to_string(), addr))
+                match scheme {
+                    None => Ok(ConnectionTarget::tcp(rest.to_string(), addr)),
+                    Some("db") => Ok(ConnectionTarget::db(rest.to_string(), addr)),
+                    Some("fsw") => Ok(ConnectionTarget::fsw(rest.to_string(), addr)),
+                    Some(other) => Err(SharedString::from(format!(
+                        "unknown scheme `{other}://` — expected host:port, db://host:port, \
+                         or fsw://host:port"
+                    ))),
+                }
             }),
         }
     }
@@ -182,16 +212,44 @@ pub struct ConnectionTarget {
 }
 
 impl ConnectionTarget {
-    /// Built-in kind: mirror a remote metor-db over TCP. Live telemetry
-    /// streams into the shared DB and history hydrates on demand; the mirror
-    /// reconnects on its own until disconnected.
+    /// Built-in kind: connect with identity discovery. Whatever answers at
+    /// `addr` — a metor-db server (mirrored, with on-demand history
+    /// hydration) or an fsw link server (streamed in, with panel commands
+    /// forwarded up) — the backend commits to that mode and reconnects on
+    /// its own until disconnected. All three built-in kinds share the
+    /// `tcp:<addr>` id: a layout and a recents row belong to the system at
+    /// an address, not to the transport mode.
     pub fn tcp(name: impl Into<SharedString>, addr: SocketAddr) -> Self {
         Self {
             id: TargetId(SharedString::from(format!("tcp:{addr}"))),
             name: name.into(),
             detail: SharedString::from(addr.to_string()),
-            backend: Arc::new(TcpBackend { addr }),
+            backend: Arc::new(DiscoverBackend { addr }),
             address: Some(SharedString::from(addr.to_string())),
+        }
+    }
+
+    /// [`tcp`](Self::tcp) pinned to the metor-db mirror mode (`db://` in
+    /// the address input): no identity probe, fails against an fsw link.
+    pub fn db(name: impl Into<SharedString>, addr: SocketAddr) -> Self {
+        Self {
+            id: TargetId(SharedString::from(format!("tcp:{addr}"))),
+            name: name.into(),
+            detail: SharedString::from(format!("{addr} · metor-db")),
+            backend: Arc::new(TcpBackend { addr }),
+            address: Some(SharedString::from(format!("db://{addr}"))),
+        }
+    }
+
+    /// [`tcp`](Self::tcp) pinned to the fsw link mode (`fsw://` in the
+    /// address input): a metor-db answering here is a clean failure.
+    pub fn fsw(name: impl Into<SharedString>, addr: SocketAddr) -> Self {
+        Self {
+            id: TargetId(SharedString::from(format!("tcp:{addr}"))),
+            name: name.into(),
+            detail: SharedString::from(format!("{addr} · fsw")),
+            backend: Arc::new(FswBackend { addr }),
+            address: Some(SharedString::from(format!("fsw://{addr}"))),
         }
     }
 
@@ -219,36 +277,40 @@ impl ConnectionTarget {
     }
 }
 
+/// The `MirrorEvent → ConnectionStatus` mapping every db-mirror path
+/// shares: the supervisor emits Connecting before every attempt; once a
+/// handshake has succeeded, later attempts read as reconnects.
+fn mirror_status(status: StatusHandle) -> impl Fn(MirrorEvent) + Send + Sync + 'static {
+    let connected_once = AtomicBool::new(false);
+    move |event| {
+        let status_for = |event| match event {
+            MirrorEvent::Connecting => {
+                if connected_once.load(Ordering::Relaxed) {
+                    ConnectionStatus::Reconnecting
+                } else {
+                    ConnectionStatus::Connecting
+                }
+            }
+            MirrorEvent::Connected => {
+                connected_once.store(true, Ordering::Relaxed);
+                ConnectionStatus::Connected
+            }
+            MirrorEvent::Disconnected => ConnectionStatus::Reconnecting,
+            MirrorEvent::Failed => {
+                ConnectionStatus::Failed(SharedString::new_static("connection failed"))
+            }
+        };
+        status.set(status_for(event));
+    }
+}
+
 struct TcpBackend {
     addr: SocketAddr,
 }
 
 impl ConnectionBackend for TcpBackend {
     fn connect(&self, ctx: ConnectContext) -> Connected {
-        let status = ctx.status.clone();
-        // The supervisor emits Connecting before every attempt; once a
-        // handshake has succeeded, later attempts read as reconnects.
-        let connected_once = std::sync::atomic::AtomicBool::new(false);
-        let remote = RemoteDb::new(self.addr).on_event(move |event| {
-            let status_for = |event| match event {
-                MirrorEvent::Connecting => {
-                    if connected_once.load(Ordering::Relaxed) {
-                        ConnectionStatus::Reconnecting
-                    } else {
-                        ConnectionStatus::Connecting
-                    }
-                }
-                MirrorEvent::Connected => {
-                    connected_once.store(true, Ordering::Relaxed);
-                    ConnectionStatus::Connected
-                }
-                MirrorEvent::Disconnected => ConnectionStatus::Reconnecting,
-                MirrorEvent::Failed => {
-                    ConnectionStatus::Failed(SharedString::new_static("connection failed"))
-                }
-            };
-            status.set(status_for(event));
-        });
+        let remote = RemoteDb::new(self.addr).on_event(mirror_status(ctx.status.clone()));
         let hydrator = remote.hydrator();
         let db = ctx.db.clone();
         ctx.spawn(move || async move {
@@ -260,6 +322,124 @@ impl ConnectionBackend for TcpBackend {
         Connected {
             hydrator: Some(hydrator),
             local_authority: false,
+            resolved: None,
+        }
+    }
+}
+
+const LINK_BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const LINK_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// The fsw mode's whole lifecycle: identify (or take the discovery
+/// connection), stream until the link drops, back off, repeat. A metor-db
+/// answering is a clean failure each round — the mode is pinned.
+async fn fsw_loop(addr: SocketAddr, db: Arc<DB>, status: StatusHandle, mut next: Option<Peer>) {
+    let mut backoff = LINK_BACKOFF_INITIAL;
+    let mut connected_once = false;
+    loop {
+        let peer = match next.take() {
+            Some(peer) => Ok(peer),
+            None => {
+                status.set(if connected_once {
+                    ConnectionStatus::Reconnecting
+                } else {
+                    ConnectionStatus::Connecting
+                });
+                identify(addr).await
+            }
+        };
+        match peer {
+            Ok(Peer::Fsw { info, rx, tx, buf }) => {
+                status.set(ConnectionStatus::Connected);
+                connected_once = true;
+                backoff = LINK_BACKOFF_INITIAL;
+                let err = fsw_stream(info, rx, tx, buf, &db).await;
+                tracing::info!(%err, %addr, "fsw link dropped; reconnecting");
+                status.set(ConnectionStatus::Reconnecting);
+            }
+            Ok(Peer::Db(_)) => status.set(ConnectionStatus::Failed(SharedString::new_static(
+                "a metor-db answered at this address; connect it with db:// (or the plain address)",
+            ))),
+            Err(err) => status.set(if connected_once {
+                ConnectionStatus::Reconnecting
+            } else {
+                ConnectionStatus::Failed(SharedString::from(format!("{addr}: {err}")))
+            }),
+        }
+        stellarator::sleep(backoff).await;
+        backoff = (backoff * 2).min(LINK_BACKOFF_MAX);
+    }
+}
+
+/// Pinned fsw link mode (`fsw://`).
+struct FswBackend {
+    addr: SocketAddr,
+}
+
+impl ConnectionBackend for FswBackend {
+    fn connect(&self, ctx: ConnectContext) -> Connected {
+        let (db, status, addr) = (ctx.db.clone(), ctx.status.clone(), self.addr);
+        ctx.spawn(move || async move { fsw_loop(addr, db, status, None).await });
+        Connected {
+            hydrator: None,
+            // The panel's DB is the system of record for an fsw stream, the
+            // same authority the old dial-in flow had.
+            local_authority: true,
+            resolved: None,
+        }
+    }
+}
+
+/// The bare-address kind: identify once, commit to what answered for the
+/// connection's lifetime, and send the mode's real resources through the
+/// [`Resolved`] channel.
+struct DiscoverBackend {
+    addr: SocketAddr,
+}
+
+impl ConnectionBackend for DiscoverBackend {
+    fn connect(&self, ctx: ConnectContext) -> Connected {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (db, status, addr) = (ctx.db.clone(), ctx.status.clone(), self.addr);
+        ctx.spawn(move || async move {
+            let mut backoff = LINK_BACKOFF_INITIAL;
+            loop {
+                status.set(ConnectionStatus::Connecting);
+                // The terminal arms never return, but the compiler sees a
+                // loop; clones keep the borrows straight.
+                match identify(addr).await {
+                    Ok(Peer::Db(_)) => {
+                        let remote = RemoteDb::new(addr).on_event(mirror_status(status.clone()));
+                        let _ = tx.send(Resolved {
+                            hydrator: Some(remote.hydrator()),
+                            local_authority: false,
+                        });
+                        // The probe connection is gone; the mirror dials and
+                        // supervises itself from here.
+                        remote.spawn(db.clone());
+                        std::future::pending::<()>().await
+                    }
+                    Ok(peer @ Peer::Fsw { .. }) => {
+                        let _ = tx.send(Resolved {
+                            hydrator: None,
+                            local_authority: true,
+                        });
+                        fsw_loop(addr, db.clone(), status.clone(), Some(peer)).await
+                    }
+                    Err(err) => {
+                        status.set(ConnectionStatus::Failed(SharedString::from(format!(
+                            "{addr}: {err}"
+                        ))));
+                        stellarator::sleep(backoff).await;
+                        backoff = (backoff * 2).min(LINK_BACKOFF_MAX);
+                    }
+                }
+            }
+        });
+        Connected {
+            hydrator: None,
+            local_authority: false,
+            resolved: Some(rx),
         }
     }
 }

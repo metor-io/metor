@@ -183,3 +183,55 @@ fn sanitize_id_is_safe_and_collision_proof() {
     let d = persist::sanitize_id("véhicule-1");
     assert!(d.is_ascii());
 }
+
+// ---------------------------------------------------------------------------
+// The default resolver's protocol grammar: bare = discover, schemes pin.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_resolver_grammar_parses_all_three_forms() {
+    let resolver = AddressResolver::default();
+    // All three forms address the same system, so they share one id — a
+    // layout belongs to the address, not the transport mode.
+    let bare = (resolver.resolve)("127.0.0.1:2240").unwrap();
+    let db = (resolver.resolve)("db://127.0.0.1:2240").unwrap();
+    let fsw = (resolver.resolve)("fsw://127.0.0.1:2240").unwrap();
+    assert_eq!(bare.id.as_str(), "tcp:127.0.0.1:2240");
+    assert_eq!(db.id, bare.id);
+    assert_eq!(fsw.id, bare.id);
+    // The pinned forms keep their scheme in the persistable address, so a
+    // recent re-materializes with the pin intact.
+    assert_eq!(bare.address.as_ref().map(|a| a.as_ref()), Some("127.0.0.1:2240"));
+    assert_eq!(db.address.as_ref().map(|a| a.as_ref()), Some("db://127.0.0.1:2240"));
+    assert_eq!(fsw.address.as_ref().map(|a| a.as_ref()), Some("fsw://127.0.0.1:2240"));
+
+    let Err(err) = (resolver.resolve)("carrier://127.0.0.1:2240") else {
+        panic!("junk scheme resolved")
+    };
+    assert!(err.contains("db://"), "the error teaches the grammar: {err}");
+    let Err(err) = (resolver.resolve)("not-an-addr") else {
+        panic!("junk address resolved")
+    };
+    assert!(err.contains("host:port"), "{err}");
+}
+
+#[test]
+fn schemed_recents_rematerialize_and_replace_by_id() {
+    let mut state = ConnectionsState::default();
+    let fsw = (state.resolver().resolve)("fsw://10.0.0.5:2240").unwrap();
+    state.record_connected(&fsw, 7);
+
+    // A fresh session (empty registry): the recent still yields a
+    // connectable target through the default resolver.
+    let sections = state.sections();
+    let entry = &sections.recents[0];
+    assert!(entry.target.is_some(), "fsw recent re-materialized");
+
+    // Connecting to the same address in another mode replaces the recent
+    // (retain-by-id), never duplicating the row or forking the layout.
+    let bare = (state.resolver().resolve)("10.0.0.5:2240").unwrap();
+    state.record_connected(&bare, 9);
+    let index = state.index();
+    assert_eq!(index.recents.len(), 1);
+    assert_eq!(index.recents[0].address.as_deref(), Some("10.0.0.5:2240"));
+}

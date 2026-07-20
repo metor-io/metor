@@ -40,7 +40,7 @@ pub(crate) mod window_controls;
 pub use app::PanelApp;
 pub use connections::{
     AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionStatus,
-    ConnectionTarget, RegistryHandle, TargetId,
+    ConnectionTarget, RegistryHandle, Resolved, TargetId,
 };
 pub use inspector::palette::{Category, InspectionItem, ItemProvider};
 

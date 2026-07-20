@@ -21,7 +21,7 @@ mod target;
 pub use picker::ConnectionPicker;
 pub use target::{
     AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionStatus,
-    ConnectionTarget, StatusHandle, TargetId,
+    ConnectionTarget, StatusHandle, TargetId, Resolved,
 };
 
 use std::sync::Arc;
@@ -70,6 +70,9 @@ pub struct ActiveConnection {
     cancel: CancelToken,
     status: StatusHandle,
     hydrator: Option<Hydrator>,
+    /// A discovery backend's late-bound resources; drained by the poll task
+    /// and cleared once applied.
+    resolved: Option<std::sync::mpsc::Receiver<target::Resolved>>,
     /// Poll-task bookkeeping: last status generation folded into the UI.
     last_generation: u64,
 }
@@ -320,6 +323,28 @@ impl ConnectionsStore {
                         store.state.apply(op);
                         changed = true;
                     }
+                    // Apply late-bound discovery resolutions: the backend
+                    // learned its mode after connect() returned, and the
+                    // hydrator/authority routing happens here instead.
+                    let mut resolutions = Vec::new();
+                    for conn in &mut store.active {
+                        if let Some(rx) = &conn.resolved
+                            && let Ok(resolved) = rx.try_recv()
+                        {
+                            conn.resolved = None;
+                            conn.hydrator = resolved.hydrator.clone();
+                            resolutions.push((conn.target.id.clone(), resolved));
+                            changed = true;
+                        }
+                    }
+                    for (id, resolved) in resolutions {
+                        if let Some(hydrator) = resolved.hydrator {
+                            Hydrators::global(cx).insert(id, hydrator);
+                        }
+                        if resolved.local_authority {
+                            store.spawn_lod_once();
+                        }
+                    }
                     for conn in &mut store.active {
                         let generation = conn.status.generation();
                         if generation != conn.last_generation {
@@ -435,15 +460,8 @@ impl ConnectionsStore {
         if let Some(hydrator) = &connected.hydrator {
             Hydrators::global(cx).insert(target.id.clone(), hydrator.clone());
         }
-        if connected.local_authority && !self.lod_spawned {
-            self.lod_spawned = true;
-            let db = self.db.clone();
-            // Deliberately outlives the connection: the LoD companion serves
-            // the whole DB, and its buckets stay valid after a disconnect.
-            drop(stellarator::struc_con::stellar(move || async move {
-                metor_db::lod::spawn(db);
-                std::future::pending::<()>().await
-            }));
+        if connected.local_authority {
+            self.spawn_lod_once();
         }
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -458,9 +476,25 @@ impl ConnectionsStore {
             cancel,
             status,
             hydrator: connected.hydrator,
+            resolved: connected.resolved,
             last_generation: 0,
         });
         cx.notify();
+    }
+
+    /// Spawn the DB-wide LoD companion for the first local-authority
+    /// connection. Deliberately outlives the connection: the companion
+    /// serves the whole DB, and its buckets stay valid after a disconnect.
+    fn spawn_lod_once(&mut self) {
+        if self.lod_spawned {
+            return;
+        }
+        self.lod_spawned = true;
+        let db = self.db.clone();
+        drop(stellarator::struc_con::stellar(move || async move {
+            metor_db::lod::spawn(db);
+            std::future::pending::<()>().await
+        }));
     }
 
     /// Cancel `id`'s backend. The stellar executor drops the backend's tasks
