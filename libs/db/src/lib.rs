@@ -5,7 +5,7 @@ use metor_proto::types::{PacketHeader, PacketTy};
 use metor_proto::vtable::builder::{
     OpBuilder, component, raw_field, raw_table, schema, timestamp, vtable,
 };
-use metor_proto::vtable::{RealizedField, builder};
+use metor_proto::vtable::{ElementKey, RealizedField, builder};
 use metor_proto::{
     registry,
     schema::Schema,
@@ -323,6 +323,22 @@ impl DB {
                         if !rf.dynamic {
                             return Err(Error::ComponentNotFound(rf.component_id));
                         }
+                        // Name the keyed member by its dotted path before
+                        // `insert_component` falls back to the numeric id, so the
+                        // panel shows `health.error_counts.<kind>`. A member that
+                        // reappears already has real metadata, so leave it be.
+                        if !state.component_metadata.contains_key(&rf.component_id)
+                            && let Some(name) = dynamic_member_name(&rf)
+                        {
+                            state.set_component_metadata(
+                                ComponentMetadata {
+                                    component_id: rf.component_id,
+                                    name,
+                                    metadata: Default::default(),
+                                },
+                                &self.path,
+                            )?;
+                        }
                         let schema = ComponentSchema::new(rf.ty, rf.shape);
                         state.insert_component(rf.component_id, schema, &self.path)?;
                         new_series = true;
@@ -421,6 +437,30 @@ impl DB {
             })
             .clone()
     }
+}
+
+/// The dotted display name of a lazily-realized dynamic map/list member,
+/// joining the container path, the element key, and the member leaf
+/// (`health.error_counts.publish_dropped`). `None` for a static field or a
+/// member template, which carry no runtime key.
+fn dynamic_member_name(rf: &RealizedField) -> Option<String> {
+    let container = rf.container?;
+    let mut name = String::from(container);
+    match rf.element? {
+        ElementKey::Key(key) => {
+            name.push('.');
+            name.push_str(key);
+        }
+        ElementKey::Index(idx) => {
+            use core::fmt::Write as _;
+            let _ = write!(name, ".{idx}");
+        }
+    }
+    if let Some(member) = rf.member.filter(|m| !m.is_empty()) {
+        name.push('.');
+        name.push_str(member);
+    }
+    Some(name)
 }
 
 impl State {
@@ -2321,6 +2361,13 @@ mod dynamic_ingest_tests {
             assert!(s.get_component(ComponentId::new("processes.htop.pid")).is_some());
             assert!(s.get_component(ComponentId::new("processes.init.cpu_usage")).is_some());
             assert!(s.latest_dynamic_tables.contains_key(&id));
+            // The keyed member carries its dotted name, not the numeric id, and
+            // is visible (only the template stays hidden).
+            let meta = s
+                .get_component_metadata(ComponentId::new("processes.htop.pid"))
+                .expect("keyed member metadata");
+            assert_eq!(meta.name, "processes.htop.pid");
+            assert!(!meta.is_hidden());
         });
 
         let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
@@ -2328,5 +2375,55 @@ mod dynamic_ingest_tests {
         assert_eq!(sink.values[&ComponentId::new("processes.htop.cpu_usage")], 0.5);
         assert_eq!(sink.values[&ComponentId::new("processes.init.pid")], 1002.0);
         assert_eq!(sink.values[&ComponentId::new("processes.init.cpu_usage")], 0.25);
+    }
+
+    /// A scalar-valued map (the `SystemHealth.error_counts` shape) has an empty
+    /// member leaf, so the keyed member is named `<container>.<key>` directly.
+    #[stellarator::test]
+    async fn scalar_map_member_named_by_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::create(dir.path().to_path_buf()).unwrap();
+        let id: PacketId = [11, 0];
+        let members = vec![raw_field(0, 8, schema(PrimType::U64, &[], path_component("")))];
+        let v = vtable([raw_field(
+            8,
+            8,
+            timestamp(raw_table(0, 8), map("counts", members, 16, 8)),
+        )]);
+        db.insert_vtable(VTableMsg {
+            vtable: v.clone(),
+            id,
+        })
+        .unwrap();
+
+        let mut t = Vec::new();
+        put_i64(&mut t, 1000); // timestamp @0
+        put_u32(&mut t, 16); // slot.trailer_off @8
+        put_u32(&mut t, 32); // slot.byte_len @12
+        put_u32(&mut t, 48); // entry[0].key_off -> "drop"
+        put_u32(&mut t, 4); // entry[0].key_len
+        put_u64(&mut t, 7); // entry[0].value
+        put_u32(&mut t, 52); // entry[1].key_off -> "over"
+        put_u32(&mut t, 4); // entry[1].key_len
+        put_u64(&mut t, 9); // entry[1].value
+        t.extend_from_slice(b"drop"); // @48
+        t.extend_from_slice(b"over"); // @52
+
+        db.ingest_table(id, &t).unwrap();
+        db.with_state(|s| {
+            let meta = s
+                .get_component_metadata(ComponentId::new("counts.drop"))
+                .expect("keyed member metadata");
+            assert_eq!(meta.name, "counts.drop");
+            assert!(!meta.is_hidden());
+            // Not the numeric-id fallback.
+            assert_ne!(meta.name, ComponentId::new("counts.drop").to_string());
+            assert_eq!(
+                s.get_component_metadata(ComponentId::new("counts.over"))
+                    .unwrap()
+                    .name,
+                "counts.over"
+            );
+        });
     }
 }

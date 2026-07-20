@@ -338,6 +338,10 @@ struct WalkCtx<'a> {
     base: usize,
     path: PathHasher,
     element: Option<ElementKey<'a>>,
+    /// The dotted path of the enclosing dynamic container (the [`Op::List`]/
+    /// [`Op::Map`] `name`), so a lazily-created keyed member can be named
+    /// `<container>.<key>.<member>` at ingest instead of by numeric id.
+    container: Option<&'a str>,
     frame: Option<ComponentId>,
     timestamp: Option<Timestamp>,
     depth: usize,
@@ -349,6 +353,7 @@ impl Default for WalkCtx<'_> {
             base: 0,
             path: PathHasher::new(),
             element: None,
+            container: None,
             frame: None,
             timestamp: None,
             depth: 0,
@@ -369,6 +374,12 @@ pub struct RealizedField<'a> {
     pub frame: Option<ComponentId>,
     /// The dynamic-frame element this field came from, if any (`None` for static fields).
     pub element: Option<ElementKey<'a>>,
+    /// The enclosing dynamic container's dotted path and this member's leaf
+    /// name (`None` for static fields). With [`element`](Self::element) they
+    /// reconstruct the member's dotted name — `<container>.<key>.<member>` —
+    /// which the hashed [`component_id`](Self::component_id) alone cannot.
+    pub container: Option<&'a str>,
+    pub member: Option<&'a str>,
     /// Whether this field was realized through a dynamic terminal
     /// ([`Op::PathComponent`], reached via [`Op::List`]/[`Op::Map`]). In
     /// schema/registration mode (`table = None`) such a field is a member
@@ -625,13 +636,13 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         loop {
             match realized_op {
                 RealizedOp::Component(RealizedComponent { component_id }) => {
-                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, false, table, f);
+                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, false, None, table, f);
                 }
                 RealizedOp::PathComponent(leaf) => {
                     let mut leaf_path = ctx.path;
                     leaf_path.push(leaf.name);
                     let component_id = leaf_path.finish();
-                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, true, table, f);
+                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, true, Some(leaf.name), table, f);
                 }
                 RealizedOp::Schema(s) => {
                     let s = schema.insert(s);
@@ -670,6 +681,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         schema: &Option<RealizedSchema<'a>>,
         timestamp: Option<Timestamp>,
         dynamic: bool,
+        member: Option<&'a str>,
         table: Option<&'a [u8]>,
         f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
     ) -> Result<(), Error> {
@@ -695,6 +707,8 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             ty: schema.ty,
             frame,
             element: ctx.element,
+            container: ctx.container,
+            member,
             dynamic,
         })
     }
@@ -727,6 +741,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                 base: 0,
                 path: prefix_path,
                 element: None,
+                container: Some(dynm.name),
                 frame,
                 timestamp,
                 depth: ctx.depth + 1,
@@ -772,6 +787,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                 base: member_base,
                 path: elem_path,
                 element: Some(key),
+                container: Some(dynm.name),
                 frame,
                 timestamp,
                 depth: ctx.depth + 1,
