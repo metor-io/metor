@@ -73,6 +73,22 @@ def _source_ref() -> dict[str, Any]:
     return {"file": path, "line": frame.f_lineno, "col": 1}
 
 
+def _validate_namespace(namespace: str | None) -> str | None:
+    """A mission namespace is a bare dotted path (``"sat1"``, ``"fleet.sat1"``):
+    non-empty, no leading/trailing dot, and every segment non-empty. It prefixes
+    every component name the target registers, so a malformed one would corrupt
+    every :class:`ComponentId`; reject it here rather than emit it."""
+    if namespace is None:
+        return None
+    if not isinstance(namespace, str):
+        raise TypeError(f"namespace must be a str, not {type(namespace).__name__}")
+    if not namespace or namespace.startswith(".") or namespace.endswith("."):
+        raise ValueError(f"namespace {namespace!r} must be a non-empty dotted path")
+    if any(seg == "" for seg in namespace.split(".")):
+        raise ValueError(f"namespace {namespace!r} has an empty segment")
+    return namespace
+
+
 def _json_scalar(value: Any, key: str) -> Any:
     """Coerce a params value to something serde's JSON codec accepts, naming
     the offending key when it cannot."""
@@ -371,8 +387,11 @@ class Mission:
 
     ``sim_dt`` (seconds) selects a free-running simulated clock; without it the
     loop paces a wall clock at ``cycle_rate``. ``default_depth`` is the in-flight
-    record depth for a buffer with no rate hint. These are the only knobs
-    ``CoordinatorSpec`` carries.
+    record depth for a buffer with no rate hint. ``namespace`` is a bare dotted
+    prefix (``"sat1"``) stamped onto every component name this target registers
+    and announces, so several targets sharing one db keep disjoint id spaces;
+    ``None`` leaves names and ids identical to an un-namespaced mission. These
+    are the only knobs ``CoordinatorSpec`` carries.
     """
 
     def __init__(
@@ -380,10 +399,12 @@ class Mission:
         cycle_rate: float,
         sim_dt: float | None = None,
         default_depth: int | None = None,
+        namespace: str | None = None,
     ):
         self.cycle_rate = float(cycle_rate)
         self.sim_dt = sim_dt
         self.default_depth = default_depth
+        self.namespace = _validate_namespace(namespace)
         self.coordinator = SystemHandle(COORDINATOR)
         self._artifacts: list[dict[str, Any]] = []
         self._states: list[dict[str, Any]] = []
@@ -642,6 +663,7 @@ class Mission:
                 "cycle_rate": self.cycle_rate,
                 "default_depth": self.default_depth,
                 "clock": self._clock(),
+                "namespace": self.namespace,
             },
             "artifacts": self._artifacts,
             "states": self._states,

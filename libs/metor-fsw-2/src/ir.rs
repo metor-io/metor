@@ -157,6 +157,16 @@ pub struct CoordinatorSpec {
     pub default_depth: Option<usize>,
     /// Which clock drives the per-cycle timestamp.
     pub clock: ClockSpec,
+    /// A dotted prefix stamped onto every component name this target
+    /// registers and announces (`"sat1"` → `sat1.coordinator.health`,
+    /// `sat1.<instance>.<frame>.<field>`). It shifts every telemetry
+    /// [`ComponentId`](metor_proto::types::ComponentId) uniformly, so several
+    /// targets connected into one db keep disjoint namespaces. `None` is the
+    /// unprefixed identity — names and ids are byte-identical to an
+    /// un-namespaced mission. Wiring resolves on the bare instance names
+    /// regardless; the prefix rides only the registry/announce seam.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 /// Which clock drives the run loop, the serializable mirror of

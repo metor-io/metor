@@ -59,7 +59,7 @@ use serde::Deserialize;
 
 use crate::message::{MsgIn, MsgOut};
 use crate::registry::AllOutputs;
-use crate::system::{BuildSystem, CyclicSystem, Out, System};
+use crate::system::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, System};
 
 /// The set of alarms one [`AlarmSystem`] instance evaluates, one
 /// [`AlarmSpec`] per repeated `alarm` child node. An alarm-less instance is
@@ -497,6 +497,21 @@ impl BuildSystem for AlarmSystem {
             next_occurrence: Timestamp::now().0 as u64,
             scratch: Vec::new(),
         }
+    }
+
+    /// Prefix each authored target with the mission namespace so its
+    /// [`ComponentId`] matches the namespace-qualified registry the engine
+    /// resolves against. The `component` string itself is rewritten, so the
+    /// broadcast [`AlarmDef`] target and the raise messages carry the same
+    /// qualified name. A no-op without a namespace, leaving ids byte-identical.
+    fn configure(&mut self, ctx: &BuildCtx) -> Result<(), ConfigureError> {
+        if let Some(ns) = ctx.namespace {
+            for rt in &mut self.alarms {
+                rt.spec.target.component = format!("{ns}.{}", rt.spec.target.component);
+                rt.component_id = ComponentId::new(&rt.spec.target.component);
+            }
+        }
+        Ok(())
     }
 }
 

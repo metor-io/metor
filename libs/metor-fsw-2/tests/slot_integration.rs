@@ -81,6 +81,7 @@ fn seq_coordinator() -> CoordinatorSpec {
         cycle_rate: 1000.0,
         default_depth: Some(8),
         clock: ClockSpec::Simulated { dt_secs: 0.000_002 },
+        namespace: None,
     }
 }
 

@@ -368,7 +368,7 @@ impl Pack {
             let mut system = ctor(p);
             #[cfg(feature = "wiring")]
             if let Some(msgs) = msgs {
-                system.configure(&crate::BuildCtx { msgs })?;
+                system.configure(&crate::BuildCtx { msgs, namespace: None })?;
             }
             taken = true;
             cell.attach();
@@ -627,7 +627,7 @@ where
         // parity path, where configure never runs.
         #[cfg(feature = "wiring")]
         if let Some(msgs) = msgs {
-            system.configure(&crate::BuildCtx { msgs })?;
+            system.configure(&crate::BuildCtx { msgs, namespace: None })?;
         }
         let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
         let pending: Pending = Box::new(move |src, mount| {

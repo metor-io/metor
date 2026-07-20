@@ -35,6 +35,7 @@ fn maximal() -> Wiring {
             cycle_rate: 120.0,
             default_depth: Some(8),
             clock: ClockSpec::Simulated { dt_secs: 0.5 },
+            namespace: None,
         },
         artifacts: vec![
             Artifact {

@@ -35,6 +35,11 @@ pub(crate) struct LoadCtx<'a> {
     /// The registry's message table, which [`BuildSystem::configure`] resolves
     /// config name tokens against.
     pub msgs: &'a MsgTable,
+    /// The mission namespace, if any, forwarded to
+    /// [`BuildSystem::configure`] so a system that hashes authored component
+    /// names (the alarm engine) can prefix them to match the qualified
+    /// registry.
+    pub namespace: Option<&'a str>,
 }
 
 /// The params surface a static-path factory decodes, the typed twin of the dl
@@ -135,7 +140,10 @@ where
     // Resolve config references (message name tokens) against the registry
     // tables the params value cannot carry.
     system
-        .configure(&BuildCtx { msgs: ctx.msgs })
+        .configure(&BuildCtx {
+            msgs: ctx.msgs,
+            namespace: ctx.namespace,
+        })
         .map_err(|e| match e {
             ConfigureError::UnknownMsg { name, available } => LoadErrorKind::UnknownMsgName {
                 system: ctx.name.to_string(),

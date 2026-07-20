@@ -333,6 +333,65 @@ async fn registry_query_view_and_read() {
     assert_eq!(imu.omega, 5.0, "producer increments omega each cycle");
 }
 
+/// A mission namespace shifts every registry key and announced leaf id under
+/// the `<namespace>.` prefix — user frames and the coordinator's own buffers
+/// alike — while the port's own frame id and the unprefixed identity are left
+/// for the un-namespaced case (pinned by `registry_query_view_and_read`).
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn namespace_prefixes_registry_keys_and_announce() {
+    let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    b.namespace = Some("sat1".into());
+    let p = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
+    let c = b.push_node(cyclic_node("consumer".into(), Consumer));
+    b.connect(
+        PortRef {
+            system: p,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+        PortRef {
+            system: c,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+    );
+    let coord = b.build().unwrap();
+    let registry = coord.registry();
+
+    // The key is the namespace-qualified id; the bare id no longer resolves.
+    let entry = registry
+        .get(ComponentId::new("sat1.producer.imu"))
+        .expect("sat1.producer.imu in the registry");
+    assert!(registry.get(ComponentId::new("producer.imu")).is_none());
+    assert_eq!(&*entry.instance, "sat1.producer");
+    // The port's own frame id is namespace-independent: only the qualified
+    // key and the announced leaves carry the prefix.
+    assert!(matches!(
+        entry.desc.schema,
+        crate::PortSchema::Table { frame_id, .. } if frame_id == ComponentId::new("imu")
+    ));
+
+    // The announce form nests every leaf under the qualified instance.
+    let (_, metadata) = entry.announce().expect("Table entry announces");
+    let omega = metadata
+        .iter()
+        .find(|m| m.name == "sat1.producer.imu.omega")
+        .expect("announced omega leaf under the namespace");
+    assert_eq!(
+        omega.component_id,
+        ComponentId::new("sat1.producer.imu.omega")
+    );
+
+    // The coordinator's own reserved buffers are qualified through the same
+    // seam, so its `Node::name` stays `"coordinator"` for wiring while its
+    // telemetry keys move under the namespace.
+    assert!(
+        registry
+            .get(ComponentId::new("sat1.coordinator.health"))
+            .is_some()
+    );
+    assert!(registry.get(ComponentId::new("coordinator.health")).is_none());
+}
+
 // ---------------------------------------------------------------------------
 // 2. End-to-end in All mode over a real connection: the announce replay
 //    first, then per-cycle Table packets.

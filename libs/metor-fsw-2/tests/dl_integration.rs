@@ -131,6 +131,7 @@ fn dl_coordinator() -> CoordinatorSpec {
         cycle_rate: 200.0,
         default_depth: Some(8),
         clock: ClockSpec::Simulated { dt_secs: 0.005 },
+        namespace: None,
     }
 }
 

@@ -35,6 +35,21 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(sim["clock"], {"Simulated": {"dt_secs": 0.5}})
         self.assertEqual(sim["default_depth"], 8)
 
+    def test_namespace_emission_and_validation(self):
+        # Absent by default: an un-namespaced mission emits a null namespace,
+        # keeping component ids identical to before.
+        self.assertIsNone(Mission(cycle_rate=100.0).to_ir()["coordinator"]["namespace"])
+
+        # A dotted namespace rides in the coordinator dict verbatim.
+        ns = Mission(cycle_rate=100.0, namespace="fleet.sat1").to_ir()["coordinator"]
+        self.assertEqual(ns["namespace"], "fleet.sat1")
+
+        # Malformed namespaces are rejected at construction.
+        for bad in ["", ".sat1", "sat1.", "sat1..a"]:
+            mc._missions.clear()
+            with self.assertRaises(ValueError):
+                Mission(cycle_rate=100.0, namespace=bad)
+
     def test_add_records_system_and_ports(self):
         m = Mission(cycle_rate=100.0)
         a = m.add("a", static_system("Alarms"))

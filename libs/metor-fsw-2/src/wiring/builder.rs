@@ -64,6 +64,7 @@ impl WiringBuilder {
                     cycle_rate: 100.0,
                     default_depth: None,
                     clock: ClockSpec::Wall,
+                    namespace: None,
                 },
                 artifacts: Vec::new(),
                 states: Vec::new(),
@@ -82,6 +83,7 @@ impl WiringBuilder {
             cycle_rate,
             default_depth: self.wiring.coordinator.default_depth,
             clock,
+            namespace: self.wiring.coordinator.namespace.clone(),
         };
         self
     }

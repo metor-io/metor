@@ -3,7 +3,8 @@
   "coordinator": {
     "cycle_rate": 120.0,
     "default_depth": null,
-    "clock": { "Simulated": { "dt_secs": 0.5 } }
+    "clock": { "Simulated": { "dt_secs": 0.5 } },
+    "namespace": null
   },
   "artifacts": [
     {

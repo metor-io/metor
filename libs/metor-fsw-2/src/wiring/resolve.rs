@@ -127,6 +127,9 @@ pub fn resolve_with(
     let mut graph = InitGraph::new(config);
     graph.worker_exe = opts.worker_exe;
     graph.shm_dir = opts.shm_dir;
+    // The mission namespace rides the registry/announce seam (`InitGraph::qualify`)
+    // and is threaded into each static system's `configure` via `LoadCtx`.
+    graph.namespace = wiring.coordinator.namespace.clone();
 
     // Serialized path-stripped so the telemetered topology matches the
     // bundle's `wiring.json` byte-for-byte regardless of the build tree.
@@ -345,6 +348,7 @@ fn resolve_static(
         params,
         name: &spec.name,
         msgs: &registry.msgs,
+        namespace: graph.namespace.as_deref(),
     })?;
     let desc = node.desc.clone();
     let handle = graph.push_node(node);

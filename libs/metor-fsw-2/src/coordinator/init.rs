@@ -287,6 +287,13 @@ pub(crate) struct InitGraph {
     /// [`set_wiring_manifest`](Self::set_wiring_manifest), which also injects the
     /// matching `wiring` Host output onto the coordinator #0 bundle.
     pub(crate) wiring_manifest: Option<WiringManifest>,
+    /// The mission namespace, prepended to every telemetry instance name at
+    /// the registry/announce seam ([`qualify`](Self::qualify)). `None` leaves
+    /// names and ids byte-identical to an un-namespaced mission. Set by the
+    /// front-end from [`CoordinatorSpec::namespace`](crate::ir::CoordinatorSpec);
+    /// deliberately not on [`CoordinatorConfig`], which stays `Copy`, and not on
+    /// [`Node::name`], which wiring resolves against unprefixed.
+    pub(crate) namespace: Option<String>,
 }
 
 impl InitGraph {
@@ -298,6 +305,7 @@ impl InitGraph {
             worker_exe: None,
             shm_dir: None,
             wiring_manifest: None,
+            namespace: None,
         };
         // Register the coordinator's own channels as system #0, so they flow
         // through the same validate/size/allocate/register passes as every
@@ -353,6 +361,20 @@ impl InitGraph {
     /// The handle addressing the coordinator's own system-#0 bundle.
     pub(crate) fn coordinator_handle(&self) -> SystemHandle {
         SystemHandle { id: 0 }
+    }
+
+    /// Qualify a telemetry instance name with the mission
+    /// [`namespace`](Self::namespace): `"sat1.<instance>"` when set, the bare
+    /// name otherwise. This is the one seam the prefix rides — registry keys,
+    /// the announce prefix, and file-backed ring names all pass through it,
+    /// while wiring/edge resolution keeps using the unprefixed
+    /// [`Node::name`]. The reserved `"coordinator"` bundle is qualified here
+    /// too, since it registers as an ordinary node.
+    fn qualify(&self, instance: &str) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{ns}.{instance}"),
+            None => instance.to_string(),
+        }
     }
 
     /// The registered descriptor of `handle`.
@@ -787,7 +809,11 @@ impl InitGraph {
             let mut row = Vec::with_capacity(sys.desc.outputs.len());
             for (out_idx, port) in sys.desc.outputs.iter().enumerate() {
                 let readers = fan_out.get(&(sid, out_idx)).copied().unwrap_or(0) + n_reg + slack;
-                let instance = sys.name.clone();
+                // The one prefixing seam: the registry key, the announce
+                // prefix (via `RegistryEntry::instance`), and the ring file
+                // name all key off this qualified name; wiring stays on
+                // `sys.name`.
+                let instance = self.qualify(&sys.name);
                 let role = BufferRole::Output {
                     system: sid,
                     port: out_idx,
@@ -842,6 +868,7 @@ impl InitGraph {
         // entry: inbound control, not an output. SelfTap inputs allocate
         // nothing (already counted in `fan_out`).
         for (sid, sys) in self.systems.iter().enumerate() {
+            let instance = self.qualify(&sys.name);
             for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 if port.conn != PortConn::Host {
                     continue;
@@ -855,7 +882,7 @@ impl InitGraph {
                     let session = alloc.session.as_ref().expect("proc graphs have a session");
                     let path = session
                         .path()
-                        .join(format!("{}.{}.ring", sys.name, port.name));
+                        .join(format!("{instance}.{}.ring", port.name));
                     let ring =
                         alloc_ring_at(&path, port.delivery, port.max_size, depth, 1 + slack)?;
                     alloc.host_input_paths.insert((sid, in_idx), path);
@@ -873,7 +900,7 @@ impl InitGraph {
                         system: sid,
                         input: in_idx,
                     },
-                    instance: Some(sys.name.clone()),
+                    instance: Some(instance.clone()),
                 });
                 alloc.host_input_rings.insert((sid, in_idx), ring);
             }
@@ -946,7 +973,7 @@ impl InitGraph {
                         system: sid,
                         input: in_idx,
                     },
-                    instance: Some(sys.name.clone()),
+                    instance: Some(self.qualify(&sys.name)),
                 });
             }
         }
