@@ -24,7 +24,7 @@ use core::marker::PhantomData;
 use metor_fsw_ring::{NoWake, View, WakeSink, WakeSource, WriteError, Writer};
 use metor_proto::types::{Msg, PacketId};
 use metor_proto_wkt::{
-    AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, LogEvent, ReloadSequences,
+    AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmRaised, LogEvent, ReloadSequences,
     SequenceChannelEvent, SequenceCommand, SequenceRegistry, WiringManifest,
 };
 use serde::de::DeserializeOwned;
@@ -58,6 +58,9 @@ impl NamedMsg for ReloadSequences {
 }
 impl NamedMsg for AlarmDef {
     const NAME: &'static str = "AlarmDef";
+}
+impl NamedMsg for AlarmDefs {
+    const NAME: &'static str = "AlarmDefs";
 }
 impl NamedMsg for AlarmRaised {
     const NAME: &'static str = "AlarmRaised";

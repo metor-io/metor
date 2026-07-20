@@ -52,7 +52,7 @@ use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_wkt::{
-    AlarmAck, AlarmCleared, AlarmDef, AlarmLimit, AlarmRaised, AlarmTarget, LimitKind,
+    AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmLimit, AlarmRaised, AlarmTarget, LimitKind,
     OccurrenceId, Severity,
 };
 use serde::Deserialize;
@@ -425,7 +425,10 @@ pub struct AlarmIn {
 /// already evaluate.
 #[derive(crate::SystemOutput)]
 pub struct AlarmOut {
-    defs: MsgOut<AlarmDef>,
+    /// The full def set as one latest-wins snapshot: the downlink retains
+    /// it, so a panel connecting mid-mission still learns every alarm.
+    #[fsw(snapshot)]
+    defs: MsgOut<AlarmDefs>,
     raised: MsgOut<AlarmRaised>,
     cleared: MsgOut<AlarmCleared>,
     all: AllOutputs,
@@ -512,10 +515,10 @@ impl CyclicSystem for AlarmSystem {
         if !self.booted {
             self.booted = true;
             // Defs broadcast at the first execute, not `init`; see the module
-            // docs on boot order.
-            for rt in &self.alarms {
-                output.defs.publish(&rt.spec.to_def());
-            }
+            // docs on boot order. One snapshot record carries the whole set.
+            output.defs.publish(&AlarmDefs {
+                defs: self.alarms.iter().map(|rt| rt.spec.to_def()).collect(),
+            });
         }
 
         // Operator acks first, so a latched, already-recovered occurrence

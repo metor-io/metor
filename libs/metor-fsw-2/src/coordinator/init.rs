@@ -311,7 +311,12 @@ impl InitGraph {
                 PortDesc::of::<crate::SystemHealth>().with_conn(PortConn::Host),
                 PortDesc::msg_named::<crate::LogEvent>("log").with_conn(PortConn::Host),
                 PortDesc::of::<CoordinatorStatus>().with_conn(PortConn::Host),
-                PortDesc::msg_named::<SequenceRegistry>("sequences").with_conn(PortConn::Host),
+                // Latest-wins boot state, not an event stream: Snapshot
+                // delivery is what lets the downlink retain the newest
+                // record for late-joining link connections.
+                PortDesc::msg_named::<SequenceRegistry>("sequences")
+                    .with_delivery(Delivery::Snapshot)
+                    .with_conn(PortConn::Host),
                 PortDesc::msg_named::<SequenceCommand>("commands")
                     .untelemetered()
                     .with_conn(PortConn::Host),
@@ -361,7 +366,10 @@ impl InitGraph {
     /// Called again, the latest manifest wins: the single injected port is
     /// replaced in place, never accumulated.
     pub(crate) fn set_wiring_manifest(&mut self, manifest: WiringManifest) {
-        let mut port = PortDesc::msg_named::<WiringManifest>("wiring");
+        // Snapshot: the manifest is latest-wins boot state the downlink
+        // retains for late-joining link connections.
+        let mut port =
+            PortDesc::msg_named::<WiringManifest>("wiring").with_delivery(Delivery::Snapshot);
         port.conn = PortConn::Host;
         port.max_size = wiring_manifest_max_size(&manifest.ir_json);
         let outputs = &mut self.systems[0].desc.outputs;

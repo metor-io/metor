@@ -1253,24 +1253,22 @@ fn uplink_minted_ports_are_untelemetered() {
     assert_eq!(minted[2].id(), crate::PortId::Packet(AlarmAck::ID));
 }
 
-/// A late connection gets its own announce replay before data: the second
-/// tap decodes the stream from its own connect onward, no restart needed.
+/// A late connection gets its own announce replay before data — and the
+/// retained snapshot channels with it: the boot `SequenceRegistry` was
+/// broadcast once at cycle 1, long before this connection existed, yet the
+/// downlink's retention hands it to the newcomer.
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn late_connection_gets_the_announce_replay() {
+async fn late_connection_gets_replay_and_retained_snapshots() {
+    use metor_proto_wkt::SequenceRegistry;
+
     let link = test_link(true);
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     b.push_node(cyclic_node(
         "telemetry".into(),
-        downlink(
-            &link,
-            TelemetryMode::Subset {
-                instances: vec!["producer".to_string()],
-                frames: Vec::new(),
-            },
-        ),
+        downlink(&link, TelemetryMode::All),
     ));
     let mut coord = b.build().unwrap();
     coord.run_for(10).await;
@@ -1279,7 +1277,11 @@ async fn late_connection_gets_the_announce_replay() {
     let tap = WireTap::connect(&link).await;
     // The server still fans out nothing new (no cycles run), but the replay
     // arrives immediately on accept.
-    tap.settle(|pkts| !pkts.is_empty()).await;
+    tap.settle(|pkts| {
+        pkts.iter()
+            .any(|p| matches!(p, WirePkt::Msg { id, .. } if *id == SequenceRegistry::ID))
+    })
+    .await;
     let announces = tap.announces();
     assert!(
         announces
@@ -1287,6 +1289,18 @@ async fn late_connection_gets_the_announce_replay() {
             .any(|(_, meta)| meta.iter().any(|m| m.name == "producer.imu.omega")),
         "the late connection decoded the replay"
     );
+    // The retained boot registry decodes like a live record.
+    let pkts = tap.pkts.borrow();
+    let registry = pkts
+        .iter()
+        .find_map(|p| match p {
+            WirePkt::Msg { id, payload } if *id == SequenceRegistry::ID => {
+                postcard::from_bytes::<SequenceRegistry>(payload).ok()
+            }
+            _ => None,
+        })
+        .expect("the retained boot registry replayed");
+    assert!(registry.channels.is_empty(), "no slots in this mission");
 }
 
 /// The identity packet leads every connection and advertises the uplink's

@@ -234,3 +234,34 @@ async fn loopback_replays_then_streams_and_reads_commands() {
 
     crate::SharedLifecycle::shutdown(&mut state);
 }
+
+/// Retained snapshot records ride every new connection's seed, after the
+/// identity + announces, and an update replaces the slot in place.
+#[test]
+fn retained_records_replay_to_new_connections() {
+    let state = server();
+    state.set_retained_slots(2);
+    state.set_announces(&[]).ok();
+    let identity = identity_bytes(vec![]);
+
+    // Nothing retained yet: the seed is just the identity.
+    let bare = state.push_test_conn();
+    assert_eq!(bare.pending_bytes(), identity);
+
+    state.retain(0, b"AAAA");
+    state.retain(1, b"BB");
+    let seeded = state.push_test_conn();
+    let mut expected = identity.clone();
+    expected.extend_from_slice(b"AAAA");
+    expected.extend_from_slice(b"BB");
+    assert_eq!(seeded.pending_bytes(), expected, "slot order preserved");
+
+    // A fresh record replaces its slot; earlier connections are untouched
+    // (they already ingested the live broadcast).
+    state.retain(0, b"A2");
+    let updated = state.push_test_conn();
+    let mut expected = identity;
+    expected.extend_from_slice(b"A2");
+    expected.extend_from_slice(b"BB");
+    assert_eq!(updated.pending_bytes(), expected);
+}

@@ -300,8 +300,8 @@ impl Registry {
     /// app-built registry starts here and adds its own systems.
     pub fn with_builtins() -> Self {
         use metor_proto_wkt::{
-            AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, ReloadSequences, SequenceChannelEvent,
-            SequenceCommand, SequenceRegistry,
+            AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmRaised, ReloadSequences,
+            SequenceChannelEvent, SequenceCommand, SequenceRegistry,
         };
         use crate::telemetry::{LinkParams, LinkState, TelemetrySystem, UplinkSystem};
 
@@ -324,6 +324,7 @@ impl Registry {
             .register_msg::<SequenceChannelEvent>()
             .register_msg::<ReloadSequences>()
             .register_msg::<AlarmDef>()
+            .register_msg::<AlarmDefs>()
             .register_msg::<AlarmRaised>()
             .register_msg::<AlarmCleared>()
             .register_msg::<AlarmAck>()

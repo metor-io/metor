@@ -93,6 +93,12 @@ struct ServerShared {
     /// accepted connections park on
     /// [`announce_ready`](Self::announce_ready) meanwhile.
     announce_blob: RefCell<Option<Rc<Vec<u8>>>>,
+    /// The newest framed record of each Snapshot message tap, replayed to
+    /// every new connection right after the announces — latest-wins boot
+    /// state (a wiring manifest, a sequence registry) a late joiner would
+    /// otherwise never see. Slot-indexed by the downlink; an empty slot has
+    /// no record yet.
+    retained: RefCell<Vec<Vec<u8>>>,
     announce_ready: WaitQueue,
     conns: RefCell<Vec<Rc<Conn>>>,
     /// Per-connection task guards, pruned as connections close; clearing
@@ -135,6 +141,7 @@ impl LinkState {
             shared: Rc::new(ServerShared {
                 uplink_msgs: RefCell::new(Vec::new()),
                 announce_blob: RefCell::new(None),
+                retained: RefCell::new(Vec::new()),
                 announce_ready: WaitQueue::new(),
                 conns: RefCell::new(Vec::new()),
                 conn_guards: RefCell::new(Vec::new()),
@@ -215,6 +222,21 @@ impl LinkState {
         Ok(())
     }
 
+    /// Size the retained-record store: one slot per Snapshot message tap,
+    /// assigned by the downlink's init alongside the announce set.
+    pub(crate) fn set_retained_slots(&self, n: usize) {
+        self.shared.retained.borrow_mut().resize(n, Vec::new());
+    }
+
+    /// Replace `slot`'s retained record with a freshly framed one. The slot
+    /// buffer is reused, so the steady state copies without allocating.
+    pub(crate) fn retain(&self, slot: usize, framed: &[u8]) {
+        let mut retained = self.shared.retained.borrow_mut();
+        let buf = &mut retained[slot];
+        buf.clear();
+        buf.extend_from_slice(framed);
+    }
+
     /// Whether any connection is live; the downlink skips framing entirely
     /// when nothing would receive it (taps still drain).
     pub fn has_connections(&self) -> bool {
@@ -271,15 +293,12 @@ impl LinkState {
 
     #[cfg(test)]
     pub(crate) fn push_test_conn(&self) -> Rc<Conn> {
+        let seed = match self.shared.announce_blob.borrow().as_ref() {
+            Some(blob) => seed_replay(blob, &self.shared),
+            None => Vec::new(),
+        };
         let conn = Rc::new(Conn {
-            pending: RefCell::new(
-                self.shared
-                    .announce_blob
-                    .borrow()
-                    .as_ref()
-                    .map(|b| b.to_vec())
-                    .unwrap_or_default(),
-            ),
+            pending: RefCell::new(seed),
             wake: WaitQueue::new(),
             closed: Cell::new(false),
         });
@@ -360,7 +379,7 @@ async fn accept_loop(listener: TcpListener, shared: Rc<ServerShared>) {
             }
         };
         let conn = Rc::new(Conn {
-            pending: RefCell::new(blob.to_vec()),
+            pending: RefCell::new(seed_replay(&blob, &shared)),
             wake: WaitQueue::new(),
             closed: Cell::new(false),
         });
@@ -376,6 +395,17 @@ async fn accept_loop(listener: TcpListener, shared: Rc<ServerShared>) {
         let task = stellarator::spawn(conn_task(shared.clone(), conn.clone(), stream)).drop_guard();
         shared.conn_guards.borrow_mut().push((conn, task));
     }
+}
+
+/// A new connection's opening bytes: the identity + announce blob, then
+/// the newest retained record of every Snapshot message tap — schemas
+/// first, then the latest-wins boot state a late joiner missed live.
+fn seed_replay(blob: &[u8], shared: &ServerShared) -> Vec<u8> {
+    let mut seed = blob.to_vec();
+    for record in shared.retained.borrow().iter() {
+        seed.extend_from_slice(record);
+    }
+    seed
 }
 
 /// One connection's life: writer and reader race, and whichever half fails

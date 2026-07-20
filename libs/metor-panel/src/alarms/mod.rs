@@ -17,7 +17,8 @@ use gpui::{App, Context, Entity, Global, Task, prelude::*};
 use metor_db::DB;
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
-    AlarmAck, AlarmCleared, AlarmDef, AlarmId, AlarmLimit, AlarmRaised, OccurrenceId, Severity,
+    AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmId, AlarmLimit, AlarmRaised, OccurrenceId,
+    Severity,
 };
 
 use crate::msg_ingest::{IngestSource, ingest_all};
@@ -269,6 +270,15 @@ impl AlarmStore {
             let db = db.clone();
             async move |this, cx| {
                 let sources = vec![
+                    // The live snapshot channel: the whole def set in one
+                    // record (retained by the link for late joiners).
+                    IngestSource::new(AlarmDefs::ID, |store: &mut Self, _ts, defs: AlarmDefs| {
+                        for def in defs.defs {
+                            store.state.apply_def(def);
+                        }
+                    }),
+                    // Per-def records, still folded for recordings that
+                    // predate the set-shaped channel.
                     IngestSource::new(AlarmDef::ID, |store: &mut Self, _ts, def| {
                         store.state.apply_def(def)
                     }),

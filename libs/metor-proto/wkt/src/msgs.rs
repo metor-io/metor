@@ -626,6 +626,14 @@ pub struct AlarmDef {
     pub default_severity: Severity,
 }
 
+/// The full alarm definition set, published as one latest-wins snapshot so
+/// the downlink can retain it for late-joining connections — a per-def
+/// stream would coalesce to the last alarm under snapshot delivery.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+pub struct AlarmDefs {
+    pub defs: Vec<AlarmDef>,
+}
+
 /// The source of truth that an alarm is *firing*, broadcast by the control system. The
 /// event time is the message-log timestamp.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
@@ -1394,6 +1402,7 @@ mod wiring_manifest_tests {
             SequenceCommand::ID,
             ReloadSequences::ID,
             AlarmDef::ID,
+            AlarmDefs::ID,
             AlarmRaised::ID,
             AlarmCleared::ID,
             AlarmAck::ID,
@@ -1443,6 +1452,7 @@ mod log_event_tests {
             ReloadSequences::ID,
             WiringManifest::ID,
             AlarmDef::ID,
+            AlarmDefs::ID,
             AlarmRaised::ID,
             AlarmCleared::ID,
             AlarmAck::ID,

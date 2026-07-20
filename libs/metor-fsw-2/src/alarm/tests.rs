@@ -313,7 +313,7 @@ fn spec_defaults() {
 #[cfg(not(miri))]
 mod system {
     use metor_proto::types::{ComponentId, Timestamp};
-    use metor_proto_wkt::{AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, LimitKind, Severity};
+    use metor_proto_wkt::{AlarmAck, AlarmCleared, AlarmDefs, AlarmRaised, LimitKind, Severity};
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use crate::{
@@ -514,16 +514,17 @@ mod system {
         ));
         let coord = b.build().unwrap();
 
-        let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
+        let mut defs = tap::<AlarmDefs>(&coord, "alarms.AlarmDefs");
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
         let mut cleared = tap::<AlarmCleared>(&coord, "alarms.AlarmCleared");
 
         let mut coord = coord;
         coord.run_for(cycles).await;
 
-        // Both defs broadcast; thresholds are the display limits.
+        // Both defs broadcast in the one snapshot record; thresholds are the
+        // display limits.
         let mut got_defs = Vec::new();
-        defs.drain(|d| got_defs.push(d)).unwrap();
+        defs.drain(|set| got_defs.extend(set.defs)).unwrap();
         assert_eq!(got_defs.len(), 2);
         let def = got_defs.iter().find(|d| d.id == "RATE_HIGH").unwrap();
         assert_eq!(def.default_severity, Severity::Warning);
@@ -687,7 +688,7 @@ mod system {
             ])),
         ));
         let coord = b.build().unwrap();
-        let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
+        let mut defs = tap::<AlarmDefs>(&coord, "alarms.AlarmDefs");
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
         let registry = coord.registry();
         let health_entry = registry
@@ -698,7 +699,7 @@ mod system {
         coord.run_for(4).await;
 
         let mut n_defs = 0;
-        defs.drain(|_| n_defs += 1).unwrap();
+        defs.drain(|set| n_defs += set.defs.len()).unwrap();
         assert_eq!(n_defs, 4, "defs broadcast even for disabled alarms");
 
         // Only the first DUP survives resolution, and it raises; the rest stay dark.

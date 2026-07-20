@@ -145,6 +145,7 @@ impl BuildSystem for TelemetrySystem {
             mode: params.mode(),
             taps: Vec::new(),
             batch: Vec::new(),
+            retain_scratch: Vec::new(),
             status: LinkStatus::default(),
         }
     }
@@ -470,6 +471,13 @@ struct Tap {
     /// a cycle with no new record contributes nothing (the pinned newest
     /// record is not re-sent). `u64::MAX` means nothing contributed yet.
     last_committed: u64,
+    /// Snapshot *message* taps: this tap's slot in the link's retained
+    /// store. The newest framed record is held there and replayed to every
+    /// late-joining connection — latest-wins boot state (a wiring manifest,
+    /// a sequence registry) that would otherwise stream exactly once.
+    /// Continuously-republished frames need no retention (a new connection
+    /// sees them within a cycle), so frame taps stay `None`.
+    retain_slot: Option<usize>,
 }
 
 /// How a tap frames a drained record, projected from the entry's schema.
@@ -500,6 +508,8 @@ pub struct TelemetrySystem {
     taps: Vec<Tap>,
     /// The cycle's batch scratch, cleared and refilled in place.
     batch: Vec<u8>,
+    /// One framed record, reused across retained-tap updates.
+    retain_scratch: Vec<u8>,
     /// The last published gauge, so the frame goes out on change only.
     status: LinkStatus,
 }
@@ -513,6 +523,7 @@ impl TelemetrySystem {
             mode: config.mode,
             taps: Vec::new(),
             batch: Vec::new(),
+            retain_scratch: Vec::new(),
             status: LinkStatus::default(),
         }
     }
@@ -538,6 +549,7 @@ impl System for TelemetrySystem {
         let mut taps = Vec::new();
         let mut announces = Vec::new();
         let mut n_tables = 0usize;
+        let mut n_retained = 0usize;
         let mut announced_msgs = std::collections::HashSet::new();
         // Deferred health reports: iterating `output.all` borrows the output
         // bundle, so `output.health()` (a `&mut` borrow) runs after the loop.
@@ -594,11 +606,19 @@ impl System for TelemetrySystem {
                     Wire::Msg
                 }
             };
+            let retain_slot = (entry.delivery() == Delivery::Snapshot
+                && matches!(wire, Wire::Msg))
+            .then(|| {
+                let slot = n_retained;
+                n_retained += 1;
+                slot
+            });
             taps.push(Tap {
                 view,
                 delivery: entry.delivery(),
                 wire,
                 last_committed: u64::MAX,
+                retain_slot,
             });
         }
 
@@ -615,6 +635,7 @@ impl System for TelemetrySystem {
             .link
             .as_ref()
             .expect("downlink attached to a TcpServer state (the builtin link pack's ctor)");
+        link.get().set_retained_slots(n_retained);
         if link.get().set_announces(&announces).is_err() {
             // A second downlink on one server would corrupt the replay every
             // connection decodes against.
@@ -708,11 +729,25 @@ impl CyclicSystem for TelemetrySystem {
                     }
                     tap.last_committed = committed;
                     match tap.view.try_latest() {
-                        Ok(Some(grant)) => {
-                            if let Some(batch) = &mut batch {
-                                append_record(batch, &tap.wire, &grant);
+                        Ok(Some(grant)) => match tap.retain_slot {
+                            // A retained tap frames once and the bytes go
+                            // both ways: appended to this cycle's batch and
+                            // held for future connections' replays — even
+                            // with no connection live right now.
+                            Some(slot) => {
+                                self.retain_scratch.clear();
+                                append_record(&mut self.retain_scratch, &tap.wire, &grant);
+                                link.retain(slot, &self.retain_scratch);
+                                if let Some(batch) = &mut batch {
+                                    batch.extend_from_slice(&self.retain_scratch);
+                                }
                             }
-                        }
+                            None => {
+                                if let Some(batch) = &mut batch {
+                                    append_record(batch, &tap.wire, &grant);
+                                }
+                            }
+                        },
                         Ok(None) => {}
                         Err(_) => output.health().error("telemetry_input_corrupt"),
                     }
