@@ -79,7 +79,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_ring::NoWake;
 
-use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus, pack_name};
+use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus};
+use crate::FrameStr;
 use crate::abi::FswStatus;
 use crate::descriptor::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind, compatible};
 use crate::dl::{DlSlot, DlSystem};
@@ -108,11 +109,10 @@ pub struct SlotStatus {
     /// The current [`SlotState::code`]
     /// (Empty=0/Loaded=1/Loading=2/Running=3/Done=4/Stopped=5).
     pub phase: u8,
-    /// Used length of `occupant`, zero when no occupant is selected.
-    pub occ_len: u8,
-    pub _pad: [u8; 6],
-    /// The selected occupant's name, fixed buffer plus length.
-    pub occupant: [u8; NAME_CAP],
+    pub _pad: [u8; 7],
+    /// The selected occupant's name, empty when no occupant is selected.
+    #[metor_fsw(nest)]
+    pub occupant: FrameStr<NAME_CAP>,
 }
 
 // ---------------------------------------------------------------------------
@@ -920,15 +920,14 @@ impl SlotRunner {
 
     /// Publish the host-side [`SlotStatus`] frame.
     fn publish_status(&mut self, now: Timestamp) {
-        let (occupant, occ_len) = match self.selected {
-            Some(idx) => pack_name(&self.allowed[idx].name),
-            None => ([0u8; NAME_CAP], 0),
+        let occupant = match self.selected {
+            Some(idx) => FrameStr::new(&self.allowed[idx].name),
+            None => FrameStr::EMPTY,
         };
         let frame = SlotStatus {
             timestamp: now,
             phase: self.state.code(),
-            occ_len,
-            _pad: [0; 6],
+            _pad: [0; 7],
             occupant,
         };
         if self.status_out.write(&frame).is_err()

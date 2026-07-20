@@ -33,6 +33,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::DEFAULT_DEPTH;
 use crate::descriptor::{Hz, PortId};
+use crate::FrameStr;
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, LogLevel};
 use crate::message::{MsgIn, MsgOut};
@@ -50,7 +51,7 @@ mod status;
 pub use error::WireError;
 pub(crate) use slot::validate_slot_spec;
 pub use slot::{AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError, SlotStatus};
-pub(crate) use status::{CyclicSlot, pack_name};
+pub(crate) use status::CyclicSlot;
 pub use status::{NAME_CAP, SlotState, StopReason, StoppedSystem, WorkerRunState, WorkerStatus};
 
 /// The default [`CoordinatorConfig::reader_slack`].
@@ -153,15 +154,14 @@ pub(crate) struct PortRef {
 /// Max stopped systems named in one status record.
 pub const MAX_STOPPED: usize = 32;
 
-/// One stopped-system entry in [`CoordinatorStatus`]: a reason code, a used
-/// name length, and a fixed-size name buffer.
+/// One stopped-system entry in [`CoordinatorStatus`]: a reason code and the
+/// stopped system's name.
 #[derive(crate::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[repr(C)]
 struct StoppedEntry {
     reason: u8,
-    len: u8,
-    _pad: [u8; 6],
-    name: [u8; NAME_CAP],
+    _pad: [u8; 7],
+    name: FrameStr<NAME_CAP>,
 }
 
 /// Max process workers named in one status record.
@@ -178,9 +178,8 @@ struct WorkerEntry {
     restarts: u32,
     /// A [`WorkerRunState::code`].
     state: u8,
-    len: u8,
-    _pad: [u8; 6],
-    name: [u8; NAME_CAP],
+    _pad: [u8; 7],
+    name: FrameStr<NAME_CAP>,
 }
 
 /// The coordinator's own status frame: which cyclic systems have hard-stopped
@@ -821,12 +820,10 @@ impl Coordinator {
                 offset_of!(CoordinatorStatus, stopped),
                 |l| {
                     for sys in stopped.iter().take(MAX_STOPPED) {
-                        let (name, len) = pack_name(&sys.name);
                         l.push(StoppedEntry {
                             reason: sys.reason.code(),
-                            len,
-                            _pad: [0; 6],
-                            name,
+                            _pad: [0; 7],
+                            name: FrameStr::new(&sys.name),
                         });
                     }
                 },
@@ -836,14 +833,12 @@ impl Coordinator {
                 offset_of!(CoordinatorStatus, workers),
                 |l| {
                     for w in workers.iter().take(MAX_WORKERS) {
-                        let (name, len) = pack_name(&w.name);
                         l.push(WorkerEntry {
                             pid: w.pid,
                             restarts: w.restarts,
                             state: w.state.code(),
-                            len,
-                            _pad: [0; 6],
-                            name,
+                            _pad: [0; 7],
+                            name: FrameStr::new(&w.name),
                         });
                     }
                 },

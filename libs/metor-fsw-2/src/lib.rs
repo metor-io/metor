@@ -119,6 +119,7 @@ mod shared;
 mod system;
 mod telemetry;
 mod testbench;
+mod text;
 mod writer;
 
 pub mod clock;
@@ -147,6 +148,7 @@ pub mod params_docs;
 pub mod proc;
 
 pub use dynamic::{FrameList, FrameMap, Slot};
+pub use text::FrameStr;
 pub use frame::Frame;
 pub use writer::{DynamicWriteError, FrameScratch, FrameWriter, KeyError, ListWriter, MapWriter};
 

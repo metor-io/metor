@@ -364,11 +364,7 @@ fn last_occupant(view: &mut Input<SlotStatus>) -> Option<String> {
     let mut last = None;
     view.drain(|f| {
         let s = f.get();
-        last = Some(
-            core::str::from_utf8(&s.occupant[..s.occ_len as usize])
-                .expect("utf-8 occupant name")
-                .to_string(),
-        );
+        last = Some(s.occupant.as_str().to_string());
     })
     .expect("no lap");
     last

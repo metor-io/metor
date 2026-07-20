@@ -192,8 +192,3 @@ pub const NAME_CAP: usize = 48;
 
 // The build-validated cap and the wire protocol's documented cap are one invariant.
 const _: () = assert!(NAME_CAP == metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP);
-
-/// Pack a name into a fixed [`NAME_CAP`] buffer plus used length, truncating.
-pub(crate) fn pack_name(name: &str) -> ([u8; NAME_CAP], u8) {
-    crate::dynamic::pack_str::<NAME_CAP>(name)
-}
