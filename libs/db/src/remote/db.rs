@@ -122,12 +122,12 @@ impl RemoteDb {
     }
 }
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound a handshake request: old-protocol peers record unknown request
 /// messages as telemetry and never reply, which would otherwise hang the
 /// mirror forever.
-async fn handshake_request<T>(
+pub(super) async fn handshake_request<T>(
     fut: impl Future<Output = Result<T, metor_proto_stellar::Error>>,
 ) -> Result<T, Error> {
     futures_lite::future::or(async { fut.await.map_err(Error::from) }, async {
