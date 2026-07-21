@@ -14,10 +14,12 @@
 //! threads upsert targets through; the store drains it on the gpui thread
 //! and repaints observers.
 
+pub mod discovery;
 pub mod persist;
 mod picker;
 mod target;
 
+pub use discovery::mdns_source;
 pub use picker::ConnectionPicker;
 pub use target::{
     AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionStatus,

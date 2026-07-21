@@ -9427,6 +9427,7 @@ dependencies = [
  "hifitime",
  "image",
  "jiff",
+ "mdns-sd",
  "metor-db",
  "metor-fsw-2",
  "metor-proto",

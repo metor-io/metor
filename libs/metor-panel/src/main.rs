@@ -57,5 +57,8 @@ fn main() {
         },
     );
 
-    metor_panel::PanelApp::new(db).connection(sandbox).run();
+    metor_panel::PanelApp::new(db)
+        .connection(sandbox)
+        .connection_source(metor_panel::connections::mdns_source())
+        .run();
 }
