@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::connections::{AddressResolver, ConnectionTarget, RegistryHandle, TargetId};
+use crate::icons::Icon;
 use crate::inspector::Inspector;
 use crate::inspector::edits::{
     self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
@@ -197,7 +198,12 @@ impl AppRoot {
         cx.notify();
     }
 
-    fn open_connections(&mut self, _: &OpenConnections, _window: &mut Window, cx: &mut Context<Self>) {
+    fn open_connections(
+        &mut self,
+        _: &OpenConnections,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(picker) = &self.connection_picker
             && !picker.read(cx).dismissed
         {
@@ -311,12 +317,9 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut rows = crate::inspector::reflect::rows_for_any_entity(
-            &pane.clone().into_any(),
-            &self.db,
-            cx,
-        )
-        .unwrap_or_default();
+        let mut rows =
+            crate::inspector::reflect::rows_for_any_entity(&pane.clone().into_any(), &self.db, cx)
+                .unwrap_or_default();
         let db = self.db.clone();
         let on_open_inspector = crate::inspector::open_inspector(cx);
         rows.push(Box::new(crate::inspector::rows::NavRow::new(
@@ -574,12 +577,11 @@ impl AppRoot {
             let state = store.state();
             let active = state.active_count();
             if active == 0 {
-                // Healthy: a bare green dot keeps the title bar compact.
-                bar = bar.child(div().text_color(theme.control_active).child("\u{25cf}"));
+                bar = bar.child(Icon::Dot.svg_color(7.0, theme.control_active));
             } else {
                 if let Some(severity) = state.highest_active_severity() {
                     let idx = crate::alarms::severity_index(severity);
-                    bar = bar.child(div().text_color(theme.alarm_color(idx)).child("\u{25cf}"));
+                    bar = bar.child(Icon::Dot.svg_color(7.0, theme.alarm_color(idx)));
                 }
                 let counts = state.counts_by_severity();
                 for idx in (0..counts.len()).rev() {
@@ -623,7 +625,10 @@ impl AppRoot {
 
     /// A flat, borderless titlebar control: quiet at rest, background on
     /// hover. The titlebar reads as one surface instead of a row of pills.
-    fn titlebar_segment(theme: &crate::theme::Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
+    fn titlebar_segment(
+        theme: &crate::theme::Theme,
+        id: &'static str,
+    ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
             .px(px(8.0))
@@ -684,7 +689,7 @@ impl AppRoot {
         };
 
         Self::titlebar_segment(theme, "connection-segment")
-            .child(div().text_size(px(10.0)).text_color(dot).child("\u{25cf}"))
+            .child(crate::icons::Icon::Dot.svg_color(7.0, dot))
             .child(label)
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -745,8 +750,6 @@ impl AppRoot {
             .pl(px(if cfg!(target_os = "macos") { 78.0 } else { 8.0 }))
             .child(self.render_connection_segment(theme, cx));
 
-        // Right: quiet controls, grouped by hairlines instead of per-pill
-        // borders.
         let mut right = div()
             .occlude()
             .flex()
@@ -761,9 +764,7 @@ impl AppRoot {
         right = right.child(
             Self::titlebar_segment(theme, "global-time-range")
                 .child(range_label)
-                .child(
-                    crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary),
-                )
+                .child(crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary))
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
                     let Some(open) = crate::inspector::open_inspector(cx) else {
                         return;
@@ -1106,12 +1107,8 @@ impl PanelApp {
                             store.upsert_target(target, cx);
                         }
                         for id in auto_connect.take().unwrap_or_default() {
-                            let Some(target) = store
-                                .state()
-                                .targets()
-                                .iter()
-                                .find(|t| t.id == id)
-                                .cloned()
+                            let Some(target) =
+                                store.state().targets().iter().find(|t| t.id == id).cloned()
                             else {
                                 tracing::warn!(%id, "auto-connect target not registered");
                                 continue;

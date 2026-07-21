@@ -3,8 +3,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Bounds, Context, Entity, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
-    SharedString, Styled, Subscription, TextRun, Window, canvas, div, point, prelude::*, px,
+    AnyElement, Bounds, Context, Entity, Hsla, IntoElement, MouseButton, PathBuilder, Pixels,
+    Point, SharedString, Styled, Subscription, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
@@ -21,7 +21,9 @@ mod event_overlay;
 pub use event_overlay::EventOverlay;
 
 mod event_flags;
-use event_flags::{ClusterPaint, EventCluster, FLAG_HIT_PX, GUTTER_H, cluster_events, paint_event_flags};
+use event_flags::{
+    ClusterPaint, EventCluster, FLAG_HIT_PX, GUTTER_H, cluster_events, paint_event_flags,
+};
 
 mod bounds;
 pub use bounds::*;
@@ -220,7 +222,10 @@ fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us: f64) -> S
         if offset_us == 0 {
             "0".to_string()
         } else {
-            format!("{}", hifitime::Duration::from_microseconds(offset_us as f64))
+            format!(
+                "{}",
+                hifitime::Duration::from_microseconds(offset_us as f64)
+            )
         }
     };
     match fmt {
@@ -695,10 +700,20 @@ fn paint_overlay(
     window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
 
     // Axes are neutral unless given an explicit color.
-    let label_color =
-        |i: usize| -> Hsla { axis_colors.get(i).copied().flatten().unwrap_or(theme.text_secondary) };
-    let rule_color =
-        |i: usize| -> Hsla { axis_colors.get(i).copied().flatten().unwrap_or(theme.axis_color) };
+    let label_color = |i: usize| -> Hsla {
+        axis_colors
+            .get(i)
+            .copied()
+            .flatten()
+            .unwrap_or(theme.text_secondary)
+    };
+    let rule_color = |i: usize| -> Hsla {
+        axis_colors
+            .get(i)
+            .copied()
+            .flatten()
+            .unwrap_or(theme.axis_color)
+    };
 
     // Per-axis Y tick labels, right-aligned within each stacked column.
     for i in 0..axis_count {
@@ -723,8 +738,7 @@ fn paint_overlay(
             // Right-aligned 4px clear of the axis rule; a label wider than
             // its column pins to the pane edge instead of painting over the
             // tile border (this canvas draws above the tile chrome).
-            let label_x =
-                (col_right - shaped.width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
+            let label_x = (col_right - shaped.width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
             let origin = point(label_x, y - label_font_size / 2.0);
             let _ = shaped.paint(origin, label_font_size, window, cx);
         }
@@ -811,12 +825,10 @@ fn paint_overlay(
         }
         if !label.is_empty() {
             let run = make_run(label.as_ref(), *color);
-            let shaped = window.text_system().shape_line(
-                label.clone(),
-                label_font_size,
-                &[run],
-                None,
-            );
+            let shaped =
+                window
+                    .text_system()
+                    .shape_line(label.clone(), label_font_size, &[run], None);
             let origin = point(
                 pb.origin.x + pb.size.width - shaped.width - px(4.0),
                 y - label_font_size - px(2.0),
@@ -852,6 +864,18 @@ struct CursorPaint {
     trace_markers: Vec<(f64, f64, Hsla)>,
 }
 
+/// Build a marker rect whose edges land on physical pixels. Plot projection
+/// commonly produces fractional logical coordinates; feeding those directly
+/// to a rounded quad can make opposite corners cover different pixel samples.
+fn marker_bounds(center: Point<Pixels>, scale_factor: f32) -> Bounds<Pixels> {
+    let snap = |value: Pixels| px((f32::from(value) * scale_factor).round() / scale_factor);
+    let left = snap(center.x - px(3.0));
+    let top = snap(center.y - px(3.0));
+    let right = snap(center.x + px(3.0));
+    let bottom = snap(center.y + px(3.0));
+    Bounds::new(point(left, top), gpui::size(right - left, bottom - top))
+}
+
 fn paint_cursors(
     outer_bounds: Bounds<Pixels>,
     view: &PlotView,
@@ -867,6 +891,7 @@ fn paint_cursors(
     // maps them straight to screen.
     let view = view.x_bounds();
     let theme = crate::theme::theme(cx);
+    let scale_factor = window.scale_factor();
 
     for cursor in cursors {
         let (a, b) = if cursor.t_start.0 <= cursor.t_end.0 {
@@ -928,14 +953,10 @@ fn paint_cursors(
                 {
                     continue;
                 }
-                let dot = Bounds {
-                    origin: point(screen.x - px(3.0), screen.y - px(3.0)),
-                    size: gpui::Size {
-                        width: px(6.0),
-                        height: px(6.0),
-                    },
-                };
-                window.paint_quad(gpui::fill(dot, *color));
+                let dot = marker_bounds(screen, scale_factor);
+                let mut dot_quad = gpui::fill(dot, *color);
+                dot_quad.corner_radii = gpui::Corners::all(px(1.5));
+                window.paint_quad(dot_quad);
             }
         }
     }
@@ -996,6 +1017,7 @@ fn paint_hover_markers(
     // Markers carry normalized [0,1] Y, so a 0..1 Y view maps them straight
     // to screen.
     let view = view.x_bounds();
+    let scale_factor = window.scale_factor();
     for &(ts, norm_y, color) in markers {
         let screen = view.to_screen(pb, ts, norm_y);
         if screen.x < pb.origin.x
@@ -1005,14 +1027,10 @@ fn paint_hover_markers(
         {
             continue;
         }
-        let dot = Bounds {
-            origin: point(screen.x - px(3.0), screen.y - px(3.0)),
-            size: gpui::Size {
-                width: px(6.0),
-                height: px(6.0),
-            },
-        };
-        window.paint_quad(gpui::fill(dot, color));
+        let dot = marker_bounds(screen, scale_factor);
+        let mut dot_quad = gpui::fill(dot, color);
+        dot_quad.corner_radii = gpui::Corners::all(px(1.5));
+        window.paint_quad(dot_quad);
     }
 }
 
@@ -1463,7 +1481,8 @@ impl TimeSeriesPlot {
         let Some(view) = self.line_plot.read(cx).effective_view(cx) else {
             return;
         };
-        let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view.x_bounds(), cx) else {
+        let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view.x_bounds(), cx)
+        else {
             return;
         };
         let entity = hit.into_any();
@@ -1991,7 +2010,10 @@ impl TimeSeriesPlot {
                 div()
                     .text_size(px(LABEL_FONT_SIZE))
                     .text_color(theme.text_primary)
-                    .child(SharedString::from(format!("{} events", cluster.events.len()))),
+                    .child(SharedString::from(format!(
+                        "{} events",
+                        cluster.events.len()
+                    ))),
             )
             .child(
                 div()
@@ -2086,7 +2108,11 @@ impl TimeSeriesPlot {
 
     /// Typed detail block for the selected pinned event, reusing each store's
     /// own record fields (log-panel `key: value` styling).
-    fn event_detail_element(&self, detail: &EventDetail, theme: &crate::theme::Theme) -> AnyElement {
+    fn event_detail_element(
+        &self,
+        detail: &EventDetail,
+        theme: &crate::theme::Theme,
+    ) -> AnyElement {
         let mut body = div().flex().flex_col().gap_y_0().pt_1();
         match detail {
             EventDetail::Log(ev) => {
@@ -2160,7 +2186,11 @@ fn event_summary_row(ev: &PlotEvent, theme: &crate::theme::Theme) -> impl IntoEl
 }
 
 /// One `key: value` detail row in the pinned popover.
-fn kv_row(key: &str, value: impl Into<SharedString>, theme: &crate::theme::Theme) -> impl IntoElement {
+fn kv_row(
+    key: &str,
+    value: impl Into<SharedString>,
+    theme: &crate::theme::Theme,
+) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
@@ -2201,7 +2231,10 @@ impl Render for TimeSeriesPlot {
         let mut root = div().flex().flex_col().size_full().bg(theme.bg_secondary);
 
         let mut inner = div()
-            .id(("time-series-plot", cx.entity().entity_id().as_u64() as usize))
+            .id((
+                "time-series-plot",
+                cx.entity().entity_id().as_u64() as usize,
+            ))
             .flex_1()
             .min_h_0()
             .relative()
@@ -2407,8 +2440,15 @@ impl Render for TimeSeriesPlot {
                           cx| {
                         if let Some(view) = view {
                             paint_overlay(
-                                bounds, &view, &colors, &markers, &limit_lines, data_start, fmt,
-                                window, cx,
+                                bounds,
+                                &view,
+                                &colors,
+                                &markers,
+                                &limit_lines,
+                                data_start,
+                                fmt,
+                                window,
+                                cx,
                             );
                         }
                     },
@@ -2524,11 +2564,7 @@ impl Render for TimeSeriesPlot {
                                         .map(|s| {
                                             let b = view.axis_bounds(s.axis_index);
                                             let h = (b.max_y - b.min_y).max(1e-12);
-                                            (
-                                                s.ts.0 as f64,
-                                                (s.value - b.min_y) / h,
-                                                s.color,
-                                            )
+                                            (s.ts.0 as f64, (s.value - b.min_y) / h, s.color)
                                         })
                                         .collect()
                                 })

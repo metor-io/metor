@@ -11,11 +11,12 @@
 //! automatically on first open when nothing is connected.
 
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
-    SharedString, Window, deferred, div, prelude::*, px,
+    App, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render, SharedString,
+    Window, deferred, div, prelude::*, px,
 };
 
 use super::{ConnectionStatus, ConnectionTarget, ConnectionsStore, PickerEntry, TargetId, persist};
+use crate::icons::Icon;
 use crate::inspector::rows::text_field::TextField;
 use crate::theme::{Theme, theme};
 
@@ -332,7 +333,13 @@ impl ConnectionPicker {
     /// The star that pins a target: a real toggle with its own hit area,
     /// visibly separate from the row so it never reads as part of a
     /// row-wide click. Clicking never connects.
-    fn star(&self, id: &TargetId, favorite: bool, theme: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn star(
+        &self,
+        id: &TargetId,
+        favorite: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let id = id.clone();
         div()
             .id(SharedString::from(format!("star-{id}")))
@@ -343,7 +350,6 @@ impl ConnectionPicker {
             .items_center()
             .justify_center()
             .rounded(px(4.0))
-            .text_size(px(16.0))
             .text_color(if favorite {
                 theme.alarm_color(1)
             } else {
@@ -351,11 +357,11 @@ impl ConnectionPicker {
             })
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_primary).text_color(theme.alarm_color(1)))
-            .child(SharedString::new_static(if favorite {
-                "\u{2605}"
+            .child(if favorite {
+                Icon::Favorite.svg_color(8.0, theme.alarm_color(1))
             } else {
-                "\u{2606}"
-            }))
+                Icon::Favorite.svg(8.0)
+            })
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, _, _window, cx| {
@@ -387,13 +393,13 @@ impl ConnectionPicker {
             .id(SharedString::from(format!("action-{}", target.id)))
             .flex_shrink_0()
             .h_full()
-            .px(px(14.0))
+            .px(px(8.0))
             .flex()
+            .min_w(px(75.))
             .items_center()
             .justify_center()
             .border_l_2()
-            .border_color(Theme::dim(accent, 0.45))
-            .bg(Theme::dim(accent, 0.08))
+            .bg(Theme::dim(accent, 0.11))
             .text_size(px(12.0))
             .text_color(accent)
             .cursor_pointer()
@@ -428,8 +434,8 @@ impl ConnectionPicker {
         };
         div()
             .id(SharedString::from(format!("fav-{}", entry.id)))
-            .w(px(170.0))
-            .p(px(10.0))
+            .w(px(200.0))
+            .p(px(8.0))
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -477,7 +483,7 @@ impl ConnectionPicker {
                     .text_color(theme.text_secondary)
                     .overflow_hidden()
                     .child(if connected {
-                        SharedString::new_static("connected \u{2014} click to disconnect")
+                        SharedString::new_static("connected")
                     } else {
                         entry.detail.clone()
                     }),
@@ -557,6 +563,7 @@ impl ConnectionPicker {
             row = row.child(
                 cell()
                     .flex_shrink_0()
+                    .items_center()
                     .text_size(px(11.0))
                     .text_color(theme.error_accent)
                     .child(reason.clone()),

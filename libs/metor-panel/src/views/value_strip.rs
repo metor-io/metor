@@ -80,6 +80,9 @@ pub enum StripPreset {
 #[derive(Clone)]
 pub struct StripStyle {
     pub preset: StripPreset,
+    /// Let a non-wrapping strip and its cells expose their max-content width.
+    /// Used when the host provides horizontal scrolling around the strip.
+    pub intrinsic_width: bool,
     /// Dashboard-only: render a solo unlabeled scalar at a larger font size
     /// so lone values read as the focal point of the tile.
     pub solo_emphasize: bool,
@@ -94,6 +97,7 @@ impl StripStyle {
     pub fn dashboard() -> Self {
         Self {
             preset: StripPreset::Dashboard,
+            intrinsic_width: false,
             solo_emphasize: true,
             unit: SharedString::default(),
             placeholder: SharedString::new_static("—"),
@@ -104,6 +108,7 @@ impl StripStyle {
     pub fn boxes() -> Self {
         Self {
             preset: StripPreset::Boxes,
+            intrinsic_width: false,
             solo_emphasize: false,
             unit: SharedString::default(),
             placeholder: SharedString::new_static("…"),
@@ -112,6 +117,11 @@ impl StripStyle {
 
     pub fn with_unit(mut self, unit: impl Into<SharedString>) -> Self {
         self.unit = unit.into();
+        self
+    }
+
+    pub fn with_intrinsic_width(mut self) -> Self {
+        self.intrinsic_width = true;
         self
     }
 }
@@ -157,6 +167,7 @@ impl StripBehavior {
 
 fn style_equivalent(a: &StripStyle, b: &StripStyle) -> bool {
     a.preset == b.preset
+        && a.intrinsic_width == b.intrinsic_width
         && a.solo_emphasize == b.solo_emphasize
         && a.unit == b.unit
         && a.placeholder == b.placeholder
@@ -561,9 +572,11 @@ impl Render for ComponentValueStrip {
         let mut row = div()
             .flex()
             .flex_row()
-            .flex_wrap()
             .items_center()
             .gap(px(4.0));
+        if !style.intrinsic_width {
+            row = row.flex_wrap();
+        }
 
         for (idx, cell) in cells.iter().enumerate() {
             let is_pending = behavior.highlighted.contains(&idx);
@@ -677,7 +690,7 @@ impl Render for ComponentValueStrip {
                     (component_id.0.wrapping_mul(31) ^ idx as u64).wrapping_add(0x1001) as usize;
                 let mut bg = theme.control_active;
                 bg.a = 0.15;
-                div()
+                let mut group = div()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -703,8 +716,11 @@ impl Render for ComponentValueStrip {
                                     cx.refresh_windows();
                                 },
                             ),
-                    )
-                    .into_any_element()
+                    );
+                if style.intrinsic_width {
+                    group = group.flex_none();
+                }
+                group.into_any_element()
             } else {
                 atom.into_any_element()
             };
@@ -712,13 +728,16 @@ impl Render for ComponentValueStrip {
             row = row.child(child);
         }
 
-        div()
+        let mut root = div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);
             }))
-            .child(row)
-            .into_any_element()
+            .child(row);
+        if style.intrinsic_width {
+            root = root.flex_none();
+        }
+        root.into_any_element()
     }
 }
 
@@ -755,8 +774,12 @@ fn build_editing_chrome(
         .px(px(6.0))
         .py(px(3.0))
         .rounded(px(3.0))
-        .overflow_hidden()
-        .w(cell_width(style.preset, false));
+        .overflow_hidden();
+    atom = if style.intrinsic_width {
+        atom.min_w(cell_width(style.preset, false)).flex_none()
+    } else {
+        atom.w(cell_width(style.preset, false))
+    };
 
     let bg = if error || is_pending {
         theme.drop_target
@@ -779,6 +802,7 @@ fn build_editing_chrome(
                 .text_size(label_size)
                 .text_color(theme.text_tertiary)
                 .flex_none()
+                .when(style.intrinsic_width, |label| label.whitespace_nowrap())
                 .child(label.clone()),
         );
     }
@@ -855,7 +879,14 @@ fn build_cell_chrome(
     let needs_fixed_width =
         labeled && !matches!((style.preset, is_solo), (StripPreset::Dashboard, true));
     if needs_fixed_width {
-        atom = atom.w(cell_width(style.preset, is_solo));
+        atom = if style.intrinsic_width {
+            atom.min_w(cell_width(style.preset, is_solo))
+        } else {
+            atom.w(cell_width(style.preset, is_solo))
+        };
+    }
+    if style.intrinsic_width {
+        atom = atom.flex_none();
     }
 
     match style.preset {
@@ -884,6 +915,7 @@ fn build_cell_chrome(
                 .text_size(label_size)
                 .text_color(theme.text_tertiary)
                 .flex_none()
+                .when(style.intrinsic_width, |label| label.whitespace_nowrap())
                 .child(label.clone()),
         );
     }
