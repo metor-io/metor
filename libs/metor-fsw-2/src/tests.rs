@@ -255,6 +255,68 @@ fn skip_attribute_overrides_default() {
     assert!(!sink.values.contains_key(&ComponentId::new("ovr.hidden")));
 }
 
+// A nested struct reaches telemetry through the standalone derives (the v1
+// macro crate), not the `Frame` derive — padding must skip on that path too.
+#[derive(
+    AsVTable,
+    Metadatatize,
+    Componentize,
+    metor_fsw::Decomponentize,
+    IntoBytes,
+    Immutable,
+    KnownLayout,
+    FromBytes,
+    Default,
+    Clone,
+    Copy,
+)]
+#[repr(C)]
+struct PadWheel {
+    speed: f64,
+    arm: u8,
+    _pad: [u8; 7],
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "wheelf")]
+struct PadWheelFrame {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    #[metor_fsw(nest)]
+    wheels: [PadWheel; 2],
+}
+
+#[test]
+fn nested_struct_pad_field_skipped() {
+    let frame = PadWheelFrame {
+        timestamp: Timestamp(1),
+        wheels: [PadWheel {
+            speed: 2.0,
+            arm: 1,
+            _pad: [0; 7],
+        }; 2],
+    };
+    let mut sink = RecSink::default();
+    PadWheelFrame::as_vtable()
+        .apply(frame.as_bytes(), &mut sink)
+        .unwrap()
+        .unwrap();
+    assert!(sink.values.contains_key(&ComponentId::new("wheelf.wheels.0.speed")));
+    assert!(sink.values.contains_key(&ComponentId::new("wheelf.wheels.1.arm")));
+    for w in 0..2 {
+        for i in 0..7 {
+            let id = format!("wheelf.wheels.{w}._pad.{i}");
+            assert!(
+                !sink.values.contains_key(&ComponentId::new(&id)),
+                "{id} must not be telemetered"
+            );
+        }
+    }
+    let names: Vec<String> = PadWheelFrame::metadata("").map(|m| m.name).collect();
+    assert!(names.iter().all(|n| !n.contains("_pad")), "{names:?}");
+}
+
 // --- FrameList / FrameMap: build, serialize, apply ---
 
 #[derive(AsVTable, IntoBytes, Immutable, KnownLayout, Clone, Copy)]

@@ -42,7 +42,7 @@ pub fn componentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> Toke
     let sink_calls = fields
         .fields
         .iter()
-        .filter(|f| !f.timestamp)
+        .filter(|f| !f.timestamp && !f.skipped())
         .map(|field| {
             let ident = field.ident.as_ref().expect("only named fields allowed");
             if field.is_nested() {

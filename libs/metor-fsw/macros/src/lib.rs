@@ -28,6 +28,12 @@ struct Field {
     #[darling(default)]
     #[allow(dead_code)]
     max: Option<usize>,
+    /// `#[metor_fsw(skip)]` force-hides a field from telemetry;
+    /// `#[metor_fsw(skip = false)]` opts a `_`-prefixed field back in. Absent,
+    /// a field is skipped iff its name starts with `_` — the convention for
+    /// `#[repr(C)]` padding.
+    #[darling(default)]
+    skip: Option<bool>,
 }
 
 impl Field {
@@ -45,6 +51,18 @@ impl Field {
     /// Componentize/Decomponentize derives.
     pub fn component_id(&self) -> String {
         self.component_name()
+    }
+
+    /// Whether the field is omitted from telemetry: never becomes a component
+    /// and never round-trips through encode/decode. `_`-prefixed fields skip by
+    /// default (padding), overridable in either direction with
+    /// `#[metor_fsw(skip)]`.
+    pub fn skipped(&self) -> bool {
+        self.skip.unwrap_or_else(|| {
+            self.ident
+                .as_ref()
+                .is_some_and(|i| i.to_string().starts_with('_'))
+        })
     }
 
     /// Whether this field should recurse rather than emit a scalar leaf: either

@@ -122,8 +122,9 @@ pub fn as_vtable_impl(
                     .map(move |field| field.with_timestamp(timestamp_source.clone()))
                 }
             });
-            // The timestamp field is the source only; never emitted as a component.
-            let vtable_items = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
+            // The timestamp field is the source only; never emitted as a
+            // component, and neither are `skip`ped fields.
+            let vtable_items = fields.fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
                 let ty = &field.ty;
                 let name = field.component_name();
                 let name = if let Some(parent) = &parent {
@@ -140,7 +141,7 @@ pub fn as_vtable_impl(
             });
             // Dynamic member-template form (frames.md §4): leaves are
             // `path_component`, names are relative to the element base.
-            let element_items = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
+            let element_items = fields.fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
                 let ty = &field.ty;
                 let name = field.component_name();
                 let ident = &field.ident;
