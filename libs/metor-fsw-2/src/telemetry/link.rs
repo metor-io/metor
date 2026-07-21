@@ -134,6 +134,10 @@ pub struct LinkState {
     name: Option<String>,
     shared: Rc<ServerShared>,
     accept_guard: Option<JoinHandleDropGuard<()>>,
+    /// The mDNS advertisement, live between `start` and `shutdown`; dropping
+    /// it unregisters the service. `None` for a loopback bind or a daemon
+    /// that couldn't start.
+    advertiser: Option<mdns_sd::ServiceDaemon>,
 }
 
 impl LinkState {
@@ -160,6 +164,7 @@ impl LinkState {
                 inbound_dropped: Cell::new(0),
             }),
             accept_guard: None,
+            advertiser: None,
         })
     }
 
@@ -367,14 +372,20 @@ impl crate::SharedLifecycle for LinkState {
     /// first attached system's init, so a runtime is up and connections can
     /// arrive before the downlink announces (they park on the replay).
     fn start(&mut self) {
+        let name = self.node_name();
+        self.advertiser = super::discovery::advertise(&name, self.local_addr);
         let listener = self.listener.take().expect("start runs once");
         let shared = self.shared.clone();
         self.accept_guard = Some(stellarator::spawn(accept_loop(listener, shared)).drop_guard());
     }
 
     /// Dropping the guards cancels the accept loop and every connection
-    /// task; the sockets close with them.
+    /// task; the sockets close with them. Shutting down the mDNS daemon
+    /// unregisters the advertisement with a goodbye.
     fn shutdown(&mut self) {
+        if let Some(advertiser) = self.advertiser.take() {
+            let _ = advertiser.shutdown();
+        }
         self.accept_guard = None;
         self.shared.conn_guards.borrow_mut().clear();
         self.shared.conns.borrow_mut().clear();

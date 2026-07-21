@@ -41,6 +41,7 @@
 //! into the downlink's health as `link_conn_dropped`) and is never
 //! disconnected; see the [`link`] module doc for the server's policies.
 
+mod discovery;
 mod link;
 
 pub use link::{LinkParams, LinkState, LinkStats};

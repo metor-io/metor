@@ -25,8 +25,9 @@ metor-fsw-2-macros = { path = "macros" }
 metor-fsw-ring = { path = "ring", default-features = false, features = ["async", "mmap", "futex"] }
 memmap2 = "0.9"
 
-# host identity (default mDNS node name)
+# service discovery
 gethostname = "1.1"
+mdns-sd = "0.13"
 
 # async
 futures-lite = "2.5.0"
