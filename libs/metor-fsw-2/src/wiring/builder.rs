@@ -254,6 +254,16 @@ impl WiringBuilder {
         self
     }
 
+    /// [`serve`](Self::serve) with a human node name advertised over mDNS.
+    /// An unnamed link falls back to the OS hostname at advertise time.
+    pub fn serve_named(mut self, name: &str, addr: SocketAddr) -> Self {
+        self.wiring
+            .states
+            .push(StateSpec::tcp_server_named("link", addr, Some(name)));
+        self.push_system(SystemSpec::downlink("telemetry"));
+        self
+    }
+
     /// Adds the built-in command uplink under the instance name `"uplink"`,
     /// relaying the named msgs off the [`serve`](Self::serve) link. Declare
     /// it before its consumers and a command is consumed the same cycle it

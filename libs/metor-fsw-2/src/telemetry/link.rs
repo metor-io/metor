@@ -60,6 +60,10 @@ const RECV_BUF: usize = 1024;
 pub struct LinkParams {
     /// The address the FSW listens on.
     pub addr: std::net::SocketAddr,
+    /// Human node name advertised over mDNS. `None` falls back to the OS
+    /// hostname at advertise time.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// One inbound `Msg` packet off any connection, queued for the uplink.
@@ -125,6 +129,9 @@ pub struct LinkState {
     /// Bound at construction, taken by `start`.
     listener: Option<TcpListener>,
     local_addr: std::net::SocketAddr,
+    /// The configured node name; `None` resolves to the hostname in
+    /// [`node_name`](Self::node_name).
+    name: Option<String>,
     shared: Rc<ServerShared>,
     accept_guard: Option<JoinHandleDropGuard<()>>,
 }
@@ -138,6 +145,7 @@ impl LinkState {
         Ok(Self {
             listener: Some(listener),
             local_addr,
+            name: None,
             shared: Rc::new(ServerShared {
                 uplink_msgs: RefCell::new(Vec::new()),
                 announce_blob: RefCell::new(None),
@@ -158,6 +166,22 @@ impl LinkState {
     /// The bound address — the advertised port when the config said port 0.
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.local_addr
+    }
+
+    /// Set the configured node name (from [`LinkParams::name`]). A builder
+    /// step off [`bind`](Self::bind) so the registry factory threads it in
+    /// without changing `bind`'s signature.
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// The effective node name advertised over mDNS: the configured name, or
+    /// the OS hostname when unset.
+    pub fn node_name(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned())
     }
 
     /// Advertise the uplink's command set for the identity packet. Runs

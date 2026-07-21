@@ -9207,6 +9207,7 @@ dependencies = [
  "clap 4.6.0",
  "crc32fast",
  "futures-lite 2.6.1",
+ "gethostname",
  "inventory",
  "libloading",
  "memmap2",

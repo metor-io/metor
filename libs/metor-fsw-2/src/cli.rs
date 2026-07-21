@@ -690,8 +690,18 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
             .find(|s| s.ty == TCP_SERVER_TYPE)
         {
             Some(state) => {
-                state.params =
-                    crate::ir::ParamSource::Value(serde_json::json!({ "addr": addr.to_string() }));
+                // Override only the address; a mission-set `name` (advertised
+                // over mDNS) survives the CLI address override.
+                match &mut state.params {
+                    crate::ir::ParamSource::Value(v) => {
+                        v["addr"] = serde_json::Value::String(addr.to_string());
+                    }
+                    other => {
+                        *other = crate::ir::ParamSource::Value(
+                            serde_json::json!({ "addr": addr.to_string() }),
+                        );
+                    }
+                }
             }
             None => {
                 wiring.states.push(StateSpec::tcp_server("link", addr));

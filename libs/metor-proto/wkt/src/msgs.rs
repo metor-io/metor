@@ -1059,6 +1059,23 @@ impl Msg for LinkInfo {
     const ID: PacketId = [224, 61];
 }
 
+/// DNS-SD service type an fsw link advertises itself under, for mDNS
+/// discovery on the local link. A ground tool browses this type to find
+/// every reachable fsw by name.
+pub const FSW_SERVICE_TYPE: &str = "_metor-fsw._tcp.local.";
+
+/// TXT-record key for the advertised [`LINK_PROTOCOL_VERSION`], so a
+/// browser can skip an incompatible link before it dials.
+pub const TXT_PROTOCOL_VERSION: &str = "pv";
+
+/// TXT-record key for the fsw's telemetry namespace, when it has one — the
+/// same bare dotted prefix its components carry.
+pub const TXT_NAMESPACE: &str = "ns";
+
+/// TXT-record key naming the advertised role, always `"fsw"` for a link
+/// server; reserved so one service type can grow sibling roles later.
+pub const TXT_ROLE: &str = "role";
+
 /// Every message of the node/link control protocols. Servers consult
 /// this to keep stray protocol messages out of recorded telemetry; other
 /// unmatched messages (alarms, sequences, …) are telemetry by design —

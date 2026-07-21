@@ -303,10 +303,22 @@ impl StateSpec {
     /// tree: the state's factory deserializes it with serde, so the
     /// `SocketAddr` reads from the JSON string.
     pub fn tcp_server(name: &str, addr: SocketAddr) -> Self {
+        Self::tcp_server_named(name, addr, None)
+    }
+
+    /// [`tcp_server`](Self::tcp_server) with an advertised node name folded
+    /// into the params — the value the mDNS advertiser publishes. `None`
+    /// emits identical params to `tcp_server`, so an unnamed server's IR is
+    /// unchanged.
+    pub fn tcp_server_named(name: &str, addr: SocketAddr, node_name: Option<&str>) -> Self {
+        let mut params = serde_json::json!({ "addr": addr.to_string() });
+        if let Some(node_name) = node_name {
+            params["name"] = serde_json::Value::String(node_name.to_string());
+        }
         Self {
             name: name.to_string(),
             ty: TCP_SERVER_TYPE.to_string(),
-            params: ParamSource::Value(serde_json::json!({ "addr": addr.to_string() })),
+            params: ParamSource::Value(params),
             src: None,
         }
     }

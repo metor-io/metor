@@ -348,11 +348,14 @@ def Alarms(alarms: list[Alarm]) -> Spec:  # noqa: N802 - a system-type wrapper
     return static_system("Alarms", alarm=[a.to_json() for a in alarms])
 
 
-def TcpServer(addr: str) -> Spec:  # noqa: N802
+def TcpServer(addr: str, name: str | None = None) -> Spec:  # noqa: N802
     """The built-in link server state (``LinkParams``): the FSW listens on
     ``addr``; ground tools connect to it for the downlink stream and command
-    ingest alike. Declare it with :meth:`Mission.state`."""
-    return static_system("TcpServer", addr=addr)
+    ingest alike. Declare it with :meth:`Mission.state`.
+
+    ``name`` is the human node name advertised over mDNS for discovery; when
+    omitted the FSW falls back to the OS hostname."""
+    return static_system("TcpServer", **_drop_none({"addr": addr, "name": name}))
 
 
 def Uplink(msgs: list[str] | None = None) -> Spec:  # noqa: N802

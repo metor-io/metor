@@ -25,6 +25,9 @@ metor-fsw-2-macros = { path = "macros" }
 metor-fsw-ring = { path = "ring", default-features = false, features = ["async", "mmap", "futex"] }
 memmap2 = "0.9"
 
+# host identity (default mDNS node name)
+gethostname = "1.1"
+
 # async
 futures-lite = "2.5.0"
 stellarator = { path = "../stellarator" }

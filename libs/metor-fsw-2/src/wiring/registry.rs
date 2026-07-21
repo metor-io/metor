@@ -316,7 +316,10 @@ impl Registry {
         let mut r = Self::new();
         r.register::<crate::AlarmSystem, _>("Alarms");
         let mut link_pack = crate::Pack::new();
-        let link = link_pack.shared_state("TcpServer", |p: LinkParams| LinkState::bind(p.addr));
+        let link = link_pack
+            .shared_state("TcpServer", |p: LinkParams| {
+                LinkState::bind(p.addr).map(|s| s.with_name(p.name))
+            });
         let link_pack = link_pack
             .system_type_shared::<TelemetrySystem, _>("Downlink", &link, {
                 let link = link.clone();
