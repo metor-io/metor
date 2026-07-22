@@ -14,10 +14,12 @@
 use std::path::{Path, PathBuf};
 
 use metor_fsw_2::wiring::{
-    Registry, Wiring, build_artifacts, build_target, eval_python_mission, load_bundle, resolve,
+    Registry, Wiring, build_target, eval_python_mission, load_bundle, provision_artifacts, resolve,
     write_bundle,
 };
 use metor_fsw_2::{BuildOptions, PackageOptions};
+
+mod common;
 
 fn mission(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
@@ -25,13 +27,19 @@ fn mission(name: &str) -> PathBuf {
 
 /// A unique temp directory for this test's bundle (process-scoped, best-effort cleanup).
 fn temp_bundle_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("adcs-fsw2-bundle-{tag}-{}.bundle", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "adcs-fsw2-bundle-{tag}-{}.bundle",
+        std::process::id()
+    ))
 }
 
 /// Evaluate `mission.py` into a built `Wiring`, in-process (test binaries can't host a
 /// `process=#true` worker). `None` — skip, not fail — when Python or the build plumbing is
 /// unavailable (offline/sandboxed cargo, no CPython ≥ 3.10).
 fn eval_and_build() -> Option<Wiring> {
+    if !common::ensure_stubs() {
+        return None;
+    }
     let mut wiring = match eval_python_mission(&mission("mission.py")) {
         Ok(w) => w,
         Err(e) => {
@@ -42,8 +50,8 @@ fn eval_and_build() -> Option<Wiring> {
     for spec in &mut wiring.systems {
         spec.process = false;
     }
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return None;
     }
     Some(wiring)
@@ -70,12 +78,15 @@ fn python_mission_packages_and_runs() {
     // artifact — no verbatim source manifest.
     assert!(dir.join("wiring.json").exists(), "frozen IR written");
     assert!(dir.join("meta.json").exists(), "JSON sidecar written");
-    assert!(dir.join("mission.py").exists(), "python provenance rides along");
+    assert!(
+        dir.join("mission.py").exists(),
+        "python provenance rides along"
+    );
     for artifact in &wiring.artifacts {
+        let cdylib = metor_fsw_2::wiring::cdylib_file_name(&artifact.lib);
         assert!(
-            dir.join(&artifact.cdylib).exists(),
-            "cdylib `{}` copied into the bundle",
-            artifact.cdylib
+            dir.join(&cdylib).exists(),
+            "cdylib `{cdylib}` copied into the bundle"
         );
     }
 
@@ -86,7 +97,10 @@ fn python_mission_packages_and_runs() {
     assert_eq!(loaded.artifacts.len(), wiring.artifacts.len());
     for artifact in &loaded.artifacts {
         assert!(
-            artifact.path.as_deref().is_some_and(|p| p.starts_with(&dir)),
+            artifact
+                .path
+                .as_deref()
+                .is_some_and(|p| p.starts_with(&dir)),
             "bundle artifact path points inside the bundle dir"
         );
     }
@@ -123,8 +137,12 @@ fn python_mission_round_trips_as_metor_archive() {
     for spec in &mut loaded.systems {
         spec.process = false;
     }
-    let mut coord = resolve(&loaded, &Registry::with_builtins()).expect("resolve the .metor bundle");
-    assert!(coord.output_instances().len() >= 3, "systems registered from the archive");
+    let mut coord =
+        resolve(&loaded, &Registry::with_builtins()).expect("resolve the .metor bundle");
+    assert!(
+        coord.output_instances().len() >= 3,
+        "systems registered from the archive"
+    );
     stellarator::run(move || async move {
         coord.run_for(50).await;
     });

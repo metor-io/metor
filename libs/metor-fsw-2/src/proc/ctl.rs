@@ -24,7 +24,7 @@
 //! request(InitReq)            -------->  wait_init
 //! wait_state(Ready)           <--------  bind_init; report(Ready)
 //! step(now, deadline)         -------->  next() -> Step { seq, now }
-//!   … one fsw_execute …
+//!   ... one fsw_pack_execute ...
 //! (ack == seq)                <--------  done(seq, status)
 //! request(ShutdownReq)        -------->  next() -> Shutdown
 //! wait_state(Done)            <--------  shutdown/destroy; report(Done)
@@ -108,17 +108,17 @@ struct CtlBlock {
 const CTL_FILE_SIZE: usize = 64;
 const _: () = assert!(core::mem::size_of::<CtlBlock>() <= CTL_FILE_SIZE);
 
-/// The worker lifecycle, held in [`CtlBlock::state`].
+/// The worker lifecycle held in the shared control block.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerState {
     /// Host created the block; the worker has not reported yet.
     Booting = 0,
-    /// Worker mapped its rings, opened the artifact, and ran `fsw_create`.
+    /// Worker mapped its rings, opened the artifact, and ran `fsw_pack_create`.
     Attached = 1,
     /// Host asks the worker to bind and init.
     InitReq = 2,
-    /// Worker ran `fsw_bind_init`; ready to step.
+    /// Worker ran `fsw_pack_bind_init`; ready to step.
     Ready = 3,
     /// Host asks the worker to shut down and exit.
     ShutdownReq = 4,

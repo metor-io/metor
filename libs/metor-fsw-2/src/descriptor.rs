@@ -36,6 +36,7 @@ use metor_fsw::Metadatatize;
 use metor_proto::types::{ComponentId, PacketId, PrimType};
 use metor_proto::vtable::{Op, VTable};
 use metor_proto_wkt::ComponentMetadata;
+use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
 
 use crate::frame::Frame;
@@ -92,11 +93,16 @@ pub enum PortSchema {
         /// which [`PortDesc::announce`] derives the instance-prefixed ids.
         metadata: Vec<ComponentMetadata>,
     },
-    /// A self-describing postcard record. The 2-byte [`PacketId`] is the whole
-    /// schema, so there is no vtable and nothing to announce.
+    /// A self-describing postcard record: the 2-byte [`PacketId`] keys the
+    /// wire, and `schema` describes the payload so the downlink can announce
+    /// it and ground tools decode records generically.
     Postcard {
         /// The edge key, `M::ID`.
         id: PacketId,
+        /// The payload's postcard schema, announced to the db as
+        /// [`MsgMetadata`](metor_proto_wkt::MsgMetadata). `None` only for
+        /// value-minted dynamic ports, which have no static type.
+        schema: Option<Box<OwnedNamedType>>,
     },
 }
 
@@ -274,7 +280,10 @@ impl PortDesc {
         Self {
             name: M::NAME.into(),
             max_size: MAX_MSG_BYTES,
-            schema: PortSchema::Postcard { id: M::ID },
+            schema: PortSchema::Postcard {
+                id: M::ID,
+                schema: Some(Box::new(OwnedNamedType::from(<M as postcard_schema::Schema>::SCHEMA))),
+            },
             delivery: Delivery::Log,
             fan_in: FanIn::Many,
             telemetered: true,
@@ -302,7 +311,7 @@ impl PortDesc {
         Self {
             name: name.into(),
             max_size: MAX_MSG_BYTES,
-            schema: PortSchema::Postcard { id },
+            schema: PortSchema::Postcard { id, schema: None },
             delivery: Delivery::Log,
             fan_in: FanIn::Many,
             telemetered: true,
@@ -314,7 +323,7 @@ impl PortDesc {
     pub fn id(&self) -> PortId {
         match &self.schema {
             PortSchema::Table { frame_id, .. } => PortId::Component(*frame_id),
-            PortSchema::Postcard { id } => PortId::Packet(*id),
+            PortSchema::Postcard { id, .. } => PortId::Packet(*id),
         }
     }
 

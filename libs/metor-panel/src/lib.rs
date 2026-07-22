@@ -13,8 +13,10 @@ use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod alarms;
+pub mod logs;
 pub mod app;
 pub mod config;
+pub mod connections;
 pub mod dynamic;
 pub mod gpu_context;
 pub(crate) mod graph_canvas;
@@ -25,6 +27,7 @@ pub mod inspect;
 pub mod inspector;
 pub(crate) mod msg_ingest;
 pub mod node_editor;
+pub mod plot_events;
 pub mod sequences;
 pub mod presets;
 pub mod theme;
@@ -35,6 +38,10 @@ pub mod wiring;
 pub(crate) mod window_controls;
 
 pub use app::PanelApp;
+pub use connections::{
+    AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionStatus,
+    ConnectionTarget, RegistryHandle, Resolved, TargetId,
+};
 pub use inspector::palette::{Category, InspectionItem, ItemProvider};
 
 /// Borrow as a [`ComponentView`] without copying the backing buffer.

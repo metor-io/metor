@@ -3,7 +3,9 @@
 //! A mission's `pyproject.toml` lists its loadable artifacts under
 //! `[tool.metor.artifacts]`; for each, `stubgen` reads the pack's manifest
 //! (the `<cdylib>.manifest` sidecar the build driver writes, so nothing is
-//! `dlopen`ed into this process) and emits a checked-in `packs/<id>.py`:
+//! `dlopen`ed into this process) and emits a `packs/<id>.py` — into the
+//! mission tree by default, or into a build directory via `--out-dir` (how
+//! a mission's PEP 517 backend keeps stubs venv-only):
 //!
 //! - an `ARTIFACT` constant carrying the artifact id, crate, lib stem, and a
 //!   `sha256:<hex>` hash of the manifest bytes (the staleness anchor
@@ -32,7 +34,7 @@ use crate::abi::{PackEntryDesc, PackManifest};
 use crate::descriptor::{Delivery, FanIn, PortDesc, PortSchema};
 
 use super::model::Wiring;
-use super::{BuildOptions, WiringBuilder, build_artifacts};
+use super::{BuildOptions, WiringBuilder, provision_artifacts};
 
 /// Everything a `stubgen` invocation needs: the mission directory whose
 /// `pyproject.toml` lists the artifacts, whether to build them first, and
@@ -41,6 +43,10 @@ use super::{BuildOptions, WiringBuilder, build_artifacts};
 pub struct StubgenOptions {
     /// The mission directory (holds `pyproject.toml`; stubs land in `packs/`).
     pub mission_dir: PathBuf,
+    /// Where to write the `packs` package (default: `<mission_dir>/packs`).
+    /// A build front-end (e.g. a PEP 517 backend) points this at its own
+    /// build directory instead of the source tree.
+    pub out_dir: Option<PathBuf>,
     /// Verify the checked-in stubs are byte-identical instead of writing them.
     pub check: bool,
     /// Build the listed crates first (the default). `false` requires them
@@ -207,7 +213,7 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
             }
             b.build()
         };
-        build_artifacts(
+        provision_artifacts(
             &mut wiring,
             &BuildOptions {
                 release: opts.release,
@@ -218,19 +224,17 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
         for ((id, e), art) in artifacts.into_iter().zip(wiring.artifacts.into_iter()) {
             let path = art
                 .path
-                .expect("build_artifacts fills every path or errors");
+                .expect("provision_artifacts fills every path or errors");
             located.push((id, e, path));
         }
     } else {
         for (id, e) in artifacts {
             let cdylib = super::cdylib_file_name(&e.lib);
-            let path =
-                locate_prebuilt(&opts.mission_dir, &cdylib, opts.release).ok_or_else(|| {
-                    StubgenError::NotBuilt {
-                        id: id.clone(),
-                        crate_name: e.crate_name_field.clone(),
-                        cdylib: cdylib.clone(),
-                    }
+            let path = super::build_driver::locate_built(&opts.mission_dir, &cdylib, opts.release)
+                .ok_or_else(|| StubgenError::NotBuilt {
+                    id: id.clone(),
+                    crate_name: e.crate_name_field.clone(),
+                    cdylib: cdylib.clone(),
                 })?;
             located.push((id, e, path));
         }
@@ -239,14 +243,23 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
     // The package files that never vary: an empty `__init__.py` and the
     // `py.typed` marker, written once so `from packs.<id> import ...` and
     // pyright both work.
-    let packs_dir = opts.mission_dir.join("packs");
+    let packs_dir = opts
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| opts.mission_dir.join("packs"));
     let mut report = StubgenReport::default();
     reconcile(&packs_dir.join("__init__.py"), "", opts.check, &mut report)?;
     reconcile(&packs_dir.join("py.typed"), "", opts.check, &mut report)?;
 
     for (id, entry, so) in &located {
         let bytes = manifest_bytes(id, so)?;
-        let module = render_module(id, &entry.crate_name_field, &entry.lib, &bytes)?;
+        let module = render_module(
+            id,
+            &entry.crate_name_field,
+            &entry.lib,
+            &bytes,
+            &StubFlavor::Local,
+        )?;
         reconcile(
             &packs_dir.join(format!("{id}.py")),
             &module,
@@ -311,33 +324,32 @@ fn reconcile(
     Ok(())
 }
 
-/// Search the workspace target directory for a prebuilt cdylib, respecting
-/// `CARGO_TARGET_DIR` and the profile, without running cargo (`--no-build`).
-fn locate_prebuilt(mission_dir: &Path, cdylib: &str, release: bool) -> Option<PathBuf> {
-    let profile = if release { "release" } else { "debug" };
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        roots.push(PathBuf::from(dir));
-    }
-    // Walk up from the mission dir looking for a `target/` sibling of a
-    // workspace `Cargo.toml`.
-    let mut dir = mission_dir.canonicalize().ok();
-    while let Some(d) = dir {
-        roots.push(d.join("target"));
-        dir = d.parent().map(Path::to_path_buf);
-    }
-    for root in roots {
-        let candidate = root.join(profile).join(cdylib);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Codegen
 // ---------------------------------------------------------------------------
+
+/// Which shape of `ARTIFACT` constant a generated module carries.
+///
+/// A **local** module (mission-level `stubgen`) records identity only; the
+/// build driver compiles the crate at build/run time. A **prebuilt** module
+/// (`pack dev`, and the published pack wheel) also locates its own per-triple
+/// library payload (`_libs/` next to the module), stamps the generating ABI
+/// version, and names the distribution it belongs to — the fields the
+/// recorder passes through to [`Artifact`](super::model::Artifact)'s
+/// `prebuilt_dir`/`dist`.
+#[derive(Clone, Debug)]
+pub enum StubFlavor {
+    /// Identity-only `ARTIFACT`; the artifact is crate-built.
+    Local,
+    /// Self-locating `ARTIFACT` over a `_libs/<triple>/` payload.
+    Prebuilt {
+        /// The `FSW_ABI_VERSION` the pack was built against.
+        abi_version: u32,
+        /// The owning distribution's `(name, version)`, from the pack's
+        /// `pyproject.toml` `[project]` table.
+        dist: Option<(String, String)>,
+    },
+}
 
 /// The one-module code generator: decode the manifest, collect frame markers
 /// and nested dataclasses, and render the deterministic module text.
@@ -346,6 +358,7 @@ pub fn render_module(
     crate_name: &str,
     lib: &str,
     manifest_bytes: &[u8],
+    flavor: &StubFlavor,
 ) -> Result<String, StubgenError> {
     let msg: PackManifest =
         postcard::from_bytes(manifest_bytes).map_err(|e| StubgenError::Manifest {
@@ -365,13 +378,26 @@ pub fn render_module(
     }
 
     let mut out = String::new();
-    out.push_str(&header(id, crate_name));
+    out.push_str(&header(id, crate_name, flavor));
     out.push_str("from __future__ import annotations\n\n");
+    if matches!(flavor, StubFlavor::Prebuilt { .. }) {
+        out.push_str("from pathlib import Path\n\n");
+    }
     out.push_str(&cg.imports());
     out.push('\n');
     out.push_str(&format!(
-        "ARTIFACT = Artifact(\n    id=\"{id}\",\n    crate=\"{crate_name}\",\n    lib=\"{lib}\",\n    manifest_hash=\"{hash}\",\n)\n",
+        "ARTIFACT = Artifact(\n    id=\"{id}\",\n    crate=\"{crate_name}\",\n    lib=\"{lib}\",\n    manifest_hash=\"{hash}\",\n",
     ));
+    if let StubFlavor::Prebuilt { abi_version, dist } = flavor {
+        out.push_str("    prebuilt=str(Path(__file__).resolve().parent / \"_libs\"),\n");
+        out.push_str(&format!("    abi_version={abi_version},\n"));
+        if let Some((name, version)) = dist {
+            out.push_str(&format!(
+                "    dist=\"{name}\",\n    dist_version=\"{version}\",\n"
+            ));
+        }
+    }
+    out.push_str(")\n");
 
     for (name, base) in &cg.frames {
         out.push_str(&format!(
@@ -405,17 +431,28 @@ pub(super) fn manifest_hash(bytes: &[u8]) -> String {
 /// The generated-file header: a provenance line and the regenerate/verify
 /// commands, deliberately free of timestamps and absolute paths so `--check`
 /// is a byte diff.
-fn header(id: &str, crate_name: &str) -> String {
-    format!(
-        "# @generated by `metor-fsw stubgen` from the `{id}` pack manifest (crate `{crate_name}`).\n\
-         # Do not edit by hand.\n\
-         #\n\
-         # Regenerate after changing the pack's params or ports:\n\
-         #     metor-fsw stubgen\n\
-         # Verify the checked-in stubs are current (CI):\n\
-         #     metor-fsw stubgen --check\n\
-         \"\"\"Typed pack module for artifact `{id}`.\"\"\"\n\n",
-    )
+fn header(id: &str, crate_name: &str, flavor: &StubFlavor) -> String {
+    match flavor {
+        StubFlavor::Local => format!(
+            "# @generated by `metor-fsw stubgen` from the `{id}` pack manifest (crate `{crate_name}`).\n\
+             # Do not edit by hand.\n\
+             #\n\
+             # Regenerate after changing the pack's params or ports:\n\
+             #     metor-fsw stubgen\n\
+             # Verify the checked-in stubs are current (CI):\n\
+             #     metor-fsw stubgen --check\n\
+             \"\"\"Typed pack module for artifact `{id}`.\"\"\"\n\n",
+        ),
+        StubFlavor::Prebuilt { .. } => format!(
+            "# @generated by `metor-fsw pack dev` from the `{id}` pack manifest (crate `{crate_name}`).\n\
+             # Do not edit by hand.\n\
+             #\n\
+             # Regenerate after changing the pack's params or ports:\n\
+             #     metor-fsw pack dev\n\
+             # (a `uv sync` of a mission depending on this pack runs it for you)\n\
+             \"\"\"Typed pack module for artifact `{id}`.\"\"\"\n\n",
+        ),
+    }
 }
 
 /// The mutable state a module's codegen threads: collected frame markers,
@@ -1134,7 +1171,10 @@ mod tests {
         PortDesc {
             name: name.to_string(),
             max_size: 8,
-            schema: PortSchema::Postcard { id: [7, 0] },
+            schema: PortSchema::Postcard {
+                id: [7, 0],
+                schema: None,
+            },
             delivery: Delivery::Log,
             fan_in: FanIn::One,
             telemetered: false,
@@ -1200,8 +1240,22 @@ mod tests {
     #[test]
     fn render_is_deterministic_and_structured() {
         let bytes = demo_manifest();
-        let a = render_module("demo", "demo-systems", "demo_systems", &bytes).unwrap();
-        let b = render_module("demo", "demo-systems", "demo_systems", &bytes).unwrap();
+        let a = render_module(
+            "demo",
+            "demo-systems",
+            "demo_systems",
+            &bytes,
+            &StubFlavor::Local,
+        )
+        .unwrap();
+        let b = render_module(
+            "demo",
+            "demo-systems",
+            "demo_systems",
+            &bytes,
+            &StubFlavor::Local,
+        )
+        .unwrap();
         assert_eq!(a, b, "codegen is deterministic");
 
         assert!(a.contains("@generated by `metor-fsw stubgen`"));
@@ -1224,13 +1278,51 @@ mod tests {
         assert!(a.contains("limit: int | None = None"));
     }
 
+    /// The prebuilt flavor self-locates its `_libs` payload and carries the
+    /// generating ABI version plus dist provenance; the local flavor carries
+    /// none of that.
+    #[test]
+    fn prebuilt_flavor_locates_and_stamps() {
+        let bytes = demo_manifest();
+        let flavor = StubFlavor::Prebuilt {
+            abi_version: crate::abi::FSW_ABI_VERSION,
+            dist: Some(("demo-pack".into(), "1.2.0".into())),
+        };
+        let a = render_module("demo", "demo-systems", "demo_systems", &bytes, &flavor).unwrap();
+
+        assert!(a.contains("@generated by `metor-fsw pack dev`"));
+        assert!(a.contains("from pathlib import Path"));
+        assert!(a.contains("prebuilt=str(Path(__file__).resolve().parent / \"_libs\"),"));
+        assert!(a.contains(&format!("abi_version={},", crate::abi::FSW_ABI_VERSION)));
+        assert!(a.contains("dist=\"demo-pack\","));
+        assert!(a.contains("dist_version=\"1.2.0\","));
+
+        let local = render_module(
+            "demo",
+            "demo-systems",
+            "demo_systems",
+            &bytes,
+            &StubFlavor::Local,
+        )
+        .unwrap();
+        assert!(!local.contains("prebuilt="));
+        assert!(!local.contains("abi_version="));
+        assert!(!local.contains("pathlib"));
+    }
+
     /// One fixture, two consumers: the checked-in `python/tests/data/demo.py`
     /// (imported by the Python suite) must be exactly what this codegen
     /// produces. Regenerate it with the ignored `fixture_dump::write_demo_fixture`.
     #[test]
     fn demo_fixture_matches_checked_in() {
-        let generated =
-            render_module("demo", "demo-systems", "demo_systems", &demo_manifest()).unwrap();
+        let generated = render_module(
+            "demo",
+            "demo-systems",
+            "demo_systems",
+            &demo_manifest(),
+            &StubFlavor::Local,
+        )
+        .unwrap();
         let checked_in = include_str!("../../python/tests/data/demo.py");
         assert_eq!(
             generated, checked_in,
@@ -1298,6 +1390,7 @@ mod integration {
     fn opts(dir: &std::path::Path, check: bool) -> StubgenOptions {
         StubgenOptions {
             mission_dir: dir.to_path_buf(),
+            out_dir: None,
             check,
             build: true,
             release: false,
@@ -1340,7 +1433,7 @@ mod integration {
                 "metor_fsw_2_dl_fixture",
             )
             .build();
-        if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
             eprintln!("skipping: build failed: {e}");
             return;
         }
@@ -1385,8 +1478,14 @@ mod fixture_dump {
     #[test]
     #[ignore = "regenerates the checked-in Python fixture; run on codegen changes"]
     fn write_demo_fixture() {
-        let text =
-            super::render_module("demo", "demo-systems", "demo_systems", &demo_manifest()).unwrap();
+        let text = super::render_module(
+            "demo",
+            "demo-systems",
+            "demo_systems",
+            &demo_manifest(),
+            &super::StubFlavor::Local,
+        )
+        .unwrap();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/python/tests/data/demo.py");
         std::fs::write(path, text).unwrap();
     }

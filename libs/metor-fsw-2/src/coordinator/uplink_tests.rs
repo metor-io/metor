@@ -1,39 +1,36 @@
-//! Scripted-uplink command dispatch, moved in-crate from
-//! `tests/slot_integration.rs` (WP3).
+//! Uplinked command dispatch off the shared link server.
 //!
-//! These exercise the command path from an [`UplinkSystem`] into a slot and the
-//! coordinator bundle: same-cycle dispatch of an uplinked `Load`+`Start`, the
-//! reload re-emission of the [`SequenceRegistry`], and per-id output routing
-//! with garbage tolerance. Each drives the uplink with a [`MockRecv`]
-//! test-double transport that replays a fixed script — a construct the
-//! [`Wiring`](crate::wiring::Wiring) front end has no way to express (its uplink
-//! is the built-in TCP one), so the coverage lives here against the builder
-//! rather than in the external Wiring-path test crate.
+//! These exercise the command path from an [`UplinkSystem`] into a slot and
+//! the coordinator bundle: same-cycle dispatch of an uplinked `Load`+`Start`,
+//! the reload re-emission of the [`SequenceRegistry`], and per-id output
+//! routing with garbage tolerance. Each seeds the shared [`LinkState`]'s
+//! inbound queue directly (the server's reader tasks are covered in the
+//! `telemetry::link` tests), registering the uplink ahead of its consumers —
+//! the placement that makes a queued command land the same cycle it is
+//! republished.
 //!
 //! The two slot tests open the `metor-fsw-2-seq-fixture` `waiter` entry over a
 //! real shared-object boundary; if the fixture cannot be built the body skips.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
-use metor_proto::types::{ComponentId, IntoLenPacket, Msg, OwnedPacket};
+use metor_proto::types::{ComponentId, Msg};
 use metor_proto_wkt::{
     ReloadSequences, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
     SequenceRegistry,
 };
-use stellarator::buf::{IoBuf, Slice};
 
 use crate::{
-    AllowedOccupant, ClockMode, CoordinatorConfig, CyclicSystem, DlPack, DlSystem, Input, MsgIn,
-    Out, RecvTransport, SlotStatus, System, SystemHealth, SystemInput, SystemOutput, Timestamp,
-    TransportError, UplinkSystem, split_record,
+    AllowedOccupant, ClockMode, CoordinatorConfig, CyclicSystem, DlPack, DlSystem, Input, LinkState,
+    MsgIn, Out, Shared, SlotStatus, System, SystemHealth, SystemInput, SystemOutput, Timestamp,
+    UplinkSystem, split_record,
 };
 
 use super::PortRef;
-use super::init::{Node, SystemBind, async_node, cyclic_node};
+use super::init::{Node, SystemBind, cyclic_node};
 use super::slot::{SlotReg, plan_slot};
 use crate::descriptor::PortId;
 
@@ -123,49 +120,23 @@ fn load(ch: &str, occupant: &str) -> SequenceCommand {
 }
 
 // ---------------------------------------------------------------------------
-// The mock uplink transport
+// The seeded link
 // ---------------------------------------------------------------------------
 
-/// A [`RecvTransport`] that replays a fixed script of pre-encoded wire packets,
-/// then reports `Disconnected` like a dropped link. Each packet is real wire
-/// bytes re-parsed, so the loopback exercises the same parse-and-route path a
-/// network reader uses.
-struct MockRecv {
-    queue: VecDeque<Vec<u8>>,
+/// A constructed link state, never started: these tests feed the inbound
+/// queue directly rather than through a socket.
+fn test_link() -> Shared<LinkState> {
+    let link = Shared::new("TcpServer");
+    link.set(LinkState::bind("127.0.0.1:0".parse().unwrap()).expect("bind"))
+        .ok();
+    link
 }
 
-/// Encode one Msg to its framed wire bytes, stripping the 4-byte length prefix
-/// that `OwnedPacket::parse` does not expect.
-fn wire_msg<M: Msg + serde::Serialize>(msg: &M) -> Vec<u8> {
-    let pkt = msg.into_len_packet();
-    pkt.inner[4..].to_vec()
-}
-
-impl MockRecv {
-    fn new(cmds: Vec<SequenceCommand>) -> Self {
-        Self {
-            queue: cmds.iter().map(wire_msg).collect(),
-        }
-    }
-
-    /// A script of arbitrary pre-encoded packets.
-    fn from_packets(packets: Vec<Vec<u8>>) -> Self {
-        Self {
-            queue: packets.into(),
-        }
-    }
-}
-
-impl RecvTransport for MockRecv {
-    async fn recv(&mut self, _buf: Vec<u8>) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-        match self.queue.pop_front() {
-            Some(bytes) => {
-                let slice = bytes.try_slice(..).expect("non-empty packet");
-                OwnedPacket::parse(slice).map_err(|e| TransportError::Io(Box::new(e)))
-            }
-            None => Err(TransportError::Disconnected),
-        }
-    }
+/// Queue one typed msg on the link as its postcard payload under `M::ID` —
+/// the bytes a wire `Msg` packet's payload carries.
+fn queue<M: Msg + serde::Serialize>(link: &Shared<LinkState>, msg: &M) {
+    link.get()
+        .push_inbound(M::ID, &postcard::to_allocvec(msg).expect("encode"));
 }
 
 /// Drain a message ring, decoding every record as `M` after checking its
@@ -210,7 +181,25 @@ fn uplink_command_loads_and_starts_same_cycle() {
     };
     let loaded = open_waiter(&lib);
 
+    let link = test_link();
+    queue(&link, &load("adcs", "waiter"));
+    queue(
+        &link,
+        &SequenceCommand {
+            channel: "adcs".to_string(),
+            command: SequenceCommandKind::Start,
+        },
+    );
+
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    // The uplink steps first, so the queued commands hit the slot's command
+    // ring at the head of the cycle.
+    let uplink = b.push_node(cyclic_node(
+        "uplink".into(),
+        UplinkSystem::new()
+            .attach(link.clone())
+            .with_msg::<SequenceCommand>(),
+    ));
     // The slot starts empty; the uplink alone drives it.
     let allowed = vec![occ("waiter", loaded)];
     let (desc, ports, process) = plan_slot("adcs", &allowed).unwrap();
@@ -224,17 +213,6 @@ fn uplink_command_loads_and_starts_same_cycle() {
             process,
         }),
     });
-    let uplink = b.push_node(async_node(
-        "uplink".into(),
-        UplinkSystem::new(MockRecv::new(vec![
-            load("adcs", "waiter"),
-            SequenceCommand {
-                channel: "adcs".to_string(),
-                command: SequenceCommandKind::Start,
-            },
-        ]))
-        .with_msg::<SequenceCommand>(),
-    ));
     b.connect(
         PortRef {
             system: uplink,
@@ -290,7 +268,16 @@ fn reload_request_reemits_registry() {
     };
     let loaded = open_waiter(&lib);
 
+    let link = test_link();
+    queue(&link, &ReloadSequences {});
+
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
+    let uplink = b.push_node(cyclic_node(
+        "uplink".into(),
+        UplinkSystem::new()
+            .attach(link.clone())
+            .with_msg::<ReloadSequences>(),
+    ));
     let allowed = vec![occ("waiter", loaded)];
     let (desc, ports, process) = plan_slot("adcs", &allowed).unwrap();
     let _slot = b.push_node(Node {
@@ -303,11 +290,6 @@ fn reload_request_reemits_registry() {
             process,
         }),
     });
-    let uplink = b.push_node(async_node(
-        "uplink".into(),
-        UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
-            .with_msg::<ReloadSequences>(),
-    ));
     b.connect(
         PortRef {
             system: uplink,
@@ -388,48 +370,47 @@ impl CyclicSystem for CmdTap {
     }
 }
 
-/// Received Msgs route by their declared output id. A second declared command
+/// Queued msgs route by their declared output id. A second declared command
 /// type gets its own output, an unknown id counts on the uplink's health, and
-/// a malformed payload under a known id is dropped with the link staying up.
+/// a malformed payload under a known id is dropped by the consumer's own
+/// drain with everything else still flowing.
 #[test]
 fn uplink_routes_by_declared_output_and_survives_garbage() {
-    use metor_proto::types::LenPacket;
-
     RELOADS_SEEN.store(0, Relaxed);
     CMDS_SEEN.store(0, Relaxed);
 
-    // The script is a second-type command (routes to `reloads`), an id the
+    // The queue is a second-type command (routes to `reloads`), an id the
     // uplink declares no output for (SequenceChannelEvent is downlink traffic),
     // a malformed payload under a known id, and finally a valid
-    // SequenceCommand, which arrives only if the garbage did not kill the
-    // reader.
-    let unroutable = wire_msg(&SequenceChannelEvent {
-        channel: "adcs".to_string(),
-        kind: SequenceEventKind::Started,
-    });
-    let malformed = {
-        // A SequenceCommand-id Msg whose payload cannot postcard-decode; its
-        // string-length varint points far past the end.
-        let mut pkt = LenPacket::msg(SequenceCommand::ID, 4);
-        pkt.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        pkt.inner[4..].to_vec()
-    };
-    let valid = wire_msg(&SequenceCommand {
-        channel: "anything".to_string(),
-        command: SequenceCommandKind::Start,
-    });
-    let reload = wire_msg(&ReloadSequences {});
+    // SequenceCommand, which arrives only if the garbage wedged nothing.
+    let link = test_link();
+    queue(&link, &ReloadSequences {});
+    queue(
+        &link,
+        &SequenceChannelEvent {
+            channel: "adcs".to_string(),
+            kind: SequenceEventKind::Started,
+        },
+    );
+    link.get()
+        .push_inbound(SequenceCommand::ID, &[0xFF, 0xFF, 0xFF, 0xFF]);
+    queue(
+        &link,
+        &SequenceCommand {
+            channel: "anything".to_string(),
+            command: SequenceCommandKind::Start,
+        },
+    );
 
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
-    let tap = b.push_node(cyclic_node(CmdTap::NAME.into(), CmdTap));
-    let uplink = b.push_node(async_node(
+    let uplink = b.push_node(cyclic_node(
         "uplink".into(),
-        UplinkSystem::new(MockRecv::from_packets(vec![
-            reload, unroutable, malformed, valid,
-        ]))
-        .with_msg::<ReloadSequences>()
-        .with_msg::<SequenceCommand>(),
+        UplinkSystem::new()
+            .attach(link.clone())
+            .with_msg::<ReloadSequences>()
+            .with_msg::<SequenceCommand>(),
     ));
+    let tap = b.push_node(cyclic_node(CmdTap::NAME.into(), CmdTap));
     b.connect(
         PortRef {
             system: uplink,
@@ -461,8 +442,7 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
     );
 
     let coord = stellarator::run(|| async move {
-        // Plenty of cycles for the async uplink to drain its 4-packet script.
-        coord.run_for(40).await;
+        coord.run_for(5).await;
         coord
     });
 
@@ -474,8 +454,8 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
     assert_eq!(
         CMDS_SEEN.load(Relaxed),
         1,
-        "the valid command after the malformed one arrived; the link stayed up \
-         and the garbage payload was dropped"
+        "the valid command after the malformed one arrived; the garbage \
+         payload was dropped at the consumer's drain"
     );
     let mut errors = 0;
     health

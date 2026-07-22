@@ -33,7 +33,8 @@ use metor_proto::types::Timestamp;
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState};
 use crate::descriptor::{Declarations, PortDesc, SystemDescriptor, SystemKind};
-use crate::health::{HealthPort, SystemHealth, SystemLog};
+use crate::health::{HealthPort, LogEvent, SystemHealth};
+use crate::message::MsgOut;
 use crate::message::MsgTable;
 use crate::port::Output;
 
@@ -149,12 +150,13 @@ where
     fn decls() -> Declarations {
         let mut decls = O::decls();
         decls.push(PortDesc::of::<SystemHealth>());
-        decls.push(PortDesc::of::<SystemLog>());
+        decls.push(PortDesc::msg_named::<LogEvent>("log"));
         decls
     }
 
-    /// Only the user bundle counts drops; the framework's own health/log
-    /// ports publish through the sizing-aware path and never drop.
+    /// Only the user bundle counts drops here; the health port publishes
+    /// through the sizing-aware path, and the log port folds its own drops
+    /// into health as `log_dropped`.
     fn take_dropped(&mut self) -> u64 {
         self.ports.take_dropped()
     }
@@ -170,8 +172,10 @@ where
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let ports = O::bind(src);
         let health: Output<SystemHealth, WD> = Output::bind(src);
-        let log: Output<SystemLog, WD> = Output::bind(src);
-        Out::new(ports, HealthPort::new(health, log))
+        let log: MsgOut<LogEvent, WD> = MsgOut::bind(src);
+        let mut health = HealthPort::new(health, log);
+        health.set_instance(src.instance_name());
+        Out::new(ports, health)
     }
 }
 
@@ -257,6 +261,12 @@ pub struct BuildCtx<'a> {
     /// The registered message types, keyed by
     /// [`NamedMsg::NAME`](crate::NamedMsg).
     pub msgs: &'a MsgTable,
+    /// The mission namespace, when the front-end set one. A system that hashes
+    /// authored component names into [`ComponentId`](metor_proto::types::ComponentId)s
+    /// (the alarm engine's limit targets) prepends it here so its lookups match
+    /// the namespace-qualified registry. `None` on the pack/in-dylib path,
+    /// whose systems are constructed in isolation from host config.
+    pub namespace: Option<&'a str>,
 }
 
 /// A [`configure`](BuildSystem::configure) failure. It carries no source
@@ -380,28 +390,42 @@ pub trait AsyncSystem: System {
     }
 }
 
+/// The framework tail every cyclic output bundle carries: the health port
+/// the runner times and publishes through. [`Out`] is the standard carrier;
+/// a hand-written bundle (one whose config-minted ports must trail the
+/// health pair, like the uplink's fan-out) implements it directly.
+pub trait HealthOutput: SystemOutput {
+    fn health(&mut self) -> &mut HealthPort;
+}
+
+impl<O: SystemOutput> HealthOutput for Out<O> {
+    fn health(&mut self) -> &mut HealthPort {
+        Out::health(self)
+    }
+}
+
 /// Drives a [`CyclicSystem`] on behalf of the coordinator. It owns the port
 /// bundles between cycles, times each `execute`, and publishes a health
 /// record per cycle.
-pub struct CyclicRunner<S, O>
+pub struct CyclicRunner<S>
 where
-    S: CyclicSystem<Output = Out<O>>,
-    O: SystemOutput,
+    S: CyclicSystem,
+    S::Output: HealthOutput,
 {
     system: S,
     input: S::Input,
-    output: Out<O>,
+    output: S::Output,
     state: SlotState,
 }
 
-impl<S, O> CyclicRunner<S, O>
+impl<S> CyclicRunner<S>
 where
-    S: CyclicSystem<Output = Out<O>>,
-    O: SystemOutput,
+    S: CyclicSystem,
+    S::Output: HealthOutput,
 {
     /// Assemble a runner from a constructed system and its bound port
     /// bundles.
-    pub fn new(system: S, input: S::Input, output: Out<O>) -> Self {
+    pub fn new(system: S, input: S::Input, output: S::Output) -> Self {
         Self {
             system,
             input,
@@ -444,17 +468,17 @@ where
     }
 
     /// Borrow the output bundle, e.g. for a test to read a produced port back.
-    pub fn output(&mut self) -> &mut Out<O> {
+    pub fn output(&mut self) -> &mut S::Output {
         &mut self.output
     }
 }
 
 /// Type-erased entry points, so the coordinator can hold a heterogeneous
 /// `Vec<Box<dyn CyclicSlot>>`. Everything delegates to the inherent methods.
-impl<S, O> CyclicSlot for CyclicRunner<S, O>
+impl<S> CyclicSlot for CyclicRunner<S>
 where
-    S: CyclicSystem<Output = Out<O>>,
-    O: SystemOutput,
+    S: CyclicSystem,
+    S::Output: HealthOutput,
 {
     fn init(&mut self) {
         CyclicRunner::init(self)

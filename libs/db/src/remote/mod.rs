@@ -5,10 +5,12 @@
 //! tiering engine); this module owns the how.
 
 mod db;
+mod fsw;
 mod hydrate;
 mod offload;
 
-pub use db::RemoteDb;
+pub use db::{MirrorEvent, RemoteDb};
+pub use fsw::{Peer, fsw_stream, identify};
 pub use hydrate::Hydrator;
 pub use hydrate::hydrate_span;
 pub use offload::offload_span;

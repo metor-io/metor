@@ -16,7 +16,7 @@
 //! (its `Drop` runs `fsw_destroy`) releases the ring roles, and a later
 //! `Load` attaches fresh handles over the same regions. [`SlotRunner`]
 //! therefore keeps per-port ring templates and can create any number of
-//! occupants over them, one at a time, each a fresh `fsw_create` state.
+//! occupants over them, one at a time, each a fresh `fsw_pack_create` state.
 //!
 //! # Registered ports
 //!
@@ -54,8 +54,8 @@
 //! # Process mode
 //!
 //! A slot whose occupants carry an [`OccupantBacking::Artifact`] runs them
-//! **out of process** (`docs/process-slots.md`): `Load` spawns a worker
-//! instead of calling `fsw_create` — one worker per occupant Load, driven
+//! **out of process** (`docs/process-systems.md`): `Load` spawns a worker
+//! instead of calling `fsw_pack_create`. Each Load gets one worker, driven
 //! through the ctl lifecycle and torn down by kill + reclaim, the process
 //! twin of the hard-drop — and the host never dlopens the occupant
 //! artifacts. Everything above the occupant seam (commands, events, status,
@@ -79,7 +79,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_ring::NoWake;
 
-use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus, pack_name};
+use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus};
+use crate::FrameStr;
 use crate::abi::FswStatus;
 use crate::descriptor::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind, compatible};
 use crate::dl::{DlSlot, DlSystem};
@@ -108,11 +109,10 @@ pub struct SlotStatus {
     /// The current [`SlotState::code`]
     /// (Empty=0/Loaded=1/Loading=2/Running=3/Done=4/Stopped=5).
     pub phase: u8,
-    /// Used length of `occupant`, zero when no occupant is selected.
-    pub occ_len: u8,
-    pub _pad: [u8; 6],
-    /// The selected occupant's name, fixed buffer plus length.
-    pub occupant: [u8; NAME_CAP],
+    pub _pad: [u8; 7],
+    /// The selected occupant's name, empty when no occupant is selected.
+    #[metor_fsw(nest)]
+    pub occupant: FrameStr<NAME_CAP>,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,11 +121,11 @@ pub struct SlotStatus {
 
 /// Where an [`AllowedOccupant`]'s code lives and how `Load` reaches it.
 pub enum OccupantBacking {
-    /// An opened library in this process; `Load` runs `fsw_create` over the
+    /// An opened library in this process; `Load` runs `fsw_pack_create` over the
     /// handle, which stays loaded across swaps.
     Dl(Box<DlSystem>),
     /// A built cdylib the occupant's **worker process** opens
-    /// (`docs/process-slots.md`); the host keeps only the path and never
+    /// (`docs/process-systems.md`); the host keeps only the path and never
     /// loads the artifact itself. Slots mix backings never: `plan_slot`
     /// requires the whole allowed set on one side of the seam.
     Artifact(PathBuf),
@@ -135,7 +135,7 @@ pub enum OccupantBacking {
 /// `Load` selects it by `name`; `descriptor` is the self-description the
 /// slot's contract was derived from and validated against (a dl open or a
 /// describe worker sourced it, per the backing), and `params` is the
-/// postcard blob `fsw_create` decodes.
+/// postcard blob `fsw_pack_create` decodes.
 pub struct AllowedOccupant {
     pub name: String,
     pub params: Vec<u8>,
@@ -156,7 +156,7 @@ impl AllowedOccupant {
 }
 
 /// Names an [`AllowedOccupant`] to load at startup, so a slot comes up
-/// populated instead of empty. [`SlotRunner::init`] applies it once, starting
+/// populated instead of empty. Slot init applies it once, starting
 /// the occupant too when `start` is set.
 #[derive(Clone, Debug)]
 pub struct InitialOccupant {
@@ -197,6 +197,11 @@ pub enum SlotConfigError {
         occupant: String,
         port: &'static str,
     },
+    #[error(
+        "allowed occupant `{occupant}` declares a capability; capability \
+         systems are wired for the whole run, never slot occupants"
+    )]
+    CapabilityOccupant { occupant: String },
 }
 
 /// The pure-spec half of slot validation: a non-empty allowed set, and an
@@ -244,6 +249,14 @@ pub(crate) fn plan_slot(
         .count();
     if n_proc != 0 && n_proc != allowed.len() {
         return Err(SlotConfigError::MixedBacking);
+    }
+    if let Some(occ) = allowed
+        .iter()
+        .find(|a| !a.descriptor.capabilities.is_empty())
+    {
+        return Err(SlotConfigError::CapabilityOccupant {
+            occupant: occ.name.clone(),
+        });
     }
     let process = n_proc == allowed.len();
     // Every allowed occupant must share the contract; the slot sizes and
@@ -407,7 +420,7 @@ pub(crate) struct SlotReg {
     /// bind arm reads the occupant/tail split and the tail-port indices off
     /// it instead of re-deriving them by shape.
     pub ports: SlotPorts,
-    /// Run occupants out of process (`docs/process-slots.md`): the occupant
+    /// Run occupants out of process (`docs/process-systems.md`): the occupant
     /// prefix's crossing rings — its outputs, its Edge inputs' producers, and
     /// the host control ring — are allocated as session-dir files a worker
     /// process can attach. The runner tail stays host-side either way.
@@ -577,6 +590,7 @@ impl SlotRunner {
                         self.input_regions.clone(),
                         self.output_regions.clone(),
                         &self.name,
+                        &self.name,
                         crate::Mount::SlotOccupant,
                     )
                 };
@@ -678,6 +692,15 @@ impl SlotRunner {
     /// Emit a [`SequenceChannelEvent`] tagged with this slot's instance name.
     /// Best effort; a full ring drops the event rather than blocking the cycle.
     fn emit_event(&mut self, kind: SequenceEventKind) {
+        match &kind {
+            SequenceEventKind::Failed { reason } => {
+                tracing::error!(slot = %self.name, %reason, "slot occupant failed")
+            }
+            SequenceEventKind::Refused { reason } => {
+                tracing::warn!(slot = %self.name, %reason, "slot command refused")
+            }
+            kind => tracing::info!(slot = %self.name, event = ?kind, "slot event"),
+        }
         let _ = self.events.emit(&SequenceChannelEvent {
             channel: self.name.to_string(),
             kind,
@@ -897,15 +920,14 @@ impl SlotRunner {
 
     /// Publish the host-side [`SlotStatus`] frame.
     fn publish_status(&mut self, now: Timestamp) {
-        let (occupant, occ_len) = match self.selected {
-            Some(idx) => pack_name(&self.allowed[idx].name),
-            None => ([0u8; NAME_CAP], 0),
+        let occupant = match self.selected {
+            Some(idx) => FrameStr::new(&self.allowed[idx].name),
+            None => FrameStr::EMPTY,
         };
         let frame = SlotStatus {
             timestamp: now,
             phase: self.state.code(),
-            occ_len,
-            _pad: [0; 6],
+            _pad: [0; 7],
             occupant,
         };
         if self.status_out.write(&frame).is_err()

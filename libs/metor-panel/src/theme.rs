@@ -174,6 +174,12 @@ impl Theme {
         }
     }
 
+    /// A theme token at reduced alpha, for tints and dimmed borders derived
+    /// from accent colors without introducing new literals at call sites.
+    pub fn dim(color: Hsla, alpha: f32) -> Hsla {
+        Hsla { a: alpha, ..color }
+    }
+
     /// Solid color for a sequence channel's run state (`run_state_index`: 0 = idle,
     /// 1 = running, 2 = completed, 3 = aborted, 4 = stopped, 5 = failed). Tracks the
     /// theme's `control_active`/`error_accent` for the running/failed poles; the

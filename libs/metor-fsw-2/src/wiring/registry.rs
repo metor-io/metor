@@ -21,10 +21,7 @@ use crate::binder::BindPorts;
 use crate::coordinator::init::{self, Node};
 use crate::descriptor::SystemDescriptor;
 use crate::message::MsgTable;
-use crate::system::{
-    AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, SystemOutput,
-};
-use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetrySystem, UplinkSystem};
+use crate::system::{AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput};
 
 use super::error::{LoadError, LoadErrorKind};
 
@@ -38,6 +35,16 @@ pub(crate) struct LoadCtx<'a> {
     /// The registry's message table, which [`BuildSystem::configure`] resolves
     /// config name tokens against.
     pub msgs: &'a MsgTable,
+    /// The mission namespace, if any, forwarded to
+    /// [`BuildSystem::configure`] so a system that hashes authored component
+    /// names (the alarm engine) can prefix them to match the qualified
+    /// registry.
+    pub namespace: Option<&'a str>,
+    /// The shared state this instance attaches to, resolved by name from
+    /// [`SystemSpec::attach`](super::SystemSpec) during the states pass.
+    /// `None` for an ordinary system; a shared-state entry's factory requires
+    /// it.
+    pub attach: Option<&'a crate::pack::AttachTarget>,
 }
 
 /// The params surface a static-path factory decodes, the typed twin of the dl
@@ -76,8 +83,8 @@ pub struct CyclicKind;
 /// Marker for an async system's [`IntoNode`] impl.
 pub struct AsyncKind;
 
-/// Turns a constructed system into an init-graph [`Node`] via the right
-/// erasure helper, and reports its static descriptor. The `Kind` parameter
+/// Turns a constructed system into an internal graph node via the right
+/// type-erasure helper, and reports its static descriptor. The `Kind` parameter
 /// keeps the cyclic and async blanket impls from overlapping (a type could in
 /// principle implement both system traits), so a single [`Registry::register`]
 /// covers either.
@@ -93,10 +100,10 @@ pub trait IntoNode<Kind>: Sized {
 }
 
 #[allow(private_interfaces)]
-impl<S, O> IntoNode<CyclicKind> for S
+impl<S> IntoNode<CyclicKind> for S
 where
-    S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts + 'static,
+    S: CyclicSystem + 'static,
+    S::Output: HealthOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     fn into_node(self, name: String) -> Node {
@@ -138,7 +145,10 @@ where
     // Resolve config references (message name tokens) against the registry
     // tables the params value cannot carry.
     system
-        .configure(&BuildCtx { msgs: ctx.msgs })
+        .configure(&BuildCtx {
+            msgs: ctx.msgs,
+            namespace: ctx.namespace,
+        })
         .map_err(|e| match e {
             ConfigureError::UnknownMsg { name, available } => LoadErrorKind::UnknownMsgName {
                 system: ctx.name.to_string(),
@@ -174,7 +184,7 @@ fn decode_static_params<P: serde::de::DeserializeOwned>(
 /// fields fill in and a required field is a clean missing-field error). A
 /// `serde_json::Value` alone cannot serve both, since `()` needs `Null` and a
 /// defaulted struct needs `{}`.
-struct NoParams;
+pub(crate) struct NoParams;
 
 impl<'de> serde::Deserializer<'de> for NoParams {
     type Error = serde::de::value::Error;
@@ -256,6 +266,11 @@ pub(crate) fn decode_value_params<P: serde::de::DeserializeOwned>(
 pub(super) struct RegistryEntry {
     pub(super) factory: SystemFactory,
     descriptor: EntryDescriptor,
+    /// `true` for a pack entry that attaches to a pack-shared state by name
+    /// ([`Pack::system_type_shared`](crate::Pack::system_type_shared)): the
+    /// resolver requires its spec to carry an `attach`, and rejects an
+    /// `attach` on any entry where this is `false`.
+    pub(super) shared: bool,
 }
 
 /// A registered type's descriptor without construction: computed on demand
@@ -284,6 +299,9 @@ pub struct Registry {
     /// [`NamedMsg::NAME`](crate::NamedMsg). Config name tokens (an uplink's
     /// `msgs` list) resolve against this table in [`BuildSystem::configure`].
     pub(super) msgs: MsgTable,
+    /// Pack-declared shared states, keyed by their declaration name — the
+    /// `type=` a [`StateSpec`](super::StateSpec) constructs through.
+    pub(super) states: HashMap<&'static str, std::cell::RefCell<crate::pack::StateEntry>>,
 }
 
 impl Registry {
@@ -293,28 +311,45 @@ impl Registry {
     }
 
     /// A registry pre-loaded with the built-in systems under their `type=`
-    /// names: the alarm engine (`"Alarms"`), the TCP telemetry downlink
-    /// (`"TcpDownlink"`), and the TCP command uplink (`"TcpUplink"`), plus the
-    /// well-known message set in the message table so a mission's `msgs` list
-    /// can name any of them out of the box. An app-built registry starts here
-    /// and adds its own systems.
+    /// names — the alarm engine (`"Alarms"`) and the link pack: one shared
+    /// `"TcpServer"` state serving the `"Downlink"` and `"Uplink"` systems
+    /// attached to it — plus the well-known message set in the message table
+    /// so a mission's `msgs` list can name any of them out of the box. An
+    /// app-built registry starts here and adds its own systems.
     pub fn with_builtins() -> Self {
         use metor_proto_wkt::{
-            AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, ReloadSequences, SequenceChannelEvent,
-            SequenceCommand, SequenceRegistry,
+            AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmRaised, ReloadSequences,
+            SequenceChannelEvent, SequenceCommand, SequenceRegistry,
         };
+        use crate::telemetry::{LinkParams, LinkState, TelemetrySystem, UplinkSystem};
+
         let mut r = Self::new();
         r.register::<crate::AlarmSystem, _>("Alarms");
-        r.register::<TelemetrySystem<TcpTransport>, _>("TcpDownlink");
-        r.register::<UplinkSystem<TcpRecvTransport>, _>("TcpUplink");
+        let mut link_pack = crate::Pack::new();
+        link_pack.shared_state("TcpServer", |p: LinkParams| {
+            LinkState::bind(p.addr).map(|s| s.with_name(p.name))
+        });
+        // The `Downlink`/`Uplink` entries no longer capture the link token:
+        // the resolver hands each `ctor` the `Shared<LinkState>` a mission
+        // named via `attach=`, and the ctor attaches it.
+        let link_pack = link_pack
+            .system_type_shared::<TelemetrySystem, LinkState>("Downlink", |p, link| {
+                <TelemetrySystem as BuildSystem>::new(p).attach(link)
+            })
+            .system_type_shared::<UplinkSystem, LinkState>("Uplink", |p, link| {
+                <UplinkSystem as BuildSystem>::new(p).attach(link)
+            });
+        r.register_pack(link_pack);
         r.register_msg::<SequenceCommand>()
             .register_msg::<SequenceRegistry>()
             .register_msg::<SequenceChannelEvent>()
             .register_msg::<ReloadSequences>()
             .register_msg::<AlarmDef>()
+            .register_msg::<AlarmDefs>()
             .register_msg::<AlarmRaised>()
             .register_msg::<AlarmCleared>()
-            .register_msg::<AlarmAck>();
+            .register_msg::<AlarmAck>()
+            .register_msg::<metor_proto_wkt::LogEvent>();
         r
     }
 
@@ -345,6 +380,7 @@ impl Registry {
             RegistryEntry {
                 factory: Box::new(factory::<S, K>),
                 descriptor: EntryDescriptor::Fn(<S as IntoNode<K>>::descriptor),
+                shared: false,
             },
         );
         self
@@ -358,9 +394,14 @@ impl Registry {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        for entry in pack.into_entries() {
+        let (entries, states) = pack.into_parts();
+        for state in states {
+            self.states.insert(state.name(), RefCell::new(state));
+        }
+        for entry in entries {
             let name = entry.name();
             let descriptor = Box::new(entry.descriptor().clone());
+            let shared = entry.shared;
             let entry = Rc::new(RefCell::new(entry));
             let factory = Box::new(move |ctx: &mut LoadCtx| {
                 let mut entry = entry.borrow_mut();
@@ -381,12 +422,31 @@ impl Registry {
                     src,
                     name: ctx.name,
                     msgs: ctx.msgs,
+                    attach: ctx.attach,
                 };
                 // The create phase runs here (a bad config fails at registration);
                 // the returned node rides the ordinary cyclic bind path.
                 init::pending_node(ctx.name.to_string(), &mut entry, params).map_err(|e| match e {
                     // The params decode already carries its span; unwrap it.
                     crate::pack::MakeError::Params(e) => *e,
+                    // A by-name attach that named a wrong-typed state: refine
+                    // the generic create error into the attach diagnostic.
+                    crate::pack::MakeError::AttachTypeMismatch { system, state } => {
+                        LoadErrorKind::AttachTypeMismatch {
+                            system: system.to_string(),
+                            attach: state.to_string(),
+                        }
+                        .whole(ctx.params.diag_src(ctx.name))
+                    }
+                    // Reached only when a shared entry's create runs without a
+                    // resolved attach; the resolver's pre-check normally
+                    // pre-empts it with the spanned `MissingAttach`.
+                    crate::pack::MakeError::MissingAttach { system } => {
+                        LoadErrorKind::MissingAttach {
+                            system: system.to_string(),
+                        }
+                        .whole(ctx.params.diag_src(ctx.name))
+                    }
                     other => LoadErrorKind::PackCreate {
                         system: ctx.name.to_string(),
                         message: other.to_string(),
@@ -399,6 +459,7 @@ impl Registry {
                 RegistryEntry {
                     factory,
                     descriptor: EntryDescriptor::Value(descriptor),
+                    shared,
                 },
             );
         }

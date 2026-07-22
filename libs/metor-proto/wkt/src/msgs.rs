@@ -576,7 +576,7 @@ pub type AlarmId = String;
 pub type OccurrenceId = u64;
 
 /// Alarm severity, ordered low → high so consumers can compute the highest active level.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Info,
@@ -586,7 +586,7 @@ pub enum Severity {
 
 /// Which side of a value a display limit sits on. A band is expressed as an `Upper`
 /// plus a `Lower` entry.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LimitKind {
     Upper,
@@ -597,7 +597,7 @@ pub enum LimitKind {
 /// where to draw guide lines, they are **not** the boundary that decides firing. The
 /// control system evaluates firing (hysteresis, debounce, rate, …) and reports it via
 /// [`AlarmRaised`].
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct AlarmLimit {
     pub kind: LimitKind,
     pub value: f64,
@@ -607,16 +607,16 @@ pub struct AlarmLimit {
 
 /// The component (and optional element index) an alarm pertains to, enabling plots to
 /// auto-associate limit lines and tinting with the traces that show that data.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct AlarmTarget {
     pub component_id: ComponentId,
-    pub element_index: Option<usize>,
+    pub element_index: Option<u64>,
 }
 
 /// Declaration / description of an alarm, broadcast by the control system. Carries the
 /// human-readable identity and the informational display limits. The event time is the
 /// message-log timestamp.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct AlarmDef {
     pub id: AlarmId,
     pub name: String,
@@ -626,13 +626,17 @@ pub struct AlarmDef {
     pub default_severity: Severity,
 }
 
-impl Msg for AlarmDef {
-    const ID: PacketId = [224, 37];
+/// The full alarm definition set, published as one latest-wins snapshot so
+/// the downlink can retain it for late-joining connections — a per-def
+/// stream would coalesce to the last alarm under snapshot delivery.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+pub struct AlarmDefs {
+    pub defs: Vec<AlarmDef>,
 }
 
 /// The source of truth that an alarm is *firing*, broadcast by the control system. The
 /// event time is the message-log timestamp.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct AlarmRaised {
     pub def_id: AlarmId,
     pub occurrence: OccurrenceId,
@@ -641,34 +645,22 @@ pub struct AlarmRaised {
     pub message: String,
 }
 
-impl Msg for AlarmRaised {
-    const ID: PacketId = [224, 38];
-}
-
 /// Marks a previously raised [`occurrence`](AlarmRaised::occurrence) as resolved,
 /// broadcast by the control system.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct AlarmCleared {
     pub def_id: AlarmId,
     pub occurrence: OccurrenceId,
 }
 
-impl Msg for AlarmCleared {
-    const ID: PacketId = [224, 39];
-}
-
 /// Operator acknowledgment of an alarm occurrence, published by the panel so every
 /// connected client sees the ack.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct AlarmAck {
     pub def_id: AlarmId,
     pub occurrence: OccurrenceId,
     pub operator: String,
     pub note: Option<String>,
-}
-
-impl Msg for AlarmAck {
-    const ID: PacketId = [224, 40];
 }
 
 /// Human-readable, unique channel (slot instance) name, e.g. `"adcs"` — the stable
@@ -689,7 +681,7 @@ pub type SequenceName = String;
 
 /// One channel slot declared by the control system: its name (the channel's stable
 /// address) and the set of sequence names that may be loaded into it.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct SequenceChannelSpec {
     pub name: SequenceChannelName,
     pub available: Vec<SequenceName>,
@@ -698,15 +690,9 @@ pub struct SequenceChannelSpec {
 /// Whole-registry declaration of the sequence channels, broadcast by the control system.
 /// Re-publishing replaces the registry — the latest wins. This is the configuration the
 /// sequence UI sources from the control system.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct SequenceRegistry {
     pub channels: Vec<SequenceChannelSpec>,
-}
-
-impl Msg for SequenceRegistry {
-    // Fresh id: the u64-`channel_id` protocol retired [224,41] (see the note above
-    // [`SequenceCommand`]); [224,45..57] belong to the sealed-node transfer protocol.
-    const ID: PacketId = [224, 58];
 }
 
 /// Run state of a channel's loaded sequence, as reported by the control system.
@@ -724,7 +710,7 @@ pub enum SequenceRunState {
 /// A single transition in a channel's lifecycle. Events arrive in order through one log,
 /// so the per-channel state machine (`Loaded` → `Started` → `Progress`* → terminal) is
 /// totally ordered.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceEventKind {
     /// A sequence was loaded into the channel.
@@ -763,20 +749,15 @@ pub enum SequenceEventKind {
 }
 
 /// A granular per-channel state update, broadcast by the control system (control → panel).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct SequenceChannelEvent {
     pub channel: SequenceChannelName,
     pub kind: SequenceEventKind,
 }
 
-impl Msg for SequenceChannelEvent {
-    // Fresh id — see the retirement note above [`SequenceCommand`].
-    const ID: PacketId = [224, 59];
-}
-
 /// An operator command on a channel, published by the panel (panel → control). The
 /// control system executes it and reports the result via [`SequenceChannelEvent`].
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceCommandKind {
     /// Load the named sequence into the channel.
@@ -802,25 +783,16 @@ pub enum SequenceCommandKind {
 /// took **fresh** `PacketId`s ([224,58..60]) rather than mis-decoding every historical
 /// recording persisted under the old ids. The retired ids are reserved forever: an old
 /// recording's records must stay cleanly *unmatched*, never reinterpreted.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct SequenceCommand {
     pub channel: SequenceChannelName,
     pub command: SequenceCommandKind,
 }
 
-impl Msg for SequenceCommand {
-    // Fresh id — see the retirement note on the struct.
-    const ID: PacketId = [224, 60];
-}
-
 /// Asks the control system to re-read its sequence source(s) (disk, etc.) and re-publish
 /// an updated [`SequenceRegistry`]. Global scope. Published by the panel.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Default)]
 pub struct ReloadSequences {}
-
-impl Msg for ReloadSequences {
-    const ID: PacketId = [224, 44];
-}
 
 /// The complete mission wiring IR, broadcast by the control system at startup
 /// and re-broadcast on a [`ReloadSequences`] request — the same telemetry
@@ -832,7 +804,7 @@ impl Msg for ReloadSequences {
 /// it so a consumer can gate before parsing. Because the payload carries the
 /// full graph it can exceed the default message-ring cap, so the control
 /// system sizes its `wiring` channel from the concrete payload at build.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct WiringManifest {
     /// The IR schema version the `ir_json` was produced against.
     pub ir_version: u32,
@@ -840,10 +812,43 @@ pub struct WiringManifest {
     pub ir_json: String,
 }
 
-impl Msg for WiringManifest {
-    // Next free id after the name-addressed sequence types ([224,58..60]); the
-    // sealed-node protocol owns [224,45..57] and the alarm types [224,37..40].
-    const ID: PacketId = [224, 61];
+/// Log severity, ordered low → high so consumers can filter by minimum level.
+/// Mirrors the `tracing` level set.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// One log line from the flight software, broadcast on the downlink
+/// (control → panel). Carries both hand-written lines (a system's health-port
+/// log call) and host `tracing` events routed through the forwarding layer.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+pub struct LogEvent {
+    /// Source-side event time on the mission clock: health-port lines and
+    /// forwarded tracing events are both stamped with the cycle timestamp of
+    /// the cycle that flushed them (wall time equals it only under a wall
+    /// clock).
+    pub timestamp: Timestamp,
+    pub level: LogLevel,
+    /// Filter key: the emitting system's instance name for health-port lines,
+    /// the tracing target for forwarded events.
+    pub source: String,
+    /// The tracing target (module path); empty for health-port lines.
+    pub target: String,
+    pub message: String,
+    /// Active tracing span scope, root → leaf joined with `:` (e.g.
+    /// `"run:load_slot"`). `None` for health-port lines.
+    pub span: Option<String>,
+    /// Event key-values beyond the message, Debug-formatted.
+    pub fields: Vec<(String, String)>,
+    /// Source location of the emitting tracing event, when known.
+    pub file: Option<String>,
+    pub line: Option<u32>,
 }
 
 /// Version of the sealed-node transfer protocol ([224,45]..[224,57]).
@@ -1029,7 +1034,49 @@ impl Msg for NodeAck {
     const ID: PacketId = [224, 55];
 }
 
-/// Every message of the sealed-node transfer protocol. Servers consult
+/// Version of the fsw link identity protocol ([`LinkInfo`]), independent
+/// of [`NODE_PROTOCOL_VERSION`].
+pub const LINK_PROTOCOL_VERSION: u32 = 1;
+
+/// Identity push from an fsw link server: the FIRST packet on every
+/// accepted connection, ahead of the schema announce replay. A metor-db
+/// server never sends it, and an fsw link server never answers
+/// [`GetDbInfo`] — the pair is how one address form serves both peers: a
+/// client probes with `GetDbInfo` and lets the first packet's id decide
+/// the mode.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LinkInfo {
+    pub protocol_version: u32,
+    /// Capability bits, reserved (0 for now).
+    pub features: u64,
+    /// The uplink's configured command set: the msg ids a ground client
+    /// should forward up the link. The uplink's minted ports are
+    /// untelemetered, so forwarding these can never echo back down.
+    pub command_ids: Vec<PacketId>,
+}
+
+impl Msg for LinkInfo {
+    const ID: PacketId = [224, 61];
+}
+
+/// DNS-SD service type an fsw link advertises itself under, for mDNS
+/// discovery on the local link. A ground tool browses this type to find
+/// every reachable fsw by name.
+pub const FSW_SERVICE_TYPE: &str = "_metor-fsw._tcp.local.";
+
+/// TXT-record key for the advertised [`LINK_PROTOCOL_VERSION`], so a
+/// browser can skip an incompatible link before it dials.
+pub const TXT_PROTOCOL_VERSION: &str = "pv";
+
+/// TXT-record key for the fsw's telemetry namespace, when it has one — the
+/// same bare dotted prefix its components carry.
+pub const TXT_NAMESPACE: &str = "ns";
+
+/// TXT-record key naming the advertised role, always `"fsw"` for a link
+/// server; reserved so one service type can grow sibling roles later.
+pub const TXT_ROLE: &str = "role";
+
+/// Every message of the node/link control protocols. Servers consult
 /// this to keep stray protocol messages out of recorded telemetry; other
 /// unmatched messages (alarms, sequences, …) are telemetry by design —
 /// the msg log is their pub/sub channel.
@@ -1050,6 +1097,7 @@ pub const NODE_PROTOCOL_MESSAGES: &[PacketId] = &[
     // get recorded as telemetry.
     [224, 56],
     [224, 57],
+    LinkInfo::ID,
 ];
 
 #[cfg(test)]
@@ -1311,13 +1359,35 @@ mod sequence_tests {
         }
     }
 
-    /// The pinned ids themselves — moving one silently re-keys every persisted recording.
+    /// The pinned ids themselves. These are the natural schema-name-hash ids
+    /// the blanket `Msg` impl assigns; the pin catches a type rename, which
+    /// would silently re-key every persisted recording. (The old hand-held
+    /// ids [224,58..60]/[224,44] are retired: historical records stay cleanly
+    /// unmatched.)
     #[test]
     fn sequence_packet_ids_are_pinned() {
-        assert_eq!(SequenceRegistry::ID, [224, 58]);
-        assert_eq!(SequenceChannelEvent::ID, [224, 59]);
-        assert_eq!(SequenceCommand::ID, [224, 60]);
-        assert_eq!(ReloadSequences::ID, [224, 44]);
+        assert_eq!(SequenceRegistry::ID, [78, 109]);
+        assert_eq!(SequenceChannelEvent::ID, [133, 5]);
+        assert_eq!(SequenceCommand::ID, [225, 247]);
+        assert_eq!(ReloadSequences::ID, [209, 95]);
+    }
+}
+
+#[cfg(test)]
+mod alarm_id_tests {
+    use super::*;
+
+    /// The pinned natural schema-name-hash ids; the pin catches a type
+    /// rename, which would silently re-key every persisted recording.
+    #[test]
+    fn alarm_ids_are_pinned() {
+        assert_eq!(AlarmDef::ID, [178, 74]);
+        assert_eq!(AlarmRaised::ID, [217, 65]);
+        assert_eq!(AlarmCleared::ID, [91, 221]);
+        assert_eq!(AlarmAck::ID, [253, 188]);
+        for id in [AlarmDef::ID, AlarmRaised::ID, AlarmCleared::ID, AlarmAck::ID] {
+            assert!(!NODE_PROTOCOL_MESSAGES.contains(&id));
+        }
     }
 }
 
@@ -1337,17 +1407,19 @@ mod wiring_manifest_tests {
         assert_eq!(back.ir_json, manifest.ir_json);
     }
 
-    /// The pinned id — moving it silently re-keys every persisted recording —
+    /// The pinned id — the natural schema-name-hash id; the pin catches a
+    /// type rename, which would silently re-key every persisted recording —
     /// and its distinctness from every other assigned id in this module.
     #[test]
     fn wiring_manifest_id_is_pinned_and_unique() {
-        assert_eq!(WiringManifest::ID, [224, 61]);
+        assert_eq!(WiringManifest::ID, [9, 81]);
         for id in [
             SequenceRegistry::ID,
             SequenceChannelEvent::ID,
             SequenceCommand::ID,
             ReloadSequences::ID,
             AlarmDef::ID,
+            AlarmDefs::ID,
             AlarmRaised::ID,
             AlarmCleared::ID,
             AlarmAck::ID,
@@ -1355,5 +1427,83 @@ mod wiring_manifest_tests {
             assert_ne!(id, WiringManifest::ID);
         }
         assert!(!NODE_PROTOCOL_MESSAGES.contains(&WiringManifest::ID));
+    }
+}
+
+#[cfg(test)]
+mod log_event_tests {
+    use super::*;
+
+    #[test]
+    fn log_event_roundtrips() {
+        let ev = LogEvent {
+            timestamp: Timestamp(42),
+            level: LogLevel::Warn,
+            source: "nav".into(),
+            target: "metor_fsw2::coordinator".into(),
+            message: "slot load failed".into(),
+            span: Some("run:load_slot".into()),
+            fields: vec![("slot".into(), "nav".into())],
+            file: Some("src/coordinator/slot.rs".into()),
+            line: Some(690),
+        };
+        let bytes = postcard::to_allocvec(&ev).expect("encode");
+        let back: LogEvent = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.level, ev.level);
+        assert_eq!(back.source, ev.source);
+        assert_eq!(back.message, ev.message);
+        assert_eq!(back.span, ev.span);
+        assert_eq!(back.fields, ev.fields);
+    }
+
+    /// The pinned id — the natural schema-name-hash id; the pin catches a
+    /// type rename, which would silently re-key every persisted recording —
+    /// and its distinctness from every other assigned id in this module.
+    #[test]
+    fn log_event_id_is_pinned_and_unique() {
+        assert_eq!(LogEvent::ID, [7, 209]);
+        for id in [
+            SequenceRegistry::ID,
+            SequenceChannelEvent::ID,
+            SequenceCommand::ID,
+            ReloadSequences::ID,
+            WiringManifest::ID,
+            AlarmDef::ID,
+            AlarmDefs::ID,
+            AlarmRaised::ID,
+            AlarmCleared::ID,
+            AlarmAck::ID,
+        ] {
+            assert_ne!(id, LogEvent::ID);
+        }
+        assert!(!NODE_PROTOCOL_MESSAGES.contains(&LogEvent::ID));
+        // Levels order low → high for min-level filtering.
+        assert!(LogLevel::Trace < LogLevel::Debug && LogLevel::Warn < LogLevel::Error);
+    }
+}
+
+#[cfg(test)]
+mod link_info_tests {
+    use super::*;
+
+    /// The pinned id — hand-allocated past the retired [224,58..=60] range —
+    /// and its stray-drop membership: both servers key their
+    /// never-record-as-telemetry hygiene off [`NODE_PROTOCOL_MESSAGES`].
+    #[test]
+    fn link_info_id_is_pinned_and_protocol_member() {
+        assert_eq!(LinkInfo::ID, [224, 61]);
+        assert!(NODE_PROTOCOL_MESSAGES.contains(&LinkInfo::ID));
+    }
+
+    #[test]
+    fn link_info_round_trips() {
+        let info = LinkInfo {
+            protocol_version: LINK_PROTOCOL_VERSION,
+            features: 0,
+            command_ids: vec![SequenceCommand::ID, AlarmAck::ID],
+        };
+        let bytes = postcard::to_allocvec(&info).expect("encode");
+        let back: LinkInfo = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back, info);
     }
 }

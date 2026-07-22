@@ -14,7 +14,7 @@
 //!         .params(PlantParams { init_angle: 0.5 }).end()
 //!     .system("nav").ty("Nav").end()
 //!     .connect("plant", "sensors", "nav", "sensors")
-//!     .telemetry("127.0.0.1:2240".parse().unwrap())
+//!     .serve("127.0.0.1:2240".parse().unwrap())
 //!     .build();
 //! ```
 //!
@@ -36,7 +36,7 @@ use serde::Serialize;
 
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, StateSpec, SystemSpec, Wiring,
 };
 use super::validate;
 
@@ -64,8 +64,10 @@ impl WiringBuilder {
                     cycle_rate: 100.0,
                     default_depth: None,
                     clock: ClockSpec::Wall,
+                    namespace: None,
                 },
                 artifacts: Vec::new(),
+                states: Vec::new(),
                 systems: Vec::new(),
                 slots: Vec::new(),
                 edges: Vec::new(),
@@ -81,6 +83,7 @@ impl WiringBuilder {
             cycle_rate,
             default_depth: self.wiring.coordinator.default_depth,
             clock,
+            namespace: self.wiring.coordinator.namespace.clone(),
         };
         self
     }
@@ -94,12 +97,12 @@ impl WiringBuilder {
     /// Declares a loadable [`Artifact`], one pack (any number of system
     /// types) per cdylib.
     ///
-    /// `lib_stem` is the bare library stem (`adcs_plant`), decorated into the
-    /// platform's file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
-    /// `adcs_plant.dll`) via [`cdylib_file_name`](super::cdylib_file_name).
-    /// A `system` spec's `ty` selects the pack entry. The artifact's `path`
-    /// starts out unset; the build driver
-    /// ([`build_artifacts`](super::build_artifacts)) fills it in.
+    /// `lib_stem` is the bare library stem (`adcs_plant`), decorated into a
+    /// per-triple file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
+    /// `adcs_plant.dll`) when the artifact is provisioned. A `system` spec's
+    /// `ty` selects the pack entry. The artifact's `path` starts out unset;
+    /// the build driver ([`provision_artifacts`](super::provision_artifacts)) fills it
+    /// in.
     ///
     /// Panics on a duplicate `id`.
     pub fn artifact(
@@ -113,8 +116,10 @@ impl WiringBuilder {
         self.wiring.artifacts.push(Artifact {
             id,
             crate_name: crate_name.into(),
-            cdylib: super::cdylib_file_name(lib_stem.as_ref()),
+            lib: lib_stem.as_ref().to_string(),
             path: None,
+            prebuilt_dir: None,
+            dist: None,
             manifest_hash: None,
             src: None,
         });
@@ -133,6 +138,7 @@ impl WiringBuilder {
                 process: false,
                 src: None,
                 scope: None,
+                attach: None,
             },
         }
     }
@@ -203,22 +209,70 @@ impl WiringBuilder {
         self
     }
 
-    /// Adds the built-in TCP telemetry downlink under the instance name
-    /// `"telemetry"`, tapping every output. For a subset tap or a second
-    /// downlink, declare an ordinary system with the `TcpDownlink` type
-    /// instead. Resolving either requires a registry seeded from
-    /// [`Registry::with_builtins`](super::Registry::with_builtins).
-    pub fn telemetry(mut self, addr: SocketAddr) -> Self {
-        self.push_system(SystemSpec::tcp_downlink("telemetry", addr));
+    /// Declares a pack-shared state instance: `ty` is the key a registered
+    /// pack declared via [`Pack::shared_state`](crate::Pack::shared_state),
+    /// and `params` is its construction value tree. Panics on a duplicate
+    /// state name or type, the builder's insert-time twin of validate.
+    pub fn state(self, name: impl Into<String>, ty: impl Into<String>) -> Self {
+        self.state_value(name, ty, serde_json::Value::Object(serde_json::Map::new()))
+    }
+
+    /// [`state`](Self::state) with an explicit params value tree.
+    pub fn state_value(
+        mut self,
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        params: serde_json::Value,
+    ) -> Self {
+        let name = name.into();
+        let ty = ty.into();
+        assert!(
+            !self
+                .wiring
+                .states
+                .iter()
+                .any(|s| s.name == name || s.ty == ty),
+            "state `{name}` (type `{ty}`) is already declared"
+        );
+        self.wiring.states.push(StateSpec {
+            name,
+            ty,
+            params: ParamSource::Value(params),
+            src: None,
+        });
         self
     }
 
-    /// Adds the built-in TCP command uplink under the instance name
-    /// `"uplink"`. It reads command messages off its own connection to
-    /// `addr`, separate from the downlink's; route its commands onward with
-    /// explicit message edges.
-    pub fn uplink(mut self, addr: SocketAddr) -> Self {
-        self.push_system(SystemSpec::tcp_uplink("uplink", addr));
+    /// Serves the telemetry link: declares the built-in `TcpServer` state
+    /// under the name `"link"` listening on `addr`, plus an all-taps
+    /// downlink under the instance name `"telemetry"`. For a subset tap,
+    /// declare an ordinary system with the `Downlink` type instead.
+    /// Resolving requires a registry seeded from
+    /// [`Registry::with_builtins`](super::Registry::with_builtins).
+    pub fn serve(mut self, addr: SocketAddr) -> Self {
+        self.wiring.states.push(StateSpec::tcp_server("link", addr));
+        self.push_system(SystemSpec::downlink("telemetry"));
+        self
+    }
+
+    /// [`serve`](Self::serve) with a human node name advertised over mDNS.
+    /// An unnamed link falls back to the OS hostname at advertise time.
+    pub fn serve_named(mut self, name: &str, addr: SocketAddr) -> Self {
+        self.wiring
+            .states
+            .push(StateSpec::tcp_server_named("link", addr, Some(name)));
+        self.push_system(SystemSpec::downlink("telemetry"));
+        self
+    }
+
+    /// Adds the built-in command uplink under the instance name `"uplink"`,
+    /// relaying the named msgs off the [`serve`](Self::serve) link. Declare
+    /// it before its consumers and a command is consumed the same cycle it
+    /// is republished; route its commands onward with explicit message
+    /// edges.
+    pub fn uplink<'a>(mut self, msgs: impl IntoIterator<Item = &'a str>) -> Self {
+        let msgs: Vec<&str> = msgs.into_iter().collect();
+        self.push_system(SystemSpec::uplink("uplink", &msgs));
         self
     }
 
@@ -403,6 +457,14 @@ impl SystemSpecBuilder {
         let bytes = postcard::to_allocvec(&params)
             .expect("params postcard-encode (Serialize is infallible)");
         self.spec.params = ParamSource::Postcard(bytes);
+        self
+    }
+
+    /// Attaches this system to the pack-shared state declared under `state`
+    /// ([`WiringBuilder::state`]). Required for a shared-state system type
+    /// (the built-in `Downlink`/`Uplink`), rejected on any other.
+    pub fn attach(mut self, state: impl Into<String>) -> Self {
+        self.spec.attach = Some(state.into());
         self
     }
 

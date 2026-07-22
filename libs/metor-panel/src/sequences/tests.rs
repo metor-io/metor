@@ -265,14 +265,14 @@ fn reset_returns_completed_channel_to_idle() {
 }
 
 #[test]
-fn is_resettable_only_in_terminal_safe_states() {
+fn is_resettable_only_in_terminal_states() {
     use super::is_resettable;
     assert!(is_resettable(SequenceRunState::Completed));
     assert!(is_resettable(SequenceRunState::Aborted));
+    assert!(is_resettable(SequenceRunState::Stopped));
+    assert!(is_resettable(SequenceRunState::Failed));
     assert!(!is_resettable(SequenceRunState::Idle));
     assert!(!is_resettable(SequenceRunState::Running));
-    assert!(!is_resettable(SequenceRunState::Stopped));
-    assert!(!is_resettable(SequenceRunState::Failed));
 }
 
 #[test]

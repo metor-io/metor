@@ -17,7 +17,8 @@ use gpui::{App, Context, Entity, Global, Task, prelude::*};
 use metor_db::DB;
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
-    AlarmAck, AlarmCleared, AlarmDef, AlarmId, AlarmLimit, AlarmRaised, OccurrenceId, Severity,
+    AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmId, AlarmLimit, AlarmRaised, OccurrenceId,
+    Severity,
 };
 
 use crate::msg_ingest::{IngestSource, ingest_all};
@@ -66,6 +67,9 @@ pub struct AlarmState {
     active: HashMap<OccurrenceId, ActiveAlarm>,
     acked: HashSet<OccurrenceId>,
     history: VecDeque<AlarmEvent>,
+    /// Total events ever pushed; a monotonic staleness stamp for observers
+    /// (the plot's event overlay) that stays valid as the ring evicts.
+    history_pushed: u64,
 }
 
 impl AlarmState {
@@ -128,9 +132,15 @@ impl AlarmState {
 
     fn push_event(&mut self, event: AlarmEvent) {
         self.history.push_back(event);
+        self.history_pushed += 1;
         while self.history.len() > MAX_HISTORY {
             self.history.pop_front();
         }
+    }
+
+    /// Total events ever pushed; a cheap change stamp for the plot's event overlay.
+    pub fn history_pushed(&self) -> u64 {
+        self.history_pushed
     }
 
     /// Active alarms, highest severity first then most recently raised.
@@ -183,7 +193,7 @@ impl AlarmState {
     fn targets(def: &AlarmDef, component_id: ComponentId, element: usize) -> bool {
         def.target.as_ref().is_some_and(|target| {
             target.component_id == component_id
-                && target.element_index.map(|i| i == element).unwrap_or(true)
+                && target.element_index.map(|i| i as usize == element).unwrap_or(true)
         })
     }
 
@@ -260,6 +270,15 @@ impl AlarmStore {
             let db = db.clone();
             async move |this, cx| {
                 let sources = vec![
+                    // The live snapshot channel: the whole def set in one
+                    // record (retained by the link for late joiners).
+                    IngestSource::new(AlarmDefs::ID, |store: &mut Self, _ts, defs: AlarmDefs| {
+                        for def in defs.defs {
+                            store.state.apply_def(def);
+                        }
+                    }),
+                    // Per-def records, still folded for recordings that
+                    // predate the set-shaped channel.
                     IngestSource::new(AlarmDef::ID, |store: &mut Self, _ts, def| {
                         store.state.apply_def(def)
                     }),

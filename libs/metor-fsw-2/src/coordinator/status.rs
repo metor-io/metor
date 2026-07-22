@@ -11,7 +11,7 @@ use metor_proto::types::Timestamp;
 pub enum StopReason {
     /// A loaded system panicked inside its `.so`; the boundary caught it and
     /// returned [`FswStatus::Panicked`](crate::abi::FswStatus). Only reachable
-    /// for a [`DlSlot`](crate::dl) or its process twin; a static
+    /// for a loaded slot or its process twin; a static
     /// `CyclicRunner` cannot produce it (a panic there unwinds the host
     /// directly).
     Panicked,
@@ -32,13 +32,13 @@ impl StopReason {
 
 /// Where a cyclic slot sits in its lifecycle, from empty through running to
 /// done or hard-stopped. A static
-/// [`CyclicRunner`](crate::CyclicRunner) and a build-time
-/// [`DlSlot`](crate::dl::DlSlot) only ever inhabit `Running`/`Stopped` (once
+/// [`CyclicRunner`](crate::CyclicRunner) and a build-time loaded slot only
+/// ever inhabit `Running`/`Stopped` (once
 /// `Stopped` they are never cleared; a sequence-mode worker's `DlSlot` also
 /// latches `Done`, its poll-once guard); a process slot's `Stopped` clears
-/// back to `Running` when its worker restarts (`docs/process-systems.md`
-/// §6); the runtime [`SlotRunner`](slot) uses all six — `Loading` only in
-/// process mode — and recovers from a terminal state via `Load`/`Reset`.
+/// back to `Running` when its worker restarts (see `docs/process-systems.md`).
+/// A runtime slot uses all six states. Only process mode uses `Loading`.
+/// `Load` or `Reset` can clear a terminal state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     /// No occupant; `step` is a cheap no-op. (Runtime slots only.)
@@ -77,7 +77,7 @@ impl SlotState {
         }
     }
 
-    /// The wire phase code published in [`SlotStatus::phase`], in lifecycle
+    /// The wire phase code published in [`crate::SlotStatus::phase`], in lifecycle
     /// order (Empty=0/Loaded=1/Loading=2/Running=3/Done=4/Stopped=5).
     pub fn code(&self) -> u8 {
         match self {
@@ -108,7 +108,7 @@ impl SlotState {
 }
 
 /// The name and stop reason of one hard-stopped cyclic system, surfaced
-/// through [`Coordinator::stopped`] and the coordinator status frame.
+/// through [`crate::Coordinator::stopped`] and the coordinator status frame.
 #[derive(Clone, Debug)]
 pub struct StoppedSystem {
     pub name: Arc<str>,
@@ -146,7 +146,7 @@ pub(crate) trait CyclicSlot {
 }
 
 /// Where a process system's worker is in its life, as telemetered in the
-/// status frame's worker list and [`Coordinator::workers`].
+/// status frame's worker list and [`crate::Coordinator::workers`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerRunState {
     /// Dead past the restart budget; the stop is permanent.
@@ -170,7 +170,7 @@ impl WorkerRunState {
 }
 
 /// One process system's worker facts, as reported by
-/// [`Coordinator::workers`]: the instance name, the worker pid (this is how
+/// [`crate::Coordinator::workers`]: the instance name, the worker pid (this is how
 /// an operator learns a system runs out-of-process, and where), the restart
 /// count, and the run state. The same facts ride the status frame's
 /// `workers` list.
@@ -184,7 +184,8 @@ pub struct WorkerStatus {
 }
 
 /// The one shared byte cap on every name packed into a fixed-size host frame
-/// (a stopped system in [`CoordinatorStatus`], the occupant in [`SlotStatus`])
+/// (a stopped system in the coordinator status frame, the occupant in
+/// [`crate::SlotStatus`])
 /// and the validated cap on slot instance names, which double as the sequence
 /// channels' wire address (`SequenceCommand::channel`). Matches
 /// [`SEQUENCE_CHANNEL_NAME_CAP`](metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP).
@@ -192,8 +193,3 @@ pub const NAME_CAP: usize = 48;
 
 // The build-validated cap and the wire protocol's documented cap are one invariant.
 const _: () = assert!(NAME_CAP == metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP);
-
-/// Pack a name into a fixed [`NAME_CAP`] buffer plus used length, truncating.
-pub(crate) fn pack_name(name: &str) -> ([u8; NAME_CAP], u8) {
-    crate::dynamic::pack_str::<NAME_CAP>(name)
-}

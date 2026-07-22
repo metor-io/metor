@@ -555,6 +555,19 @@ impl TileGroup {
         cx.notify();
     }
 
+    /// Whether any pane holds an item. A fresh group keeps one empty pane
+    /// around, so "no items anywhere" is the real test for an untouched
+    /// layout (used to decide if loading a saved one needs consent).
+    pub fn has_items(&self, cx: &App) -> bool {
+        fn member_has_items(member: &Member, cx: &App) -> bool {
+            match member {
+                Member::Pane(pane) => !pane.read(cx).items().is_empty(),
+                Member::Axis(axis) => axis.members.iter().any(|m| member_has_items(m, cx)),
+            }
+        }
+        member_has_items(&self.root, cx)
+    }
+
     /// Snapshot the full layout (tree shape, flexes, and each item's own
     /// persisted state) for saving to disk.
     pub fn serialize(&self, cx: &App) -> SerializedTileGroup {

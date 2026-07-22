@@ -18,6 +18,7 @@ fn base_wiring() -> Wiring {
             clock: ClockSpec::Wall,
         },
         artifacts: Vec::new(),
+        states: Vec::new(),
         systems: Vec::new(),
         slots: Vec::new(),
         edges: Vec::new(),
@@ -34,6 +35,7 @@ fn system(name: &str, scope: Option<usize>) -> SystemSpec {
         process: false,
         src: None,
         scope,
+        attach: None,
     }
 }
 

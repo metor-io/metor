@@ -44,6 +44,7 @@ pub(crate) async fn commissioning(
     // No mode commanded (ctrl holds its identity reference, as it always has before the
     // first ModeCmd); complete when successive q̂ deltas stay small for the dwell.
     progress("estimator warm-up");
+    tracing::info!("commissioning started; estimator warm-up");
     let t0 = now();
     let mut last_q = None;
     let mut settled_since: Option<Timestamp> = None;
@@ -56,9 +57,10 @@ pub(crate) async fn commissioning(
         if secs_since(t0) > params.warmup_timeout_s {
             mode.publish(&ModeCmd::safe().stamped(now()));
             progress("timeout in warm-up");
+            tracing::warn!(budget_s = params.warmup_timeout_s, "warm-up timed out; safing");
             return Outcome::Failed;
         }
-        let Some(e) = att.latest() else { continue };
+        let Ok(Some(e)) = att.latest() else { continue };
         let q = e.q_hat_b_eci;
         rate = e.omega_b.norm().into_buf();
         if let Some(prev) = last_q {
@@ -79,6 +81,7 @@ pub(crate) async fn commissioning(
     if rate > params.rate_detumble_enter {
         mode.publish(&ModeCmd::detumble().stamped(now()));
         progress("detumbling");
+        tracing::warn!(rate, "boot tumble beyond wheel capture; detumbling");
         let t0 = now();
         loop {
             if wait(NEXT_CYCLE).await.aborted() {
@@ -88,9 +91,10 @@ pub(crate) async fn commissioning(
             if secs_since(t0) > params.detumble_timeout_s {
                 mode.publish(&ModeCmd::safe().stamped(now()));
                 progress("timeout in detumble");
+                tracing::warn!(budget_s = params.detumble_timeout_s, "detumble timed out; safing");
                 return Outcome::Failed;
             }
-            let Some(e) = att.latest() else { continue };
+            let Ok(Some(e)) = att.latest() else { continue };
             let rate: f64 = e.omega_b.norm().into_buf();
             if rate < params.rate_detumble_exit {
                 break;
@@ -103,6 +107,7 @@ pub(crate) async fn commissioning(
     // holds under the coarse gate for the dwell.
     mode.publish(&ModeCmd::settling().stamped(now()));
     progress("coarse pointing");
+    tracing::info!(rate, "estimator settled; slewing onto the velocity-vector target");
     let t0 = now();
     let mut ok_since: Option<Timestamp> = None;
     loop {
@@ -113,6 +118,7 @@ pub(crate) async fn commissioning(
         if secs_since(t0) > params.settle_timeout_s {
             mode.publish(&ModeCmd::safe().stamped(now()));
             progress("timeout in coarse pointing");
+            tracing::warn!(budget_s = params.settle_timeout_s, "coarse pointing timed out; safing");
             return Outcome::Failed;
         }
         match tracking_error(&mut att, &mut gps) {
@@ -131,6 +137,7 @@ pub(crate) async fn commissioning(
     // breach resets the dwell; the phase timeout catches a loop that cannot hold).
     mode.publish(&ModeCmd::pointing().stamped(now()));
     progress("pointing");
+    tracing::info!(gate_rad = params.coarse_err_rad, "coarse gate held; confirming fine pointing");
     let t0 = now();
     let mut ok_since: Option<Timestamp> = None;
     loop {
@@ -141,6 +148,7 @@ pub(crate) async fn commissioning(
         if secs_since(t0) > params.confirm_timeout_s {
             mode.publish(&ModeCmd::safe().stamped(now()));
             progress("timeout in pointing confirm");
+            tracing::warn!(budget_s = params.confirm_timeout_s, "pointing confirm timed out; safing");
             return Outcome::Failed;
         }
         match tracking_error(&mut att, &mut gps) {
@@ -154,6 +162,7 @@ pub(crate) async fn commissioning(
         }
     }
     progress("commissioned");
+    tracing::info!("commissioned");
     Outcome::Completed
 }
 
@@ -161,8 +170,8 @@ pub(crate) async fn commissioning(
 /// `target_for(LAW_HIL, gps)`, the same law/guard ctrl steers by. `None` until both an
 /// estimate and a GPS fix have arrived.
 fn tracking_error(att: &mut Input<AttitudeEstimate>, gps: &mut Input<Gps>) -> Option<f64> {
-    let q_hat = att.latest()?.q_hat_b_eci;
-    let g = gps.latest()?;
+    let q_hat = att.latest().ok().flatten()?.q_hat_b_eci;
+    let g = gps.latest().ok().flatten()?;
     let target = target_for(ModeCmd::LAW_HIL, &g.pos_eci, &g.vel_eci);
     Some(q_hat.angular_distance(&target).into_buf().abs())
 }

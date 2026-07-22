@@ -75,8 +75,15 @@ use crate::descriptor::SystemDescriptor;
 /// manifest so generated stubs carry the units and prose that make params
 /// usable. Version 7 drops the never-populated per-entry and per-port doc
 /// slots. Version 8 serializes [`SystemDescriptor`] directly in the manifest,
-/// replacing the `*Msg` mirror family.
-pub const FSW_ABI_VERSION: u32 = 8;
+/// replacing the `*Msg` mirror family. Version 9 passes the instance name to
+/// `fsw_pack_bind_init` (stamped into the entry's [`LogEvent`] records as
+/// their `source`) and carries the implicit log port as a message channel
+/// instead of a frame. Version 10 carries each Postcard port's payload
+/// schema in the descriptor, so the downlink can announce message schemas
+/// to the ground.
+///
+/// [`LogEvent`]: crate::LogEvent
+pub const FSW_ABI_VERSION: u32 = 10;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles
@@ -191,19 +198,23 @@ pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
 pub struct RawBinder<'a> {
     inputs: slice::Iter<'a, FswRing>,
     outputs: slice::Iter<'a, FswRing>,
+    instance: &'a str,
 }
 
 impl<'a> RawBinder<'a> {
     /// Build a cursor over the host's input and output handle arrays.
+    /// `instance` is the host-assigned instance name, stamped into the bound
+    /// entry's log events.
     ///
     /// # Safety
     /// Every region named by an `FswRing` here must satisfy
     /// [`RingBuffer::attach_raw`]'s contract, a live header-valid ring region
     /// that outlives every `Writer` and `View` this binder produces.
-    pub unsafe fn new(inputs: &'a [FswRing], outputs: &'a [FswRing]) -> Self {
+    pub unsafe fn new(inputs: &'a [FswRing], outputs: &'a [FswRing], instance: &'a str) -> Self {
         Self {
             inputs: inputs.iter(),
             outputs: outputs.iter(),
+            instance,
         }
     }
 
@@ -241,6 +252,10 @@ impl<'a> RingSource for RawBinder<'a> {
 
     // `output_registry()` keeps the panicking default: a loaded system is never
     // the telemetry downlink, so it has no broad-access registry.
+
+    fn instance_name(&self) -> &str {
+        self.instance
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,11 +371,24 @@ pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_v
     // SAFETY: caller asserts `pack` is a live `PackHost` from `run_pack_open`.
     let host = unsafe { &*(pack as *mut PackHost) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // Shared state and capabilities stay on the static registry: a
+        // loaded artifact gets neither a cross-FFI state-construction call
+        // nor a read grant over every ring.
+        assert!(
+            host.pack.state_entries().next().is_none(),
+            "packs with shared state cannot export over the pack ABI"
+        );
         let msg = PackManifest {
             systems: host
                 .pack
                 .entries()
                 .map(|e| {
+                    assert!(
+                        e.descriptor().capabilities.is_empty(),
+                        "entry `{}` declares a capability; capability entries \
+                         cannot export over the pack ABI",
+                        e.name(),
+                    );
                     let schema = OwnedNamedType::from(e.params_schema());
                     // Params docs are collected from this `.so`'s own
                     // `#[derive(ParamsDocs)]` submissions, keyed by schema name.
@@ -417,11 +445,19 @@ pub unsafe fn run_pack_create(
             .pack
             .entry_at_mut(index as usize)
             .expect("entry index in range (host resolved it from this pack's manifest)");
-        let pending = entry
+        let created = entry
             .create(crate::EntryParams::Postcard(bytes))
             .expect("entry create (params decode + state construction)");
+        // The host binds positionally against the exported static manifest;
+        // an instance that minted ports would misbind silently, so it is
+        // rejected here instead.
+        assert!(
+            created.instance_desc.is_none(),
+            "entry `{}` minted ports at create; config-minted ports cannot cross the pack ABI",
+            entry.name(),
+        );
         Box::into_raw(Box::new(PackAbiState {
-            pending: Some(pending),
+            pending: Some(created.pending),
             mount: mount_from_raw(mount),
             driver: None,
             poisoned: false,
@@ -434,19 +470,24 @@ pub unsafe fn run_pack_create(
 /// [`FswRing`] arrays (positionally, in descriptor order, via [`RawBinder`])
 /// and run the driver's init. Bind and init are fused; a caught panic leaves
 /// the driver unbound, so [`run_pack_execute`] reports
-/// [`FswStatus::Panicked`].
+/// [`FswStatus::Panicked`]. `name`/`name_len` carry the host-assigned
+/// instance name (UTF-8; a non-UTF-8 or null name binds as empty), stamped
+/// into the entry's log events.
 ///
 /// # Safety
 /// `state` is a live pointer from [`run_pack_create`]. `inputs`/`outputs`
 /// name `n_in`/`n_out` valid [`FswRing`] handles whose regions satisfy
 /// [`RingBuffer::attach_raw`]'s contract and outlive the driver (until
-/// [`run_pack_destroy`]).
+/// [`run_pack_destroy`]). `name`/`name_len` name a readable byte range (or
+/// null/0), valid for the duration of the call.
 pub unsafe fn run_pack_bind_init(
     state: *mut c_void,
     inputs: *const FswRing,
     n_in: usize,
     outputs: *const FswRing,
     n_out: usize,
+    name: *const u8,
+    name_len: usize,
 ) {
     if state.is_null() {
         return;
@@ -456,9 +497,11 @@ pub unsafe fn run_pack_bind_init(
     // SAFETY: caller asserts the handle arrays are valid (or null/0).
     let (in_slice, out_slice) =
         unsafe { (rings_from_raw(inputs, n_in), rings_from_raw(outputs, n_out)) };
+    // SAFETY: caller asserts the name range is readable (or null/0).
+    let instance = core::str::from_utf8(unsafe { bytes_from_raw(name, name_len) }).unwrap_or("");
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: caller asserts each region outlives the driver.
-        let mut binder = unsafe { RawBinder::new(in_slice, out_slice) };
+        let mut binder = unsafe { RawBinder::new(in_slice, out_slice, instance) };
         let pending = st
             .pending
             .take()
@@ -490,6 +533,10 @@ pub unsafe fn run_pack_execute(state: *mut c_void, now: u64) -> FswStatus {
         return FswStatus::Panicked;
     };
     let now = Timestamp(now as i64);
+    // Republish the mission clock inside this linkage unit (a dylib links its
+    // own copy of the static), so tracing events fired during the step are
+    // born on the cycle timeline.
+    crate::clock::set_mission_now(now);
     let outcome = catch_unwind(AssertUnwindSafe(|| driver.step(now)));
     match outcome {
         Ok(crate::StepStatus::Running) => FswStatus::Running,
@@ -588,6 +635,10 @@ macro_rules! export_pack {
 
             #[unsafe(no_mangle)]
             pub extern "C" fn fsw_pack_open() -> *mut c_void {
+                // The dylib links its own copy of tracing's dispatcher, so
+                // install the pack-side forwarding subscriber here; without
+                // it, tracing macros inside the pack silently no-op.
+                $crate::logfwd::init_pack_tracing();
                 abi::run_pack_open($pack_fn)
             }
 
@@ -623,9 +674,13 @@ macro_rules! export_pack {
                 n_in: usize,
                 outputs: *const abi::FswRing,
                 n_out: usize,
+                name: *const u8,
+                name_len: usize,
             ) {
                 // SAFETY: the host upholds run_pack_bind_init's contract.
-                unsafe { abi::run_pack_bind_init(state, inputs, n_in, outputs, n_out) }
+                unsafe {
+                    abi::run_pack_bind_init(state, inputs, n_in, outputs, n_out, name, name_len)
+                }
             }
 
             #[unsafe(no_mangle)]

@@ -85,7 +85,7 @@ fn descriptor_orders_ports_by_signature() {
         vec![
             PortId::Component(PkNav::FRAME_ID),
             PortId::Component(crate::SystemHealth::FRAME_ID),
-            PortId::Component(crate::SystemLog::FRAME_ID),
+            PortId::Packet(metor_proto_wkt::LogEvent::ID),
         ]
     );
 }
@@ -294,6 +294,139 @@ fn bad_params_fail_at_create() {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// Pack-shared state: several entries granted the same `&mut` instance, with
+// the state's lifecycle run once across all of them.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Tally {
+    value: f64,
+    starts: u32,
+    shutdowns: u32,
+    report: Option<Rc<RefCell<(f64, u32, u32)>>>,
+}
+
+impl crate::SharedLifecycle for Tally {
+    fn start(&mut self) {
+        self.starts += 1;
+    }
+
+    fn shutdown(&mut self) {
+        self.shutdowns += 1;
+        if let Some(report) = &self.report {
+            *report.borrow_mut() = (self.value, self.starts, self.shutdowns);
+        }
+    }
+}
+
+fn bump(s: &mut Tally, _now: Timestamp) {
+    s.value += 1.0;
+}
+
+fn double(s: &mut Tally, _now: Timestamp) {
+    s.value *= 2.0;
+}
+
+/// The headline: two entries attached to one shared state see the *same*
+/// instance in registration order (`(((0+1)*2+1)*2+1)*2 = 14`), and the
+/// lifecycle hooks ran exactly once around the whole run.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn shared_state_entries_share_one_instance() {
+    let report = Rc::new(RefCell::new((0.0, 0, 0)));
+    let mut pack = Pack::new();
+    let tally = pack.shared_state("Tally", {
+        let report = report.clone();
+        move |(): ()| {
+            Ok::<_, std::convert::Infallible>(Tally {
+                report: Some(report.clone()),
+                ..Tally::default()
+            })
+        }
+    });
+    let mut pack = pack
+        .system("bump", system(bump).shared(&tally))
+        .system("double", system(double).shared(&tally));
+
+    pack.state_entry_mut("Tally")
+        .expect("declared")
+        .create(EntryParams::Postcard(&[]))
+        .expect("state constructs");
+
+    let mut b = crate::coordinator::init::InitGraph::new(config());
+    for name in ["bump", "double"] {
+        b.push_node(
+            pending_node(
+                name.into(),
+                pack.entry_mut(name).expect("registered"),
+                EntryParams::Postcard(&[]),
+            )
+            .expect("create"),
+        );
+    }
+    let mut coord = b.build().unwrap();
+    coord.run_for(3).await;
+
+    assert_eq!(*report.borrow(), (14.0, 1, 1));
+    assert!(coord.stopped().is_empty());
+}
+
+/// An attached entry cannot instantiate before the state's own wiring
+/// declaration constructed the instance.
+#[test]
+fn shared_entry_requires_constructed_state() {
+    let mut pack = Pack::new();
+    let tally = pack.shared_state("Tally", |(): ()| {
+        Ok::<_, std::convert::Infallible>(Tally::default())
+    });
+    let mut pack = pack.system("bump", system(bump).shared(&tally));
+    let entry = pack.entry_mut("bump").unwrap();
+    assert!(!entry.reloadable());
+    assert!(matches!(
+        entry.create(EntryParams::Postcard(&[])),
+        Err(MakeError::StateNotConstructed { state: "Tally" })
+    ));
+}
+
+/// An attached entry instantiates once, like a `.state(...)` entry.
+#[test]
+fn shared_entry_instantiates_once() {
+    let mut pack = Pack::new();
+    let tally = pack.shared_state("Tally", |(): ()| {
+        Ok::<_, std::convert::Infallible>(Tally::default())
+    });
+    let mut pack = pack.system("bump", system(bump).shared(&tally));
+    pack.state_entry_mut("Tally")
+        .unwrap()
+        .create(EntryParams::Postcard(&[]))
+        .unwrap();
+    let entry = pack.entry_mut("bump").unwrap();
+    drop(entry.create(EntryParams::Postcard(&[])).expect("first"));
+    assert!(matches!(
+        entry.create(EntryParams::Postcard(&[])),
+        Err(MakeError::SharedEntryReinstantiated)
+    ));
+}
+
+/// A failing shared-state init fn (resource acquisition) surfaces as a
+/// create error naming the state, not a panic.
+#[test]
+fn shared_state_init_failure_reports() {
+    let mut pack = Pack::new();
+    let _tally: crate::Shared<Tally> =
+        pack.shared_state("Tally", |(): ()| Err("address in use".to_string()));
+    let err = pack
+        .state_entry_mut("Tally")
+        .unwrap()
+        .create(EntryParams::Postcard(&[]))
+        .expect_err("init failed");
+    assert!(matches!(
+        err,
+        MakeError::StateInit { state: "Tally", ref detail } if detail == "address in use"
+    ));
+}
+
 /// A wired task loops on `cycle().await`: state in locals, exactly one
 /// publish per coordinator cycle, and drops from the future-owned output
 /// (forced by a stalled broad reader) fold into its health — the counter
@@ -404,4 +537,130 @@ async fn task_cycles_every_cycle_and_folds_drops() {
         health.errors
     );
     drop(stalled);
+}
+
+// ---------------------------------------------------------------------------
+// A struct-authored attached entry whose construction mints ports: the host
+// registers the instance descriptor, not the static one.
+// ---------------------------------------------------------------------------
+
+#[derive(crate::SystemInput)]
+struct MintIn {}
+
+#[derive(crate::SystemOutput)]
+struct MintOut {}
+
+#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+struct MintParams {
+    mint: bool,
+}
+
+struct MintSys {
+    mint: bool,
+}
+
+impl crate::BuildSystem for MintSys {
+    type Params = MintParams;
+    fn new(params: MintParams) -> Self {
+        Self { mint: params.mint }
+    }
+}
+
+impl crate::System for MintSys {
+    type Input = MintIn;
+    type Output = crate::Out<MintOut>;
+    const NAME: &'static str = "mint";
+}
+
+impl crate::CyclicSystem for MintSys {
+    fn instance_descriptor(&self) -> crate::SystemDescriptor {
+        let mut desc = <Self as crate::CyclicSystem>::descriptor();
+        if self.mint {
+            desc.outputs.push(
+                crate::PortDesc::msg_dynamic("cmd", SequenceCommand::ID).untelemetered(),
+            );
+        }
+        desc
+    }
+
+    fn execute(&mut self, _now: Timestamp, _input: &mut MintIn, _output: &mut Self::Output) {}
+}
+
+#[test]
+fn system_type_shared_registers_instance_descriptor() {
+    use crate::message::MsgTable;
+    use crate::pack::AttachTarget;
+
+    // A shared entry attaches by name: build the resolved token the resolver
+    // would hand its create, and drive create through the value surface.
+    fn mint_params<'a>(
+        value: &'a serde_json::Value,
+        msgs: &'a MsgTable,
+        attach: &'a AttachTarget,
+    ) -> EntryParams<'a> {
+        EntryParams::Value {
+            value,
+            src: "Mint",
+            name: "mint",
+            msgs,
+            attach: Some(attach),
+        }
+    }
+
+    let msgs = MsgTable::default();
+    let mut pack = Pack::new();
+    let tally = pack.shared_state("Tally", |(): ()| {
+        Ok::<_, std::convert::Infallible>(Tally::default())
+    });
+    let attach = AttachTarget {
+        ty: "Tally",
+        token: std::rc::Rc::new(tally.clone()),
+    };
+    let mut pack = pack.system_type_shared::<MintSys, Tally>("Mint", |p, _tally| {
+        <MintSys as crate::BuildSystem>::new(p)
+    });
+    pack.state_entry_mut("Tally")
+        .unwrap()
+        .create(EntryParams::Postcard(&[]))
+        .unwrap();
+
+    // A non-minting instance stands on the static descriptor.
+    let plain = serde_json::json!({ "mint": false });
+    let created = pack
+        .entry_mut("Mint")
+        .unwrap()
+        .create(mint_params(&plain, &msgs, &attach))
+        .unwrap();
+    assert!(matches!(created.instance_desc, None));
+
+    // A second instantiation is rejected, so re-register for the minting one.
+    let mut pack = Pack::new();
+    let tally = pack.shared_state("Tally", |(): ()| {
+        Ok::<_, std::convert::Infallible>(Tally::default())
+    });
+    let attach = AttachTarget {
+        ty: "Tally",
+        token: std::rc::Rc::new(tally.clone()),
+    };
+    let mut pack = pack.system_type_shared::<MintSys, Tally>("Mint", |p, _tally| {
+        <MintSys as crate::BuildSystem>::new(p)
+    });
+    pack.state_entry_mut("Tally")
+        .unwrap()
+        .create(EntryParams::Postcard(&[]))
+        .unwrap();
+    let minting = serde_json::json!({ "mint": true });
+    let node = pending_node(
+        "mint".into(),
+        pack.entry_mut("Mint").unwrap(),
+        mint_params(&minting, &msgs, &attach),
+    )
+    .expect("create");
+    assert!(
+        node.desc
+            .outputs
+            .iter()
+            .any(|p| p.id() == PortId::Packet(SequenceCommand::ID)),
+        "the minted port reached the registered descriptor"
+    );
 }

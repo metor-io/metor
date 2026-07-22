@@ -80,7 +80,7 @@ use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
 use crate::port::capacity_for;
 use crate::proc::session::SessionDir;
 use crate::registry::{Registry, RegistryEntry};
-use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
+use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, HealthOutput};
 
 use super::bind::{ProcBindCtx, bind_systems};
 use super::slot::SlotReg;
@@ -102,15 +102,15 @@ struct CyclicReg<S> {
     system: S,
 }
 
-impl<S, O> CyclicRegistration for CyclicReg<S>
+impl<S> CyclicRegistration for CyclicReg<S>
 where
-    S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts + 'static,
+    S: CyclicSystem + 'static,
+    S::Output: HealthOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
         let input = <S::Input as BindPorts>::bind(binder);
-        let output = <Out<O> as BindPorts>::bind(binder);
+        let output = <S::Output as BindPorts>::bind(binder);
         Box::new(CyclicRunner::new(self.system, input, output))
     }
 }
@@ -209,10 +209,10 @@ pub(crate) struct Node {
 /// Build a cyclic system's [`Node`] under `name` from its instance descriptor
 /// (what this configured instance actually carries) and an erased [`CyclicReg`]
 /// bind.
-pub(crate) fn cyclic_node<S, O>(name: String, system: S) -> Node
+pub(crate) fn cyclic_node<S>(name: String, system: S) -> Node
 where
-    S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts + 'static,
+    S: CyclicSystem + 'static,
+    S::Output: HealthOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     let desc = system.instance_descriptor();
@@ -246,14 +246,17 @@ pub(crate) fn pending_node(
     entry: &mut crate::pack::PackEntry,
     params: crate::pack::EntryParams<'_>,
 ) -> Result<Node, crate::pack::MakeError> {
-    let pending = entry.create(params)?;
+    let created = entry.create(params)?;
+    let desc = created
+        .instance_desc
+        .unwrap_or_else(|| entry.descriptor().clone());
     let driver = PendingDriver {
-        pending,
+        pending: created.pending,
         entry_name: entry.name(),
     };
     Ok(Node {
         name,
-        desc: entry.descriptor().clone(),
+        desc,
         bind: SystemBind::Cyclic(Box::new(driver)),
     })
 }
@@ -284,6 +287,13 @@ pub(crate) struct InitGraph {
     /// [`set_wiring_manifest`](Self::set_wiring_manifest), which also injects the
     /// matching `wiring` Host output onto the coordinator #0 bundle.
     pub(crate) wiring_manifest: Option<WiringManifest>,
+    /// The mission namespace, prepended to every telemetry instance name at
+    /// the registry/announce seam ([`qualify`](Self::qualify)). `None` leaves
+    /// names and ids byte-identical to an un-namespaced mission. Set by the
+    /// front-end from [`CoordinatorSpec::namespace`](crate::ir::CoordinatorSpec);
+    /// deliberately not on [`CoordinatorConfig`], which stays `Copy`, and not on
+    /// [`Node::name`], which wiring resolves against unprefixed.
+    pub(crate) namespace: Option<String>,
 }
 
 impl InitGraph {
@@ -295,6 +305,7 @@ impl InitGraph {
             worker_exe: None,
             shm_dir: None,
             wiring_manifest: None,
+            namespace: None,
         };
         // Register the coordinator's own channels as system #0, so they flow
         // through the same validate/size/allocate/register passes as every
@@ -306,9 +317,14 @@ impl InitGraph {
             inputs: vec![PortDesc::msg::<ReloadSequences>()],
             outputs: vec![
                 PortDesc::of::<crate::SystemHealth>().with_conn(PortConn::Host),
-                PortDesc::of::<crate::SystemLog>().with_conn(PortConn::Host),
+                PortDesc::msg_named::<crate::LogEvent>("log").with_conn(PortConn::Host),
                 PortDesc::of::<CoordinatorStatus>().with_conn(PortConn::Host),
-                PortDesc::msg_named::<SequenceRegistry>("sequences").with_conn(PortConn::Host),
+                // Latest-wins boot state, not an event stream: Snapshot
+                // delivery is what lets the downlink retain the newest
+                // record for late-joining link connections.
+                PortDesc::msg_named::<SequenceRegistry>("sequences")
+                    .with_delivery(Delivery::Snapshot)
+                    .with_conn(PortConn::Host),
                 PortDesc::msg_named::<SequenceCommand>("commands")
                     .untelemetered()
                     .with_conn(PortConn::Host),
@@ -347,6 +363,20 @@ impl InitGraph {
         SystemHandle { id: 0 }
     }
 
+    /// Qualify a telemetry instance name with the mission
+    /// [`namespace`](Self::namespace): `"sat1.<instance>"` when set, the bare
+    /// name otherwise. This is the one seam the prefix rides — registry keys,
+    /// the announce prefix, and file-backed ring names all pass through it,
+    /// while wiring/edge resolution keeps using the unprefixed
+    /// [`Node::name`]. The reserved `"coordinator"` bundle is qualified here
+    /// too, since it registers as an ordinary node.
+    fn qualify(&self, instance: &str) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{ns}.{instance}"),
+            None => instance.to_string(),
+        }
+    }
+
     /// The registered descriptor of `handle`.
     pub(crate) fn descriptor_of(&self, handle: SystemHandle) -> &SystemDescriptor {
         &self.systems[handle.id].desc
@@ -358,7 +388,10 @@ impl InitGraph {
     /// Called again, the latest manifest wins: the single injected port is
     /// replaced in place, never accumulated.
     pub(crate) fn set_wiring_manifest(&mut self, manifest: WiringManifest) {
-        let mut port = PortDesc::msg_named::<WiringManifest>("wiring");
+        // Snapshot: the manifest is latest-wins boot state the downlink
+        // retains for late-joining link connections.
+        let mut port =
+            PortDesc::msg_named::<WiringManifest>("wiring").with_delivery(Delivery::Snapshot);
         port.conn = PortConn::Host;
         port.max_size = wiring_manifest_max_size(&manifest.ir_json);
         let outputs = &mut self.systems[0].desc.outputs;
@@ -776,7 +809,11 @@ impl InitGraph {
             let mut row = Vec::with_capacity(sys.desc.outputs.len());
             for (out_idx, port) in sys.desc.outputs.iter().enumerate() {
                 let readers = fan_out.get(&(sid, out_idx)).copied().unwrap_or(0) + n_reg + slack;
-                let instance = sys.name.clone();
+                // The one prefixing seam: the registry key, the announce
+                // prefix (via `RegistryEntry::instance`), and the ring file
+                // name all key off this qualified name; wiring stays on
+                // `sys.name`.
+                let instance = self.qualify(&sys.name);
                 let role = BufferRole::Output {
                     system: sid,
                     port: out_idx,
@@ -831,6 +868,7 @@ impl InitGraph {
         // entry: inbound control, not an output. SelfTap inputs allocate
         // nothing (already counted in `fan_out`).
         for (sid, sys) in self.systems.iter().enumerate() {
+            let instance = self.qualify(&sys.name);
             for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 if port.conn != PortConn::Host {
                     continue;
@@ -844,7 +882,7 @@ impl InitGraph {
                     let session = alloc.session.as_ref().expect("proc graphs have a session");
                     let path = session
                         .path()
-                        .join(format!("{}.{}.ring", sys.name, port.name));
+                        .join(format!("{instance}.{}.ring", port.name));
                     let ring =
                         alloc_ring_at(&path, port.delivery, port.max_size, depth, 1 + slack)?;
                     alloc.host_input_paths.insert((sid, in_idx), path);
@@ -862,7 +900,7 @@ impl InitGraph {
                         system: sid,
                         input: in_idx,
                     },
-                    instance: Some(sys.name.clone()),
+                    instance: Some(instance.clone()),
                 });
                 alloc.host_input_rings.insert((sid, in_idx), ring);
             }
@@ -935,7 +973,7 @@ impl InitGraph {
                         system: sid,
                         input: in_idx,
                     },
-                    instance: Some(sys.name.clone()),
+                    instance: Some(self.qualify(&sys.name)),
                 });
             }
         }
@@ -949,14 +987,19 @@ impl InitGraph {
     /// next: validation, edge resolution, fan-out counting, ring allocation,
     /// registry freeze, copy-in planning, bind.
     pub(crate) fn build(self) -> Result<Coordinator, WireError> {
+        let init_span = tracing::info_span!("init");
+        let _init_span = init_span.enter();
+        tracing::debug!(systems = self.systems.len(), "validating graph");
         self.validate_cycle_rate()?;
         self.validate_simulated_step()?;
         self.validate_receive_all_last()?;
         self.validate_slot_name_caps()?;
         self.validate_port_axes()?;
         let cons_edges = self.solve_edges()?;
+        tracing::debug!(edges = cons_edges.len(), "edges solved");
         let fan_out = self.count_fan_out(&cons_edges);
         let mut alloc = self.alloc_rings(&cons_edges, &fan_out)?;
+        tracing::debug!(rings = alloc.reg_entries.len(), "rings allocated");
         let seq_registry = self.seq_registry_payload();
         let registry = freeze_registry(std::mem::take(&mut alloc.reg_entries))?;
         let mut plumbing = self.plan_copy_ins(&cons_edges, &mut alloc);
@@ -985,6 +1028,11 @@ impl InitGraph {
             &registry,
             &proc_ctx,
         )?;
+        tracing::info!(
+            cyclic = cyclic.len(),
+            r#async = pending_async.len(),
+            "graph bound"
+        );
 
         Ok(Coordinator {
             config,

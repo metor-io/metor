@@ -1,12 +1,10 @@
-//! Deferred port construction, resolved by handing each typed port its
-//! pre-allocated ring.
+//! Deferred port construction over rings chosen during graph build.
 //!
-//! The build phase reserves one [`RingBuffer`] per port before any system is
-//! constructed. Binding then walks each system's port bundle and gives every
-//! typed [`Output`](crate::Output) and [`Input`](crate::Input) its ring. The
-//! walk is positional. The generated [`BindPorts::bind`] visits port fields in
-//! the same order as `descriptors()`, and a [`Binder`] cursor pops one ring
-//! per port, so each port lines up with the ring reserved for it.
+//! Each output gets one [`RingBuffer`]. A frame input often gets a view into
+//! its producer's output ring. A message input may get one ring per producer.
+//! An async snapshot input gets a private copy-in ring. Binding walks each
+//! bundle in descriptor order, so the ring plan and generated
+//! [`BindPorts::bind`] code must use the same order.
 //!
 //! ## Matched wake endpoints
 //!
@@ -86,6 +84,7 @@ pub struct Binder<'a> {
     outputs: slice::Iter<'a, BoundPort>,
     inputs: slice::Iter<'a, BoundInput>,
     registry: Arc<Registry>,
+    instance: &'a str,
 }
 
 impl<'a> Binder<'a> {
@@ -93,11 +92,13 @@ impl<'a> Binder<'a> {
         outputs: &'a [BoundPort],
         inputs: &'a [BoundInput],
         registry: Arc<Registry>,
+        instance: &'a str,
     ) -> Self {
         Self {
             outputs: outputs.iter(),
             inputs: inputs.iter(),
             registry,
+            instance,
         }
     }
 }
@@ -158,6 +159,13 @@ pub trait RingSource {
     /// than fabricate an empty registry.
     fn registry(&self) -> Arc<Registry> {
         panic!("this ring source carries no registry (host-only capability)")
+    }
+
+    /// The bound system's instance name, stamped into its implicit log port's
+    /// [`LogEvent`](crate::LogEvent)s as their `source`. Empty when the
+    /// supplier carries none.
+    fn instance_name(&self) -> &str {
+        ""
     }
 }
 
@@ -222,6 +230,13 @@ impl RingSource for AnySource<'_, '_> {
             Self::Raw(_) => panic!("a loaded pack entry carries no registry"),
         }
     }
+
+    fn instance_name(&self) -> &str {
+        match self {
+            Self::Host(b) => b.instance_name(),
+            Self::Raw(b) => b.instance_name(),
+        }
+    }
 }
 
 impl<'a> RingSource for Binder<'a> {
@@ -281,6 +296,10 @@ impl<'a> RingSource for Binder<'a> {
 
     fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
+    }
+
+    fn instance_name(&self) -> &str {
+        self.instance
     }
 }
 

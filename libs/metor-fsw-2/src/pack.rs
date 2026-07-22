@@ -1,9 +1,9 @@
 //! Packs: many systems from one crate, one construction point.
 //!
 //! A [`Pack`] is a list of erased system entries a crate's `pack()` fn builds
-//! (see `docs/design-packs-authoring.md`). One pack serves every loading
+//! (see `docs/packs.md`). One pack serves every loading
 //! mode: [`Registry::register_pack`](crate::Registry) makes each entry a
-//! `type=` in the static registry, and the pack ABI (v5) exports the same
+//! `type=` in the static registry, and the pack ABI exports the same
 //! entries from a cdylib. Because `pack()` runs once per load, entries can
 //! capture clones of a shared handle built inside it — the construction point
 //! two systems sharing an owned resource (a socket, a bus) never had.
@@ -69,7 +69,22 @@ pub enum EntryParams<'a> {
         src: &'a str,
         name: &'a str,
         msgs: &'a crate::message::MsgTable,
+        /// The shared state this system attaches to, resolved by name from
+        /// [`SystemSpec::attach`](crate::wiring::SystemSpec) during the states
+        /// pass. `None` for an ordinary system; a shared-state entry's create
+        /// requires it.
+        attach: Option<&'a AttachTarget>,
     },
+}
+
+/// The resolved shared state a system attaches to: the erased `Shared<St>`
+/// token a shared entry downcasts at create, plus the state's registry type
+/// key for the mismatch diagnostic. Built by the resolver's states pass and
+/// threaded through [`EntryParams::Value`]; its fields are crate-internal.
+#[cfg(feature = "wiring")]
+pub struct AttachTarget {
+    pub(crate) ty: &'static str,
+    pub(crate) token: std::rc::Rc<dyn core::any::Any>,
 }
 
 /// A create-phase failure: bad params, or a moved-in state already taken.
@@ -89,6 +104,32 @@ pub enum MakeError {
     /// (a moved-in value) and has already been instantiated once.
     #[error("entry holds moved-in state and was already instantiated (not reloadable)")]
     StateTaken,
+    /// A shared-state init fn failed (the state's own construction, e.g. a
+    /// listener bind).
+    #[error("shared state `{state}` failed to construct: {detail}")]
+    StateInit {
+        state: &'static str,
+        detail: String,
+    },
+    /// An entry attached to a shared state was instantiated before the
+    /// state's own wiring declaration constructed it.
+    #[error("system attaches to shared state `{state}`, which no wiring declaration constructs")]
+    StateNotConstructed { state: &'static str },
+    /// An entry attached to a shared state was instantiated a second time.
+    #[error("shared-state entry was already instantiated once (not reloadable)")]
+    SharedEntryReinstantiated,
+    /// A shared-state system's wiring named no state to attach to.
+    #[error("system `{system}` attaches to a shared state, but no wiring declaration named one")]
+    MissingAttach { system: &'static str },
+    /// A shared-state system named a state whose type does not match the
+    /// concrete shared type the system attaches to.
+    #[error(
+        "system `{system}` cannot attach to state `{state}`: its type is not the system's shared-state type"
+    )]
+    AttachTypeMismatch {
+        system: &'static str,
+        state: &'static str,
+    },
 }
 
 /// Decode an entry's typed params from any params surface.
@@ -98,8 +139,20 @@ pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Res
         #[cfg(feature = "wiring")]
         EntryParams::Value {
             value, src, name, ..
-        } => crate::wiring::decode_value_params(value, name, src)
-            .map_err(|e| MakeError::Params(Box::new(e))),
+        } => {
+            // The empty surface serves unit and all-defaults params alike:
+            // `{}` cannot deserialize as `()` through serde_json, so route it
+            // through the same dual-shape deserializer the static registry
+            // path uses. A required field still falls through to the spanned
+            // value decode for its missing-field error.
+            if value.as_object().is_some_and(|m| m.is_empty())
+                && let Ok(p) = P::deserialize(crate::wiring::NoParams)
+            {
+                return Ok(p);
+            }
+            crate::wiring::decode_value_params(value, name, src)
+                .map_err(|e| MakeError::Params(Box::new(e)))
+        }
     }
 }
 
@@ -133,7 +186,26 @@ pub(crate) fn resolve_defaults(
 pub type Pending =
     Box<dyn for<'a, 'b, 'c> FnOnce(&'a mut AnySource<'b, 'c>, Mount) -> Box<dyn Driver>>;
 
-pub(crate) type CreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<Pending, MakeError>>;
+/// What an entry's create phase yields: the bind-phase half, plus the
+/// descriptor this configured instance actually carries when it differs
+/// from the entry's static one (configure-minted ports). The host registers
+/// the instance descriptor; the positional ABI, which binds against the
+/// exported static manifest, rejects the divergence instead.
+pub struct Created {
+    pub(crate) pending: Pending,
+    pub(crate) instance_desc: Option<SystemDescriptor>,
+}
+
+impl From<Pending> for Created {
+    fn from(pending: Pending) -> Self {
+        Self {
+            pending,
+            instance_desc: None,
+        }
+    }
+}
+
+pub(crate) type CreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<Created, MakeError>>;
 
 /// One erased system entry of a [`Pack`]: its name (the registry `type=` /
 /// manifest key), its descriptor (computed from parameter types, no instance
@@ -148,6 +220,11 @@ pub struct PackEntry {
     /// `false` for an entry whose state was moved in with `.state(...)`: it
     /// can be instantiated once, and never as a slot occupant.
     pub(crate) reloadable: bool,
+    /// `true` for an entry that attaches to a pack-shared state by name
+    /// ([`system_type_shared`](Pack::system_type_shared)): its wiring must
+    /// carry an `attach`, and a plain entry must not. Drives the resolver's
+    /// attach/shared consistency checks.
+    pub(crate) shared: bool,
     pub(crate) create: CreateFn,
 }
 
@@ -173,8 +250,8 @@ impl PackEntry {
     }
 
     /// Run the create phase: decode params, build the user state, and hand
-    /// back the bind-phase [`Pending`].
-    pub fn create(&mut self, params: EntryParams<'_>) -> Result<Pending, MakeError> {
+    /// back the bind-phase half with its instance descriptor.
+    pub fn create(&mut self, params: EntryParams<'_>) -> Result<Created, MakeError> {
         (self.create)(params)
     }
 
@@ -198,15 +275,197 @@ impl PackEntry {
     }
 }
 
+/// The construction half of one pack-declared shared state: decode the
+/// state's own params off its wiring declaration and run the init fn.
+pub(crate) type StateCreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<(), MakeError>>;
+
+/// One pack-declared shared state: its name (the wiring `state` type key),
+/// its params schema, its construction fn, and the erased cell the resolve
+/// passes check construction/attachment against.
+pub struct StateEntry {
+    pub(crate) name: &'static str,
+    pub(crate) params_schema: &'static NamedType,
+    pub(crate) cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
+    /// The `Shared<St>` token, erased as `Rc<dyn Any>`, so a system attaching
+    /// by name can downcast it back to the concrete `Shared<St>` at create.
+    /// Cloned into the resolver's name→[`AttachTarget`] map each states pass.
+    pub(crate) token: std::rc::Rc<dyn core::any::Any>,
+    pub(crate) create: StateCreateFn,
+}
+
+impl StateEntry {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn params_schema(&self) -> &'static NamedType {
+        self.params_schema
+    }
+
+    /// Construct the state from its wiring declaration's params.
+    pub fn create(&mut self, params: EntryParams<'_>) -> Result<(), MakeError> {
+        (self.create)(params)
+    }
+}
+
 /// A crate's system entries, built by its `pack()` fn.
 #[derive(Default)]
 pub struct Pack {
     entries: Vec<PackEntry>,
+    states: Vec<StateEntry>,
 }
 
 impl Pack {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Declare this pack's shared state under `name` and hand back the
+    /// [`Shared`](crate::Shared) token attached entries capture — sharing
+    /// is scoped to this pack because nothing outside `pack()` can reach
+    /// the token. The state is constructed once, from its own wiring
+    /// declaration's params; a fallible `init` makes resource acquisition
+    /// (a listener bind) a resolve-time error rather than a runtime one.
+    pub fn shared_state<S, P, E, F>(
+        &mut self,
+        name: &'static str,
+        mut init: F,
+    ) -> crate::Shared<S>
+    where
+        S: crate::SharedLifecycle,
+        P: DeserializeOwned + postcard_schema::Schema + 'static,
+        E: core::fmt::Display + 'static,
+        F: FnMut(P) -> Result<S, E> + 'static,
+    {
+        let token = crate::Shared::new(name);
+        let cell = token.erased();
+        // The token erased as `Rc<dyn Any>`, so a system attaching by name can
+        // downcast it back to `Shared<S>` at create (`S: SharedLifecycle` is
+        // `'static`, so `Shared<S>: 'static` and `Any` holds).
+        let token_any: std::rc::Rc<dyn core::any::Any> = std::rc::Rc::new(token.clone());
+        let create: StateCreateFn = {
+            let token = token.clone();
+            Box::new(move |params: EntryParams<'_>| {
+                let p: P = decode_params(params)?;
+                let state = init(p).map_err(|e| MakeError::StateInit {
+                    state: name,
+                    detail: e.to_string(),
+                })?;
+                token.set(state).map_err(|_| MakeError::StateInit {
+                    state: name,
+                    detail: "already constructed (duplicate declaration)".into(),
+                })
+            })
+        };
+        self.states.push(StateEntry {
+            name,
+            params_schema: <P as postcard_schema::Schema>::SCHEMA,
+            cell,
+            token: token_any,
+            create,
+        });
+        token
+    }
+
+    /// Register a struct-authored system that attaches to a pack-shared state
+    /// *by name*: the mission's [`SystemSpec::attach`](crate::wiring::SystemSpec)
+    /// picks which state instance, and the resolver hands `ctor` the resolved
+    /// [`Shared`](crate::Shared) token (the second argument) at create time.
+    /// `St` is the concrete shared type the entry binds — a mission naming a
+    /// state of any other type is an `AttachTypeMismatch`. The driver is
+    /// wrapped so the state's [`SharedLifecycle`](crate::SharedLifecycle) hooks
+    /// run once across all attached entries. Attached entries are cyclic-only,
+    /// instantiable once, and never slot occupants.
+    pub fn system_type_shared<T, St>(
+        mut self,
+        name: &'static str,
+        mut ctor: impl FnMut(T::Params, crate::Shared<St>) -> T + 'static,
+    ) -> Self
+    where
+        St: crate::SharedLifecycle,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
+        T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
+        T::Input: crate::BindPorts + 'static,
+        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
+    {
+        let mut descriptor = <T as crate::CyclicSystem>::descriptor();
+        descriptor.name = name.into();
+        let static_desc = descriptor.clone();
+        let mut taken = false;
+        #[cfg_attr(not(feature = "wiring"), allow(unused_variables, unused_mut))]
+        let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
+            if taken {
+                return Err(MakeError::SharedEntryReinstantiated);
+            }
+            // A shared entry resolves only through the static registry's value
+            // path (a `wiring` build); the postcard/dl path never attaches.
+            #[cfg(feature = "wiring")]
+            {
+                // Copy the resolved attach target + msgs off the value surface
+                // before `params` moves into decode (the proven `msgs` pattern).
+                let (attach, msgs) = match &params {
+                    EntryParams::Value { attach, msgs, .. } => (*attach, Some(*msgs)),
+                    EntryParams::Postcard(_) => (None, None),
+                };
+                let attach = attach.ok_or(MakeError::MissingAttach { system: name })?;
+                // Recover the concrete token; a wrong-typed state is a clean
+                // mismatch rather than a compile-time impossibility.
+                let token: crate::Shared<St> = attach
+                    .token
+                    .downcast_ref::<crate::Shared<St>>()
+                    .ok_or(MakeError::AttachTypeMismatch {
+                        system: name,
+                        state: attach.ty,
+                    })?
+                    .clone();
+                let cell = token.erased();
+                if !cell.is_constructed() {
+                    return Err(MakeError::StateNotConstructed { state: cell.name() });
+                }
+                let p: T::Params = decode_params(params)?;
+                let mut system = ctor(p, token);
+                if let Some(msgs) = msgs {
+                    system.configure(&crate::BuildCtx { msgs, namespace: None })?;
+                }
+                taken = true;
+                cell.attach();
+                let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
+                let pending: Pending = Box::new(move |src, mount| {
+                    crate::handler::mount_driver(src, mount, move |src| {
+                        let input = <T::Input as crate::BindPorts>::bind(src);
+                        let output = <T::Output as crate::BindPorts>::bind(src);
+                        let inner = RunnerDriver(crate::CyclicRunner::new(system, input, output));
+                        Box::new(AttachedDriver::new(Box::new(inner), cell))
+                    })
+                });
+                Ok(Created {
+                    pending,
+                    instance_desc,
+                })
+            }
+            // Without the value path a shared entry has no attach surface, so
+            // its only honest create outcome is the missing-attach error.
+            #[cfg(not(feature = "wiring"))]
+            {
+                let _ = (&params, &static_desc, &mut ctor);
+                Err(MakeError::MissingAttach { system: name })
+            }
+        });
+        let mut entry = PackEntry {
+            name,
+            descriptor,
+            params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
+            params_default: <T as crate::BuildSystem>::params_default_blob()
+                .filter(|b| !b.is_empty()),
+            reloadable: false,
+            shared: true,
+            create,
+        };
+        if entry.params_default.is_some() {
+            entry.wrap_create_with_defaults();
+        }
+        self.entries.push(entry);
+        self
     }
 
     /// Register a fn-authored system under `name`: the entry
@@ -217,7 +476,8 @@ impl Pack {
         self
     }
 
-    /// Register a struct-authored system type (a [`#[system]`](crate::system)
+    /// Register a struct-authored system type (a
+    /// [`#[system]`](macro@crate::system)
     /// impl or hand-written trait impls) under `name`. The struct's
     /// `BuildSystem` supplies params and construction; the entry's descriptor
     /// is the type's static one, so config-minted ports and capabilities are
@@ -229,14 +489,14 @@ impl Pack {
     /// so a dl/pack config need spell only its overrides. A hand-written
     /// `BuildSystem` impl declares none this way; use
     /// [`system_type_with_defaults`](Self::system_type_with_defaults).
-    pub fn system_type<T, O>(mut self, name: &'static str) -> Self
+    pub fn system_type<T>(mut self, name: &'static str) -> Self
     where
-        T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
         T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
         T::Input: crate::BindPorts + 'static,
-        O: crate::SystemOutput + crate::BindPorts + 'static,
+        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
     {
-        let mut entry = system_type_entry::<T, O>(name);
+        let mut entry = system_type_entry::<T>(name);
         // An empty blob (unit-like params) declares no defaults, matching
         // the empty-params guards on the decode paths.
         if let Some(blob) =
@@ -255,18 +515,18 @@ impl Pack {
     /// see through — hand-written [`BuildSystem`](crate::BuildSystem) impls
     /// and generic systems. The typed `defaults` argument is the schema
     /// check: a defaults value of the wrong type does not compile.
-    pub fn system_type_with_defaults<T, O>(
+    pub fn system_type_with_defaults<T>(
         mut self,
         name: &'static str,
         defaults: T::Params,
     ) -> Self
     where
-        T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
         T::Params: serde::Serialize + DeserializeOwned + postcard_schema::Schema + 'static,
         T::Input: crate::BindPorts + 'static,
-        O: crate::SystemOutput + crate::BindPorts + 'static,
+        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
     {
-        let mut entry = system_type_entry::<T, O>(name);
+        let mut entry = system_type_entry::<T>(name);
         entry.params_default = Some(
             postcard::to_allocvec(&defaults)
                 .expect("params postcard-encode (Serialize is infallible)"),
@@ -295,7 +555,7 @@ impl Pack {
         let inputs = std::mem::take(&mut sink.inputs);
         let mut outputs = std::mem::take(&mut sink.outputs);
         outputs.push(crate::PortDesc::of::<crate::SystemHealth>());
-        outputs.push(crate::PortDesc::of::<crate::SystemLog>());
+        outputs.push(crate::PortDesc::msg_named::<crate::LogEvent>("log"));
         let descriptor = SystemDescriptor {
             name: name.into(),
             kind: crate::SystemKind::Cyclic,
@@ -332,7 +592,7 @@ impl Pack {
                     }
                 }
             });
-            Ok(pending)
+            Ok(pending.into())
         });
         self.entries.push(PackEntry {
             name,
@@ -340,6 +600,7 @@ impl Pack {
             params_schema,
             params_default: None,
             reloadable: true,
+            shared: false,
             create,
         });
         self
@@ -377,6 +638,16 @@ impl Pack {
         self.entries.iter_mut().find(|e| e.name == name)
     }
 
+    /// The shared-state entry named `name`, for direct construction in
+    /// tests and the wiring states pass.
+    pub fn state_entry_mut(&mut self, name: &str) -> Option<&mut StateEntry> {
+        self.states.iter_mut().find(|s| s.name == name)
+    }
+
+    pub fn state_entries(&self) -> impl Iterator<Item = &StateEntry> {
+        self.states.iter()
+    }
+
     /// The entry at manifest position `index`, the ABI's addressing.
     pub(crate) fn entry_at_mut(&mut self, index: usize) -> Option<&mut PackEntry> {
         self.entries.get_mut(index)
@@ -389,24 +660,26 @@ impl Pack {
     pub fn into_entries(self) -> Vec<PackEntry> {
         self.entries
     }
+
+    /// Split into system entries and shared-state entries, for hosts that
+    /// index both (the static registry).
+    pub fn into_parts(self) -> (Vec<PackEntry>, Vec<StateEntry>) {
+        (self.entries, self.states)
+    }
 }
 
 /// The [`Pack::system_type`] entry body, shared with the explicit-defaults
 /// variant so the two differ only in where the defaults blob comes from.
-fn system_type_entry<T, O>(name: &'static str) -> PackEntry
+fn system_type_entry<T>(name: &'static str) -> PackEntry
 where
-    T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+    T: crate::CyclicSystem + crate::BuildSystem + 'static,
     T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
     T::Input: crate::BindPorts + 'static,
-    O: crate::SystemOutput + crate::BindPorts + 'static,
+    T::Output: crate::HealthOutput + crate::BindPorts + 'static,
 {
     let mut descriptor = <T as crate::CyclicSystem>::descriptor();
-    assert!(
-        descriptor.capabilities.is_empty(),
-        "pack entries cannot hold capabilities (`{name}` declares one); \
-         capability systems stay on the static registry"
-    );
     descriptor.name = name.into();
+    let static_desc = descriptor.clone();
     let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
         #[cfg(feature = "wiring")]
         let msgs = match &params {
@@ -421,18 +694,22 @@ where
         // parity path, where configure never runs.
         #[cfg(feature = "wiring")]
         if let Some(msgs) = msgs {
-            system.configure(&crate::BuildCtx { msgs })?;
+            system.configure(&crate::BuildCtx { msgs, namespace: None })?;
         }
+        let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
         let pending: Pending = Box::new(move |src, mount| {
             crate::handler::mount_driver(src, mount, move |src| {
                 let input = <T::Input as crate::BindPorts>::bind(src);
-                let output = <crate::Out<O> as crate::BindPorts>::bind(src);
+                let output = <T::Output as crate::BindPorts>::bind(src);
                 Box::new(RunnerDriver(crate::CyclicRunner::new(
                     system, input, output,
                 )))
             })
         });
-        Ok(pending)
+        Ok(Created {
+            pending,
+            instance_desc,
+        })
     });
     PackEntry {
         name,
@@ -440,21 +717,38 @@ where
         params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
         params_default: None,
         reloadable: true,
+        shared: false,
         create,
     }
 }
 
+/// The configured instance's descriptor when it differs from the entry's
+/// static one (a configure step minted ports), else `None` — the static
+/// descriptor stands and hosts skip a clone. Compared by encoding: the
+/// descriptor is plain serializable data with no cheaper equality.
+fn instance_desc_if_minted<S: crate::CyclicSystem>(
+    system: &S,
+    static_desc: &SystemDescriptor,
+    name: &'static str,
+) -> Option<SystemDescriptor> {
+    let mut desc = system.instance_descriptor();
+    desc.name = name.into();
+    let minted = postcard::to_allocvec(&desc).expect("descriptor encodes (postcard)")
+        != postcard::to_allocvec(static_desc).expect("descriptor encodes (postcard)");
+    minted.then_some(desc)
+}
+
 /// A [`CyclicRunner`](crate::CyclicRunner) driven behind the pack seam, for
 /// struct-authored entries.
-struct RunnerDriver<S, O>(crate::CyclicRunner<S, O>)
+struct RunnerDriver<S>(crate::CyclicRunner<S>)
 where
-    S: crate::CyclicSystem<Output = crate::Out<O>>,
-    O: crate::SystemOutput;
+    S: crate::CyclicSystem,
+    S::Output: crate::HealthOutput;
 
-impl<S, O> Driver for RunnerDriver<S, O>
+impl<S> Driver for RunnerDriver<S>
 where
-    S: crate::CyclicSystem<Output = crate::Out<O>>,
-    O: crate::SystemOutput,
+    S: crate::CyclicSystem,
+    S::Output: crate::HealthOutput,
 {
     fn init(&mut self) {
         self.0.init()
@@ -465,6 +759,42 @@ where
     }
     fn shutdown(&mut self) {
         self.0.shutdown()
+    }
+}
+
+/// The wrapper around an entry attached to a pack-shared state: fans the
+/// state's once-per-instance [`SharedLifecycle`](crate::SharedLifecycle)
+/// hooks in around the inner driver's own lifecycle — `start` before the
+/// first attached init, `shutdown` after the last attached shutdown.
+pub(crate) struct AttachedDriver {
+    inner: Box<dyn Driver>,
+    cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
+}
+
+impl AttachedDriver {
+    /// The attach count was taken at entry create (where the wiring's
+    /// unused-state check reads it); this pairs the release with it.
+    pub(crate) fn new(
+        inner: Box<dyn Driver>,
+        cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
+    ) -> Self {
+        Self { inner, cell }
+    }
+}
+
+impl Driver for AttachedDriver {
+    fn init(&mut self) {
+        self.cell.ensure_started();
+        self.inner.init();
+    }
+
+    fn step(&mut self, now: Timestamp) -> StepStatus {
+        self.inner.step(now)
+    }
+
+    fn shutdown(&mut self) {
+        self.inner.shutdown();
+        self.cell.release();
     }
 }
 

@@ -60,6 +60,14 @@ impl ComponentMetadata {
             .unwrap_or_default()
     }
 
+    /// Marks a shaped `U8` component as UTF-8 text, so the panel renders the
+    /// buffer up to its first NUL as a string instead of a numeric array.
+    pub fn with_string(mut self) -> Self {
+        self.metadata
+            .insert("is_string".to_string(), "true".to_string());
+        self
+    }
+
     pub fn group_name(&self) -> Option<&str> {
         self.metadata.get("group_name").map(|v| v.as_str())
     }

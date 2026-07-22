@@ -20,7 +20,7 @@ fn raised(occurrence: u64, severity: Severity) -> AlarmRaised {
     }
 }
 
-fn def_with_target(element_index: Option<usize>) -> AlarmDef {
+fn def_with_target(element_index: Option<u64>) -> AlarmDef {
     AlarmDef {
         id: "A".into(),
         name: "Alarm A".into(),

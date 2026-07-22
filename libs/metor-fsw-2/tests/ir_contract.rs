@@ -13,8 +13,8 @@
 
 use metor_fsw_2::ir::{EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
 use metor_fsw_2::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, InitialOccupantSpec,
-    ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
 };
 use serde_json::{Value, json};
 
@@ -35,15 +35,34 @@ fn maximal() -> Wiring {
             cycle_rate: 120.0,
             default_depth: Some(8),
             clock: ClockSpec::Simulated { dt_secs: 0.5 },
+            namespace: None,
         },
-        artifacts: vec![Artifact {
-            id: "adcs".into(),
-            crate_name: "adcs-systems".into(),
-            cdylib: "libadcs_systems.dylib".into(),
-            path: None,
-            manifest_hash: None,
-            src: src(3),
-        }],
+        artifacts: vec![
+            Artifact {
+                id: "adcs".into(),
+                crate_name: "adcs-systems".into(),
+                lib: "adcs_systems".into(),
+                path: None,
+                prebuilt_dir: None,
+                dist: None,
+                manifest_hash: None,
+                src: src(3),
+            },
+            Artifact {
+                id: "gnc".into(),
+                crate_name: "gnc-systems".into(),
+                lib: "gnc_systems".into(),
+                path: None,
+                prebuilt_dir: Some("/venv/gnc_pack/_libs".into()),
+                dist: Some(DistRef {
+                    name: "gnc-pack".into(),
+                    version: "1.2.0".into(),
+                }),
+                manifest_hash: Some("sha256:0".into()),
+                src: None,
+            },
+        ],
+        states: Vec::new(),
         systems: vec![
             SystemSpec {
                 name: "block.plant".into(),
@@ -53,6 +72,7 @@ fn maximal() -> Wiring {
                 process: true,
                 src: src(5),
                 scope: Some(0),
+                attach: None,
             },
             SystemSpec {
                 name: "postcard_sys".into(),
@@ -62,6 +82,7 @@ fn maximal() -> Wiring {
                 process: false,
                 src: None,
                 scope: Some(1),
+                attach: None,
             },
             SystemSpec {
                 name: "bare".into(),
@@ -71,6 +92,7 @@ fn maximal() -> Wiring {
                 process: false,
                 src: None,
                 scope: None,
+                attach: Some("link".into()),
             },
         ],
         slots: vec![SlotSpec {
@@ -181,13 +203,27 @@ fn representation_is_externally_tagged() {
     // Absent optionals render as null, not omitted.
     assert_eq!(v["systems"][2]["ty"], Value::Null);
     assert_eq!(v["systems"][2]["scope"], Value::Null);
+
+    // The v3 artifact fields: the arch-neutral lib stem, a prebuilt dir as a
+    // plain path string, and dist provenance as a { name, version } object.
+    assert_eq!(v["artifacts"][0]["lib"], json!("adcs_systems"));
+    assert_eq!(v["artifacts"][0]["prebuilt_dir"], Value::Null);
+    assert_eq!(v["artifacts"][0]["dist"], Value::Null);
+    assert_eq!(
+        v["artifacts"][1]["prebuilt_dir"],
+        json!("/venv/gnc_pack/_libs")
+    );
+    assert_eq!(
+        v["artifacts"][1]["dist"],
+        json!({ "name": "gnc-pack", "version": "1.2.0" })
+    );
 }
 
 /// The shared fixture: the exact JSON the Python emitter must produce, minus
 /// the build- and provenance-dependent fields both consumers normalize away
-/// (`src` everywhere, and each artifact's platform `cdylib` and located
-/// `path`). Deserializing then re-serializing proves the fixture is precisely
-/// what Rust round-trips to.
+/// (`src` everywhere, and each artifact's located `path`/`prebuilt_dir`).
+/// Deserializing then re-serializing proves the fixture is precisely what
+/// Rust round-trips to.
 #[test]
 fn golden_fixture_round_trips() {
     const GOLDEN: &str = include_str!("golden/mission.json");
@@ -201,15 +237,16 @@ fn golden_fixture_round_trips() {
 }
 
 /// Strip the fields the cross-language comparison ignores: every `src` anchor
-/// (line numbers track the emitting source) and each artifact's `cdylib`
-/// (platform-specific) and `path` (build-located).
+/// (line numbers track the emitting source) and each artifact's `path` and
+/// `prebuilt_dir` (both machine-located). The `lib` stem is arch-neutral and
+/// stays in the comparison.
 pub fn normalize(mut v: Value) -> Value {
     strip_key(&mut v, "src");
     if let Some(artifacts) = v.get_mut("artifacts").and_then(Value::as_array_mut) {
         for a in artifacts {
             if let Some(obj) = a.as_object_mut() {
-                obj.remove("cdylib");
                 obj.remove("path");
+                obj.remove("prebuilt_dir");
             }
         }
     }

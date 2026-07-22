@@ -1,0 +1,42 @@
+# The adcs pack as a Python distribution (docs/design-packaging.md §6.1).
+#
+# A mission consumes it as an ordinary dependency; while it lives in this
+# repo, a `[tool.uv.sources]` path entry points here and `uv sync` runs the
+# backend, which lays out `.metor/adcs_pack/` (typed module + host-triple
+# lib) via `metor-fsw pack dev` and exposes it to the venv.
+
+[project]
+name = "adcs-pack"
+version = "0.1.0"
+description = "The plant, nav, and ctrl systems of the adcs-fsw2 mission"
+requires-python = ">=3.11"
+
+# While this pack lives in the metor repo, the backend resolves from the
+# checkout (uv ≥ 0.11 applies `[tool.uv.sources]` to `build-system.requires`)
+# and `metor-fsw` deliberately stays out of `requires`: the backend's cargo
+# fallback always builds the checkout's binary fresh, where a path-source
+# binary wheel would go stale. A published pack instead declares
+# `requires = ["metor-build", "metor-fsw"]` and drops the sources entry.
+[build-system]
+requires = ["metor-build"]
+build-backend = "metor_build"
+
+[tool.metor.pack]
+id = "adcs"
+
+[tool.uv.sources]
+metor-build = { path = "../../../../libs/metor-fsw-2/python/metor-build" }
+
+# Rebuild (and so regenerate the module + lib) when the pack sources change,
+# including the sibling contracts crate. Out-of-dir (`../`) globs need
+# uv ≥ 0.11 — on 0.5.x only the in-dir globs invalidate, and a
+# contracts-only change must be healed with
+# `uv sync --reinstall-package adcs-pack`.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../../contracts/src/**/*.rs" },
+    { file = "../../contracts/Cargo.toml" },
+]

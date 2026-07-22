@@ -35,7 +35,7 @@ pub fn decomponentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> To
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
     let fields = data.take_struct().unwrap();
-    let if_arms = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
+    let if_arms = fields.fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
         let ty = &field.ty;
         let ident = &field.ident;
         // Nested/dynamic fields forward every value (a `FrameList`/`FrameMap` slot

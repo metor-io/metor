@@ -16,7 +16,7 @@ use crate::inspector::rows::{
 };
 use crate::views::list_plot::{ListLinePlot, ListTrace};
 use crate::views::time_series::time_range::TimeRangeBehavior;
-use crate::views::time_series::{LinePlot, Override, Trace, YAxis};
+use crate::views::time_series::{EventOverlay, LinePlot, Override, Trace, YAxis};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
@@ -50,6 +50,14 @@ impl InspectorRegistry {
             |lp| &lp.axes,
             |lp| &mut lp.axes,
             AddBehavior::Default(Arc::new(|_cx| YAxis::new("Y"))),
+        );
+        self.register_entity_list::<LinePlot, EventOverlay>(
+            db.clone(),
+            |lp| &lp.event_overlays,
+            |lp| &mut lp.event_overlays,
+            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
+                builders::build_event_overlay_wizard(parent, db, cx)
+            })),
         );
         self.register_entity_list::<Viewer3d, crate::views::viewer_3d::ModelEntry>(
             db.clone(),

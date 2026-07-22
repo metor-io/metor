@@ -131,6 +131,7 @@ fn dl_coordinator() -> CoordinatorSpec {
         cycle_rate: 200.0,
         default_depth: Some(8),
         clock: ClockSpec::Simulated { dt_secs: 0.005 },
+        namespace: None,
     }
 }
 
@@ -259,6 +260,13 @@ fn dlopen_cyclic_system_end_to_end() {
             .expect("second instance's output is registered")
             .expect("a reader slot is available"),
     );
+    let mut log_in: MsgIn<metor_fsw_2::LogEvent> = MsgIn::new(
+        coord
+            .registry()
+            .view(ComponentId::new("dl_counter.log"))
+            .expect("the implicit log channel is registered")
+            .expect("a reader slot is available"),
+    );
 
     // 4. Run several cycles. The producer runs before the consumer each cycle,
     //    so the consumer samples that cycle's fresh value. `run_for` performs
@@ -271,6 +279,7 @@ fn dlopen_cyclic_system_end_to_end() {
     });
 
     // 5. The loaded system produced correct output: count = start + value.
+    let mut last_out_ts = Timestamp(0);
     {
         let out = out_view
             .latest()
@@ -281,6 +290,7 @@ fn dlopen_cyclic_system_end_to_end() {
             1000 + CYCLES as u64,
             "start + latest value"
         );
+        last_out_ts = out.get().timestamp;
     }
 
     // 5a. The second instance of the same entry ran independently, with its
@@ -309,25 +319,52 @@ fn dlopen_cyclic_system_end_to_end() {
         "every-record log semantics across the dl boundary"
     );
 
+    // 5c. The fixture's `tracing::info!` inside execute crossed the boundary
+    //     too: the export shim installs a per-dylib subscriber, and each
+    //     instance's end_cycle drains the dylib's queue onto its own log
+    //     port, re-stamped with the instance name.
+    let mut traced: Vec<metor_fsw_2::LogEvent> = Vec::new();
+    log_in
+        .drain(|ev| traced.push(ev))
+        .expect("log ring readable");
+    let ev = traced
+        .iter()
+        .find(|ev| ev.message == "tick counted")
+        .expect("the pack's tracing event reached its log port");
+    assert_eq!(ev.source, "dl_counter", "attributed to the instance");
+    // Born on the mission clock: the ABI shim republishes each step's `now`
+    // inside the dylib, so the last cycle's event carries exactly the cycle
+    // timestamp the last tick_out frame does.
+    assert!(
+        traced.iter().any(|ev| ev.timestamp == last_out_ts),
+        "traced events live on the simulated cycle clock, not wall time"
+    );
+    assert_eq!(ev.level, metor_fsw_2::LogLevel::Info);
+    assert!(
+        ev.fields.iter().any(|(k, _)| k == "count"),
+        "the event's fields survive: {:?}",
+        ev.fields
+    );
+
     // 6. Teardown ordering: dropping the coordinator runs `fsw_pack_destroy` before
     //    the `Library` unloads and before the `RingTable` frees the regions.
     //    Not crashing here is the assertion.
     drop(coord);
-    drop((out_view, events_in, twin_view));
+    drop((out_view, events_in, twin_view, log_in));
 }
 
-/// Building through the driver ([`build_artifacts`]) leaves a
+/// Building through the driver ([`provision_artifacts`]) leaves a
 /// `<cdylib>.manifest` sidecar next to the `.so` — raw postcard
 /// [`PackManifest`] bytes naming the same entries the opened pack reports
 /// — and `manifest_sidecar: false` opts out. Byte-level sidecar ≡ describe
 /// equality is asserted in the driver's own unit tests
 /// (`wiring::build_driver`), where the raw describe bytes are reachable.
 ///
-/// [`build_artifacts`]: metor_fsw_2::wiring::build_artifacts
+/// [`provision_artifacts`]: metor_fsw_2::wiring::provision_artifacts
 /// [`PackManifest`]: metor_fsw_2::abi::PackManifest
 #[test]
 fn build_driver_writes_manifest_sidecar() {
-    use metor_fsw_2::wiring::{BuildOptions, WiringBuilder, build_artifacts};
+    use metor_fsw_2::wiring::{BuildOptions, WiringBuilder, provision_artifacts};
 
     let fixture = || {
         WiringBuilder::new()
@@ -339,8 +376,8 @@ fn build_driver_writes_manifest_sidecar() {
             .build()
     };
     let mut wiring = fixture();
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     let so = wiring.artifacts[0].path.clone().expect("path filled");
@@ -370,7 +407,7 @@ fn build_driver_writes_manifest_sidecar() {
         ..BuildOptions::default()
     };
     let mut wiring = fixture();
-    build_artifacts(&mut wiring, &opts).expect("rebuild is a cargo no-op");
+    provision_artifacts(&mut wiring, &opts).expect("rebuild is a cargo no-op");
     assert!(!sidecar.exists(), "opted out, so no sidecar is written");
 }
 

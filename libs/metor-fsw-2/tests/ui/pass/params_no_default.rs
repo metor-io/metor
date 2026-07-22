@@ -59,6 +59,6 @@ fn main() {
     );
     let _: Cooperative = <Cooperative as BuildSystem>::new(());
     let _ = metor_fsw_2::Pack::new()
-        .system_type::<Bare, _>("bare")
-        .system_type::<Defaulted, _>("defaulted");
+        .system_type::<Bare>("bare")
+        .system_type::<Defaulted>("defaulted");
 }

@@ -8,7 +8,7 @@
 //! shadow arc — the phase is **computed** by scanning [`in_earth_shadow`] at the mission
 //! epoch, never hardcoded. The `mode` slot starts empty (ctrl holds its identity reference)
 //! so the estimator behavior under sun loss is the whole subject. Deterministic: seeded
-//! RNG, fixed epoch, no wall clock. Gated off `miri` (build_artifacts builds the sequence
+//! RNG, fixed epoch, no wall clock. Gated off `miri` (provision_artifacts builds the sequence
 //! cdylibs the slot loads even when unoccupied).
 
 #![cfg(not(miri))]
@@ -24,12 +24,14 @@ use adcs_contracts::{
 };
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{ParamSource, build_artifacts, eval_python_mission, resolve};
+use metor_fsw_2::wiring::{ParamSource, eval_python_mission, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
 fn mission_py() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
 }
+
+mod common;
 
 /// The first lit→dark orbit phase at the mission epoch, by scanning the shadow function
 /// around the boot orbit (equatorial, radius `EARTH_RADIUS + ALTITUDE`) in 0.1° steps.
@@ -50,6 +52,9 @@ fn shadow_entry_phase() -> f64 {
 
 /// The patched mission: boot at `phase` radians of orbit, slot empty (no commissioning).
 fn build_static(phase: f64) -> Option<Coordinator> {
+    if !common::ensure_stubs() {
+        return None;
+    }
     let mut wiring = match eval_python_mission(&mission_py()) {
         Ok(w) => w,
         Err(e) => {
@@ -58,7 +63,11 @@ fn build_static(phase: f64) -> Option<Coordinator> {
         }
     };
     // Boot the plant `phase` radians into its orbit — the eclipse-arc anchor.
-    let plant = wiring.systems.iter_mut().find(|s| s.name == "plant").expect("the plant system");
+    let plant = wiring
+        .systems
+        .iter_mut()
+        .find(|s| s.name == "plant")
+        .expect("the plant system");
     let ParamSource::Value(serde_json::Value::Object(params)) = &mut plant.params else {
         panic!("plant carries a params value tree");
     };
@@ -71,8 +80,8 @@ fn build_static(phase: f64) -> Option<Coordinator> {
     for slot in &mut wiring.slots {
         slot.initial = None;
     }
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return None;
     }
     let mut registry = Registry::with_builtins();
@@ -113,15 +122,20 @@ async fn run_and_sample(mut coord: Coordinator, cycles: usize) -> Vec<Sample> {
             (world_view, sensors_view, disturb_view, est_view, body_view);
         loop {
             stellarator::yield_now().await;
-            let (Some(w), Some(s), Some(d), Some(b)) =
-                (world.latest(), sensors.latest(), disturb.latest(), body.latest())
-            else {
+            let (Ok(Some(w)), Ok(Some(s)), Ok(Some(d)), Ok(Some(b))) = (
+                world.latest(),
+                sensors.latest(),
+                disturb.latest(),
+                body.latest(),
+            ) else {
                 continue;
             };
             // Before nav's first estimate the error is measured against the MEKF's identity
             // init — still meaningful (it is what ctrl flies on).
             let q_hat = est
                 .latest()
+                .ok()
+                .flatten()
                 .map(|e| e.get().q_hat_b_eci)
                 .unwrap_or_else(Quat::identity);
             let est_err: f64 = q_hat.angular_distance(&b.get().q_b_eci).into_buf().abs();
@@ -153,7 +167,11 @@ async fn eclipse_darkens_sensors_and_nav_stays_bounded() {
         return;
     };
     let samples = run_and_sample(coord, 2000).await;
-    assert!(samples.len() > 1000, "the sampler kept up: {}", samples.len());
+    assert!(
+        samples.len() > 1000,
+        "the sampler kept up: {}",
+        samples.len()
+    );
 
     let err_0 = samples.first().unwrap().est_err;
     let err_f = samples.last().unwrap().est_err;
@@ -165,9 +183,15 @@ async fn eclipse_darkens_sensors_and_nav_stays_bounded() {
     );
     for s in &samples {
         assert!(!s.illuminated, "the whole window is in shadow: {s:?}");
-        assert!(s.css_max < CSS_THRESHOLD, "every CSS head stays noise-floor: {s:?}");
+        assert!(
+            s.css_max < CSS_THRESHOLD,
+            "every CSS head stays noise-floor: {s:?}"
+        );
         assert!(s.srp == 0.0, "SRP is off in shadow: {s:?}");
-        assert!(s.est_err.is_finite(), "the mag-only estimate stays finite: {s:?}");
+        assert!(
+            s.est_err.is_finite(),
+            "the mag-only estimate stays finite: {s:?}"
+        );
     }
     // Mag-only from a COLD start owes no convergence: the about-B̂ component is unobserved,
     // and ctrl steering on the imperfect estimate moves the truth underneath it, so the
@@ -221,5 +245,8 @@ async fn shadow_entry_flips_sensors_in_lockstep_and_nav_rides_through() {
     let err_f = samples.last().unwrap().est_err;
     println!("[transition] err at entry {err_at_entry:.4}, err at end {err_f:.4} rad");
     assert!(err_at_entry < 0.1, "converged before entry: {err_at_entry}");
-    assert!(err_f < 0.2, "the estimate rides through the sun loss: {err_f}");
+    assert!(
+        err_f < 0.2,
+        "the estimate rides through the sun loss: {err_f}"
+    );
 }

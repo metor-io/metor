@@ -1,0 +1,22 @@
+# The FSW ABI marker distribution (docs/packaging.md).
+#
+# Its version IS the ABI number: every pack wheel is stamped
+# `Requires-Dist: metor-fsw-abi==<abi>` at assembly and `metor-fsw` depends
+# on its own ABI version, so mixing a pack with an incompatible metor-fsw
+# fails inside `uv lock` as a legible dependency conflict — before anything
+# runs. One release per ABI bump, nothing else; a Rust test pins this
+# version to `FSW_ABI_VERSION`.
+
+[project]
+name = "metor-fsw-abi"
+version = "10"
+description = "Version marker for the metor-fsw pack ABI; depended on, never imported"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "metor_fsw_abi"
+module-root = ""

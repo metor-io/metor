@@ -44,6 +44,11 @@ pub struct NavState {
     /// with the plant's (both start at 0 and advance by `DT` each cycle), so nav evaluates its
     /// sun/field references at the same epoch the plant generated the measurement at.
     t_sim: f64,
+    /// Whether the CSS saw the sun last cycle (`None` before the first sample), so the
+    /// lost/reacquired transitions log once per edge instead of per cycle.
+    sun_visible: Option<bool>,
+    /// Whether a GPS fix has arrived yet, so the first one logs once.
+    had_fix: bool,
 }
 
 impl NavState {
@@ -58,6 +63,8 @@ impl NavState {
             sigma: p.meas_sigma,
             mag_model: MagneticModel::default(),
             t_sim: 0.0,
+            sun_visible: None,
+            had_fix: false,
         }
     }
 
@@ -75,14 +82,18 @@ impl NavState {
         let epoch = epoch_at(state.t_sim);
         state.t_sim += DT;
 
-        let Some(s) = sensors.latest() else {
+        let Ok(Some(s)) = sensors.latest() else {
             return; // no sensor sample yet
         };
         let s = s.clone();
-        let Some(g) = gps.latest() else {
+        let Ok(Some(g)) = gps.latest() else {
             return; // no GPS fix yet
         };
         let gps_pos: V3 = g.pos_eci;
+        if !state.had_fix {
+            state.had_fix = true;
+            tracing::info!(t_sim = state.t_sim, "first GPS fix; filter references live");
+        }
 
         // The inertial (ECI) references nav models itself from what the flight software knows:
         // the sun direction from the ephemeris at this epoch (a unit vector), and the WMM
@@ -95,7 +106,18 @@ impl NavState {
         // stay unit vectors, so normalize the measurement like the reference. The sun
         // observation comes from the CSS reconstruction — when the heads are dark (eclipse)
         // the filter updates on the magnetometer alone.
-        state.state = match sun_from_css(&s.css) {
+        let sun_b = sun_from_css(&s.css);
+        // Log the visibility edges only: losing the sun degrades the filter to
+        // magnetometer-only (the about-B̂ attitude rides the gyro until it returns).
+        match (state.sun_visible, sun_b.is_some()) {
+            (Some(true), false) => {
+                tracing::warn!(t_sim = state.t_sim, "sun lost; running magnetometer-only")
+            }
+            (Some(false), true) => tracing::info!(t_sim = state.t_sim, "sun reacquired"),
+            _ => {}
+        }
+        state.sun_visible = Some(sun_b.is_some());
+        state.state = match sun_b {
             Some(sun_b) => state.state.clone().estimate_attitude(
                 [sun_b, s.mag_b.normalize()],
                 [sun_eci, mag_eci],

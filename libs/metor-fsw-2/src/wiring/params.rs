@@ -31,7 +31,7 @@ use serde_json::{Map, Value};
 use super::{LoadError, LoadErrorKind};
 
 /// Encodes a params value tree into the postcard bytes described by `schema`,
-/// over the [`conform_and_encode`] tail.
+/// with the module's schema conformance rules.
 ///
 /// A value tree carries no document spans, so the rendered JSON stands in as
 /// the diagnostic source and every error anchors to the whole surface.

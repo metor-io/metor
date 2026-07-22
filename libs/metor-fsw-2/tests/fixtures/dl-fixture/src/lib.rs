@@ -114,6 +114,9 @@ impl CyclicSystem for DlCounter {
             }
         };
         let count = self.start + (value as f64 * self.scale).round() as u64;
+        // Exercises the pack-side tracing pipeline: the export shim installed
+        // a per-dylib subscriber, so this lands on the instance's log port.
+        tracing::info!(count, "tick counted");
         let _ = output.out.write(&TickOut {
             timestamp: now,
             count,
@@ -183,8 +186,8 @@ impl BuildSystem for DlEcho {
 /// The crate's pack, referenced by `export_pack!` below.
 pub fn pack() -> Pack {
     Pack::new()
-        .system_type::<DlCounter, _>("DlCounter")
-        .system_type::<DlEcho, _>("DlEcho")
+        .system_type::<DlCounter>("DlCounter")
+        .system_type::<DlEcho>("DlEcho")
 }
 
 // Exports the `fsw_*` C symbols the host resolves after `dlopen`.

@@ -57,8 +57,8 @@ pub fn as_vtable_impl(
         }
     });
     // The timestamp field feeds the source above and is filtered out
-    // of the component fields.
-    let vtable_items = fields.iter().filter(|f| !f.timestamp).map(|field| {
+    // of the component fields, as are `skip`ped fields.
+    let vtable_items = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
         let ty = &field.ty;
         let name = field.component_name();
         let name = if let Some(parent) = parent {
@@ -76,7 +76,7 @@ pub fn as_vtable_impl(
     // `element_fields` names members relative to a plain string prefix
     // instead of a component path, so a dynamic container can stamp
     // out copies under names chosen at runtime.
-    let element_items = fields.iter().filter(|f| !f.timestamp).map(|field| {
+    let element_items = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
         let ty = &field.ty;
         let name = field.component_name();
         let ident = &field.ident;

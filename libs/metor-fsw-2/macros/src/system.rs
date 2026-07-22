@@ -16,12 +16,15 @@
 //! A `PhantomData` field is skipped by both walks and default-constructed by
 //! `bind`, so a hand-written bundle can carry one for its own generics.
 //!
-//! One field attribute is recognized. `#[fsw(telemetered = false)]` excludes
-//! an output port from telemetry, lowering to `.untelemetered()` on the port's
-//! descriptor. The `CommandOut<M>` type alias is sugar for exactly this on a
-//! `MsgOut<M>`; the alias carries no flag of its own, so the derive spots the
-//! type token and applies the override. The attribute is rejected on inputs,
-//! which are never telemetered.
+//! Two field attributes are recognized, both output-only.
+//! `#[fsw(telemetered = false)]` excludes an output port from telemetry,
+//! lowering to `.untelemetered()` on the port's descriptor; the
+//! `CommandOut<M>` type alias is sugar for exactly this on a `MsgOut<M>`
+//! (the alias carries no flag of its own, so the derive spots the type
+//! token and applies the override). `#[fsw(snapshot)]` marks a message
+//! channel latest-wins, lowering to `.with_delivery(Delivery::Snapshot)` —
+//! the downlink retains such a channel's newest record for late-joining
+//! link connections instead of streaming it as an event log.
 
 use darling::FromDeriveInput;
 use darling::ast;
@@ -49,6 +52,9 @@ struct BundleField {
     /// `#[fsw(telemetered = false)]`, the output-only telemetry opt-out.
     #[darling(default)]
     telemetered: Option<bool>,
+    /// `#[fsw(snapshot)]`, the output-only latest-wins delivery marker.
+    #[darling(default)]
+    snapshot: darling::util::Flag,
 }
 
 impl BundleField {
@@ -70,6 +76,12 @@ impl BundleField {
                 &self.ty,
                 "`#[fsw(telemetered = ..)]` applies to output ports only \
                  (an input is never downlinked)",
+            ));
+        }
+        if dir == Dir::Input && self.snapshot.is_present() {
+            return Err(syn::Error::new_spanned(
+                &self.ty,
+                "`#[fsw(snapshot)]` applies to output ports only",
             ));
         }
         Ok(())
@@ -128,6 +140,9 @@ fn decls_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
         let mut decl = quote! { <#ty>::decl() };
         if f.is_command_out() || f.telemetered == Some(false) {
             decl = quote! { #decl.untelemetered() };
+        }
+        if f.snapshot.is_present() {
+            decl = quote! { #decl.with_delivery(#fsw2::Delivery::Snapshot) };
         }
         quote! { declarations.push(#decl); }
     });

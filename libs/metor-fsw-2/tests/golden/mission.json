@@ -1,25 +1,38 @@
 {
-  "ir_version": 2,
+  "ir_version": 5,
   "coordinator": {
     "cycle_rate": 120.0,
     "default_depth": null,
-    "clock": { "Simulated": { "dt_secs": 0.5 } }
+    "clock": { "Simulated": { "dt_secs": 0.5 } },
+    "namespace": null
   },
   "artifacts": [
     {
       "id": "adcs",
       "crate_name": "adcs-systems",
-      "cdylib": "libadcs_systems.dylib",
+      "lib": "adcs_systems",
       "path": null,
+      "prebuilt_dir": null,
+      "dist": null,
       "manifest_hash": null,
       "src": null
     },
     {
       "id": "seqs",
       "crate_name": "adcs-sequences",
-      "cdylib": "libadcs_sequences.dylib",
+      "lib": "adcs_sequences",
       "path": null,
+      "prebuilt_dir": null,
+      "dist": null,
       "manifest_hash": null,
+      "src": null
+    }
+  ],
+  "states": [
+    {
+      "name": "link",
+      "ty": "TcpServer",
+      "params": { "Value": { "addr": "127.0.0.1:2240" } },
       "src": null
     }
   ],
@@ -39,7 +52,8 @@
       },
       "process": true,
       "src": null,
-      "scope": 0
+      "scope": 0,
+      "attach": null
     },
     {
       "name": "block.nav",
@@ -48,7 +62,8 @@
       "params": "None",
       "process": false,
       "src": null,
-      "scope": 0
+      "scope": 0,
+      "attach": null
     },
     {
       "name": "alarms",
@@ -72,16 +87,18 @@
       },
       "process": false,
       "src": null,
-      "scope": null
+      "scope": null,
+      "attach": null
     },
     {
       "name": "uplink",
-      "ty": "TcpUplink",
+      "ty": "Uplink",
       "artifact": null,
-      "params": { "Value": { "addr": "127.0.0.1:2240", "msgs": ["SequenceCommand"] } },
+      "params": { "Value": { "msgs": ["SequenceCommand"] } },
       "process": false,
       "src": null,
-      "scope": null
+      "scope": null,
+      "attach": "link"
     }
   ],
   "slots": [

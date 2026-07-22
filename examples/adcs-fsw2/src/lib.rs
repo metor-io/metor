@@ -15,8 +15,8 @@
 //!
 //! ```text
 //! cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.py --build            # headless sim
-//! cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.py --build --wall \
-//!     --telemetry 127.0.0.1:2240                                                 # live → panel
+//! cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.py --build --wall     # live → panel
+//! # the mission's TcpServer state listens on 127.0.0.1:2240; connect the panel to it
 //! ```
 //!
 //! This crate links **none** of the system crates and **not** `adcs-contracts`: the runner
@@ -28,7 +28,7 @@
 use std::path::Path;
 
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{build_artifacts, eval_python_mission, resolve};
+use metor_fsw_2::wiring::{eval_python_mission, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator};
 
 /// The mission file the CLI runner reads, resolved against this crate's manifest so the
@@ -43,7 +43,7 @@ fn mission_py() -> std::path::PathBuf {
 /// driver only recompiles crates cargo considers stale, so re-runs are incremental.
 ///
 /// This mirrors exactly what `metor-fsw run mission.py --build` does internally (evaluate →
-/// `build_artifacts` → `resolve`), minus the CLI overrides — it is the test's entry point.
+/// `provision_artifacts` → `resolve`), minus the CLI overrides — it is the test's entry point.
 pub fn build_sim_coordinator() -> anyhow::Result<Coordinator> {
     let mut wiring = eval_python_mission(&mission_py()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     // A `process=#true` system re-execs the current binary as its worker, which only the CLI
@@ -52,6 +52,6 @@ pub fn build_sim_coordinator() -> anyhow::Result<Coordinator> {
     for spec in &mut wiring.systems {
         spec.process = false;
     }
-    build_artifacts(&mut wiring, &BuildOptions::default())?;
+    provision_artifacts(&mut wiring, &BuildOptions::default())?;
     Ok(resolve(&wiring, &Registry::with_builtins())?)
 }

@@ -1,16 +1,19 @@
-# metor_config
+# The metor Python toolchain
 
-The Python front-end recorder for metor-fsw missions. A mission file builds a
-`Mission`, adds systems and slots, and connects their ports; at exit the
-recorder serializes the mission to the `Wiring` IR JSON the Rust host ingests
-(`$METOR_IR_OUT`, or stdout).
+One directory per distribution (see `../docs/packaging.md`):
 
-Stdlib only, CPython 3.10+. The `metor-fsw` binary embeds this package and
-materializes it per run, so a mission needs no `pip install`; `$METOR_CONFIG_PY`
-points the host at a live checkout of this directory instead.
+- `metor-config/` — the mission-config recorder. A mission file builds a
+  `Mission`, adds systems and slots, and connects their ports; at exit the
+  recorder serializes the mission to the `Wiring` IR JSON the Rust host
+  ingests (`$METOR_IR_OUT`). Stdlib only, CPython 3.10+. The `metor-fsw`
+  binary embeds this package as the no-venv fallback (a venv-installed copy
+  is preferred); `$METOR_CONFIG_PY` points the host at a live checkout of
+  `metor-config/` instead.
+- `metor-build/` — the PEP 517/660 build backend pack crates declare.
+- `tests/` — the recorder test suite.
 
 ```python
-from metor_config import Mission, Alarms, Alarm, Target, band, TcpUplink, TcpDownlink
+from metor_config import Mission, Alarms, Alarm, Target, band, TcpServer, Uplink, Downlink
 
 m = Mission(cycle_rate=120.0, sim_dt=1 / 120)
 adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")

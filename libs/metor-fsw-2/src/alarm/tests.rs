@@ -313,7 +313,7 @@ fn spec_defaults() {
 #[cfg(not(miri))]
 mod system {
     use metor_proto::types::{ComponentId, Timestamp};
-    use metor_proto_wkt::{AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, LimitKind, Severity};
+    use metor_proto_wkt::{AlarmAck, AlarmCleared, AlarmDefs, AlarmRaised, LimitKind, Severity};
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use crate::{
@@ -514,16 +514,17 @@ mod system {
         ));
         let coord = b.build().unwrap();
 
-        let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
+        let mut defs = tap::<AlarmDefs>(&coord, "alarms.AlarmDefs");
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
         let mut cleared = tap::<AlarmCleared>(&coord, "alarms.AlarmCleared");
 
         let mut coord = coord;
         coord.run_for(cycles).await;
 
-        // Both defs broadcast; thresholds are the display limits.
+        // Both defs broadcast in the one snapshot record; thresholds are the
+        // display limits.
         let mut got_defs = Vec::new();
-        defs.drain(|d| got_defs.push(d)).unwrap();
+        defs.drain(|set| got_defs.extend(set.defs)).unwrap();
         assert_eq!(got_defs.len(), 2);
         let def = got_defs.iter().find(|d| d.id == "RATE_HIGH").unwrap();
         assert_eq!(def.default_severity, Severity::Warning);
@@ -665,6 +666,67 @@ mod system {
         assert_eq!(got[0].message, "plant.status.degraded = 1.0000");
     }
 
+    /// Under a mission namespace the engine prefixes its authored targets, so
+    /// they resolve against the namespace-qualified registry and the broadcast
+    /// def carries the qualified component id. `configure` is the seam the
+    /// front-end threads the namespace through.
+    #[stellarator::test]
+    async fn namespace_prefixes_alarm_targets() {
+        use crate::{BuildCtx, MsgTable};
+
+        let mut b = crate::coordinator::init::InitGraph::new(config());
+        b.namespace = Some("sat1".into());
+        let script = vec![0.7, 0.7, 1.5];
+        let cycles = script.len();
+        b.push_node(cyclic_node(Plant::NAME.into(), Plant { script, cycle: 0 }));
+        let mut alarms = AlarmSystem::new(params(vec![alarm(
+            "RATE_HIGH",
+            "plant.gyro.rates.1",
+            None,
+        )]));
+        // The front-end applies the namespace here (the static factory's
+        // `configure` call); the graph seam qualifies the Plant's registry
+        // keys to match.
+        alarms
+            .configure(&BuildCtx {
+                msgs: &MsgTable::default(),
+                namespace: Some("sat1"),
+            })
+            .unwrap();
+        b.push_node(cyclic_node(AlarmSystem::NAME.into(), alarms));
+        let coord = b.build().unwrap();
+
+        // The engine's own message outputs are namespace-qualified too.
+        let mut defs = tap::<AlarmDefs>(&coord, "sat1.alarms.AlarmDefs");
+        let mut raised = tap::<AlarmRaised>(&coord, "sat1.alarms.AlarmRaised");
+        let mut coord = coord;
+        coord.run_for(cycles).await;
+
+        let mut got_defs = Vec::new();
+        defs.drain(|set| got_defs.extend(set.defs)).unwrap();
+        let def = got_defs.iter().find(|d| d.id == "RATE_HIGH").unwrap();
+        assert_eq!(
+            def.target.as_ref().unwrap().component_id,
+            ComponentId::new("sat1.plant.gyro.rates.1"),
+            "the def target is the namespace-qualified component"
+        );
+
+        // The alarm resolved the prefixed target against the qualified
+        // registry entry and raised; its message names the qualified component.
+        let mut got_raised = Vec::new();
+        raised.drain(|r| got_raised.push(r)).unwrap();
+        assert!(
+            !got_raised.is_empty(),
+            "the namespaced target resolved and raised"
+        );
+        assert!(got_raised.iter().all(|r| r.def_id == "RATE_HIGH"));
+        assert!(
+            got_raised[0]
+                .message
+                .starts_with("sat1.plant.gyro.rates.1")
+        );
+    }
+
     /// Misconfigured targets disable their alarms and surface through health.
     /// The def still broadcasts and nothing ever raises.
     #[stellarator::test]
@@ -687,7 +749,7 @@ mod system {
             ])),
         ));
         let coord = b.build().unwrap();
-        let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
+        let mut defs = tap::<AlarmDefs>(&coord, "alarms.AlarmDefs");
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
         let registry = coord.registry();
         let health_entry = registry
@@ -698,7 +760,7 @@ mod system {
         coord.run_for(4).await;
 
         let mut n_defs = 0;
-        defs.drain(|_| n_defs += 1).unwrap();
+        defs.drain(|set| n_defs += set.defs.len()).unwrap();
         assert_eq!(n_defs, 4, "defs broadcast even for disabled alarms");
 
         // Only the first DUP survives resolution, and it raises; the rest stay dark.

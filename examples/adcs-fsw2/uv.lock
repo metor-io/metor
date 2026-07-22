@@ -1,0 +1,35 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "adcs-fsw2"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "adcs-pack" },
+    { name = "adcs-seqs" },
+    { name = "metor-config" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "adcs-pack", editable = "systems/adcs-systems" },
+    { name = "adcs-seqs", editable = "systems/adcs-sequences" },
+    { name = "metor-config", editable = "../../libs/metor-fsw-2/python/metor-config" },
+]
+
+[[package]]
+name = "adcs-pack"
+version = "0.1.0"
+source = { editable = "systems/adcs-systems" }
+
+[[package]]
+name = "adcs-seqs"
+version = "0.1.0"
+source = { editable = "systems/adcs-sequences" }
+
+[[package]]
+name = "metor-config"
+version = "0.3.0"
+source = { editable = "../../libs/metor-fsw-2/python/metor-config" }

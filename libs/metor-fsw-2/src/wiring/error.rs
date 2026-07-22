@@ -128,6 +128,14 @@ impl LoadErrorKind {
             ValueParams { .. } => "fsw_wiring::value_params",
             StaticPostcardParams { .. } => "fsw_wiring::static_postcard_params",
             PackCreate { .. } => "fsw_wiring::pack_create",
+            UnknownStateType { .. } => "fsw_wiring::unknown_state_type",
+            DuplicateState { .. } => "fsw_wiring::duplicate_state",
+            StateInit { .. } => "fsw_wiring::state_init",
+            StateUnused { .. } => "fsw_wiring::state_unused",
+            AttachUnknownState { .. } => "fsw_wiring::attach_unknown_state",
+            AttachOnNonSharedSystem { .. } => "fsw_wiring::attach_on_non_shared_system",
+            MissingAttach { .. } => "fsw_wiring::missing_attach",
+            AttachTypeMismatch { .. } => "fsw_wiring::attach_type_mismatch",
             PackSystem { .. } => "fsw_wiring::pack_system",
             PackTypeRequired { .. } => "fsw_wiring::pack_type_required",
             OccupantAmbiguous { .. } => "fsw_wiring::occupant_ambiguous",
@@ -184,7 +192,7 @@ impl LoadErrorKind {
                 format!("declare an `artifact \"{artifact}\" ...` node, or fix the `artifact=` ref")
             }
             ArtifactNotBuilt { .. } => {
-                "`build_artifacts` must set this artifact's `path` before `resolve`".into()
+                "`provision_artifacts` must set this artifact's `path` before `resolve`".into()
             }
             DlOpen { .. } => "this dl system failed to load".into(),
             DlParamEncode { .. } => {
@@ -195,6 +203,14 @@ impl LoadErrorKind {
                 "typed `params(...)` cannot reach a static system".into()
             }
             PackCreate { .. } => "this system".into(),
+            UnknownStateType { .. } => "no registered pack declares this state type".into(),
+            DuplicateState { .. } => "state names must be unique".into(),
+            StateInit { .. } => "this state's construction failed".into(),
+            StateUnused { .. } => "declared here, attached nowhere".into(),
+            AttachUnknownState { .. } => "no `state` declares this name".into(),
+            AttachOnNonSharedSystem { .. } => "this system type declares no shared state".into(),
+            MissingAttach { .. } => "a shared-state system needs an `attach` state".into(),
+            AttachTypeMismatch { .. } => "this state's type is not the system's shared type".into(),
             PackSystem { .. } => "this instance".into(),
             PackTypeRequired { .. } => "add `type=\"…\"`".into(),
             OccupantAmbiguous { .. } => "this slot".into(),
@@ -335,7 +351,7 @@ pub enum LoadErrorKind {
     /// artifact records no hash and skips the check.
     #[error(
         "generated stubs for artifact `{artifact}` are stale (the pack manifest changed since \
-         they were generated); regenerate with `metor-fsw stubgen`"
+         they were generated); regenerate with `uv sync` (or `metor-fsw stubgen`)"
     )]
     StaleStubs {
         /// The artifact whose recorded and live manifest hashes disagree.
@@ -384,6 +400,57 @@ pub enum LoadErrorKind {
     /// failure surfaces as its own spanned error instead.
     #[error("system `{system}` failed to create: {message}")]
     PackCreate { system: String, message: String },
+
+    /// A `state` spec's `type=` matches no shared state a registered pack
+    /// declared.
+    #[error(
+        "state `{name}`: no registered pack declares shared state type `{ty}`{}",
+        if available.is_empty() { String::new() } else { format!(" (declared: {available})") }
+    )]
+    UnknownStateType {
+        name: String,
+        ty: String,
+        /// The comma-joined declared state types, for the message.
+        available: String,
+    },
+
+    /// Two `state` specs share one instance name (or one state type, which
+    /// has exactly one instance).
+    #[error("state `{name}` is declared more than once")]
+    DuplicateState { name: String },
+
+    /// A shared state's own init fn failed — resource acquisition, like a
+    /// listener bind — or its params did not decode.
+    #[error("state `{name}` (type `{ty}`) failed to construct: {message}")]
+    StateInit {
+        name: String,
+        ty: String,
+        message: String,
+    },
+
+    /// A declared state no created system attached to: the state would run
+    /// (its lifecycle serves attached systems only) for nobody, which is a
+    /// config defect, not a quiet default.
+    #[error("state `{name}` (type `{ty}`) is declared but no system in this wiring attaches to it")]
+    StateUnused { name: String, ty: String },
+
+    /// A system's `attach` named a state no `state` declaration provides.
+    #[error("system `{system}` attaches to state `{attach}`, which no `state` declares")]
+    AttachUnknownState { system: String, attach: String },
+
+    /// A system set `attach`, but its type declares no pack-shared state to
+    /// attach to.
+    #[error("system `{system}` sets attach=`{attach}`, but its type is not a shared-state system")]
+    AttachOnNonSharedSystem { system: String, attach: String },
+
+    /// A shared-state system named no state to attach to.
+    #[error("system `{system}` is a shared-state system but names no `attach` state")]
+    MissingAttach { system: String },
+
+    /// A system's `attach` named a state whose type is not the concrete
+    /// shared type the system binds.
+    #[error("system `{system}` cannot attach to state `{attach}`: incompatible shared-state type")]
+    AttachTypeMismatch { system: String, attach: String },
 
     /// A loaded pack has no entry under the requested name, or the entry
     /// selection failed (the wrapped [`DlError`](crate::dl::DlError) says

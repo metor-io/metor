@@ -3,8 +3,9 @@
 //!
 //! [`system(execute_fn)`](system) builds a [`SystemDef`] whose port set is
 //! the fn's parameter types. `.init(fn)` supplies construction from typed
-//! params; `.state(value)` moves a prebuilt state in (the shared-handle
-//! case). A [`Pack`](crate::Pack) turns defs into erased entries:
+//! params; `.state(value)` moves one prebuilt state into a single-use entry.
+//! `.shared(token)` attaches a cyclic entry to pack-shared state. A
+//! [`Pack`](crate::Pack) turns defs into erased entries:
 //!
 //! ```ignore
 //! fn nav_init(p: NavParams) -> NavState { ... }
@@ -42,7 +43,7 @@ pub(crate) use driver::{FnDriver, FutureDriver, OccupantFuture, bind_health_tail
 pub(crate) use task::TaskParamsSpec;
 
 use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind};
-use crate::health::{SystemHealth, SystemLog};
+use crate::health::SystemHealth;
 use crate::pack::{EntryParams, MakeError, PackEntry, Pending, decode_params};
 
 /// Start a fn-authored system from its per-cycle execute fn. The fn takes a
@@ -81,6 +82,9 @@ pub struct InitWith<G, M2> {
 /// A prebuilt state moved into the entry (instantiable once).
 pub struct Prebuilt<S>(Option<S>);
 
+/// An attachment to a pack-shared state (instantiable once).
+pub struct Attached<S>(crate::Shared<S>);
+
 impl<S, M, F> SystemDef<S, M, F, NoInit>
 where
     F: ExecuteFn<S, M>,
@@ -109,6 +113,21 @@ where
         SystemDef {
             execute: self.execute,
             init: Prebuilt(Some(state)),
+            _m: PhantomData,
+        }
+    }
+
+    /// Attach to a pack-shared state: the execute fn's `&mut S` is the
+    /// *same* instance every entry attached to `token` sees, granted one
+    /// scoped borrow per step. Like [`state`](Self::state), the entry is instantiable once
+    /// and never a slot occupant.
+    pub fn shared(self, token: &crate::Shared<S>) -> SystemDef<S, M, F, Attached<S>>
+    where
+        S: crate::SharedLifecycle,
+    {
+        SystemDef {
+            execute: self.execute,
+            init: Attached(token.clone()),
             _m: PhantomData,
         }
     }
@@ -178,7 +197,7 @@ fn descriptor_for<P: ExecParamSet>(name: &'static str) -> SystemDescriptor {
     let inputs = sink.inputs;
     let mut outputs = sink.outputs;
     outputs.push(PortDesc::of::<SystemHealth>());
-    outputs.push(PortDesc::of::<SystemLog>());
+    outputs.push(PortDesc::msg_named::<crate::LogEvent>("log"));
     SystemDescriptor {
         name: name.into(),
         kind: SystemKind::Cyclic,
@@ -202,15 +221,20 @@ where
             params_schema: <() as Schema>::SCHEMA,
             params_default: None,
             reloadable: true,
+            shared: false,
             create: Box::new(move |params: EntryParams<'_>| {
                 decode_params::<()>(params)?;
                 let execute = execute.clone();
                 let pending: Pending = Box::new(move |src, mount| {
                     mount_driver(src, mount, move |src| {
-                        Box::new(FnDriver::bind(S::default(), execute, src))
+                        Box::new(FnDriver::bind(
+                            driver::StateAccess::Owned(S::default()),
+                            execute,
+                            src,
+                        ))
                     })
                 });
-                Ok(pending)
+                Ok(pending.into())
             }),
         }
     }
@@ -234,16 +258,21 @@ where
             params_schema: <G::Params as Schema>::SCHEMA,
             params_default: defaults,
             reloadable: true,
+            shared: false,
             create: Box::new(move |params: EntryParams<'_>| {
                 let p: G::Params = decode_params(params)?;
                 let state = init.clone().call(p);
                 let execute = execute.clone();
                 let pending: Pending = Box::new(move |src, mount| {
                     mount_driver(src, mount, move |src| {
-                        Box::new(FnDriver::bind(state, execute, src))
+                        Box::new(FnDriver::bind(
+                            driver::StateAccess::Owned(state),
+                            execute,
+                            src,
+                        ))
                     })
                 });
-                Ok(pending)
+                Ok(pending.into())
             }),
         };
         if entry.params_default.is_some() {
@@ -268,16 +297,71 @@ where
             params_schema: <() as Schema>::SCHEMA,
             params_default: None,
             reloadable: false,
+            shared: false,
             create: Box::new(move |params: EntryParams<'_>| {
                 decode_params::<()>(params)?;
                 let state = state.take().ok_or(MakeError::StateTaken)?;
                 let execute = execute.clone();
                 let pending: Pending = Box::new(move |src, mount| {
                     mount_driver(src, mount, move |src| {
-                        Box::new(FnDriver::bind(state, execute, src))
+                        Box::new(FnDriver::bind(
+                            driver::StateAccess::Owned(state),
+                            execute,
+                            src,
+                        ))
                     })
                 });
-                Ok(pending)
+                Ok(pending.into())
+            }),
+        }
+    }
+}
+
+impl<S, M, F> IntoPackEntry for SystemDef<S, M, F, Attached<S>>
+where
+    S: crate::SharedLifecycle,
+    M: 'static,
+    F: ExecuteFn<S, M> + Clone,
+{
+    fn into_entry(self, name: &'static str) -> PackEntry {
+        let execute = self.execute;
+        let token = self.init.0;
+        let mut taken = false;
+        // The fn-authored `.shared(&token)` path keeps its compile-time
+        // capture (hand-built packs), so it is not a by-name attach entry:
+        // `shared: false` exempts it from the resolver's attach-consistency
+        // checks. It still requires a matching state via `is_constructed()`.
+        PackEntry {
+            name,
+            descriptor: descriptor_for::<F::Params>(name),
+            params_schema: <() as Schema>::SCHEMA,
+            params_default: None,
+            reloadable: false,
+            shared: false,
+            create: Box::new(move |params: EntryParams<'_>| {
+                decode_params::<()>(params)?;
+                if taken {
+                    return Err(MakeError::SharedEntryReinstantiated);
+                }
+                let cell = token.erased();
+                if !cell.is_constructed() {
+                    return Err(MakeError::StateNotConstructed { state: cell.name() });
+                }
+                taken = true;
+                cell.attach();
+                let token = token.clone();
+                let execute = execute.clone();
+                let pending: Pending = Box::new(move |src, mount| {
+                    mount_driver(src, mount, move |src| {
+                        let inner = FnDriver::bind(
+                            driver::StateAccess::Shared(token.clone()),
+                            execute,
+                            src,
+                        );
+                        Box::new(crate::pack::AttachedDriver::new(Box::new(inner), cell))
+                    })
+                });
+                Ok(pending.into())
             }),
         }
     }

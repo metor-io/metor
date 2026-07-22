@@ -19,7 +19,7 @@ pub fn decomponentize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> Token
     } = args;
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
-    let if_arms = fields.iter().filter(|f| !f.timestamp).map(|field| {
+    let if_arms = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
         let ty = &field.ty;
         let ident = &field.ident;
         // Nested and dynamic fields have no single id to match, so every value

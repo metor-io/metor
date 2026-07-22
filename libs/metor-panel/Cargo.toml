@@ -14,6 +14,8 @@ metor-proto.path = "../metor-proto"
 metor-proto.features = ["std", "facet"]
 metor-proto-wkt.path = "../metor-proto/wkt"
 metor-proto-wkt.features = ["nox"]
+# mDNS/DNS-SD browsing: discover fsw links on the local network by name.
+mdns-sd = "0.13"
 # The mission wiring IR (Wiring) plus its serde_json codec, without the KDL
 # front-end: the System Graph tile decodes a WiringManifest's ir_json into it.
 metor-fsw-2 = { path = "../metor-fsw-2", default-features = false, features = ["wiring-model"] }
@@ -26,6 +28,8 @@ facet-json = "=0.44.5"
 facet-format = "=0.44.5"
 facet-dessert = "=0.44.5"
 postcard = "1"
+# Schema-driven decode of unknown message ids for the plot event overlay.
+postcard-dyn = "0.2"
 serde = "1"
 serde_json = "1"
 smallvec = "1"
@@ -92,3 +96,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 [dev-dependencies]
 tempfile = "3.13.0"
 gpui = { version = "*", features = ["test-support"] }
+# Builds a concrete schema for the unknown-message decode test.
+postcard-schema = { version = "0.2", features = ["use-std"] }

@@ -68,6 +68,9 @@ pub struct SequenceState {
     /// Declaration order from the latest registry, for stable UI ordering.
     order: Vec<SharedString>,
     history: VecDeque<SequenceLogEntry>,
+    /// Total events ever pushed; a monotonic staleness stamp for observers
+    /// (the plot's event overlay) that stays valid as the ring evicts.
+    history_pushed: u64,
 }
 
 impl SequenceState {
@@ -178,9 +181,15 @@ impl SequenceState {
 
     fn push_event(&mut self, event: SequenceLogEntry) {
         self.history.push_back(event);
+        self.history_pushed += 1;
         while self.history.len() > MAX_HISTORY {
             self.history.pop_front();
         }
+    }
+
+    /// Total events ever pushed; a cheap change stamp for the plot's event overlay.
+    pub fn history_pushed(&self) -> u64 {
+        self.history_pushed
     }
 
     /// Channels in registry declaration order.

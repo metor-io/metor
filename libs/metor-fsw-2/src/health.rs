@@ -2,40 +2,51 @@
 //!
 //! Systems in this crate never return errors from `execute`. Instead, every
 //! system implicitly owns a pair of output ports, one carrying a
-//! [`SystemHealth`] frame and one carrying a [`SystemLog`] frame, and reports
+//! [`SystemHealth`] frame and one carrying [`LogEvent`] messages, and reports
 //! trouble as ordinary telemetry over them. A [`HealthPort`] bundles the two
 //! ports with the counter state behind them.
 //!
-//! The split of responsibilities is fixed. The system itself only calls
+//! A cyclic system calls
 //! [`HealthPort::error`] to bump a named error counter and
 //! [`HealthPort::log`] to queue a log line. The framework wraps each call to
 //! `execute` and drives [`HealthPort::end_cycle`] afterwards, which stamps the
 //! standard counters (cycle count, total errors, execute duration) and
-//! publishes one health record plus any queued log lines.
+//! publishes one health record plus one [`LogEvent`] per queued line.
+//! A free-running [`AsyncSystem`](crate::AsyncSystem) owns its health timing
+//! and must choose when to send its queued state.
 //!
 //! Named error counters ride the dynamic [`FrameMap`] tail of the health
 //! frame, so each kind surfaces as its own `health.error_counts.<kind>`
-//! component. Log messages are fixed-size byte arrays because frames have no
-//! string type; lines longer than [`LOG_MSG_CAP`] are truncated.
+//! component. Log lines travel as self-describing message records on a log
+//! ring, so the downlink forwards them like any other message and a line is
+//! never truncated to fit a frame slot.
+//!
+//! Pack authors can use either [`HealthPort::log`] or `tracing` macros: the
+//! `export_pack!` shim installs a per-dylib forwarding subscriber
+//! ([`crate::logfwd::init_pack_tracing`], `INFO` and up), and `end_cycle`
+//! drains the dylib's queue onto the instance's own log port, so both paths
+//! land on the same downlinked stream attributed to the instance.
 
 use core::mem::offset_of;
+use std::sync::Arc;
 
 use metor_fsw_ring::{NoWake, WakeSource};
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-// `FromBytes` lets these output-only frames also be read back through a typed
+// `FromBytes` lets this output-only frame also be read back through a typed
 // `Input` port.
 
 use crate::Frame;
-use crate::dynamic::{FrameList, FrameMap, pack_str};
+use crate::dynamic::FrameMap;
+use crate::message::MsgOut;
 use crate::port::Output;
+
+pub use metor_proto_wkt::{LogEvent, LogLevel};
 
 /// Max distinct named error counters carried in one health record.
 pub const MAX_ERR_KINDS: usize = 16;
-/// Max log lines flushed in one log record.
-pub const MAX_LINES: usize = 16;
-/// Byte capacity of one log line's message; longer lines are truncated.
-pub const LOG_MSG_CAP: usize = 64;
+/// Max log lines queued in one cycle; further lines are dropped and counted.
+pub const MAX_LINES: usize = 64;
 
 /// A telemetry frame that snapshots one system's run counters at the end of
 /// each cycle.
@@ -56,52 +67,9 @@ pub struct SystemHealth {
     pub error_counts: FrameMap<u64, MAX_ERR_KINDS>,
 }
 
-/// A fixed-size log entry carried on the [`SystemLog`] frame, holding a
-/// severity level, the used byte length, and the message bytes.
-#[derive(metor_fsw::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
-#[repr(C)]
-pub struct LogLine {
-    pub level: u8,
-    pub len: u8,
-    pub _pad: [u8; 6],
-    pub msg: [u8; LOG_MSG_CAP],
-}
-
-impl LogLine {
-    fn new(level: Level, msg: &str) -> Self {
-        let (msg, len) = pack_str::<LOG_MSG_CAP>(msg);
-        Self {
-            level: level as u8,
-            len,
-            _pad: [0; 6],
-            msg,
-        }
-    }
-}
-
-/// A telemetry frame carrying the lines a system queued through
-/// [`HealthPort::log`] during one cycle.
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
-#[repr(C)]
-#[metor_fsw(name = "log")]
-pub struct SystemLog {
-    #[metor_fsw(timestamp)]
-    pub timestamp: Timestamp,
-    pub lines: FrameList<LogLine, MAX_LINES>,
-}
-
-/// Log severity, stored as the [`LogLine::level`] byte.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Level {
-    Info = 0,
-    Warn = 1,
-    Error = 2,
-}
-
 /// The handle a system uses to report errors and log lines as telemetry.
 ///
-/// It bundles the [`SystemHealth`] and [`SystemLog`] output ports with the
+/// It bundles the [`SystemHealth`] and [`LogEvent`] output ports with the
 /// counter state behind them, and is surfaced to a system as
 /// `output.health()`. See the [module docs](self) for who calls what.
 pub struct HealthPort<WD = NoWake>
@@ -109,12 +77,15 @@ where
     WD: WakeSource,
 {
     health: Output<SystemHealth, WD>,
-    log: Output<SystemLog, WD>,
+    log: MsgOut<LogEvent, WD>,
+    /// The owning system's instance name, stamped into every emitted
+    /// [`LogEvent`] as its `source`. Empty until the binder threads it in.
+    instance: Arc<str>,
     cycles: u64,
     errors: u64,
     last_execute_micros: u64,
     error_counts: Vec<(String, u64)>,
-    pending: Vec<LogLine>,
+    pending: Vec<(LogLevel, String)>,
 }
 
 impl<WD> HealthPort<WD>
@@ -122,16 +93,22 @@ where
     WD: WakeSource,
 {
     /// Builds the handle from the two framework-allocated output ports.
-    pub fn new(health: Output<SystemHealth, WD>, log: Output<SystemLog, WD>) -> Self {
+    pub fn new(health: Output<SystemHealth, WD>, log: MsgOut<LogEvent, WD>) -> Self {
         Self {
             health,
             log,
+            instance: Arc::from(""),
             cycles: 0,
             errors: 0,
             last_execute_micros: 0,
             error_counts: Vec::new(),
             pending: Vec::new(),
         }
+    }
+
+    /// Sets the instance name stamped into emitted [`LogEvent`]s as `source`.
+    pub(crate) fn set_instance(&mut self, name: &str) {
+        self.instance = Arc::from(name);
     }
 
     // ---- system-facing API ----
@@ -157,20 +134,45 @@ where
     }
 
     /// Queues a log line for the next [`end_cycle`](Self::end_cycle); lines
-    /// past [`MAX_LINES`] are dropped.
-    pub fn log(&mut self, level: Level, msg: &str) {
+    /// past [`MAX_LINES`] are dropped and counted as `log_dropped` errors.
+    pub fn log(&mut self, level: LogLevel, msg: &str) {
         if self.pending.len() < MAX_LINES {
-            self.pending.push(LogLine::new(level, msg));
+            self.pending.push((level, msg.to_string()));
+        } else {
+            self.error("log_dropped");
+        }
+    }
+
+    /// Emits one pre-built [`LogEvent`] directly, bypassing the pending queue
+    /// so the event keeps its own timestamp and fields. The tracing drain path.
+    pub(crate) fn emit_event(&mut self, ev: &LogEvent) {
+        if self.log.emit(ev).is_err() {
+            self.error("log_dropped");
         }
     }
 
     /// Closes a cycle by bumping `cycles`, stamping the execute duration, and
-    /// publishing one health record plus any queued log lines.
+    /// publishing one health record plus one [`LogEvent`] per queued line.
     pub fn end_cycle(&mut self, timestamp: Timestamp, execute_micros: u64) {
         self.cycles += 1;
         self.last_execute_micros = execute_micros;
         self.publish_health(timestamp);
         self.flush_logs(timestamp);
+        // Inside a pack dylib the tracing forward queue is per-dylib and the
+        // loop is single-threaded, so everything queued since the last drain
+        // was fired by this instance's own execute — drain it here, restamped
+        // with this instance as the source. False everywhere else (the host
+        // coordinator owns the host queue).
+        if crate::logfwd::pack_mode() {
+            let instance = self.instance.clone();
+            let dropped = crate::logfwd::drain(|mut ev| {
+                ev.source = instance.to_string();
+                self.emit_event(&ev);
+            });
+            for _ in 0..dropped {
+                self.error("log_dropped");
+            }
+        }
     }
 
     fn publish_health(&mut self, timestamp: Timestamp) {
@@ -202,23 +204,19 @@ where
     }
 
     fn flush_logs(&mut self, timestamp: Timestamp) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let frame = SystemLog {
-            timestamp,
-            lines: FrameList::EMPTY,
-        };
-        let pending = core::mem::take(&mut self.pending);
-        let result = self.log.write_with(&frame, |fw| {
-            let _ = fw.list(&frame.lines, offset_of!(SystemLog, lines), |l| {
-                for line in &pending {
-                    l.push(*line);
-                }
-            });
-        });
-        if result.is_err() {
-            self.error("log_publish_failed");
+        for (level, message) in core::mem::take(&mut self.pending) {
+            let ev = LogEvent {
+                timestamp,
+                level,
+                source: self.instance.to_string(),
+                target: String::new(),
+                message,
+                span: None,
+                fields: Vec::new(),
+                file: None,
+                line: None,
+            };
+            self.emit_event(&ev);
         }
     }
 }
@@ -228,7 +226,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::port::{Input, buffer_capacity, frame_list_iter};
+    use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn};
+    use crate::port::{Input, buffer_capacity, capacity_for};
     use metor_fsw::Decomponentize;
     use metor_fsw_ring::{Config, RingBuffer};
     use metor_proto::types::{ComponentId, ComponentView};
@@ -259,21 +258,21 @@ mod tests {
         }
     }
 
-    fn port_with_readers() -> (HealthPort, Input<SystemHealth>, Input<SystemLog>) {
+    fn port_with_readers() -> (HealthPort, Input<SystemHealth>, MsgIn<LogEvent>) {
         let health_ring = RingBuffer::create_in_memory(Config {
             capacity: buffer_capacity::<SystemHealth>(8),
             max_readers: 1,
         });
         let log_ring = RingBuffer::create_in_memory(Config {
-            capacity: buffer_capacity::<SystemLog>(8),
+            capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
             max_readers: 1,
         });
+        let log_in = MsgIn::new(log_ring.view(NoWake).unwrap());
         let port = HealthPort::new(
             Output::new(health_ring.writer(NoWake).unwrap()),
-            Output::new(log_ring.writer(NoWake).unwrap()),
+            MsgOut::new(log_ring.writer(NoWake).unwrap()),
         );
         let health_in = Input::new(health_ring.view(NoWake).unwrap());
-        let log_in = Input::new(log_ring.view(NoWake).unwrap());
         (port, health_in, log_in)
     }
 
@@ -338,26 +337,43 @@ mod tests {
     }
 
     #[test]
-    fn log_lines_are_capped_and_truncated() {
+    fn log_lines_flush_as_stamped_events() {
         let (mut port, _health_in, mut log_in) = port_with_readers();
-        let long = "x".repeat(LOG_MSG_CAP + 20);
-        port.log(Level::Error, &long);
-        for i in 0..MAX_LINES + 3 {
-            port.log(Level::Info, &format!("line {i}"));
-        }
+        port.set_instance("nav");
+        let long = "x".repeat(500);
+        port.log(LogLevel::Error, &long);
+        port.log(LogLevel::Info, "line 1");
         port.end_cycle(Timestamp(3), 0);
 
-        let grant = log_in
+        let mut events: Vec<LogEvent> = Vec::new();
+        log_in.drain(|ev| events.push(ev)).unwrap();
+        assert_eq!(events.len(), 2);
+        // No fixed-size slot, so a long line survives whole.
+        assert_eq!(events[0].level, LogLevel::Error);
+        assert_eq!(events[0].message, long);
+        assert_eq!(events[0].source, "nav");
+        assert_eq!(events[0].timestamp, Timestamp(3));
+        assert_eq!(events[0].span, None);
+        assert_eq!(events[1].level, LogLevel::Info);
+        assert_eq!(events[1].message, "line 1");
+    }
+
+    #[test]
+    fn log_lines_past_the_cap_drop_and_count() {
+        let (mut port, mut health_in, mut log_in) = port_with_readers();
+        for i in 0..MAX_LINES + 3 {
+            port.log(LogLevel::Info, &format!("line {i}"));
+        }
+        port.end_cycle(Timestamp(1), 0);
+
+        let mut n = 0;
+        log_in.drain(|_| n += 1).unwrap();
+        assert_eq!(n, MAX_LINES);
+        let grant = health_in
             .latest()
             .expect("ring readable")
-            .expect("log published");
-        let lines: Vec<LogLine> =
-            frame_list_iter(grant.table(), offset_of!(SystemLog, lines)).collect();
-        assert_eq!(lines.len(), MAX_LINES);
-        let first = lines[0];
-        assert_eq!(first.level, Level::Error as u8);
-        assert_eq!(first.len as usize, LOG_MSG_CAP);
-        assert_eq!(&first.msg[..], &long.as_bytes()[..LOG_MSG_CAP]);
+            .expect("health published");
+        assert_eq!(grant.get().errors, 3);
     }
 
     #[test]
@@ -365,6 +381,8 @@ mod tests {
         let (mut port, mut health_in, mut log_in) = port_with_readers();
         port.end_cycle(Timestamp(1), 0);
         assert!(health_in.latest().unwrap().is_some());
-        assert!(log_in.latest().unwrap().is_none());
+        let mut n = 0;
+        log_in.drain(|_| n += 1).unwrap();
+        assert_eq!(n, 0);
     }
 }

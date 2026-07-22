@@ -3,6 +3,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::connections::{AddressResolver, ConnectionTarget, RegistryHandle, TargetId};
+use crate::icons::Icon;
 use crate::inspector::Inspector;
 use crate::inspector::edits::{
     self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
@@ -11,9 +13,9 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, SequenceGridPanel,
-    SequencePanel, TablePanel, TextPanel, TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel,
-    XyPlotPanel,
+    AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, LogPanel, PlotPanel,
+    SequenceGridPanel, SequencePanel, TablePanel, TextPanel, TrafficLightGridPanel,
+    TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -35,6 +37,7 @@ actions!(
         CycleTabBackward,
         ToggleCmdLock,
         OpenReviewEdits,
+        OpenConnections,
     ]
 );
 
@@ -61,6 +64,12 @@ struct AppRoot {
     /// The transient chord menu, present only while open. Dropped (and focus
     /// returned to the root) once it dismisses, mirroring `inspector`.
     transient: Option<Entity<crate::transient::Transient>>,
+    /// The connection picker, present only while open, mirroring `inspector`.
+    connection_picker: Option<Entity<crate::connections::ConnectionPicker>>,
+    /// Queued picker open; `true` means the picker must stay up until
+    /// something connects (the first-open case). Drained in `render` like
+    /// the other pending requests so focus transfer has a `Window`.
+    pending_connection_picker: Option<bool>,
     /// Armed by mouse-down on the titlebar; the next mouse-move hands the
     /// drag to the compositor via `start_window_move` (Linux — macOS and
     /// Windows drag natively through the transparent titlebar / HTCAPTION).
@@ -95,6 +104,17 @@ impl AppRoot {
         if let Some(store) = crate::alarms::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
         }
+        // Repaint the titlebar chip when connections change, and greet a
+        // fresh session (nothing connected, nothing auto-connected) with
+        // the picker instead of an empty tile tree.
+        let mut pending_connection_picker = None;
+        if let Some(store) = crate::connections::try_global(cx) {
+            cx.observe(&store, |_, _, cx| cx.notify()).detach();
+            store.update(cx, |store, _| store.set_tiles(tiles.downgrade()));
+            if store.read(cx).active().is_empty() {
+                pending_connection_picker = Some(true);
+            }
+        }
         Self {
             db,
             tiles,
@@ -104,6 +124,8 @@ impl AppRoot {
             pending_pane_inspector_request: None,
             pending_inspector_open: None,
             transient: None,
+            connection_picker: None,
+            pending_connection_picker,
             should_move: false,
             focus_handle: cx.focus_handle(),
         }
@@ -173,6 +195,42 @@ impl AppRoot {
         });
         transient.focus_handle(cx).focus(window);
         self.transient = Some(transient);
+        cx.notify();
+    }
+
+    fn open_connections(
+        &mut self,
+        _: &OpenConnections,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(picker) = &self.connection_picker
+            && !picker.read(cx).dismissed
+        {
+            return;
+        }
+        self.pending_connection_picker = Some(false);
+        cx.notify();
+    }
+
+    fn open_connection_picker(
+        &mut self,
+        require_connection: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = crate::connections::try_global(cx) else {
+            return;
+        };
+        let parent_focus = self.focus_handle.clone();
+        let picker = cx.new(|cx| {
+            let mut picker =
+                crate::connections::ConnectionPicker::new(store, require_connection, cx);
+            picker.set_parent_focus(parent_focus);
+            picker
+        });
+        picker.focus_handle(cx).focus(window);
+        self.connection_picker = Some(picker);
         cx.notify();
     }
 
@@ -259,12 +317,9 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut rows = crate::inspector::reflect::rows_for_any_entity(
-            &pane.clone().into_any(),
-            &self.db,
-            cx,
-        )
-        .unwrap_or_default();
+        let mut rows =
+            crate::inspector::reflect::rows_for_any_entity(&pane.clone().into_any(), &self.db, cx)
+                .unwrap_or_default();
         let db = self.db.clone();
         let on_open_inspector = crate::inspector::open_inspector(cx);
         rows.push(Box::new(crate::inspector::rows::NavRow::new(
@@ -385,6 +440,17 @@ impl Render for AppRoot {
             self.focus_handle.focus(window);
         }
 
+        if let Some(picker) = &self.connection_picker
+            && picker.read(cx).dismissed
+        {
+            self.connection_picker = None;
+            self.focus_handle.focus(window);
+        }
+
+        if let Some(require_connection) = self.pending_connection_picker.take() {
+            self.open_connection_picker(require_connection, window, cx);
+        }
+
         if let Some((item, position)) = self.pending_inspector_request.take() {
             self.open_inspector(&*item, position, window, cx);
         }
@@ -433,6 +499,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::handle_plot_component_action))
             .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))
+            .on_action(cx.listener(Self::open_connections))
             .on_modifiers_changed(cx.listener(
                 |this, event: &gpui::ModifiersChangedEvent, _window, cx| {
                     if !event.modifiers.shift && this.hover_preview.take().is_some() {
@@ -456,6 +523,10 @@ impl Render for AppRoot {
 
         if let Some(transient) = &self.transient {
             root = root.child(transient.clone());
+        }
+
+        if let Some(picker) = &self.connection_picker {
+            root = root.child(picker.clone());
         }
 
         if let Some(preview) = &self.hover_preview {
@@ -506,12 +577,11 @@ impl AppRoot {
             let state = store.state();
             let active = state.active_count();
             if active == 0 {
-                // Healthy: a bare green dot keeps the title bar compact.
-                bar = bar.child(div().text_color(theme.control_active).child("\u{25cf}"));
+                bar = bar.child(Icon::Dot.svg_color(7.0, theme.control_active));
             } else {
                 if let Some(severity) = state.highest_active_severity() {
                     let idx = crate::alarms::severity_index(severity);
-                    bar = bar.child(div().text_color(theme.alarm_color(idx)).child("\u{25cf}"));
+                    bar = bar.child(Icon::Dot.svg_color(7.0, theme.alarm_color(idx)));
                 }
                 let counts = state.counts_by_severity();
                 for idx in (0..counts.len()).rev() {
@@ -553,6 +623,84 @@ impl AppRoot {
         });
     }
 
+    /// A flat, borderless titlebar control: quiet at rest, background on
+    /// hover. The titlebar reads as one surface instead of a row of pills.
+    fn titlebar_segment(
+        theme: &crate::theme::Theme,
+        id: &'static str,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .px(px(8.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(12.0))
+            .text_color(theme.text_primary)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.bg_primary))
+    }
+
+    fn titlebar_separator(theme: &crate::theme::Theme) -> gpui::Div {
+        div().w(px(1.0)).h(px(14.0)).bg(theme.border_primary)
+    }
+
+    /// The titlebar's identity: which system(s) this panel is looking at.
+    /// Sits on the left like an editor's project breadcrumb; clicking opens
+    /// the connection dialog.
+    fn render_connection_segment(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::connections::ConnectionStatus;
+
+        let summary = crate::connections::try_global(cx).map(|store| {
+            let store = store.read(cx);
+            let active = store.active();
+            let label: SharedString = match active {
+                [] => SharedString::new_static("not connected"),
+                [only] => only.target.name.clone(),
+                many => SharedString::from(format!("{} systems", many.len())),
+            };
+            // The dot shows the worst status so a degraded mirror is
+            // visible even while other connections are healthy.
+            let worst = active
+                .iter()
+                .map(|c| match c.status() {
+                    ConnectionStatus::Failed(_) => 2,
+                    ConnectionStatus::Connecting | ConnectionStatus::Reconnecting => 1,
+                    _ => 0,
+                })
+                .max();
+            let dot = match worst {
+                None => theme.text_tertiary,
+                Some(2) => theme.error_accent,
+                Some(1) => theme.text_secondary,
+                Some(_) => theme.control_active,
+            };
+            (label, dot)
+        });
+        let Some((label, dot)) = summary else {
+            return div().into_any_element();
+        };
+
+        Self::titlebar_segment(theme, "connection-segment")
+            .child(crate::icons::Icon::Dot.svg_color(7.0, dot))
+            .child(label)
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _window, cx| {
+                    this.pending_connection_picker = Some(false);
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
     fn render_titlebar(
         &self,
         theme: &crate::theme::Theme,
@@ -591,32 +739,32 @@ impl AppRoot {
             });
 
         // Occluded so these controls win the non-client hit-test: without it,
-        // Windows resolves clicks over the pills to the surrounding titlebar
-        // drag area (HTCAPTION) and drags the window instead of clicking.
+        // Windows resolves clicks over the segments to the surrounding
+        // titlebar drag area (HTCAPTION) and drags the window instead of
+        // clicking. Left: the panel's identity — what it's connected to.
+        let left = div()
+            .occlude()
+            .flex()
+            .flex_row()
+            .items_center()
+            .pl(px(if cfg!(target_os = "macos") { 78.0 } else { 8.0 }))
+            .child(self.render_connection_segment(theme, cx));
+
         let mut right = div()
             .occlude()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
+            .gap(px(6.0))
             .pr(px(8.0));
 
-        // Global time-range pill: shows the window every Auto-range plot
-        // follows; clicking opens a preset/custom picker.
+        // Global time range: the window every Auto-range plot follows;
+        // clicking opens a preset/custom picker.
         let range_label = SharedString::from(format!("{}", GlobalTimeRange::get(cx)));
         right = right.child(
-            div()
-                .id("global-time-range")
-                .px(px(8.0))
-                .py(px(2.0))
-                .bg(theme.pill_bg)
-                .border_1()
-                .border_color(theme.pill_border)
-                .rounded(px(4.0))
-                .text_size(px(12.0))
-                .text_color(theme.text_primary)
+            Self::titlebar_segment(theme, "global-time-range")
                 .child(range_label)
-                .cursor_pointer()
+                .child(crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary))
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
                     let Some(open) = crate::inspector::open_inspector(cx) else {
                         return;
@@ -632,23 +780,16 @@ impl AppRoot {
                 }),
         );
 
+        right = right.child(Self::titlebar_separator(theme));
         right = right.child(self.render_alarm_summary(theme, cx));
 
         if edit_count > 0 {
             let label = SharedString::from(format!("{} pending", edit_count));
+            right = right.child(Self::titlebar_separator(theme));
             right = right.child(
-                div()
-                    .id("pending-pill")
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .bg(theme.pill_bg)
-                    .border_1()
-                    .border_color(theme.pill_border)
-                    .rounded(px(4.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
+                Self::titlebar_segment(theme, "pending-edits")
+                    .text_color(theme.text_secondary)
                     .child(label)
-                    .cursor_pointer()
                     .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
                         pending_edits_mut(cx).open_review_requested = true;
                         cx.refresh_windows();
@@ -656,6 +797,7 @@ impl AppRoot {
             );
         }
 
+        right = right.child(Self::titlebar_separator(theme));
         right = right.child(lock_button);
 
         div()
@@ -676,7 +818,7 @@ impl AppRoot {
             .flex()
             .flex_row()
             .items_center()
-            .justify_end()
+            .justify_between()
             // Drag gesture for compositors that need an explicit hand-off:
             // mouse-down arms, the first mouse-move starts the compositor
             // drag. macOS drags natively via the transparent titlebar and
@@ -716,6 +858,7 @@ impl AppRoot {
                     })
                 },
             )
+            .child(left)
             .child(right)
             .when(
                 crate::window_controls::needs_window_controls(window),
@@ -750,7 +893,10 @@ fn global_time_range_rows(cx: &gpui::App) -> Vec<Box<dyn InspectorRow>> {
 pub struct PanelApp {
     db: Arc<DB>,
     server_addr: Option<SocketAddr>,
-    remote_addr: Option<SocketAddr>,
+    targets: Vec<ConnectionTarget>,
+    connection_sources: Vec<Box<dyn FnOnce(RegistryHandle)>>,
+    auto_connect: Vec<TargetId>,
+    address_resolver: Option<AddressResolver>,
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
     overlays: Vec<Box<dyn FnOnce(&mut App) -> gpui::AnyView>>,
@@ -762,11 +908,53 @@ impl PanelApp {
         Self {
             db,
             server_addr: None,
-            remote_addr: None,
+            targets: Vec::new(),
+            connection_sources: Vec::new(),
+            auto_connect: Vec::new(),
+            address_resolver: None,
             command_providers: Vec::new(),
             init_hooks: Vec::new(),
             overlays: Vec::new(),
         }
+    }
+
+    /// Pre-register a connectable target in the picker.
+    pub fn connection(mut self, target: ConnectionTarget) -> Self {
+        self.targets.push(target);
+        self
+    }
+
+    /// Hand a [`RegistryHandle`] to a discovery source at startup. The
+    /// source owns its own threads (an mDNS scan, a cloud poll) and upserts
+    /// targets as it finds them; they appear in the picker reactively.
+    pub fn connection_source(mut self, source: impl FnOnce(RegistryHandle) + 'static) -> Self {
+        self.connection_sources.push(Box::new(source));
+        self
+    }
+
+    /// Connect to a registered target immediately at startup, skipping the
+    /// picker. The id must match a target registered via
+    /// [`connection`](PanelApp::connection).
+    pub fn auto_connect(mut self, id: impl Into<SharedString>) -> Self {
+        self.auto_connect.push(TargetId(id.into()));
+        self
+    }
+
+    /// Replace how the dialog's "Connect to address…" input is interpreted.
+    /// The default parses `host:port` into the built-in TCP mirror; a
+    /// wrapper speaking its own protocol supplies a placeholder and a parse
+    /// function producing any [`ConnectionTarget`]. The same resolver
+    /// revives address-carrying recents across restarts.
+    pub fn address_resolver(
+        mut self,
+        placeholder: impl Into<SharedString>,
+        resolve: impl Fn(&str) -> Result<ConnectionTarget, SharedString> + Send + Sync + 'static,
+    ) -> Self {
+        self.address_resolver = Some(AddressResolver {
+            placeholder: placeholder.into(),
+            resolve: Arc::new(resolve),
+        });
+        self
     }
 
     /// Mount a consumer-built view over the window root. `build` runs at startup
@@ -794,9 +982,13 @@ impl PanelApp {
     /// Mirror a long-running remote metor-db at `addr`: live telemetry
     /// streams into the local DB, and plots hydrate remote-only history on
     /// demand (gaps render as translucent bands until their nodes land).
-    pub fn remote(mut self, addr: SocketAddr) -> Self {
-        self.remote_addr = Some(addr);
-        self
+    ///
+    /// Sugar over [`connection`](PanelApp::connection) +
+    /// [`auto_connect`](PanelApp::auto_connect) with the built-in TCP target.
+    pub fn remote(self, addr: SocketAddr) -> Self {
+        let target = ConnectionTarget::tcp("Remote", addr);
+        let id = target.id.0.clone();
+        self.connection(target).auto_connect(id)
     }
 
     /// Register a custom palette category with a pull-based provider. The
@@ -842,7 +1034,10 @@ impl PanelApp {
         let PanelApp {
             db,
             server_addr,
-            remote_addr,
+            targets,
+            connection_sources,
+            auto_connect,
+            address_resolver,
             command_providers,
             init_hooks,
             overlays,
@@ -859,32 +1054,10 @@ impl PanelApp {
             });
         }
 
-        let remote_handles = remote_addr.map(|addr| {
-            let remote = metor_db::remote::RemoteDb::new(addr);
-            let hydrator = remote.hydrator();
-            let remote_db = db.clone();
-            stellar(move || async move {
-                remote.spawn(remote_db);
-                // The mirror and hydrator tasks own this thread's runtime;
-                // park so it never winds down.
-                std::future::pending::<()>().await
-            });
-            hydrator
-        });
-
-        // This panel is the system of record when it isn't mirroring
-        // someone else; it computes the min/max LoD companions wide plot
-        // views render from. Mirrors receive them via manifest seeding +
-        // hydration instead — locally computed buckets would disagree
-        // with the origin's.
-        if remote_addr.is_none() {
-            let lod_db = db.clone();
-            stellar(move || async move {
-                metor_db::lod::spawn(lod_db);
-                std::future::pending::<()>().await
-            });
-        }
-
+        let mut targets = Some(targets);
+        let mut connection_sources = Some(connection_sources);
+        let mut auto_connect = Some(auto_connect);
+        let mut address_resolver = Some(address_resolver);
         let mut command_providers = Some(command_providers);
         let mut init_hooks = Some(init_hooks);
         let mut overlays = Some(overlays);
@@ -904,9 +1077,6 @@ impl PanelApp {
                 cx.set_global(crate::theme::ActiveTheme(Arc::new(
                     crate::theme::DARK.clone(),
                 )));
-                if let Some(hydrator) = remote_handles.clone() {
-                    cx.set_global(crate::hydration::HydratorGlobal(hydrator));
-                }
                 edits::init(cx);
                 ItemRegistry::init(cx);
                 crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
@@ -917,9 +1087,40 @@ impl PanelApp {
                 crate::node_editor::inspector_rows::register_inspector_rows(cx);
                 crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
+                crate::logs::LogStore::init(db.clone(), cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
+                crate::plot_events::EventSourceRegistry::init(cx);
                 crate::wiring::WiringStore::init(db.clone(), cx);
                 register_pane_item_deserializers(db.clone(), cx);
+
+                // Connections: seed builder-registered targets, hand the
+                // registry to discovery sources, then fire auto-connects.
+                // LoD spawning is a store concern — it starts with the first
+                // local-authority connection rather than at boot.
+                let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
+                if let Some(store) = crate::connections::try_global(cx) {
+                    store.update(cx, |store, cx| {
+                        if let Some(resolver) = address_resolver.take().flatten() {
+                            store.set_resolver(resolver);
+                        }
+                        for target in targets.take().unwrap_or_default() {
+                            store.upsert_target(target, cx);
+                        }
+                        for id in auto_connect.take().unwrap_or_default() {
+                            let Some(target) =
+                                store.state().targets().iter().find(|t| t.id == id).cloned()
+                            else {
+                                tracing::warn!(%id, "auto-connect target not registered");
+                                continue;
+                            };
+                            store.connect(target, cx);
+                        }
+                    });
+                }
+                for source in connection_sources.take().unwrap_or_default() {
+                    source(registry.clone());
+                }
+                register_connection_commands(cx);
 
                 // Consumer extensions: register custom palette providers, run
                 // init hooks, then build overlays. All happen after the built-in
@@ -999,6 +1200,38 @@ impl PanelApp {
     }
 }
 
+/// Palette entries for the connection system: "Connect…" opens the picker,
+/// and each active connection contributes a "Disconnect <name>" command.
+/// Pull-based like every provider, so the disconnect list always matches
+/// the live set.
+fn register_connection_commands(cx: &mut App) {
+    ItemRegistry::register(
+        cx,
+        Category::Command,
+        Arc::new(|cx| {
+            let mut items = vec![InspectionItem::Command {
+                label: SharedString::new_static("Connect\u{2026}"),
+                callback: Arc::new(|window, cx| {
+                    window.dispatch_action(Box::new(OpenConnections), cx);
+                }),
+            }];
+            if let Some(store) = crate::connections::try_global(cx) {
+                for conn in store.read(cx).active() {
+                    let id = conn.target.id.clone();
+                    let store = store.clone();
+                    items.push(InspectionItem::Command {
+                        label: SharedString::from(format!("Disconnect {}", conn.target.name)),
+                        callback: Arc::new(move |_window, cx| {
+                            store.update(cx, |store, cx| store.disconnect(&id, cx));
+                        }),
+                    });
+                }
+            }
+            items
+        }),
+    );
+}
+
 /// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
 /// every built-in panel kind. One closure per kind, parsing the kind's
 /// `*Config` blob with `facet-json` and constructing the panel via its
@@ -1011,6 +1244,7 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
 
     register_panel::<TextPanel>(&mut reg, db.clone(), TextPanel::from_config);
     register_panel::<AlarmPanel>(&mut reg, db.clone(), AlarmPanel::from_config);
+    register_panel::<LogPanel>(&mut reg, db.clone(), LogPanel::from_config);
     register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
     register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
     register_panel::<TablePanel>(&mut reg, db.clone(), TablePanel::from_config);

@@ -5,9 +5,9 @@
 //! positional ring binding — but every lifecycle call executes outside the
 //! coordinator's address space, and the rings that cross the boundary are
 //! mmap-backed files both sides attach. The worker is stepped in lockstep
-//! with the cycle through a small shared **control block** ([`ctl`]): the
+//! with the cycle through a small shared control block: the
 //! host rings a doorbell carrying the cycle timestamp, the worker runs one
-//! `fsw_execute` and acks, and the host bounds its wait with a deadline so a
+//! `fsw_pack_execute` and acks, and the host bounds its wait with a deadline so a
 //! hung worker costs a telemetered timeout, not a stalled loop.
 //!
 //! The mechanism needs a cross-process futex, so process systems are

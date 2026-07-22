@@ -19,6 +19,7 @@ impl AssetSource for IconAssets {
             "icons/chevron_up.svg" => Some(include_bytes!("../assets/icons/chevron_up.svg")),
             "icons/close.svg" => Some(include_bytes!("../assets/icons/close.svg")),
             "icons/container.svg" => Some(include_bytes!("../assets/icons/container.svg")),
+            "icons/dot.svg" => Some(include_bytes!("../assets/icons/dot.svg")),
             "icons/entity.svg" => Some(include_bytes!("../assets/icons/entity.svg")),
             "icons/exit-fullscreen.svg" => {
                 Some(include_bytes!("../assets/icons/exit-fullscreen.svg"))
@@ -56,6 +57,7 @@ impl AssetSource for IconAssets {
                 Some(include_bytes!("../assets/icons/vertical-chevrons.svg"))
             }
             "icons/viewport.svg" => Some(include_bytes!("../assets/icons/viewport.svg")),
+            "icons/favorite.svg" => Some(include_bytes!("../assets/icons/favorite.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -80,6 +82,7 @@ pub enum Icon {
     ChevronUp,
     Close,
     Container,
+    Dot,
     Entity,
     ExitFullscreen,
     Folder,
@@ -109,6 +112,7 @@ pub enum Icon {
     TileGraph,
     VerticalChevrons,
     Viewport,
+    Favorite,
 }
 
 impl Icon {
@@ -122,6 +126,7 @@ impl Icon {
             Icon::ChevronUp => "icons/chevron_up.svg",
             Icon::Close => "icons/close.svg",
             Icon::Container => "icons/container.svg",
+            Icon::Dot => "icons/dot.svg",
             Icon::Entity => "icons/entity.svg",
             Icon::ExitFullscreen => "icons/exit-fullscreen.svg",
             Icon::Folder => "icons/folder.svg",
@@ -151,6 +156,7 @@ impl Icon {
             Icon::TileGraph => "icons/tile_graph.svg",
             Icon::VerticalChevrons => "icons/vertical-chevrons.svg",
             Icon::Viewport => "icons/viewport.svg",
+            Icon::Favorite => "icons/favorite.svg",
         }
     }
 

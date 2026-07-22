@@ -81,6 +81,7 @@ fn seq_coordinator() -> CoordinatorSpec {
         cycle_rate: 1000.0,
         default_depth: Some(8),
         clock: ClockSpec::Simulated { dt_secs: 0.000_002 },
+        namespace: None,
     }
 }
 
@@ -363,11 +364,7 @@ fn last_occupant(view: &mut Input<SlotStatus>) -> Option<String> {
     let mut last = None;
     view.drain(|f| {
         let s = f.get();
-        last = Some(
-            core::str::from_utf8(&s.occupant[..s.occ_len as usize])
-                .expect("utf-8 occupant name")
-                .to_string(),
-        );
+        last = Some(s.occupant.as_str().to_string());
     })
     .expect("no lap");
     last

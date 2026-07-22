@@ -1,0 +1,23 @@
+# The metor-fsw CLI as a binary distribution (docs/packaging.md).
+#
+# The wheel ships the real binary as package data plus a console-script
+# shim; `metor_fsw.find()` is the resolver-pinned locator tooling uses.
+# The in-tree backend cargo-builds the release binary and writes a
+# platform-tagged wheel; `uv build` from this directory produces it.
+# Version tracks the metor-fsw-2 crate; the ABI pin tracks
+# `FSW_ABI_VERSION` — both enforced by Rust tests.
+
+[project]
+name = "metor-fsw"
+version = "0.14.2"
+description = "Build, package, and run metor-fsw missions"
+requires-python = ">=3.10"
+dependencies = ["metor-fsw-abi==10"]
+
+[project.scripts]
+metor-fsw = "metor_fsw:main"
+
+[build-system]
+requires = []
+build-backend = "metor_fsw_dist"
+backend-path = ["_backend"]

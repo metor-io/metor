@@ -25,19 +25,16 @@ use serde::{Deserialize, Serialize};
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-///
-/// v2 dropped the `ParamSource::Kdl` variant with the KDL front-end (phase 4):
-/// a wire-shape change, so a v1 bundle fails the version check and must be
-/// rebuilt.
-pub const IR_VERSION: u32 = 2;
+pub const IR_VERSION: u32 = 5;
 
 /// A plain-data description of a complete mission, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
 ///
-/// Produced by [`parse`](crate::wiring::parse) or [`WiringBuilder`](crate::wiring::WiringBuilder),
-/// consumed by [`resolve`](crate::wiring::resolve). The telemetry downlink and the
-/// command uplink appear here as ordinary systems with the built-in registry
-/// types [`TCP_DOWNLINK_TYPE`] and [`TCP_UPLINK_TYPE`], not as dedicated fields.
+/// Produced by [`eval_python_mission`](crate::wiring::eval_python_mission) or
+/// [`WiringBuilder`](crate::wiring::WiringBuilder), and consumed by
+/// [`resolve`](crate::wiring::resolve). The telemetry link appears
+/// here as an ordinary [`TCP_SERVER_TYPE`] state plus [`DOWNLINK_TYPE`]/
+/// [`UPLINK_TYPE`] systems, not as dedicated fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Wiring {
     /// The [`IR_VERSION`] this value was produced against. Deliberately not
@@ -48,6 +45,11 @@ pub struct Wiring {
     pub coordinator: CoordinatorSpec,
     /// The shared objects this mission loads, one pack per cdylib.
     pub artifacts: Vec<Artifact>,
+    /// The pack-shared state instances, constructed before any system (see
+    /// [`Pack::shared_state`](crate::Pack::shared_state)). A document that
+    /// omits the field declares none.
+    #[serde(default)]
+    pub states: Vec<StateSpec>,
     /// The system instances, either static (resolved in the
     /// [`Registry`](crate::wiring::Registry)) or loaded from an [`Artifact`].
     pub systems: Vec<SystemSpec>,
@@ -65,16 +67,18 @@ pub struct Wiring {
 }
 
 impl Wiring {
-    /// A clone with every [`Artifact::path`] cleared: the relocatable,
-    /// reproducible form of the IR. Paths point into a build tree, so they are
-    /// provenance rather than identity — [`resolve`](crate::wiring::resolve)
-    /// re-derives them on load. Stripping them is what lets the bundle's
-    /// `wiring.json` stay byte-reproducible and a `WiringManifest` describe the
-    /// same topology regardless of where it was built.
+    /// A clone with every [`Artifact::path`] and [`Artifact::prebuilt_dir`]
+    /// cleared: the relocatable, reproducible form of the IR. Both point into
+    /// a build tree or an installed environment, so they are provenance rather
+    /// than identity — [`resolve`](crate::wiring::resolve) re-derives them on
+    /// load. Stripping them is what lets the bundle's `wiring.json` stay
+    /// byte-reproducible and a `WiringManifest` describe the same topology
+    /// regardless of where it was built.
     pub fn path_stripped(&self) -> Wiring {
         let mut w = self.clone();
         for artifact in &mut w.artifacts {
             artifact.path = None;
+            artifact.prebuilt_dir = None;
         }
         w
     }
@@ -108,17 +112,23 @@ pub struct ScopeSpec {
     pub src: Option<SourceRef>,
 }
 
-/// Registry `type=` of the built-in TCP telemetry downlink, a
-/// [`TelemetrySystem`](crate::TelemetrySystem) over a
-/// [`TcpTransport`](crate::TcpTransport) configured by
-/// [`DownlinkParams`](crate::DownlinkParams).
-pub const TCP_DOWNLINK_TYPE: &str = "TcpDownlink";
+/// State `type=` of the built-in link server, a
+/// [`LinkState`](crate::LinkState) configured by
+/// [`LinkParams`](crate::LinkParams). The FSW listens on its `addr`; ground
+/// tools connect to it for the downlink stream and command ingest alike.
+pub const TCP_SERVER_TYPE: &str = "TcpServer";
 
-/// Registry `type=` of the built-in TCP command uplink, an
-/// [`UplinkSystem`](crate::UplinkSystem) over a
-/// [`TcpRecvTransport`](crate::TcpRecvTransport) configured by
+/// Registry `type=` of the built-in telemetry downlink, a
+/// [`TelemetrySystem`](crate::TelemetrySystem) attached to the mission's
+/// [`TCP_SERVER_TYPE`] state, configured by
+/// [`DownlinkParams`](crate::DownlinkParams).
+pub const DOWNLINK_TYPE: &str = "Downlink";
+
+/// Registry `type=` of the built-in command uplink, an
+/// [`UplinkSystem`](crate::UplinkSystem) attached to the mission's
+/// [`TCP_SERVER_TYPE`] state, configured by
 /// [`UplinkParams`](crate::UplinkParams).
-pub const TCP_UPLINK_TYPE: &str = "TcpUplink";
+pub const UPLINK_TYPE: &str = "Uplink";
 
 /// Coordinator-wide configuration, the serializable mirror of
 /// [`CoordinatorConfig`](crate::CoordinatorConfig).
@@ -132,6 +142,16 @@ pub struct CoordinatorSpec {
     pub default_depth: Option<usize>,
     /// Which clock drives the per-cycle timestamp.
     pub clock: ClockSpec,
+    /// A dotted prefix stamped onto every component name this target
+    /// registers and announces (`"sat1"` → `sat1.coordinator.health`,
+    /// `sat1.<instance>.<frame>.<field>`). It shifts every telemetry
+    /// [`ComponentId`](metor_proto::types::ComponentId) uniformly, so several
+    /// targets connected into one db keep disjoint namespaces. `None` is the
+    /// unprefixed identity — names and ids are byte-identical to an
+    /// un-namespaced mission. Wiring resolves on the bare instance names
+    /// regardless; the prefix rides only the registry/announce seam.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 /// Which clock drives the run loop, the serializable mirror of
@@ -162,13 +182,28 @@ pub struct Artifact {
     /// The cargo package name, used by the build driver as
     /// `cargo build -p <crate_name>`.
     pub crate_name: String,
-    /// The produced shared-object file name (`libfoo.so`, `libfoo.dylib`,
-    /// `foo.dll`).
-    pub cdylib: String,
+    /// The bare library stem (`foo` for `libfoo.so`/`libfoo.dylib`/`foo.dll`).
+    /// The file name is derived per target triple at provision time
+    /// ([`cdylib_file_name_for`](crate::wiring::cdylib_file_name_for)); the IR
+    /// stays arch-neutral.
+    pub lib: String,
     /// The resolved artifact location, filled in by
-    /// [`build_artifacts`](crate::wiring::build_artifacts). `None` until built or
+    /// [`provision_artifacts`](crate::wiring::provision_artifacts). `None` until built or
     /// located.
     pub path: Option<PathBuf>,
+    /// Where a prebuilt artifact's per-triple libraries live: a directory
+    /// with one `<triple>/` subdirectory per shipped target, each holding the
+    /// cdylib and its `.manifest` sidecar — an installed pack wheel's `_libs`
+    /// dir, or a local pack's `.metor/libs`. `None` for a crate-built
+    /// artifact, which the build driver compiles instead
+    /// (`docs/packaging.md`). Provenance like `path`: stripped by
+    /// [`Wiring::path_stripped`].
+    #[serde(default)]
+    pub prebuilt_dir: Option<PathBuf>,
+    /// The published distribution this artifact came from, if any. Pure
+    /// provenance, carried into the bundle's `meta.json`.
+    #[serde(default)]
+    pub dist: Option<DistRef>,
     /// The `sha256:<hex>` hash of the pack manifest the generated stub module
     /// (`metor-fsw stubgen`) was produced against, carried through from the
     /// module's `ARTIFACT` constant. [`resolve`](crate::wiring::resolve)
@@ -179,6 +214,36 @@ pub struct Artifact {
     #[serde(default)]
     pub manifest_hash: Option<String>,
     /// Where this artifact was declared.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
+}
+
+/// The published distribution an [`Artifact`] was installed from, as the
+/// generated stub module recorded it (`dist="adcs-pack"`,
+/// `dist_version="1.2.0"`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DistRef {
+    /// The distribution name.
+    pub name: String,
+    /// The distribution version string.
+    pub version: String,
+}
+
+/// One pack-shared state instance: a `type=` declared by a statically
+/// registered pack via [`Pack::shared_state`](crate::Pack::shared_state),
+/// constructed once from `params` before any system. A system binds to it by
+/// naming it in [`SystemSpec::attach`] — the reference lives on the *system*
+/// side; a state carries only its own construction params (a listen address).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StateSpec {
+    /// The instance name, for diagnostics and host lookups.
+    pub name: String,
+    /// The pack-declared state key.
+    pub ty: String,
+    /// Where the state's params come from. [`ParamSource::Postcard`] is
+    /// rejected: states construct on the static path only.
+    pub params: ParamSource,
+    /// Where this state was declared.
     #[serde(default)]
     pub src: Option<SourceRef>,
 }
@@ -213,38 +278,70 @@ pub struct SystemSpec {
     /// unscoped (always, for the Rust builder).
     #[serde(default)]
     pub scope: Option<usize>,
+    /// The [`StateSpec::name`] this system attaches to, for a system whose
+    /// type declares pack-shared state (the built-in `Downlink`/`Uplink` bind
+    /// the link server this way). `None` for an ordinary system; a shared-state
+    /// system without it is a resolve-time error, and a plain system with it is
+    /// rejected too.
+    #[serde(default)]
+    pub attach: Option<String>,
+}
+
+impl StateSpec {
+    /// The built-in link server state, the spec pushed by
+    /// [`WiringBuilder::serve`](crate::wiring::WiringBuilder::serve) and the
+    /// CLI `--serve` flag. The `addr` rides as a [`ParamSource::Value`]
+    /// tree: the state's factory deserializes it with serde, so the
+    /// `SocketAddr` reads from the JSON string.
+    pub fn tcp_server(name: &str, addr: SocketAddr) -> Self {
+        Self::tcp_server_named(name, addr, None)
+    }
+
+    /// [`tcp_server`](Self::tcp_server) with an advertised node name folded
+    /// into the params — the value the mDNS advertiser publishes. `None`
+    /// emits identical params to `tcp_server`, so an unnamed server's IR is
+    /// unchanged.
+    pub fn tcp_server_named(name: &str, addr: SocketAddr, node_name: Option<&str>) -> Self {
+        let mut params = serde_json::json!({ "addr": addr.to_string() });
+        if let Some(node_name) = node_name {
+            params["name"] = serde_json::Value::String(node_name.to_string());
+        }
+        Self {
+            name: name.to_string(),
+            ty: TCP_SERVER_TYPE.to_string(),
+            params: ParamSource::Value(params),
+            src: None,
+        }
+    }
 }
 
 impl SystemSpec {
-    /// A built-in TCP telemetry downlink instance that taps every output, the
-    /// spec pushed by [`WiringBuilder::telemetry`](crate::wiring::WiringBuilder::telemetry)
-    /// and the CLI `--telemetry` flag. A subset tap instead declares
-    /// `instances`/`frames` children on an ordinary `system` node.
-    pub fn tcp_downlink(name: &str, addr: SocketAddr) -> Self {
-        Self::tcp_builtin(name, TCP_DOWNLINK_TYPE, addr)
+    /// A built-in downlink instance that taps every output. A subset tap
+    /// instead declares `instances`/`frames` params on an ordinary `system`
+    /// node of the [`DOWNLINK_TYPE`].
+    pub fn downlink(name: &str) -> Self {
+        Self::link_builtin(name, DOWNLINK_TYPE, serde_json::json!({}))
     }
 
-    /// A built-in TCP command uplink instance, the spec pushed by
-    /// [`WiringBuilder::uplink`](crate::wiring::WiringBuilder::uplink) and the CLI
-    /// `--uplink` flag. Its commands are routed by explicit edges
-    /// (`connect "<name>" -> … msg="…"`).
-    pub fn tcp_uplink(name: &str, addr: SocketAddr) -> Self {
-        Self::tcp_builtin(name, TCP_UPLINK_TYPE, addr)
+    /// A built-in uplink instance relaying the named msgs. Its commands are
+    /// routed by explicit edges (`connect "<name>" -> … msg="…"`).
+    pub fn uplink(name: &str, msgs: &[&str]) -> Self {
+        Self::link_builtin(name, UPLINK_TYPE, serde_json::json!({ "msgs": msgs }))
     }
 
-    /// Both built-ins take a single `addr=` param, carried as a
-    /// [`ParamSource::Value`] tree: the static path deserializes it with
-    /// serde, so the `SocketAddr` reads from the JSON string and the params'
-    /// `#[serde(default)]` fields are honored.
-    fn tcp_builtin(name: &str, ty: &str, addr: SocketAddr) -> Self {
+    /// The built-in link systems attach to the [`WiringBuilder::serve`] state,
+    /// declared under the name `"link"`
+    /// ([`WiringBuilder`](crate::wiring::WiringBuilder)).
+    fn link_builtin(name: &str, ty: &str, params: serde_json::Value) -> Self {
         Self {
             name: name.to_string(),
             ty: Some(ty.to_string()),
             artifact: None,
-            params: ParamSource::Value(serde_json::json!({ "addr": addr.to_string() })),
+            params: ParamSource::Value(params),
             process: false,
             src: None,
             scope: None,
+            attach: Some("link".to_string()),
         }
     }
 }
@@ -252,7 +349,7 @@ impl SystemSpec {
 /// Where a [`SystemSpec`]'s params come from.
 ///
 /// At [`resolve`](crate::wiring::resolve) every variant reduces to the same encodings:
-/// the canonical postcard `Params` bytes that cross `fsw_create` for a loaded
+/// the canonical postcard `Params` bytes that cross `fsw_pack_create` for a loaded
 /// system, or a typed `S::Params` value for a static one. Which decoder runs
 /// is decided by [`SystemSpec::artifact`], not by the variant.
 /// [`Value`](ParamSource::Value) carries a plain value tree — the format the
@@ -260,7 +357,7 @@ impl SystemSpec {
 /// `Params` schema and postcard-encoded for a loaded system, or
 /// serde-deserialized (field defaults honored) for a static one.
 /// [`Postcard`](ParamSource::Postcard) carries a `Params` value the Rust
-/// builder already encoded, exactly the bytes `fsw_create` decodes; it is
+/// builder already encoded, exactly the bytes `fsw_pack_create` decodes; it is
 /// dl-only, since a static system has no postcard decode path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ParamSource {
@@ -300,7 +397,7 @@ pub struct SlotSpec {
     /// The occupant to apply at startup, if any.
     pub initial: Option<InitialOccupantSpec>,
     /// `true` runs every occupant out of process (`process=#true`,
-    /// `docs/process-slots.md`): resolve describes each allowed occupant
+    /// `docs/process-systems.md`): resolve describes each allowed occupant
     /// through a worker instead of dlopening it, and every `Load` spawns a
     /// worker over the slot's session-dir rings. Per-slot means all-occupants,
     /// so a `Load` can never change the slot's fault domain. Default `false`;

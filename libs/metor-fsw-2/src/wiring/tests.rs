@@ -483,8 +483,10 @@ fn err_static_system_with_typed_params() {
             cycle_rate: 100.0,
             default_depth: None,
             clock: ClockSpec::Wall,
+            namespace: None,
         },
         artifacts: Vec::new(),
+        states: Vec::new(),
         systems: vec![SystemSpec {
             name: "nav".into(),
             ty: Some("NavFilter".into()),
@@ -493,6 +495,7 @@ fn err_static_system_with_typed_params() {
             process: false,
             src: None,
             scope: None,
+            attach: None,
         }],
         slots: Vec::new(),
         edges: Vec::new(),
@@ -840,37 +843,49 @@ async fn pack_entry_defaults_overlay_value_overrides() {
     );
 }
 
-/// The TCP built-ins' specs carry their `addr` as a `Value` tree, and the
-/// variant survives a serde round-trip of the spec.
+/// The link built-ins' specs carry their params as `Value` trees, and the
+/// variant survives a serde round-trip of each spec.
 #[test]
 fn builtin_link_specs_carry_value_params() {
-    let spec =
-        crate::wiring::SystemSpec::tcp_downlink("telemetry", "127.0.0.1:2240".parse().unwrap());
-    match &spec.params {
+    let state =
+        crate::wiring::StateSpec::tcp_server("link", "127.0.0.1:2240".parse().unwrap());
+    match &state.params {
         ParamSource::Value(v) => {
             assert_eq!(v, &serde_json::json!({ "addr": "127.0.0.1:2240" }))
         }
         other => panic!("expected ParamSource::Value, got {other:?}"),
     }
+    let json = serde_json::to_string(&state).expect("serialize");
+    let back: crate::wiring::StateSpec = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, state, "state Value params round-trip");
+
+    let spec = crate::wiring::SystemSpec::uplink("uplink", &["SequenceCommand"]);
+    match &spec.params {
+        ParamSource::Value(v) => {
+            assert_eq!(v, &serde_json::json!({ "msgs": ["SequenceCommand"] }))
+        }
+        other => panic!("expected ParamSource::Value, got {other:?}"),
+    }
     let json = serde_json::to_string(&spec).expect("serialize");
     let back: crate::wiring::SystemSpec = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back, spec, "Value params round-trip");
+    assert_eq!(back, spec, "system Value params round-trip");
 }
 
-/// Both built-ins resolve and run from their `Value` params: the
-/// `SocketAddr` reads from the JSON string and the subset/msgs fields fall
-/// back to their serde defaults.
+/// The whole link pack resolves and runs from its `Value` params: the state
+/// constructs from the JSON `addr` string (an ephemeral port here), the
+/// attached systems find it, and the subset/msgs fields fall back to their
+/// serde defaults.
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn builder_telemetry_and_uplink_resolve_from_value_params() {
+async fn builder_serve_and_uplink_resolve_from_value_params() {
     let wiring = WiringBuilder::new()
         .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.001 })
         .system("imu")
         .ty("ImuDriver")
         .params_value(serde_json::json!({ "i2c_bus": 1, "sample_hz": 200.0 }))
         .end()
-        .telemetry("127.0.0.1:59422".parse().unwrap())
-        .uplink("127.0.0.1:59423".parse().unwrap())
+        .uplink(["SequenceCommand"])
+        .serve("127.0.0.1:0".parse().unwrap())
         .build();
     let mut coord = resolve(&wiring, &registry()).expect("builtins resolve from Value params");
     coord.run_for(5).await;
@@ -947,8 +962,9 @@ fn bundle_manifest_hash_checked_at_load() {
             "metor_fsw_2_dl_fixture",
         )
         .build();
-    if let Err(e) = crate::wiring::build_artifacts(&mut wiring, &crate::BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = crate::wiring::provision_artifacts(&mut wiring, &crate::BuildOptions::default())
+    {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     let so = wiring.artifacts[0].path.clone().expect("path filled");
@@ -962,6 +978,24 @@ fn bundle_manifest_hash_checked_at_load() {
     write_bundle(&wiring, &PackageOptions::default(), &dir).expect("write the bundle");
     load_bundle(&dir).expect("a matching bundle loads (hash verified)");
 
+    // meta.json records the flight provenance: source kind, the exact copied
+    // bytes' sha256, and the recorded manifest hash.
+    let meta: crate::wiring::BundleMeta =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap())
+            .expect("meta.json parses");
+    assert_eq!(meta.packs.len(), 1);
+    let pack = &meta.packs[0];
+    assert_eq!(pack.artifact_id, "fixture");
+    assert_eq!(pack.source, crate::wiring::PackSourceKind::CrateBuilt);
+    assert_eq!(pack.manifest_hash, wiring.artifacts[0].manifest_hash);
+    let member = crate::wiring::cdylib_file_name(&wiring.artifacts[0].lib);
+    let copied = std::fs::read(dir.join(member)).unwrap();
+    assert_eq!(
+        pack.cdylib_sha256,
+        super::stubgen::manifest_hash(&copied),
+        "provenance digests the bytes actually in the bundle"
+    );
+
     let wiring_path = dir.join(crate::wiring::WIRING_FILE_NAME);
     let wiring_bytes = std::fs::read(&wiring_path).unwrap();
     let mut changed = wiring_bytes.clone();
@@ -974,7 +1008,8 @@ fn bundle_manifest_hash_checked_at_load() {
     std::fs::write(&wiring_path, wiring_bytes).unwrap();
 
     // Tamper the copied sidecar: the load-time hash check now refuses it.
-    let copied_sidecar = crate::dl::manifest_sidecar_path(&dir.join(&wiring.artifacts[0].cdylib));
+    let member = crate::wiring::cdylib_file_name(&wiring.artifacts[0].lib);
+    let copied_sidecar = crate::dl::manifest_sidecar_path(&dir.join(member));
     std::fs::write(&copied_sidecar, b"tampered").expect("overwrite the sidecar");
     let err = load_bundle(&dir).expect_err("a tampered sidecar is refused");
     assert!(
@@ -1009,8 +1044,9 @@ fn metor_archive_round_trips_and_is_reproducible() {
             "metor_fsw_2_dl_fixture",
         )
         .build();
-    if let Err(e) = crate::wiring::build_artifacts(&mut wiring, &crate::BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = crate::wiring::provision_artifacts(&mut wiring, &crate::BuildOptions::default())
+    {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
 
@@ -1039,9 +1075,22 @@ fn metor_archive_round_trips_and_is_reproducible() {
         .expect("artifact path filled");
     assert!(path.exists(), "the unpacked .so is a real file for dlopen");
     assert!(
-        path.file_name().and_then(|n| n.to_str()) == Some(&wiring.artifacts[0].cdylib),
+        path.file_name().and_then(|n| n.to_str())
+            == Some(crate::wiring::cdylib_file_name(&wiring.artifacts[0].lib).as_str()),
         "unpacked under the cdylib name"
     );
+}
+
+/// A pre-provenance `meta.json` (no `packs` field) still deserializes — old
+/// bundles keep loading.
+#[test]
+fn bundle_meta_without_packs_deserializes() {
+    let meta: crate::wiring::BundleMeta = serde_json::from_str(
+        r#"{ "abi_version": 8, "target": null, "profile": "debug",
+             "built_at_unix": 0, "ir_sha256": "sha256:00" }"#,
+    )
+    .expect("old meta.json deserializes");
+    assert!(meta.packs.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,7 +1106,7 @@ fn wiring_json_without_provenance_fields_deserializes() {
         r#"{{
         "ir_version": {IR_VERSION},
         "coordinator": {{ "cycle_rate": 100.0, "default_depth": null, "clock": "Wall" }},
-        "artifacts": [{{ "id": "plant", "crate_name": "adcs-plant", "cdylib": "libadcs_plant.so", "path": null }}],
+        "artifacts": [{{ "id": "plant", "crate_name": "adcs-plant", "lib": "adcs_plant", "path": null }}],
         "systems": [{{ "name": "a", "ty": "Src", "artifact": null, "params": "None" }}],
         "slots": [{{ "name": "adcs", "inputs": [], "outputs": [],
                      "allow": [{{ "occupant": "ctrl", "params": "None" }}], "initial": null }}],
@@ -1187,8 +1236,10 @@ fn bare_wiring() -> Wiring {
             cycle_rate: 100.0,
             default_depth: None,
             clock: ClockSpec::Wall,
+            namespace: None,
         },
         artifacts: Vec::new(),
+        states: Vec::new(),
         systems: Vec::new(),
         slots: Vec::new(),
         edges: Vec::new(),
@@ -1205,6 +1256,7 @@ fn static_system(name: &str, ty: Option<&str>) -> SystemSpec {
         process: false,
         src: None,
         scope: None,
+        attach: None,
     }
 }
 
@@ -1270,8 +1322,10 @@ fn validate_rejects_duplicate_artifact_ids() {
     let art = |id: &str| Artifact {
         id: id.into(),
         crate_name: "c".into(),
-        cdylib: "libc.so".into(),
+        lib: "c".into(),
         path: None,
+        prebuilt_dir: None,
+        dist: None,
         manifest_hash: None,
         src: None,
     };
@@ -1462,4 +1516,435 @@ fn builder_panics_on_initial_outside_allow() {
         .allow("a")
         .initial("b", SlotInitState::Loaded)
         .end();
+}
+
+// ---------------------------------------------------------------------------
+// Pack-shared states through the wiring: the states pass, its failure
+// modes, and the unused-state gate.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+struct TestLinkParams {
+    tag: f64,
+}
+
+#[derive(Default)]
+struct TestLink {
+    tag: f64,
+}
+
+impl crate::SharedLifecycle for TestLink {}
+
+static STATE_TAG_SEEN: AtomicU64 = AtomicU64::new(0);
+
+fn observe(s: &mut TestLink, _now: Timestamp) {
+    STATE_TAG_SEEN.store(s.tag.to_bits(), Relaxed);
+}
+
+/// A registry whose one pack declares a shared state and an attached entry;
+/// `fail_init` makes the state's init report a construction failure.
+fn link_registry(fail_init: bool) -> Registry {
+    let mut pack = crate::Pack::new();
+    let link = pack.shared_state("TestLink", move |p: TestLinkParams| {
+        if fail_init {
+            Err("address in use".to_string())
+        } else {
+            Ok(TestLink { tag: p.tag })
+        }
+    });
+    let pack = pack.system("Watcher", crate::system(observe).shared(&link));
+    let mut r = Registry::new();
+    r.register_pack(pack);
+    r
+}
+
+/// The happy path: the states pass constructs the instance from its own
+/// value params, the attached system resolves, and the run observes the
+/// constructed state.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn state_constructs_and_attached_system_runs() {
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Wall)
+        .state_value("link", "TestLink", serde_json::json!({ "tag": 3.5 }))
+        .system("watch")
+        .ty("Watcher")
+        .end()
+        .build();
+    let mut coord = resolve(&wiring, &link_registry(false)).expect("states resolve");
+    coord.run_for(2).await;
+    assert_eq!(f64::from_bits(STATE_TAG_SEEN.load(Relaxed)), 3.5);
+    assert!(coord.stopped().is_empty());
+}
+
+#[test]
+fn err_unknown_state_type() {
+    let wiring = WiringBuilder::new()
+        .state_value("link", "Nope", serde_json::json!({}))
+        .build();
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected UnknownStateType"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::UnknownStateType { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_state_init_failure_is_a_load_error() {
+    let wiring = WiringBuilder::new()
+        .state_value("link", "TestLink", serde_json::json!({ "tag": 1.0 }))
+        .system("watch")
+        .ty("Watcher")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &link_registry(true)) {
+        Ok(_) => panic!("expected StateInit"),
+        Err(e) => e,
+    };
+    match &err.kind {
+        LoadErrorKind::StateInit { message, .. } => {
+            assert!(message.contains("address in use"), "{message}")
+        }
+        other => panic!("expected StateInit, got {other:?}"),
+    }
+}
+
+#[test]
+fn err_state_declared_but_unattached() {
+    let wiring = WiringBuilder::new()
+        .state_value("link", "TestLink", serde_json::json!({ "tag": 1.0 }))
+        .build();
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected StateUnused"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::StateUnused { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_attached_system_without_state_declaration() {
+    let wiring = WiringBuilder::new()
+        .system("watch")
+        .ty("Watcher")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected PackCreate"),
+        Err(e) => e,
+    };
+    match &err.kind {
+        LoadErrorKind::PackCreate { message, .. } => assert!(
+            message.contains("no wiring declaration constructs"),
+            "{message}"
+        ),
+        other => panic!("expected PackCreate, got {other:?}"),
+    }
+}
+
+#[test]
+fn err_duplicate_state_declaration() {
+    let mut wiring = bare_wiring();
+    for name in ["link", "link"] {
+        wiring.states.push(crate::wiring::StateSpec {
+            name: name.into(),
+            ty: "TestLink".into(),
+            params: ParamSource::None,
+            src: None,
+        });
+    }
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected DuplicateState"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::DuplicateState { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_state_with_postcard_params() {
+    let mut wiring = bare_wiring();
+    wiring.states.push(crate::wiring::StateSpec {
+        name: "link".into(),
+        ty: "TestLink".into(),
+        params: ParamSource::Postcard(vec![1, 2, 3]),
+        src: None,
+    });
+    let err = match resolve(&wiring, &link_registry(false)) {
+        Ok(_) => panic!("expected StateInit"),
+        Err(e) => e,
+    };
+    assert!(matches!(err.kind, LoadErrorKind::StateInit { .. }), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// By-name attach: a shared-state system names its state, resolved against the
+// built-in link pack (`Downlink`/`Uplink` bind `TcpServer` by name).
+// ---------------------------------------------------------------------------
+
+/// A shared-state system (the built-in `Downlink`) with no `attach` is a
+/// hard error — the by-type magic is gone, so nothing binds it implicitly.
+#[test]
+fn err_shared_system_without_attach() {
+    let wiring = WiringBuilder::new()
+        .serve("127.0.0.1:0".parse().unwrap())
+        .system("dl")
+        .ty("Downlink")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected MissingAttach"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::MissingAttach { .. }),
+        "{err:?}"
+    );
+}
+
+/// An `attach` naming no declared state is caught structurally, in validate.
+#[test]
+fn err_attach_unknown_state() {
+    // Built via the struct directly: the builder's `end()` would panic on the
+    // same validate error, so drive `resolve` (which runs validate) instead.
+    let mut wiring = bare_wiring();
+    wiring.states.push(crate::wiring::StateSpec::tcp_server(
+        "link",
+        "127.0.0.1:0".parse().unwrap(),
+    ));
+    let mut dl = crate::wiring::SystemSpec::downlink("dl");
+    dl.attach = Some("ghost".into());
+    wiring.systems.push(dl);
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected AttachUnknownState"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::AttachUnknownState { .. }),
+        "{err:?}"
+    );
+}
+
+/// A plain (non-shared) system given an `attach` is rejected: attachment is
+/// only for a system type that declares shared state.
+#[test]
+fn err_attach_on_non_shared_system() {
+    let wiring = WiringBuilder::new()
+        .serve("127.0.0.1:0".parse().unwrap())
+        .system("nav")
+        .ty("NavFilter")
+        .params_value(serde_json::json!({ "gain": 1.0 }))
+        .attach("link")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected AttachOnNonSharedSystem"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::AttachOnNonSharedSystem { .. }),
+        "{err:?}"
+    );
+}
+
+/// An `attach` naming a state of the wrong type is a clean mismatch: the
+/// `Downlink` binds `LinkState`, but this state is a `TestLink`.
+#[test]
+fn err_attach_type_mismatch() {
+    // Built-ins (so `Downlink` is registered) plus a pack declaring an
+    // unrelated shared state type.
+    let mut r = registry();
+    let mut pack = crate::Pack::new();
+    let _tl = pack.shared_state("TestLink", |p: TestLinkParams| {
+        Ok::<_, String>(TestLink { tag: p.tag })
+    });
+    // An attacher keeps the state from tripping the unused-state check first.
+    let pack = pack.system("watch", crate::system(observe).shared(&_tl));
+    r.register_pack(pack);
+
+    let mut wiring = bare_wiring();
+    wiring.states.push(crate::wiring::StateSpec::tcp_server(
+        "link",
+        "127.0.0.1:0".parse().unwrap(),
+    ));
+    wiring.states.push(crate::wiring::StateSpec {
+        name: "other".into(),
+        ty: "TestLink".into(),
+        params: ParamSource::Value(serde_json::json!({ "tag": 1.0 })),
+        src: None,
+    });
+    // `Downlink` binds `LinkState`, but `other` is a `TestLink`.
+    let mut dl = crate::wiring::SystemSpec::downlink("dl");
+    dl.attach = Some("other".into());
+    wiring.systems.push(dl);
+    // Keep `link` attached so we reach the mismatch, not the unused check.
+    wiring.systems.push(crate::wiring::SystemSpec::uplink("uplink", &[]));
+
+    let err = match resolve(&wiring, &r) {
+        Ok(_) => panic!("expected AttachTypeMismatch"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::AttachTypeMismatch { .. }),
+        "{err:?}"
+    );
+}
+
+/// A serialized `Wiring` predating the `states` field deserializes with an
+/// empty list, and a declared state round-trips through JSON.
+#[test]
+fn states_field_serde_defaults_and_round_trips() {
+    let mut json = serde_json::to_value(bare_wiring()).expect("serialize");
+    json.as_object_mut().expect("object").remove("states");
+    let back: Wiring = serde_json::from_value(json).expect("deserialize without states");
+    assert!(back.states.is_empty());
+
+    let wiring = WiringBuilder::new()
+        .state_value("link", "TestLink", serde_json::json!({ "tag": 2.0 }))
+        .build();
+    let json = serde_json::to_string(&wiring).expect("serialize");
+    let back: Wiring = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, wiring, "state specs round-trip");
+}
+
+// ---------------------------------------------------------------------------
+// The link server end to end through the wiring: resolve from the builder,
+// stream to a real client, and take a command back — the full round trip a
+// ground tool makes.
+// ---------------------------------------------------------------------------
+
+static E2E_CMDS: AtomicU64 = AtomicU64::new(0);
+
+struct SeqSink;
+
+#[derive(SystemInput)]
+struct SeqSinkIn {
+    commands: crate::MsgIn<metor_proto_wkt::SequenceCommand>,
+}
+
+impl System for SeqSink {
+    type Input = SeqSinkIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "seq_sink";
+}
+
+impl CyclicSystem for SeqSink {
+    fn execute(&mut self, _now: Timestamp, input: &mut SeqSinkIn, _o: &mut Self::Output) {
+        input
+            .commands
+            .drain(|_| {
+                E2E_CMDS.fetch_add(1, Relaxed);
+            })
+            .unwrap();
+    }
+}
+
+impl BuildSystem for SeqSink {
+    type Params = ();
+    fn new(_params: Self::Params) -> Self {
+        SeqSink
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn link_server_end_to_end_through_the_wiring() {
+    use metor_proto::types::IntoLenPacket;
+    use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    E2E_CMDS.store(0, Relaxed);
+
+    // The builtin link pack, assembled here rather than via `with_builtins`
+    // so the test keeps the token (the resolved state's bound port is only
+    // reachable through it).
+    let mut r = Registry::new();
+    let mut pack = crate::Pack::new();
+    let link = pack.shared_state("TcpServer", |p: crate::LinkParams| {
+        crate::LinkState::bind(p.addr)
+    });
+    let pack = pack
+        .system_type_shared::<crate::TelemetrySystem, crate::LinkState>("Downlink", |p, link| {
+            <crate::TelemetrySystem as BuildSystem>::new(p).attach(link)
+        })
+        .system_type_shared::<crate::UplinkSystem, crate::LinkState>("Uplink", |p, link| {
+            <crate::UplinkSystem as BuildSystem>::new(p).attach(link)
+        });
+    r.register_pack(pack);
+    r.register::<MsgSrc, _>("MsgSrc");
+    r.register::<SeqSink, _>("SeqSink");
+    r.register_msg::<SequenceCommand>();
+
+    // Wall clock: the loop's inter-cycle sleeps are what let the io reactor
+    // serve the sockets during the run.
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Wall)
+        .uplink(["SequenceCommand"])
+        .system("src")
+        .ty("MsgSrc")
+        .end()
+        .system("sink")
+        .ty("SeqSink")
+        .end()
+        .connect_msg("uplink", "sink", "SequenceCommand")
+        .serve("127.0.0.1:0".parse().unwrap())
+        .build();
+    let mut coord = resolve(&wiring, &r).expect("the link mission resolves");
+    let addr = link.get().local_addr();
+
+    // A real ground client: read the stream, and answer the first packet
+    // (the announce replay's head) with one uplinked command.
+    let received = Rc::new(Cell::new(0u64));
+    let counted = received.clone();
+    let client = stellarator::spawn(async move {
+        use stellarator::io::{AsyncWrite, SplitExt};
+        let stream = stellarator::net::TcpStream::connect(addr)
+            .await
+            .expect("connect");
+        let (rx, tx) = stream.split();
+        let mut packets = metor_proto_stellar::PacketStream::new(rx);
+        let mut buf = vec![0u8; 1024];
+        let mut sent = false;
+        loop {
+            let Ok(pkt) = packets.next_grow(buf).await else {
+                return;
+            };
+            counted.set(counted.get() + 1);
+            if !sent {
+                let cmd = SequenceCommand {
+                    channel: "adcs".to_string(),
+                    command: SequenceCommandKind::Start,
+                };
+                tx.write_all(cmd.into_len_packet().inner)
+                    .await
+                    .0
+                    .expect("send the command");
+                sent = true;
+            }
+            buf = pkt.into_buf().into_inner();
+        }
+    })
+    .drop_guard();
+
+    coord.run_for(300).await;
+    drop(client);
+
+    assert!(
+        E2E_CMDS.load(Relaxed) >= 1,
+        "the client's command crossed the link into the sink"
+    );
+    assert!(
+        received.get() > 10,
+        "the client received the replay and a live stream: {} packets",
+        received.get()
+    );
+    assert!(coord.stopped().is_empty());
 }

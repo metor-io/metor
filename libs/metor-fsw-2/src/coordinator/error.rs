@@ -4,8 +4,8 @@ use crate::descriptor::{Hz, PortId};
 
 use super::NAME_CAP;
 
-/// A defect in the declared graph, reported by [`build`](super::init::InitGraph::build)
-/// before any byte flows.
+/// A defect in the declared graph, reported during graph build before any
+/// byte flows.
 ///
 /// Not `Eq`: [`InvalidCycleRate`](WireError::InvalidCycleRate) carries the
 /// offending `f64` rate so the message can name it.
@@ -76,8 +76,8 @@ pub enum WireError {
     /// between two cyclic systems. The step loop runs in registration order,
     /// so the consumer would execute before its producer every cycle and
     /// permanently read the previous cycle's value, exactly the staleness
-    /// [`connect_delayed`](super::init::InitGraph::connect_delayed) exists to make
-    /// explicit. Fix by registering the producer before the consumer, or
+    /// `connect_delayed` exists to make explicit. Fix by registering the
+    /// producer before the consumer, or
     /// declare the one-cycle delay with `connect_delayed`. Log edges are
     /// exempt, as are edges touching an async endpoint (async systems run off
     /// the copy-in step or their own task, not the registration-ordered loop).
@@ -89,11 +89,12 @@ pub enum WireError {
         consumer: String,
         port: PortId,
     },
-    /// The configured `cycle_rate` cannot pace a [`Wall`](ClockMode::Wall)
+    /// The configured `cycle_rate` cannot pace a
+    /// [`Wall`](crate::ClockMode::Wall)
     /// clock. It must be finite and positive to become a per-cycle `Duration`
     /// budget; a zero, negative, NaN, or infinite rate would panic in
     /// `Duration::from_secs_f64` at run time. A
-    /// [`Simulated`](ClockMode::Simulated) clock ignores the rate, so it is not
+    /// [`Simulated`](crate::ClockMode::Simulated) clock ignores the rate, so it is not
     /// validated there.
     #[error("cycle_rate {rate} cannot pace a Wall clock — it must be finite and positive")]
     InvalidCycleRate { rate: Hz },

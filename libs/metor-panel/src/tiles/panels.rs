@@ -11,14 +11,15 @@ use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
 use crate::views::time_series::{
-    LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, TimeFormat, Trace, YAxis,
+    EventOverlay, LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, TimeFormat, Trace,
+    YAxis,
 };
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, SequenceGrid,
-    SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_browser,
-    new_component_table, new_data_table,
+    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, LevelFilter, LogView,
+    SequenceGrid, SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
+    new_component_browser, new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -129,6 +130,76 @@ impl PaneItem for AlarmPanel {
     fn to_config(&self, cx: &App) -> AlarmPanelConfig {
         AlarmPanelConfig {
             show_history: self.inner.read(cx).is_history(),
+        }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into())
+    }
+}
+
+/// Persisted shape of a [`LogPanel`]: the view's filters and follow mode.
+#[derive(facet::Facet)]
+pub struct LogPanelConfig {
+    pub min_level: LevelFilter,
+    pub source: String,
+    pub follow: bool,
+}
+
+impl Default for LogPanelConfig {
+    fn default() -> Self {
+        Self {
+            min_level: LevelFilter::default(),
+            source: String::new(),
+            follow: true,
+        }
+    }
+}
+
+/// Pane item streaming the flight software's log lines.
+pub struct LogPanel {
+    inner: Entity<LogView>,
+}
+
+impl LogPanel {
+    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(LogView::new);
+        Self { inner }
+    }
+
+    pub fn from_config(cfg: LogPanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| {
+            let mut view = LogView::new(cx);
+            view.set_filters(cfg.min_level, cfg.source, cfg.follow);
+            view
+        });
+        Self { inner }
+    }
+}
+
+impl Render for LogPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for LogPanel {
+    type Config = LogPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("Logs")
+    }
+
+    fn serialization_key() -> &'static str {
+        "logs"
+    }
+
+    fn to_config(&self, cx: &App) -> LogPanelConfig {
+        let view = self.inner.read(cx);
+        LogPanelConfig {
+            min_level: view.min_level,
+            source: view.source.clone(),
+            follow: view.follow,
         }
     }
 
@@ -636,6 +707,20 @@ pub struct PlotPanelConfig {
     /// Suppress the alarm out-of-bounds background tint on this plot. Stored
     /// inverted so the default (and old layouts) show it.
     pub hide_alarm_color: bool,
+    /// Event-flag overlays drawn in the plot's top gutter. Additive — old
+    /// layouts deserialize to empty (the feature is simply off).
+    pub event_overlays: Vec<EventOverlayConfig>,
+}
+
+/// Persisted shape of one [`EventOverlay`]. The live overlay is held as an
+/// `Entity<EventOverlay>`, and its `key` isn't `Facet`-serializable, so the
+/// key is stored as its stable string tag.
+#[derive(facet::Facet, Default, Clone)]
+pub struct EventOverlayConfig {
+    /// `"logs" | "alarms" | "sequences" | "msg:e03c"` (lowercase hex, no sep).
+    pub kind: String,
+    pub label: String,
+    pub visible: bool,
 }
 
 /// Serializable shape of [`PanelPosition`].
@@ -825,6 +910,16 @@ impl PlotPanel {
                     .map(|a| cx.new(|_| YAxis::from(a.clone())))
                     .collect();
             }
+            // Unparseable kinds are dropped silently (a removed built-in, or a
+            // corrupt hex id).
+            lp.event_overlays = cfg
+                .event_overlays
+                .iter()
+                .filter_map(|o| {
+                    let key = crate::plot_events::kind_key_from_string(&o.kind)?;
+                    Some(cx.new(|_| EventOverlay::new(o.label.clone(), key)))
+                })
+                .collect();
             cx.notify();
         });
         if !cfg.cursors.is_empty() {
@@ -910,6 +1005,18 @@ impl PaneItem for PlotPanel {
             measurement_panel,
             hide_alarm_limits: !lp.show_alarm_limits,
             hide_alarm_color: !lp.show_alarm_color,
+            event_overlays: lp
+                .event_overlays
+                .iter()
+                .map(|o| {
+                    let o = o.read(cx);
+                    EventOverlayConfig {
+                        kind: crate::plot_events::kind_key_to_string(o.key),
+                        label: o.label.to_string(),
+                        visible: o.visible,
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1667,6 +1774,18 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
+    rows.push(Box::new(CommandRow::new("Logs", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| LogPanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
     rows.push(Box::new(CommandRow::new("Sequences", {
         let db = db.clone();
         let pane = pane.clone();
@@ -1806,10 +1925,30 @@ mod tests {
             measurement_panel: Default::default(),
             hide_alarm_limits: false,
             hide_alarm_color: false,
+            event_overlays: vec![
+                EventOverlayConfig {
+                    kind: "alarms".into(),
+                    label: "Alarms".into(),
+                    visible: true,
+                },
+                EventOverlayConfig {
+                    kind: "msg:e03c".into(),
+                    label: "Widget".into(),
+                    visible: false,
+                },
+            ],
         };
         let s = facet_json::to_string(&plot).unwrap();
         let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
         assert_eq!(back.label, "speed");
+        assert_eq!(back.event_overlays.len(), 2);
+        assert_eq!(back.event_overlays[1].kind, "msg:e03c");
+        assert!(!back.event_overlays[1].visible);
+        // The stored kind parses back to the same key.
+        assert_eq!(
+            crate::plot_events::kind_key_from_string(&back.event_overlays[1].kind),
+            Some(crate::plot_events::EventKindKey::Msg([0xe0, 0x3c]))
+        );
         assert_eq!(back.traces[0].axis_index, 1);
         assert_eq!(back.axes.len(), 2);
         assert_eq!(back.axes[1].label, "rpm");

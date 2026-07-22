@@ -1,266 +1,213 @@
-# Design — cross-process systems
+# Process systems and process slots
 
-> **Status: implemented** (2026-07-08). Built as planned in
-> `docs/process-systems-plan.md` W1–W8; the two deltas from this document are
-> noted inline (§5 worker-exe override, §7 builder signature).
->
-> **Pack update (2026-07-11, `docs/packs.md`):** the single-system dl ABI this rode on
-> became the pack ABI v5. The protocol here is unchanged, but the artifact surface moved:
-> a describe worker's output bytes are now the **pack manifest** (`PackManifestMsg`, every
-> entry's descriptor), `WorkerManifest::Run` carries the pack **entry name** the worker
-> resolves after its own `DlPack::open`, and the lifecycle symbols are the `fsw_pack_*`
-> family. The prose below keeps the pre-pack names where it narrates the design; §1, §4,
-> and §5 have been updated to the shipped spellings.
+A process system runs a pack entry outside the coordinator process. It uses the
+same pack ABI and the same ring data as an in-process loaded system.
 
-Systems currently run in one process, statically linked or dlopen'd. This design adds a third
-mode: a system running in its **own OS process**, exchanging frames with the rest of the graph
-over the same shared-memory rings. Nothing about the existing modes changes; a mission mixes all
-three freely.
+If the worker crashes, panics, or misses a deadline, the coordinator can report
+the fault and keep running other systems. Process mode adds startup cost and
+worker cleanup, so it is a choice for systems that need this isolation.
 
-The one-sentence shape: **a process system is a dlopen system whose `dlopen` happens in a worker
-process, with mmap-backed rings for data and a futex doorbell for stepping.**
+A process slot applies the same isolation to a runtime-selected occupant. Each
+load starts a new worker for the selected entry.
 
-## 1. What already carries over
+Use process mode when a system must not share the coordinator's address space.
+The main reasons are fault isolation and a clear step deadline. Keep a system
+in process when low start cost and simple cleanup matter more.
 
-The design leans on properties the tree already has:
+## Use process mode
 
-- The ring region is offset-addressed with no process-local pointers, validated on attach
-  (magic/version/arch tag), and the `mmap` feature (`RingBuffer::create_mmap` /
-  `attach_mmap`) already produces cross-process-capable regions. Two processes mapping the same
-  file at different base addresses run the identical atomic protocol.
-- The writer claim lives in the region, so single-writer is already enforced cross-process.
-- The dl ABI (`src/abi`) already reduces a system to serialized bytes plus `(base, len, role)`
-  ring handles, binds positionally in descriptor order, and runs every wake endpoint as `NoWake`
-  because cyclic systems poll their inputs each step. None of that changes: the worker process
-  runs the **same** `DlPack::open` / `fsw_pack_create` / `fsw_pack_bind_init` /
-  `fsw_pack_execute` lifecycle against the same cdylib artifact, just with regions it
-  `attach_mmap`ed itself.
-- Wiring, validation, ring sizing, params encoding, the registry, and telemetry are all
-  descriptor-driven and never touch the system instance. The descriptor already crosses an
-  untrusted boundary as postcard bytes (`SystemDescriptorMsg`), and `into_descriptor()`
-  reconstructs it host-side with no static types — so the same bytes can arrive over a process
-  boundary instead of the C ABI, and the host validates/wires exactly like a dl system.
+Set `process=True` when adding a system from a pack:
 
-So the new machinery is exactly three things: a cross-process wake primitive, a per-worker
-control block that steps the system in lockstep with the cycle, and the launch/attach/teardown
-plumbing around a worker process.
-
-One isolation rule holds throughout: **the host never dlopens a process system's artifact.**
-Everything the host needs from the foreign code — the descriptor and the params schema — arrives
-as serialized bytes from a short-lived worker run (§5), so load-time constructors, `describe`,
-and every later lifecycle call all execute outside the coordinator's address space. A process
-system's fault isolation covers its whole lifecycle, not just the steady state.
-
-## 2. The wake backend — and why not the `atomic-wait` crate
-
-The step protocol needs "wait until this shared `AtomicU32` changes / wake the waiter", i.e. a
-futex. The `atomic-wait` crate has exactly the right API, but **it is process-private on every
-platform** (verified against `atomic-wait` 1.1.0 sources):
-
-- Linux: `FUTEX_WAIT | FUTEX_PRIVATE_FLAG` — the kernel keys private futexes by
-  `(mm, uaddr)`, so a waiter and a waker in different processes never match, even on the same
-  `MAP_SHARED` page.
-- macOS: libc++'s `__libcpp_atomic_monitor`/`__libcpp_atomic_wait`, whose contention table is a
-  per-process static.
-- Windows/FreeBSD: `WaitOnAddress` / `UMTX_OP_*_PRIVATE`, both documented process-local.
-
-We therefore keep `atomic-wait`'s API **shape** but implement the shared-memory variants
-ourselves, as a small `wake` module in the ring crate (feature `futex`, no new deps beyond
-`libc`):
-
-```rust
-pub fn wait(a: &AtomicU32, expected: u32);
-pub fn wait_timeout(a: &AtomicU32, expected: u32, timeout: Duration) -> WaitOutcome; // Woken | TimedOut
-pub fn wake_one(a: &AtomicU32);
-pub fn wake_all(a: &AtomicU32);
+```python
+plant = m.add("plant", Plant(seed=4), process=True)
 ```
 
-- **Linux**: `SYS_futex` with plain `FUTEX_WAIT`/`FUTEX_WAKE` (no private flag), which is keyed
-  by the underlying page and works across processes on a shared mapping.
-- **macOS**: `os_sync_wait_on_address{,_with_timeout}` / `os_sync_wake_by_address_{any,all}`
-  with the `SHARED` flag — the public futex API since macOS 14.4. We require 14.4+ for process
-  systems (the older `__ulock_*` shared ops are a private-API fallback we do not take).
-- Other targets: the module is `cfg`'d out and process systems fail to resolve with a clean
-  error.
+The system keeps the same params, ports, and place in the cycle. The host runs
+its pack entry in a worker instead of loading it into the coordinator process.
 
-Spurious wakeups are allowed (as in `atomic-wait`); every caller re-checks its predicate in a
-loop. The module is excluded from Miri (syscalls); its protocol users are tested with threads,
-which shared futexes also support.
+The system must come from an artifact. A static registry system has no pack
+library for a worker to open.
 
-The ring's per-ring `wake_word` / `FLAG_WAKE_SHARED` reservation stays reserved. Cyclic-only
-process systems need no per-ring wake (all dl wake endpoints are `NoWake`); the doorbell lives in
-the control block instead. Per-ring shared wakes become interesting only with cross-process
-*async* systems, which are out of scope (§8).
+## Platform support
 
-## 3. Data path: which rings become mmap
+Process mode needs a wait primitive that works across processes. It is built on
+Linux and macOS. macOS hosts need 14.4 or later.
 
-At `build()`, a ring is allocated with `create_mmap` instead of heap iff it crosses a process
-boundary: **every output ring of a process system** (including its implicit health/log), and
-**every output ring some process system consumes over an edge**. Everything else stays heap.
-In-process consumers of an mmap ring (telemetry views, other systems' inputs) use the
-coordinator's own mapping — a ring handle is backing-erased, so nothing downstream can tell.
+Other targets keep `proc::worker_entry()` as a no-op. A graph with a process
+system fails at build time.
 
-Ring files live in a per-run session directory — `/dev/shm` when present, else the OS temp dir —
-named `metor-fsw-<pid>-<n>/`, one `<instance>.<port>.ring` per shared ring plus one
-`<instance>.ctl` control file per worker. The coordinator owns the directory and removes it
-best-effort on drop; regions are ephemeral IPC state, never archives.
+## Worker entry point
 
-## 4. The control block and the step protocol
+The framework re-runs the host executable as its worker. Any binary that embeds
+the framework and uses process mode must call this first:
 
-One small mmap file per worker, `#[repr(C)]`, following the ring's header discipline
-(magic/version/arch-tag validated on attach; all mutable words atomic):
-
-```text
-CtlBlock {
-    magic, version, arch_tag,          // immutable, written by the host before spawn
-    state:    AtomicU32,  // lifecycle handshake (also its own futex word)
-    doorbell: AtomicU32,  // step sequence, host-incremented
-    ack:      AtomicU32,  // last step sequence the worker completed
-    status:   AtomicU32,  // raw FswStatus of the last execute (untrusted, from_raw'd)
-    now:      AtomicU64,  // the step's Timestamp tick, written before doorbell
+```rust
+fn main() {
+    metor_fsw_2::proc::worker_entry();
+    // normal host setup
 }
 ```
 
-Lifecycle over `state` (each transition wakes the word): host spawns the worker at `build()`
-with `state = Booting`; the worker maps everything, dlopens, runs `fsw_pack_create`, and reports
-`Attached`. `ProcSlot::init` (the coordinator's init barrier) requests `InitReq`; the worker runs
-`fsw_pack_bind_init` (binding claims its ring roles and runs the driver's init) and reports
-`Ready`. Shutdown is `ShutdownReq` → worker runs `fsw_pack_shutdown`/`fsw_pack_destroy`
-(releasing its ring roles), reports `Done`, and exits. Any worker-side failure latches `Failed`
-plus a status code.
+When `METOR_FSW_WORKER` is not set, the call returns at once. When it is set,
+the call reads the worker manifest, runs worker mode, and exits without running
+the rest of `main`.
 
-Stepping, in the cycle loop (`ProcSlot::step`, keeping registration-order semantics — downstream
-systems in the same cycle see this system's outputs):
+The `metor-fsw` CLI installs this guard.
 
-- **Host:** store `now` (Release rides the doorbell), increment `doorbell`, `wake_one`; then
-  `wait_timeout(ack, old, deadline)` until `ack == doorbell`.
-- **Worker loop:** `wait(doorbell, last)`; on wake re-check `state` (shutdown?) and `doorbell`;
-  if new, load `now`, run one `fsw_pack_execute` through the existing `DlSlot`, store `status`,
-  store `ack = doorbell`, `wake_one(ack)`.
+## Two worker modes
 
-A missed deadline does **not** stop the loop: the coordinator telemeters a
-`proc_step_timeout` error on its own health (the worker owns the system's health ring, so the
-host cannot write it) and moves on. The sequence protocol makes lateness self-healing — a slow
-worker that wakes later sees only the newest doorbell value, runs once for it, and skipped cycles
-are simply skipped; latest-wins consumers re-serve their pinned records meanwhile. The deadline
-comes from `CoordinatorConfig::proc_step_timeout` (default 100 ms; the wall cycle budget is
-usually far tighter, so a healthy worker never sees it).
+A postcard `WorkerManifest` selects one of two modes.
 
-`FswStatus::Panicked` from the worker maps to `SlotState::Stopped { Panicked }` exactly like a
-dl slot; the worker destroys its state on panic (freeing its reader slots and writer claims,
-same policy as `DlSlot::step`) and exits.
+Describe mode opens a pack, reads its manifest bytes, writes them to a file,
+and exits. The coordinator uses this mode while it resolves a process system.
+The coordinator process does not load that pack.
 
-## 5. The worker process
+Run mode opens a pack entry and drives it until shutdown. Its manifest names
+the artifact, entry, params, instance, control file, input ring files, and
+output ring files.
 
-The worker is not a separate binary: it is **the host executable re-executed** with
-`METOR_FSW_WORKER=<manifest>` in its environment. The framework exposes
+## Shared files
 
-```rust
-metor_fsw_2::proc::worker_entry(); // call first in main(); runs the worker loop and exits if the env var is set
+One coordinator run owns a session directory. It uses `/dev/shm` when that
+directory exists, and the OS temp directory otherwise.
+
+The session contains:
+
+- one mmap file for each shared ring
+- one control file per worker
+- one launch manifest per worker
+- short-lived files used by describe workers
+
+The coordinator removes the session on drop as a best effort.
+
+## Control protocol
+
+The control file holds a fixed header and atomic words. The header has a magic
+value, layout version, and architecture tag.
+
+The host and worker follow this order:
+
+```text
+host                                      worker
+create control, spawn                 -> attach files, open pack, create
+wait for Attached                     <- report Attached
+request Init                           -> bind rings and init
+wait for Ready                        <- report Ready
+send sequence and timestamp           -> execute one step
+wait for matching ack                 <- report status and ack
+request Shutdown                      -> shutdown and destroy
+wait for Done                         <- report Done and exit
 ```
 
-The `metor-fsw` CLI calls it, so the shipped runner supports process systems out of the box; an
-application embedding the framework in its own binary must call it first thing in `main`, and
-this is loudly documented. A missing guard (the child ran the app's main instead) surfaces as a
-clean timeout error naming the guard — at resolve for a describe run, at `build()` for a run
-worker that never reports `Attached` — and the child is killed either way.
-`CoordinatorBuilder::worker_exe` (builder-scoped, so `CoordinatorConfig` stays `Copy`) overrides
-the executable for hosts that want a dedicated worker binary; `CoordinatorBuilder::shm_dir`
-overrides the session root the same way.
+The host sends one timestamp for each coordinator cycle. The worker serves the
+newest sequence it sees and acks that sequence.
 
-The worker has two modes, selected by the manifest:
+If a worker misses several doorbells, it skips old steps. A late ack from an
+old step does not satisfy the next wait.
 
-- **Describe** (at resolve): the manifest names the artifact and an output file. The worker
-  dlopens the artifact, runs `fsw_pack_describe`, writes the raw postcard **pack manifest**
-  bytes (`PackManifestMsg` — one `SystemDescriptorMsg` per entry) to the output file, and
-  exits. The host decodes through the same `decode_pack_manifest` path the dl loader uses —
-  the same untrusted-bytes handling `DlPack::open` applies, just fed from a file instead of a
-  `ByteSink`. This is what keeps the host free of foreign code: it never opens the artifact
-  itself, and one describe run covers every entry the artifact exports. A describe run is
-  bounded by a timeout, and its stderr is captured into the resolve diagnostic on failure.
-- **Run** (at `build()`): the manifest carries the ABI version, instance name, artifact path,
-  the pack **entry name** (`WorkerManifest::Run.system`, resolved by the worker's own
-  `DlPack::open(...).system(name)`), canonical params bytes, the control-file path, and the
-  input/output ring file paths **in descriptor order** — the same positional contract the
-  in-process dl bind uses. The worker maps each ring file (`attach_mmap`), turns its regions
-  into `FswRing` handles, and drives an ordinary `DlSlot`; the maps outlive the slot so the
-  dl teardown-ordering contract holds unchanged.
+## Deadlines
 
-Because each run worker executes the crate's `pack()` in its own address space, process-mode
-entries share no pack state with each other or with the host (`docs/packs.md` §4).
+The first worker attach may take up to 10 seconds. Init may also take up to 10
+seconds. Clean shutdown gets a 1 second grace period before the host kills the
+child.
 
-The two spawns dlopen the artifact twice, in two different (short-lived, then long-lived)
-processes; that is deliberate — resolve can fail for unrelated reasons, and coupling a live
-worker's lifetime to the resolve phase buys nothing.
+Each steady-state step has its own deadline. The default is 100 ms. A live but
+late worker adds a coordinator health error and the main loop continues.
 
-## 6. Liveness and reclamation
+The timeout does not cancel code already running in the child. The next
+doorbell can replace the missed step.
 
-A worker can die abruptly (crash, OOM-kill, operator `kill -9`) while holding a writer claim and
-reader cursors in shared regions. Today nothing reclaims those, and a dead reader's pinned cursor
-would backpressure every upstream producer forever. With real cross-process peers this stops
-being hypothetical, so the ring grows the reclamation the layout already reserved room for:
+## Fixed process system behavior
 
-- Each `ReaderSlot` gains an `owner: AtomicU64` (carved from the existing 48-byte pad), stamped
-  with the claiming process id in `view()`. The writer claim word stores the claimant's pid
-  instead of `1`. Region `VERSION` bumps 2 → 3 (regions are ephemeral; no migration).
-- `unsafe fn RingBuffer::reclaim_owner(pid)` frees every reader slot owned by `pid` (bumping the
-  slot epoch first, per the reserved reclamation discipline) and releases the writer claim if
-  `pid` holds it. The safety contract: the owner process is dead, so none of its stores race.
+Resolve starts a describe worker, checks the returned descriptor, encodes
+params, and adds a process node. The run worker starts when the graph builds.
 
-The host detects death via `Child::try_wait` on every step timeout and at init. On death it
-SIGKILLs (belt and braces), reaps, runs `reclaim_owner` over the worker's rings (its own outputs
-plus its producers' outputs — the host knows the exact set), and marks the slot
-`Stopped { ProcessDied }` (a new `StopReason`). Either way the rest of the mission keeps flowing
-at full rate instead of backpressuring into the dead reader.
+The first spawn blocks until the worker reports `Attached`. Later restarts do
+not block the cycle loop.
 
-**Restart.** A dead worker — or one whose system panicked, which in a worker is fully
-quarantined, unlike the in-process dl path — is respawned up to
-`CoordinatorConfig::proc_max_restarts` times (default 3; `0` restores permanent-stop), each
-attempt after a `proc_restart_backoff` delay (default 500 ms). The respawn pipeline is
-**non-blocking**: it is polled one phase per cycle (backoff → spawn → wait `Attached` → request
-init → wait `Ready`), so a restart never stalls the loop the way the initial blocking spawn at
-`build()` may. The fresh worker re-runs the same on-disk manifest — same ring files, same params
-— and its new views start at the rings' current positions, so records committed during the
-outage are skipped, not replayed. During the outage the slot reports `Stopped` (the transition
-is telemetered like any stop) and clears back to `Running` on recovery; past the budget the stop
-is terminal, like an in-process panic.
+## Restart policy
 
-**Worker telemetry.** The coordinator status frame carries a worker list beside the stopped
-list: one entry per process system with the worker's **pid** (`0` between workers), the restart
-count, and a run-state code (Stopped/Restarting/Running) — this is how telemetry says a system
-runs out-of-process at all. `Coordinator::workers()` is the host-side accessor, and each begun
-restart also bumps a `proc_restart` error (with a warn log naming the instance) on coordinator
-health, beside the `proc_step_timeout` counter.
+A fixed process system can restart after its worker dies or reports a panic.
+The defaults are:
 
-## 7. Wiring surface
+- at most 3 restart attempts
+- 500 ms before each attempt
+- 100 ms for each step ack
 
-A process system is an artifact-backed `system` node with one new property:
+`ResolveOptions` can change the worker executable, session root, step timeout,
+restart count, and restart delay. These are host choices and do not enter the
+portable IR.
 
-```kdl
-system "imu" artifact="imu-driver" process=#true sample_hz=200.0
+A restart has these stages:
+
+```text
+stop -> reap -> reclaim ring roles -> delay -> spawn -> attach -> init -> run
 ```
 
-`SystemSpec` gains `process: bool` (serde-default false, so existing documents are unchanged).
-`process=#true` without `artifact=` is a resolve error (a static-registry type has no loadable
-form the worker can reconstruct; a statically-linked worker mode is future work). Resolve runs a
-describe-mode worker (§5) instead of `DlPack::open`, decodes the pack manifest and selects the
-entry (the node's `type=`, or the sole export) for its descriptor and params schema, encodes
-params through the same schema-guided path as `resolve_dl`, and registers via
-`CoordinatorBuilder::add_proc_cyclic(name, descriptor, artifact_path, system, params)` — no
-`DlSystem` handle exists for a process system, and the `Params` schema stays in
-the resolver (its only consumer). A `Reg::Proc`
-registration flows through the uniform validate/size/allocate passes untouched and binds to a
-`ProcSlot` (host half) at `build()`. Process systems are cyclic-only, like dl systems.
-`WiringBuilder` gets the matching `process()` toggle on its dl-system surface.
+Each attempt uses one unit of the restart limit. A failure during attach or init
+can start another attempt while the limit remains.
 
-## 8. Limitations (v1) and future work
+The new worker's input views start at the current ring positions. It skips data
+written during the outage.
 
-- **Cyclic only, stepped serially.** Each `ProcSlot::step` blocks the loop until ack or
-  deadline. Overlapping independent workers within a cycle (fan-out doorbells, join before
-  dependents) is a natural follow-on once the protocol has soaked.
-- **No cross-process async systems**, and therefore no per-ring shared wakes; the ring's
-  `wake_word` stays reserved.
-- **Platforms:** Linux and macOS 14.4+. Windows has no shared wait-on-address; process systems
-  are cleanly unsupported there.
-- **`/dev/shm` vs temp files:** regular-file mmap works everywhere; `shm_open`/`memfd` backings
-  are a portability/perf refinement later.
+## Process slots
+
+A slot can put every allowed occupant in process mode:
+
+```python
+mode = m.slot(
+    "mode",
+    inputs=["estimate"],
+    outputs=["mode_cmd"],
+    allow=[commissioning(), safe_mode()],
+    initial="commissioning",
+    initial_state="running",
+    process=True,
+)
+```
+
+Resolve describes each allowed pack without loading it in the host. Every
+occupant must match the slot's port contract and must be reloadable.
+
+Each Load starts a new worker. Load has an attach stage and an init stage. The
+slot reports `Loading` until both finish.
+
+A process slot does not auto-restart a failed occupant. A sequence may perform
+actions that must not run twice without an operator command.
+
+Stop, Reset, Unload, and a new Load end the old worker first. The host kills and
+reaps it, then reclaims its ring roles before another worker can bind.
+
+## Step status
+
+The worker sends the raw ABI status in its ack:
+
+- `Running` keeps the entry active.
+- `Done` ends a slot task without an error.
+- `Panicked` marks the entry as stopped.
+
+For a slot task, the worker latches `Done`. Extra doorbells return `Done`
+without polling the finished future.
+
+A panic causes the worker to destroy its foreign state. The host then applies
+the fixed-system restart rule or the slot failure rule.
+
+## Cleanup after failure
+
+A worker can die while it owns a writer or reader role in a ring. The host
+keeps handles for every ring that worker attached.
+
+The host reaps the child, then reclaims roles owned by its process id. Reaping
+comes first so the child cannot write to the ring during reclaim.
+
+This cleanup prevents a dead reader from keeping a ring full and prevents a
+dead writer claim from blocking the next worker.
+
+## Dedicated worker executables
+
+By default, the host re-runs itself. `ResolveOptions::worker_exe` can name a
+small worker binary instead.
+
+The chosen binary must use the same framework build and must call
+`worker_entry()` first. ABI, control layout, and ring architecture checks reject
+mixed or incompatible builds.

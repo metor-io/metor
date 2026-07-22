@@ -1,18 +1,29 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Entity, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
-    SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
+    AnyElement, Bounds, Context, Entity, Hsla, IntoElement, MouseButton, PathBuilder, Pixels,
+    Point, SharedString, Styled, Subscription, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
 
 #[allow(unused_imports)]
 use crate::inspect;
+use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
+use crate::views::json_tree::JsonTree;
 
 mod axis;
 pub use axis::YAxis;
+
+mod event_overlay;
+pub use event_overlay::EventOverlay;
+
+mod event_flags;
+use event_flags::{
+    ClusterPaint, EventCluster, FLAG_HIT_PX, GUTTER_H, cluster_events, paint_event_flags,
+};
 
 mod bounds;
 pub use bounds::*;
@@ -211,7 +222,10 @@ fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us: f64) -> S
         if offset_us == 0 {
             "0".to_string()
         } else {
-            format!("{}", hifitime::Duration::from_microseconds(offset_us as f64))
+            format!(
+                "{}",
+                hifitime::Duration::from_microseconds(offset_us as f64)
+            )
         }
     };
     match fmt {
@@ -686,10 +700,20 @@ fn paint_overlay(
     window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
 
     // Axes are neutral unless given an explicit color.
-    let label_color =
-        |i: usize| -> Hsla { axis_colors.get(i).copied().flatten().unwrap_or(theme.text_secondary) };
-    let rule_color =
-        |i: usize| -> Hsla { axis_colors.get(i).copied().flatten().unwrap_or(theme.axis_color) };
+    let label_color = |i: usize| -> Hsla {
+        axis_colors
+            .get(i)
+            .copied()
+            .flatten()
+            .unwrap_or(theme.text_secondary)
+    };
+    let rule_color = |i: usize| -> Hsla {
+        axis_colors
+            .get(i)
+            .copied()
+            .flatten()
+            .unwrap_or(theme.axis_color)
+    };
 
     // Per-axis Y tick labels, right-aligned within each stacked column.
     for i in 0..axis_count {
@@ -714,8 +738,7 @@ fn paint_overlay(
             // Right-aligned 4px clear of the axis rule; a label wider than
             // its column pins to the pane edge instead of painting over the
             // tile border (this canvas draws above the tile chrome).
-            let label_x =
-                (col_right - shaped.width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
+            let label_x = (col_right - shaped.width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
             let origin = point(label_x, y - label_font_size / 2.0);
             let _ = shaped.paint(origin, label_font_size, window, cx);
         }
@@ -802,12 +825,10 @@ fn paint_overlay(
         }
         if !label.is_empty() {
             let run = make_run(label.as_ref(), *color);
-            let shaped = window.text_system().shape_line(
-                label.clone(),
-                label_font_size,
-                &[run],
-                None,
-            );
+            let shaped =
+                window
+                    .text_system()
+                    .shape_line(label.clone(), label_font_size, &[run], None);
             let origin = point(
                 pb.origin.x + pb.size.width - shaped.width - px(4.0),
                 y - label_font_size - px(2.0),
@@ -843,6 +864,18 @@ struct CursorPaint {
     trace_markers: Vec<(f64, f64, Hsla)>,
 }
 
+/// Build a marker rect whose edges land on physical pixels. Plot projection
+/// commonly produces fractional logical coordinates; feeding those directly
+/// to a rounded quad can make opposite corners cover different pixel samples.
+fn marker_bounds(center: Point<Pixels>, scale_factor: f32) -> Bounds<Pixels> {
+    let snap = |value: Pixels| px((f32::from(value) * scale_factor).round() / scale_factor);
+    let left = snap(center.x - px(3.0));
+    let top = snap(center.y - px(3.0));
+    let right = snap(center.x + px(3.0));
+    let bottom = snap(center.y + px(3.0));
+    Bounds::new(point(left, top), gpui::size(right - left, bottom - top))
+}
+
 fn paint_cursors(
     outer_bounds: Bounds<Pixels>,
     view: &PlotView,
@@ -858,6 +891,7 @@ fn paint_cursors(
     // maps them straight to screen.
     let view = view.x_bounds();
     let theme = crate::theme::theme(cx);
+    let scale_factor = window.scale_factor();
 
     for cursor in cursors {
         let (a, b) = if cursor.t_start.0 <= cursor.t_end.0 {
@@ -919,14 +953,10 @@ fn paint_cursors(
                 {
                     continue;
                 }
-                let dot = Bounds {
-                    origin: point(screen.x - px(3.0), screen.y - px(3.0)),
-                    size: gpui::Size {
-                        width: px(6.0),
-                        height: px(6.0),
-                    },
-                };
-                window.paint_quad(gpui::fill(dot, *color));
+                let dot = marker_bounds(screen, scale_factor);
+                let mut dot_quad = gpui::fill(dot, *color);
+                dot_quad.corner_radii = gpui::Corners::all(px(1.5));
+                window.paint_quad(dot_quad);
             }
         }
     }
@@ -987,6 +1017,7 @@ fn paint_hover_markers(
     // Markers carry normalized [0,1] Y, so a 0..1 Y view maps them straight
     // to screen.
     let view = view.x_bounds();
+    let scale_factor = window.scale_factor();
     for &(ts, norm_y, color) in markers {
         let screen = view.to_screen(pb, ts, norm_y);
         if screen.x < pb.origin.x
@@ -996,14 +1027,10 @@ fn paint_hover_markers(
         {
             continue;
         }
-        let dot = Bounds {
-            origin: point(screen.x - px(3.0), screen.y - px(3.0)),
-            size: gpui::Size {
-                width: px(6.0),
-                height: px(6.0),
-            },
-        };
-        window.paint_quad(gpui::fill(dot, color));
+        let dot = marker_bounds(screen, scale_factor);
+        let mut dot_quad = gpui::fill(dot, color);
+        dot_quad.corner_radii = gpui::Corners::all(px(1.5));
+        window.paint_quad(dot_quad);
     }
 }
 
@@ -1127,6 +1154,30 @@ pub struct TimeSeriesPlot {
     /// driving the crosshair and value readout. `None` unless a bare hover
     /// (no modifier, no drag) is over the plot area.
     hover: Option<Point<Pixels>>,
+    /// Enabled event sources resolved once per frame in `render`, so the flag
+    /// canvas can query them without touching `&mut App` during paint.
+    frame_sources: Vec<Rc<dyn EventSource>>,
+    /// Repaint subscriptions on the enabled sources, refreshed only when the
+    /// enabled key set (`event_sub_keys`) changes.
+    event_subs: Vec<Subscription>,
+    event_sub_keys: Vec<EventKindKey>,
+    /// This frame's flag clusters, cached by the flag canvas for gutter
+    /// hit-testing and the popovers.
+    event_clusters: Vec<EventCluster>,
+    /// Index into `event_clusters` of the flag under the pointer, or `None`.
+    /// Transient — recomputed on every gutter hover.
+    hovered_event_cluster: Option<usize>,
+    /// The pinned flag popover, keyed by timestamp (clusters rebuild per frame).
+    pinned_event: Option<PinnedEvent>,
+    /// Lazily-built tree for a pinned event whose detail is decoded JSON.
+    event_json_tree: Option<Entity<JsonTree>>,
+}
+
+/// A pinned event popover: the flag it opened on (by timestamp, since the
+/// cluster list rebuilds each frame) and which of its events is selected.
+struct PinnedEvent {
+    x_ts: i64,
+    selected: usize,
 }
 
 /// Build traces for `component_id` × `indices`, cycling theme colors and
@@ -1195,6 +1246,13 @@ impl TimeSeriesPlot {
             panel_position: PanelPosition::default(),
             panel_drag: None,
             hover: None,
+            frame_sources: Vec::new(),
+            event_subs: Vec::new(),
+            event_sub_keys: Vec::new(),
+            event_clusters: Vec::new(),
+            hovered_event_cluster: None,
+            pinned_event: None,
+            event_json_tree: None,
         }
     }
 
@@ -1423,7 +1481,8 @@ impl TimeSeriesPlot {
         let Some(view) = self.line_plot.read(cx).effective_view(cx) else {
             return;
         };
-        let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view.x_bounds(), cx) else {
+        let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view.x_bounds(), cx)
+        else {
             return;
         };
         let entity = hit.into_any();
@@ -1552,7 +1611,8 @@ impl TimeSeriesPlot {
     /// Called whenever a gesture that owns the pointer (pan, zoom, cursor
     /// drag, inspector) begins, and on mouse-leave.
     fn clear_hover(&mut self, cx: &mut Context<Self>) {
-        if self.hover.take().is_some() {
+        let had = self.hover.take().is_some() || self.hovered_event_cluster.take().is_some();
+        if had {
             cx.notify();
         }
     }
@@ -1575,6 +1635,20 @@ impl TimeSeriesPlot {
             self.clear_hover(cx);
             return;
         };
+        // The flag gutter takes precedence over trace hover, and suppresses the
+        // normal value readout while the pointer is over a flag.
+        if let Some(idx) = self.event_cluster_at(event.position, pa) {
+            let changed = self.hovered_event_cluster != Some(idx) || self.hover.is_some();
+            self.hovered_event_cluster = Some(idx);
+            self.hover = None;
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
+        if self.hovered_event_cluster.take().is_some() {
+            cx.notify();
+        }
         let axis_count = self.line_plot.read(cx).axes.len();
         if axis_zone(event.position, pa, axis_count) != AxisZone::Plot {
             self.clear_hover(cx);
@@ -1708,11 +1782,439 @@ impl TimeSeriesPlot {
                 .into_any_element(),
         )
     }
+
+    // -- Event flags ---------------------------------------------------------
+
+    /// Resolve the enabled event sources for this frame and keep the repaint
+    /// subscriptions in sync. Runs in `render`, not paint, because
+    /// [`EventSourceRegistry::source_for`] needs `&mut App` to lazily spin up a
+    /// message store and observing a source needs `&mut Context`.
+    fn sync_event_sources(&mut self, cx: &mut Context<Self>) {
+        let db = self.line_plot.read(cx).db().clone();
+        let overlays = self.line_plot.read(cx).event_overlays.clone();
+        let mut sources: Vec<Rc<dyn EventSource>> = Vec::new();
+        let mut keys: Vec<EventKindKey> = Vec::new();
+        for overlay in &overlays {
+            let overlay = overlay.read(cx);
+            if !overlay.visible {
+                continue;
+            }
+            let key = overlay.key;
+            if let Some(source) = EventSourceRegistry::source_for(key, &db, cx) {
+                keys.push(key);
+                sources.push(source);
+            }
+        }
+        // Re-subscribe only when the enabled set changes; the handles
+        // themselves are cheap and refreshed every frame regardless.
+        if keys != self.event_sub_keys {
+            self.event_subs.clear();
+            for source in &sources {
+                if let Some(target) = source.observe_target(cx)
+                    && let Some(sub) = self.observe_event_target(target, cx)
+                {
+                    self.event_subs.push(sub);
+                }
+            }
+            self.event_sub_keys = keys;
+        }
+        self.frame_sources = sources;
+    }
+
+    /// Observe an event source's backing store for repaints. `observe` needs a
+    /// typed handle, so the erased target is matched against the known store
+    /// types; an unrecognized store just goes unobserved.
+    fn observe_event_target(
+        &self,
+        target: gpui::AnyEntity,
+        cx: &mut Context<Self>,
+    ) -> Option<Subscription> {
+        if let Ok(store) = target.clone().downcast::<crate::logs::LogStore>() {
+            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
+        }
+        if let Ok(store) = target.clone().downcast::<crate::alarms::AlarmStore>() {
+            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
+        }
+        if let Ok(store) = target.clone().downcast::<crate::sequences::SequenceStore>() {
+            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
+        }
+        if let Ok(store) = target.downcast::<crate::plot_events::MsgEventStore>() {
+            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
+        }
+        None
+    }
+
+    /// Query this frame's sources over the visible window and cluster the
+    /// results into flags, mapping each event's time to a screen x.
+    fn build_event_clusters(
+        &self,
+        view: &PlotView,
+        pa: Bounds<Pixels>,
+        cx: &gpui::App,
+    ) -> Vec<EventCluster> {
+        if self.frame_sources.is_empty() {
+            return Vec::new();
+        }
+        let range = Timestamp(view.x.0 as i64)..Timestamp(view.x.1 as i64);
+        let mut events: Vec<PlotEvent> = Vec::new();
+        for source in &self.frame_sources {
+            events.extend(source.events_in(range.clone(), cx));
+        }
+        // Ascending by time so the screen x's are ascending (the transform is
+        // monotonic), which is what the clustering walk assumes.
+        events.sort_by_key(|e| e.ts.0);
+        let x_bounds = view.x_bounds();
+        let positioned: Vec<(Pixels, PlotEvent)> = events
+            .into_iter()
+            .map(|e| (x_bounds.to_screen(pa, e.ts.0 as f64, 0.0).x, e))
+            .collect();
+        cluster_events(positioned)
+    }
+
+    /// Index of the flag whose chip is under `pos`, when the pointer is
+    /// inside the top gutter band: the estimated chip extent to the right of
+    /// the rule hits, plus [`FLAG_HIT_PX`] of slack to its left. Confined to
+    /// the gutter so trace hover/pan/zoom below is untouched.
+    fn event_cluster_at(&self, pos: Point<Pixels>, pa: Bounds<Pixels>) -> Option<usize> {
+        let top = pa.origin.y;
+        if pos.y < top || pos.y > top + px(GUTTER_H) {
+            return None;
+        }
+        if pos.x < pa.origin.x || pos.x > pa.origin.x + pa.size.width {
+            return None;
+        }
+        let mut best: Option<(usize, f32)> = None;
+        for (i, cluster) in self.event_clusters.iter().enumerate().rev() {
+            let offset = f32::from(pos.x - cluster.x);
+            let chip_w = f32::from(EventCluster::chip_width(
+                cluster.chip_label().chars().count(),
+            ));
+            let hit = (-FLAG_HIT_PX..=chip_w).contains(&offset);
+            // Prefer the flag whose rule is nearest, so a chip overdrawn by a
+            // truncated neighbor still resolves to the closer rule.
+            let dist = offset.abs();
+            if hit && best.map(|(_, d)| dist < d).unwrap_or(true) {
+                best = Some((i, dist));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Rebuild the JSON detail tree for the pinned selection when its detail
+    /// decodes to JSON. Called on pin/selection change, not per frame, so the
+    /// tree (and its notify) doesn't churn the window.
+    fn sync_pinned_json_tree(&mut self, cx: &mut Context<Self>) {
+        let value = self.pinned_event.as_ref().and_then(|pin| {
+            let cluster = self
+                .event_clusters
+                .iter()
+                .min_by_key(|c| (c.ts().0 - pin.x_ts).abs())?;
+            match &cluster.events.get(pin.selected)?.detail {
+                EventDetail::Json(value) => Some(value.clone()),
+                _ => None,
+            }
+        });
+        match value {
+            Some(value) => match &self.event_json_tree {
+                Some(tree) => tree.update(cx, |t, cx| t.set_value(value, cx)),
+                None => self.event_json_tree = Some(cx.new(|cx| JsonTree::new(value, cx))),
+            },
+            None => self.event_json_tree = None,
+        }
+    }
+
+    /// Hover popover for the flag under the pointer: header plus a summary row
+    /// per event. Native div positioned below the gutter, clamped to the plot.
+    fn event_hover_popover(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let idx = self.hovered_event_cluster?;
+        let cluster = self.event_clusters.get(idx)?;
+        let pa = self.last_plot_area?;
+        let view = self.line_plot.read(cx).effective_view(cx)?;
+        let theme = crate::theme::theme(cx);
+
+        let count = cluster.events.len();
+        let first = cluster.events.first()?;
+        let header = if count > 1 {
+            SharedString::from(format!("{} (and {} more)", first.label, count - 1))
+        } else {
+            first.label.clone()
+        };
+
+        let mut boxed = div()
+            .flex()
+            .flex_col()
+            .gap_y_0()
+            .px(px(READOUT_PAD_X))
+            .py(px(READOUT_PAD_Y))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_primary)
+            .rounded(px(3.0))
+            .child(
+                div()
+                    .text_size(px(LABEL_FONT_SIZE))
+                    .text_color(theme.text_secondary)
+                    .child(header),
+            );
+        for ev in cluster.events.iter().take(EVENT_POPOVER_ROWS) {
+            boxed = boxed.child(event_summary_row(ev, &theme));
+        }
+
+        let shown = count.min(EVENT_POPOVER_ROWS);
+        let size = gpui::Size {
+            width: px(240.0),
+            height: px((1 + shown) as f32 * 16.0 + 8.0),
+        };
+        let anchor = point(cluster.x, pa.origin.y + px(GUTTER_H));
+        let origin = cursor::readout_origin(anchor, size, pa, px(4.0));
+        let inner_origin = point(
+            pa.origin.x - px(left_margin(view.axis_count())),
+            pa.origin.y - px(PADDING),
+        );
+        Some(
+            div()
+                .absolute()
+                .left(origin.x - inner_origin.x)
+                .top(origin.y - inner_origin.y)
+                .child(boxed)
+                .into_any_element(),
+        )
+    }
+
+    /// Pinned popover: a taller, elevated panel with a close button, a
+    /// scrollable event list whose rows select, and the selected event's typed
+    /// detail below. Occludes the plot so clicks inside don't clear the pin.
+    fn event_pinned_popover(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let pin = self.pinned_event.as_ref()?;
+        let pa = self.last_plot_area?;
+        let view = self.line_plot.read(cx).effective_view(cx)?;
+        let theme = crate::theme::theme(cx);
+
+        let cluster = self
+            .event_clusters
+            .iter()
+            .min_by_key(|c| (c.ts().0 - pin.x_ts).abs())?;
+        if cluster.events.is_empty() {
+            return None;
+        }
+        let selected = pin.selected.min(cluster.events.len() - 1);
+
+        // Header: title + close button.
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(LABEL_FONT_SIZE))
+                    .text_color(theme.text_primary)
+                    .child(SharedString::from(format!(
+                        "{} events",
+                        cluster.events.len()
+                    ))),
+            )
+            .child(
+                div()
+                    .id("event-popover-close")
+                    .cursor_pointer()
+                    .text_size(px(LABEL_FONT_SIZE))
+                    .text_color(theme.text_secondary)
+                    .child(SharedString::new_static("✕"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                            this.pinned_event = None;
+                            this.event_json_tree = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
+
+        // Event list: one selectable row per event.
+        let mut list = div()
+            .id("event-popover-list")
+            .flex()
+            .flex_col()
+            .max_h(px(320.0))
+            .overflow_y_scroll();
+        for (i, ev) in cluster.events.iter().enumerate() {
+            let is_selected = i == selected;
+            let row_bg = if is_selected {
+                theme.selection_bg
+            } else {
+                gpui::transparent_black()
+            };
+            list = list.child(
+                div()
+                    .id(("event-popover-row", i))
+                    .cursor_pointer()
+                    .rounded(px(2.0))
+                    .bg(row_bg)
+                    .child(event_summary_row(ev, &theme))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &gpui::MouseDownEvent, _window, cx| {
+                            if let Some(pin) = this.pinned_event.as_mut() {
+                                pin.selected = i;
+                            }
+                            this.sync_pinned_json_tree(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        let detail = self.event_detail_element(&cluster.events[selected].detail, &theme);
+
+        let panel = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(300.0))
+            .px(px(READOUT_PAD_X))
+            .py(px(READOUT_PAD_Y))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.selection_bg)
+            .rounded(px(4.0))
+            .occlude()
+            .child(header)
+            .child(list)
+            .child(detail);
+
+        let size = gpui::Size {
+            width: px(300.0),
+            height: px(360.0),
+        };
+        let anchor = point(cluster.x, pa.origin.y + px(GUTTER_H));
+        let origin = cursor::readout_origin(anchor, size, pa, px(4.0));
+        let inner_origin = point(
+            pa.origin.x - px(left_margin(view.axis_count())),
+            pa.origin.y - px(PADDING),
+        );
+        Some(
+            div()
+                .absolute()
+                .left(origin.x - inner_origin.x)
+                .top(origin.y - inner_origin.y)
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    /// Typed detail block for the selected pinned event, reusing each store's
+    /// own record fields (log-panel `key: value` styling).
+    fn event_detail_element(
+        &self,
+        detail: &EventDetail,
+        theme: &crate::theme::Theme,
+    ) -> AnyElement {
+        let mut body = div().flex().flex_col().gap_y_0().pt_1();
+        match detail {
+            EventDetail::Log(ev) => {
+                body = body
+                    .child(kv_row("level", format!("{:?}", ev.level), theme))
+                    .child(kv_row("source", ev.source.clone(), theme))
+                    .child(kv_row("message", ev.message.clone(), theme));
+                for (k, v) in &ev.fields {
+                    body = body.child(kv_row(k, v.clone(), theme));
+                }
+            }
+            EventDetail::Alarm(ev) => {
+                body = body
+                    .child(kv_row("alarm", ev.def_id.clone(), theme))
+                    .child(kv_row("severity", format!("{:?}", ev.severity), theme));
+                if !ev.detail.is_empty() {
+                    body = body.child(kv_row("detail", ev.detail.clone(), theme));
+                }
+            }
+            EventDetail::Sequence(entry) => {
+                body = body
+                    .child(kv_row("channel", entry.channel_name.to_string(), theme))
+                    .child(kv_row("event", entry.label.to_string(), theme));
+            }
+            EventDetail::Json(_) => {
+                if let Some(tree) = &self.event_json_tree {
+                    body = body.child(tree.clone());
+                }
+            }
+            EventDetail::Raw(len) => {
+                body = body.child(
+                    div()
+                        .text_size(px(LABEL_FONT_SIZE))
+                        .text_color(theme.text_secondary)
+                        .child(SharedString::from(format!(
+                            "{len} bytes (no schema announced)"
+                        ))),
+                );
+            }
+        }
+        body.into_any_element()
+    }
+}
+
+/// Rows shown in a flag popover before the list is elided.
+const EVENT_POPOVER_ROWS: usize = 8;
+
+/// One event summary line: time, a color dot, and the one-line label.
+fn event_summary_row(ev: &PlotEvent, theme: &crate::theme::Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(LABEL_FONT_SIZE))
+                .text_color(theme.text_tertiary)
+                .child(SharedString::from(crate::views::log_panel::format_time(
+                    ev.ts.0,
+                ))),
+        )
+        .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(ev.color))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(LABEL_FONT_SIZE))
+                .text_color(theme.text_secondary)
+                .child(ev.label.clone()),
+        )
+}
+
+/// One `key: value` detail row in the pinned popover.
+fn kv_row(
+    key: &str,
+    value: impl Into<SharedString>,
+    theme: &crate::theme::Theme,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .gap_1()
+        .text_size(px(LABEL_FONT_SIZE))
+        .child(
+            div()
+                .text_color(theme.text_tertiary)
+                .child(SharedString::from(format!("{key}:"))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_color(theme.text_primary)
+                .child(value.into()),
+        )
 }
 
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
+        // Resolve this frame's event sources (and refresh their repaint subs)
+        // before building canvases, so the flag canvas can query them in paint.
+        self.sync_event_sources(cx);
         let trace_entities: Vec<Entity<Trace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
         // Drives the left chrome width: one Y_LABEL_WIDTH column per axis.
@@ -1724,11 +2226,15 @@ impl Render for TimeSeriesPlot {
         let cursors_lp = self.line_plot.clone();
         let cursors_weak = cx.entity().downgrade();
         let hover_weak = cx.entity().downgrade();
+        let flags_weak = cx.entity().downgrade();
 
         let mut root = div().flex().flex_col().size_full().bg(theme.bg_secondary);
 
         let mut inner = div()
-            .id(("time-series-plot", cx.entity().entity_id().as_u64() as usize))
+            .id((
+                "time-series-plot",
+                cx.entity().entity_id().as_u64() as usize,
+            ))
             .flex_1()
             .min_h_0()
             .relative()
@@ -1752,6 +2258,22 @@ impl Render for TimeSeriesPlot {
                     if event.modifiers.alt {
                         this.start_cursor_drag(event, window, cx);
                         return;
+                    }
+                    // A click on a flag pins its popover; any other plot click
+                    // clears an open pin before falling through to pan setup.
+                    if let Some(pa) = this.last_plot_area
+                        && let Some(idx) = this.event_cluster_at(event.position, pa)
+                    {
+                        let x_ts = this.event_clusters[idx].ts().0;
+                        this.pinned_event = Some(PinnedEvent { x_ts, selected: 0 });
+                        this.sync_pinned_json_tree(cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    if this.pinned_event.take().is_some() {
+                        this.event_json_tree = None;
+                        cx.notify();
                     }
                     let axis_count = this.line_plot.read(cx).axes.len();
                     let zone = this
@@ -1918,9 +2440,49 @@ impl Render for TimeSeriesPlot {
                           cx| {
                         if let Some(view) = view {
                             paint_overlay(
-                                bounds, &view, &colors, &markers, &limit_lines, data_start, fmt,
-                                window, cx,
+                                bounds,
+                                &view,
+                                &colors,
+                                &markers,
+                                &limit_lines,
+                                data_start,
+                                fmt,
+                                window,
+                                cx,
                             );
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        let mut out = None;
+                        let _ = flags_weak.update(cx, |this, cx| {
+                            let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
+                                return;
+                            };
+                            let pa = plot_area(bounds, view.axis_count());
+                            let clusters = this.build_event_clusters(&view, pa, cx);
+                            let theme = crate::theme::theme(cx);
+                            let paints: Vec<ClusterPaint> = clusters
+                                .iter()
+                                .map(|c| ClusterPaint {
+                                    x: c.x,
+                                    color: c.color(&theme),
+                                    label: c.chip_label(),
+                                })
+                                .collect();
+                            this.event_clusters = clusters;
+                            out = Some((view, paints));
+                        });
+                        (bounds, out)
+                    },
+                    move |_, (bounds, data), window, cx| {
+                        if let Some((view, paints)) = data {
+                            paint_event_flags(bounds, &view, &paints, window, cx);
                         }
                     },
                 )
@@ -2002,11 +2564,7 @@ impl Render for TimeSeriesPlot {
                                         .map(|s| {
                                             let b = view.axis_bounds(s.axis_index);
                                             let h = (b.max_y - b.min_y).max(1e-12);
-                                            (
-                                                s.ts.0 as f64,
-                                                (s.value - b.min_y) / h,
-                                                s.color,
-                                            )
+                                            (s.ts.0 as f64, (s.value - b.min_y) / h, s.color)
                                         })
                                         .collect()
                                 })
@@ -2046,6 +2604,13 @@ impl Render for TimeSeriesPlot {
 
         if let Some(readout) = self.hover_readout(cx) {
             inner = inner.child(readout);
+        }
+
+        // Event-flag popovers: a pinned one wins over the transient hover one.
+        if let Some(popover) = self.event_pinned_popover(cx) {
+            inner = inner.child(popover);
+        } else if let Some(popover) = self.event_hover_popover(cx) {
+            inner = inner.child(popover);
         }
 
         root = root.child(inner);

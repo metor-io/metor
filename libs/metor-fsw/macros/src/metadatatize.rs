@@ -54,7 +54,7 @@ pub fn metadatatize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> Toke
             }
         }
         ast::Data::Struct(fields) => {
-            let metadata_items = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
+            let metadata_items = fields.fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
                 let ty = &field.ty;
 
                 let name = field.component_name();

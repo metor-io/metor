@@ -1,0 +1,20 @@
+# The pack-crate PEP 517/660 backend as a distribution
+# (docs/packaging.md).
+#
+# Published packs declare `[build-system] requires = ["metor-build", …]`;
+# in-repo packs reach the same code through a one-file `backend-path` shim
+# until this is on an index.
+
+[project]
+name = "metor-build"
+version = "0.1.0"
+description = "PEP 517/660 build backend for metor pack crates"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "metor_build"
+module-root = ""

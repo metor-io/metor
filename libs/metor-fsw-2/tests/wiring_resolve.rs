@@ -3,7 +3,7 @@
 //! Each test describes a mission as data with the Rust [`WiringBuilder`]. The
 //! mission wires a statically linked producer into a dlopen'd consumer loaded
 //! from the `metor-fsw-2-dl-fixture` artifact. The tests then run
-//! [`build_artifacts`] to compile the fixture and locate its shared library,
+//! [`provision_artifacts`] to compile the fixture and locate its shared library,
 //! [`resolve`] the wiring into a coordinator, and run it, checking that outputs
 //! appear under their instance names and that params reach the loaded system.
 //!
@@ -16,7 +16,7 @@ use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
     BuildSystem, ClockSpec, CyclicSystem, DlPack, Frame, Input, Out, Output, System, SystemInput,
     SystemKind, SystemOutput, WiringBuilder,
-    wiring::{BuildOptions, Registry, build_artifacts, resolve},
+    wiring::{BuildOptions, Registry, provision_artifacts, resolve},
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -113,12 +113,12 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
         })
         .end()
         .connect("ticker", "tick_in", "counter", "tick_in")
-        .telemetry("127.0.0.1:2240".parse().unwrap())
+        .serve("127.0.0.1:0".parse().unwrap())
         .build();
 
     // Build the fixture crate and record where its shared library landed.
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
     assert!(
@@ -213,8 +213,8 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
         "no explicit type on the dl system"
     );
 
-    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: build_artifacts failed: {e}");
+    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: provision_artifacts failed: {e}");
         return;
     }
 

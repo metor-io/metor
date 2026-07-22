@@ -11,7 +11,7 @@
 //! Inputs support two consumption patterns. [`Input::latest`] serves cyclic
 //! systems that want the freshest sample. It consumes any backlog but leaves
 //! the newest record pinned on the ring, so a cycle with no new data sees the
-//! same record again and the writer waits rather than overwrite it.
+//! same record again. The writer returns `WouldBlock` rather than overwrite it.
 //! [`Input::drain`] serves command and event channels that must see every
 //! record, handing each one to a callback in order and freeing it as soon as
 //! the callback returns.
@@ -278,7 +278,7 @@ where
 
 /// An input consumes the frames an upstream [`Output`] publishes, through a
 /// read-only [`View`] of that output's ring. Records are read in place and
-/// handed out as a typed [`FrameGrant`] or [`FrameRef`]; the writer never
+/// handed out as a typed [`FrameRef`]; the writer never
 /// overwrites a record a reader has yet to release.
 pub struct Input<F, RD = NoWake>
 where

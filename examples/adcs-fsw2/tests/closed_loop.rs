@@ -28,8 +28,10 @@ use std::path::Path;
 use adcs_contracts::{BodyState, ModeCmd, tracking_sample};
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{build_artifacts, eval_python_mission, resolve};
+use metor_fsw_2::wiring::{eval_python_mission, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input};
+
+mod common;
 
 /// The mission file — the same one the CLI runner and the other tests read.
 fn mission_py() -> std::path::PathBuf {
@@ -69,7 +71,7 @@ struct Measure {
 /// the static, dlopen, and process loading modes is the pack surface's whole point.
 fn build_static() -> Coordinator {
     let mut wiring = eval_python_mission(&mission_py()).expect("evaluate mission.py");
-    build_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
     for spec in &mut wiring.systems {
         // plant/nav/ctrl: link statically via the Registry rather than dlopen. Process
         // isolation needs an artifact to spawn, so it drops with it — in-proc static systems
@@ -105,7 +107,7 @@ async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
         let mut body = body_view;
         loop {
             stellarator::yield_now().await;
-            if let Some(b) = body.latest() {
+            if let Ok(Some(b)) = body.latest() {
                 captured
                     .borrow_mut()
                     .push(tracking_sample(b.get(), CONVERGED_LAW));
@@ -118,8 +120,12 @@ async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
     drop(sampler); // abort the sampler before reading the captured trajectory
 
     let trajectory = samples.borrow();
-    let (e0, r0) = *trajectory.first().expect("the sampler captured the initial state");
-    let (ef, rf) = *trajectory.last().expect("the sampler captured the final state");
+    let (e0, r0) = *trajectory
+        .first()
+        .expect("the sampler captured the initial state");
+    let (ef, rf) = *trajectory
+        .last()
+        .expect("the sampler captured the final state");
     Measure { e0, r0, ef, rf }
 }
 
@@ -134,7 +140,11 @@ fn assert_converged(label: &str, m: &Measure) {
         m.r0,
         m.rf
     );
-    assert!(m.e0 > 0.3, "[{label}] starts with a real offset (>0.3 rad), got {}", m.e0);
+    assert!(
+        m.e0 > 0.3,
+        "[{label}] starts with a real offset (>0.3 rad), got {}",
+        m.e0
+    );
     assert!(
         m.ef < m.e0 * 0.25,
         "[{label}] tracking error shrinks to <25% of start: {} -> {}",
@@ -146,7 +156,12 @@ fn assert_converged(label: &str, m: &Measure) {
         "[{label}] final tracking error converges below 0.1 rad (~6 deg): {}",
         m.ef
     );
-    assert!(m.rf < m.r0, "[{label}] body rate damps: {} -> {}", m.r0, m.rf);
+    assert!(
+        m.rf < m.r0,
+        "[{label}] body rate damps: {} -> {}",
+        m.r0,
+        m.rf
+    );
     assert!(
         m.rf < 0.05,
         "[{label}] final body rate near the orbital rate (<0.05 rad/s): {}",
@@ -156,6 +171,9 @@ fn assert_converged(label: &str, m: &Measure) {
 
 #[stellarator::test]
 async fn closed_loop_converges_static_and_dlopen() {
+    // This suite hard-requires the build plumbing, stubs included.
+    assert!(common::ensure_stubs(), "generate the mission's pack stubs");
+
     // Path 1 — plant/nav/ctrl statically linked (slot/sequences still dlopen).
     let static_run = run_and_measure(build_static(), CYCLES).await;
     assert_converged("static", &static_run);

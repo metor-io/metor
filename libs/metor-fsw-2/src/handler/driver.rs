@@ -8,19 +8,36 @@ use core::marker::PhantomData;
 
 use metor_proto::types::Timestamp;
 
-use crate::binder::AnySource;
-use crate::health::{HealthPort, SystemHealth, SystemLog};
+use crate::binder::{AnySource, RingSource};
+use crate::health::{HealthPort, LogEvent, SystemHealth};
+use crate::message::MsgOut;
 use crate::pack::{Driver, StepStatus};
 use crate::port::Output;
 
 use super::param::{BindCx, CycleCx};
 use super::tuples::{ExecParamSet, ExecuteFn};
 
+/// How a fn-authored driver reaches its state: owned outright (the zero-cost
+/// default), or the scoped borrow of a pack-shared instance.
+pub(crate) enum StateAccess<S> {
+    Owned(S),
+    Shared(crate::Shared<S>),
+}
+
+impl<S> StateAccess<S> {
+    fn with<R>(&mut self, f: impl FnOnce(&mut S) -> R) -> R {
+        match self {
+            StateAccess::Owned(state) => f(state),
+            StateAccess::Shared(token) => f(&mut token.get()),
+        }
+    }
+}
+
 pub(crate) struct FnDriver<S, M, F>
 where
     F: ExecuteFn<S, M>,
 {
-    state: S,
+    state: StateAccess<S>,
     execute: F,
     ports: <F::Params as ExecParamSet>::State,
     health: HealthPort,
@@ -34,7 +51,7 @@ where
 {
     /// Bind the parameter states in declaration order, then the implicit
     /// health/log tail — the same order the entry's descriptor declares.
-    pub(crate) fn bind(state: S, execute: F, src: &mut AnySource) -> Self {
+    pub(crate) fn bind(state: StateAccess<S>, execute: F, src: &mut AnySource) -> Self {
         let ports = {
             let mut cx = BindCx {
                 src,
@@ -57,8 +74,10 @@ where
 /// appends, after the user ports.
 pub(crate) fn bind_health_tail(src: &mut AnySource) -> HealthPort {
     let health: Output<SystemHealth> = Output::bind(src);
-    let log: Output<SystemLog> = Output::bind(src);
-    HealthPort::new(health, log)
+    let log: MsgOut<LogEvent> = MsgOut::bind(src);
+    let mut port = HealthPort::new(health, log);
+    port.set_instance(src.instance_name());
+    port
 }
 
 impl<S, M, F> Driver for FnDriver<S, M, F>
@@ -71,12 +90,21 @@ where
     fn step(&mut self, now: Timestamp) -> StepStatus {
         let start = std::time::Instant::now();
         {
-            let mut cx = CycleCx {
-                now,
-                health: Some(&mut self.health),
-            };
-            let items = <F::Params as ExecParamSet>::get(&mut self.ports, &mut cx);
-            self.execute.call(&mut self.state, items);
+            let Self {
+                state,
+                execute,
+                ports,
+                health,
+                ..
+            } = self;
+            state.with(|state| {
+                let mut cx = CycleCx {
+                    now,
+                    health: Some(health),
+                };
+                let items = <F::Params as ExecParamSet>::get(ports, &mut cx);
+                execute.call(state, items);
+            });
         }
         let micros = start.elapsed().as_micros() as u64;
         if <F::Params as ExecParamSet>::take_dropped(&mut self.ports) > 0 {
@@ -152,7 +180,7 @@ impl Driver for FutureDriver {
         // A wired task has no SequenceStatus output; progress lines land on
         // the entry's ordinary log so they still flow off-board.
         for line in self.clock.drain_progress() {
-            self.health.log(crate::health::Level::Info, &line);
+            self.health.log(crate::health::LogLevel::Info, &line);
         }
         match poll {
             Poll::Ready(outcome) => {

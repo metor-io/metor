@@ -1,27 +1,15 @@
-"""The adcs-fsw2 mission, expressed with the `metor_config` Python front-end.
+from metor_config import Alarm, Alarms, Downlink, Mission, Target, TcpServer, Uplink, band
+from adcs_pack import Ctrl, Nav, Plant
+from adcs_seqs import commissioning, safe_mode
 
-This is the mission: the coordinator config, artifacts, systems, `mode` slot,
-and edges the CLI runner and the tracked tests read, evaluated once at
-build/package time into the `Wiring` IR.
+m = Mission(
+    cycle_rate=120.0,
+    sim_dt=1 / 120,
+    namespace="cube_sat"
+)
 
-Systems and occupants come from generated, `py.typed` pack modules
-(`metor-fsw stubgen`): importing `Plant`/`Nav`/`Ctrl` and
-`commissioning`/`safe_mode` gives pyright-checked params, ports, and frames,
-and each module's `ARTIFACT` is registered implicitly — no `m.artifact(...)`.
-Alarms and links stay on the `metor_config` builtins.
+link = m.state("link", TcpServer(addr="0.0.0.0:2240", name="cube_sat"))
 
-    metor-fsw stubgen                                            # regenerate packs/
-    metor-fsw run examples/adcs-fsw2/mission.py --build          # headless sim
-"""
-
-from metor_config import Alarm, Alarms, Mission, Target, TcpDownlink, TcpUplink, band
-from packs.adcs import Ctrl, Nav, Plant
-from packs.seqs import commissioning, safe_mode
-
-m = Mission(cycle_rate=120.0, sim_dt=1 / 120)
-
-# The plant's disturbance/actuator environment is spelled out in full, physically
-# honest for a ~3 kg spacecraft at 400 km. `process=True` runs it in its own worker.
 plant = m.add(
     "plant",
     Plant(
@@ -74,7 +62,8 @@ alarms = m.add(
     ]),
 )
 
-# Detumble enters only above 1.0 rad/s; the gates/budgets ride the allow line.
+uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand", "AlarmAck", "ReloadSequences"]))
+
 mode = m.slot(
     "mode",
     inputs=["attitude_estimate", "gps"],
@@ -102,8 +91,8 @@ mode = m.slot(
 m.connect(plant.sensors, nav.sensors)
 m.connect(plant.gps, nav.gps)
 m.connect(plant.gps, ctrl.gps)
-m.connect(plant.sensors, ctrl.sensors)  # measured B for the magnetorquer laws
-m.connect(plant.wheels, ctrl.wheels)  # telemetered wheel momentum for desat
+m.connect(plant.sensors, ctrl.sensors)
+m.connect(plant.wheels, ctrl.wheels)
 m.connect(nav.attitude_estimate, ctrl.attitude_estimate)
 m.connect(nav.attitude_estimate, mode.attitude_estimate)
 m.connect(plant.gps, mode.gps)
@@ -112,13 +101,9 @@ m.connect(mode.mode_cmd, ctrl.mode_cmd, delayed=True)
 m.connect(ctrl.torque_cmd, plant.torque_cmd, delayed=True)
 m.connect(ctrl.mtq_cmd, plant.mtq_cmd, delayed=True)
 
-uplink = m.add(
-    "uplink",
-    TcpUplink(addr="127.0.0.1:2240", msgs=["SequenceCommand", "AlarmAck", "ReloadSequences"]),
-)
-downlink = m.add("downlink", TcpDownlink(addr="127.0.0.1:2240"))
+downlink = m.add("downlink", Downlink(link))
 
-m.route(uplink, mode, msg="SequenceCommand")  # ground commands
-m.route(m.coordinator, mode, msg="SequenceCommand")  # in-proc control_handle
-m.route(uplink, alarms, msg="AlarmAck")  # operator acks (gate latching alarms)
-m.route(uplink, m.coordinator, msg="ReloadSequences")  # panel Reload -> registry re-emit
+m.route(uplink, mode, msg="SequenceCommand")  #
+m.route(m.coordinator, mode, msg="SequenceCommand")
+m.route(uplink, alarms, msg="AlarmAck")
+m.route(uplink, m.coordinator, msg="ReloadSequences")

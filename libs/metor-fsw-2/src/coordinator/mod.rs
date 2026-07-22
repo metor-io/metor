@@ -7,8 +7,8 @@
 //! ([`resolve`](crate::wiring::resolve)) via [`init::InitGraph::build`].
 //! [`Coordinator::run_for`] drives the lifecycle: spawn the async systems, init
 //! everything behind a barrier, step the cyclic systems once per cycle, run the
-//! async copy-in mirror, publish coordinator-level health and a status frame,
-//! and tear it all down.
+//! async copy-in mirror, update health or status when their state changes, and
+//! tear the graph down.
 //!
 //! Cyclic systems step in registration order, once per cycle; the build-time
 //! passes ([`init`]) reject any wiring whose dataflow disagrees with that
@@ -33,8 +33,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::DEFAULT_DEPTH;
 use crate::descriptor::{Hz, PortId};
+use crate::FrameStr;
 use crate::dynamic::FrameList;
-use crate::health::{HealthPort, Level};
+use crate::health::{HealthPort, LogLevel};
 use crate::message::{MsgIn, MsgOut};
 use crate::port::Output;
 use crate::proc::session::SessionDir;
@@ -50,7 +51,7 @@ mod status;
 pub use error::WireError;
 pub(crate) use slot::validate_slot_spec;
 pub use slot::{AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError, SlotStatus};
-pub(crate) use status::{CyclicSlot, pack_name};
+pub(crate) use status::CyclicSlot;
 pub use status::{NAME_CAP, SlotState, StopReason, StoppedSystem, WorkerRunState, WorkerStatus};
 
 /// The default [`CoordinatorConfig::reader_slack`].
@@ -153,15 +154,14 @@ pub(crate) struct PortRef {
 /// Max stopped systems named in one status record.
 pub const MAX_STOPPED: usize = 32;
 
-/// One stopped-system entry in [`CoordinatorStatus`]: a reason code, a used
-/// name length, and a fixed-size name buffer.
+/// One stopped-system entry in [`CoordinatorStatus`]: a reason code and the
+/// stopped system's name.
 #[derive(crate::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[repr(C)]
 struct StoppedEntry {
     reason: u8,
-    len: u8,
-    _pad: [u8; 6],
-    name: [u8; NAME_CAP],
+    _pad: [u8; 7],
+    name: FrameStr<NAME_CAP>,
 }
 
 /// Max process workers named in one status record.
@@ -178,9 +178,8 @@ struct WorkerEntry {
     restarts: u32,
     /// A [`WorkerRunState::code`].
     state: u8,
-    len: u8,
-    _pad: [u8; 6],
-    name: [u8; NAME_CAP],
+    _pad: [u8; 7],
+    name: FrameStr<NAME_CAP>,
 }
 
 /// The coordinator's own status frame: which cyclic systems have hard-stopped
@@ -598,6 +597,18 @@ impl Coordinator {
              Coordinator to run again"
         );
         self.started = true;
+        let run_span = tracing::info_span!("run");
+        let _run_span = run_span.enter();
+        tracing::info!(
+            cycles,
+            systems = self.cyclic.len(),
+            clock = match self.config.clock {
+                ClockMode::Wall => "wall",
+                ClockMode::Simulated { .. } => "simulated",
+            },
+            rate_hz = self.config.cycle_rate,
+            "mission starting"
+        );
         let tasks = self.start().await;
         self.channels.emit_boot();
         // The Wall pacing budget. Only computed under a `Wall` clock, since
@@ -621,6 +632,10 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => simulated_now(epoch, dt, k as u64),
             };
+            // Publish to the ambient mission clock before anything steps, so
+            // out-of-port stamps (tracing events, async health) land on the
+            // cycle timeline.
+            crate::clock::set_mission_now(now);
             // A reload request re-emits the registry and manifest for consumers
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.
@@ -635,6 +650,7 @@ impl Coordinator {
             }
             self.run_copy_ins();
             self.update_status(now);
+            self.drain_forwarded_logs(now);
             match self.config.clock {
                 // Wall: sleep out the remainder of the cycle budget.
                 ClockMode::Wall => {
@@ -650,6 +666,7 @@ impl Coordinator {
                 ClockMode::Simulated { .. } => stellarator::yield_now().await,
             }
         }
+        tracing::info!(cycle = self.cycle, "mission shutting down");
         self.shutdown(tasks).await;
     }
 
@@ -735,12 +752,14 @@ impl Coordinator {
         for slot in &mut self.cyclic {
             if slot.drain_timeouts() > 0 {
                 self.coord_health.error("proc_step_timeout");
-                self.coord_health.log(Level::Warn, slot.name());
+                self.coord_health.log(LogLevel::Warn, slot.name());
+                tracing::warn!(system = slot.name(), "worker step missed its deadline");
                 worker_event = true;
             }
             if slot.drain_restarts() > 0 {
                 self.coord_health.error("proc_restart");
-                self.coord_health.log(Level::Warn, slot.name());
+                self.coord_health.log(LogLevel::Warn, slot.name());
+                tracing::warn!(system = slot.name(), "worker restarting");
                 worker_event = true;
             }
         }
@@ -776,7 +795,8 @@ impl Coordinator {
             for i in 0..self.stopped.len() {
                 let name = self.stopped[i].name.clone();
                 self.coord_health.error("system_stopped");
-                self.coord_health.log(Level::Warn, &name);
+                self.coord_health.log(LogLevel::Warn, &name);
+                tracing::error!(system = %name, "system stopped");
             }
             self.coord_health.end_cycle(now, 0);
         }
@@ -800,12 +820,10 @@ impl Coordinator {
                 offset_of!(CoordinatorStatus, stopped),
                 |l| {
                     for sys in stopped.iter().take(MAX_STOPPED) {
-                        let (name, len) = pack_name(&sys.name);
                         l.push(StoppedEntry {
                             reason: sys.reason.code(),
-                            len,
-                            _pad: [0; 6],
-                            name,
+                            _pad: [0; 7],
+                            name: FrameStr::new(&sys.name),
                         });
                     }
                 },
@@ -815,14 +833,12 @@ impl Coordinator {
                 offset_of!(CoordinatorStatus, workers),
                 |l| {
                     for w in workers.iter().take(MAX_WORKERS) {
-                        let (name, len) = pack_name(&w.name);
                         l.push(WorkerEntry {
                             pid: w.pid,
                             restarts: w.restarts,
                             state: w.state.code(),
-                            len,
-                            _pad: [0; 6],
-                            name,
+                            _pad: [0; 7],
+                            name: FrameStr::new(&w.name),
                         });
                     }
                 },
@@ -833,10 +849,23 @@ impl Coordinator {
         }
     }
 
+    /// Drain the tracing forward queue onto the coordinator's log port. Runs
+    /// once per cycle (after the slots step) and once more at shutdown;
+    /// events fired before the first cycle (build, init) flush here too.
+    fn drain_forwarded_logs(&mut self, now: Timestamp) {
+        let dropped = crate::logfwd::drain(|ev| self.coord_health.emit_event(&ev));
+        if dropped > 0 {
+            for _ in 0..dropped {
+                self.coord_health.error("log_dropped");
+            }
+            self.coord_health.end_cycle(now, 0);
+        }
+    }
+
     fn telemeter_overrun(&mut self, now: Timestamp, elapsed: Duration, budget: Duration) {
         self.coord_health.error("cycle_overrun");
         self.coord_health.log(
-            Level::Warn,
+            LogLevel::Warn,
             &format!(
                 "cycle overran: {}us > {}us",
                 elapsed.as_micros(),
@@ -865,9 +894,10 @@ impl Coordinator {
             if !handle.0.is_complete() {
                 self.coord_health.error("async_shutdown_timeout");
                 self.coord_health.log(
-                    Level::Error,
+                    LogLevel::Error,
                     &format!("async system '{}' exceeded shutdown deadline", task.name),
                 );
+                tracing::error!(system = %task.name, "async system exceeded shutdown deadline");
                 let _ = handle.0.cancel();
             }
             let _ = handle.await;
@@ -875,6 +905,9 @@ impl Coordinator {
         for slot in self.cyclic.iter_mut().rev() {
             slot.shutdown();
         }
+        // Late tracing events (task teardown, slot shutdown) still reach the
+        // downlink's final batches.
+        self.drain_forwarded_logs(Timestamp::now());
     }
 }
 

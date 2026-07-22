@@ -35,7 +35,7 @@ use crate::dl::DlSystem;
 use super::error::{LoadError, LoadErrorKind};
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, ParamSource,
-    SlotInitState, SlotSpec, SourceRef, SystemSpec, Wiring,
+    SlotInitState, SlotSpec, SourceRef, StateSpec, SystemSpec, Wiring,
 };
 use super::registry::{LoadCtx, Registry, StaticParams};
 use super::{encode_value_params, stubgen, validate};
@@ -96,8 +96,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 /// Both front-ends land here, so static and dl systems go through identical
 /// validation, sizing, and telemetry passes. A static system (no `artifact`)
 /// is instantiated through the [`Registry`] factory; a dl system is opened
-/// from its built [`Artifact::path`] and registered with
-/// [`InitGraph::add_dl_cyclic`](crate::coordinator::init::InitGraph::add_dl_cyclic).
+/// from its built [`Artifact::path`] and registered as a loaded cyclic node.
 ///
 /// A `Wiring` carries no source text (a builder-origin one never had any), so
 /// resolve-time [`LoadError`]s hold a best-effort snippet rather than original
@@ -127,6 +126,9 @@ pub fn resolve_with(
     let mut graph = InitGraph::new(config);
     graph.worker_exe = opts.worker_exe;
     graph.shm_dir = opts.shm_dir;
+    // The mission namespace rides the registry/announce seam (`InitGraph::qualify`)
+    // and is threaded into each static system's `configure` via `LoadCtx`.
+    graph.namespace = wiring.coordinator.namespace.clone();
 
     // Serialized path-stripped so the telemetered topology matches the
     // bundle's `wiring.json` byte-for-byte regardless of the build tree.
@@ -136,6 +138,16 @@ pub fn resolve_with(
         ir_version: wiring.ir_version,
         ir_json,
     });
+
+    // --- States pass: pack-shared states construct before any system, so
+    //     an attached entry's create finds its instance in place. Each
+    //     construction yields the token a by-name attach downcasts, keyed by
+    //     the state's declaration name for the systems pass.
+    let mut state_tokens: HashMap<&str, crate::pack::AttachTarget> = HashMap::new();
+    for spec in &wiring.states {
+        let target = resolve_state(spec, registry)?;
+        state_tokens.insert(spec.name.as_str(), target);
+    }
 
     // --- Systems pass: static via the Registry, dl via the loader --------
     let mut instances: HashMap<String, Instance> = HashMap::new();
@@ -170,7 +182,7 @@ pub fn resolve_with(
                     deferred.push(spec);
                     continue;
                 }
-                resolve_static(spec, registry, &mut graph)?
+                resolve_static(spec, registry, &state_tokens, &mut graph)?
             }
         };
         // `validate` guaranteed instance-name uniqueness, so the insert is new.
@@ -187,8 +199,26 @@ pub fn resolve_with(
     // --- Deferred receive-all systems: the last cyclic registrations, still
     //     ahead of the edges pass, which only needs the finished instance map.
     for spec in deferred {
-        let (handle, desc) = resolve_static(spec, registry, &mut graph)?;
+        let (handle, desc) = resolve_static(spec, registry, &state_tokens, &mut graph)?;
         instances.insert(spec.name.clone(), Instance { handle, desc });
+    }
+
+    // Every declared state must have gained an attachment by now (attach
+    // counts at entry create): a state serving nobody is a config defect —
+    // a link server with no downlink serves silence — so it fails like any
+    // other wiring mistake.
+    for spec in &wiring.states {
+        let entry = registry
+            .states
+            .get(spec.ty.as_str())
+            .expect("the states pass resolved this type");
+        if entry.borrow().cell.attached() == 0 {
+            return Err(LoadErrorKind::StateUnused {
+                name: spec.name.clone(),
+                ty: spec.ty.clone(),
+            }
+            .whole(state_src(spec)));
+        }
     }
 
     // --- Edges pass ------------------------------------------------------
@@ -230,6 +260,69 @@ pub fn resolve_with(
     })
 }
 
+/// Construct one pack-shared state through its registered
+/// [`StateEntry`](crate::StateEntry): decode the spec's params off the value
+/// surface and run the state's init fn. Construction failure (a listener
+/// bind) is a spanned load error, not a runtime one. Returns the
+/// [`AttachTarget`](crate::pack::AttachTarget) a by-name attach downcasts.
+fn resolve_state(
+    spec: &StateSpec,
+    registry: &Registry,
+) -> Result<crate::pack::AttachTarget, LoadError> {
+    let Some(entry) = registry.states.get(spec.ty.as_str()) else {
+        let mut available: Vec<&str> = registry.states.keys().copied().collect();
+        available.sort_unstable();
+        return Err(LoadErrorKind::UnknownStateType {
+            name: spec.name.clone(),
+            ty: spec.ty.clone(),
+            available: available.join(", "),
+        }
+        .whole(state_src(spec)));
+    };
+    let snippet = state_src(spec);
+    // A paramless spec conforms an empty object against the state's schema,
+    // the same all-defaults decode a paramless pack entry gets.
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let value = match &spec.params {
+        ParamSource::Postcard(_) => {
+            unreachable!("validate() rejects postcard params on a state")
+        }
+        ParamSource::Value(value) => value,
+        ParamSource::None => &empty,
+    };
+    let params = crate::pack::EntryParams::Value {
+        value,
+        src: &snippet,
+        name: &spec.name,
+        msgs: &registry.msgs,
+        attach: None,
+    };
+    entry.borrow_mut().create(params).map_err(|e| match e {
+        crate::pack::MakeError::Params(e) => *e,
+        other => LoadErrorKind::StateInit {
+            name: spec.name.clone(),
+            ty: spec.ty.clone(),
+            message: other.to_string(),
+        }
+        .whole(snippet.clone()),
+    })?;
+    let entry = entry.borrow();
+    Ok(crate::pack::AttachTarget {
+        ty: entry.name(),
+        token: entry.token.clone(),
+    })
+}
+
+/// A best-effort source snippet for a state spec's errors.
+pub(super) fn state_src(spec: &StateSpec) -> String {
+    format!(
+        "state \"{}\" type=\"{}\"{}",
+        spec.name,
+        spec.ty,
+        src_anchor(spec.src.as_ref())
+    )
+}
+
 /// Instantiate a static system through the [`Registry`] factory.
 ///
 /// A value-tree spec passes its params straight through as
@@ -238,6 +331,7 @@ pub fn resolve_with(
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
+    state_tokens: &HashMap<&str, crate::pack::AttachTarget>,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     // `type=` and non-postcard params are guaranteed for a static system by
@@ -250,6 +344,32 @@ fn resolve_static(
         .factories
         .get(ty)
         .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.whole(system_src(spec)))?;
+
+    // Attach/shared consistency: a shared-state entry needs an `attach`, and a
+    // plain entry must not carry one. `validate` already proved a present
+    // `attach` names a declared state, so the map lookup here always hits.
+    let attach = match (factory.shared, spec.attach.as_deref()) {
+        (true, Some(name)) => Some(
+            state_tokens
+                .get(name)
+                .expect("validate() proved this attach names a declared state"),
+        ),
+        (true, None) => {
+            return Err(LoadErrorKind::MissingAttach {
+                system: spec.name.clone(),
+            }
+            .whole(system_src(spec)));
+        }
+        (false, Some(attach)) => {
+            return Err(LoadErrorKind::AttachOnNonSharedSystem {
+                system: spec.name.clone(),
+                attach: attach.to_string(),
+            }
+            .whole(system_src(spec)));
+        }
+        (false, None) => None,
+    };
+
     let snippet;
     let params = match &spec.params {
         ParamSource::Postcard(_) => {
@@ -268,6 +388,8 @@ fn resolve_static(
         params,
         name: &spec.name,
         msgs: &registry.msgs,
+        namespace: graph.namespace.as_deref(),
+        attach,
     })?;
     let desc = node.desc.clone();
     let handle = graph.push_node(node);
@@ -740,14 +862,18 @@ pub(super) fn slot_config_error(
             }
             .at(src, span)
         }
-        // A mount-reserved port is an occupant-contract defect too: the
-        // artifact predates the pack ABI and must be rebuilt.
+        // A mount-reserved port and a declared capability are
+        // occupant-contract defects too: the occupant cannot honor the
+        // slot's contract as declared.
         SlotConfigError::OccupantMismatch { occupant, .. }
-        | SlotConfigError::ReservedPort { occupant, .. } => LoadErrorKind::SlotOccupantMismatch {
-            slot: name,
-            occupant,
+        | SlotConfigError::ReservedPort { occupant, .. }
+        | SlotConfigError::CapabilityOccupant { occupant } => {
+            LoadErrorKind::SlotOccupantMismatch {
+                slot: name,
+                occupant,
+            }
+            .at(src, span)
         }
-        .at(src, span),
         SlotConfigError::MixedBacking => {
             unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
         }
@@ -870,7 +996,7 @@ fn resolve_slot(
     Ok((handle, desc))
 }
 
-/// Resolve a process slot's allowed set (`docs/process-slots.md` §8): the
+/// Resolve a process slot's allowed set (`docs/process-systems.md`): the
 /// [`resolve_proc`] recipe once per allowed occupant, so the host never
 /// dlopens any occupant artifact. The resulting [`AllowedOccupant`]s carry
 /// [`OccupantBacking::Artifact`], which is what makes [`plan_slot`] register

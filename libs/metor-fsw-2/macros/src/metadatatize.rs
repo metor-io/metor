@@ -20,7 +20,7 @@ pub fn metadatatize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> TokenSt
     let where_clause = &generics.where_clause;
     let impeller_wkt = quote! { #crate_name::metor_proto_wkt };
 
-    let metadata_items = fields.iter().filter(|f| !f.timestamp).map(|field| {
+    let metadata_items = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
         let ty = &field.ty;
 
         let name = field.component_name();

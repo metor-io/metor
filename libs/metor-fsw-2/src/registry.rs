@@ -4,7 +4,8 @@
 //! build order. That covers every system's user frames plus their implicit
 //! `health` and `log` outputs, every message channel, and the
 //! coordinator-owned `health`, `log`, `status`, `sequences`, and `commands`
-//! buffers. Broad or dynamic readers (a downlink, a logger, a recorder, a
+//! buffers. A mission with a wiring manifest also has a `wiring` output.
+//! Broad or dynamic readers (a downlink, a logger, a recorder, a
 //! debugger) all reach outputs through this one index rather than through any
 //! per-port wiring.
 //!

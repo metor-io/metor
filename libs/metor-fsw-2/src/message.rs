@@ -4,11 +4,11 @@
 //! [`Frame`](crate::Frame) is a fixed component group announced through a
 //! vtable, a message record describes itself: the 2-byte [`Msg::ID`] followed
 //! by the postcard-serialized payload, written verbatim onto a byte ring. The
-//! id alone names the schema, so any consumer decodes a record with nothing
-//! but the bytes in front of it. Message rings use log delivery, which means
-//! every record is preserved in order rather than coalesced into a
-//! latest-wins snapshot, and a full ring backpressures the emitter instead of
-//! dropping.
+//! id alone names the schema, so any consumer decodes a record from the bytes
+//! in front of it. Message rings use log delivery, so readers drain each
+//! producer's records in order instead of taking only the latest one. A full
+//! ring makes [`emit`](MsgOut::emit) fail. [`publish`](MsgOut::publish) drops
+//! the new record and counts the loss.
 //!
 //! [`MsgOut<M>`](MsgOut) and [`MsgIn<M>`](MsgIn) are the message twins of
 //! [`Output<F>`](crate::Output) and [`Input<F>`](crate::Input). Each is typed
@@ -24,8 +24,8 @@ use core::marker::PhantomData;
 use metor_fsw_ring::{NoWake, View, WakeSink, WakeSource, WriteError, Writer};
 use metor_proto::types::{Msg, PacketId};
 use metor_proto_wkt::{
-    AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, ReloadSequences, SequenceChannelEvent,
-    SequenceCommand, SequenceRegistry, WiringManifest,
+    AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmRaised, LogEvent, ReloadSequences,
+    SequenceChannelEvent, SequenceCommand, SequenceRegistry, WiringManifest,
 };
 use serde::de::DeserializeOwned;
 
@@ -39,7 +39,7 @@ use crate::descriptor::PortDesc;
 /// explicitly rather than derived from the Rust type name so that renaming
 /// the type cannot silently change the wire token. Resolution from token to
 /// type happens through a [`MsgTable`].
-pub trait NamedMsg: Msg {
+pub trait NamedMsg: Msg + postcard_schema::Schema {
     /// The stable wire, config, and registry token for this message type.
     const NAME: &'static str;
 }
@@ -59,6 +59,9 @@ impl NamedMsg for ReloadSequences {
 impl NamedMsg for AlarmDef {
     const NAME: &'static str = "AlarmDef";
 }
+impl NamedMsg for AlarmDefs {
+    const NAME: &'static str = "AlarmDefs";
+}
 impl NamedMsg for AlarmRaised {
     const NAME: &'static str = "AlarmRaised";
 }
@@ -70,6 +73,9 @@ impl NamedMsg for AlarmAck {
 }
 impl NamedMsg for WiringManifest {
     const NAME: &'static str = "WiringManifest";
+}
+impl NamedMsg for LogEvent {
+    const NAME: &'static str = "LogEvent";
 }
 
 /// A lookup from message name tokens to packet ids.
@@ -355,8 +361,7 @@ where
     /// arbitrary, and irrelevant since each record describes itself. Records
     /// with a different id and records that fail to decode are skipped. Each
     /// record is borrowed in place and freed for the writer as soon as `f`
-    /// returns, and a full ring backpressures the emitter rather than
-    /// dropping. Ring corruption is returned to the caller.
+    /// returns. Ring corruption is returned to the caller.
     pub fn drain(&mut self, mut f: impl FnMut(M)) -> Result<(), crate::ReadError> {
         for view in &mut self.views {
             crate::port::drain_view(view, |rec| {

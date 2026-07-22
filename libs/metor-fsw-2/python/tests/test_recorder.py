@@ -4,7 +4,7 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "metor-config"))
 
 import metor_config as mc
 from metor_config import (
@@ -12,8 +12,9 @@ from metor_config import (
     Alarms,
     Mission,
     Target,
-    TcpDownlink,
-    TcpUplink,
+    Downlink,
+    TcpServer,
+    Uplink,
     band,
     static_system,
 )
@@ -34,16 +35,34 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(sim["clock"], {"Simulated": {"dt_secs": 0.5}})
         self.assertEqual(sim["default_depth"], 8)
 
+    def test_namespace_emission_and_validation(self):
+        # Absent by default: an un-namespaced mission emits a null namespace,
+        # keeping component ids identical to before.
+        self.assertIsNone(Mission(cycle_rate=100.0).to_ir()["coordinator"]["namespace"])
+
+        # A dotted namespace rides in the coordinator dict verbatim.
+        ns = Mission(cycle_rate=100.0, namespace="fleet.sat1").to_ir()["coordinator"]
+        self.assertEqual(ns["namespace"], "fleet.sat1")
+
+        # Malformed namespaces are rejected at construction.
+        for bad in ["", ".sat1", "sat1.", "sat1..a"]:
+            mc._missions.clear()
+            with self.assertRaises(ValueError):
+                Mission(cycle_rate=100.0, namespace=bad)
+
     def test_add_records_system_and_ports(self):
         m = Mission(cycle_rate=100.0)
+        link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
         a = m.add("a", static_system("Alarms"))
-        b = m.add("b", TcpDownlink(addr="127.0.0.1:2240"))
+        b = m.add("b", Downlink(link))
         m.connect(a.out, b.feed)
         ir = m.to_ir()
         self.assertEqual([s["name"] for s in ir["systems"]], ["a", "b"])
         self.assertEqual(ir["systems"][0]["ty"], "Alarms")
         self.assertIsNone(ir["systems"][0]["artifact"])
         self.assertEqual(ir["systems"][0]["params"], "None")
+        self.assertIsNone(ir["systems"][0]["attach"])
+        self.assertEqual(ir["systems"][1]["attach"], "link")
         edge = ir["edges"][0]
         self.assertEqual((edge["from"], edge["out"], edge["to"], edge["in_"]), ("a", "out", "b", "feed"))
         self.assertEqual(edge["kind"], "Frame")
@@ -57,7 +76,7 @@ class RecorderTest(unittest.TestCase):
         ir = m.to_ir()
         self.assertEqual(ir["artifacts"][0]["id"], "adcs")
         self.assertEqual(ir["artifacts"][0]["crate_name"], "adcs-systems")
-        self.assertTrue(ir["artifacts"][0]["cdylib"].endswith(("adcs_systems.dylib", "adcs_systems.so", "adcs_systems.dll")))
+        self.assertEqual(ir["artifacts"][0]["lib"], "adcs_systems")
         self.assertIsNone(ir["artifacts"][0]["path"])
         plant = ir["systems"][0]
         self.assertEqual(plant["ty"], "Plant")
@@ -67,9 +86,10 @@ class RecorderTest(unittest.TestCase):
 
     def test_delayed_and_message_edges(self):
         m = Mission(cycle_rate=100.0)
+        link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
         ctrl = m.add("ctrl", static_system("Ctrl"))
         plant = m.add("plant", static_system("Plant"))
-        uplink = m.add("uplink", TcpUplink(addr="127.0.0.1:2240", msgs=["Cmd"]))
+        uplink = m.add("uplink", Uplink(link, msgs=["Cmd"]))
         m.connect(ctrl.torque_cmd, plant.torque_cmd, delayed=True)
         m.route(uplink, plant, msg="Cmd")
         m.route(m.coordinator, plant, msg="Cmd")
@@ -144,9 +164,12 @@ class RecorderTest(unittest.TestCase):
         self.assertNotIn("severity", a)
 
     def test_uplink_downlink_shapes(self):
-        up = TcpUplink(addr="127.0.0.1:2240", msgs=["Cmd"])._param_source()["Value"]
-        self.assertEqual(up, {"addr": "127.0.0.1:2240", "msgs": ["Cmd"]})
-        self.assertEqual(TcpDownlink(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
+        link = mc.StateHandle("link")
+        uplink = Uplink(link, msgs=["Cmd"])
+        self.assertEqual(uplink._param_source()["Value"], {"msgs": ["Cmd"]})
+        self.assertEqual(uplink.attach, "link")
+        self.assertEqual(Downlink(link).attach, "link")
+        self.assertEqual(TcpServer(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
 
     # -- error cases --------------------------------------------------------
 

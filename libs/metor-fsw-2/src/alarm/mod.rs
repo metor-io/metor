@@ -1,14 +1,14 @@
 //! Limit alarms over telemetered components.
 //!
-//! An alarm is just a message, and the alarm engine is just a system.
-//! [`AlarmSystem`] is an ordinary [`CyclicSystem`](crate::CyclicSystem) that
+//! The alarm engine sends alarm state through standard message ports.
+//! [`AlarmSystem`] is a [`CyclicSystem`](crate::CyclicSystem) that
 //! watches telemetered components through an [`AllOutputs`](crate::AllOutputs)
 //! tap and publishes over ordinary message ports. It emits an [`AlarmDef`] per
 //! configured alarm at boot, then [`AlarmRaised`] and [`AlarmCleared`] as
 //! alarms transition. Anything that consumes telemetered messages sees them
 //! with no extra plumbing.
 //!
-//! The module splits into three pieces:
+//! The module has three parts:
 //!
 //! - the config surface ([`AlarmsParams`], [`AlarmSpec`]), the serde types a
 //!   mission file's `system "alarms" type="Alarms" { alarm … }` node
@@ -52,14 +52,14 @@ use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_wkt::{
-    AlarmAck, AlarmCleared, AlarmDef, AlarmLimit, AlarmRaised, AlarmTarget, LimitKind,
+    AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmLimit, AlarmRaised, AlarmTarget, LimitKind,
     OccurrenceId, Severity,
 };
 use serde::Deserialize;
 
 use crate::message::{MsgIn, MsgOut};
 use crate::registry::AllOutputs;
-use crate::system::{BuildSystem, CyclicSystem, Out, System};
+use crate::system::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, System};
 
 /// The set of alarms one [`AlarmSystem`] instance evaluates, one
 /// [`AlarmSpec`] per repeated `alarm` child node. An alarm-less instance is
@@ -243,7 +243,7 @@ impl AlarmSpec {
             description: self.description.clone(),
             target: Some(AlarmTarget {
                 component_id: ComponentId::new(&self.target.component),
-                element_index: self.target.element,
+                element_index: self.target.element.map(|e| e as u64),
             }),
             limits,
             default_severity: self.severity,
@@ -425,7 +425,10 @@ pub struct AlarmIn {
 /// already evaluate.
 #[derive(crate::SystemOutput)]
 pub struct AlarmOut {
-    defs: MsgOut<AlarmDef>,
+    /// The full def set as one latest-wins snapshot: the downlink retains
+    /// it, so a panel connecting mid-mission still learns every alarm.
+    #[fsw(snapshot)]
+    defs: MsgOut<AlarmDefs>,
     raised: MsgOut<AlarmRaised>,
     cleared: MsgOut<AlarmCleared>,
     all: AllOutputs,
@@ -495,6 +498,21 @@ impl BuildSystem for AlarmSystem {
             scratch: Vec::new(),
         }
     }
+
+    /// Prefix each authored target with the mission namespace so its
+    /// [`ComponentId`] matches the namespace-qualified registry the engine
+    /// resolves against. The `component` string itself is rewritten, so the
+    /// broadcast [`AlarmDef`] target and the raise messages carry the same
+    /// qualified name. A no-op without a namespace, leaving ids byte-identical.
+    fn configure(&mut self, ctx: &BuildCtx) -> Result<(), ConfigureError> {
+        if let Some(ns) = ctx.namespace {
+            for rt in &mut self.alarms {
+                rt.spec.target.component = format!("{ns}.{}", rt.spec.target.component);
+                rt.component_id = ComponentId::new(&rt.spec.target.component);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl System for AlarmSystem {
@@ -512,10 +530,10 @@ impl CyclicSystem for AlarmSystem {
         if !self.booted {
             self.booted = true;
             // Defs broadcast at the first execute, not `init`; see the module
-            // docs on boot order.
-            for rt in &self.alarms {
-                output.defs.publish(&rt.spec.to_def());
-            }
+            // docs on boot order. One snapshot record carries the whole set.
+            output.defs.publish(&AlarmDefs {
+                defs: self.alarms.iter().map(|rt| rt.spec.to_def()).collect(),
+            });
         }
 
         // Operator acks first, so a latched, already-recovered occurrence
@@ -579,14 +597,20 @@ impl CyclicSystem for AlarmSystem {
                     Some(EvalEvent::Raise {
                         occurrence,
                         severity,
-                    }) => output.raised.publish(&AlarmRaised {
-                        def_id: rt.spec.id.clone(),
-                        occurrence,
-                        severity,
-                        value: Some(value),
-                        message: raise_message(&rt.spec.target, value),
-                    }),
+                    }) => {
+                        // Debug, not info: the raise already broadcasts as its
+                        // own message, so the log stream need not double it.
+                        tracing::debug!(alarm = %rt.spec.id, ?severity, value, "alarm raised");
+                        output.raised.publish(&AlarmRaised {
+                            def_id: rt.spec.id.clone(),
+                            occurrence,
+                            severity,
+                            value: Some(value),
+                            message: raise_message(&rt.spec.target, value),
+                        })
+                    }
                     Some(EvalEvent::Clear { occurrence }) => {
+                        tracing::debug!(alarm = %rt.spec.id, "alarm cleared");
                         output.cleared.publish(&AlarmCleared {
                             def_id: rt.spec.id.clone(),
                             occurrence,
@@ -707,7 +731,7 @@ impl AlarmSystem {
         for (kind, line) in failures {
             let health = output.health();
             health.error(kind);
-            health.log(crate::health::Level::Warn, &line);
+            health.log(crate::health::LogLevel::Warn, &line);
         }
     }
 }

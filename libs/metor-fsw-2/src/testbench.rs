@@ -15,10 +15,11 @@
 //! let est = bench.read::<AttitudeEstimate>().expect("published");
 //! ```
 //!
-//! The bench mounts the entry wired (no occupant tail) and holds one writer
-//! per input and one view per output, addressed by frame type. Message
-//! ports get the same treatment through [`send`](TestBench::send) /
-//! [`recv`](TestBench::recv).
+//! The bench mounts the entry wired, with no slot ports. It holds each ring
+//! and creates a short-lived input writer for each call. It keeps one view per
+//! output. Frame and message lookup uses the payload id, so the bench cannot
+//! pick between two ports with the same id. It also cannot supply an
+//! [`AllOutputs`](crate::AllOutputs) grant because its registry is empty.
 
 use metor_fsw_ring::{Config, NoWake, RingBuffer, View};
 use metor_proto::types::Timestamp;
@@ -62,8 +63,11 @@ impl TestBench {
     /// `&[]` for a paramless entry), allocate a ring per declared port, and
     /// bind it exactly as the coordinator would.
     pub fn new(entry: &mut PackEntry, params: &[u8]) -> Result<Self, MakeError> {
-        let pending = entry.create(EntryParams::Postcard(params))?;
-        let descriptor = entry.descriptor().clone();
+        let crate::Created {
+            pending,
+            instance_desc,
+        } = entry.create(EntryParams::Postcard(params))?;
+        let descriptor = instance_desc.unwrap_or_else(|| entry.descriptor().clone());
         let input_rings: Vec<RingBuffer> = descriptor.inputs.iter().map(ring_for).collect();
         let output_rings: Vec<RingBuffer> = descriptor.outputs.iter().map(ring_for).collect();
         // Claim the bench's read views before the entry binds or inits, so
@@ -84,7 +88,7 @@ impl TestBench {
             .map(|r| BoundInput::One(BoundPort::new(r.clone())))
             .collect();
         let registry = std::sync::Arc::new(Registry::new(Vec::new()));
-        let mut binder = Binder::new(&outs, &ins, registry);
+        let mut binder = Binder::new(&outs, &ins, registry, &descriptor.name);
         let mut src = AnySource::Host(&mut binder);
         let mut driver = pending(&mut src, Mount::Wired);
         driver.init();

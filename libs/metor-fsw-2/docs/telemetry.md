@@ -1,480 +1,163 @@
-# Telemetry Downlink + the Registry
+# Telemetry link
 
-The telemetry downlink streams other systems' outputs — component frames *and* message channels
-alike — out of the process in metor-proto's wire format — the format `metor-db` ingests. It rests
-on a general capability, the **registry** (`src/registry.rs`, one keyspace for both payload kinds),
-which lets any broad or dynamic reader reach every tappable buffer in the graph by id. The downlink
-is the registry's first consumer; a logger, recorder, or debugger would use the same registry the
-same way.
+The telemetry link serves telemetry and commands on one TCP socket. Ground tools connect to the flight software. The flight software does not dial a ground address.
 
-The code lives in two modules:
+Telemetry gives operators and ground tools a live view of the mission. The
+uplink gives them a path to send commands back. Together they make the running
+software observable and controllable without adding network code to each
+system.
 
-- `src/registry.rs` — `Registry` and `RegistryEntry`: the by-id index over the coordinator's
-  ring table.
-- `src/telemetry/mod.rs` — `TelemetrySystem`, the `Transport` trait and `TcpTransport`, the
-  snapshot/hand-off mechanism, the async sender. Unit tests are in `src/telemetry/tests.rs`.
+## Mission setup
 
----
+This Python config serves all telemetry and accepts two command types:
 
-## 1. Purpose & the metor-proto wire symmetry
+```python
+from metor_config import Downlink, Mission, TcpServer, Uplink
 
-Flight software is useful only if its state can be observed off-board. The downlink **taps** the
-output ring buffers that other systems already write and re-emits each buffer's latest record as a
-metor-proto **`Table` packet** referencing a once-announced **`VTable`**. A frame's ring payload *is*
-its table bytes — `Output::write` does a single `try_write` of `frame.as_bytes()` — so there is no
-serialization step: the bytes a system committed are the bytes that go on the wire, and `metor-db`
-stores them with no translation. The downlink and the database are two ends of one protocol.
+m = Mission(cycle_rate=100.0)
 
-This is the same VTable symmetry that `examples/cube-sat/src/main.rs` exercises by hand: it calls
-`tx.init_world::<CubeSat>(id)` once (vtable + metadata) and then, every cycle,
-`LenPacket::table(id, cap)` / `extend_from_slice(frame.as_bytes())` / `tx.send(pkt)` / `pkt.clear()`.
-The downlink generalizes that hand-written loop to *every* output of a running graph, with
-per-instance namespacing, without blocking the control cycle on the socket.
+link = m.state(
+    "link",
+    TcpServer(addr="0.0.0.0:2240", name="sat-a"),
+)
 
----
+uplink = m.add(
+    "uplink",
+    Uplink(link, msgs=["SequenceCommand", "AlarmAck"]),
+)
 
-## 2. The general registry
+downlink = m.add("downlink", Downlink(link))
+```
 
-The mechanism the streamer uses to reach all outputs is a first-class capability available to every
-system, not a telemetry special case. The registry is the centerpiece; telemetry is merely its first
-consumer.
+The address belongs to the server state, not to either system. Port `0` is valid. The server advertises the port that the OS chose. Each system takes the `link` handle its constructor requires — that is what attaches it to this server.
 
-### 2.1 What it is
+`Downlink(link)` selects every output marked for telemetry. A subset can match an instance name or an output name:
 
-The coordinator owns a `RingTable`: a `Vec<RingEntry>` where every `RingEntry { ring, frame_id, role,
-instance }` is one buffer in the graph. The registry is a thin, queryable index over that same table.
-It is built in `build()` from the fully populated ring table and stored as `Arc<Registry>` on
-the `Coordinator`; `Coordinator::registry()` returns a clone of that `Arc`.
+```python
+downlink = m.add(
+    "downlink",
+    Downlink(
+        link,
+        instances=["nav", "controller"],
+        frames=["health", "AlarmRaised"],
+    ),
+)
+```
+
+The two lists use OR rules. An entry matches if either list contains its name. The `frames` list also matches message channel names.
+
+The uplink creates one message output for each name in `msgs`. A route must connect that output to each user:
+
+```python
+m.route(uplink, mode_slot, msg="SequenceCommand")
+m.route(uplink, alarms, msg="AlarmAck")
+```
+
+Uplink outputs do not enter the downlink. This rule stops a command from going back to ground as telemetry.
+
+Three parts share the work:
+
+- A `TcpServer` state owns the listener and all live links.
+- A `Downlink` system reads selected output rings and sends their records.
+- An `Uplink` system reads command packets and writes them to message output ports.
+
+Both systems attach to the same `TcpServer` state by naming its handle, so the
+mission spells the wiring rather than the host inferring it. Socket work runs
+outside the control cycle. The systems only move bytes between rings and bounded
+queues.
+
+## Cycle order
+
+The uplink should run before its users. A command received between cycles can then reach its user in the next cycle.
+
+The downlink has the `ReceiveAll` capability. The config loader places all static `ReceiveAll` systems after normal cyclic systems. This group can include the alarm system as well as the downlink.
+
+The build step rejects a normal cyclic system placed after the first `ReceiveAll` system. This check makes each broad reader see records from the same cycle.
+
+The downlink claims its read views in `init`. A view starts at the current write point. It cannot see a record that another system wrote only in `init`.
+
+Publish one-time values in the first `execute`, after the downlink has claimed its view. Mark a one-time message as a snapshot when new TCP clients must receive its latest value. The link retains that value after the downlink reads it.
+
+## Downlink records
+
+Each output has two separate traits: schema and delivery.
+
+The schema sets the packet form:
+
+- A table output sends a `Table` packet. Its payload is the record from the ring.
+- A message output sends a `Msg` packet. Its record starts with the message id, followed by postcard data.
+
+The delivery setting controls how the downlink reads the ring:
+
+- `Snapshot` sends the newest record after a new commit.
+- `Log` sends every pending record in commit order.
+
+For example, a state frame often uses table schema with snapshot delivery. An alarm event uses message schema with log delivery. The downlink handles both through the same tap code.
+
+Table bytes need no data conversion. The downlink gives each table tap a packet id, then sends its vtable and component metadata before table data.
+
+The link also sends `SetMsgMetadata` for each known message id. It sends each message schema once, even when many systems have an output with that id.
+
+## Connection start
+
+Each new TCP client receives this data in order:
+
+1. `LinkInfo`, as the first packet.
+2. Table vtables and component metadata.
+3. Message metadata.
+4. The latest retained snapshot messages.
+5. Live cycle batches.
+
+`LinkInfo` contains the link protocol version, feature bits, and the message ids that the uplink accepts. The current packet does not contain the mDNS node name.
+
+The link retains snapshot messages because some of them report boot state once. It does not retain table snapshots. Systems tend to publish table state each cycle, so a new client soon gets a fresh value.
+
+## Command input
+
+All client readers feed one inbound FIFO. The FIFO keeps arrival order across clients.
+
+The reader accepts `Msg` packets as commands. It ignores `Table`, the old `MsgStream` request, and node or link control messages. The uplink then matches the message id against its configured output list.
+
+The uplink copies the payload without decoding it. Each receiving `MsgIn` decodes its own type and skips a payload that does not decode.
+
+An id outside the uplink list records `uplink_unroutable`. A full output ring records `uplink_dropped`. In both cases the uplink continues to drain its input.
+
+## Bounded loss
+
+Network delay must not delay the control cycle.
+
+Each client has at most 1 MiB of pending output. If a new cycle batch would cross that limit, that client misses the whole batch. Other clients still receive it, and the link keeps the slow client open.
+
+The inbound command FIFO holds 256 messages. A new message is lost when the FIFO is full.
+
+The downlink reports these cases through health:
+
+- `link_conn_dropped` for a lost client batch
+- `link_inbound_dropped` for a full command FIFO
+- `link_disconnect` when a client link ends
+- `telemetry_reader_slot` when a tap cannot claim a ring view
+- `telemetry_input_corrupt` when a tap cannot read its ring
+
+The `link_status` frame reports live links, accepted links, and lost output batches. It publishes when one of those values changes.
+
+The downlink drains every tap even when no client is present. This keeps its ring reader current. Live records have no network user in that case, apart from retained snapshot messages.
+
+## Local discovery
+
+The current server advertises non-loopback binds with mDNS and DNS-SD. It uses this service type:
 
 ```text
-Registry
-  entries:  Vec<RegistryEntry>           // one per tappable buffer, build order
-  by_key:   HashMap<ComponentId, usize>  // instance-qualified id -> entries index
+_metor-fsw._tcp.local.
 ```
 
-```text
-RegistryEntry
-  key:         ComponentId    // instance-qualified id  (§2.2)
-  instance:    Arc<str>       // "imu_left", or "coordinator" for coordinator-owned buffers
-  name:        Arc<str>       // the port name within the instance: F::NAME, M::NAME, or an
-                               // explicit coordinator channel string ("sequences")
-  schema:      EntrySchema    // Table { frame_id, vtable, metadata } | Postcard   (§6)
-  delivery:    Delivery       // Snapshot | Log — how a broad reader should drain this entry
-  telemetered: bool           // does the downlink / AllOutputs tap this entry (§3)
-  ring:        RingBuffer     // crate-private read source; reached only via view()
-```
+The service instance uses `TcpServer.name`. If the config omits the name, it uses the OS host name.
 
-**One registry, both payload kinds.** The registry indexes every tappable buffer — component
-frames *and* message channels alike, including the coordinator's own `commands`/`sequences`
-channels — in one keyspace, so a same-instance name collision between a frame and a channel is
-*detectable* at `build()` (`WireError::DuplicateRegistryKey`) rather than shadowed by two parallel
-tables. `EntrySchema` is the registry's projection of the port's `PortSchema` axis (system.md §5.1):
-`Table { frame_id, vtable, metadata }` carries the **prefixed** announce schema (§6, captured at
-`build()` — the authoritative unprefixed `VTable` lives on `PortDesc` and is otherwise dropped after
-sizing, because a broad consumer reads buffers by id and has no static frame type `F` to call
-`F::as_vtable()` on); `Postcard` carries neither — a `(PacketId, postcard)` record is
-self-describing on the wire, so a message entry has no vtable/metadata to capture. `telemetered`
-lets an entry stay registered (visible to a debugger/test by key through the full `Registry`) while
-being filtered out of the in-graph `AllOutputs` broadcast tap — this is how a command channel (e.g.
-the uplink's or coordinator's `commands`) avoids echoing straight back onto the downlink (§3)
-without needing a second index.
+The TXT record includes the link protocol version as `pv` and the role `fsw`. A wildcard bind lets the mDNS service list the host network addresses. A fixed non-loopback bind advertises that address.
 
-`RegistryEntry.ring` is crate-private. External callers reach the buffer only through
-`RegistryEntry::view()`, so every reader is slot-accounted (§2.5); the registry never hands out the
-raw `RingBuffer`.
+The server does not advertise a loopback bind. Local development with `127.0.0.1` still needs a direct address.
 
-### 2.2 The key
+mDNS works on the local multicast link. Routers do not carry it by default. It does not prove that a found service is the expected flight software.
 
-Two instances of one system type share a frame `ComponentId` (`ImuDriver`'s `imu` frame is
-`ComponentId::new("imu")` for *both* `imu_left` and `imu_right`), so `frame_id` alone cannot be the
-key. The key is the **instance-qualified id** `ComponentId::new("<instance>.<frame>")` — e.g.
-`ComponentId::new("imu_left.imu")`.
+The TCP link has no auth or encryption. Any host that can reach the port can read telemetry and send accepted command ids. Use discovery and this link only on a trusted network until the link gains peer auth.
 
-- It is a `ComponentId` (a `u64`): cheap, `Copy`, `Hash`, the project's universal name type.
-- **It is exactly the value the downlink puts on the wire** — the prefixed `Op::Frame` tag id (§6).
-  The key, the wire id, and the prefix are one identity.
-- It is derivable from data the `RingEntry` already carries: `instance` + `frame_id`.
-
-`instance` (`Arc<str>`) and `frame_id` are kept on the entry for human-readable subset filtering
-(§3) and for the metadata names, but the map key is the qualified id.
-
-### 2.3 Build order
-
-The registry is built in `build()` before the bind loop, so a system can pull it in
-`BindPorts::bind`. To make this work, the per-system output rings *and* the coordinator-owned
-`health`/`log`/`coordinator_status` rings are allocated up front (the coordinator-owned rings depend
-on no edges), the registry is assembled from all of them, and only then does binding run. Each
-`RegistryEntry` is built once at allocation, capturing the prefixed announce vtable + metadata (§6).
-
-### 2.4 How a system gets a handle
-
-A registry consumer receives `Arc<Registry>` through the binder. The host `Binder` carries the
-registry and exposes `RingSource::registry(&self) -> Arc<Registry>`. A system whose output bundle
-wants broad access declares a field of the **`AllOutputs`** capability type (`src/registry.rs`) —
-not a typed port — in its output bundle; the `#[derive(SystemOutput)]` walk sees `AllOutputs::decl()`
-contribute `PortDecl::Capability(Capability::ReceiveAll)` instead of a `PortDesc`, and
-`AllOutputs::bind` pulls the registry handle in the generated `BindPorts::bind`, exactly where typed
-ports pull their rings. Because the registry is complete before the bind loop (§2.3), this is safe
-and needs no second phase.
-
-The registry coexists with typed `connect`/`PortRef` wiring cleanly: **typed wiring is for known
-compile-time edges** (validated, compatibility-checked, sized into fan-out); **the registry is for
-broad or dynamic access** where the consumer does not know the producer at compile time. They share
-the same underlying rings; the registry never bypasses or duplicates a typed edge, it offers a by-id
-read path over the same ring table.
-
-Registry access is host-only: only the host `Binder` carries a registry — a
-non-host `RingSource`'s default `registry()` panics rather than fabricate an empty one (system.md
-§5.4). The telemetry downlink is never dlopen'd.
-
-### 2.5 Sizing: every registry reader is a fan-out consumer
-
-`RegistryEntry::view()` calls `RingBuffer::view(NoWake, NoWake)`, which **claims a reader slot** from
-the buffer's fixed `max_readers` table. This is the critical interaction with build-time sizing: the
-rings have no crash-slot reclamation, so `max_readers` is set once at `build()`.
-
-The coordinator sizes for the known registry consumers **self-derived, not manually bumped**:
-`build()` counts how many descriptors declare the `ReceiveAll` capability (`n_reg`) by scanning
-every registered system's `capabilities` — no counter-bump call anywhere, and any
-future `AllOutputs`-declaring system (a recorder, a second downlink) is picked up automatically just
-by declaring the field. Every output ring is sized
-
-```text
-max_readers = fan_out + n_reg + READER_SLACK   // READER_SLACK = 4
-```
-
-and the coordinator-owned buffers are sized `1 + n_reg + READER_SLACK`. "All"-mode telemetry
-contributes one slot to every buffer (one `AllOutputs` field); a second registry consumer would add
-one more each. A cyclic system declaring `ReceiveAll` must additionally be **registered last**
-among cyclic systems (`WireError::ReceiveAllNotLast`, enforced at `build()`, coordinator.md §3.4) —
-its end-of-cycle snapshot would otherwise observe some systems one cycle stale.
-This is exact and cannot over-subscribe for the known consumers.
-
-If a slot budget is nonetheless exhausted — a hand-built over-subscription — `view()` returns
-`Err(FullReaderTable)`; the downlink surfaces it as health and skips that tap rather than panicking
-(§3). There is no runtime late attach: a consumer connecting after `build()` has no reserved slot
-beyond the static `READER_SLACK`.
-
----
-
-## 3. Telemetry as a registry consumer
-
-`TelemetrySystem<T: Transport>` is an ordinary `CyclicSystem`, **registered last** so its `execute`
-runs after every other system's `execute` in the cycle (`run_for` drives the cyclic systems in
-registration order) — an end-of-cycle snapshot of the freshest output of each tapped buffer.
-
-It has no typed input ports. `TelemetryIn` is empty; `TelemetryPorts` (its output bundle) declares
-one `AllOutputs` field — a bind-time `Capability`, not a wired port (system.md §5.3) — which exists
-only to carry the `Arc<Registry>` pulled via the binder (§2.4). `AllOutputs::entries()` is already
-telemetered-only (the `Registry`'s `telemetered` flag filters at the source), so a command channel
-or an opted-out frame never even reaches the mode matcher below.
-
-**`TelemetryMode`** selects the tap set, over both payload kinds uniformly:
-
-- `All` — tap every telemetered registry entry, frames *and* message channels alike. This includes
-  every system's user output frames *and* their implicit per-system `health`/`log` frames (those are
-  `Output`-role buffers carrying the system's instance), plus the coordinator-owned
-  `health`/`log`/`coordinator_status`/`sequences` buffers (prefixed `"coordinator"`, §6) — but *not*
-  an untelemetered channel (e.g. `coordinator.commands`, the uplink's `CommandOut` outputs).
-- `Subset { instances, frames }` — tap an entry when its `instance` name matches one of `instances`
-  **or** its `name` (`RegistryEntry::name` — a frame's `F::NAME` or a message channel's `M::NAME`)
-  matches one of `frames` (a plain string compare — the field is called `frames` for historical
-  reasons but matches a message channel's name identically). Matching either list is enough.
-
-**`init()`** resolves the tap set and spawns the sender. It runs on the coordinator's loop task
-within `start()`, so `stellarator::spawn` has a runtime and the sender announces before any data is
-queued. For each registry entry that `mode.matches`, `init`:
-
-- claims one read `View` via `entry.view()`; on `Err(FullReaderTable)` it records
-  `output.health().error("telemetry_reader_slot")` and skips the tap;
-- picks a **lane** off the entry's `Delivery` axis (Snapshot → a coalescing slot, Log → the shared
-  FIFO, §4) and a **wire** framing off its `EntrySchema` (Table → announce + a sequential `PacketId`,
-  Postcard → forwarded as-is, no announce);
-- records a `Tap { view, lane, wire, last_committed }` and, for a Table entry, an
-  `Announce { packet_id, vtable, metadata }` carrying the entry's prefixed schema.
-
-**Known gap (B9): the init-time emit window.** `RingBuffer::view()` starts a reader **at the
-buffer's current commit point** — "it never sees older data" (`ring/src/lib.rs`).
-Every other system's `init` (both async systems, behind the coordinator's startup barrier, and every
-cyclic system, in registration order) completes **before** telemetry's own `init` runs (telemetry is
-registered last, coordinator.md §3.4/§3.7), so any frame or message a system emits *only* during its
-own `init` — and never rewrites later — is already committed by the time telemetry's `view()`
-attaches, and is therefore invisible to the downlink for the rest of the run: the view's cursor
-starts right past it. A frame that is republished every cycle (the common case) is unaffected — the
-downlink simply picks it up the next cycle. This applies symmetrically to a live panel connecting
-*after* the mission has been running for a while: a fresh telemetry view (and a fresh panel
-subscription behind it) starts at whatever the ring's live edge is at attach time, not at mission
-start, so a one-shot init-time record is equally invisible to a late-joining consumer. Not yet fixed;
-noted here as the honest limit of "the downlink taps every output," not solved by a backlog replay.
-
-It then creates a bounded `thingbuf` channel of reusable `Vec<u8>` batch slots and spawns
-`run_sender`, retaining its cancellation guard for teardown.
-
-**`execute(now)`** (end-of-cycle) acquires one batch slot without blocking, then drains Snapshot
-taps to their newest record and Log taps in order into that batch. If no slot is free, it still
-drains every tap to avoid backpressuring the mission and reports `telemetry_dropped`.
-
-**`shutdown()`** drops the channel sender. The async sender exits after the queue is drained; its
-task guard remains the cancellation backstop.
-
-No telemetry-specific coordinator hook exists: the only coordinator surface is the general registry
-(§2) plus the fact that any last-registered cyclic system observes end-of-cycle state. A recorder or
-logger would be written identically.
-
----
-
-## 4. Cycle / sender split — never block control on the network
-
-> **Current implementation (normative):** `execute` uses `try_send_ref` on one bounded
-> `thingbuf` queue of reusable `Vec<u8>` batches. Snapshot taps append their newest record and Log
-> taps append every record to the current cycle's batch. When no queue slot is available, all taps
-> are still drained to avoid pinning mission rings, the records are discarded, and
-> `telemetry_dropped` is reported. `run_sender` consumes one batch at a time, returns its emptied
-> vector to the queue slot, and reconnects with announcement replay after transport errors.
->
-> The two-lane `HandOff` design below is historical design context. It is not the implemented
-> queue or drop policy.
-
-The cycle is single-threaded and synchronous; `PacketSink::send` is async TCP. `execute` must not
-await the socket — a slow or stalled link must never delay control. The work is split between the
-in-cycle drain stage and an async sender task, bridged by one bounded, **two-lane** hand-off.
-
-Each tap is one of two lanes, chosen once at `init` from the entry's `Delivery` axis (§2.5) — this
-is also where frames and messages stop needing separate machinery: a Table×Snapshot frame tap and a
-Postcard×Log message tap are just two lane/wire combinations of the same `Tap`, and a hypothetical
-Table×Log (an every-record frame log) falls out for free with zero extra code.
-
-### Drain stage (in-cycle, `execute`)
-
-For each tap, `execute` reads the `View` per its lane, borrowing each record **in place** off the
-ring — there is no per-tap scratch copy:
-
-```text
-Lane::Coalesce { slot }:      // Snapshot entries (frames, by default)
-  compare the ring's `committed` word against the tap's `last_committed`; if
-  unchanged, nothing new this cycle — skip (the pinned newest record is not
-  re-sent). Otherwise borrow the newest record via View::try_latest, build one
-  LenPacket (Table or Msg framing, per the tap's `wire`) and
-  handoff.push_snapshot(slot, pkt)     // never blocks
-
-Lane::Fifo:                   // Log entries (messages, by default)
-  drain every record in order (per-record read grants); build one LenPacket per
-  record and
-  handoff.push_log(pkt)                // never blocks, for each record
-```
-
-A buffer with no new record this cycle is simply skipped. Each record is one copy: from the borrowed
-ring bytes into the freshly built `LenPacket`. It is a `memcpy`; there are no syscalls and no
-`.await` in the cycle.
-
-### Historical hand-off proposal (`HandOff`)
-
-```text
-HandOff
-  slots:             Mutex<Vec<Option<LenPacket>>>  // Snapshot lane: one coalescing slot per tap
-  fifo:               Mutex<VecDeque<LenPacket>>     // Log lane: one bounded FIFO shared by every Log tap
-  pending:            AtomicBool                     // either lane has something waiting; avoids busy-spin
-  dropped_snapshots:  AtomicU64                      // Snapshot lane: coalesced-away (overwritten un-sent)
-  dropped_logs:       AtomicU64                      // Log lane: dropped-oldest on overflow
-  wq:                 WaitQueue                      // wakes the parked sender
-```
-
-- **Snapshot lane** — `push_snapshot(slot, pkt)` (cycle side, never blocks): if the slot is already
-  occupied, the previous un-sent packet is overwritten and `dropped_snapshots` is incremented; the
-  new packet takes the slot. A snapshot is latest-wins state, so a newer one supersedes an older
-  un-sent one — at most one pending packet per tap.
-- **Log lane** — `push_log(pkt)` (cycle side, never blocks): appended to a shared, bounded FIFO
-  (`LOG_HANDOFF_CAP = 1024`); an event/command record must never be coalesced, so every drained
-  record is queued in order and forwarded verbatim (cross-*channel* order is irrelevant — each
-  record self-addresses by its wire id). Overflow drops the **oldest** queued record (not the
-  newest) and counts it in `dropped_logs`, bounding memory while keeping the most recent history.
-- Both `push_*` set `pending` and wake the sender.
-- `drain()` (sender side): takes every occupied Snapshot slot *and* the whole Log FIFO in one call
-  — `(Vec<LenPacket>, Vec<LenPacket>)` — releasing both locks before any `.await`.
-
-### Sender task (`run_sender`)
-
-`stellarator::spawn`ed at `init`. It announces every tap (§5), then loops: drain the batch queue and
-send each batch via `Transport::send`; a closed, drained queue (shutdown) ends the task. Any
-transport error — a failed connect included — drops the batch in flight, backs off (100 ms doubling
-to a 5 s cap, reset on success), and re-enters the announce phase, so every connect starts with a
-full announce replay and a restarted consumer can decode tables again. The loss of an established
-connection is counted and folded into the system's health as `link_reconnect`; the cycle is
-unaffected throughout (while the sender backs off, the queue fills and the cycle side counts
-`telemetry_dropped`).
-
-### Historical two-lane drop policy
-
-The rings themselves are lossless — a writer backpressures rather than overwrite unread data — so
-the hand-off is where the "never let a slow link touch the cycle" trade is made explicitly:
-
-- The Snapshot lane coalesces per tap; the cycle never blocks on a backed-up link.
-- When a stalled link leaves a Snapshot slot occupied, the next snapshot overwrites it and counts a
-  drop; the Log lane drops the **oldest** queued record past its cap instead — losing history, never
-  reordering the record log by dropping a newer one.
-- `execute` surfaces both in-band: it compares `HandOff.dropped_snapshots`/`dropped_logs` against
-  `last_dropped`/`last_msg_dropped` watermarks and emits `output.health().error("telemetry_dropped")`
-  / `.error("telemetry_msg_dropped")` once per newly dropped record, so loss is observable through
-  the telemetry system's own health frame.
-
----
-
-## 5. Wire protocol — announce once, stream per cycle
-
-The downlink reuses the metor-proto primitives verbatim; nothing here is new protocol.
-
-- **Announce-once (per Table tap, on connect).** Each Table tap has a sequential `PacketId`
-  (`[u8;2]`). The sender sends `VTableMsg { id, vtable }` carrying the **prefixed** vtable (§6),
-  followed by one `SetComponentMetadata(ComponentMetadata)` per component. This is exactly what
-  `SinkExt::init_world` does (`send_vtable` then `send_metadata`), but with a per-instance prefix
-  instead of the type's static names. A **Postcard** (message) tap needs no announce — the record is
-  self-describing on the wire (its own `PacketId` prefixes the postcard payload), so `wire = Wire::Msg`
-  skips this step entirely (§4).
-- **Stream-per-cycle.** For a Table tap with a fresh record, `execute` builds `LenPacket::table(id,
-  cap)` and `extend_from_slice`s the latest table bytes; for a Postcard tap it builds
-  `LenPacket::msg(id, cap)` from the record's own embedded id instead. Either way the sender forwards
-  it verbatim; `metor-db` ingest receives `VTableMsg` then `Table(id)` packets for frames, or bare
-  `Msg` packets for messages — precisely what the downlink emits.
-- **Dynamic frames** (`FrameList`/`FrameMap`). The table bytes already include the trailer
-  (`Output::write_with`/`publish_with` writes `fw.table()`), and the announced `VTable` already
-  carries the `Op::List`/`Op::Map` ops. The downlink forwards both as-is — bytes plus List/Map-bearing
-  vtable — and does nothing dynamic-aware itself; it is a pure forwarder.
-
----
-
-## 6. Instance-name prefixing
-
-Each tapped buffer is announced under a vtable + metadata whose component names are prefixed by the
-instance name, so `imu_left` emits `imu_left.imu.omega` and `imu_right` emits `imu_right.imu.omega` —
-never colliding on the wire despite sharing the `imu` frame id. The **table bytes are unchanged**: the
-layout is positional, and only the names/ids the vtable maps those bytes to change.
-
-The unprefixed `VTable` on `PortDesc` bakes each component's *hashed* id into the ops, and a hash is
-one-way, so the prefixed vtable cannot be re-derived from the unprefixed one. Instead the prefixed
-schema is re-derived from the static frame type with the instance as a `ComponentPath` prefix:
-
-- `AsVTable::vtable_fields(prefix)` takes a path prefix, so the prefixed vtable is
-  `vtable(F::vtable_fields(prefix))` — leaves become `component(instance.chain(frame).chain(field).id)`.
-- `Metadatatize::metadata(prefix)` likewise yields prefixed `ComponentMetadata`. The alloc-free
-  `PathHasher` rolls the same id as `ComponentId::new("<instance>.<frame>.<field>")`.
-
-Because this needs the static `F` (erased to `PortDesc` by build time), a Table `PortDesc`'s
-`PortSchema::Table` variant carries the prefix factory captured when the descriptor is derived
-(system.md §5.1):
-
-```text
-PortSchema::Table {
-    vtable: VTable,
-    announce: AnnounceFn,   // Arc<dyn Fn(&str) -> (VTable, Vec<ComponentMetadata>)>
-}
-```
-
-`PortDesc::of::<F>()` stores `announce_of::<F>`, a closure that closes over `F` and produces the
-prefixed vtable + metadata for any instance name. (A Postcard `PortDesc` carries no `announce` at
-all — a message channel has no per-instance schema to prefix, only its `PacketId`.) At `build()` the
-coordinator knows each port's instance, calls `announce(instance)`, and stores the result in the
-entry's `EntrySchema::Table { vtable, metadata, .. }` (§2.1). Coordinator-owned buffers
-(`instance = None`) use the synthetic prefix `"coordinator"`.
-
-The prefixed `Op::Frame` tag id equals `ComponentId::new("<instance>.<frame>")` — the same value used
-as the registry key (§2.2), so the key, the wire id, and the prefix are one consistent identity.
-
----
-
-## 7. Transport abstraction
-
-A small trait isolates the wire from the streamer:
-
-```rust
-pub trait Transport {
-    async fn announce(&mut self, msg: &VTableMsg, meta: &[ComponentMetadata]) -> Result<(), TransportError>;
-    async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError>;
-}
-```
-
-`TransportError` is either `Disconnected` or `Io` (a boxed, transport-agnostic I/O error). An error
-sends the sender into its backoff/redial loop; the in-cycle snapshot stage keeps running and simply
-drops.
-
-**`TcpTransport`** is the shipping transport. It holds a `SocketAddr` and an optional `TcpConn`
-(`PacketSink<OwnedWriter<TcpStream>>` plus the read half, held only to keep the socket open — replies
-are not read). It connects lazily on first use inside the async sender task — `TcpStream::connect`,
-`split()`, `PacketSink::new` — the same path cube-sat uses. `announce` is `send_vtable` +
-`send_metadata` (a `VTableMsg` then a `SetComponentMetadata` per component); `send` is
-`PacketSink::send`.
-
-The system is generic over `T: Transport`. The builder/loader supplies a `TcpTransport`; the unit
-tests drive a deterministic in-memory mock against the same trait.
-
-**Lifecycle.** Connect lazily, redial forever. An error drops the `TcpConn`, so the next call
-reconnects; the sender's backoff paces the redials and replays the announces on each connect (§4).
-The in-cycle stage keeps running and drops while the link is down, so control is unaffected.
-
----
-
-## 8. KDL / builder surface
-
-The downlink is an **ordinary registry system** — a `system` node of the built-in
-`type="TcpDownlink"`, not a dedicated grammar. `"telemetry"` is a conventional instance name,
-not a reserved word; several downlink instances are legal.
-
-```kdl
-system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
-    instances "nav" "imu"      // optional subset children; omit both to tap everything
-    frames "gyro_b"
-}
-```
-
-- The params are `DownlinkParams { addr, instances, frames }` (`src/telemetry/mod.rs`): both
-  lists absent ⇒ `TelemetryMode::All`; either present ⇒ `Subset` (an entry matches if its
-  instance *or* frame/channel name is listed).
-- The resolver **defers** every static `ReceiveAll` system behind the other cyclic
-  registrations (`docs/alarms.md` §7 F1), so the node's document position is free — it is
-  still registered last (§3).
-- **Builder surfaces:** `WiringBuilder::telemetry(addr)` pushes the equivalent
-  `SystemSpec::tcp_downlink("telemetry", addr)`; a direct `CoordinatorBuilder` user registers
-  `add_cyclic(TelemetrySystem::new(TelemetryConfig { transport, mode }))` **after** its other
-  cyclic systems (`build()` enforces the ordering). No manual reader-slot bookkeeping either
-  way: `TelemetryPorts`'s `AllOutputs` field is what earns the downlink its reader slot on
-  every buffer, self-derived at `build()` by counting `ReceiveAll` capabilities (§2.5).
-- `TelemetryConfig<T: Transport>` carries the concrete `transport` value and the `mode` —
-  the mock-transport test path; `TcpDownlink` is `TelemetrySystem<TcpTransport>`.
-
----
-
-## 9. Reused vs new
-
-**Reused:**
-
-- The coordinator's `RingTable`/`RingEntry`/`BufferRole` and `output_instances` — the registry indexes
-  this, it does not replace it.
-- `RingBuffer::view`, `View::try_latest`/`try_read` (`metor-fsw-ring`).
-- `PortDesc.vtable` — the authoritative layout, captured into the registry entry.
-- `VTableMsg`, `SetComponentMetadata`, `LenPacket::table`/`extend_from_slice`, `PacketSink::send`,
-  `SinkExt::{send_vtable, send_metadata, init_world}` — the whole wire path; cube-sat is the precedent.
-- `ComponentPath`/`chain`/`PathHasher`, `AsVTable::vtable_fields(prefix)`,
-  `Metadatatize::metadata(prefix)` — the prefix.
-
-**New:**
-
-- `Registry` + `RegistryEntry`, keyed by the instance-qualified id, stored as `Arc<Registry>` on
-  `Coordinator` and reachable via `Binder::registry()` — one index for frames *and* message channels
-  (`EntrySchema::{Table, Postcard}`).
-- The prefixed `vtable`/`metadata` on a Table entry, sourced via the `announce` prefix factory on
-  `PortSchema::Table`.
-- `max_readers = fan_out + n_reg + READER_SLACK` sizing, `n_reg` self-derived by counting
-  `ReceiveAll` capabilities across every registered descriptor.
-- `TelemetrySystem`, the bounded per-cycle batch queue and async-sender split, its
-  `telemetry_dropped`/`telemetry_reader_slot` health counters, and the `Transport` trait with
-  `TcpTransport`.
-
----
-
-## 10. Not yet implemented
-
-- **`bbq`/SHM transport.** `metor-proto/bbq` is a local shared-memory framed queue speaking the
-  identical `LenPacket` format and would be a drop-in `Transport` for a co-located consumer. Only the
-  TCP transport ships; the KDL loader accepts `transport "tcp"` only.
-- **Runtime late attach.** Broad access is sized for the registry consumers known at `build()`; the
-  rings have no crash-slot reclamation, so a consumer attaching at runtime has no reserved slot beyond
-  the static `READER_SLACK` (§2.5).
+Stopping the server shuts down the mDNS service and closes all TCP tasks.
