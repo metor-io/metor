@@ -138,6 +138,7 @@ impl WiringBuilder {
                 process: false,
                 src: None,
                 scope: None,
+                attach: None,
             },
         }
     }
@@ -456,6 +457,14 @@ impl SystemSpecBuilder {
         let bytes = postcard::to_allocvec(&params)
             .expect("params postcard-encode (Serialize is infallible)");
         self.spec.params = ParamSource::Postcard(bytes);
+        self
+    }
+
+    /// Attaches this system to the pack-shared state declared under `state`
+    /// ([`WiringBuilder::state`]). Required for a shared-state system type
+    /// (the built-in `Downlink`/`Uplink`), rejected on any other.
+    pub fn attach(mut self, state: impl Into<String>) -> Self {
+        self.spec.attach = Some(state.into());
         self
     }
 

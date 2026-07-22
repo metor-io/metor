@@ -65,7 +65,7 @@ pub enum WorkerManifest {
         system: String,
         /// The pack cdylib to load.
         artifact: PathBuf,
-        /// Canonical postcard `Params` bytes for `fsw_create`.
+        /// Canonical postcard `Params` bytes for `fsw_pack_create`.
         params: Vec<u8>,
         /// The control-block file ([`CtlWorker::attach`]).
         ctl: PathBuf,
@@ -81,7 +81,7 @@ pub enum WorkerManifest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunMode {
     /// A steady-state cyclic system: each doorbell is one
-    /// [`DlSlot::step`](crate::coordinator::CyclicSlot::step), and a stray
+    /// loaded-slot step, and a stray
     /// `Done` folds to keep-running exactly as it would in-process.
     Cyclic,
     /// A process slot's sequence occupant: each doorbell is one
@@ -102,7 +102,7 @@ pub(crate) mod fail_code {
     pub const RINGS: u32 = 2;
     /// The artifact failed to load or describe ([`DlError`](crate::dl::DlError)).
     pub const ARTIFACT: u32 = 3;
-    /// `fsw_create` panicked inside the artifact.
+    /// `fsw_pack_create` panicked inside the artifact.
     pub const CREATE: u32 = 4;
 }
 

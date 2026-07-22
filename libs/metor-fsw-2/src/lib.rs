@@ -1,10 +1,8 @@
-//! A framework for building modular flight software.
+//! Build flight software as a checked graph of small systems.
 //!
-//! A mission is a graph of **systems** (an IMU driver, a navigation filter, an
-//! attitude controller) that a single **coordinator** wires together, schedules,
-//! and observes. Systems exchange **frames** of typed components over
-//! shared-memory ring buffers, and the graph streams its state off-board through
-//! a downlink that is itself an ordinary system.
+//! The coordinator owns the graph, its ring buffers, and the cycle clock. Each
+//! system reads typed inputs and writes typed outputs. The wiring pass checks the
+//! graph before the first cycle runs.
 //!
 //! ```text
 //!            coordinator (sizes rings, binds ports, drives the cycle)
@@ -15,14 +13,11 @@
 //!           [downlink] --> TCP --> ground
 //! ```
 //!
-//! # Frames
+//! # Data
 //!
-//! A [`Frame`] is a `#[repr(C)]` struct whose fields are components sharing one
-//! logical timestamp, the whole group named by a `ComponentId`. One
-//! `#[derive(Frame)]` propagates the marked timestamp field to every component
-//! and describes the struct with a vtable, so a frame's in-memory bytes are also
-//! its wire bytes. Nothing in the data path serializes; a peer system, the
-//! downlink, and a ground database all read the same representation.
+//! A [`Frame`] is a `#[repr(C)]` struct whose fields share one timestamp. Its
+//! memory bytes are also its ring and wire bytes. A vtable describes those
+//! fields to code that does not know the Rust type.
 //!
 //! ```edition2021
 //! use metor_fsw_2::*;
@@ -45,64 +40,52 @@
 //! }
 //! ```
 //!
-//! Everything derive-generated code names is re-exported from this crate's
-//! root, so a system crate depends only on this crate and not on the component
-//! and protocol crates underneath.
+//! [`FrameList`] and [`FrameMap`] add a bounded variable-size trailer. Their
+//! const bounds keep the worst-case record size known when the coordinator
+//! sizes a ring. [`FrameWriter`] builds these records.
 //!
-//! [`FrameList`] and [`FrameMap`] members add bounded runtime dynamism (a
-//! variable number of elements stored past the fixed region) while keeping the
-//! worst-case frame size a compile-time constant, so rings can still be sized up
-//! front. [`FrameWriter`] builds such a frame's bytes; a consumer reads them
-//! back through the vtable [`apply`](FrameRef::apply) path.
+//! Commands and events use postcard messages through [`MsgOut`] and [`MsgIn`].
+//! Message inputs may accept many producers. Each producer still owns its own
+//! single-writer ring.
 //!
-//! # Systems and ports
+//! # Systems
 //!
-//! A system implements [`System`] plus one of two driving traits. A
-//! [`CyclicSystem`] is ticked by the coordinator, which calls `execute` once per
-//! cycle with the shared cycle [`Timestamp`]. An [`AsyncSystem`] owns its own
-//! loop; the coordinator spawns `run` once and the system paces itself. The
-//! `#[system]` attribute macro derives the port bundles and trait impls from an
-//! inherent impl block, so most systems write only their `execute` or `run`.
+//! The crate has four authoring forms:
 //!
-//! Ports are typed handles over ring buffers. An [`Output`] owns the ring a
-//! frame is published to; an [`Input`] borrows a read-only view of an upstream
-//! ring. Publishing a fixed-size frame is a single ring write, and reading hands
-//! back a zero-copy grant borrowed in place. A writer never overwrites a record
-//! a reader has not consumed; a full ring surfaces as a [`WriteError`] instead
-//! of silent loss. Beside frames there is a second payload kind, postcard
-//! **messages** ([`MsgOut`], [`MsgIn`]), for commands and events that fan in
-//! from many producers.
+//! - A function passed to [`system()`] runs once per cycle. Its arguments declare
+//!   its ports.
+//! - A function passed to [`Pack::task`] owns its ports in a future. The driver
+//!   polls that future once per cycle. Sequences use this form.
+//! - A [`CyclicSystem`] struct runs once per cycle.
+//! - An [`AsyncSystem`] struct owns a free-running task and waits on input or
+//!   time. The coordinator does not poll it once per cycle.
 //!
-//! Systems never return errors. Every output bundle carries an implicit
-//! health/log port pair (the [`health`] module), and the framework publishes
-//! a per-system [`SystemHealth`] frame and any queued [`LogEvent`] messages
-//! each cycle, so a system's troubles flow off-board like any other telemetry.
+//! An [`Output`] owns a ring writer. An [`Input`] owns a read view into an
+//! upstream ring. A full ring makes a write return [`WriteError`]. The
+//! `publish` helpers keep the cycle moving by dropping the new record and
+//! counting that loss for health telemetry.
 //!
-//! # The coordinator and wiring
+//! Each system has health and log outputs. Cyclic drivers close a health cycle
+//! after each step and send a [`SystemHealth`] frame plus queued [`LogEvent`]
+//! messages. A free-running [`AsyncSystem`] controls when it sends its own
+//! health data.
 //!
-//! The [`Coordinator`] reads each system's static [`SystemDescriptor`] before
-//! constructing anything, validates the connection graph, allocates and sizes
-//! every ring, binds the ports, and then drives the cycle on a wall or simulated
-//! clock. Graphs are wired from a [`WiringBuilder`](wiring::WiringBuilder) in
-//! Rust or a `mission.py`, both evaluated into the [`Wiring`](wiring::Wiring) IR
-//! and resolved through the [`wiring`] module (the `wiring` feature).
+//! # Wiring and loading
 //!
-//! A crate's systems can also be compiled as a **pack** `cdylib` exporting
-//! the C ABI in [`abi`] (one [`export_pack!`] per crate over its `pack()` fn)
-//! and loaded at runtime through [`dl`]. A loaded pack describes every entry
-//! over the ABI, and each is validated and wired exactly like a statically
-//! linked system. Both modules build without the `wiring` feature.
+//! A `mission.py` file and [`WiringBuilder`] both create the same [`Wiring`] IR.
+//! The resolver checks that IR, loads
+//! each system descriptor, builds the graph, sizes its rings, and returns a
+//! ready [`Coordinator`].
 //!
-//! # Built-in systems
+//! A [`Pack`] lists the systems one crate exports. The host can link a pack,
+//! load its `cdylib` in the host through [`dl`], or run an entry in a worker
+//! through [`proc`]. All three paths use the same descriptors and port rules.
 //!
-//! The crate ships the common infrastructure as ordinary systems: the TCP
-//! telemetry downlink and command uplink ([`TelemetrySystem`],
-//! [`UplinkSystem`]), the limit-alarm engine ([`AlarmSystem`]), and the
-//! [`sequence`] runtime that polls async-fn systems once per cycle —
-//! `wait()`, `cycle()`, and cooperative cancellation for slot occupants.
+//! # More detail
 //!
-//! The `docs/` directory of this crate holds the detailed design documents;
-//! `DESIGN.md` is the overview.
+//! Start with [`docs/README.md`](https://github.com/metor-io/metor/blob/main/libs/metor-fsw-2/docs/README.md).
+//! It links to focused design docs for frames, systems, wiring, loading,
+//! process workers, telemetry, alarms, and runtime slots.
 
 mod alarm;
 mod binder;
@@ -144,7 +127,7 @@ pub mod params_docs;
 
 // Cross-process systems need a shared futex (Linux, macOS 14.4+); on other
 // targets the module reduces to a no-op `worker_entry` and `build()` rejects
-// process registrations. See docs/process-systems.md §2 for the floor.
+// process registrations. See docs/process-systems.md for the platform floor.
 pub mod proc;
 
 pub use dynamic::{FrameList, FrameMap, Slot};

@@ -1,4 +1,4 @@
-# The FSW ABI marker distribution (docs/design-packaging.md §9.1).
+# The FSW ABI marker distribution (docs/packaging.md).
 #
 # Its version IS the ABI number: every pack wheel is stamped
 # `Requires-Dist: metor-fsw-abi==<abi>` at assembly and `metor-fsw` depends

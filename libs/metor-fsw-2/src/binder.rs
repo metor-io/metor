@@ -1,12 +1,10 @@
-//! Deferred port construction, resolved by handing each typed port its
-//! pre-allocated ring.
+//! Deferred port construction over rings chosen during graph build.
 //!
-//! The build phase reserves one [`RingBuffer`] per port before any system is
-//! constructed. Binding then walks each system's port bundle and gives every
-//! typed [`Output`](crate::Output) and [`Input`](crate::Input) its ring. The
-//! walk is positional. The generated [`BindPorts::bind`] visits port fields in
-//! the same order as `descriptors()`, and a [`Binder`] cursor pops one ring
-//! per port, so each port lines up with the ring reserved for it.
+//! Each output gets one [`RingBuffer`]. A frame input often gets a view into
+//! its producer's output ring. A message input may get one ring per producer.
+//! An async snapshot input gets a private copy-in ring. Binding walks each
+//! bundle in descriptor order, so the ring plan and generated
+//! [`BindPorts::bind`] code must use the same order.
 //!
 //! ## Matched wake endpoints
 //!

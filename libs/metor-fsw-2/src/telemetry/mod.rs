@@ -26,9 +26,9 @@
 //! `Table` packet whose payload is the ring record itself (the bytes a system
 //! committed are the bytes on the wire), referencing a `VTable` announced to
 //! each connection before any data. A postcard entry is framed as a
-//! self-describing `Msg` packet whose id is the record's leading two bytes,
-//! with no announce step. The two axes combine freely; an every-record table
-//! log needs no extra code. The wire is a plain stream of length-prefixed
+//! `Msg` packet whose id is the record's leading two bytes. When the port has
+//! a message schema, the replay includes one `SetMsgMetadata` packet for that
+//! id. The two axes combine freely. The wire is a plain stream of length-prefixed
 //! packets, so a batch is just the cycle's packets concatenated and the
 //! receiver never notices the batching.
 //!

@@ -1,6 +1,6 @@
 # The metor Python toolchain
 
-One directory per distribution (`docs/design-packaging.md` §4):
+One directory per distribution (see `../docs/packaging.md`):
 
 - `metor-config/` — the mission-config recorder. A mission file builds a
   `Mission`, adds systems and slots, and connects their ports; at exit the

@@ -9,8 +9,8 @@
 //! [`HealthPort::log`](crate::health::HealthPort::log) lines and reach the
 //! ground with no extra downlink plumbing.
 //!
-//! The queue seam exists because `on_event` can fire from any thread (the
-//! build pipeline, the async sender tasks) while ring writes belong to the
+//! The queue exists because `on_event` can fire from any thread, such as a
+//! build worker or another tracing thread, while ring writes belong to the
 //! single-threaded cycle loop. It is bounded and drop-newest: a runaway log
 //! source costs events, counted and folded into coordinator health as
 //! `log_dropped`, never memory or cycle time. Events fired before the mission
@@ -20,7 +20,6 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
-use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
@@ -104,7 +103,7 @@ impl Visit for FieldVisitor {
 /// The forwarding layer. Compose it onto a `tracing_subscriber::registry()`
 /// stack; [`forward_layer`] builds one for embedders.
 pub struct ForwardLayer {
-    /// Least-severe level forwarded; `TRACE` passes everything through to an
+    /// Maximum verbosity forwarded. `TRACE` allows every level through to an
     /// external `with_filter`.
     max_level: tracing::Level,
 }

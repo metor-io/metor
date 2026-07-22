@@ -7,8 +7,8 @@
 //! ([`resolve`](crate::wiring::resolve)) via [`init::InitGraph::build`].
 //! [`Coordinator::run_for`] drives the lifecycle: spawn the async systems, init
 //! everything behind a barrier, step the cyclic systems once per cycle, run the
-//! async copy-in mirror, publish coordinator-level health and a status frame,
-//! and tear it all down.
+//! async copy-in mirror, update health or status when their state changes, and
+//! tear the graph down.
 //!
 //! Cyclic systems step in registration order, once per cycle; the build-time
 //! passes ([`init`]) reject any wiring whose dataflow disagrees with that

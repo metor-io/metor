@@ -9,24 +9,20 @@
 //!  mission.py ───┘
 //! ```
 //!
-//! Both front-ends — the Rust [`WiringBuilder`] and an evaluated `.py` mission
-//! ([`eval_python_mission`]) — produce the same [`Wiring`], a plain data model
+//! Both front ends, the Rust [`WiringBuilder`] and an evaluated `.py` mission
+//! ([`eval_python_mission`]), produce the same [`Wiring`], a plain data model
 //! of systems, slots, edges, and coordinator config. [`resolve`](resolve::resolve)
-//! ([`resolve.rs`](resolve)) gates it through [`validate`](validate), then walks
-//! it: a [`Node`](crate::coordinator::init::Node) per system (static systems via
-//! the [`Registry`] in [`registry.rs`](registry), dl and process systems from
-//! their built [`Artifact`]s), the edges, and the coordinator config, all pushed
-//! onto an [`InitGraph`](crate::coordinator::init::InitGraph) and built
-//! ([`InitGraph::build`](crate::coordinator::init::InitGraph::build)). One resolver feeds both
+//! checks it, then creates one internal node per system. Static systems come
+//! from the [`Registry`]. Loaded and process systems come from built
+//! [`Artifact`]s. The resolver adds all edges and coordinator settings, then
+//! builds the graph. One resolver feeds both
 //! front-ends, so every graph check runs identically for either. Every error is
 //! a [`LoadError`], a `miette` [`Diagnostic`](miette::Diagnostic) anchored on the
 //! spec's [`SourceRef`] when it has one.
 //!
-//! Around that core sit the supporting surfaces: [`bundle`] packs a resolved
-//! mission and its artifacts into a `.metor` archive; [`build_driver`] compiles
-//! an [`Artifact`]'s cdylib; [`stubgen`] generates the Python stub module for a
-//! built pack; [`params`] encodes a value tree against an artifact's exported
-//! `Params` schema.
+//! The module can also pack a mission into a `.metor` archive, build an
+//! [`Artifact`]'s cdylib, generate Python stubs, and encode a value tree
+//! against an artifact's exported `Params` schema.
 //!
 //! ## Params
 //!

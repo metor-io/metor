@@ -15,10 +15,11 @@
 //! let est = bench.read::<AttitudeEstimate>().expect("published");
 //! ```
 //!
-//! The bench mounts the entry wired (no occupant tail) and holds one writer
-//! per input and one view per output, addressed by frame type. Message
-//! ports get the same treatment through [`send`](TestBench::send) /
-//! [`recv`](TestBench::recv).
+//! The bench mounts the entry wired, with no slot ports. It holds each ring
+//! and creates a short-lived input writer for each call. It keeps one view per
+//! output. Frame and message lookup uses the payload id, so the bench cannot
+//! pick between two ports with the same id. It also cannot supply an
+//! [`AllOutputs`](crate::AllOutputs) grant because its registry is empty.
 
 use metor_fsw_ring::{Config, NoWake, RingBuffer, View};
 use metor_proto::types::Timestamp;

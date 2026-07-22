@@ -36,7 +36,7 @@ enum Command {
     Run(RunArgs),
     /// Generate the typed Python pack modules (`packs/<id>.py`) for a mission.
     Stubgen(StubgenArgs),
-    /// Pack-crate packaging (`docs/design-packaging.md`).
+    /// Pack-crate commands (`docs/cli.md`).
     #[command(subcommand)]
     Pack(PackCmd),
 }
@@ -331,11 +331,11 @@ fn cmd_pack_dev(args: PackDevArgs) -> miette::Result<()> {
 /// `stubgen`: read the mission's `pyproject.toml`, (build and) describe each
 /// listed artifact, and write — or, with `--check`, verify — its typed pack
 /// module. Deprecated in favor of per-pack `pack dev`
-/// (`docs/design-packaging.md` §10); kept working for one release.
+/// (`docs/cli.md`); kept working for one release.
 fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
     eprintln!(
         "warning: mission-level `stubgen` is deprecated; give each pack crate a \
-         `pyproject.toml` and use `metor-fsw pack dev` (docs/design-packaging.md §10)"
+         `pyproject.toml` and use `metor-fsw pack dev` (docs/cli.md)"
     );
     let opts = StubgenOptions {
         mission_dir: args.dir,
@@ -379,7 +379,7 @@ fn load_source(path: &Path) -> miette::Result<Wiring> {
     if path.extension().is_some_and(|e| e == "kdl") {
         return Err(miette::miette!(
             "KDL mission support was removed; missions are Python (`.py`). Port `{}` to a \
-             `mission.py` (see docs/design-python-config.md)",
+             `mission.py` (see docs/wiring.md)",
             path.display()
         ));
     }

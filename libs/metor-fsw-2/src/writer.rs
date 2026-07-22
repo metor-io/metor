@@ -1,8 +1,9 @@
 //! Serializing a frame's bytes, fixed region first and dynamic members after.
 //!
 //! [`FrameWriter`] builds a frame's table inside a growable [`LenPacket`]. It
-//! copies the `#[repr(C)]` fixed region in first, with every dynamic slot
-//! zeroed. Each [`list`](FrameWriter::list) or [`map`](FrameWriter::map) call
+//! copies the `#[repr(C)]` fixed region in first. The caller must set each
+//! dynamic member to its `EMPTY` value. Each [`list`](FrameWriter::list) or
+//! [`map`](FrameWriter::map) call
 //! then appends that member's element block to the trailer at an 8-byte
 //! boundary and patches the member's [`Slot`] with the block's offset and byte
 //! length. Offsets are measured from the start of the fixed region, so one
@@ -52,7 +53,8 @@ pub enum KeyError {
 }
 
 /// A dynamic member exceeded the bounds used to compute its frame's
-/// [`Frame::MAX_SIZE`]. The member is rolled back before this is returned.
+/// [`Componentize::MAX_SIZE`](metor_fsw::Componentize::MAX_SIZE). The member
+/// is rolled back before this is returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DynamicWriteError {
     #[error("frame list exceeds its {max}-element bound")]

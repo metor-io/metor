@@ -1,4 +1,4 @@
-# The metor-fsw CLI as a binary distribution (docs/design-packaging.md §4).
+# The metor-fsw CLI as a binary distribution (docs/packaging.md).
 #
 # The wheel ships the real binary as package data plus a console-script
 # shim; `metor_fsw.find()` is the resolver-pinned locator tooling uses.

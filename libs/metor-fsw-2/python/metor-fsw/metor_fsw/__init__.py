@@ -2,7 +2,7 @@
 
 The wheel ships the real CLI as package data (`metor_fsw/bin/metor-fsw`),
 so consumers resolve it through Python's import machinery — pinned by the
-resolver, immune to stale copies on `PATH` (`docs/design-packaging.md` §4).
+resolver, immune to stale copies on `PATH` (`docs/packaging.md`).
 `find()` is what tooling (the `metor-build` backend) calls; `main()` backs
 the `metor-fsw` console script for humans.
 """

@@ -21,9 +21,9 @@
 //! element type of an enclosing list or map uses only its own relative name;
 //! the enclosing op accumulates the runtime part of the path.
 //!
-//! Element names cannot be enumerated at compile time, so neither type emits
-//! static metadata. The producer announces each list index or map key the
-//! first time it appears.
+//! Element names cannot be listed at compile time, so neither type emits
+//! static metadata for each index or key. The vtable holds the element form,
+//! and each record supplies the live indices or keys.
 
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};

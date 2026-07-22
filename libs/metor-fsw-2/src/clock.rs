@@ -15,7 +15,7 @@
 //! crosses `fsw_pack_execute` — packs and process workers read the same
 //! clock with no extra plumbing. Before the first cycle reaches a linkage
 //! unit (build, bind, init) the clock is unset and readers fall back to wall
-//! time, which coincides with the mission epoch at boot.
+//! time. A simulated run chooses its epoch when `run_for` starts.
 
 use core::sync::atomic::{AtomicI64, Ordering::Relaxed};
 

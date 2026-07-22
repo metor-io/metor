@@ -25,29 +25,14 @@ use serde::{Deserialize, Serialize};
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-///
-/// v2 dropped the `ParamSource::Kdl` variant with the KDL front-end (phase 4):
-/// a wire-shape change, so a v1 bundle fails the version check and must be
-/// rebuilt.
-///
-/// v3 replaced [`Artifact`]'s serialized shared-object file name with the bare
-/// library stem ([`Artifact::lib`]) and added the prebuilt-artifact fields
-/// (`prebuilt_dir`, `dist`). The file name is derived per target triple at
-/// provision time — recording it froze the *recording* host's platform into
-/// the IR, which broke cross-target packaging.
-///
-/// v4 added [`Wiring::states`] and replaced the outbound `TcpDownlink`/
-/// `TcpUplink` built-ins with the in-FSW link server: a [`TCP_SERVER_TYPE`]
-/// state the [`DOWNLINK_TYPE`]/[`UPLINK_TYPE`] systems attach to. A
-/// vocabulary change — a v3 bundle's link specs would resolve to types that
-/// no longer exist — so old bundles fail the version check and rebuild.
-pub const IR_VERSION: u32 = 4;
+pub const IR_VERSION: u32 = 5;
 
 /// A plain-data description of a complete mission, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
 ///
-/// Produced by [`parse`](crate::wiring::parse) or [`WiringBuilder`](crate::wiring::WiringBuilder),
-/// consumed by [`resolve`](crate::wiring::resolve). The telemetry link appears
+/// Produced by [`eval_python_mission`](crate::wiring::eval_python_mission) or
+/// [`WiringBuilder`](crate::wiring::WiringBuilder), and consumed by
+/// [`resolve`](crate::wiring::resolve). The telemetry link appears
 /// here as an ordinary [`TCP_SERVER_TYPE`] state plus [`DOWNLINK_TYPE`]/
 /// [`UPLINK_TYPE`] systems, not as dedicated fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -211,7 +196,7 @@ pub struct Artifact {
     /// cdylib and its `.manifest` sidecar — an installed pack wheel's `_libs`
     /// dir, or a local pack's `.metor/libs`. `None` for a crate-built
     /// artifact, which the build driver compiles instead
-    /// (`docs/design-packaging.md` §8). Provenance like `path`: stripped by
+    /// (`docs/packaging.md`). Provenance like `path`: stripped by
     /// [`Wiring::path_stripped`].
     #[serde(default)]
     pub prebuilt_dir: Option<PathBuf>,
@@ -246,10 +231,9 @@ pub struct DistRef {
 
 /// One pack-shared state instance: a `type=` declared by a statically
 /// registered pack via [`Pack::shared_state`](crate::Pack::shared_state),
-/// constructed once from `params` before any system. Systems attach to it
-/// structurally — inside the declaring `pack()` — so a spec carries no
-/// reference field; the declaration exists so the state's own params
-/// (a listen address) live in the mission document like everything else.
+/// constructed once from `params` before any system. A system binds to it by
+/// naming it in [`SystemSpec::attach`] — the reference lives on the *system*
+/// side; a state carries only its own construction params (a listen address).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StateSpec {
     /// The instance name, for diagnostics and host lookups.
@@ -294,6 +278,13 @@ pub struct SystemSpec {
     /// unscoped (always, for the Rust builder).
     #[serde(default)]
     pub scope: Option<usize>,
+    /// The [`StateSpec::name`] this system attaches to, for a system whose
+    /// type declares pack-shared state (the built-in `Downlink`/`Uplink` bind
+    /// the link server this way). `None` for an ordinary system; a shared-state
+    /// system without it is a resolve-time error, and a plain system with it is
+    /// rejected too.
+    #[serde(default)]
+    pub attach: Option<String>,
 }
 
 impl StateSpec {
@@ -338,6 +329,9 @@ impl SystemSpec {
         Self::link_builtin(name, UPLINK_TYPE, serde_json::json!({ "msgs": msgs }))
     }
 
+    /// The built-in link systems attach to the [`WiringBuilder::serve`] state,
+    /// declared under the name `"link"`
+    /// ([`WiringBuilder`](crate::wiring::WiringBuilder)).
     fn link_builtin(name: &str, ty: &str, params: serde_json::Value) -> Self {
         Self {
             name: name.to_string(),
@@ -347,6 +341,7 @@ impl SystemSpec {
             process: false,
             src: None,
             scope: None,
+            attach: Some("link".to_string()),
         }
     }
 }
@@ -354,7 +349,7 @@ impl SystemSpec {
 /// Where a [`SystemSpec`]'s params come from.
 ///
 /// At [`resolve`](crate::wiring::resolve) every variant reduces to the same encodings:
-/// the canonical postcard `Params` bytes that cross `fsw_create` for a loaded
+/// the canonical postcard `Params` bytes that cross `fsw_pack_create` for a loaded
 /// system, or a typed `S::Params` value for a static one. Which decoder runs
 /// is decided by [`SystemSpec::artifact`], not by the variant.
 /// [`Value`](ParamSource::Value) carries a plain value tree — the format the
@@ -362,7 +357,7 @@ impl SystemSpec {
 /// `Params` schema and postcard-encoded for a loaded system, or
 /// serde-deserialized (field defaults honored) for a static one.
 /// [`Postcard`](ParamSource::Postcard) carries a `Params` value the Rust
-/// builder already encoded, exactly the bytes `fsw_create` decodes; it is
+/// builder already encoded, exactly the bytes `fsw_pack_create` decodes; it is
 /// dl-only, since a static system has no postcard decode path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ParamSource {
@@ -402,7 +397,7 @@ pub struct SlotSpec {
     /// The occupant to apply at startup, if any.
     pub initial: Option<InitialOccupantSpec>,
     /// `true` runs every occupant out of process (`process=#true`,
-    /// `docs/process-slots.md`): resolve describes each allowed occupant
+    /// `docs/process-systems.md`): resolve describes each allowed occupant
     /// through a worker instead of dlopening it, and every `Load` spawns a
     /// worker over the slot's session-dir rings. Per-slot means all-occupants,
     /// so a `Load` can never change the slot's fault domain. Default `false`;

@@ -1,9 +1,9 @@
 //! Packs: many systems from one crate, one construction point.
 //!
 //! A [`Pack`] is a list of erased system entries a crate's `pack()` fn builds
-//! (see `docs/design-packs-authoring.md`). One pack serves every loading
+//! (see `docs/packs.md`). One pack serves every loading
 //! mode: [`Registry::register_pack`](crate::Registry) makes each entry a
-//! `type=` in the static registry, and the pack ABI (v5) exports the same
+//! `type=` in the static registry, and the pack ABI exports the same
 //! entries from a cdylib. Because `pack()` runs once per load, entries can
 //! capture clones of a shared handle built inside it — the construction point
 //! two systems sharing an owned resource (a socket, a bus) never had.
@@ -69,7 +69,22 @@ pub enum EntryParams<'a> {
         src: &'a str,
         name: &'a str,
         msgs: &'a crate::message::MsgTable,
+        /// The shared state this system attaches to, resolved by name from
+        /// [`SystemSpec::attach`](crate::wiring::SystemSpec) during the states
+        /// pass. `None` for an ordinary system; a shared-state entry's create
+        /// requires it.
+        attach: Option<&'a AttachTarget>,
     },
+}
+
+/// The resolved shared state a system attaches to: the erased `Shared<St>`
+/// token a shared entry downcasts at create, plus the state's registry type
+/// key for the mismatch diagnostic. Built by the resolver's states pass and
+/// threaded through [`EntryParams::Value`]; its fields are crate-internal.
+#[cfg(feature = "wiring")]
+pub struct AttachTarget {
+    pub(crate) ty: &'static str,
+    pub(crate) token: std::rc::Rc<dyn core::any::Any>,
 }
 
 /// A create-phase failure: bad params, or a moved-in state already taken.
@@ -103,6 +118,18 @@ pub enum MakeError {
     /// An entry attached to a shared state was instantiated a second time.
     #[error("shared-state entry was already instantiated once (not reloadable)")]
     SharedEntryReinstantiated,
+    /// A shared-state system's wiring named no state to attach to.
+    #[error("system `{system}` attaches to a shared state, but no wiring declaration named one")]
+    MissingAttach { system: &'static str },
+    /// A shared-state system named a state whose type does not match the
+    /// concrete shared type the system attaches to.
+    #[error(
+        "system `{system}` cannot attach to state `{state}`: its type is not the system's shared-state type"
+    )]
+    AttachTypeMismatch {
+        system: &'static str,
+        state: &'static str,
+    },
 }
 
 /// Decode an entry's typed params from any params surface.
@@ -193,6 +220,11 @@ pub struct PackEntry {
     /// `false` for an entry whose state was moved in with `.state(...)`: it
     /// can be instantiated once, and never as a slot occupant.
     pub(crate) reloadable: bool,
+    /// `true` for an entry that attaches to a pack-shared state by name
+    /// ([`system_type_shared`](Pack::system_type_shared)): its wiring must
+    /// carry an `attach`, and a plain entry must not. Drives the resolver's
+    /// attach/shared consistency checks.
+    pub(crate) shared: bool,
     pub(crate) create: CreateFn,
 }
 
@@ -254,6 +286,10 @@ pub struct StateEntry {
     pub(crate) name: &'static str,
     pub(crate) params_schema: &'static NamedType,
     pub(crate) cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
+    /// The `Shared<St>` token, erased as `Rc<dyn Any>`, so a system attaching
+    /// by name can downcast it back to the concrete `Shared<St>` at create.
+    /// Cloned into the resolver's name→[`AttachTarget`] map each states pass.
+    pub(crate) token: std::rc::Rc<dyn core::any::Any>,
     pub(crate) create: StateCreateFn,
 }
 
@@ -303,6 +339,10 @@ impl Pack {
     {
         let token = crate::Shared::new(name);
         let cell = token.erased();
+        // The token erased as `Rc<dyn Any>`, so a system attaching by name can
+        // downcast it back to `Shared<S>` at create (`S: SharedLifecycle` is
+        // `'static`, so `Shared<S>: 'static` and `Any` holds).
+        let token_any: std::rc::Rc<dyn core::any::Any> = std::rc::Rc::new(token.clone());
         let create: StateCreateFn = {
             let token = token.clone();
             Box::new(move |params: EntryParams<'_>| {
@@ -321,23 +361,25 @@ impl Pack {
             name,
             params_schema: <P as postcard_schema::Schema>::SCHEMA,
             cell,
+            token: token_any,
             create,
         });
         token
     }
 
-    /// Register a struct-authored system attached to a pack-shared state:
-    /// `ctor` closes over the [`Shared`](crate::Shared) token (construction
-    /// is the attachment), and the entry's driver is wrapped so the state's
-    /// [`SharedLifecycle`](crate::SharedLifecycle) hooks run once across
-    /// all attached entries. Attached entries are cyclic-only (see the
-    /// [`shared`](crate::shared) module doc), instantiable once, and never
-    /// slot occupants.
+    /// Register a struct-authored system that attaches to a pack-shared state
+    /// *by name*: the mission's [`SystemSpec::attach`](crate::wiring::SystemSpec)
+    /// picks which state instance, and the resolver hands `ctor` the resolved
+    /// [`Shared`](crate::Shared) token (the second argument) at create time.
+    /// `St` is the concrete shared type the entry binds — a mission naming a
+    /// state of any other type is an `AttachTypeMismatch`. The driver is
+    /// wrapped so the state's [`SharedLifecycle`](crate::SharedLifecycle) hooks
+    /// run once across all attached entries. Attached entries are cyclic-only,
+    /// instantiable once, and never slot occupants.
     pub fn system_type_shared<T, St>(
         mut self,
         name: &'static str,
-        state: &crate::Shared<St>,
-        mut ctor: impl FnMut(T::Params) -> T + 'static,
+        mut ctor: impl FnMut(T::Params, crate::Shared<St>) -> T + 'static,
     ) -> Self
     where
         St: crate::SharedLifecycle,
@@ -349,43 +391,65 @@ impl Pack {
         let mut descriptor = <T as crate::CyclicSystem>::descriptor();
         descriptor.name = name.into();
         let static_desc = descriptor.clone();
-        let cell = state.erased();
         let mut taken = false;
+        #[cfg_attr(not(feature = "wiring"), allow(unused_variables, unused_mut))]
         let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
             if taken {
                 return Err(MakeError::SharedEntryReinstantiated);
             }
-            if !cell.is_constructed() {
-                return Err(MakeError::StateNotConstructed { state: cell.name() });
-            }
+            // A shared entry resolves only through the static registry's value
+            // path (a `wiring` build); the postcard/dl path never attaches.
             #[cfg(feature = "wiring")]
-            let msgs = match &params {
-                EntryParams::Value { msgs, .. } => Some(*msgs),
-                _ => None,
-            };
-            let p: T::Params = decode_params(params)?;
-            #[cfg_attr(not(feature = "wiring"), allow(unused_mut))]
-            let mut system = ctor(p);
-            #[cfg(feature = "wiring")]
-            if let Some(msgs) = msgs {
-                system.configure(&crate::BuildCtx { msgs, namespace: None })?;
-            }
-            taken = true;
-            cell.attach();
-            let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
-            let cell = cell.clone();
-            let pending: Pending = Box::new(move |src, mount| {
-                crate::handler::mount_driver(src, mount, move |src| {
-                    let input = <T::Input as crate::BindPorts>::bind(src);
-                    let output = <T::Output as crate::BindPorts>::bind(src);
-                    let inner = RunnerDriver(crate::CyclicRunner::new(system, input, output));
-                    Box::new(AttachedDriver::new(Box::new(inner), cell))
+            {
+                // Copy the resolved attach target + msgs off the value surface
+                // before `params` moves into decode (the proven `msgs` pattern).
+                let (attach, msgs) = match &params {
+                    EntryParams::Value { attach, msgs, .. } => (*attach, Some(*msgs)),
+                    EntryParams::Postcard(_) => (None, None),
+                };
+                let attach = attach.ok_or(MakeError::MissingAttach { system: name })?;
+                // Recover the concrete token; a wrong-typed state is a clean
+                // mismatch rather than a compile-time impossibility.
+                let token: crate::Shared<St> = attach
+                    .token
+                    .downcast_ref::<crate::Shared<St>>()
+                    .ok_or(MakeError::AttachTypeMismatch {
+                        system: name,
+                        state: attach.ty,
+                    })?
+                    .clone();
+                let cell = token.erased();
+                if !cell.is_constructed() {
+                    return Err(MakeError::StateNotConstructed { state: cell.name() });
+                }
+                let p: T::Params = decode_params(params)?;
+                let mut system = ctor(p, token);
+                if let Some(msgs) = msgs {
+                    system.configure(&crate::BuildCtx { msgs, namespace: None })?;
+                }
+                taken = true;
+                cell.attach();
+                let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
+                let pending: Pending = Box::new(move |src, mount| {
+                    crate::handler::mount_driver(src, mount, move |src| {
+                        let input = <T::Input as crate::BindPorts>::bind(src);
+                        let output = <T::Output as crate::BindPorts>::bind(src);
+                        let inner = RunnerDriver(crate::CyclicRunner::new(system, input, output));
+                        Box::new(AttachedDriver::new(Box::new(inner), cell))
+                    })
+                });
+                Ok(Created {
+                    pending,
+                    instance_desc,
                 })
-            });
-            Ok(Created {
-                pending,
-                instance_desc,
-            })
+            }
+            // Without the value path a shared entry has no attach surface, so
+            // its only honest create outcome is the missing-attach error.
+            #[cfg(not(feature = "wiring"))]
+            {
+                let _ = (&params, &static_desc, &mut ctor);
+                Err(MakeError::MissingAttach { system: name })
+            }
         });
         let mut entry = PackEntry {
             name,
@@ -394,6 +458,7 @@ impl Pack {
             params_default: <T as crate::BuildSystem>::params_default_blob()
                 .filter(|b| !b.is_empty()),
             reloadable: false,
+            shared: true,
             create,
         };
         if entry.params_default.is_some() {
@@ -411,7 +476,8 @@ impl Pack {
         self
     }
 
-    /// Register a struct-authored system type (a [`#[system]`](crate::system)
+    /// Register a struct-authored system type (a
+    /// [`#[system]`](macro@crate::system)
     /// impl or hand-written trait impls) under `name`. The struct's
     /// `BuildSystem` supplies params and construction; the entry's descriptor
     /// is the type's static one, so config-minted ports and capabilities are
@@ -534,6 +600,7 @@ impl Pack {
             params_schema,
             params_default: None,
             reloadable: true,
+            shared: false,
             create,
         });
         self
@@ -650,6 +717,7 @@ where
         params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
         params_default: None,
         reloadable: true,
+        shared: false,
         create,
     }
 }

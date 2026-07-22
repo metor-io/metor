@@ -373,7 +373,7 @@ pub(super) fn build_cdylib(
 
 /// Fill every artifact path without running cargo (`--no-build`): a prebuilt
 /// artifact selects by triple as always, a crate artifact is searched for
-/// under the workspace target directory via [`locate_built`]. A missing
+/// under the workspace target directory. A missing
 /// library is a hard [`BuildError::NotBuilt`]. No sidecar work — a previously
 /// built library has its sidecar adjacent, and resolve's staleness gate
 /// covers it.

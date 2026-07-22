@@ -4,8 +4,7 @@
 //! every entry **stored** rather than compressed — identical inputs produce
 //! byte-identical wheels with no compressor in the loop, and installers
 //! accept stored entries per the zip and wheel specs. Pack payloads are a
-//! few MB of shared objects; a size guardrail is phase 4's concern
-//! (`docs/design-packaging.md` §7.1).
+//! few MB of shared objects. See `docs/packaging.md` for the wheel layout.
 //!
 //! [`write_wheel`] assembles the `dist-info` (`METADATA`, `WHEEL`, a sha256
 //! `RECORD`) around the caller's files and writes

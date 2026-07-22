@@ -16,7 +16,7 @@
 //! (its `Drop` runs `fsw_destroy`) releases the ring roles, and a later
 //! `Load` attaches fresh handles over the same regions. [`SlotRunner`]
 //! therefore keeps per-port ring templates and can create any number of
-//! occupants over them, one at a time, each a fresh `fsw_create` state.
+//! occupants over them, one at a time, each a fresh `fsw_pack_create` state.
 //!
 //! # Registered ports
 //!
@@ -54,8 +54,8 @@
 //! # Process mode
 //!
 //! A slot whose occupants carry an [`OccupantBacking::Artifact`] runs them
-//! **out of process** (`docs/process-slots.md`): `Load` spawns a worker
-//! instead of calling `fsw_create` — one worker per occupant Load, driven
+//! **out of process** (`docs/process-systems.md`): `Load` spawns a worker
+//! instead of calling `fsw_pack_create`. Each Load gets one worker, driven
 //! through the ctl lifecycle and torn down by kill + reclaim, the process
 //! twin of the hard-drop — and the host never dlopens the occupant
 //! artifacts. Everything above the occupant seam (commands, events, status,
@@ -121,11 +121,11 @@ pub struct SlotStatus {
 
 /// Where an [`AllowedOccupant`]'s code lives and how `Load` reaches it.
 pub enum OccupantBacking {
-    /// An opened library in this process; `Load` runs `fsw_create` over the
+    /// An opened library in this process; `Load` runs `fsw_pack_create` over the
     /// handle, which stays loaded across swaps.
     Dl(Box<DlSystem>),
     /// A built cdylib the occupant's **worker process** opens
-    /// (`docs/process-slots.md`); the host keeps only the path and never
+    /// (`docs/process-systems.md`); the host keeps only the path and never
     /// loads the artifact itself. Slots mix backings never: `plan_slot`
     /// requires the whole allowed set on one side of the seam.
     Artifact(PathBuf),
@@ -135,7 +135,7 @@ pub enum OccupantBacking {
 /// `Load` selects it by `name`; `descriptor` is the self-description the
 /// slot's contract was derived from and validated against (a dl open or a
 /// describe worker sourced it, per the backing), and `params` is the
-/// postcard blob `fsw_create` decodes.
+/// postcard blob `fsw_pack_create` decodes.
 pub struct AllowedOccupant {
     pub name: String,
     pub params: Vec<u8>,
@@ -156,7 +156,7 @@ impl AllowedOccupant {
 }
 
 /// Names an [`AllowedOccupant`] to load at startup, so a slot comes up
-/// populated instead of empty. [`SlotRunner::init`] applies it once, starting
+/// populated instead of empty. Slot init applies it once, starting
 /// the occupant too when `start` is set.
 #[derive(Clone, Debug)]
 pub struct InitialOccupant {
@@ -420,7 +420,7 @@ pub(crate) struct SlotReg {
     /// bind arm reads the occupant/tail split and the tail-port indices off
     /// it instead of re-deriving them by shape.
     pub ports: SlotPorts,
-    /// Run occupants out of process (`docs/process-slots.md`): the occupant
+    /// Run occupants out of process (`docs/process-systems.md`): the occupant
     /// prefix's crossing rings — its outputs, its Edge inputs' producers, and
     /// the host control ring — are allocated as session-dir files a worker
     /// process can attach. The runner tail stays host-side either way.

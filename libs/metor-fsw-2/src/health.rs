@@ -6,12 +6,14 @@
 //! trouble as ordinary telemetry over them. A [`HealthPort`] bundles the two
 //! ports with the counter state behind them.
 //!
-//! The split of responsibilities is fixed. The system itself only calls
+//! A cyclic system calls
 //! [`HealthPort::error`] to bump a named error counter and
 //! [`HealthPort::log`] to queue a log line. The framework wraps each call to
 //! `execute` and drives [`HealthPort::end_cycle`] afterwards, which stamps the
 //! standard counters (cycle count, total errors, execute duration) and
 //! publishes one health record plus one [`LogEvent`] per queued line.
+//! A free-running [`AsyncSystem`](crate::AsyncSystem) owns its health timing
+//! and must choose when to send its queued state.
 //!
 //! Named error counters ride the dynamic [`FrameMap`] tail of the health
 //! frame, so each kind surfaces as its own `health.error_counts.<kind>`

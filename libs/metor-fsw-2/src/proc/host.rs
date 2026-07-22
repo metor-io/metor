@@ -4,7 +4,7 @@
 //! Two lifecycles share one core. [`ProcSlot`] is the process twin of
 //! [`DlSlot`](crate::dl): a fixed system driven for the whole run, restarted
 //! on death within a budget. [`SeqWorker`] is the per-Load twin behind a
-//! process slot's occupant (`docs/process-slots.md`): spawned by `Load`,
+//! process slot's occupant (`docs/process-systems.md`): spawned by `Load`,
 //! stepped while the occupant runs, and ended — kill, reap, reclaim — when
 //! the occupant is stopped, reset, unloaded, or replaced. Both embed
 //! [`WorkerHandle`], the spawn/poll/kill mechanics; what differs is policy
@@ -569,9 +569,9 @@ impl CyclicSlot for ProcSlot {
 /// carry their deadline; the terminal phases are latched, so a poll past the
 /// end re-serves the answer instead of re-driving the ctl block.
 enum LoadPhase {
-    /// Spawned; waiting for `Attached` (ring maps, dlopen, `fsw_create`).
+    /// Spawned; waiting for `Attached` (ring maps, dlopen, `fsw_pack_create`).
     Attaching { deadline: Instant },
-    /// Init requested; waiting for `Ready` (`fsw_bind_init` claimed the ring
+    /// Init requested; waiting for `Ready` (`fsw_pack_bind_init` claimed the ring
     /// roles and built the occupant future).
     Initing { deadline: Instant },
     /// Bound and steppable.
@@ -589,7 +589,7 @@ pub(crate) enum LoadPoll {
     Failed { stage: &'static str },
 }
 
-/// The worker behind one process-slot occupant Load (`docs/process-slots.md`):
+/// The worker behind one process-slot occupant Load (`docs/process-systems.md`):
 /// where [`ProcSlot`] drives a fixed system for the whole run, a `SeqWorker`
 /// lives exactly one Load cycle — spawned when the runner loads an occupant,
 /// stepped while it runs, and ended (kill + reap + reclaim, the process twin
@@ -613,7 +613,7 @@ impl SeqWorker {
     /// Spawn a worker for one occupant from its persisted manifest, entering
     /// the polled pipeline. Non-blocking, and nothing is killed here: tearing
     /// down any previous worker is the caller's job, *before* this spawn, so
-    /// the fresh worker's `fsw_bind_init` claims ring roles only after the
+    /// the fresh worker's `fsw_pack_bind_init` claims ring roles only after the
     /// old ones were reclaimed — the reader-budget invariant.
     pub(crate) fn spawn(
         exe: &Path,

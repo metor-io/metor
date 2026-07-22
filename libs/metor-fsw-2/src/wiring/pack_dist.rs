@@ -1,5 +1,5 @@
 //! Pack-crate packaging: `[tool.metor.pack]` config and the `pack dev`
-//! editable layout (`docs/design-packaging.md` §6).
+//! editable layout (`docs/packaging.md`).
 //!
 //! A pack crate is also a Python project: its `pyproject.toml` names the
 //! distribution (`[project]`) and the pack (`[tool.metor.pack]` — artifact
@@ -17,8 +17,8 @@
 //!
 //! — the same shape an installed pack wheel unpacks to, so the recorder,
 //! provisioning, and pyright cannot tell a local editable pack from a
-//! published one. A pack's PEP 517 backend runs this on `uv sync`; the
-//! multi-triple `pack build`/`publish` flow lands in phase 2.
+//! published one. A pack's PEP 517 backend runs this on `uv sync`. The same
+//! module also builds and publishes multi-target wheels.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,7 @@ pub struct PackConfig {
 }
 
 /// How a pack target is compiled (`[tool.metor.pack.builder]`,
-/// `docs/design-packaging.md` §7.2). Wheel builds always force `--release`
+/// `docs/packaging.md`). Wheel builds always force `--release`
 /// and, for the cargo-family builders, `--config profile.release.strip=true`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Builder {
@@ -443,7 +443,7 @@ fn is_dev_pack(dir: &Path) -> bool {
 }
 
 /// The mission's dev-pack roots: its pyproject's path sources filtered to
-/// the rebuildable packs ([`is_dev_pack`]).
+/// the rebuildable packs.
 pub fn dev_pack_roots(mission_dir: &Path) -> Vec<PathBuf> {
     super::py::path_source_roots(mission_dir)
         .into_iter()
@@ -467,7 +467,7 @@ pub fn refresh_dev_packs(
 }
 
 // ---------------------------------------------------------------------------
-// pack build / assemble / publish (docs/design-packaging.md §7)
+// pack build / assemble / publish (docs/packaging.md)
 // ---------------------------------------------------------------------------
 
 /// Knobs for [`pack_build`].

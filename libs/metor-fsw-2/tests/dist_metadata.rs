@@ -1,5 +1,5 @@
 //! The Python toolchain dists' metadata mirrors constants owned by this
-//! crate; these tests are the drift guards (`docs/design-packaging.md` §4,
+//! crate; these tests are the drift guards (see `docs/packaging.md`,
 //! §9.1). Plain string checks over the committed `pyproject.toml`s — no
 //! TOML parse, so the pins stay greppable exactly as asserted.
 

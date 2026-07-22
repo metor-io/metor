@@ -16,8 +16,8 @@
 //! against, the target triple its `.so`s were compiled for, the build profile,
 //! a timestamp, the `sha256` of the `wiring.json` bytes (the determinism
 //! backstop CI diffs), and the `metor_config` recorder version the mission was
-//! evaluated with. [`load_bundle`] refuses any bundle whose ABI, IR, or
-//! target does not match this host — a triple mismatch is a clean
+//! evaluated with. [`load_bundle`] checks the ABI and target. The later
+//! resolve pass checks the IR version. A triple mismatch is a clean
 //! [`BundleError::TargetMismatch`] before any dlopen, where an arch mismatch
 //! used to surface as a dlopen mystery. It verifies the frozen IR digest and
 //! each recorded manifest hash. A manifest hash checks interface compatibility;
@@ -75,7 +75,7 @@ pub struct BundleMeta {
     pub ir_sha256: String,
     /// Per-artifact provenance: what was actually packaged, hashed from the
     /// exact bytes copied into the bundle. The flight record that outlives
-    /// the packaging venv (`docs/design-packaging.md` §9.2); recording only —
+    /// the packaging venv (`docs/packaging.md`); recording only,
     /// the load gates (ABI, IR hash, triple, manifest hash) cover integrity.
     /// Serde-defaulted so pre-provenance bundles load unchanged.
     #[serde(default)]
@@ -449,8 +449,8 @@ fn provenance_name(source: &Path) -> String {
 /// `.metor` file is unpacked to a temp directory first, a directory is read in
 /// place.
 ///
-/// Reads `meta.json`, checks the ABI version, IR version, and target triple
-/// against this host, deserializes `wiring.json`, fills each artifact's path
+/// Reads `meta.json`, checks the ABI version and target triple against this
+/// host, deserializes `wiring.json`, fills each artifact's path
 /// from the `.so` copied alongside, and verifies every recorded manifest hash
 /// against the copied sidecar. Fails before any dlopen with the matching
 /// [`BundleError`] on any mismatch.

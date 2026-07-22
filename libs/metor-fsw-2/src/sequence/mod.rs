@@ -1,6 +1,7 @@
 //! The clock and status runtime under async-fn systems and sequences.
 //!
-//! A sequence is an `async fn` whose [`Input`]/[`Output`] ports are moved into
+//! A sequence is an `async fn` whose [`Input`](crate::Input) and
+//! [`Output`] ports are moved into
 //! the future it becomes, owned for the future's whole life — registered with
 //! [`Pack::task`](crate::Pack::task) like any async entry. The entry's driver
 //! polls that future once per cycle, and everything time-shaped inside the
@@ -27,7 +28,7 @@
 //! Port order, ring sizing, and compatibility come from the entry's
 //! descriptor, computed from the fn's parameter types (`crate::handler`);
 //! the [`SlotControlIn`] input and [`SequenceStatus`] output are appended by
-//! the occupant *mount*, never declared by the entry (`docs/packs.md` §9).
+//! the occupant *mount*, never declared by the entry (see `docs/packs.md`).
 //!
 //! This module is compiled unconditionally (no `wiring` feature gate), since
 //! sequences are a runtime feature independent of the config front-end.

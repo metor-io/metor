@@ -10,7 +10,7 @@ re-runs this build whenever the pack sources change.
 
 ``build_wheel`` produces the published form: ``metor-fsw pack build``
 compiles every configured target and assembles the fat, deterministic
-``py3-none-any`` wheel (``docs/design-packaging.md`` §7). sdists stay
+``py3-none-any`` wheel (see ``docs/packaging.md``). sdists stay
 refused — packs are binary-only by design.
 
 Configuration, all from the pack's ``pyproject.toml``:
@@ -131,5 +131,5 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 def build_sdist(sdist_directory, config_settings=None):
     raise NotImplementedError(
         "metor packs are published as binary wheels, never sdists "
-        "(docs/design-packaging.md §7)"
+        "(docs/packaging.md)"
     )

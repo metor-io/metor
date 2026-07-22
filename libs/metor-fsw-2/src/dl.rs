@@ -1,13 +1,13 @@
 //! Loading and driving pack shared objects.
 //!
 //! [`DlPack::open`] loads a pack `cdylib`, checks its ABI version word,
-//! resolves the `fsw_pack_*` exports named by the [`abi`](crate::abi)
+//! resolves the `fsw_pack_*` exports named by the [`abi`]
 //! constants, opens the pack (`fsw_pack_open`, which runs the crate's
 //! `pack()` once), and decodes its manifest into per-entry
 //! [`SystemDescriptor`]s. [`DlPack::system`] selects one entry as a
 //! [`DlSystem`], and from there the builder treats it like any statically
 //! linked system; wiring, validation, and ring sizing all run against the
-//! descriptor. At `build()` the coordinator binds a [`DlSlot`] in place of a
+//! descriptor. At `build()` the coordinator binds a loaded slot in place of a
 //! typed runner. The slot forwards `init`, `step`, and `shutdown` across the
 //! C ABI, handing the shared object its per-port ring regions as raw
 //! [`FswRing`] handles. Timestamps cross the ABI as the raw `Timestamp` tick,
@@ -23,16 +23,16 @@
 //! returns is trusted as a Rust value. `fsw_pack_execute` returns a raw `u32`
 //! rather than an [`FswStatus`], because materializing a `repr(u32)` enum from
 //! an out-of-range discriminant is immediate undefined behavior. Every call
-//! site converts through [`FswStatus::from_raw`], which folds unknown words to
+//! site validates the raw word and folds unknown values to
 //! `Panicked`. Likewise a manifest that fails to decode, or an entry that
 //! declares capabilities the host cannot grant across the ABI, is a clean
 //! [`DlError`] at load time rather than a panic later.
 //!
 //! ## Teardown ordering
 //!
-//! A [`DlSlot`] owns an `Rc<PackLib>` and the opaque `*mut state` returned by
-//! `fsw_pack_create`. Its [`Drop`] calls `fsw_pack_destroy` before the
-//! `PackLib` can drop, because the `Rc` field drops after the `Drop` body
+//! Each loaded slot owns a shared library handle and the opaque `*mut state`
+//! returned by `fsw_pack_create`. Its `Drop` calls `fsw_pack_destroy` before
+//! the library handle can drop, because the handle field drops after `Drop`
 //! runs. `PackLib`'s own field order then closes the pack (`fsw_pack_close`)
 //! before the `Library` unloads. And the coordinator drops its slots before
 //! its ring table, so no non-owning ring attach outlives its region and no
@@ -290,7 +290,7 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
 /// The raw manifest bytes alone, for the worker's describe mode and the build
 /// driver's manifest sidecar: the object is loaded, ABI-checked, described,
 /// and unloaded *in this process*. The worker's host decodes the bytes
-/// without ever loading the object itself (`docs/process-systems.md` §5).
+/// without ever loading the object itself (see `docs/process-systems.md`).
 #[cfg(any(target_os = "linux", target_os = "macos", feature = "wiring"))]
 pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> {
     // Dropping the PackLib closes the pack and unloads the library.
@@ -299,7 +299,7 @@ pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> 
 
 /// The manifest sidecar path for a built pack library: `<so_path>.manifest`,
 /// the raw postcard [`PackManifest`](abi::PackManifest) bytes the build
-/// driver wrote next to the `.so` (`docs/wiring.md` §6.1).
+/// driver wrote next to the `.so` (see `docs/wiring.md`).
 #[cfg(feature = "wiring")]
 pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
     let mut name = so_path.as_os_str().to_owned();
@@ -350,7 +350,7 @@ fn reject_capabilities(entry: PackEntryDesc) -> Result<PackEntryDesc, DlError> {
 // DlPack + DlSystem, the loaded handles
 // ---------------------------------------------------------------------------
 
-/// A loaded pack: the shared [`PackLib`], the decoded per-entry descriptors,
+/// A loaded pack: the shared library handle, the decoded per-entry descriptors,
 /// and the resolved lifecycle pointers. [`system`](Self::system) selects one
 /// entry as a [`DlSystem`], the unit the builder registers.
 pub struct DlPack {
@@ -449,9 +449,9 @@ impl DlPack {
 /// One selected pack entry, loaded and ready to register: the unit the wiring
 /// resolver's dl path and a slot's allowed-occupant list consume.
 ///
-/// The [`PackLib`] lives in an `Rc` shared with every [`DlSlot`] built from
-/// this handle, so the shared object stays loaded (and the pack open) as long
-/// as any of them exists.
+/// The library handle lives in an `Rc` shared with every loaded slot built
+/// from this handle. The shared object stays loaded and the pack stays open
+/// while any slot exists.
 pub struct DlSystem {
     lib: Rc<PackLib>,
     fns: PackFns,

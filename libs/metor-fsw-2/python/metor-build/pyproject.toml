@@ -1,5 +1,5 @@
 # The pack-crate PEP 517/660 backend as a distribution
-# (docs/design-packaging.md §4).
+# (docs/packaging.md).
 #
 # Published packs declare `[build-system] requires = ["metor-build", …]`;
 # in-repo packs reach the same code through a one-file `backend-path` shim

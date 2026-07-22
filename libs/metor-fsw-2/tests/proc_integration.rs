@@ -12,7 +12,7 @@
 //! outputs (user frame, Postcard events, implicit health), clean teardown,
 //! and a SIGKILL'd worker: `StopReason::ProcessDied`, ring reclamation, and
 //! the rest of the graph flowing on. The second half covers **process-mode
-//! slots** (`docs/process-slots.md`): the polled Load pipeline and occupant
+//! slots** (see `docs/process-systems.md`): the polled Load pipeline and occupant
 //! swap over one ring set, worker death folding to a terminal stop with an
 //! operator `Reset` recovery, the cooperative abort crossing the process
 //! boundary, and the isolation canary proving the host never maps an
@@ -626,7 +626,7 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Process-mode slots (docs/process-slots.md)
+// Process-mode slots (docs/process-systems.md)
 // ---------------------------------------------------------------------------
 
 // SlotState wire codes (SlotState::code): Empty=0, Loaded=1, Loading=2, Running=3, Done=4, Stopped=5.

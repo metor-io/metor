@@ -1,14 +1,14 @@
 //! Limit alarms over telemetered components.
 //!
-//! An alarm is just a message, and the alarm engine is just a system.
-//! [`AlarmSystem`] is an ordinary [`CyclicSystem`](crate::CyclicSystem) that
+//! The alarm engine sends alarm state through standard message ports.
+//! [`AlarmSystem`] is a [`CyclicSystem`](crate::CyclicSystem) that
 //! watches telemetered components through an [`AllOutputs`](crate::AllOutputs)
 //! tap and publishes over ordinary message ports. It emits an [`AlarmDef`] per
 //! configured alarm at boot, then [`AlarmRaised`] and [`AlarmCleared`] as
 //! alarms transition. Anything that consumes telemetered messages sees them
 //! with no extra plumbing.
 //!
-//! The module splits into three pieces:
+//! The module has three parts:
 //!
 //! - the config surface ([`AlarmsParams`], [`AlarmSpec`]), the serde types a
 //!   mission file's `system "alarms" type="Alarms" { alarm … }` node
