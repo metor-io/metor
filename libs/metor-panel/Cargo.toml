@@ -16,7 +16,7 @@ metor-proto-wkt.path = "../metor-proto/wkt"
 metor-proto-wkt.features = ["nox"]
 # mDNS/DNS-SD browsing: discover fsw links on the local network by name.
 mdns-sd = "0.13"
-# The mission wiring IR (Wiring) plus its serde_json codec, without the KDL
+# The target wiring IR (Wiring) plus its serde_json codec, without the KDL
 # front-end: the System Graph tile decodes a WiringManifest's ir_json into it.
 metor-fsw-2 = { path = "../metor-fsw-2", default-features = false, features = ["wiring-model"] }
 nox.path = "../nox"

@@ -1,7 +1,7 @@
 //! Ingests the control system's [`WiringManifest`] broadcast into a single
 //! app-global store the System Graph tile observes.
 //!
-//! The manifest carries the whole mission wiring IR as JSON (`metor-fsw-2`'s
+//! The manifest carries the whole target wiring IR as JSON (`metor-fsw-2`'s
 //! [`Wiring`]), re-broadcast on startup and on reload — the same telemetry
 //! pub/sub pattern [`SequenceRegistry`](metor_proto_wkt::SequenceRegistry)
 //! uses. There is exactly one live topology, so the fold is latest-wins: each

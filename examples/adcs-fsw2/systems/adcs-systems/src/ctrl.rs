@@ -1,4 +1,4 @@
-//! The **controller** of the `adcs-fsw2` mission. It commands both actuators:
+//! The **controller** of the `adcs-fsw2` target. It commands both actuators:
 //!
 //! - **Reaction wheels** ([`TorqueCmd`]): the Yang-LQR body torque toward the pointing-law
 //!   target the `mode` slot commands (`ModeCmd.law` — nadir or velocity-vector/HIL), computed

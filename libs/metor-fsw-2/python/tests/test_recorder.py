@@ -10,7 +10,7 @@ import metor_config as mc
 from metor_config import (
     Alarm,
     Alarms,
-    Mission,
+    Component,
     Target,
     Downlink,
     TcpServer,
@@ -22,36 +22,36 @@ from metor_config import (
 
 class RecorderTest(unittest.TestCase):
     def setUp(self):
-        # The exactly-one-Mission tracker is module-global; isolate each test.
-        mc._missions.clear()
+        # The exactly-one-Target tracker is module-global; isolate each test.
+        mc._targets.clear()
 
     def test_coordinator_clock_and_knobs(self):
-        wall = Mission(cycle_rate=100.0).to_ir()["coordinator"]
+        wall = Target(cycle_rate=100.0).to_ir()["coordinator"]
         self.assertEqual(wall["clock"], "Wall")
         self.assertEqual(wall["cycle_rate"], 100.0)
         self.assertIsNone(wall["default_depth"])
 
-        sim = Mission(cycle_rate=120.0, sim_dt=0.5, default_depth=8).to_ir()["coordinator"]
+        sim = Target(cycle_rate=120.0, sim_dt=0.5, default_depth=8).to_ir()["coordinator"]
         self.assertEqual(sim["clock"], {"Simulated": {"dt_secs": 0.5}})
         self.assertEqual(sim["default_depth"], 8)
 
     def test_namespace_emission_and_validation(self):
-        # Absent by default: an un-namespaced mission emits a null namespace,
+        # Absent by default: an un-namespaced target emits a null namespace,
         # keeping component ids identical to before.
-        self.assertIsNone(Mission(cycle_rate=100.0).to_ir()["coordinator"]["namespace"])
+        self.assertIsNone(Target(cycle_rate=100.0).to_ir()["coordinator"]["namespace"])
 
         # A dotted namespace rides in the coordinator dict verbatim.
-        ns = Mission(cycle_rate=100.0, namespace="fleet.sat1").to_ir()["coordinator"]
+        ns = Target(cycle_rate=100.0, namespace="fleet.sat1").to_ir()["coordinator"]
         self.assertEqual(ns["namespace"], "fleet.sat1")
 
         # Malformed namespaces are rejected at construction.
         for bad in ["", ".sat1", "sat1.", "sat1..a"]:
-            mc._missions.clear()
+            mc._targets.clear()
             with self.assertRaises(ValueError):
-                Mission(cycle_rate=100.0, namespace=bad)
+                Target(cycle_rate=100.0, namespace=bad)
 
     def test_add_records_system_and_ports(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
         a = m.add("a", static_system("Alarms"))
         b = m.add("b", Downlink(link))
@@ -69,7 +69,7 @@ class RecorderTest(unittest.TestCase):
         self.assertFalse(edge["delayed"])
 
     def test_loaded_system_via_artifact_handle(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")
         m.add("plant", adcs.Plant(gain=1.0), process=True)
         m.add("nav", adcs["Nav"]())  # item access yields the same entry callable
@@ -85,7 +85,7 @@ class RecorderTest(unittest.TestCase):
         self.assertTrue(plant["process"])
 
     def test_delayed_and_message_edges(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
         ctrl = m.add("ctrl", static_system("Ctrl"))
         plant = m.add("plant", static_system("Plant"))
@@ -100,7 +100,7 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(edges[2]["from"], "coordinator")
 
     def test_scope_nesting_and_indices(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         with m.scope("outer"):
             outer = m.add("sys", static_system("A"))
             with m.scope("inner"):
@@ -115,7 +115,7 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual([s["scope"] for s in ir["systems"]], [0, 1, None])
 
     def test_slot_records_allow_and_initial(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         seqs = m.artifact("seqs", crate="adcs-sequences", lib="adcs_sequences")
         m.slot(
             "mode",
@@ -134,7 +134,7 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(slot["initial"], {"occupant": "commissioning", "state": "Running"})
 
     def test_source_ref_anchors_to_this_file(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         m.add("a", static_system("A"))
         src = m.to_ir()["systems"][0]["src"]
         self.assertTrue(src["file"].endswith("test_recorder.py"))
@@ -147,7 +147,7 @@ class RecorderTest(unittest.TestCase):
                 id="RATE_HIGH",
                 name="Rate High",
                 description="body rate high",
-                target=Target("plant.gyro", element=1),
+                target=Component("plant.gyro", element=1),
                 warning=band(above=0.05, below=-0.05),
                 critical=band(above=0.15),
                 debounce=2,
@@ -174,36 +174,36 @@ class RecorderTest(unittest.TestCase):
     # -- error cases --------------------------------------------------------
 
     def test_duplicate_instance_name(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         m.add("a", static_system("A"))
         with self.assertRaisesRegex(ValueError, "duplicate instance name 'a'"):
             m.add("a", static_system("B"))
 
     def test_unknown_initial_occupant(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         seqs = m.artifact("seqs", crate="c", lib="l")
         with self.assertRaisesRegex(ValueError, "initial occupant 'missing'"):
             m.slot("mode", inputs=[], outputs=[], allow=[seqs.safe_mode()], initial="missing")
 
     def test_non_json_param_names_the_key(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         with self.assertRaisesRegex(TypeError, "'bad'"):
             m.add("a", static_system("A", bad=object()))
 
     def test_dataclass_rejects_unknown_kwargs(self):
         with self.assertRaises(TypeError):
-            Target("x", bogus=1)
+            Component("x", bogus=1)
         with self.assertRaises(TypeError):
             band(above=1.0, sideways=2.0)
         with self.assertRaises(TypeError):
-            Alarm(id="x", name="n", target=Target("c"), nope=1)
+            Alarm(id="x", name="n", target=Component("c"), nope=1)
 
-    def test_exactly_one_mission_rule(self):
-        mc._missions.clear()
+    def test_exactly_one_target_rule(self):
+        mc._targets.clear()
         with self.assertRaisesRegex(RuntimeError, "found 0"):
             mc.emit()
-        Mission(cycle_rate=1.0)
-        Mission(cycle_rate=2.0)
+        Target(cycle_rate=1.0)
+        Target(cycle_rate=2.0)
         with self.assertRaisesRegex(RuntimeError, "found 2"):
             mc.emit()
 

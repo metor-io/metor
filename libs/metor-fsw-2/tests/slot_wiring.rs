@@ -1,6 +1,6 @@
 //! Runtime slots driven through the [`WiringBuilder`] front end.
 //!
-//! Each test builds a `slot` mission with [`WiringBuilder`] rather than a
+//! Each test builds a `slot` target with [`WiringBuilder`] rather than a
 //! hand-built coordinator. The build driver ([`provision_artifacts`]) compiles and
 //! locates the occupant shared library, and [`resolve`] turns the whole thing
 //! into a live [`Coordinator`]. The tests then observe the slot from the
@@ -30,7 +30,7 @@ const FIXTURE_STEM: &str = "metor_fsw_2_seq_fixture";
 const RUNNING: u8 = 3;
 const DONE: u8 = 4;
 
-/// A slot mission whose single allowed occupant is the `waiter` fixture,
+/// A slot target whose single allowed occupant is the `waiter` fixture,
 /// started at init. `waiter` has no user ports, so the slot declares no
 /// `input` or `output`.
 fn slot_wiring() -> metor_fsw_2::Wiring {
@@ -309,7 +309,7 @@ struct GainOut {
     gain: f64,
 }
 
-/// A slot mission whose single allowed occupant carries typed params.
+/// A slot target whose single allowed occupant carries typed params.
 fn param_slot_wiring() -> metor_fsw_2::Wiring {
     WiringBuilder::new()
         .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.000002 })

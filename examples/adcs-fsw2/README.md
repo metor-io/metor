@@ -1,6 +1,6 @@
 # adcs-fsw2 — closed-loop ADCS on metor-fsw-2, with `dlopen`'d systems
 
-A self-contained spacecraft attitude-determination-and-control mission built on the
+A self-contained spacecraft attitude-determination-and-control target built on the
 `metor-fsw-2` framework: a plant/dynamics system, an MEKF navigation filter, and a
 Yang-LQR controller in a closed feedback loop (reusing the `metor-fsw/adcs` math and
 `nox` six-dof dynamics), commissioned by a runtime **sequence slot**.
@@ -29,7 +29,7 @@ reading the physical **NOAA WMM** field in Tesla), a noisy **GPS** measurement (
 first-order Gauss-Markov position error + white velocity noise — the orbit state the flight
 software flies on), reaction-wheel and per-source **disturbance-torque** telemetry, the
 ground-truth **body** state (true attitude + body rate + ECI orbit), and the **world**
-environment — the true ECI sun direction (nox-frames' Vallado model at the mission epoch),
+environment — the true ECI sun direction (nox-frames' Vallado model at the target epoch),
 the WMM magnetic field the sensors observe, and the illumination truth flag.
 
 The **nav** filter reconstructs the sun vector from the raw CSS readings (opposed-pair
@@ -50,7 +50,7 @@ ladder**, not a script of timed waits: estimator warm-up (gated on successive q�
 settling), an optional magnetorquer detumble (entered only above a rate the wheels shouldn't
 capture; the boot tumble is not), then coarse and fine pointing gated on the live tracking
 error to the velocity-vector target, each phase under a timeout that safes the spacecraft
-and fails the sequence. Its gates and budgets are sequence **params** on the mission's
+and fails the sequence. Its gates and budgets are sequence **params** on the target's
 `allow` line. A `safe_mode` sequence is the second allowed occupant (Loaded by an operator
 to drop to a nadir-pointing safe state).
 
@@ -61,24 +61,24 @@ to drop to a nadir-pointing safe state).
 | `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / gps / body / world / attitude_estimate / mode_cmd / torque_cmd / mtq_cmd / wheels / disturb), the per-system `Params`, and only the physics **both sides** rely on — orbital constants + inertia, the actuator envelope (wheel torque/momentum limits, torquer dipole limit), the WMM magnetic-field + sun-direction models (the plant's truth *and* nav's references), the Nadir/HIL pointing laws, and the desat/detumble magnetorquer laws. Linked by the cdylibs (and the test), **not** by the host. |
 | `adcs-systems` | `systems/adcs-systems/` | The three cyclic systems as **one pack in one cdylib** (`fn pack()` + `export_pack!`): the orbiting rigid-body **plant** and its physics (wheel dynamics, disturbance-torque model, GPS/magnetometer error models, magnetorquers, sensor suite), the MEKF **nav** filter (`sun_from_css` reconstruction, its own sun/WMM references at the GPS position, magnetometer-only through eclipses), and the Yang-LQR + magnetorquer-law **ctrl** controller. Plant and nav are fn-authored (state struct + `init` fn + `execute` fn); ctrl deliberately stays `#[system]` struct-authored so the pack exercises both styles. |
 | `adcs-sequences` | `systems/adcs-sequences/` | Both async-fn sequence occupants of the `mode` slot as one pack cdylib: the condition-based commissioning ladder (params on the `allow` line) and the one-shot safing drop. |
-| `adcs-fsw2` | (this crate) | The mission **host**: builds + `dlopen`s the cdylibs and runs the coordinator. Links only `metor-fsw-2` — it is fully schema-agnostic (frames validated from serialized VTables, params encoded from each `.so`'s exported schema). |
+| `adcs-fsw2` | (this crate) | The target **host**: builds + `dlopen`s the cdylibs and runs the coordinator. Links only `metor-fsw-2` — it is fully schema-agnostic (frames validated from serialized VTables, params encoded from each `.so`'s exported schema). |
 
 `adcs-systems` is `crate-type = ["cdylib", "rlib"]`: the cdylib is what the host loads; the
 rlib lets the convergence test register the **same** `pack()` statically for the parity
 check. The `export_pack!` C-ABI symbols ride an `export` feature (on by default for the
 cdylib, off when the test links the rlib) so the rlib carries no `fsw_pack_*` exports.
 
-## The mission front-end
+## The target front-end
 
-The mission is described in `mission.py` through the `metor_config` Python front-end
-(`libs/metor-fsw-2/python`): `metor-fsw build|run|package mission.py` spawns a subprocess
+The target is described in `target.py` through the `metor_config` Python front-end
+(`libs/metor-fsw-2/python`): `metor-fsw build|run|package target.py` spawns a subprocess
 CPython that evaluates the file against the recorder and emits the versioned `Wiring` IR that
 `resolve` consumes. Systems and occupants come from generated, `py.typed` pack modules, so
 params, ports, and frames are pyright-checked. The CLI runner and every tracked test read
 this one file.
 
 The generated modules are **venv-only build artifacts**
-(`libs/metor-fsw-2/docs/design-packaging.md`): the mission is a virtual uv project whose
+(`libs/metor-fsw-2/docs/design-packaging.md`): the target is a virtual uv project whose
 packs are ordinary dependencies — `[tool.uv.sources]` path entries pointing at
 `systems/adcs-systems` and `systems/adcs-sequences` while they live in this repo. Each
 pack's own PEP 517 backend runs `metor-fsw pack dev` on `uv sync`, building the host triple
@@ -90,7 +90,7 @@ index build with the same import. Nothing generated is checked in.
 ```sh
 cd examples/adcs-fsw2
 uv sync            # builds the packs, regenerates .metor/packs, installs the .pth
-uv run pyright     # type-checks mission.py against the fresh stubs
+uv run pyright     # type-checks target.py against the fresh stubs
 ```
 
 `[tool.uv] cache-keys` covers the pack crates' sources, so `uv sync` regenerates the stubs
@@ -98,7 +98,7 @@ whenever a system's params, ports, or frames change; a stub that is stale anyway
 then the pack edited without a re-sync) is refused at load by the resolve-time manifest-hash
 check. The first sync compiles `metor-fsw` and both packs, so it takes a few minutes and uv
 shows no progress unless run as `uv sync -v`; point `METOR_FSW_BIN` at a prebuilt `metor-fsw`
-to skip the framework compile. The evaluator also puts a mission-adjacent `.metor` on
+to skip the framework compile. The evaluator also puts a target-adjacent `.metor` on
 `PYTHONPATH`, so a bare `cargo run`/`cargo test` works once stubs exist (the tracked suites
 regenerate them themselves); prefixing run commands with `uv run --` additionally keeps the
 stubs fresh via uv's implicit sync.
@@ -114,12 +114,12 @@ ingests.
    ```sh
    cargo run -p metor-panel
    ```
-2. In another terminal, run the mission — telemetry **down**, command **up**:
+2. In another terminal, run the target — telemetry **down**, command **up**:
    ```sh
    cd examples/adcs-fsw2 && uv run -- cargo run -p metor-fsw-2 --bin metor-fsw -- \
-       run mission.py --build --wall
+       run target.py --build --wall
    ```
-   The links are systems in `mission.py`: its `downlink` (`TcpDownlink`) streams every frame
+   The links are systems in `target.py`: its `downlink` (`TcpDownlink`) streams every frame
    to the panel, and its `uplink` (`TcpUplink`) opens a **second** connection that ingests
    the panel's `SequenceCommand`s so you can drive the `mode` slot live (Load/Start/Abort
    `commissioning` or `safe_mode`). Uplink and downlink use separate connections
@@ -142,7 +142,7 @@ ingests.
    nadir safing. The alarm view carries `ADCS_RATE_HIGH` (body rate) and `RW_MOMENTUM_HIGH`
    (wheel-0 stored momentum vs the saturation limit).
 
-The mission converges in ~30 s of real time. The terminal prints only a heartbeat — the
+The target converges in ~30 s of real time. The terminal prints only a heartbeat — the
 host stays schema-agnostic (it doesn't decode the frames), so convergence is watched in the
 panel (or asserted headlessly by `cargo test`). Ctrl-C to stop. If the panel isn't running
 the downlink/uplink just fail to connect and the control loop runs unaffected.
@@ -153,7 +153,7 @@ the downlink/uplink just fail to connect and the control loop runs unaffected.
 
 ### Booting with the reaction wheels disarmed
 
-Set `disarmed=True` on the `plant` system in `mission.py` to bring the spacecraft up with
+Set `disarmed=True` on the `plant` system in `target.py` to bring the spacecraft up with
 every reaction wheel offline (the cube-sat `--disarmed` parity): the plant applies no control
 torque until the wheels are armed, so the spacecraft tumbles freely. (Live operator arm/disarm
 of individual wheels is a panel-command surface metor-fsw-2 does not yet expose — see the
@@ -165,17 +165,17 @@ ergonomics report.)
 cargo test -p adcs-fsw2     # builds the cdylibs, then asserts convergence + parity
 ```
 
-`tests/closed_loop.rs` runs the **same** `mission.py` two ways — `plant`/`nav`/`ctrl`
+`tests/closed_loop.rs` runs the **same** `target.py` two ways — `plant`/`nav`/`ctrl`
 registered statically (the rlib's `pack()` into a `Registry`) and the same pack `dlopen`'d
 from its cdylib — with the `mode` slot's sequences dlopen in both. It asserts both converge onto the
 commanded pointing target and that the dlopen run matches the static one **bit-for-bit** (same
 systems, same params, same seed, just loaded vs linked). `tests/momentum.rs` preloads the
 wheels and asserts the desaturation law dumps stored momentum through the torquers while the
-mission keeps pointing (and that the `RW_MOMENTUM_HIGH` alarm's nested target path resolves
+target keeps pointing (and that the `RW_MOMENTUM_HIGH` alarm's nested target path resolves
 live). `tests/eclipse.rs` boots inside / just before the Earth-shadow arc (the entry phase
 is computed, not hardcoded) and asserts the CSS heads go dark, SRP switches off, and the
 magnetometer-only estimate rides through the sun loss. `tests/sequences.rs` exercises the `mode` slot end-to-end (auto-run, interactive
-Load→Start→Abort, and the downlinked sequence events); `tests/bundle.rs` checks the mission
+Load→Start→Abort, and the downlinked sequence events); `tests/bundle.rs` checks the target
 bundles and runs. All build real cdylibs, so they are slower than plain unit tests and are
 gated off `miri`. The physics itself is unit-tested underneath: the WMM band, shadow
 geometry, and magnetorquer laws in `adcs-contracts`, and the wheel model, disturbance

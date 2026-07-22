@@ -1897,7 +1897,7 @@ async fn link_server_end_to_end_through_the_wiring() {
         .connect_msg("uplink", "sink", "SequenceCommand")
         .serve("127.0.0.1:0".parse().unwrap())
         .build();
-    let mut coord = resolve(&wiring, &r).expect("the link mission resolves");
+    let mut coord = resolve(&wiring, &r).expect("the link target resolves");
     let addr = link.get().local_addr();
 
     // A real ground client: read the stream, and answer the first packet

@@ -8,7 +8,7 @@ A task can run as a normal wired system. It can also run as the occupant of a
 runtime slot. The same task body works in both cases, but a slot adds commands,
 progress, and status.
 
-A slot lets the mission choose or replace one allowed behavior at run time. The goal is to let operators choose between different modes of operation at runtime. For example you might want to first power on the device and then you might want to run a built-in-test. You can equate this to scripts in other fsw systems.
+A slot lets the target choose or replace one allowed behavior at run time. The goal is to let operators choose between different modes of operation at runtime. For example you might want to first power on the device and then you might want to run a built-in-test. You can equate this to scripts in other fsw systems.
 
 A slot can also hold a cyclic pack entry. Async tasks get cooperative cancel. Cyclic occupants stop on cancel without running async cleanup.
 
@@ -41,7 +41,7 @@ pub fn pack() -> Pack {
 }
 ```
 
-The future owns its ports and local variables. No task runs on a timer thread. The host polls it once for each mission cycle with a no-op waker.
+The future owns its ports and local variables. No task runs on a timer thread. The host polls it once for each FSW cycle with a no-op waker.
 
 The task must return one of these results:
 
@@ -51,12 +51,12 @@ The task must return one of these results:
 
 After a task returns, its driver does not poll it again.
 
-## Mission time
+## FSW time
 
 Task helpers read the current poll's `CycleClock`:
 
-- `now()` returns the timestamp for this mission cycle.
-- `wait(duration)` waits for mission time, not wall time.
+- `now()` returns the timestamp for this FSW cycle.
+- `wait(duration)` waits for FSW time, not wall time.
 - `cycle()` waits until a later poll has a greater timestamp.
 - `progress(text)` adds a status line for this cycle.
 - `aborted()` reads the latched cancel flag.
@@ -82,7 +82,7 @@ A repeated timestamp does not complete `cycle()`. Normal simulated clocks use a 
 
 ## Wired tasks
 
-A wired task is a normal cyclic entry. Its declared ports connect through mission edges. It also has the usual health and log outputs.
+A wired task is a normal cyclic entry. Its declared ports connect through target edges. It also has the usual health and log outputs.
 
 It has no slot command input and no `SequenceStatus` output. Calls to `progress` become `Info` log messages after each poll.
 
@@ -94,7 +94,7 @@ This form suits long-lived async state code that needs one poll per cycle but do
 
 A slot is one fixed place in the cyclic schedule. The coordinator owns its rings for the whole run. Loading an occupant attaches fresh port handles to those rings.
 
-Every allowed occupant must have the same user-port contract. The config lists that contract by frame name. Build checks each candidate before the mission starts.
+Every allowed occupant must have the same user-port contract. The config lists that contract by frame name. Build checks each candidate before the target starts.
 
 Every entry already has health and log outputs after its user outputs. A slot mount then adds two more ports:
 
@@ -221,7 +221,7 @@ The coordinator stores each ring that crosses the worker boundary in the run's s
 
 Each runtime `Load` starts a new worker. The slot enters Loading while the worker starts, attaches rings, creates the entry, and runs init. The coordinator checks this work once per cycle. It does not block a cycle on the full load.
 
-An initial process occupant completes this work during the mission init barrier. A configured Running occupant can then start on the first cycle.
+An initial process occupant completes this work during the target init barrier. A configured Running occupant can then start on the first cycle.
 
 When loading finishes, the slot enters Loaded. `Start` then begins one worker step per cycle.
 
@@ -229,6 +229,6 @@ The coordinator waits up to `proc_step_timeout` for each step reply. A late work
 
 A runtime process slot does not restart a dead worker on its own. Use `Reset` or `Load` to create a new worker.
 
-`Stop` kills the current worker and reclaims its ring roles. `Reset` and a new `Load` also tear down the old worker first. Mission shutdown asks the worker to stop, waits for a short grace period, then kills it if needed.
+`Stop` kills the current worker and reclaims its ring roles. `Reset` and a new `Load` also tear down the old worker first. Target shutdown asks the worker to stop, waits for a short grace period, then kills it if needed.
 
 Process slots need a shared futex. The framework supports them on Linux and macOS 14.4 or later. Resolve rejects them on other targets.

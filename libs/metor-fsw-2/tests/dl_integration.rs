@@ -2,7 +2,7 @@
 //!
 //! The `tests_abi` suite calls the generated `fsw_*` symbols inside the test
 //! binary itself; this test crosses a real shared-object boundary. It builds
-//! the `metor-fsw-2-dl-fixture` crate as a `cdylib`, describes the mission as a
+//! the `metor-fsw-2-dl-fixture` crate as a `cdylib`, describes the target as a
 //! [`Wiring`] (a static producer plus one or two dlopen'd consumers), points
 //! the artifact at the freshly built `.so`, and [`resolve`]s it into a live
 //! [`Coordinator`]. Running a few cycles exercises the loader, the manifest
@@ -124,7 +124,7 @@ fn locate_fixture() -> Option<PathBuf> {
     common::locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
 }
 
-/// A 200 Hz, depth-8, 5 ms-per-step simulated mission, the shared coordinator
+/// A 200 Hz, depth-8, 5 ms-per-step simulated target, the shared coordinator
 /// config across the dl tests.
 fn dl_coordinator() -> CoordinatorSpec {
     CoordinatorSpec {
@@ -194,7 +194,7 @@ fn dlopen_cyclic_system_end_to_end() {
     );
     drop((loaded, pack));
 
-    // 2. Describe the mission: a static producer into two instances of the
+    // 2. Describe the target: a static producer into two instances of the
     //    same loaded entry, each with its own params (start=1000, start=2000).
     //    One opened pack mints any number of independent instances.
     let mut wiring = WiringBuilder::new()
@@ -332,7 +332,7 @@ fn dlopen_cyclic_system_end_to_end() {
         .find(|ev| ev.message == "tick counted")
         .expect("the pack's tracing event reached its log port");
     assert_eq!(ev.source, "dl_counter", "attributed to the instance");
-    // Born on the mission clock: the ABI shim republishes each step's `now`
+    // Born on the FSW clock: the ABI shim republishes each step's `now`
     // inside the dylib, so the last cycle's event carries exactly the cycle
     // timestamp the last tick_out frame does.
     assert!(

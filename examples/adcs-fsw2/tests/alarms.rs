@@ -1,5 +1,5 @@
-//! The mission's alarm end-to-end gate (`docs/alarms.md`): the `ADCS_RATE_HIGH`
-//! alarm declared in `mission.py` — a shaped nox-tensor target
+//! The target's alarm end-to-end gate (`docs/alarms.md`): the `ADCS_RATE_HIGH`
+//! alarm declared in `target.py` — a shaped nox-tensor target
 //! (`plant.sensors.gyro_b` element 1) — raises on the boot tumble and clears as the
 //! controller detumbles, observed as wkt alarm Msgs on the alarm engine's registered
 //! message channels (the exact records the downlink would ship to the panel).
@@ -10,7 +10,7 @@ use metor_fsw_2::MsgIn;
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::{AlarmCleared, AlarmDef, AlarmRaised, Severity};
 
-/// Enough of the 120 Hz mission for the commissioning detumble to settle well below
+/// Enough of the 120 Hz target for the commissioning detumble to settle well below
 /// the alarm's ±0.05 rad/s warning band (the convergence gate uses the same budget).
 const CYCLES: usize = 4000;
 
@@ -51,7 +51,7 @@ fn rate_alarm_raises_on_boot_tumble_and_clears() {
     assert_eq!(
         got_defs.len(),
         2,
-        "both mission alarms broadcast defs: {got_defs:?}"
+        "both target alarms broadcast defs: {got_defs:?}"
     );
     let def = got_defs
         .iter()

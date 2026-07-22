@@ -72,7 +72,7 @@
 //!
 //! # Wiring and loading
 //!
-//! A `mission.py` file and [`WiringBuilder`] both create the same [`Wiring`] IR.
+//! A `target.py` file and [`WiringBuilder`] both create the same [`Wiring`] IR.
 //! The resolver checks that IR, loads
 //! each system descriptor, builds the graph, sizes its rings, and returns a
 //! ready [`Coordinator`].
@@ -112,7 +112,7 @@ pub mod logfwd;
 // Not gated on `wiring`; sequences are an ABI/runtime feature.
 pub mod sequence;
 
-// The pure-data mission IR. Available without the front-end (feature
+// The pure-data target IR. Available without the front-end (feature
 // `wiring-model`) so an IR consumer can emit and re-ingest it; the
 // `wiring`-gated `wiring` module re-exports these types alongside its resolver.
 #[cfg(feature = "wiring-model")]

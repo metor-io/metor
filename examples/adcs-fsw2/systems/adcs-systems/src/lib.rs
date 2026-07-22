@@ -1,8 +1,8 @@
-//! The three cyclic systems of the `adcs-fsw2` mission — the rigid-body [`plant`], the MEKF
+//! The three cyclic systems of the `adcs-fsw2` target — the rigid-body [`plant`], the MEKF
 //! [`nav`] filter, and the Yang-LQR [`ctrl`] controller — as **one pack in one crate**
 //! (docs/design-packs-authoring.md): a single `cdylib` the host `dlopen`s, a single `fn
 //! pack()` every loading mode shares (static registry, dlopen, process worker), and the
-//! mission's `system` nodes selecting entries by `type=`.
+//! target's `system` nodes selecting entries by `type=`.
 //!
 //! The pack deliberately mixes both authoring styles: `plant` and `nav` are fn-authored
 //! (a plain state struct, an `init` fn, an `execute` fn whose signature is the port set),
@@ -21,7 +21,7 @@ use metor_fsw_2::{Pack, system};
 
 use crate::{nav::NavState, plant::PlantState};
 
-/// This crate's pack: the three entries under the names the mission's `system` nodes select
+/// This crate's pack: the three entries under the names the target's `system` nodes select
 /// (`type="Plant"` / `type="Nav"` / `type="Ctrl"`).
 pub fn pack() -> Pack {
     Pack::new()
@@ -35,8 +35,8 @@ metor_fsw_2::export_pack!(pack, feature = "export");
 #[cfg(test)]
 mod tests {
     /// `Ctrl` is `#[system]`-authored with `CtrlParams: Default`, so the pack
-    /// declares its defaults blob and a mission node may spell only overrides
-    /// (mission.kdl still spells the gains in full, exercising the other
+    /// declares its defaults blob and a target node may spell only overrides
+    /// (target.kdl still spells the gains in full, exercising the other
     /// form). The fn-authored entries declare no defaults, which is why the
     /// plant node spells its whole environment.
     #[test]

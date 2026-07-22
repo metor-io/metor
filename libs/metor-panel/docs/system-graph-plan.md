@@ -60,7 +60,7 @@ The plan doc itself is committed first as
   against telemetry later.
 - **Scope hierarchy.** Scopes (from `scopes[].parent`) render as collapsible
   group containers; a collapsed scope becomes one aggregate node and edges to its
-  members re-route to the group node. Flat missions (no scopes) render flat.
+  members re-route to the group node. Flat targets (no scopes) render flat.
 - **Auto-layout.** Deterministic layered layout: topological layering over
   non-delayed frame edges (delayed and msg edges excluded from layering, drawn as
   back/side edges); layers left→right; within-layer order minimized by a

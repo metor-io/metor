@@ -4,7 +4,7 @@ The second realism arc after `gps-wmm-plan.md`, all confirmed with the user:
 
 1. **Environmental disturbance torques** — gravity-gradient, aero drag (force also on the
    orbit), residual magnetic dipole, SRP. Without them wheel momentum never builds, so
-   nothing in the mission ever *needs* managing.
+   nothing in the target ever *needs* managing.
 2. **Magnetorquers** — a second actuator (`τ = m × B`), carrying **desaturation** (the
    cross-product momentum-dumping law) and a **B-cross detumble** law (`LAW_DETUMBLE`,
    selectable but not yet commanded by any sequence — the commissioning rewrite is a later
@@ -71,20 +71,20 @@ Quaternion convention matches the existing code: `v_eci = q_b_eci ⊛ v_b`.
   ECI-frame — the old plant applied it un-rotated, self-consistently wrong) and clamped
   per axis to `RW_TORQUE_MAX`; law dispatch (detumble idles the wheels).
 - **nav**: normalizes the Tesla `mag_b` before the MEKF.
-- **mission.kdl**: plant params spelled out (dlopen schema encoding has no serde
+- **target.kdl**: plant params spelled out (dlopen schema encoding has no serde
   defaults); `k_desat`/`k_detumble`; `plant→ctrl` sensors+wheels edges; `ctrl→plant`
   `mtq_cmd` delayed back-edge; `RW_MOMENTUM_HIGH` alarm on
   `plant.wheels.wheels.0.ang_momentum`.
 - **tests**: contracts (saturation, friction decay, disturbance magnitude bands, law
   signs), plant (L conservation, detumble damps a tumble), `tests/momentum.rs` (desat-on
-  vs desat-off dump margin + live alarm-path resolution + mission stays converged).
+  vs desat-off dump margin + live alarm-path resolution + target stays converged).
 
 ## Found along the way (fixed in their own commits)
 
 - `nox::six_dof` had no Euler coupling at all (above).
 - A disconnected `TcpDownlink` stalled **every** ring at depth from boot (its ReceiveAll
   tap views stopped draining when the batch queue filled behind the reconnect backoff) —
-  the whole mission flew on frozen data whenever no panel was listening.
+  the whole target flew on frozen data whenever no panel was listening.
 - Canceling a task parked in `stellarator::sleep` corrupted the maitake timer wheel
   (cancel's lost wake + future kept alive until a stale-waker deallocation + a refcount
   double-decrement) — the downlink's parked sender tripped it at coordinator teardown.

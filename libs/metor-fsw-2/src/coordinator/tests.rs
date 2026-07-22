@@ -2424,7 +2424,7 @@ fn proc_and_process_slot_share_a_session() {
 }
 
 // ---------------------------------------------------------------------------
-// WiringManifest emission: the coordinator broadcasts the full mission IR on
+// WiringManifest emission: the coordinator broadcasts the full target IR on
 // its `wiring` channel at boot and re-fires it on a ReloadSequences request,
 // sizing the ring from the concrete payload (the IR overruns the default cap).
 // ---------------------------------------------------------------------------

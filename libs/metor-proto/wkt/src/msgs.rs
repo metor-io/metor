@@ -778,7 +778,7 @@ pub enum SequenceCommandKind {
 ///
 /// **Retired ids [224,41], [224,42], [224,43]:** the original
 /// `SequenceRegistry`/`SequenceChannelEvent`/`SequenceCommand` addressed channels by a
-/// `channel_id: u64` (the slot's build-order index — reordering a mission file silently
+/// `channel_id: u64` (the slot's build-order index — reordering a target file silently
 /// re-addressed commands). The name-addressed types changed the postcard layout, so they
 /// took **fresh** `PacketId`s ([224,58..60]) rather than mis-decoding every historical
 /// recording persisted under the old ids. The retired ids are reserved forever: an old
@@ -794,7 +794,7 @@ pub struct SequenceCommand {
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Default)]
 pub struct ReloadSequences {}
 
-/// The complete mission wiring IR, broadcast by the control system at startup
+/// The complete target wiring IR, broadcast by the control system at startup
 /// and re-broadcast on a [`ReloadSequences`] request — the same telemetry
 /// pub/sub pattern [`SequenceRegistry`] uses. The payload is the versioned
 /// `Wiring` serialized as JSON (the self-describing §6 wire format), so a
@@ -829,7 +829,7 @@ pub enum LogLevel {
 /// log call) and host `tracing` events routed through the forwarding layer.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
 pub struct LogEvent {
-    /// Source-side event time on the mission clock: health-port lines and
+    /// Source-side event time on the FSW clock: health-port lines and
     /// forwarded tracing events are both stamped with the cycle timestamp of
     /// the cycle that flushed them (wall time equals it only under a wall
     /// clock).

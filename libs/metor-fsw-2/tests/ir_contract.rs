@@ -5,7 +5,7 @@
 //!
 //! Two checks anchor that contract: a maximal `Wiring` that round-trips through
 //! JSON unchanged (and whose rendering pins the enum tagging), and the shared
-//! `tests/golden/mission.json` fixture — the same file the Python golden test
+//! `tests/golden/target.json` fixture — the same file the Python golden test
 //! consumes — deserialized and re-serialized to prove it is exactly what Rust
 //! accepts and emits.
 
@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 fn maximal() -> Wiring {
     let src = |line| {
         Some(SourceRef {
-            file: Some("mission.py".into()),
+            file: Some("target.py".into()),
             line,
             col: 1,
         })
@@ -226,7 +226,7 @@ fn representation_is_externally_tagged() {
 /// Rust round-trips to.
 #[test]
 fn golden_fixture_round_trips() {
-    const GOLDEN: &str = include_str!("golden/mission.json");
+    const GOLDEN: &str = include_str!("golden/target.json");
     let w: Wiring = serde_json::from_str(GOLDEN).expect("golden fixture deserializes as Wiring");
     let reserialized = normalize(serde_json::to_value(&w).unwrap());
     let on_disk = normalize(serde_json::from_str(GOLDEN).unwrap());

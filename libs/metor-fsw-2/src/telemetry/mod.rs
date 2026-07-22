@@ -34,7 +34,7 @@
 //!
 //! # Loss policy
 //!
-//! The link must never backpressure the mission. Taps drain every cycle no
+//! The link must never backpressure the target. Taps drain every cycle no
 //! matter what — an undrained view stalls its producer's ring — and framing
 //! is skipped entirely with no connections. A connection that cannot keep up
 //! misses whole batches behind its byte cap (counted per occurrence, folded
@@ -105,7 +105,7 @@ pub struct TelemetryConfig {
 /// Wiring parameters for the built-in downlink (`type="Downlink"`): an
 /// optional tap subset. With both lists absent every entry is tapped; with
 /// either present an entry is tapped when its instance or its frame/channel
-/// name is listed. The link itself is the mission's `TcpServer` state
+/// name is listed. The link itself is the target's `TcpServer` state
 /// declaration, not a per-system address.
 ///
 /// ```python

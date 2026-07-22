@@ -1,4 +1,4 @@
-//! Load a coordinator from a [`Wiring`] mission IR.
+//! Load a coordinator from a [`Wiring`] target IR.
 //!
 //! This module is a pure front-end onto the init graph, no coordinator logic of
 //! its own. The pipeline is one line:
@@ -6,11 +6,11 @@
 //! ```text
 //! WiringBuilder ─┐
 //!                ├─→ Wiring ─→ validate ─→ resolve ─→ InitGraph ─→ Coordinator
-//!  mission.py ───┘
+//!  target.py ───┘
 //! ```
 //!
-//! Both front ends, the Rust [`WiringBuilder`] and an evaluated `.py` mission
-//! ([`eval_python_mission`]), produce the same [`Wiring`], a plain data model
+//! Both front ends, the Rust [`WiringBuilder`] and an evaluated `.py` target
+//! ([`eval_python_target`]), produce the same [`Wiring`], a plain data model
 //! of systems, slots, edges, and coordinator config. [`resolve`](resolve::resolve)
 //! checks it, then creates one internal node per system. Static systems come
 //! from the [`Registry`]. Loaded and process systems come from built
@@ -20,7 +20,7 @@
 //! a [`LoadError`], a `miette` [`Diagnostic`](miette::Diagnostic) anchored on the
 //! spec's [`SourceRef`] when it has one.
 //!
-//! The module can also pack a mission into a `.metor` archive, build an
+//! The module can also pack a target into a `.metor` archive, build an
 //! [`Artifact`]'s cdylib, generate Python stubs, and encode a value tree
 //! against an artifact's exported `Params` schema.
 //!
@@ -76,7 +76,7 @@ pub use pack_dist::{
     read_pack_config, refresh_dev_packs,
 };
 pub use params::encode_value_params;
-pub use py::{eval_python_mission, is_python_mission};
+pub use py::{eval_python_target, is_python_target};
 pub use registry::{AsyncKind, CyclicKind, IntoNode, Registry};
 pub(crate) use registry::NoParams;
 pub use resolve::{ResolveOptions, resolve, resolve_with};

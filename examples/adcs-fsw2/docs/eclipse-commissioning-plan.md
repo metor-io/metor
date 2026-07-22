@@ -21,7 +21,7 @@ Two work items, coupled through the `Sensors` frame and the sequence tests:
 ## Scope decisions to confirm (flagged, with recommendations)
 
 1. **Shadow model: cylindrical umbra.** At 400 km cone vs cylinder differ <1 s of a ~2100 s
-   eclipse arc; penumbra transit ~8 s — both below this mission's fidelity. Documented
+   eclipse arc; penumbra transit ~8 s — both below this target's fidelity. Documented
    non-goals.
 2. **Six-head CSS, restored from cube-sat and finished properly** (user-confirmed — the
    port dropped it). cube-sat (`main.rs:123-158`) modeled one cosine-response photodiode
@@ -33,7 +33,7 @@ Two work items, coupled through the `Sensors` frame and the sequence tests:
    `ŝ_b ≈ normalize([r₊ₓ−r₋ₓ, r₊ᵧ−r₋ᵧ, r₊𝓏−r₋𝓏])`. Six orthogonal 90° cones cover the
    full sphere (any unit vector has a component ≥ 1/√3 ⇒ a lit reading ≥ 0.577), so FOV is
    genuinely modeled per head while sun availability still reduces to illumination — as
-   real missions design it.
+   real targets design it.
 3. **Validity is derived FSW-side, not a plant-provided bit.** With real readings there is
    no `sun_valid` field: nav declares the sun lost when every reading is below
    `CSS_THRESHOLD` (0.1 ≈ 50σ of head noise, ~6× below the minimum lit reading) — the
@@ -65,7 +65,7 @@ Two work items, coupled through the `Sensors` frame and the sequence tests:
   eclipse mode is a one-element `estimate_attitude([mag], [mag_ref], [σ])` call. **No
   mekf.rs change needed.** About-B̂ attitude is instantaneously unobservable; gyro
   propagation + the orbit rotating B̂ bounds it over test-length shadows.
-- **The default mission never eclipses in-test**: sun at 2024-01-01 is ŝ ≈ (0.18, −0.90,
+- **The default target never eclipses in-test**: sun at 2024-01-01 is ŝ ≈ (0.18, −0.90,
   −0.39); shadow entry is at orbit phase ≈33° ≈ 500 s in (period 5554 s), eclipse arc
   ≈35 min. closed_loop's 33 s stays sunlit and byte-identical at phase 0.
 - Ctrl clamps the dipole to the `MTQ_MAX_DIPOLE` const, so tests cannot crank torquer
@@ -105,7 +105,7 @@ pub fn in_earth_shadow(pos_eci: &V3, sun_eci: &V3) -> bool {
 - New contracts const `CSS_THRESHOLD: f64 = 0.1` — shared by nav (validity gate) and the
   eclipse test's assertions. Head normals are the plant's model (±X/±Y/±Z), not contract.
 - `ModeCmd`: `const DETUMBLE: u8 = 4` + `detumble()` ctor (layout unchanged).
-- `PlantParams.init_orbit_phase: f64` (spelled in mission.kdl).
+- `PlantParams.init_orbit_phase: f64` (spelled in target.kdl).
 - New `CommissioningParams`: rate_detumble_enter 1.0 / exit 0.8; est_delta_rad 0.001 /
   est_dwell_s 0.2; coarse_err_rad 0.2 / coarse_dwell_s 0.5; confirm_dwell_s 1.0; timeouts
   warmup 10 / detumble 900 / settle 60 / confirm 30 s. All on the `allow` line.
@@ -161,7 +161,7 @@ Boot runs go 0→2→3 (`ModeCmd` list stays `[SETTLING, POINTING]`). `safe_mode
 `_gps` in the same port position. Settling now lands ~1.5–2 s in (estimator settle) vs the
 old 100 ms ⇒ closed_loop CYCLES ~4000→4400 (measure).
 
-## mission.kdl sketch
+## target.kdl sketch
 
 `init_orbit_phase 0.0` on plant; `input frame="gps"` on the slot +
 `connect "plant" -> "mode" frame="gps"`; the `allow occupant="commissioning"` line carries
@@ -198,7 +198,7 @@ normalization — inside the MEKF's 0.02 weight, but verify convergence empirica
 brittle event-count assertions (enumerate once); slot-contract lockstep for future ports
 (`SlotOccupantMismatch` is at least loud); every CommissioningParams field must be spelled
 on the allow line; estimator-settle gate chatter under cranked noise (params make it
-tunable); detumble |ω̂| exit stalls when ω is B̂-parallel (mission-gated so it never runs;
+tunable); detumble |ω̂| exit stalls when ω is B̂-parallel (target-gated so it never runs;
 tests assert the timeout path).
 
 ## Verify

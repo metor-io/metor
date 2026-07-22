@@ -13,7 +13,7 @@ use crate::dl::DlError;
 /// The [`kind`](LoadError::kind) carries the failure's payload and display
 /// string; the [`anchor`](LoadError::anchor) — when it has one — the source
 /// snippet and offending span, so rendering the error as a [`miette`] report
-/// points at the mission line responsible. A few kinds are spanless (version
+/// points at the target line responsible. A few kinds are spanless (version
 /// skew, front-end metadata bugs) and carry no anchor.
 ///
 /// [`SourceRef`]: super::SourceRef

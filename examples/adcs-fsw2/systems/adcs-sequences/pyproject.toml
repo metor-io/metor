@@ -4,7 +4,7 @@
 [project]
 name = "adcs-seqs"
 version = "0.1.0"
-description = "The commissioning and safe-mode sequences of the adcs-fsw2 mission"
+description = "The commissioning and safe-mode sequences of the adcs-fsw2 target"
 requires-python = ">=3.11"
 
 [build-system]

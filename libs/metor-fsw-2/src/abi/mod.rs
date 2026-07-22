@@ -533,10 +533,10 @@ pub unsafe fn run_pack_execute(state: *mut c_void, now: u64) -> FswStatus {
         return FswStatus::Panicked;
     };
     let now = Timestamp(now as i64);
-    // Republish the mission clock inside this linkage unit (a dylib links its
+    // Republish the FSW clock inside this linkage unit (a dylib links its
     // own copy of the static), so tracing events fired during the step are
     // born on the cycle timeline.
-    crate::clock::set_mission_now(now);
+    crate::clock::set_now(now);
     let outcome = catch_unwind(AssertUnwindSafe(|| driver.step(now)));
     match outcome {
         Ok(crate::StepStatus::Running) => FswStatus::Running,

@@ -6,7 +6,7 @@ use miette::IntoDiagnostic;
 use crate::wiring::{
     BuildOptions, Builder, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions,
     PackageOptions, Registry, StubgenOptions, WIRING_FILE_NAME, Wiring, build_target,
-    eval_python_mission, is_python_mission, load_bundle, locate_artifacts, pack_assemble,
+    eval_python_target, is_python_target, load_bundle, locate_artifacts, pack_assemble,
     pack_build, pack_dev, pack_publish, provision_artifacts, refresh_dev_packs, resolve, stubgen,
     unpack_metor, write_bundle,
 };
@@ -18,7 +18,7 @@ mod ui;
 #[command(
     name = "metor-fsw",
     version,
-    about = "Build, package, and run metor-fsw missions",
+    about = "Build, package, and run metor-fsw targets",
     long_about = None
 )]
 struct Cli {
@@ -32,9 +32,9 @@ enum Command {
     Build(BuildArgs),
     /// Produce a relocatable bundle directory (the cdylibs plus a manifest).
     Package(PackageArgs),
-    /// Run a mission: a source `.py` (built automatically) or a bundle dir.
+    /// Run a target: a source `.py` (built automatically) or a bundle dir.
     Run(RunArgs),
-    /// Generate the typed Python pack modules (`packs/<id>.py`) for a mission.
+    /// Generate the typed Python pack modules (`packs/<id>.py`) for a target.
     Stubgen(StubgenArgs),
     /// Pack-crate commands (`docs/cli.md`).
     #[command(subcommand)]
@@ -122,15 +122,15 @@ struct PackDevArgs {
 
 #[derive(Args, Debug)]
 struct BuildArgs {
-    /// The `.py` mission file.
-    mission: PathBuf,
+    /// The `.py` target file.
+    target: PathBuf,
     /// Build the `--release` profile (default: debug).
     #[arg(long)]
     release: bool,
     /// Provision for this target triple: prebuilt artifacts select their
     /// `<triple>/` payload, crate artifacts cross-compile.
-    #[arg(long, value_name = "TRIPLE")]
-    target: Option<String>,
+    #[arg(long = "target", value_name = "TRIPLE")]
+    triple: Option<String>,
     /// An extra arg appended to every `cargo build` (repeatable).
     #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
     cargo_arg: Vec<String>,
@@ -142,8 +142,8 @@ struct BuildArgs {
 
 #[derive(Args, Debug)]
 struct PackageArgs {
-    /// The `.py` mission source. Required unless `--check-ir`.
-    mission: Option<PathBuf>,
+    /// The `.py` target source. Required unless `--check-ir`.
+    target: Option<PathBuf>,
     /// The bundle output: a directory (conventionally `*.bundle`), or a
     /// single-file `*.metor` archive (dispatched by the `.metor` extension).
     #[arg(short = 'o', long = "out", value_name = "OUT")]
@@ -151,8 +151,8 @@ struct PackageArgs {
     /// Package for this target triple: prebuilt artifacts select their
     /// `<triple>/` payload (no cargo), crate artifacts cross-compile, and the
     /// bundle records the triple. Defaults to the host.
-    #[arg(long, value_name = "TRIPLE")]
-    target: Option<String>,
+    #[arg(long = "target", value_name = "TRIPLE")]
+    triple: Option<String>,
     /// Instead of packaging, re-evaluate the given bundle's provenance source
     /// and diff the produced IR against its frozen `wiring.json`; exit non-zero
     /// on drift (the determinism gate, runnable in CI).
@@ -172,8 +172,8 @@ struct PackageArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// A source `.py` mission (built automatically) or a bundle directory
-    /// (cargo-free). Defaults to `mission.py` in the current directory.
+    /// A source `.py` target (built automatically) or a bundle directory
+    /// (cargo-free). Defaults to `target.py` in the current directory.
     target: Option<PathBuf>,
     /// Locate previously built cdylibs without running cargo; errors when one
     /// is missing. A no-op for bundles, which are always cargo-free.
@@ -189,11 +189,11 @@ struct RunArgs {
     /// build for the host architecture.
     #[arg(long)]
     no_manifest_sidecar: bool,
-    /// Use a paced wall clock, overriding the mission's clock.
+    /// Use a paced wall clock, overriding the target's clock.
     #[arg(long, group = "clock")]
     wall: bool,
     /// Use a free-running simulated clock with this per-cycle step in seconds,
-    /// overriding the mission's clock.
+    /// overriding the target's clock.
     #[arg(long, value_name = "SECS", group = "clock")]
     sim_dt: Option<f64>,
     /// Override the coordinator cycle rate (Hz).
@@ -202,16 +202,16 @@ struct RunArgs {
     /// Run this many cycles, then stop (default: run until interrupted).
     #[arg(long, value_name = "N")]
     cycles: Option<usize>,
-    /// Serve the telemetry link on this address, overriding the mission's
+    /// Serve the telemetry link on this address, overriding the target's
     /// `TcpServer` state (or declaring one, with an all-taps downlink, when
-    /// the mission has none).
+    /// the target has none).
     #[arg(long, value_name = "ADDR")]
     serve: Option<std::net::SocketAddr>,
 }
 
 #[derive(Args, Debug)]
 struct StubgenArgs {
-    /// The mission directory whose `pyproject.toml` lists the artifacts
+    /// The target directory whose `pyproject.toml` lists the artifacts
     /// (default: the current directory). Stubs land in its `packs/`.
     #[arg(default_value = ".")]
     dir: PathBuf,
@@ -328,17 +328,17 @@ fn cmd_pack_dev(args: PackDevArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// `stubgen`: read the mission's `pyproject.toml`, (build and) describe each
+/// `stubgen`: read the target's `pyproject.toml`, (build and) describe each
 /// listed artifact, and write — or, with `--check`, verify — its typed pack
 /// module. Deprecated in favor of per-pack `pack dev`
 /// (`docs/cli.md`); kept working for one release.
 fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
     eprintln!(
-        "warning: mission-level `stubgen` is deprecated; give each pack crate a \
+        "warning: target-level `stubgen` is deprecated; give each pack crate a \
          `pyproject.toml` and use `metor-fsw pack dev` (docs/cli.md)"
     );
     let opts = StubgenOptions {
-        mission_dir: args.dir,
+        target_dir: args.dir,
         out_dir: args.out_dir,
         check: args.check,
         build: !args.no_build,
@@ -369,37 +369,37 @@ fn merge_target(cargo_args: &[String], target: Option<&str>) -> Vec<String> {
     merged
 }
 
-/// Load a source mission into a [`Wiring`]. Missions are Python: a `.py` file
+/// Load a source target into a [`Wiring`]. Targets are Python: a `.py` file
 /// is evaluated by a subprocess CPython. A `.kdl` file gets a clear
 /// removed-feature error; any other extension is unrecognized.
 fn load_source(path: &Path) -> miette::Result<Wiring> {
-    if is_python_mission(path) {
-        return eval_python_mission(path);
+    if is_python_target(path) {
+        return eval_python_target(path);
     }
     if path.extension().is_some_and(|e| e == "kdl") {
         return Err(miette::miette!(
-            "KDL mission support was removed; missions are Python (`.py`). Port `{}` to a \
-             `mission.py` (see docs/wiring.md)",
+            "KDL target support was removed; targets are Python (`.py`). Port `{}` to a \
+             `target.py` (see docs/wiring.md)",
             path.display()
         ));
     }
     Err(miette::miette!(
-        "unrecognized mission `{}`; missions are Python (`.py`)",
+        "unrecognized target `{}`; targets are Python (`.py`)",
         path.display()
     ))
 }
 
-/// Refresh a source mission's dev packs — the path-source pack dependencies
+/// Refresh a source target's dev packs — the path-source pack dependencies
 /// its pyproject names — so the generated modules (manifest hashes, params)
-/// the mission imports are current before it is evaluated. Prebuilt pack
+/// the target imports are current before it is evaluated. Prebuilt pack
 /// artifacts are only *selected* at provisioning, so this is where their
 /// sources get rebuilt; cargo's incremental build makes a clean tree a no-op.
 fn refresh_source_packs(
-    mission: &Path,
+    target: &Path,
     release: bool,
     cargo_args: &[String],
 ) -> miette::Result<()> {
-    let dir = match mission.parent() {
+    let dir = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
@@ -416,9 +416,9 @@ fn refresh_source_packs(
 
 /// `build`: load the wiring, provision every artifact's `.so`, print them.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
-    let cargo_args = merge_target(&args.cargo_arg, args.target.as_deref());
-    refresh_source_packs(&args.mission, args.release, &cargo_args)?;
-    let mut wiring = load_source(&args.mission)?;
+    let cargo_args = merge_target(&args.cargo_arg, args.triple.as_deref());
+    refresh_source_packs(&args.target, args.release, &cargo_args)?;
+    let mut wiring = load_source(&args.target)?;
     provision_artifacts(
         &mut wiring,
         &build_opts(args.release, &cargo_args, args.no_manifest_sidecar),
@@ -439,18 +439,18 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     if let Some(bundle) = &args.check_ir {
         return cmd_check_ir(bundle);
     }
-    // The bundle freezes the evaluated `Wiring` as IR, so the packaged mission
+    // The bundle freezes the evaluated `Wiring` as IR, so the packaged target
     // runs with no Python and no config parse on target.
-    let mission = args.mission.as_deref().ok_or_else(|| {
-        miette::miette!("`package` needs a mission source (`.py`), or `--check-ir <bundle>`")
+    let target = args.target.as_deref().ok_or_else(|| {
+        miette::miette!("`package` needs a target source (`.py`), or `--check-ir <bundle>`")
     })?;
     let out = args
         .out
         .as_deref()
         .ok_or_else(|| miette::miette!("`package` needs an output path (`-o <out>`)"))?;
-    let cargo_args = merge_target(&args.cargo_arg, args.target.as_deref());
-    refresh_source_packs(mission, args.release, &cargo_args)?;
-    let mut wiring = load_source(mission)?;
+    let cargo_args = merge_target(&args.cargo_arg, args.triple.as_deref());
+    refresh_source_packs(target, args.release, &cargo_args)?;
+    let mut wiring = load_source(target)?;
     provision_artifacts(
         &mut wiring,
         &build_opts(args.release, &cargo_args, args.no_manifest_sidecar),
@@ -459,7 +459,7 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     let opts = PackageOptions {
         release: args.release,
         target: build_target(&cargo_args),
-        provenance: Some(mission.to_path_buf()),
+        provenance: Some(target.to_path_buf()),
         // Current time; a reproducible build pins this.
         built_at_unix: None,
     };
@@ -505,7 +505,7 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
 
     let source = find_provenance(&dir).ok_or_else(|| {
         miette::miette!(
-            "bundle `{}` carries no provenance source (mission.py); cannot --check-ir",
+            "bundle `{}` carries no provenance source (target.py); cannot --check-ir",
             bundle.display()
         )
     })?;
@@ -525,7 +525,7 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
 
 /// The provenance source inside a bundle directory.
 fn find_provenance(dir: &Path) -> Option<PathBuf> {
-    let p = dir.join("mission.py");
+    let p = dir.join("target.py");
     p.exists().then_some(p)
 }
 
@@ -563,7 +563,7 @@ fn normalized_ir(wiring: &Wiring) -> String {
 async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     let target = match &args.target {
         Some(target) => target.clone(),
-        None => detect_mission()?,
+        None => detect_target()?,
     };
     refresh_run_packs(&target, &args)?;
     let mut wiring = load_run_wiring(&target)?;
@@ -594,26 +594,26 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     ))
 }
 
-/// `run` with no target uses `mission.py` in the current directory.
-fn detect_mission() -> miette::Result<PathBuf> {
+/// `run` with no target uses `target.py` in the current directory.
+fn detect_target() -> miette::Result<PathBuf> {
     let cwd = std::env::current_dir().into_diagnostic()?;
-    detect_mission_in(&cwd)
+    detect_target_in(&cwd)
 }
 
-/// [`detect_mission`] against an explicit directory (the current directory is
+/// [`detect_target`] against an explicit directory (the current directory is
 /// process-global, so tests probe this).
-fn detect_mission_in(dir: &Path) -> miette::Result<PathBuf> {
-    let mission = dir.join("mission.py");
-    if mission.exists() {
-        return Ok(mission);
+fn detect_target_in(dir: &Path) -> miette::Result<PathBuf> {
+    let target = dir.join("target.py");
+    if target.exists() {
+        return Ok(target);
     }
     Err(miette::miette!(
-        "no `mission.py` in `{}`; pass a mission `.py` or a bundle: `metor-fsw run <target>`",
+        "no `target.py` in `{}`; pass a target `.py` or a bundle: `metor-fsw run <target>`",
         dir.display()
     ))
 }
 
-/// Refresh a source mission's dev packs before evaluation
+/// Refresh a source target's dev packs before evaluation
 /// ([`refresh_source_packs`]). Skipped for bundles, which are cargo-free by
 /// contract, and under `--no-build`, which extends its "locate, never build"
 /// promise to the packs.
@@ -636,7 +636,7 @@ fn load_run_wiring(target: &Path) -> miette::Result<Wiring> {
     load_source(target)
 }
 
-/// Fill a source mission's artifact paths: the cargo build driver by default
+/// Fill a source target's artifact paths: the cargo build driver by default
 /// (incremental, so a fresh tree is a no-op), or a cargo-free search of the
 /// workspace target dir with `--no-build`. A bundle's paths are already
 /// recorded, so this is a no-op for it.
@@ -672,7 +672,7 @@ fn is_bundle(path: &Path) -> bool {
 }
 
 /// Apply `run`'s override flags onto the loaded [`Wiring`] before [`resolve`].
-/// A flag always beats the mission's own setting.
+/// A flag always beats the target's own setting.
 fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     if args.wall {
         wiring.coordinator.clock = ClockSpec::Wall;
@@ -690,7 +690,7 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
             .find(|s| s.ty == TCP_SERVER_TYPE)
         {
             Some(state) => {
-                // Override only the address; a mission-set `name` (advertised
+                // Override only the address; a target-set `name` (advertised
                 // over mDNS) survives the CLI address override.
                 match &mut state.params {
                     crate::ir::ParamSource::Value(v) => {
@@ -733,7 +733,7 @@ mod tests {
     use super::*;
 
     /// Normalized IR clears the `src` file name (the provenance copy sits at a
-    /// different path than the original source), so the same mission evaluated
+    /// different path than the original source), so the same target evaluated
     /// from two paths is not spurious drift — but a real emission change is.
     #[test]
     fn normalized_ir_ignores_source_path_but_not_content() {
@@ -756,17 +756,17 @@ mod tests {
         };
 
         let mut frozen = base();
-        frozen.systems[0].src = anchor("/build/mission.py");
+        frozen.systems[0].src = anchor("/build/target.py");
         let mut relocated = base();
-        relocated.systems[0].src = anchor("/tmp/bundle/mission.py");
+        relocated.systems[0].src = anchor("/tmp/bundle/target.py");
         assert_eq!(
             normalized_ir(&frozen),
             normalized_ir(&relocated),
-            "same mission, different provenance path — not drift"
+            "same target, different provenance path — not drift"
         );
 
         let mut changed = base();
-        changed.systems[0].src = anchor("/build/mission.py");
+        changed.systems[0].src = anchor("/build/target.py");
         changed.coordinator.cycle_rate = 200.0;
         assert_ne!(
             normalized_ir(&frozen),
@@ -775,22 +775,22 @@ mod tests {
         );
     }
 
-    /// `run` with no target accepts exactly `mission.py` in the directory and
+    /// `run` with no target accepts exactly `target.py` in the directory and
     /// errors helpfully otherwise.
     #[test]
-    fn detect_mission_wants_mission_py() {
+    fn detect_target_wants_target_py() {
         let dir = tempfile::tempdir().unwrap();
-        let err = detect_mission_in(dir.path()).expect_err("nothing to detect yet");
-        assert!(err.to_string().contains("mission.py"), "{err}");
-        std::fs::write(dir.path().join("mission.py"), "").unwrap();
+        let err = detect_target_in(dir.path()).expect_err("nothing to detect yet");
+        assert!(err.to_string().contains("target.py"), "{err}");
+        std::fs::write(dir.path().join("target.py"), "").unwrap();
         assert_eq!(
-            detect_mission_in(dir.path()).unwrap(),
-            dir.path().join("mission.py")
+            detect_target_in(dir.path()).unwrap(),
+            dir.path().join("target.py")
         );
     }
 
     /// The pre-eval pack refresh leaves bundles alone (cargo-free by
-    /// contract), honors `--no-build`, and is a clean no-op for a mission
+    /// contract), honors `--no-build`, and is a clean no-op for a target
     /// with no path-source packs.
     #[test]
     fn refresh_run_packs_skips_and_noops() {
@@ -809,22 +809,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         refresh_run_packs(dir.path(), &args(false)).expect("bundle dir: skipped");
 
-        let mission = dir.path().join("mission.py");
-        std::fs::write(&mission, "").unwrap();
-        refresh_run_packs(&mission, &args(true)).expect("--no-build: skipped");
-        refresh_run_packs(&mission, &args(false)).expect("no pyproject: nothing to refresh");
+        let target = dir.path().join("target.py");
+        std::fs::write(&target, "").unwrap();
+        refresh_run_packs(&target, &args(true)).expect("--no-build: skipped");
+        refresh_run_packs(&target, &args(false)).expect("no pyproject: nothing to refresh");
     }
 
-    /// Provenance discovery finds `mission.py`, and is `None` when a bundle
+    /// Provenance discovery finds `target.py`, and is `None` when a bundle
     /// carries none.
     #[test]
     fn find_provenance_finds_python() {
         let dir = tempfile::tempdir().unwrap();
         assert!(find_provenance(dir.path()).is_none(), "no provenance yet");
-        std::fs::write(dir.path().join("mission.py"), "").unwrap();
+        std::fs::write(dir.path().join("target.py"), "").unwrap();
         assert_eq!(
             find_provenance(dir.path()),
-            Some(dir.path().join("mission.py"))
+            Some(dir.path().join("target.py"))
         );
     }
 }

@@ -1,8 +1,8 @@
-//! The slots/sequences end-to-end gate (WP10 Wave 7): the `adcs-fsw2` mission's `mode`
+//! The slots/sequences end-to-end gate (WP10 Wave 7): the `adcs-fsw2` target's `mode`
 //! **slot** runs a real async-fn pack occupant through the full `dlopen` path, alongside the
 //! untouched plant/nav/ctrl loop.
 //!
-//! Two scenarios, both built from the SAME `mission.py` the CLI runner consumes (evaluate →
+//! Two scenarios, both built from the SAME `target.py` the CLI runner consumes (evaluate →
 //! `provision_artifacts` → `resolve` with an empty `Registry`, exactly as `closed_loop.rs` /
 //! `bundle.rs` set up — the sequence cdylibs are built by `provision_artifacts` like any
 //! artifact):
@@ -33,12 +33,12 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{ParamSource, eval_python_mission, provision_artifacts, resolve};
+use metor_fsw_2::wiring::{ParamSource, eval_python_target, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, SequenceStatus, split_record};
 
-/// The mission file — the same one the CLI runner and the other tests read.
+/// The target file — the same one the CLI runner and the other tests read.
 fn mission_py() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
 }
 
 mod common;
@@ -49,18 +49,18 @@ const COMPLETED: u8 = 1;
 const ABORTED: u8 = 2;
 const FAILED: u8 = 3;
 
-/// Build the mission off `mission.py`. When `auto_run` is false the slot's `initial`
+/// Build the target off `target.py`. When `auto_run` is false the slot's `initial`
 /// occupant is cleared so the slot starts **empty** (the interactive scenario drives it by
-/// hand); otherwise the mission's `initial ... state="running"` stands. `None` if the build
+/// hand); otherwise the target's `initial ... state="running"` stands. `None` if the build
 /// plumbing is unavailable (so the caller skips rather than fails spuriously, like `bundle`).
 fn build_mission(auto_run: bool) -> Option<Coordinator> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_mission(&mission_py()) {
+    let mut wiring = match eval_python_target(&mission_py()) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("skipping: mission.py did not evaluate: {e}");
+            eprintln!("skipping: target.py did not evaluate: {e}");
             return None;
         }
     };
@@ -79,7 +79,7 @@ fn build_mission(auto_run: bool) -> Option<Coordinator> {
             slot.initial = None;
         }
     }
-    Some(resolve(&wiring, &Registry::with_builtins()).expect("resolve the mission"))
+    Some(resolve(&wiring, &Registry::with_builtins()).expect("resolve the target"))
 }
 
 /// Tap the slot's occupant `SequenceStatus` (`mode.sequence`) and its `ModeCmd` output
@@ -242,7 +242,7 @@ fn interactive_load_then_abort_safes() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Downlink (Wave 5): the real mission's `mode` slot emits the ordered
+// 3. Downlink (Wave 5): the real target's `mode` slot emits the ordered
 //    commissioning lifecycle as `SequenceChannelEvent`s on its message channel, and
 //    the coordinator emits a boot `SequenceRegistry` listing the slot's allowed
 //    occupants — the exact wire path the panel's sequence view sources. Taps the
@@ -359,7 +359,7 @@ fn commissioning_emits_ordered_sequence_messages() {
 // ---------------------------------------------------------------------------
 // 4. Detumble: entered when the estimated rate exceeds the (patched) gate, the
 //    wheels idle under LAW_DETUMBLE, and a phase timeout safes + Fails. The
-//    mission gate (1.0 rad/s) is deliberately never reached by the boot tumble,
+//    target gate (1.0 rad/s) is deliberately never reached by the boot tumble,
 //    so this scenario patches the allow-line params — and uses the timeout path
 //    as its deterministic assertion (magnetorquer authority is far too small to
 //    finish a real detumble inside a test budget).
@@ -373,8 +373,8 @@ fn detumble_times_out_to_failed_with_wheels_idle() {
     if !common::ensure_stubs() {
         return;
     }
-    let Some(mut wiring) = eval_python_mission(&mission_py())
-        .map_err(|e| eprintln!("skipping: mission.py did not evaluate: {e}"))
+    let Some(mut wiring) = eval_python_target(&mission_py())
+        .map_err(|e| eprintln!("skipping: target.py did not evaluate: {e}"))
         .ok()
     else {
         return;
@@ -398,7 +398,7 @@ fn detumble_times_out_to_failed_with_wheels_idle() {
         return;
     }
     let mut coord =
-        resolve(&wiring, &Registry::with_builtins()).expect("resolve the patched mission");
+        resolve(&wiring, &Registry::with_builtins()).expect("resolve the patched target");
     let (seq, mode) = tap_slot(&mut coord);
     // A second mode view + the controller's torque output, for the wheels-idle assertion.
     let (_, mode_for_torque) = tap_slot(&mut coord);

@@ -1,7 +1,7 @@
 //! End-to-end tests for driving a dl graph through the [`Wiring`] data model.
 //!
-//! Each test describes a mission as data with the Rust [`WiringBuilder`]. The
-//! mission wires a statically linked producer into a dlopen'd consumer loaded
+//! Each test describes a target as data with the Rust [`WiringBuilder`]. The
+//! target wires a statically linked producer into a dlopen'd consumer loaded
 //! from the `metor-fsw-2-dl-fixture` artifact. The tests then run
 //! [`provision_artifacts`] to compile the fixture and locate its shared library,
 //! [`resolve`] the wiring into a coordinator, and run it, checking that outputs
@@ -96,7 +96,7 @@ fn fixture_lib_stem() -> &'static str {
 
 #[test]
 fn dl_graph_via_wiring_resolve_end_to_end() {
-    // Describe the mission with the Rust builder: a static producer and a
+    // Describe the target with the Rust builder: a static producer and a
     // dlopen'd consumer with typed params.
     let mut wiring = WiringBuilder::new()
         .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })

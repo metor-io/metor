@@ -1,4 +1,4 @@
-//! The rigid-body **plant** of the `adcs-fsw2` mission. It propagates a real 400 km orbit
+//! The rigid-body **plant** of the `adcs-fsw2` target. It propagates a real 400 km orbit
 //! (gravity + drag) and the full Euler attitude dynamics — including the gyroscopic coupling
 //! of the stored reaction-wheel momentum — under the environmental disturbance torques a
 //! small spacecraft actually lives on (gravity gradient, aero drag about the CP–CG offset,
@@ -232,7 +232,7 @@ pub struct PlantState {
     wheels: [ReactionWheel; 3],
     bias: V3,
     rng: StdRng,
-    /// Seconds of simulated mission time (a deterministic per-cycle counter, not wall time)
+    /// Seconds of simulated FSW time (a deterministic per-cycle counter, not wall time)
     /// — drives the epoch the real sun direction + WMM field are evaluated at.
     t_sim: f64,
     /// The NOAA WMM handle for the true magnetic field (built once — holds C-library state).
@@ -386,7 +386,7 @@ pub fn execute(
     state.bias = state.bias + state.noise(meas_sigma * 1e-2);
     let gyro_b = omega_b_true + state.bias + state.noise(meas_sigma);
     // The true ECI environment at this epoch/position: the real sun direction (nox-frames
-    // Vallado model) and the NOAA WMM magnetic field, both at the deterministic mission epoch.
+    // Vallado model) and the NOAA WMM magnetic field, both at the deterministic target epoch.
     let epoch = epoch_at(state.t_sim);
     let pos_eci = state.body.pos.linear();
     let vel_eci = state.body.vel.linear();
@@ -475,7 +475,7 @@ pub fn execute(
     let tau_body = rw_torque_b + d.total_b() + mtq_torque_b;
     let h_w_mid = h_w_b + rw_torque_b * (DT / 2.0);
     state.body = propagate(state.body.clone(), tau_body, h_w_mid, d.aero_force_eci);
-    // Advance the deterministic mission clock (drives the sun epoch — never wall time).
+    // Advance the deterministic FSW clock (drives the sun epoch — never wall time).
     state.t_sim += DT;
 }
 
@@ -619,7 +619,7 @@ mod tests {
     /// contracts' WMM band test.
     #[test]
     fn disturbance_torques_sane_at_400km() {
-        // The mission's honest environment (`mission.kdl` spells the same values out).
+        // The target's honest environment (`target.kdl` spells the same values out).
         let p = PlantParams {
             init_angle: 0.0,
             init_rate: 0.0,
@@ -717,7 +717,7 @@ mod tests {
     }
 
     /// The B-cross detumble law closed on the true dynamics damps the field-perpendicular
-    /// rate component. Gain and torquer authority are cranked well above the mission values
+    /// rate component. Gain and torquer authority are cranked well above the target values
     /// so the decay fits a test budget — the asserted property is the law's, not the gain's.
     /// (The field-parallel component is untouchable per instant; an inclined orbit rotates
     /// B̂ too slowly to matter over this window, so only ω_⊥ is asserted.)
@@ -726,7 +726,7 @@ mod tests {
         let omega0: V3 = (tensor![1.0, 1.0, 1.0] as V3).normalize() * 0.1;
         let mut body = orbit_body(0.9, omega0);
         let mut mag_model = MagneticModel::default();
-        let k_detumble = 5e-4; // mission default ×10
+        let k_detumble = 5e-4; // target default ×10
         let mtq_max = 10.0 * MTQ_MAX_DIPOLE;
         let mut t_sim = 0.0;
         let omega_perp = |body: &Body, mag_b: &V3| -> f64 {

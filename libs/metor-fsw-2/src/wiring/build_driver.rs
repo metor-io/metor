@@ -379,7 +379,7 @@ pub(super) fn build_cdylib(
 /// covers it.
 pub fn locate_artifacts(
     wiring: &mut Wiring,
-    mission_dir: &Path,
+    target_dir: &Path,
     release: bool,
 ) -> Result<(), BuildError> {
     for artifact in &mut wiring.artifacts {
@@ -389,7 +389,7 @@ pub fn locate_artifacts(
         }
         let cdylib = super::cdylib_file_name(&artifact.lib);
         let path =
-            locate_built(mission_dir, &cdylib, release).ok_or_else(|| BuildError::NotBuilt {
+            locate_built(target_dir, &cdylib, release).ok_or_else(|| BuildError::NotBuilt {
                 crate_name: artifact.crate_name.clone(),
                 cdylib: cdylib.clone(),
             })?;

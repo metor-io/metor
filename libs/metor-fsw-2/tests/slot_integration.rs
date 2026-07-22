@@ -2,7 +2,7 @@
 //! constructed through the [`Wiring`] front end.
 //!
 //! Each test builds the `metor-fsw-2-seq-fixture` crate as a `cdylib`, declares
-//! a `slot` mission with [`WiringBuilder`], points the artifact at the located
+//! a `slot` target with [`WiringBuilder`], points the artifact at the located
 //! `.so`, and [`resolve`]s it into a [`Coordinator`]. The `waiter`/`napper`
 //! sequence occupants and the `beater` cyclic occupant are all pack entries the
 //! fixture exports, allowed into a slot by name. The tests then drive the
@@ -14,7 +14,7 @@
 //! Two conventions run through every test:
 //!
 //! * Commands are ordinary dataflow. A slot acts only on [`SequenceCommand`]s
-//!   that arrive over an explicitly connected edge, so each mission wires its
+//!   that arrive over an explicitly connected edge, so each target wires its
 //!   producer (the in-process control handle or another system) to the slot
 //!   with an explicit message edge.
 //! * Status taps are opened before the run. An overwrite ring's reader starts
@@ -74,7 +74,7 @@ fn locate_fixture() -> Option<PathBuf> {
     common::locate_fixture(FIXTURE_CRATE, FIXTURE_STEM)
 }
 
-/// A 1000 Hz, depth-8 simulated mission whose 2µs-per-cycle clock elapses the
+/// A 1000 Hz, depth-8 simulated target whose 2µs-per-cycle clock elapses the
 /// fixture's 2µs wait in a single step — the shared coordinator config.
 fn seq_coordinator() -> CoordinatorSpec {
     CoordinatorSpec {
@@ -85,7 +85,7 @@ fn seq_coordinator() -> CoordinatorSpec {
     }
 }
 
-/// Point the mission's single artifact at the located fixture (in place of the
+/// Point the target's single artifact at the located fixture (in place of the
 /// build driver) and resolve it through the empty registry into a coordinator.
 fn resolve_slot(mut wiring: Wiring, lib: &Path) -> Coordinator {
     wiring.artifacts[0].path = Some(lib.to_path_buf());
@@ -119,7 +119,7 @@ const ABORTED: u8 = 2;
 // Slot lifecycle
 // ---------------------------------------------------------------------------
 
-/// A single-`waiter` slot mission with the coordinator's command edge wired to
+/// A single-`waiter` slot target with the coordinator's command edge wired to
 /// it, the shared shape behind the lifecycle tests.
 fn waiter_slot() -> Wiring {
     WiringBuilder::new()
@@ -1048,7 +1048,7 @@ fn initial_occupant_outside_allowed_set_is_rejected() {
 // A plain cyclic entry as a slot occupant
 // ---------------------------------------------------------------------------
 
-/// A single-`beater` slot mission: the occupant tail is a mount property, so a
+/// A single-`beater` slot target: the occupant tail is a mount property, so a
 /// slot loads an ordinary cyclic entry (the fixture's fn-style `beater`).
 fn beater_slot() -> Wiring {
     WiringBuilder::new()

@@ -4,7 +4,7 @@ A pack groups system entries in one Rust crate. The crate can link the pack
 into a host, export it as one shared library, or load it in a worker.
 
 A pack makes a set of related systems available as one loadable and
-distributable unit. A mission can choose systems from that unit without
+distributable unit. A target can choose systems from that unit without
 statically linking every possible system into the host.
 
 Each load calls the crate's `pack()` function once. The returned `Pack` holds
@@ -100,7 +100,7 @@ and the resolver rejects it as a slot occupant.
 ## Pack-shared state
 
 `Pack::shared_state` declares state that several entries in one static pack can
-use. A mission state declaration supplies its params.
+use. A target state declaration supplies its params.
 
 ```rust
 pub fn pack() -> Pack {

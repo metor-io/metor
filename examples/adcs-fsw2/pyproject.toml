@@ -1,7 +1,7 @@
 [project]
 name = "adcs-fsw2"
 version = "0.1.0"
-description = "adcs-fsw2 mission config"
+description = "adcs-fsw2 target config"
 requires-python = ">=3.11"
 dependencies = ["adcs-pack", "adcs-seqs", "metor-config"]
 

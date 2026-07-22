@@ -51,7 +51,7 @@ range. `MagneticModel` (holds C state, `&mut self`, not Clone) is built once per
 - **nav**: inputs `sensors` + `gps` (drop `world`); hold `MagneticModel` + `t_sim` counter;
   compute sun + WMM-mag references from GPS position at `epoch_at(t_sim)` (lockstep with plant).
 - **ctrl**: input `gps` instead of `body`; target from `gps.pos_eci`/`gps.vel_eci`.
-- **mission.kdl**: `plant->nav gps` (add), drop `plant->nav world`; `plant->ctrl gps` (was body).
+- **target.kdl**: `plant->nav gps` (add), drop `plant->nav world`; `plant->ctrl gps` (was body).
 - **tests/closed_loop.rs**: unchanged (taps truth `plant.body`); must still converge + parity.
 - **README.md** + **docs/ergonomics-report.md**: diagrams, frame list, field paths, parity table.
 

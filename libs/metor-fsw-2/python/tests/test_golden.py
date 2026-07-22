@@ -1,5 +1,5 @@
 """The cross-language contract: the recorder must emit exactly the shared
-``tests/golden/mission.json`` fixture the Rust round-trip test also consumes,
+``tests/golden/target.json`` fixture the Rust round-trip test also consumes,
 modulo the fields both sides normalize away (``src`` anchors, the located
 ``path``/``prebuilt_dir``, and the emitter-only ``metor_config_version``
 envelope field)."""
@@ -12,16 +12,16 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "metor-config"))
 
 import metor_config as mc
-from metor_config import Alarm, Alarms, Mission, Target, TcpServer, Uplink, band
+from metor_config import Alarm, Alarms, Component, Target, TcpServer, Uplink, band
 
 GOLDEN = os.path.join(
-    os.path.dirname(__file__), "..", "..", "tests", "golden", "mission.json"
+    os.path.dirname(__file__), "..", "..", "tests", "golden", "target.json"
 )
 
 
-def build_mission() -> Mission:
-    """The mission whose IR is the golden fixture."""
-    m = Mission(cycle_rate=120.0, sim_dt=0.5)
+def build_target() -> Target:
+    """The target whose IR is the golden fixture."""
+    m = Target(cycle_rate=120.0, sim_dt=0.5)
     adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")
     seqs = m.artifact("seqs", crate="adcs-sequences", lib="adcs_sequences")
     with m.scope("block"):
@@ -44,7 +44,7 @@ def build_mission() -> Mission:
                 id="ADCS_RATE_HIGH",
                 name="Body Rate High",
                 description="Measured body-Y rate exceeds the detumbled envelope",
-                target=Target("block.plant.sensors.gyro_b", element=1),
+                target=Component("block.plant.sensors.gyro_b", element=1),
                 warning=band(above=0.05, below=-0.05),
                 critical=band(above=0.15, below=-0.15),
                 debounce=2,
@@ -88,12 +88,12 @@ def normalize(v):
 
 class GoldenTest(unittest.TestCase):
     def setUp(self):
-        mc._missions.clear()
+        mc._targets.clear()
 
     def test_emits_the_golden_fixture(self):
         with open(GOLDEN, encoding="utf-8") as f:
             expected = normalize(json.load(f))
-        actual = normalize(build_mission().to_ir())
+        actual = normalize(build_target().to_ir())
         self.assertEqual(actual, expected)
 
 

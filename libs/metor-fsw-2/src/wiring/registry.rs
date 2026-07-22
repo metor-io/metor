@@ -35,7 +35,7 @@ pub(crate) struct LoadCtx<'a> {
     /// The registry's message table, which [`BuildSystem::configure`] resolves
     /// config name tokens against.
     pub msgs: &'a MsgTable,
-    /// The mission namespace, if any, forwarded to
+    /// The target namespace, if any, forwarded to
     /// [`BuildSystem::configure`] so a system that hashes authored component
     /// names (the alarm engine) can prefix them to match the qualified
     /// registry.
@@ -314,7 +314,7 @@ impl Registry {
     /// names — the alarm engine (`"Alarms"`) and the link pack: one shared
     /// `"TcpServer"` state serving the `"Downlink"` and `"Uplink"` systems
     /// attached to it — plus the well-known message set in the message table
-    /// so a mission's `msgs` list can name any of them out of the box. An
+    /// so a target's `msgs` list can name any of them out of the box. An
     /// app-built registry starts here and adds its own systems.
     pub fn with_builtins() -> Self {
         use metor_proto_wkt::{
@@ -330,7 +330,7 @@ impl Registry {
             LinkState::bind(p.addr).map(|s| s.with_name(p.name))
         });
         // The `Downlink`/`Uplink` entries no longer capture the link token:
-        // the resolver hands each `ctor` the `Shared<LinkState>` a mission
+        // the resolver hands each `ctor` the `Shared<LinkState>` a target
         // named via `attach=`, and the ctor attaches it.
         let link_pack = link_pack
             .system_type_shared::<TelemetrySystem, LinkState>("Downlink", |p, link| {
@@ -388,7 +388,7 @@ impl Registry {
 
     /// Register every entry of a pack under its entry name as the `type=`
     /// key, so the same `pack()` a cdylib exports serves a statically-linked
-    /// mission. Two instances of one entry construct through the same shared
+    /// target. Two instances of one entry construct through the same shared
     /// entry (a non-reloadable `.state(...)` entry rejects the second).
     pub fn register_pack(&mut self, pack: crate::Pack) -> &mut Self {
         use std::cell::RefCell;

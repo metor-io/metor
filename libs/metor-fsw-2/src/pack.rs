@@ -368,10 +368,10 @@ impl Pack {
     }
 
     /// Register a struct-authored system that attaches to a pack-shared state
-    /// *by name*: the mission's [`SystemSpec::attach`](crate::wiring::SystemSpec)
+    /// *by name*: the target's [`SystemSpec::attach`](crate::wiring::SystemSpec)
     /// picks which state instance, and the resolver hands `ctor` the resolved
     /// [`Shared`](crate::Shared) token (the second argument) at create time.
-    /// `St` is the concrete shared type the entry binds — a mission naming a
+    /// `St` is the concrete shared type the entry binds — a target naming a
     /// state of any other type is an `AttachTypeMismatch`. The driver is
     /// wrapped so the state's [`SharedLifecycle`](crate::SharedLifecycle) hooks
     /// run once across all attached entries. Attached entries are cyclic-only,

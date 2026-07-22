@@ -1,5 +1,5 @@
 {
-    "include": ["mission.py"],
+    "include": ["target.py"],
     "venvPath": ".",
     "venv": ".venv"
 }

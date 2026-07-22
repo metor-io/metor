@@ -666,7 +666,7 @@ mod system {
         assert_eq!(got[0].message, "plant.status.degraded = 1.0000");
     }
 
-    /// Under a mission namespace the engine prefixes its authored targets, so
+    /// Under a target namespace the engine prefixes its authored targets, so
     /// they resolve against the namespace-qualified registry and the broadcast
     /// def carries the qualified component id. `configure` is the seam the
     /// front-end threads the namespace through.

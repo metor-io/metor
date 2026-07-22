@@ -1,7 +1,7 @@
 //! Fluent construction of a [`Wiring`] from Rust.
 //!
 //! [`WiringBuilder`] is the Rust-native counterpart to the Python front-end.
-//! Both produce the same [`Wiring`] value, so anything a `mission.py` can
+//! Both produce the same [`Wiring`] value, so anything a `target.py` can
 //! declare can be declared here instead.
 //!
 //! ```no_run
@@ -20,7 +20,7 @@
 //!
 //! The builder wraps a [`Wiring`] and stamps its structure as it goes: a
 //! declared name that collides, an `artifact=` that names nothing, a slot with
-//! no allowed occupant — each is a mistake in the mission definition, caught
+//! no allowed occupant — each is a mistake in the target definition, caught
 //! at the offending call with a panic (the shared checks in
 //! [`validate`](super::validate) format the message). A `WiringBuilder`-built
 //! `Wiring` therefore always passes [`validate`](super::validate::validate);

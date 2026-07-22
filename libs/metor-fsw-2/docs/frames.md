@@ -4,7 +4,7 @@ A frame groups values that share one timestamp. Systems use frames for sampled s
 
 Each frame is a `#[repr(C)]` struct. Its fixed bytes form the start of each ring record.
 
-A frame gives systems one view of state at a point in mission time. Values
+A frame gives systems one view of state at a point in FSW time. Values
 that belong to one sample stay together, and every consumer agrees on their
 names and types. The same frame can pass between systems, telemetry, and
 storage without a second data model.
