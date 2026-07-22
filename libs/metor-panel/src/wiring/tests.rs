@@ -26,6 +26,7 @@ fn wiring_with_system(name: &str) -> Wiring {
             process: false,
             src: None,
             scope: None,
+            attach: None,
         }],
         slots: Vec::new(),
         edges: Vec::new(),

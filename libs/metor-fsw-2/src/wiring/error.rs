@@ -132,6 +132,10 @@ impl LoadErrorKind {
             DuplicateState { .. } => "fsw_wiring::duplicate_state",
             StateInit { .. } => "fsw_wiring::state_init",
             StateUnused { .. } => "fsw_wiring::state_unused",
+            AttachUnknownState { .. } => "fsw_wiring::attach_unknown_state",
+            AttachOnNonSharedSystem { .. } => "fsw_wiring::attach_on_non_shared_system",
+            MissingAttach { .. } => "fsw_wiring::missing_attach",
+            AttachTypeMismatch { .. } => "fsw_wiring::attach_type_mismatch",
             PackSystem { .. } => "fsw_wiring::pack_system",
             PackTypeRequired { .. } => "fsw_wiring::pack_type_required",
             OccupantAmbiguous { .. } => "fsw_wiring::occupant_ambiguous",
@@ -203,6 +207,10 @@ impl LoadErrorKind {
             DuplicateState { .. } => "state names must be unique".into(),
             StateInit { .. } => "this state's construction failed".into(),
             StateUnused { .. } => "declared here, attached nowhere".into(),
+            AttachUnknownState { .. } => "no `state` declares this name".into(),
+            AttachOnNonSharedSystem { .. } => "this system type declares no shared state".into(),
+            MissingAttach { .. } => "a shared-state system needs an `attach` state".into(),
+            AttachTypeMismatch { .. } => "this state's type is not the system's shared type".into(),
             PackSystem { .. } => "this instance".into(),
             PackTypeRequired { .. } => "add `type=\"…\"`".into(),
             OccupantAmbiguous { .. } => "this slot".into(),
@@ -425,6 +433,24 @@ pub enum LoadErrorKind {
     /// config defect, not a quiet default.
     #[error("state `{name}` (type `{ty}`) is declared but no system in this wiring attaches to it")]
     StateUnused { name: String, ty: String },
+
+    /// A system's `attach` named a state no `state` declaration provides.
+    #[error("system `{system}` attaches to state `{attach}`, which no `state` declares")]
+    AttachUnknownState { system: String, attach: String },
+
+    /// A system set `attach`, but its type declares no pack-shared state to
+    /// attach to.
+    #[error("system `{system}` sets attach=`{attach}`, but its type is not a shared-state system")]
+    AttachOnNonSharedSystem { system: String, attach: String },
+
+    /// A shared-state system named no state to attach to.
+    #[error("system `{system}` is a shared-state system but names no `attach` state")]
+    MissingAttach { system: String },
+
+    /// A system's `attach` named a state whose type is not the concrete
+    /// shared type the system binds.
+    #[error("system `{system}` cannot attach to state `{attach}`: incompatible shared-state type")]
+    AttachTypeMismatch { system: String, attach: String },
 
     /// A loaded pack has no entry under the requested name, or the entry
     /// selection failed (the wrapped [`DlError`](crate::dl::DlError) says

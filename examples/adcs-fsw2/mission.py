@@ -2,14 +2,14 @@ from metor_config import Alarm, Alarms, Downlink, Mission, Target, TcpServer, Up
 from adcs_pack import Ctrl, Nav, Plant
 from adcs_seqs import commissioning, safe_mode
 
-m = Mission(cycle_rate=120.0, sim_dt=1 / 120)
+m = Mission(
+    cycle_rate=120.0,
+    sim_dt=1 / 120,
+    namespace="cube_sat"
+)
 
-# The link server: the FSW listens here; the panel (or any ground tool)
-# connects for the downlink stream and command ingest alike.
-m.state("link", TcpServer(addr="127.0.0.1:2240"))
+link = m.state("link", TcpServer(addr="0.0.0.0:2240", name="cube_sat"))
 
-# The plant's disturbance/actuator environment is spelled out in full, physically
-# honest for a ~3 kg spacecraft at 400 km. `process=True` runs it in its own worker.
 plant = m.add(
     "plant",
     Plant(
@@ -62,11 +62,8 @@ alarms = m.add(
     ]),
 )
 
-# The uplink is declared before its consumers, so a ground command is
-# consumed the same cycle it is republished.
-uplink = m.add("uplink", Uplink(msgs=["SequenceCommand", "AlarmAck", "ReloadSequences"]))
+uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand", "AlarmAck", "ReloadSequences"]))
 
-# Detumble enters only above 1.0 rad/s; the gates/budgets ride the allow line.
 mode = m.slot(
     "mode",
     inputs=["attitude_estimate", "gps"],
@@ -94,8 +91,8 @@ mode = m.slot(
 m.connect(plant.sensors, nav.sensors)
 m.connect(plant.gps, nav.gps)
 m.connect(plant.gps, ctrl.gps)
-m.connect(plant.sensors, ctrl.sensors)  # measured B for the magnetorquer laws
-m.connect(plant.wheels, ctrl.wheels)  # telemetered wheel momentum for desat
+m.connect(plant.sensors, ctrl.sensors)
+m.connect(plant.wheels, ctrl.wheels)
 m.connect(nav.attitude_estimate, ctrl.attitude_estimate)
 m.connect(nav.attitude_estimate, mode.attitude_estimate)
 m.connect(plant.gps, mode.gps)
@@ -104,9 +101,9 @@ m.connect(mode.mode_cmd, ctrl.mode_cmd, delayed=True)
 m.connect(ctrl.torque_cmd, plant.torque_cmd, delayed=True)
 m.connect(ctrl.mtq_cmd, plant.mtq_cmd, delayed=True)
 
-downlink = m.add("downlink", Downlink())
+downlink = m.add("downlink", Downlink(link))
 
-m.route(uplink, mode, msg="SequenceCommand")  # ground commands
-m.route(m.coordinator, mode, msg="SequenceCommand")  # in-proc control_handle
-m.route(uplink, alarms, msg="AlarmAck")  # operator acks (gate latching alarms)
-m.route(uplink, m.coordinator, msg="ReloadSequences")  # panel Reload -> registry re-emit
+m.route(uplink, mode, msg="SequenceCommand")  #
+m.route(m.coordinator, mode, msg="SequenceCommand")
+m.route(uplink, alarms, msg="AlarmAck")
+m.route(uplink, m.coordinator, msg="ReloadSequences")

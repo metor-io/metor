@@ -96,8 +96,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 /// Both front-ends land here, so static and dl systems go through identical
 /// validation, sizing, and telemetry passes. A static system (no `artifact`)
 /// is instantiated through the [`Registry`] factory; a dl system is opened
-/// from its built [`Artifact::path`] and registered with
-/// [`InitGraph::add_dl_cyclic`](crate::coordinator::init::InitGraph::add_dl_cyclic).
+/// from its built [`Artifact::path`] and registered as a loaded cyclic node.
 ///
 /// A `Wiring` carries no source text (a builder-origin one never had any), so
 /// resolve-time [`LoadError`]s hold a best-effort snippet rather than original
@@ -141,9 +140,13 @@ pub fn resolve_with(
     });
 
     // --- States pass: pack-shared states construct before any system, so
-    //     an attached entry's create finds its instance in place.
+    //     an attached entry's create finds its instance in place. Each
+    //     construction yields the token a by-name attach downcasts, keyed by
+    //     the state's declaration name for the systems pass.
+    let mut state_tokens: HashMap<&str, crate::pack::AttachTarget> = HashMap::new();
     for spec in &wiring.states {
-        resolve_state(spec, registry)?;
+        let target = resolve_state(spec, registry)?;
+        state_tokens.insert(spec.name.as_str(), target);
     }
 
     // --- Systems pass: static via the Registry, dl via the loader --------
@@ -179,7 +182,7 @@ pub fn resolve_with(
                     deferred.push(spec);
                     continue;
                 }
-                resolve_static(spec, registry, &mut graph)?
+                resolve_static(spec, registry, &state_tokens, &mut graph)?
             }
         };
         // `validate` guaranteed instance-name uniqueness, so the insert is new.
@@ -196,7 +199,7 @@ pub fn resolve_with(
     // --- Deferred receive-all systems: the last cyclic registrations, still
     //     ahead of the edges pass, which only needs the finished instance map.
     for spec in deferred {
-        let (handle, desc) = resolve_static(spec, registry, &mut graph)?;
+        let (handle, desc) = resolve_static(spec, registry, &state_tokens, &mut graph)?;
         instances.insert(spec.name.clone(), Instance { handle, desc });
     }
 
@@ -260,8 +263,12 @@ pub fn resolve_with(
 /// Construct one pack-shared state through its registered
 /// [`StateEntry`](crate::StateEntry): decode the spec's params off the value
 /// surface and run the state's init fn. Construction failure (a listener
-/// bind) is a spanned load error, not a runtime one.
-fn resolve_state(spec: &StateSpec, registry: &Registry) -> Result<(), LoadError> {
+/// bind) is a spanned load error, not a runtime one. Returns the
+/// [`AttachTarget`](crate::pack::AttachTarget) a by-name attach downcasts.
+fn resolve_state(
+    spec: &StateSpec,
+    registry: &Registry,
+) -> Result<crate::pack::AttachTarget, LoadError> {
     let Some(entry) = registry.states.get(spec.ty.as_str()) else {
         let mut available: Vec<&str> = registry.states.keys().copied().collect();
         available.sort_unstable();
@@ -288,6 +295,7 @@ fn resolve_state(spec: &StateSpec, registry: &Registry) -> Result<(), LoadError>
         src: &snippet,
         name: &spec.name,
         msgs: &registry.msgs,
+        attach: None,
     };
     entry.borrow_mut().create(params).map_err(|e| match e {
         crate::pack::MakeError::Params(e) => *e,
@@ -297,6 +305,11 @@ fn resolve_state(spec: &StateSpec, registry: &Registry) -> Result<(), LoadError>
             message: other.to_string(),
         }
         .whole(snippet.clone()),
+    })?;
+    let entry = entry.borrow();
+    Ok(crate::pack::AttachTarget {
+        ty: entry.name(),
+        token: entry.token.clone(),
     })
 }
 
@@ -318,6 +331,7 @@ pub(super) fn state_src(spec: &StateSpec) -> String {
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
+    state_tokens: &HashMap<&str, crate::pack::AttachTarget>,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     // `type=` and non-postcard params are guaranteed for a static system by
@@ -330,6 +344,32 @@ fn resolve_static(
         .factories
         .get(ty)
         .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.whole(system_src(spec)))?;
+
+    // Attach/shared consistency: a shared-state entry needs an `attach`, and a
+    // plain entry must not carry one. `validate` already proved a present
+    // `attach` names a declared state, so the map lookup here always hits.
+    let attach = match (factory.shared, spec.attach.as_deref()) {
+        (true, Some(name)) => Some(
+            state_tokens
+                .get(name)
+                .expect("validate() proved this attach names a declared state"),
+        ),
+        (true, None) => {
+            return Err(LoadErrorKind::MissingAttach {
+                system: spec.name.clone(),
+            }
+            .whole(system_src(spec)));
+        }
+        (false, Some(attach)) => {
+            return Err(LoadErrorKind::AttachOnNonSharedSystem {
+                system: spec.name.clone(),
+                attach: attach.to_string(),
+            }
+            .whole(system_src(spec)));
+        }
+        (false, None) => None,
+    };
+
     let snippet;
     let params = match &spec.params {
         ParamSource::Postcard(_) => {
@@ -349,6 +389,7 @@ fn resolve_static(
         name: &spec.name,
         msgs: &registry.msgs,
         namespace: graph.namespace.as_deref(),
+        attach,
     })?;
     let desc = node.desc.clone();
     let handle = graph.push_node(node);
@@ -955,7 +996,7 @@ fn resolve_slot(
     Ok((handle, desc))
 }
 
-/// Resolve a process slot's allowed set (`docs/process-slots.md` §8): the
+/// Resolve a process slot's allowed set (`docs/process-systems.md`): the
 /// [`resolve_proc`] recipe once per allowed occupant, so the host never
 /// dlopens any occupant artifact. The resulting [`AllowedOccupant`]s carry
 /// [`OccupantBacking::Artifact`], which is what makes [`plan_slot`] register

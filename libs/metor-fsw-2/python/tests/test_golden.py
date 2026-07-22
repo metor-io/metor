@@ -52,8 +52,8 @@ def build_mission() -> Mission:
             )
         ]),
     )
-    m.state("link", TcpServer(addr="127.0.0.1:2240"))
-    uplink = m.add("uplink", Uplink(msgs=["SequenceCommand"]))
+    link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
+    uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand"]))
     mode = m.slot(
         "mode",
         inputs=["attitude_estimate", "gps"],

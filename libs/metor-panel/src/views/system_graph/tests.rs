@@ -35,6 +35,7 @@ fn system(name: &str, scope: Option<usize>) -> SystemSpec {
         process: false,
         src: None,
         scope,
+        attach: None,
     }
 }
 

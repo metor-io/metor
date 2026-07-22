@@ -16,27 +16,28 @@ from metor_config import Downlink, Mission, TcpServer, Uplink
 
 m = Mission(cycle_rate=100.0)
 
-m.state(
+link = m.state(
     "link",
     TcpServer(addr="0.0.0.0:2240", name="sat-a"),
 )
 
 uplink = m.add(
     "uplink",
-    Uplink(msgs=["SequenceCommand", "AlarmAck"]),
+    Uplink(link, msgs=["SequenceCommand", "AlarmAck"]),
 )
 
-downlink = m.add("downlink", Downlink())
+downlink = m.add("downlink", Downlink(link))
 ```
 
-The address belongs to the server state, not to either system. Port `0` is valid. The server advertises the port that the OS chose.
+The address belongs to the server state, not to either system. Port `0` is valid. The server advertises the port that the OS chose. Each system takes the `link` handle its constructor requires — that is what attaches it to this server.
 
-`Downlink()` selects every output marked for telemetry. A subset can match an instance name or an output name:
+`Downlink(link)` selects every output marked for telemetry. A subset can match an instance name or an output name:
 
 ```python
 downlink = m.add(
     "downlink",
     Downlink(
+        link,
         instances=["nav", "controller"],
         frames=["health", "AlarmRaised"],
     ),
@@ -60,8 +61,9 @@ Three parts share the work:
 - A `Downlink` system reads selected output rings and sends their records.
 - An `Uplink` system reads command packets and writes them to message output ports.
 
-The two systems attach to the same `TcpServer` state. Socket work runs outside
-the control cycle. The systems only move bytes between rings and bounded
+Both systems attach to the same `TcpServer` state by naming its handle, so the
+mission spells the wiring rather than the host inferring it. Socket work runs
+outside the control cycle. The systems only move bytes between rings and bounded
 queues.
 
 ## Cycle order

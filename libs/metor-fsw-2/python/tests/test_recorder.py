@@ -52,14 +52,17 @@ class RecorderTest(unittest.TestCase):
 
     def test_add_records_system_and_ports(self):
         m = Mission(cycle_rate=100.0)
+        link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
         a = m.add("a", static_system("Alarms"))
-        b = m.add("b", Downlink())
+        b = m.add("b", Downlink(link))
         m.connect(a.out, b.feed)
         ir = m.to_ir()
         self.assertEqual([s["name"] for s in ir["systems"]], ["a", "b"])
         self.assertEqual(ir["systems"][0]["ty"], "Alarms")
         self.assertIsNone(ir["systems"][0]["artifact"])
         self.assertEqual(ir["systems"][0]["params"], "None")
+        self.assertIsNone(ir["systems"][0]["attach"])
+        self.assertEqual(ir["systems"][1]["attach"], "link")
         edge = ir["edges"][0]
         self.assertEqual((edge["from"], edge["out"], edge["to"], edge["in_"]), ("a", "out", "b", "feed"))
         self.assertEqual(edge["kind"], "Frame")
@@ -83,9 +86,10 @@ class RecorderTest(unittest.TestCase):
 
     def test_delayed_and_message_edges(self):
         m = Mission(cycle_rate=100.0)
+        link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
         ctrl = m.add("ctrl", static_system("Ctrl"))
         plant = m.add("plant", static_system("Plant"))
-        uplink = m.add("uplink", Uplink(msgs=["Cmd"]))
+        uplink = m.add("uplink", Uplink(link, msgs=["Cmd"]))
         m.connect(ctrl.torque_cmd, plant.torque_cmd, delayed=True)
         m.route(uplink, plant, msg="Cmd")
         m.route(m.coordinator, plant, msg="Cmd")
@@ -160,8 +164,11 @@ class RecorderTest(unittest.TestCase):
         self.assertNotIn("severity", a)
 
     def test_uplink_downlink_shapes(self):
-        up = Uplink(msgs=["Cmd"])._param_source()["Value"]
-        self.assertEqual(up, {"msgs": ["Cmd"]})
+        link = mc.StateHandle("link")
+        uplink = Uplink(link, msgs=["Cmd"])
+        self.assertEqual(uplink._param_source()["Value"], {"msgs": ["Cmd"]})
+        self.assertEqual(uplink.attach, "link")
+        self.assertEqual(Downlink(link).attach, "link")
         self.assertEqual(TcpServer(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
 
     # -- error cases --------------------------------------------------------

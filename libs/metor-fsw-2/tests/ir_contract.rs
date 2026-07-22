@@ -72,6 +72,7 @@ fn maximal() -> Wiring {
                 process: true,
                 src: src(5),
                 scope: Some(0),
+                attach: None,
             },
             SystemSpec {
                 name: "postcard_sys".into(),
@@ -81,6 +82,7 @@ fn maximal() -> Wiring {
                 process: false,
                 src: None,
                 scope: Some(1),
+                attach: None,
             },
             SystemSpec {
                 name: "bare".into(),
@@ -90,6 +92,7 @@ fn maximal() -> Wiring {
                 process: false,
                 src: None,
                 scope: None,
+                attach: Some("link".into()),
             },
         ],
         slots: vec![SlotSpec {

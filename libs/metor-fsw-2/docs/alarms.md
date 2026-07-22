@@ -141,7 +141,7 @@ An ack must match both the alarm id and the active occurrence id. The system ign
 Ack messages use a normal route from an uplink:
 
 ```python
-uplink = m.add("uplink", Uplink(msgs=["AlarmAck"]))
+uplink = m.add("uplink", Uplink(link, msgs=["AlarmAck"]))
 m.route(uplink, alarms, msg="AlarmAck")
 ```
 

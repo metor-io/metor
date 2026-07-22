@@ -140,9 +140,11 @@ The slot name is its command address and telemetry prefix. Names may hold at mos
 The uplink must list `SequenceCommand`, and an edge must route it to the slot:
 
 ```python
-uplink = m.add("uplink", Uplink(msgs=["SequenceCommand"]))
+uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand"]))
 m.route(uplink, mode, msg="SequenceCommand")
 ```
+
+(`link` is the handle from `m.state("link", TcpServer(...))`.)
 
 Code in the host can also use the coordinator command output:
 

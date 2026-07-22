@@ -588,22 +588,48 @@ impl crate::CyclicSystem for MintSys {
 
 #[test]
 fn system_type_shared_registers_instance_descriptor() {
+    use crate::message::MsgTable;
+    use crate::pack::AttachTarget;
+
+    // A shared entry attaches by name: build the resolved token the resolver
+    // would hand its create, and drive create through the value surface.
+    fn mint_params<'a>(
+        value: &'a serde_json::Value,
+        msgs: &'a MsgTable,
+        attach: &'a AttachTarget,
+    ) -> EntryParams<'a> {
+        EntryParams::Value {
+            value,
+            src: "Mint",
+            name: "mint",
+            msgs,
+            attach: Some(attach),
+        }
+    }
+
+    let msgs = MsgTable::default();
     let mut pack = Pack::new();
     let tally = pack.shared_state("Tally", |(): ()| {
         Ok::<_, std::convert::Infallible>(Tally::default())
     });
-    let mut pack = pack.system_type_shared::<MintSys, _>("Mint", &tally, <MintSys as crate::BuildSystem>::new);
+    let attach = AttachTarget {
+        ty: "Tally",
+        token: std::rc::Rc::new(tally.clone()),
+    };
+    let mut pack = pack.system_type_shared::<MintSys, Tally>("Mint", |p, _tally| {
+        <MintSys as crate::BuildSystem>::new(p)
+    });
     pack.state_entry_mut("Tally")
         .unwrap()
         .create(EntryParams::Postcard(&[]))
         .unwrap();
 
     // A non-minting instance stands on the static descriptor.
-    let plain = postcard::to_allocvec(&MintParams { mint: false }).unwrap();
+    let plain = serde_json::json!({ "mint": false });
     let created = pack
         .entry_mut("Mint")
         .unwrap()
-        .create(EntryParams::Postcard(&plain))
+        .create(mint_params(&plain, &msgs, &attach))
         .unwrap();
     assert!(matches!(created.instance_desc, None));
 
@@ -612,16 +638,22 @@ fn system_type_shared_registers_instance_descriptor() {
     let tally = pack.shared_state("Tally", |(): ()| {
         Ok::<_, std::convert::Infallible>(Tally::default())
     });
-    let mut pack = pack.system_type_shared::<MintSys, _>("Mint", &tally, <MintSys as crate::BuildSystem>::new);
+    let attach = AttachTarget {
+        ty: "Tally",
+        token: std::rc::Rc::new(tally.clone()),
+    };
+    let mut pack = pack.system_type_shared::<MintSys, Tally>("Mint", |p, _tally| {
+        <MintSys as crate::BuildSystem>::new(p)
+    });
     pack.state_entry_mut("Tally")
         .unwrap()
         .create(EntryParams::Postcard(&[]))
         .unwrap();
-    let params = postcard::to_allocvec(&MintParams { mint: true }).unwrap();
+    let minting = serde_json::json!({ "mint": true });
     let node = pending_node(
         "mint".into(),
         pack.entry_mut("Mint").unwrap(),
-        EntryParams::Postcard(&params),
+        mint_params(&minting, &msgs, &attach),
     )
     .expect("create");
     assert!(

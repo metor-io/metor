@@ -4,8 +4,7 @@
 //! systems. It binds its listener at construction (a taken port is a
 //! resolve-time error), spawns one accept task at
 //! [`start`](crate::SharedLifecycle::start), and serves every connection the
-//! same full stream: the announce replay first — the same packets a
-//! reconnecting outbound downlink used to send — then each cycle's batch.
+//! same full stream: the announce replay first, then each cycle's batch.
 //! The read half of every connection feeds one bounded inbound queue the
 //! uplink system drains into its minted command ports.
 //!
@@ -14,8 +13,8 @@
 //! `broadcast` appends the cycle's batch to each live connection's pending
 //! buffer and wakes its writer task; the cycle never awaits the sockets. A
 //! connection whose pending buffer would exceed [`PENDING_CAP`] misses the
-//! whole batch and the loss is counted — the zmq-pub policy: a stalled
-//! ground tool is never disconnected, never delays the cycle, and never
+//! whole batch and the loss is counted. A stalled ground tool is not
+//! disconnected, does not delay the cycle, and does not
 //! costs its sibling connections data. With no connections nothing is
 //! buffered at all.
 //!
@@ -79,7 +78,7 @@ pub struct LinkStats {
     pub accepted: u64,
     /// Connections that ended (error, EOF, or hangup).
     pub closed: u64,
-    /// Whole batches dropped for one connection over [`PENDING_CAP`].
+    /// Whole batches dropped for one connection over the pending-byte cap.
     pub conn_dropped: u64,
     /// Inbound msgs dropped on a full queue.
     pub inbound_dropped: u64,

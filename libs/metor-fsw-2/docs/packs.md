@@ -105,20 +105,18 @@ use. A mission state declaration supplies its params.
 ```rust
 pub fn pack() -> Pack {
     let mut pack = Pack::new();
-    let bus = pack.shared_state("Bus", open_bus);
+    pack.shared_state("Bus", open_bus);
 
     pack
-        .system_type_shared("Reader", &bus, Reader::new)
-        .system_type_shared("Writer", &bus, Writer::new)
+        .system_type_shared::<Reader, Bus>("Reader", |p, bus| Reader::new(p).attach(bus))
+        .system_type_shared::<Writer, Bus>("Writer", |p, bus| Writer::new(p).attach(bus))
 }
 ```
 
-The resolver creates the shared state before either entry. Its lifecycle starts
-before the first attached system init and ends after the last attached system
-shutdown.
-
-Attached entries can instantiate once and cannot fill slots. Each worker calls
-`pack()` in its own process, so pack state does not cross a process boundary.
+The state's lifecycle starts before the first attached system init and ends
+after the last attached system shutdown. Attached entries can instantiate once
+and cannot fill slots. Each worker calls `pack()` in its own process, so pack
+state does not cross a process boundary.
 
 ## ABI v10
 

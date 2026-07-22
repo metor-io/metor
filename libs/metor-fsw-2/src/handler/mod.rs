@@ -3,8 +3,9 @@
 //!
 //! [`system(execute_fn)`](system) builds a [`SystemDef`] whose port set is
 //! the fn's parameter types. `.init(fn)` supplies construction from typed
-//! params; `.state(value)` moves a prebuilt state in (the shared-handle
-//! case). A [`Pack`](crate::Pack) turns defs into erased entries:
+//! params; `.state(value)` moves one prebuilt state into a single-use entry.
+//! `.shared(token)` attaches a cyclic entry to pack-shared state. A
+//! [`Pack`](crate::Pack) turns defs into erased entries:
 //!
 //! ```ignore
 //! fn nav_init(p: NavParams) -> NavState { ... }
@@ -118,8 +119,7 @@ where
 
     /// Attach to a pack-shared state: the execute fn's `&mut S` is the
     /// *same* instance every entry attached to `token` sees, granted one
-    /// scoped borrow per step (see the [`shared`](crate::shared) module
-    /// doc). Like [`state`](Self::state), the entry is instantiable once
+    /// scoped borrow per step. Like [`state`](Self::state), the entry is instantiable once
     /// and never a slot occupant.
     pub fn shared(self, token: &crate::Shared<S>) -> SystemDef<S, M, F, Attached<S>>
     where
@@ -221,6 +221,7 @@ where
             params_schema: <() as Schema>::SCHEMA,
             params_default: None,
             reloadable: true,
+            shared: false,
             create: Box::new(move |params: EntryParams<'_>| {
                 decode_params::<()>(params)?;
                 let execute = execute.clone();
@@ -257,6 +258,7 @@ where
             params_schema: <G::Params as Schema>::SCHEMA,
             params_default: defaults,
             reloadable: true,
+            shared: false,
             create: Box::new(move |params: EntryParams<'_>| {
                 let p: G::Params = decode_params(params)?;
                 let state = init.clone().call(p);
@@ -295,6 +297,7 @@ where
             params_schema: <() as Schema>::SCHEMA,
             params_default: None,
             reloadable: false,
+            shared: false,
             create: Box::new(move |params: EntryParams<'_>| {
                 decode_params::<()>(params)?;
                 let state = state.take().ok_or(MakeError::StateTaken)?;
@@ -324,12 +327,17 @@ where
         let execute = self.execute;
         let token = self.init.0;
         let mut taken = false;
+        // The fn-authored `.shared(&token)` path keeps its compile-time
+        // capture (hand-built packs), so it is not a by-name attach entry:
+        // `shared: false` exempts it from the resolver's attach-consistency
+        // checks. It still requires a matching state via `is_constructed()`.
         PackEntry {
             name,
             descriptor: descriptor_for::<F::Params>(name),
             params_schema: <() as Schema>::SCHEMA,
             params_default: None,
             reloadable: false,
+            shared: false,
             create: Box::new(move |params: EntryParams<'_>| {
                 decode_params::<()>(params)?;
                 if taken {

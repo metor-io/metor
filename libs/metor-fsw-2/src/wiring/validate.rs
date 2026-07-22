@@ -159,6 +159,26 @@ pub(crate) fn check_state(state: &StateSpec) -> Result<(), LoadError> {
 /// `process` system must name one, and a static system must carry a `type` and
 /// no [`ParamSource::Postcard`] (the static path has no postcard decoder).
 pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
+    // An `attach` must name a declared state, and only a static system can hold
+    // one — a loaded/process pack cannot own shared state (the pack ABI forbids
+    // it). The static shared-vs-plain check needs the registry and lives in
+    // `resolve` instead.
+    if let Some(attach) = &spec.attach {
+        if !wiring.states.iter().any(|s| &s.name == attach) {
+            return Err(LoadErrorKind::AttachUnknownState {
+                system: spec.name.clone(),
+                attach: attach.clone(),
+            }
+            .whole(system_src(spec)));
+        }
+        if spec.artifact.is_some() {
+            return Err(LoadErrorKind::AttachOnNonSharedSystem {
+                system: spec.name.clone(),
+                attach: attach.clone(),
+            }
+            .whole(system_src(spec)));
+        }
+    }
     match (&spec.artifact, spec.process) {
         (Some(artifact), _) => {
             if !artifact_exists(wiring, artifact) {

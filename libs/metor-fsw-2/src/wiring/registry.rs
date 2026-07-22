@@ -40,6 +40,11 @@ pub(crate) struct LoadCtx<'a> {
     /// names (the alarm engine) can prefix them to match the qualified
     /// registry.
     pub namespace: Option<&'a str>,
+    /// The shared state this instance attaches to, resolved by name from
+    /// [`SystemSpec::attach`](super::SystemSpec) during the states pass.
+    /// `None` for an ordinary system; a shared-state entry's factory requires
+    /// it.
+    pub attach: Option<&'a crate::pack::AttachTarget>,
 }
 
 /// The params surface a static-path factory decodes, the typed twin of the dl
@@ -78,8 +83,8 @@ pub struct CyclicKind;
 /// Marker for an async system's [`IntoNode`] impl.
 pub struct AsyncKind;
 
-/// Turns a constructed system into an init-graph [`Node`] via the right
-/// erasure helper, and reports its static descriptor. The `Kind` parameter
+/// Turns a constructed system into an internal graph node via the right
+/// type-erasure helper, and reports its static descriptor. The `Kind` parameter
 /// keeps the cyclic and async blanket impls from overlapping (a type could in
 /// principle implement both system traits), so a single [`Registry::register`]
 /// covers either.
@@ -261,6 +266,11 @@ pub(crate) fn decode_value_params<P: serde::de::DeserializeOwned>(
 pub(super) struct RegistryEntry {
     pub(super) factory: SystemFactory,
     descriptor: EntryDescriptor,
+    /// `true` for a pack entry that attaches to a pack-shared state by name
+    /// ([`Pack::system_type_shared`](crate::Pack::system_type_shared)): the
+    /// resolver requires its spec to carry an `attach`, and rejects an
+    /// `attach` on any entry where this is `false`.
+    pub(super) shared: bool,
 }
 
 /// A registered type's descriptor without construction: computed on demand
@@ -316,18 +326,18 @@ impl Registry {
         let mut r = Self::new();
         r.register::<crate::AlarmSystem, _>("Alarms");
         let mut link_pack = crate::Pack::new();
-        let link = link_pack
-            .shared_state("TcpServer", |p: LinkParams| {
-                LinkState::bind(p.addr).map(|s| s.with_name(p.name))
-            });
+        link_pack.shared_state("TcpServer", |p: LinkParams| {
+            LinkState::bind(p.addr).map(|s| s.with_name(p.name))
+        });
+        // The `Downlink`/`Uplink` entries no longer capture the link token:
+        // the resolver hands each `ctor` the `Shared<LinkState>` a mission
+        // named via `attach=`, and the ctor attaches it.
         let link_pack = link_pack
-            .system_type_shared::<TelemetrySystem, _>("Downlink", &link, {
-                let link = link.clone();
-                move |p| <TelemetrySystem as BuildSystem>::new(p).attach(link.clone())
+            .system_type_shared::<TelemetrySystem, LinkState>("Downlink", |p, link| {
+                <TelemetrySystem as BuildSystem>::new(p).attach(link)
             })
-            .system_type_shared::<UplinkSystem, _>("Uplink", &link, {
-                let link = link.clone();
-                move |p| <UplinkSystem as BuildSystem>::new(p).attach(link.clone())
+            .system_type_shared::<UplinkSystem, LinkState>("Uplink", |p, link| {
+                <UplinkSystem as BuildSystem>::new(p).attach(link)
             });
         r.register_pack(link_pack);
         r.register_msg::<SequenceCommand>()
@@ -370,6 +380,7 @@ impl Registry {
             RegistryEntry {
                 factory: Box::new(factory::<S, K>),
                 descriptor: EntryDescriptor::Fn(<S as IntoNode<K>>::descriptor),
+                shared: false,
             },
         );
         self
@@ -390,6 +401,7 @@ impl Registry {
         for entry in entries {
             let name = entry.name();
             let descriptor = Box::new(entry.descriptor().clone());
+            let shared = entry.shared;
             let entry = Rc::new(RefCell::new(entry));
             let factory = Box::new(move |ctx: &mut LoadCtx| {
                 let mut entry = entry.borrow_mut();
@@ -410,12 +422,31 @@ impl Registry {
                     src,
                     name: ctx.name,
                     msgs: ctx.msgs,
+                    attach: ctx.attach,
                 };
                 // The create phase runs here (a bad config fails at registration);
                 // the returned node rides the ordinary cyclic bind path.
                 init::pending_node(ctx.name.to_string(), &mut entry, params).map_err(|e| match e {
                     // The params decode already carries its span; unwrap it.
                     crate::pack::MakeError::Params(e) => *e,
+                    // A by-name attach that named a wrong-typed state: refine
+                    // the generic create error into the attach diagnostic.
+                    crate::pack::MakeError::AttachTypeMismatch { system, state } => {
+                        LoadErrorKind::AttachTypeMismatch {
+                            system: system.to_string(),
+                            attach: state.to_string(),
+                        }
+                        .whole(ctx.params.diag_src(ctx.name))
+                    }
+                    // Reached only when a shared entry's create runs without a
+                    // resolved attach; the resolver's pre-check normally
+                    // pre-empts it with the spanned `MissingAttach`.
+                    crate::pack::MakeError::MissingAttach { system } => {
+                        LoadErrorKind::MissingAttach {
+                            system: system.to_string(),
+                        }
+                        .whole(ctx.params.diag_src(ctx.name))
+                    }
                     other => LoadErrorKind::PackCreate {
                         system: ctx.name.to_string(),
                         message: other.to_string(),
@@ -428,6 +459,7 @@ impl Registry {
                 RegistryEntry {
                     factory,
                     descriptor: EntryDescriptor::Value(descriptor),
+                    shared,
                 },
             );
         }

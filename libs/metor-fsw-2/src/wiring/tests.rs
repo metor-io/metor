@@ -495,6 +495,7 @@ fn err_static_system_with_typed_params() {
             process: false,
             src: None,
             scope: None,
+            attach: None,
         }],
         slots: Vec::new(),
         edges: Vec::new(),
@@ -1255,6 +1256,7 @@ fn static_system(name: &str, ty: Option<&str>) -> SystemSpec {
         process: false,
         src: None,
         scope: None,
+        attach: None,
     }
 }
 
@@ -1682,6 +1684,119 @@ fn err_state_with_postcard_params() {
     assert!(matches!(err.kind, LoadErrorKind::StateInit { .. }), "{err:?}");
 }
 
+// ---------------------------------------------------------------------------
+// By-name attach: a shared-state system names its state, resolved against the
+// built-in link pack (`Downlink`/`Uplink` bind `TcpServer` by name).
+// ---------------------------------------------------------------------------
+
+/// A shared-state system (the built-in `Downlink`) with no `attach` is a
+/// hard error — the by-type magic is gone, so nothing binds it implicitly.
+#[test]
+fn err_shared_system_without_attach() {
+    let wiring = WiringBuilder::new()
+        .serve("127.0.0.1:0".parse().unwrap())
+        .system("dl")
+        .ty("Downlink")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected MissingAttach"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::MissingAttach { .. }),
+        "{err:?}"
+    );
+}
+
+/// An `attach` naming no declared state is caught structurally, in validate.
+#[test]
+fn err_attach_unknown_state() {
+    // Built via the struct directly: the builder's `end()` would panic on the
+    // same validate error, so drive `resolve` (which runs validate) instead.
+    let mut wiring = bare_wiring();
+    wiring.states.push(crate::wiring::StateSpec::tcp_server(
+        "link",
+        "127.0.0.1:0".parse().unwrap(),
+    ));
+    let mut dl = crate::wiring::SystemSpec::downlink("dl");
+    dl.attach = Some("ghost".into());
+    wiring.systems.push(dl);
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected AttachUnknownState"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::AttachUnknownState { .. }),
+        "{err:?}"
+    );
+}
+
+/// A plain (non-shared) system given an `attach` is rejected: attachment is
+/// only for a system type that declares shared state.
+#[test]
+fn err_attach_on_non_shared_system() {
+    let wiring = WiringBuilder::new()
+        .serve("127.0.0.1:0".parse().unwrap())
+        .system("nav")
+        .ty("NavFilter")
+        .params_value(serde_json::json!({ "gain": 1.0 }))
+        .attach("link")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected AttachOnNonSharedSystem"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::AttachOnNonSharedSystem { .. }),
+        "{err:?}"
+    );
+}
+
+/// An `attach` naming a state of the wrong type is a clean mismatch: the
+/// `Downlink` binds `LinkState`, but this state is a `TestLink`.
+#[test]
+fn err_attach_type_mismatch() {
+    // Built-ins (so `Downlink` is registered) plus a pack declaring an
+    // unrelated shared state type.
+    let mut r = registry();
+    let mut pack = crate::Pack::new();
+    let _tl = pack.shared_state("TestLink", |p: TestLinkParams| {
+        Ok::<_, String>(TestLink { tag: p.tag })
+    });
+    // An attacher keeps the state from tripping the unused-state check first.
+    let pack = pack.system("watch", crate::system(observe).shared(&_tl));
+    r.register_pack(pack);
+
+    let mut wiring = bare_wiring();
+    wiring.states.push(crate::wiring::StateSpec::tcp_server(
+        "link",
+        "127.0.0.1:0".parse().unwrap(),
+    ));
+    wiring.states.push(crate::wiring::StateSpec {
+        name: "other".into(),
+        ty: "TestLink".into(),
+        params: ParamSource::Value(serde_json::json!({ "tag": 1.0 })),
+        src: None,
+    });
+    // `Downlink` binds `LinkState`, but `other` is a `TestLink`.
+    let mut dl = crate::wiring::SystemSpec::downlink("dl");
+    dl.attach = Some("other".into());
+    wiring.systems.push(dl);
+    // Keep `link` attached so we reach the mismatch, not the unused check.
+    wiring.systems.push(crate::wiring::SystemSpec::uplink("uplink", &[]));
+
+    let err = match resolve(&wiring, &r) {
+        Ok(_) => panic!("expected AttachTypeMismatch"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::AttachTypeMismatch { .. }),
+        "{err:?}"
+    );
+}
+
 /// A serialized `Wiring` predating the `states` field deserializes with an
 /// empty list, and a declared state round-trips through JSON.
 #[test]
@@ -1757,13 +1872,11 @@ async fn link_server_end_to_end_through_the_wiring() {
         crate::LinkState::bind(p.addr)
     });
     let pack = pack
-        .system_type_shared::<crate::TelemetrySystem, _>("Downlink", &link, {
-            let link = link.clone();
-            move |p| <crate::TelemetrySystem as BuildSystem>::new(p).attach(link.clone())
+        .system_type_shared::<crate::TelemetrySystem, crate::LinkState>("Downlink", |p, link| {
+            <crate::TelemetrySystem as BuildSystem>::new(p).attach(link)
         })
-        .system_type_shared::<crate::UplinkSystem, _>("Uplink", &link, {
-            let link = link.clone();
-            move |p| <crate::UplinkSystem as BuildSystem>::new(p).attach(link.clone())
+        .system_type_shared::<crate::UplinkSystem, crate::LinkState>("Uplink", |p, link| {
+            <crate::UplinkSystem as BuildSystem>::new(p).attach(link)
         });
     r.register_pack(pack);
     r.register::<MsgSrc, _>("MsgSrc");

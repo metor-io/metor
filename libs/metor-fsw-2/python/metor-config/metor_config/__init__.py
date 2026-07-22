@@ -38,7 +38,10 @@ __version__ = "0.3.0"
 # v4 added the `states` list and replaced the outbound TcpDownlink/TcpUplink
 # built-ins with the in-FSW link server (a `TcpServer` state the `Downlink`/
 # `Uplink` systems attach to).
-IR_VERSION = 4
+# v5 made attachment explicit: a system names the state it attaches to via the
+# `attach` field (the built-in `Downlink`/`Uplink` take the state handle in
+# their constructor), replacing the host's compiled-in by-type association.
+IR_VERSION = 5
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -129,6 +132,11 @@ class Spec:
         self.ty = ty
         self.artifact = artifact
         self.params = _params(params)
+        # The pack-shared state this system attaches to, set by a shared-state
+        # spec helper (`Uplink`/`Downlink`) from the handle its constructor
+        # takes; `None` for an ordinary system. Rendered into the IR by
+        # `Mission.add`.
+        self.attach: str | None = None
 
     def _param_source(self) -> Any:
         # `ParamSource`, externally tagged: no params -> the unit "None".
@@ -253,6 +261,16 @@ class PortRef:
         self.port = port
 
 
+class StateHandle:
+    """A declared pack-shared state (:meth:`Mission.state`). Pass it to a
+    shared-state system's constructor (``Downlink(link)``, ``Uplink(link,
+    …)``) to attach that system to this state; the handle carries only the
+    state's declaration name."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+
 class SystemHandle:
     """A registered system or slot. Attribute access yields a :class:`PortRef`
     at runtime; the annotation is :data:`Any` because an untyped handle (a slot,
@@ -358,23 +376,35 @@ def TcpServer(addr: str, name: str | None = None) -> Spec:  # noqa: N802
     return static_system("TcpServer", **_drop_none({"addr": addr, "name": name}))
 
 
-def Uplink(msgs: list[str] | None = None) -> Spec:  # noqa: N802
-    """The built-in command uplink (``UplinkParams``), attached to the
-    mission's ``TcpServer`` state. Add it before its consumers and a command
-    is consumed the same cycle it arrives."""
-    return static_system("Uplink", **_drop_none({"msgs": msgs}))
+def _attached(spec: Spec, state: StateHandle) -> Spec:
+    """Attach ``spec`` to the pack-shared ``state`` and return it."""
+    if not isinstance(state, StateHandle):
+        raise TypeError(
+            f"expected a state handle from m.state(...), not {type(state).__name__}"
+        )
+    spec.attach = state.name
+    return spec
+
+
+def Uplink(state: StateHandle, msgs: list[str] | None = None) -> Spec:  # noqa: N802
+    """The built-in command uplink (``UplinkParams``), draining the ``state``
+    link server (the handle :meth:`Mission.state` returned for a
+    :func:`TcpServer`). Add it before its consumers and a command is consumed
+    the same cycle it arrives."""
+    return _attached(static_system("Uplink", **_drop_none({"msgs": msgs})), state)
 
 
 def Downlink(  # noqa: N802
+    state: StateHandle,
     instances: list[str] | None = None,
     frames: list[str] | None = None,
 ) -> Spec:
-    """The built-in telemetry downlink (``DownlinkParams``), attached to the
-    mission's ``TcpServer`` state; omitting both subset lists taps
-    everything."""
-    return static_system(
-        "Downlink",
-        **_drop_none({"instances": instances, "frames": frames}),
+    """The built-in telemetry downlink (``DownlinkParams``), streaming over the
+    ``state`` link server (the handle :meth:`Mission.state` returned for a
+    :func:`TcpServer`); omitting both subset lists taps everything."""
+    return _attached(
+        static_system("Downlink", **_drop_none({"instances": instances, "frames": frames})),
+        state,
     )
 
 
@@ -481,7 +511,7 @@ class Mission:
         earlier one lacked. A prebuilt pack built against a different FSW ABI
         than the evaluating host expects is refused here, naming the pack —
         the record-time tier of the three-layer ABI gate
-        (``docs/design-packaging.md`` §9.1)."""
+        (see ``docs/packaging.md``)."""
         expected = os.environ.get("METOR_EXPECTED_ABI")
         if (
             expected is not None
@@ -523,11 +553,12 @@ class Mission:
 
     # -- systems and slots --------------------------------------------------
 
-    def state(self, name: str, spec: Spec) -> None:
-        """Declare a pack-shared state instance (``m.state("link",
+    def state(self, name: str, spec: Spec) -> StateHandle:
+        """Declare a pack-shared state instance (``link = m.state("link",
         TcpServer(addr="0.0.0.0:2240"))``): constructed once, before any
         system, from its own params. States live in their own namespace and
-        take no edges."""
+        take no edges. The returned handle is passed to a shared-state
+        system's constructor (``Downlink(link)``) to attach it."""
         if any(s["name"] == name or s["ty"] == spec.ty for s in self._states):
             raise ValueError(f"state {name!r} (type {spec.ty!r}) is already declared")
         self._states.append(
@@ -538,6 +569,7 @@ class Mission:
                 "src": _source_ref(),
             }
         )
+        return StateHandle(name)
 
     def add(self, name: str, spec: H, process: bool = False) -> H:
         """Register ``spec`` under ``name`` (scope-prefixed) and return its handle.
@@ -558,6 +590,7 @@ class Mission:
                 "process": bool(process),
                 "src": _source_ref(),
                 "scope": scope,
+                "attach": spec.attach,
             }
         )
         return cast(H, SystemHandle(full))

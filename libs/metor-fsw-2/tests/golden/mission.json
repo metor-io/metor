@@ -1,5 +1,5 @@
 {
-  "ir_version": 4,
+  "ir_version": 5,
   "coordinator": {
     "cycle_rate": 120.0,
     "default_depth": null,
@@ -52,7 +52,8 @@
       },
       "process": true,
       "src": null,
-      "scope": 0
+      "scope": 0,
+      "attach": null
     },
     {
       "name": "block.nav",
@@ -61,7 +62,8 @@
       "params": "None",
       "process": false,
       "src": null,
-      "scope": 0
+      "scope": 0,
+      "attach": null
     },
     {
       "name": "alarms",
@@ -85,7 +87,8 @@
       },
       "process": false,
       "src": null,
-      "scope": null
+      "scope": null,
+      "attach": null
     },
     {
       "name": "uplink",
@@ -94,7 +97,8 @@
       "params": { "Value": { "msgs": ["SequenceCommand"] } },
       "process": false,
       "src": null,
-      "scope": null
+      "scope": null,
+      "attach": "link"
     }
   ],
   "slots": [
