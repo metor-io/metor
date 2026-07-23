@@ -8,7 +8,7 @@ m = Target(
     namespace="cube_sat"
 )
 
-link = m.state("link", TcpServer(addr="0.0.0.0:2240", name="cube_sat"))
+link = m.state("link", TcpServer(addr="[::]:2240", name="cube_sat"))
 
 plant = m.add(
     "plant",

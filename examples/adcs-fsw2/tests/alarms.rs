@@ -8,7 +8,7 @@
 
 use metor_fsw_2::MsgIn;
 use metor_fsw_2::metor_proto::types::ComponentId;
-use metor_fsw_2::metor_proto_wkt::{AlarmCleared, AlarmDef, AlarmRaised, Severity};
+use metor_fsw_2::metor_proto_wkt::{AlarmCleared, AlarmDefs, AlarmRaised, Severity};
 
 /// Enough of the 120 Hz target for the commissioning detumble to settle well below
 /// the alarm's ±0.05 rad/s warning band (the convergence gate uses the same budget).
@@ -34,9 +34,9 @@ fn rate_alarm_raises_on_boot_tumble_and_clears() {
             .view()
             .expect("a reader slot is available")
     };
-    let mut defs: MsgIn<AlarmDef> = MsgIn::new(tap("alarms.AlarmDef"));
-    let mut raised: MsgIn<AlarmRaised> = MsgIn::new(tap("alarms.AlarmRaised"));
-    let mut cleared: MsgIn<AlarmCleared> = MsgIn::new(tap("alarms.AlarmCleared"));
+    let mut defs: MsgIn<AlarmDefs> = MsgIn::new(tap("cube_sat.alarms.AlarmDefs"));
+    let mut raised: MsgIn<AlarmRaised> = MsgIn::new(tap("cube_sat.alarms.AlarmRaised"));
+    let mut cleared: MsgIn<AlarmCleared> = MsgIn::new(tap("cube_sat.alarms.AlarmCleared"));
 
     let coord = stellarator::run(|| async move {
         let mut coord = coord;
@@ -47,7 +47,7 @@ fn rate_alarm_raises_on_boot_tumble_and_clears() {
 
     // The def broadcast: the panel's plot limit lines are the firing thresholds.
     let mut got_defs = Vec::new();
-    defs.drain(|d| got_defs.push(d));
+    let _ = defs.drain(|batch| got_defs.extend(batch.defs));
     assert_eq!(
         got_defs.len(),
         2,
@@ -60,7 +60,7 @@ fn rate_alarm_raises_on_boot_tumble_and_clears() {
     let target = def.target.as_ref().expect("targeted alarm");
     assert_eq!(
         target.component_id,
-        ComponentId::new("plant.sensors.gyro_b")
+        ComponentId::new("cube_sat.plant.sensors.gyro_b")
     );
     assert_eq!(target.element_index, Some(1));
     assert_eq!(
@@ -80,7 +80,7 @@ fn rate_alarm_raises_on_boot_tumble_and_clears() {
     let target = wheel_def.target.as_ref().expect("targeted alarm");
     assert_eq!(
         target.component_id,
-        ComponentId::new("plant.wheels.wheels.0.ang_momentum")
+        ComponentId::new("cube_sat.plant.wheels.wheels.0.ang_momentum")
     );
     assert_eq!(target.element_index, Some(0));
 
@@ -89,7 +89,7 @@ fn rate_alarm_raises_on_boot_tumble_and_clears() {
     // occurrence to Critical past ±0.15 — before settling; a re-raise of the SAME
     // occurrence is an escalation, not a new firing.)
     let mut got_raised = Vec::new();
-    raised.drain(|r| got_raised.push(r));
+    let _ = raised.drain(|r| got_raised.push(r));
     assert!(!got_raised.is_empty(), "the boot tumble raised");
     assert_eq!(got_raised[0].def_id, "ADCS_RATE_HIGH");
     assert_eq!(got_raised[0].severity, Severity::Warning);
@@ -102,7 +102,7 @@ fn rate_alarm_raises_on_boot_tumble_and_clears() {
     raised_occ.dedup();
     raised_occ.sort_unstable();
     let mut cleared_occ = Vec::new();
-    cleared.drain(|c| cleared_occ.push(c.occurrence));
+    let _ = cleared.drain(|c| cleared_occ.push(c.occurrence));
     cleared_occ.sort_unstable();
     assert_eq!(
         raised_occ, cleared_occ,

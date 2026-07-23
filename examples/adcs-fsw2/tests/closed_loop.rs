@@ -34,7 +34,7 @@ use metor_fsw_2::{BuildOptions, Coordinator, Input};
 mod common;
 
 /// The target file — the same one the CLI runner and the other tests read.
-fn mission_py() -> std::path::PathBuf {
+fn target_py() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
 }
 
@@ -70,7 +70,7 @@ struct Measure {
 /// The registry gets the **same** `pack()` the cdylib exports — one registration serving
 /// the static, dlopen, and process loading modes is the pack surface's whole point.
 fn build_static() -> Coordinator {
-    let mut wiring = eval_python_target(&mission_py()).expect("evaluate target.py");
+    let mut wiring = eval_python_target(&target_py()).expect("evaluate target.py");
     provision_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
     for spec in &mut wiring.systems {
         // plant/nav/ctrl: link statically via the Registry rather than dlopen. Process
@@ -96,7 +96,7 @@ async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
     let body_view: Input<BodyState> = Input::new(
         coord
             .registry()
-            .view(ComponentId::new("plant.body"))
+            .view(ComponentId::new("cube_sat.plant.body"))
             .expect("plant.body is registered")
             .expect("a reader slot is available"),
     );
@@ -177,6 +177,13 @@ async fn closed_loop_converges_static_and_dlopen() {
     // Path 1 — plant/nav/ctrl statically linked (slot/sequences still dlopen).
     let static_run = run_and_measure(build_static(), CYCLES).await;
     assert_converged("static", &static_run);
+
+    // Dropping path 1's coordinator cancels its `TcpServer` accept task, but the
+    // cancelled task (which owns the listener) is only reaped on later scheduler
+    // ticks — yield so the port is actually released before path 2 binds it.
+    for _ in 0..8 {
+        stellarator::yield_now().await;
+    }
 
     // Path 2 — the SAME target, every system dlopen'd + resolved from the `Wiring`.
     let dl_coord = adcs_fsw2::build_sim_coordinator()

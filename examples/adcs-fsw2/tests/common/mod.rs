@@ -6,9 +6,17 @@
 //! target's `[tool.uv.sources]`.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use metor_fsw_2::wiring::{PackDevOptions, pack_dev};
+
+/// Resolving `target.py` binds its `TcpServer` on a fixed port; tests that do
+/// so in the same binary take this guard so the parallel threads don't race
+/// on the bind. Poisoning is ignored — a panicked holder released the port.
+pub fn link_port_guard() -> MutexGuard<'static, ()> {
+    static LINK_PORT: Mutex<()> = Mutex::new(());
+    LINK_PORT.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Lay out both packs' `.metor` payloads, once per test binary; `false`
 /// (with a note) if they cannot be built here — callers skip, matching the

@@ -25,7 +25,7 @@
 //! `coordinator::uplink_tests`. The fixture build runs inside the test; if the
 //! build plumbing is unavailable the body is skipped rather than failed.
 
-#![cfg(all(feature = "wiring", not(miri)))]
+#![cfg(not(miri))]
 
 use std::path::{Path, PathBuf};
 

@@ -6,8 +6,6 @@
 //! message when none is found. They share one `#[test]` so their `$METOR_PYTHON`
 //! mutations never race the other cases.
 
-#![cfg(feature = "wiring")]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -75,8 +73,8 @@ fn subprocess_eval() {
 
     // $METOR_PYTHON is honored: a bogus interpreter is a clean error.
     unsafe { std::env::set_var("METOR_PYTHON", "/nonexistent/python-xyz") };
-    let err = eval_python_target(&fixture("trivial_target.py"))
-        .expect_err("a bogus $METOR_PYTHON fails");
+    let err =
+        eval_python_target(&fixture("trivial_target.py")).expect_err("a bogus $METOR_PYTHON fails");
     assert!(err.to_string().contains("python-xyz"));
     unsafe { std::env::remove_var("METOR_PYTHON") };
 }

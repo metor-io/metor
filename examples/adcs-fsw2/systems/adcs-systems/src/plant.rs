@@ -643,7 +643,7 @@ mod tests {
         let vel: V3 = tensor![0.0, v_orbit, 0.0];
         // A generic attitude so nothing sits on a principal axis or parallel to the field.
         let q = Quat::from_axis_angle(tensor![1.0, 1.0, 1.0], 0.5);
-        let epoch = adcs_contracts::mission_epoch();
+        let epoch = adcs_contracts::target_epoch();
         let mut model = MagneticModel::default();
         let mag = mag_field_eci(&mut model, epoch, &pos);
         let d = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag, true);

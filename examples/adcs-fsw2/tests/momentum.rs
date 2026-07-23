@@ -24,7 +24,7 @@ use metor_fsw_2::wiring::Registry;
 use metor_fsw_2::wiring::{ParamSource, Wiring, eval_python_target, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, MsgIn};
 
-fn mission_py() -> std::path::PathBuf {
+fn target_py() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
 }
 
@@ -68,7 +68,7 @@ fn build_static(k_desat: f64) -> Option<Coordinator> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_target(&mission_py()) {
+    let mut wiring = match eval_python_target(&target_py()) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("skipping: target.py did not evaluate: {e}");
@@ -121,19 +121,19 @@ async fn run_and_measure(mut coord: Coordinator) -> Measure {
     let registry = coord.registry();
     let wheels_view: Input<Wheels> = Input::new(
         registry
-            .view(ComponentId::new("plant.wheels"))
+            .view(ComponentId::new("cube_sat.plant.wheels"))
             .expect("plant.wheels is registered")
             .expect("a reader slot is available"),
     );
     let body_view: Input<BodyState> = Input::new(
         registry
-            .view(ComponentId::new("plant.body"))
+            .view(ComponentId::new("cube_sat.plant.body"))
             .expect("plant.body is registered")
             .expect("a reader slot is available"),
     );
     let mut raised: MsgIn<AlarmRaised> = MsgIn::new(
         registry
-            .get(ComponentId::new("alarms.AlarmRaised"))
+            .get(ComponentId::new("cube_sat.alarms.AlarmRaised"))
             .expect("alarms.AlarmRaised is registered")
             .view()
             .expect("a reader slot is available"),

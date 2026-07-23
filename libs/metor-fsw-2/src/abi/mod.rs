@@ -714,5 +714,5 @@ macro_rules! export_pack {
     };
 }
 
-#[cfg(all(test, feature = "wiring"))]
+#[cfg(test)]
 mod tests;

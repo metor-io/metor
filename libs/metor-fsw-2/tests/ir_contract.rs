@@ -9,8 +9,6 @@
 //! consumes — deserialized and re-serialized to prove it is exactly what Rust
 //! accepts and emits.
 
-#![cfg(feature = "wiring")]
-
 use metor_fsw_2::ir::{EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
 use metor_fsw_2::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,

@@ -11,7 +11,7 @@
 //! the fixture crate, so the suite stays runnable in environments without the
 //! fixture toolchain.
 
-#![cfg(all(feature = "wiring", not(miri)))]
+#![cfg(not(miri))]
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
 use metor_fsw_2::metor_proto_wkt::{

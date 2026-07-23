@@ -58,9 +58,10 @@ fn eval_and_build() -> Option<Wiring> {
 }
 
 #[test]
-fn python_mission_packages_and_runs() {
+fn python_target_packages_and_runs() {
     // A `.py` target packages through the IR path, then runs cargo-free with no Python on
     // the run side: load the frozen IR and run it.
+    let _guard = common::link_port_guard();
     let Some(wiring) = eval_and_build() else {
         return;
     };
@@ -117,9 +118,10 @@ fn python_mission_packages_and_runs() {
 }
 
 #[test]
-fn python_mission_round_trips_as_metor_archive() {
+fn python_target_round_trips_as_metor_archive() {
     // The single-file `.metor` form: pack the target into one tar, then load it back
     // (unpacked to a temp dir) and run it cargo-free.
+    let _guard = common::link_port_guard();
     let Some(wiring) = eval_and_build() else {
         return;
     };

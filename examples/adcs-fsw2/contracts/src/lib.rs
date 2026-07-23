@@ -124,14 +124,14 @@ pub fn mag_field_eci(model: &mut MagneticModel, epoch: Epoch, pos_eci: &V3) -> V
 /// The target start epoch (UTC) the environment models are evaluated against. A **fixed**
 /// constant (not wall-clock) so a `Simulated` run is reproducible — the parity test relies on
 /// the static and dlopen runs computing the identical sun direction.
-pub fn mission_epoch() -> Epoch {
+pub fn target_epoch() -> Epoch {
     Epoch::from_gregorian_utc(2024, 1, 1, 0, 0, 0, 0)
 }
 
 /// The epoch `t_sim_s` seconds into the target (the plant advances this from a deterministic
 /// per-cycle counter, never wall time).
 pub fn epoch_at(t_sim_s: f64) -> Epoch {
-    mission_epoch() + Duration::from_seconds(t_sim_s)
+    target_epoch() + Duration::from_seconds(t_sim_s)
 }
 
 /// The unit vector pointing at the sun in ECI at `epoch` — the real-world sun direction from
@@ -746,7 +746,7 @@ mod tests {
             tensor![0.0, radius, 0.0],
             (tensor![1.0, 1.0, 1.0] as V3).normalize() * radius,
         ] {
-            let b = mag_field_eci(&mut model, mission_epoch(), &pos);
+            let b = mag_field_eci(&mut model, target_epoch(), &pos);
             let mag = b.norm().into_buf();
             assert!(
                 (1.0e-5..6.0e-5).contains(&mag),

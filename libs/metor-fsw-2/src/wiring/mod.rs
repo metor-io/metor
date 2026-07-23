@@ -51,8 +51,7 @@ mod stubgen;
 mod validate;
 mod wheel;
 
-// The pure-data IR lives at the crate root (feature `wiring-model`) so it is
-// available without the front-end; the submodules here reach it as
+// The pure-data IR lives at the crate root; the submodules here reach it as
 // `super::model`.
 pub(crate) use crate::ir as model;
 
@@ -77,8 +76,8 @@ pub use pack_dist::{
 };
 pub use params::encode_value_params;
 pub use py::{eval_python_target, is_python_target};
-pub use registry::{AsyncKind, CyclicKind, IntoNode, Registry};
 pub(crate) use registry::NoParams;
+pub use registry::{AsyncKind, CyclicKind, IntoNode, Registry};
 pub use resolve::{ResolveOptions, resolve, resolve_with};
 pub use stubgen::{StubgenError, StubgenOptions, StubgenReport, stubgen};
 

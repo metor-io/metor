@@ -18,7 +18,7 @@ metor-proto-wkt.features = ["nox"]
 mdns-sd = "0.13"
 # The target wiring IR (Wiring) plus its serde_json codec, without the KDL
 # front-end: the System Graph tile decodes a WiringManifest's ir_json into it.
-metor-fsw-2 = { path = "../metor-fsw-2", default-features = false, features = ["wiring-model"] }
+metor-fsw-2 = { path = "../metor-fsw-2" }
 nox.path = "../nox"
 facet = { version = "0.44.3", features = ["reflect", "smallvec", "gpui"] }
 # Pin the facet-format chain to the last 0.44.x set that still depends on

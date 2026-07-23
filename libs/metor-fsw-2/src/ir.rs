@@ -2,9 +2,9 @@
 //!
 //! This module is the target IR: pure data plus its serde/serde_json codec,
 //! carrying no runtime types, so an evaluated front-end can emit it and the
-//! host can re-ingest it with only the `wiring-model` feature. The Python-eval
-//! path, the Rust builder, and the shared resolver live under the `wiring`-gated
-//! [`wiring`](crate::wiring) module, which re-exports these types.
+//! host can re-ingest it. The Python-eval path, the Rust builder, and the
+//! shared resolver live under the [`wiring`](crate::wiring) module, which
+//! re-exports these types.
 //!
 //! Both front-ends produce this type. The Python `metor_config` recorder emits
 //! it as JSON and the [`wiring::WiringBuilder`](crate::wiring::WiringBuilder)

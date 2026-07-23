@@ -10,7 +10,7 @@
 //! When the fixture cannot be built (no cargo, no fixture crate on disk) the
 //! tests skip rather than fail.
 
-#![cfg(all(feature = "wiring", not(miri)))]
+#![cfg(not(miri))]
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{

@@ -33,7 +33,7 @@ use metor_fsw_2::{BuildOptions, Coordinator};
 
 /// The target file the CLI runner reads, resolved against this crate's manifest so the
 /// headless convergence check finds it regardless of the working directory.
-fn mission_py() -> std::path::PathBuf {
+fn target_py() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
 }
 
@@ -45,7 +45,7 @@ fn mission_py() -> std::path::PathBuf {
 /// This mirrors exactly what `metor-fsw run target.py --build` does internally (evaluate →
 /// `provision_artifacts` → `resolve`), minus the CLI overrides — it is the test's entry point.
 pub fn build_sim_coordinator() -> anyhow::Result<Coordinator> {
-    let mut wiring = eval_python_target(&mission_py()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let mut wiring = eval_python_target(&target_py()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     // A `process=#true` system re-execs the current binary as its worker, which only the CLI
     // runner's `main` supports (`metor_fsw_2::proc::worker_entry`) — a test binary would hang
     // the describe handshake. The headless/test configuration runs every system in-process.
