@@ -1088,6 +1088,7 @@ impl PanelApp {
                 crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::logs::LogStore::init(db.clone(), cx);
+                crate::presets::TargetPresetStore::init(db.clone(), cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
                 crate::plot_events::EventSourceRegistry::init(cx);
                 crate::wiring::WiringStore::init(db.clone(), cx);

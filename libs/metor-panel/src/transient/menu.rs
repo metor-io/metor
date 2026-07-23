@@ -126,7 +126,7 @@ fn layout_menu(tiles: Entity<TileGroup>, on_open: OpenInspectorCallback) -> Vec<
         ChordNode::command("l", "Load preset", {
             let tiles = tiles.clone();
             let on_open = on_open.clone();
-            move |window, cx| open_centered(&on_open, preset_load_rows(tiles.clone()), window, cx)
+            move |window, cx| open_centered(&on_open, preset_load_rows(tiles.clone(), cx), window, cx)
         }),
     ]
 }
