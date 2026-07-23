@@ -74,7 +74,7 @@ pub enum ClockMode {
     Wall,
     /// A simulated clock. Each cycle's `now` advances by `dt` from a start epoch
     /// and the loop never sleeps, so cycles run as fast as the host allows. `dt`
-    /// is the logical step, which keeps a mission converging in fixed simulated
+    /// is the logical step, which keeps a target converging in fixed simulated
     /// time no matter how fast it actually runs.
     Simulated { dt: Duration },
 }
@@ -412,7 +412,7 @@ struct CoordChannels {
     /// The sole writer of the coordinator's `wiring` channel, present only when
     /// a front-end supplied a manifest.
     wiring_out: Option<MsgOut<WiringManifest>>,
-    /// The full mission IR to broadcast on the `wiring` channel; `None` mirrors
+    /// The full target IR to broadcast on the `wiring` channel; `None` mirrors
     /// `wiring_out`.
     wiring_manifest: Option<WiringManifest>,
     wiring_emitted: bool,
@@ -429,7 +429,7 @@ impl CoordChannels {
         let _ = self.seq_registry_out.emit(&self.seq_registry);
     }
 
-    /// Emit the full mission IR on the `wiring` channel — the live/historical
+    /// Emit the full target IR on the `wiring` channel — the live/historical
     /// topology the panel graph tile consumes. A no-op when no front-end set a
     /// manifest.
     fn emit_wiring_manifest(&mut self) {
@@ -580,7 +580,7 @@ impl Coordinator {
 
     /// Run the lifecycle for a bounded number of cycles: init all (behind the
     /// barrier), run, then shut all down. Convenient for tests and bounded
-    /// missions.
+    /// targets.
     ///
     /// # Panics
     ///
@@ -607,7 +607,7 @@ impl Coordinator {
                 ClockMode::Simulated { .. } => "simulated",
             },
             rate_hz = self.config.cycle_rate,
-            "mission starting"
+            "target starting"
         );
         let tasks = self.start().await;
         self.channels.emit_boot();
@@ -632,10 +632,10 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => simulated_now(epoch, dt, k as u64),
             };
-            // Publish to the ambient mission clock before anything steps, so
+            // Publish to the ambient FSW clock before anything steps, so
             // out-of-port stamps (tracing events, async health) land on the
             // cycle timeline.
-            crate::clock::set_mission_now(now);
+            crate::clock::set_now(now);
             // A reload request re-emits the registry and manifest for consumers
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.
@@ -666,7 +666,7 @@ impl Coordinator {
                 ClockMode::Simulated { .. } => stellarator::yield_now().await,
             }
         }
-        tracing::info!(cycle = self.cycle, "mission shutting down");
+        tracing::info!(cycle = self.cycle, "target shutting down");
         self.shutdown(tasks).await;
     }
 

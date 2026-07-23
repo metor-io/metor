@@ -2,9 +2,9 @@
 
 One directory per distribution (see `../docs/packaging.md`):
 
-- `metor-config/` — the mission-config recorder. A mission file builds a
-  `Mission`, adds systems and slots, and connects their ports; at exit the
-  recorder serializes the mission to the `Wiring` IR JSON the Rust host
+- `metor-config/` — the target-config recorder. A target file builds a
+  `Target`, adds systems and slots, and connects their ports; at exit the
+  recorder serializes the target to the `Wiring` IR JSON the Rust host
   ingests (`$METOR_IR_OUT`). Stdlib only, CPython 3.10+. The `metor-fsw`
   binary embeds this package as the no-venv fallback (a venv-installed copy
   is preferred); `$METOR_CONFIG_PY` points the host at a live checkout of
@@ -13,9 +13,9 @@ One directory per distribution (see `../docs/packaging.md`):
 - `tests/` — the recorder test suite.
 
 ```python
-from metor_config import Mission, Alarms, Alarm, Target, band, TcpServer, Uplink, Downlink
+from metor_config import Target, Alarms, Alarm, Target, band, TcpServer, Uplink, Downlink
 
-m = Mission(cycle_rate=120.0, sim_dt=1 / 120)
+m = Target(cycle_rate=120.0, sim_dt=1 / 120)
 adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")
 plant = m.add("plant", adcs.Plant(init_angle=0.5), process=True)
 nav = m.add("nav", adcs.Nav(meas_sigma=0.02))
@@ -30,6 +30,6 @@ python3 -m unittest discover -s tests
 ```
 
 `tests/test_golden.py` asserts the recorder emits exactly
-`libs/metor-fsw-2/tests/golden/mission.json` — the same fixture the Rust
+`libs/metor-fsw-2/tests/golden/target.json` — the same fixture the Rust
 `tests/ir_contract.rs` round-trip test consumes, so the JSON contract is checked
 from both sides.

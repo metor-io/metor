@@ -143,7 +143,7 @@ impl Theme {
     }
 
     /// Tint for a component-frame edge in the system graph — the blue family,
-    /// the calmer of the two edge kinds since frame edges dominate a mission.
+    /// the calmer of the two edge kinds since frame edges dominate a target.
     pub fn frame_edge_color(&self) -> Hsla {
         self.line_colors[1]
     }

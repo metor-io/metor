@@ -46,7 +46,6 @@
 use core::ffi::c_void;
 use std::ffi::OsStr;
 use std::path::Path;
-#[cfg(feature = "wiring")]
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::slice;
@@ -291,7 +290,6 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
 /// driver's manifest sidecar: the object is loaded, ABI-checked, described,
 /// and unloaded *in this process*. The worker's host decodes the bytes
 /// without ever loading the object itself (see `docs/process-systems.md`).
-#[cfg(any(target_os = "linux", target_os = "macos", feature = "wiring"))]
 pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> {
     // Dropping the PackLib closes the pack and unloads the library.
     open_and_describe(path.as_ref()).map(|(_lib, buf)| buf)
@@ -300,7 +298,6 @@ pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> 
 /// The manifest sidecar path for a built pack library: `<so_path>.manifest`,
 /// the raw postcard [`PackManifest`](abi::PackManifest) bytes the build
 /// driver wrote next to the `.so` (see `docs/wiring.md`).
-#[cfg(feature = "wiring")]
 pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
     let mut name = so_path.as_os_str().to_owned();
     name.push(".manifest");
@@ -310,7 +307,6 @@ pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
 /// The raw postcard [`PackManifest`](abi::PackManifest) bytes of the `<so>.manifest` sidecar,
 /// if the build driver wrote one (sidecar-hash ≡ describe-hash). `None` when no
 /// sidecar sits next to the library, leaving the caller to describe it.
-#[cfg(feature = "wiring")]
 pub(crate) fn manifest_sidecar_bytes(so_path: &Path) -> Option<Vec<u8>> {
     std::fs::read(manifest_sidecar_path(so_path)).ok()
 }

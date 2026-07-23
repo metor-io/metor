@@ -1,10 +1,10 @@
 # Command-line guide
 
-The `metor-fsw` command builds, packages, and runs missions. It also builds
+The `metor-fsw` command builds, packages, and runs targets. It also builds
 and publishes pack distributions.
 
 The command line gives local development, CI, and target runs one way to call
-the same build and load code. Use it when working with `mission.py`, mission
+the same build and load code. Use it when working with `target.py`, target
 bundles, or pack wheels.
 
 See [Packaging](packaging.md) for the artifacts these commands create and the
@@ -12,18 +12,18 @@ checks that make them safe to load.
 
 ## Common workflows
 
-Develop a pack, then run a source mission:
+Develop a pack, then run a source target:
 
 ```sh
 metor-fsw pack dev systems/adcs-systems
-metor-fsw run mission.py
+metor-fsw run target.py
 ```
 
-Build a target mission bundle:
+Build a cross-compiled target bundle:
 
 ```sh
-metor-fsw package mission.py \
-  -o dist/mission.metor \
+metor-fsw package target.py \
+  -o dist/target.metor \
   --target aarch64-unknown-linux-gnu \
   --release
 ```
@@ -35,9 +35,9 @@ metor-fsw pack build systems/adcs-systems
 metor-fsw pack publish systems/adcs-systems --index internal
 ```
 
-## Mission commands
+## Target commands
 
-The mission commands are:
+The target commands are:
 
 ```text
 metor-fsw build
@@ -46,39 +46,39 @@ metor-fsw run
 metor-fsw stubgen
 ```
 
-With no mission path, commands that need source look for `mission.py` in the
+With no target path, commands that need source look for `target.py` in the
 current directory.
 
-### Build a source mission
+### Build a source target
 
-`build` evaluates the Python mission and provides each artifact:
+`build` evaluates the Python target and provides each artifact:
 
 ```sh
-metor-fsw build mission.py
-metor-fsw build mission.py --release
-metor-fsw build mission.py --target aarch64-unknown-linux-gnu
+metor-fsw build target.py
+metor-fsw build target.py --release
+metor-fsw build target.py --target aarch64-unknown-linux-gnu
 ```
 
 A local crate artifact runs Cargo. An installed pack selects the library for
 the target triple from its package. Build writes a manifest sidecar beside a
 new library unless `--no-manifest-sidecar` is set.
 
-### Run a mission
+### Run a target
 
 Run source directly:
 
 ```sh
-metor-fsw run mission.py
+metor-fsw run target.py
 ```
 
 Source runs refresh direct path-source packs and build artifacts by default.
 `--no-build` skips both steps and locates existing libraries instead.
 
-Run a packaged mission without Python or Cargo:
+Run a packaged target without Python or Cargo:
 
 ```sh
-metor-fsw run dist/mission.bundle
-metor-fsw run dist/mission.metor
+metor-fsw run dist/target.bundle
+metor-fsw run dist/target.metor
 ```
 
 Useful run flags include:
@@ -92,31 +92,31 @@ Useful run flags include:
 --serve ADDR
 ```
 
-These flags override mission settings. A run exits with an error if a system
+These flags override target settings. A run exits with an error if a system
 hard-stops.
 
-### Package a mission
+### Package a target
 
 Write a directory bundle or a single `.metor` file:
 
 ```sh
-metor-fsw package mission.py -o dist/mission.bundle
-metor-fsw package mission.py -o dist/mission.metor
-metor-fsw package mission.py -o dist/mission.metor \
+metor-fsw package target.py -o dist/target.bundle
+metor-fsw package target.py -o dist/target.metor
+metor-fsw package target.py -o dist/target.metor \
   --target aarch64-unknown-linux-gnu --release
 ```
 
 Check whether a bundle's copied source still emits the same wiring IR:
 
 ```sh
-metor-fsw package --check-ir dist/mission.metor
+metor-fsw package --check-ir dist/target.metor
 ```
 
 Use this check in CI to find config drift or input that changes between runs.
 
 ### Legacy stub generation
 
-Mission-level `stubgen` remains for old projects. New pack projects generate
+Target-level `stubgen` remains for old projects. New pack projects generate
 their typed Python module through `pack dev` and `pack build`.
 
 ## Pack commands
@@ -144,7 +144,7 @@ The command builds the host library, describes the pack, and writes the local
 `.metor/<module>` payload. The `metor_build` editable backend also runs this
 during `uv sync`.
 
-Before a source mission command runs, the CLI refreshes each direct editable
+Before a source target command runs, the CLI refreshes each direct editable
 pack dependency. Cargo makes an unchanged refresh cheap.
 
 ### Build a pack wheel

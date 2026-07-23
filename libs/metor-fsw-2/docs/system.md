@@ -1,11 +1,11 @@
 # Systems
 
-A system is one unit of mission code. It owns state, reads typed input ports,
+A system is one unit of target code. It owns state, reads typed input ports,
 and writes typed output ports. A driver decides when the system runs.
 
 A system gives one flight-software function a clear boundary. Sensor input,
 state estimation, control, and device output can stay separate while they run
-as one mission. This makes each function easier to test, replace, and reuse.
+as one target. This makes each function easier to test, replace, and reuse.
 
 ## Start with a function system
 
@@ -49,7 +49,7 @@ The crate has four system forms:
 | Function system | Once per cycle | Most small cyclic systems |
 | Struct cyclic system | Once per cycle | State and port sets that read better as named types |
 | Cycle-polled pack task | One future poll per cycle | Sequences and other work that spans cycles |
-| Free-running `AsyncSystem` | In its own task | Host I/O and timers that do not follow mission cycles |
+| Free-running `AsyncSystem` | In its own task | Host I/O and timers that do not follow FSW cycles |
 
 All four forms produce a `SystemDescriptor`. The descriptor lets the host
 inspect ports before it builds the system. The run rule is the main reason to
@@ -115,13 +115,13 @@ Snapshot inputs use private copy-in rings. Message inputs read producer rings wi
 
 The coordinator does not call `HealthPort::end_cycle` for this form. The system must choose when to publish health and flush queued logs. It must also choose how to report output publish drops.
 
-Use this form for work driven by I/O or a timer rather than the mission cycle.
+Use this form for work driven by I/O or a timer rather than the FSW cycle.
 
 ## Cycle-polled pack task
 
 `Pack::task` accepts an async fn whose ports move into its future. This is not a free-running `AsyncSystem`.
 
-The coordinator polls the future once per cycle with a no-op waker. `cycle().await` and `wait().await` use the mission cycle clock.
+The coordinator polls the future once per cycle with a no-op waker. `cycle().await` and `wait().await` use the FSW cycle clock.
 
 ```rust
 async fn warmup(mut output: Output<Ready>) -> Outcome {

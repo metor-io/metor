@@ -388,7 +388,7 @@ fn lockstep_end_to_end(lib_path: &Path) {
 // ---------------------------------------------------------------------------
 //
 // The worker restart/timeout policy (`proc_step_timeout`, `proc_max_restarts`,
-// `proc_restart_backoff`) is host-environment policy, not mission topology, so
+// `proc_restart_backoff`) is host-environment policy, not target topology, so
 // it rides `ResolveOptions` rather than the `Wiring` IR — the resolve path sets
 // it as overrides onto the derived `CoordinatorConfig`.
 

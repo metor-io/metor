@@ -4,8 +4,8 @@
 //! lockstep and the estimate rides through the sun loss.
 //!
 //! Both runs use the static path (plant/nav/ctrl as rlibs, the `momentum.rs` pattern) off a
-//! patched `mission.py`: `init_orbit_phase` places the boot inside / just before the
-//! shadow arc — the phase is **computed** by scanning [`in_earth_shadow`] at the mission
+//! patched `target.py`: `init_orbit_phase` places the boot inside / just before the
+//! shadow arc — the phase is **computed** by scanning [`in_earth_shadow`] at the target
 //! epoch, never hardcoded. The `mode` slot starts empty (ctrl holds its identity reference)
 //! so the estimator behavior under sun loss is the whole subject. Deterministic: seeded
 //! RNG, fixed epoch, no wall clock. Gated off `miri` (provision_artifacts builds the sequence
@@ -20,23 +20,23 @@ use std::rc::Rc;
 
 use adcs_contracts::{
     ALTITUDE, AttitudeEstimate, BodyState, CSS_THRESHOLD, Disturbances, EARTH_RADIUS, Quat,
-    Sensors, V3, World, in_earth_shadow, mission_epoch, sun_dir_eci,
+    Sensors, V3, World, in_earth_shadow, target_epoch, sun_dir_eci,
 };
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{ParamSource, eval_python_mission, provision_artifacts, resolve};
+use metor_fsw_2::wiring::{ParamSource, eval_python_target, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
-fn mission_py() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
+fn target_py() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
 }
 
 mod common;
 
-/// The first lit→dark orbit phase at the mission epoch, by scanning the shadow function
+/// The first lit→dark orbit phase at the target epoch, by scanning the shadow function
 /// around the boot orbit (equatorial, radius `EARTH_RADIUS + ALTITUDE`) in 0.1° steps.
 fn shadow_entry_phase() -> f64 {
-    let sun = sun_dir_eci(mission_epoch());
+    let sun = sun_dir_eci(target_epoch());
     let r = EARTH_RADIUS + ALTITUDE;
     let pos = |theta: f64| -> V3 { V3::from_buf([theta.cos(), theta.sin(), 0.0]) * r };
     let step = 0.1f64.to_radians();
@@ -47,18 +47,18 @@ fn shadow_entry_phase() -> f64 {
         }
         theta += step;
     }
-    panic!("an equatorial 400 km orbit at the mission epoch always crosses Earth shadow");
+    panic!("an equatorial 400 km orbit at the target epoch always crosses Earth shadow");
 }
 
-/// The patched mission: boot at `phase` radians of orbit, slot empty (no commissioning).
+/// The patched target: boot at `phase` radians of orbit, slot empty (no commissioning).
 fn build_static(phase: f64) -> Option<Coordinator> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_mission(&mission_py()) {
+    let mut wiring = match eval_python_target(&target_py()) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("skipping: mission.py did not evaluate: {e}");
+            eprintln!("skipping: target.py did not evaluate: {e}");
             return None;
         }
     };
@@ -86,10 +86,10 @@ fn build_static(phase: f64) -> Option<Coordinator> {
     }
     let mut registry = Registry::with_builtins();
     registry.register_pack(adcs_systems::pack());
-    Some(resolve(&wiring, &registry).expect("resolve the patched mission"))
+    Some(resolve(&wiring, &registry).expect("resolve the patched target"))
 }
 
-/// One cycle's view of the mission: the truth illumination flag, the brightest CSS head,
+/// One cycle's view of the target: the truth illumination flag, the brightest CSS head,
 /// |SRP torque|, and the attitude-estimate error against truth.
 #[derive(Clone, Copy, Debug)]
 struct Sample {
@@ -109,11 +109,11 @@ async fn run_and_sample(mut coord: Coordinator, cycles: usize) -> Vec<Sample> {
             .unwrap_or_else(|| panic!("`{name}` is registered"))
             .expect("a reader slot is available")
     };
-    let world_view: Input<World> = Input::new(tap("plant.world"));
-    let sensors_view: Input<Sensors> = Input::new(tap("plant.sensors"));
-    let disturb_view: Input<Disturbances> = Input::new(tap("plant.disturb"));
-    let est_view: Input<AttitudeEstimate> = Input::new(tap("nav.attitude_estimate"));
-    let body_view: Input<BodyState> = Input::new(tap("plant.body"));
+    let world_view: Input<World> = Input::new(tap("cube_sat.plant.world"));
+    let sensors_view: Input<Sensors> = Input::new(tap("cube_sat.plant.sensors"));
+    let disturb_view: Input<Disturbances> = Input::new(tap("cube_sat.plant.disturb"));
+    let est_view: Input<AttitudeEstimate> = Input::new(tap("cube_sat.nav.attitude_estimate"));
+    let body_view: Input<BodyState> = Input::new(tap("cube_sat.plant.body"));
 
     let samples = Rc::new(RefCell::new(Vec::<Sample>::new()));
     let captured = samples.clone();
@@ -162,6 +162,7 @@ async fn run_and_sample(mut coord: Coordinator, cycles: usize) -> Vec<Sample> {
 /// validity threshold, and the mag-only estimate neither diverges nor goes non-finite.
 #[stellarator::test]
 async fn eclipse_darkens_sensors_and_nav_stays_bounded() {
+    let _guard = common::link_port_guard();
     // ~11.5° past entry — inside the ~137° shadow arc for the whole 2000-cycle window.
     let Some(coord) = build_static(shadow_entry_phase() + 0.2) else {
         return;
@@ -208,6 +209,7 @@ async fn eclipse_darkens_sensors_and_nav_stays_bounded() {
 /// mid-run (once — a single crossing), and the estimate rides through the sun loss.
 #[stellarator::test]
 async fn shadow_entry_flips_sensors_in_lockstep_and_nav_rides_through() {
+    let _guard = common::link_port_guard();
     // 1° before entry ≈ 15 s of orbit; the 3000-cycle (25 s) window crosses mid-run.
     let Some(coord) = build_static(shadow_entry_phase() - 1.0f64.to_radians()) else {
         return;

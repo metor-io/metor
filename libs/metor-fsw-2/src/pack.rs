@@ -63,7 +63,6 @@ pub enum EntryParams<'a> {
     /// spans of its own.
     ///
     /// [`ParamSource::Value`]: crate::wiring::ParamSource::Value
-    #[cfg(feature = "wiring")]
     Value {
         value: &'a serde_json::Value,
         src: &'a str,
@@ -81,7 +80,6 @@ pub enum EntryParams<'a> {
 /// token a shared entry downcasts at create, plus the state's registry type
 /// key for the mismatch diagnostic. Built by the resolver's states pass and
 /// threaded through [`EntryParams::Value`]; its fields are crate-internal.
-#[cfg(feature = "wiring")]
 pub struct AttachTarget {
     pub(crate) ty: &'static str,
     pub(crate) token: std::rc::Rc<dyn core::any::Any>,
@@ -94,7 +92,6 @@ pub enum MakeError {
     #[error("pack entry params did not decode: {0}")]
     Postcard(#[from] postcard::Error),
     /// The value params surface did not deserialize (spans inside).
-    #[cfg(feature = "wiring")]
     #[error(transparent)]
     Params(Box<crate::wiring::LoadError>),
     /// A `configure` step failed to resolve a config reference.
@@ -107,10 +104,7 @@ pub enum MakeError {
     /// A shared-state init fn failed (the state's own construction, e.g. a
     /// listener bind).
     #[error("shared state `{state}` failed to construct: {detail}")]
-    StateInit {
-        state: &'static str,
-        detail: String,
-    },
+    StateInit { state: &'static str, detail: String },
     /// An entry attached to a shared state was instantiated before the
     /// state's own wiring declaration constructed it.
     #[error("system attaches to shared state `{state}`, which no wiring declaration constructs")]
@@ -136,7 +130,6 @@ pub enum MakeError {
 pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Result<P, MakeError> {
     match params {
         EntryParams::Postcard(bytes) => Ok(postcard::from_bytes(bytes)?),
-        #[cfg(feature = "wiring")]
         EntryParams::Value {
             value, src, name, ..
         } => {
@@ -160,10 +153,6 @@ pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Res
 /// entry declared defaults: an absent config uses the defaults verbatim, a
 /// value surface is schema-encoded over the decoded default base (top-level
 /// overrides), and explicit postcard bytes pass through complete.
-///
-/// `schema` is unused without the `wiring` feature (only the value surface
-/// consults it), so a runtime-only build carries the bytes through as-is.
-#[cfg_attr(not(feature = "wiring"), allow(unused_variables))]
 pub(crate) fn resolve_defaults(
     params: EntryParams<'_>,
     defaults: &[u8],
@@ -172,7 +161,6 @@ pub(crate) fn resolve_defaults(
     match params {
         EntryParams::Postcard(bytes) if bytes.is_empty() => Ok(defaults.to_vec()),
         EntryParams::Postcard(bytes) => Ok(bytes.to_vec()),
-        #[cfg(feature = "wiring")]
         EntryParams::Value { value, name, .. } => {
             let owned = postcard_schema::schema::owned::OwnedNamedType::from(schema);
             crate::wiring::encode_value_params(value, &owned, name, Some(defaults))
@@ -326,11 +314,7 @@ impl Pack {
     /// the token. The state is constructed once, from its own wiring
     /// declaration's params; a fallible `init` makes resource acquisition
     /// (a listener bind) a resolve-time error rather than a runtime one.
-    pub fn shared_state<S, P, E, F>(
-        &mut self,
-        name: &'static str,
-        mut init: F,
-    ) -> crate::Shared<S>
+    pub fn shared_state<S, P, E, F>(&mut self, name: &'static str, mut init: F) -> crate::Shared<S>
     where
         S: crate::SharedLifecycle,
         P: DeserializeOwned + postcard_schema::Schema + 'static,
@@ -368,10 +352,10 @@ impl Pack {
     }
 
     /// Register a struct-authored system that attaches to a pack-shared state
-    /// *by name*: the mission's [`SystemSpec::attach`](crate::wiring::SystemSpec)
+    /// *by name*: the target's [`SystemSpec::attach`](crate::wiring::SystemSpec)
     /// picks which state instance, and the resolver hands `ctor` the resolved
     /// [`Shared`](crate::Shared) token (the second argument) at create time.
-    /// `St` is the concrete shared type the entry binds — a mission naming a
+    /// `St` is the concrete shared type the entry binds — a target naming a
     /// state of any other type is an `AttachTypeMismatch`. The driver is
     /// wrapped so the state's [`SharedLifecycle`](crate::SharedLifecycle) hooks
     /// run once across all attached entries. Attached entries are cyclic-only,
@@ -392,14 +376,12 @@ impl Pack {
         descriptor.name = name.into();
         let static_desc = descriptor.clone();
         let mut taken = false;
-        #[cfg_attr(not(feature = "wiring"), allow(unused_variables, unused_mut))]
         let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
             if taken {
                 return Err(MakeError::SharedEntryReinstantiated);
             }
             // A shared entry resolves only through the static registry's value
-            // path (a `wiring` build); the postcard/dl path never attaches.
-            #[cfg(feature = "wiring")]
+            // path; the postcard/dl path never attaches.
             {
                 // Copy the resolved attach target + msgs off the value surface
                 // before `params` moves into decode (the proven `msgs` pattern).
@@ -425,7 +407,10 @@ impl Pack {
                 let p: T::Params = decode_params(params)?;
                 let mut system = ctor(p, token);
                 if let Some(msgs) = msgs {
-                    system.configure(&crate::BuildCtx { msgs, namespace: None })?;
+                    system.configure(&crate::BuildCtx {
+                        msgs,
+                        namespace: None,
+                    })?;
                 }
                 taken = true;
                 cell.attach();
@@ -442,13 +427,6 @@ impl Pack {
                     pending,
                     instance_desc,
                 })
-            }
-            // Without the value path a shared entry has no attach surface, so
-            // its only honest create outcome is the missing-attach error.
-            #[cfg(not(feature = "wiring"))]
-            {
-                let _ = (&params, &static_desc, &mut ctor);
-                Err(MakeError::MissingAttach { system: name })
             }
         });
         let mut entry = PackEntry {
@@ -515,11 +493,7 @@ impl Pack {
     /// see through — hand-written [`BuildSystem`](crate::BuildSystem) impls
     /// and generic systems. The typed `defaults` argument is the schema
     /// check: a defaults value of the wrong type does not compile.
-    pub fn system_type_with_defaults<T>(
-        mut self,
-        name: &'static str,
-        defaults: T::Params,
-    ) -> Self
+    pub fn system_type_with_defaults<T>(mut self, name: &'static str, defaults: T::Params) -> Self
     where
         T: crate::CyclicSystem + crate::BuildSystem + 'static,
         T::Params: serde::Serialize + DeserializeOwned + postcard_schema::Schema + 'static,
@@ -681,20 +655,20 @@ where
     descriptor.name = name.into();
     let static_desc = descriptor.clone();
     let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
-        #[cfg(feature = "wiring")]
         let msgs = match &params {
             EntryParams::Value { msgs, .. } => Some(*msgs),
             _ => None,
         };
         let p: T::Params = decode_params(params)?;
-        #[cfg_attr(not(feature = "wiring"), allow(unused_mut))]
         let mut system = T::new(p);
         // The host-context configure phase runs only where a message
         // table exists (the static path); the postcard path is the dl
         // parity path, where configure never runs.
-        #[cfg(feature = "wiring")]
         if let Some(msgs) = msgs {
-            system.configure(&crate::BuildCtx { msgs, namespace: None })?;
+            system.configure(&crate::BuildCtx {
+                msgs,
+                namespace: None,
+            })?;
         }
         let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
         let pending: Pending = Box::new(move |src, mount| {

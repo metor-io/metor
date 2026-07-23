@@ -6,7 +6,7 @@
 //! them after collapsed scopes swallow their members. The *geometry* half —
 //! layers, ordering, positions, wire routes — is delegated to the shared
 //! [`graph_layout`](crate::graph_layout) engine, driven by the non-delayed
-//! frame edges (the mission's acyclic execution-dependency DAG) with
+//! frame edges (the target's acyclic execution-dependency DAG) with
 //! declaration order as the tie-break. The result is a pure function of the
 //! [`Wiring`] IR, the collapsed set, and the flow direction, so it is
 //! unit-tested without any gpui state.
@@ -133,7 +133,7 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
     let mut rep: HashMap<String, SharedString> = HashMap::new();
     // Ordered, de-duplicated node builders keyed by id.
     let mut node_kind: BTreeMap<SharedString, (GraphNodeKind, Option<usize>)> = BTreeMap::new();
-    // First-seen order: declaration order for a flat mission, and the layout
+    // First-seen order: declaration order for a flat target, and the layout
     // engine's tie-break rank.
     let mut first_seen: Vec<SharedString> = Vec::new();
 
@@ -232,7 +232,7 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
             size: card_size(node_kind[id].0),
         })
         .collect();
-    // The non-delayed frame edges are the mission's execution-dependency DAG;
+    // The non-delayed frame edges are the target's execution-dependency DAG;
     // they alone drive layering. Delayed feedback and message edges route by
     // wherever those layers put their endpoints.
     let layout_edges: Vec<LayoutEdge> = edges

@@ -19,7 +19,7 @@ re-test, both startup orders) remains:
    exact reported wedge), `load_while_running_is_refused` (slot_integration).
 4. DONE — the coordinator #0 bundle consumes `ReloadSequences` and re-emits
    the `SequenceRegistry` (test `reload_request_reemits_registry`);
-   mission.kdl wires `uplink -> coordinator msg="ReloadSequences"`, so the
+   target.kdl wires `uplink -> coordinator msg="ReloadSequences"`, so the
    panel's Reload button now works and a late-started panel recovers its
    Load picker.
 5. TODO — live re-test with the real panel, both startup orders. If green,
@@ -29,7 +29,7 @@ re-test, both startup orders) remains:
 
 Loading a sequence from the panel leaves the channel on the existing sequence.
 Reported in BOTH startup orders:
-- Panel started AFTER the mission: panel shows `mode` Completed, "no sequence
+- Panel started AFTER the target: panel shows `mode` Completed, "no sequence
   loaded", last message "commissioned"; Load and Reset both appear dead.
 - Panel started FIRST (user confirmed): still can't load anything, even after
   Reset.
@@ -109,7 +109,7 @@ Panel-after-boot case additionally hits the empty-`available` picker (facts
 4. **Registry re-emission**: consume `ReloadSequences` — natural shape: the
    coordinator (#0) gains a `reload: MsgIn<ReloadSequences>` input in its
    bundle; drain each cycle; re-emit the `SequenceRegistry` on request.
-   mission.kdl: uplink `msgs` list gains "ReloadSequences" +
+   target.kdl: uplink `msgs` list gains "ReloadSequences" +
    `connect "uplink" -> "coordinator" msg="ReloadSequences"`. Panel's Reload
    button then actually works; late-started panels recover `available`.
    (Alternative considered: periodic re-emit; explicit request is cleaner.)

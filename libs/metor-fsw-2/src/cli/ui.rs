@@ -4,7 +4,7 @@
 //! pipeline's tracing output into a live display — active `build`-target
 //! spans render as a pinned progress line (spinner, label, the crate cargo is
 //! currently compiling, elapsed time) while `cargo`-target events stream
-//! above it — and [`print_preflight`] lists the systems and slots a mission
+//! above it — and [`print_preflight`] lists the systems and slots a target
 //! will run before it starts. Both degrade to plain text when stderr is not a
 //! terminal: indicatif hides its bars and events print as ordinary lines,
 //! and the pre-flight colors are gated on stream support.

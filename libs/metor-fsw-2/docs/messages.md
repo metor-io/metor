@@ -4,7 +4,7 @@ Systems send frames and messages through typed ports. Both use the same ring typ
 
 Ports are the typed connection points between systems. They let one system
 publish data without knowing which systems will read it. This keeps system code
-independent from the mission layout.
+independent from the target layout.
 
 Rings carry records from one producer to one or more readers. They preserve
 unread data and let each reader advance at its own rate. Snapshot delivery

@@ -1,7 +1,7 @@
 //! The generated pack stubs stay in sync with the packs, and a stale stub is
 //! refused at resolve.
 //!
-//! Stubs are venv-only build artifacts here: the mission's PEP 517 backend
+//! Stubs are venv-only build artifacts here: the target's PEP 517 backend
 //! (`_backend/metor_build`) regenerates them into `.metor/packs` on every
 //! `uv sync`, so there is no checked-in copy to byte-diff. The round-trip test
 //! keeps the contract stubgen's `--check` relies on — generation into an
@@ -23,15 +23,15 @@ use metor_fsw_2::wiring::{
     stubgen,
 };
 
-fn mission_dir() -> PathBuf {
+fn target_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 /// Generating into an `--out-dir` and re-running with `--check` against the
 /// same directory is clean: generation is deterministic, and `--check` still
-/// functions against a build directory. The converted mission has no
+/// functions against a build directory. The converted target has no
 /// `[tool.metor.artifacts]` anymore (both packs are dependencies), so the
-/// deprecated mission-level path is exercised over a fabricated mission dir.
+/// deprecated target-level path is exercised over a fabricated target dir.
 #[test]
 fn stubgen_out_dir_roundtrips() {
     let out = tempfile::tempdir().unwrap();
@@ -41,7 +41,7 @@ fn stubgen_out_dir_roundtrips() {
     )
     .unwrap();
     let opts = |check| StubgenOptions {
-        mission_dir: out.path().to_path_buf(),
+        target_dir: out.path().to_path_buf(),
         out_dir: Some(out.path().join("packs")),
         check,
         build: true,
@@ -69,11 +69,11 @@ fn stubgen_out_dir_roundtrips() {
 }
 
 /// The adcs pack's `pack dev` layout regenerates byte-identically — the
-/// pack-side sibling of the mission round-trip above, keeping the backend's
+/// pack-side sibling of the target round-trip above, keeping the backend's
 /// regenerate-on-sync flow deterministic.
 #[test]
 fn pack_dev_module_is_deterministic() {
-    let pack = mission_dir().join("systems").join("adcs-systems");
+    let pack = target_dir().join("systems").join("adcs-systems");
     let module = pack.join(".metor").join("adcs_pack").join("__init__.py");
     let first = match pack_dev(&pack, &PackDevOptions::default()) {
         Ok(_) => std::fs::read(&module).expect("module written"),
@@ -90,12 +90,12 @@ fn pack_dev_module_is_deterministic() {
     );
 }
 
-/// `run`'s pre-eval refresh covers exactly this mission's two system packs —
+/// `run`'s pre-eval refresh covers exactly this target's two system packs —
 /// the `metor-config` path source is not a pack and stays untouched — and a
 /// refresh lays out module, lib, and sidecar for each, byte-stable on rerun.
 #[test]
 fn refresh_covers_exactly_the_dev_packs() {
-    let dir = mission_dir();
+    let dir = target_dir();
     let systems = dir.join("systems");
     assert_eq!(
         dev_pack_roots(&dir),

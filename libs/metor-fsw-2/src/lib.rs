@@ -72,7 +72,7 @@
 //!
 //! # Wiring and loading
 //!
-//! A `mission.py` file and [`WiringBuilder`] both create the same [`Wiring`] IR.
+//! A `target.py` file and [`WiringBuilder`] both create the same [`Wiring`] IR.
 //! The resolver checks that IR, loads
 //! each system descriptor, builds the graph, sizes its rings, and returns a
 //! ready [`Coordinator`].
@@ -109,16 +109,12 @@ pub mod clock;
 pub mod health;
 pub mod logfwd;
 
-// Not gated on `wiring`; sequences are an ABI/runtime feature.
 pub mod sequence;
 
-// The pure-data mission IR. Available without the front-end (feature
-// `wiring-model`) so an IR consumer can emit and re-ingest it; the
-// `wiring`-gated `wiring` module re-exports these types alongside its resolver.
-#[cfg(feature = "wiring-model")]
+// The pure-data target IR; the `wiring` module re-exports these types
+// alongside its resolver.
 pub mod ir;
 
-#[cfg(feature = "wiring")]
 pub mod wiring;
 
 pub mod abi;
@@ -131,8 +127,8 @@ pub mod params_docs;
 pub mod proc;
 
 pub use dynamic::{FrameList, FrameMap, Slot};
-pub use text::FrameStr;
 pub use frame::Frame;
+pub use text::FrameStr;
 pub use writer::{DynamicWriteError, FrameScratch, FrameWriter, KeyError, ListWriter, MapWriter};
 
 pub use metor_fsw_ring::{ReadError, WriteError};
@@ -154,8 +150,8 @@ pub use pack::{
     Created, Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StateEntry,
     StepStatus,
 };
-pub use shared::{Shared, SharedGuard, SharedLifecycle};
 pub use registry::{AllOutputs, Registry, RegistryEntry};
+pub use shared::{Shared, SharedGuard, SharedLifecycle};
 pub use telemetry::{
     DownlinkParams, LinkParams, LinkState, LinkStats, TelemetryConfig, TelemetryMode,
     TelemetrySystem, UplinkParams, UplinkSystem,
@@ -205,17 +201,14 @@ pub use {metor_proto, metor_proto_wkt, zerocopy};
 
 pub use dl::{DlError, DlPack, DlSystem};
 
-#[cfg(feature = "wiring-model")]
 pub use ir::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, DistRef, EdgeSpec,
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, StateSpec, SystemSpec,
     TCP_SERVER_TYPE, UPLINK_TYPE, Wiring,
 };
 
-#[cfg(feature = "wiring")]
 pub use wiring::{BuildError, BuildOptions, BundleError, PackageOptions, WiringBuilder};
 
-#[cfg(feature = "wiring")]
 pub mod cli;
 
 // Frame acceptance tests span frame/dynamic/writer, so they live at the

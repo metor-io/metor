@@ -739,7 +739,7 @@ mod tests {
         );
     }
 
-    /// The well-known message name tokens are frozen; mission configs and
+    /// The well-known message name tokens are frozen; target configs and
     /// registry keys depend on them.
     #[test]
     fn wkt_named_msg_tokens_frozen() {

@@ -37,7 +37,7 @@ pub struct PackConfig {
     /// The generated top-level module name. Default: the distribution name
     /// normalized to an identifier (`adcs-pack` → `adcs_pack`).
     pub module: String,
-    /// The artifact id mission IR references. Default: the module name.
+    /// The artifact id target IR references. Default: the module name.
     pub id: String,
     /// The cargo package. Default: `Cargo.toml`'s `[package] name`.
     pub crate_name: String,
@@ -366,7 +366,7 @@ pub fn pack_dev(dir: &Path, opts: &PackDevOptions) -> Result<PackDevReport, Pack
     // with the sidecar sourced from the usual host twin). The pack's own
     // manifest anchors the build when it has one, so the workspace resolves
     // from the pack rather than the process cwd — `run` invokes this from
-    // the mission dir, which need not be a cargo workspace at all.
+    // the target dir, which need not be a cargo workspace at all.
     let mut cargo_args = opts.cargo_args.clone();
     let manifest = dir.join("Cargo.toml");
     if manifest.is_file() {
@@ -442,25 +442,25 @@ fn is_dev_pack(dir: &Path) -> bool {
     })
 }
 
-/// The mission's dev-pack roots: its pyproject's path sources filtered to
+/// The target's dev-pack roots: its pyproject's path sources filtered to
 /// the rebuildable packs.
-pub fn dev_pack_roots(mission_dir: &Path) -> Vec<PathBuf> {
-    super::py::path_source_roots(mission_dir)
+pub fn dev_pack_roots(target_dir: &Path) -> Vec<PathBuf> {
+    super::py::path_source_roots(target_dir)
         .into_iter()
         .filter(|dir| is_dev_pack(dir))
         .collect()
 }
 
-/// Re-run [`pack_dev`] for every dev pack `mission_dir`'s pyproject
+/// Re-run [`pack_dev`] for every dev pack `target_dir`'s pyproject
 /// references, so their `.metor/` payloads (module + lib) are current before
-/// the mission is evaluated. Cheap when nothing changed — cargo's build is
+/// the target is evaluated. Cheap when nothing changed — cargo's build is
 /// incremental and the layout rewrite is byte-identical. The first failing
 /// pack aborts.
 pub fn refresh_dev_packs(
-    mission_dir: &Path,
+    target_dir: &Path,
     opts: &PackDevOptions,
 ) -> Result<Vec<PackDevReport>, PackError> {
-    dev_pack_roots(mission_dir)
+    dev_pack_roots(target_dir)
         .iter()
         .map(|dir| pack_dev(dir, opts))
         .collect()
@@ -1077,7 +1077,7 @@ mod tests {
     }
 
     /// `dev_pack_roots` keeps exactly the path sources that are dev packs,
-    /// and a mission with none refreshes to nothing (no cargo spawned).
+    /// and a target with none refreshes to nothing (no cargo spawned).
     #[test]
     fn dev_pack_roots_filter_path_sources() {
         let tmp = tempfile::tempdir().unwrap();

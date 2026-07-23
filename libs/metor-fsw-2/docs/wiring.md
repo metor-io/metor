@@ -1,16 +1,16 @@
-# Mission wiring
+# Target wiring
 
-Mission wiring says what runs and how data moves between systems. It does not
-run system code. The wiring layer turns a mission into a checked coordinator.
+Target wiring says what runs and how data moves between systems. It does not
+run system code. The wiring layer turns a target into a checked coordinator.
 
-Wiring connects separate systems into one mission. It chooses which systems
+Wiring connects separate systems into one target. It chooses which systems
 run, how each one is set up, and which outputs feed which inputs. The same
-system code can then serve several missions with different layouts.
+system code can then serve several targets with different layouts.
 
 The main flow is:
 
 ```text
-mission.py ─┐
+target.py ─┐
             ├─> Wiring IR ─> validate ─> resolve ─> coordinator
 Rust builder┘
 ```
@@ -18,9 +18,9 @@ Rust builder┘
 Both front ends produce the same `Wiring` value. The resolver applies the same
 checks to both.
 
-## Python missions
+## Python targets
 
-The CLI runs a `mission.py` with CPython 3.10 or later. The `metor_config`
+The CLI runs a `target.py` with CPython 3.10 or later. The `metor_config`
 package records each call and writes IR as JSON. Python does not hold memory
 used by the running coordinator.
 
@@ -28,10 +28,10 @@ This example declares two pack systems, one process boundary, a feedback edge,
 and a link server:
 
 ```python
-from metor_config import Downlink, Mission, TcpServer
+from metor_config import Downlink, Target, TcpServer
 from adcs_pack import Nav, Plant
 
-m = Mission(cycle_rate=100.0, sim_dt=0.01, namespace="sat1")
+m = Target(cycle_rate=100.0, sim_dt=0.01, namespace="sat1")
 
 link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
 
@@ -59,7 +59,7 @@ m.route(uplink, mode, msg="SequenceCommand")
 Message edges can fan in and out. They do not take part in frame cycle checks.
 They cannot use a delay.
 
-## Rust missions
+## Rust targets
 
 `WiringBuilder` builds the same IR without Python:
 
@@ -97,7 +97,7 @@ The top-level fields are:
 - `edges`: frame and message links
 - `scopes`: block names and parent links recorded by the Python front end
 
-Artifact paths do not form part of mission identity. `path_stripped()` removes
+Artifact paths do not form part of target identity. `path_stripped()` removes
 build paths and prebuilt roots before a bundle stores or reports the IR.
 
 ## Systems and artifacts
@@ -135,7 +135,7 @@ Postcard params work only for loaded systems and slot occupants.
 ## Shared states
 
 A static pack can declare a shared state type with `Pack::shared_state`. The
-mission must declare one state value of that type before attached systems can
+target must declare one state value of that type before attached systems can
 run.
 
 `m.state(name, spec)` returns a handle. A system attaches by taking that handle
@@ -160,7 +160,7 @@ uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand"]))
 ```
 
 The CLI `run --serve ADDR` changes the address of an existing `TcpServer`. If
-the mission has no server, it adds one and adds an all-output downlink.
+the target has no server, it adds one and adds an all-output downlink.
 
 ## Slots
 

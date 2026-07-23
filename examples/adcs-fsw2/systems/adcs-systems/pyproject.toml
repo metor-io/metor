@@ -1,6 +1,6 @@
 # The adcs pack as a Python distribution (docs/design-packaging.md §6.1).
 #
-# A mission consumes it as an ordinary dependency; while it lives in this
+# A target consumes it as an ordinary dependency; while it lives in this
 # repo, a `[tool.uv.sources]` path entry points here and `uv sync` runs the
 # backend, which lays out `.metor/adcs_pack/` (typed module + host-triple
 # lib) via `metor-fsw pack dev` and exposes it to the venv.
@@ -8,7 +8,7 @@
 [project]
 name = "adcs-pack"
 version = "0.1.0"
-description = "The plant, nav, and ctrl systems of the adcs-fsw2 mission"
+description = "The plant, nav, and ctrl systems of the adcs-fsw2 target"
 requires-python = ">=3.11"
 
 # While this pack lives in the metor repo, the backend resolves from the

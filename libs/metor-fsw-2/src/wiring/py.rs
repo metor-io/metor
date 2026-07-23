@@ -1,6 +1,6 @@
-//! Evaluate a `.py` mission by running it under a subprocess CPython.
+//! Evaluate a `.py` target by running it under a subprocess CPython.
 //!
-//! The mission file imports the `metor_config` recorder, builds a mission, and
+//! The target file imports the `metor_config` recorder, builds a target, and
 //! at exit writes the serialized [`Wiring`] IR. This module resolves an
 //! interpreter, materializes the embedded recorder, runs the file, and ingests
 //! the JSON it produced — landing a `Wiring` the shared
@@ -8,7 +8,7 @@
 //! [`WiringBuilder`](super::WiringBuilder).
 //!
 //! Errors keep their native surface: a Python-level failure prints CPython's
-//! own traceback (the mission file is just a script, so `pdb` and IDE debuggers
+//! own traceback (the target file is just a script, so `pdb` and IDE debuggers
 //! work), and the host's [`LoadError`] anchors resolve-time failures via the
 //! `src` fields the recorder fills.
 
@@ -36,8 +36,8 @@ const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
     ),
 ];
 
-/// `true` if `path` is a Python mission (a `.py` file the CLI evaluates).
-pub fn is_python_mission(path: &Path) -> bool {
+/// `true` if `path` is a Python target (a `.py` file the CLI evaluates).
+pub fn is_python_target(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "py")
 }
 
@@ -53,13 +53,13 @@ pub(super) fn metor_config_version() -> &'static str {
         .expect("embedded metor_config declares __version__")
 }
 
-/// Evaluate a `.py` mission into a [`Wiring`].
+/// Evaluate a `.py` target into a [`Wiring`].
 ///
 /// Resolves an interpreter (`$METOR_PYTHON` → `$VIRTUAL_ENV/bin/python` →
 /// `python3`, requiring ≥ 3.10), runs the file with the recorder on
 /// `PYTHONPATH` and `$METOR_IR_OUT` pointed at a temp file, then reads back the
 /// IR. A non-zero exit passes the child's stderr through verbatim.
-pub fn eval_python_mission(path: &Path) -> miette::Result<Wiring> {
+pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
     let python = resolve_interpreter()?;
 
     // Recorder source, in preference order: a live checkout via
@@ -85,18 +85,18 @@ pub fn eval_python_mission(path: &Path) -> miette::Result<Wiring> {
         .tempfile()
         .into_diagnostic()?;
 
-    // A mission whose stubs are venv-only build artifacts keeps them in
-    // `.metor/packs` beside the mission file, and each path-source pack
+    // A target whose stubs are venv-only build artifacts keeps them in
+    // `.metor/packs` beside the target file, and each path-source pack
     // dependency keeps its module in `<pack>/.metor`; putting those build
     // dirs on the path lets a bare `metor-fsw run` (or a Rust test) evaluate
-    // the mission without the venv active. In a venv they resolve there
+    // the target without the venv active. In a venv they resolve there
     // first-equal — the contents are the same artifacts the backends expose.
-    if let Some(mission_dir) = path.parent() {
-        let stubs = mission_dir.join(".metor");
+    if let Some(target_dir) = path.parent() {
+        let stubs = target_dir.join(".metor");
         if stubs.is_dir() {
             roots.push(stubs);
         }
-        roots.extend(pack_stub_roots(mission_dir));
+        roots.extend(pack_stub_roots(target_dir));
     }
 
     let status = Command::new(&python)
@@ -124,18 +124,18 @@ pub fn eval_python_mission(path: &Path) -> miette::Result<Wiring> {
     }
 
     let json = std::fs::read_to_string(ir_file.path())
-        .map_err(|e| miette!("mission `{}` produced no IR: {e}", path.display()))?;
+        .map_err(|e| miette!("target `{}` produced no IR: {e}", path.display()))?;
     ingest_ir(&json, path)
 }
 
 /// Deserialize the emitted IR. The IR version is checked at resolve time.
 fn ingest_ir(json: &str, path: &Path) -> miette::Result<Wiring> {
     let raw: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| miette!("mission `{}` emitted invalid JSON: {e}", path.display()))?;
+        .map_err(|e| miette!("target `{}` emitted invalid JSON: {e}", path.display()))?;
 
     serde_json::from_value(raw).map_err(|e| {
         miette!(
-            "mission `{}` emitted an IR this host cannot read: {e}",
+            "target `{}` emitted an IR this host cannot read: {e}",
             path.display()
         )
     })
@@ -196,14 +196,14 @@ fn imports_metor_config(python: &Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// The path-source dependency roots of the mission-adjacent
+/// The path-source dependency roots of the target-adjacent
 /// `pyproject.toml`: each `[tool.uv.sources] <dist> = {{ path = … }}` entry,
-/// mission-relative, sorted. Direct sources only — a pack's own path-source
+/// target-relative, sorted. Direct sources only — a pack's own path-source
 /// dependencies are not chased, the same limitation as the `PYTHONPATH` scan,
 /// so refresh and import visibility stay symmetric. Best-effort by design —
 /// no pyproject or no sources means "no roots".
-pub(super) fn path_source_roots(mission_dir: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(mission_dir.join("pyproject.toml")) else {
+pub(super) fn path_source_roots(target_dir: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(target_dir.join("pyproject.toml")) else {
         return Vec::new();
     };
     let Ok(doc) = text.parse::<toml::Value>() else {
@@ -220,18 +220,18 @@ pub(super) fn path_source_roots(mission_dir: &Path) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = sources
         .values()
         .filter_map(|entry| entry.get("path")?.as_str())
-        .map(|rel| mission_dir.join(rel))
+        .map(|rel| target_dir.join(rel))
         .collect();
     roots.sort();
     roots
 }
 
-/// The `.metor` build dirs of the mission's path-source pack dependencies:
+/// The `.metor` build dirs of the target's path-source pack dependencies:
 /// each [`path_source_roots`] entry whose target carries one. Best-effort by
 /// design — a real dependency problem surfaces as Python's own
-/// `ModuleNotFoundError` with the mission traceback.
-fn pack_stub_roots(mission_dir: &Path) -> Vec<PathBuf> {
-    path_source_roots(mission_dir)
+/// `ModuleNotFoundError` with the target traceback.
+fn pack_stub_roots(target_dir: &Path) -> Vec<PathBuf> {
+    path_source_roots(target_dir)
         .into_iter()
         .map(|root| root.join(".metor"))
         .filter(|dir| dir.is_dir())

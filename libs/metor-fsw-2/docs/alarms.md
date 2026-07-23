@@ -2,16 +2,16 @@
 
 The built-in `Alarms` system checks numeric components once per cycle. It sends alarm definitions, raises, and clears as message telemetry.
 
-Alarms surface problems in the running mission to an operator. They turn raw
+Alarms surface problems in the running target to an operator. They turn raw
 values into clear raise and clear events, keep track of active problems, and
 support operator acknowledgment when a response is required.
 
-## Mission setup
+## Setup
 
 This example checks one element of a three-axis rate:
 
 ```python
-from metor_config import Alarm, Alarms, Target, band
+from metor_config import Alarm, Alarms, Component, band
 
 alarms = m.add(
     "alarms",
@@ -20,7 +20,7 @@ alarms = m.add(
             id="BODY_RATE_HIGH",
             name="Body rate high",
             description="Body Y rate is outside the limit",
-            target=Target("plant.sensors.gyro_b", element=1),
+            target=Component("plant.sensors.gyro_b", element=1),
             warning=band(above=0.05, below=-0.05),
             critical=band(above=0.15, below=-0.15),
             debounce=2,
@@ -43,9 +43,9 @@ The alarm system uses normal framework ports. `AllOutputs` gives it read
 access to telemetered frame values. Message ports send definitions and events
 and accept `AlarmAck`. The coordinator needs no alarm-specific path.
 
-## Target names
+## Component references
 
-A target names a component in a telemetered table output. The common form is:
+A `Component` names a component value in a telemetered table output. The common form is:
 
 ```text
 <instance>.<frame>.<field>
@@ -53,7 +53,7 @@ A target names a component in a telemetered table output. The common form is:
 
 The `element` value selects an item from the component shape. Omit it for a scalar. The default element is zero.
 
-If the mission has a namespace, the build step adds it to the target. With namespace `cube_sat`, this target:
+If the target has a namespace, the build step adds it to the component id. With namespace `cube_sat`, this reference:
 
 ```text
 plant.sensors.gyro_b
@@ -65,7 +65,7 @@ becomes:
 cube_sat.plant.sensors.gyro_b
 ```
 
-The target must be static in the vtable. The alarm resolver skips dynamic member templates. It can still target a fixed component whose value has more than one element.
+The component must be static in the vtable. The alarm resolver skips dynamic member templates. It can still target a fixed component whose value has more than one element.
 
 The source output must allow telemetry. `AllOutputs` hides outputs marked as not telemetered.
 
@@ -82,9 +82,9 @@ Parameter decoding rejects these cases:
 - `debounce` equal to zero
 - a negative, NaN, or infinite hysteresis
 
-The system resolves targets in `init`. It uses one ring view for each source entry, even when several alarms read fields from that entry.
+The system resolves component references in `init`. It uses one ring view for each source entry, even when several alarms read fields from that entry.
 
-It disables an alarm when it finds a duplicate id, no target, a bad element index, or no free reader slot. It logs the cause and adds a health error. It does not stop the mission.
+It disables an alarm when it finds a duplicate id, an unresolved component, a bad element index, or no free reader slot. It logs the cause and adds a health error. It does not stop the target.
 
 The health keys are:
 
@@ -107,7 +107,7 @@ Each definition contains the display name, text, target, default severity, and e
 
 The system reads the newest record for each watched output every cycle. If the producer has not written a new record, the view returns the last value again. The alarm keeps checking that value.
 
-Before the first source record, the alarm does no work for that target.
+Before the first source record, the alarm does no work.
 
 For each value, the system picks one of three cases:
 
@@ -147,7 +147,7 @@ m.route(uplink, alarms, msg="AlarmAck")
 
 The system drains acks before it checks values. A recovered latch can clear in the same cycle that its ack arrives.
 
-Corrupt ack ring data records `alarm_ack_corrupt`. Corrupt target ring data records `alarm_input_corrupt`.
+Corrupt ack ring data records `alarm_ack_corrupt`. Corrupt source ring data records `alarm_input_corrupt`.
 
 ## Event output
 

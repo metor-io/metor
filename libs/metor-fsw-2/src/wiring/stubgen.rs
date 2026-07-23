@@ -1,11 +1,11 @@
 //! Generate typed Python pack modules from pack manifests (`metor-fsw stubgen`).
 //!
-//! A mission's `pyproject.toml` lists its loadable artifacts under
+//! A target's `pyproject.toml` lists its loadable artifacts under
 //! `[tool.metor.artifacts]`; for each, `stubgen` reads the pack's manifest
 //! (the `<cdylib>.manifest` sidecar the build driver writes, so nothing is
 //! `dlopen`ed into this process) and emits a `packs/<id>.py` — into the
-//! mission tree by default, or into a build directory via `--out-dir` (how
-//! a mission's PEP 517 backend keeps stubs venv-only):
+//! target tree by default, or into a build directory via `--out-dir` (how
+//! a target's PEP 517 backend keeps stubs venv-only):
 //!
 //! - an `ARTIFACT` constant carrying the artifact id, crate, lib stem, and a
 //!   `sha256:<hex>` hash of the manifest bytes (the staleness anchor
@@ -36,14 +36,14 @@ use crate::descriptor::{Delivery, FanIn, PortDesc, PortSchema};
 use super::model::Wiring;
 use super::{BuildOptions, WiringBuilder, provision_artifacts};
 
-/// Everything a `stubgen` invocation needs: the mission directory whose
+/// Everything a `stubgen` invocation needs: the target directory whose
 /// `pyproject.toml` lists the artifacts, whether to build them first, and
 /// whether to only verify the checked-in stubs.
 #[derive(Clone, Debug)]
 pub struct StubgenOptions {
-    /// The mission directory (holds `pyproject.toml`; stubs land in `packs/`).
-    pub mission_dir: PathBuf,
-    /// Where to write the `packs` package (default: `<mission_dir>/packs`).
+    /// The target directory (holds `pyproject.toml`; stubs land in `packs/`).
+    pub target_dir: PathBuf,
+    /// Where to write the `packs` package (default: `<target_dir>/packs`).
     /// A build front-end (e.g. a PEP 517 backend) points this at its own
     /// build directory instead of the source tree.
     pub out_dir: Option<PathBuf>,
@@ -196,10 +196,10 @@ fn read_artifacts(pyproject: &Path) -> Result<Vec<(String, ArtifactEntry)>, Stub
     Ok(out)
 }
 
-/// Generate (or verify) the pack modules for the mission at
-/// [`StubgenOptions::mission_dir`].
+/// Generate (or verify) the pack modules for the target at
+/// [`StubgenOptions::target_dir`].
 pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
-    let pyproject = opts.mission_dir.join("pyproject.toml");
+    let pyproject = opts.target_dir.join("pyproject.toml");
     let artifacts = read_artifacts(&pyproject)?;
 
     // Locate each artifact's cdylib: build via the driver (the default, which
@@ -230,7 +230,7 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
     } else {
         for (id, e) in artifacts {
             let cdylib = super::cdylib_file_name(&e.lib);
-            let path = super::build_driver::locate_built(&opts.mission_dir, &cdylib, opts.release)
+            let path = super::build_driver::locate_built(&opts.target_dir, &cdylib, opts.release)
                 .ok_or_else(|| StubgenError::NotBuilt {
                     id: id.clone(),
                     crate_name: e.crate_name_field.clone(),
@@ -246,7 +246,7 @@ pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
     let packs_dir = opts
         .out_dir
         .clone()
-        .unwrap_or_else(|| opts.mission_dir.join("packs"));
+        .unwrap_or_else(|| opts.target_dir.join("packs"));
     let mut report = StubgenReport::default();
     reconcile(&packs_dir.join("__init__.py"), "", opts.check, &mut report)?;
     reconcile(&packs_dir.join("py.typed"), "", opts.check, &mut report)?;
@@ -330,7 +330,7 @@ fn reconcile(
 
 /// Which shape of `ARTIFACT` constant a generated module carries.
 ///
-/// A **local** module (mission-level `stubgen`) records identity only; the
+/// A **local** module (target-level `stubgen`) records identity only; the
 /// build driver compiles the crate at build/run time. A **prebuilt** module
 /// (`pack dev`, and the published pack wheel) also locates its own per-triple
 /// library payload (`_libs/` next to the module), stamps the generating ABI
@@ -449,7 +449,7 @@ fn header(id: &str, crate_name: &str, flavor: &StubFlavor) -> String {
              #\n\
              # Regenerate after changing the pack's params or ports:\n\
              #     metor-fsw pack dev\n\
-             # (a `uv sync` of a mission depending on this pack runs it for you)\n\
+             # (a `uv sync` of a target depending on this pack runs it for you)\n\
              \"\"\"Typed pack module for artifact `{id}`.\"\"\"\n\n",
         ),
     }
@@ -1376,7 +1376,7 @@ mod integration {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn mission_dir() -> tempfile::TempDir {
+    fn target_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("pyproject.toml"),
@@ -1389,7 +1389,7 @@ mod integration {
 
     fn opts(dir: &std::path::Path, check: bool) -> StubgenOptions {
         StubgenOptions {
-            mission_dir: dir.to_path_buf(),
+            target_dir: dir.to_path_buf(),
             out_dir: None,
             check,
             build: true,
@@ -1401,7 +1401,7 @@ mod integration {
     #[test]
     fn generate_then_check_roundtrips() {
         let _guard = lock();
-        let dir = mission_dir();
+        let dir = target_dir();
         if let Err(e) = stubgen(&opts(dir.path(), false)) {
             eprintln!("skipping: stubgen build failed: {e}");
             return;

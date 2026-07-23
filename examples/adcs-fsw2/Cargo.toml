@@ -6,8 +6,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-# The mission host links ONLY the framework: `main` delegates to `metor_fsw_2::cli::main()`
-# (the runner evaluates `mission.py`), and the convergence test's `build_sim_coordinator` builds
+# The target host links ONLY the framework: `main` delegates to `metor_fsw_2::cli::main()`
+# (the runner evaluates `target.py`), and the convergence test's `build_sim_coordinator` builds
 # + dlopens the system cdylibs. It links neither the system crates nor the shared
 # `adcs-contracts` — frames are validated from serialized VTables and params encoded from the
 # exported schema, so the host stays schema-agnostic (dl-open.md §6.3, §8; cli-runner.md §6).
@@ -31,5 +31,5 @@ serde = { version = "1.0", features = ["derive"] }
 # The stubgen round-trip test generates into a temp `--out-dir` (stubs are
 # venv-only build artifacts; there is no checked-in copy to byte-diff).
 tempfile = "3.13"
-# The eclipse/momentum/sequences tests patch the evaluated mission's params value trees.
+# The eclipse/momentum/sequences tests patch the evaluated target's params value trees.
 serde_json = "1.0"

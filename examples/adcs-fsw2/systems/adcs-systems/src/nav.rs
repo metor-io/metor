@@ -1,4 +1,4 @@
-//! The MEKF **navigation filter** of the `adcs-fsw2` mission. It wraps
+//! The MEKF **navigation filter** of the `adcs-fsw2` target. It wraps
 //! [`metor_fsw_adcs::mekf::State`] (a multiplicative EKF), reconstructing the sun
 //! observation from the six raw CSS head readings ([`sun_from_css`]) and modeling the
 //! inertial **references** itself (cube-sat's `Nav::from_sensors`): the sun direction from
@@ -40,7 +40,7 @@ pub struct NavState {
     sigma: f64,
     /// The NOAA WMM handle for the reference magnetic field (built once — holds C-library state).
     mag_model: MagneticModel,
-    /// Seconds of simulated mission time — a deterministic per-cycle counter kept in lockstep
+    /// Seconds of simulated FSW time — a deterministic per-cycle counter kept in lockstep
     /// with the plant's (both start at 0 and advance by `DT` each cycle), so nav evaluates its
     /// sun/field references at the same epoch the plant generated the measurement at.
     t_sim: f64,
@@ -76,7 +76,7 @@ impl NavState {
         gps: &mut Input<Gps>,
         estimate: &mut Output<AttitudeEstimate>,
     ) {
-        // Advance the deterministic mission clock in lockstep with the plant (every cycle,
+        // Advance the deterministic FSW clock in lockstep with the plant (every cycle,
         // regardless of whether a sample is ready), so the reference epoch matches the epoch the
         // plant stamped this cycle's measurement at.
         let epoch = epoch_at(state.t_sim);

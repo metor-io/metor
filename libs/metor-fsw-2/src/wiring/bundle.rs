@@ -1,21 +1,21 @@
-//! Relocatable bundles, directories that carry everything a mission needs to
+//! Relocatable bundles, directories that carry everything a target needs to
 //! run without a source tree, a cargo install, or any config front-end.
 //!
-//! A bundle holds the frozen mission IR side by side with the code it names:
+//! A bundle holds the frozen target IR side by side with the code it names:
 //! `wiring.json` is the versioned [`Wiring`] serialized as JSON (source
 //! anchors, scopes, and per-artifact manifest hashes intact, but artifact
 //! `path`s stripped so the bundle stays relocatable and byte-reproducible),
 //! `meta.json` is a plain-serde [`BundleMeta`] sidecar, and every artifact's
 //! built `cdylib` — plus its `<cdylib>.manifest` sidecar when the build driver
-//! wrote one — is copied in alongside. The `mission.py` that produced the
-//! mission rides along as verbatim provenance and is never consumed on load:
+//! wrote one — is copied in alongside. The `target.py` that produced the
+//! target rides along as verbatim provenance and is never consumed on load:
 //! the run path needs no Python and no config parse, strictly more hermetic
 //! than re-evaluating source on target.
 //!
 //! [`BundleMeta`] records the ABI version and IR version the bundle was built
 //! against, the target triple its `.so`s were compiled for, the build profile,
 //! a timestamp, the `sha256` of the `wiring.json` bytes (the determinism
-//! backstop CI diffs), and the `metor_config` recorder version the mission was
+//! backstop CI diffs), and the `metor_config` recorder version the target was
 //! evaluated with. [`load_bundle`] checks the ABI and target. The later
 //! resolve pass checks the IR version. A triple mismatch is a clean
 //! [`BundleError::TargetMismatch`] before any dlopen, where an arch mismatch
@@ -45,7 +45,7 @@ const META_FILE: &str = "meta.json";
 const WIRING_FILE: &str = "wiring.json";
 /// Base name of the optional provenance copy of the source file; the real name
 /// keeps the source's `.py` extension.
-const PROVENANCE_STEM: &str = "mission";
+const PROVENANCE_STEM: &str = "target";
 
 /// Extension of the single-file bundle form: an uncompressed tar of the
 /// directory layout.
@@ -119,7 +119,7 @@ pub struct PackageOptions {
     /// The target triple the `.so`s were built for, recorded in `meta.json`
     /// and checked against the host at load. `None` records no target.
     pub target: Option<String>,
-    /// The `mission.py` to copy in verbatim as provenance, never consumed on
+    /// The `target.py` to copy in verbatim as provenance, never consumed on
     /// load. `None` writes no provenance copy.
     pub provenance: Option<PathBuf>,
     /// The package timestamp recorded as `built_at_unix`; `None` uses the
@@ -436,8 +436,8 @@ fn write_archive(members: &[(String, MemberSource)], path: &Path) -> Result<(), 
     fs::write(path, out).map_err(io_at(path))
 }
 
-/// The provenance copy's file name: `mission.<ext>` keeping the source's
-/// extension (`mission.py`), or bare `mission` when the source has none.
+/// The provenance copy's file name: `target.<ext>` keeping the source's
+/// extension (`target.py`), or bare `target` when the source has none.
 fn provenance_name(source: &Path) -> String {
     match source.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!("{PROVENANCE_STEM}.{ext}"),

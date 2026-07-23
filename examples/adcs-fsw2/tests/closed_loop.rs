@@ -2,15 +2,15 @@
 //! spacecraft to track its commanded pointing law — **through the dlopen path**, and
 //! matching the statically-linked path bit-for-bit.
 //!
-//! Both runs resolve the **same** `mission.py` (so the `mode` slot's async-fn pack
+//! Both runs resolve the **same** `target.py` (so the `mode` slot's async-fn pack
 //! occupant — always a dlopen cdylib — commissions the spacecraft identically in both), and
 //! differ in exactly one thing: whether the `plant`/`nav`/`ctrl` systems are linked
 //! statically or `dlopen`'d.
 //!
-//! 1. **static** — `mission.py` resolved with `plant`/`nav`/`ctrl` linked as an rlib via a
+//! 1. **static** — `target.py` resolved with `plant`/`nav`/`ctrl` linked as an rlib via a
 //!    [`Registry`] (their `artifact` refs nulled so `resolve` takes the static factory);
 //!    the `mode` slot's sequences stay dlopen.
-//! 2. **dlopen** — the SAME mission, every system `dlopen`'d
+//! 2. **dlopen** — the SAME target, every system `dlopen`'d
 //!    (`adcs_fsw2::build_sim_coordinator`).
 //!
 //! Both must converge (the controller tracks the velocity-vector target the auto-run
@@ -28,17 +28,17 @@ use std::path::Path;
 use adcs_contracts::{BodyState, ModeCmd, tracking_sample};
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{eval_python_mission, provision_artifacts, resolve};
+use metor_fsw_2::wiring::{eval_python_target, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
 mod common;
 
-/// The mission file — the same one the CLI runner and the other tests read.
-fn mission_py() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
+/// The target file — the same one the CLI runner and the other tests read.
+fn target_py() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
 }
 
-/// Cycles each mission runs (≈33 s of simulated time at 120 Hz) — enough to commission and
+/// Cycles each target runs (≈33 s of simulated time at 120 Hz) — enough to commission and
 /// converge onto the (slowly orbit-rotating) pointing target.
 const CYCLES: usize = 4000;
 
@@ -61,7 +61,7 @@ struct Measure {
     rf: f64,
 }
 
-/// Resolve the mission with `plant`/`nav`/`ctrl` linked **statically** (the parity
+/// Resolve the target with `plant`/`nav`/`ctrl` linked **statically** (the parity
 /// reference): build every artifact (the `mode` slot's sequence cdylibs are still loaded),
 /// then null the three systems' `artifact` refs so `resolve` instantiates them through the
 /// [`Registry`] factory instead of `dlopen`. The slot/sequences remain dlopen in both paths,
@@ -70,7 +70,7 @@ struct Measure {
 /// The registry gets the **same** `pack()` the cdylib exports — one registration serving
 /// the static, dlopen, and process loading modes is the pack surface's whole point.
 fn build_static() -> Coordinator {
-    let mut wiring = eval_python_mission(&mission_py()).expect("evaluate mission.py");
+    let mut wiring = eval_python_target(&target_py()).expect("evaluate target.py");
     provision_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
     for spec in &mut wiring.systems {
         // plant/nav/ctrl: link statically via the Registry rather than dlopen. Process
@@ -81,7 +81,7 @@ fn build_static() -> Coordinator {
     }
     let mut registry = Registry::with_builtins();
     registry.register_pack(adcs_systems::pack());
-    resolve(&wiring, &registry).expect("resolve the mission with static systems")
+    resolve(&wiring, &registry).expect("resolve the target with static systems")
 }
 
 /// Run `coord` for `cycles`, measuring convergence by tapping the plant's `body` output (the
@@ -96,7 +96,7 @@ async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
     let body_view: Input<BodyState> = Input::new(
         coord
             .registry()
-            .view(ComponentId::new("plant.body"))
+            .view(ComponentId::new("cube_sat.plant.body"))
             .expect("plant.body is registered")
             .expect("a reader slot is available"),
     );
@@ -172,13 +172,20 @@ fn assert_converged(label: &str, m: &Measure) {
 #[stellarator::test]
 async fn closed_loop_converges_static_and_dlopen() {
     // This suite hard-requires the build plumbing, stubs included.
-    assert!(common::ensure_stubs(), "generate the mission's pack stubs");
+    assert!(common::ensure_stubs(), "generate the target's pack stubs");
 
     // Path 1 — plant/nav/ctrl statically linked (slot/sequences still dlopen).
     let static_run = run_and_measure(build_static(), CYCLES).await;
     assert_converged("static", &static_run);
 
-    // Path 2 — the SAME mission, every system dlopen'd + resolved from the `Wiring`.
+    // Dropping path 1's coordinator cancels its `TcpServer` accept task, but the
+    // cancelled task (which owns the listener) is only reaped on later scheduler
+    // ticks — yield so the port is actually released before path 2 binds it.
+    for _ in 0..8 {
+        stellarator::yield_now().await;
+    }
+
+    // Path 2 — the SAME target, every system dlopen'd + resolved from the `Wiring`.
     let dl_coord = adcs_fsw2::build_sim_coordinator()
         .expect("build the system cdylibs, dlopen + resolve them");
     let dl_run = run_and_measure(dl_coord, CYCLES).await;

@@ -13,7 +13,7 @@
 //! build worker or another tracing thread, while ring writes belong to the
 //! single-threaded cycle loop. It is bounded and drop-newest: a runaway log
 //! source costs events, counted and folded into coordinator health as
-//! `log_dropped`, never memory or cycle time. Events fired before the mission
+//! `log_dropped`, never memory or cycle time. Events fired before the target
 //! starts (build, init) simply sit in the queue and flush on the first cycle.
 
 use std::collections::VecDeque;
@@ -151,9 +151,9 @@ where
             names.join(":")
         });
         let ev = LogEvent {
-            // Mission time at the instant the event fired; wall only before
+            // FSW time at the instant the event fired; wall only before
             // the first cycle (build/init), which coincides with the epoch.
-            timestamp: crate::clock::mission_now_or_wall(),
+            timestamp: crate::clock::now_or_wall(),
             level: level_of(meta.level()),
             source: meta.target().to_string(),
             target: meta.target().to_string(),

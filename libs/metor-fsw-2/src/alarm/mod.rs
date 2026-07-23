@@ -11,7 +11,7 @@
 //! The module has three parts:
 //!
 //! - the config surface ([`AlarmsParams`], [`AlarmSpec`]), the serde types a
-//!   mission file's `system "alarms" type="Alarms" { alarm … }` node
+//!   target file's `system "alarms" type="Alarms" { alarm … }` node
 //!   deserializes into, validated at load so a bad spec is a spanned config
 //!   error rather than a runtime surprise;
 //! - the evaluation state machine ([`AlarmEval`]), pure per-alarm state with
@@ -46,7 +46,7 @@
 //!
 //! A target that fails to resolve (unknown component, out-of-range element,
 //! duplicate alarm id, no reader slot left) disables that alarm and reports
-//! through health; it never panics the mission.
+//! through health; it never panics the target.
 
 use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{ComponentId, Timestamp};
@@ -412,7 +412,7 @@ impl AlarmEval {
 
 /// Operator acks flowing into [`AlarmSystem`] over an ordinary message edge
 /// (`connect "uplink" -> "alarms" msg="AlarmAck"`), its only input. Zero
-/// producers is a legal, ack-less mission.
+/// producers is a legal, ack-less target.
 #[derive(crate::SystemInput)]
 pub struct AlarmIn {
     acks: MsgIn<AlarmAck>,
@@ -426,7 +426,7 @@ pub struct AlarmIn {
 #[derive(crate::SystemOutput)]
 pub struct AlarmOut {
     /// The full def set as one latest-wins snapshot: the downlink retains
-    /// it, so a panel connecting mid-mission still learns every alarm.
+    /// it, so a panel connecting mid-target still learns every alarm.
     #[fsw(snapshot)]
     defs: MsgOut<AlarmDefs>,
     raised: MsgOut<AlarmRaised>,
@@ -458,7 +458,7 @@ struct Watch {
 
 /// The alarm engine, a cyclic system that evaluates the configured limit
 /// alarms each cycle and reports transitions as alarm messages. Registered
-/// like any system, either as `m.add("alarms", Alarms(...))` in a `mission.py`
+/// like any system, either as `m.add("alarms", Alarms(...))` in a `target.py`
 /// or with `add_cyclic_named`; it reads through a receive-all tap, so it must
 /// register after the systems it watches.
 pub struct AlarmSystem {
@@ -499,7 +499,7 @@ impl BuildSystem for AlarmSystem {
         }
     }
 
-    /// Prefix each authored target with the mission namespace so its
+    /// Prefix each authored target with the target namespace so its
     /// [`ComponentId`] matches the namespace-qualified registry the engine
     /// resolves against. The `component` string itself is rewritten, so the
     /// broadcast [`AlarmDef`] target and the raise messages carry the same

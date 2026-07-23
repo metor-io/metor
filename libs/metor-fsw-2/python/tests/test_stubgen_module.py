@@ -3,7 +3,7 @@
 The checked-in ``tests/data/demo.py`` is the exact module ``metor-fsw
 stubgen`` produces for a fixture manifest (a Rust golden test pins the text).
 Here the recorder side is exercised: importing the module, constructing its
-typed entries, and adding them to a :class:`Mission` records the same IR the
+typed entries, and adding them to a :class:`Target` records the same IR the
 untyped Phase 1 path would, and the artifact the module declares is
 auto-registered — no explicit ``m.artifact(...)`` needed.
 """
@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "metor-config")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "data"))
 
 import metor_config as mc
-from metor_config import Artifact, InPort, Mission, OutPort, System
+from metor_config import Artifact, InPort, Target, OutPort, System
 
 import demo
 
@@ -58,10 +58,10 @@ class TypedCoreTest(unittest.TestCase):
 
 class RecordTest(unittest.TestCase):
     def setUp(self):
-        mc._missions.clear()
+        mc._targets.clear()
 
     def test_add_auto_registers_artifact_and_records_system(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         w = m.add("w", demo.Widget(count=5))
         ir = m.to_ir()
 
@@ -85,7 +85,7 @@ class RecordTest(unittest.TestCase):
         self.assertEqual((ref.instance, ref.port), ("w", "sensors"))
 
     def test_occupant_callable_records_in_a_slot(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         mode = m.slot(
             "mode",
             inputs=["gps"],
@@ -101,13 +101,13 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(mode.name, "mode")
 
     def test_duplicate_artifact_ids_dedupe(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         m.add("a", demo.Widget())
         m.add("b", demo.Widget())
         self.assertEqual(len(m.to_ir()["artifacts"]), 1)
 
     def test_conflicting_artifact_definition_is_an_error(self):
-        m = Mission(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         m.add("a", demo.Widget())
         rogue = System("Widget", Artifact(id="demo", crate="other", lib="other"))
         with self.assertRaises(ValueError):

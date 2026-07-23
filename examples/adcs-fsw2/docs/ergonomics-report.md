@@ -1,13 +1,13 @@
 # metor-fsw-2 ergonomics report
 
 Written while bringing `adcs-fsw2` to feature parity with the older `examples/cube-sat`
-mission. The parity port — full plant physics (reaction wheels, orbit/gravity, sensor
+target. The parity port — full plant physics (reaction wheels, orbit/gravity, sensor
 suite), pointing modes wired through the `mode` slot into the controller, nav reference
 modeling, live uplink — landed cleanly and entirely example-side. This report records the
-friction that surfaced and what would make the framework more ergonomic for the next mission.
+friction that surfaced and what would make the framework more ergonomic for the next target.
 
 The headline: **`metor-fsw-2`'s architecture is a real step up from the cube-sat monolith**
-(dlopen cdylib systems, declarative `mission.kdl`, a shared `contracts` crate, framework-
+(dlopen cdylib systems, declarative `target.kdl`, a shared `contracts` crate, framework-
 native slots/sequences, framework telemetry/uplink, a static-vs-dlopen parity test). Every
 item below is a refinement, not a redesign. They are ordered roughly by impact.
 
@@ -17,7 +17,7 @@ item below is a refinement, not a redesign. They are ordered roughly by impact.
 
 > **RESOLVED (2026-07-05, `libs/metor-fsw-2/docs/alarms.md`):** the recommended generic
 > `AlarmSystem` shipped as a framework built-in (`system "alarms" type="Alarms"`), and this
-> mission now declares an `ADCS_RATE_HIGH` alarm in `mission.kdl`. The design differs from
+> target now declares an `ADCS_RATE_HIGH` alarm in `target.kdl`. The design differs from
 > the sketch below where the framework moved underneath it: the bespoke `alarm_out()` /
 > `message_out(channel)` capabilities (§2) were obsoleted by the wiring-parity work — a
 > telemetered `MsgOut<AlarmRaised>` is now just an ordinary output-bundle port — and the
@@ -41,7 +41,7 @@ that code**:
 
 So anything host-side that emits subscribable messages **must be a metor-fsw-2 library
 system**. That is the correct home for a *generic* monitor, but it means the framework, not
-the mission, owns the feature.
+the target, owns the feature.
 
 **Recommendation — add a generic `AlarmSystem` to metor-fsw-2** (modeled on
 `TelemetrySystem`, registered before it). The design is mostly free:
@@ -112,7 +112,7 @@ drives `ctrl`) has a meaningless timestamp.
 
 Each system's `Params` must derive **both** `Schema` (the dlopen path, postcard across
 `fsw_create`) **and** `FromKdlNode` (the static path, when a `Registry` resolves the same
-`mission.kdl`). The two are independent re-encodings of the same fields, and a mission author
+`target.kdl`). The two are independent re-encodings of the same fields, and a target author
 has to know to add both — the second only surfaces when you try to link a system statically
 (which the parity test does). The contracts crate also repeats the long frame-derive litany
 (`Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone` + `#[repr(C)]` + manual `_pad`
@@ -131,7 +131,7 @@ once `ctrl` consumes `ModeCmd`, the control loop depends on the slot's mode writ
 pure-static reference can no longer reproduce the dlopen run.
 
 The resolution turned out clean and is worth noting as a **pattern**, not just a workaround:
-the test resolves the **same `mission.kdl`** for both paths, nulling `plant`/`nav`/`ctrl`'s
+the test resolves the **same `target.kdl`** for both paths, nulling `plant`/`nav`/`ctrl`'s
 `artifact` so `resolve` links them statically via a `Registry`, while the `mode` slot's
 sequences stay dlopen in both (`tests/closed_loop.rs`). Result: the two runs differ in exactly
 one variable (system linkage) and stay **bit-identical**, which is a *stronger* parity claim
@@ -171,18 +171,18 @@ Sharing one `ReactionWheel` struct as both the plant's internal state and its te
   degenerates when the pointing direction is anti-parallel to the body axis (the velocity-
   vector law at orbit injection); the `target_for` NaN-guard handles it. Nothing for the
   framework here — just a reminder that app math owns its singularities.
-- **No deterministic mission epoch — systems roll their own sim-time.** The `Simulated` clock
+- **No deterministic target epoch — systems roll their own sim-time.** The `Simulated` clock
   seeds its start epoch from `Timestamp::now()` (wall clock), so the per-cycle `now` a system
-  receives is not a reproducible mission time. Any system that needs a deterministic epoch (here
+  receives is not a reproducible FSW time. Any system that needs a deterministic epoch (here
   the plant and nav both do — for the sun ephemeris and the WMM field) must keep a **private
   `t_sim` counter** (`+= DT` each cycle from a fixed `mission_epoch()`), and two systems that
   must agree on the epoch (plant generates a measurement, nav references it) rely on both
   counters starting at 0 and advancing in lockstep. A framework-provided deterministic
-  `sim_time()`/mission-epoch handle (seeded from the mission, not the wall clock) would remove
+  `sim_time()`/target-epoch handle (seeded from the target, not the wall clock) would remove
   the duplicated counters and the lockstep assumption. Related to the sequence-`now` gap (§4).
 - **`disarmed` is a KDL edit, not a CLI flag.** The runner exposes `--build/--wall/
-  --telemetry/--uplink` but no mission-specific flags, so the `--disarmed` parity is a
-  `mission.kdl` property. Fine, but worth a generic "override any system param from the CLI"
+  --telemetry/--uplink` but no target-specific flags, so the `--disarmed` parity is a
+  `target.kdl` property. Fine, but worth a generic "override any system param from the CLI"
   story (`--set plant.disarmed=#true`) for operability.
 - **Single-nested-field frames double their name in component paths** *(found in the
   disturbances/desat pass)*. A frame `wheels` whose one field is `wheels: [ReactionWheel; 3]`
@@ -198,7 +198,7 @@ Sharing one `ReactionWheel` struct as both the plant's internal state and its te
   field is a resolve error (`missing required param 'rho'`) even though the same field
   defaults fine when a `Registry` deserializes the params for a statically-linked system.
   Either the schema should carry defaults or the mismatch deserves a loud doc note; this
-  mission just spells every plant param out in `mission.kdl`.
+  target just spells every plant param out in `target.kdl`.
 
 ---
 

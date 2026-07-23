@@ -283,13 +283,13 @@ pub(crate) struct InitGraph {
     /// Override of the shared-memory session root; `None` picks `/dev/shm`
     /// when present, else the OS temp dir.
     pub(crate) shm_dir: Option<PathBuf>,
-    /// The mission IR to broadcast as a [`WiringManifest`], set by
+    /// The target IR to broadcast as a [`WiringManifest`], set by
     /// [`set_wiring_manifest`](Self::set_wiring_manifest), which also injects the
     /// matching `wiring` Host output onto the coordinator #0 bundle.
     pub(crate) wiring_manifest: Option<WiringManifest>,
-    /// The mission namespace, prepended to every telemetry instance name at
+    /// The target namespace, prepended to every telemetry instance name at
     /// the registry/announce seam ([`qualify`](Self::qualify)). `None` leaves
-    /// names and ids byte-identical to an un-namespaced mission. Set by the
+    /// names and ids byte-identical to an un-namespaced target. Set by the
     /// front-end from [`CoordinatorSpec::namespace`](crate::ir::CoordinatorSpec);
     /// deliberately not on [`CoordinatorConfig`], which stays `Copy`, and not on
     /// [`Node::name`], which wiring resolves against unprefixed.
@@ -363,7 +363,7 @@ impl InitGraph {
         SystemHandle { id: 0 }
     }
 
-    /// Qualify a telemetry instance name with the mission
+    /// Qualify a telemetry instance name with the target
     /// [`namespace`](Self::namespace): `"sat1.<instance>"` when set, the bare
     /// name otherwise. This is the one seam the prefix rides — registry keys,
     /// the announce prefix, and file-backed ring names all pass through it,

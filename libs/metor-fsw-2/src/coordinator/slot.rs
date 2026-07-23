@@ -1,7 +1,7 @@
 //! Runtime-swappable slot occupants.
 //!
 //! A slot is a cyclic system the coordinator drives every cycle like any
-//! other, except that its occupant can be replaced while the mission runs.
+//! other, except that its occupant can be replaced while the target runs.
 //! Runtime commands `Load`, `Start`, `Stop`, `Abort`, and `Reset` the
 //! occupant over the same create/execute/destroy ABI a statically wired
 //! dynamic system uses; there are no extra lifecycle symbols. Occupants are
@@ -11,7 +11,7 @@
 //!
 //! # Ring ownership
 //!
-//! The coordinator owns every ring for the whole mission. An occupant only
+//! The coordinator owns every ring for the whole target. An occupant only
 //! borrows writer and reader handles over them, so dropping the occupant
 //! (its `Drop` runs `fsw_destroy`) releases the ring roles, and a later
 //! `Load` attaches fresh handles over the same regions. [`SlotRunner`]
@@ -167,7 +167,7 @@ pub struct InitialOccupant {
 }
 
 /// A slot registration `plan_slot` rejected. The wiring front-end maps these
-/// onto its own `LoadError`s; a mission author's typo is not a library bug, so
+/// onto its own `LoadError`s; a target author's typo is not a library bug, so
 /// none of these panic.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum SlotConfigError {
@@ -632,7 +632,7 @@ impl SlotRunner {
     /// A worker failed the slot — mid-pipeline or mid-run: land the terminal
     /// stop and tell the operator why. No auto-restart, deliberately:
     /// re-running a sequence silently re-issues every command it already
-    /// sent, a mission-level decision, so recovery stays with the operator's
+    /// sent, a target-level decision, so recovery stays with the operator's
     /// existing `Reset`/`Load`.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn fail_occupant(&mut self, reason: String) {
@@ -1009,7 +1009,7 @@ impl CyclicSlot for SlotRunner {
     }
 
     fn shutdown(&mut self) {
-        // Mission teardown is the one graceful exit a proc occupant's worker
+        // Target teardown is the one graceful exit a proc occupant's worker
         // gets — shutdown request, grace window, then kill — unlike the
         // runtime `Stop`'s immediate kill; blocking is acceptable here.
         #[cfg(any(target_os = "linux", target_os = "macos"))]

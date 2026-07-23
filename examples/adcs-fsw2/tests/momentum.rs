@@ -7,7 +7,7 @@
 //! resolution.
 //!
 //! Both runs use the static path (plant/nav/ctrl as rlibs, like `closed_loop.rs`'s parity
-//! reference) off a patched `mission.py`: the wheel preload set to a controllable level,
+//! reference) off a patched `target.py`: the wheel preload set to a controllable level,
 //! the alarm band scaled around it, and `k_desat` set per run. Gated off `miri`
 //! (provision_artifacts still builds the sequence cdylibs the `mode` slot loads).
 
@@ -21,11 +21,11 @@ use adcs_contracts::{BodyState, V3, Wheels};
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::AlarmRaised;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{ParamSource, Wiring, eval_python_mission, provision_artifacts, resolve};
+use metor_fsw_2::wiring::{ParamSource, Wiring, eval_python_target, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, MsgIn};
 
-fn mission_py() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("mission.py")
+fn target_py() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("target.py")
 }
 
 mod common;
@@ -46,19 +46,19 @@ fn params_of<'a>(
     }
 }
 
-/// 75 s of mission at 120 Hz. The torquers' authority against the ~40 µT field is
+/// 75 s of target at 120 Hz. The torquers' authority against the ~40 µT field is
 /// ~1e-5 N·m at the 0.2 A·m² clamp, so the window is enough to dump a few 1e-4 N·m·s of
 /// the field-perpendicular preload — well above the no-desat baseline's drift.
 const CYCLES: usize = 9000;
 
-/// Per-wheel stored-momentum preload (N·m·s). Sized by controllability, not the mission
+/// Per-wheel stored-momentum preload (N·m·s). Sized by controllability, not the target
 /// alarm band: the gyroscopic coupling `ω × h_w` during the commissioning slew (ω ~ 0.05)
 /// must stay well under the wheels' 2e-3 N·m authority, capping |Σh| near 0.017 — so the
 /// run patches the alarm band down around the preload instead of preloading into the
-/// mission's near-saturation band (where the spacecraft is genuinely uncontrollable).
+/// target's near-saturation band (where the spacecraft is genuinely uncontrollable).
 const PRELOAD: f64 = 0.01;
 
-/// The `mission.kdl` mission with the preload cranked, `k_desat` set for this run, and the
+/// The `target.kdl` target with the preload cranked, `k_desat` set for this run, and the
 /// boot tumble becalmed — with ~0.06 N·m·s stored, the gyroscopic coupling `ω × h_w` of the
 /// full 0.15 rad/s tumble (~6e-3 N·m) dwarfs the wheels' 2e-3 N·m authority and the
 /// spacecraft precesses uncontrollably (the very failure desat exists to prevent; not this
@@ -68,10 +68,10 @@ fn build_static(k_desat: f64) -> Option<Coordinator> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_mission(&mission_py()) {
+    let mut wiring = match eval_python_target(&target_py()) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("skipping: mission.py did not evaluate: {e}");
+            eprintln!("skipping: target.py did not evaluate: {e}");
             return None;
         }
     };
@@ -102,7 +102,7 @@ fn build_static(k_desat: f64) -> Option<Coordinator> {
     }
     let mut registry = Registry::with_builtins();
     registry.register_pack(adcs_systems::pack());
-    Some(resolve(&wiring, &registry).expect("resolve the patched mission"))
+    Some(resolve(&wiring, &registry).expect("resolve the patched target"))
 }
 
 /// One run's measurements: total wheel momentum |Σh| at the first and last cycle, the
@@ -121,19 +121,19 @@ async fn run_and_measure(mut coord: Coordinator) -> Measure {
     let registry = coord.registry();
     let wheels_view: Input<Wheels> = Input::new(
         registry
-            .view(ComponentId::new("plant.wheels"))
+            .view(ComponentId::new("cube_sat.plant.wheels"))
             .expect("plant.wheels is registered")
             .expect("a reader slot is available"),
     );
     let body_view: Input<BodyState> = Input::new(
         registry
-            .view(ComponentId::new("plant.body"))
+            .view(ComponentId::new("cube_sat.plant.body"))
             .expect("plant.body is registered")
             .expect("a reader slot is available"),
     );
     let mut raised: MsgIn<AlarmRaised> = MsgIn::new(
         registry
-            .get(ComponentId::new("alarms.AlarmRaised"))
+            .get(ComponentId::new("cube_sat.alarms.AlarmRaised"))
             .expect("alarms.AlarmRaised is registered")
             .view()
             .expect("a reader slot is available"),
@@ -203,10 +203,10 @@ async fn desat_dumps_preloaded_momentum() {
     // The alarm's nested-array target resolved and fired on the preload — the live check
     // of the `plant.wheels.wheels.0.ang_momentum` path.
     assert!(a.momentum_alarm, "RW_MOMENTUM_HIGH raised on the preload");
-    // Desat rides along without destabilizing the mission: the boot tumble still damps.
+    // Desat rides along without destabilizing the target: the boot tumble still damps.
     assert!(
         a.rate_f < 0.05,
-        "mission still converges under desat: {}",
+        "target still converges under desat: {}",
         a.rate_f
     );
     // The torquers dumped a measurable slice of the preload relative to the no-desat

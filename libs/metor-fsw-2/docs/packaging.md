@@ -1,11 +1,11 @@
 # Packaging
 
-Packaging turns pack and mission source into artifacts that can run without
+Packaging turns pack and target source into artifacts that can run without
 the source tree that built them.
 
-A pack package makes a set of systems available to mission authors. A mission
-bundle fixes one mission's wiring and native libraries for a target. Together
-they support pack reuse, repeatable mission builds, and deployment to hosts
+A pack package makes a set of systems available to target authors. A target
+bundle fixes one target's wiring and native libraries for a target triple. Together
+they support pack reuse, repeatable target builds, and deployment to hosts
 that do not have Python, Cargo, or the original repository.
 
 See the [command-line guide](cli.md) for the commands that build, inspect, run,
@@ -17,15 +17,15 @@ Metor FSW produces two main artifact types:
 
 | Artifact | Used by | Contains |
 | --- | --- | --- |
-| Pack wheel | Mission authors | Typed Python module, native libraries, pack manifests |
-| Mission bundle | Mission host | Frozen wiring IR, selected native libraries, build metadata |
+| Pack wheel | Target authors | Typed Python module, native libraries, pack manifests |
+| Target bundle | Target host | Frozen wiring IR, selected native libraries, build metadata |
 
-A pack wheel can serve many missions. A mission bundle serves one resolved
-mission.
+A pack wheel can serve many targets. A target bundle serves one resolved
+target.
 
-For example, a team may publish `adcs-pack` once. Several missions can import
-its `Plant` and `Nav` system types. Each mission can then produce its own
-`.metor` bundle with different params, edges, and target libraries.
+For example, a team may publish `adcs-pack` once. Several targets can import
+its `Plant` and `Nav` system types. Each target can then produce its own
+`.metor` bundle with different params, edges, and per-triple libraries.
 
 ## Pack project metadata
 
@@ -97,12 +97,12 @@ Local development writes the same module shape that an installed wheel uses:
 ```
 
 `__init__.py` contains typed system classes, port markers, params, artifact
-data, and the manifest hash. A mission imports those classes to record system
+data, and the manifest hash. A target imports those classes to record system
 specs in its wiring IR.
 
 Using the installed layout during development keeps imports and artifact
-selection the same in both cases. A mission can switch between an editable
-path source and an indexed wheel without changing `mission.py`.
+selection the same in both cases. A target can switch between an editable
+path source and an indexed wheel without changing `target.py`.
 
 ## Pack wheel layout
 
@@ -138,16 +138,16 @@ compatible minor range for `metor-config` unless the project already declares
 those requirements. These pins stop an environment from combining a pack with
 an incompatible host or recorder.
 
-## Mission bundles
+## Target bundles
 
-A mission bundle fixes the wiring IR and every native library that the mission
+A target bundle fixes the wiring IR and every native library that the target
 needs. It can be a directory or a single `.metor` file.
 
 ```text
-mission.bundle/
+target.bundle/
   meta.json
   wiring.json
-  mission.py
+  target.py
   libadcs_systems.so
   libadcs_systems.so.manifest
 ```
@@ -155,10 +155,10 @@ mission.bundle/
 The `.metor` form contains the same members in an uncompressed tar archive.
 The archive uses a fixed member order and clears variable tar metadata.
 
-`wiring.json` holds wiring IR v4 with build paths removed. It is the mission
-definition that the target will resolve and run.
+`wiring.json` holds wiring IR v4 with build paths removed. It is the target
+definition that the host will resolve and run.
 
-`mission.py` records provenance. Bundle load never evaluates it. A CI check
+`target.py` records provenance. Bundle load never evaluates it. A CI check
 may evaluate the copy later and compare its output with the frozen IR.
 
 `meta.json` records:
@@ -178,17 +178,17 @@ Bundle load checks the ABI version, target triple, wiring digest, library
 names, and manifest hashes before it loads native code. Resolve then checks the
 IR version, params, ports, and graph.
 
-These checks give failures clear causes. A host can report a wrong target,
-stale pack interface, changed library, or changed wiring before the mission
-starts.
+These checks give failures clear causes. A host can report a wrong target
+triple, stale pack interface, changed library, or changed wiring before the
+target starts.
 
 The library hash checks that the copied native file did not change. The
 manifest hash checks that the pack interface still matches the interface used
-when the mission was built. They protect different parts of the package.
+when the target was built. They protect different parts of the package.
 
 ## Repeatable output
 
-Artifact paths do not form part of mission identity. Packaging removes local
+Artifact paths do not form part of target identity. Packaging removes local
 build paths from the IR before it writes `wiring.json`.
 
 Generated pack modules use stable ordering and contain no build timestamp.
@@ -196,12 +196,12 @@ Wheel entries use a fixed order and timestamp. `.metor` archive entries use a
 fixed order and cleared metadata.
 
 The bundle records a digest of the exact `wiring.json` bytes. A config-stability
-check can evaluate the copied `mission.py`, remove location-only differences,
+check can evaluate the copied `target.py`, remove location-only differences,
 and compare the result with those frozen bytes.
 
 This does not prove that two native builds have the same machine code. It does
-make changes in mission structure, pack interfaces, and packaged files visible
-to CI and the target loader.
+make changes in target structure, pack interfaces, and packaged files visible
+to CI and the host loader.
 
 ## Cross-target builds
 

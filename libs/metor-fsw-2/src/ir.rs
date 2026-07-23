@@ -1,10 +1,10 @@
-//! The [`Wiring`] data model, a plain serializable description of a mission.
+//! The [`Wiring`] data model, a plain serializable description of a target.
 //!
-//! This module is the mission IR: pure data plus its serde/serde_json codec,
+//! This module is the target IR: pure data plus its serde/serde_json codec,
 //! carrying no runtime types, so an evaluated front-end can emit it and the
-//! host can re-ingest it with only the `wiring-model` feature. The Python-eval
-//! path, the Rust builder, and the shared resolver live under the `wiring`-gated
-//! [`wiring`](crate::wiring) module, which re-exports these types.
+//! host can re-ingest it. The Python-eval path, the Rust builder, and the
+//! shared resolver live under the [`wiring`](crate::wiring) module, which
+//! re-exports these types.
 //!
 //! Both front-ends produce this type. The Python `metor_config` recorder emits
 //! it as JSON and the [`wiring::WiringBuilder`](crate::wiring::WiringBuilder)
@@ -27,10 +27,10 @@ use serde::{Deserialize, Serialize};
 /// different-generation producer fails loudly instead of misresolving.
 pub const IR_VERSION: u32 = 5;
 
-/// A plain-data description of a complete mission, naming the systems that
+/// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
 ///
-/// Produced by [`eval_python_mission`](crate::wiring::eval_python_mission) or
+/// Produced by [`eval_python_target`](crate::wiring::eval_python_target) or
 /// [`WiringBuilder`](crate::wiring::WiringBuilder), and consumed by
 /// [`resolve`](crate::wiring::resolve). The telemetry link appears
 /// here as an ordinary [`TCP_SERVER_TYPE`] state plus [`DOWNLINK_TYPE`]/
@@ -43,7 +43,7 @@ pub struct Wiring {
     pub ir_version: u32,
     /// Coordinator-wide config (cycle rate, default ring depth, clock).
     pub coordinator: CoordinatorSpec,
-    /// The shared objects this mission loads, one pack per cdylib.
+    /// The shared objects this target loads, one pack per cdylib.
     pub artifacts: Vec<Artifact>,
     /// The pack-shared state instances, constructed before any system (see
     /// [`Pack::shared_state`](crate::Pack::shared_state)). A document that
@@ -91,7 +91,7 @@ impl Wiring {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceRef {
     /// The source file, when the front-end knows it (the evaluated
-    /// `mission.py`'s path).
+    /// `target.py`'s path).
     pub file: Option<String>,
     /// 1-based line of the declaring node.
     pub line: u32,
@@ -119,13 +119,13 @@ pub struct ScopeSpec {
 pub const TCP_SERVER_TYPE: &str = "TcpServer";
 
 /// Registry `type=` of the built-in telemetry downlink, a
-/// [`TelemetrySystem`](crate::TelemetrySystem) attached to the mission's
+/// [`TelemetrySystem`](crate::TelemetrySystem) attached to the target's
 /// [`TCP_SERVER_TYPE`] state, configured by
 /// [`DownlinkParams`](crate::DownlinkParams).
 pub const DOWNLINK_TYPE: &str = "Downlink";
 
 /// Registry `type=` of the built-in command uplink, an
-/// [`UplinkSystem`](crate::UplinkSystem) attached to the mission's
+/// [`UplinkSystem`](crate::UplinkSystem) attached to the target's
 /// [`TCP_SERVER_TYPE`] state, configured by
 /// [`UplinkParams`](crate::UplinkParams).
 pub const UPLINK_TYPE: &str = "Uplink";
@@ -148,7 +148,7 @@ pub struct CoordinatorSpec {
     /// [`ComponentId`](metor_proto::types::ComponentId) uniformly, so several
     /// targets connected into one db keep disjoint namespaces. `None` is the
     /// unprefixed identity — names and ids are byte-identical to an
-    /// un-namespaced mission. Wiring resolves on the bare instance names
+    /// un-namespaced target. Wiring resolves on the bare instance names
     /// regardless; the prefix rides only the registry/announce seam.
     #[serde(default)]
     pub namespace: Option<String>,

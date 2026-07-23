@@ -1,27 +1,27 @@
 # Metor FSW design
 
-Metor FSW is a framework for building modular flight software. A mission is a
+Metor FSW is a framework for building modular flight software. A target is a
 checked graph of systems. Each system has typed input and output ports. The
 coordinator owns the graph, its ring buffers, and the cycle clock.
 
-It lets a team build a mission from small parts that can be developed, tested,
+It lets a team build a target from small parts that can be developed, tested,
 and reused on their own. A sensor driver, estimator, and controller each have
-one clear job. The mission then connects those parts and checks that they agree
+one clear job. The target then connects those parts and checks that they agree
 about the data they exchange.
 
-Mission code can link systems into the host, load them from a pack library, or
+Target code can link systems into the host, load them from a pack library, or
 run them in a worker process. All three forms use the same port descriptions
 and wiring checks.
 
-## One mission cycle
+## One FSW cycle
 
-The resolver checks the mission before it runs. It loads each system
+The resolver checks the target before it runs. It loads each system
 description, checks each edge, sizes the rings, and binds the ports.
 
-The coordinator then runs cyclic systems in mission order. One timestamp is
+The coordinator then runs cyclic systems in wiring order. One timestamp is
 used for the full cycle.
 
-For example, a mission may run these systems in this order:
+For example, a target may run these systems in this order:
 
 ```text
 imu -> navigation -> control -> downlink
@@ -54,7 +54,7 @@ See [Frames](frames.md) and [Ports, messages, and rings](messages.md).
 Use a function system for most cyclic work. Its function args declare its
 ports.
 
-Use `Pack::task` for an async function that must advance on the mission clock.
+Use `Pack::task` for an async function that must advance on the FSW clock.
 The driver polls it once per cycle. Sequences use this form.
 
 Use a `CyclicSystem` struct when state and port bundles need named types. Use an
@@ -63,17 +63,17 @@ The coordinator does not poll that task once per cycle.
 
 See [Systems](system.md) and [Coordinator](coordinator.md).
 
-## Mission input
+## Target input
 
-A `mission.py` file and the Rust `WiringBuilder` both produce wiring IR v4.
+A `target.py` file and the Rust `WiringBuilder` both produce wiring IR v4.
 The IR holds shared states, systems, runtime slots, edges, artifacts, and
 coordinator settings.
 
 The resolver applies the same checks to both inputs. It also writes a stripped
 copy of the IR to the wiring manifest output for tools that inspect a live
-mission.
+target.
 
-See [Mission wiring](wiring.md).
+See [Target wiring](wiring.md).
 
 ## Code loading
 

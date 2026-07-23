@@ -55,11 +55,11 @@ enum Dir {
 
 /// Resolve-time overrides that a [`Wiring`] does not itself carry.
 ///
-/// A `Wiring` is a portable mission description, so host-environment policy —
+/// A `Wiring` is a portable target description, so host-environment policy —
 /// where a process worker's executable lives, where the shared-memory session
 /// dir is rooted, how a worker's steps are timed and its crashes recovered — is
 /// supplied here at [`resolve_with`] time rather than baked into the IR. These
-/// are deployment decisions, not mission topology, so they stay off the
+/// are deployment decisions, not target topology, so they stay off the
 /// serialized IR (`wiring.json` is unaffected); each override falls back to the
 /// matching [`CoordinatorConfig`] default when `None`. The defaults (re-exec
 /// the host binary as the worker, `/dev/shm` or the OS temp dir for sessions,
@@ -126,7 +126,7 @@ pub fn resolve_with(
     let mut graph = InitGraph::new(config);
     graph.worker_exe = opts.worker_exe;
     graph.shm_dir = opts.shm_dir;
-    // The mission namespace rides the registry/announce seam (`InitGraph::qualify`)
+    // The target namespace rides the registry/announce seam (`InitGraph::qualify`)
     // and is threaded into each static system's `configure` via `LoadCtx`.
     graph.namespace = wiring.coordinator.namespace.clone();
 

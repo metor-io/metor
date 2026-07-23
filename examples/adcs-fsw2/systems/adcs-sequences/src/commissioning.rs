@@ -8,12 +8,12 @@
 //! Every transition is gated on what the FSW observes (the attitude estimate and the GPS
 //! orbit state — never truth), every phase has a timeout that safes the spacecraft and
 //! fails the sequence, and a cooperative `Abort` (latched at any `wait`) safes and bails
-//! out `Aborted`. The gates and budgets ride [`CommissioningParams`] off the mission's
+//! out `Aborted`. The gates and budgets ride [`CommissioningParams`] off the target's
 //! `allow` line, which is also how tests patch them.
 //!
 //! *Detumble (magnetorquer-only rate damping, `LAW_DETUMBLE`) is entered only when the
 //! estimated rate is beyond what the reaction wheels should capture — the boot tumble is
-//! not, so mission runs go straight from warm-up to coarse pointing.
+//! not, so target runs go straight from warm-up to coarse pointing.
 
 use core::time::Duration;
 

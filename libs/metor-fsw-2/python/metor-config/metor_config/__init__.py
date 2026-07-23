@@ -1,8 +1,8 @@
-"""Record a metor-fsw mission as the ``Wiring`` IR the host resolves.
+"""Record a metor-fsw target as the ``Wiring`` IR the host resolves.
 
-A mission file builds a :class:`Mission`, declares its artifacts, adds systems
+A target file builds a :class:`Target`, declares its artifacts, adds systems
 and slots, and connects their ports; each call records a plain-data spec. At
-interpreter exit (or an explicit :func:`emit`) the recorded mission is
+interpreter exit (or an explicit :func:`emit`) the recorded target is
 serialized to the JSON ``Wiring`` the Rust host ingests.
 
 serde's representation is the contract, so the shapes here mirror
@@ -13,8 +13,8 @@ absent optionals emitted as ``null``. Any divergence is a bug here, never a
 reason to bend the Rust side.
 
 The surface is an explicit builder with no global state beyond the
-exactly-one-``Mission`` rule. Blocks are plain functions over :class:`PortRef`
-values; :meth:`Mission.scope` gives them collision-free instance names and a
+exactly-one-``Target`` rule. Blocks are plain functions over :class:`PortRef`
+values; :meth:`Target.scope` gives them collision-free instance names and a
 place in the IR scope tree.
 """
 
@@ -46,8 +46,8 @@ IR_VERSION = 5
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
 
-# Every live Mission, so emission can enforce the exactly-one rule.
-_missions: list["Mission"] = []
+# Every live Target, so emission can enforce the exactly-one rule.
+_targets: list["Target"] = []
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ def _source_ref() -> dict[str, Any]:
 
 
 def _validate_namespace(namespace: str | None) -> str | None:
-    """A mission namespace is a bare dotted path (``"sat1"``, ``"fleet.sat1"``):
+    """A target namespace is a bare dotted path (``"sat1"``, ``"fleet.sat1"``):
     non-empty, no leading/trailing dot, and every segment non-empty. It prefixes
     every component name the target registers, so a malformed one would corrupt
     every :class:`ComponentId`; reject it here rather than emit it."""
@@ -135,7 +135,7 @@ class Spec:
         # The pack-shared state this system attaches to, set by a shared-state
         # spec helper (`Uplink`/`Downlink`) from the handle its constructor
         # takes; `None` for an ordinary system. Rendered into the IR by
-        # `Mission.add`.
+        # `Target.add`.
         self.attach: str | None = None
 
     def _param_source(self) -> Any:
@@ -182,7 +182,7 @@ class ArtifactHandle:
 # runtime they are thin: `Frame`/`Msg` are empty markers, `InPort`/`OutPort`
 # are erased generics that never get instantiated (a handle's `__getattr__`
 # returns a `PortRef`), and `System` is a `Spec` that also carries the
-# artifact it came from so `Mission.add` can auto-register it. All the typing
+# artifact it came from so `Target.add` can auto-register it. All the typing
 # lives in the generated annotations, which pyright reads; the recorder's
 # behavior is exactly Phase 1's.
 # ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ class ArtifactHandle:
 # mismatch a pyright error at `connect`.
 F = TypeVar("F")
 
-# The spec type `Mission.add` echoes back, so a generated entry's handle keeps
+# The spec type `Target.add` echoes back, so a generated entry's handle keeps
 # the entry's typed port attributes.
 H = TypeVar("H", bound="Spec")
 
@@ -224,8 +224,8 @@ class InPort(Generic[F]):
 @dataclass(frozen=True)
 class Artifact:
     """A loadable pack, as a generated module declares it in its ``ARTIFACT``
-    constant. Using an entry from the module auto-registers this on the mission
-    (:meth:`Mission.add`); ``manifest_hash`` is the staleness anchor the host
+    constant. Using an entry from the module auto-registers this on the target
+    (:meth:`Target.add`); ``manifest_hash`` is the staleness anchor the host
     checks at resolve.
 
     A prebuilt pack's module (``metor-fsw pack dev``, or an installed pack
@@ -262,7 +262,7 @@ class PortRef:
 
 
 class StateHandle:
-    """A declared pack-shared state (:meth:`Mission.state`). Pass it to a
+    """A declared pack-shared state (:meth:`Target.state`). Pass it to a
     shared-state system's constructor (``Downlink(link)``, ``Uplink(link,
     …)``) to attach that system to this state; the handle carries only the
     state's declaration name."""
@@ -304,7 +304,7 @@ def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
-class Target:
+class Component:
     """The component value an alarm monitors: an instance-prefixed component id
     plus an optional element index into its shape."""
 
@@ -334,7 +334,7 @@ class Alarm:
 
     id: str
     name: str
-    target: Target
+    target: Component
     description: str = ""
     warning: band | None = None
     critical: band | None = None
@@ -369,7 +369,7 @@ def Alarms(alarms: list[Alarm]) -> Spec:  # noqa: N802 - a system-type wrapper
 def TcpServer(addr: str, name: str | None = None) -> Spec:  # noqa: N802
     """The built-in link server state (``LinkParams``): the FSW listens on
     ``addr``; ground tools connect to it for the downlink stream and command
-    ingest alike. Declare it with :meth:`Mission.state`.
+    ingest alike. Declare it with :meth:`Target.state`.
 
     ``name`` is the human node name advertised over mDNS for discovery; when
     omitted the FSW falls back to the OS hostname."""
@@ -388,7 +388,7 @@ def _attached(spec: Spec, state: StateHandle) -> Spec:
 
 def Uplink(state: StateHandle, msgs: list[str] | None = None) -> Spec:  # noqa: N802
     """The built-in command uplink (``UplinkParams``), draining the ``state``
-    link server (the handle :meth:`Mission.state` returned for a
+    link server (the handle :meth:`Target.state` returned for a
     :func:`TcpServer`). Add it before its consumers and a command is consumed
     the same cycle it arrives."""
     return _attached(static_system("Uplink", **_drop_none({"msgs": msgs})), state)
@@ -400,7 +400,7 @@ def Downlink(  # noqa: N802
     frames: list[str] | None = None,
 ) -> Spec:
     """The built-in telemetry downlink (``DownlinkParams``), streaming over the
-    ``state`` link server (the handle :meth:`Mission.state` returned for a
+    ``state`` link server (the handle :meth:`Target.state` returned for a
     :func:`TcpServer`); omitting both subset lists taps everything."""
     return _attached(
         static_system("Downlink", **_drop_none({"instances": instances, "frames": frames})),
@@ -409,21 +409,21 @@ def Downlink(  # noqa: N802
 
 
 # ---------------------------------------------------------------------------
-# The mission
+# The target
 # ---------------------------------------------------------------------------
 
 _INIT_STATES = {"empty": "Empty", "loaded": "Loaded", "running": "Running"}
 
 
-class Mission:
-    """A mission under construction. Exactly one may exist at emission time.
+class Target:
+    """A target under construction. Exactly one may exist at emission time.
 
     ``sim_dt`` (seconds) selects a free-running simulated clock; without it the
     loop paces a wall clock at ``cycle_rate``. ``default_depth`` is the in-flight
     record depth for a buffer with no rate hint. ``namespace`` is a bare dotted
     prefix (``"sat1"``) stamped onto every component name this target registers
     and announces, so several targets sharing one db keep disjoint id spaces;
-    ``None`` leaves names and ids identical to an un-namespaced mission. These
+    ``None`` leaves names and ids identical to an un-namespaced target. These
     are the only knobs ``CoordinatorSpec`` carries.
     """
 
@@ -447,7 +447,7 @@ class Mission:
         self._scopes: list[dict[str, Any]] = []
         self._scope_stack: list[int] = []
         self._names: set[str] = set()
-        _missions.append(self)
+        _targets.append(self)
 
     # -- artifacts ----------------------------------------------------------
 
@@ -499,7 +499,7 @@ class Mission:
 
     def _register_spec_artifact(self, spec: Spec) -> None:
         """Auto-register a generated :class:`System`'s declaring artifact, so a
-        mission never has to spell ``m.artifact(...)`` for a stubbed pack."""
+        target never has to spell ``m.artifact(...)`` for a stubbed pack."""
         decl = getattr(spec, "artifact_decl", None)
         if decl is not None:
             self._register_artifact(decl)
@@ -691,7 +691,7 @@ class Mission:
         return "Wall"
 
     def to_ir(self) -> dict[str, Any]:
-        """The serialized ``Wiring`` this mission describes."""
+        """The serialized ``Wiring`` this target describes."""
         return {
             "ir_version": IR_VERSION,
             "metor_config_version": __version__,
@@ -715,17 +715,17 @@ class Mission:
 # ---------------------------------------------------------------------------
 
 
-def _the_mission() -> Mission:
-    if len(_missions) != 1:
+def _the_target() -> Target:
+    if len(_targets) != 1:
         raise RuntimeError(
-            f"exactly one Mission must exist at emission, found {len(_missions)}"
+            f"exactly one Target must exist at emission, found {len(_targets)}"
         )
-    return _missions[0]
+    return _targets[0]
 
 
-def emit(mission: Mission | None = None) -> None:
-    """Write the mission IR to ``$METOR_IR_OUT`` (stdout if unset)."""
-    ir = (mission or _the_mission()).to_ir()
+def emit(target: Target | None = None) -> None:
+    """Write the target IR to ``$METOR_IR_OUT`` (stdout if unset)."""
+    ir = (target or _the_target()).to_ir()
     text = json.dumps(ir, indent=2)
     out = os.environ.get("METOR_IR_OUT")
     if out:
@@ -736,10 +736,10 @@ def emit(mission: Mission | None = None) -> None:
 
 
 def _emit_at_exit() -> None:
-    # Emit only for a well-formed single-mission module; a broken module has
+    # Emit only for a well-formed single-target module; a broken module has
     # already raised, and its traceback is the error surface.
-    if len(_missions) == 1:
-        emit(_missions[0])
+    if len(_targets) == 1:
+        emit(_targets[0])
 
 
 atexit.register(_emit_at_exit)

@@ -272,7 +272,7 @@ impl WorkerHandle {
         HandlePoll::Pending
     }
 
-    /// The graceful end for mission teardown: request shutdown, give the
+    /// The graceful end for target teardown: request shutdown, give the
     /// worker the grace window to report and exit, then end it for certain
     /// either way. Blocking is acceptable here, unlike the cycle loop.
     fn shutdown_graceful(&mut self) {
@@ -751,7 +751,7 @@ impl SeqWorker {
         self.handle.kill_reap_reclaim();
     }
 
-    /// Mission teardown: the graceful exit `Stop` deliberately skips —
+    /// Target teardown: the graceful exit `Stop` deliberately skips —
     /// shutdown request, grace window, then kill — matching [`ProcSlot`]'s,
     /// since blocking is acceptable there.
     pub(crate) fn shutdown(&mut self) {

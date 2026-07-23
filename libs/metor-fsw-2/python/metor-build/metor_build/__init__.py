@@ -1,6 +1,6 @@
 """PEP 517/660 build backend for metor pack crates.
 
-``uv sync`` of a mission with a path-source pack dependency lands here.
+``uv sync`` of a target with a path-source pack dependency lands here.
 ``build_editable`` runs ``metor-fsw pack dev`` in the pack crate — building
 the host triple and laying out ``.metor/<module>/`` (the typed module plus
 its ``_libs`` payload) — and installs a wheel whose only payload is a

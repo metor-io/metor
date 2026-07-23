@@ -1,27 +1,27 @@
-//! Bundle round-trip smoke: freeze `mission.py` to the IR bundle layout, load it
+//! Bundle round-trip smoke: freeze `target.py` to the IR bundle layout, load it
 //! back cargo-free, resolve, and run a few cycles.
 //!
 //! The bundle carries the frozen `Wiring` IR (`wiring.json` + `meta.json`) plus
-//! the built `.so`s, not verbatim source — so a mission runs with no Python and
-//! no config parse on target. Two legs, both packaged from `mission.py` (evaluate
+//! the built `.so`s, not verbatim source — so a target runs with no Python and
+//! no config parse on target. Two legs, both packaged from `target.py` (evaluate
 //! → IR → bundle → run): the directory bundle and the single-file `.metor`
 //! archive. Convergence parity stays in `closed_loop.rs`; here we only assert the
 //! bundle is self-contained and runnable. Gated off `miri` (it builds + `dlopen`s
-//! real cdylibs) and skipped without a CPython ≥ 3.10 to evaluate `mission.py`.
+//! real cdylibs) and skipped without a CPython ≥ 3.10 to evaluate `target.py`.
 
 #![cfg(not(miri))]
 
 use std::path::{Path, PathBuf};
 
 use metor_fsw_2::wiring::{
-    Registry, Wiring, build_target, eval_python_mission, load_bundle, provision_artifacts, resolve,
+    Registry, Wiring, build_target, eval_python_target, load_bundle, provision_artifacts, resolve,
     write_bundle,
 };
 use metor_fsw_2::{BuildOptions, PackageOptions};
 
 mod common;
 
-fn mission(name: &str) -> PathBuf {
+fn target(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
@@ -33,17 +33,17 @@ fn temp_bundle_dir(tag: &str) -> PathBuf {
     ))
 }
 
-/// Evaluate `mission.py` into a built `Wiring`, in-process (test binaries can't host a
+/// Evaluate `target.py` into a built `Wiring`, in-process (test binaries can't host a
 /// `process=#true` worker). `None` — skip, not fail — when Python or the build plumbing is
 /// unavailable (offline/sandboxed cargo, no CPython ≥ 3.10).
 fn eval_and_build() -> Option<Wiring> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_mission(&mission("mission.py")) {
+    let mut wiring = match eval_python_target(&target("target.py")) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("skipping: mission.py did not evaluate: {e}");
+            eprintln!("skipping: target.py did not evaluate: {e}");
             return None;
         }
     };
@@ -58,9 +58,10 @@ fn eval_and_build() -> Option<Wiring> {
 }
 
 #[test]
-fn python_mission_packages_and_runs() {
-    // A `.py` mission packages through the IR path, then runs cargo-free with no Python on
+fn python_target_packages_and_runs() {
+    // A `.py` target packages through the IR path, then runs cargo-free with no Python on
     // the run side: load the frozen IR and run it.
+    let _guard = common::link_port_guard();
     let Some(wiring) = eval_and_build() else {
         return;
     };
@@ -69,7 +70,7 @@ fn python_mission_packages_and_runs() {
     let _ = std::fs::remove_dir_all(&dir);
     let opts = PackageOptions {
         target: build_target(&[]),
-        provenance: Some(mission("mission.py")),
+        provenance: Some(target("target.py")),
         ..PackageOptions::default()
     };
     write_bundle(&wiring, &opts, &dir).expect("write the bundle");
@@ -79,7 +80,7 @@ fn python_mission_packages_and_runs() {
     assert!(dir.join("wiring.json").exists(), "frozen IR written");
     assert!(dir.join("meta.json").exists(), "JSON sidecar written");
     assert!(
-        dir.join("mission.py").exists(),
+        dir.join("target.py").exists(),
         "python provenance rides along"
     );
     for artifact in &wiring.artifacts {
@@ -117,9 +118,10 @@ fn python_mission_packages_and_runs() {
 }
 
 #[test]
-fn python_mission_round_trips_as_metor_archive() {
-    // The single-file `.metor` form: pack the mission into one tar, then load it back
+fn python_target_round_trips_as_metor_archive() {
+    // The single-file `.metor` form: pack the target into one tar, then load it back
     // (unpacked to a temp dir) and run it cargo-free.
+    let _guard = common::link_port_guard();
     let Some(wiring) = eval_and_build() else {
         return;
     };

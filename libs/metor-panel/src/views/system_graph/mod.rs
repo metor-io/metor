@@ -3,7 +3,7 @@
 //!
 //! Topology comes from the [`WiringStore`](crate::wiring::WiringStore) — the
 //! latest [`WiringManifest`](metor_proto_wkt::WiringManifest) the control
-//! system broadcast — so the tile always reflects the live mission. It never
+//! system broadcast — so the tile always reflects the live target. It never
 //! edits anything: nodes (systems, slots, the coordinator, collapsed-scope
 //! groups) are laid out deterministically by [`layout`], wires are drawn with
 //! the shared [`graph_canvas`](crate::graph_canvas) primitives, and the only

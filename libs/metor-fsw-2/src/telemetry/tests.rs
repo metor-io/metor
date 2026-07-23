@@ -333,7 +333,7 @@ async fn registry_query_view_and_read() {
     assert_eq!(imu.omega, 5.0, "producer increments omega each cycle");
 }
 
-/// A mission namespace shifts every registry key and announced leaf id under
+/// A target namespace shifts every registry key and announced leaf id under
 /// the `<namespace>.` prefix — user frames and the coordinator's own buffers
 /// alike — while the port's own frame id and the unprefixed identity are left
 /// for the un-namespaced case (pinned by `registry_query_view_and_read`).
@@ -713,7 +713,7 @@ async fn drop_policy_never_blocks_and_counts() {
     let prod = b.push_node(cyclic_node("producer".into(), Producer { n: 0.0 }));
     // A downstream consumer of the same output telemetry taps: the stalled
     // link must not starve it (regression: an undrained tap view stalls the
-    // producer's ring for EVERY consumer, freezing the whole mission).
+    // producer's ring for EVERY consumer, freezing the whole target).
     let cons = b.push_node(cyclic_node(Consumer::NAME.into(), Consumer));
     b.connect(
         PortRef {
@@ -1181,7 +1181,7 @@ async fn uplink_routes_and_survives_garbage() {
 async fn uplink_relays_arbitrary_user_msgs() {
     use crate::MsgIn;
 
-    /// A mission-local command type, unknown to the framework.
+    /// A target-local command type, unknown to the framework.
     #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema, Debug)]
     struct SetGain {
         gain: u32,
@@ -1332,7 +1332,7 @@ async fn late_connection_gets_replay_and_retained_snapshots() {
     let mut coord = b.build().unwrap();
     coord.run_for(10).await;
 
-    // Connect only now, mid-mission (the coordinator has already run).
+    // Connect only now, mid-target (the coordinator has already run).
     let tap = WireTap::connect(&link).await;
     // The server still fans out nothing new (no cycles run), but the replay
     // arrives immediately on accept.
@@ -1359,7 +1359,7 @@ async fn late_connection_gets_replay_and_retained_snapshots() {
             _ => None,
         })
         .expect("the retained boot registry replayed");
-    assert!(registry.channels.is_empty(), "no slots in this mission");
+    assert!(registry.channels.is_empty(), "no slots in this target");
 }
 
 /// The identity packet leads every connection and advertises the uplink's

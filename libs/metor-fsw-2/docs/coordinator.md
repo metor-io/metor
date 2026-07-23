@@ -2,13 +2,13 @@
 
 The coordinator owns a ready system graph and runs it. Build fixes the graph, ring sizes, reader counts, and port bindings before the first system starts.
 
-The coordinator turns a set of systems into one ordered mission. It gives each
-cycle one time, runs systems in a known order, starts and stops the mission as
+The coordinator turns a set of systems into one ordered target. It gives each
+cycle one time, runs systems in a known order, starts and stops the target as
 a unit, and reports failures that affect the whole run.
 
 ## A cycle at a glance
 
-Cyclic systems run in mission order. A system can publish a value for a later
+Cyclic systems run in wiring order. A system can publish a value for a later
 system to use in the same cycle.
 
 ```text
@@ -21,19 +21,19 @@ control reads estimate N
 
 Every cyclic system receives the same timestamp for that cycle. After the
 cyclic steps, the coordinator copies new state to free-running async systems,
-updates mission status, and either waits for the next wall-clock cycle or
+updates target status, and either waits for the next wall-clock cycle or
 yields in simulated mode.
 
 A backward state edge must be marked as delayed. The consumer then uses the
-value from an earlier cycle. This makes feedback timing part of the mission
+value from an earlier cycle. This makes feedback timing part of the target
 design instead of an effect of system order.
 
-## From mission to run graph
+## From target to run graph
 
 Two front ends create the same `Wiring` IR:
 
 - a Rust `WiringBuilder`
-- an evaluated `mission.py`
+- an evaluated `target.py`
 
 The shared resolver checks the IR and builds an `InitGraph`. The init graph stores systems, slots, edges, and run config as plain host data.
 
@@ -52,7 +52,7 @@ No data flows before these passes finish.
 
 ## Node and port order
 
-Node zero is always the coordinator. It owns health, log, status, sequence registry, and command outputs. A mission loaded through the wiring front end also adds a wiring manifest output.
+Node zero is always the coordinator. It owns health, log, status, sequence registry, and command outputs. A target loaded through the wiring front end also adds a wiring manifest output.
 
 User system order has two roles:
 
@@ -137,7 +137,7 @@ Each cycle does this work:
 
 ```text
 choose one timestamp
-publish it as mission time
+publish it as FSW time
 handle registry reload requests
 step cyclic slots in order
 copy new snapshots to async inputs
@@ -176,7 +176,7 @@ Coordinator health counts host faults such as:
 
 The current run loop closes a coordinator health cycle after a worker event, a stopped-set change, a host log queue drop, or a cycle overrun. Other error calls stay in the health state until a later close. An error near the end of shutdown may not reach a health record.
 
-The coordinator health cycle count does not equal the mission cycle count.
+The coordinator health cycle count does not equal the FSW cycle count.
 
 ## Shutdown
 

@@ -261,7 +261,7 @@ pub struct BuildCtx<'a> {
     /// The registered message types, keyed by
     /// [`NamedMsg::NAME`](crate::NamedMsg).
     pub msgs: &'a MsgTable,
-    /// The mission namespace, when the front-end set one. A system that hashes
+    /// The target namespace, when the front-end set one. A system that hashes
     /// authored component names into [`ComponentId`](metor_proto::types::ComponentId)s
     /// (the alarm engine's limit targets) prepends it here so its lookups match
     /// the namespace-qualified registry. `None` on the pack/in-dylib path,

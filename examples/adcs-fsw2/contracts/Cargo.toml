@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 publish = false
-description = "Shared compile-time contracts (frames + per-system Params) for the adcs-fsw2 dlopen mission"
+description = "Shared compile-time contracts (frames + per-system Params) for the adcs-fsw2 dlopen target"
 
 [dependencies]
 # The frame derives (`Frame`/`AsVTable`/…) are self-contained — they expand to

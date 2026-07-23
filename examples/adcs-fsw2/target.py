@@ -1,14 +1,14 @@
-from metor_config import Alarm, Alarms, Downlink, Mission, Target, TcpServer, Uplink, band
+from metor_config import Alarm, Alarms, Component, Downlink, Target, TcpServer, Uplink, band
 from adcs_pack import Ctrl, Nav, Plant
 from adcs_seqs import commissioning, safe_mode
 
-m = Mission(
+m = Target(
     cycle_rate=120.0,
     sim_dt=1 / 120,
     namespace="cube_sat"
 )
 
-link = m.state("link", TcpServer(addr="0.0.0.0:2240", name="cube_sat"))
+link = m.state("link", TcpServer(addr="[::]:2240", name="cube_sat"))
 
 plant = m.add(
     "plant",
@@ -41,7 +41,7 @@ alarms = m.add(
             id="ADCS_RATE_HIGH",
             name="Body Rate High",
             description="Measured body-Y rate exceeds the detumbled envelope",
-            target=Target("plant.sensors.gyro_b", element=1),
+            target=Component("plant.sensors.gyro_b", element=1),
             warning=band(above=0.05, below=-0.05),
             critical=band(above=0.15, below=-0.15),
             debounce=2,
@@ -53,7 +53,7 @@ alarms = m.add(
             description="Wheel-0 stored momentum approaching the saturation limit",
             # instance `plant`, frame `wheels`, field `wheels: [ReactionWheel; 3]`,
             # wheel 0, its X-axis momentum element.
-            target=Target("plant.wheels.wheels.0.ang_momentum", element=0),
+            target=Component("plant.wheels.wheels.0.ang_momentum", element=0),
             warning=band(above=0.03, below=-0.03),
             critical=band(above=0.038, below=-0.038),
             debounce=2,

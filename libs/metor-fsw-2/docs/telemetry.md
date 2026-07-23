@@ -2,19 +2,19 @@
 
 The telemetry link serves telemetry and commands on one TCP socket. Ground tools connect to the flight software. The flight software does not dial a ground address.
 
-Telemetry gives operators and ground tools a live view of the mission. The
+Telemetry gives operators and ground tools a live view of the target. The
 uplink gives them a path to send commands back. Together they make the running
 software observable and controllable without adding network code to each
 system.
 
-## Mission setup
+## Target setup
 
 This Python config serves all telemetry and accepts two command types:
 
 ```python
-from metor_config import Downlink, Mission, TcpServer, Uplink
+from metor_config import Downlink, Target, TcpServer, Uplink
 
-m = Mission(cycle_rate=100.0)
+m = Target(cycle_rate=100.0)
 
 link = m.state(
     "link",
@@ -62,7 +62,7 @@ Three parts share the work:
 - An `Uplink` system reads command packets and writes them to message output ports.
 
 Both systems attach to the same `TcpServer` state by naming its handle, so the
-mission spells the wiring rather than the host inferring it. Socket work runs
+target spells the wiring rather than the host inferring it. Socket work runs
 outside the control cycle. The systems only move bytes between rings and bounded
 queues.
 

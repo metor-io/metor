@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 publish = false
-description = "The plant, nav, and ctrl systems of the adcs-fsw2 mission, one pack in one dlopen'd cdylib"
+description = "The plant, nav, and ctrl systems of the adcs-fsw2 target, one pack in one dlopen'd cdylib"
 
-# A loadable shared object (the mission host `dlopen`s the produced `lib*.so`/`lib*.dylib`)
+# A loadable shared object (the target host `dlopen`s the produced `lib*.so`/`lib*.dylib`)
 # AND an rlib, so the convergence test can also register the same `pack()` statically for
 # the static-vs-dlopen parity comparison (dl-open.md §8). The `export` feature gates the
 # `export_pack!` C-ABI symbols so the rlib carries none (the test links it with

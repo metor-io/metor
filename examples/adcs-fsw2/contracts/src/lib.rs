@@ -1,4 +1,4 @@
-//! Shared **compile-time contracts** for the `adcs-fsw2` dlopen mission (dl-open.md §8).
+//! Shared **compile-time contracts** for the `adcs-fsw2` dlopen target (dl-open.md §8).
 //!
 //! This crate is the agreement every system `cdylib` is built against: the frame structs
 //! that flow over the rings (their `VTable`s must match byte-for-byte on both sides of a
@@ -8,7 +8,7 @@
 //!
 //! It is shared **among the cdylibs** (`adcs-systems`/`adcs-sequences`) and linked by
 //! the convergence test (to decode outputs and to register the systems statically), but it
-//! is **not** linked by the mission host at runtime: the host validates frames from the
+//! is **not** linked by the target host at runtime: the host validates frames from the
 //! serialized `VTable`s and encodes params from the exported `Params` schema, never linking
 //! a frame or param Rust type.
 
@@ -121,17 +121,17 @@ pub fn mag_field_eci(model: &mut MagneticModel, epoch: Epoch, pos_eci: &V3) -> V
     ecef_to_eci(epoch).dot(&b_ecef)
 }
 
-/// The mission start epoch (UTC) the environment models are evaluated against. A **fixed**
+/// The target start epoch (UTC) the environment models are evaluated against. A **fixed**
 /// constant (not wall-clock) so a `Simulated` run is reproducible — the parity test relies on
 /// the static and dlopen runs computing the identical sun direction.
-pub fn mission_epoch() -> Epoch {
+pub fn target_epoch() -> Epoch {
     Epoch::from_gregorian_utc(2024, 1, 1, 0, 0, 0, 0)
 }
 
-/// The epoch `t_sim_s` seconds into the mission (the plant advances this from a deterministic
+/// The epoch `t_sim_s` seconds into the target (the plant advances this from a deterministic
 /// per-cycle counter, never wall time).
 pub fn epoch_at(t_sim_s: f64) -> Epoch {
-    mission_epoch() + Duration::from_seconds(t_sim_s)
+    target_epoch() + Duration::from_seconds(t_sim_s)
 }
 
 /// The unit vector pointing at the sun in ECI at `epoch` — the real-world sun direction from
@@ -387,7 +387,7 @@ pub struct MtqCmd {
     pub dipole_b: V3,
 }
 
-/// The mission-mode command a slot sequence emits each transition (sequences-slots.md §4):
+/// The target-mode command a slot sequence emits each transition (sequences-slots.md §4):
 /// the discrete ADCS phase plus the active **pointing law**. Produced by the `mode` slot's
 /// occupant (`adcs-sequences`' `commissioning` / `safe_mode`) and consumed by the controller, which
 /// selects its target attitude from `law`. `_pad` keeps the `#[repr(C)]` layout padding-free
@@ -398,7 +398,7 @@ pub struct MtqCmd {
 pub struct ModeCmd {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    /// The commanded mission phase: `0` idle, `1` settling, `2` pointing, `3` safe.
+    /// The commanded target phase: `0` idle, `1` settling, `2` pointing, `3` safe.
     pub mode: u8,
     /// The commanded pointing law: `0` nadir, `1` velocity-vector (HIL).
     pub law: u8,
@@ -406,7 +406,7 @@ pub struct ModeCmd {
 }
 
 impl ModeCmd {
-    /// The mission-phase byte values, mirrored by the example test's assertions.
+    /// The target-phase byte values, mirrored by the example test's assertions.
     pub const IDLE: u8 = 0;
     pub const SETTLING: u8 = 1;
     pub const POINTING: u8 = 2;
@@ -572,7 +572,7 @@ pub fn tracking_sample(body: &BodyState, law: u8) -> (f64, f64) {
 //
 // Each derives `Serialize`/`Deserialize`/`Schema` — the postcard contract across
 // `fsw_create`, and `Deserialize` is also what the static `Registry` path uses to
-// read the same params off `mission.kdl` (the parity test's static path).
+// read the same params off `target.kdl` (the parity test's static path).
 
 /// Plant parameters: the initial attitude/rate offset, the sensor-noise sigma, the RNG seed
 /// (so a run is reproducible), whether the reaction wheels boot disarmed, and the disturbance
@@ -683,7 +683,7 @@ fn default_k_detumble() -> f64 {
     5e-5
 }
 
-/// The mission's flight gains. `Ctrl` is `#[system]`-authored, so this
+/// The target's flight gains. `Ctrl` is `#[system]`-authored, so this
 /// `Default` also becomes the pack entry's declared defaults blob on the
 /// dlopen path — a `system` node may spell only its overrides.
 impl Default for CtrlParams {
@@ -699,7 +699,7 @@ impl Default for CtrlParams {
 
 /// The commissioning sequence's gates and budgets — every phase transition is
 /// condition-based, and every phase has a timeout that safes the spacecraft
-/// ([`Outcome::Failed`](metor_fsw_2::Outcome)). Spelled out in full on the mission's
+/// ([`Outcome::Failed`](metor_fsw_2::Outcome)). Spelled out in full on the target's
 /// `allow occupant="commissioning"` line (the dlopen occupant encoder has no serde
 /// defaults), which is also how tests patch individual gates.
 #[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
@@ -746,7 +746,7 @@ mod tests {
             tensor![0.0, radius, 0.0],
             (tensor![1.0, 1.0, 1.0] as V3).normalize() * radius,
         ] {
-            let b = mag_field_eci(&mut model, mission_epoch(), &pos);
+            let b = mag_field_eci(&mut model, target_epoch(), &pos);
             let mag = b.norm().into_buf();
             assert!(
                 (1.0e-5..6.0e-5).contains(&mag),
