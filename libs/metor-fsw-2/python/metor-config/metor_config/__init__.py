@@ -409,6 +409,247 @@ def Downlink(  # noqa: N802
 
 
 # ---------------------------------------------------------------------------
+# Panel presets
+# ---------------------------------------------------------------------------
+
+
+def component_id(name: str) -> int:
+    """The numeric id of a fully-qualified component name — masked FNV-1a-64,
+    mirroring the Rust ``ComponentId::new``."""
+    h = 0xCBF29CE484222325
+    for b in name.encode():
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h & ~(1 << 63)
+
+
+def _qualify(name: str, namespace: str | None) -> str:
+    return f"{namespace}.{name}" if namespace else name
+
+
+# The panel's categorical trace palette, cycled when a trace has no explicit
+# color. Colors are "#rrggbbaa" strings (the layout document's encoding).
+_TRACE_PALETTE = [
+    "#fab387ff",  # peach
+    "#89b4faff",  # blue
+    "#a6e3a1ff",  # green
+    "#f38ba8ff",  # red
+    "#cba6f7ff",  # mauve
+    "#94e2d5ff",  # teal
+    "#f9e2afff",  # yellow
+    "#f5c2e7ff",  # pink
+]
+
+
+@dataclass(frozen=True)
+class PaneState:
+    """One pane item: a panel serialization key plus its config dict, embedded
+    into the layout as a JSON blob.
+
+    The escape hatch for panel kinds without a typed helper below — any pane
+    the panel can serialize can be authored this way. Component references
+    inside a raw ``state`` must be fully qualified (namespace included): the
+    recorder cannot rewrite an opaque dict."""
+
+    kind: str
+    state: dict[str, Any]
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        return {"kind": self.kind, "state": json.dumps(self.state)}
+
+
+@dataclass(frozen=True)
+class Trace:
+    """One plot trace over ``component`` (namespace-relative), element
+    ``element`` of its shape. ``color`` is ``"#rrggbbaa"``; unset cycles the
+    panel palette."""
+
+    component: str
+    element: int = 0
+    label: str | None = None
+    color: str | None = None
+
+
+@dataclass(frozen=True)
+class TimeSeriesPlot:
+    """A time-series plot pane. ``x_range`` uses the panel's time-range
+    grammar (e.g. ``"LAST 30m"``); empty follows the layout's global range."""
+
+    traces: list[Trace]
+    label: str = ""
+    x_range: str = ""
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        traces = [
+            _drop_none(
+                {
+                    "component_id": component_id(_qualify(t.component, namespace)),
+                    "element_index": t.element,
+                    "label": t.label or t.component,
+                    "color": t.color or _TRACE_PALETTE[i % len(_TRACE_PALETTE)],
+                }
+            )
+            for i, t in enumerate(self.traces)
+        ]
+        state = {"label": self.label, "x_range": self.x_range, "traces": traces}
+        return PaneState("time_series_plot", state)._item(namespace)
+
+
+@dataclass(frozen=True)
+class Text:
+    """A single component's latest value rendered as text."""
+
+    component: str
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        state = {"component": _qualify(self.component, namespace)}
+        return PaneState("component_text", state)._item(namespace)
+
+
+@dataclass(frozen=True)
+class TrafficLight:
+    """One component as a colored on/off square."""
+
+    component: str
+    color: str | None = None
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        state = _drop_none(
+            {"component": _qualify(self.component, namespace), "color": self.color}
+        )
+        return PaneState("traffic_light", state)._item(namespace)
+
+
+@dataclass(frozen=True)
+class TrafficLightGrid:
+    """Every component matching a glob ``pattern`` as a traffic-light grid."""
+
+    pattern: str
+    color: str | None = None
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        state = _drop_none(
+            {"pattern": _qualify(self.pattern, namespace), "color": self.color}
+        )
+        return PaneState("traffic_light_grid", state)._item(namespace)
+
+
+def Logs() -> PaneState:  # noqa: N802 - pane constructors read as types
+    """The streaming log viewer."""
+    return PaneState("logs", {})
+
+
+def AlarmList(history: bool = False) -> PaneState:  # noqa: N802
+    """The alarm list with acknowledge controls."""
+    return PaneState("alarm", {"show_history": history})
+
+
+def SequenceList(history: bool = False) -> PaneState:  # noqa: N802
+    """The per-channel sequence control list."""
+    return PaneState("sequence", {"show_history": history})
+
+
+def ComponentTable() -> PaneState:  # noqa: N802
+    """Every component in the db as a flat table."""
+    return PaneState("component_table", {})
+
+
+def DataTable() -> PaneState:  # noqa: N802
+    """One row per component, grouped by namespace, with live values."""
+    return PaneState("data_table", {})
+
+
+@dataclass(frozen=True)
+class Pane:
+    """A tabbed pane holding one item per tab. Splits accept pane content
+    directly, so an explicit ``Pane`` is only needed for tabs or chrome
+    (``hide_tab_bar``)."""
+
+    items: list[Any]
+    active: int = 0
+    hide_tab_bar: bool = False
+
+    def _node(self, namespace: str | None) -> dict[str, Any]:
+        return {
+            "Pane": {
+                "active_index": self.active,
+                "hide_tab_bar": self.hide_tab_bar,
+                "items": [i._item(namespace) for i in self.items],
+            }
+        }
+
+
+def _as_node(child: Any, namespace: str | None) -> dict[str, Any]:
+    """A split child: a nested split or pane serializes itself; bare pane
+    content wraps into a single-tab pane."""
+    if hasattr(child, "_node"):
+        return child._node(namespace)
+    return Pane([child])._node(namespace)
+
+
+@dataclass(frozen=True)
+class _Split:
+    axis: str
+    children: list[Any]
+    flexes: list[float] | None = None
+
+    def _node(self, namespace: str | None) -> dict[str, Any]:
+        flexes = self.flexes or [1.0] * len(self.children)
+        if len(flexes) != len(self.children):
+            raise ValueError(
+                f"{len(self.children)} split children but {len(flexes)} flexes"
+            )
+        return {
+            "Split": {
+                "axis": self.axis,
+                "flexes": [float(f) for f in flexes],
+                "children": [_as_node(c, namespace) for c in self.children],
+            }
+        }
+
+
+def HSplit(*children: Any, flexes: list[float] | None = None) -> _Split:  # noqa: N802
+    """Children side by side, weighted by ``flexes`` (equal when omitted)."""
+    return _Split("Horizontal", list(children), flexes)
+
+
+def VSplit(*children: Any, flexes: list[float] | None = None) -> _Split:  # noqa: N802
+    """Children stacked vertically, weighted by ``flexes`` (equal when omitted)."""
+    return _Split("Vertical", list(children), flexes)
+
+
+@dataclass(frozen=True)
+class Preset:
+    """One named layout a target ships as a recommended default. ``layout``
+    is a split tree, a pane, or bare pane content; ``time_range`` seeds the
+    layout-wide window in the panel's time-range grammar."""
+
+    name: str
+    layout: Any
+    time_range: str = ""
+
+    def to_json(self, namespace: str | None) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "layout": {
+                "global_time_range": self.time_range,
+                "root": _as_node(self.layout, namespace),
+            },
+        }
+
+
+def Presets(presets: list[Preset]) -> Spec:  # noqa: N802 - a system-type wrapper
+    """The built-in preset broadcaster, its ``PresetsParams`` carrying one
+    entry per preset under the ``preset`` field the Rust struct declares.
+
+    Component references are namespace-relative, like alarm targets: recording
+    qualifies them with the target's namespace, so the ids match what the
+    target registers. The ``Target`` must therefore exist first — the usual
+    ``m.add("presets", Presets([...]))`` order."""
+    namespace = _the_target().namespace
+    return static_system("Presets", preset=[p.to_json(namespace) for p in presets])
+
+
+# ---------------------------------------------------------------------------
 # The target
 # ---------------------------------------------------------------------------
 

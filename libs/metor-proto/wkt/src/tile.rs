@@ -19,6 +19,10 @@ pub const TILE_LAYOUT_VERSION: u32 = 4;
 /// A complete tile layout document.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TileLayout {
+    /// Zero is never written by the panel — an absent version marks a
+    /// document whose producer (a preset builder) delegates stamping to
+    /// whoever publishes it.
+    #[serde(default)]
     pub version: u32,
     /// App-wide default time window in the panel's time-range string grammar
     /// (e.g. `"LAST 30m"`); plots with an auto range follow it. Empty (and

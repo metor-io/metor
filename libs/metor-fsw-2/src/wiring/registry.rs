@@ -325,6 +325,7 @@ impl Registry {
 
         let mut r = Self::new();
         r.register::<crate::AlarmSystem, _>("Alarms");
+        r.register::<crate::PresetSystem, _>("Presets");
         let mut link_pack = crate::Pack::new();
         link_pack.shared_state("TcpServer", |p: LinkParams| {
             LinkState::bind(p.addr).map(|s| s.with_name(p.name))
@@ -349,7 +350,8 @@ impl Registry {
             .register_msg::<AlarmRaised>()
             .register_msg::<AlarmCleared>()
             .register_msg::<AlarmAck>()
-            .register_msg::<metor_proto_wkt::LogEvent>();
+            .register_msg::<metor_proto_wkt::LogEvent>()
+            .register_msg::<metor_proto_wkt::PresetDefs>();
         r
     }
 

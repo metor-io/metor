@@ -208,5 +208,79 @@ class RecorderTest(unittest.TestCase):
             mc.emit()
 
 
+class PresetTest(unittest.TestCase):
+    def setUp(self):
+        mc._targets.clear()
+
+    def test_component_id_masks_and_hashes(self):
+        # Pinned against the Rust `ComponentId::new` (see the parity test in
+        # src/preset/tests.rs) — the two must agree byte-for-byte.
+        self.assertEqual(
+            mc.component_id("sat1.plant.gyro.rates"), 3325449500645109259
+        )
+        self.assertEqual(mc.component_id("x") >> 63, 0)
+
+    def test_presets_qualify_and_embed(self):
+        import json
+
+        m = Target(cycle_rate=100.0, namespace="sat1")
+        m.add(
+            "presets",
+            mc.Presets(
+                [
+                    mc.Preset(
+                        name="ops",
+                        time_range="LAST 30m",
+                        layout=mc.VSplit(
+                            mc.TimeSeriesPlot([mc.Trace("plant.gyro.rates", element=1)]),
+                            mc.Pane([mc.Logs(), mc.AlarmList()], active=1),
+                            flexes=[2.0, 1.0],
+                        ),
+                    )
+                ]
+            ),
+        )
+        sys_spec = next(s for s in m.to_ir()["systems"] if s["name"] == "presets")
+        preset = sys_spec["params"]["Value"]["preset"][0]
+        self.assertEqual(preset["name"], "ops")
+        layout = preset["layout"]
+        self.assertEqual(layout["global_time_range"], "LAST 30m")
+        self.assertNotIn("version", layout, "stamping is the Rust side's job")
+
+        split = layout["root"]["Split"]
+        self.assertEqual(split["axis"], "Vertical")
+        self.assertEqual(split["flexes"], [2.0, 1.0])
+
+        # Bare pane content wraps into a single-tab pane; the trace id is the
+        # namespace-qualified hash and an unset color cycles the palette.
+        plot_pane = split["children"][0]["Pane"]
+        plot = json.loads(plot_pane["items"][0]["state"])
+        trace = plot["traces"][0]
+        self.assertEqual(
+            trace["component_id"], mc.component_id("sat1.plant.gyro.rates")
+        )
+        self.assertEqual(trace["element_index"], 1)
+        self.assertEqual(trace["label"], "plant.gyro.rates")
+        self.assertTrue(trace["color"].startswith("#"))
+
+        tab_pane = split["children"][1]["Pane"]
+        self.assertEqual(tab_pane["active_index"], 1)
+        self.assertEqual(
+            [i["kind"] for i in tab_pane["items"]], ["logs", "alarm"]
+        )
+
+    def test_presets_flex_arity_is_checked(self):
+        Target(cycle_rate=100.0)
+        with self.assertRaisesRegex(ValueError, "2 split children but 1 flexes"):
+            mc.Presets(
+                [
+                    mc.Preset(
+                        name="bad",
+                        layout=mc.HSplit(mc.Logs(), mc.DataTable(), flexes=[1.0]),
+                    )
+                ]
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
