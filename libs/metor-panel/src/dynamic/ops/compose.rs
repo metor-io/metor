@@ -148,8 +148,7 @@ fn binary(
 /// Element-wise binary arithmetic operator. Each variant is a separate node
 /// at runtime — the `op_tag` is per-variant so existing serialized graphs
 /// hash to the same `NodeId` after the consolidation refactor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
-#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
     Add,
     Sub,

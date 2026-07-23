@@ -3,82 +3,27 @@ use std::sync::Arc;
 
 use gpui::{Context, Entity, Global};
 
+pub use metor_proto_wkt::{
+    SplitAxis, TabOrientation, TILE_LAYOUT_VERSION, TileItem, TileLayout, TileNode, TilePane,
+    TileSplit,
+};
+
 use super::item::{PaneItem, PaneItemHandle};
-use super::pane::TabOrientation;
 
-/// On-disk form of a tile layout.
-#[derive(facet::Facet)]
-pub struct SerializedTileGroup {
-    /// Bumped only on a structural break in the document. Field-level changes
-    /// rely on Facet's `#[facet(default)]` instead.
-    pub version: u32,
-    /// App-wide default time window in `TimeRangeBehavior`'s string
-    /// grammar; plots with an `Auto` range follow it. Stored as text
-    /// because the behavior's internals aren't `Facet`-serializable.
-    /// Empty (and absent, in older layouts) means full range.
-    #[facet(default)]
-    pub global_time_range: String,
-    pub root: SerializedMember,
-}
-
-/// Node in a serialized tree; mirrors the runtime `Member` enum.
-#[derive(facet::Facet)]
-#[repr(u8)]
-pub enum SerializedMember {
-    Pane(SerializedPane),
-    Split(SerializedSplit),
-}
-
-/// Persisted split node: axis, per-child flex weights, and recursive children.
-#[derive(facet::Facet)]
-pub struct SerializedSplit {
-    pub axis: SerializedAxis,
-    pub flexes: Vec<f32>,
-    pub children: Vec<SerializedMember>,
-}
-
-#[derive(facet::Facet, Clone, Copy)]
-#[repr(u8)]
-pub enum SerializedAxis {
-    Horizontal,
-    Vertical,
-}
-
-impl From<gpui::Axis> for SerializedAxis {
-    fn from(axis: gpui::Axis) -> Self {
-        match axis {
-            gpui::Axis::Horizontal => SerializedAxis::Horizontal,
-            gpui::Axis::Vertical => SerializedAxis::Vertical,
-        }
+// `SplitAxis` and `gpui::Axis` are both foreign here, so the conversions are
+// free functions rather than `From` impls.
+pub(crate) fn split_axis(axis: gpui::Axis) -> SplitAxis {
+    match axis {
+        gpui::Axis::Horizontal => SplitAxis::Horizontal,
+        gpui::Axis::Vertical => SplitAxis::Vertical,
     }
 }
 
-impl From<SerializedAxis> for gpui::Axis {
-    fn from(axis: SerializedAxis) -> Self {
-        match axis {
-            SerializedAxis::Horizontal => gpui::Axis::Horizontal,
-            SerializedAxis::Vertical => gpui::Axis::Vertical,
-        }
+pub(crate) fn gpui_axis(axis: SplitAxis) -> gpui::Axis {
+    match axis {
+        SplitAxis::Horizontal => gpui::Axis::Horizontal,
+        SplitAxis::Vertical => gpui::Axis::Vertical,
     }
-}
-
-/// Persisted pane: which tab was active plus the items themselves.
-#[derive(facet::Facet)]
-pub struct SerializedPane {
-    pub active_index: usize,
-    pub tab_orientation: TabOrientation,
-    pub hide_tab_bar: bool,
-    pub locked_size: Option<(f32, f32)>,
-    pub items: Vec<SerializedItem>,
-}
-
-/// Persisted pane item, tagged with the [`PaneItem::serialization_key`] used
-/// to pick a deserializer at load time. `state` is a `facet-json` blob the
-/// owning panel produced via its own `*Config` struct.
-#[derive(facet::Facet)]
-pub struct SerializedItem {
-    pub kind: String,
-    pub state: String,
 }
 
 type DeserializeFn =
@@ -100,10 +45,10 @@ pub struct ItemRegistry {
 impl Global for ItemRegistry {}
 
 impl ItemRegistry {
-    /// Associate `T`'s serialization key with a constructor from a facet-json
+    /// Associate `T`'s serialization key with a constructor from a JSON
     /// blob. Each panel decides what shape to expect inside `state`; the
     /// closure is responsible for parsing it (typically with
-    /// `facet_json::from_str` into a `*Config` struct).
+    /// `serde_json::from_str` into a `*Config` struct).
     pub fn register<T: PaneItem>(
         &mut self,
         deserialize: impl Fn(&str, &mut Context<super::pane::Pane>) -> Option<Entity<T>> + 'static,
@@ -134,37 +79,36 @@ impl ItemRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tiles::pane::TabOrientation;
 
-    fn sample_layout() -> SerializedTileGroup {
-        SerializedTileGroup {
+    fn sample_layout() -> TileLayout {
+        TileLayout {
             version: 1,
             global_time_range: String::new(),
-            root: SerializedMember::Split(SerializedSplit {
-                axis: SerializedAxis::Horizontal,
+            root: TileNode::Split(TileSplit {
+                axis: SplitAxis::Horizontal,
                 flexes: vec![1.0, 2.0],
                 children: vec![
-                    SerializedMember::Pane(SerializedPane {
+                    TileNode::Pane(TilePane {
                         active_index: 0,
                         tab_orientation: TabOrientation::Horizontal,
                         hide_tab_bar: false,
                         locked_size: None,
-                        items: vec![SerializedItem {
+                        items: vec![TileItem {
                             kind: "component_text".into(),
                             state: r#"{"component":"foo"}"#.into(),
                         }],
                     }),
-                    SerializedMember::Pane(SerializedPane {
+                    TileNode::Pane(TilePane {
                         active_index: 1,
                         tab_orientation: TabOrientation::Vertical,
                         hide_tab_bar: true,
                         locked_size: Some((300.0, 200.0)),
                         items: vec![
-                            SerializedItem {
+                            TileItem {
                                 kind: "component_table".into(),
                                 state: "{}".into(),
                             },
-                            SerializedItem {
+                            TileItem {
                                 kind: "time_series_plot".into(),
                                 state: r#"{"label":"speed"}"#.into(),
                             },
@@ -178,18 +122,18 @@ mod tests {
     #[test]
     fn round_trip_preserves_tree_shape() {
         let original = sample_layout();
-        let json = facet_json::to_string(&original).expect("serialize");
-        let parsed: SerializedTileGroup = facet_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: TileLayout = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(parsed.version, 1);
-        let SerializedMember::Split(split) = parsed.root else {
+        let TileNode::Split(split) = parsed.root else {
             panic!("expected split");
         };
-        assert!(matches!(split.axis, SerializedAxis::Horizontal));
+        assert!(matches!(split.axis, SplitAxis::Horizontal));
         assert_eq!(split.flexes, vec![1.0, 2.0]);
         assert_eq!(split.children.len(), 2);
 
-        let SerializedMember::Pane(p0) = &split.children[0] else {
+        let TileNode::Pane(p0) = &split.children[0] else {
             panic!("expected pane");
         };
         assert_eq!(p0.active_index, 0);
@@ -200,7 +144,7 @@ mod tests {
         assert_eq!(p0.items[0].kind, "component_text");
         assert_eq!(p0.items[0].state, r#"{"component":"foo"}"#);
 
-        let SerializedMember::Pane(p1) = &split.children[1] else {
+        let TileNode::Pane(p1) = &split.children[1] else {
             panic!("expected pane");
         };
         assert_eq!(p1.active_index, 1);
@@ -208,5 +152,24 @@ mod tests {
         assert!(p1.hide_tab_bar);
         assert_eq!(p1.locked_size, Some((300.0, 200.0)));
         assert_eq!(p1.items.len(), 2);
+    }
+
+    /// Pins the wire format facet-json produced before the serde migration:
+    /// externally tagged enum variants, `null` options, and additive fields
+    /// defaulting when absent.
+    #[test]
+    fn reads_pre_serde_layout_json() {
+        let json = r#"{"version":1,"root":{"Split":{"axis":"Vertical","flexes":[1,1],"children":[{"Pane":{"active_index":0,"tab_orientation":"Horizontal","hide_tab_bar":false,"locked_size":null,"items":[{"kind":"node_editor","state":"{}"}]}},{"Pane":{"active_index":0,"tab_orientation":"Vertical","hide_tab_bar":true,"locked_size":[300.0,200.0],"items":[]}}]}}}"#;
+        let parsed: TileLayout = serde_json::from_str(json).expect("legacy layout parses");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.global_time_range, "");
+        let TileNode::Split(split) = parsed.root else {
+            panic!("expected split");
+        };
+        assert!(matches!(split.axis, SplitAxis::Vertical));
+        let TileNode::Pane(p1) = &split.children[1] else {
+            panic!("expected pane");
+        };
+        assert_eq!(p1.locked_size, Some((300.0, 200.0)));
     }
 }

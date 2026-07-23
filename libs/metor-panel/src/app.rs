@@ -1290,7 +1290,7 @@ fn register_panel<T: crate::tiles::PaneItem>(
     from_config: fn(T::Config, Arc<DB>, &mut Context<T>) -> T,
 ) {
     reg.register::<T>(move |state, cx| {
-        let cfg: T::Config = facet_json::from_str(state).unwrap_or_default();
+        let cfg: T::Config = serde_json::from_str(state).unwrap_or_default();
         let db = db.clone();
         Some(cx.new(|cx| from_config(cfg, db, cx)))
     });

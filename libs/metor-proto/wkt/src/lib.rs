@@ -6,12 +6,14 @@ use serde::{Deserialize, Serialize};
 mod metadata;
 mod msgs;
 mod path;
+mod tile;
 #[cfg(feature = "nox")]
 mod value;
 
 pub use metadata::*;
 pub use msgs::*;
 pub use path::*;
+pub use tile::*;
 #[cfg(feature = "nox")]
 pub use value::*;
 

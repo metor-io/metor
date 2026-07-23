@@ -5,6 +5,7 @@ use gpui::{
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
+use serde::{Deserialize, Serialize};
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
@@ -26,7 +27,8 @@ use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
 /// Persisted shape of a [`TextPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TextPanelConfig {
     /// Display label and serialization key for the source component.
     pub component: String,
@@ -84,7 +86,8 @@ impl PaneItem for TextPanel {
 
 /// Persisted shape of an [`AlarmPanel`]. The panel shows global alarm state, so the
 /// only persisted bit is which tab it opens on.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AlarmPanelConfig {
     pub show_history: bool,
 }
@@ -139,7 +142,8 @@ impl PaneItem for AlarmPanel {
 }
 
 /// Persisted shape of a [`LogPanel`]: the view's filters and follow mode.
-#[derive(facet::Facet)]
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogPanelConfig {
     pub min_level: LevelFilter,
     pub source: String,
@@ -210,7 +214,8 @@ impl PaneItem for LogPanel {
 
 /// Persisted shape of a [`SequencePanel`]. Sequence state is global, so the only persisted
 /// bit is the view's list mode (defaulted).
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct SequencePanelConfig {
     pub show_history: bool,
 }
@@ -266,7 +271,8 @@ impl PaneItem for SequencePanel {
 
 /// Persisted shape of a [`SequenceGridPanel`]. No per-panel config — the grid reads the
 /// global sequence store.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct SequenceGridPanelConfig {}
 
 /// Pane item with the compact many-channel sequence grid.
@@ -312,7 +318,8 @@ impl PaneItem for SequenceGridPanel {
 }
 
 /// Persisted shape of a [`TrafficLightPanel`].
-#[derive(facet::Facet, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct TrafficLightPanelConfig {
     pub component: String,
     pub color: Option<Hsla>,
@@ -381,7 +388,8 @@ impl PaneItem for TrafficLightPanel {
 }
 
 /// Persisted shape of a [`TrafficLightGridPanel`].
-#[derive(facet::Facet, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct TrafficLightGridPanelConfig {
     pub pattern: String,
     pub color: Option<Hsla>,
@@ -452,7 +460,8 @@ impl PaneItem for TrafficLightGridPanel {
 
 /// Persisted shape of a [`TablePanel`]. Currently empty — the panel renders
 /// every component in the DB and has no per-instance configuration.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TablePanelConfig {}
 
 /// Pane item listing every component in the DB as a flat table.
@@ -498,7 +507,8 @@ impl PaneItem for TablePanel {
 }
 
 /// Persisted shape of a [`DataTablePanel`]. No per-instance configuration today.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DataTablePanelConfig {}
 
 /// Pane item rendering one row per component, grouped by namespace, with
@@ -549,9 +559,10 @@ impl PaneItem for DataTablePanel {
 ///
 /// `root_override` is an empty `Vec` rather than `Option<Vec<_>>` because
 /// "empty path" already encodes the no-override case and round-trips
-/// through facet-json without an extra discriminator. Filter-view state
+/// through JSON without an extra discriminator. Filter-view state
 /// (`SelectionRoot::Filter`) is not persisted yet.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct BrowserPanelConfig {
     pub custom_title: Override<String>,
     pub root_override: Vec<String>,
@@ -673,7 +684,8 @@ impl Render for PlotPanel {
 }
 
 /// Persisted shape of a [`PlotPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct PlotPanelConfig {
     pub label: String,
     pub traces: Vec<TraceConfig>,
@@ -715,7 +727,8 @@ pub struct PlotPanelConfig {
 /// Persisted shape of one [`EventOverlay`]. The live overlay is held as an
 /// `Entity<EventOverlay>`, and its `key` isn't `Facet`-serializable, so the
 /// key is stored as its stable string tag.
-#[derive(facet::Facet, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 pub struct EventOverlayConfig {
     /// `"logs" | "alarms" | "sequences" | "msg:e03c"` (lowercase hex, no sep).
     pub kind: String,
@@ -728,8 +741,7 @@ pub struct EventOverlayConfig {
 /// `Track`/`Pinned` are split into separate variants rather than a single
 /// optional point so the JSON discriminator is clean and old layouts that
 /// default to `Track` deserialize without an extra flag.
-#[derive(facet::Facet, Default, Clone, Copy, Debug)]
-#[repr(u8)]
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug)]
 pub enum MeasurementPanelConfig {
     #[default]
     Track,
@@ -762,7 +774,8 @@ impl From<MeasurementPanelConfig> for PanelPosition {
 /// The focused trace is stored by its position in the panel's trace list at
 /// save-time (not by `EntityId`, which doesn't survive). `t_start`/`t_end`
 /// are raw microseconds because `Timestamp` doesn't implement `Facet` yet.
-#[derive(facet::Facet, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 pub struct MeasurementCursorConfig {
     pub t_start_us: i64,
     pub t_end_us: i64,
@@ -776,7 +789,8 @@ pub struct MeasurementCursorConfig {
 /// `#[facet(skip)]` because the inspector doesn't expose them — but we *do*
 /// need them on disk, so the persistence boundary uses this parallel
 /// struct.
-#[derive(facet::Facet, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct TraceConfig {
     pub component_id: ComponentId,
     pub element_index: usize,
@@ -839,7 +853,8 @@ impl From<TraceConfig> for Trace {
 
 /// Persisted shape of one [`YAxis`]. Parallel struct because the live axis
 /// is held as an `Entity<YAxis>` in the plot.
-#[derive(facet::Facet, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct YAxisConfig {
     pub label: String,
     pub y_min_override: Override<f64>,
@@ -1060,7 +1075,8 @@ impl Render for XyPlotPanel {
 }
 
 /// Persisted shape of an [`XyPlotPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct XyPlotPanelConfig {
     pub label: String,
     pub traces: Vec<XyTraceConfig>,
@@ -1075,7 +1091,8 @@ pub struct XyPlotPanelConfig {
 ///
 /// Mirrors [`TraceConfig`]; both axes' `(component_id, element_index)`
 /// pairs need to round-trip on disk even though the inspector hides them.
-#[derive(facet::Facet, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct XyTraceConfig {
     pub x_component_id: ComponentId,
     pub x_element_index: usize,
@@ -1217,7 +1234,8 @@ impl Render for ListPlotPanel {
 }
 
 /// Persisted shape of a [`ListPlotPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ListPlotPanelConfig {
     pub label: String,
     pub traces: Vec<ListTraceConfig>,
@@ -1229,7 +1247,8 @@ pub struct ListPlotPanelConfig {
 }
 
 /// Persisted shape of one [`ListTrace`].
-#[derive(facet::Facet, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct ListTraceConfig {
     pub component_id: ComponentId,
     pub len: usize,
@@ -1333,7 +1352,8 @@ impl PaneItem for ListPlotPanel {
 }
 
 /// Persisted shape of a [`Viewer3dPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Viewer3dPanelConfig {
     pub models: Vec<ModelConfig>,
     pub camera: CameraConfig,
@@ -1343,7 +1363,8 @@ pub struct Viewer3dPanelConfig {
 ///
 /// Mirrors the data fields of [`crate::views::viewer_3d::ModelEntry`] but
 /// avoids the live `Entity` wrapping so the config can round-trip directly.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ModelConfig {
     pub label: String,
     pub path: String,
@@ -1355,7 +1376,8 @@ pub struct ModelConfig {
 ///
 /// `glam::Vec3` is not `Facet`, so the target is unpacked into three fields
 /// at the persistence boundary.
-#[derive(facet::Facet)]
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct CameraConfig {
     pub target_x: f32,
     pub target_y: f32,
@@ -1882,17 +1904,17 @@ mod tests {
     use super::*;
     use metor_proto::types::ComponentId;
 
-    /// Each panel's `*Config` round-trips through facet-json without loss.
+    /// Each panel's `*Config` round-trips through JSON without loss.
     /// Mirrors the per-instance shape that `to_config` would produce; this
     /// test pins the wire format independently of the panel-construction
     /// code path so a missing field in either direction shows up here.
     #[test]
-    fn panel_configs_round_trip_through_facet_json() {
+    fn panel_configs_round_trip_through_json() {
         let text = TextPanelConfig {
             component: "altitude".into(),
         };
-        let s = facet_json::to_string(&text).unwrap();
-        let back: TextPanelConfig = facet_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&text).unwrap();
+        let back: TextPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.component, "altitude");
 
         let plot = PlotPanelConfig {
@@ -1938,8 +1960,8 @@ mod tests {
                 },
             ],
         };
-        let s = facet_json::to_string(&plot).unwrap();
-        let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&plot).unwrap();
+        let back: PlotPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.label, "speed");
         assert_eq!(back.event_overlays.len(), 2);
         assert_eq!(back.event_overlays[1].kind, "msg:e03c");
@@ -1968,7 +1990,7 @@ mod tests {
         // `x_range` existed must still load, defaulting to `Relative`, no
         // explicit axes, and a follow-global range.
         let legacy = r#"{"label":"old","traces":[],"custom_title":"Auto","y_min_override":"Auto","y_max_override":"Auto","default_measurements":[],"cursors":[],"measurement_panel":"Track"}"#;
-        let back: PlotPanelConfig = facet_json::from_str(legacy).unwrap();
+        let back: PlotPanelConfig = serde_json::from_str(legacy).unwrap();
         assert_eq!(back.x_time_format, TimeFormat::Relative);
         assert!(back.axes.is_empty());
         assert!(back.x_range.is_empty());
@@ -1990,8 +2012,8 @@ mod tests {
                 fov_y_rad: std::f32::consts::FRAC_PI_3,
             },
         };
-        let s = facet_json::to_string(&viewer).unwrap();
-        let back: Viewer3dPanelConfig = facet_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&viewer).unwrap();
+        let back: Viewer3dPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.models.len(), 1);
         assert_eq!(back.models[0].label, "satellite");
         assert_eq!(back.models[0].path, "sat.glb");
@@ -2019,8 +2041,8 @@ mod tests {
             y_min_override: Override::Auto,
             y_max_override: Override::Custom(2.5),
         };
-        let s = facet_json::to_string(&xy).unwrap();
-        let back: XyPlotPanelConfig = facet_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&xy).unwrap();
+        let back: XyPlotPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.label, "phase");
         assert_eq!(back.traces.len(), 1);
         assert_eq!(back.traces[0].x_component_id, ComponentId(2));

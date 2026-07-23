@@ -21,8 +21,7 @@ use crate::dynamic::node::BuildError;
 
 /// Typed scalar — used both for op args (`Scale.k`, `Constant.value`) and as
 /// the boundary type when reading/writing element values. Mirrors `PrimType`.
-#[derive(Clone, Copy, Debug, PartialEq, facet::Facet)]
-#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TypedScalar {
     U8(u8),
     U16(u16),

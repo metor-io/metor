@@ -12,6 +12,7 @@ use gpui::{
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::theme::theme;
@@ -32,7 +33,7 @@ pub struct WidgetSpec {
     pub default_size: (f32, f32),
     pub label: Arc<dyn Fn(&DashboardWidget) -> SharedString>,
     /// Build receives the widget's persisted config string. Each builder
-    /// chooses how to parse it (typically `facet_json::from_str` into a
+    /// chooses how to parse it (typically `serde_json::from_str` into a
     /// kind-specific config struct).
     pub build: Arc<dyn Fn(&str, &Arc<DB>, &mut App) -> (AnyView, gpui::AnyEntity)>,
 }
@@ -153,13 +154,15 @@ impl WidgetRegistry {
 }
 
 /// Persisted shape of a text widget — the source component to display.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TextWidgetConfig {
     pub component: String,
 }
 
 /// Persisted shape of an image widget — the file path to load.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ImageWidgetConfig {
     pub path: String,
 }
@@ -167,37 +170,37 @@ pub struct ImageWidgetConfig {
 /// Persisted shape of a monitor widget — the source component to monitor
 /// plus the inspector-editable display fields.
 ///
-/// `unit` and `show_sparkline` are `Option` (with `#[facet(default)]` for
-/// pre-existing blobs): `None` means "never edited", so restore keeps the
+/// `unit` and `show_sparkline` are `Option`: `None` means "never edited", so restore keeps the
 /// constructor's metadata-derived defaults instead of clobbering them.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct MonitorWidgetConfig {
     pub component: String,
-    #[facet(default)]
     pub unit: Option<String>,
-    #[facet(default)]
     pub show_sparkline: Option<bool>,
 }
 
 /// Persisted shape of a traffic-light widget.
-#[derive(facet::Facet, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct TrafficLightWidgetConfig {
     pub component: String,
     pub color: Option<Hsla>,
 }
 
 /// Persisted shape of a traffic-light grid widget.
-#[derive(facet::Facet, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct TrafficLightGridWidgetConfig {
     pub pattern: String,
     pub color: Option<Hsla>,
 }
 
-/// Parse a widget's facet-json blob into its expected config type, falling
+/// Parse a widget's JSON blob into its expected config type, falling
 /// back to `Default` on any parse error so labels and builders degrade
 /// gracefully on a stale or hand-edited file.
-fn parse_or_default<T: facet::Facet<'static> + Default>(blob: &str) -> T {
-    facet_json::from_str::<T>(blob).unwrap_or_default()
+fn parse_or_default<T: serde::de::DeserializeOwned + Default>(blob: &str) -> T {
+    serde_json::from_str::<T>(blob).unwrap_or_default()
 }
 
 /// Render an empty string as `"?"` so labels stay legible when a widget
@@ -231,7 +234,7 @@ fn placeholder_spec(kind: &WidgetKind) -> Arc<WidgetSpec> {
     })
 }
 
-/// Snapshot a live widget's editable state into a fresh facet-json blob.
+/// Snapshot a live widget's editable state into a fresh JSON blob.
 ///
 /// Returns `None` for widget kinds whose persisted config never changes
 /// after construction (text, image, table, viewer3d) — the cached blob on
@@ -298,7 +301,7 @@ pub fn serialize_widget_state(
                 })
                 .collect(),
         };
-        return facet_json::to_string(&cfg).ok();
+        return serde_json::to_string(&cfg).ok();
     }
     if *kind == WidgetKind::traffic_light() {
         let tl = entity.clone().downcast::<TrafficLight>().ok()?;
@@ -307,7 +310,7 @@ pub fn serialize_widget_state(
             component: v.name().to_string(),
             color: Some(v.color()),
         };
-        return facet_json::to_string(&cfg).ok();
+        return serde_json::to_string(&cfg).ok();
     }
     if *kind == WidgetKind::traffic_light_grid() {
         let g = entity.clone().downcast::<TrafficLightGrid>().ok()?;
@@ -316,7 +319,7 @@ pub fn serialize_widget_state(
             pattern: v.pattern().to_string(),
             color: Some(v.color()),
         };
-        return facet_json::to_string(&cfg).ok();
+        return serde_json::to_string(&cfg).ok();
     }
     if *kind == WidgetKind::monitor() {
         let m = entity.clone().downcast::<Monitor>().ok()?;
@@ -324,7 +327,7 @@ pub fn serialize_widget_state(
         let mut cfg = parse_or_default::<MonitorWidgetConfig>(config);
         cfg.unit = Some(v.unit.to_string());
         cfg.show_sparkline = Some(v.show_sparkline);
-        return facet_json::to_string(&cfg).ok();
+        return serde_json::to_string(&cfg).ok();
     }
     None
 }
@@ -523,7 +526,7 @@ mod tests {
 
     #[test]
     fn monitor_config_tolerates_pre_display_field_blobs() {
-        let cfg: MonitorWidgetConfig = facet_json::from_str(r#"{"component":"a.b"}"#).unwrap();
+        let cfg: MonitorWidgetConfig = serde_json::from_str(r#"{"component":"a.b"}"#).unwrap();
         assert_eq!(cfg.component, "a.b");
         assert_eq!(cfg.unit, None);
         assert_eq!(cfg.show_sparkline, None);
@@ -536,8 +539,8 @@ mod tests {
             unit: Some("V".to_string()),
             show_sparkline: Some(false),
         };
-        let blob = facet_json::to_string(&cfg).unwrap();
-        let back: MonitorWidgetConfig = facet_json::from_str(&blob).unwrap();
+        let blob = serde_json::to_string(&cfg).unwrap();
+        let back: MonitorWidgetConfig = serde_json::from_str(&blob).unwrap();
         assert_eq!(back.component, "a.b");
         assert_eq!(back.unit.as_deref(), Some("V"));
         assert_eq!(back.show_sparkline, Some(false));

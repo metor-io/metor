@@ -1035,7 +1035,7 @@ fn paint_hover_markers(
 }
 
 /// Rendering mode for a single [`Trace`].
-#[derive(Clone, Copy, Default, PartialEq, facet::Facet)]
+#[derive(Clone, Copy, Default, PartialEq, facet::Facet, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum PlotStyle {
     #[default]
@@ -1072,7 +1072,9 @@ impl PlotStyle {
 /// time so events can be read against real-world clocks; `Utc` uses UTC and
 /// `Local` the machine's timezone. Data positions are unchanged — only the
 /// tick labels and their anchoring differ.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, facet::Facet)]
+#[derive(
+    Clone, Copy, Default, PartialEq, Eq, Debug, facet::Facet, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum TimeFormat {
     #[default]

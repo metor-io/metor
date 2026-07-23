@@ -85,8 +85,7 @@ fn map(
 
 /// Affine transformation against a scalar `k`. Same signature for every
 /// variant: one `TypedScalar` arg, dtype promoted against the input dtype.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
-#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AffineOp {
     /// `x * k`
     Scale,
@@ -129,8 +128,7 @@ pub fn affine(
 
 /// Single-input unary math. Schema and validation rules depend on the
 /// variant — see each variant's docstring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
-#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     /// `|x|`. Rejects `Bool`. Identity on unsigned ints. Output dtype: input.
     Abs,
@@ -397,8 +395,7 @@ pub fn index(input: Arc<dyn DynamicNode>, i: usize) -> Result<Arc<dyn DynamicNod
 
 /// Comparison operator for [`threshold`]. Variants name the relation between
 /// the input element and the threshold `k` that produces a `1.0` output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
-#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ThresholdOp {
     /// `input > k`
     Gt,

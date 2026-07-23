@@ -1049,7 +1049,7 @@ fn variadic_parent_order_follows_target_socket() {
 }
 
 #[test]
-fn config_round_trips_through_facet_json() {
+fn config_round_trips_through_json() {
     let mut g = NodeGraph::new(0xDEAD_BEEF);
     g.insert_node(
         "clk".into(),
@@ -1101,8 +1101,8 @@ fn config_round_trips_through_facet_json() {
 
     let viewport = Viewport { x: -50.0, y: 75.0 };
     let cfg = NodeEditorConfig::from_graph(&g, viewport.clone());
-    let json = facet_json::to_string(&cfg).expect("serialize");
-    let parsed: NodeEditorConfig = facet_json::from_str(&json).expect("parse");
+    let json = serde_json::to_string(&cfg).expect("serialize");
+    let parsed: NodeEditorConfig = serde_json::from_str(&json).expect("parse");
 
     assert_eq!(parsed.viewport.x, viewport.x);
     assert_eq!(parsed.viewport.y, viewport.y);
@@ -1164,7 +1164,7 @@ fn config_ignores_removed_legacy_fields() {
     // still carry them; hydration must skip the unknown keys, not fail.
     let json =
         r#"{"owner_uuid":123,"viewport":{"x":1.0,"y":2.0,"zoom":1.5},"nodes":[],"edges":[]}"#;
-    let parsed: NodeEditorConfig = facet_json::from_str(json).expect("legacy keys tolerated");
+    let parsed: NodeEditorConfig = serde_json::from_str(json).expect("legacy keys tolerated");
     assert_eq!(parsed.viewport.x, 1.0);
     assert_eq!(parsed.viewport.y, 2.0);
 }

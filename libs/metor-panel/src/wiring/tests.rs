@@ -15,6 +15,7 @@ fn wiring_with_system(name: &str) -> Wiring {
             cycle_rate: 100.0,
             default_depth: None,
             clock: ClockSpec::Wall,
+            namespace: None,
         },
         artifacts: Vec::new(),
         states: Vec::new(),

@@ -1,9 +1,9 @@
 //! On-disk state for the connection system, under
 //! `dirs::config_dir()/metor/panel/connections/`.
 //!
-//! Two artifacts, both facet-json with the same tolerant-read conventions
-//! as [`config`](crate::config):
-//! - `index.json` — favorites and the recents list. Address-carrying
+//! Two artifacts with the same tolerant-read conventions as
+//! [`config`](crate::config):
+//! - `index.json` — facet-json; favorites and the recents list. Address-carrying
 //!   recents stay connectable across restarts through the installed
 //!   address resolver; discovery-only recents carry display fields alone,
 //!   reappearing as connectable once their source re-produces the target.

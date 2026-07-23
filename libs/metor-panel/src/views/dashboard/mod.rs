@@ -12,6 +12,7 @@ use gpui::{
     Window, div, point, prelude::*, px,
 };
 use metor_db::DB;
+use serde::{Deserialize, Serialize};
 
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::theme::theme;
@@ -33,12 +34,12 @@ fn snap_px(v: f32) -> f32 {
 }
 
 /// Monotonic id assigned to a widget on placement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, facet::Facet)]
-#[facet(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct WidgetId(pub u64);
 
 /// Pixel rectangle within the dashboard canvas.
-#[derive(Debug, Clone, Copy, facet::Facet)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WidgetRect {
     pub x: f32,
     pub y: f32,
@@ -51,8 +52,8 @@ pub struct WidgetRect {
 /// Exposed as a newtype over [`SharedString`] so downstream code can
 /// register additional kinds beyond the shipped built-ins via
 /// [`WidgetKind::new`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, facet::Facet)]
-#[facet(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct WidgetKind(pub SharedString);
 
 impl WidgetKind {
@@ -92,9 +93,9 @@ impl WidgetKind {
 /// One placed widget (position + persisted config).
 ///
 /// `config` is an opaque blob whose shape is owned by the
-/// [`WidgetKind`]; each kind's builder parses it via `facet_json::from_str`
+/// [`WidgetKind`]; each kind's builder parses it via `serde_json::from_str`
 /// (or any other format it chooses) into a kind-specific config struct.
-#[derive(Debug, Clone, facet::Facet)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardWidget {
     pub id: WidgetId,
     pub rect: WidgetRect,
@@ -566,16 +567,16 @@ fn component_picker_rows(
                             component,
                             ..Default::default()
                         };
-                        facet_json::to_string(&cfg)
+                        serde_json::to_string(&cfg)
                     } else if kind == WidgetKind::traffic_light() {
                         let cfg = widgets::TrafficLightWidgetConfig {
                             component,
                             color: None,
                         };
-                        facet_json::to_string(&cfg)
+                        serde_json::to_string(&cfg)
                     } else {
                         let cfg = widgets::TextWidgetConfig { component };
-                        facet_json::to_string(&cfg)
+                        serde_json::to_string(&cfg)
                     }
                     .expect("component widget config serializes");
                     let kind = kind.clone();
@@ -601,7 +602,7 @@ fn traffic_light_grid_pattern_rows(
                 color: None,
             };
             let config =
-                facet_json::to_string(&cfg).expect("traffic light grid widget config serializes");
+                serde_json::to_string(&cfg).expect("traffic light grid widget config serializes");
             dashboard.update(cx, |this, cx| {
                 this.add_widget(WidgetKind::traffic_light_grid(), config, cx);
             });
@@ -617,7 +618,7 @@ fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRo
                 let cfg = widgets::ImageWidgetConfig {
                     path: input.to_string(),
                 };
-                let config = facet_json::to_string(&cfg).expect("image widget config serializes");
+                let config = serde_json::to_string(&cfg).expect("image widget config serializes");
                 dashboard.update(cx, |this, cx| {
                     this.add_widget(WidgetKind::image(), config, cx);
                 });
@@ -747,7 +748,8 @@ impl Render for DashboardPanel {
 }
 
 /// Persisted shape of [`DashboardPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DashboardPanelConfig {
     pub title: String,
     pub next_id: u64,
@@ -791,12 +793,12 @@ impl PaneItem for DashboardPanel {
     }
 }
 
-/// Rebuild a [`DashboardPanel`] from its persisted facet-json blob.
+/// Rebuild a [`DashboardPanel`] from its persisted JSON blob.
 ///
 /// Returns a freshly defaulted dashboard if the blob fails to parse —
 /// preferable to crashing on a stale or hand-edited config file.
 pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<DashboardPanel> {
-    let cfg: DashboardPanelConfig = facet_json::from_str(blob).unwrap_or_default();
+    let cfg: DashboardPanelConfig = serde_json::from_str(blob).unwrap_or_default();
 
     let mut widget_views = HashMap::new();
     let mut widget_entities = HashMap::new();

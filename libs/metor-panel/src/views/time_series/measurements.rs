@@ -22,7 +22,7 @@ use crate::dynamic::tensor::read_f64_at;
 ///
 /// `facet::Facet` so the set of enabled kinds round-trips through the panel
 /// layout serialization.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Facet)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Facet, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum MeasurementKind {
     DeltaX,

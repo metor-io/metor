@@ -1,27 +1,31 @@
 //! Persistence shape for a node editor pane. Round-trips through
-//! `facet_json` alongside the rest of the dashboard preset (the editor's
+//! `serde_json` alongside the rest of the dashboard preset (the editor's
 //! `NodeEditor::to_config` produces this; `NodeEditor::from_config` parses
 //! it back). Per-preset: each `NodeEditorConfig` is embedded inside a
 //! `SerializedItem`'s `state` blob, so swapping presets swaps the graph.
+
+use serde::{Deserialize, Serialize};
 
 use crate::node_editor::coordinator::OwnerId;
 use crate::node_editor::graph::{EdgeEntry, NodeGraph, Position};
 use crate::node_editor::spec::NodeSpec;
 
-#[derive(Clone, Debug, Default, facet::Facet)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NodeEditorConfig {
     pub viewport: Viewport,
     pub nodes: Vec<SerializedNode>,
     pub edges: Vec<SerializedEdge>,
 }
 
-#[derive(Clone, Debug, Default, facet::Facet)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Viewport {
     pub x: f32,
     pub y: f32,
 }
 
-#[derive(Clone, Debug, facet::Facet)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SerializedNode {
     pub flow_id: String,
     pub spec: NodeSpec,
@@ -29,7 +33,7 @@ pub struct SerializedNode {
     pub y: f32,
 }
 
-#[derive(Clone, Debug, facet::Facet)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SerializedEdge {
     pub source: String,
     pub target: String,

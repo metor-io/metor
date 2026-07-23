@@ -16,6 +16,7 @@ fn base_wiring() -> Wiring {
             cycle_rate: 100.0,
             default_depth: None,
             clock: ClockSpec::Wall,
+            namespace: None,
         },
         artifacts: Vec::new(),
         states: Vec::new(),
@@ -188,7 +189,7 @@ fn top_bottom_flows_down() {
 #[test]
 fn config_without_direction_defaults() {
     let json = r#"{"viewport":{"x":1.0,"y":2.0},"overrides":[],"collapsed":[]}"#;
-    let cfg: super::config::SystemGraphConfig = facet_json::from_str(json).expect("deserialize");
+    let cfg: super::config::SystemGraphConfig = serde_json::from_str(json).expect("deserialize");
     assert_eq!(cfg.direction, Direction::LeftRight);
     assert_eq!(cfg.viewport.x, 1.0);
 }
