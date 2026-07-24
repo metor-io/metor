@@ -1,4 +1,23 @@
-from metor_config import Alarm, Alarms, Component, Downlink, Target, TcpServer, Uplink, band
+from metor_config import (
+    Alarm,
+    AlarmList,
+    Alarms,
+    Component,
+    Downlink,
+    HSplit,
+    Logs,
+    Pane,
+    Preset,
+    Presets,
+    SequenceList,
+    Target,
+    TcpServer,
+    TimeSeriesPlot,
+    Trace,
+    Uplink,
+    VSplit,
+    band,
+)
 from adcs_pack import Ctrl, Nav, Plant
 from adcs_seqs import commissioning, safe_mode
 
@@ -58,6 +77,48 @@ alarms = m.add(
             critical=band(above=0.038, below=-0.038),
             debounce=2,
             hysteresis=0.001,
+        ),
+    ]),
+)
+
+# The layout the panel offers on a fresh connection: rates and wheel momentum
+# up top, the operational surfaces (logs, alarms, sequences) below.
+presets = m.add(
+    "presets",
+    Presets([
+        Preset(
+            name="adcs-ops",
+            time_range="LAST 5m",
+            layout=VSplit(
+                HSplit(
+                    TimeSeriesPlot(
+                        label="Body Rates",
+                        traces=[
+                            Trace("plant.sensors.gyro_b", element=i, label=f"gyro_b.{ax}")
+                            for i, ax in enumerate("xyz")
+                        ]
+                        + [
+                            Trace("nav.attitude_estimate.omega_b", element=1, label="omega_b.y")
+                        ],
+                    ),
+                    TimeSeriesPlot(
+                        label="Wheel Momentum",
+                        traces=[
+                            Trace(
+                                f"plant.wheels.wheels.{w}.ang_momentum",
+                                label=f"wheel {w}",
+                            )
+                            for w in range(3)
+                        ],
+                    ),
+                ),
+                HSplit(
+                    Logs(),
+                    Pane([AlarmList(), SequenceList()]),
+                    flexes=[2.0, 1.0],
+                ),
+                flexes=[2.0, 1.0],
+            ),
         ),
     ]),
 )
