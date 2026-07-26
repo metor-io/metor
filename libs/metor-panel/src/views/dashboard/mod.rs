@@ -1145,6 +1145,7 @@ fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRo
             if !input.is_empty() {
                 let cfg = widgets::ImageWidgetConfig {
                     path: input.to_string(),
+                    data: String::new(),
                 };
                 let config = serde_json::to_string(&cfg).expect("image widget config serializes");
                 dashboard.update(cx, |this, cx| {
@@ -1589,6 +1590,97 @@ mod tests {
         assert_eq!(back.connectors[0].style.label, "feed");
         assert!(back.connectors[0].style.on_top);
         assert_eq!(back.next_connector_id, 3);
+    }
+
+    /// Cross-language pin: a dashboard emitted by the Python preset builder
+    /// (`metor_config.Dashboard`) must parse into this config exactly.
+    ///
+    /// The widget `config` blob is an opaque string to the FSW-side preset
+    /// validator, so nothing upstream catches a shape mismatch — without this
+    /// test, a rename here turns a shipped dashboard into placeholder tiles
+    /// with no error anywhere.
+    #[test]
+    fn a_python_authored_dashboard_parses() {
+        let blob = r##"{"title": "ADCS", "next_id": 5, "widgets": [{"id": 1, "rect": {"x": 20.0, "y": 20.0, "w": 90.0, "h": 200.0}, "kind": "meter", "config": "{\"component\": \"sat1.plant.wheels.h\", \"element\": 0, \"min\": -0.04, \"max\": 0.04, \"unit\": \"N m s\", \"orientation\": \"Vertical\"}"}, {"id": 2, "rect": {"x": 200.0, "y": 20.0, "w": 150.0, "h": 60.0}, "kind": "state_chip", "config": "{\"component\": \"sat1.mode.mode_cmd\", \"element\": 0, \"states\": [{\"value\": 0.0, \"label\": \"IDLE\"}, {\"value\": 2.0, \"label\": \"POINTING\", \"color\": \"#a6e3a1ff\"}], \"unknown_label\": \"\"}"}, {"id": 3, "rect": {"x": 20.0, "y": 260.0, "w": 220.0, "h": 260.0}, "kind": "attitude", "config": "{\"component\": \"sat1.nav.attitude_estimate.q_hat_b_eci\", \"element_offset\": 0, \"vectors\": [{\"component\": \"sat1.plant.sensors.mag_b\", \"label\": \"mag\"}]}"}, {"id": 4, "rect": {"x": 200.0, "y": 120.0, "w": 260.0, "h": 110.0}, "kind": "sequence_control", "config": "{\"channel\": \"mode\", \"compact\": false}"}], "connectors": [{"id": 1, "points": [{"Widget": {"id": 3, "side": "Top", "t": 0.2045}}, {"Widget": {"id": 1, "side": "Bottom", "t": 1.0}}], "style": {"width": 1.5, "dashed": false, "shape": "Orthogonal", "arrow": "End", "label": "momentum", "on_top": false, "bind": {"component": "sat1.plant.wheels.arm", "element": 0, "threshold": 0.0}}}, {"id": 2, "points": [{"Widget": {"id": 2, "side": "Right", "t": 0.5}}, {"Free": {"x": 600.0, "y": 60.0}}], "style": {"width": 1.5, "dashed": true, "shape": "Curved", "arrow": "None", "label": "", "on_top": true}}], "next_connector_id": 3}"##;
+
+        let cfg: DashboardPanelConfig = serde_json::from_str(blob).unwrap();
+        assert_eq!(cfg.title, "ADCS");
+        assert_eq!(
+            cfg.widgets
+                .iter()
+                .map(|w| w.kind.0.as_ref())
+                .collect::<Vec<_>>(),
+            ["meter", "state_chip", "attitude", "sequence_control"]
+        );
+
+        // Every widget kind must be one the registry knows; an unregistered
+        // kind renders as "? unknown kind" rather than failing to parse.
+        for w in &cfg.widgets {
+            assert!(
+                w.kind == WidgetKind::meter()
+                    || w.kind == WidgetKind::state_chip()
+                    || w.kind == WidgetKind::attitude()
+                    || w.kind == WidgetKind::sequence_control(),
+                "unregistered kind {:?}",
+                w.kind
+            );
+        }
+
+        // Each widget's opaque blob must parse into that kind's config.
+        let meter: crate::views::MeterConfig =
+            serde_json::from_str(&cfg.widgets[0].config).unwrap();
+        assert_eq!(meter.component, "sat1.plant.wheels.h");
+        assert_eq!((meter.min, meter.max), (-0.04, 0.04));
+        assert!(matches!(
+            meter.orientation,
+            crate::views::Orientation::Vertical
+        ));
+
+        let chip: crate::views::StateChipConfig =
+            serde_json::from_str(&cfg.widgets[1].config).unwrap();
+        assert_eq!(chip.states.len(), 2);
+        assert_eq!(chip.states[1].label, "POINTING");
+        assert!(chip.states[1].color.is_some());
+
+        let att: crate::views::AttitudeConfig =
+            serde_json::from_str(&cfg.widgets[2].config).unwrap();
+        assert_eq!(att.vectors[0].label, "mag");
+
+        let seq: crate::views::SequenceControlConfig =
+            serde_json::from_str(&cfg.widgets[3].config).unwrap();
+        assert_eq!(seq.channel, "mode");
+
+        assert_eq!(cfg.connectors.len(), 2);
+        let schematic = &cfg.connectors[0];
+        assert_eq!(schematic.style.shape, LineShape::Orthogonal);
+        assert_eq!(schematic.style.arrow, ArrowEnds::End);
+        assert!(!schematic.style.on_top);
+        assert_eq!(
+            schematic.style.bind.as_ref().unwrap().component,
+            "sat1.plant.wheels.arm"
+        );
+        assert!(matches!(
+            schematic.points[0],
+            ConnectorAnchor::Widget {
+                id: WidgetId(3),
+                side: Side::Top,
+                ..
+            }
+        ));
+
+        let leader = &cfg.connectors[1];
+        assert_eq!(leader.style.shape, LineShape::Curved);
+        assert!(leader.style.on_top && leader.style.dashed);
+        assert!(matches!(leader.points[1], ConnectorAnchor::Free { .. }));
+
+        // Both connectors resolve once their widgets are in place.
+        for c in &cfg.connectors {
+            assert!(
+                connectors::resolve_all(c, &cfg.widgets).is_some(),
+                "connector {:?} did not resolve",
+                c.id
+            );
+        }
     }
 
     #[test]

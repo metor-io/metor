@@ -479,6 +479,9 @@ class TimeSeriesPlot:
     x_range: str = ""
 
     def _item(self, namespace: str | None) -> dict[str, Any]:
+        return PaneState("time_series_plot", self._state(namespace))._item(namespace)
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
         traces = [
             _drop_none(
                 {
@@ -490,8 +493,11 @@ class TimeSeriesPlot:
             )
             for i, t in enumerate(self.traces)
         ]
-        state = {"label": self.label, "x_range": self.x_range, "traces": traces}
-        return PaneState("time_series_plot", state)._item(namespace)
+        return {"label": self.label, "x_range": self.x_range, "traces": traces}
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        # The dashboard names this kind `plot`, not `time_series_plot`.
+        return "plot", self._state(namespace), (400.0, 250.0)
 
 
 @dataclass(frozen=True)
@@ -556,6 +562,449 @@ def ComponentTable() -> PaneState:  # noqa: N802
 def DataTable() -> PaneState:  # noqa: N802
     """One row per component, grouped by namespace, with live values."""
     return PaneState("data_table", {})
+
+
+# ---------------------------------------------------------------------------
+# Dashboard widgets and connectors
+# ---------------------------------------------------------------------------
+#
+# A dashboard is one pane whose contents are free-placed at pixel rects rather
+# than split, plus the connectors that turn those boxes into a diagram. Widget
+# kinds are a separate namespace from pane kinds -- the same view can appear on
+# both surfaces under different names -- so each widget below reports its own
+# `_widget(namespace) -> (kind, state, default_size)`.
+
+
+def _caller_dir() -> str:
+    """Directory of the first stack frame outside this package.
+
+    Asset paths in a target file are written relative to that file, not to
+    whatever directory the host happened to be launched from.
+    """
+    frame: Any = sys._getframe(1)
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    while frame is not None:
+        file = os.path.abspath(frame.f_code.co_filename)
+        if os.path.dirname(file) != pkg_dir:
+            return os.path.dirname(file)
+        frame = frame.f_back
+    return os.getcwd()
+
+
+@dataclass(frozen=True)
+class Meter:
+    """A bar meter over one element. A scale spanning zero fills outward from
+    zero, so a signed quantity reads correctly in both directions.
+
+    Warn/critical ticks are not configured here: the panel reads them from the
+    alarm definitions for the same element."""
+
+    component: str
+    element: int = 0
+    min: float = 0.0
+    max: float = 1.0
+    unit: str | None = None
+    label: str | None = None
+    orientation: str = "vertical"
+    color: str | None = None
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        state = _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "element": self.element,
+                "min": float(self.min),
+                "max": float(self.max),
+                "unit": self.unit,
+                "label": self.label,
+                "orientation": _enum(self.orientation, ("vertical", "horizontal")),
+                "color": self.color,
+            }
+        )
+        size = (90.0, 200.0) if self.orientation.lower() == "vertical" else (220.0, 60.0)
+        return "meter", state, size
+
+
+@dataclass(frozen=True)
+class Gauge:
+    """A dial over one element. ``sweep`` is the total arc in degrees,
+    symmetric about vertical; ``style`` is ``"arc"`` or ``"needle"``."""
+
+    component: str
+    element: int = 0
+    min: float = 0.0
+    max: float = 1.0
+    unit: str | None = None
+    label: str | None = None
+    sweep: float = 240.0
+    style: str = "arc"
+    color: str | None = None
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        state = _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "element": self.element,
+                "min": float(self.min),
+                "max": float(self.max),
+                "unit": self.unit,
+                "label": self.label,
+                "sweep_degrees": float(self.sweep),
+                "style": _enum(self.style, ("arc", "needle")),
+                "color": self.color,
+            }
+        )
+        return "gauge", state, (160.0, 140.0)
+
+
+@dataclass(frozen=True)
+class State:
+    """One row of a :class:`StateChip` table: the code, what it means, and
+    optionally the colour it shows in."""
+
+    value: float
+    label: str
+    color: str | None = None
+
+    def _json(self) -> dict[str, Any]:
+        return _drop_none(
+            {"value": float(self.value), "label": self.label, "color": self.color}
+        )
+
+
+@dataclass(frozen=True)
+class StateChip:
+    """A numeric element shown as the state it means. ``unknown`` is displayed
+    for a code the table does not list; empty shows the raw number."""
+
+    component: str
+    states: list[State]
+    element: int = 0
+    label: str | None = None
+    unknown: str = ""
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        state = _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "element": self.element,
+                "label": self.label,
+                "states": [s._json() for s in self.states],
+                "unknown_label": self.unknown,
+            }
+        )
+        return "state_chip", state, (150.0, 60.0)
+
+
+@dataclass(frozen=True)
+class VectorMarker:
+    """A body-frame 3-vector plotted on an :class:`Attitude` ball."""
+
+    component: str
+    label: str = ""
+    color: str | None = None
+
+    def _json(self, namespace: str | None) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "label": self.label,
+                "color": self.color,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class Attitude:
+    """An attitude ball over a four-element quaternion (``[x, y, z, w]``),
+    with optional body-frame direction markers."""
+
+    component: str
+    vectors: list[VectorMarker] | None = None
+    element_offset: int = 0
+    label: str | None = None
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        state = _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "element_offset": self.element_offset,
+                "label": self.label,
+                "vectors": [v._json(namespace) for v in (self.vectors or [])],
+            }
+        )
+        return "attitude", state, (220.0, 260.0)
+
+
+@dataclass(frozen=True)
+class SequenceControl:
+    """Start/stop controls for one sequence channel. ``channel`` is the slot
+    instance name, which is the address a command carries -- it is not
+    namespace-qualified."""
+
+    channel: str
+    compact: bool = False
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        return (
+            "sequence_control",
+            {"channel": self.channel, "compact": self.compact},
+            (260.0, 110.0),
+        )
+
+
+@dataclass(frozen=True)
+class Image:
+    """A static image, inlined into the preset at record time.
+
+    ``path`` is resolved relative to the target file. The bytes travel with
+    the preset because the panel may be running on a machine that has never
+    seen the target's filesystem."""
+
+    path: str
+    _base_dir: str | None = None
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        import base64
+
+        base = self._base_dir or _caller_dir()
+        full = self.path if os.path.isabs(self.path) else os.path.join(base, self.path)
+        with open(full, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        return "image", {"path": self.path, "data": data}, (300.0, 200.0)
+
+
+@dataclass(frozen=True, eq=False)
+class Place:
+    """One widget at a pixel rect on a :class:`Dashboard`.
+
+    The object is also the handle a :class:`Connector` attaches to, mirroring
+    how ``m.route`` refers to what ``m.add`` returned. Identity is the key, so
+    two placements with equal fields stay distinct."""
+
+    widget: Any
+    x: float
+    y: float
+    w: float | None = None
+    h: float | None = None
+
+    def _rect(self, default: tuple[float, float]) -> dict[str, float]:
+        return {
+            "x": float(self.x),
+            "y": float(self.y),
+            "w": float(self.w if self.w is not None else default[0]),
+            "h": float(self.h if self.h is not None else default[1]),
+        }
+
+
+@dataclass(frozen=True)
+class At:
+    """A free connector anchor at a canvas point."""
+
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
+class Edge:
+    """A named side of a placed widget, when the automatic facing side is not
+    what you want. ``t`` runs 0..1 along that side."""
+
+    place: Place
+    side: str = "bottom"
+    t: float = 0.5
+
+
+@dataclass(frozen=True)
+class Bind:
+    """Telemetry that colours a connector: on above ``threshold`` in
+    magnitude, dimmed below it. This is what makes a pipe show flow."""
+
+    component: str
+    element: int = 0
+    threshold: float = 0.0
+    on_color: str | None = None
+
+    def _json(self, namespace: str | None) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "element": self.element,
+                "threshold": float(self.threshold),
+                "on_color": self.on_color,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class Connector:
+    """A line through two or more anchors: a :class:`Place`, an :class:`Edge`,
+    or an :class:`At`.
+
+    ``on_top`` picks which side of the widgets the line paints on -- leave it
+    off for a schematic run, which should disappear into the box it enters,
+    and set it for a callout leader that has to cross one."""
+
+    points: list[Any]
+    shape: str = "orthogonal"
+    dashed: bool = False
+    arrow: str = "none"
+    color: str | None = None
+    width: float = 1.5
+    label: str = ""
+    on_top: bool = False
+    bind: Bind | None = None
+
+
+_SIDES = ("top", "right", "bottom", "left")
+
+
+def _enum(value: str, allowed: tuple[str, ...]) -> str:
+    """A Rust unit enum variant from a lowercase spelling."""
+    key = value.strip().lower()
+    if key not in allowed:
+        raise ValueError(f"expected one of {allowed}, got {value!r}")
+    return key.capitalize() if key != "none" else "None"
+
+
+def _center(rect: dict[str, float]) -> tuple[float, float]:
+    return rect["x"] + rect["w"] / 2.0, rect["y"] + rect["h"] / 2.0
+
+
+def _facing_side(rect: dict[str, float], toward: tuple[float, float]) -> tuple[str, float]:
+    """The side of ``rect`` that faces ``toward``, and where along it to
+    attach.
+
+    A bare :class:`Place` used as a connector endpoint picks its side this
+    way, so ``Connector([a, b])`` produces the line a person would have drawn
+    without naming edges. ``t`` projects the target's position onto the side
+    so the run stays as straight as the geometry allows.
+    """
+    cx, cy = _center(rect)
+    dx, dy = toward[0] - cx, toward[1] - cy
+    if abs(dx) >= abs(dy):
+        side = "right" if dx >= 0 else "left"
+        t = 0.5 if rect["h"] <= 0 else (toward[1] - rect["y"]) / rect["h"]
+    else:
+        side = "bottom" if dy >= 0 else "top"
+        t = 0.5 if rect["w"] <= 0 else (toward[0] - rect["x"]) / rect["w"]
+    return side, min(max(t, 0.0), 1.0)
+
+
+@dataclass(frozen=True)
+class Dashboard:
+    """A pane of free-placed widgets plus the connectors between them.
+
+    Widget ids are assigned in placement order; connectors refer to
+    :class:`Place` handles rather than ids, so reordering the list cannot
+    silently repoint a line."""
+
+    widgets: list[Place]
+    connectors: list[Connector] | None = None
+    title: str = "Dashboard"
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        return PaneState("dashboard", self._state(namespace))._item(namespace)
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        raise TypeError("a Dashboard cannot be placed inside another Dashboard")
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
+        entries: list[dict[str, Any]] = []
+        rects: dict[int, dict[str, float]] = {}
+        ids: dict[int, int] = {}
+
+        for index, place in enumerate(self.widgets, start=1):
+            if not isinstance(place, Place):
+                raise TypeError(
+                    f"Dashboard widgets must be Place(...), got {type(place).__name__}"
+                )
+            kind, state, default = place.widget._widget(namespace)
+            rect = place._rect(default)
+            ids[id(place)] = index
+            rects[id(place)] = rect
+            entries.append(
+                {
+                    "id": index,
+                    "rect": rect,
+                    "kind": kind,
+                    "config": json.dumps(state),
+                }
+            )
+
+        lines = [
+            self._connector(c, n, ids, rects, namespace)
+            for n, c in enumerate(self.connectors or [], start=1)
+        ]
+
+        return {
+            "title": self.title,
+            "next_id": len(entries) + 1,
+            "widgets": entries,
+            "connectors": lines,
+            "next_connector_id": len(lines) + 1,
+        }
+
+    def _connector(
+        self,
+        connector: Connector,
+        index: int,
+        ids: dict[int, int],
+        rects: dict[int, dict[str, float]],
+        namespace: str | None,
+    ) -> dict[str, Any]:
+        if len(connector.points) < 2:
+            raise ValueError("a Connector needs at least two points")
+
+        def resolved_center(point: Any) -> tuple[float, float]:
+            """Where a point sits, for choosing a neighbour's facing side."""
+            if isinstance(point, At):
+                return float(point.x), float(point.y)
+            place = point.place if isinstance(point, Edge) else point
+            rect = rects.get(id(place))
+            if rect is None:
+                raise ValueError("connector refers to a widget not on this dashboard")
+            return _center(rect)
+
+        anchors: list[dict[str, Any]] = []
+        for i, point in enumerate(connector.points):
+            if isinstance(point, At):
+                anchors.append({"Free": {"x": float(point.x), "y": float(point.y)}})
+                continue
+            place = point.place if isinstance(point, Edge) else point
+            widget_id = ids.get(id(place))
+            if widget_id is None:
+                raise ValueError("connector refers to a widget not on this dashboard")
+            if isinstance(point, Edge):
+                side, t = point.side, point.t
+            else:
+                # Face the neighbour: the previous point for the last anchor,
+                # the next one otherwise.
+                neighbour = connector.points[i - 1] if i == len(connector.points) - 1 else connector.points[i + 1]
+                side, t = _facing_side(rects[id(place)], resolved_center(neighbour))
+            anchors.append(
+                {
+                    "Widget": {
+                        "id": widget_id,
+                        "side": _enum(side, _SIDES),
+                        "t": float(t),
+                    }
+                }
+            )
+
+        style = _drop_none(
+            {
+                "color": connector.color,
+                "width": float(connector.width),
+                "dashed": connector.dashed,
+                "shape": _enum(connector.shape, ("straight", "orthogonal", "curved")),
+                "arrow": _enum(connector.arrow, ("none", "end", "both")),
+                "label": connector.label,
+                "on_top": connector.on_top,
+                "bind": connector.bind._json(namespace) if connector.bind else None,
+            }
+        )
+        return {"id": index, "points": anchors, "style": style}
 
 
 @dataclass(frozen=True)

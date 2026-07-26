@@ -221,11 +221,16 @@ pub struct TextWidgetConfig {
     pub component: String,
 }
 
-/// Persisted shape of an image widget — the file path to load.
+/// Persisted shape of an image widget.
+///
+/// `data` carries the image itself, base64 (optionally as a `data:` URI), so
+/// a target-shipped preset renders on a panel that cannot see the target's
+/// filesystem. `path` is the local-authoring form.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ImageWidgetConfig {
     pub path: String,
+    pub data: String,
 }
 
 /// Persisted shape of a monitor widget — the source component to monitor
@@ -476,7 +481,7 @@ fn build_table(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::Any
 
 fn build_image(config: &str, _db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     let cfg = parse_or_default::<ImageWidgetConfig>(config);
-    as_view_and_entity(cx.new(|_cx| ImageWidget::load(cfg.path)))
+    as_view_and_entity(cx.new(|_cx| ImageWidget::load(&cfg)))
 }
 
 fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
@@ -580,16 +585,29 @@ fn build_traffic_light_grid(
     as_view_and_entity(entity)
 }
 
-/// Widget that decodes an image from disk and paints it into its bounds.
+/// Widget that decodes an image and paints it into its bounds.
 struct ImageWidget {
     render_image: Option<Arc<RenderImage>>,
     label: SharedString,
 }
 
 impl ImageWidget {
-    fn load(path: String) -> Self {
-        let render_image = std::fs::read(&path)
-            .ok()
+    /// Inline bytes win over `path`.
+    ///
+    /// A target ships its presets over a link and the panel may be running on
+    /// a machine that has never seen the target's filesystem, so a diagram
+    /// referenced only by path would be a broken tile there. `path` remains
+    /// for layouts a user authored locally against their own files.
+    fn load(cfg: &ImageWidgetConfig) -> Self {
+        let (bytes, source) = match decode_inline(&cfg.data) {
+            Some(bytes) => (Some(bytes), SharedString::new_static("inline image")),
+            None => (
+                std::fs::read(&cfg.path).ok(),
+                SharedString::from(cfg.path.clone()),
+            ),
+        };
+
+        let render_image = bytes
             .and_then(|bytes| image::load_from_memory(&bytes).ok())
             .map(|img| {
                 let rgba = img.to_rgba8();
@@ -601,9 +619,9 @@ impl ImageWidget {
             });
 
         let label = if render_image.is_some() {
-            SharedString::from(path)
+            source
         } else {
-            SharedString::from(format!("Failed to load: {}", path))
+            SharedString::from(format!("Failed to load: {}", source))
         };
 
         Self {
@@ -611,6 +629,22 @@ impl ImageWidget {
             label,
         }
     }
+}
+
+/// Decode an image widget's inline payload, accepting either raw base64 or a
+/// `data:` URI so a preset author can paste either.
+fn decode_inline(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    if data.is_empty() {
+        return None;
+    }
+    let payload = match data.split_once("base64,") {
+        Some((prefix, rest)) if prefix.starts_with("data:") => rest,
+        _ => data,
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .ok()
 }
 
 impl Render for ImageWidget {
@@ -649,6 +683,31 @@ struct PlaceholderWidget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_image_data_accepts_raw_base64_and_data_uris() {
+        // "hi" in base64.
+        assert_eq!(decode_inline("aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(
+            decode_inline("data:image/png;base64,aGk=").as_deref(),
+            Some(&b"hi"[..])
+        );
+        // Whitespace from a wrapped literal in a preset file.
+        assert_eq!(decode_inline(" aGk= \n").as_deref(), Some(&b"hi"[..]));
+    }
+
+    #[test]
+    fn undecodable_inline_data_falls_through_to_the_path() {
+        assert!(decode_inline("").is_none());
+        assert!(decode_inline("not base64!!").is_none());
+    }
+
+    #[test]
+    fn image_config_tolerates_pre_inline_blobs() {
+        let cfg: ImageWidgetConfig = serde_json::from_str(r#"{"path":"/tmp/a.png"}"#).unwrap();
+        assert_eq!(cfg.path, "/tmp/a.png");
+        assert!(cfg.data.is_empty());
+    }
 
     #[test]
     fn monitor_config_tolerates_pre_display_field_blobs() {
