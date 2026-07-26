@@ -168,6 +168,62 @@ where
     })
 }
 
+/// The last committed sample's leading `count` elements, or `None` when the
+/// component has never produced one or is shorter than `count`.
+pub(crate) fn latest_elements(
+    db: &DB,
+    component: ComponentId,
+    count: usize,
+) -> Option<SmallVec<[f64; 4]>> {
+    db.with_state(|state| {
+        let comp = state.get_component(component)?;
+        let latest = comp.time_series.latest()?;
+        let (_size, view) = comp.schema.parse_value(latest.data()).ok()?;
+        let values: SmallVec<[f64; 4]> = view.iter().take(count).map(|v| v.as_f64()).collect();
+        (values.len() == count).then_some(values)
+    })
+}
+
+/// Spawn a task forwarding a component's leading `count` elements to `apply`.
+///
+/// The vector counterpart of [`spawn_scalar_stream`], for views bound to a
+/// quaternion or a 3-vector rather than a single number. Samples shorter than
+/// `count` are skipped rather than padded — a half-read attitude is worse
+/// than a stale one.
+pub(crate) fn spawn_elements_stream<E, F>(
+    db: Arc<DB>,
+    component: ComponentId,
+    count: usize,
+    cx: &mut Context<E>,
+    apply: F,
+) -> gpui::Task<()>
+where
+    E: 'static,
+    F: Fn(&mut E, &[f64], &mut Context<E>) + Send + 'static,
+{
+    cx.spawn(async move |this, cx| {
+        let mut stream = component.into_stream(&db).await;
+        if let Some(seed) = latest_elements(&db, component, count) {
+            let _ = this.update(cx, |view, cx| apply(view, &seed, cx));
+        }
+        loop {
+            let values: SmallVec<[f64; 4]> = {
+                let view = stream.next().await;
+                let cv = view.as_component_view();
+                cv.iter().take(count).map(|v| v.as_f64()).collect()
+            };
+            let result = this.update(cx, |view, cx| {
+                if values.len() == count {
+                    apply(view, &values, cx);
+                }
+            });
+            if result.is_err() {
+                break;
+            }
+        }
+    })
+}
+
 /// Spawn a task that drains a stream and forwards the boolean
 /// [`any_on`] to `apply` on the parent entity.
 ///

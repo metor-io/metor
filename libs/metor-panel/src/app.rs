@@ -13,7 +13,8 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, BrowserPanel, DataTablePanel, GaugePanel, ListPlotPanel, LogPanel, MeterPanel,
+    AlarmPanel, AttitudePanel, BrowserPanel, DataTablePanel, GaugePanel, ListPlotPanel, LogPanel,
+    MeterPanel,
     PlotPanel, SequenceControlPanel, SequenceGridPanel, SequencePanel, StateChipPanel, TablePanel,
     TextPanel, TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
 };
@@ -1264,6 +1265,7 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     register_panel::<MeterPanel>(&mut reg, db.clone(), MeterPanel::from_config);
     register_panel::<GaugePanel>(&mut reg, db.clone(), GaugePanel::from_config);
     register_panel::<StateChipPanel>(&mut reg, db.clone(), StateChipPanel::from_config);
+    register_panel::<AttitudePanel>(&mut reg, db.clone(), AttitudePanel::from_config);
     register_panel::<SequenceControlPanel>(
         &mut reg,
         db.clone(),

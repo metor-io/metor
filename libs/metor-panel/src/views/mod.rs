@@ -1,4 +1,5 @@
 pub mod alarm_panel;
+pub mod attitude;
 pub(crate) mod binding;
 pub mod column_browser;
 pub mod component_browser;
@@ -31,6 +32,7 @@ pub mod viewer_3d;
 pub mod xy_plot;
 
 pub use alarm_panel::AlarmView;
+pub use attitude::{AttitudeConfig, AttitudeIndicator, VectorMarker, VectorMarkerConfig};
 pub use column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 pub use component_browser::{BrowserEvent, ComponentBrowser, new_component_browser};
 pub use component_table::{ComponentTable, new_component_table};

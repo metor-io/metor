@@ -18,10 +18,10 @@ use crate::views::time_series::{
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, Gauge, GaugeConfig,
-    LevelFilter, LogView, Meter, MeterConfig, SequenceControl, SequenceControlConfig, SequenceGrid,
-    SequenceView, StateChip, StateChipConfig, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
-    new_component_browser, new_component_table, new_data_table,
+    AlarmView, AttitudeConfig, AttitudeIndicator, ComponentBrowser, ComponentTable, ComponentText,
+    DataTable, Gauge, GaugeConfig, LevelFilter, LogView, Meter, MeterConfig, SequenceControl,
+    SequenceControlConfig, SequenceGrid, SequenceView, StateChip, StateChipConfig, TimeSeriesPlot,
+    TrafficLight, TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -505,6 +505,47 @@ impl PaneItem for StateChipPanel {
     }
 
     fn to_config(&self, cx: &App) -> StateChipConfig {
+        self.inner.read(cx).to_config(cx)
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item rendering a quaternion component as an attitude ball.
+pub struct AttitudePanel {
+    inner: Entity<AttitudeIndicator>,
+    label: SharedString,
+}
+
+impl AttitudePanel {
+    pub fn from_config(cfg: AttitudeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let label =
+            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let inner = cx.new(|cx| AttitudeIndicator::from_config(&cfg, db, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for AttitudePanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for AttitudePanel {
+    type Config = AttitudeConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "attitude"
+    }
+
+    fn to_config(&self, cx: &App) -> AttitudeConfig {
         self.inner.read(cx).to_config(cx)
     }
 
@@ -1943,6 +1984,31 @@ pub(crate) fn new_panel_rows(
     )));
 
     rows.push(Box::new(NavRow::new(
+        "Attitude",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                let db_outer = db.clone();
+                let pane = pane.clone();
+                component_picker_rows(db.clone(), move |_component_id, name, cx| {
+                    let cfg = AttitudeConfig {
+                        component: name.clone(),
+                        ..Default::default()
+                    };
+                    let db = db_outer.clone();
+                    pane.update(cx, |pane, cx| {
+                        let item: Box<dyn PaneItemHandle> =
+                            Box::new(cx.new(|cx| AttitudePanel::from_config(cfg, db, cx)));
+                        pane.add_item(item, cx);
+                    });
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
         "Sequence Control",
         SharedString::new_static(""),
         {
@@ -2484,5 +2550,27 @@ mod tests {
             serde_json::from_str(r#"{"channel":"mode"}"#).unwrap();
         assert_eq!(partial.channel, "mode");
         assert!(!partial.compact);
+
+        let attitude = AttitudeConfig {
+            component: "sat.nav.attitude_estimate.q_hat_b_eci".into(),
+            element_offset: 0,
+            label: Some("estimate".into()),
+            vectors: vec![crate::views::VectorMarkerConfig {
+                component: "sat.plant.sensors.mag_b".into(),
+                label: "mag".into(),
+                color: Some(Hsla::default()),
+            }],
+            hide_readout: false,
+        };
+        let s = serde_json::to_string(&attitude).unwrap();
+        let back: AttitudeConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, attitude);
+        assert_eq!(back.vectors[0].label, "mag");
+
+        let partial: AttitudeConfig =
+            serde_json::from_str(r#"{"component":"sat.body.q_b_eci"}"#).unwrap();
+        assert_eq!(partial.element_offset, 0);
+        assert!(partial.vectors.is_empty());
+        assert!(!partial.hide_readout);
     }
 }

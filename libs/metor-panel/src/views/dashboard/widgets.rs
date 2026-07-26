@@ -20,9 +20,9 @@ use crate::tiles::panels::{PlotPanelConfig, TraceConfig};
 use crate::views::time_series::{LinePlot, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
-    ComponentText, Gauge, GaugeConfig, Meter, MeterConfig, Monitor, SequenceControl,
-    SequenceControlConfig, StateChip, StateChipConfig, TimeSeriesPlot, TrafficLight,
-    TrafficLightGrid, new_component_table,
+    AttitudeConfig, AttitudeIndicator, ComponentText, Gauge, GaugeConfig, Meter, MeterConfig,
+    Monitor, SequenceControl, SequenceControlConfig, StateChip, StateChipConfig, TimeSeriesPlot,
+    TrafficLight, TrafficLightGrid, new_component_table,
 };
 
 use super::{DashboardWidget, WidgetKind};
@@ -200,6 +200,18 @@ impl WidgetRegistry {
                     ))
                 }),
                 build: Arc::new(build_sequence_control),
+            },
+        );
+        self.register(
+            WidgetKind::attitude(),
+            WidgetSpec {
+                default_size: (220.0, 260.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<AttitudeConfig>(&w.config);
+                    let name = cfg.label.unwrap_or(cfg.component);
+                    SharedString::from(format!("Attitude: {}", display_or_unknown(&name)))
+                }),
+                build: Arc::new(build_attitude),
             },
         );
     }
@@ -389,6 +401,10 @@ pub fn serialize_widget_state(
         let s = entity.clone().downcast::<SequenceControl>().ok()?;
         return serde_json::to_string(&s.read(cx).to_config()).ok();
     }
+    if *kind == WidgetKind::attitude() {
+        let a = entity.clone().downcast::<AttitudeIndicator>().ok()?;
+        return serde_json::to_string(&a.read(cx).to_config(cx)).ok();
+    }
     if *kind == WidgetKind::monitor() {
         let m = entity.clone().downcast::<Monitor>().ok()?;
         let v = m.read(cx);
@@ -536,6 +552,16 @@ fn build_state_chip(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui:
         }));
     }
     as_view_and_entity(cx.new(|cx| StateChip::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_attitude(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<AttitudeConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    as_view_and_entity(cx.new(|cx| AttitudeIndicator::from_config(&cfg, db.clone(), cx)))
 }
 
 fn build_sequence_control(config: &str, _db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {

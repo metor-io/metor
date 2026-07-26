@@ -96,6 +96,9 @@ impl WidgetKind {
     pub fn sequence_control() -> Self {
         Self(SharedString::new_static("sequence_control"))
     }
+    pub fn attitude() -> Self {
+        Self(SharedString::new_static("attitude"))
+    }
 
     fn default_size(&self, cx: &App) -> (f32, f32) {
         widgets::widget_spec(self, cx).default_size
@@ -593,6 +596,31 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
                             ..Default::default()
                         };
                         serde_json::to_string(&cfg).expect("state chip config serializes")
+                    },
+                )
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
+        "Attitude",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                let dashboard = dashboard.clone();
+                crate::tiles::panels::component_picker_rows(
+                    db.clone(),
+                    move |_component_id, name, cx| {
+                        let cfg = crate::views::AttitudeConfig {
+                            component: name.clone(),
+                            ..Default::default()
+                        };
+                        let blob =
+                            serde_json::to_string(&cfg).expect("attitude config serializes");
+                        dashboard.update(cx, |this, cx| {
+                            this.add_widget(WidgetKind::attitude(), blob, cx);
+                        });
                     },
                 )
             })
