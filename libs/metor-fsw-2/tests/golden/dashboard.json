@@ -1,0 +1,211 @@
+{
+  "title": "Golden",
+  "next_id": 11,
+  "widgets": [
+    {
+      "id": 1,
+      "rect": {
+        "x": 20.0,
+        "y": 20.0,
+        "w": 90.0,
+        "h": 200.0
+      },
+      "kind": "meter",
+      "config": "{\"component\": \"sat1.wheels.h\", \"element\": 1, \"min\": -0.04, \"max\": 0.04, \"unit\": \"N m s\", \"orientation\": \"Vertical\"}"
+    },
+    {
+      "id": 2,
+      "rect": {
+        "x": 120.0,
+        "y": 20.0,
+        "w": 150.0,
+        "h": 140.0
+      },
+      "kind": "gauge",
+      "config": "{\"component\": \"sat1.sensors.gyro_b\", \"element\": 1, \"min\": -0.2, \"max\": 0.2, \"label\": \"rate y\", \"sweep_degrees\": 200.0, \"style\": \"Needle\"}"
+    },
+    {
+      "id": 3,
+      "rect": {
+        "x": 280.0,
+        "y": 20.0,
+        "w": 150.0,
+        "h": 60.0
+      },
+      "kind": "state_chip",
+      "config": "{\"component\": \"sat1.mode.mode_cmd\", \"element\": 0, \"states\": [{\"value\": 0.0, \"label\": \"IDLE\"}, {\"value\": 3.0, \"label\": \"SAFE\", \"color\": \"#f38ba8ff\"}], \"unknown_label\": \"UNKNOWN\"}"
+    },
+    {
+      "id": 4,
+      "rect": {
+        "x": 20.0,
+        "y": 200.0,
+        "w": 220.0,
+        "h": 260.0
+      },
+      "kind": "attitude",
+      "config": "{\"component\": \"sat1.nav.attitude_estimate.q_hat_b_eci\", \"element_offset\": 0, \"vectors\": [{\"component\": \"sat1.sensors.mag_b\", \"label\": \"mag\", \"color\": \"#89b4faff\"}]}"
+    },
+    {
+      "id": 5,
+      "rect": {
+        "x": 280.0,
+        "y": 100.0,
+        "w": 260.0,
+        "h": 110.0
+      },
+      "kind": "sequence_control",
+      "config": "{\"channel\": \"mode\", \"compact\": true}"
+    },
+    {
+      "id": 6,
+      "rect": {
+        "x": 440.0,
+        "y": 20.0,
+        "w": 70.0,
+        "h": 60.0
+      },
+      "kind": "traffic_light",
+      "config": "{\"component\": \"sat1.world.illuminated\"}"
+    },
+    {
+      "id": 7,
+      "rect": {
+        "x": 520.0,
+        "y": 20.0,
+        "w": 190.0,
+        "h": 60.0
+      },
+      "kind": "traffic_light_grid",
+      "config": "{\"pattern\": \"sat1.wheels.wheels.*.arm\"}"
+    },
+    {
+      "id": 8,
+      "rect": {
+        "x": 440.0,
+        "y": 100.0,
+        "w": 160.0,
+        "h": 60.0
+      },
+      "kind": "text",
+      "config": "{\"component\": \"sat1.ctrl.mtq_cmd.dipole_b\"}"
+    },
+    {
+      "id": 9,
+      "rect": {
+        "x": 440.0,
+        "y": 200.0,
+        "w": 400.0,
+        "h": 250.0
+      },
+      "kind": "plot",
+      "config": "{\"label\": \"\", \"x_range\": \"\", \"traces\": [{\"component_id\": 1944926231901928425, \"element_index\": 0, \"label\": \"sensors.gyro_b\", \"color\": \"#fab387ff\"}]}"
+    },
+    {
+      "id": 10,
+      "rect": {
+        "x": 20.0,
+        "y": 520.0,
+        "w": 200.0,
+        "h": 140.0
+      },
+      "kind": "image",
+      "config": "{\"path\": \"/Users/sphw/code/metor/metor/libs/metor-fsw-2/python/tests/data/pixel.png\", \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFUlEQVR42mM4oWGjccKGAUh8+PABACQSBlUPXSXnAAAAAElFTkSuQmCC\"}"
+    }
+  ],
+  "connectors": [
+    {
+      "id": 1,
+      "points": [
+        {
+          "Widget": {
+            "id": 4,
+            "side": "Top",
+            "t": 0.7954545454545454
+          }
+        },
+        {
+          "Widget": {
+            "id": 2,
+            "side": "Left",
+            "t": 0.7142857142857143
+          }
+        },
+        {
+          "Widget": {
+            "id": 1,
+            "side": "Right",
+            "t": 0.35
+          }
+        }
+      ],
+      "style": {
+        "width": 1.5,
+        "dashed": false,
+        "shape": "Orthogonal",
+        "arrow": "End",
+        "label": "flow",
+        "on_top": false,
+        "bind": {
+          "component": "sat1.wheels.wheels.0.arm",
+          "element": 0,
+          "threshold": 0.5
+        }
+      }
+    },
+    {
+      "id": 2,
+      "points": [
+        {
+          "Widget": {
+            "id": 10,
+            "side": "Top",
+            "t": 0.25
+          }
+        },
+        {
+          "Free": {
+            "x": 700.0,
+            "y": 400.0
+          }
+        }
+      ],
+      "style": {
+        "color": "#f9e2afff",
+        "width": 2.0,
+        "dashed": true,
+        "shape": "Curved",
+        "arrow": "Both",
+        "label": "leader",
+        "on_top": true
+      }
+    },
+    {
+      "id": 3,
+      "points": [
+        {
+          "Widget": {
+            "id": 1,
+            "side": "Right",
+            "t": 0.05
+          }
+        },
+        {
+          "Free": {
+            "x": 900.0,
+            "y": 30.0
+          }
+        }
+      ],
+      "style": {
+        "width": 1.5,
+        "dashed": false,
+        "shape": "Straight",
+        "arrow": "None",
+        "label": "",
+        "on_top": false
+      }
+    }
+  ],
+  "next_connector_id": 4
+}

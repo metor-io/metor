@@ -57,6 +57,12 @@ A unified row-list overlay that serves as both command palette (centered) and ri
 
 Concrete renderers — plots (`time_series`, `xy_plot`, `list_plot`), tables (`data_table`, `component_table`, `table`), 3D scene (`viewer_3d`, built on Bevy as a render pipeline embedded in gpui via wgpu), traffic lights, value strips, dashboards, etc. They consume `ComponentStream`s and emit `Inspectable` rows.
 
+Scalar instruments (`meter`, `gauge`, `state_chip`, `attitude`) share `views/binding.rs`, which owns stream seeding, late metadata binding, and reading warn/critical limits out of the alarm store. A new instrument binds through it rather than growing its own copy, and never takes limits as configuration.
+
+Every one of those is registered on **both** surfaces from a single config type: a `PaneItem` in `tiles/panels.rs` plus a `WidgetKind` in `views/dashboard/widgets.rs`. `TrafficLight` is the reference for the pattern.
+
+`views/dashboard/connectors.rs` adds schematic lines over the dashboard canvas — anchors resolve against live widget rects each frame, `on_top` picks whether a line paints under the widgets (a pipe) or over them (a callout leader), and `bind` colours a line from telemetry. Line geometry lives in `graph_canvas.rs` alongside the node editor's.
+
 ### Theme (`src/theme.rs`)
 
 All colors live in the `Theme` struct, accessed as `DARK.selection_bg` etc. **Never** hardcode `Hsla` literals outside `theme.rs`. `hex(0xRRGGBB, alpha)` is a `const fn` for theme tables.

@@ -507,8 +507,13 @@ class Text:
     component: str
 
     def _item(self, namespace: str | None) -> dict[str, Any]:
-        state = {"component": _qualify(self.component, namespace)}
-        return PaneState("component_text", state)._item(namespace)
+        return PaneState("component_text", self._state(namespace))._item(namespace)
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
+        return {"component": _qualify(self.component, namespace)}
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        return "text", self._state(namespace), (160.0, 60.0)
 
 
 @dataclass(frozen=True)
@@ -519,10 +524,15 @@ class TrafficLight:
     color: str | None = None
 
     def _item(self, namespace: str | None) -> dict[str, Any]:
-        state = _drop_none(
+        return PaneState("traffic_light", self._state(namespace))._item(namespace)
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
+        return _drop_none(
             {"component": _qualify(self.component, namespace), "color": self.color}
         )
-        return PaneState("traffic_light", state)._item(namespace)
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        return "traffic_light", self._state(namespace), (120.0, 120.0)
 
 
 @dataclass(frozen=True)
@@ -533,10 +543,15 @@ class TrafficLightGrid:
     color: str | None = None
 
     def _item(self, namespace: str | None) -> dict[str, Any]:
-        state = _drop_none(
+        return PaneState("traffic_light_grid", self._state(namespace))._item(namespace)
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
+        return _drop_none(
             {"pattern": _qualify(self.pattern, namespace), "color": self.color}
         )
-        return PaneState("traffic_light_grid", state)._item(namespace)
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        return "traffic_light_grid", self._state(namespace), (360.0, 200.0)
 
 
 def Logs() -> PaneState:  # noqa: N802 - pane constructors read as types

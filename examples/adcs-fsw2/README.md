@@ -124,8 +124,18 @@ ingests.
    the panel's `SequenceCommand`s so you can drive the `mode` slot live (Load/Start/Abort
    `commissioning` or `safe_mode`). Uplink and downlink use separate connections
    (docs/messages.md §4.5) — both point at the same metor-db endpoint, `127.0.0.1:2240`.
-3. In the panel, the `plant` / `nav` / `ctrl` / `mode` (and `coordinator`) instances appear
-   in the component tree. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against
+3. On a first connection the panel opens the **`adcs-dashboard`** preset this target ships
+   (see `target.py`): the attitude ball with the magnetometer direction marked on it, dials
+   for the three body rates, bipolar bars for the wheels and magnetorquers, phase/law chips,
+   Load/Start/Abort for the `mode` channel, and a bus drawing whose reaction wheels,
+   torquers, and sun sensor are wired by leader lines to the instruments that read them.
+   Warn/critical ticks on the meters and gauges are *not* configured in the preset — they
+   come from the `ADCS_RATE_HIGH` and `RW_MOMENTUM_HIGH` definitions, so a limit is stated
+   once and shown everywhere. The plot-centric **`adcs-ops`** layout is still available under
+   Load Preset, and a locally saved layout always wins over both.
+
+   In the component tree the `plant` / `nav` / `ctrl` / `mode` (and `coordinator`) instances
+   appear. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against
    `plant.body.q_b_eci` and watch the estimate track truth as the controller slews the
    spacecraft onto the commanded pointing target; `plant.sensors.gyro_b` shows the rate
    damping, `plant.wheels.wheels.0.ang_momentum` a reaction wheel's stored momentum (physical

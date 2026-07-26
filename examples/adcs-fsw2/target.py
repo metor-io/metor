@@ -2,20 +2,36 @@ from metor_config import (
     Alarm,
     AlarmList,
     Alarms,
+    At,
+    Attitude,
+    Bind,
     Component,
+    Connector,
+    Dashboard,
     Downlink,
+    Edge,
+    Gauge,
     HSplit,
+    Image,
     Logs,
+    Meter,
     Pane,
+    Place,
     Preset,
     Presets,
+    SequenceControl,
     SequenceList,
+    State,
+    StateChip,
     Target,
     TcpServer,
     TimeSeriesPlot,
     Trace,
+    TrafficLight,
+    TrafficLightGrid,
     Uplink,
     VSplit,
+    VectorMarker,
     band,
 )
 from adcs_pack import Ctrl, Nav, Plant
@@ -81,11 +97,196 @@ alarms = m.add(
     ]),
 )
 
-# The layout the panel offers on a fresh connection: rates and wheel momentum
-# up top, the operational surfaces (logs, alarms, sequences) below.
+# --- the operator dashboard -------------------------------------------------
+#
+# Instrument scales come from the contract constants, so the panel and the
+# plant agree on what "full" means: RW_MOMENTUM_MAX = 0.04 N·m·s per wheel and
+# MTQ_MAX_DIPOLE = 0.2 A·m² per axis. Warn/critical ticks are *not* set here —
+# the meters and gauges read them from the ADCS_RATE_HIGH and RW_MOMENTUM_HIGH
+# definitions above, so a limit is stated once and shown everywhere.
+RW_MOMENTUM_MAX = 0.04
+MTQ_MAX_DIPOLE = 0.2
+RATE_FULL_SCALE = 0.2  # rad/s, comfortably past the critical rate band
+
+mode_chip = Place(
+    StateChip(
+        "mode.mode_cmd",
+        element=0,
+        label="phase",
+        states=[
+            State(0, "IDLE"),
+            State(1, "SETTLING", "#f9e2afff"),
+            State(2, "POINTING", "#a6e3a1ff"),
+            State(3, "SAFE", "#f38ba8ff"),
+            State(4, "DETUMBLE", "#cba6f7ff"),
+        ],
+    ),
+    20, 20, 160, 62,
+)
+law_chip = Place(
+    StateChip(
+        "mode.mode_cmd",
+        element=1,
+        label="law",
+        states=[State(0, "NADIR"), State(1, "VELOCITY"), State(2, "B-CROSS")],
+    ),
+    190, 20, 160, 62,
+)
+# `illuminated` is a 0/1 flag, so an on/off light says it better than a number.
+eclipse = Place(TrafficLight("plant.world.illuminated"), 360, 20, 70, 62)
+wheel_arm = Place(TrafficLightGrid("plant.wheels.wheels.*.arm"), 440, 20, 190, 62)
+sequence = Place(SequenceControl("mode"), 640, 20, 300, 120)
+
+attitude = Place(
+    Attitude(
+        "nav.attitude_estimate.q_hat_b_eci",
+        label="attitude estimate",
+        vectors=[VectorMarker("plant.sensors.mag_b", "mag")],
+    ),
+    20, 100, 260, 320,
+)
+
+# One gauge per body axis: the question here is "where in the envelope is this
+# rate", which a dial answers faster than a bar.
+rate_gauges = [
+    Place(
+        Gauge(
+            "plant.sensors.gyro_b",
+            element=i,
+            label=f"ω {axis}",
+            unit="rad/s",
+            min=-RATE_FULL_SCALE,
+            max=RATE_FULL_SCALE,
+        ),
+        300 + 160 * i, 100, 150, 140,
+    )
+    for i, axis in enumerate("xyz")
+]
+
+# Wheel momentum is signed and saturating, so vertical bipolar bars filling
+# outward from zero: the direction of the stored momentum is the point.
+wheel_meters = [
+    Place(
+        Meter(
+            f"plant.wheels.wheels.{w}.ang_momentum",
+            element=0,
+            label=f"wheel {w}",
+            unit="N·m·s",
+            min=-RW_MOMENTUM_MAX,
+            max=RW_MOMENTUM_MAX,
+        ),
+        300 + 92 * w, 260, 84, 210,
+    )
+    for w in range(3)
+]
+
+mtq_meters = [
+    Place(
+        Meter(
+            "ctrl.mtq_cmd.dipole_b",
+            element=i,
+            label=f"MTQ {axis}",
+            unit="A·m²",
+            min=-MTQ_MAX_DIPOLE,
+            max=MTQ_MAX_DIPOLE,
+            orientation="horizontal",
+        ),
+        590, 260 + 68 * i, 350, 60,
+    )
+    for i, axis in enumerate("xyz")
+]
+
+rate_plot = Place(
+    TimeSeriesPlot(
+        label="Body Rates",
+        traces=[
+            Trace("plant.sensors.gyro_b", element=i, label=f"gyro_b.{ax}")
+            for i, ax in enumerate("xyz")
+        ],
+    ),
+    970, 100, 520, 240,
+)
+momentum_plot = Place(
+    TimeSeriesPlot(
+        label="Wheel Momentum",
+        traces=[
+            Trace(f"plant.wheels.wheels.{w}.ang_momentum", label=f"wheel {w}")
+            for w in range(3)
+        ],
+    ),
+    970, 360, 520, 240,
+)
+
+# The bus outline, placed 1:1 with its pixels so the leader lines below can
+# name a point on the drawing by its position in the image.
+BUS_X, BUS_Y = 20, 470
+bus = Place(Image("assets/bus.png"), BUS_X, BUS_Y, 420, 260)
+
+
+def on_bus(x: float, y: float) -> At:
+    """A canvas anchor at image-pixel ``(x, y)`` of the bus drawing."""
+    return At(BUS_X + x, BUS_Y + y)
+
+
+adcs_dashboard = Dashboard(
+    title="ADCS Ops",
+    widgets=[
+        mode_chip, law_chip, eclipse, wheel_arm, sequence,
+        attitude, *rate_gauges, *wheel_meters, *mtq_meters,
+        rate_plot, momentum_plot, bus,
+    ],
+    connectors=[
+        # Signal flow, drawn under the widgets so each run disappears into the
+        # box it enters, the way a schematic should read. `bind` energizes the
+        # actuator legs off live telemetry.
+        Connector([attitude, rate_gauges[1]], label="ω", arrow="end"),
+        Connector(
+            [rate_gauges[1], wheel_meters[1]],
+            label="control",
+            arrow="end",
+            bind=Bind("plant.wheels.wheels.1.arm"),
+        ),
+        Connector(
+            [wheel_meters[2], mtq_meters[0]],
+            label="desat",
+            arrow="end",
+            dashed=True,
+            bind=Bind("ctrl.mtq_cmd.dipole_b", threshold=1e-6),
+        ),
+        # Callout leaders from parts of the drawing to the live instrument for
+        # that hardware. These paint *over* the widgets, since a leader has to
+        # cross what lies between its ends.
+        Connector(
+            [on_bus(210, 155), Edge(wheel_meters[1], "bottom", 0.5)],
+            shape="curved",
+            arrow="end",
+            on_top=True,
+            label="reaction wheels",
+        ),
+        Connector(
+            [on_bus(210, 96), Edge(mtq_meters[1], "left", 0.5)],
+            shape="curved",
+            arrow="end",
+            on_top=True,
+            label="magnetorquers",
+        ),
+        Connector(
+            [on_bus(210, 46), Edge(attitude, "bottom", 0.5)],
+            shape="curved",
+            arrow="end",
+            on_top=True,
+            label="sun sensor",
+        ),
+    ],
+)
+
+# `adcs-dashboard` leads the list, so a panel with no saved layout for this
+# target opens on it; `adcs-ops` stays available from the preset palette for
+# the plot-centric view that suits debugging a control loop.
 presets = m.add(
     "presets",
     Presets([
+        Preset(name="adcs-dashboard", time_range="LAST 5m", layout=adcs_dashboard),
         Preset(
             name="adcs-ops",
             time_range="LAST 5m",
