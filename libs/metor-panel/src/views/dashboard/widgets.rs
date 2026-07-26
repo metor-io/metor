@@ -20,8 +20,8 @@ use crate::tiles::panels::{PlotPanelConfig, TraceConfig};
 use crate::views::time_series::{LinePlot, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
-    ComponentText, Meter, MeterConfig, Monitor, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
-    new_component_table,
+    ComponentText, Gauge, GaugeConfig, Meter, MeterConfig, Monitor, StateChip, StateChipConfig,
+    TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_table,
 };
 
 use super::{DashboardWidget, WidgetKind};
@@ -161,6 +161,30 @@ impl WidgetRegistry {
                     SharedString::from(format!("Meter: {}", display_or_unknown(&name)))
                 }),
                 build: Arc::new(build_meter),
+            },
+        );
+        self.register(
+            WidgetKind::gauge(),
+            WidgetSpec {
+                default_size: (160.0, 140.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<GaugeConfig>(&w.config);
+                    let name = cfg.label.unwrap_or(cfg.component);
+                    SharedString::from(format!("Gauge: {}", display_or_unknown(&name)))
+                }),
+                build: Arc::new(build_gauge),
+            },
+        );
+        self.register(
+            WidgetKind::state_chip(),
+            WidgetSpec {
+                default_size: (150.0, 60.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<StateChipConfig>(&w.config);
+                    let name = cfg.label.unwrap_or(cfg.component);
+                    SharedString::from(format!("State: {}", display_or_unknown(&name)))
+                }),
+                build: Arc::new(build_state_chip),
             },
         );
     }
@@ -338,6 +362,14 @@ pub fn serialize_widget_state(
         let m = entity.clone().downcast::<Meter>().ok()?;
         return serde_json::to_string(&m.read(cx).to_config()).ok();
     }
+    if *kind == WidgetKind::gauge() {
+        let g = entity.clone().downcast::<Gauge>().ok()?;
+        return serde_json::to_string(&g.read(cx).to_config()).ok();
+    }
+    if *kind == WidgetKind::state_chip() {
+        let c = entity.clone().downcast::<StateChip>().ok()?;
+        return serde_json::to_string(&c.read(cx).to_config(cx)).ok();
+    }
     if *kind == WidgetKind::monitor() {
         let m = entity.clone().downcast::<Monitor>().ok()?;
         let v = m.read(cx);
@@ -465,6 +497,26 @@ fn build_meter(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyE
         }));
     }
     as_view_and_entity(cx.new(|cx| Meter::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_gauge(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<GaugeConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    as_view_and_entity(cx.new(|cx| Gauge::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_state_chip(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<StateChipConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    as_view_and_entity(cx.new(|cx| StateChip::from_config(&cfg, db.clone(), cx)))
 }
 
 fn build_traffic_light_grid(

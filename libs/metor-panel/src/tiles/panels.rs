@@ -18,9 +18,10 @@ use crate::views::time_series::{
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, LevelFilter, LogView,
-    Meter, MeterConfig, SequenceGrid, SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
-    new_component_browser, new_component_table, new_data_table,
+    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, Gauge, GaugeConfig,
+    LevelFilter, LogView, Meter, MeterConfig, SequenceGrid, SequenceView, StateChip,
+    StateChipConfig, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_browser,
+    new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -423,6 +424,88 @@ impl PaneItem for MeterPanel {
 
     fn to_config(&self, cx: &App) -> MeterConfig {
         self.inner.read(cx).to_config()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item rendering one element of a component as a dial.
+pub struct GaugePanel {
+    inner: Entity<Gauge>,
+    label: SharedString,
+}
+
+impl GaugePanel {
+    pub fn from_config(cfg: GaugeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let label =
+            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let inner = cx.new(|cx| Gauge::from_config(&cfg, db, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for GaugePanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for GaugePanel {
+    type Config = GaugeConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "gauge"
+    }
+
+    fn to_config(&self, cx: &App) -> GaugeConfig {
+        self.inner.read(cx).to_config()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item rendering one element of a component as a named discrete state.
+pub struct StateChipPanel {
+    inner: Entity<StateChip>,
+    label: SharedString,
+}
+
+impl StateChipPanel {
+    pub fn from_config(cfg: StateChipConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let label =
+            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let inner = cx.new(|cx| StateChip::from_config(&cfg, db, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for StateChipPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for StateChipPanel {
+    type Config = StateChipConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "state_chip"
+    }
+
+    fn to_config(&self, cx: &App) -> StateChipConfig {
+        self.inner.read(cx).to_config(cx)
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1771,23 +1854,46 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             let pane = pane.clone();
             Box::new(move |_cx| {
-                let db_outer = db.clone();
-                let pane = pane.clone();
-                crate::inspector::trace_picker::select_traces_wizard_rows(
-                    db.clone(),
-                    Arc::new(|_cx| 0),
-                    Arc::new(move |traces, _window, cx| {
-                        let db = db_outer.clone();
-                        pane.update(cx, |pane, cx| {
-                            for cfg in meter_configs_for_traces(&db, &traces, cx) {
-                                let db = db.clone();
-                                let item: Box<dyn PaneItemHandle> =
-                                    Box::new(cx.new(|cx| MeterPanel::from_config(cfg, db, cx)));
-                                pane.add_item(item, cx);
-                            }
-                        });
-                    }),
-                )
+                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
+                    Box::new(cx.new(|cx| MeterPanel::from_config(seed.into(), db, cx)))
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "Gauge",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
+                    Box::new(cx.new(|cx| GaugePanel::from_config(seed.into(), db, cx)))
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "State Chip",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
+                    // A chip's state table can't be derived from the schema,
+                    // so it opens showing the raw code until the operator
+                    // names the states.
+                    let cfg = StateChipConfig {
+                        component: seed.component,
+                        element: seed.element,
+                        label: Some(seed.label),
+                        ..Default::default()
+                    };
+                    Box::new(cx.new(|cx| StateChipPanel::from_config(cfg, db, cx)))
+                })
             })
         },
     )));
@@ -1950,31 +2056,93 @@ fn traffic_light_grid_pattern_rows(db: Arc<DB>, pane: Entity<Pane>) -> Vec<Box<d
     ))]
 }
 
-/// One [`MeterConfig`] per picked trace, so selecting x/y/z yields three
-/// meters rather than forcing three trips through the wizard.
+/// Everything a scalar instrument needs to bind and scale itself, derived
+/// from one picked trace.
 ///
-/// Each config's scale is seeded from the element's declared alarm limits
-/// (see [`crate::views::meter::suggested_scale`]); the operator can retune it
-/// from the inspector afterwards.
-pub(crate) fn meter_configs_for_traces(db: &DB, traces: &[Trace], cx: &App) -> Vec<MeterConfig> {
+/// The scale is seeded from the element's declared alarm limits (see
+/// [`crate::views::meter::suggested_scale`]) so a new instrument opens
+/// already showing its redline; the operator can retune it afterwards.
+pub(crate) struct ScaleSeed {
+    pub component: String,
+    pub element: usize,
+    pub label: String,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// One seed per picked trace, so selecting x/y/z yields three instruments
+/// rather than forcing three trips through the wizard.
+pub(crate) fn scale_seeds_for_traces(db: &DB, traces: &[Trace], cx: &App) -> Vec<ScaleSeed> {
     traces
         .iter()
         .map(|trace| {
             let at =
                 crate::views::binding::ElementRef::new(trace.component_id, trace.element_index);
             let (min, max) = crate::views::meter::suggested_scale(at, cx);
-            MeterConfig {
+            ScaleSeed {
                 component: crate::views::binding::component_meta(db, trace.component_id)
                     .name
                     .to_string(),
                 element: trace.element_index,
-                label: Some(trace.label.to_string()),
+                label: trace.label.to_string(),
                 min,
                 max,
-                ..Default::default()
             }
         })
         .collect()
+}
+
+impl From<ScaleSeed> for MeterConfig {
+    fn from(seed: ScaleSeed) -> Self {
+        Self {
+            component: seed.component,
+            element: seed.element,
+            label: Some(seed.label),
+            min: seed.min,
+            max: seed.max,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<ScaleSeed> for GaugeConfig {
+    fn from(seed: ScaleSeed) -> Self {
+        Self {
+            component: seed.component,
+            element: seed.element,
+            label: Some(seed.label),
+            min: seed.min,
+            max: seed.max,
+            ..Default::default()
+        }
+    }
+}
+
+/// The trace wizard wired to a scalar-instrument constructor: every picked
+/// element becomes its own tile, built by `make`.
+///
+/// Meter, gauge, and chip differ only in what they construct from a
+/// [`ScaleSeed`], so they share one wizard rather than three copies of the
+/// same closure nest.
+fn instrument_wizard_rows(
+    db: Arc<DB>,
+    pane: Entity<Pane>,
+    make: fn(ScaleSeed, Arc<DB>, &mut Context<Pane>) -> Box<dyn PaneItemHandle>,
+) -> Vec<Box<dyn InspectorRow>> {
+    let db_outer = db.clone();
+    crate::inspector::trace_picker::select_traces_wizard_rows(
+        db,
+        Arc::new(|_cx| 0),
+        Arc::new(move |traces, _window, cx| {
+            let db = db_outer.clone();
+            pane.update(cx, |pane, cx| {
+                for seed in scale_seeds_for_traces(&db, &traces, cx) {
+                    let item = make(seed, db.clone(), cx);
+                    pane.add_item(item, cx);
+                }
+            });
+        }),
+    )
 }
 
 /// Rows listing every known component; selecting one invokes `on_select`.
@@ -2183,5 +2351,55 @@ mod tests {
             partial.orientation,
             crate::views::Orientation::Vertical
         ));
+
+        let gauge = GaugeConfig {
+            component: "sat.gyro".into(),
+            element: 1,
+            label: Some("rate y".into()),
+            min: -0.2,
+            max: 0.2,
+            unit: Some("rad/s".into()),
+            sweep_degrees: 200.0,
+            style: crate::views::GaugeStyle::Needle,
+            color: Some(Hsla::default()),
+            hide_value: false,
+            hide_limits: true,
+        };
+        let s = serde_json::to_string(&gauge).unwrap();
+        assert_eq!(serde_json::from_str::<GaugeConfig>(&s).unwrap(), gauge);
+
+        // A gauge missing its sweep must not degenerate to a zero-width dial.
+        let partial: GaugeConfig =
+            serde_json::from_str(r#"{"component":"sat.gyro"}"#).unwrap();
+        assert!(partial.sweep_degrees > 0.0);
+        assert!(matches!(partial.style, crate::views::GaugeStyle::Arc));
+
+        let chip = StateChipConfig {
+            component: "sat.mode.mode_cmd".into(),
+            element: 0,
+            label: Some("mode".into()),
+            states: vec![
+                crate::views::StateEntryConfig {
+                    value: 0.0,
+                    label: "IDLE".into(),
+                    color: None,
+                },
+                crate::views::StateEntryConfig {
+                    value: 3.0,
+                    label: "SAFE".into(),
+                    color: Some(Hsla::default()),
+                },
+            ],
+            unknown_label: "UNKNOWN".into(),
+        };
+        let s = serde_json::to_string(&chip).unwrap();
+        let back: StateChipConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, chip);
+        assert_eq!(back.states[1].label, "SAFE");
+
+        let partial: StateChipConfig =
+            serde_json::from_str(r#"{"component":"sat.mode.mode_cmd"}"#).unwrap();
+        assert!(partial.states.is_empty());
+        assert!(partial.unknown_label.is_empty());
     }
 }

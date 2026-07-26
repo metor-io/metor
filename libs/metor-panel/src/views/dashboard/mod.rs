@@ -87,6 +87,12 @@ impl WidgetKind {
     pub fn meter() -> Self {
         Self(SharedString::new_static("meter"))
     }
+    pub fn gauge() -> Self {
+        Self(SharedString::new_static("gauge"))
+    }
+    pub fn state_chip() -> Self {
+        Self(SharedString::new_static("state_chip"))
+    }
 
     fn default_size(&self, cx: &App) -> (f32, f32) {
         widgets::widget_spec(self, cx).default_size
@@ -533,7 +539,60 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
         {
             let dashboard = dashboard.clone();
             let db = db.clone();
-            Box::new(move |_cx| meter_picker_rows(dashboard.clone(), db.clone()))
+            Box::new(move |_cx| {
+                instrument_widget_rows(
+                    dashboard.clone(),
+                    db.clone(),
+                    WidgetKind::meter(),
+                    |seed| {
+                        serde_json::to_string(&crate::views::MeterConfig::from(seed))
+                            .expect("meter config serializes")
+                    },
+                )
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
+        "Gauge",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                instrument_widget_rows(
+                    dashboard.clone(),
+                    db.clone(),
+                    WidgetKind::gauge(),
+                    |seed| {
+                        serde_json::to_string(&crate::views::GaugeConfig::from(seed))
+                            .expect("gauge config serializes")
+                    },
+                )
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
+        "State Chip",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                instrument_widget_rows(
+                    dashboard.clone(),
+                    db.clone(),
+                    WidgetKind::state_chip(),
+                    |seed| {
+                        let cfg = crate::views::StateChipConfig {
+                            component: seed.component,
+                            element: seed.element,
+                            label: Some(seed.label),
+                            ..Default::default()
+                        };
+                        serde_json::to_string(&cfg).expect("state chip config serializes")
+                    },
+                )
+            })
         },
     )));
     rows.push(Box::new(NavRow::new(
@@ -601,19 +660,24 @@ fn component_picker_rows(
         .collect()
 }
 
-/// Trace wizard for "+ widget → Meter": each picked element becomes its own
-/// meter, scaled from that element's declared alarm limits.
-fn meter_picker_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
+/// Trace wizard for the scalar instruments: each picked element becomes its
+/// own widget of `kind`, with `blob` turning the seed into that kind's
+/// config. Mirrors the pane-side `instrument_wizard_rows`.
+fn instrument_widget_rows(
+    dashboard: Entity<DashboardPanel>,
+    db: Arc<DB>,
+    kind: WidgetKind,
+    blob: fn(crate::tiles::panels::ScaleSeed) -> String,
+) -> Vec<Box<dyn InspectorRow>> {
     let db_outer = db.clone();
     crate::inspector::trace_picker::select_traces_wizard_rows(
         db,
         Arc::new(|_cx| 0),
         Arc::new(move |traces, _window, cx| {
-            let configs = crate::tiles::panels::meter_configs_for_traces(&db_outer, &traces, cx);
+            let seeds = crate::tiles::panels::scale_seeds_for_traces(&db_outer, &traces, cx);
             dashboard.update(cx, |this, cx| {
-                for cfg in configs {
-                    let blob = serde_json::to_string(&cfg).expect("meter config serializes");
-                    this.add_widget(WidgetKind::meter(), blob, cx);
+                for seed in seeds {
+                    this.add_widget(kind.clone(), blob(seed), cx);
                 }
             });
         }),

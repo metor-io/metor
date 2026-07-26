@@ -187,7 +187,7 @@ impl Meter {
 /// The element's own name when the component has more than one, else the
 /// component's — a single-element meter labelled `"[0]"` tells the operator
 /// nothing.
-fn default_label(
+pub(crate) fn default_label(
     element_names: &[SharedString],
     element: usize,
     component_name: &SharedString,
@@ -251,7 +251,7 @@ const SCALE_HEADROOM: f64 = 1.25;
 
 /// Where a limit value sits along the track, or `None` when it falls outside
 /// the meter's scale and would otherwise pin misleadingly to an end.
-fn limit_position(value: f64, min: f64, max: f64) -> Option<f32> {
+pub(crate) fn limit_position(value: f64, min: f64, max: f64) -> Option<f32> {
     let span = max - min;
     if !span.is_finite() || span.abs() < f64::EPSILON {
         return None;
