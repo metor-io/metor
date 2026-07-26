@@ -19,9 +19,9 @@ use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
     AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, Gauge, GaugeConfig,
-    LevelFilter, LogView, Meter, MeterConfig, SequenceGrid, SequenceView, StateChip,
-    StateChipConfig, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_browser,
-    new_component_table, new_data_table,
+    LevelFilter, LogView, Meter, MeterConfig, SequenceControl, SequenceControlConfig, SequenceGrid,
+    SequenceView, StateChip, StateChipConfig, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
+    new_component_browser, new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -506,6 +506,50 @@ impl PaneItem for StateChipPanel {
 
     fn to_config(&self, cx: &App) -> StateChipConfig {
         self.inner.read(cx).to_config(cx)
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item giving one sequence channel its own start/stop controls.
+pub struct SequenceControlPanel {
+    inner: Entity<SequenceControl>,
+    label: SharedString,
+}
+
+impl SequenceControlPanel {
+    pub fn from_config(
+        cfg: SequenceControlConfig,
+        _db: Arc<DB>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let label = SharedString::from(cfg.channel.clone());
+        let inner = cx.new(|cx| SequenceControl::from_config(&cfg, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for SequenceControlPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for SequenceControlPanel {
+    type Config = SequenceControlConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "sequence_control"
+    }
+
+    fn to_config(&self, cx: &App) -> SequenceControlConfig {
+        self.inner.read(cx).to_config()
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1898,6 +1942,31 @@ pub(crate) fn new_panel_rows(
         },
     )));
 
+    rows.push(Box::new(NavRow::new(
+        "Sequence Control",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |cx| {
+                let db = db.clone();
+                let pane = pane.clone();
+                crate::views::sequence_control::channel_picker_rows(cx, move |channel, cx| {
+                    let cfg = SequenceControlConfig {
+                        channel,
+                        compact: false,
+                    };
+                    let db = db.clone();
+                    pane.update(cx, |pane, cx| {
+                        let item: Box<dyn PaneItemHandle> =
+                            Box::new(cx.new(|cx| SequenceControlPanel::from_config(cfg, db, cx)));
+                        pane.add_item(item, cx);
+                    });
+                })
+            })
+        },
+    )));
+
     rows.push(Box::new(CommandRow::new("Component Table", {
         let db = db.clone();
         let pane = pane.clone();
@@ -2401,5 +2470,19 @@ mod tests {
             serde_json::from_str(r#"{"component":"sat.mode.mode_cmd"}"#).unwrap();
         assert!(partial.states.is_empty());
         assert!(partial.unknown_label.is_empty());
+
+        let seq = SequenceControlConfig {
+            channel: "mode".into(),
+            compact: true,
+        };
+        let s = serde_json::to_string(&seq).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SequenceControlConfig>(&s).unwrap(),
+            seq
+        );
+        let partial: SequenceControlConfig =
+            serde_json::from_str(r#"{"channel":"mode"}"#).unwrap();
+        assert_eq!(partial.channel, "mode");
+        assert!(!partial.compact);
     }
 }

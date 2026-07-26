@@ -20,8 +20,9 @@ use crate::tiles::panels::{PlotPanelConfig, TraceConfig};
 use crate::views::time_series::{LinePlot, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
-    ComponentText, Gauge, GaugeConfig, Meter, MeterConfig, Monitor, StateChip, StateChipConfig,
-    TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_table,
+    ComponentText, Gauge, GaugeConfig, Meter, MeterConfig, Monitor, SequenceControl,
+    SequenceControlConfig, StateChip, StateChipConfig, TimeSeriesPlot, TrafficLight,
+    TrafficLightGrid, new_component_table,
 };
 
 use super::{DashboardWidget, WidgetKind};
@@ -185,6 +186,20 @@ impl WidgetRegistry {
                     SharedString::from(format!("State: {}", display_or_unknown(&name)))
                 }),
                 build: Arc::new(build_state_chip),
+            },
+        );
+        self.register(
+            WidgetKind::sequence_control(),
+            WidgetSpec {
+                default_size: (260.0, 110.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<SequenceControlConfig>(&w.config);
+                    SharedString::from(format!(
+                        "Sequence: {}",
+                        display_or_unknown(&cfg.channel)
+                    ))
+                }),
+                build: Arc::new(build_sequence_control),
             },
         );
     }
@@ -370,6 +385,10 @@ pub fn serialize_widget_state(
         let c = entity.clone().downcast::<StateChip>().ok()?;
         return serde_json::to_string(&c.read(cx).to_config(cx)).ok();
     }
+    if *kind == WidgetKind::sequence_control() {
+        let s = entity.clone().downcast::<SequenceControl>().ok()?;
+        return serde_json::to_string(&s.read(cx).to_config()).ok();
+    }
     if *kind == WidgetKind::monitor() {
         let m = entity.clone().downcast::<Monitor>().ok()?;
         let v = m.read(cx);
@@ -517,6 +536,11 @@ fn build_state_chip(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui:
         }));
     }
     as_view_and_entity(cx.new(|cx| StateChip::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_sequence_control(config: &str, _db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<SequenceControlConfig>(config);
+    as_view_and_entity(cx.new(|cx| SequenceControl::from_config(&cfg, cx)))
 }
 
 fn build_traffic_light_grid(

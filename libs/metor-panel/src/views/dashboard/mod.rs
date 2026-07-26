@@ -93,6 +93,9 @@ impl WidgetKind {
     pub fn state_chip() -> Self {
         Self(SharedString::new_static("state_chip"))
     }
+    pub fn sequence_control() -> Self {
+        Self(SharedString::new_static("sequence_control"))
+    }
 
     fn default_size(&self, cx: &App) -> (f32, f32) {
         widgets::widget_spec(self, cx).default_size
@@ -592,6 +595,27 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
                         serde_json::to_string(&cfg).expect("state chip config serializes")
                     },
                 )
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
+        "Sequence Control",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            Box::new(move |cx| {
+                let dashboard = dashboard.clone();
+                crate::views::sequence_control::channel_picker_rows(cx, move |channel, cx| {
+                    let cfg = crate::views::SequenceControlConfig {
+                        channel,
+                        compact: false,
+                    };
+                    let blob =
+                        serde_json::to_string(&cfg).expect("sequence control config serializes");
+                    dashboard.update(cx, |this, cx| {
+                        this.add_widget(WidgetKind::sequence_control(), blob, cx);
+                    });
+                })
             })
         },
     )));

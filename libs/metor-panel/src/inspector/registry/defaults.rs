@@ -39,6 +39,7 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::TrafficLightGrid>();
         self.register_inspectable::<crate::views::Meter>();
         self.register_inspectable::<crate::views::Gauge>();
+        self.register_inspectable::<crate::views::SequenceControl>();
         self.register_entity_list::<crate::views::StateChip, crate::views::StateEntry>(
             db.clone(),
             |c| &c.states,
