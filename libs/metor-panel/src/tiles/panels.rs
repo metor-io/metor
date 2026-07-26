@@ -19,7 +19,7 @@ use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
     AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, LevelFilter, LogView,
-    SequenceGrid, SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
+    Meter, MeterConfig, SequenceGrid, SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
     new_component_browser, new_component_table, new_data_table,
 };
 
@@ -380,6 +380,49 @@ impl PaneItem for TrafficLightPanel {
             component: self.label.to_string(),
             color: Some(self.inner.read(cx).color()),
         }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item rendering one element of a component as a bar meter.
+///
+/// Carries no config of its own — [`MeterConfig`] is shared with the
+/// dashboard widget, so a meter behaves identically on either surface.
+pub struct MeterPanel {
+    inner: Entity<Meter>,
+    label: SharedString,
+}
+
+impl MeterPanel {
+    pub fn from_config(cfg: MeterConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let inner = cx.new(|cx| Meter::from_config(&cfg, db, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for MeterPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for MeterPanel {
+    type Config = MeterConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "meter"
+    }
+
+    fn to_config(&self, cx: &App) -> MeterConfig {
+        self.inner.read(cx).to_config()
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1721,6 +1764,34 @@ pub(crate) fn new_panel_rows(
         },
     )));
 
+    rows.push(Box::new(NavRow::new(
+        "Meter",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                let db_outer = db.clone();
+                let pane = pane.clone();
+                crate::inspector::trace_picker::select_traces_wizard_rows(
+                    db.clone(),
+                    Arc::new(|_cx| 0),
+                    Arc::new(move |traces, _window, cx| {
+                        let db = db_outer.clone();
+                        pane.update(cx, |pane, cx| {
+                            for cfg in meter_configs_for_traces(&db, &traces, cx) {
+                                let db = db.clone();
+                                let item: Box<dyn PaneItemHandle> =
+                                    Box::new(cx.new(|cx| MeterPanel::from_config(cfg, db, cx)));
+                                pane.add_item(item, cx);
+                            }
+                        });
+                    }),
+                )
+            })
+        },
+    )));
+
     rows.push(Box::new(CommandRow::new("Component Table", {
         let db = db.clone();
         let pane = pane.clone();
@@ -1877,6 +1948,33 @@ fn traffic_light_grid_pattern_rows(db: Arc<DB>, pane: Entity<Pane>) -> Vec<Box<d
             });
         },
     ))]
+}
+
+/// One [`MeterConfig`] per picked trace, so selecting x/y/z yields three
+/// meters rather than forcing three trips through the wizard.
+///
+/// Each config's scale is seeded from the element's declared alarm limits
+/// (see [`crate::views::meter::suggested_scale`]); the operator can retune it
+/// from the inspector afterwards.
+pub(crate) fn meter_configs_for_traces(db: &DB, traces: &[Trace], cx: &App) -> Vec<MeterConfig> {
+    traces
+        .iter()
+        .map(|trace| {
+            let at =
+                crate::views::binding::ElementRef::new(trace.component_id, trace.element_index);
+            let (min, max) = crate::views::meter::suggested_scale(at, cx);
+            MeterConfig {
+                component: crate::views::binding::component_meta(db, trace.component_id)
+                    .name
+                    .to_string(),
+                element: trace.element_index,
+                label: Some(trace.label.to_string()),
+                min,
+                max,
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Rows listing every known component; selecting one invokes `on_select`.
@@ -2056,5 +2154,34 @@ mod tests {
         assert!(matches!(back.x_max_override, Override::Auto));
         assert!(matches!(back.y_min_override, Override::Auto));
         assert!(matches!(back.y_max_override, Override::Custom(v) if (v - 2.5).abs() < 1e-9));
+
+        let meter = MeterConfig {
+            component: "sat.wheels.h".into(),
+            element: 2,
+            label: Some("wheel 2".into()),
+            min: -0.04,
+            max: 0.04,
+            unit: Some("N·m·s".into()),
+            orientation: crate::views::Orientation::Horizontal,
+            color: Some(Hsla::default()),
+            hide_value: true,
+            hide_limits: false,
+        };
+        let s = serde_json::to_string(&meter).unwrap();
+        let back: MeterConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, meter);
+
+        // A meter blob written before a field existed must still load, and
+        // must not degrade to a zero-width scale.
+        let partial: MeterConfig =
+            serde_json::from_str(r#"{"component":"sat.wheels.h","element":1}"#).unwrap();
+        assert_eq!(partial.component, "sat.wheels.h");
+        assert_eq!(partial.element, 1);
+        assert_eq!(partial.label, None);
+        assert_eq!((partial.min, partial.max), (0.0, 1.0));
+        assert!(matches!(
+            partial.orientation,
+            crate::views::Orientation::Vertical
+        ));
     }
 }

@@ -37,6 +37,7 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::SequenceView>();
         self.register_inspectable::<crate::views::TrafficLight>();
         self.register_inspectable::<crate::views::TrafficLightGrid>();
+        self.register_inspectable::<crate::views::Meter>();
         self.register_entity_list::<LinePlot, Trace>(
             db.clone(),
             |lp| &lp.traces,

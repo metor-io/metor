@@ -20,7 +20,8 @@ use crate::tiles::panels::{PlotPanelConfig, TraceConfig};
 use crate::views::time_series::{LinePlot, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
-    ComponentText, Monitor, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_table,
+    ComponentText, Meter, MeterConfig, Monitor, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
+    new_component_table,
 };
 
 use super::{DashboardWidget, WidgetKind};
@@ -148,6 +149,18 @@ impl WidgetRegistry {
                     SharedString::from(format!("Traffic Lights: {}", label))
                 }),
                 build: Arc::new(build_traffic_light_grid),
+            },
+        );
+        self.register(
+            WidgetKind::meter(),
+            WidgetSpec {
+                default_size: (90.0, 200.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<MeterConfig>(&w.config);
+                    let name = cfg.label.unwrap_or(cfg.component);
+                    SharedString::from(format!("Meter: {}", display_or_unknown(&name)))
+                }),
+                build: Arc::new(build_meter),
             },
         );
     }
@@ -321,6 +334,10 @@ pub fn serialize_widget_state(
         };
         return serde_json::to_string(&cfg).ok();
     }
+    if *kind == WidgetKind::meter() {
+        let m = entity.clone().downcast::<Meter>().ok()?;
+        return serde_json::to_string(&m.read(cx).to_config()).ok();
+    }
     if *kind == WidgetKind::monitor() {
         let m = entity.clone().downcast::<Monitor>().ok()?;
         let v = m.read(cx);
@@ -438,6 +455,16 @@ fn build_traffic_light(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gp
         entity.update(cx, |t, cx| t.set_color(color, cx));
     }
     as_view_and_entity(entity)
+}
+
+fn build_meter(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<MeterConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    as_view_and_entity(cx.new(|cx| Meter::from_config(&cfg, db.clone(), cx)))
 }
 
 fn build_traffic_light_grid(

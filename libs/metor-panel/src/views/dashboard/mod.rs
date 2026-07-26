@@ -84,6 +84,9 @@ impl WidgetKind {
     pub fn traffic_light_grid() -> Self {
         Self(SharedString::new_static("traffic_light_grid"))
     }
+    pub fn meter() -> Self {
+        Self(SharedString::new_static("meter"))
+    }
 
     fn default_size(&self, cx: &App) -> (f32, f32) {
         widgets::widget_spec(self, cx).default_size
@@ -525,6 +528,15 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
         },
     )));
     rows.push(Box::new(NavRow::new(
+        "Meter",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| meter_picker_rows(dashboard.clone(), db.clone()))
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
         "Image",
         SharedString::new_static(""),
         {
@@ -587,6 +599,25 @@ fn component_picker_rows(
             )) as Box<dyn InspectorRow>
         })
         .collect()
+}
+
+/// Trace wizard for "+ widget → Meter": each picked element becomes its own
+/// meter, scaled from that element's declared alarm limits.
+fn meter_picker_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
+    let db_outer = db.clone();
+    crate::inspector::trace_picker::select_traces_wizard_rows(
+        db,
+        Arc::new(|_cx| 0),
+        Arc::new(move |traces, _window, cx| {
+            let configs = crate::tiles::panels::meter_configs_for_traces(&db_outer, &traces, cx);
+            dashboard.update(cx, |this, cx| {
+                for cfg in configs {
+                    let blob = serde_json::to_string(&cfg).expect("meter config serializes");
+                    this.add_widget(WidgetKind::meter(), blob, cx);
+                }
+            });
+        }),
+    )
 }
 
 /// Single-question wizard for "+ widget → Traffic Light Grid": prompts for
