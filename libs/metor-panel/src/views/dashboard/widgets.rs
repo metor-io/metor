@@ -194,10 +194,7 @@ impl WidgetRegistry {
                 default_size: (260.0, 110.0),
                 label: Arc::new(|w| {
                     let cfg = parse_or_default::<SequenceControlConfig>(&w.config);
-                    SharedString::from(format!(
-                        "Sequence: {}",
-                        display_or_unknown(&cfg.channel)
-                    ))
+                    SharedString::from(format!("Sequence: {}", display_or_unknown(&cfg.channel)))
                 }),
                 build: Arc::new(build_sequence_control),
             },
