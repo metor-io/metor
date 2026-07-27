@@ -12,7 +12,6 @@ from metor_config import (
     Edge,
     Gauge,
     HSplit,
-    Image,
     Logs,
     Meter,
     Pane,
@@ -27,7 +26,6 @@ from metor_config import (
     TcpServer,
     TimeSeriesPlot,
     Trace,
-    TrafficLight,
     TrafficLightGrid,
     Uplink,
     VSplit,
@@ -99,6 +97,12 @@ alarms = m.add(
 
 # --- the operator dashboard -------------------------------------------------
 #
+# Laid out on an explicit grid: every widget is placed from a column/row
+# constant rather than a literal, so the gutters between them stay uniform and
+# nothing can silently overlap. GUTTER also sets the width of the lanes the
+# schematic connectors run through — a line squeezed against a widget edge
+# reads as a rendering fault rather than as a connection.
+#
 # Instrument scales come from the contract constants, so the panel and the
 # plant agree on what "full" means: RW_MOMENTUM_MAX = 0.04 N·m·s per wheel and
 # MTQ_MAX_DIPOLE = 0.2 A·m² per axis. Warn/critical ticks are *not* set here —
@@ -107,6 +111,22 @@ alarms = m.add(
 RW_MOMENTUM_MAX = 0.04
 MTQ_MAX_DIPOLE = 0.2
 RATE_FULL_SCALE = 0.2  # rad/s, comfortably past the critical rate band
+
+GUTTER = 14
+LANE = 40  # a gutter wide enough for a connector and its label
+
+# Columns: status/attitude on the left, instruments in the middle, plots right.
+COL_A = 20                       # attitude
+COL_A_W = 270
+COL_B = COL_A + COL_A_W + LANE   # gauges, wheels, sequence, torquers
+COL_B_W = 534
+COL_C = COL_B + COL_B_W + 30     # plots
+COL_C_W = 560
+
+ROW_STATUS = 20
+ROW_MAIN = ROW_STATUS + 64 + GUTTER + 6      # 104
+ROW_WHEELS = ROW_MAIN + 150 + LANE           # 294
+ROW_TORQUERS = ROW_WHEELS + 150 + 30         # 474
 
 mode_chip = Place(
     StateChip(
@@ -121,7 +141,7 @@ mode_chip = Place(
             State(4, "DETUMBLE", "#cba6f7ff"),
         ],
     ),
-    20, 20, 160, 62,
+    COL_A, ROW_STATUS, 150, 64,
 )
 law_chip = Place(
     StateChip(
@@ -130,12 +150,21 @@ law_chip = Place(
         label="law",
         states=[State(0, "NADIR"), State(1, "VELOCITY"), State(2, "B-CROSS")],
     ),
-    190, 20, 160, 62,
+    COL_A + 164, ROW_STATUS, 150, 64,
 )
-# `illuminated` is a 0/1 flag, so an on/off light says it better than a number.
-eclipse = Place(TrafficLight("plant.world.illuminated"), 360, 20, 70, 62)
-wheel_arm = Place(TrafficLightGrid("plant.wheels.wheels.*.arm"), 440, 20, 190, 62)
-sequence = Place(SequenceControl("mode"), 640, 20, 300, 120)
+# A chip rather than a traffic light: `illuminated` is a 0/1 flag, but an
+# unlabelled square asks the operator to remember which way round it reads.
+eclipse = Place(
+    StateChip(
+        "plant.world.illuminated",
+        label="sun",
+        states=[State(0, "ECLIPSE", "#585b70ff"), State(1, "SUNLIT", "#f9e2afff")],
+    ),
+    COL_A + 328, ROW_STATUS, 150, 64,
+)
+wheel_arm = Place(
+    TrafficLightGrid("plant.wheels.wheels.*.arm"), COL_A + 492, ROW_STATUS, 130, 64
+)
 
 attitude = Place(
     Attitude(
@@ -143,11 +172,12 @@ attitude = Place(
         label="attitude estimate",
         vectors=[VectorMarker("plant.sensors.mag_b", "mag")],
     ),
-    20, 100, 260, 320,
+    COL_A, ROW_MAIN, COL_A_W, 340,
 )
 
 # One gauge per body axis: the question here is "where in the envelope is this
 # rate", which a dial answers faster than a bar.
+GAUGE_W = 170
 rate_gauges = [
     Place(
         Gauge(
@@ -158,13 +188,14 @@ rate_gauges = [
             min=-RATE_FULL_SCALE,
             max=RATE_FULL_SCALE,
         ),
-        300 + 160 * i, 100, 150, 140,
+        COL_B + (GAUGE_W + GUTTER - 2) * i, ROW_MAIN, GAUGE_W, 150,
     )
     for i, axis in enumerate("xyz")
 ]
 
 # Wheel momentum is signed and saturating, so vertical bipolar bars filling
 # outward from zero: the direction of the stored momentum is the point.
+WHEEL_W = 100
 wheel_meters = [
     Place(
         Meter(
@@ -175,10 +206,16 @@ wheel_meters = [
             min=-RW_MOMENTUM_MAX,
             max=RW_MOMENTUM_MAX,
         ),
-        300 + 92 * w, 260, 84, 210,
+        COL_B + (WHEEL_W + GUTTER) * w, ROW_WHEELS, WHEEL_W, 150,
     )
     for w in range(3)
 ]
+
+sequence = Place(
+    SequenceControl("mode"),
+    COL_B + (WHEEL_W + GUTTER) * 3, ROW_WHEELS,
+    COL_B_W - (WHEEL_W + GUTTER) * 3, 150,
+)
 
 mtq_meters = [
     Place(
@@ -191,7 +228,7 @@ mtq_meters = [
             max=MTQ_MAX_DIPOLE,
             orientation="horizontal",
         ),
-        590, 260 + 68 * i, 350, 60,
+        COL_B, ROW_TORQUERS + 68 * i, COL_B_W, 56,
     )
     for i, axis in enumerate("xyz")
 ]
@@ -204,7 +241,7 @@ rate_plot = Place(
             for i, ax in enumerate("xyz")
         ],
     ),
-    970, 100, 520, 240,
+    COL_C, ROW_MAIN, COL_C_W, 250,
 )
 momentum_plot = Place(
     TimeSeriesPlot(
@@ -214,68 +251,51 @@ momentum_plot = Place(
             for w in range(3)
         ],
     ),
-    970, 360, 520, 240,
+    COL_C, ROW_MAIN + 250 + 30, COL_C_W, 250,
 )
 
-# The bus outline, placed 1:1 with its pixels so the leader lines below can
-# name a point on the drawing by its position in the image.
-BUS_X, BUS_Y = 20, 470
-bus = Place(Image("assets/bus.png"), BUS_X, BUS_Y, 420, 260)
+# Signal flow, under the widgets so each run disappears into the box it enters
+# the way a schematic should read. Waypoints put every leg down the middle of a
+# lane rather than letting the router graze a widget edge, and `bind` energizes
+# the actuator legs off live telemetry.
+LANE_AB = COL_A + COL_A_W + LANE // 2          # between attitude and the gauges
+LANE_GAUGE_WHEEL = ROW_MAIN + 150 + LANE // 2  # between the gauges and wheels
 
 
-def on_bus(x: float, y: float) -> At:
-    """A canvas anchor at image-pixel ``(x, y)`` of the bus drawing."""
-    return At(BUS_X + x, BUS_Y + y)
+def _center_x(place: Place) -> float:
+    return place.x + (place.w or 0) / 2
 
 
 adcs_dashboard = Dashboard(
     title="ADCS Ops",
     widgets=[
-        mode_chip, law_chip, eclipse, wheel_arm, sequence,
-        attitude, *rate_gauges, *wheel_meters, *mtq_meters,
-        rate_plot, momentum_plot, bus,
+        mode_chip, law_chip, eclipse, wheel_arm,
+        attitude, *rate_gauges, *wheel_meters, sequence, *mtq_meters,
+        rate_plot, momentum_plot,
     ],
     connectors=[
-        # Signal flow, drawn under the widgets so each run disappears into the
-        # box it enters, the way a schematic should read. `bind` energizes the
-        # actuator legs off live telemetry.
-        Connector([attitude, rate_gauges[1]], label="ω", arrow="end"),
         Connector(
-            [rate_gauges[1], wheel_meters[1]],
+            [
+                Edge(attitude, "right", 0.5),
+                At(LANE_AB, attitude.y + 170),
+                At(LANE_AB, rate_gauges[0].y + 75),
+                Edge(rate_gauges[0], "left", 0.5),
+            ],
+            shape="straight",
+            arrow="end",
+            label="ω",
+        ),
+        Connector(
+            [
+                Edge(rate_gauges[1], "bottom", 0.5),
+                At(_center_x(rate_gauges[1]), LANE_GAUGE_WHEEL),
+                At(_center_x(wheel_meters[1]), LANE_GAUGE_WHEEL),
+                Edge(wheel_meters[1], "top", 0.5),
+            ],
+            shape="straight",
+            arrow="end",
             label="control",
-            arrow="end",
             bind=Bind("plant.wheels.wheels.1.arm"),
-        ),
-        Connector(
-            [wheel_meters[2], mtq_meters[0]],
-            label="desat",
-            arrow="end",
-            dashed=True,
-            bind=Bind("ctrl.mtq_cmd.dipole_b", threshold=1e-6),
-        ),
-        # Callout leaders from parts of the drawing to the live instrument for
-        # that hardware. These paint *over* the widgets, since a leader has to
-        # cross what lies between its ends.
-        Connector(
-            [on_bus(210, 155), Edge(wheel_meters[1], "bottom", 0.5)],
-            shape="curved",
-            arrow="end",
-            on_top=True,
-            label="reaction wheels",
-        ),
-        Connector(
-            [on_bus(210, 96), Edge(mtq_meters[1], "left", 0.5)],
-            shape="curved",
-            arrow="end",
-            on_top=True,
-            label="magnetorquers",
-        ),
-        Connector(
-            [on_bus(210, 46), Edge(attitude, "bottom", 0.5)],
-            shape="curved",
-            arrow="end",
-            on_top=True,
-            label="sun sensor",
         ),
     ],
 )

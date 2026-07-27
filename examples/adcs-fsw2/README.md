@@ -125,14 +125,19 @@ ingests.
    `commissioning` or `safe_mode`). Uplink and downlink use separate connections
    (docs/messages.md §4.5) — both point at the same metor-db endpoint, `127.0.0.1:2240`.
 3. On a first connection the panel opens the **`adcs-dashboard`** preset this target ships
-   (see `target.py`): the attitude ball with the magnetometer direction marked on it, dials
-   for the three body rates, bipolar bars for the wheels and magnetorquers, phase/law chips,
-   Load/Start/Abort for the `mode` channel, and a bus drawing whose reaction wheels,
-   torquers, and sun sensor are wired by leader lines to the instruments that read them.
-   Warn/critical ticks on the meters and gauges are *not* configured in the preset — they
-   come from the `ADCS_RATE_HIGH` and `RW_MOMENTUM_HIGH` definitions, so a limit is stated
-   once and shown everywhere. The plot-centric **`adcs-ops`** layout is still available under
-   Load Preset, and a locally saved layout always wins over both.
+   (see `target.py`): status chips across the top, the attitude ball with the magnetometer
+   direction marked on it, dials for the three body rates, bipolar bars for wheel momentum
+   and magnetorquer dipole, Load/Start/Abort for the `mode` channel, and the two plots on the
+   right. Warn/critical ticks on the meters and gauges are *not* configured in the preset —
+   they come from the `ADCS_RATE_HIGH` and `RW_MOMENTUM_HIGH` definitions, so a limit is
+   stated once and shown everywhere. The plot-centric **`adcs-ops`** layout is still
+   available under Load Preset, and a locally saved layout always wins over both.
+
+   The layout is built from column/row constants rather than literal coordinates, and
+   `target.py` asserts `Dashboard.overlaps()` is empty, so the grid cannot drift into
+   panels sitting on top of each other. Two connectors run down the gutters between the
+   instruments to show the signal flow; the one into the wheels is `bind`-coloured, so it
+   only lights when that wheel is armed.
 
    In the component tree the `plant` / `nav` / `ctrl` / `mode` (and `coordinator`) instances
    appear. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against

@@ -35,18 +35,27 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use super::binding::{component_meta, spawn_elements_stream, spawn_meta_resolver};
-use crate::theme::theme;
+use crate::theme::{Theme, theme};
 
 /// Pitch angle that moves the horizon by a full ball radius.
 const PITCH_FULL_SCALE: f32 = std::f32::consts::FRAC_PI_2;
-/// Pitch ladder rung spacing.
-const LADDER_STEP_DEG: f32 = 10.0;
+/// Pitch ladder rung spacing. Coarse on purpose: a rung every 10° packs the
+/// ball with more lines than anyone reads off it, and the horizon plus the
+/// numeric readout already carry the precision.
+const LADDER_STEP_DEG: f32 = 20.0;
 /// Rung half-width as a fraction of the ball radius.
 const LADDER_HALF_WIDTH: f32 = 0.28;
 /// Points sampled along a ball arc.
 const ARC_SAMPLES: usize = 48;
 /// Marker dot radius.
 const MARKER_PX: f32 = 3.5;
+/// Alpha of the sky and ground fills. The ball is a backdrop for the markers
+/// and the reticle, not the subject, so the hue carries at the border and
+/// stays washed out across the interior.
+const FILL_ALPHA: f32 = 0.18;
+/// Alpha of a pitch ladder rung — between the fill it sits on and the
+/// full-strength border, so it is legible without competing with either.
+const LADDER_ALPHA: f32 = 0.55;
 
 /// Persisted shape of one plotted body-frame direction.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -326,6 +335,17 @@ fn stroke_polyline(points: &[Point<Pixels>], width: Pixels, color: Hsla, window:
     }
 }
 
+/// Stroke a closed outline around `points`, joining the last back to the
+/// first — the border half of the pill treatment.
+fn outline(points: &[Point<Pixels>], width: Pixels, color: Hsla, window: &mut Window) {
+    if points.len() < 3 {
+        return;
+    }
+    let mut closed: Vec<Point<Pixels>> = points.to_vec();
+    closed.push(points[0]);
+    stroke_polyline(&closed, width, color, window);
+}
+
 fn fill_polygon(points: &[Point<Pixels>], color: Hsla, window: &mut Window) {
     if points.len() < 3 {
         return;
@@ -350,9 +370,11 @@ impl Render for AttitudeIndicator {
         let (roll, pitch, yaw) = self.quat.map(euler_zyx).unwrap_or((0.0, 0.0, 0.0));
         let has_fix = self.quat.is_some();
 
-        let sky = theme.control_active;
-        let ground = theme.line_colors[0];
-        let chrome = theme.text_primary;
+        // Full-strength hues: the paint pass dims them for the fills and
+        // keeps them solid for the borders.
+        let sky = theme.horizon_sky;
+        let ground = theme.horizon_ground;
+        let reticle = theme.text_primary;
         let rim = theme.border_primary;
         let backdrop = theme.bg_secondary;
         let palette = theme.line_colors;
@@ -401,31 +423,30 @@ impl Render for AttitudeIndicator {
                         .map(|o| place(center, o, 0.0))
                         .collect();
                     fill_polygon(&disc, backdrop, window);
+                    outline(&disc, px(1.0), rim, window);
                     return;
                 }
 
+                // Each half is drawn the way the plot legend draws a pill:
+                // the hue at low alpha inside, the same hue at full strength
+                // around the edge. The border traces the arc *and* the
+                // horizon chord, so the split is crisp without a separate
+                // line over the top of it.
                 let d = (pitch / PITCH_FULL_SCALE) * radius;
                 for (side_ground, color) in [(false, sky), (true, ground)] {
                     let poly: Vec<Point<Pixels>> = half_disc(radius, d, side_ground)
                         .into_iter()
                         .map(|o| place(center, o, roll))
                         .collect();
-                    fill_polygon(&poly, color, window);
-                }
-
-                // Horizon line, drawn over the fills so the boundary stays
-                // crisp against either colour.
-                if let Some(h) = chord_half_width(radius, d) {
-                    stroke_polyline(
-                        &[place(center, (-h, d), roll), place(center, (h, d), roll)],
-                        px(1.5),
-                        chrome,
-                        window,
-                    );
+                    fill_polygon(&poly, Theme::dim(color, FILL_ALPHA), window);
+                    outline(&poly, px(1.5), color, window);
                 }
 
                 // Pitch ladder: rungs at fixed angles, each trimmed to the
-                // ball so none pokes out past the rim.
+                // ball so none pokes out past the rim. A rung takes the hue
+                // of the half it sits in rather than a neutral grey, so the
+                // scale reads as part of the sky or the ground instead of as
+                // a separate layer laid over both.
                 let step_px = (LADDER_STEP_DEG.to_radians() / PITCH_FULL_SCALE) * radius;
                 let mut k = 1;
                 loop {
@@ -433,7 +454,7 @@ impl Render for AttitudeIndicator {
                     if rung_offset > radius + step_px {
                         break;
                     }
-                    for sign in [-1.0_f32, 1.0] {
+                    for (sign, hue) in [(-1.0_f32, sky), (1.0, ground)] {
                         let y = d + sign * rung_offset;
                         let Some(h) = chord_half_width(radius, y) else {
                             continue;
@@ -445,7 +466,7 @@ impl Render for AttitudeIndicator {
                                 place(center, (half, y), roll),
                             ],
                             px(1.0),
-                            chrome,
+                            Theme::dim(hue, LADDER_ALPHA),
                             window,
                         );
                     }
@@ -486,7 +507,7 @@ impl Render for AttitudeIndicator {
                         place(center, (-wing * 0.35, 0.0), 0.0),
                     ],
                     px(2.0),
-                    chrome,
+                    reticle,
                     window,
                 );
                 stroke_polyline(
@@ -495,18 +516,9 @@ impl Render for AttitudeIndicator {
                         place(center, (wing, 0.0), 0.0),
                     ],
                     px(2.0),
-                    chrome,
+                    reticle,
                     window,
                 );
-
-                // Rim last, so fills and ladder rungs are bounded by it.
-                let ring: Vec<Point<Pixels>> = (0..=ARC_SAMPLES)
-                    .map(|i| {
-                        let t = 2.0 * std::f32::consts::PI * (i as f32 / ARC_SAMPLES as f32);
-                        place(center, (radius * t.cos(), radius * t.sin()), 0.0)
-                    })
-                    .collect();
-                stroke_polyline(&ring, px(1.0), rim, window);
             },
         );
 

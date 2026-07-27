@@ -88,6 +88,13 @@ pub struct Theme {
     pub line_color: Hsla,
     /// Categorical palette cycled through when a plot has several series.
     pub line_colors: [Hsla; 8],
+    /// Sky and ground of an attitude ball, and any other horizon-split
+    /// instrument. Named rather than indexed out of `line_colors`, because
+    /// the categorical palette's order is a per-theme choice — one theme
+    /// leads with blue — and a horizon painted upside down reads as a fault
+    /// in the instrument rather than as a theme.
+    pub horizon_sky: Hsla,
+    pub horizon_ground: Hsla,
     pub grid_color: Hsla,
     pub axis_color: Hsla,
     pub zero_line_color: Hsla,
@@ -186,12 +193,12 @@ impl Theme {
     /// intermediate states use fixed hues that read on both light and dark themes.
     pub fn run_state_color(&self, run_state_index: usize) -> Hsla {
         match run_state_index {
-            1 => self.control_active,   // running
-            2 => hex(0x4090e0, 1.0),    // completed — calm blue
-            3 => hex(0xe0a030, 1.0),    // aborted — amber (commanded safe stop)
-            4 => hex(0xe06820, 1.0),    // stopped — orange (hard, possibly unsafe)
-            5 => self.error_accent,     // failed
-            _ => self.text_tertiary,    // idle / unknown
+            1 => self.control_active, // running
+            2 => hex(0x4090e0, 1.0),  // completed — calm blue
+            3 => hex(0xe0a030, 1.0),  // aborted — amber (commanded safe stop)
+            4 => hex(0xe06820, 1.0),  // stopped — orange (hard, possibly unsafe)
+            5 => self.error_accent,   // failed
+            _ => self.text_tertiary,  // idle / unknown
         }
     }
 
@@ -272,6 +279,8 @@ pub static DARK: Theme = Theme {
 
     line_color: hex(0xe08a30, 1.0),
     line_colors: LINE_COLORS,
+    horizon_sky: hex(0x4aa0e0, 1.0),
+    horizon_ground: hex(0xff7c1f, 1.0),
     grid_color: hex(0x2e2b28, 1.0),
     axis_color: hex(0x4d4843, 1.0),
     zero_line_color: hex(0x6b6560, 1.0),
@@ -314,6 +323,8 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
         hex(0xf9e2af, 1.0), // yellow
         hex(0xf5c2e7, 1.0), // pink
     ],
+    horizon_sky: hex(0x89b4fa, 1.0),
+    horizon_ground: hex(0xfab387, 1.0),
     grid_color: hex(0x313244, 1.0),
     axis_color: hex(0x45475a, 1.0),
     zero_line_color: hex(0x585b70, 1.0),
@@ -356,6 +367,8 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
         hex(0xeed49f, 1.0), // yellow
         hex(0xf5bde6, 1.0), // pink
     ],
+    horizon_sky: hex(0x8aadf4, 1.0),
+    horizon_ground: hex(0xf5a97f, 1.0),
     grid_color: hex(0x363a4f, 1.0),
     axis_color: hex(0x494d64, 1.0),
     zero_line_color: hex(0x5b6078, 1.0),
@@ -398,6 +411,8 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
         hex(0xdf8e1d, 1.0), // yellow
         hex(0xea76cb, 1.0), // pink
     ],
+    horizon_sky: hex(0x1e66f5, 1.0),
+    horizon_ground: hex(0xfe640b, 1.0),
     grid_color: hex(0xdce0e8, 1.0),
     axis_color: hex(0xccd0da, 1.0),
     zero_line_color: hex(0xbcc0cc, 1.0),
@@ -440,6 +455,8 @@ pub static AYU_DARK: Theme = Theme {
         hex(0xffb454, 1.0), // yellow
         hex(0xf07178, 1.0), // pink/red
     ],
+    horizon_sky: hex(0x59c2ff, 1.0),
+    horizon_ground: hex(0xe6b450, 1.0),
     grid_color: hex(0x11151c, 1.0),
     axis_color: hex(0x1a1e28, 1.0),
     zero_line_color: hex(0x2a2e38, 1.0),
@@ -482,6 +499,8 @@ pub static EVERFOREST_DARK: Theme = Theme {
         hex(0xdbbc7f, 1.0), // yellow
         hex(0xd699b6, 1.0), // pink
     ],
+    horizon_sky: hex(0x7fbbb3, 1.0),
+    horizon_ground: hex(0xe69875, 1.0),
     grid_color: hex(0x3d484d, 1.0),
     axis_color: hex(0x475258, 1.0),
     zero_line_color: hex(0x56635f, 1.0),
@@ -524,6 +543,8 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
         hex(0xdfa000, 1.0), // yellow
         hex(0xdf69ba, 1.0), // pink
     ],
+    horizon_sky: hex(0x3a94c5, 1.0),
+    horizon_ground: hex(0xf57d26, 1.0),
     grid_color: hex(0xefebd4, 1.0),
     axis_color: hex(0xe6e2cc, 1.0),
     zero_line_color: hex(0xbdc3af, 1.0),
@@ -566,6 +587,8 @@ pub static ROSE_PINE: Theme = Theme {
         hex(0xf6c177, 1.0), // gold
         hex(0xeb6f92, 1.0), // love
     ],
+    horizon_sky: hex(0x31748f, 1.0),
+    horizon_ground: hex(0xf6c177, 1.0),
     grid_color: hex(0x21202e, 1.0),
     axis_color: hex(0x403d52, 1.0),
     zero_line_color: hex(0x524f67, 1.0),
@@ -608,6 +631,8 @@ pub static ROSE_PINE_MOON: Theme = Theme {
         hex(0xf6c177, 1.0), // gold
         hex(0xea9a97, 1.0), // rose
     ],
+    horizon_sky: hex(0x3e8fb0, 1.0),
+    horizon_ground: hex(0xf6c177, 1.0),
     grid_color: hex(0x2a283e, 1.0),
     axis_color: hex(0x44415a, 1.0),
     zero_line_color: hex(0x56526e, 1.0),
@@ -650,6 +675,8 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
         hex(0xea9d34, 1.0), // gold
         hex(0xb4637a, 1.0), // love
     ],
+    horizon_sky: hex(0x286983, 1.0),
+    horizon_ground: hex(0xea9d34, 1.0),
     grid_color: hex(0xf4ede8, 1.0),
     axis_color: hex(0xdfdad9, 1.0),
     zero_line_color: hex(0xcecacd, 1.0),
@@ -692,6 +719,8 @@ pub static MAKING_SOFTWARE: Theme = Theme {
         hex(0xd9a200, 1.0), // amber
         hex(0xc94f9b, 1.0), // magenta
     ],
+    horizon_sky: hex(0x1342ff, 1.0),
+    horizon_ground: hex(0xe35d3a, 1.0),
     grid_color: hex(0xe6ebff, 1.0),
     axis_color: hex(0xb9c7fd, 1.0),
     zero_line_color: hex(0x97acff, 1.0),
@@ -734,6 +763,8 @@ pub static DEPARTURE: Theme = Theme {
         hex(0x5090e0, 1.0), // blue
         hex(0xb0a040, 1.0), // olive
     ],
+    horizon_sky: hex(0x4ad0d0, 1.0),
+    horizon_ground: hex(0xf0a040, 1.0),
     grid_color: hex(0x2a2018, 1.0),
     axis_color: hex(0x3a2a18, 1.0),
     zero_line_color: hex(0x5a3e20, 1.0),
@@ -782,6 +813,8 @@ pub static KINTSUGI: Theme = Theme {
         hex(0xe08542, 1.0), // burnt orange
         hex(0x8fa3b3, 1.0), // slate
     ],
+    horizon_sky: hex(0x6c7a8a, 1.0),
+    horizon_ground: hex(0xdbad49, 1.0),
     grid_color: hex(0x1d1d1c, 1.0),
     axis_color: hex(0x444444, 1.0),
     zero_line_color: hex(0x5c584f, 1.0),

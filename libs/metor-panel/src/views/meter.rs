@@ -324,17 +324,33 @@ impl Render for Meter {
         tile = tile.child(bar);
 
         if self.show_value {
-            let text = match self.value {
-                Some(v) if self.unit.is_empty() => format_number(v),
-                Some(v) => format!("{} {}", format_number(v), self.unit),
+            let value = match self.value {
+                Some(v) => format_number(v),
                 None => "—".to_string(),
             };
-            tile = tile.child(
+            let reading =
                 div()
                     .text_color(theme.text_primary)
                     .truncate()
-                    .child(SharedString::from(text)),
-            );
+                    .child(SharedString::from(if vertical || self.unit.is_empty() {
+                        value
+                    } else {
+                        format!("{value} {}", self.unit)
+                    }));
+            tile = tile.child(reading);
+
+            // A vertical meter is only as wide as its bar, so a unit sharing
+            // the value's line truncates the number itself — the one thing
+            // that has to stay readable. Give it its own line there; a
+            // horizontal bar has room to keep them together.
+            if vertical && !self.unit.is_empty() {
+                tile = tile.child(
+                    div()
+                        .text_color(theme.text_tertiary)
+                        .truncate()
+                        .child(self.unit.clone()),
+                );
+            }
         }
 
         tile
