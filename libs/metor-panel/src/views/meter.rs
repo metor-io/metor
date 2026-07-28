@@ -84,6 +84,11 @@ impl Default for MeterConfig {
 /// Single-element bar meter.
 #[derive(facet::Facet)]
 pub struct Meter {
+    /// What this meter reads. Editable: picking another component or element
+    /// in the inspector rebinds the stream on the next frame. Declared first
+    /// so the binding heads the inspector page — fields are walked in order.
+    pub component_id: ComponentId,
+    pub element: usize,
     pub label: SharedString,
     pub min: f64,
     pub max: f64,
@@ -92,15 +97,19 @@ pub struct Meter {
     pub color: Hsla,
     pub show_value: bool,
     pub show_limits: bool,
-    /// The name this meter was configured with — written back on save, so a
-    /// component that never registered doesn't lose its binding to a
-    /// debug-formatted id.
+    /// The name the meter was configured with, kept as the fallback for a
+    /// component that has never registered — [`to_config`](Self::to_config)
+    /// prefers the live name for whatever id is currently bound.
     #[facet(skip)]
     component: SharedString,
+    /// What `_task` is actually streaming, compared against the editable
+    /// fields each frame.
     #[facet(opaque)]
-    at: ElementRef,
+    bound: Option<ElementRef>,
     #[facet(skip)]
     value: Option<f64>,
+    #[facet(opaque)]
+    db: Arc<DB>,
     #[facet(opaque)]
     _task: gpui::Task<()>,
     #[facet(opaque)]
@@ -125,15 +134,16 @@ impl Meter {
         // component's.
         let keep_label = cfg.label.is_some();
         let keep_unit = cfg.unit.is_some();
-        let resolver_task = spawn_meta_resolver(db, component_id, cx, move |meter, meta, cx| {
-            if !keep_label {
-                meter.label = default_label(&meta.element_names, element, &meta.name);
-            }
-            if !keep_unit {
-                meter.unit = meta.unit;
-            }
-            cx.notify();
-        });
+        let resolver_task =
+            spawn_meta_resolver(db.clone(), component_id, cx, move |meter, meta, cx| {
+                if !keep_label {
+                    meter.label = default_label(&meta.element_names, element, &meta.name);
+                }
+                if !keep_unit {
+                    meter.unit = meta.unit;
+                }
+                cx.notify();
+            });
 
         Self {
             label: cfg
@@ -153,17 +163,69 @@ impl Meter {
             show_value: !cfg.hide_value,
             show_limits: !cfg.hide_limits,
             component: SharedString::from(cfg.component.clone()),
-            at,
+            component_id,
+            element,
+            bound: Some(at),
             value: None,
+            db,
             _task: task,
             _resolver_task: resolver_task,
         }
     }
 
+    /// Where this meter currently reads from.
+    fn at(&self) -> ElementRef {
+        ElementRef::new(self.component_id, self.element)
+    }
+
+    /// Restart the stream when the inspector has re-pointed the meter.
+    ///
+    /// Label and unit are re-derived from the new component: they described
+    /// the old one, and carrying them across would leave a bar labelled
+    /// `gyro_b.x` reading wheel momentum. A value from the previous binding
+    /// is dropped rather than left on screen under the new scale.
+    fn rebind(&mut self, cx: &mut Context<Self>) {
+        let want = self.at();
+        if !binding::rebound(want, &mut self.bound) {
+            return;
+        }
+        let element = want.element;
+        let meta = component_meta(&self.db, want.component);
+        self.label = default_label(&meta.element_names, element, &meta.name);
+        self.unit = meta.unit;
+        self.component = meta.name;
+        self.value = None;
+        self._task = spawn_scalar_stream(
+            self.db.clone(),
+            want.component,
+            element,
+            cx,
+            |meter, value, cx| {
+                meter.value = Some(value);
+                cx.notify();
+            },
+        );
+        self._resolver_task = spawn_meta_resolver(
+            self.db.clone(),
+            want.component,
+            cx,
+            move |meter, meta, cx| {
+                meter.label = default_label(&meta.element_names, element, &meta.name);
+                meter.unit = meta.unit;
+                cx.notify();
+            },
+        );
+    }
+
     pub fn to_config(&self) -> MeterConfig {
         MeterConfig {
-            component: self.component.to_string(),
-            element: self.at.element,
+            // Resolve the name for whatever is bound *now*, so a rebind is
+            // what gets saved; the configured name is only the fallback for a
+            // component nothing has registered.
+            component: binding::component_name(&self.db, self.component_id)
+                .unwrap_or_else(|| self.component.clone())
+                .to_string(),
+            element: self.element,
             label: Some(self.label.to_string()),
             min: self.min,
             max: self.max,
@@ -173,10 +235,6 @@ impl Meter {
             hide_value: !self.show_value,
             hide_limits: !self.show_limits,
         }
-    }
-
-    pub fn component_id(&self) -> ComponentId {
-        self.at.component
     }
 
     pub fn component(&self) -> &SharedString {
@@ -262,15 +320,17 @@ pub(crate) fn limit_position(value: f64, min: f64, max: f64) -> Option<f32> {
 
 impl Render for Meter {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.rebind(cx);
         let theme = theme(cx);
+        let at = self.at();
         let vertical = self.orientation == Orientation::Vertical;
 
         let (min, max) = (self.min, self.max);
         let color = self.color;
         let track_color = theme.border_primary;
-        let tint = binding::alarm_tint(self.at, cx);
+        let tint = binding::alarm_tint(at, cx);
         let marks: Vec<(f32, Hsla)> = if self.show_limits {
-            binding::limit_marks(self.at, cx)
+            binding::limit_marks(at, cx)
                 .into_iter()
                 .filter_map(|(v, c)| limit_position(v, min, max).map(|t| (t, c)))
                 .collect()

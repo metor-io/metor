@@ -115,6 +115,37 @@ where
     })
 }
 
+/// The component's registered name, or `None` when nothing has registered it.
+///
+/// Distinct from [`component_meta`]'s `name`, which falls back to a
+/// debug-formatted id. That fallback is fine to *display* but must never be
+/// persisted: a saved layout re-hashes the name to recover the id, so writing
+/// `"ComponentId(123)"` would silently rebind the view somewhere else on the
+/// next load.
+pub(crate) fn component_name(db: &DB, component: ComponentId) -> Option<SharedString> {
+    db.with_state(|state| {
+        state
+            .get_component_metadata(component)
+            .map(|m| SharedString::from(m.name.clone()))
+    })
+}
+
+/// Whether an instrument's editable binding has moved off what its stream
+/// task is actually reading, recording the new target if so.
+///
+/// The inspector writes a view's fields straight through facet's `Poke` and
+/// then repaints; there is no hook to run a side effect. So a view whose
+/// binding is editable compares the two at the top of its `render` and
+/// respawns when they disagree — the same shape
+/// [`TrafficLightGrid`](super::TrafficLightGrid) uses to recompile its glob.
+pub(crate) fn rebound(want: ElementRef, bound: &mut Option<ElementRef>) -> bool {
+    if *bound == Some(want) {
+        return false;
+    }
+    *bound = Some(want);
+    true
+}
+
 /// The last committed value of one element, or `None` when the component has
 /// never produced a sample.
 pub(crate) fn latest_scalar(db: &DB, at: ElementRef) -> Option<f64> {
@@ -327,5 +358,39 @@ mod tests {
     #[test]
     fn any_on_empty() {
         assert!(!any_on(Vec::<ElementValue>::new().into_iter()));
+    }
+
+    /// The rebind check runs on every frame, so "unchanged" has to be the
+    /// cheap, silent path — a helper that reported a rebind each time would
+    /// respawn the stream task 120 times a second.
+    #[test]
+    fn an_unchanged_binding_never_reports_a_rebind() {
+        let at = ElementRef::new(ComponentId(7), 1);
+        let mut bound = Some(at);
+        assert!(!rebound(at, &mut bound));
+        assert!(!rebound(at, &mut bound));
+    }
+
+    #[test]
+    fn a_changed_binding_reports_once_and_then_settles() {
+        let mut bound = Some(ElementRef::new(ComponentId(7), 1));
+
+        // A different component rebinds.
+        let moved = ElementRef::new(ComponentId(9), 1);
+        assert!(rebound(moved, &mut bound));
+        assert!(!rebound(moved, &mut bound));
+
+        // So does a different element of the same component: an instrument
+        // pointed at gyro x is not the one pointed at gyro y.
+        let other_element = ElementRef::new(ComponentId(9), 2);
+        assert!(rebound(other_element, &mut bound));
+        assert!(!rebound(other_element, &mut bound));
+    }
+
+    #[test]
+    fn an_unbound_instrument_binds_on_its_first_check() {
+        let mut bound = None;
+        assert!(rebound(ElementRef::new(ComponentId(1), 0), &mut bound));
+        assert!(!rebound(ElementRef::new(ComponentId(1), 0), &mut bound));
     }
 }

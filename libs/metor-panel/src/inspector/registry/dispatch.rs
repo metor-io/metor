@@ -152,6 +152,7 @@ fn scalar_as_f64(peek: &Peek<'_, '_>, scalar: ScalarType) -> Option<f64> {
         ScalarType::I64 => peek.get::<i64>().ok().map(|v| *v as f64),
         ScalarType::U32 => peek.get::<u32>().ok().map(|v| *v as f64),
         ScalarType::U64 => peek.get::<u64>().ok().map(|v| *v as f64),
+        ScalarType::USize => peek.get::<usize>().ok().map(|v| *v as f64),
         _ => None,
     }
 }
@@ -173,6 +174,9 @@ fn read_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, cx: &App)
         }
         ScalarType::U64 => {
             crate::inspector::reflect::get_field::<u64>(any_entity, idx, cx).map(|v| v as f64)
+        }
+        ScalarType::USize => {
+            crate::inspector::reflect::get_field::<usize>(any_entity, idx, cx).map(|v| v as f64)
         }
         _ => None,
     }
@@ -196,6 +200,11 @@ fn write_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, v: f64, 
         }
         ScalarType::U64 => {
             crate::inspector::reflect::set_field::<u64>(any_entity, idx, v as u64, cx)
+        }
+        // `usize` is what the crate indexes elements with, so a view exposing
+        // one would otherwise have its field silently skipped.
+        ScalarType::USize => {
+            crate::inspector::reflect::set_field::<usize>(any_entity, idx, v.max(0.0) as usize, cx)
         }
         _ => {}
     }

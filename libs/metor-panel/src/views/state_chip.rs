@@ -17,7 +17,7 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
-use super::binding::{ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
+use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
 use super::format_number;
 use crate::theme::theme;
 
@@ -71,15 +71,26 @@ pub struct StateChipConfig {
 /// Single-element discrete-state indicator.
 #[derive(facet::Facet)]
 pub struct StateChip {
+    /// What this chip reads. Editable: picking another component or element
+    /// in the inspector rebinds the stream on the next frame. Declared first
+    /// so the binding heads the inspector page — fields are walked in order.
+    pub component_id: ComponentId,
+    pub element: usize,
     pub label: SharedString,
     pub unknown_label: SharedString,
     pub states: Vec<Entity<StateEntry>>,
+    /// Fallback name for a component nothing has registered;
+    /// [`to_config`](Self::to_config) prefers the live name for the bound id.
     #[facet(skip)]
     component: SharedString,
+    /// What `_task` is actually streaming, compared against the editable
+    /// fields each frame.
     #[facet(opaque)]
-    at: ElementRef,
+    bound: Option<ElementRef>,
     #[facet(skip)]
     value: Option<f64>,
+    #[facet(opaque)]
+    db: Arc<DB>,
     #[facet(opaque)]
     _task: gpui::Task<()>,
     #[facet(opaque)]
@@ -98,12 +109,14 @@ impl StateChip {
         });
 
         let keep_label = cfg.label.is_some();
-        let resolver_task = spawn_meta_resolver(db, component_id, cx, move |chip, meta, cx| {
-            if !keep_label {
-                chip.label = super::meter::default_label(&meta.element_names, element, &meta.name);
-            }
-            cx.notify();
-        });
+        let resolver_task =
+            spawn_meta_resolver(db.clone(), component_id, cx, move |chip, meta, cx| {
+                if !keep_label {
+                    chip.label =
+                        super::meter::default_label(&meta.element_names, element, &meta.name);
+                }
+                cx.notify();
+            });
 
         let states = cfg
             .states
@@ -129,17 +142,61 @@ impl StateChip {
             unknown_label: SharedString::from(cfg.unknown_label.clone()),
             states,
             component: SharedString::from(cfg.component.clone()),
-            at: ElementRef::new(component_id, element),
+            component_id,
+            element,
+            bound: Some(ElementRef::new(component_id, element)),
             value: None,
+            db,
             _task: task,
             _resolver_task: resolver_task,
         }
     }
 
+    /// Restart the stream when the inspector has re-pointed the chip.
+    ///
+    /// The state table is *kept*: it is the operator's translation of a code
+    /// space, not something derived from the component, and rebinding
+    /// between two components that share an encoding (a commanded mode and
+    /// the reported one) is the reason to edit the binding at all.
+    fn rebind(&mut self, cx: &mut Context<Self>) {
+        let want = ElementRef::new(self.component_id, self.element);
+        if !binding::rebound(want, &mut self.bound) {
+            return;
+        }
+        let element = want.element;
+        let meta = component_meta(&self.db, want.component);
+        self.label = super::meter::default_label(&meta.element_names, element, &meta.name);
+        self.component = meta.name;
+        self.value = None;
+        self._task = spawn_scalar_stream(
+            self.db.clone(),
+            want.component,
+            element,
+            cx,
+            |chip, value, cx| {
+                chip.value = Some(value);
+                cx.notify();
+            },
+        );
+        self._resolver_task = spawn_meta_resolver(
+            self.db.clone(),
+            want.component,
+            cx,
+            move |chip, meta, cx| {
+                chip.label = super::meter::default_label(&meta.element_names, element, &meta.name);
+                cx.notify();
+            },
+        );
+    }
+
     pub fn to_config(&self, cx: &gpui::App) -> StateChipConfig {
         StateChipConfig {
-            component: self.component.to_string(),
-            element: self.at.element,
+            // Resolve the name for whatever is bound *now*, so a rebind is
+            // what gets saved.
+            component: binding::component_name(&self.db, self.component_id)
+                .unwrap_or_else(|| self.component.clone())
+                .to_string(),
+            element: self.element,
             label: Some(self.label.to_string()),
             states: self
                 .states
@@ -174,6 +231,7 @@ fn match_state(
 
 impl Render for StateChip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.rebind(cx);
         let theme = theme(cx);
         let states: Vec<(f64, SharedString, Option<Hsla>)> = self
             .states

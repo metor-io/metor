@@ -34,7 +34,9 @@ use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use super::binding::{component_meta, spawn_elements_stream, spawn_meta_resolver};
+use super::binding::{
+    self, ElementRef, component_meta, spawn_elements_stream, spawn_meta_resolver,
+};
 use crate::theme::{Theme, theme};
 
 /// Pitch angle that moves the horizon by a full ball radius.
@@ -84,13 +86,21 @@ pub struct AttitudeConfig {
 /// One body-frame direction plotted on the ball.
 #[derive(facet::Facet)]
 pub struct VectorMarker {
+    /// The 3-vector this marker plots. Editable, like the ball's own binding.
+    pub component_id: ComponentId,
     pub label: SharedString,
     pub color: Option<Hsla>,
+    /// Fallback name for a component nothing has registered.
     #[facet(skip)]
     component: SharedString,
+    /// What `_task` is streaming, compared against `component_id` each frame.
+    #[facet(opaque)]
+    bound: Option<ComponentId>,
     /// Latest sample, unnormalized; `None` until the component produces one.
     #[facet(skip)]
     value: Option<[f32; 3]>,
+    #[facet(opaque)]
+    db: Arc<DB>,
     #[facet(opaque)]
     _task: gpui::Task<()>,
 }
@@ -98,51 +108,91 @@ pub struct VectorMarker {
 impl VectorMarker {
     fn from_config(cfg: &VectorMarkerConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let component_id = ComponentId::new(&cfg.component);
-        let task = spawn_elements_stream(db, component_id, 3, cx, |marker, v, cx| {
-            marker.value = Some([v[0] as f32, v[1] as f32, v[2] as f32]);
-            cx.notify();
-        });
+        let task = spawn_marker_stream(&db, component_id, cx);
         Self {
+            component_id,
             label: SharedString::from(cfg.label.clone()),
             color: cfg.color,
             component: SharedString::from(cfg.component.clone()),
+            bound: Some(component_id),
             value: None,
+            db,
             _task: task,
         }
     }
 
     fn to_config(&self) -> VectorMarkerConfig {
         VectorMarkerConfig {
-            component: self.component.to_string(),
+            component: binding::component_name(&self.db, self.component_id)
+                .unwrap_or_else(|| self.component.clone())
+                .to_string(),
             label: self.label.to_string(),
             color: self.color,
         }
     }
 
-    pub fn empty() -> Self {
+    /// Restart the stream when the inspector has re-pointed the marker.
+    /// Driven from the ball's render, since a marker is data rather than a
+    /// view and never gets a render pass of its own.
+    fn rebind(&mut self, cx: &mut Context<Self>) {
+        if self.bound == Some(self.component_id) {
+            return;
+        }
+        self.bound = Some(self.component_id);
+        self.component = component_meta(&self.db, self.component_id).name;
+        self.value = None;
+        self._task = spawn_marker_stream(&self.db, self.component_id, cx);
+    }
+
+    /// An empty marker, as the inspector's "add" affordance creates it. It
+    /// binds to nothing until a component is picked, which the next render
+    /// then acts on.
+    pub fn empty(db: Arc<DB>) -> Self {
         Self {
+            component_id: ComponentId(0),
             label: SharedString::new_static(""),
             color: None,
             component: SharedString::new_static(""),
+            bound: Some(ComponentId(0)),
             value: None,
+            db,
             _task: gpui::Task::ready(()),
         }
     }
 }
 
+fn spawn_marker_stream(
+    db: &Arc<DB>,
+    component: ComponentId,
+    cx: &mut Context<VectorMarker>,
+) -> gpui::Task<()> {
+    spawn_elements_stream(db.clone(), component, 3, cx, |marker, v, cx| {
+        marker.value = Some([v[0] as f32, v[1] as f32, v[2] as f32]);
+        cx.notify();
+    })
+}
+
 /// Quaternion-bound attitude ball.
 #[derive(facet::Facet)]
 pub struct AttitudeIndicator {
+    /// The quaternion this ball reads, and where in the frame it starts.
+    /// Editable: picking another component rebinds on the next frame.
+    pub component_id: ComponentId,
+    pub element_offset: usize,
     pub label: SharedString,
     pub show_readout: bool,
     pub vectors: Vec<Entity<VectorMarker>>,
+    /// Fallback name for a component nothing has registered.
     #[facet(skip)]
     component: SharedString,
-    #[facet(skip)]
-    element_offset: usize,
+    /// What `_task` is streaming, compared against the editable fields.
+    #[facet(opaque)]
+    bound: Option<ElementRef>,
     /// Latest attitude as `[x, y, z, w]`.
     #[facet(skip)]
     quat: Option<[f32; 4]>,
+    #[facet(opaque)]
+    db: Arc<DB>,
     #[facet(opaque)]
     _task: gpui::Task<()>,
     #[facet(opaque)]
@@ -155,21 +205,7 @@ impl AttitudeIndicator {
         let meta = component_meta(&db, component_id);
         let offset = cfg.element_offset;
 
-        let task = spawn_elements_stream(
-            db.clone(),
-            component_id,
-            offset + 4,
-            cx,
-            move |view, v, cx| {
-                view.quat = Some([
-                    v[offset] as f32,
-                    v[offset + 1] as f32,
-                    v[offset + 2] as f32,
-                    v[offset + 3] as f32,
-                ]);
-                cx.notify();
-            },
-        );
+        let task = spawn_quat_stream(&db, component_id, offset, cx);
 
         let keep_label = cfg.label.is_some();
         let resolver_task =
@@ -199,16 +235,45 @@ impl AttitudeIndicator {
             show_readout: !cfg.hide_readout,
             vectors,
             component: SharedString::from(cfg.component.clone()),
+            component_id,
             element_offset: offset,
+            bound: Some(ElementRef::new(component_id, offset)),
             quat: None,
+            db,
             _task: task,
             _resolver_task: resolver_task,
         }
     }
 
+    /// Restart the quaternion stream when the inspector has re-pointed the
+    /// ball, and let each marker do the same for itself.
+    fn rebind(&mut self, cx: &mut Context<Self>) {
+        for marker in self.vectors.clone() {
+            marker.update(cx, |m, cx| m.rebind(cx));
+        }
+
+        let want = ElementRef::new(self.component_id, self.element_offset);
+        if !binding::rebound(want, &mut self.bound) {
+            return;
+        }
+        let offset = want.element;
+        let meta = component_meta(&self.db, want.component);
+        self.label = meta.name.clone();
+        self.component = meta.name;
+        self.quat = None;
+        self._task = spawn_quat_stream(&self.db, want.component, offset, cx);
+        self._resolver_task =
+            spawn_meta_resolver(self.db.clone(), want.component, cx, |view, meta, cx| {
+                view.label = meta.name;
+                cx.notify();
+            });
+    }
+
     pub fn to_config(&self, cx: &gpui::App) -> AttitudeConfig {
         AttitudeConfig {
-            component: self.component.to_string(),
+            component: binding::component_name(&self.db, self.component_id)
+                .unwrap_or_else(|| self.component.clone())
+                .to_string(),
             element_offset: self.element_offset,
             label: Some(self.label.to_string()),
             vectors: self
@@ -223,6 +288,23 @@ impl AttitudeIndicator {
     pub fn component(&self) -> &SharedString {
         &self.component
     }
+}
+
+fn spawn_quat_stream(
+    db: &Arc<DB>,
+    component: ComponentId,
+    offset: usize,
+    cx: &mut Context<AttitudeIndicator>,
+) -> gpui::Task<()> {
+    spawn_elements_stream(db.clone(), component, offset + 4, cx, move |view, v, cx| {
+        view.quat = Some([
+            v[offset] as f32,
+            v[offset + 1] as f32,
+            v[offset + 2] as f32,
+            v[offset + 3] as f32,
+        ]);
+        cx.notify();
+    })
 }
 
 /// Roll, pitch and yaw in radians from a `[x, y, z, w]` body←reference
@@ -366,6 +448,7 @@ struct Marker {
 
 impl Render for AttitudeIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.rebind(cx);
         let theme = theme(cx);
         let (roll, pitch, yaw) = self.quat.map(euler_zyx).unwrap_or((0.0, 0.0, 0.0));
         let has_fix = self.quat.is_some();

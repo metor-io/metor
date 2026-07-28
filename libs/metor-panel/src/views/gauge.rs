@@ -86,6 +86,11 @@ impl Default for GaugeConfig {
 /// Single-element dial.
 #[derive(facet::Facet)]
 pub struct Gauge {
+    /// What this dial reads. Editable: picking another component or element
+    /// in the inspector rebinds the stream on the next frame. Declared first
+    /// so the binding heads the inspector page — fields are walked in order.
+    pub component_id: ComponentId,
+    pub element: usize,
     pub label: SharedString,
     pub min: f64,
     pub max: f64,
@@ -95,12 +100,18 @@ pub struct Gauge {
     pub color: Hsla,
     pub show_value: bool,
     pub show_limits: bool,
+    /// Fallback name for a component nothing has registered;
+    /// [`to_config`](Self::to_config) prefers the live name for the bound id.
     #[facet(skip)]
     component: SharedString,
+    /// What `_task` is actually streaming, compared against the editable
+    /// fields each frame.
     #[facet(opaque)]
-    at: ElementRef,
+    bound: Option<ElementRef>,
     #[facet(skip)]
     value: Option<f64>,
+    #[facet(opaque)]
+    db: Arc<DB>,
     #[facet(opaque)]
     _task: gpui::Task<()>,
     #[facet(opaque)]
@@ -121,15 +132,17 @@ impl Gauge {
 
         let keep_label = cfg.label.is_some();
         let keep_unit = cfg.unit.is_some();
-        let resolver_task = spawn_meta_resolver(db, component_id, cx, move |gauge, meta, cx| {
-            if !keep_label {
-                gauge.label = super::meter::default_label(&meta.element_names, element, &meta.name);
-            }
-            if !keep_unit {
-                gauge.unit = meta.unit;
-            }
-            cx.notify();
-        });
+        let resolver_task =
+            spawn_meta_resolver(db.clone(), component_id, cx, move |gauge, meta, cx| {
+                if !keep_label {
+                    gauge.label =
+                        super::meter::default_label(&meta.element_names, element, &meta.name);
+                }
+                if !keep_unit {
+                    gauge.unit = meta.unit;
+                }
+                cx.notify();
+            });
 
         Self {
             label: cfg
@@ -152,17 +165,65 @@ impl Gauge {
             show_value: !cfg.hide_value,
             show_limits: !cfg.hide_limits,
             component: SharedString::from(cfg.component.clone()),
-            at: ElementRef::new(component_id, element),
+            component_id,
+            element,
+            bound: Some(ElementRef::new(component_id, element)),
             value: None,
+            db,
             _task: task,
             _resolver_task: resolver_task,
         }
     }
 
+    /// Where this dial currently reads from.
+    fn at(&self) -> ElementRef {
+        ElementRef::new(self.component_id, self.element)
+    }
+
+    /// Restart the stream when the inspector has re-pointed the dial. Label
+    /// and unit are re-derived: they described the old component, and a dial
+    /// labelled `ω x` reading wheel momentum is worse than no label.
+    fn rebind(&mut self, cx: &mut Context<Self>) {
+        let want = self.at();
+        if !binding::rebound(want, &mut self.bound) {
+            return;
+        }
+        let element = want.element;
+        let meta = component_meta(&self.db, want.component);
+        self.label = super::meter::default_label(&meta.element_names, element, &meta.name);
+        self.unit = meta.unit;
+        self.component = meta.name;
+        self.value = None;
+        self._task = spawn_scalar_stream(
+            self.db.clone(),
+            want.component,
+            element,
+            cx,
+            |gauge, value, cx| {
+                gauge.value = Some(value);
+                cx.notify();
+            },
+        );
+        self._resolver_task = spawn_meta_resolver(
+            self.db.clone(),
+            want.component,
+            cx,
+            move |gauge, meta, cx| {
+                gauge.label = super::meter::default_label(&meta.element_names, element, &meta.name);
+                gauge.unit = meta.unit;
+                cx.notify();
+            },
+        );
+    }
+
     pub fn to_config(&self) -> GaugeConfig {
         GaugeConfig {
-            component: self.component.to_string(),
-            element: self.at.element,
+            // Resolve the name for whatever is bound *now*, so a rebind is
+            // what gets saved.
+            component: binding::component_name(&self.db, self.component_id)
+                .unwrap_or_else(|| self.component.clone())
+                .to_string(),
+            element: self.element,
             label: Some(self.label.to_string()),
             min: self.min,
             max: self.max,
@@ -298,17 +359,19 @@ fn arc_steps(sweep_rad: f32, fraction: f32) -> usize {
 
 impl Render for Gauge {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.rebind(cx);
         let theme = theme(cx);
+        let at = self.at();
         let sweep_rad = (self.sweep_degrees.clamp(1.0, 360.0) as f32).to_radians();
         let (min, max) = (self.min, self.max);
         let color = self.color;
         let style = self.style;
         let track_color = theme.border_primary;
         let hub_color = theme.text_primary;
-        let tint = binding::alarm_tint(self.at, cx);
+        let tint = binding::alarm_tint(at, cx);
         let span = self.value.map(|v| fill_span(v, min, max));
         let marks: Vec<(f32, Hsla)> = if self.show_limits {
-            binding::limit_marks(self.at, cx)
+            binding::limit_marks(at, cx)
                 .into_iter()
                 .filter_map(|(v, c)| super::meter::limit_position(v, min, max).map(|t| (t, c)))
                 .collect()
