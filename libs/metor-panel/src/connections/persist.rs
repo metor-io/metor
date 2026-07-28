@@ -25,6 +25,28 @@ pub struct ConnectionsIndex {
     /// Most-recent first, capped at [`RECENTS_CAP`].
     #[facet(default)]
     pub recents: Vec<RecentEntry>,
+    /// Connection knobs the operator set, keyed by target. Kept apart from
+    /// [`recents`](Self::recents) so an answer outlives eviction past
+    /// [`RECENTS_CAP`].
+    #[facet(default)]
+    pub options: Vec<TargetOptions>,
+}
+
+#[derive(facet::Facet, Clone, Debug, Default)]
+pub struct TargetOptions {
+    pub id: String,
+    #[facet(default)]
+    pub values: Vec<SavedOption>,
+}
+
+/// One saved answer. The value is a string rather than a typed union: it is
+/// re-typed against the target's live declaration on the way back in, so a
+/// knob that changed shape reads as its new default instead of failing the
+/// whole file's parse.
+#[derive(facet::Facet, Clone, Debug, Default)]
+pub struct SavedOption {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(facet::Facet, Clone, Debug, Default)]

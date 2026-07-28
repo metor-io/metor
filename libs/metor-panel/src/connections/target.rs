@@ -20,6 +20,8 @@ use metor_db::remote::{Hydrator, MirrorEvent, Peer, RemoteDb, fsw_stream, identi
 use stellarator::struc_con::ThreadBuilder;
 use stellarator::util::CancelToken;
 
+use super::options::{ConnectionOption, ConnectionOptions, OptionSpec};
+
 /// Stable identity for a connectable target; keys the per-target layout
 /// cache and the favorites/recents index, so it must survive restarts and
 /// address changes. Wrapper authors supply it; the built-in TCP kind derives
@@ -90,6 +92,10 @@ pub struct ConnectContext {
     /// their tasks and closes their IO when it fires.
     pub cancel: CancelToken,
     pub status: StatusHandle,
+    /// The operator's answers to the knobs this target declared, complete
+    /// against its spec. A snapshot: changing one restarts the backend
+    /// through here rather than mutating it in flight.
+    pub options: ConnectionOptions,
 }
 
 impl ConnectContext {
@@ -209,6 +215,10 @@ pub struct ConnectionTarget {
     /// [`with_address`](Self::with_address) for resolver-produced kinds;
     /// discovery-only targets leave it unset and don't persist.
     pub(crate) address: Option<SharedString>,
+    /// Knobs this target's backend reads at connect time. Empty for the
+    /// built-in kinds and for anything a discoverer produces — those fall
+    /// back to the panel-wide set installed on the store.
+    pub options: OptionSpec,
 }
 
 impl ConnectionTarget {
@@ -226,6 +236,7 @@ impl ConnectionTarget {
             detail: SharedString::from(addr.to_string()),
             backend: Arc::new(DiscoverBackend { addr }),
             address: Some(SharedString::from(addr.to_string())),
+            options: OptionSpec::default(),
         }
     }
 
@@ -238,6 +249,7 @@ impl ConnectionTarget {
             detail: SharedString::from(format!("{addr} · metor-db")),
             backend: Arc::new(TcpBackend { addr }),
             address: Some(SharedString::from(format!("db://{addr}"))),
+            options: OptionSpec::default(),
         }
     }
 
@@ -250,6 +262,7 @@ impl ConnectionTarget {
             detail: SharedString::from(format!("{addr} · fsw")),
             backend: Arc::new(FswBackend { addr }),
             address: Some(SharedString::from(format!("fsw://{addr}"))),
+            options: OptionSpec::default(),
         }
     }
 
@@ -265,6 +278,7 @@ impl ConnectionTarget {
             detail: detail.into(),
             backend: Arc::new(backend),
             address: None,
+            options: OptionSpec::default(),
         }
     }
 
@@ -273,6 +287,15 @@ impl ConnectionTarget {
     /// set this on every target they produce.
     pub fn with_address(mut self, address: impl Into<SharedString>) -> Self {
         self.address = Some(address.into());
+        self
+    }
+
+    /// Declare the knobs this target's backend reads out of
+    /// [`ConnectContext::options`]. Replaces the panel-wide default set for
+    /// this target rather than adding to it — a backend that knows its own
+    /// configuration surface knows all of it.
+    pub fn with_options(mut self, options: impl IntoIterator<Item = ConnectionOption>) -> Self {
+        self.options = options.into_iter().collect();
         self
     }
 }

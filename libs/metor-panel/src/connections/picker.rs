@@ -15,18 +15,29 @@ use gpui::{
     Window, deferred, div, prelude::*, px,
 };
 
+use super::options::option_rows;
 use super::{ConnectionStatus, ConnectionTarget, ConnectionsStore, PickerEntry, TargetId, persist};
 use crate::icons::Icon;
 use crate::inspector::rows::text_field::TextField;
+use crate::inspector::{Inspector, InspectorMode};
 use crate::theme::{Theme, theme};
 
 const DIALOG_WIDTH: f32 = 640.0;
 const ROW_HEIGHT: f32 = 36.0;
 
-/// What the dialog is currently doing: browsing, typing an ad-hoc address,
-/// or answering the load-saved-layout question shown right after connecting.
+/// What the dialog is currently doing: browsing, configuring one target,
+/// typing an ad-hoc address, or answering the load-saved-layout question
+/// shown right after connecting.
 enum Phase {
     Browse,
+    /// One target's knobs, rendered by an inline [`Inspector`] so the page
+    /// inherits the palette's whole keyboard model instead of growing its
+    /// own. Escape at the inspector's root dismisses it, which
+    /// [`Render`] reads as "back to browsing".
+    Options {
+        target: ConnectionTarget,
+        inspector: Entity<Inspector>,
+    },
     ManualAddress { error: Option<SharedString> },
     LayoutChoice { layout: String, choice: usize },
 }
@@ -171,6 +182,31 @@ impl ConnectionPicker {
         }
     }
 
+    /// Whether `target` has anything to configure — its own declaration or
+    /// the panel-wide fallback. Drives the gear affordance and the palette
+    /// entry alike, so an unconfigurable target never advertises a page
+    /// that would render empty.
+    fn configurable(&self, target: &ConnectionTarget, cx: &App) -> bool {
+        !self.store.read(cx).state().spec_for(target).is_empty()
+    }
+
+    fn enter_options(
+        &mut self,
+        target: ConnectionTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = option_rows(self.store.clone(), target.clone(), cx);
+        let parent_focus = self.focus_handle.clone();
+        let inspector = cx.new(|cx| {
+            let mut insp = Inspector::new(rows, InspectorMode::Inline, cx);
+            insp.set_parent_focus(parent_focus);
+            insp
+        });
+        inspector.focus_handle(cx).focus(window);
+        self.phase = Phase::Options { target, inspector };
+    }
+
     fn enter_manual_address(&mut self, cx: &App) {
         self.phase = Phase::ManualAddress { error: None };
         self.search.clear();
@@ -257,6 +293,10 @@ impl ConnectionPicker {
     ) {
         let key = event.keystroke.key.as_str();
         match &self.phase {
+            // The embedded inspector holds focus and handles its own keys;
+            // events bubble up here afterwards, so the dialog stays out of
+            // the way entirely rather than double-handling them.
+            Phase::Options { .. } => return,
             Phase::ManualAddress { .. } => {
                 match key {
                     "escape" => self.leave_manual_address(),
@@ -373,6 +413,38 @@ impl ConnectionPicker {
             )
     }
 
+    /// The gear that opens a target's knobs: its own hit area beside the
+    /// star, so clicking it configures rather than connects. Absent when
+    /// the target has nothing to configure.
+    fn gear(
+        &self,
+        target: &ConnectionTarget,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let target = target.clone();
+        div()
+            .id(SharedString::from(format!("gear-{}", target.id)))
+            .flex_shrink_0()
+            .w(px(26.0))
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.bg_primary))
+            .child(Icon::Setting.svg_color(11.0, theme.text_tertiary))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.enter_options(target.clone(), window, cx);
+                    cx.notify();
+                }),
+            )
+    }
+
     /// The connect/disconnect action: a full-height segment at the row's
     /// right edge — `| info | button |` — split off by a dimmed green/red
     /// left border, with a faint matching tint and accent text. Width
@@ -475,6 +547,14 @@ impl ConnectionPicker {
                             .text_color(theme.text_primary)
                             .child(entry.name.clone()),
                     )
+                    .when_some(
+                        entry
+                            .target
+                            .as_ref()
+                            .filter(|t| self.configurable(t, cx))
+                            .cloned(),
+                        |row, target| row.child(self.gear(&target, theme, cx)),
+                    )
                     .child(self.star(&entry.id, entry.favorite, theme, cx)),
             )
             .child(
@@ -570,6 +650,9 @@ impl ConnectionPicker {
             );
         }
         if let Some(target) = entry.target.clone() {
+            if self.configurable(&target, cx) {
+                row = row.child(cell().child(self.gear(&target, theme, cx)));
+            }
             row = row.child(self.action_button(target, connected, theme, cx));
         } else {
             row = row.child(
@@ -688,6 +771,81 @@ impl ConnectionPicker {
         );
 
         body.into_any_element()
+    }
+
+    /// One target's knobs: a back affordance and title, the inline
+    /// inspector holding the rows, and the same connect/disconnect button
+    /// the browse rows use — so a knob can be set and the connection made
+    /// without stepping back out.
+    fn render_options(
+        &self,
+        target: &ConnectionTarget,
+        inspector: &Entity<Inspector>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let connected = self.store.read(cx).is_connected(&target.id);
+        let title = SharedString::from(format!("{} \u{00b7} options", target.name));
+
+        div()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .child(
+                div()
+                    .h(px(ROW_HEIGHT))
+                    .px(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .border_b_1()
+                    .border_color(theme.border_primary)
+                    .child(
+                        div()
+                            .id("options-back")
+                            .text_size(px(11.0))
+                            .text_color(theme.text_tertiary)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.text_primary))
+                            .child(SharedString::new_static("\u{2190} back to systems"))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.leave_options(window, cx);
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_primary)
+                            .child(title),
+                    ),
+            )
+            .child(inspector.clone())
+            .child(
+                div()
+                    .h(px(ROW_HEIGHT))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .border_t_1()
+                    .border_color(theme.border_primary)
+                    .child(self.action_button(target.clone(), connected, theme, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn leave_options(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.phase = Phase::Browse;
+        window.focus(&self.focus_handle);
+        cx.notify();
     }
 
     fn render_manual_address(
@@ -835,7 +993,7 @@ impl Focusable for ConnectionPicker {
 }
 
 impl Render for ConnectionPicker {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.dismissed {
             return div().into_any_element();
         }
@@ -895,8 +1053,19 @@ impl Render for ConnectionPicker {
             )
             .child(caption_right);
 
+        // The inline inspector reports Escape-at-root as a dismissal; for
+        // this host that means "back to browsing", not "close the dialog".
+        if let Phase::Options { inspector, .. } = &self.phase
+            && inspector.read(cx).dismissed
+        {
+            self.leave_options(window, cx);
+        }
+
         let body = match &self.phase {
             Phase::Browse => self.render_browse(&theme.clone(), cx),
+            Phase::Options { target, inspector } => {
+                self.render_options(&target.clone(), &inspector.clone(), &theme.clone(), cx)
+            }
             Phase::ManualAddress { error } => {
                 self.render_manual_address(&error.clone(), &theme.clone(), cx)
             }

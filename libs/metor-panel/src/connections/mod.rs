@@ -15,11 +15,14 @@
 //! and repaints observers.
 
 pub mod discovery;
+pub mod options;
 pub mod persist;
 mod picker;
 mod target;
 
 pub use discovery::mdns_source;
+pub use options::{ConnectionOption, ConnectionOptions, OptionKind, OptionSpec, OptionValue};
+use options::OptionValues;
 pub use picker::ConnectionPicker;
 pub use target::{
     AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionStatus,
@@ -118,6 +121,15 @@ pub struct ConnectionsState {
     /// Re-materializes address-carrying recents; also drives the dialog's
     /// address input. Defaults to the built-in `host:port` TCP kind.
     resolver: AddressResolver,
+    /// Knobs offered for targets that declare none of their own — the only
+    /// way discovered and address-resolved targets get a configuration
+    /// surface, since a wrapper author never constructs those.
+    default_options: OptionSpec,
+    /// The operator's answers, keyed by target. Kept apart from `recents`
+    /// so a knob outlives eviction past [`persist::RECENTS_CAP`], and
+    /// stored as declared values rather than a full resolved set so a
+    /// changed default reaches targets the operator never touched.
+    overrides: Vec<(TargetId, OptionValues)>,
 }
 
 impl ConnectionsState {
@@ -171,6 +183,61 @@ impl ConnectionsState {
         &self.resolver
     }
 
+    pub fn set_default_options(&mut self, options: OptionSpec) {
+        self.default_options = options;
+    }
+
+    /// The knobs shown for `target`: its own declaration, or the panel-wide
+    /// fallback when it declared none.
+    pub fn spec_for<'a>(&'a self, target: &'a ConnectionTarget) -> &'a OptionSpec {
+        if target.options.is_empty() {
+            &self.default_options
+        } else {
+            &target.options
+        }
+    }
+
+    /// `target`'s spec defaults with the operator's saved answers folded in.
+    /// Complete against the spec, which is what makes
+    /// [`ConnectionOptions`]' accessors total.
+    pub fn options_for(&self, target: &ConnectionTarget) -> ConnectionOptions {
+        let saved = self
+            .overrides
+            .iter()
+            .find(|(id, _)| id == &target.id)
+            .map(|(_, values)| values);
+        let values = self
+            .spec_for(target)
+            .iter()
+            .map(|option| {
+                let value = saved
+                    .and_then(|s| s.iter().find(|(k, _)| k == &option.key))
+                    // Re-typing through the kind is what turns a string
+                    // read off disk into the declared shape, and what
+                    // drops an answer that no longer fits it — a removed
+                    // choice, a toggle that became a number.
+                    .and_then(|(_, v)| OptionValue::decode(&v.encode(), &option.kind))
+                    .unwrap_or_else(|| option.default_value());
+                (option.key.clone(), value)
+            })
+            .collect();
+        ConnectionOptions::from_values(values)
+    }
+
+    pub fn set_option(&mut self, id: &TargetId, key: &str, value: OptionValue) {
+        let values = match self.overrides.iter_mut().find(|(t, _)| t == id) {
+            Some((_, values)) => values,
+            None => {
+                self.overrides.push((id.clone(), OptionValues::new()));
+                &mut self.overrides.last_mut().expect("just pushed").1
+            }
+        };
+        match values.iter_mut().find(|(k, _)| k == key) {
+            Some((_, slot)) => *slot = value,
+            None => values.push((SharedString::from(key.to_string()), value)),
+        }
+    }
+
     pub fn load_index(&mut self, index: persist::ConnectionsIndex) {
         self.favorites = index
             .favorites
@@ -178,12 +245,47 @@ impl ConnectionsState {
             .map(|id| TargetId(id.into()))
             .collect();
         self.recents = index.recents;
+        // Values arrive as strings and stay that way until a spec claims
+        // them: the target they belong to may not be registered yet, and
+        // its declaration is what says how to read them.
+        self.overrides = index
+            .options
+            .into_iter()
+            .map(|entry| {
+                let values = entry
+                    .values
+                    .into_iter()
+                    .map(|v| {
+                        (
+                            SharedString::from(v.key),
+                            OptionValue::Text(SharedString::from(v.value)),
+                        )
+                    })
+                    .collect();
+                (TargetId(entry.id.into()), values)
+            })
+            .collect();
     }
 
     pub fn index(&self) -> persist::ConnectionsIndex {
         persist::ConnectionsIndex {
             favorites: self.favorites.iter().map(|f| f.as_str().to_string()).collect(),
             recents: self.recents.clone(),
+            options: self
+                .overrides
+                .iter()
+                .filter(|(_, values)| !values.is_empty())
+                .map(|(id, values)| persist::TargetOptions {
+                    id: id.as_str().to_string(),
+                    values: values
+                        .iter()
+                        .map(|(key, value)| persist::SavedOption {
+                            key: key.to_string(),
+                            value: value.encode(),
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 
@@ -421,6 +523,32 @@ impl ConnectionsStore {
         self.state.set_resolver(resolver);
     }
 
+    pub fn set_default_options(&mut self, options: OptionSpec) {
+        self.state.set_default_options(options);
+    }
+
+    /// Record an answer to one of `target`'s knobs and, when the target is
+    /// live, restart its backend so the new value takes effect. Options are
+    /// a connect-time snapshot; cancel-and-reconnect is the existing
+    /// uniform teardown, so no backend needs live-update code.
+    pub fn set_option(
+        &mut self,
+        target: &ConnectionTarget,
+        key: &str,
+        value: OptionValue,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.set_option(&target.id, key, value);
+        if let Err(err) = persist::save_index(&self.state.index()) {
+            tracing::error!(%err, "save connections index failed");
+        }
+        if self.is_connected(&target.id) {
+            self.disconnect(&target.id, cx);
+            self.connect(target.clone(), cx);
+        }
+        cx.notify();
+    }
+
     pub fn toggle_favorite(&mut self, id: &TargetId, cx: &mut Context<Self>) {
         self.state.toggle_favorite(id);
         if let Err(err) = persist::save_index(&self.state.index()) {
@@ -458,6 +586,7 @@ impl ConnectionsStore {
             db: self.db.clone(),
             cancel: cancel.clone(),
             status: status.clone(),
+            options: self.state.options_for(&target),
         });
         if let Some(hydrator) = &connected.hydrator {
             Hydrators::global(cx).insert(target.id.clone(), hydrator.clone());

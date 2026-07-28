@@ -47,6 +47,14 @@ pub enum InspectorMode {
     Anchored(Point<Pixels>),
     /// Float near the top-center, used for the command palette.
     Centered,
+    /// Draw as a plain child of a host view rather than a floating overlay:
+    /// no anchoring, no deferred layer, no dismiss-on-outside-click. The
+    /// host sizes the surrounding column and polls
+    /// [`dismissed`](Inspector::dismissed) the way the window root does.
+    /// Lets a dialog embed a row form and inherit the whole keyboard model —
+    /// page stack, breadcrumbs, search, inline edit — instead of
+    /// reimplementing it.
+    Inline,
 }
 
 /// Inputs needed to open an inspector from a callback.
@@ -667,13 +675,15 @@ impl Inspector {
             .into_any_element()
         };
 
-        let width = match self.mode {
-            InspectorMode::Anchored(_) => px(280.0),
-            InspectorMode::Centered => px(500.0),
+        let frame = match self.mode {
+            InspectorMode::Anchored(_) => frame.w(px(280.0)),
+            InspectorMode::Centered => frame.w(px(500.0)),
+            // The host's column owns the width; a border and rounding would
+            // draw a panel inside a panel, so inline drops both.
+            InspectorMode::Inline => frame.w_full().border_0().rounded(px(0.0)),
         };
 
         frame
-            .w(width)
             .max_h(px(400.0))
             .child(self.render_input_bar(cx))
             .child(div().py(px(2.0)).child(items_element))
@@ -795,6 +805,8 @@ impl Render for Inspector {
 
                 deferred(centered).with_priority(1).into_any_element()
             }
+            // No overlay at all: the host places the panel in its own tree.
+            InspectorMode::Inline => panel.into_any_element(),
         }
     }
 }

@@ -170,6 +170,96 @@ fn index_round_trips_and_tolerates_empty_object() {
     assert!(empty.favorites.is_empty() && empty.recents.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Connection options: spec resolution, override folding, and index round-trip.
+// ---------------------------------------------------------------------------
+
+fn knobs() -> Vec<ConnectionOption> {
+    vec![
+        ConnectionOption::toggle("commanding", "Allow commanding", true),
+        ConnectionOption::choice("rate", "Telemetry", ["Full", "Decimated"], 1),
+        ConnectionOption::number("depth", "Buffer depth", 4096.0, 0.0, 65536.0),
+    ]
+}
+
+#[test]
+fn options_resolve_to_spec_defaults_then_overrides() {
+    let mut state = ConnectionsState::default();
+    let sim = target("sim", "Sim").with_options(knobs());
+
+    let defaults = state.options_for(&sim);
+    assert!(defaults.bool("commanding"));
+    assert_eq!(defaults.choice("rate"), "Decimated");
+    assert_eq!(defaults.number("depth"), 4096.0);
+
+    state.set_option(&sim.id, "commanding", OptionValue::Bool(false));
+    state.set_option(&sim.id, "rate", OptionValue::Choice("Full".into()));
+    let set = state.options_for(&sim);
+    assert!(!set.bool("commanding"));
+    assert_eq!(set.choice("rate"), "Full");
+    // Untouched knobs still come from the spec.
+    assert_eq!(set.number("depth"), 4096.0);
+
+    // Overrides are per-target: a sibling declaring the same keys is
+    // unaffected.
+    let bench = target("bench", "Bench").with_options(knobs());
+    assert!(state.options_for(&bench).bool("commanding"));
+}
+
+#[test]
+fn panel_wide_default_covers_only_undeclared_targets() {
+    let mut state = ConnectionsState::default();
+    state.set_default_options(
+        vec![ConnectionOption::toggle("commanding", "Allow commanding", false)].into(),
+    );
+
+    // A discovered target declares nothing, so the panel-wide set is its
+    // whole configuration surface.
+    let discovered = ConnectionTarget::tcp("Vehicle", "10.0.0.7:2240".parse().unwrap());
+    assert_eq!(state.spec_for(&discovered).len(), 1);
+    assert!(!state.options_for(&discovered).bool("commanding"));
+
+    // A target with its own declaration replaces the fallback rather than
+    // merging with it.
+    let sim = target("sim", "Sim").with_options(knobs());
+    assert_eq!(state.spec_for(&sim).len(), 3);
+    assert!(state.options_for(&sim).bool("commanding"));
+}
+
+#[test]
+fn option_index_round_trips_and_retypes_against_the_spec() {
+    let mut state = ConnectionsState::default();
+    let sim = target("sim", "Sim").with_options(knobs());
+    state.set_option(&sim.id, "commanding", OptionValue::Bool(false));
+    state.set_option(&sim.id, "depth", OptionValue::Number(128.0));
+
+    let json = facet_json::to_string(&state.index()).unwrap();
+    let parsed: persist::ConnectionsIndex = facet_json::from_str(&json).unwrap();
+    let mut restored = ConnectionsState::default();
+    restored.load_index(parsed);
+
+    let values = restored.options_for(&sim);
+    assert!(!values.bool("commanding"));
+    assert_eq!(values.number("depth"), 128.0);
+    assert_eq!(values.choice("rate"), "Decimated");
+
+    // A knob whose declaration changed under a saved answer falls back to
+    // its new default instead of poisoning the file: `commanding` is now a
+    // choice, and `depth`'s saved number no longer parses as one.
+    let rebuilt = target("sim", "Sim").with_options(vec![
+        ConnectionOption::choice("commanding", "Commanding", ["Off", "On"], 1),
+        ConnectionOption::text("depth", "Buffer", "n", "auto"),
+    ]);
+    let values = restored.options_for(&rebuilt);
+    assert_eq!(values.choice("commanding"), "On");
+    // Text accepts any string, so the saved number survives as one.
+    assert_eq!(values.text("depth"), "128");
+
+    // A target that never had options contributes nothing to the file.
+    let empty: persist::ConnectionsIndex = facet_json::from_str("{}").unwrap();
+    assert!(empty.options.is_empty());
+}
+
 #[test]
 fn sanitize_id_is_safe_and_collision_proof() {
     let a = persist::sanitize_id("tcp:127.0.0.1:2240");
