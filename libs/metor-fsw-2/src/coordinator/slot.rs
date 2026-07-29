@@ -854,6 +854,7 @@ impl SlotRunner {
             }
         });
         if result.is_err() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             self.fail_occupant("corrupt sequence status ring".to_string());
             details.clear();
             self.detail_scratch = details;
@@ -933,6 +934,7 @@ impl SlotRunner {
         if self.status_out.write(&frame).is_err()
             && !matches!(self.state, SlotState::Stopped { .. })
         {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             self.fail_occupant("slot status output blocked".to_string());
         }
     }
@@ -962,6 +964,7 @@ impl CyclicSlot for SlotRunner {
         if self.commands.drain(|c| cmds.push(c)).is_err() {
             cmds.clear();
             self.cmd_scratch = cmds;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             self.fail_occupant("corrupt sequence command ring".to_string());
             return;
         }
