@@ -39,8 +39,9 @@ pub(crate) mod window_controls;
 
 pub use app::PanelApp;
 pub use connections::{
-    AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionStatus,
-    ConnectionTarget, RegistryHandle, Resolved, TargetId,
+    AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionOption,
+    ConnectionOptions, ConnectionStatus, ConnectionTarget, OptionKind, OptionSpec, OptionValue,
+    RegistryHandle, Resolved, TargetId,
 };
 pub use inspector::palette::{Category, InspectionItem, ItemProvider};
 

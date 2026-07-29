@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 pub type NodeIx = usize;
 
 /// Flow direction of the layered layout.
-#[derive(facet::Facet, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(facet::Facet, serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Direction {
     #[default]

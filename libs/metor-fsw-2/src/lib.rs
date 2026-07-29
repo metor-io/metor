@@ -97,6 +97,7 @@ mod handler;
 mod message;
 mod pack;
 mod port;
+mod preset;
 mod registry;
 mod shared;
 mod system;
@@ -168,6 +169,8 @@ pub use port::{
 };
 
 pub use alarm::{AlarmIn, AlarmOut, AlarmSpec, AlarmSystem, AlarmsParams, BandSpec, TargetSpec};
+
+pub use preset::{PresetIn, PresetOut, PresetSpec, PresetSystem, PresetsParams};
 
 pub use message::{
     CommandOut, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, MsgTable, NamedMsg, split_record,

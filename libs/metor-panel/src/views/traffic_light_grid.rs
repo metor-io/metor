@@ -12,8 +12,9 @@ use smallvec::SmallVec;
 
 use crate::inspector::plot_preview::shift_hover_listener;
 
+use super::binding::{component_meta, spawn_on_stream};
 use super::tooltip::TooltipText;
-use super::traffic_light::{component_meta, spawn_on_stream, traffic_light_swatch};
+use super::traffic_light::traffic_light_swatch;
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::theme::theme;
 

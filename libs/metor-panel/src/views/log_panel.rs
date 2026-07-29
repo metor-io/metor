@@ -19,7 +19,9 @@ use crate::views::table::{Column, ColumnSort, Table, TableDelegate};
 
 /// The viewer's level floor. `All` shows everything received (the FSW side
 /// already filters what it forwards); the rest hide rows below the floor.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, facet::Facet)]
+#[derive(
+    Clone, Copy, Default, PartialEq, Eq, Debug, facet::Facet, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum LevelFilter {
     #[default]

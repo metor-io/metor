@@ -13,12 +13,12 @@ use smallvec::SmallVec;
 
 use crate::theme::theme;
 use drag::ResizeDrag;
-use serial::{SerializedItem, SerializedMember, SerializedPane, SerializedSplit};
+use serial::{TileItem, TileNode, TilePane, TileSplit};
 
 pub use drag::SplitDirection;
 pub use item::{PaneItem, PaneItemHandle};
 pub use pane::{Pane, PaneEvent, PlotComponentAction, PreviewPlotAction, TabOrientation};
-pub use serial::{ItemRegistry, SerializedTileGroup};
+pub use serial::{ItemRegistry, TileLayout};
 
 /// Sequence of member indices locating a node in the split tree.
 ///
@@ -44,8 +44,9 @@ impl EventEmitter<TileGroupEvent> for TileGroup {}
 
 const RESIZE_HANDLE_SIZE: f32 = 1.0;
 
-/// Layout version this binary writes and accepts on read. Bump in lockstep
-/// with [`TileGroup::serialize`] when the document shape changes.
+/// Layout version this binary writes and accepts on read. Lives in
+/// `metor-proto-wkt` so targets shipping preset layouts share it; bump in
+/// lockstep with [`TileGroup::serialize`] when the document shape changes.
 ///
 /// Version history:
 /// - 1: initial.
@@ -53,16 +54,19 @@ const RESIZE_HANDLE_SIZE: f32 = 1.0;
 ///   measurement cursors.
 /// - 3: `PlotPanelConfig` gains `measurement_panel` (track/pinned position
 ///   for the native measurement readout panel).
-const SUPPORTED_LAYOUT_VERSION: u32 = 3;
+/// - 4: facet-json → serde_json migration; colors re-encode as RGBA hex and
+///   `PrimType` values as kebab-case. Items from older documents that hold
+///   either fall back to their config defaults.
+const SUPPORTED_LAYOUT_VERSION: u32 = serial::TILE_LAYOUT_VERSION;
 
 /// Failure modes when loading a layout from JSON.
 #[derive(Debug)]
 pub enum LoadError {
-    /// `facet-json` couldn't parse the document.
-    Parse(facet_json::DeserializeError),
+    /// The document isn't valid layout JSON.
+    Parse(serde_json::Error),
     /// The document claims a layout version newer than this build knows how to
     /// read. Older versions load fine — the format is field-additive with
-    /// facet defaults — so only a forward version gap is rejected.
+    /// serde defaults — so only a forward version gap is rejected.
     UnsupportedVersion(u32),
 }
 
@@ -80,8 +84,8 @@ impl std::fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-impl From<facet_json::DeserializeError> for LoadError {
-    fn from(e: facet_json::DeserializeError) -> Self {
+impl From<serde_json::Error> for LoadError {
+    fn from(e: serde_json::Error) -> Self {
         Self::Parse(e)
     }
 }
@@ -204,19 +208,19 @@ impl Member {
         }
     }
 
-    fn serialize(&self, cx: &App) -> SerializedMember {
+    fn serialize(&self, cx: &App) -> TileNode {
         match self {
             Member::Pane(pane) => {
                 let pane = pane.read(cx);
                 let items = pane
                     .items()
                     .iter()
-                    .map(|item| SerializedItem {
+                    .map(|item| TileItem {
                         kind: item.serialization_key().to_string(),
                         state: item.serialize(cx),
                     })
                     .collect();
-                SerializedMember::Pane(SerializedPane {
+                TileNode::Pane(TilePane {
                     active_index: pane.active_index(),
                     items,
                     tab_orientation: pane.tab_orientation(),
@@ -224,8 +228,8 @@ impl Member {
                     locked_size: pane.locked_size().map(|s| (s.width, s.height)),
                 })
             }
-            Member::Axis(axis) => SerializedMember::Split(SerializedSplit {
-                axis: axis.axis.into(),
+            Member::Axis(axis) => TileNode::Split(TileSplit {
+                axis: serial::split_axis(axis.axis),
                 flexes: axis.flexes.clone(),
                 children: axis.members.iter().map(|m| m.serialize(cx)).collect(),
             }),
@@ -570,8 +574,8 @@ impl TileGroup {
 
     /// Snapshot the full layout (tree shape, flexes, and each item's own
     /// persisted state) for saving to disk.
-    pub fn serialize(&self, cx: &App) -> SerializedTileGroup {
-        SerializedTileGroup {
+    pub fn serialize(&self, cx: &App) -> TileLayout {
+        TileLayout {
             version: SUPPORTED_LAYOUT_VERSION,
             global_time_range: crate::views::time_series::time_range::GlobalTimeRange::get(cx)
                 .to_string(),
@@ -582,11 +586,10 @@ impl TileGroup {
     /// Convenience: snapshot to a JSON string ready to write to disk.
     ///
     /// Panics on serialization failure — every field in the serialized tree
-    /// is plain `Facet` data, so the only way `facet_json::to_string` can
-    /// fail here is a programmer error (e.g. a freshly-added field with no
-    /// `Facet` impl).
+    /// is plain data, so the only way `serde_json::to_string` can fail here
+    /// is a programmer error.
     pub fn to_json(&self, cx: &App) -> String {
-        facet_json::to_string(&self.serialize(cx)).expect("tile layout always serializes")
+        serde_json::to_string(&self.serialize(cx)).expect("tile layout always serializes")
     }
 
     /// Convenience: load a layout from a JSON string. The application picks
@@ -596,8 +599,8 @@ impl TileGroup {
         registry: &ItemRegistry,
         cx: &mut Context<Self>,
     ) -> Result<Self, LoadError> {
-        let serialized: SerializedTileGroup = facet_json::from_str(json)?;
-        // Older layouts load fine — the document is field-additive with facet
+        let serialized: TileLayout = serde_json::from_str(json)?;
+        // Older layouts load fine — the document is field-additive with serde
         // defaults — so only reject versions this build predates.
         if serialized.version > SUPPORTED_LAYOUT_VERSION {
             return Err(LoadError::UnsupportedVersion(serialized.version));
@@ -622,10 +625,10 @@ impl TileGroup {
         Ok(())
     }
 
-    /// Rebuild a layout from a [`SerializedTileGroup`]. Items whose
-    /// serialization key is absent from `registry` are silently dropped.
+    /// Rebuild a layout from a [`TileLayout`]. Items whose serialization
+    /// key is absent from `registry` are silently dropped.
     pub fn deserialize(
-        serialized: SerializedTileGroup,
+        serialized: TileLayout,
         registry: &ItemRegistry,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -651,13 +654,13 @@ impl TileGroup {
     }
 
     fn deserialize_member(
-        serialized: &SerializedMember,
+        serialized: &TileNode,
         registry: &ItemRegistry,
         panes: &mut Vec<Entity<Pane>>,
         cx: &mut Context<Self>,
     ) -> Member {
         match serialized {
-            SerializedMember::Pane(sp) => {
+            TileNode::Pane(sp) => {
                 let pane = cx.new(|cx| {
                     let items: Vec<Box<dyn PaneItemHandle>> = sp
                         .items
@@ -682,13 +685,13 @@ impl TileGroup {
                 panes.push(pane.clone());
                 Member::Pane(pane)
             }
-            SerializedMember::Split(ss) => {
+            TileNode::Split(ss) => {
                 let members: Vec<Member> = ss
                     .children
                     .iter()
                     .map(|child| Self::deserialize_member(child, registry, panes, cx))
                     .collect();
-                let mut axis = SplitAxis::new(ss.axis.into(), members);
+                let mut axis = SplitAxis::new(serial::gpui_axis(ss.axis), members);
                 if ss.flexes.len() == axis.members.len() {
                     axis.flexes = ss.flexes.clone();
                 }
@@ -812,10 +815,10 @@ mod tests {
     use crate::tiles::pane::TabOrientation;
 
     fn empty_pane_layout(version: u32) -> String {
-        let layout = SerializedTileGroup {
+        let layout = TileLayout {
             version,
             global_time_range: String::new(),
-            root: SerializedMember::Pane(SerializedPane {
+            root: TileNode::Pane(TilePane {
                 active_index: 0,
                 tab_orientation: TabOrientation::Horizontal,
                 hide_tab_bar: false,
@@ -823,7 +826,7 @@ mod tests {
                 items: vec![],
             }),
         };
-        facet_json::to_string(&layout).expect("serialize")
+        serde_json::to_string(&layout).expect("serialize")
     }
 
     #[gpui::test]

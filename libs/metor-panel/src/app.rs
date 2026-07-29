@@ -3,7 +3,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::connections::{AddressResolver, ConnectionTarget, RegistryHandle, TargetId};
+use crate::connections::{
+    AddressResolver, ConnectionOption, ConnectionTarget, OptionSpec, RegistryHandle, TargetId,
+};
 use crate::icons::Icon;
 use crate::inspector::Inspector;
 use crate::inspector::edits::{
@@ -13,9 +15,10 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, LogPanel, PlotPanel,
-    SequenceGridPanel, SequencePanel, TablePanel, TextPanel, TrafficLightGridPanel,
-    TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
+    AlarmPanel, AttitudePanel, BrowserPanel, DataTablePanel, GaugePanel, ListPlotPanel, LogPanel,
+    MeterPanel,
+    PlotPanel, SequenceControlPanel, SequenceGridPanel, SequencePanel, StateChipPanel, TablePanel,
+    TextPanel, TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -897,6 +900,7 @@ pub struct PanelApp {
     connection_sources: Vec<Box<dyn FnOnce(RegistryHandle)>>,
     auto_connect: Vec<TargetId>,
     address_resolver: Option<AddressResolver>,
+    default_options: OptionSpec,
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
     overlays: Vec<Box<dyn FnOnce(&mut App) -> gpui::AnyView>>,
@@ -912,6 +916,7 @@ impl PanelApp {
             connection_sources: Vec::new(),
             auto_connect: Vec::new(),
             address_resolver: None,
+            default_options: OptionSpec::default(),
             command_providers: Vec::new(),
             init_hooks: Vec::new(),
             overlays: Vec::new(),
@@ -937,6 +942,19 @@ impl PanelApp {
     /// [`connection`](PanelApp::connection).
     pub fn auto_connect(mut self, id: impl Into<SharedString>) -> Self {
         self.auto_connect.push(TargetId(id.into()));
+        self
+    }
+
+    /// Declare the knobs shown for every target that doesn't declare its
+    /// own. This is the only way a discovered or address-resolved target
+    /// gets a configuration surface — a wrapper never constructs those, so
+    /// it can't hang a spec off them with
+    /// [`ConnectionTarget::with_options`].
+    pub fn default_connection_options(
+        mut self,
+        options: impl IntoIterator<Item = ConnectionOption>,
+    ) -> Self {
+        self.default_options = options.into_iter().collect();
         self
     }
 
@@ -1038,6 +1056,7 @@ impl PanelApp {
             connection_sources,
             auto_connect,
             address_resolver,
+            default_options,
             command_providers,
             init_hooks,
             overlays,
@@ -1058,6 +1077,7 @@ impl PanelApp {
         let mut connection_sources = Some(connection_sources);
         let mut auto_connect = Some(auto_connect);
         let mut address_resolver = Some(address_resolver);
+        let mut default_options = Some(default_options);
         let mut command_providers = Some(command_providers);
         let mut init_hooks = Some(init_hooks);
         let mut overlays = Some(overlays);
@@ -1088,6 +1108,7 @@ impl PanelApp {
                 crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::logs::LogStore::init(db.clone(), cx);
+                crate::presets::TargetPresetStore::init(db.clone(), cx);
                 crate::sequences::SequenceStore::init(db.clone(), cx);
                 crate::plot_events::EventSourceRegistry::init(cx);
                 crate::wiring::WiringStore::init(db.clone(), cx);
@@ -1102,6 +1123,9 @@ impl PanelApp {
                     store.update(cx, |store, cx| {
                         if let Some(resolver) = address_resolver.take().flatten() {
                             store.set_resolver(resolver);
+                        }
+                        if let Some(options) = default_options.take() {
+                            store.set_default_options(options);
                         }
                         for target in targets.take().unwrap_or_default() {
                             store.upsert_target(target, cx);
@@ -1201,9 +1225,10 @@ impl PanelApp {
 }
 
 /// Palette entries for the connection system: "Connect…" opens the picker,
-/// and each active connection contributes a "Disconnect <name>" command.
-/// Pull-based like every provider, so the disconnect list always matches
-/// the live set.
+/// each active connection contributes a "Disconnect <name>" command, and
+/// every configurable target contributes a sub-menu of its knobs — the same
+/// rows the dialog embeds, reached without the dialog. Pull-based like every
+/// provider, so both lists always match the live registry.
 fn register_connection_commands(cx: &mut App) {
     ItemRegistry::register(
         cx,
@@ -1215,17 +1240,36 @@ fn register_connection_commands(cx: &mut App) {
                     window.dispatch_action(Box::new(OpenConnections), cx);
                 }),
             }];
-            if let Some(store) = crate::connections::try_global(cx) {
-                for conn in store.read(cx).active() {
-                    let id = conn.target.id.clone();
-                    let store = store.clone();
-                    items.push(InspectionItem::Command {
-                        label: SharedString::from(format!("Disconnect {}", conn.target.name)),
-                        callback: Arc::new(move |_window, cx| {
-                            store.update(cx, |store, cx| store.disconnect(&id, cx));
-                        }),
-                    });
-                }
+            let Some(store) = crate::connections::try_global(cx) else {
+                return items;
+            };
+            for conn in store.read(cx).active() {
+                let id = conn.target.id.clone();
+                let store = store.clone();
+                items.push(InspectionItem::Command {
+                    label: SharedString::from(format!("Disconnect {}", conn.target.name)),
+                    callback: Arc::new(move |_window, cx| {
+                        store.update(cx, |store, cx| store.disconnect(&id, cx));
+                    }),
+                });
+            }
+            let configurable: Vec<ConnectionTarget> = store
+                .read(cx)
+                .state()
+                .targets()
+                .iter()
+                .filter(|t| !store.read(cx).state().spec_for(t).is_empty())
+                .cloned()
+                .collect();
+            for target in configurable {
+                let store = store.clone();
+                items.push(InspectionItem::SubMenu {
+                    label: SharedString::from(format!("{} \u{00b7} options", target.name)),
+                    summary: target.detail.clone(),
+                    build: Arc::new(move |cx| {
+                        crate::connections::options::option_rows(store.clone(), target.clone(), cx)
+                    }),
+                });
             }
             items
         }),
@@ -1260,6 +1304,15 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         db.clone(),
         TrafficLightGridPanel::from_config,
     );
+    register_panel::<MeterPanel>(&mut reg, db.clone(), MeterPanel::from_config);
+    register_panel::<GaugePanel>(&mut reg, db.clone(), GaugePanel::from_config);
+    register_panel::<StateChipPanel>(&mut reg, db.clone(), StateChipPanel::from_config);
+    register_panel::<AttitudePanel>(&mut reg, db.clone(), AttitudePanel::from_config);
+    register_panel::<SequenceControlPanel>(
+        &mut reg,
+        db.clone(),
+        SequenceControlPanel::from_config,
+    );
     register_panel::<crate::node_editor::pane::NodeEditor>(
         &mut reg,
         db.clone(),
@@ -1290,7 +1343,7 @@ fn register_panel<T: crate::tiles::PaneItem>(
     from_config: fn(T::Config, Arc<DB>, &mut Context<T>) -> T,
 ) {
     reg.register::<T>(move |state, cx| {
-        let cfg: T::Config = facet_json::from_str(state).unwrap_or_default();
+        let cfg: T::Config = serde_json::from_str(state).unwrap_or_default();
         let db = db.clone();
         Some(cx.new(|cx| from_config(cfg, db, cx)))
     });

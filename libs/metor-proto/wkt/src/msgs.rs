@@ -812,6 +812,26 @@ pub struct WiringManifest {
     pub ir_json: String,
 }
 
+/// One named panel layout a target ships as a recommended default.
+///
+/// `layout` is a serde_json-encoded [`TileLayout`](crate::TileLayout)
+/// document — the tree is recursive, which a postcard schema cannot express,
+/// so it crosses the ring as a plain postcard `String` (the
+/// [`WiringManifest`] convention). The document carries its own version for
+/// consumers to gate on before hydrating.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+pub struct Preset {
+    pub name: String,
+    pub layout: String,
+}
+
+/// The full preset set, published as one latest-wins snapshot so the
+/// downlink can retain it for late-joining connections.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+pub struct PresetDefs {
+    pub presets: Vec<Preset>,
+}
+
 /// Log severity, ordered low → high so consumers can filter by minimum level.
 /// Mirrors the `tracing` level set.
 #[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1388,6 +1408,19 @@ mod alarm_id_tests {
         for id in [AlarmDef::ID, AlarmRaised::ID, AlarmCleared::ID, AlarmAck::ID] {
             assert!(!NODE_PROTOCOL_MESSAGES.contains(&id));
         }
+    }
+}
+
+#[cfg(test)]
+mod preset_id_tests {
+    use super::*;
+
+    /// The pinned natural schema-name-hash ids; the pin catches a type
+    /// rename, which would silently re-key every persisted recording.
+    #[test]
+    fn preset_ids_are_pinned() {
+        assert_eq!(PresetDefs::ID, [173, 20]);
+        assert!(!NODE_PROTOCOL_MESSAGES.contains(&PresetDefs::ID));
     }
 }
 

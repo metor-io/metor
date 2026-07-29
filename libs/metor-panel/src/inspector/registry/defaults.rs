@@ -37,6 +37,26 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::SequenceView>();
         self.register_inspectable::<crate::views::TrafficLight>();
         self.register_inspectable::<crate::views::TrafficLightGrid>();
+        self.register_inspectable::<crate::views::Meter>();
+        self.register_inspectable::<crate::views::Gauge>();
+        self.register_inspectable::<crate::views::SequenceControl>();
+        self.register_entity_list::<crate::views::AttitudeIndicator, crate::views::VectorMarker>(
+            db.clone(),
+            |a| &a.vectors,
+            |a| &mut a.vectors,
+            AddBehavior::Default(Arc::new({
+                // A marker owns a stream, so it needs the db a freshly-added
+                // one will bind against once a component is picked.
+                let db = db.clone();
+                move |_cx| crate::views::VectorMarker::empty(db.clone())
+            })),
+        );
+        self.register_entity_list::<crate::views::StateChip, crate::views::StateEntry>(
+            db.clone(),
+            |c| &c.states,
+            |c| &mut c.states,
+            AddBehavior::Default(Arc::new(|_cx| crate::views::StateEntry::empty())),
+        );
         self.register_entity_list::<LinePlot, Trace>(
             db.clone(),
             |lp| &lp.traces,
@@ -265,14 +285,14 @@ impl InspectorRegistry {
                     Box::new(ColorRow {
                         label,
                         color: initial,
-                        read_color: Arc::new(move |cx| {
-                            match crate::inspector::reflect::get_field::<Override<Hsla>>(
+                        read_color: Arc::new(
+                            move |cx| match crate::inspector::reflect::get_field::<Override<Hsla>>(
                                 &read, idx, cx,
                             ) {
                                 Some(Override::Custom(c)) => c,
                                 _ => initial,
-                            }
-                        }),
+                            },
+                        ),
                         on_change: Arc::new(move |c, _w, cx| {
                             crate::inspector::reflect::set_field::<Override<Hsla>>(
                                 &write,
@@ -354,11 +374,10 @@ impl InspectorRegistry {
                             }
                         };
                         let auto_set = set_override.clone();
-                        let mut rows: Vec<Box<dyn InspectorRow>> =
-                            vec![Box::new(CommandRow::new(
-                                "Auto (follow global)",
-                                Arc::new(move |_w, cx| auto_set(Override::Auto, cx)),
-                            ))];
+                        let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
+                            "Auto (follow global)",
+                            Arc::new(move |_w, cx| auto_set(Override::Auto, cx)),
+                        ))];
                         let current_text = current
                             .as_custom()
                             .map(|b| SharedString::from(format!("{b}")))
@@ -392,7 +411,8 @@ impl InspectorRegistry {
     fn register_trace_builder(&mut self, _db: Arc<DB>) {
         self.register_type_builder::<Trace>(Arc::new(|any_entity, db, cx| {
             let trace: Entity<Trace> = any_entity.clone().downcast().expect("Trace type mismatch");
-            let mut rows = crate::inspector::reflect::default_rows_for_any_entity(&any_entity, db, cx);
+            let mut rows =
+                crate::inspector::reflect::default_rows_for_any_entity(&any_entity, db, cx);
 
             let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) else {
                 return rows;

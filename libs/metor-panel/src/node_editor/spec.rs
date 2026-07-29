@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use metor_db::DB;
 use metor_proto::types::{ComponentId, PrimType};
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::dynamic::ops::compose::BinaryOp;
@@ -21,8 +22,7 @@ use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
 use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, ops};
 
-#[derive(Clone, Debug, PartialEq, facet::Facet)]
-#[repr(u8)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NodeSpec {
     FixedRate {
         hz: f64,

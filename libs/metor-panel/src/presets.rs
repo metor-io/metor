@@ -1,10 +1,17 @@
 //! Save/load tile-layout presets.
 //!
-//! Two destinations:
+//! Three sources:
 //! - **File on disk** — caller provides the path (typically picked via the OS
 //!   save dialog). Round-trip is plain `std::fs`.
 //! - **Built-in directory** — `dirs::config_dir()/metor/panel/presets/`. Each
 //!   preset is one `<name>.json` file. The directory is created on demand.
+//! - **The connected target** — a target declaring `Presets(...)` broadcasts
+//!   a [`PresetDefs`] snapshot the link replays on every connection;
+//!   [`TargetPresetStore`] tails it and offers the layouts in the palette.
+//!   The first arrival also applies a shipped preset automatically when the
+//!   session is a blank slate (no local per-target layout, untouched tiles) —
+//!   the same silent-when-empty rule the connection picker uses for locally
+//!   saved layouts, which always take precedence over shipped ones.
 //!
 //! Loading goes through [`load_into_tiles`], which fetches the panel-item
 //! [`tiles::ItemRegistry`] from gpui's globals and asks the
@@ -12,10 +19,15 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::{fs, io};
 
-use gpui::{App, Entity};
+use gpui::{App, Context, Entity, Global, Task, prelude::*};
+use metor_db::DB;
+use metor_proto::types::Msg;
+use metor_proto_wkt::{Preset, PresetDefs};
 
+use crate::msg_ingest::{IngestSource, ingest_all};
 use crate::tiles::TileGroup;
 
 /// Resolve the per-user preset directory path. Does **not** create it —
@@ -104,4 +116,82 @@ pub fn load_into_tiles(json: &str, tiles: &Entity<TileGroup>, cx: &mut App) {
             tracing::error!(%e, "failed to load preset");
         }
     });
+}
+
+/// The latest [`PresetDefs`] snapshot off the link, one preset list at a
+/// time — a re-publish replaces the set, mirroring the wire semantics.
+pub struct TargetPresetStore {
+    presets: Vec<Preset>,
+    _task: Task<()>,
+}
+
+pub struct GlobalTargetPresets(pub Entity<TargetPresetStore>);
+
+impl Global for GlobalTargetPresets {}
+
+/// The shared store, or `None` if it was never initialized (e.g. in tests).
+pub fn try_target_presets(cx: &App) -> Option<Entity<TargetPresetStore>> {
+    cx.try_global::<GlobalTargetPresets>().map(|g| g.0.clone())
+}
+
+impl TargetPresetStore {
+    pub fn init(db: Arc<DB>, cx: &mut App) {
+        let entity = cx.new(|cx| TargetPresetStore::new(db, cx));
+        cx.observe(&entity, apply_shipped_preset).detach();
+        cx.set_global(GlobalTargetPresets(entity));
+    }
+
+    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let task = cx.spawn(async move |this, cx| {
+            let sources = vec![IngestSource::new(
+                PresetDefs::ID,
+                |store: &mut Self, _ts, defs: PresetDefs| store.presets = defs.presets,
+            )];
+            ingest_all(db, sources, this, cx).await
+        });
+        Self {
+            presets: Vec::new(),
+            _task: task,
+        }
+    }
+
+    pub fn presets(&self) -> &[Preset] {
+        &self.presets
+    }
+}
+
+/// Apply a target-shipped preset to a blank slate: an active connection whose
+/// target has no locally saved layout (the user's own arrangement always
+/// wins) and an untouched tile tree. Runs on every store notify; once tiles
+/// hold anything — including a just-applied preset — it is a no-op, and the
+/// layout autosave then owns persistence like any other layout.
+fn apply_shipped_preset(store: Entity<TargetPresetStore>, cx: &mut App) {
+    let Some(connections) = crate::connections::try_global(cx) else {
+        return;
+    };
+    let tiles = {
+        let conns = connections.read(cx);
+        let active = conns.active();
+        if active.is_empty() {
+            return;
+        }
+        if active
+            .iter()
+            .any(|c| crate::connections::persist::load_layout(&c.target.id).is_some())
+        {
+            return;
+        }
+        let Some(tiles) = conns.tiles() else {
+            return;
+        };
+        tiles
+    };
+    if tiles.read(cx).has_items(cx) {
+        return;
+    }
+    let Some(layout) = store.read(cx).presets.first().map(|p| p.layout.clone()) else {
+        return;
+    };
+    load_into_tiles(&layout, &tiles, cx);
+    connections.update(cx, |conns, _| conns.note_loaded_layout(layout));
 }

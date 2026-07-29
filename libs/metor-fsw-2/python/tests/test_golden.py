@@ -2,7 +2,13 @@
 ``tests/golden/target.json`` fixture the Rust round-trip test also consumes,
 modulo the fields both sides normalize away (``src`` anchors, the located
 ``path``/``prebuilt_dir``, and the emitter-only ``metor_config_version``
-envelope field)."""
+envelope field).
+
+``tests/golden/dashboard.json`` is the same idea one layer down, for the
+panel: a dashboard preset covering every widget kind and both connector
+layers. The panel's ``DashboardPanelConfig`` test parses that same file, so a
+rename on either side breaks a test instead of silently degrading a shipped
+preset into placeholder tiles."""
 
 import json
 import os
@@ -12,11 +18,101 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "metor-config"))
 
 import metor_config as mc
-from metor_config import Alarm, Alarms, Component, Target, TcpServer, Uplink, band
+from metor_config import (
+    Alarm,
+    Alarms,
+    At,
+    Attitude,
+    Bind,
+    Component,
+    Connector,
+    Dashboard,
+    Edge,
+    Gauge,
+    Image,
+    Meter,
+    Place,
+    SequenceControl,
+    State,
+    StateChip,
+    Target,
+    TcpServer,
+    Text,
+    TimeSeriesPlot,
+    Trace,
+    TrafficLight,
+    TrafficLightGrid,
+    Uplink,
+    VectorMarker,
+    band,
+)
 
 GOLDEN = os.path.join(
     os.path.dirname(__file__), "..", "..", "tests", "golden", "target.json"
 )
+DASHBOARD_GOLDEN = os.path.join(
+    os.path.dirname(__file__), "..", "..", "tests", "golden", "dashboard.json"
+)
+FIXTURE_PNG = os.path.join(os.path.dirname(__file__), "data", "pixel.png")
+
+
+def build_dashboard() -> Dashboard:
+    """A dashboard exercising every widget kind and both connector layers."""
+    meter = Place(
+        Meter("wheels.h", element=1, min=-0.04, max=0.04, unit="N m s"), 20, 20
+    )
+    gauge = Place(
+        Gauge("sensors.gyro_b", label="rate y", element=1, min=-0.2, max=0.2,
+              style="needle", sweep=200.0),
+        120, 20, 150, 140,
+    )
+    chip = Place(
+        StateChip(
+            "mode.mode_cmd",
+            states=[State(0, "IDLE"), State(3, "SAFE", "#f38ba8ff")],
+            unknown="UNKNOWN",
+        ),
+        280, 20,
+    )
+    att = Place(
+        Attitude(
+            "nav.attitude_estimate.q_hat_b_eci",
+            vectors=[VectorMarker("sensors.mag_b", "mag", "#89b4faff")],
+        ),
+        20, 200,
+    )
+    seq = Place(SequenceControl("mode", compact=True), 280, 100)
+    light = Place(TrafficLight("world.illuminated"), 440, 20, 70, 60)
+    grid = Place(TrafficLightGrid("wheels.wheels.*.arm"), 520, 20, 190, 60)
+    text = Place(Text("ctrl.mtq_cmd.dipole_b"), 440, 100)
+    plot = Place(TimeSeriesPlot([Trace("sensors.gyro_b", element=0)]), 440, 200)
+    image = Place(Image(FIXTURE_PNG), 20, 520, 200, 140)
+
+    return Dashboard(
+        title="Golden",
+        widgets=[meter, gauge, chip, att, seq, light, grid, text, plot, image],
+        connectors=[
+            # Under the widgets, telemetry-coloured: the schematic case.
+            Connector(
+                [att, gauge, meter],
+                label="flow",
+                arrow="end",
+                bind=Bind("wheels.wheels.0.arm", threshold=0.5),
+            ),
+            # Over them, with an explicit edge and a free end: the callout case.
+            Connector(
+                [Edge(image, "top", 0.25), At(700.0, 400.0)],
+                shape="curved",
+                dashed=True,
+                arrow="both",
+                on_top=True,
+                label="leader",
+                color="#f9e2afff",
+                width=2.0,
+            ),
+            Connector([meter, At(900.0, 30.0)], shape="straight"),
+        ],
+    )
 
 
 def build_target() -> Target:
@@ -95,6 +191,14 @@ class GoldenTest(unittest.TestCase):
             expected = normalize(json.load(f))
         actual = normalize(build_target().to_ir())
         self.assertEqual(actual, expected)
+
+    def test_emits_the_golden_dashboard(self):
+        # `sat1` so the fixture also pins namespace qualification of every
+        # component reference a widget or a binding carries.
+        Target(cycle_rate=100.0, namespace="sat1")
+        with open(DASHBOARD_GOLDEN, encoding="utf-8") as f:
+            expected = json.load(f)
+        self.assertEqual(build_dashboard()._state("sat1"), expected)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ use gpui::{
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
+use serde::{Deserialize, Serialize};
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
@@ -17,16 +18,18 @@ use crate::views::time_series::{
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, LevelFilter, LogView,
-    SequenceGrid, SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid,
-    new_component_browser, new_component_table, new_data_table,
+    AlarmView, AttitudeConfig, AttitudeIndicator, ComponentBrowser, ComponentTable, ComponentText,
+    DataTable, Gauge, GaugeConfig, LevelFilter, LogView, Meter, MeterConfig, SequenceControl,
+    SequenceControlConfig, SequenceGrid, SequenceView, StateChip, StateChipConfig, TimeSeriesPlot,
+    TrafficLight, TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
 /// Persisted shape of a [`TextPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TextPanelConfig {
     /// Display label and serialization key for the source component.
     pub component: String,
@@ -84,7 +87,8 @@ impl PaneItem for TextPanel {
 
 /// Persisted shape of an [`AlarmPanel`]. The panel shows global alarm state, so the
 /// only persisted bit is which tab it opens on.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AlarmPanelConfig {
     pub show_history: bool,
 }
@@ -139,7 +143,8 @@ impl PaneItem for AlarmPanel {
 }
 
 /// Persisted shape of a [`LogPanel`]: the view's filters and follow mode.
-#[derive(facet::Facet)]
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogPanelConfig {
     pub min_level: LevelFilter,
     pub source: String,
@@ -210,7 +215,8 @@ impl PaneItem for LogPanel {
 
 /// Persisted shape of a [`SequencePanel`]. Sequence state is global, so the only persisted
 /// bit is the view's list mode (defaulted).
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct SequencePanelConfig {
     pub show_history: bool,
 }
@@ -266,7 +272,8 @@ impl PaneItem for SequencePanel {
 
 /// Persisted shape of a [`SequenceGridPanel`]. No per-panel config — the grid reads the
 /// global sequence store.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct SequenceGridPanelConfig {}
 
 /// Pane item with the compact many-channel sequence grid.
@@ -312,7 +319,8 @@ impl PaneItem for SequenceGridPanel {
 }
 
 /// Persisted shape of a [`TrafficLightPanel`].
-#[derive(facet::Facet, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct TrafficLightPanelConfig {
     pub component: String,
     pub color: Option<Hsla>,
@@ -380,8 +388,219 @@ impl PaneItem for TrafficLightPanel {
     }
 }
 
+/// Pane item rendering one element of a component as a bar meter.
+///
+/// Carries no config of its own — [`MeterConfig`] is shared with the
+/// dashboard widget, so a meter behaves identically on either surface.
+pub struct MeterPanel {
+    inner: Entity<Meter>,
+    label: SharedString,
+}
+
+impl MeterPanel {
+    pub fn from_config(cfg: MeterConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let inner = cx.new(|cx| Meter::from_config(&cfg, db, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for MeterPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for MeterPanel {
+    type Config = MeterConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "meter"
+    }
+
+    fn to_config(&self, cx: &App) -> MeterConfig {
+        self.inner.read(cx).to_config()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item rendering one element of a component as a dial.
+pub struct GaugePanel {
+    inner: Entity<Gauge>,
+    label: SharedString,
+}
+
+impl GaugePanel {
+    pub fn from_config(cfg: GaugeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let label =
+            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let inner = cx.new(|cx| Gauge::from_config(&cfg, db, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for GaugePanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for GaugePanel {
+    type Config = GaugeConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "gauge"
+    }
+
+    fn to_config(&self, cx: &App) -> GaugeConfig {
+        self.inner.read(cx).to_config()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item rendering one element of a component as a named discrete state.
+pub struct StateChipPanel {
+    inner: Entity<StateChip>,
+    label: SharedString,
+}
+
+impl StateChipPanel {
+    pub fn from_config(cfg: StateChipConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let label =
+            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let inner = cx.new(|cx| StateChip::from_config(&cfg, db, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for StateChipPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for StateChipPanel {
+    type Config = StateChipConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "state_chip"
+    }
+
+    fn to_config(&self, cx: &App) -> StateChipConfig {
+        self.inner.read(cx).to_config(cx)
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item rendering a quaternion component as an attitude ball.
+pub struct AttitudePanel {
+    inner: Entity<AttitudeIndicator>,
+    label: SharedString,
+}
+
+impl AttitudePanel {
+    pub fn from_config(cfg: AttitudeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let label =
+            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let inner = cx.new(|cx| AttitudeIndicator::from_config(&cfg, db, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for AttitudePanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for AttitudePanel {
+    type Config = AttitudeConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "attitude"
+    }
+
+    fn to_config(&self, cx: &App) -> AttitudeConfig {
+        self.inner.read(cx).to_config(cx)
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Pane item giving one sequence channel its own start/stop controls.
+pub struct SequenceControlPanel {
+    inner: Entity<SequenceControl>,
+    label: SharedString,
+}
+
+impl SequenceControlPanel {
+    pub fn from_config(
+        cfg: SequenceControlConfig,
+        _db: Arc<DB>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let label = SharedString::from(cfg.channel.clone());
+        let inner = cx.new(|cx| SequenceControl::from_config(&cfg, cx));
+        Self { inner, label }
+    }
+}
+
+impl Render for SequenceControlPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for SequenceControlPanel {
+    type Config = SequenceControlConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "sequence_control"
+    }
+
+    fn to_config(&self, cx: &App) -> SequenceControlConfig {
+        self.inner.read(cx).to_config()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
 /// Persisted shape of a [`TrafficLightGridPanel`].
-#[derive(facet::Facet, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct TrafficLightGridPanelConfig {
     pub pattern: String,
     pub color: Option<Hsla>,
@@ -452,7 +671,8 @@ impl PaneItem for TrafficLightGridPanel {
 
 /// Persisted shape of a [`TablePanel`]. Currently empty — the panel renders
 /// every component in the DB and has no per-instance configuration.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TablePanelConfig {}
 
 /// Pane item listing every component in the DB as a flat table.
@@ -498,7 +718,8 @@ impl PaneItem for TablePanel {
 }
 
 /// Persisted shape of a [`DataTablePanel`]. No per-instance configuration today.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DataTablePanelConfig {}
 
 /// Pane item rendering one row per component, grouped by namespace, with
@@ -549,9 +770,10 @@ impl PaneItem for DataTablePanel {
 ///
 /// `root_override` is an empty `Vec` rather than `Option<Vec<_>>` because
 /// "empty path" already encodes the no-override case and round-trips
-/// through facet-json without an extra discriminator. Filter-view state
+/// through JSON without an extra discriminator. Filter-view state
 /// (`SelectionRoot::Filter`) is not persisted yet.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct BrowserPanelConfig {
     pub custom_title: Override<String>,
     pub root_override: Vec<String>,
@@ -673,7 +895,8 @@ impl Render for PlotPanel {
 }
 
 /// Persisted shape of a [`PlotPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct PlotPanelConfig {
     pub label: String,
     pub traces: Vec<TraceConfig>,
@@ -715,7 +938,8 @@ pub struct PlotPanelConfig {
 /// Persisted shape of one [`EventOverlay`]. The live overlay is held as an
 /// `Entity<EventOverlay>`, and its `key` isn't `Facet`-serializable, so the
 /// key is stored as its stable string tag.
-#[derive(facet::Facet, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 pub struct EventOverlayConfig {
     /// `"logs" | "alarms" | "sequences" | "msg:e03c"` (lowercase hex, no sep).
     pub kind: String,
@@ -728,8 +952,7 @@ pub struct EventOverlayConfig {
 /// `Track`/`Pinned` are split into separate variants rather than a single
 /// optional point so the JSON discriminator is clean and old layouts that
 /// default to `Track` deserialize without an extra flag.
-#[derive(facet::Facet, Default, Clone, Copy, Debug)]
-#[repr(u8)]
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug)]
 pub enum MeasurementPanelConfig {
     #[default]
     Track,
@@ -762,7 +985,8 @@ impl From<MeasurementPanelConfig> for PanelPosition {
 /// The focused trace is stored by its position in the panel's trace list at
 /// save-time (not by `EntityId`, which doesn't survive). `t_start`/`t_end`
 /// are raw microseconds because `Timestamp` doesn't implement `Facet` yet.
-#[derive(facet::Facet, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 pub struct MeasurementCursorConfig {
     pub t_start_us: i64,
     pub t_end_us: i64,
@@ -776,7 +1000,8 @@ pub struct MeasurementCursorConfig {
 /// `#[facet(skip)]` because the inspector doesn't expose them — but we *do*
 /// need them on disk, so the persistence boundary uses this parallel
 /// struct.
-#[derive(facet::Facet, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct TraceConfig {
     pub component_id: ComponentId,
     pub element_index: usize,
@@ -839,7 +1064,8 @@ impl From<TraceConfig> for Trace {
 
 /// Persisted shape of one [`YAxis`]. Parallel struct because the live axis
 /// is held as an `Entity<YAxis>` in the plot.
-#[derive(facet::Facet, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct YAxisConfig {
     pub label: String,
     pub y_min_override: Override<f64>,
@@ -1060,7 +1286,8 @@ impl Render for XyPlotPanel {
 }
 
 /// Persisted shape of an [`XyPlotPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct XyPlotPanelConfig {
     pub label: String,
     pub traces: Vec<XyTraceConfig>,
@@ -1075,7 +1302,8 @@ pub struct XyPlotPanelConfig {
 ///
 /// Mirrors [`TraceConfig`]; both axes' `(component_id, element_index)`
 /// pairs need to round-trip on disk even though the inspector hides them.
-#[derive(facet::Facet, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct XyTraceConfig {
     pub x_component_id: ComponentId,
     pub x_element_index: usize,
@@ -1217,7 +1445,8 @@ impl Render for ListPlotPanel {
 }
 
 /// Persisted shape of a [`ListPlotPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ListPlotPanelConfig {
     pub label: String,
     pub traces: Vec<ListTraceConfig>,
@@ -1229,7 +1458,8 @@ pub struct ListPlotPanelConfig {
 }
 
 /// Persisted shape of one [`ListTrace`].
-#[derive(facet::Facet, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct ListTraceConfig {
     pub component_id: ComponentId,
     pub len: usize,
@@ -1333,7 +1563,8 @@ impl PaneItem for ListPlotPanel {
 }
 
 /// Persisted shape of a [`Viewer3dPanel`].
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Viewer3dPanelConfig {
     pub models: Vec<ModelConfig>,
     pub camera: CameraConfig,
@@ -1343,7 +1574,8 @@ pub struct Viewer3dPanelConfig {
 ///
 /// Mirrors the data fields of [`crate::views::viewer_3d::ModelEntry`] but
 /// avoids the live `Entity` wrapping so the config can round-trip directly.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ModelConfig {
     pub label: String,
     pub path: String,
@@ -1355,7 +1587,8 @@ pub struct ModelConfig {
 ///
 /// `glam::Vec3` is not `Facet`, so the target is unpacked into three fields
 /// at the persistence boundary.
-#[derive(facet::Facet)]
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct CameraConfig {
     pub target_x: f32,
     pub target_y: f32,
@@ -1699,6 +1932,107 @@ pub(crate) fn new_panel_rows(
         },
     )));
 
+    rows.push(Box::new(NavRow::new(
+        "Meter",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
+                    Box::new(cx.new(|cx| MeterPanel::from_config(seed.into(), db, cx)))
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "Gauge",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
+                    Box::new(cx.new(|cx| GaugePanel::from_config(seed.into(), db, cx)))
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "State Chip",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
+                    // A chip's state table can't be derived from the schema,
+                    // so it opens showing the raw code until the operator
+                    // names the states.
+                    let cfg = StateChipConfig {
+                        component: seed.component,
+                        element: seed.element,
+                        label: Some(seed.label),
+                        ..Default::default()
+                    };
+                    Box::new(cx.new(|cx| StateChipPanel::from_config(cfg, db, cx)))
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "Attitude",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                let db_outer = db.clone();
+                let pane = pane.clone();
+                component_picker_rows(db.clone(), move |_component_id, name, cx| {
+                    let cfg = AttitudeConfig {
+                        component: name.clone(),
+                        ..Default::default()
+                    };
+                    let db = db_outer.clone();
+                    pane.update(cx, |pane, cx| {
+                        let item: Box<dyn PaneItemHandle> =
+                            Box::new(cx.new(|cx| AttitudePanel::from_config(cfg, db, cx)));
+                        pane.add_item(item, cx);
+                    });
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "Sequence Control",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |cx| {
+                let db = db.clone();
+                let pane = pane.clone();
+                crate::views::sequence_control::channel_picker_rows(cx, move |channel, cx| {
+                    let cfg = SequenceControlConfig {
+                        channel,
+                        compact: false,
+                    };
+                    let db = db.clone();
+                    pane.update(cx, |pane, cx| {
+                        let item: Box<dyn PaneItemHandle> =
+                            Box::new(cx.new(|cx| SequenceControlPanel::from_config(cfg, db, cx)));
+                        pane.add_item(item, cx);
+                    });
+                })
+            })
+        },
+    )));
+
     rows.push(Box::new(CommandRow::new("Component Table", {
         let db = db.clone();
         let pane = pane.clone();
@@ -1857,6 +2191,95 @@ fn traffic_light_grid_pattern_rows(db: Arc<DB>, pane: Entity<Pane>) -> Vec<Box<d
     ))]
 }
 
+/// Everything a scalar instrument needs to bind and scale itself, derived
+/// from one picked trace.
+///
+/// The scale is seeded from the element's declared alarm limits (see
+/// [`crate::views::meter::suggested_scale`]) so a new instrument opens
+/// already showing its redline; the operator can retune it afterwards.
+pub(crate) struct ScaleSeed {
+    pub component: String,
+    pub element: usize,
+    pub label: String,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// One seed per picked trace, so selecting x/y/z yields three instruments
+/// rather than forcing three trips through the wizard.
+pub(crate) fn scale_seeds_for_traces(db: &DB, traces: &[Trace], cx: &App) -> Vec<ScaleSeed> {
+    traces
+        .iter()
+        .map(|trace| {
+            let at =
+                crate::views::binding::ElementRef::new(trace.component_id, trace.element_index);
+            let (min, max) = crate::views::meter::suggested_scale(at, cx);
+            ScaleSeed {
+                component: crate::views::binding::component_meta(db, trace.component_id)
+                    .name
+                    .to_string(),
+                element: trace.element_index,
+                label: trace.label.to_string(),
+                min,
+                max,
+            }
+        })
+        .collect()
+}
+
+impl From<ScaleSeed> for MeterConfig {
+    fn from(seed: ScaleSeed) -> Self {
+        Self {
+            component: seed.component,
+            element: seed.element,
+            label: Some(seed.label),
+            min: seed.min,
+            max: seed.max,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<ScaleSeed> for GaugeConfig {
+    fn from(seed: ScaleSeed) -> Self {
+        Self {
+            component: seed.component,
+            element: seed.element,
+            label: Some(seed.label),
+            min: seed.min,
+            max: seed.max,
+            ..Default::default()
+        }
+    }
+}
+
+/// The trace wizard wired to a scalar-instrument constructor: every picked
+/// element becomes its own tile, built by `make`.
+///
+/// Meter, gauge, and chip differ only in what they construct from a
+/// [`ScaleSeed`], so they share one wizard rather than three copies of the
+/// same closure nest.
+fn instrument_wizard_rows(
+    db: Arc<DB>,
+    pane: Entity<Pane>,
+    make: fn(ScaleSeed, Arc<DB>, &mut Context<Pane>) -> Box<dyn PaneItemHandle>,
+) -> Vec<Box<dyn InspectorRow>> {
+    let db_outer = db.clone();
+    crate::inspector::trace_picker::select_traces_wizard_rows(
+        db,
+        Arc::new(|_cx| 0),
+        Arc::new(move |traces, _window, cx| {
+            let db = db_outer.clone();
+            pane.update(cx, |pane, cx| {
+                for seed in scale_seeds_for_traces(&db, &traces, cx) {
+                    let item = make(seed, db.clone(), cx);
+                    pane.add_item(item, cx);
+                }
+            });
+        }),
+    )
+}
+
 /// Rows listing every known component; selecting one invokes `on_select`.
 pub(crate) fn component_picker_rows(
     db: Arc<DB>,
@@ -1882,17 +2305,17 @@ mod tests {
     use super::*;
     use metor_proto::types::ComponentId;
 
-    /// Each panel's `*Config` round-trips through facet-json without loss.
+    /// Each panel's `*Config` round-trips through JSON without loss.
     /// Mirrors the per-instance shape that `to_config` would produce; this
     /// test pins the wire format independently of the panel-construction
     /// code path so a missing field in either direction shows up here.
     #[test]
-    fn panel_configs_round_trip_through_facet_json() {
+    fn panel_configs_round_trip_through_json() {
         let text = TextPanelConfig {
             component: "altitude".into(),
         };
-        let s = facet_json::to_string(&text).unwrap();
-        let back: TextPanelConfig = facet_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&text).unwrap();
+        let back: TextPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.component, "altitude");
 
         let plot = PlotPanelConfig {
@@ -1938,8 +2361,8 @@ mod tests {
                 },
             ],
         };
-        let s = facet_json::to_string(&plot).unwrap();
-        let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&plot).unwrap();
+        let back: PlotPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.label, "speed");
         assert_eq!(back.event_overlays.len(), 2);
         assert_eq!(back.event_overlays[1].kind, "msg:e03c");
@@ -1968,7 +2391,7 @@ mod tests {
         // `x_range` existed must still load, defaulting to `Relative`, no
         // explicit axes, and a follow-global range.
         let legacy = r#"{"label":"old","traces":[],"custom_title":"Auto","y_min_override":"Auto","y_max_override":"Auto","default_measurements":[],"cursors":[],"measurement_panel":"Track"}"#;
-        let back: PlotPanelConfig = facet_json::from_str(legacy).unwrap();
+        let back: PlotPanelConfig = serde_json::from_str(legacy).unwrap();
         assert_eq!(back.x_time_format, TimeFormat::Relative);
         assert!(back.axes.is_empty());
         assert!(back.x_range.is_empty());
@@ -1990,8 +2413,8 @@ mod tests {
                 fov_y_rad: std::f32::consts::FRAC_PI_3,
             },
         };
-        let s = facet_json::to_string(&viewer).unwrap();
-        let back: Viewer3dPanelConfig = facet_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&viewer).unwrap();
+        let back: Viewer3dPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.models.len(), 1);
         assert_eq!(back.models[0].label, "satellite");
         assert_eq!(back.models[0].path, "sat.glb");
@@ -2019,8 +2442,8 @@ mod tests {
             y_min_override: Override::Auto,
             y_max_override: Override::Custom(2.5),
         };
-        let s = facet_json::to_string(&xy).unwrap();
-        let back: XyPlotPanelConfig = facet_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&xy).unwrap();
+        let back: XyPlotPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.label, "phase");
         assert_eq!(back.traces.len(), 1);
         assert_eq!(back.traces[0].x_component_id, ComponentId(2));
@@ -2034,5 +2457,120 @@ mod tests {
         assert!(matches!(back.x_max_override, Override::Auto));
         assert!(matches!(back.y_min_override, Override::Auto));
         assert!(matches!(back.y_max_override, Override::Custom(v) if (v - 2.5).abs() < 1e-9));
+
+        let meter = MeterConfig {
+            component: "sat.wheels.h".into(),
+            element: 2,
+            label: Some("wheel 2".into()),
+            min: -0.04,
+            max: 0.04,
+            unit: Some("N·m·s".into()),
+            orientation: crate::views::Orientation::Horizontal,
+            color: Some(Hsla::default()),
+            hide_value: true,
+            hide_limits: false,
+        };
+        let s = serde_json::to_string(&meter).unwrap();
+        let back: MeterConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, meter);
+
+        // A meter blob written before a field existed must still load, and
+        // must not degrade to a zero-width scale.
+        let partial: MeterConfig =
+            serde_json::from_str(r#"{"component":"sat.wheels.h","element":1}"#).unwrap();
+        assert_eq!(partial.component, "sat.wheels.h");
+        assert_eq!(partial.element, 1);
+        assert_eq!(partial.label, None);
+        assert_eq!((partial.min, partial.max), (0.0, 1.0));
+        assert!(matches!(
+            partial.orientation,
+            crate::views::Orientation::Vertical
+        ));
+
+        let gauge = GaugeConfig {
+            component: "sat.gyro".into(),
+            element: 1,
+            label: Some("rate y".into()),
+            min: -0.2,
+            max: 0.2,
+            unit: Some("rad/s".into()),
+            sweep_degrees: 200.0,
+            style: crate::views::GaugeStyle::Needle,
+            color: Some(Hsla::default()),
+            hide_value: false,
+            hide_limits: true,
+        };
+        let s = serde_json::to_string(&gauge).unwrap();
+        assert_eq!(serde_json::from_str::<GaugeConfig>(&s).unwrap(), gauge);
+
+        // A gauge missing its sweep must not degenerate to a zero-width dial.
+        let partial: GaugeConfig =
+            serde_json::from_str(r#"{"component":"sat.gyro"}"#).unwrap();
+        assert!(partial.sweep_degrees > 0.0);
+        assert!(matches!(partial.style, crate::views::GaugeStyle::Arc));
+
+        let chip = StateChipConfig {
+            component: "sat.mode.mode_cmd".into(),
+            element: 0,
+            label: Some("mode".into()),
+            states: vec![
+                crate::views::StateEntryConfig {
+                    value: 0.0,
+                    label: "IDLE".into(),
+                    color: None,
+                },
+                crate::views::StateEntryConfig {
+                    value: 3.0,
+                    label: "SAFE".into(),
+                    color: Some(Hsla::default()),
+                },
+            ],
+            unknown_label: "UNKNOWN".into(),
+        };
+        let s = serde_json::to_string(&chip).unwrap();
+        let back: StateChipConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, chip);
+        assert_eq!(back.states[1].label, "SAFE");
+
+        let partial: StateChipConfig =
+            serde_json::from_str(r#"{"component":"sat.mode.mode_cmd"}"#).unwrap();
+        assert!(partial.states.is_empty());
+        assert!(partial.unknown_label.is_empty());
+
+        let seq = SequenceControlConfig {
+            channel: "mode".into(),
+            compact: true,
+        };
+        let s = serde_json::to_string(&seq).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SequenceControlConfig>(&s).unwrap(),
+            seq
+        );
+        let partial: SequenceControlConfig =
+            serde_json::from_str(r#"{"channel":"mode"}"#).unwrap();
+        assert_eq!(partial.channel, "mode");
+        assert!(!partial.compact);
+
+        let attitude = AttitudeConfig {
+            component: "sat.nav.attitude_estimate.q_hat_b_eci".into(),
+            element_offset: 0,
+            label: Some("estimate".into()),
+            vectors: vec![crate::views::VectorMarkerConfig {
+                component: "sat.plant.sensors.mag_b".into(),
+                label: "mag".into(),
+                color: Some(Hsla::default()),
+            }],
+            hide_readout: false,
+        };
+        let s = serde_json::to_string(&attitude).unwrap();
+        let back: AttitudeConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, attitude);
+        assert_eq!(back.vectors[0].label, "mag");
+
+        let partial: AttitudeConfig =
+            serde_json::from_str(r#"{"component":"sat.body.q_b_eci"}"#).unwrap();
+        assert_eq!(partial.element_offset, 0);
+        assert!(partial.vectors.is_empty());
+        assert!(!partial.hide_readout);
     }
 }

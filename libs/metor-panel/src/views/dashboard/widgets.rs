@@ -12,6 +12,7 @@ use gpui::{
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::theme::theme;
@@ -19,7 +20,9 @@ use crate::tiles::panels::{PlotPanelConfig, TraceConfig};
 use crate::views::time_series::{LinePlot, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
-    ComponentText, Monitor, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_table,
+    AttitudeConfig, AttitudeIndicator, ComponentText, Gauge, GaugeConfig, Meter, MeterConfig,
+    Monitor, SequenceControl, SequenceControlConfig, StateChip, StateChipConfig, TimeSeriesPlot,
+    TrafficLight, TrafficLightGrid, new_component_table,
 };
 
 use super::{DashboardWidget, WidgetKind};
@@ -32,7 +35,7 @@ pub struct WidgetSpec {
     pub default_size: (f32, f32),
     pub label: Arc<dyn Fn(&DashboardWidget) -> SharedString>,
     /// Build receives the widget's persisted config string. Each builder
-    /// chooses how to parse it (typically `facet_json::from_str` into a
+    /// chooses how to parse it (typically `serde_json::from_str` into a
     /// kind-specific config struct).
     pub build: Arc<dyn Fn(&str, &Arc<DB>, &mut App) -> (AnyView, gpui::AnyEntity)>,
 }
@@ -149,55 +152,121 @@ impl WidgetRegistry {
                 build: Arc::new(build_traffic_light_grid),
             },
         );
+        self.register(
+            WidgetKind::meter(),
+            WidgetSpec {
+                default_size: (90.0, 200.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<MeterConfig>(&w.config);
+                    let name = cfg.label.unwrap_or(cfg.component);
+                    SharedString::from(format!("Meter: {}", display_or_unknown(&name)))
+                }),
+                build: Arc::new(build_meter),
+            },
+        );
+        self.register(
+            WidgetKind::gauge(),
+            WidgetSpec {
+                default_size: (160.0, 140.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<GaugeConfig>(&w.config);
+                    let name = cfg.label.unwrap_or(cfg.component);
+                    SharedString::from(format!("Gauge: {}", display_or_unknown(&name)))
+                }),
+                build: Arc::new(build_gauge),
+            },
+        );
+        self.register(
+            WidgetKind::state_chip(),
+            WidgetSpec {
+                default_size: (150.0, 60.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<StateChipConfig>(&w.config);
+                    let name = cfg.label.unwrap_or(cfg.component);
+                    SharedString::from(format!("State: {}", display_or_unknown(&name)))
+                }),
+                build: Arc::new(build_state_chip),
+            },
+        );
+        self.register(
+            WidgetKind::sequence_control(),
+            WidgetSpec {
+                default_size: (260.0, 110.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<SequenceControlConfig>(&w.config);
+                    SharedString::from(format!("Sequence: {}", display_or_unknown(&cfg.channel)))
+                }),
+                build: Arc::new(build_sequence_control),
+            },
+        );
+        self.register(
+            WidgetKind::attitude(),
+            WidgetSpec {
+                default_size: (220.0, 260.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<AttitudeConfig>(&w.config);
+                    let name = cfg.label.unwrap_or(cfg.component);
+                    SharedString::from(format!("Attitude: {}", display_or_unknown(&name)))
+                }),
+                build: Arc::new(build_attitude),
+            },
+        );
     }
 }
 
 /// Persisted shape of a text widget — the source component to display.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TextWidgetConfig {
     pub component: String,
 }
 
-/// Persisted shape of an image widget — the file path to load.
-#[derive(facet::Facet, Default)]
+/// Persisted shape of an image widget.
+///
+/// `data` carries the image itself, base64 (optionally as a `data:` URI), so
+/// a target-shipped preset renders on a panel that cannot see the target's
+/// filesystem. `path` is the local-authoring form.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ImageWidgetConfig {
     pub path: String,
+    pub data: String,
 }
 
 /// Persisted shape of a monitor widget — the source component to monitor
 /// plus the inspector-editable display fields.
 ///
-/// `unit` and `show_sparkline` are `Option` (with `#[facet(default)]` for
-/// pre-existing blobs): `None` means "never edited", so restore keeps the
+/// `unit` and `show_sparkline` are `Option`: `None` means "never edited", so restore keeps the
 /// constructor's metadata-derived defaults instead of clobbering them.
-#[derive(facet::Facet, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct MonitorWidgetConfig {
     pub component: String,
-    #[facet(default)]
     pub unit: Option<String>,
-    #[facet(default)]
     pub show_sparkline: Option<bool>,
 }
 
 /// Persisted shape of a traffic-light widget.
-#[derive(facet::Facet, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct TrafficLightWidgetConfig {
     pub component: String,
     pub color: Option<Hsla>,
 }
 
 /// Persisted shape of a traffic-light grid widget.
-#[derive(facet::Facet, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct TrafficLightGridWidgetConfig {
     pub pattern: String,
     pub color: Option<Hsla>,
 }
 
-/// Parse a widget's facet-json blob into its expected config type, falling
+/// Parse a widget's JSON blob into its expected config type, falling
 /// back to `Default` on any parse error so labels and builders degrade
 /// gracefully on a stale or hand-edited file.
-fn parse_or_default<T: facet::Facet<'static> + Default>(blob: &str) -> T {
-    facet_json::from_str::<T>(blob).unwrap_or_default()
+fn parse_or_default<T: serde::de::DeserializeOwned + Default>(blob: &str) -> T {
+    serde_json::from_str::<T>(blob).unwrap_or_default()
 }
 
 /// Render an empty string as `"?"` so labels stay legible when a widget
@@ -231,7 +300,7 @@ fn placeholder_spec(kind: &WidgetKind) -> Arc<WidgetSpec> {
     })
 }
 
-/// Snapshot a live widget's editable state into a fresh facet-json blob.
+/// Snapshot a live widget's editable state into a fresh JSON blob.
 ///
 /// Returns `None` for widget kinds whose persisted config never changes
 /// after construction (text, image, table, viewer3d) — the cached blob on
@@ -298,7 +367,7 @@ pub fn serialize_widget_state(
                 })
                 .collect(),
         };
-        return facet_json::to_string(&cfg).ok();
+        return serde_json::to_string(&cfg).ok();
     }
     if *kind == WidgetKind::traffic_light() {
         let tl = entity.clone().downcast::<TrafficLight>().ok()?;
@@ -307,7 +376,7 @@ pub fn serialize_widget_state(
             component: v.name().to_string(),
             color: Some(v.color()),
         };
-        return facet_json::to_string(&cfg).ok();
+        return serde_json::to_string(&cfg).ok();
     }
     if *kind == WidgetKind::traffic_light_grid() {
         let g = entity.clone().downcast::<TrafficLightGrid>().ok()?;
@@ -316,7 +385,27 @@ pub fn serialize_widget_state(
             pattern: v.pattern().to_string(),
             color: Some(v.color()),
         };
-        return facet_json::to_string(&cfg).ok();
+        return serde_json::to_string(&cfg).ok();
+    }
+    if *kind == WidgetKind::meter() {
+        let m = entity.clone().downcast::<Meter>().ok()?;
+        return serde_json::to_string(&m.read(cx).to_config()).ok();
+    }
+    if *kind == WidgetKind::gauge() {
+        let g = entity.clone().downcast::<Gauge>().ok()?;
+        return serde_json::to_string(&g.read(cx).to_config()).ok();
+    }
+    if *kind == WidgetKind::state_chip() {
+        let c = entity.clone().downcast::<StateChip>().ok()?;
+        return serde_json::to_string(&c.read(cx).to_config(cx)).ok();
+    }
+    if *kind == WidgetKind::sequence_control() {
+        let s = entity.clone().downcast::<SequenceControl>().ok()?;
+        return serde_json::to_string(&s.read(cx).to_config()).ok();
+    }
+    if *kind == WidgetKind::attitude() {
+        let a = entity.clone().downcast::<AttitudeIndicator>().ok()?;
+        return serde_json::to_string(&a.read(cx).to_config(cx)).ok();
     }
     if *kind == WidgetKind::monitor() {
         let m = entity.clone().downcast::<Monitor>().ok()?;
@@ -324,7 +413,7 @@ pub fn serialize_widget_state(
         let mut cfg = parse_or_default::<MonitorWidgetConfig>(config);
         cfg.unit = Some(v.unit.to_string());
         cfg.show_sparkline = Some(v.show_sparkline);
-        return facet_json::to_string(&cfg).ok();
+        return serde_json::to_string(&cfg).ok();
     }
     None
 }
@@ -392,7 +481,7 @@ fn build_table(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::Any
 
 fn build_image(config: &str, _db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     let cfg = parse_or_default::<ImageWidgetConfig>(config);
-    as_view_and_entity(cx.new(|_cx| ImageWidget::load(cfg.path)))
+    as_view_and_entity(cx.new(|_cx| ImageWidget::load(&cfg)))
 }
 
 fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
@@ -437,6 +526,51 @@ fn build_traffic_light(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gp
     as_view_and_entity(entity)
 }
 
+fn build_meter(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<MeterConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    as_view_and_entity(cx.new(|cx| Meter::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_gauge(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<GaugeConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    as_view_and_entity(cx.new(|cx| Gauge::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_state_chip(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<StateChipConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    as_view_and_entity(cx.new(|cx| StateChip::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_attitude(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<AttitudeConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    as_view_and_entity(cx.new(|cx| AttitudeIndicator::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_sequence_control(config: &str, _db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<SequenceControlConfig>(config);
+    as_view_and_entity(cx.new(|cx| SequenceControl::from_config(&cfg, cx)))
+}
+
 fn build_traffic_light_grid(
     config: &str,
     db: &Arc<DB>,
@@ -451,16 +585,29 @@ fn build_traffic_light_grid(
     as_view_and_entity(entity)
 }
 
-/// Widget that decodes an image from disk and paints it into its bounds.
+/// Widget that decodes an image and paints it into its bounds.
 struct ImageWidget {
     render_image: Option<Arc<RenderImage>>,
     label: SharedString,
 }
 
 impl ImageWidget {
-    fn load(path: String) -> Self {
-        let render_image = std::fs::read(&path)
-            .ok()
+    /// Inline bytes win over `path`.
+    ///
+    /// A target ships its presets over a link and the panel may be running on
+    /// a machine that has never seen the target's filesystem, so a diagram
+    /// referenced only by path would be a broken tile there. `path` remains
+    /// for layouts a user authored locally against their own files.
+    fn load(cfg: &ImageWidgetConfig) -> Self {
+        let (bytes, source) = match decode_inline(&cfg.data) {
+            Some(bytes) => (Some(bytes), SharedString::new_static("inline image")),
+            None => (
+                std::fs::read(&cfg.path).ok(),
+                SharedString::from(cfg.path.clone()),
+            ),
+        };
+
+        let render_image = bytes
             .and_then(|bytes| image::load_from_memory(&bytes).ok())
             .map(|img| {
                 let rgba = img.to_rgba8();
@@ -472,9 +619,9 @@ impl ImageWidget {
             });
 
         let label = if render_image.is_some() {
-            SharedString::from(path)
+            source
         } else {
-            SharedString::from(format!("Failed to load: {}", path))
+            SharedString::from(format!("Failed to load: {}", source))
         };
 
         Self {
@@ -482,6 +629,22 @@ impl ImageWidget {
             label,
         }
     }
+}
+
+/// Decode an image widget's inline payload, accepting either raw base64 or a
+/// `data:` URI so a preset author can paste either.
+fn decode_inline(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    if data.is_empty() {
+        return None;
+    }
+    let payload = match data.split_once("base64,") {
+        Some((prefix, rest)) if prefix.starts_with("data:") => rest,
+        _ => data,
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .ok()
 }
 
 impl Render for ImageWidget {
@@ -522,8 +685,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inline_image_data_accepts_raw_base64_and_data_uris() {
+        // "hi" in base64.
+        assert_eq!(decode_inline("aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(
+            decode_inline("data:image/png;base64,aGk=").as_deref(),
+            Some(&b"hi"[..])
+        );
+        // Whitespace from a wrapped literal in a preset file.
+        assert_eq!(decode_inline(" aGk= \n").as_deref(), Some(&b"hi"[..]));
+    }
+
+    #[test]
+    fn undecodable_inline_data_falls_through_to_the_path() {
+        assert!(decode_inline("").is_none());
+        assert!(decode_inline("not base64!!").is_none());
+    }
+
+    #[test]
+    fn image_config_tolerates_pre_inline_blobs() {
+        let cfg: ImageWidgetConfig = serde_json::from_str(r#"{"path":"/tmp/a.png"}"#).unwrap();
+        assert_eq!(cfg.path, "/tmp/a.png");
+        assert!(cfg.data.is_empty());
+    }
+
+    #[test]
     fn monitor_config_tolerates_pre_display_field_blobs() {
-        let cfg: MonitorWidgetConfig = facet_json::from_str(r#"{"component":"a.b"}"#).unwrap();
+        let cfg: MonitorWidgetConfig = serde_json::from_str(r#"{"component":"a.b"}"#).unwrap();
         assert_eq!(cfg.component, "a.b");
         assert_eq!(cfg.unit, None);
         assert_eq!(cfg.show_sparkline, None);
@@ -536,8 +724,8 @@ mod tests {
             unit: Some("V".to_string()),
             show_sparkline: Some(false),
         };
-        let blob = facet_json::to_string(&cfg).unwrap();
-        let back: MonitorWidgetConfig = facet_json::from_str(&blob).unwrap();
+        let blob = serde_json::to_string(&cfg).unwrap();
+        let back: MonitorWidgetConfig = serde_json::from_str(&blob).unwrap();
         assert_eq!(back.component, "a.b");
         assert_eq!(back.unit.as_deref(), Some("V"));
         assert_eq!(back.show_sparkline, Some(false));

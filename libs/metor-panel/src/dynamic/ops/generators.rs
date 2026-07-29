@@ -16,8 +16,7 @@ use crate::dynamic::tensor::{TypedScalar, shape_elems, write_f64_as};
 
 /// Periodic waveform shape. Phase 1 set covers the four common shapes; add
 /// new variants here and extend [`Waveform::sample`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
-#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Waveform {
     Sin,
     Cos,

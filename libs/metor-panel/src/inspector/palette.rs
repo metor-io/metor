@@ -417,7 +417,7 @@ fn register_preset_provider(tiles: Entity<TileGroup>, cx: &mut App) {
         items.push(InspectionItem::SubMenu {
             label: SharedString::new_static("Load preset"),
             summary: SharedString::new_static(""),
-            build: Arc::new(move |_cx| preset_load_rows(tiles_for_load.clone())),
+            build: Arc::new(move |cx| preset_load_rows(tiles_for_load.clone(), cx)),
         });
 
         items
@@ -504,8 +504,20 @@ pub(crate) fn preset_save_rows(tiles: Entity<TileGroup>) -> Vec<Box<dyn Inspecto
 
 /// Rows for the **Load preset** submenu: the saved presets plus a "Load from
 /// file…" OS dialog. Shared by the command palette and the transient chord menu.
-pub(crate) fn preset_load_rows(tiles: Entity<TileGroup>) -> Vec<Box<dyn InspectorRow>> {
+pub(crate) fn preset_load_rows(tiles: Entity<TileGroup>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    // Target-shipped presets first: on a fresh connection they're the rows
+    // the operator came for, and the local list below can grow long.
+    if let Some(store) = presets::try_target_presets(cx) {
+        for preset in store.read(cx).presets() {
+            let tiles = tiles.clone();
+            let layout = preset.layout.clone();
+            rows.push(Box::new(CommandRow::new(
+                SharedString::from(format!("{} — from target", preset.name)),
+                Arc::new(move |_window, cx| presets::load_into_tiles(&layout, &tiles, cx)),
+            )));
+        }
+    }
     for (name, path) in presets::list_presets() {
         let tiles = tiles.clone();
         rows.push(Box::new(CommandRow::new(

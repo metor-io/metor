@@ -8,9 +8,9 @@ use gpui::{AnyEntity, AnyView, App, Entity, Render, SharedString};
 pub trait PaneItem: Render + Sized + 'static {
     /// Persisted shape — every panel pairs itself with a sister `*Config`
     /// struct and uses it as the on-disk format. The default
-    /// [`PaneItem::serialize`] body just facet-json-encodes the result of
+    /// [`PaneItem::serialize`] body just JSON-encodes the result of
     /// [`PaneItem::to_config`], so panels rarely need to override it.
-    type Config: facet::Facet<'static> + Default;
+    type Config: serde::Serialize + serde::de::DeserializeOwned + Default;
 
     fn tab_title(&self, cx: &App) -> SharedString;
 
@@ -21,12 +21,12 @@ pub trait PaneItem: Render + Sized + 'static {
     /// Snapshot the item's own state into its [`PaneItem::Config`].
     fn to_config(&self, cx: &App) -> Self::Config;
 
-    /// Encode the snapshot as a facet-json blob. Paired with an
-    /// [`ItemRegistry`] deserializer keyed on [`PaneItem::serialization_key`];
-    /// the registered closure receives the same string and is responsible for
-    /// parsing it (typically with `facet_json::from_str::<Self::Config>`).
+    /// Encode the snapshot as a JSON blob. Paired with an [`ItemRegistry`]
+    /// deserializer keyed on [`PaneItem::serialization_key`]; the registered
+    /// closure receives the same string and is responsible for parsing it
+    /// (typically with `serde_json::from_str::<Self::Config>`).
     fn serialize(&self, cx: &App) -> String {
-        facet_json::to_string(&self.to_config(cx)).expect("PaneItem::Config must serialize cleanly")
+        serde_json::to_string(&self.to_config(cx)).expect("PaneItem::Config must serialize cleanly")
     }
 
     /// Whether the tab bar should render a close affordance for this item.

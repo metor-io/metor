@@ -42,6 +42,9 @@ wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 image = "0.25"
+# Image widgets carry their bytes inline so a target-shipped preset works on
+# a panel that has never seen the target's filesystem.
+base64 = "0.22"
 glam = "0.32"
 crossbeam-channel = "0.5"
 futures-lite = "2.5.0"

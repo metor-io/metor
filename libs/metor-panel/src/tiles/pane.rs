@@ -40,13 +40,7 @@ const TAB_HEIGHT: f32 = 28.0;
 const TAB_CLOSE_SIZE: f32 = 16.0;
 const TAB_RAIL_WIDTH: f32 = 160.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, facet::Facet)]
-#[repr(u8)]
-pub enum TabOrientation {
-    #[default]
-    Horizontal,
-    Vertical,
-}
+pub use super::serial::TabOrientation;
 
 /// Messages a pane sends to the [`TileGroup`](super::TileGroup) that owns it.
 ///
@@ -572,7 +566,7 @@ mod tests {
     use crate::tiles::{PaneItem, TileGroup};
     use gpui::{App, SharedString};
 
-    #[derive(facet::Facet, Default)]
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
     struct TestItemConfig {}
 
     struct TestItem;
@@ -603,7 +597,7 @@ mod tests {
         Box::new(cx.new(|_| TestItem))
     }
 
-    #[derive(facet::Facet, Default)]
+    #[derive(serde::Serialize, serde::Deserialize, Default)]
     struct OtherItemConfig {}
 
     struct OtherItem;

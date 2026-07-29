@@ -233,8 +233,7 @@ pub(crate) fn interp(
 /// Resampling strategy. `Zoh` and `LatestAt` share semantics (zero-order
 /// hold) but get distinct `op_tag`s so the editor can label them differently
 /// and existing serialized graphs reconcile to the same `NodeId`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
-#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ResampleMode {
     /// Zero-order hold: emit the most recent input bytes on every tick.
     Zoh,

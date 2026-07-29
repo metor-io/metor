@@ -512,7 +512,7 @@ impl SequenceView {
 }
 
 /// A small flat pill-styled button. Caller attaches `.on_click` and any color overrides.
-fn pill_button(
+pub(crate) fn pill_button(
     theme: &crate::theme::Theme,
     id: (&'static str, usize),
     label: &'static str,

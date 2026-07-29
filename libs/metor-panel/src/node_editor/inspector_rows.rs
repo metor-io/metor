@@ -11,7 +11,7 @@
 //!
 //! ## Why not full Facet reflection?
 //!
-//! `NodeSpec` does derive `Facet`, but the inspector's default enum
+//! Even if `NodeSpec` derived `Facet`, the inspector's default enum
 //! dispatch (`registry/dispatch.rs::default_row_for_shape`) renders an
 //! enum as a single variant *picker*. To expose the active variant's
 //! per-field rows automatically, the walker would need a nested write

@@ -1,4 +1,4 @@
-//! Persistence shape for a System Graph tile. Round-trips through `facet_json`
+//! Persistence shape for a System Graph tile. Round-trips through `serde_json`
 //! as the tile's `PaneItem::Config`. Only view state lives here — the topology
 //! itself is always the latest [`WiringManifest`](metor_proto_wkt::WiringManifest)
 //! from the store, never persisted.
@@ -6,13 +6,15 @@
 use std::collections::{BTreeSet, HashMap};
 
 use gpui::SharedString;
+use serde::{Deserialize, Serialize};
 
 use crate::graph_layout::Direction;
 
 /// View state the tile persists: the pan offset, any manually-dragged node
 /// positions, which scopes the operator has collapsed, and the flow
 /// direction.
-#[derive(Clone, Debug, Default, facet::Facet)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SystemGraphConfig {
     pub viewport: Viewport,
     /// Manual position overrides keyed by node id. Presence of any override
@@ -22,19 +24,19 @@ pub struct SystemGraphConfig {
     pub collapsed: Vec<String>,
     /// Flow direction of the auto-layout. Defaulted so documents saved
     /// before the field existed still load.
-    #[facet(default)]
     pub direction: Direction,
 }
 
 /// Pan offset in graph space (`screen = graph - viewport`).
-#[derive(Clone, Debug, Default, facet::Facet)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Viewport {
     pub x: f32,
     pub y: f32,
 }
 
 /// One manually-positioned node.
-#[derive(Clone, Debug, facet::Facet)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeOverride {
     pub id: String,
     pub x: f32,
