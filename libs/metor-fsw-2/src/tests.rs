@@ -790,33 +790,3 @@ fn max_size_formula() {
     // Concretely: 24 fixed + 128 list + 160 map + 8 pad = 320.
     assert_eq!(<SysBoth as Componentize>::MAX_SIZE, 320);
 }
-
-/// `#[frame(name = "...")]` is the whole preamble: the derive stack,
-/// `#[repr(C)]`, and the name attribute, with field attributes untouched.
-mod frame_attr_sugar {
-    use metor_proto::types::Timestamp;
-
-    #[metor_fsw_2_macros::frame(name = "sugar")]
-    #[derive(Default, Clone)]
-    pub struct Sugar {
-        #[metor_fsw(timestamp)]
-        pub timestamp: Timestamp,
-        pub value: f64,
-    }
-
-    #[test]
-    fn frame_attr_expands_to_a_working_frame() {
-        use crate::Frame;
-        assert_eq!(Sugar::NAME, "sugar");
-        let s = Sugar {
-            timestamp: Timestamp(7),
-            value: 1.5,
-        };
-        assert_eq!(s.timestamp(), Timestamp(7));
-        // The zerocopy derives landed: the fixed region round-trips.
-        use zerocopy::{FromBytes, IntoBytes};
-        let bytes = s.as_bytes();
-        let (back, _) = Sugar::ref_from_prefix(bytes).expect("repr(C) layout");
-        assert_eq!(back.value, 1.5);
-    }
-}

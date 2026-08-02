@@ -39,9 +39,6 @@ pub struct PresetSpec {
     pub layout: TileLayout,
 }
 
-#[derive(crate::SystemInput)]
-pub struct PresetIn {}
-
 /// The single telemetered port: the full preset set as one latest-wins
 /// snapshot, retained by the downlink for late-joining connections.
 #[derive(crate::SystemOutput)]
@@ -53,43 +50,37 @@ pub struct PresetOut {
 /// The preset broadcaster. Publishes the configured set once, on the first
 /// execute; every later cycle is a no-op.
 pub struct PresetSystem {
-    presets: Vec<PresetSpec>,
-    booted: bool,
+    presets: Option<Vec<PresetSpec>>,
 }
 
 impl BuildSystem for PresetSystem {
     type Params = PresetsParams;
 
     fn new(params: PresetsParams) -> Self {
-        Self {
-            presets: params.preset,
-            booted: false,
-        }
+        Self { presets: Some(params.preset) }
     }
 }
 
 impl System for PresetSystem {
-    type Input = PresetIn;
+    type Input = ();
     type Output = Out<PresetOut>;
     const NAME: &'static str = "presets";
 }
 
 impl CyclicSystem for PresetSystem {
-    fn execute(&mut self, _now: Timestamp, _input: &mut PresetIn, output: &mut Out<PresetOut>) {
-        if self.booted {
+    fn execute(&mut self, _now: Timestamp, _input: &mut (), output: &mut Out<PresetOut>) {
+        let Some(presets) = self.presets.take() else {
             return;
-        }
-        self.booted = true;
-        let presets = self
-            .presets
-            .iter()
+        };
+        let presets = presets
+            .into_iter()
             .map(|spec| {
-                let mut layout = spec.layout.clone();
+                let mut layout = spec.layout;
                 if layout.version == 0 {
                     layout.version = TILE_LAYOUT_VERSION;
                 }
                 Preset {
-                    name: spec.name.clone(),
+                    name: spec.name,
                     layout: serde_json::to_string(&layout).expect("tile layout always serializes"),
                 }
             })

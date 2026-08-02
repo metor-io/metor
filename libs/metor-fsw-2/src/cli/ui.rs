@@ -22,9 +22,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::wiring::{ClockSpec, Wiring};
 
 /// Install the CLI's tracing subscriber. `build`-target spans get the pinned
-/// progress line; `cargo` and `build` events pass the default filter, which
-/// `RUST_LOG` overrides for debugging. Runtime events at `INFO` and up are
-/// additionally forwarded onto the downlink as `LogEvent`s
+/// progress line; `cargo` and `build` events print bare (no timestamp, level,
+/// or target — cargo's own output carries that), while runtime events get the
+/// full default format. The default filter passes `cargo`/`build` at `INFO`,
+/// which `RUST_LOG` overrides for debugging. Runtime events at `INFO` and up
+/// are additionally forwarded onto the downlink as `LogEvent`s
 /// ([`crate::logfwd`]); the build/cargo UI streams stay terminal-only.
 pub(super) fn init_tracing() {
     let indicatif_layer = IndicatifLayer::new().with_progress_style(
@@ -45,16 +47,26 @@ pub(super) fn init_tracing() {
         .with_target("build", tracing::level_filters::LevelFilter::OFF)
         .with_target("cargo", tracing::level_filters::LevelFilter::OFF)
         .with_default(tracing::Level::INFO);
+    let ansi = std::io::stderr().is_terminal();
+    let ui = |meta: &tracing::Metadata<'_>| matches!(meta.target(), "build" | "cargo");
     tracing_subscriber::registry()
         .with(indicatif_layer.with_filter(filter_fn(|meta| meta.target() == "build")))
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(writer)
+                .with_writer(writer.clone())
                 .without_time()
                 .with_target(false)
                 .with_level(false)
-                .with_ansi(std::io::stderr().is_terminal())
-                .with_filter(events),
+                .with_ansi(ansi)
+                .with_filter(events.clone())
+                .with_filter(filter_fn(ui)),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(ansi)
+                .with_filter(events)
+                .with_filter(filter_fn(move |meta| !ui(meta))),
         )
         .with(crate::logfwd::forward_layer().with_filter(forward))
         .init();

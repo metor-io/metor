@@ -72,7 +72,7 @@ use crate::descriptor::SystemDescriptor;
 /// Version 5 is the pack ABI: one cdylib exports many systems through the
 /// `fsw_pack_*` surface, replacing the one-system `fsw_describe`/`fsw_create`
 /// family entirely. Version 6 adds per-params-field doc strings to the
-/// manifest so generated stubs carry the units and prose that make params
+/// manifest so generated pack modules carry the units and prose that make params
 /// usable. Version 7 drops the never-populated per-entry and per-port doc
 /// slots. Version 8 serializes [`SystemDescriptor`] directly in the manifest,
 /// replacing the `*Msg` mirror family. Version 9 passes the instance name to
@@ -392,7 +392,7 @@ pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_v
                     let schema = OwnedNamedType::from(e.params_schema());
                     // Params docs are collected from this `.so`'s own
                     // `#[derive(ParamsDocs)]` submissions, keyed by schema name.
-                    let params_docs = crate::params_docs_for(&schema.name);
+                    let params_docs = crate::params_docs::params_docs_for(&schema.name);
                     PackEntryDesc {
                         descriptor: e.descriptor().clone(),
                         params_schema: schema,

@@ -71,14 +71,14 @@ pub enum DynamicWriteError {
 /// the map-key staging buffer. `Output::write_with` pools one per port and
 /// threads it through [`FrameWriter::from_scratch`]/[`FrameWriter::finish`],
 /// so the allocations converge to the largest frame written and then recycle.
-pub struct FrameScratch {
+pub(crate) struct FrameScratch {
     packet: LenPacket,
     keys: Vec<u8>,
 }
 
 impl FrameScratch {
     /// A fresh backing whose packet reserves `cap` bytes.
-    pub fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             packet: LenPacket::table([0, 0], cap),
             keys: Vec::new(),
@@ -116,7 +116,7 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     ///
     /// The packet is cleared back to its header first, leaving it
     /// byte-equivalent to a newly constructed table packet.
-    pub fn from_scratch(scratch: FrameScratch, fixed: &F) -> Self {
+    pub(crate) fn from_scratch(scratch: FrameScratch, fixed: &F) -> Self {
         let FrameScratch {
             mut packet,
             mut keys,
@@ -224,7 +224,7 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     }
 
     /// Finishes the frame, handing the pooled backing back to the caller.
-    pub fn finish(self) -> FrameScratch {
+    pub(crate) fn finish(self) -> FrameScratch {
         FrameScratch {
             packet: self.packet,
             keys: self.keys,

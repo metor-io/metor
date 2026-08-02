@@ -270,9 +270,8 @@ pub(crate) type StateCreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result
 /// One pack-declared shared state: its name (the wiring `state` type key),
 /// its params schema, its construction fn, and the erased cell the resolve
 /// passes check construction/attachment against.
-pub struct StateEntry {
+pub(crate) struct StateEntry {
     pub(crate) name: &'static str,
-    pub(crate) params_schema: &'static NamedType,
     pub(crate) cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
     /// The `Shared<St>` token, erased as `Rc<dyn Any>`, so a system attaching
     /// by name can downcast it back to the concrete `Shared<St>` at create.
@@ -282,16 +281,12 @@ pub struct StateEntry {
 }
 
 impl StateEntry {
-    pub fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         self.name
     }
 
-    pub fn params_schema(&self) -> &'static NamedType {
-        self.params_schema
-    }
-
     /// Construct the state from its wiring declaration's params.
-    pub fn create(&mut self, params: EntryParams<'_>) -> Result<(), MakeError> {
+    pub(crate) fn create(&mut self, params: EntryParams<'_>) -> Result<(), MakeError> {
         (self.create)(params)
     }
 }
@@ -343,7 +338,6 @@ impl Pack {
         };
         self.states.push(StateEntry {
             name,
-            params_schema: <P as postcard_schema::Schema>::SCHEMA,
             cell,
             token: token_any,
             create,
@@ -606,19 +600,19 @@ impl Pack {
         self
     }
 
-    /// The entry named `name`, for direct [`TestBench`](crate::TestBench) or
-    /// pack-entry registration use.
+    /// The entry named `name`, for pack-entry registration use.
     pub fn entry_mut(&mut self, name: &str) -> Option<&mut PackEntry> {
         self.entries.iter_mut().find(|e| e.name == name)
     }
 
     /// The shared-state entry named `name`, for direct construction in
     /// tests and the wiring states pass.
-    pub fn state_entry_mut(&mut self, name: &str) -> Option<&mut StateEntry> {
+    #[cfg(test)]
+    pub(crate) fn state_entry_mut(&mut self, name: &str) -> Option<&mut StateEntry> {
         self.states.iter_mut().find(|s| s.name == name)
     }
 
-    pub fn state_entries(&self) -> impl Iterator<Item = &StateEntry> {
+    pub(crate) fn state_entries(&self) -> impl Iterator<Item = &StateEntry> {
         self.states.iter()
     }
 
@@ -637,7 +631,7 @@ impl Pack {
 
     /// Split into system entries and shared-state entries, for hosts that
     /// index both (the static registry).
-    pub fn into_parts(self) -> (Vec<PackEntry>, Vec<StateEntry>) {
+    pub(crate) fn into_parts(self) -> (Vec<PackEntry>, Vec<StateEntry>) {
         (self.entries, self.states)
     }
 }

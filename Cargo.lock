@@ -9323,7 +9323,6 @@ dependencies = [
  "sha2 0.10.9",
  "stellarator",
  "tempfile",
- "thingbuf",
  "thiserror 2.0.19",
  "toml 0.8.23",
  "tracing",

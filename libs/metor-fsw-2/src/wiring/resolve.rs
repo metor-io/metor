@@ -38,7 +38,7 @@ use super::model::{
     SlotInitState, SlotSpec, SourceRef, StateSpec, SystemSpec, Wiring,
 };
 use super::registry::{LoadCtx, Registry, StaticParams};
-use super::{encode_value_params, stubgen, validate};
+use super::{encode_value_params, pack_module, validate};
 
 /// One resolved instance after the systems pass.
 struct Instance {
@@ -766,7 +766,7 @@ fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
                 Err(_) => continue,
             },
         };
-        if stubgen::manifest_hash(&bytes) != recorded {
+        if pack_module::manifest_hash(&bytes) != recorded {
             return Err(LoadErrorKind::StaleStubs {
                 artifact: artifact.id.clone(),
             }
@@ -927,20 +927,16 @@ fn resolve_slot(
         allowed
     };
 
-    let initial = match &slot.initial {
-        None => None,
-        Some(i) => match i.state {
-            SlotInitState::Empty => None,
-            SlotInitState::Loaded => Some(InitialOccupant {
-                occupant: i.occupant.clone(),
-                start: false,
-            }),
-            SlotInitState::Running => Some(InitialOccupant {
-                occupant: i.occupant.clone(),
-                start: true,
-            }),
+    let initial = slot.initial.as_ref().map(|i| match i.state {
+        SlotInitState::Loaded => InitialOccupant {
+            occupant: i.occupant.clone(),
+            start: false,
         },
-    };
+        SlotInitState::Running => InitialOccupant {
+            occupant: i.occupant.clone(),
+            start: true,
+        },
+    });
 
     // `plan_slot` is the one place the registered contract is derived and the
     // descriptor-level checks run, so this front-end cannot drift from it.

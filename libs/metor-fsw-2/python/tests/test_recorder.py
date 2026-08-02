@@ -10,8 +10,10 @@ import metor_config as mc
 from metor_config import (
     Alarm,
     Alarms,
+    Artifact,
     Component,
     Target,
+    System,
     Downlink,
     TcpServer,
     Uplink,
@@ -68,11 +70,11 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(edge["kind"], "Frame")
         self.assertFalse(edge["delayed"])
 
-    def test_loaded_system_via_artifact_handle(self):
+    def test_generated_system_auto_registers_artifact(self):
         m = Target(cycle_rate=100.0)
-        adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")
-        m.add("plant", adcs.Plant(gain=1.0), process=True)
-        m.add("nav", adcs["Nav"]())  # item access yields the same entry callable
+        adcs = Artifact(id="adcs", crate="adcs-systems", lib="adcs_systems")
+        m.add("plant", System("Plant", adcs, gain=1.0), process=True)
+        m.add("nav", System("Nav", adcs))
         ir = m.to_ir()
         self.assertEqual(ir["artifacts"][0]["id"], "adcs")
         self.assertEqual(ir["artifacts"][0]["crate_name"], "adcs-systems")
@@ -116,12 +118,12 @@ class RecorderTest(unittest.TestCase):
 
     def test_slot_records_allow_and_initial(self):
         m = Target(cycle_rate=100.0)
-        seqs = m.artifact("seqs", crate="adcs-sequences", lib="adcs_sequences")
+        seqs = Artifact(id="seqs", crate="adcs-sequences", lib="adcs_sequences")
         m.slot(
             "mode",
             inputs=["gps"],
             outputs=["cmd"],
-            allow=[seqs.commissioning(rate=1.0), seqs.safe_mode()],
+            allow=[System("commissioning", seqs, rate=1.0), System("safe_mode", seqs)],
             initial="commissioning",
             initial_state="running",
         )
@@ -181,9 +183,28 @@ class RecorderTest(unittest.TestCase):
 
     def test_unknown_initial_occupant(self):
         m = Target(cycle_rate=100.0)
-        seqs = m.artifact("seqs", crate="c", lib="l")
+        seqs = Artifact(id="seqs", crate="c", lib="l")
         with self.assertRaisesRegex(ValueError, "initial occupant 'missing'"):
-            m.slot("mode", inputs=[], outputs=[], allow=[seqs.safe_mode()], initial="missing")
+            m.slot(
+                "mode",
+                inputs=[],
+                outputs=[],
+                allow=[System("safe_mode", seqs)],
+                initial="missing",
+            )
+
+    def test_empty_is_not_an_initial_occupant_state(self):
+        m = Target(cycle_rate=100.0)
+        seqs = Artifact(id="seqs", crate="c", lib="l")
+        with self.assertRaisesRegex(ValueError, "unknown initial_state 'empty'"):
+            m.slot(
+                "mode",
+                inputs=[],
+                outputs=[],
+                allow=[System("safe_mode", seqs)],
+                initial="safe_mode",
+                initial_state="empty",
+            )
 
     def test_non_json_param_names_the_key(self):
         m = Target(cycle_rate=100.0)

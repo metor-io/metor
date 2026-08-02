@@ -265,13 +265,6 @@ impl LinkState {
         buf.extend_from_slice(framed);
     }
 
-    /// Whether any connection is live; the downlink skips framing entirely
-    /// when nothing would receive it (taps still drain).
-    pub fn has_connections(&self) -> bool {
-        self.shared.conns.borrow_mut().retain(|c| !c.closed.get());
-        !self.shared.conns.borrow().is_empty()
-    }
-
     /// Append one batch of already-framed packets to every live connection
     /// and wake the writers. A connection over its pending cap misses the
     /// whole batch (counted); the cycle never awaits a socket.

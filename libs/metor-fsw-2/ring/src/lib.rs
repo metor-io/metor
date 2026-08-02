@@ -94,7 +94,7 @@
 //! The shared region carries no wake state. Waking is a pair of traits
 //! injected per handle, [`WakeSource`] to notify and [`WakeSink`] to await.
 //! [`NoWake`] serves synchronous consumers, and [`Notifier`] (behind the
-//! `async` feature) wakes tasks within one process. Only the data direction
+//! `Notifier` wakes tasks within one process. Only the data direction
 //! wakes: writers use the non-blocking [`Writer::try_write`], so nothing ever
 //! waits for space.
 //!
@@ -104,10 +104,7 @@
 //! code, run under Miri. `MIRI.md` in the crate root describes what is
 //! covered and how to run it.
 
-#[cfg(all(
-    feature = "futex",
-    any(target_os = "linux", target_os = "android", target_os = "macos")
-))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod wake;
 
 use std::cell::UnsafeCell;
@@ -383,41 +380,24 @@ impl std::error::Error for AttachError {}
 #[repr(C, align(8))]
 struct Word(UnsafeCell<u64>);
 
-/// The memory a ring lives in, reduced to a `(base, len)` byte range plus
-/// the destructor that releases it. The kinds of backing memory (heap, mmap,
-/// caller-owned) differ only in how they drop.
+/// The memory a ring lives in, reduced to a `(base, len)` byte range and its
+/// concrete owner.
 ///
 /// Every constructor guarantees the region contract that all of the ring's
 /// `unsafe` relies on. `base..base + len` is a single allocation that is
 /// interior-mutable (writing through pointers derived from `base` is sound),
 /// 8-byte aligned, and stable for the backing's lifetime. The ring forms
 /// `&AtomicU64` references and plain byte slices over it.
-pub struct Backing {
+struct Backing {
     base: *mut u8,
     len: usize,
-    /// Drop context passed through to `drop_fn`. Null for
-    /// [`heap`](Backing::heap) and [`raw`](Backing::raw).
-    ctx: *mut (),
-    /// Destructor. `None` means non-owning, as in
-    /// [`RingBuffer::attach_raw`].
-    drop_fn: Option<unsafe fn(*mut (), *mut u8, usize)>,
+    _owner: BackingOwner,
 }
 
-/// Rebuild and free the `Box<[Word]>` that [`Backing::heap`] leaked into
-/// `base`.
-///
-/// # Safety
-/// `(base, len)` came from `Backing::heap`, so it is a leaked `Box<[Word]>`
-/// of `len/8` words, and this runs exactly once (the `Drop` contract).
-unsafe fn heap_drop(_ctx: *mut (), base: *mut u8, len: usize) {
-    // SAFETY: reconstructs exactly the allocation `heap` leaked, same pointer
-    // and same word count, transferring ownership back for the free.
-    unsafe {
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-            base as *mut Word,
-            len / 8,
-        )))
-    };
+enum BackingOwner {
+    Heap { _words: Box<[Word]> },
+    Mmap { _map: memmap2::MmapMut },
+    Raw,
 }
 
 impl Backing {
@@ -429,15 +409,11 @@ impl Backing {
         let words = size.div_ceil(8);
         let buf: Box<[Word]> = (0..words).map(|_| Word(UnsafeCell::new(0u64))).collect();
         let len = buf.len() * 8;
-        // `into_raw` hands over the whole-allocation pointer and its
-        // provenance. No live `Box` remains, so every later access derives
-        // from this one owning pointer.
-        let base = Box::into_raw(buf) as *mut u8;
+        let base = buf.as_ptr() as *mut u8;
         Self {
             base,
             len,
-            ctx: std::ptr::null_mut(),
-            drop_fn: Some(heap_drop),
+            _owner: BackingOwner::Heap { _words: buf },
         }
     }
 
@@ -452,89 +428,38 @@ impl Backing {
         Self {
             base,
             len,
-            ctx: std::ptr::null_mut(),
-            drop_fn: None,
+            _owner: BackingOwner::Raw,
         }
     }
 
     /// An mmap-backed region. The mapping is unmapped when the backing drops.
-    #[cfg(feature = "mmap")]
     fn mmap(map: memmap2::MmapMut) -> Self {
-        // # Safety: `ctx` is the `Box<MmapMut>` leaked below; runs exactly once.
-        unsafe fn mmap_drop(ctx: *mut (), _base: *mut u8, _len: usize) {
-            // SAFETY: reconstructs the box `mmap` leaked, transferring
-            // ownership back; `MmapMut::drop` unmaps.
-            unsafe { drop(Box::from_raw(ctx as *mut memmap2::MmapMut)) };
-        }
-        // The mapping itself never moves. Boxing keeps the `MmapMut` value at
-        // a stable heap address for `ctx`.
-        let map = Box::new(map);
         let (base, len) = (map.as_ptr() as *mut u8, map.len());
         Self {
             base,
             len,
-            ctx: Box::into_raw(map) as *mut (),
-            drop_fn: Some(mmap_drop),
-        }
-    }
-
-    /// Assemble a backing from raw parts. This is the extension point for
-    /// custom regions such as a static arena; pair it with
-    /// [`RingBuffer::attach`].
-    ///
-    /// # Safety
-    /// - `base..base + len` satisfies the region contract (see [`Backing`])
-    ///   for the backing's whole lifetime.
-    /// - If `drop_fn` is `Some`, calling it exactly once, from any thread,
-    ///   with exactly `(ctx, base, len)` must be sound, and that call must be
-    ///   the only release of the resources they name.
-    pub unsafe fn from_raw_parts(
-        base: *mut u8,
-        len: usize,
-        ctx: *mut (),
-        drop_fn: Option<unsafe fn(*mut (), *mut u8, usize)>,
-    ) -> Self {
-        Self {
-            base,
-            len,
-            ctx,
-            drop_fn,
+            _owner: BackingOwner::Mmap { _map: map },
         }
     }
 
     /// Base of the region.
     #[inline]
-    pub fn base(&self) -> *mut u8 {
+    fn base(&self) -> *mut u8 {
         self.base
     }
 
     /// Length of the region in bytes.
     #[inline]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.len
     }
 
-    /// Whether the region is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl Drop for Backing {
-    fn drop(&mut self) {
-        if let Some(f) = self.drop_fn {
-            // SAFETY: the constructor contracts guarantee `f(ctx, base, len)`
-            // is sound to call exactly once with these exact values, and
-            // `Drop` runs at most once.
-            unsafe { f(self.ctx, self.base, self.len) };
-        }
-    }
 }
 
 // SAFETY: the raw pointers make `Backing` `!Send + !Sync` by default, but the
 // ring upholds both. Region bytes are only touched through atomics or under
 // the `committed` Release/Acquire handshake, and the constructor contracts
-// allow `drop_fn` to run on whichever thread drops the last handle.
+// allow the concrete owner to drop on whichever thread drops the last handle.
 unsafe impl Send for Backing {}
 unsafe impl Sync for Backing {}
 
@@ -575,26 +500,22 @@ impl WakeSink for NoWake {
 
 /// A shared wait queue that wakes tasks within one process. The writer and
 /// its views share clones of a single `Notifier`, so a commit wakes the
-/// awaiting readers. Behind the `async` feature.
-#[cfg(feature = "async")]
+/// awaiting readers.
 #[derive(Clone)]
 pub struct Notifier(Arc<stellarator::sync::WaitQueue>);
 
-#[cfg(feature = "async")]
 impl Default for Notifier {
     fn default() -> Self {
         Self(Arc::new(stellarator::sync::WaitQueue::new()))
     }
 }
 
-#[cfg(feature = "async")]
 impl WakeSource for Notifier {
     fn notify(&self) {
         self.0.wake_all();
     }
 }
 
-#[cfg(feature = "async")]
 impl WakeSink for Notifier {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F) {
         let _ = self.0.wait_for(ready).await;
@@ -799,7 +720,6 @@ impl RingBuffer {
 
     /// Create a new mmap-backed region at `path`, truncating any existing
     /// file.
-    #[cfg(feature = "mmap")]
     pub fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
         let (reader_table_offset, data_offset, total) = layout(&cfg);
         let file = std::fs::OpenOptions::new()
@@ -833,7 +753,6 @@ impl RingBuffer {
     /// compatible build and is not being concurrently torn down. The
     /// magic/version/arch handshake guards against accidental misuse but not
     /// deliberate corruption.
-    #[cfg(feature = "mmap")]
     pub unsafe fn attach_mmap(path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -869,17 +788,14 @@ impl RingBuffer {
         unsafe { Self::attach(Backing::raw(base, len)) }
     }
 
-    /// Attach over an already-initialized region held by `backing`,
-    /// validating its header and reading the geometry back out of it. This is
-    /// the shared tail of [`RingBuffer::attach_mmap`] and
-    /// [`RingBuffer::attach_raw`], and the door for custom
-    /// [`Backing::from_raw_parts`] regions.
+    /// Attach over an already-initialized concrete backing, validating its
+    /// header and reading the geometry back out of it.
     ///
     /// # Safety
     /// `backing`'s region is live (all [`Backing::len`] bytes are readable)
     /// and is not being torn down concurrently. `read_header` validates
     /// everything else before any reference is formed into the region.
-    pub unsafe fn attach(backing: Backing) -> Result<Self, AttachError> {
+    unsafe fn attach(backing: Backing) -> Result<Self, AttachError> {
         let base = backing.base();
         // SAFETY: `backing.len()` bytes are readable (caller contract);
         // `read_header` bounds every read against that length.

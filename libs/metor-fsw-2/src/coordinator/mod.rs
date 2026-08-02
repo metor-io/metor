@@ -395,9 +395,7 @@ fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
 /// [`SequenceRegistry`] and [`WiringManifest`] broadcast once at the head of a
 /// run (and re-fired on a [`ReloadSequences`] request so a late consumer
 /// resyncs), the take-once operator command writer, and the reload request
-/// fan-in drained each cycle. The two `_emitted` latches make the boot
-/// emission idempotent; the manifest channel is absent unless a front-end set
-/// one.
+/// fan-in drained each cycle.
 struct CoordChannels {
     /// The single writer over the coordinator's `commands` output, handed out
     /// once by [`take_control`](Self::take_control) (see
@@ -408,14 +406,12 @@ struct CoordChannels {
     /// The prebuilt boot [`SequenceRegistry`] payload (the slots plus their
     /// allowed occupants), emitted once at the head of a run.
     seq_registry: SequenceRegistry,
-    seq_registry_emitted: bool,
     /// The sole writer of the coordinator's `wiring` channel, present only when
     /// a front-end supplied a manifest.
     wiring_out: Option<MsgOut<WiringManifest>>,
     /// The full target IR to broadcast on the `wiring` channel; `None` mirrors
     /// `wiring_out`.
     wiring_manifest: Option<WiringManifest>,
-    wiring_emitted: bool,
     /// The [`ReloadSequences`] fan-in, drained each cycle: any request re-emits
     /// the registry and manifest, so a consumer that connected after boot can
     /// recover the channel list on demand.
@@ -438,18 +434,11 @@ impl CoordChannels {
         }
     }
 
-    /// Emit the boot registry and manifest exactly once, at the head of the
-    /// run, so a tap claimed after `build()` observes them ahead of any live
-    /// edge activity. Idempotent: the `_emitted` latches gate re-entry.
+    /// Emit the boot registry and manifest at the head of the one permitted
+    /// run, so a tap claimed after `build()` observes them first.
     fn emit_boot(&mut self) {
-        if !self.seq_registry_emitted {
-            self.emit_sequence_registry();
-            self.seq_registry_emitted = true;
-        }
-        if !self.wiring_emitted {
-            self.emit_wiring_manifest();
-            self.wiring_emitted = true;
-        }
+        self.emit_sequence_registry();
+        self.emit_wiring_manifest();
     }
 
     /// Drain the cycle's reload requests; on any request re-emit the registry

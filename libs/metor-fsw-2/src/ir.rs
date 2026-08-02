@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 5;
+pub const IR_VERSION: u32 = 6;
 
 /// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
@@ -204,13 +204,12 @@ pub struct Artifact {
     /// provenance, carried into the bundle's `meta.json`.
     #[serde(default)]
     pub dist: Option<DistRef>,
-    /// The `sha256:<hex>` hash of the pack manifest the generated stub module
-    /// (`metor-fsw stubgen`) was produced against, carried through from the
+    /// The `sha256:<hex>` hash of the pack manifest the generated pack module
+    /// was produced against, carried through from the
     /// module's `ARTIFACT` constant. [`resolve`](crate::wiring::resolve)
-    /// compares it against the live manifest and refuses a stale stub
+    /// compares it against the live manifest and refuses a stale module
     /// ([`StaleStubs`](crate::wiring::LoadErrorKind::StaleStubs)). `None` for a
-    /// builder-authored artifact and hand-written `pack()` handles, which skip
-    /// the check.
+    /// builder-authored artifact, which skips the check.
     #[serde(default)]
     pub manifest_hash: Option<String>,
     /// Where this artifact was declared.
@@ -219,7 +218,7 @@ pub struct Artifact {
 }
 
 /// The published distribution an [`Artifact`] was installed from, as the
-/// generated stub module recorded it (`dist="adcs-pack"`,
+/// generated pack module recorded it (`dist="adcs-pack"`,
 /// `dist_version="1.2.0"`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DistRef {
@@ -446,8 +445,6 @@ pub struct InitialOccupantSpec {
 /// The startup lifecycle state of a [`SlotSpec`]'s initial occupant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlotInitState {
-    /// No initial occupant; the slot starts empty.
-    Empty,
     /// Load the occupant at startup, built but not polling.
     Loaded,
     /// Load and start the occupant, running from the first cycle.

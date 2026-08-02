@@ -36,11 +36,6 @@ const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
     ),
 ];
 
-/// `true` if `path` is a Python target (a `.py` file the CLI evaluates).
-pub fn is_python_target(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e == "py")
-}
-
 /// The embedded recorder's `__version__`, scanned from the embedded source —
 /// the version this binary pairs with, used to derive the `metor-config`
 /// compatible-range pin stamped into pack wheels.

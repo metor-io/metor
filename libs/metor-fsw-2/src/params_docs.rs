@@ -1,4 +1,4 @@
-//! Per-field params documentation for generated stubs (ABI v6).
+//! Per-field params documentation for generated pack modules (ABI v6).
 //!
 //! `#[derive(ParamsDocs)]` on a system's `Params` struct submits its field
 //! `#[doc]` comments into a pack-crate-local [`inventory`] collection. Because
@@ -6,7 +6,7 @@
 //! there can look each entry's params docs up by schema name and ship them in
 //! the manifest ([`PackEntryDesc::params_docs`]) — with no doc field
 //! crossing the ABI as anything but plain strings, and no trait bound forcing
-//! every params type to opt in. `metor-fsw stubgen` renders them as the units
+//! every params type to opt in. Pack module generation renders them as the units
 //! and prose that make params usable.
 //!
 //! [`run_pack_describe`]: crate::abi::run_pack_describe
@@ -29,7 +29,7 @@ inventory::collect!(ParamsDocEntry);
 /// The `(field, doc)` pairs a params type of schema name `schema` declared, or
 /// empty when it derived no [`ParamsDocs`](macro@crate::ParamsDocs) (docs are
 /// optional). Called from the manifest describe path inside a pack `.so`.
-pub fn params_docs_for(schema: &str) -> Vec<(String, String)> {
+pub(crate) fn params_docs_for(schema: &str) -> Vec<(String, String)> {
     inventory::iter::<ParamsDocEntry>
         .into_iter()
         .find(|e| e.schema == schema)

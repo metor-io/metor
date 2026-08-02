@@ -476,7 +476,6 @@ fn raw_attach_swap_reacquire() {
 
 // ----- mmap backing (feature-gated) -----
 
-#[cfg(feature = "mmap")]
 #[test]
 fn mmap_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
@@ -764,7 +763,6 @@ fn attach_rejects_misaligned() {
 /// `attach_mmap` on a file truncated below its self-declared `total_size` (or
 /// even below the header) fails cleanly instead of mapping short and reading
 /// out of bounds.
-#[cfg(feature = "mmap")]
 #[test]
 fn attach_mmap_rejects_truncated_file() {
     let dir = tempfile::tempdir().unwrap();

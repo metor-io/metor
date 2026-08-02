@@ -225,7 +225,7 @@ libadcs_pack.so
 libadcs_pack.so.manifest
 ```
 
-Stub generation and bundle checks prefer the sidecar. They do not need to load
+Pack module generation and bundle checks prefer the sidecar. They do not need to load
 the library.
 
 Generated Python modules record a SHA-256 hash of the manifest. Resolve rejects

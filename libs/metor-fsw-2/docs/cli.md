@@ -43,7 +43,6 @@ The target commands are:
 metor-fsw build
 metor-fsw package
 metor-fsw run
-metor-fsw stubgen
 ```
 
 With no target path, commands that need source look for `target.py` in the
@@ -113,11 +112,6 @@ metor-fsw package --check-ir dist/target.metor
 ```
 
 Use this check in CI to find config drift or input that changes between runs.
-
-### Legacy stub generation
-
-Target-level `stubgen` remains for old projects. New pack projects generate
-their typed Python module through `pack dev` and `pack build`.
 
 ## Pack commands
 

@@ -21,7 +21,7 @@
 //! spec's [`SourceRef`] when it has one.
 //!
 //! The module can also pack a target into a `.metor` archive, build an
-//! [`Artifact`]'s cdylib, generate Python stubs, and encode a value tree
+//! [`Artifact`]'s cdylib, generate typed pack modules, and encode a value tree
 //! against an artifact's exported `Params` schema.
 //!
 //! ## Params
@@ -37,17 +37,17 @@
 
 // The `Wiring` data model's two front-ends (the Python-eval path and the Rust
 // builder), the registry and resolver split below, and the supporting bundle,
-// build-driver, and stubgen surfaces.
+// build-driver, and pack-module codegen surfaces.
 mod build_driver;
 mod builder;
 mod bundle;
 mod error;
 mod pack_dist;
+mod pack_module;
 mod params;
 mod py;
 mod registry;
 mod resolve;
-mod stubgen;
 mod validate;
 mod wheel;
 
@@ -58,7 +58,7 @@ pub(crate) use crate::ir as model;
 pub use build_driver::{
     BuildError, BuildOptions, build_target, locate_artifacts, provision_artifacts,
 };
-pub use builder::{ArtifactSystemBuilder, SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
+pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use bundle::{
     BundleError, BundleMeta, METOR_EXTENSION, PackProvenance, PackSourceKind, PackageOptions,
     WIRING_FILE_NAME, load_bundle, unpack_metor, write_bundle,
@@ -75,18 +75,17 @@ pub use pack_dist::{
     read_pack_config, refresh_dev_packs,
 };
 pub use params::encode_value_params;
-pub use py::{eval_python_target, is_python_target};
+pub use py::eval_python_target;
 pub(crate) use registry::NoParams;
 pub use registry::{AsyncKind, CyclicKind, IntoNode, Registry};
 pub use resolve::{ResolveOptions, resolve, resolve_with};
-pub use stubgen::{StubgenError, StubgenOptions, StubgenReport, stubgen};
 
 // The typed value-tree param decode, shared with the `pack` bind path.
 pub(crate) use registry::decode_value_params;
 
 /// The shared-object file name for a library `stem` on the host platform
-/// (`libfoo.so`, `libfoo.dylib`, `foo.dll`), used by the build driver and the
-/// stub generator to locate an [`Artifact::lib`]'s output.
+/// (`libfoo.so`, `libfoo.dylib`, `foo.dll`), used by the build driver to locate
+/// an [`Artifact::lib`]'s output.
 pub fn cdylib_file_name(stem: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("lib{stem}.dylib")

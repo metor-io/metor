@@ -181,16 +181,10 @@ impl<F: Frame, WD: WakeSource> Output<F, WD> {
         }
     }
 
-    /// This port's static descriptor, for wiring and sizing before any data
-    /// flows.
-    pub fn descriptor() -> PortDesc {
-        PortDesc::of::<F>()
-    }
-
     /// This field's entry in the bundle's [`decls`](crate::SystemOutput::decls)
     /// walk, an ordinary wired port.
     pub fn decl() -> PortDesc {
-        Self::descriptor()
+        PortDesc::of::<F>()
     }
 
     /// Take and clear the [`publish`](Self::publish) drop counter.
@@ -297,15 +291,10 @@ impl<F: Frame, RD: WakeSink> Input<F, RD> {
         }
     }
 
-    /// This port's static descriptor, the required producer shape.
-    pub fn descriptor() -> PortDesc {
-        PortDesc::of::<F>()
-    }
-
     /// This field's entry in the bundle's [`decls`](crate::SystemInput::decls)
     /// walk, an ordinary wired port.
     pub fn decl() -> PortDesc {
-        Self::descriptor()
+        PortDesc::of::<F>()
     }
 }
 
@@ -428,14 +417,9 @@ where
         }
     }
 
-    /// The borrowed record as a [`FrameRef`].
-    pub fn as_ref(&self) -> FrameRef<'_, F> {
-        FrameRef::new(&self.grant)
-    }
-
     /// The fixed region, read in place (see [`FrameRef::get`]).
     pub fn get(&self) -> &F {
-        self.as_ref().get()
+        FrameRef::<F>::new(&self.grant).get()
     }
 
     /// The raw table bytes, fixed region plus trailer.
@@ -449,7 +433,7 @@ where
         &self,
         sink: &mut D,
     ) -> Result<Result<(), D::Error>, ProtoError> {
-        self.as_ref().apply(sink)
+        FrameRef::<F>::new(&self.grant).apply(sink)
     }
 }
 

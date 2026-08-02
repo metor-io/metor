@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use metor_fsw_2::wiring::{eval_python_target, is_python_target};
+use metor_fsw_2::wiring::eval_python_target;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -28,14 +28,6 @@ fn have_python() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-#[test]
-fn extension_dispatch() {
-    assert!(is_python_target(Path::new("target.py")));
-    assert!(is_python_target(Path::new("/abs/path/adcs.py")));
-    assert!(!is_python_target(Path::new("target.kdl")));
-    assert!(!is_python_target(Path::new("target")));
 }
 
 #[test]

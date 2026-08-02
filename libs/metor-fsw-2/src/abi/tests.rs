@@ -23,6 +23,8 @@ use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::PortSchema;
+
 use crate::abi::{
     FswRing, FswStatus, PackManifest, ROLE_INPUT, ROLE_OUTPUT, run_pack_bind_init, run_pack_close,
     run_pack_create, run_pack_describe, run_pack_destroy, run_pack_execute, run_pack_open,
@@ -457,7 +459,10 @@ fn dl_announce_prefixes_vtable_ids() {
 
     // The vtable carried on the port itself stays unprefixed; `compatible()`
     // validates wiring against the frame-relative ids.
-    let unprefixed = realized_ids(port.vtable().expect("table port"));
+    let PortSchema::Table { vtable, .. } = &port.schema else {
+        panic!("table port");
+    };
+    let unprefixed = realized_ids(vtable);
     assert!(
         unprefixed.contains(&ComponentId::new("tick_out.count")),
         "PortDesc.vtable stays unprefixed for compatibility: {unprefixed:?}"
@@ -869,7 +874,6 @@ fn port_desc_round_trips_both_arms() {
     assert_eq!(rd.name, "SequenceCommand");
     assert_eq!(rd.max_size, d.max_size);
     assert!(matches!(rd.schema, PortSchema::Postcard { .. }));
-    assert!(rd.vtable().is_none(), "no vtable on a Postcard port");
     assert_eq!(rd.delivery, Delivery::Log);
     assert_eq!(rd.fan_in, FanIn::Many);
     assert!(!rd.telemetered, "the opt-out survived the wire");

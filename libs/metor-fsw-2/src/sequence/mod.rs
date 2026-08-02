@@ -57,7 +57,7 @@ mod tests;
 /// functions. It is `!Send`, which is fine because a poll is synchronous and
 /// single-threaded.
 #[derive(Default)]
-pub struct CycleClock {
+pub(crate) struct CycleClock {
     /// The cycle's coordinator time, refreshed before each poll.
     pub now: Cell<Timestamp>,
     /// Set once an abort frame arrives, and never cleared.
@@ -69,7 +69,7 @@ pub struct CycleClock {
 
 impl CycleClock {
     /// Take the accumulated progress lines, leaving the buffer empty.
-    pub fn drain_progress(&self) -> Vec<String> {
+    pub(crate) fn drain_progress(&self) -> Vec<String> {
         core::mem::take(&mut *self.progress.borrow_mut())
     }
 }
@@ -83,7 +83,7 @@ thread_local! {
 ///
 /// The clock is cleared on the way out even if `f` panics (a drop guard), so
 /// a caught panic in one poll never leaves a stale clock behind for the next.
-pub fn with_clock<R>(clock: &Rc<CycleClock>, f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_clock<R>(clock: &Rc<CycleClock>, f: impl FnOnce() -> R) -> R {
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
@@ -96,7 +96,7 @@ pub fn with_clock<R>(clock: &Rc<CycleClock>, f: impl FnOnce() -> R) -> R {
 }
 
 /// The ambient clock of the current poll, or `None` outside one.
-pub fn current() -> Option<Rc<CycleClock>> {
+pub(crate) fn current() -> Option<Rc<CycleClock>> {
     SEQ_CLOCK.with(|c| c.borrow().clone())
 }
 /// How a sequence finished. The host only needs to know the future is done;
@@ -311,7 +311,7 @@ pub struct SlotControlIn {
 /// Publish one [`SequenceStatus`] record with the given run state and
 /// progress lines. The occupant driver drives its health `end_cycle`
 /// separately.
-pub fn publish_status(
+pub(crate) fn publish_status(
     out: &mut Output<SequenceStatus>,
     now: Timestamp,
     run_state: u8,

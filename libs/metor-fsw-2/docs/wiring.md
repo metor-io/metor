@@ -84,7 +84,7 @@ resolve time and returns a `LoadError`.
 ## The wiring IR
 
 Both examples produce `Wiring`, a plain data value that serde can read and
-write. The current IR version is 4. A host rejects another version during
+write. The current IR version is 6. A host rejects another version during
 resolve.
 
 The top-level fields are:

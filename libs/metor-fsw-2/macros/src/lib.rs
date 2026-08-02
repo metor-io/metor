@@ -29,7 +29,6 @@ mod as_vtable;
 mod componentize;
 mod decomponentize;
 mod frame;
-mod frame_attr;
 mod metadatatize;
 mod params_docs;
 mod sig;
@@ -110,7 +109,7 @@ pub fn frame_derive(input: TokenStream) -> TokenStream {
 }
 
 /// Derives `ParamsDocs`: submits a system's `Params` field doc comments into
-/// the crate-local params-docs collection, so `metor-fsw stubgen` can render
+/// the crate-local params-docs collection, so pack module generation can render
 /// them. Docs are optional; undocumented fields contribute nothing.
 #[proc_macro_derive(ParamsDocs)]
 pub fn params_docs_derive(input: TokenStream) -> TokenStream {
@@ -130,15 +129,6 @@ pub fn system_input(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(SystemOutput, attributes(fsw))]
 pub fn system_output(input: TokenStream) -> TokenStream {
     system::system_output(input)
-}
-
-/// `#[frame(name = "...")]` expands to the full frame preamble — the
-/// `Frame` + zerocopy derive stack, `#[repr(C)]`, and the name attribute —
-/// so a frame declaration is one line instead of four. Field attributes
-/// (`#[metor_fsw(timestamp)]`) and any extra `#[derive(...)]` pass through.
-#[proc_macro_attribute]
-pub fn frame(attr: TokenStream, item: TokenStream) -> TokenStream {
-    frame_attr::frame_attr(attr, item)
 }
 
 /// Builds a complete system from a type's inherent impl block, deriving

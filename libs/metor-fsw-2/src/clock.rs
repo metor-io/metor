@@ -34,7 +34,7 @@ pub(crate) fn set_now(now: Timestamp) {
 
 /// The current cycle's timestamp, or `None` before the first cycle reaches
 /// this linkage unit.
-pub fn now() -> Option<Timestamp> {
+fn now() -> Option<Timestamp> {
     match NOW.load(Relaxed) {
         UNSET => None,
         v => Some(Timestamp(v)),
@@ -42,6 +42,6 @@ pub fn now() -> Option<Timestamp> {
 }
 
 /// [`now`], falling back to wall time before the first cycle.
-pub fn now_or_wall() -> Timestamp {
+pub(crate) fn now_or_wall() -> Timestamp {
     now().unwrap_or_else(Timestamp::now)
 }

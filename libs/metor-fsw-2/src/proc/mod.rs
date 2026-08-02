@@ -26,13 +26,15 @@ pub(crate) mod host;
 pub(crate) mod worker;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use ctl::{CtlError, CtlHost, CtlWorker, StepOutcome, WorkerCmd, WorkerState};
+pub(crate) use ctl::StepOutcome;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use ctl::{CtlWorker, WorkerCmd, WorkerState};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use host::{ProcError, describe_via_worker};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use worker::worker_guard_installed;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use worker::{RunMode, WORKER_ENV, WorkerManifest, worker_entry};
+pub use worker::worker_entry;
 
 /// On targets without process-system support the guard is a no-op, so an
 /// application's unconditional `worker_entry()` call stays portable.
