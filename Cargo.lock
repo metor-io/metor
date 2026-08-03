@@ -9401,6 +9401,7 @@ name = "metor-fsw-ring"
 version = "0.14.2"
 dependencies = [
  "libc",
+ "loom",
  "memmap2",
  "stellarator",
  "tempfile",

@@ -31,8 +31,8 @@
 //!
 //! All shared state lives in one contiguous region that holds offsets and
 //! atomics but no pointers, so the same code runs over a heap allocation, a
-//! memory-mapped file (behind the `mmap` feature), or any region the caller
-//! provides ([`RingBuffer::attach_raw`]).
+//! memory-mapped file, or any region the caller provides
+//! ([`RingBuffer::attach_raw`]).
 //!
 //! ```text
 //! 0x00 ┌───────────────────────────┐
@@ -93,27 +93,27 @@
 //!
 //! The shared region carries no wake state. Waking is a pair of traits
 //! injected per handle, [`WakeSource`] to notify and [`WakeSink`] to await.
-//! [`NoWake`] serves synchronous consumers, and [`Notifier`] (behind the
-//! `Notifier` wakes tasks within one process. Only the data direction
-//! wakes: writers use the non-blocking [`Writer::try_write`], so nothing ever
-//! waits for space.
+//! [`NoWake`] serves synchronous consumers, and [`Notifier`] wakes tasks
+//! within one process. Only the data direction wakes: writers use the
+//! non-blocking [`Writer::try_write`], so nothing ever waits for space.
 //!
 //! # Verification
 //!
-//! The synchronous paths, which include all of the unsafe pointer and atomic
-//! code, run under Miri. `MIRI.md` in the crate root describes what is
-//! covered and how to run it.
+//! Three passes, each covering what the others cannot, documented in the crate
+//! root. `MIRI.md`: the synchronous tests under Miri, for provenance, leaks and
+//! data races over real allocations. `KANI.md`: the position arithmetic and the
+//! geometry validation every `unsafe` deref here cites, proved over symbolic
+//! inputs rather than sampled. `LOOM.md`: the atomic orderings below, including
+//! the registration handshake, under every interleaving.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod wake;
 
+mod sync;
+
+use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+use crate::sync::{Arc, AtomicU64, fence};
 use std::cell::UnsafeCell;
-use std::sync::Arc;
-use std::sync::atomic::{
-    AtomicU64,
-    Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
-    fence,
-};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 // ---------------------------------------------------------------------------
@@ -180,13 +180,39 @@ struct Control {
 struct ReaderSlot {
     cursor: AtomicU64,
     owner: AtomicU64,
-    _pad: [u8; 48],
+    _pad: [u8; READER_SLOT_PAD],
 }
 
-/// Byte offset of the control block.
+/// Bytes of padding that round a [`ReaderSlot`] out to a cache line. Zero
+/// under loom, whose atomics carry tracking state and blow past 64 bytes on
+/// their own.
+#[cfg(not(ring_loom))]
+const READER_SLOT_PAD: usize = 48;
+#[cfg(ring_loom)]
+const READER_SLOT_PAD: usize = 0;
+
+/// Byte offset of the control block. Cache line 1, after the header.
 const OFF_CONTROL: usize = 0x40;
+
 /// Header plus control block size. The reader table starts here.
+///
+/// Fixed at two cache lines for the real layout, since that is the region
+/// format. Under loom the control block outgrows one line, so the constant is
+/// derived instead and the reader table simply starts further in; nothing but
+/// the loom models ever observes the difference.
+#[cfg(not(ring_loom))]
 const HEADER_SIZE: usize = 0x80;
+#[cfg(ring_loom)]
+const HEADER_SIZE: usize = (OFF_CONTROL + size_of::<Control>()).next_multiple_of(64);
+
+// The shipped region format, pinned so the loom fork above can never move it.
+#[cfg(not(ring_loom))]
+const _: () = {
+    assert!(size_of::<RegionHeader>() <= OFF_CONTROL);
+    assert!(OFF_CONTROL + size_of::<Control>() <= HEADER_SIZE);
+    assert!(size_of::<ReaderSlot>() == 64);
+    assert!(align_of::<ReaderSlot>() == 8);
+};
 /// One reader-table slot's stride.
 const READER_SLOT_SIZE: usize = size_of::<ReaderSlot>();
 
@@ -210,8 +236,17 @@ const fn arch_tag() -> u64 {
 /// alias two claimants across a pid wrap-around, so reclaim promptly after
 /// reaping a dead peer, before spawning replacements.
 #[inline]
+#[cfg(not(kani))]
 fn owner_tag() -> u64 {
     std::process::id() as u64
+}
+
+/// Kani has no process to ask, and the harnesses never depend on the tag's
+/// value, only on it being nonzero.
+#[inline]
+#[cfg(kani)]
+fn owner_tag() -> u64 {
+    1
 }
 
 /// Round `n` up to the next multiple of 8.
@@ -228,6 +263,63 @@ pub const fn round_up8(n: usize) -> usize {
 #[inline]
 pub const fn frame_len(payload_len: usize) -> usize {
     8 + round_up8(payload_len)
+}
+
+// ---------------------------------------------------------------------------
+// Position arithmetic
+//
+// The three predicates below carry the crate's load-bearing invariants:
+// records never straddle the wrap, the writer never laps a reader, and a
+// length read out of the region is bounded before it becomes a slice length.
+// They are free functions over plain integers so `verify.rs` can prove them
+// for every input rather than for the handful the unit tests pick.
+// ---------------------------------------------------------------------------
+
+/// Where a record of `rec` bytes goes when written at absolute position
+/// `committed`, as `(start_abs, gap)`. A nonzero `gap` is the wrap gap left
+/// unused at the end of the current lap because the record would not fit
+/// contiguously.
+///
+/// `capacity` is a power of two and `rec <= capacity`.
+#[inline]
+const fn reserve(committed: u64, rec: u64, capacity: u64) -> (u64, u64) {
+    let phys = committed & (capacity - 1);
+    if phys + rec > capacity {
+        let gap = capacity - phys;
+        (committed + gap, gap)
+    } else {
+        (committed, 0)
+    }
+}
+
+/// Whether a write needing `need` bytes fits without overwriting the slowest
+/// active reader.
+///
+/// Assumes `slowest <= committed`: a cursor is only ever moved to a position
+/// the writer has already published. Violating it costs a wrapped subtraction,
+/// which reads as "full" or overflows the sum, never as space that is not
+/// there — see `KANI.md`. `Writer::fits` checks the assumption under the
+/// verification cfgs.
+#[inline]
+const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> bool {
+    committed.wrapping_sub(slowest) + need <= capacity
+}
+
+/// Whether a record whose length field reads `len` fits inside the data region
+/// when its header starts at physical offset `phys`.
+///
+/// This is the straddle predicate `phys + frame_len(len) <= capacity`, kept in
+/// `u64` and rewritten to avoid overflow. `capacity - 8 - phys` cannot
+/// underflow (`phys <= capacity - 8` for an 8-aligned in-bounds header) and is
+/// a multiple of 8, and for a multiple of 8 `m`, `round_up8(len) > m` exactly
+/// when `len > m` — so comparing the raw length is the same test as comparing
+/// the padded one, without the padding's chance to wrap.
+///
+/// The caller must not convert `len` to `usize` first: on a 32-bit target
+/// `frame_len` of a garbage length wraps and defeats this very check.
+#[inline]
+const fn record_fits(len: u64, phys: u64, capacity: u64) -> bool {
+    len <= capacity - 8 - phys
 }
 
 // ---------------------------------------------------------------------------
@@ -644,13 +736,7 @@ impl Inner {
     /// `gap` is a wrap gap left at the end of the current lap.
     #[inline]
     fn reserve(&self, committed: u64, rec: u64) -> (u64, u64) {
-        let phys = committed & self.mask;
-        if phys + rec > self.capacity {
-            let gap = self.capacity - phys;
-            (committed + gap, gap)
-        } else {
-            (committed, 0)
-        }
+        reserve(committed, rec, self.capacity)
     }
 
     /// Write a record's header and payload at physical offset `phys`. Plain
@@ -960,8 +1046,9 @@ impl RingBuffer {
     }
 
     /// Number of currently registered views. Test-only introspection into the
-    /// reader table, for the slot-reclamation tests.
-    #[cfg(test)]
+    /// reader table, for the slot-reclamation tests, which the loom models do
+    /// not run.
+    #[cfg(all(test, not(ring_loom)))]
     pub(crate) fn reader_count(&self) -> usize {
         (0..self.inner.max_readers)
             .filter(|&s| self.inner.slot_cursor(s).load(Relaxed) != FREE_SLOT)
@@ -1031,7 +1118,7 @@ unsafe fn init_region(
                 .write(ReaderSlot {
                     cursor: AtomicU64::new(FREE_SLOT),
                     owner: AtomicU64::new(0),
-                    _pad: [0; 48],
+                    _pad: [0; READER_SLOT_PAD],
                 });
         }
     }
@@ -1045,14 +1132,7 @@ struct Geometry {
     max_readers: u32,
 }
 
-/// Validate and read the immutable header fields from an existing region.
-///
-/// After `Ok`, every offset the ring will ever dereference (the control
-/// block, all `max_readers` reader slots, and `data_offset + phys` for
-/// `phys < capacity`) lies inside `[0, region_len)` and is 8-aligned. In
-/// other words, attaching restores the same geometry invariant that `layout`
-/// and `init_region` establish at creation. All arithmetic is checked `u64`,
-/// so a hostile header cannot overflow its way past a bound.
+/// Read and validate the immutable header fields of an existing region.
 ///
 /// # Safety
 /// `base` points at a readable region of at least `region_len` bytes.
@@ -1070,7 +1150,21 @@ unsafe fn read_header(base: *mut u8, region_len: usize) -> Result<Geometry, Atta
     let hdr_bytes =
         unsafe { core::slice::from_raw_parts(base as *const u8, size_of::<RegionHeader>()) };
     let hdr = RegionHeader::read_from_bytes(hdr_bytes).expect("exact-size slice");
+    validate_header(&hdr, region_len)
+}
 
+/// Check a region header against the geometry invariant.
+///
+/// After `Ok`, every offset the ring will ever dereference (the control block,
+/// all `max_readers` reader slots, and `data_offset + phys` for
+/// `phys < capacity`) lies inside `[0, region_len)` and is 8-aligned. In other
+/// words, attaching restores the same geometry invariant that `layout` and
+/// `init_region` establish at creation. All arithmetic is checked `u64`, so a
+/// hostile header cannot overflow its way past a bound.
+///
+/// Split out from `read_header` and free of raw pointers so `verify.rs` can
+/// run it against a fully symbolic header.
+fn validate_header(hdr: &RegionHeader, region_len: usize) -> Result<Geometry, AttachError> {
     if hdr.magic != MAGIC {
         return Err(AttachError::BadMagic);
     }
@@ -1167,7 +1261,17 @@ impl<WD: WakeSource> Writer<WD> {
     #[inline]
     fn fits(&self, committed: u64, need: u64) -> bool {
         let slowest = self.inner.slowest_active_cursor().unwrap_or(committed);
-        committed.wrapping_sub(slowest) + need <= self.inner.capacity
+        // The assumption `fits` is written against. Checked only where it is
+        // being verified: a violation costs a spurious `WouldBlock`, so making
+        // it a panic in every downstream debug build would trade a benign
+        // outcome for a crash. Loom model
+        // `cursor_never_exceeds_committed_at_fits` is what exercises it.
+        #[cfg(any(test, ring_loom))]
+        debug_assert!(
+            slowest <= committed,
+            "cursor {slowest} is ahead of committed {committed}"
+        );
+        fits(committed, slowest, need, self.inner.capacity)
     }
 
     /// Write the record bytes, publish the wrap gap (if any) and the new
@@ -1384,16 +1488,10 @@ impl<RD: WakeSink> View<RD> {
             // guarantees `capacity >= 8`, so `phys <= cap - 8`), and `r < c`
             // orders this read after the record's publication.
             let len = unsafe { self.inner.read_len(phys) };
-            // Bound the length in u64 before converting to usize or doing
-            // pointer math; on a 32-bit target, `frame_len` of a garbage
-            // length would wrap `usize` and defeat this very check. The
-            // comparison is the straddle predicate `phys + rec > cap`
-            // rewritten to avoid overflow (`cap - phys - 8` is a multiple of
-            // 8 and cannot underflow, and for a multiple of 8 `m`,
-            // `round_up8(len) > m` exactly when `len > m`). A real record
-            // never straddles and the writer can never lap a reader, so a hit
-            // means the region is corrupt and must not be borrowed from.
-            if len > cap - 8 - phys as u64 {
+            // A real record never straddles and the writer can never lap a
+            // reader, so a failure here means the region is corrupt and must
+            // not be borrowed from.
+            if !record_fits(len, phys as u64, cap) {
                 return Err(ReadError::Corrupt);
             }
             let len = len as usize;
@@ -1443,5 +1541,13 @@ impl Drop for ReadGrant<'_> {
     }
 }
 
-#[cfg(test)]
+// The std tests drive real threads and mmap; a loom atomic touched outside
+// `loom::model` panics, so the two test modules are mutually exclusive.
+#[cfg(all(test, not(ring_loom)))]
 mod tests;
+
+#[cfg(all(test, ring_loom))]
+mod loom_tests;
+
+#[cfg(kani)]
+mod verify;

@@ -21,3 +21,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.13"
+
+[target.'cfg(ring_loom)'.dev-dependencies]
+loom = "0.7"
