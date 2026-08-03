@@ -474,9 +474,14 @@ fn raw_attach_swap_reacquire() {
     assert_eq!(&buf[..], b"raw-occ2");
 }
 
-// ----- mmap backing (feature-gated) -----
+// ----- mmap backing -----
+//
+// Excluded from Miri: these need a real temp directory and a real `mmap`,
+// neither of which Miri provides. They used to be excluded by a feature gate
+// that no longer exists.
 
 #[test]
+#[cfg(not(miri))]
 fn mmap_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ring.bin");
@@ -764,6 +769,7 @@ fn attach_rejects_misaligned() {
 /// even below the header) fails cleanly instead of mapping short and reading
 /// out of bounds.
 #[test]
+#[cfg(not(miri))]
 fn attach_mmap_rejects_truncated_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ring.bin");

@@ -395,7 +395,14 @@ struct Backing {
 }
 
 enum BackingOwner {
-    Heap { _words: Box<[Word]> },
+    /// The heap allocation, held as a raw pointer rather than a live `Box`.
+    ///
+    /// Retaining the `Box` would be unsound. Moving it into this enum is a
+    /// `Unique` retag, which invalidates every pointer already derived from
+    /// it — and `Backing::base` is derived from it, so every access the ring
+    /// ever makes would be through a dead tag. Miri reports it as the first
+    /// write in `init_region`.
+    Heap { words: *mut [Word] },
     Mmap { _map: memmap2::MmapMut },
     Raw,
 }
@@ -403,17 +410,20 @@ enum BackingOwner {
 impl Backing {
     /// Allocate a zeroed heap region of at least `size` bytes.
     ///
-    /// The region is a leaked `Box<[Word]>`, which makes it interior-mutable
-    /// and 8-aligned on every target.
+    /// The region is a `Box<[Word]>` given up to a raw pointer, which makes it
+    /// interior-mutable and 8-aligned on every target. `Drop` reconstructs the
+    /// box to free it.
     pub fn heap(size: usize) -> Self {
-        let words = size.div_ceil(8);
-        let buf: Box<[Word]> = (0..words).map(|_| Word(UnsafeCell::new(0u64))).collect();
+        let count = size.div_ceil(8);
+        let buf: Box<[Word]> = (0..count).map(|_| Word(UnsafeCell::new(0u64))).collect();
         let len = buf.len() * 8;
-        let base = buf.as_ptr() as *mut u8;
+        // Give up the box before deriving `base`, so the pointer the ring uses
+        // is the one that owns the allocation and nothing retags it later.
+        let words = Box::into_raw(buf);
         Self {
-            base,
+            base: words.cast::<u8>(),
             len,
-            _owner: BackingOwner::Heap { _words: buf },
+            _owner: BackingOwner::Heap { words },
         }
     }
 
@@ -453,7 +463,17 @@ impl Backing {
     fn len(&self) -> usize {
         self.len
     }
+}
 
+impl Drop for Backing {
+    fn drop(&mut self) {
+        if let BackingOwner::Heap { words } = self._owner {
+            // SAFETY: `words` came from `Box::into_raw` in `heap`, is the sole
+            // owner of that allocation, and is reconstructed exactly once,
+            // here. The mmap and raw variants free themselves or nothing.
+            drop(unsafe { Box::from_raw(words) });
+        }
+    }
 }
 
 // SAFETY: the raw pointers make `Backing` `!Send + !Sync` by default, but the
