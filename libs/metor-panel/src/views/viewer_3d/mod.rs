@@ -20,6 +20,9 @@ pub(crate) mod bevy_app;
 pub mod bridge;
 pub mod camera;
 
+mod config;
+pub use config::{CameraConfig, ModelConfig, Viewer3dPanelConfig};
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -41,8 +44,10 @@ use metor_db::DB;
 use metor_proto::types::{ComponentId, ComponentView};
 use smallvec::SmallVec;
 
+#[allow(unused_imports)]
+use crate::inspect;
 use crate::theme::theme;
-use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
+use crate::views::binding::{StreamUpdate, spawn_seeded_stream};
 
 pub use bridge::BevyBridge;
 pub use camera::OrbitCamera;
@@ -109,6 +114,7 @@ pub struct Viewer3d {
     camera: OrbitCamera,
 
     pub models: Vec<gpui::Entity<ModelEntry>>,
+    #[facet(inspect::range(min = "0.1", max = "3.141592653589793"))]
     pub camera_fov: f32,
 
     #[facet(skip)]
@@ -666,30 +672,29 @@ impl Viewer3d {
         extract: fn(&ComponentView<'_>) -> T,
         apply: fn(T, &mut LiveDelta),
     ) -> gpui::Task<()> {
-        cx.spawn(async move |this, cx| {
-            let mut stream = component_id.into_stream(&db).await;
-            loop {
-                let value = extract(&stream.next().await.as_component_view());
+        spawn_seeded_stream(
+            db,
+            component_id,
+            cx,
+            move |_, _| ((), move |view| Some(extract(&view))),
+            move |this, update, cx| {
+                let StreamUpdate::Value(value) = update else {
+                    return;
+                };
                 let cell = entity_cell.clone();
-                let result = this.update(cx, |this, cx| {
-                    cx.update_global::<BevyBridge, _>(|bridge, _| {
-                        bridge.with_world(move |world| {
-                            let Some(entity) = cell.get().copied() else {
-                                return;
-                            };
-                            let mut delta =
-                                world.get::<LiveDelta>(entity).copied().unwrap_or_default();
-                            apply(value, &mut delta);
-                            world.entity_mut(entity).insert(delta);
-                        });
+                cx.update_global::<BevyBridge, _>(|bridge, _| {
+                    bridge.with_world(move |world| {
+                        let Some(entity) = cell.get().copied() else {
+                            return;
+                        };
+                        let mut delta = world.get::<LiveDelta>(entity).copied().unwrap_or_default();
+                        apply(value, &mut delta);
+                        world.entity_mut(entity).insert(delta);
                     });
-                    this.mark_dirty(cx);
                 });
-                if result.is_err() {
-                    break;
-                }
-            }
-        })
+                this.mark_dirty(cx);
+            },
+        )
     }
 }
 

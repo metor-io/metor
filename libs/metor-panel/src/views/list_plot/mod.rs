@@ -16,11 +16,17 @@ use gpui::{
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
+#[allow(unused_imports)]
+use crate::inspect;
+
 use super::time_series::{
-    AxisZone, LABEL_FONT_SIZE, Override, PADDING, PlotBounds, PlotStyle, X_LABEL_HEIGHT,
-    Y_LABEL_WIDTH, axis_zone, plot_area,
+    AxisZone, Override, PADDING, PlotBounds, PlotStyle, X_LABEL_HEIGHT, Y_LABEL_WIDTH, axis_zone,
+    plot_area,
 };
 use super::xy_plot::{paint_xy_overlay, paint_xy_underlay};
+
+mod config;
+pub use config::{ListPlotPanelConfig, ListTraceConfig};
 
 mod line_plot;
 pub use line_plot::ListLinePlot;
@@ -41,6 +47,7 @@ pub struct ListTrace {
     pub style: PlotStyle,
     pub visible: bool,
     pub label: SharedString,
+    #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
 }
 
@@ -247,73 +254,14 @@ impl Render for ListPlot {
             );
 
         if show_legend {
-            let legend_bg = theme.plot_chrome_bg();
-            let mut legend_row = div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap_1()
-                .gap_y_0()
-                .pl(px(Y_LABEL_WIDTH + PADDING))
-                .pb_1()
-                .bg(legend_bg);
-
-            for trace_entity in trace_entities.iter() {
-                let trace = trace_entity.read(cx);
-                let visible = trace.visible;
-                let opacity = if visible { 1.0 } else { 0.3 };
-                let color = Hsla {
-                    a: opacity,
-                    ..trace.color
-                };
-                let text_color = Hsla {
-                    a: opacity,
-                    ..theme.text_secondary
-                };
-                let label = trace.label.clone();
-                let toggle_target = trace_entity.clone();
-                let inspect_target = trace_entity.clone();
-
-                legend_row = legend_row.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event: &gpui::MouseDownEvent, _window, cx| {
-                                toggle_target.update(cx, |t, cx| {
-                                    t.visible = !t.visible;
-                                    cx.notify();
-                                });
-                                this.line_plot.update(cx, |_, cx| cx.notify());
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |_this, event: &gpui::MouseDownEvent, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(crate::inspector::InspectEntity {
-                                        entity: inspect_target.clone().into_any(),
-                                        position: event.position,
-                                    }),
-                                    cx,
-                                );
-                            }),
-                        )
-                        .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
-                        .child(
-                            div()
-                                .text_size(px(LABEL_FONT_SIZE))
-                                .text_color(text_color)
-                                .child(label),
-                        ),
-                );
-            }
-
-            root = root.child(legend_row);
+            root = root.child(crate::views::plot_common::plot_legend(
+                &trace_entities,
+                self.line_plot.clone(),
+                px(Y_LABEL_WIDTH + PADDING),
+                |trace| (trace.label.clone(), trace.color, trace.visible),
+                |trace| trace.visible = !trace.visible,
+                cx,
+            ));
         }
 
         root

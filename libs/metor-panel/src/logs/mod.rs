@@ -67,7 +67,8 @@ impl LogState {
     /// The record with sequence number `seq`, if the ring still holds it.
     pub fn by_seq(&self, seq: u64) -> Option<&LogRecord> {
         let front = self.pushed - self.history.len() as u64;
-        self.history.get(usize::try_from(seq.checked_sub(front)?).ok()?)
+        self.history
+            .get(usize::try_from(seq.checked_sub(front)?).ok()?)
     }
 
     /// Every source name seen, sorted; feeds the viewer's source filter.

@@ -78,7 +78,10 @@ fn build_panel_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
 }
 
 fn text_row(label: &'static str, value: impl Into<SharedString>) -> Box<dyn InspectorRow> {
-    Box::new(TextRow::readonly(SharedString::new_static(label), value.into()))
+    Box::new(TextRow::readonly(
+        SharedString::new_static(label),
+        value.into(),
+    ))
 }
 
 fn src_summary(src: &Option<SourceRef>) -> Option<SharedString> {
@@ -173,7 +176,10 @@ fn scope_or_coordinator_rows(id: &SharedString, wiring: &Wiring) -> Vec<Box<dyn 
         return vec![
             Box::new(HeaderRow::new("Coordinator")),
             text_row("Name", id.clone()),
-            text_row("Cycle rate (Hz)", format!("{}", wiring.coordinator.cycle_rate)),
+            text_row(
+                "Cycle rate (Hz)",
+                format!("{}", wiring.coordinator.cycle_rate),
+            ),
             text_row("Clock", format!("{:?}", wiring.coordinator.clock)),
         ];
     }
@@ -181,12 +187,18 @@ fn scope_or_coordinator_rows(id: &SharedString, wiring: &Wiring) -> Vec<Box<dyn 
     let members = wiring
         .systems
         .iter()
-        .filter(|s| scope_path_of(wiring, s.scope).is_some_and(|p| p == id.as_str() || p.starts_with(&format!("{id}."))))
+        .filter(|s| {
+            scope_path_of(wiring, s.scope)
+                .is_some_and(|p| p == id.as_str() || p.starts_with(&format!("{id}.")))
+        })
         .count()
         + wiring
             .slots
             .iter()
-            .filter(|s| scope_path_of(wiring, s.scope).is_some_and(|p| p == id.as_str() || p.starts_with(&format!("{id}."))))
+            .filter(|s| {
+                scope_path_of(wiring, s.scope)
+                    .is_some_and(|p| p == id.as_str() || p.starts_with(&format!("{id}.")))
+            })
             .count();
     vec![
         Box::new(HeaderRow::new("Scope")),
@@ -196,5 +208,7 @@ fn scope_or_coordinator_rows(id: &SharedString, wiring: &Wiring) -> Vec<Box<dyn 
 }
 
 fn scope_path_of(wiring: &Wiring, scope: Option<usize>) -> Option<&str> {
-    scope.and_then(|i| wiring.scopes.get(i)).map(|s| s.path.as_str())
+    scope
+        .and_then(|i| wiring.scopes.get(i))
+        .map(|s| s.path.as_str())
 }

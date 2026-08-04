@@ -50,6 +50,7 @@ impl JsonTree {
     }
 
     /// Append this node's row (and, when open, its children) to `rows`.
+    #[allow(clippy::too_many_arguments)]
     fn push_node(
         &self,
         key: Option<SharedString>,
@@ -120,12 +121,14 @@ impl JsonTree {
 
         if has_children {
             let path = path.to_string();
-            row = row.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                if !this.toggled.remove(&path) {
-                    this.toggled.insert(path.clone());
-                }
-                cx.notify();
-            }));
+            row = row
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.toggled.remove(&path) {
+                        this.toggled.insert(path.clone());
+                    }
+                    cx.notify();
+                }));
         }
 
         rows.push(row.into_any_element());

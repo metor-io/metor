@@ -390,17 +390,6 @@ pub const ALL: &[OpDescriptor] = &[
         },
         arg_count: 1,
     },
-    OpDescriptor {
-        kind: NodeSpecKind::Resample,
-        label: "Latest At",
-        category: "Resample",
-        inputs: VALUE_AND_CLOCK,
-        output: F64,
-        default_spec: || NodeSpec::Resample {
-            mode: ResampleMode::LatestAt,
-        },
-        arg_count: 1,
-    },
     // DB bridges
     OpDescriptor {
         kind: NodeSpecKind::FromDb,

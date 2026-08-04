@@ -210,7 +210,9 @@ fn history_records_event_kinds() {
 /// gpui `App` — the closures here mirror `AlarmStore::new`'s sources exactly.
 fn alarm_sources() -> Vec<IngestSource<AlarmState>> {
     vec![
-        IngestSource::new(AlarmDef::ID, |s: &mut AlarmState, _ts, def| s.apply_def(def)),
+        IngestSource::new(AlarmDef::ID, |s: &mut AlarmState, _ts, def| {
+            s.apply_def(def)
+        }),
         IngestSource::new(AlarmRaised::ID, |s: &mut AlarmState, ts, r| {
             s.apply_raised(ts, r)
         }),

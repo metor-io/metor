@@ -25,10 +25,15 @@ use std::sync::Arc;
 
 use gpui::{App, Context, Hsla, SharedString};
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ElementValue, PrimType};
+use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType};
 use smallvec::SmallVec;
 
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
+
+pub(crate) enum StreamUpdate<I, V> {
+    Ready(I),
+    Value(V),
+}
 
 /// The single number an instrument view displays: one element of one
 /// component.
@@ -146,14 +151,59 @@ pub(crate) fn rebound(want: ElementRef, bound: &mut Option<ElementRef>) -> bool 
     true
 }
 
-/// The last committed value of one element, or `None` when the component has
-/// never produced a sample.
-pub(crate) fn latest_scalar(db: &DB, at: ElementRef) -> Option<f64> {
-    db.with_state(|state| {
-        let component = state.get_component(at.component)?;
-        let latest = component.time_series.latest()?;
-        let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
-        view.iter().nth(at.element).map(|v| v.as_f64())
+/// Deliver source initialization, the latest committed value, then updates.
+pub(crate) fn spawn_seeded_stream<E, S, I, V, P, D, A>(
+    db: Arc<DB>,
+    source: S,
+    cx: &mut Context<E>,
+    prepare: P,
+    apply: A,
+) -> gpui::Task<()>
+where
+    E: 'static,
+    S: ComponentStreamBuilder + Send + 'static,
+    I: Send + 'static,
+    V: Send + 'static,
+    P: FnOnce(&DB, ComponentId) -> (I, D) + Send + 'static,
+    D: for<'a> Fn(ComponentView<'a>) -> Option<V> + Send + 'static,
+    A: Fn(&mut E, StreamUpdate<I, V>, &mut Context<E>) + Send + 'static,
+{
+    let component_id = source.component_id();
+    cx.spawn(async move |this, cx| {
+        let mut stream = source.into_stream(&db).await;
+        let (initial, decode) = prepare(&db, component_id);
+        if this
+            .update(cx, |view, cx| apply(view, StreamUpdate::Ready(initial), cx))
+            .is_err()
+        {
+            return;
+        }
+
+        let seed = db.with_state(|state| {
+            let component = state.get_component(component_id)?;
+            let latest = component.time_series.latest()?;
+            let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
+            decode(view)
+        });
+        if let Some(seed) = seed
+            && this
+                .update(cx, |view, cx| apply(view, StreamUpdate::Value(seed), cx))
+                .is_err()
+        {
+            return;
+        }
+
+        loop {
+            let value = decode(stream.next().await.as_component_view());
+            let result = this.update(cx, |view, cx| {
+                if let Some(value) = value {
+                    apply(view, StreamUpdate::Value(value), cx);
+                }
+            });
+            if result.is_err() {
+                break;
+            }
+        }
     })
 }
 
@@ -173,46 +223,21 @@ where
     E: 'static,
     F: Fn(&mut E, f64, &mut Context<E>) + Send + 'static,
 {
-    let component_id = source.component_id();
-    cx.spawn(async move |this, cx| {
-        let mut stream = source.into_stream(&db).await;
-        if let Some(seed) = latest_scalar(&db, ElementRef::new(component_id, element)) {
-            let _ = this.update(cx, |view, cx| apply(view, seed, cx));
-        }
-        loop {
-            let value = {
-                let view = stream.next().await;
-                let cv = view.as_component_view();
-                cv.iter().nth(element).map(|v| v.as_f64())
-            };
-            // The update runs even when the element is out of range, so a
-            // mis-bound view still notices its entity going away.
-            let result = this.update(cx, |view, cx| {
-                if let Some(value) = value {
-                    apply(view, value, cx);
-                }
-            });
-            if result.is_err() {
-                break;
+    spawn_seeded_stream(
+        db,
+        source,
+        cx,
+        move |_, _| {
+            ((), move |view: ComponentView<'_>| {
+                view.iter().nth(element).map(|value| value.as_f64())
+            })
+        },
+        move |view, update, cx| {
+            if let StreamUpdate::Value(value) = update {
+                apply(view, value, cx);
             }
-        }
-    })
-}
-
-/// The last committed sample's leading `count` elements, or `None` when the
-/// component has never produced one or is shorter than `count`.
-pub(crate) fn latest_elements(
-    db: &DB,
-    component: ComponentId,
-    count: usize,
-) -> Option<SmallVec<[f64; 4]>> {
-    db.with_state(|state| {
-        let comp = state.get_component(component)?;
-        let latest = comp.time_series.latest()?;
-        let (_size, view) = comp.schema.parse_value(latest.data()).ok()?;
-        let values: SmallVec<[f64; 4]> = view.iter().take(count).map(|v| v.as_f64()).collect();
-        (values.len() == count).then_some(values)
-    })
+        },
+    )
 }
 
 /// Spawn a task forwarding a component's leading `count` elements to `apply`.
@@ -232,27 +257,26 @@ where
     E: 'static,
     F: Fn(&mut E, &[f64], &mut Context<E>) + Send + 'static,
 {
-    cx.spawn(async move |this, cx| {
-        let mut stream = component.into_stream(&db).await;
-        if let Some(seed) = latest_elements(&db, component, count) {
-            let _ = this.update(cx, |view, cx| apply(view, &seed, cx));
-        }
-        loop {
-            let values: SmallVec<[f64; 4]> = {
-                let view = stream.next().await;
-                let cv = view.as_component_view();
-                cv.iter().take(count).map(|v| v.as_f64()).collect()
-            };
-            let result = this.update(cx, |view, cx| {
-                if values.len() == count {
-                    apply(view, &values, cx);
-                }
-            });
-            if result.is_err() {
-                break;
+    spawn_seeded_stream(
+        db,
+        component,
+        cx,
+        move |_, _| {
+            ((), move |view: ComponentView<'_>| {
+                let values: SmallVec<[f64; 4]> = view
+                    .iter()
+                    .take(count)
+                    .map(|value| value.as_f64())
+                    .collect();
+                (values.len() == count).then_some(values)
+            })
+        },
+        move |view, update, cx| {
+            if let StreamUpdate::Value(values) = update {
+                apply(view, &values, cx);
             }
-        }
-    })
+        },
+    )
 }
 
 /// Spawn a task that drains a stream and forwards the boolean
@@ -269,20 +293,17 @@ where
     E: 'static,
     F: Fn(&mut E, bool, &mut Context<E>) + Send + 'static,
 {
-    cx.spawn(async move |this, cx| {
-        let mut stream = source.into_stream(&db).await;
-        loop {
-            let on = {
-                let view = stream.next().await;
-                let cv = view.as_component_view();
-                any_on(cv.iter())
-            };
-            let result = this.update(cx, |target, cx| apply(target, on, cx));
-            if result.is_err() {
-                break;
+    spawn_seeded_stream(
+        db,
+        source,
+        cx,
+        |_, _| ((), |view: ComponentView<'_>| Some(any_on(view.iter()))),
+        move |view, update, cx| {
+            if let StreamUpdate::Value(on) = update {
+                apply(view, on, cx);
             }
-        }
-    })
+        },
+    )
 }
 
 /// Returns `true` if any element of the iterator is "on".

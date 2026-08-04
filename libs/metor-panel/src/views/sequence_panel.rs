@@ -162,12 +162,13 @@ pub(crate) fn channel_control_rows(
         rows.push(Box::new(CommandRow::new(
             "Start",
             Arc::new({
-            let channel = channel.clone();
-move |_window, cx| {
-                if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).start(&channel);
+                let channel = channel.clone();
+                move |_window, cx| {
+                    if let Some(store) = sequences::try_global(cx) {
+                        store.read(cx).start(&channel);
+                    }
                 }
-            }}),
+            }),
         )));
     }
     rows.push(Box::new(CommandRow::new(

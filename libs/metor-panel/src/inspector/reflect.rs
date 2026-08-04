@@ -57,8 +57,6 @@ pub fn default_rows_for_any_entity(
     let Some(adapter) = registry.entity_adapter(any_entity.entity_type()).cloned() else {
         return vec![];
     };
-    let parent_shape_id = adapter.shape_id;
-
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
     (adapter.peek)(any_entity, cx, &mut |peek| {
         let Ok(peek_struct) = (*peek).into_struct() else {
@@ -76,13 +74,14 @@ pub fn default_rows_for_any_entity(
 
             let ctx = FieldBuildCtx {
                 db,
-                label: SharedString::from(field_def.name),
+                label: SharedString::from(
+                    crate::inspect::field_label(field_def).unwrap_or(field_def.name),
+                ),
                 field_name: field_def.name,
+                field_def,
             };
 
-            if let Some(row) =
-                registry.row_for_field(&ctx, &field_peek, any_entity, idx, parent_shape_id, cx)
-            {
+            if let Some(row) = registry.row_for_field(&ctx, &field_peek, any_entity, idx, cx) {
                 rows.push(row);
             }
         }

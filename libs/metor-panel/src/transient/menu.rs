@@ -73,17 +73,13 @@ fn window_menu(
             let tiles = tiles.clone();
             let db = db.clone();
             let on_open = on_open.clone();
-            move |window, cx| {
-                split_active(&tiles, SplitDirection::Right, &db, &on_open, window, cx)
-            }
+            move |window, cx| split_active(&tiles, SplitDirection::Right, &db, &on_open, window, cx)
         }),
         ChordNode::command("s", "Split down", {
             let tiles = tiles.clone();
             let db = db.clone();
             let on_open = on_open.clone();
-            move |window, cx| {
-                split_active(&tiles, SplitDirection::Down, &db, &on_open, window, cx)
-            }
+            move |window, cx| split_active(&tiles, SplitDirection::Down, &db, &on_open, window, cx)
         }),
         ChordNode::command("n", "New tile…", {
             let tiles = tiles.clone();
@@ -91,7 +87,7 @@ fn window_menu(
             let on_open = on_open.clone();
             move |window, cx| {
                 if let Some(pane) = tiles.read(cx).active_pane(cx) {
-                    let rows = new_panel_rows(db.clone(), pane, Some(on_open.clone()));
+                    let rows = new_panel_rows(db.clone(), pane, Some(on_open.clone()), cx);
                     open_centered(&on_open, rows, window, cx);
                 }
             }
@@ -126,7 +122,9 @@ fn layout_menu(tiles: Entity<TileGroup>, on_open: OpenInspectorCallback) -> Vec<
         ChordNode::command("l", "Load preset", {
             let tiles = tiles.clone();
             let on_open = on_open.clone();
-            move |window, cx| open_centered(&on_open, preset_load_rows(tiles.clone(), cx), window, cx)
+            move |window, cx| {
+                open_centered(&on_open, preset_load_rows(tiles.clone(), cx), window, cx)
+            }
         }),
     ]
 }
@@ -212,7 +210,7 @@ fn split_active(
         Some(new_pane)
     });
     if let Some(new_pane) = new_pane {
-        let rows = new_panel_rows(db.clone(), new_pane, Some(on_open.clone()));
+        let rows = new_panel_rows(db.clone(), new_pane, Some(on_open.clone()), cx);
         open_centered(on_open, rows, window, cx);
     }
 }

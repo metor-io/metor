@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, Bounds, Context, Entity, Hsla, IntoElement, MouseButton, PathBuilder, Pixels,
-    Point, SharedString, Styled, Subscription, TextRun, Window, canvas, div, point, prelude::*, px,
+    Point, SharedString, Styled, Subscription, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
@@ -16,6 +16,12 @@ use crate::views::json_tree::JsonTree;
 
 mod axis;
 pub use axis::YAxis;
+
+mod config;
+pub use config::{
+    EventOverlayConfig, MeasurementCursorConfig, MeasurementPanelConfig, PlotPanelConfig,
+    TraceConfig, YAxisConfig,
+};
 
 mod event_overlay;
 pub use event_overlay::EventOverlay;
@@ -667,18 +673,6 @@ fn paint_overlay(
     let axis_count = view.axis_count();
     let pb = plot_area(outer_bounds, axis_count);
     let theme = crate::theme::theme(cx);
-    let label_font_size = px(LABEL_FONT_SIZE);
-    let text_style = window.text_style();
-    let font = text_style.font();
-
-    let make_run = |text: &str, color: Hsla| TextRun {
-        len: text.len(),
-        font: font.clone(),
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
 
     let axis_bg = theme.plot_chrome_bg();
     let y_axis_bg = Bounds {
@@ -727,20 +721,19 @@ fn paint_overlay(
             if y < pb.origin.y || y > pb.origin.y + pb.size.height {
                 continue;
             }
-            let text = format_value_label(tick);
-            let run = make_run(&text, color);
-            let shaped = window.text_system().shape_line(
-                SharedString::from(text),
-                label_font_size,
-                &[run],
-                None,
-            );
             // Right-aligned 4px clear of the axis rule; a label wider than
             // its column pins to the pane edge instead of painting over the
             // tile border (this canvas draws above the tile chrome).
-            let label_x = (col_right - shaped.width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
-            let origin = point(label_x, y - label_font_size / 2.0);
-            let _ = shaped.paint(origin, label_font_size, window, cx);
+            crate::views::plot_common::paint_value_label(
+                tick,
+                color,
+                |width, font_size| {
+                    let x = (col_right - width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
+                    point(x, y - font_size / 2.0)
+                },
+                window,
+                cx,
+            );
         }
     }
 
@@ -755,22 +748,22 @@ fn paint_overlay(
             continue;
         }
         let text = format_time_label(tick, t_min_i, fmt, span_us);
-        let run = make_run(&text, theme.text_secondary);
-        let shaped = window.text_system().shape_line(
-            SharedString::from(text),
-            label_font_size,
-            &[run],
-            None,
-        );
         // Centered on the tick, but a label near an edge tick is pulled
         // inside the pane so it can't run over the tile border — the right
         // chrome is only PADDING wide, far narrower than a time label.
-        let label_x = (x - shaped.width / 2.0).clamp(
-            outer_bounds.origin.x + px(2.0),
-            outer_bounds.origin.x + outer_bounds.size.width - shaped.width - px(2.0),
+        crate::views::plot_common::paint_text_label(
+            text,
+            theme.text_secondary,
+            |width, _| {
+                let label_x = (x - width / 2.0).clamp(
+                    outer_bounds.origin.x + px(2.0),
+                    outer_bounds.origin.x + outer_bounds.size.width - width - px(2.0),
+                );
+                point(label_x, pb.origin.y + pb.size.height + px(4.0))
+            },
+            window,
+            cx,
         );
-        let origin = point(label_x, pb.origin.y + pb.size.height + px(4.0));
-        let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 
     // One vertical rule per axis at its column's right edge, colored to
@@ -824,16 +817,18 @@ fn paint_overlay(
             window.paint_path(path, *color);
         }
         if !label.is_empty() {
-            let run = make_run(label.as_ref(), *color);
-            let shaped =
-                window
-                    .text_system()
-                    .shape_line(label.clone(), label_font_size, &[run], None);
-            let origin = point(
-                pb.origin.x + pb.size.width - shaped.width - px(4.0),
-                y - label_font_size - px(2.0),
+            crate::views::plot_common::paint_text_label(
+                label.clone(),
+                *color,
+                |width, font_size| {
+                    point(
+                        pb.origin.x + pb.size.width - width - px(4.0),
+                        y - font_size - px(2.0),
+                    )
+                },
+                window,
+                cx,
             );
-            let _ = shaped.paint(origin, label_font_size, window, cx);
         }
     }
 
@@ -1096,6 +1091,7 @@ pub struct Trace {
     pub style: PlotStyle,
     pub visible: bool,
     pub label: SharedString,
+    #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
     /// Index into the owning plot's `axes`. Edited via the axis picker, not
     /// reflected directly. Clamped to a valid axis by the plot's reconcile.
@@ -1388,11 +1384,7 @@ impl TimeSeriesPlot {
     /// Rehydrate persisted cursors from saved config. Trace-index references
     /// are clamped to the current trace list, and out-of-range indices fall
     /// back to "no focused trace" so the cursor still renders.
-    pub fn restore_cursors(
-        &mut self,
-        cfg: &[crate::tiles::panels::MeasurementCursorConfig],
-        cx: &mut Context<Self>,
-    ) {
+    pub fn restore_cursors(&mut self, cfg: &[MeasurementCursorConfig], cx: &mut Context<Self>) {
         let lp_weak = self.line_plot.downgrade();
         let host_weak = cx.entity().downgrade();
         let traces = self.line_plot.read(cx).traces().to_vec();
@@ -2618,73 +2610,14 @@ impl Render for TimeSeriesPlot {
         root = root.child(inner);
 
         if show_legend {
-            let legend_bg = theme.plot_chrome_bg();
-            let mut legend_row = div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap_1()
-                .gap_y_0()
-                .pl(chrome_left)
-                .pb_1()
-                .bg(legend_bg);
-
-            for trace_entity in trace_entities.iter() {
-                let trace = trace_entity.read(cx);
-                let visible = trace.visible;
-                let opacity = if visible { 1.0 } else { 0.3 };
-                let color = Hsla {
-                    a: opacity,
-                    ..trace.color
-                };
-                let text_color = Hsla {
-                    a: opacity,
-                    ..theme.text_secondary
-                };
-                let label = trace.label.clone();
-                let toggle_target = trace_entity.clone();
-                let inspect_target = trace_entity.clone();
-
-                legend_row = legend_row.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event: &gpui::MouseDownEvent, _window, cx| {
-                                toggle_target.update(cx, |t, cx| {
-                                    t.visible = !t.visible;
-                                    cx.notify();
-                                });
-                                this.line_plot.update(cx, |_, cx| cx.notify());
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |_this, event: &gpui::MouseDownEvent, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(crate::inspector::InspectEntity {
-                                        entity: inspect_target.clone().into_any(),
-                                        position: event.position,
-                                    }),
-                                    cx,
-                                );
-                            }),
-                        )
-                        .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
-                        .child(
-                            div()
-                                .text_size(px(LABEL_FONT_SIZE))
-                                .text_color(text_color)
-                                .child(label),
-                        ),
-                );
-            }
-
-            root = root.child(legend_row);
+            root = root.child(crate::views::plot_common::plot_legend(
+                &trace_entities,
+                self.line_plot.clone(),
+                chrome_left,
+                |trace| (trace.label.clone(), trace.color, trace.visible),
+                |trace| trace.visible = !trace.visible,
+                cx,
+            ));
         }
 
         root

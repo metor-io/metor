@@ -20,7 +20,7 @@ use crate::views::time_series::{EventOverlay, LinePlot, Override, Trace, YAxis};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
-use super::{AddBehavior, FieldOverride, InspectorRegistry, builders};
+use super::{AddBehavior, InspectorRegistry, builders};
 
 impl InspectorRegistry {
     pub(super) fn register_defaults(&mut self, db: Arc<DB>) {
@@ -90,35 +90,7 @@ impl InspectorRegistry {
         self.register_dashboard_builder(db.clone());
         self.register_pane_builder();
         self.register_component_browser_builder();
-        self.register_field_override::<crate::views::time_series::Trace>(
-            "stroke_width",
-            FieldOverride {
-                range: Some((0.5, 10.0)),
-                ..FieldOverride::default()
-            },
-        );
         self.register_trace_builder(db.clone());
-        self.register_field_override::<crate::views::viewer_3d::Viewer3d>(
-            "camera_fov",
-            FieldOverride {
-                range: Some((0.1, std::f64::consts::PI)),
-                ..FieldOverride::default()
-            },
-        );
-        self.register_field_override::<crate::views::xy_plot::XyTrace>(
-            "stroke_width",
-            FieldOverride {
-                range: Some((0.5, 10.0)),
-                ..FieldOverride::default()
-            },
-        );
-        self.register_field_override::<crate::views::xy_plot::XyTrace>(
-            "style",
-            FieldOverride {
-                enum_allowed: Some(&["Line", "Scatter"]),
-                ..FieldOverride::default()
-            },
-        );
         self.register_entity_list::<XyLinePlot, XyTrace>(
             db.clone(),
             |lp| &lp.traces,
@@ -126,20 +98,6 @@ impl InspectorRegistry {
             AddBehavior::Wizard(Arc::new(|parent, db, cx| {
                 builders::build_xy_trace_add_wizard(parent, db, cx)
             })),
-        );
-        self.register_field_override::<crate::views::list_plot::ListTrace>(
-            "stroke_width",
-            FieldOverride {
-                range: Some((0.5, 10.0)),
-                ..FieldOverride::default()
-            },
-        );
-        self.register_field_override::<crate::views::list_plot::ListTrace>(
-            "style",
-            FieldOverride {
-                enum_allowed: Some(&["Line", "Scatter", "Bar"]),
-                ..FieldOverride::default()
-            },
         );
         self.register_entity_list::<ListLinePlot, ListTrace>(
             db.clone(),

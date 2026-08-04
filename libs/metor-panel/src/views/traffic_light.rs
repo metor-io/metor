@@ -6,10 +6,18 @@ use gpui::{
 };
 use metor_db::DB;
 use metor_proto::types::{ComponentId, ElementValue};
+use serde::{Deserialize, Serialize};
 
 use super::binding::{component_meta, spawn_meta_resolver, spawn_on_stream};
 use crate::ComponentStreamBuilder;
 use crate::theme::{Theme, theme};
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct TrafficLightConfig {
+    pub component: String,
+    pub color: Option<Hsla>,
+}
 
 /// Single-component on/off indicator.
 ///

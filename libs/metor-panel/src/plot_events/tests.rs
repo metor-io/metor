@@ -53,7 +53,10 @@ fn kind_key_string_round_trip() {
         assert_eq!(kind_key_from_string(&s), Some(key));
     }
     // Exact wire form for a message id.
-    assert_eq!(kind_key_to_string(EventKindKey::Msg([0xe0, 0x3c])), "msg:e03c");
+    assert_eq!(
+        kind_key_to_string(EventKindKey::Msg([0xe0, 0x3c])),
+        "msg:e03c"
+    );
     assert_eq!(
         kind_key_from_string("msg:e03c"),
         Some(EventKindKey::Msg([0xe0, 0x3c]))

@@ -15,7 +15,6 @@ pub mod config;
 pub mod coordinator;
 pub mod graph;
 pub mod inspector_rows;
-pub mod palette_provider;
 pub mod pane;
 pub mod registry;
 pub mod spec;

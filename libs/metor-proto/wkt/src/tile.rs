@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bumped only on a structural break in the document. Field-level changes
 /// rely on `#[serde(default)]` instead.
-pub const TILE_LAYOUT_VERSION: u32 = 4;
+pub const TILE_LAYOUT_VERSION: u32 = 5;
 
 /// A complete tile layout document.
 #[derive(Serialize, Deserialize, Debug, Clone)]

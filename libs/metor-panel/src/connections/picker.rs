@@ -38,8 +38,13 @@ enum Phase {
         target: ConnectionTarget,
         inspector: Entity<Inspector>,
     },
-    ManualAddress { error: Option<SharedString> },
-    LayoutChoice { layout: String, choice: usize },
+    ManualAddress {
+        error: Option<SharedString>,
+    },
+    LayoutChoice {
+        layout: String,
+        choice: usize,
+    },
 }
 
 /// Everything the keyboard can land on, in visual order: favorite cards,

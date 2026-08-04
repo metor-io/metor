@@ -364,14 +364,10 @@ pub(super) fn auto_layout_positions(g: &NodeGraph) -> Vec<(FlowId, (f32, f32))> 
 
     let mut ids: Vec<FlowId> = g.nodes.keys().cloned().collect();
     ids.sort();
-    let index: HashMap<&FlowId, usize> =
-        ids.iter().enumerate().map(|(i, id)| (id, i)).collect();
+    let index: HashMap<&FlowId, usize> = ids.iter().enumerate().map(|(i, id)| (id, i)).collect();
     let sockets = |id: &FlowId| {
         let entry = &g.nodes[id];
-        (
-            input_count(entry, &g.edges, id),
-            args_count(&entry.spec),
-        )
+        (input_count(entry, &g.edges, id), args_count(&entry.spec))
     };
     let nodes: Vec<LayoutNode> = ids
         .iter()
@@ -398,11 +394,9 @@ pub(super) fn auto_layout_positions(g: &NodeGraph) -> Vec<(FlowId, (f32, f32))> 
             })
         })
         .collect();
-    let tie_break: Vec<usize> = (0..ids.len()).collect();
     let out = graph_layout::compute(&LayoutInput {
         nodes: &nodes,
         edges: &edges,
-        tie_break: &tie_break,
         options: LayoutOptions {
             layer_gap: 80.0,
             node_gap: 24.0,

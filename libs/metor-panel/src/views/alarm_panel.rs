@@ -218,10 +218,7 @@ fn active_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyElemen
                 .map(|def| def.name.clone())
                 .unwrap_or_else(|| alarm.def_id.clone());
             let acked = state.is_acked(alarm.occurrence);
-            let value_str = alarm
-                .value
-                .map(|v| format!("{v:.3}"))
-                .unwrap_or_default();
+            let value_str = alarm.value.map(|v| format!("{v:.3}")).unwrap_or_default();
             let name_color = if acked {
                 theme.text_secondary
             } else {
@@ -301,10 +298,7 @@ fn history_rows(state: &AlarmState, theme: &crate::theme::Theme) -> Vec<AnyEleme
         .map(|event| {
             let (label, color) = match event.kind {
                 AlarmEventKind::Raised => {
-                    let idx = event
-                        .severity
-                        .map(alarms::severity_index)
-                        .unwrap_or(0);
+                    let idx = event.severity.map(alarms::severity_index).unwrap_or(0);
                     ("Raised", theme.alarm_color(idx))
                 }
                 AlarmEventKind::Cleared => ("Cleared", theme.text_secondary),

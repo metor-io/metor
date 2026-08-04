@@ -9,6 +9,7 @@ pub mod dashboard;
 pub mod data_table;
 pub mod format;
 pub mod gauge;
+pub(crate) mod instrument;
 pub mod json_tree;
 pub mod lazy_pool;
 pub mod list_plot;
@@ -36,13 +37,13 @@ pub use attitude::{AttitudeConfig, AttitudeIndicator, VectorMarker, VectorMarker
 pub use column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 pub use component_browser::{BrowserEvent, ComponentBrowser, new_component_browser};
 pub use component_table::{ComponentTable, new_component_table};
-pub use component_text::ComponentText;
+pub use component_text::{ComponentText, ComponentTextConfig};
 pub use data_table::{DataTable, new_data_table};
 pub(crate) use format::format_number;
-pub use gauge::{Gauge, GaugeConfig, GaugeStyle};
 pub use format::{ElementIndexes, format_element_value, format_value};
+pub use gauge::{Gauge, GaugeConfig, GaugeStyle};
 pub use json_tree::JsonTree;
-pub use list_plot::{ListLinePlot, ListPlot, ListTrace};
+pub use list_plot::{ListLinePlot, ListPlot, ListPlotPanelConfig, ListTrace, ListTraceConfig};
 pub use log_panel::{LevelFilter, LogView};
 pub use meter::{Meter, MeterConfig, Orientation};
 pub use monitor::Monitor;
@@ -52,11 +53,15 @@ pub use sequence_grid::SequenceGrid;
 pub use sequence_panel::SequenceView;
 pub use state_chip::{StateChip, StateChipConfig, StateEntry, StateEntryConfig};
 pub use table::{Column, ColumnSort, Table, TableDelegate};
-pub use time_series::{PlotStyle, TimeSeriesPlot, Trace};
+pub use time_series::{
+    EventOverlayConfig, MeasurementCursorConfig, MeasurementPanelConfig, PlotPanelConfig,
+    PlotStyle, TimeSeriesPlot, Trace, TraceConfig, YAxisConfig,
+};
 pub use tooltip::TooltipText;
-pub use traffic_light::TrafficLight;
-pub use traffic_light_grid::TrafficLightGrid;
+pub use traffic_light::{TrafficLight, TrafficLightConfig};
+pub use traffic_light_grid::{TrafficLightGrid, TrafficLightGridConfig};
 pub use value_strip::{
     ComponentValueStrip, StripBehavior, StripCell, StripClick, StripPreset, StripStyle,
 };
-pub use xy_plot::{XyLinePlot, XyPlot, XyTrace};
+pub use viewer_3d::{CameraConfig, ModelConfig, Viewer3dPanelConfig};
+pub use xy_plot::{XyLinePlot, XyPlot, XyPlotPanelConfig, XyTrace, XyTraceConfig};

@@ -8,7 +8,6 @@ use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripClick, StripStyle};
 use crate::inspector::plot_preview::shift_hover_listener;
 use crate::theme::theme;
-use crate::{ComponentStream, WalComponentStream};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, IntoElement, Pixels, SharedString, Window, div,
     prelude::*, px,
@@ -29,7 +28,6 @@ struct ComponentRow {
     sparkline: Entity<LinePlot>,
     strip: Entity<ComponentValueStrip>,
     click: StripClick,
-    _task: gpui::Task<()>,
 }
 
 impl ComponentRow {
@@ -73,19 +71,6 @@ impl ComponentRow {
             })
         };
 
-        // Wake the row on every sample so the sort column and sparkline
-        // stay current even when the strip doesn't need to redraw.
-        let mut stream = WalComponentStream::new(&component);
-        let task = cx.spawn(async move |this, cx| {
-            loop {
-                stream.next().await;
-                let result = this.update(cx, |_this, cx| cx.notify());
-                if result.is_err() {
-                    break;
-                }
-            }
-        });
-
         Self {
             db,
             name,
@@ -93,7 +78,6 @@ impl ComponentRow {
             sparkline,
             strip,
             click,
-            _task: task,
         }
     }
 

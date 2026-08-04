@@ -372,7 +372,7 @@ impl EventSource for SequenceEventSource {
                 color: theme.run_state_color(run_state_index(entry.run_state)),
                 label: sequence_label(entry),
                 // The step label alone ("Started", "Loaded x") chips well.
-                short: entry.label.clone().into(),
+                short: entry.label.clone(),
                 detail: EventDetail::Sequence(entry.clone()),
             })
             .collect()

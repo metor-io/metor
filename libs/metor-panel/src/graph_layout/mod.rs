@@ -31,7 +31,9 @@ use smallvec::SmallVec;
 pub type NodeIx = usize;
 
 /// Flow direction of the layered layout.
-#[derive(facet::Facet, serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    facet::Facet, serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq,
+)]
 #[repr(u8)]
 pub enum Direction {
     #[default]
@@ -109,9 +111,6 @@ impl Default for LayoutOptions {
 pub struct LayoutInput<'a> {
     pub nodes: &'a [LayoutNode],
     pub edges: &'a [LayoutEdge],
-    /// Tie-break rank per node (the caller's declaration order), so ordering
-    /// ties resolve deterministically without the engine knowing about ids.
-    pub tie_break: &'a [usize],
     pub options: LayoutOptions,
 }
 
@@ -141,7 +140,6 @@ pub struct LayoutOutput {
 /// output.
 pub fn compute(input: &LayoutInput) -> LayoutOutput {
     let n = input.nodes.len();
-    debug_assert_eq!(input.tie_break.len(), n);
     let transposed = input.options.direction == Direction::TopBottom;
 
     // Normalized (left→right) sizes; a transposed layout swaps them back at
@@ -160,7 +158,7 @@ pub fn compute(input: &LayoutInput) -> LayoutOutput {
         .collect();
 
     let layers = rank::assign_layers(n, input.edges);
-    let arena = order::Arena::build(n, input.edges, &layers, input.tie_break);
+    let arena = order::Arena::build(n, input.edges, &layers);
     let geo = coords::assign(&arena, &sizes, &input.options);
 
     let mut positions: Vec<(f32, f32)> = (0..n)

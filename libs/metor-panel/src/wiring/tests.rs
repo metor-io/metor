@@ -1,6 +1,4 @@
-use metor_fsw_2::ir::{
-    ClockSpec, CoordinatorSpec, IR_VERSION, ParamSource, SystemSpec, Wiring,
-};
+use metor_fsw_2::ir::{ClockSpec, CoordinatorSpec, IR_VERSION, ParamSource, SystemSpec, Wiring};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::WiringManifest;
 
@@ -84,9 +82,14 @@ fn version_mismatch_surfaced_as_error() {
             ir_json: "{}".to_string(),
         },
     );
-    let err = state.error().expect("version mismatch must surface an error");
+    let err = state
+        .error()
+        .expect("version mismatch must surface an error");
     assert!(err.contains(&(IR_VERSION + 1).to_string()));
-    assert!(state.wiring().is_none(), "no topology from an unsupported version");
+    assert!(
+        state.wiring().is_none(),
+        "no topology from an unsupported version"
+    );
 }
 
 #[test]
@@ -102,6 +105,9 @@ fn good_manifest_after_error_clears_it() {
     assert!(state.error().is_some());
 
     state.apply(Timestamp(2), manifest_for(&wiring_with_system("gamma")));
-    assert!(state.error().is_none(), "a good manifest clears the held error");
+    assert!(
+        state.error().is_none(),
+        "a good manifest clears the held error"
+    );
     assert_eq!(state.wiring().unwrap().systems[0].name, "gamma");
 }

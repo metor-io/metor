@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::inspector::rows::tag_pill;
 use crate::theme::theme;
-use node::{ChordNode, Dispatch, dispatch};
+use node::{ChordAction, ChordNode};
 
 /// One level of the navigation stack: the rows to show, plus the crumb label of
 /// the submenu that opened it (`None` for the root level).
@@ -92,8 +92,13 @@ impl Transient {
             _ => {}
         }
 
-        match dispatch(self.current_nodes(), key) {
-            Dispatch::Descend { label, build } => {
+        let selected = self
+            .current_nodes()
+            .iter()
+            .find(|node| node.key.as_ref() == key)
+            .map(|node| (node.label.clone(), node.action.clone()));
+        match selected {
+            Some((label, ChordAction::SubMenu(build))) => {
                 let nodes = build(cx);
                 self.stack.push(Level {
                     crumb: Some(label),
@@ -101,13 +106,13 @@ impl Transient {
                 });
                 cx.notify();
             }
-            Dispatch::Leaf(callback) => {
+            Some((_, ChordAction::Command(callback))) => {
                 callback(window, cx);
                 self.dismiss(window);
                 cx.notify();
             }
             // Unknown key at this level: ignore so a stray press is harmless.
-            Dispatch::NoMatch => {}
+            None => {}
         }
     }
 }

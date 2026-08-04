@@ -30,10 +30,10 @@ use metor_fsw_2::ir::{EdgeKind, Wiring};
 pub use config::SystemGraphConfig;
 
 use crate::graph_canvas::{RoutePoints, hit_test_edges, paint_grid, paint_route};
+use crate::graph_layout::Direction;
 use crate::theme::theme;
 use crate::tiles::PaneItem;
 use crate::views::system_graph::config::Viewport;
-use crate::graph_layout::Direction;
 use crate::views::system_graph::layout::{
     GraphEdge, GraphNode, GraphNodeKind, NODE_WIDTH, card_size, layout,
 };
@@ -153,7 +153,13 @@ impl SystemGraphPanel {
         cx.notify();
     }
 
-    fn open_node_inspector(&self, id: SharedString, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
+    fn open_node_inspector(
+        &self,
+        id: SharedString,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let proxy = cx.new(|_| inspector_rows::SelectedGraphNode { id });
         window.dispatch_action(
             Box::new(crate::inspector::InspectEntity {
@@ -229,9 +235,10 @@ impl Render for SystemGraphPanel {
                         Direction::LeftRight => {
                             ((sx + NODE_WIDTH, sy + sh / 2.0), (*tx, ty + th / 2.0))
                         }
-                        Direction::TopBottom => {
-                            ((sx + NODE_WIDTH / 2.0, sy + sh), (tx + NODE_WIDTH / 2.0, *ty))
-                        }
+                        Direction::TopBottom => (
+                            (sx + NODE_WIDTH / 2.0, sy + sh),
+                            (tx + NODE_WIDTH / 2.0, *ty),
+                        ),
                     };
                     [local(src), local(tgt)].into_iter().collect()
                 } else {
@@ -353,12 +360,14 @@ impl Render for SystemGraphPanel {
                     }
                 }),
             )
-            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                let delta = event.delta.pixel_delta(px(20.0));
-                this.viewport.x -= f32::from(delta.x);
-                this.viewport.y -= f32::from(delta.y);
-                cx.notify();
-            }));
+            .on_scroll_wheel(
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    let delta = event.delta.pixel_delta(px(20.0));
+                    this.viewport.x -= f32::from(delta.x);
+                    this.viewport.y -= f32::from(delta.y);
+                    cx.notify();
+                }),
+            );
 
         // Expanded-scope containers sit behind the wires and cards.
         for container in self.render_scope_containers(&wiring, &views, &theme, cx) {
@@ -381,7 +390,11 @@ impl Render for SystemGraphPanel {
                 let (a, b) = (route[route.len().div_ceil(2) - 1], route[route.len() / 2]);
                 let mid_x = (f32::from(a.x) + f32::from(b.x)) / 2.0;
                 let mid_y = (f32::from(a.y) + f32::from(b.y)) / 2.0;
-                let kind = if edge.kind == EdgeKind::Msg { "msg" } else { "frame" };
+                let kind = if edge.kind == EdgeKind::Msg {
+                    "msg"
+                } else {
+                    "frame"
+                };
                 let delayed = if edge.delayed { " · delayed" } else { "" };
                 let label = format!("{} → {} ({kind}{delayed})", edge.from_port, edge.to_port);
                 root = root.child(
@@ -416,7 +429,11 @@ impl SystemGraphPanel {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let NodeView { node, graph_pos, height } = view;
+        let NodeView {
+            node,
+            graph_pos,
+            height,
+        } = view;
         let id = node.id.clone();
         let screen_x = graph_pos.0 - self.viewport.x;
         let screen_y = graph_pos.1 - self.viewport.y;
@@ -428,7 +445,11 @@ impl SystemGraphPanel {
             GraphNodeKind::Coordinator => (theme.line_colors[6], "coordinator"),
             GraphNodeKind::ScopeGroup => (theme.line_colors[4], "scope"),
         };
-        let border_color = if selected { theme.line_colors[0] } else { accent };
+        let border_color = if selected {
+            theme.line_colors[0]
+        } else {
+            accent
+        };
 
         let mut card = div()
             .absolute()
@@ -721,10 +742,12 @@ impl SystemGraphPanel {
                                     .child(SharedString::new_static("[collapse]"))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |this, _ev: &gpui::MouseDownEvent, _w, cx| {
-                                            this.toggle_collapsed(&collapse_path, cx);
-                                            cx.stop_propagation();
-                                        }),
+                                        cx.listener(
+                                            move |this, _ev: &gpui::MouseDownEvent, _w, cx| {
+                                                this.toggle_collapsed(&collapse_path, cx);
+                                                cx.stop_propagation();
+                                            },
+                                        ),
                                     ),
                             ),
                     )

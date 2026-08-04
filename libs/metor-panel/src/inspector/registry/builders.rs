@@ -344,7 +344,11 @@ pub(super) fn build_event_overlay_wizard(
     });
     msgs.sort_by(|a, b| a.1.cmp(&b.1));
     for (id, label) in msgs {
-        rows.push(overlay_command_row(parent.clone(), label, EventKindKey::Msg(id)));
+        rows.push(overlay_command_row(
+            parent.clone(),
+            label,
+            EventKindKey::Msg(id),
+        ));
     }
 
     rows

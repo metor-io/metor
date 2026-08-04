@@ -1,9 +1,12 @@
 use super::*;
 
 fn target(id: &str, name: &str) -> ConnectionTarget {
-    ConnectionTarget::custom(id.to_string(), name.to_string(), "", |_ctx: ConnectContext| {
-        Connected::default()
-    })
+    ConnectionTarget::custom(
+        id.to_string(),
+        name.to_string(),
+        "",
+        |_ctx: ConnectContext| Connected::default(),
+    )
 }
 
 #[test]
@@ -127,9 +130,7 @@ fn custom_resolver_revives_addressed_recents() {
             let serial = input
                 .strip_prefix("veh://")
                 .ok_or_else(|| gpui::SharedString::new_static("expected veh://<serial>"))?;
-            Ok(
-                target(&format!("veh-{serial}"), serial).with_address(input.to_string()),
-            )
+            Ok(target(&format!("veh-{serial}"), serial).with_address(input.to_string()))
         }),
     });
     // A protocol-addressed target connects once, then its discoverer is
@@ -210,7 +211,12 @@ fn options_resolve_to_spec_defaults_then_overrides() {
 fn panel_wide_default_covers_only_undeclared_targets() {
     let mut state = ConnectionsState::default();
     state.set_default_options(
-        vec![ConnectionOption::toggle("commanding", "Allow commanding", false)].into(),
+        vec![ConnectionOption::toggle(
+            "commanding",
+            "Allow commanding",
+            false,
+        )]
+        .into(),
     );
 
     // A discovered target declares nothing, so the panel-wide set is its
@@ -291,14 +297,26 @@ fn default_resolver_grammar_parses_all_three_forms() {
     assert_eq!(fsw.id, bare.id);
     // The pinned forms keep their scheme in the persistable address, so a
     // recent re-materializes with the pin intact.
-    assert_eq!(bare.address.as_ref().map(|a| a.as_ref()), Some("127.0.0.1:2240"));
-    assert_eq!(db.address.as_ref().map(|a| a.as_ref()), Some("db://127.0.0.1:2240"));
-    assert_eq!(fsw.address.as_ref().map(|a| a.as_ref()), Some("fsw://127.0.0.1:2240"));
+    assert_eq!(
+        bare.address.as_ref().map(|a| a.as_ref()),
+        Some("127.0.0.1:2240")
+    );
+    assert_eq!(
+        db.address.as_ref().map(|a| a.as_ref()),
+        Some("db://127.0.0.1:2240")
+    );
+    assert_eq!(
+        fsw.address.as_ref().map(|a| a.as_ref()),
+        Some("fsw://127.0.0.1:2240")
+    );
 
     let Err(err) = (resolver.resolve)("carrier://127.0.0.1:2240") else {
         panic!("junk scheme resolved")
     };
-    assert!(err.contains("db://"), "the error teaches the grammar: {err}");
+    assert!(
+        err.contains("db://"),
+        "the error teaches the grammar: {err}"
+    );
     let Err(err) = (resolver.resolve)("not-an-addr") else {
         panic!("junk address resolved")
     };

@@ -477,11 +477,7 @@ impl ComponentBrowserDelegate {
     /// segments don't match, the call is a no-op. Pair with
     /// [`Self::set_pending_root_path`] so the watcher retries the apply
     /// each time it publishes a fresh tree.
-    pub fn set_root_path(
-        &mut self,
-        segs: &[SharedString],
-        cx: &mut Context<ComponentBrowser>,
-    ) {
+    pub fn set_root_path(&mut self, segs: &[SharedString], cx: &mut Context<ComponentBrowser>) {
         if segs.is_empty() {
             return;
         }
@@ -492,7 +488,8 @@ impl ComponentBrowserDelegate {
         if !matches!(self.selection.root, SelectionRoot::Real) {
             return;
         }
-        let segments: SmallVec<[SharedString; 8]> = chain.iter().map(|n| n.segment.clone()).collect();
+        let segments: SmallVec<[SharedString; 8]> =
+            chain.iter().map(|n| n.segment.clone()).collect();
         if !self.selection.path.starts_with(&segments[..]) {
             self.selection.path = segments.clone();
         }

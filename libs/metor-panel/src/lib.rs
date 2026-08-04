@@ -7,13 +7,14 @@
 // the noise around.
 #![allow(clippy::arc_with_non_send_sync, clippy::type_complexity)]
 
+extern crate self as metor_panel;
+
 use std::mem::size_of;
 
 use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod alarms;
-pub mod logs;
 pub mod app;
 pub mod config;
 pub mod connections;
@@ -25,17 +26,18 @@ pub mod hydration;
 pub mod icons;
 pub mod inspect;
 pub mod inspector;
+pub mod logs;
 pub(crate) mod msg_ingest;
 pub mod node_editor;
 pub mod plot_events;
-pub mod sequences;
 pub mod presets;
+pub mod sequences;
 pub mod theme;
 pub mod tiles;
 pub mod transient;
 pub mod views;
-pub mod wiring;
 pub(crate) mod window_controls;
+pub mod wiring;
 
 pub use app::PanelApp;
 pub use connections::{

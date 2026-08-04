@@ -30,7 +30,7 @@ use gpui::{BorrowAppContext, Bounds, Context, Global, Hsla, Pixels, RenderImage}
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::time_series::TimeSeriesNodeSlice;
 use metor_db::{Component, ComponentSchema};
-use metor_proto::types::{ComponentId, PrimType, Timestamp};
+use metor_proto::types::{PrimType, Timestamp};
 use smallvec::SmallVec;
 
 use super::{PlotBounds, PlotStyle};
@@ -59,11 +59,6 @@ const MAX_TRACES: usize = 64;
 pub(crate) enum AxisSource<'a> {
     Timestamps,
     Element {
-        // Source identity travels with every component-backed variant so
-        // call sites stay uniform, but the pipeline itself only reads the
-        // resolved `component`.
-        #[allow(dead_code)]
-        component_id: ComponentId,
         component: &'a Component,
         element_index: usize,
     },
@@ -71,8 +66,6 @@ pub(crate) enum AxisSource<'a> {
         len: usize,
     },
     LatestSampleElements {
-        #[allow(dead_code)]
-        component_id: ComponentId,
         component: &'a Component,
         len: usize,
     },
@@ -82,8 +75,6 @@ pub(crate) enum AxisSource<'a> {
     /// spans its bucket's extremes, the same geometry min-max decimation
     /// produces from raw samples.
     MinMax {
-        #[allow(dead_code)]
-        component_id: ComponentId,
         component: &'a Component,
         element_index: usize,
     },
@@ -1168,7 +1159,13 @@ fn plan_min_max_trace(
         return TracePlan { spans };
     }
     // Schema is [2, ..source shape]: minima first, then maxima.
-    let n_elements = component.schema.dim.iter().skip(1).product::<usize>().max(1);
+    let n_elements = component
+        .schema
+        .dim
+        .iter()
+        .skip(1)
+        .product::<usize>()
+        .max(1);
     let sample_size = component.schema.size();
     let min_offset = element_index * size_of::<f32>();
     let max_offset = (n_elements + element_index) * size_of::<f32>();
@@ -1245,8 +1242,17 @@ fn plan_min_max_trace(
             let bucket_max = f32::from_le_bytes(max_bytes.try_into().expect("sliced to 4"));
             if !(bucket_min.is_finite() && bucket_max.is_finite()) {
                 flush_fold(
-                    upload_x, upload_y, &mut folded, &mut fold_min, &mut fold_max,
-                    fold_first_ts, fold_last_ts, epoch_x, scale_x, y_epoch, y_scale,
+                    upload_x,
+                    upload_y,
+                    &mut folded,
+                    &mut fold_min,
+                    &mut fold_max,
+                    fold_first_ts,
+                    fold_last_ts,
+                    epoch_x,
+                    scale_x,
+                    y_epoch,
+                    y_scale,
                 );
                 let count = upload_x.len() as u32;
                 if count - run_start >= 2 {
@@ -1264,15 +1270,33 @@ fn plan_min_max_trace(
             folded += 1;
             if folded >= stride {
                 flush_fold(
-                    upload_x, upload_y, &mut folded, &mut fold_min, &mut fold_max,
-                    fold_first_ts, fold_last_ts, epoch_x, scale_x, y_epoch, y_scale,
+                    upload_x,
+                    upload_y,
+                    &mut folded,
+                    &mut fold_min,
+                    &mut fold_max,
+                    fold_first_ts,
+                    fold_last_ts,
+                    epoch_x,
+                    scale_x,
+                    y_epoch,
+                    y_scale,
                 );
             }
         }
     }
     flush_fold(
-        upload_x, upload_y, &mut folded, &mut fold_min, &mut fold_max,
-        fold_first_ts, fold_last_ts, epoch_x, scale_x, y_epoch, y_scale,
+        upload_x,
+        upload_y,
+        &mut folded,
+        &mut fold_min,
+        &mut fold_max,
+        fold_first_ts,
+        fold_last_ts,
+        epoch_x,
+        scale_x,
+        y_epoch,
+        y_scale,
     );
     let count = upload_x.len() as u32;
     if count - run_start >= 2 {
@@ -1353,11 +1377,14 @@ fn upload_pair(
     let epoch_x = cache.epoch_x;
 
     let minmax_y = match (x_source, y_source) {
-        (AxisSource::Timestamps, AxisSource::Element { component, element_index, .. })
-            if lod_stride > 1 =>
-        {
-            Some((&component.schema, *element_index))
-        }
+        (
+            AxisSource::Timestamps,
+            AxisSource::Element {
+                component,
+                element_index,
+                ..
+            },
+        ) if lod_stride > 1 => Some((&component.schema, *element_index)),
         _ => None,
     };
 
@@ -1501,7 +1528,11 @@ fn select_minmax_indices(
             }
             src += probe_step;
         }
-        let (first, second) = if lo.1 <= hi.1 { (lo.1, hi.1) } else { (hi.1, lo.1) };
+        let (first, second) = if lo.1 <= hi.1 {
+            (lo.1, hi.1)
+        } else {
+            (hi.1, lo.1)
+        };
         out.push(first as u32);
         if second != first {
             out.push(second as u32);
@@ -1900,6 +1931,7 @@ mod tests {
     use super::*;
     use metor_db::disruptor::Disruptor;
     use metor_db::time_series::{TimeSeries, TimeSeriesNode};
+    use metor_proto::types::ComponentId;
     use std::path::Path;
     use stellarator::util::AtomicCell;
 
@@ -1983,16 +2015,15 @@ mod tests {
         let target = RenderTarget::new(&gpu.ctx.device, 1500, 600);
 
         let windows = [
-            (start_us, end_us),                    // full range (~20 min)
-            (end_us - 30_000_000, end_us),         // last 30 s
-            (end_us - 1_000_000, end_us),          // last 1 s (no decimation)
-            (start_us, start_us + 60_000_000),     // first minute
+            (start_us, end_us),                // full range (~20 min)
+            (end_us - 30_000_000, end_us),     // last 30 s
+            (end_us - 1_000_000, end_us),      // last 1 s (no decimation)
+            (start_us, start_us + 60_000_000), // first minute
         ];
         for (min_x, max_x) in windows {
             let draw = LineDraw {
                 x: AxisSource::Timestamps,
                 y: AxisSource::Element {
-                    component_id: component.component_id,
                     component: &component,
                     element_index: 0,
                 },
@@ -2021,9 +2052,9 @@ mod tests {
             // window-relative seconds, ordered, and finite.
             assert!(!gpu.upload_x.is_empty());
             assert!(
-                gpu.upload_x
-                    .iter()
-                    .all(|x| x.is_finite() && *x >= -span_secs as f32 && *x <= 2.0 * span_secs as f32),
+                gpu.upload_x.iter().all(|x| x.is_finite()
+                    && *x >= -span_secs as f32
+                    && *x <= 2.0 * span_secs as f32),
                 "x values escaped the rebased window for {span_secs}s"
             );
             assert!(

@@ -49,7 +49,7 @@ The split-pane layout system. `TileGroup` is the root; the tree is a recursive `
 A unified row-list overlay that serves as both command palette (centered) and right-click property editor (anchored). All "drill into another view" actions push a new page onto a stack inside the same inspector instead of opening separate windows. Modes are `Anchored(Point)` vs `Centered`.
 
 - Rows live in `rows/` (one file per widget: `BoolRow`, `NavRow`, `ColorRow`, `ScalarRow`, …). When extending row capabilities, prefer adding constructors to the existing row file rather than creating parallel row types.
-- Field rendering is driven by **facet attributes** (`#[facet(inspect::label = "…")]`, `inspect::widget`, `inspect::range(min=…,max=…)`, `inspect::read_only`). The grammar is defined in `src/inspect.rs` via `facet::define_attr_grammar!`. The grammar lives outside the derive crate because the macro needs to resolve `Attr` at the call site.
+- Field rendering is driven by **facet attributes** (`#[facet(inspect::label = "…")]`, `inspect::range(min=…,max=…)`, and `inspect::variants = "…"`). The grammar is defined in `src/inspect.rs` via `facet::define_attr_grammar!`. The grammar lives outside the derive crate because the macro needs to resolve `Attr` at the call site.
 - `registry/` chooses a row builder based on the facet type + attributes.
 - Inspector requests cross pane boundaries via the `InspectEntity` gpui action and a global `OpenInspectorCallback`.
 
