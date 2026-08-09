@@ -43,7 +43,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// patches the slot to point at it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, IntoBytes, Immutable, KnownLayout, FromBytes)]
-pub struct Slot {
+pub(crate) struct Slot {
     pub trailer_off: u32,
     pub byte_len: u32,
 }
@@ -130,10 +130,18 @@ impl<T, const MAX: usize> FrameList<T, MAX> {
         _ty: PhantomData,
     };
 
-    /// The raw slot.
-    pub const fn slot(&self) -> Slot {
-        self.slot
-    }
+}
+
+fn list_fields<T: AsVTable>(prefix: String) -> impl Iterator<Item = FieldBuilder> {
+    core::iter::once(raw_field(
+        0,
+        size_of::<Slot>() as u32,
+        list(
+            &prefix,
+            T::element_fields(String::new()),
+            size_of::<T>() as u32,
+        ),
+    ))
 }
 
 impl<T: AsVTable, const MAX: usize> AsVTable for FrameList<T, MAX> {
@@ -142,19 +150,11 @@ impl<T: AsVTable, const MAX: usize> AsVTable for FrameList<T, MAX> {
         // naming rule in the module doc); as a member template it is the
         // relative field name only. The slot sits at offset 0; the enclosing
         // frame `offset_by`s it into place.
-        Self::element_fields(path.to_name())
+        list_fields::<T>(path.to_name())
     }
 
     fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
-        core::iter::once(raw_field(
-            0,
-            size_of::<Slot>() as u32,
-            list(
-                &prefix,
-                T::element_fields(String::new()),
-                size_of::<T>() as u32,
-            ),
-        ))
+        list_fields::<T>(prefix)
     }
 }
 
@@ -214,28 +214,28 @@ impl<V, const MAX: usize, const MAX_KEY: usize> FrameMap<V, MAX, MAX_KEY> {
         _kv: PhantomData,
     };
 
-    /// The raw slot.
-    pub const fn slot(&self) -> Slot {
-        self.slot
-    }
+}
+
+fn map_fields<V: AsVTable>(prefix: String) -> impl Iterator<Item = FieldBuilder> {
+    core::iter::once(raw_field(
+        0,
+        size_of::<Slot>() as u32,
+        map(
+            &prefix,
+            V::element_fields(String::new()),
+            map_stride::<V>(),
+            map_value_offset::<V>(),
+        ),
+    ))
 }
 
 impl<V: AsVTable, const MAX: usize, const MAX_KEY: usize> AsVTable for FrameMap<V, MAX, MAX_KEY> {
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
-        Self::element_fields(path.to_name())
+        map_fields::<V>(path.to_name())
     }
 
     fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
-        core::iter::once(raw_field(
-            0,
-            size_of::<Slot>() as u32,
-            map(
-                &prefix,
-                V::element_fields(String::new()),
-                map_stride::<V>(),
-                map_value_offset::<V>(),
-            ),
-        ))
+        map_fields::<V>(prefix)
     }
 }
 

@@ -71,6 +71,12 @@ pub trait SystemInput {
     fn decls() -> Declarations;
 }
 
+impl SystemInput for () {
+    fn decls() -> Declarations {
+        Declarations::default()
+    }
+}
+
 /// A system's output bundle: a struct of [`Output<F>`](crate::Output) ports.
 /// Derive with `#[derive(SystemOutput)]`. The framework wraps it in [`Out`]
 /// to add the implicit health/log ports.
@@ -415,7 +421,6 @@ where
     system: S,
     input: S::Input,
     output: S::Output,
-    state: SlotState,
 }
 
 impl<S> CyclicRunner<S>
@@ -426,12 +431,7 @@ where
     /// Assemble a runner from a constructed system and its bound port
     /// bundles.
     pub fn new(system: S, input: S::Input, output: S::Output) -> Self {
-        Self {
-            system,
-            input,
-            output,
-            state: SlotState::Running,
-        }
+        Self { system, input, output }
     }
 
     /// Run the system's `init` once.
@@ -439,13 +439,9 @@ where
         self.system.init(&mut self.output);
     }
 
-    /// Run one cycle: time `execute`, then publish health. Does nothing once
-    /// stopped. `now` is threaded from the cycle loop so every system in a
-    /// cycle shares one timestamp.
+    /// Run one cycle: time `execute`, then publish health. `now` is threaded
+    /// from the cycle loop so every system in a cycle shares one timestamp.
     pub fn step(&mut self, now: Timestamp) {
-        if self.state.is_stopped() {
-            return;
-        }
         let start = std::time::Instant::now();
         self.system.execute(now, &mut self.input, &mut self.output);
         let micros = start.elapsed().as_micros() as u64;
@@ -457,9 +453,9 @@ where
         self.output.health().end_cycle(now, micros);
     }
 
-    /// This slot's lifecycle state (running vs hard-stopped).
+    /// Cyclic runners remain running until their coordinator shuts them down.
     pub fn state(&self) -> &SlotState {
-        &self.state
+        &SlotState::Running
     }
 
     /// Run the system's `shutdown` once.

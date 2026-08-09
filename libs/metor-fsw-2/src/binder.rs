@@ -312,3 +312,7 @@ pub trait BindPorts: Sized {
     /// Construct every port from the ring source, in `descriptors()` order.
     fn bind<S: RingSource>(src: &mut S) -> Self;
 }
+
+impl BindPorts for () {
+    fn bind<S: RingSource>(_src: &mut S) -> Self {}
+}

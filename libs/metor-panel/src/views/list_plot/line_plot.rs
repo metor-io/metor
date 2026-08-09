@@ -283,7 +283,6 @@ impl Render for ListLinePlot {
                                     Some(LineDraw {
                                         x: AxisSource::LatestSampleIndex { len: config.len },
                                         y: AxisSource::LatestSampleElements {
-                                            component_id: config.component_id,
                                             component,
                                             len: config.len,
                                         },

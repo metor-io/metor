@@ -1,7 +1,7 @@
 //! Resample an input value stream onto a target clock. The strategy is
 //! selected by [`ResampleMode`]:
 //!
-//! - `Zoh` / `LatestAt`: zero-order hold — emit the most recent input bytes
+//! - `Zoh`: zero-order hold — emit the most recent input bytes
 //!   on every tick (dtype/shape passthrough; no decoding needed).
 //! - `Linear`: per-element linear interpolation in `f64`. Output dtype = input
 //!   dtype (rounded back) for floats; integer inputs are promoted to `f64`.
@@ -44,7 +44,7 @@ fn take_decoded_slot(
     slot
 }
 
-/// Zoh / LatestAt: byte passthrough.
+/// Zoh: byte passthrough.
 async fn run_resample_zoh(
     mut input_reader: NodeReader,
     mut clock_reader: NodeReader,
@@ -230,17 +230,13 @@ pub(crate) fn interp(
     }
 }
 
-/// Resampling strategy. `Zoh` and `LatestAt` share semantics (zero-order
-/// hold) but get distinct `op_tag`s so the editor can label them differently
-/// and existing serialized graphs reconcile to the same `NodeId`.
+/// Resampling strategy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ResampleMode {
     /// Zero-order hold: emit the most recent input bytes on every tick.
     Zoh,
     /// Per-element linear interpolation in `f64`.
     Linear,
-    /// Same semantics as `Zoh`; distinct tag for UI labeling.
-    LatestAt,
 }
 
 impl ResampleMode {
@@ -248,7 +244,6 @@ impl ResampleMode {
         match self {
             ResampleMode::Zoh => op_tag::ZOH,
             ResampleMode::Linear => op_tag::LINEAR,
-            ResampleMode::LatestAt => op_tag::LATEST_AT,
         }
     }
 }
@@ -266,7 +261,7 @@ pub fn resample(
     let clock_reader = clock.subscribe();
     let in_value_size = in_schema.size();
     match mode {
-        ResampleMode::Zoh | ResampleMode::LatestAt => {
+        ResampleMode::Zoh => {
             let out_schema = in_schema.clone();
             Ok(NodeImpl::spawn(
                 id,

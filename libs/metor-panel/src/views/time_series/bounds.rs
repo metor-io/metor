@@ -417,7 +417,10 @@ mod tests {
     fn degenerate_range_centers_the_value() {
         let (lo, hi) = pad_degenerate_range(42.0, 42.0);
         assert!(lo < 42.0 && hi > 42.0);
-        assert!((42.0 - lo - (hi - 42.0)).abs() < 1e-12, "padding not symmetric");
+        assert!(
+            (42.0 - lo - (hi - 42.0)).abs() < 1e-12,
+            "padding not symmetric"
+        );
 
         // A constant zero still needs a non-empty span.
         let (lo, hi) = pad_degenerate_range(0.0, 0.0);

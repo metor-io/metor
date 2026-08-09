@@ -292,8 +292,7 @@ pub(crate) fn estimate_readout_size(header_len: usize, rows: &[(usize, usize)]) 
     let mut content_w = header_len as f32 * READOUT_CHAR_W;
     for (label_len, value_len) in rows {
         // label + a space + value, offset by the swatch column.
-        let row_w =
-            READOUT_SWATCH_W + (*label_len + 1 + *value_len) as f32 * READOUT_CHAR_W;
+        let row_w = READOUT_SWATCH_W + (*label_len + 1 + *value_len) as f32 * READOUT_CHAR_W;
         content_w = content_w.max(row_w);
     }
     let width = content_w + READOUT_PAD_X * 2.0;

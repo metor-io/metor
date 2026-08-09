@@ -205,6 +205,7 @@ fn y_element_rows(
     rows
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_trace(
     db: &DB,
     draft: &Arc<Mutex<XyDraft>>,

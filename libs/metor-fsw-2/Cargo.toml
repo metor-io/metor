@@ -22,7 +22,7 @@ metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"
 metor-fsw-2-macros = { path = "macros" }
 
 # channels
-metor-fsw-ring = { path = "ring", default-features = false, features = ["async", "mmap", "futex"] }
+metor-fsw-ring = { path = "ring" }
 memmap2 = "0.9"
 
 # service discovery
@@ -32,7 +32,6 @@ mdns-sd = "0.13"
 # async
 futures-lite = "2.5.0"
 stellarator = { path = "../stellarator" }
-thingbuf = "0.1.6"
 
 # serialization
 postcard = { version = "1.1", features = ["alloc"] }

@@ -8,6 +8,7 @@ use gpui::{
 use metor_db::DB;
 use metor_proto::types::{ComponentId, ElementValue};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::inspector::plot_preview::shift_hover_listener;
@@ -17,6 +18,13 @@ use super::tooltip::TooltipText;
 use super::traffic_light::traffic_light_swatch;
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::theme::theme;
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct TrafficLightGridConfig {
+    pub pattern: String,
+    pub color: Option<Hsla>,
+}
 
 /// Cell tracked by the grid for one matched component.
 struct GridCell {

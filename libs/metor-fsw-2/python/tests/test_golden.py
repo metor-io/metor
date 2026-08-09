@@ -21,6 +21,7 @@ import metor_config as mc
 from metor_config import (
     Alarm,
     Alarms,
+    Artifact,
     At,
     Attitude,
     Bind,
@@ -35,6 +36,7 @@ from metor_config import (
     SequenceControl,
     State,
     StateChip,
+    System,
     Target,
     TcpServer,
     Text,
@@ -118,12 +120,14 @@ def build_dashboard() -> Dashboard:
 def build_target() -> Target:
     """The target whose IR is the golden fixture."""
     m = Target(cycle_rate=120.0, sim_dt=0.5)
-    adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")
-    seqs = m.artifact("seqs", crate="adcs-sequences", lib="adcs_sequences")
+    adcs = Artifact(id="adcs", crate="adcs-systems", lib="adcs_systems")
+    seqs = Artifact(id="seqs", crate="adcs-sequences", lib="adcs_sequences")
     with m.scope("block"):
         plant = m.add(
             "plant",
-            adcs.Plant(
+            System(
+                "Plant",
+                adcs,
                 init_angle=0.5,
                 init_rate=0.15,
                 seed=42,
@@ -132,7 +136,7 @@ def build_target() -> Target:
             ),
             process=True,
         )
-        nav = m.add("nav", adcs.Nav())
+        nav = m.add("nav", System("Nav", adcs))
     m.add(
         "alarms",
         Alarms(alarms=[
@@ -154,7 +158,10 @@ def build_target() -> Target:
         "mode",
         inputs=["attitude_estimate", "gps"],
         outputs=["mode_cmd"],
-        allow=[seqs.commissioning(rate_detumble_enter=1.0), seqs.safe_mode()],
+        allow=[
+            System("commissioning", seqs, rate_detumble_enter=1.0),
+            System("safe_mode", seqs),
+        ],
         initial="commissioning",
         initial_state="running",
     )

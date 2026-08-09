@@ -302,6 +302,7 @@ fn register_command_provider(
                         new_db.clone(),
                         pane.clone(),
                         Some(new_open.clone()),
+                        _cx,
                     )
                 }),
             });

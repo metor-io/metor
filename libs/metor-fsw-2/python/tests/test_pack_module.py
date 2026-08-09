@@ -1,7 +1,7 @@
-"""The generated-pack contract, from the Python side.
+"""The generated pack-module contract, from the Python side.
 
-The checked-in ``tests/data/demo.py`` is the exact module ``metor-fsw
-stubgen`` produces for a fixture manifest (a Rust golden test pins the text).
+The checked-in ``tests/data/demo.py`` is the exact module ``metor-fsw pack
+dev`` produces for a fixture manifest (a Rust golden test pins the text).
 Here the recorder side is exercised: importing the module, constructing its
 typed entries, and adding them to a :class:`Target` records the same IR the
 untyped Phase 1 path would, and the artifact the module declares is

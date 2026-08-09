@@ -37,18 +37,12 @@ pub(super) struct Arena {
 }
 
 impl Arena {
-    pub fn build(
-        node_count: usize,
-        edges: &[LayoutEdge],
-        layers: &[usize],
-        tie_break: &[usize],
-    ) -> Self {
+    pub fn build(node_count: usize, edges: &[LayoutEdge], layers: &[usize]) -> Self {
         let mut orig: Vec<Option<NodeIx>> = (0..node_count).map(Some).collect();
         let mut layer: Vec<usize> = layers.to_vec();
-        // Deterministic sort key per vnode: real nodes by the caller's
-        // declaration order, virtual nodes by (owning edge, segment).
-        let mut tie: Vec<(usize, usize, usize)> =
-            (0..node_count).map(|i| (0, tie_break[i], 0)).collect();
+        // Deterministic sort key per vnode: real nodes by input order,
+        // virtual nodes by (owning edge, segment).
+        let mut tie: Vec<(usize, usize, usize)> = (0..node_count).map(|i| (0, i, 0)).collect();
         let mut class = Vec::with_capacity(edges.len());
         let mut dummies: Vec<Vec<usize>> = vec![Vec::new(); edges.len()];
         let mut pred: Vec<Vec<usize>> = vec![Vec::new(); node_count];

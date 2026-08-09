@@ -18,17 +18,12 @@ facet::define_attr_grammar! {
         #[target(field)]
         Label(&'static str),
 
-        /// Select a custom widget for this field.
+        /// Restrict the enum variants shown by the inspector.
         ///
-        /// Usage: `#[facet(inspect::widget = "color_picker")]`
+        /// Names are comma-separated and may contain surrounding whitespace.
+        /// Usage: `#[facet(inspect::variants = "Line, Scatter")]`
         #[target(field)]
-        Widget(&'static str),
-
-        /// Mark a field as visible but not editable.
-        ///
-        /// Usage: `#[facet(inspect::read_only)]`
-        #[target(field)]
-        ReadOnly,
+        Variants(&'static str),
 
         /// Slider range for numeric fields. Values are parsed as f64 at runtime.
         ///
@@ -43,5 +38,66 @@ facet::define_attr_grammar! {
         pub min: &'static str,
         /// Maximum value (parsed as f64 at runtime).
         pub max: &'static str,
+    }
+}
+
+#[doc(hidden)]
+pub use __attr;
+
+pub(crate) fn field_label(field: &facet::Field) -> Option<&'static str> {
+    field
+        .get_attr(Some("inspect"), "label")
+        .and_then(|attr| attr.get_as::<&'static str>())
+        .copied()
+}
+
+pub(crate) fn field_range(field: &facet::Field) -> Option<(f64, f64)> {
+    let attr = field.get_attr(Some("inspect"), "range")?;
+    let Attr::Range(range) = attr.get_as::<Attr>()? else {
+        return None;
+    };
+    Some((range.min.parse().ok()?, range.max.parse().ok()?))
+}
+
+pub(crate) fn field_variants(field: &facet::Field) -> Option<&'static str> {
+    field
+        .get_attr(Some("inspect"), "variants")
+        .and_then(|attr| attr.get_as::<&'static str>())
+        .copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use facet::Facet;
+
+    use crate::inspect;
+
+    #[derive(Facet)]
+    struct Attributes {
+        #[facet(inspect::label = "Gain")]
+        #[facet(inspect::range(min = "0.5", max = "10.0"))]
+        gain: f32,
+        #[facet(inspect::variants = "Line, Scatter")]
+        style: Style,
+    }
+
+    #[derive(Facet)]
+    #[repr(u8)]
+    enum Style {
+        Line,
+        Scatter,
+        Bar,
+    }
+
+    #[test]
+    fn decodes_supported_field_attributes() {
+        let facet::Type::User(facet::UserType::Struct(struct_type)) = Attributes::SHAPE.ty else {
+            panic!("Attributes must reflect as a struct")
+        };
+        let fields = struct_type.fields;
+
+        assert_eq!(super::field_label(&fields[0]), Some("Gain"));
+        assert_eq!(super::field_range(&fields[0]), Some((0.5, 10.0)));
+        assert_eq!(super::field_variants(&fields[1]), Some("Line, Scatter"));
     }
 }

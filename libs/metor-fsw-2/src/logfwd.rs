@@ -57,8 +57,9 @@ pub(crate) fn pack_mode() -> bool {
 pub fn init_pack_tracing() {
     PACK_MODE.store(true, Relaxed);
     use tracing_subscriber::layer::SubscriberExt;
-    let subscriber = tracing_subscriber::registry()
-        .with(ForwardLayer::new().with_max_level(tracing::Level::INFO));
+    let subscriber = tracing_subscriber::registry().with(
+        ForwardLayer.with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
@@ -102,45 +103,19 @@ impl Visit for FieldVisitor {
 
 /// The forwarding layer. Compose it onto a `tracing_subscriber::registry()`
 /// stack; [`forward_layer`] builds one for embedders.
-pub struct ForwardLayer {
-    /// Maximum verbosity forwarded. `TRACE` allows every level through to an
-    /// external `with_filter`.
-    max_level: tracing::Level,
-}
-
-impl ForwardLayer {
-    fn new() -> Self {
-        Self {
-            max_level: tracing::Level::TRACE,
-        }
-    }
-
-    /// Cap the forwarded verbosity, for stacks with no external filter.
-    pub fn with_max_level(mut self, max_level: tracing::Level) -> Self {
-        self.max_level = max_level;
-        self
-    }
-}
+pub struct ForwardLayer;
 
 /// A [`ForwardLayer`] for a host's subscriber stack. Filter it externally
 /// (`with_filter`) to choose what reaches the downlink; the CLI forwards
 /// `INFO` and up by default.
 pub fn forward_layer() -> ForwardLayer {
-    ForwardLayer::new()
+    ForwardLayer
 }
 
 impl<S> Layer<S> for ForwardLayer
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn enabled(
-        &self,
-        metadata: &tracing::Metadata<'_>,
-        _ctx: Context<'_, S>,
-    ) -> bool {
-        *metadata.level() <= self.max_level
-    }
-
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let meta = event.metadata();
         let mut visitor = FieldVisitor::default();

@@ -55,7 +55,8 @@ pub fn persist(
     // insert?" signal: we only bump `vtable_gen` (which wakes view watchers)
     // on actual additions, and we report it as the incumbent side of a
     // schema mismatch.
-    let existing_schema = db.with_state(|s| s.get_component(component_id).map(|c| c.schema.clone()));
+    let existing_schema =
+        db.with_state(|s| s.get_component(component_id).map(|c| c.schema.clone()));
     let was_new = existing_schema.is_none();
     db.with_state_mut(|s| s.insert_component(component_id, schema.clone(), &db.path))
         .map_err(|err| match err {

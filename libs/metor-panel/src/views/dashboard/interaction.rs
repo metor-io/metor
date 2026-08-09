@@ -155,7 +155,7 @@ impl DashboardPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = theme(cx);
-        let view = self.widget_views.get(&widget.id);
+        let view = self.widget_live.get(&widget.id).map(|live| &live.view);
         let r = &widget.rect;
 
         let mut container = div()

@@ -200,11 +200,7 @@ pub(super) fn paint_event_flags(
 
         // The chip claims at most the gap to the next flag (so neighbors
         // never overlap) and the plot's right edge.
-        let next_x = clusters
-            .get(i + 1)
-            .map(|c| c.x)
-            .unwrap_or(right)
-            .min(right);
+        let next_x = clusters.get(i + 1).map(|c| c.x).unwrap_or(right).min(right);
         let avail = next_x - x - px(2.0);
         let chip_y = top + px(1.0);
         match fit_label(&cluster.label, avail) {
@@ -276,10 +272,7 @@ mod tests {
     }
 
     fn colored(ts: i64, color: Hsla) -> PlotEvent {
-        PlotEvent {
-            color,
-            ..event(ts)
-        }
+        PlotEvent { color, ..event(ts) }
     }
 
     #[test]
@@ -306,7 +299,11 @@ mod tests {
     fn cluster_stays_bounded_to_threshold() {
         // A drifting chain must not snowball: 0,5,10 — 10 is 10px from the
         // anchor at 0, so it starts a new cluster despite being 5px from 5.
-        let positioned = vec![(px(0.0), event(0)), (px(5.0), event(1)), (px(10.0), event(2))];
+        let positioned = vec![
+            (px(0.0), event(0)),
+            (px(5.0), event(1)),
+            (px(10.0), event(2)),
+        ];
         let clusters = cluster_events(positioned);
         assert_eq!(clusters.len(), 2);
         assert_eq!(clusters[0].events.len(), 2);
@@ -316,7 +313,10 @@ mod tests {
     #[test]
     fn chip_labels_fit_or_collapse() {
         // Plenty of room: untouched.
-        assert_eq!(fit_label("WARN nav", px(120.0)).as_deref(), Some("WARN nav"));
+        assert_eq!(
+            fit_label("WARN nav", px(120.0)).as_deref(),
+            Some("WARN nav")
+        );
         // Tight: ellipsized to the budget.
         let tight = fit_label("WARN navigation", px(60.0)).unwrap();
         assert!(tight.ends_with('…') && tight.chars().count() < 15);
@@ -354,7 +354,10 @@ mod tests {
         let uniform = cluster_events(vec![(px(0.0), colored(0, red)), (px(2.0), colored(1, red))]);
         assert!(hsla_eq(uniform[0].color(&theme), red));
 
-        let mixed = cluster_events(vec![(px(0.0), colored(0, red)), (px(2.0), colored(1, blue))]);
+        let mixed = cluster_events(vec![
+            (px(0.0), colored(0, red)),
+            (px(2.0), colored(1, blue)),
+        ]);
         assert!(hsla_eq(mixed[0].color(&theme), theme.text_secondary));
     }
 }

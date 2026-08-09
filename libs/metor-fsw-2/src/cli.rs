@@ -5,10 +5,9 @@ use miette::IntoDiagnostic;
 
 use crate::wiring::{
     BuildOptions, Builder, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions,
-    PackageOptions, Registry, StubgenOptions, WIRING_FILE_NAME, Wiring, build_target,
-    eval_python_target, is_python_target, load_bundle, locate_artifacts, pack_assemble,
-    pack_build, pack_dev, pack_publish, provision_artifacts, refresh_dev_packs, resolve, stubgen,
-    unpack_metor, write_bundle,
+    PackageOptions, Registry, WIRING_FILE_NAME, Wiring, build_target, eval_python_target,
+    load_bundle, locate_artifacts, pack_assemble, pack_build, pack_dev, pack_publish,
+    provision_artifacts, refresh_dev_packs, resolve, unpack_metor, write_bundle,
 };
 
 mod ui;
@@ -34,8 +33,6 @@ enum Command {
     Package(PackageArgs),
     /// Run a target: a source `.py` (built automatically) or a bundle dir.
     Run(RunArgs),
-    /// Generate the typed Python pack modules (`packs/<id>.py`) for a target.
-    Stubgen(StubgenArgs),
     /// Pack-crate commands (`docs/cli.md`).
     #[command(subcommand)]
     Pack(PackCmd),
@@ -209,31 +206,6 @@ struct RunArgs {
     serve: Option<std::net::SocketAddr>,
 }
 
-#[derive(Args, Debug)]
-struct StubgenArgs {
-    /// The target directory whose `pyproject.toml` lists the artifacts
-    /// (default: the current directory). Stubs land in its `packs/`.
-    #[arg(default_value = ".")]
-    dir: PathBuf,
-    /// Write the generated `packs` package here instead of `<dir>/packs`
-    /// (for build front-ends that generate stubs into a build directory).
-    #[arg(long, value_name = "DIR")]
-    out_dir: Option<PathBuf>,
-    /// Verify the checked-in stubs are byte-identical instead of writing them
-    /// (the CI gate); exits non-zero if any are stale.
-    #[arg(long)]
-    check: bool,
-    /// Require the artifacts prebuilt (locate them without running cargo).
-    #[arg(long)]
-    no_build: bool,
-    /// Build the `--release` profile.
-    #[arg(long)]
-    release: bool,
-    /// An extra arg appended to every `cargo build` (repeatable).
-    #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
-    cargo_arg: Vec<String>,
-}
-
 pub async fn run() -> miette::Result<()> {
     // Route a re-executed worker child before anything else (process
     // systems; a no-op read of one env var otherwise).
@@ -244,7 +216,6 @@ pub async fn run() -> miette::Result<()> {
         Command::Build(a) => cmd_build(a),
         Command::Package(a) => cmd_package(a),
         Command::Run(a) => cmd_run(a).await,
-        Command::Stubgen(a) => cmd_stubgen(a),
         Command::Pack(PackCmd::Dev(a)) => cmd_pack_dev(a),
         Command::Pack(PackCmd::Build(a)) => cmd_pack_build(a),
         Command::Pack(PackCmd::Assemble(a)) => cmd_pack_assemble(a),
@@ -328,37 +299,6 @@ fn cmd_pack_dev(args: PackDevArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// `stubgen`: read the target's `pyproject.toml`, (build and) describe each
-/// listed artifact, and write — or, with `--check`, verify — its typed pack
-/// module. Deprecated in favor of per-pack `pack dev`
-/// (`docs/cli.md`); kept working for one release.
-fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
-    eprintln!(
-        "warning: target-level `stubgen` is deprecated; give each pack crate a \
-         `pyproject.toml` and use `metor-fsw pack dev` (docs/cli.md)"
-    );
-    let opts = StubgenOptions {
-        target_dir: args.dir,
-        out_dir: args.out_dir,
-        check: args.check,
-        build: !args.no_build,
-        release: args.release,
-        cargo_args: args.cargo_arg,
-    };
-    let report = stubgen(&opts).into_diagnostic()?;
-    if opts.check {
-        println!(
-            "stubgen --check: {} module(s) up to date",
-            report.modules.len()
-        );
-    } else {
-        for path in &report.modules {
-            println!("  wrote {}", path.display());
-        }
-    }
-    Ok(())
-}
-
 /// `--target` is sugar for the `--cargo-arg --target …` spelling: one flag
 /// drives prebuilt selection, crate cross-builds, and the recorded triple.
 fn merge_target(cargo_args: &[String], target: Option<&str>) -> Vec<String> {
@@ -373,15 +313,8 @@ fn merge_target(cargo_args: &[String], target: Option<&str>) -> Vec<String> {
 /// is evaluated by a subprocess CPython. A `.kdl` file gets a clear
 /// removed-feature error; any other extension is unrecognized.
 fn load_source(path: &Path) -> miette::Result<Wiring> {
-    if is_python_target(path) {
+    if path.extension().is_some_and(|e| e == "py") {
         return eval_python_target(path);
-    }
-    if path.extension().is_some_and(|e| e == "kdl") {
-        return Err(miette::miette!(
-            "KDL target support was removed; targets are Python (`.py`). Port `{}` to a \
-             `target.py` (see docs/wiring.md)",
-            path.display()
-        ));
     }
     Err(miette::miette!(
         "unrecognized target `{}`; targets are Python (`.py`)",
@@ -394,11 +327,7 @@ fn load_source(path: &Path) -> miette::Result<Wiring> {
 /// the target imports are current before it is evaluated. Prebuilt pack
 /// artifacts are only *selected* at provisioning, so this is where their
 /// sources get rebuilt; cargo's incremental build makes a clean tree a no-op.
-fn refresh_source_packs(
-    target: &Path,
-    release: bool,
-    cargo_args: &[String],
-) -> miette::Result<()> {
+fn refresh_source_packs(target: &Path, release: bool, cargo_args: &[String]) -> miette::Result<()> {
     let dir = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -684,11 +613,7 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     }
     if let Some(addr) = args.serve {
         use crate::ir::{StateSpec, SystemSpec, TCP_SERVER_TYPE};
-        match wiring
-            .states
-            .iter_mut()
-            .find(|s| s.ty == TCP_SERVER_TYPE)
-        {
+        match wiring.states.iter_mut().find(|s| s.ty == TCP_SERVER_TYPE) {
             Some(state) => {
                 // Override only the address; a target-set `name` (advertised
                 // over mDNS) survives the CLI address override.

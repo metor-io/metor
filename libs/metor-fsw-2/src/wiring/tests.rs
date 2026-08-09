@@ -971,7 +971,7 @@ fn bundle_manifest_hash_checked_at_load() {
     let sidecar_bytes = std::fs::read(crate::dl::manifest_sidecar_path(&so))
         .expect("build driver wrote the sidecar");
     // Record the true hash, as a generated stub module would.
-    wiring.artifacts[0].manifest_hash = Some(super::stubgen::manifest_hash(&sidecar_bytes));
+    wiring.artifacts[0].manifest_hash = Some(super::pack_module::manifest_hash(&sidecar_bytes));
 
     let tmp = tempfile::tempdir().expect("temp dir");
     let dir = tmp.path().join("fixture.bundle");
@@ -992,7 +992,7 @@ fn bundle_manifest_hash_checked_at_load() {
     let copied = std::fs::read(dir.join(member)).unwrap();
     assert_eq!(
         pack.cdylib_sha256,
-        super::stubgen::manifest_hash(&copied),
+        super::pack_module::manifest_hash(&copied),
         "provenance digests the bytes actually in the bundle"
     );
 

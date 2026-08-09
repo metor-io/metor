@@ -69,13 +69,6 @@ impl PortId {
         }
     }
 
-    /// The [`PacketId`] of a Postcard port, or `None` for a Table port.
-    pub fn packet(self) -> Option<PacketId> {
-        match self {
-            PortId::Component(_) => None,
-            PortId::Packet(p) => Some(p),
-        }
-    }
 }
 
 /// What one record is and how it is described (the schema axis).
@@ -353,15 +346,6 @@ impl PortDesc {
     pub fn with_delivery(mut self, d: Delivery) -> Self {
         self.delivery = d;
         self
-    }
-
-    /// The frame-relative vtable of a Table port, or `None` for a Postcard
-    /// port.
-    pub fn vtable(&self) -> Option<&VTable> {
-        match &self.schema {
-            PortSchema::Table { vtable, .. } => Some(vtable),
-            PortSchema::Postcard { .. } => None,
-        }
     }
 
     /// The announce form of a Table port under the `instance` name: the
@@ -672,20 +656,20 @@ mod tests {
         assert!(matches!(d.schema, PortSchema::Table { .. }));
     }
 
-    /// The checked accessors return `None` off-schema rather than panicking.
+    /// Schema and id variants agree for both port families.
     #[test]
-    fn checked_accessors_none_off_schema() {
+    fn schema_and_id_variants_agree() {
         let m = PortDesc::msg::<SequenceCommand>();
-        assert!(m.vtable().is_none());
+        assert!(matches!(m.schema, PortSchema::Postcard { .. }));
         assert!(m.announce("inst").is_none());
         assert!(m.id().component().is_none());
-        assert!(m.id().packet().is_some());
+        assert!(matches!(m.id(), PortId::Packet(_)));
 
         let f = PortDesc::of::<AxisProbe>();
-        assert!(f.vtable().is_some());
+        assert!(matches!(f.schema, PortSchema::Table { .. }));
         assert!(f.announce("inst").is_some());
         assert!(f.id().component().is_some());
-        assert!(f.id().packet().is_none());
+        assert!(matches!(f.id(), PortId::Component(_)));
     }
 
     /// Table pairs follow the subset rule, Postcard pairs match by id, and

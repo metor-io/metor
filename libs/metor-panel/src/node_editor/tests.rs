@@ -361,7 +361,6 @@ async fn resample_ids_match() {
     let fast_id = fast.id();
     let zoh = ops::resample::resample(src.clone(), fast.clone(), ResampleMode::Zoh).unwrap();
     let lin = ops::resample::resample(src.clone(), fast.clone(), ResampleMode::Linear).unwrap();
-    let lat = ops::resample::resample(src, fast, ResampleMode::LatestAt).unwrap();
     assert_eq!(
         zoh.id(),
         compute_node_id(
@@ -376,15 +375,6 @@ async fn resample_ids_match() {
         compute_node_id(
             &NodeSpec::Resample {
                 mode: ResampleMode::Linear
-            },
-            &[src_id, fast_id]
-        )
-    );
-    assert_eq!(
-        lat.id(),
-        compute_node_id(
-            &NodeSpec::Resample {
-                mode: ResampleMode::LatestAt
             },
             &[src_id, fast_id]
         )
@@ -1156,17 +1146,6 @@ fn config_round_trips_through_json() {
         })
         .collect();
     assert_eq!(original_ids, new_ids);
-}
-
-#[test]
-fn config_ignores_removed_legacy_fields() {
-    // Presets saved before `owner_uuid` and `viewport.zoom` were removed
-    // still carry them; hydration must skip the unknown keys, not fail.
-    let json =
-        r#"{"owner_uuid":123,"viewport":{"x":1.0,"y":2.0,"zoom":1.5},"nodes":[],"edges":[]}"#;
-    let parsed: NodeEditorConfig = serde_json::from_str(json).expect("legacy keys tolerated");
-    assert_eq!(parsed.viewport.x, 1.0);
-    assert_eq!(parsed.viewport.y, 2.0);
 }
 
 #[stellarator::test]

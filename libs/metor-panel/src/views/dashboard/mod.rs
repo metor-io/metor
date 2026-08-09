@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AnyView, App, Bounds, Context, Entity, Hsla, IntoElement, Pixels, Point, Render,
+    AnyElement, App, Bounds, Context, Entity, Hsla, IntoElement, Pixels, Point, Render,
     SharedString, Window, div, point, prelude::*, px,
 };
 use metor_db::DB;
@@ -18,7 +18,7 @@ use smallvec::SmallVec;
 
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::theme::theme;
-use crate::views::{Scrollbar, TimeSeriesPlot};
+use crate::views::Scrollbar;
 
 use crate::tiles::PaneItem;
 
@@ -33,7 +33,9 @@ pub use connectors::{
 };
 
 use widgets::create_widget_view;
-pub use widgets::{WidgetRegistry, WidgetSpec};
+pub use widgets::{
+    TileAddFlow, TileViewSpec, WidgetAddFlow, WidgetLive, WidgetRegistry, WidgetSpec,
+};
 
 const SNAP_GRID_PX: f32 = 10.0;
 
@@ -129,22 +131,19 @@ pub struct DashboardWidget {
 /// Canvas panel that lays out [`DashboardWidget`]s at absolute pixel
 /// coordinates.
 ///
-/// Widget entities live in parallel maps keyed by [`WidgetId`] so the
-/// rendered view and the inspectable data model stay addressable without
-/// holding references inside the config.
+/// Live widget handles are kept outside the persisted document.
 pub struct DashboardPanel {
     db: Arc<DB>,
     title: SharedString,
     widgets: Vec<DashboardWidget>,
-    widget_views: HashMap<WidgetId, AnyView>,
-    widget_entities: HashMap<WidgetId, gpui::AnyEntity>,
+    widget_live: HashMap<WidgetId, WidgetLive>,
 
     /// Schematic lines over the canvas. Plain data: an anchor resolves
     /// against the live widget rects each frame, so nothing here needs
     /// updating when a widget moves.
     connectors: Vec<Connector>,
     /// Stream tasks for connectors whose colour is telemetry-bound, keyed
-    /// like `widget_entities` so dropping an entry cancels its task.
+    /// like `widget_live` so dropping an entry cancels its task.
     connector_live: HashMap<ConnectorId, connectors::ConnectorLive>,
     next_connector_id: u64,
     selected_connector: Option<ConnectorId>,
@@ -166,8 +165,7 @@ impl DashboardPanel {
             db,
             title: "Dashboard".into(),
             widgets: Vec::new(),
-            widget_views: HashMap::new(),
-            widget_entities: HashMap::new(),
+            widget_live: HashMap::new(),
             connectors: Vec::new(),
             connector_live: HashMap::new(),
             next_connector_id: 1,
@@ -254,8 +252,8 @@ impl DashboardPanel {
         self.widgets
             .iter()
             .filter_map(|w| {
-                let entity = self.widget_entities.get(&w.id)?.clone();
-                Some((w.id, entity, widget_display_label(w, cx)))
+                let live = self.widget_live.get(&w.id)?;
+                Some((w.id, live.inspect.clone(), widget_display_label(w, cx)))
             })
             .collect()
     }
@@ -282,38 +280,17 @@ impl DashboardPanel {
         }
     }
 
-    /// Add a widget whose view and inspectable entity are already built.
-    ///
-    /// Used by flows (e.g. the trace wizard) that want to seed a widget
-    /// with runtime state. `config` is left empty; the pre-built state is
-    /// not round-tripped through serialization.
-    pub fn add_widget_with_entity(
+    /// Add a registered kind from an opaque persisted config blob.
+    pub fn add_widget(
         &mut self,
         kind: WidgetKind,
-        view: AnyView,
-        entity: gpui::AnyEntity,
+        config: String,
         cx: &mut Context<Self>,
     ) -> WidgetId {
         let id = self.alloc_id();
         let (w, h) = kind.default_size(cx);
         let rect = self.auto_place(w, h);
-        self.widgets.push(DashboardWidget {
-            id,
-            rect,
-            kind,
-            config: "{}".to_string(),
-        });
-        self.widget_views.insert(id, view);
-        self.widget_entities.insert(id, entity);
-        cx.notify();
-        id
-    }
-
-    fn add_widget(&mut self, kind: WidgetKind, config: String, cx: &mut Context<Self>) -> WidgetId {
-        let id = self.alloc_id();
-        let (w, h) = kind.default_size(cx);
-        let rect = self.auto_place(w, h);
-        let (view, widget_entity) = create_widget_view(&kind, &config, &self.db, cx);
+        let live = create_widget_view(&kind, &config, &self.db, cx);
         let widget = DashboardWidget {
             id,
             rect,
@@ -321,19 +298,17 @@ impl DashboardPanel {
             config,
         };
         self.widgets.push(widget);
-        self.widget_views.insert(id, view);
-        self.widget_entities.insert(id, widget_entity);
+        self.widget_live.insert(id, live);
         cx.notify();
         id
     }
 
     fn remove_widget(&mut self, id: WidgetId, cx: &mut Context<Self>) {
         self.widgets.retain(|w| w.id != id);
-        self.widget_views.remove(&id);
-        // Dropping the entity here is what cancels the widget's stream
+        // Dropping the live handles here is what cancels the widget's stream
         // tasks; a leftover entry keeps them alive for the dashboard's
         // whole lifetime.
-        self.widget_entities.remove(&id);
+        self.widget_live.remove(&id);
         if self.selected == Some(id) {
             self.selected = None;
         }
@@ -363,10 +338,10 @@ impl DashboardPanel {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(entity) = self.widget_entities.get(&widget_id) {
+        if let Some(live) = self.widget_live.get(&widget_id) {
             window.dispatch_action(
                 Box::new(crate::inspector::InspectEntity {
-                    entity: entity.clone(),
+                    entity: live.inspect.clone(),
                     position,
                 }),
                 cx,
@@ -376,11 +351,9 @@ impl DashboardPanel {
 
     fn ensure_views(&mut self, cx: &mut Context<Self>) {
         for widget in &self.widgets {
-            if !self.widget_views.contains_key(&widget.id) {
-                let (view, widget_entity) =
-                    create_widget_view(&widget.kind, &widget.config, &self.db, cx);
-                self.widget_views.insert(widget.id, view);
-                self.widget_entities.insert(widget.id, widget_entity);
+            if !self.widget_live.contains_key(&widget.id) {
+                let live = create_widget_view(&widget.kind, &widget.config, &self.db, cx);
+                self.widget_live.insert(widget.id, live);
             }
         }
     }
@@ -713,7 +686,7 @@ pub fn dashboard_rows(
         {
             let dashboard = dashboard.clone();
             let db = db.clone();
-            Box::new(move |_cx| add_widget_rows(dashboard.clone(), db.clone()))
+            Box::new(move |cx| add_widget_rows(dashboard.clone(), db.clone(), cx))
         },
     )));
 
@@ -850,7 +823,11 @@ pub fn dashboard_rows(
     rows
 }
 
-fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
+fn add_widget_rows(
+    dashboard: Entity<DashboardPanel>,
+    db: Arc<DB>,
+    cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
     rows.push(Box::new(NavRow::new(
@@ -861,21 +838,21 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
             let db = db.clone();
             Box::new(move |_cx| {
                 let dashboard = dashboard.clone();
-                let db_for_plot = db.clone();
                 crate::inspector::trace_picker::select_traces_wizard_rows(
                     db.clone(),
                     Arc::new(|_cx| 0),
                     Arc::new(move |traces, _window, cx| {
-                        let db_for_plot = db_for_plot.clone();
-                        let plot = cx.new(|cx| TimeSeriesPlot::new(db_for_plot, traces, cx));
-                        let line_plot = plot.read(cx).line_plot().clone();
+                        let config =
+                            serde_json::to_string(&crate::views::time_series::PlotPanelConfig {
+                                traces: traces
+                                    .iter()
+                                    .map(crate::views::time_series::TraceConfig::from)
+                                    .collect(),
+                                ..Default::default()
+                            })
+                            .expect("plot config serializes");
                         dashboard.update(cx, |this, cx| {
-                            this.add_widget_with_entity(
-                                WidgetKind::plot(),
-                                AnyView::from(plot),
-                                line_plot.into_any(),
-                                cx,
-                            );
+                            this.add_widget(WidgetKind::plot(), config, cx);
                         });
                     }),
                 )
@@ -991,7 +968,7 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
             let db = db.clone();
             Box::new(move |_cx| {
                 let dashboard = dashboard.clone();
-                crate::tiles::panels::component_picker_rows(
+                crate::inspector::trace_picker::component_picker_rows(
                     db.clone(),
                     move |_component_id, name, cx| {
                         let cfg = crate::views::AttitudeConfig {
@@ -1044,6 +1021,14 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
             });
         })
     })));
+
+    for (label, add_flow) in cx.global::<WidgetRegistry>().add_flows() {
+        rows.push(Box::new(NavRow::new(label, "", {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |cx| add_flow(dashboard.clone(), db.clone(), cx))
+        })));
+    }
 
     rows
 }
@@ -1100,14 +1085,14 @@ fn instrument_widget_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
     kind: WidgetKind,
-    blob: fn(crate::tiles::panels::ScaleSeed) -> String,
+    blob: fn(crate::views::instrument::ScaleSeed) -> String,
 ) -> Vec<Box<dyn InspectorRow>> {
     let db_outer = db.clone();
     crate::inspector::trace_picker::select_traces_wizard_rows(
         db,
         Arc::new(|_cx| 0),
         Arc::new(move |traces, _window, cx| {
-            let seeds = crate::tiles::panels::scale_seeds_for_traces(&db_outer, &traces, cx);
+            let seeds = crate::views::instrument::scale_seeds_for_traces(&db_outer, &traces, cx);
             dashboard.update(cx, |this, cx| {
                 for seed in seeds {
                     this.add_widget(kind.clone(), blob(seed), cx);
@@ -1498,10 +1483,8 @@ impl Render for DashboardPanel {
 #[serde(default)]
 pub struct DashboardPanelConfig {
     pub title: String,
-    pub next_id: u64,
     pub widgets: Vec<DashboardWidget>,
     pub connectors: Vec<Connector>,
-    pub next_connector_id: u64,
 }
 
 impl PaneItem for DashboardPanel {
@@ -1524,9 +1507,9 @@ impl PaneItem for DashboardPanel {
             .iter()
             .map(|w| {
                 let mut w = w.clone();
-                if let Some(entity) = self.widget_entities.get(&w.id)
-                    && let Some(blob) =
-                        widgets::serialize_widget_state(&w.kind, entity, &w.config, cx)
+                if let Some(live) = self.widget_live.get(&w.id)
+                    && let Some(spec) = cx.global::<WidgetRegistry>().spec(&w.kind)
+                    && let Some(blob) = (spec.snapshot)(&live.state, &w.config, cx)
                 {
                     w.config = blob;
                 }
@@ -1535,25 +1518,20 @@ impl PaneItem for DashboardPanel {
             .collect();
         DashboardPanelConfig {
             title: self.title.to_string(),
-            next_id: self.next_id,
             widgets,
             connectors: self.connectors.clone(),
-            next_connector_id: self.next_connector_id,
         }
     }
 }
 
-/// Where connector id allocation resumes for a loaded document.
-///
-/// A preset authored by hand or by the Python builder carries connectors but
-/// no counter, so the counter is seeded past the highest id actually present
-/// rather than trusted — otherwise the first line drawn on a shipped preset
-/// collides with one already in it.
-fn seed_connector_id(connectors: &[Connector], saved: u64) -> u64 {
+fn next_widget_id(widgets: &[DashboardWidget]) -> u64 {
+    widgets.iter().map(|w| w.id.0 + 1).max().unwrap_or(1).max(1)
+}
+
+fn next_connector_id(connectors: &[Connector]) -> u64 {
     connectors
         .iter()
         .map(|c| c.id.0 + 1)
-        .chain(std::iter::once(saved))
         .max()
         .unwrap_or(1)
         .max(1)
@@ -1571,7 +1549,6 @@ mod tests {
     fn connectors_round_trip_with_the_dashboard() {
         let cfg = DashboardPanelConfig {
             title: "P&ID".into(),
-            next_id: 4,
             widgets: Vec::new(),
             connectors: vec![Connector {
                 id: ConnectorId(2),
@@ -1582,14 +1559,12 @@ mod tests {
                     ..Default::default()
                 },
             }],
-            next_connector_id: 3,
         };
         let blob = serde_json::to_string(&cfg).unwrap();
         let back: DashboardPanelConfig = serde_json::from_str(&blob).unwrap();
         assert_eq!(back.connectors.len(), 1);
         assert_eq!(back.connectors[0].style.label, "feed");
         assert!(back.connectors[0].style.on_top);
-        assert_eq!(back.next_connector_id, 3);
     }
 
     /// Cross-language pin: the dashboard the Python preset builder emits
@@ -1692,7 +1667,10 @@ mod tests {
         assert!(leader.style.color.is_some());
         assert!(matches!(
             leader.points[0],
-            ConnectorAnchor::Widget { side: Side::Top, .. }
+            ConnectorAnchor::Widget {
+                side: Side::Top,
+                ..
+            }
         ));
         assert!(matches!(leader.points[1], ConnectorAnchor::Free { .. }));
 
@@ -1708,15 +1686,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_dashboard_saved_before_connectors_existed_still_loads() {
-        let legacy = r#"{"title":"Old","next_id":3,"widgets":[]}"#;
-        let cfg: DashboardPanelConfig = serde_json::from_str(legacy).unwrap();
-        assert_eq!(cfg.title, "Old");
-        assert!(cfg.connectors.is_empty());
-        assert_eq!(cfg.next_connector_id, 0);
-    }
-
     fn line(id: u64) -> Connector {
         Connector {
             id: ConnectorId(id),
@@ -1729,17 +1698,12 @@ mod tests {
     /// next drawn line must not collide with one already in the document.
     #[test]
     fn the_id_counter_is_seeded_past_authored_connectors() {
-        assert_eq!(seed_connector_id(&[line(7), line(3)], 0), 8);
-    }
-
-    #[test]
-    fn a_saved_counter_wins_when_it_is_ahead() {
-        assert_eq!(seed_connector_id(&[line(2)], 40), 40);
+        assert_eq!(next_connector_id(&[line(7), line(3)]), 8);
     }
 
     #[test]
     fn an_empty_dashboard_starts_at_one() {
-        assert_eq!(seed_connector_id(&[], 0), 1);
+        assert_eq!(next_connector_id(&[]), 1);
     }
 }
 
@@ -1747,18 +1711,20 @@ mod tests {
 ///
 /// Returns a freshly defaulted dashboard if the blob fails to parse —
 /// preferable to crashing on a stale or hand-edited config file.
+#[allow(clippy::items_after_test_module)]
 pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<DashboardPanel> {
     let cfg: DashboardPanelConfig = serde_json::from_str(blob).unwrap_or_default();
 
-    let mut widget_views = HashMap::new();
-    let mut widget_entities = HashMap::new();
+    let mut widget_live = HashMap::new();
     for widget in &cfg.widgets {
-        let (view, widget_entity) = create_widget_view(&widget.kind, &widget.config, &db, cx);
-        widget_views.insert(widget.id, view);
-        widget_entities.insert(widget.id, widget_entity);
+        widget_live.insert(
+            widget.id,
+            create_widget_view(&widget.kind, &widget.config, &db, cx),
+        );
     }
 
-    let next_connector_id = seed_connector_id(&cfg.connectors, cfg.next_connector_id);
+    let next_id = next_widget_id(&cfg.widgets);
+    let next_connector_id = next_connector_id(&cfg.connectors);
 
     cx.new(|_cx| DashboardPanel {
         db,
@@ -1768,15 +1734,14 @@ pub fn deserialize_dashboard(db: Arc<DB>, blob: &str, cx: &mut App) -> Entity<Da
             SharedString::from(cfg.title)
         },
         widgets: cfg.widgets,
-        widget_views,
-        widget_entities,
+        widget_live,
         connectors: cfg.connectors,
         connector_live: HashMap::new(),
         next_connector_id,
         selected_connector: None,
         tool: connectors::Tool::default(),
         draft: connectors::Draft::default(),
-        next_id: if cfg.next_id == 0 { 1 } else { cfg.next_id },
+        next_id,
         editing: false,
         selected: None,
         container_bounds: None,

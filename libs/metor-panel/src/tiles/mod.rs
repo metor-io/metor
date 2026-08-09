@@ -57,6 +57,8 @@ const RESIZE_HANDLE_SIZE: f32 = 1.0;
 /// - 4: facet-json → serde_json migration; colors re-encode as RGBA hex and
 ///   `PrimType` values as kebab-case. Items from older documents that hold
 ///   either fall back to their config defaults.
+/// - 5: drop all legacy-layout fallbacks; plot bounds live only on `axes` and
+///   dashboard allocation counters are derived from item ids.
 const SUPPORTED_LAYOUT_VERSION: u32 = serial::TILE_LAYOUT_VERSION;
 
 /// Failure modes when loading a layout from JSON.
@@ -64,9 +66,7 @@ const SUPPORTED_LAYOUT_VERSION: u32 = serial::TILE_LAYOUT_VERSION;
 pub enum LoadError {
     /// The document isn't valid layout JSON.
     Parse(serde_json::Error),
-    /// The document claims a layout version newer than this build knows how to
-    /// read. Older versions load fine — the format is field-additive with
-    /// serde defaults — so only a forward version gap is rejected.
+    /// The document's layout version differs from the one this build writes.
     UnsupportedVersion(u32),
 }
 
@@ -76,7 +76,7 @@ impl std::fmt::Display for LoadError {
             Self::Parse(e) => write!(f, "parse: {e}"),
             Self::UnsupportedVersion(v) => write!(
                 f,
-                "unsupported layout version {v}; this build reads layouts up to version {SUPPORTED_LAYOUT_VERSION}"
+                "unsupported layout version {v}; this build requires version {SUPPORTED_LAYOUT_VERSION}"
             ),
         }
     }
@@ -481,11 +481,7 @@ impl TileGroup {
     pub fn active_pane(&self, _cx: &App) -> Option<Entity<Pane>> {
         self.focused_pane
             .as_ref()
-            .filter(|p| {
-                self.panes
-                    .iter()
-                    .any(|q| q.entity_id() == p.entity_id())
-            })
+            .filter(|p| self.panes.iter().any(|q| q.entity_id() == p.entity_id()))
             .cloned()
             .or_else(|| self.panes.first().cloned())
     }
@@ -563,13 +559,9 @@ impl TileGroup {
     /// around, so "no items anywhere" is the real test for an untouched
     /// layout (used to decide if loading a saved one needs consent).
     pub fn has_items(&self, cx: &App) -> bool {
-        fn member_has_items(member: &Member, cx: &App) -> bool {
-            match member {
-                Member::Pane(pane) => !pane.read(cx).items().is_empty(),
-                Member::Axis(axis) => axis.members.iter().any(|m| member_has_items(m, cx)),
-            }
-        }
-        member_has_items(&self.root, cx)
+        self.panes
+            .iter()
+            .any(|pane| !pane.read(cx).items().is_empty())
     }
 
     /// Snapshot the full layout (tree shape, flexes, and each item's own
@@ -600,9 +592,7 @@ impl TileGroup {
         cx: &mut Context<Self>,
     ) -> Result<Self, LoadError> {
         let serialized: TileLayout = serde_json::from_str(json)?;
-        // Older layouts load fine — the document is field-additive with serde
-        // defaults — so only reject versions this build predates.
-        if serialized.version > SUPPORTED_LAYOUT_VERSION {
+        if serialized.version != SUPPORTED_LAYOUT_VERSION {
             return Err(LoadError::UnsupportedVersion(serialized.version));
         }
         Ok(Self::deserialize(serialized, registry, cx))
@@ -813,6 +803,22 @@ impl Render for TileGroup {
 mod tests {
     use super::*;
     use crate::tiles::pane::TabOrientation;
+    use crate::views::dashboard::{
+        DashboardPanelConfig, DashboardWidget, WidgetId, WidgetKind, WidgetLive, WidgetRect,
+        WidgetRegistry, WidgetSpec, deserialize_dashboard,
+    };
+    use gpui::{AnyView, IntoElement, Render, Window};
+    use std::sync::Arc;
+
+    struct RegisteredTestView {
+        value: String,
+    }
+
+    impl Render for RegisteredTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.value.clone())
+        }
+    }
 
     fn empty_pane_layout(version: u32) -> String {
         let layout = TileLayout {
@@ -830,16 +836,146 @@ mod tests {
     }
 
     #[gpui::test]
-    fn from_json_accepts_older_version(cx: &mut gpui::TestAppContext) {
-        let json = empty_pane_layout(1);
+    fn unknown_pane_round_trips_raw_kind_and_state(cx: &mut gpui::TestAppContext) {
+        let state = r#"{"plugin":"temporarily absent"}"#;
+        let layout = TileLayout {
+            version: SUPPORTED_LAYOUT_VERSION,
+            global_time_range: String::new(),
+            root: TileNode::Pane(TilePane {
+                active_index: 0,
+                tab_orientation: TabOrientation::Horizontal,
+                hide_tab_bar: false,
+                locked_size: None,
+                items: vec![serial::TileItem {
+                    kind: "downstream.plugin".into(),
+                    state: state.into(),
+                }],
+            }),
+        };
+        let json = serde_json::to_string(&layout).unwrap();
         let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
-        let ok = cx.update(|cx| {
-            tg.update(cx, |_this, cx| {
-                let registry = ItemRegistry::default();
-                TileGroup::from_json(&json, &registry, cx).is_ok()
+        cx.update(|cx| {
+            tg.update(cx, |this, cx| {
+                *this = TileGroup::from_json(&json, &ItemRegistry::default(), cx).unwrap();
             })
         });
-        assert!(ok, "a version below the supported ceiling must load");
+        cx.read(|cx| {
+            let item = &tg.read(cx).panes[0].read(cx).items()[0];
+            assert_eq!(item.serialization_key(), "downstream.plugin");
+            assert_eq!(item.serialize(cx), state);
+        });
+    }
+
+    #[gpui::test]
+    fn one_view_spec_builds_snapshots_and_inspects_in_both_hosts(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
+        let spec = Arc::new(
+            WidgetSpec::new(
+                (120.0, 80.0),
+                |_| "Registered test".into(),
+                |config, _db, cx| {
+                    let value: String = serde_json::from_str(config).unwrap();
+                    let entity = cx.new(|_| RegisteredTestView { value });
+                    let any = entity.clone().into_any();
+                    WidgetLive {
+                        view: AnyView::from(entity),
+                        inspect: any.clone(),
+                        state: any,
+                    }
+                },
+                |entity, _, cx| {
+                    let entity = entity.clone().downcast::<RegisteredTestView>().ok()?;
+                    serde_json::to_string(&entity.read(cx).value).ok()
+                },
+            )
+            .with_tile("registered_test", |_| "Registered test".into()),
+        );
+        let mut panes = ItemRegistry::default();
+        panes.register_view(spec.clone(), db.clone());
+        let config = serde_json::to_string("hello").unwrap();
+
+        let dashboard = cx.update(|cx| {
+            WidgetRegistry::init(cx);
+            cx.global_mut::<WidgetRegistry>()
+                .register_shared(WidgetKind::new("registered_test"), spec);
+            deserialize_dashboard(
+                db,
+                &serde_json::to_string(&DashboardPanelConfig {
+                    title: "Downstream".into(),
+                    widgets: vec![DashboardWidget {
+                        id: WidgetId(1),
+                        rect: WidgetRect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: 120.0,
+                            h: 80.0,
+                        },
+                        kind: WidgetKind::new("registered_test"),
+                        config: config.clone(),
+                    }],
+                    connectors: Vec::new(),
+                })
+                .unwrap(),
+                cx,
+            )
+        });
+        cx.read(|cx| {
+            let cfg = dashboard.read(cx).to_config(cx);
+            assert_eq!(cfg.widgets[0].config, config);
+            assert!(
+                dashboard.read(cx).inspectable_widgets(cx)[0]
+                    .1
+                    .clone()
+                    .downcast::<RegisteredTestView>()
+                    .is_ok()
+            );
+        });
+
+        let layout = TileLayout {
+            version: SUPPORTED_LAYOUT_VERSION,
+            global_time_range: String::new(),
+            root: TileNode::Pane(TilePane {
+                active_index: 0,
+                tab_orientation: TabOrientation::Horizontal,
+                hide_tab_bar: false,
+                locked_size: None,
+                items: vec![serial::TileItem {
+                    kind: "registered_test".into(),
+                    state: config.clone(),
+                }],
+            }),
+        };
+        let json = serde_json::to_string(&layout).unwrap();
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
+        cx.update(|cx| {
+            tg.update(cx, |this, cx| {
+                *this = TileGroup::from_json(&json, &panes, cx).unwrap();
+            })
+        });
+        cx.read(|cx| {
+            let item = &tg.read(cx).panes[0].read(cx).items()[0];
+            assert_eq!(item.serialization_key(), "registered_test");
+            assert_eq!(item.serialize(cx), config);
+            assert!(item.entity_any(cx).downcast::<RegisteredTestView>().is_ok());
+        });
+    }
+
+    #[gpui::test]
+    fn from_json_rejects_older_version(cx: &mut gpui::TestAppContext) {
+        let version = SUPPORTED_LAYOUT_VERSION - 1;
+        let json = empty_pane_layout(version);
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(Vec::new(), cx)));
+        let rejected = cx.update(|cx| {
+            tg.update(cx, |_this, cx| {
+                let registry = ItemRegistry::default();
+                matches!(
+                    TileGroup::from_json(&json, &registry, cx),
+                    Err(LoadError::UnsupportedVersion(v)) if v == version
+                )
+            })
+        });
+        assert!(rejected, "an older layout version must be rejected");
     }
 
     #[gpui::test]

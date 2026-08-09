@@ -193,6 +193,10 @@ fn representation_is_externally_tagged() {
         json!({ "Postcard": [1, 2, 3, 4] })
     );
     assert_eq!(v["slots"][0]["initial"]["state"], json!("Running"));
+    assert!(
+        serde_json::from_value::<SlotInitState>(json!("Empty")).is_err(),
+        "an absent initial occupant is the only empty-slot representation"
+    );
     assert_eq!(v["edges"][2]["kind"], json!("Msg"));
     assert_eq!(v["edges"][0]["kind"], json!("Frame"));
 

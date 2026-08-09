@@ -63,6 +63,41 @@ async fn drain_f64(
 }
 
 #[stellarator::test]
+async fn from_db_adopts_the_component_wal() {
+    use metor_db::{ComponentSchema, DB};
+    use metor_proto::types::{ComponentId, Timestamp};
+
+    let temp = tempfile::tempdir().unwrap();
+    let db = DB::create(temp.path().join("db")).unwrap();
+    let component_id = ComponentId(42);
+    db.with_state_mut(|state| {
+        state.insert_component(
+            component_id,
+            ComponentSchema::new(PrimType::F64, &[]),
+            &db.path,
+        )
+    })
+    .unwrap();
+    let component = db
+        .with_state(|state| state.get_component(component_id).cloned())
+        .unwrap();
+    let readers_before = component.wal.reader_count();
+
+    let node = ops::db_source::from_db(&db, component_id).unwrap();
+    assert_eq!(component.wal.reader_count(), readers_before);
+    let mut reader = node.subscribe();
+    assert_eq!(component.wal.reader_count(), readers_before + 1);
+
+    component
+        .push_buf(Timestamp(7), &12.5_f64.to_le_bytes())
+        .unwrap();
+    let grant = reader.next().await;
+    let (timestamp, value) = grant.sample_at(0);
+    assert_eq!(timestamp, Timestamp(7));
+    assert_eq!(f64::from_le_bytes(value.try_into().unwrap()), 12.5);
+}
+
+#[stellarator::test]
 async fn sin_chain_emits_expected_values() {
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     assert!(matches!(clock.value_type(), ValueType::Clock));

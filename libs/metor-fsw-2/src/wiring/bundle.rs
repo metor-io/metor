@@ -344,7 +344,7 @@ fn bundle_members(
             } else {
                 PackSourceKind::CrateBuilt
             },
-            cdylib_sha256: super::stubgen::manifest_hash(&so_bytes),
+            cdylib_sha256: super::pack_module::manifest_hash(&so_bytes),
             manifest_hash: artifact.manifest_hash.clone(),
         });
         artifact_members.push((cdylib.clone(), MemberSource::Inline(so_bytes)));
@@ -363,7 +363,7 @@ fn bundle_members(
         profile: if opts.release { "release" } else { "debug" }.to_string(),
         built_at_unix,
         // Hash the exact wiring.json bytes, excluding the timestamp above.
-        ir_sha256: super::stubgen::manifest_hash(json.as_bytes()),
+        ir_sha256: super::pack_module::manifest_hash(json.as_bytes()),
         packs,
     };
     let meta_json = serde_json::to_string_pretty(&meta).expect("BundleMeta serializes to JSON");
@@ -503,7 +503,7 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
 
     let wiring_path = dir.join(WIRING_FILE);
     let wiring_bytes = fs::read(&wiring_path).map_err(io_at(&wiring_path))?;
-    if super::stubgen::manifest_hash(&wiring_bytes) != meta.ir_sha256 {
+    if super::pack_module::manifest_hash(&wiring_bytes) != meta.ir_sha256 {
         return Err(BundleError::IrHashMismatch);
     }
     let mut wiring: Wiring =
@@ -533,7 +533,7 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
                 }
                 Err(e) => return Err(io_at(&sidecar)(e)),
             };
-            if super::stubgen::manifest_hash(&bytes) != recorded {
+            if super::pack_module::manifest_hash(&bytes) != recorded {
                 return Err(BundleError::ManifestHashMismatch {
                     artifact: artifact.id.clone(),
                 });

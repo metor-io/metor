@@ -150,15 +150,16 @@ impl NodeGraph {
     /// `(order, cycle_members)` — anything in `cycle_members` couldn't be
     /// reached because it's in or downstream of a cycle.
     pub(crate) fn topo_order(&self) -> (Vec<FlowId>, HashSet<FlowId>) {
-        // Build in-degree from the parent map.
         let mut indeg: HashMap<FlowId, usize> = self.nodes.keys().map(|k| (k.clone(), 0)).collect();
         let mut children: HashMap<FlowId, Vec<FlowId>> = HashMap::new();
-        for flow_id in self.nodes.keys() {
-            let parents = self.parents_of(flow_id);
-            for p in &parents {
-                children.entry(p.clone()).or_default().push(flow_id.clone());
+        for edge in &self.edges {
+            if let Some(degree) = indeg.get_mut(&edge.target) {
+                *degree += 1;
+                children
+                    .entry(edge.source.clone())
+                    .or_default()
+                    .push(edge.target.clone());
             }
-            indeg.insert(flow_id.clone(), parents.len());
         }
 
         let mut queue: Vec<FlowId> = indeg

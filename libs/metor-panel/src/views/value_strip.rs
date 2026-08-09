@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::sync::Arc;
 
 use gpui::{
@@ -6,20 +5,19 @@ use gpui::{
     MouseButton, Pixels, Point, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType};
+use metor_proto::types::{ComponentId, ElementValue, PrimType};
 use smallvec::SmallVec;
 
+use crate::ComponentStreamBuilder;
 use crate::icons::Icon;
 use crate::inspector::rows::TextField;
 use crate::theme::{Theme, theme};
-use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
-/// Display payload for one element of a component.
-#[derive(Clone, Debug, PartialEq)]
-pub struct StripCell {
-    pub label: Option<SharedString>,
-    pub value: SharedString,
-}
+use super::binding::{StreamUpdate, spawn_seeded_stream};
+pub use super::format::StripCell;
+use super::format::ValueFormatter;
+#[cfg(test)]
+use super::format::format_element;
 
 /// Scalar interpretation of every cell in a strip.
 ///
@@ -31,7 +29,9 @@ pub enum CellKind {
     /// Component isn't registered yet or its metadata can't be resolved.
     Unknown,
     Bool,
-    Enum { variants: Vec<SharedString> },
+    Enum {
+        variants: Vec<SharedString>,
+    },
     Numeric,
     String,
 }
@@ -198,8 +198,7 @@ pub struct ComponentValueStrip {
     component_id: ComponentId,
     component_name: SharedString,
     element_names: Vec<SharedString>,
-    is_string: bool,
-    enum_variants: Option<Vec<String>>,
+    formatter: ValueFormatter,
     raw_values: Vec<ElementValue>,
     style: StripStyle,
     behavior: StripBehavior,
@@ -220,73 +219,43 @@ impl ComponentValueStrip {
     ) -> Self {
         let component_id = source.component_id();
 
-        let task = cx.spawn({
-            let db = db.clone();
-            async move |this, cx| {
-                let mut stream = source.into_stream(&db).await;
-                let metadata = resolve_metadata(&db, component_id);
-                let ResolvedMetadata {
-                    element_names,
-                    enum_variants,
-                    is_string,
-                    kind,
-                    component_name,
-                } = metadata;
-                let _ = this.update(cx, |this, cx| {
-                    this.kind = kind;
-                    this.component_name = component_name;
-                    this.element_names = element_names.clone();
-                    this.is_string = is_string;
-                    this.enum_variants = enum_variants.clone();
-                    cx.notify();
-                });
-                // A fresh WAL reader only sees samples committed from now on,
-                // so paint the last committed value immediately instead of
-                // leaving the strip blank until the next sample arrives.
-                let seed = db.with_state(|state| {
-                    let component = state.get_component(component_id)?;
-                    let latest = component.time_series.latest()?;
-                    let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
+        let task = spawn_seeded_stream(
+            db.clone(),
+            source,
+            cx,
+            |db, component_id| {
+                let metadata = resolve_metadata(db, component_id);
+                let formatter = metadata.formatter.clone();
+                let element_names = metadata.element_names.clone();
+                (metadata, move |view| {
                     let raw: Vec<ElementValue> = view.iter().collect();
-                    let cells =
-                        format_cells(&view, &element_names, enum_variants.as_deref(), is_string);
+                    let cells = formatter.format_cells(&view, &element_names);
                     Some((cells, raw))
-                });
-                if let Some((cells, raw_values)) = seed {
-                    let _ = this.update(cx, |this, cx| {
+                })
+            },
+            |this, update, cx| {
+                match update {
+                    StreamUpdate::Ready(metadata) => {
+                        this.kind = metadata.kind;
+                        this.component_name = metadata.component_name;
+                        this.element_names = metadata.element_names;
+                        this.formatter = metadata.formatter;
+                    }
+                    StreamUpdate::Value((cells, raw_values)) => {
                         this.cells = cells;
                         this.raw_values = raw_values;
-                        cx.notify();
-                    });
-                }
-                loop {
-                    let (cells, raw_values) = {
-                        let view = stream.next().await;
-                        let cv = view.as_component_view();
-                        let raw: Vec<ElementValue> = cv.iter().collect();
-                        let cells =
-                            format_cells(&cv, &element_names, enum_variants.as_deref(), is_string);
-                        (cells, raw)
-                    };
-                    let result = this.update(cx, |this, cx| {
-                        this.cells = cells;
-                        this.raw_values = raw_values;
-                        cx.notify();
-                    });
-                    if result.is_err() {
-                        break;
                     }
                 }
-            }
-        });
+                cx.notify();
+            },
+        );
 
         Self {
             db,
             component_id,
             component_name: SharedString::default(),
             element_names: Vec::new(),
-            is_string: false,
-            enum_variants: None,
+            formatter: ValueFormatter::default(),
             raw_values: Vec::new(),
             style,
             behavior,
@@ -540,12 +509,7 @@ impl Render for ComponentValueStrip {
             .map(|edit| {
                 let view = edit.value.as_view();
                 let raw: Vec<ElementValue> = view.iter().collect();
-                let cells = format_cells(
-                    &view,
-                    &self.element_names,
-                    self.enum_variants.as_deref(),
-                    self.is_string,
-                );
+                let cells = self.formatter.format_cells(&view, &self.element_names);
                 (cells, raw)
             });
         let (cells, raw_values): (&[StripCell], &[ElementValue]) = match &pending {
@@ -569,11 +533,7 @@ impl Render for ComponentValueStrip {
         let editing_index = self.editing.as_ref().map(|e| e.index);
         let editing_error = self.editing.as_ref().map(|e| e.error).unwrap_or(false);
 
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.0));
+        let mut row = div().flex().flex_row().items_center().gap(px(4.0));
         if !style.intrinsic_width {
             row = row.flex_wrap();
         }
@@ -690,33 +650,28 @@ impl Render for ComponentValueStrip {
                     (component_id.0.wrapping_mul(31) ^ idx as u64).wrapping_add(0x1001) as usize;
                 let mut bg = theme.control_active;
                 bg.a = 0.15;
-                let mut group = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .child(atom)
-                    .child(
-                        div()
-                            .id(("strip-apply", chevron_id))
-                            .px(px(6.0))
-                            .h(px(25.5))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(bg)
-                            .rounded_r(px(3.0))
-                            .text_size(px(12.0))
-                            .text_color(theme.control_active)
-                            .cursor_pointer()
-                            .child(Icon::ChevronRight.svg_color(11.0, theme.control_active))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                move |event: &gpui::MouseDownEvent, window, cx| {
-                                    apply(idx, event.position, window, cx);
-                                    cx.refresh_windows();
-                                },
-                            ),
-                    );
+                let mut group = div().flex().flex_row().items_center().child(atom).child(
+                    div()
+                        .id(("strip-apply", chevron_id))
+                        .px(px(6.0))
+                        .h(px(25.5))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(bg)
+                        .rounded_r(px(3.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.control_active)
+                        .cursor_pointer()
+                        .child(Icon::ChevronRight.svg_color(11.0, theme.control_active))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |event: &gpui::MouseDownEvent, window, cx| {
+                                apply(idx, event.position, window, cx);
+                                cx.refresh_windows();
+                            },
+                        ),
+                );
                 if style.intrinsic_width {
                     group = group.flex_none();
                 }
@@ -993,8 +948,7 @@ pub fn strip_row_width(n_cells: usize) -> f32 {
 
 pub(crate) struct ResolvedMetadata {
     pub element_names: Vec<SharedString>,
-    pub enum_variants: Option<Vec<String>>,
-    pub is_string: bool,
+    pub formatter: ValueFormatter,
     pub kind: CellKind,
     pub component_name: SharedString,
 }
@@ -1044,75 +998,11 @@ pub(crate) fn resolve_metadata(db: &DB, component_id: ComponentId) -> ResolvedMe
         );
         ResolvedMetadata {
             element_names,
-            enum_variants,
-            is_string,
+            formatter: ValueFormatter::new(is_string, enum_variants),
             kind,
             component_name,
         }
     })
-}
-
-/// Render a [`ComponentView`] into display cells.
-///
-/// Collapses string and enum components into a single unlabeled cell so the
-/// strip reads as a value, not an array of bytes or discriminants.
-pub(crate) fn format_cells(
-    view: &ComponentView<'_>,
-    element_names: &[SharedString],
-    enum_variants: Option<&[String]>,
-    is_string: bool,
-) -> Vec<StripCell> {
-    if is_string && let ComponentView::U8(array) = view {
-        let buf = array.buf();
-        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        if let Ok(s) = std::str::from_utf8(&buf[..len]) {
-            return vec![StripCell {
-                label: None,
-                value: SharedString::from(s.to_string()),
-            }];
-        }
-    }
-    if let Some(variants) = enum_variants {
-        let idx = view.to_f64() as usize;
-        if let Some(name) = variants.get(idx) {
-            return vec![StripCell {
-                label: None,
-                value: SharedString::from(name.to_string()),
-            }];
-        }
-    }
-
-    let values: Vec<ElementValue> = view.iter().collect();
-    if values.is_empty() {
-        return Vec::new();
-    }
-    if values.len() == 1 {
-        return vec![StripCell {
-            label: None,
-            value: SharedString::from(format_element(values[0])),
-        }];
-    }
-    values
-        .into_iter()
-        .enumerate()
-        .map(|(i, v)| StripCell {
-            label: element_names.get(i).cloned(),
-            value: SharedString::from(format_element(v)),
-        })
-        .collect()
-}
-
-pub(crate) fn format_element(v: ElementValue) -> String {
-    match v {
-        ElementValue::Bool(b) => (if b { "true" } else { "false" }).to_string(),
-        ElementValue::F32(x) => super::format_number(x as f64),
-        ElementValue::F64(x) => super::format_number(x),
-        other => {
-            let mut s = String::new();
-            let _ = write!(s, "{}", other.as_f64());
-            super::format::pad_positive(&s)
-        }
-    }
 }
 
 #[cfg(test)]

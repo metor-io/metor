@@ -343,15 +343,15 @@ pub enum LoadErrorKind {
     #[error("system `{system}` references unknown artifact `{artifact}`")]
     UnknownArtifact { system: String, artifact: String },
 
-    /// The generated stub module for this artifact was produced against a
+    /// The generated pack module for this artifact was produced against a
     /// different pack manifest than the one now built — its params, ports, or
     /// entries have changed. Fails before any dlopen, naming the one command
-    /// that fixes it. Only a stub-backed artifact (whose `ARTIFACT` constant
+    /// that fixes it. Only a generated artifact (whose `ARTIFACT` constant
     /// carries the recorded hash) can trigger this; a builder-authored
     /// artifact records no hash and skips the check.
     #[error(
-        "generated stubs for artifact `{artifact}` are stale (the pack manifest changed since \
-         they were generated); regenerate with `uv sync` (or `metor-fsw stubgen`)"
+        "generated module for artifact `{artifact}` is stale (the pack manifest changed since \
+         it was generated); regenerate with `uv sync`"
     )]
     StaleStubs {
         /// The artifact whose recorded and live manifest hashes disagree.

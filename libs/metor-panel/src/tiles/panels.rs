@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use gpui::{
-    App, Context, Entity, Hsla, IntoElement, Render, SharedString, Window, div, prelude::*,
-};
+use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div, prelude::*};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
@@ -11,10 +9,9 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
-use crate::views::time_series::{
-    EventOverlay, LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, TimeFormat, Trace,
-    YAxis,
-};
+use crate::views::time_series::{LinePlot, Override, Trace};
+#[cfg(test)]
+use crate::views::time_series::{PlotStyle, TimeFormat};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
@@ -27,13 +24,7 @@ use crate::views::{
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
-/// Persisted shape of a [`TextPanel`].
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct TextPanelConfig {
-    /// Display label and serialization key for the source component.
-    pub component: String,
-}
+pub use crate::views::ComponentTextConfig as TextPanelConfig;
 
 /// Pane item that renders a single component's latest value as text.
 pub struct TextPanel {
@@ -318,13 +309,7 @@ impl PaneItem for SequenceGridPanel {
     }
 }
 
-/// Persisted shape of a [`TrafficLightPanel`].
-#[derive(Serialize, Deserialize, Clone, Default)]
-#[serde(default)]
-pub struct TrafficLightPanelConfig {
-    pub component: String,
-    pub color: Option<Hsla>,
-}
+pub use crate::views::TrafficLightConfig as TrafficLightPanelConfig;
 
 /// Pane item rendering one component as a coloured on/off square.
 pub struct TrafficLightPanel {
@@ -439,8 +424,7 @@ pub struct GaugePanel {
 
 impl GaugePanel {
     pub fn from_config(cfg: GaugeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let label =
-            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
         let inner = cx.new(|cx| Gauge::from_config(&cfg, db, cx));
         Self { inner, label }
     }
@@ -480,8 +464,7 @@ pub struct StateChipPanel {
 
 impl StateChipPanel {
     pub fn from_config(cfg: StateChipConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let label =
-            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
         let inner = cx.new(|cx| StateChip::from_config(&cfg, db, cx));
         Self { inner, label }
     }
@@ -521,8 +504,7 @@ pub struct AttitudePanel {
 
 impl AttitudePanel {
     pub fn from_config(cfg: AttitudeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let label =
-            SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
+        let label = SharedString::from(cfg.label.clone().unwrap_or_else(|| cfg.component.clone()));
         let inner = cx.new(|cx| AttitudeIndicator::from_config(&cfg, db, cx));
         Self { inner, label }
     }
@@ -561,11 +543,7 @@ pub struct SequenceControlPanel {
 }
 
 impl SequenceControlPanel {
-    pub fn from_config(
-        cfg: SequenceControlConfig,
-        _db: Arc<DB>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn from_config(cfg: SequenceControlConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let label = SharedString::from(cfg.channel.clone());
         let inner = cx.new(|cx| SequenceControl::from_config(&cfg, cx));
         Self { inner, label }
@@ -598,13 +576,7 @@ impl PaneItem for SequenceControlPanel {
     }
 }
 
-/// Persisted shape of a [`TrafficLightGridPanel`].
-#[derive(Serialize, Deserialize, Clone, Default)]
-#[serde(default)]
-pub struct TrafficLightGridPanelConfig {
-    pub pattern: String,
-    pub color: Option<Hsla>,
-}
+pub use crate::views::TrafficLightGridConfig as TrafficLightGridPanelConfig;
 
 /// Pane item rendering every component matching a glob pattern as a grid of
 /// traffic-light tiles.
@@ -882,10 +854,6 @@ impl PlotPanel {
         let line_plot = inner.read(cx).line_plot().clone();
         Self { inner, line_plot }
     }
-
-    pub(crate) fn inner(&self) -> &Entity<TimeSeriesPlot> {
-        &self.inner
-    }
 }
 
 impl Render for PlotPanel {
@@ -894,270 +862,16 @@ impl Render for PlotPanel {
     }
 }
 
-/// Persisted shape of a [`PlotPanel`].
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct PlotPanelConfig {
-    pub label: String,
-    pub traces: Vec<TraceConfig>,
-    pub custom_title: Override<String>,
-    /// Per-plot time window in `TimeRangeBehavior`'s string grammar (e.g.
-    /// `"LAST 30m"`). Stored as text because the behavior's
-    /// `Duration`/`Timestamp` internals aren't `Facet`-serializable; empty
-    /// means the plot follows the global range. Additive — old layouts
-    /// deserialize to empty.
-    pub x_range: String,
-    /// Legacy single-axis bounds. Retained for back-compat: on load, when
-    /// `axes` is empty these seed the primary axis; on save they mirror the
-    /// primary axis so older readers still see pinned bounds.
-    pub y_min_override: Override<f64>,
-    pub y_max_override: Override<f64>,
-    /// Y axes, stacked left-to-right. Empty in pre-multi-axis layouts, which
-    /// then fall back to a single axis seeded from the legacy fields above.
-    pub axes: Vec<YAxisConfig>,
-    /// X-axis tick rendering: relative offsets (default) or absolute
-    /// UTC/local wall-clock. Additive — old layouts default to `Relative`.
-    pub x_time_format: TimeFormat,
-    /// Locked measurement cursors that survive panel close/reopen. Unlocked
-    /// cursors are transient and never written here.
-    pub cursors: Vec<MeasurementCursorConfig>,
-    /// Where the measurement readout panel sits inside the plot. Defaults
-    /// to `Track`; `Pinned` keeps user-dragged placement across reloads.
-    pub measurement_panel: MeasurementPanelConfig,
-    /// Suppress the control system's alarm limit lines on this plot. Stored
-    /// inverted so the default (and old layouts) show them.
-    pub hide_alarm_limits: bool,
-    /// Suppress the alarm out-of-bounds background tint on this plot. Stored
-    /// inverted so the default (and old layouts) show it.
-    pub hide_alarm_color: bool,
-    /// Event-flag overlays drawn in the plot's top gutter. Additive — old
-    /// layouts deserialize to empty (the feature is simply off).
-    pub event_overlays: Vec<EventOverlayConfig>,
-}
-
-/// Persisted shape of one [`EventOverlay`]. The live overlay is held as an
-/// `Entity<EventOverlay>`, and its `key` isn't `Facet`-serializable, so the
-/// key is stored as its stable string tag.
-#[derive(Serialize, Deserialize, Default, Clone)]
-#[serde(default)]
-pub struct EventOverlayConfig {
-    /// `"logs" | "alarms" | "sequences" | "msg:e03c"` (lowercase hex, no sep).
-    pub kind: String,
-    pub label: String,
-    pub visible: bool,
-}
-
-/// Serializable shape of [`PanelPosition`].
-///
-/// `Track`/`Pinned` are split into separate variants rather than a single
-/// optional point so the JSON discriminator is clean and old layouts that
-/// default to `Track` deserialize without an extra flag.
-#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug)]
-pub enum MeasurementPanelConfig {
-    #[default]
-    Track,
-    Pinned {
-        x: f32,
-        y: f32,
-    },
-}
-
-impl From<PanelPosition> for MeasurementPanelConfig {
-    fn from(p: PanelPosition) -> Self {
-        match p {
-            PanelPosition::Track => MeasurementPanelConfig::Track,
-            PanelPosition::Pinned { x, y } => MeasurementPanelConfig::Pinned { x, y },
-        }
-    }
-}
-
-impl From<MeasurementPanelConfig> for PanelPosition {
-    fn from(c: MeasurementPanelConfig) -> Self {
-        match c {
-            MeasurementPanelConfig::Track => PanelPosition::Track,
-            MeasurementPanelConfig::Pinned { x, y } => PanelPosition::Pinned { x, y },
-        }
-    }
-}
-
-/// Persisted shape of one locked [`MeasurementCursor`].
-///
-/// The focused trace is stored by its position in the panel's trace list at
-/// save-time (not by `EntityId`, which doesn't survive). `t_start`/`t_end`
-/// are raw microseconds because `Timestamp` doesn't implement `Facet` yet.
-#[derive(Serialize, Deserialize, Default, Clone)]
-#[serde(default)]
-pub struct MeasurementCursorConfig {
-    pub t_start_us: i64,
-    pub t_end_us: i64,
-    pub focused_trace_index: i64,
-    pub enabled: Vec<MeasurementKind>,
-}
-
-/// Persisted shape of one [`Trace`].
-///
-/// `Trace` itself marks `component_id` and `element_index` as
-/// `#[facet(skip)]` because the inspector doesn't expose them — but we *do*
-/// need them on disk, so the persistence boundary uses this parallel
-/// struct.
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct TraceConfig {
-    pub component_id: ComponentId,
-    pub element_index: usize,
-    pub color: Hsla,
-    pub style: PlotStyle,
-    pub visible: bool,
-    pub label: String,
-    pub stroke_width: f32,
-    /// Which Y axis this trace draws against. Defaults to 0 (the primary
-    /// axis), so pre-multi-axis layouts load with every trace on one axis.
-    pub axis_index: usize,
-}
-
-impl Default for TraceConfig {
-    fn default() -> Self {
-        Self {
-            component_id: ComponentId(0),
-            element_index: 0,
-            color: Hsla::default(),
-            style: PlotStyle::default(),
-            visible: true,
-            label: String::new(),
-            stroke_width: 1.5,
-            axis_index: 0,
-        }
-    }
-}
-
-impl From<&Trace> for TraceConfig {
-    fn from(t: &Trace) -> Self {
-        Self {
-            component_id: t.component_id,
-            element_index: t.element_index,
-            color: t.color,
-            style: t.style,
-            visible: t.visible,
-            label: t.label.to_string(),
-            stroke_width: t.stroke_width,
-            axis_index: t.axis_index,
-        }
-    }
-}
-
-impl From<TraceConfig> for Trace {
-    fn from(t: TraceConfig) -> Self {
-        Self {
-            component_id: t.component_id,
-            element_index: t.element_index,
-            color: t.color,
-            style: t.style,
-            visible: t.visible,
-            label: t.label.into(),
-            stroke_width: t.stroke_width,
-            axis_index: t.axis_index,
-            // line_plot is set by the plot's reconcile.
-            line_plot: None,
-        }
-    }
-}
-
-/// Persisted shape of one [`YAxis`]. Parallel struct because the live axis
-/// is held as an `Entity<YAxis>` in the plot.
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct YAxisConfig {
-    pub label: String,
-    pub y_min_override: Override<f64>,
-    pub y_max_override: Override<f64>,
-    pub color: Override<Hsla>,
-}
-
-impl Default for YAxisConfig {
-    fn default() -> Self {
-        Self {
-            label: String::from("Y"),
-            y_min_override: Override::Auto,
-            y_max_override: Override::Auto,
-            color: Override::Auto,
-        }
-    }
-}
-
-impl From<&YAxis> for YAxisConfig {
-    fn from(a: &YAxis) -> Self {
-        Self {
-            label: a.label.to_string(),
-            y_min_override: a.y_min_override.clone(),
-            y_max_override: a.y_max_override.clone(),
-            color: a.color.clone(),
-        }
-    }
-}
-
-impl From<YAxisConfig> for YAxis {
-    fn from(a: YAxisConfig) -> Self {
-        YAxis {
-            label: a.label.into(),
-            y_min_override: a.y_min_override,
-            y_max_override: a.y_max_override,
-            color: a.color,
-        }
-    }
-}
+pub use crate::views::time_series::{
+    EventOverlayConfig, MeasurementCursorConfig, MeasurementPanelConfig, PlotPanelConfig,
+    TraceConfig, YAxisConfig,
+};
 
 impl PlotPanel {
     pub fn from_config(cfg: PlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let traces: Vec<Trace> = cfg.traces.into_iter().map(Trace::from).collect();
-        let panel = Self::with_traces(db, traces, cx);
-        let line_plot = panel.line_plot.clone();
-        line_plot.update(cx, |lp, cx| {
-            lp.custom_title = cfg.custom_title.map(SharedString::from);
-            if let Ok(behavior) = cfg.x_range.parse() {
-                lp.x_range = Override::Custom(behavior);
-            }
-            lp.x_time_format = cfg.x_time_format;
-            lp.show_alarm_limits = !cfg.hide_alarm_limits;
-            lp.show_alarm_color = !cfg.hide_alarm_color;
-            if cfg.axes.is_empty() {
-                // Pre-multi-axis layout: keep the synthesized primary axis and
-                // seed it from the legacy bounds.
-                if let Some(axis) = lp.axes.first().cloned() {
-                    axis.update(cx, |a, _| {
-                        a.y_min_override = cfg.y_min_override.clone();
-                        a.y_max_override = cfg.y_max_override.clone();
-                    });
-                }
-            } else {
-                lp.axes = cfg
-                    .axes
-                    .iter()
-                    .take(LinePlot::MAX_AXES)
-                    .map(|a| cx.new(|_| YAxis::from(a.clone())))
-                    .collect();
-            }
-            // Unparseable kinds are dropped silently (a removed built-in, or a
-            // corrupt hex id).
-            lp.event_overlays = cfg
-                .event_overlays
-                .iter()
-                .filter_map(|o| {
-                    let key = crate::plot_events::kind_key_from_string(&o.kind)?;
-                    Some(cx.new(|_| EventOverlay::new(o.label.clone(), key)))
-                })
-                .collect();
-            cx.notify();
-        });
-        if !cfg.cursors.is_empty() {
-            let inner = panel.inner.clone();
-            inner.update(cx, |plot, cx| plot.restore_cursors(&cfg.cursors, cx));
-        }
-        let panel_position: PanelPosition = cfg.measurement_panel.into();
-        if panel_position != PanelPosition::Track {
-            let inner = panel.inner.clone();
-            inner.update(cx, |plot, cx| plot.set_panel_position(panel_position, cx));
-        }
-        panel
+        let inner = cx.new(|cx| TimeSeriesPlot::from_config(cfg, db, cx));
+        let line_plot = inner.read(cx).line_plot().clone();
+        Self { inner, line_plot }
     }
 }
 
@@ -1173,77 +887,7 @@ impl PaneItem for PlotPanel {
     }
 
     fn to_config(&self, cx: &App) -> PlotPanelConfig {
-        let lp = self.line_plot.read(cx);
-        let trace_ids: Vec<gpui::EntityId> = lp.traces().iter().map(|e| e.entity_id()).collect();
-        let cursors: Vec<MeasurementCursorConfig> = self
-            .inner
-            .read(cx)
-            .cursors()
-            .iter()
-            .map(|c| {
-                let c = c.read(cx);
-                let focused_trace_index = c
-                    .focused_trace
-                    .and_then(|id| trace_ids.iter().position(|t| *t == id))
-                    .map(|i| i as i64)
-                    .unwrap_or(-1);
-                MeasurementCursorConfig {
-                    t_start_us: c.t_start.0,
-                    t_end_us: c.t_end.0,
-                    focused_trace_index,
-                    enabled: c.enabled.iter().copied().collect(),
-                }
-            })
-            .collect();
-        let measurement_panel: MeasurementPanelConfig = self.inner.read(cx).panel_position().into();
-        // Mirror the primary axis's bounds into the legacy fields for
-        // back-compat with readers that predate multi-axis support.
-        let (y_min_override, y_max_override) = lp
-            .axes
-            .first()
-            .map(|a| {
-                let a = a.read(cx);
-                (a.y_min_override.clone(), a.y_max_override.clone())
-            })
-            .unwrap_or((Override::Auto, Override::Auto));
-        PlotPanelConfig {
-            label: self.tab_title(cx).to_string(),
-            traces: lp
-                .traces()
-                .iter()
-                .map(|e| TraceConfig::from(e.read(cx)))
-                .collect(),
-            custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
-            x_range: lp
-                .x_range
-                .as_custom()
-                .map(|b| b.to_string())
-                .unwrap_or_default(),
-            y_min_override,
-            y_max_override,
-            axes: lp
-                .axes
-                .iter()
-                .map(|a| YAxisConfig::from(a.read(cx)))
-                .collect(),
-            x_time_format: lp.x_time_format,
-            cursors,
-            measurement_panel,
-            hide_alarm_limits: !lp.show_alarm_limits,
-            hide_alarm_color: !lp.show_alarm_color,
-            event_overlays: lp
-                .event_overlays
-                .iter()
-                .map(|o| {
-                    let o = o.read(cx);
-                    EventOverlayConfig {
-                        kind: crate::plot_events::kind_key_to_string(o.key),
-                        label: o.label.to_string(),
-                        visible: o.visible,
-                    }
-                })
-                .collect(),
-        }
+        self.inner.read(cx).to_config(cx)
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1273,10 +917,6 @@ impl XyPlotPanel {
         let line_plot = inner.read(cx).line_plot().clone();
         Self { inner, line_plot }
     }
-
-    pub(crate) fn inner(&self) -> &Entity<XyPlot> {
-        &self.inner
-    }
 }
 
 impl Render for XyPlotPanel {
@@ -1285,99 +925,13 @@ impl Render for XyPlotPanel {
     }
 }
 
-/// Persisted shape of an [`XyPlotPanel`].
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct XyPlotPanelConfig {
-    pub label: String,
-    pub traces: Vec<XyTraceConfig>,
-    pub custom_title: Override<String>,
-    pub x_min_override: Override<f64>,
-    pub x_max_override: Override<f64>,
-    pub y_min_override: Override<f64>,
-    pub y_max_override: Override<f64>,
-}
-
-/// Persisted shape of one [`XyTrace`].
-///
-/// Mirrors [`TraceConfig`]; both axes' `(component_id, element_index)`
-/// pairs need to round-trip on disk even though the inspector hides them.
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct XyTraceConfig {
-    pub x_component_id: ComponentId,
-    pub x_element_index: usize,
-    pub y_component_id: ComponentId,
-    pub y_element_index: usize,
-    pub color: Hsla,
-    pub style: PlotStyle,
-    pub visible: bool,
-    pub label: String,
-    pub stroke_width: f32,
-}
-
-impl Default for XyTraceConfig {
-    fn default() -> Self {
-        Self {
-            x_component_id: ComponentId(0),
-            x_element_index: 0,
-            y_component_id: ComponentId(0),
-            y_element_index: 0,
-            color: Hsla::default(),
-            style: PlotStyle::default(),
-            visible: true,
-            label: String::new(),
-            stroke_width: 1.5,
-        }
-    }
-}
-
-impl From<&XyTrace> for XyTraceConfig {
-    fn from(t: &XyTrace) -> Self {
-        Self {
-            x_component_id: t.x_component_id,
-            x_element_index: t.x_element_index,
-            y_component_id: t.y_component_id,
-            y_element_index: t.y_element_index,
-            color: t.color,
-            style: t.style,
-            visible: t.visible,
-            label: t.label.to_string(),
-            stroke_width: t.stroke_width,
-        }
-    }
-}
-
-impl From<XyTraceConfig> for XyTrace {
-    fn from(t: XyTraceConfig) -> Self {
-        Self {
-            x_component_id: t.x_component_id,
-            x_element_index: t.x_element_index,
-            y_component_id: t.y_component_id,
-            y_element_index: t.y_element_index,
-            color: t.color,
-            style: t.style,
-            visible: t.visible,
-            label: t.label.into(),
-            stroke_width: t.stroke_width,
-        }
-    }
-}
+pub use crate::views::xy_plot::{XyPlotPanelConfig, XyTraceConfig};
 
 impl XyPlotPanel {
     pub fn from_config(cfg: XyPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let traces: Vec<XyTrace> = cfg.traces.into_iter().map(XyTrace::from).collect();
-        let panel = Self::with_traces(db, traces, cx);
-        let line_plot = panel.line_plot.clone();
-        line_plot.update(cx, |lp, cx| {
-            lp.custom_title = cfg.custom_title.map(SharedString::from);
-            lp.x_min_override = cfg.x_min_override;
-            lp.x_max_override = cfg.x_max_override;
-            lp.y_min_override = cfg.y_min_override;
-            lp.y_max_override = cfg.y_max_override;
-            cx.notify();
-        });
-        panel
+        let inner = cx.new(|cx| XyPlot::from_config(cfg, db, cx));
+        let line_plot = inner.read(cx).line_plot().clone();
+        Self { inner, line_plot }
     }
 }
 
@@ -1393,20 +947,7 @@ impl PaneItem for XyPlotPanel {
     }
 
     fn to_config(&self, cx: &App) -> XyPlotPanelConfig {
-        let lp = self.line_plot.read(cx);
-        XyPlotPanelConfig {
-            label: self.tab_title(cx).to_string(),
-            traces: lp
-                .traces()
-                .iter()
-                .map(|e| XyTraceConfig::from(e.read(cx)))
-                .collect(),
-            custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
-            x_min_override: lp.x_min_override.clone(),
-            x_max_override: lp.x_max_override.clone(),
-            y_min_override: lp.y_min_override.clone(),
-            y_max_override: lp.y_max_override.clone(),
-        }
+        self.inner.read(cx).to_config(cx)
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1432,10 +973,6 @@ impl ListPlotPanel {
         let line_plot = inner.read(cx).line_plot().clone();
         Self { inner, line_plot }
     }
-
-    pub(crate) fn inner(&self) -> &Entity<ListPlot> {
-        &self.inner
-    }
 }
 
 impl Render for ListPlotPanel {
@@ -1444,88 +981,13 @@ impl Render for ListPlotPanel {
     }
 }
 
-/// Persisted shape of a [`ListPlotPanel`].
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct ListPlotPanelConfig {
-    pub label: String,
-    pub traces: Vec<ListTraceConfig>,
-    pub custom_title: Override<String>,
-    pub x_min_override: Override<f64>,
-    pub x_max_override: Override<f64>,
-    pub y_min_override: Override<f64>,
-    pub y_max_override: Override<f64>,
-}
-
-/// Persisted shape of one [`ListTrace`].
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct ListTraceConfig {
-    pub component_id: ComponentId,
-    pub len: usize,
-    pub color: Hsla,
-    pub style: PlotStyle,
-    pub visible: bool,
-    pub label: String,
-    pub stroke_width: f32,
-}
-
-impl Default for ListTraceConfig {
-    fn default() -> Self {
-        Self {
-            component_id: ComponentId(0),
-            len: 0,
-            color: Hsla::default(),
-            style: PlotStyle::default(),
-            visible: true,
-            label: String::new(),
-            stroke_width: 1.5,
-        }
-    }
-}
-
-impl From<&ListTrace> for ListTraceConfig {
-    fn from(t: &ListTrace) -> Self {
-        Self {
-            component_id: t.component_id,
-            len: t.len,
-            color: t.color,
-            style: t.style,
-            visible: t.visible,
-            label: t.label.to_string(),
-            stroke_width: t.stroke_width,
-        }
-    }
-}
-
-impl From<ListTraceConfig> for ListTrace {
-    fn from(t: ListTraceConfig) -> Self {
-        Self {
-            component_id: t.component_id,
-            len: t.len,
-            color: t.color,
-            style: t.style,
-            visible: t.visible,
-            label: t.label.into(),
-            stroke_width: t.stroke_width,
-        }
-    }
-}
+pub use crate::views::list_plot::{ListPlotPanelConfig, ListTraceConfig};
 
 impl ListPlotPanel {
     pub fn from_config(cfg: ListPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let traces: Vec<ListTrace> = cfg.traces.into_iter().map(ListTrace::from).collect();
-        let panel = Self::with_traces(db, traces, cx);
-        let line_plot = panel.line_plot.clone();
-        line_plot.update(cx, |lp, cx| {
-            lp.custom_title = cfg.custom_title.map(SharedString::from);
-            lp.x_min_override = cfg.x_min_override;
-            lp.x_max_override = cfg.x_max_override;
-            lp.y_min_override = cfg.y_min_override;
-            lp.y_max_override = cfg.y_max_override;
-            cx.notify();
-        });
-        panel
+        let inner = cx.new(|cx| ListPlot::from_config(cfg, db, cx));
+        let line_plot = inner.read(cx).line_plot().clone();
+        Self { inner, line_plot }
     }
 }
 
@@ -1541,20 +1003,7 @@ impl PaneItem for ListPlotPanel {
     }
 
     fn to_config(&self, cx: &App) -> ListPlotPanelConfig {
-        let lp = self.line_plot.read(cx);
-        ListPlotPanelConfig {
-            label: self.tab_title(cx).to_string(),
-            traces: lp
-                .traces()
-                .iter()
-                .map(|e| ListTraceConfig::from(e.read(cx)))
-                .collect(),
-            custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
-            x_min_override: lp.x_min_override.clone(),
-            x_max_override: lp.x_max_override.clone(),
-            y_min_override: lp.y_min_override.clone(),
-            y_max_override: lp.y_max_override.clone(),
-        }
+        self.inner.read(cx).to_config(cx)
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1562,61 +1011,7 @@ impl PaneItem for ListPlotPanel {
     }
 }
 
-/// Persisted shape of a [`Viewer3dPanel`].
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct Viewer3dPanelConfig {
-    pub models: Vec<ModelConfig>,
-    pub camera: CameraConfig,
-}
-
-/// Persisted shape of one model entry inside a [`Viewer3dPanel`].
-///
-/// Mirrors the data fields of [`crate::views::viewer_3d::ModelEntry`] but
-/// avoids the live `Entity` wrapping so the config can round-trip directly.
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct ModelConfig {
-    pub label: String,
-    pub path: String,
-    pub position_binding: Option<ComponentId>,
-    pub orientation_binding: Option<ComponentId>,
-}
-
-/// Persisted shape of [`crate::views::viewer_3d::OrbitCamera`].
-///
-/// `glam::Vec3` is not `Facet`, so the target is unpacked into three fields
-/// at the persistence boundary.
-#[derive(Serialize, Deserialize)]
-#[serde(default)]
-pub struct CameraConfig {
-    pub target_x: f32,
-    pub target_y: f32,
-    pub target_z: f32,
-    pub yaw: f32,
-    pub pitch: f32,
-    pub distance: f32,
-    pub fov_y_rad: f32,
-}
-
-impl Default for CameraConfig {
-    /// Mirror [`crate::views::viewer_3d::OrbitCamera::default`] so a parse
-    /// failure that falls back to `Default` still yields a usable camera.
-    /// The auto-derived all-zero default would render nothing
-    /// (`fov_y_rad == 0` collapses the projection matrix).
-    fn default() -> Self {
-        let cam = crate::views::viewer_3d::OrbitCamera::default();
-        Self {
-            target_x: cam.target.x,
-            target_y: cam.target.y,
-            target_z: cam.target.z,
-            yaw: cam.yaw,
-            pitch: cam.pitch,
-            distance: cam.distance,
-            fov_y_rad: cam.fov_y_rad,
-        }
-    }
-}
+pub use crate::views::viewer_3d::{CameraConfig, ModelConfig, Viewer3dPanelConfig};
 
 /// Pane item hosting the Bevy-backed 3D viewer.
 pub struct Viewer3dPanel {
@@ -1639,34 +1034,7 @@ impl Viewer3dPanel {
     /// directly on each [`crate::views::viewer_3d::ModelEntry`] entity so
     /// the viewer's reconcile pass picks them up on the next observe tick.
     pub fn from_config(cfg: Viewer3dPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| {
-            let mut viewer = Viewer3d::with_db(db, cx);
-            for model in &cfg.models {
-                viewer.add_model(model.label.clone(), model.path.clone(), cx);
-                if let Some(entry) = viewer.models().last().cloned() {
-                    let pos = model.position_binding;
-                    let orient = model.orientation_binding;
-                    entry.update(cx, |m, cx| {
-                        m.position_binding = pos;
-                        m.orientation_binding = orient;
-                        cx.notify();
-                    });
-                }
-            }
-            let cam = viewer.camera_mut();
-            cam.target = glam::Vec3::new(
-                cfg.camera.target_x,
-                cfg.camera.target_y,
-                cfg.camera.target_z,
-            );
-            cam.yaw = cfg.camera.yaw;
-            cam.pitch = cfg.camera.pitch;
-            cam.distance = cfg.camera.distance;
-            cam.fov_y_rad = cfg.camera.fov_y_rad;
-            viewer.camera_fov = cfg.camera.fov_y_rad;
-            viewer.sync_camera(cx);
-            viewer
-        });
+        let inner = cx.new(|cx| Viewer3d::from_config(cfg, db, cx));
         Self {
             inner,
             label: "3D Viewer".into(),
@@ -1692,33 +1060,7 @@ impl PaneItem for Viewer3dPanel {
     }
 
     fn to_config(&self, cx: &App) -> Viewer3dPanelConfig {
-        let inner = self.inner.read(cx);
-        let cam = inner.camera();
-        let models = inner
-            .models()
-            .iter()
-            .map(|m| {
-                let m = m.read(cx);
-                ModelConfig {
-                    label: m.label.to_string(),
-                    path: m.path.clone(),
-                    position_binding: m.position_binding_component(),
-                    orientation_binding: m.orientation_binding_component(),
-                }
-            })
-            .collect();
-        Viewer3dPanelConfig {
-            models,
-            camera: CameraConfig {
-                target_x: cam.target.x,
-                target_y: cam.target.y,
-                target_z: cam.target.z,
-                yaw: cam.yaw,
-                pitch: cam.pitch,
-                distance: cam.distance,
-                fov_y_rad: cam.fov_y_rad,
-            },
-        }
+        self.inner.read(cx).to_config(cx)
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1731,10 +1073,57 @@ impl PaneItem for Viewer3dPanel {
 /// Each row adds a freshly-constructed panel to `pane`. The time-series row
 /// detours through the trace picker, then calls `on_open_inspector` (if
 /// provided) so the user can immediately configure the plot.
+fn add_registered_panel(
+    pane: &Entity<Pane>,
+    key: &str,
+    config: &impl Serialize,
+    cx: &mut App,
+) -> Option<gpui::AnyEntity> {
+    let state = serde_json::to_string(config).ok()?;
+    add_registered_panel_state(pane, key, &state, cx)
+}
+
+fn add_registered_panel_state(
+    pane: &Entity<Pane>,
+    key: &str,
+    state: &str,
+    cx: &mut App,
+) -> Option<gpui::AnyEntity> {
+    let registry = cx.global::<super::ItemRegistry>().clone();
+    pane.update(cx, |pane, cx| {
+        let item = registry.deserialize(key, state, cx)?;
+        let inspect = item.entity_any(cx);
+        pane.add_item(item, cx);
+        Some(inspect)
+    })
+}
+
+fn inspect_created(
+    entity: gpui::AnyEntity,
+    db: &Arc<DB>,
+    on_open: &Option<OpenInspectorCallback>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(on_open) = on_open else { return };
+    let Some(rows) = crate::inspector::reflect::rows_for_any_entity(&entity, db, cx) else {
+        return;
+    };
+    on_open(
+        InspectorRequest {
+            rows,
+            mode: InspectorMode::Centered,
+        },
+        window,
+        cx,
+    );
+}
+
 pub(crate) fn new_panel_rows(
     db: Arc<DB>,
     pane: Entity<Pane>,
     on_open_inspector: Option<OpenInspectorCallback>,
+    cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
@@ -1753,31 +1142,14 @@ pub(crate) fn new_panel_rows(
                     db.clone(),
                     Arc::new(|_cx| 0),
                     Arc::new(move |traces, window, cx| {
-                        let db_for_panel = db_for_select.clone();
-                        let plot_panel =
-                            cx.new(|cx| PlotPanel::with_traces(db_for_panel, traces, cx));
-                        let inner = plot_panel.read(cx).inner().clone();
-
-                        pane.update(cx, |pane, cx| {
-                            pane.add_item(Box::new(plot_panel), cx);
-                        });
-
-                        if let Some(on_open_inspector) = &on_open_inspector {
-                            let inner_any = inner.into_any();
-                            if let Some(rows) = crate::inspector::reflect::rows_for_any_entity(
-                                &inner_any,
-                                &db_for_select,
-                                cx,
-                            ) {
-                                on_open_inspector(
-                                    InspectorRequest {
-                                        rows,
-                                        mode: InspectorMode::Centered,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
+                        let config = PlotPanelConfig {
+                            traces: traces.iter().map(TraceConfig::from).collect(),
+                            ..Default::default()
+                        };
+                        if let Some(entity) =
+                            add_registered_panel(&pane, "time_series_plot", &config, cx)
+                        {
+                            inspect_created(entity, &db_for_select, &on_open_inspector, window, cx);
                         }
                     }),
                 )
@@ -1800,31 +1172,12 @@ pub(crate) fn new_panel_rows(
                     db.clone(),
                     Arc::new(|_cx| 0),
                     Arc::new(move |trace, window, cx| {
-                        let db_for_panel = db_for_select.clone();
-                        let plot_panel =
-                            cx.new(|cx| XyPlotPanel::with_traces(db_for_panel, vec![trace], cx));
-                        let inner = plot_panel.read(cx).inner().clone();
-
-                        pane.update(cx, |pane, cx| {
-                            pane.add_item(Box::new(plot_panel), cx);
-                        });
-
-                        if let Some(on_open_inspector) = &on_open_inspector {
-                            let inner_any = inner.into_any();
-                            if let Some(rows) = crate::inspector::reflect::rows_for_any_entity(
-                                &inner_any,
-                                &db_for_select,
-                                cx,
-                            ) {
-                                on_open_inspector(
-                                    InspectorRequest {
-                                        rows,
-                                        mode: InspectorMode::Centered,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
+                        let config = XyPlotPanelConfig {
+                            traces: vec![XyTraceConfig::from(&trace)],
+                            ..Default::default()
+                        };
+                        if let Some(entity) = add_registered_panel(&pane, "xy_plot", &config, cx) {
+                            inspect_created(entity, &db_for_select, &on_open_inspector, window, cx);
                         }
                     }),
                 )
@@ -1847,31 +1200,13 @@ pub(crate) fn new_panel_rows(
                     db.clone(),
                     Arc::new(|_cx| 0),
                     Arc::new(move |trace, window, cx| {
-                        let db_for_panel = db_for_select.clone();
-                        let plot_panel =
-                            cx.new(|cx| ListPlotPanel::with_traces(db_for_panel, vec![trace], cx));
-                        let inner = plot_panel.read(cx).inner().clone();
-
-                        pane.update(cx, |pane, cx| {
-                            pane.add_item(Box::new(plot_panel), cx);
-                        });
-
-                        if let Some(on_open_inspector) = &on_open_inspector {
-                            let inner_any = inner.into_any();
-                            if let Some(rows) = crate::inspector::reflect::rows_for_any_entity(
-                                &inner_any,
-                                &db_for_select,
-                                cx,
-                            ) {
-                                on_open_inspector(
-                                    InspectorRequest {
-                                        rows,
-                                        mode: InspectorMode::Centered,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
+                        let config = ListPlotPanelConfig {
+                            traces: vec![ListTraceConfig::from(&trace)],
+                            ..Default::default()
+                        };
+                        if let Some(entity) = add_registered_panel(&pane, "list_plot", &config, cx)
+                        {
+                            inspect_created(entity, &db_for_select, &on_open_inspector, window, cx);
                         }
                     }),
                 )
@@ -1886,16 +1221,18 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             let pane = pane.clone();
             Box::new(move |_cx| {
-                let db_outer = db.clone();
                 let pane = pane.clone();
-                component_picker_rows(db.clone(), move |component_id, name, cx| {
-                    let db = db_outer.clone();
-                    pane.update(cx, |pane, cx| {
-                        let item: Box<dyn PaneItemHandle> =
-                            Box::new(cx.new(|cx| TextPanel::new(db, component_id, name, cx)));
-                        pane.add_item(item, cx);
-                    });
-                })
+                crate::inspector::trace_picker::component_picker_rows(
+                    db.clone(),
+                    move |_component_id, name, cx| {
+                        add_registered_panel(
+                            &pane,
+                            "component_text",
+                            &TextPanelConfig { component: name },
+                            cx,
+                        );
+                    },
+                )
             })
         },
     )));
@@ -1907,17 +1244,21 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             let pane = pane.clone();
             Box::new(move |_cx| {
-                let db_outer = db.clone();
                 let pane = pane.clone();
-                component_picker_rows(db.clone(), move |component_id, name, cx| {
-                    let db = db_outer.clone();
-                    pane.update(cx, |pane, cx| {
-                        let item: Box<dyn PaneItemHandle> = Box::new(
-                            cx.new(|cx| TrafficLightPanel::new(db, component_id, name, cx)),
+                crate::inspector::trace_picker::component_picker_rows(
+                    db.clone(),
+                    move |_component_id, name, cx| {
+                        add_registered_panel(
+                            &pane,
+                            "traffic_light",
+                            &TrafficLightPanelConfig {
+                                component: name,
+                                color: None,
+                            },
+                            cx,
                         );
-                        pane.add_item(item, cx);
-                    });
-                })
+                    },
+                )
             })
         },
     )));
@@ -1926,9 +1267,8 @@ pub(crate) fn new_panel_rows(
         "Traffic Light Grid",
         SharedString::new_static(""),
         {
-            let db = db.clone();
             let pane = pane.clone();
-            Box::new(move |_cx| traffic_light_grid_pattern_rows(db.clone(), pane.clone()))
+            Box::new(move |_cx| traffic_light_grid_pattern_rows(pane.clone()))
         },
     )));
 
@@ -1939,8 +1279,8 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             let pane = pane.clone();
             Box::new(move |_cx| {
-                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
-                    Box::new(cx.new(|cx| MeterPanel::from_config(seed.into(), db, cx)))
+                instrument_wizard_rows(db.clone(), pane.clone(), "meter", |seed| {
+                    serde_json::to_string(&MeterConfig::from(seed)).unwrap()
                 })
             })
         },
@@ -1953,8 +1293,8 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             let pane = pane.clone();
             Box::new(move |_cx| {
-                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
-                    Box::new(cx.new(|cx| GaugePanel::from_config(seed.into(), db, cx)))
+                instrument_wizard_rows(db.clone(), pane.clone(), "gauge", |seed| {
+                    serde_json::to_string(&GaugeConfig::from(seed)).unwrap()
                 })
             })
         },
@@ -1967,7 +1307,7 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             let pane = pane.clone();
             Box::new(move |_cx| {
-                instrument_wizard_rows(db.clone(), pane.clone(), |seed, db, cx| {
+                instrument_wizard_rows(db.clone(), pane.clone(), "state_chip", |seed| {
                     // A chip's state table can't be derived from the schema,
                     // so it opens showing the raw code until the operator
                     // names the states.
@@ -1977,7 +1317,7 @@ pub(crate) fn new_panel_rows(
                         label: Some(seed.label),
                         ..Default::default()
                     };
-                    Box::new(cx.new(|cx| StateChipPanel::from_config(cfg, db, cx)))
+                    serde_json::to_string(&cfg).unwrap()
                 })
             })
         },
@@ -1990,20 +1330,17 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             let pane = pane.clone();
             Box::new(move |_cx| {
-                let db_outer = db.clone();
                 let pane = pane.clone();
-                component_picker_rows(db.clone(), move |_component_id, name, cx| {
-                    let cfg = AttitudeConfig {
-                        component: name.clone(),
-                        ..Default::default()
-                    };
-                    let db = db_outer.clone();
-                    pane.update(cx, |pane, cx| {
-                        let item: Box<dyn PaneItemHandle> =
-                            Box::new(cx.new(|cx| AttitudePanel::from_config(cfg, db, cx)));
-                        pane.add_item(item, cx);
-                    });
-                })
+                crate::inspector::trace_picker::component_picker_rows(
+                    db.clone(),
+                    move |_component_id, name, cx| {
+                        let cfg = AttitudeConfig {
+                            component: name,
+                            ..Default::default()
+                        };
+                        add_registered_panel(&pane, "attitude", &cfg, cx);
+                    },
+                )
             })
         },
     )));
@@ -2012,36 +1349,24 @@ pub(crate) fn new_panel_rows(
         "Sequence Control",
         SharedString::new_static(""),
         {
-            let db = db.clone();
             let pane = pane.clone();
             Box::new(move |cx| {
-                let db = db.clone();
                 let pane = pane.clone();
                 crate::views::sequence_control::channel_picker_rows(cx, move |channel, cx| {
                     let cfg = SequenceControlConfig {
                         channel,
                         compact: false,
                     };
-                    let db = db.clone();
-                    pane.update(cx, |pane, cx| {
-                        let item: Box<dyn PaneItemHandle> =
-                            Box::new(cx.new(|cx| SequenceControlPanel::from_config(cfg, db, cx)));
-                        pane.add_item(item, cx);
-                    });
+                    add_registered_panel(&pane, "sequence_control", &cfg, cx);
                 })
             })
         },
     )));
 
     rows.push(Box::new(CommandRow::new("Component Table", {
-        let db = db.clone();
         let pane = pane.clone();
         Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| TablePanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
+            add_registered_panel(&pane, "component_table", &TablePanelConfig {}, cx);
         })
     })));
 
@@ -2072,15 +1397,9 @@ pub(crate) fn new_panel_rows(
     })));
 
     rows.push(Box::new(CommandRow::new("3D Viewer", {
-        let db = db.clone();
         let pane = pane.clone();
         Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| Viewer3dPanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
+            add_registered_panel(&pane, "viewer_3d", &Viewer3dPanelConfig::default(), cx);
         })
     })));
 
@@ -2172,86 +1491,39 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
+    if let Some(registry) = cx.try_global::<crate::views::dashboard::WidgetRegistry>() {
+        for (label, add_flow) in registry.tile_add_flows() {
+            rows.push(Box::new(NavRow::new(label, "", {
+                let pane = pane.clone();
+                let db = db.clone();
+                Box::new(move |cx| add_flow(pane.clone(), db.clone(), cx))
+            })));
+        }
+    }
+
     rows
 }
 
 /// Single-question wizard for "New Panel → Traffic Light Grid": prompts
 /// for a glob pattern, then constructs a [`TrafficLightGridPanel`] seeded
 /// with that pattern.
-fn traffic_light_grid_pattern_rows(db: Arc<DB>, pane: Entity<Pane>) -> Vec<Box<dyn InspectorRow>> {
+fn traffic_light_grid_pattern_rows(pane: Entity<Pane>) -> Vec<Box<dyn InspectorRow>> {
     vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
         move |pattern, _window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| TrafficLightGridPanel::new(db, pattern, cx)));
-                pane.add_item(item, cx);
-            });
+            add_registered_panel(
+                &pane,
+                "traffic_light_grid",
+                &TrafficLightGridPanelConfig {
+                    pattern: pattern.to_string(),
+                    color: None,
+                },
+                cx,
+            );
         },
     ))]
 }
 
-/// Everything a scalar instrument needs to bind and scale itself, derived
-/// from one picked trace.
-///
-/// The scale is seeded from the element's declared alarm limits (see
-/// [`crate::views::meter::suggested_scale`]) so a new instrument opens
-/// already showing its redline; the operator can retune it afterwards.
-pub(crate) struct ScaleSeed {
-    pub component: String,
-    pub element: usize,
-    pub label: String,
-    pub min: f64,
-    pub max: f64,
-}
-
-/// One seed per picked trace, so selecting x/y/z yields three instruments
-/// rather than forcing three trips through the wizard.
-pub(crate) fn scale_seeds_for_traces(db: &DB, traces: &[Trace], cx: &App) -> Vec<ScaleSeed> {
-    traces
-        .iter()
-        .map(|trace| {
-            let at =
-                crate::views::binding::ElementRef::new(trace.component_id, trace.element_index);
-            let (min, max) = crate::views::meter::suggested_scale(at, cx);
-            ScaleSeed {
-                component: crate::views::binding::component_meta(db, trace.component_id)
-                    .name
-                    .to_string(),
-                element: trace.element_index,
-                label: trace.label.to_string(),
-                min,
-                max,
-            }
-        })
-        .collect()
-}
-
-impl From<ScaleSeed> for MeterConfig {
-    fn from(seed: ScaleSeed) -> Self {
-        Self {
-            component: seed.component,
-            element: seed.element,
-            label: Some(seed.label),
-            min: seed.min,
-            max: seed.max,
-            ..Default::default()
-        }
-    }
-}
-
-impl From<ScaleSeed> for GaugeConfig {
-    fn from(seed: ScaleSeed) -> Self {
-        Self {
-            component: seed.component,
-            element: seed.element,
-            label: Some(seed.label),
-            min: seed.min,
-            max: seed.max,
-            ..Default::default()
-        }
-    }
-}
+use crate::views::instrument::{ScaleSeed, scale_seeds_for_traces};
 
 /// The trace wizard wired to a scalar-instrument constructor: every picked
 /// element becomes its own tile, built by `make`.
@@ -2262,47 +1534,25 @@ impl From<ScaleSeed> for GaugeConfig {
 fn instrument_wizard_rows(
     db: Arc<DB>,
     pane: Entity<Pane>,
-    make: fn(ScaleSeed, Arc<DB>, &mut Context<Pane>) -> Box<dyn PaneItemHandle>,
+    key: &'static str,
+    make_config: fn(ScaleSeed) -> String,
 ) -> Vec<Box<dyn InspectorRow>> {
     let db_outer = db.clone();
     crate::inspector::trace_picker::select_traces_wizard_rows(
         db,
         Arc::new(|_cx| 0),
         Arc::new(move |traces, _window, cx| {
-            let db = db_outer.clone();
-            pane.update(cx, |pane, cx| {
-                for seed in scale_seeds_for_traces(&db, &traces, cx) {
-                    let item = make(seed, db.clone(), cx);
-                    pane.add_item(item, cx);
-                }
-            });
+            for seed in scale_seeds_for_traces(&db_outer, &traces, cx) {
+                add_registered_panel_state(&pane, key, &make_config(seed), cx);
+            }
         }),
     )
-}
-
-/// Rows listing every known component; selecting one invokes `on_select`.
-pub(crate) fn component_picker_rows(
-    db: Arc<DB>,
-    on_select: impl Fn(ComponentId, String, &mut App) + 'static,
-) -> Vec<Box<dyn InspectorRow>> {
-    let on_select = Arc::new(on_select);
-    crate::inspector::trace_picker::list_components(&db)
-        .into_iter()
-        .map(|(id, name)| {
-            let on_select = on_select.clone();
-            Box::new(CommandRow::new(
-                SharedString::from(name.clone()),
-                Arc::new(move |_window, cx| {
-                    on_select(id, name.clone(), cx);
-                }),
-            )) as Box<dyn InspectorRow>
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Hsla;
     use metor_proto::types::ComponentId;
 
     /// Each panel's `*Config` round-trips through JSON without loss.
@@ -2332,8 +1582,6 @@ mod tests {
                 axis_index: 1,
             }],
             custom_title: Override::Custom("My View".into()),
-            y_min_override: Override::Custom(-10.0),
-            y_max_override: Override::Auto,
             axes: vec![
                 YAxisConfig::default(),
                 YAxisConfig {
@@ -2375,26 +1623,21 @@ mod tests {
         assert_eq!(back.traces[0].axis_index, 1);
         assert_eq!(back.axes.len(), 2);
         assert_eq!(back.axes[1].label, "rpm");
-        assert!(matches!(back.axes[1].y_max_override, Override::Custom(v) if (v - 8000.0).abs() < 1e-6));
+        assert!(
+            matches!(back.axes[1].y_max_override, Override::Custom(v) if (v - 8000.0).abs() < 1e-6)
+        );
         assert_eq!(back.traces.len(), 1);
         assert_eq!(back.traces[0].component_id, ComponentId(3));
         assert_eq!(back.traces[0].element_index, 1);
         assert_eq!(back.traces[0].label, "vx");
         assert!(matches!(back.custom_title, Override::Custom(s) if s == "My View"));
-        assert!(matches!(back.y_min_override, Override::Custom(v) if (v + 10.0).abs() < 1e-9));
-        assert!(matches!(back.y_max_override, Override::Auto));
         assert_eq!(back.x_time_format, TimeFormat::Utc);
         assert_eq!(back.x_range, "LAST 30 min");
-        assert!(back.x_range.parse::<crate::views::time_series::TimeRangeBehavior>().is_ok());
-
-        // A pre-existing layout written before `x_time_format`/`axes`/
-        // `x_range` existed must still load, defaulting to `Relative`, no
-        // explicit axes, and a follow-global range.
-        let legacy = r#"{"label":"old","traces":[],"custom_title":"Auto","y_min_override":"Auto","y_max_override":"Auto","default_measurements":[],"cursors":[],"measurement_panel":"Track"}"#;
-        let back: PlotPanelConfig = serde_json::from_str(legacy).unwrap();
-        assert_eq!(back.x_time_format, TimeFormat::Relative);
-        assert!(back.axes.is_empty());
-        assert!(back.x_range.is_empty());
+        assert!(
+            back.x_range
+                .parse::<crate::views::time_series::TimeRangeBehavior>()
+                .is_ok()
+        );
 
         let viewer = Viewer3dPanelConfig {
             models: vec![ModelConfig {
@@ -2504,8 +1747,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<GaugeConfig>(&s).unwrap(), gauge);
 
         // A gauge missing its sweep must not degenerate to a zero-width dial.
-        let partial: GaugeConfig =
-            serde_json::from_str(r#"{"component":"sat.gyro"}"#).unwrap();
+        let partial: GaugeConfig = serde_json::from_str(r#"{"component":"sat.gyro"}"#).unwrap();
         assert!(partial.sweep_degrees > 0.0);
         assert!(matches!(partial.style, crate::views::GaugeStyle::Arc));
 
@@ -2546,8 +1788,7 @@ mod tests {
             serde_json::from_str::<SequenceControlConfig>(&s).unwrap(),
             seq
         );
-        let partial: SequenceControlConfig =
-            serde_json::from_str(r#"{"channel":"mode"}"#).unwrap();
+        let partial: SequenceControlConfig = serde_json::from_str(r#"{"channel":"mode"}"#).unwrap();
         assert_eq!(partial.channel, "mode");
         assert!(!partial.compact);
 

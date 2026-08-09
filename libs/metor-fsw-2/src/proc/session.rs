@@ -2,7 +2,6 @@
 //! worker manifests for one coordinator's process systems.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The directory holding everything a run shares with its workers, owned by
 /// the [`Coordinator`](crate::Coordinator) and removed best-effort on drop —
@@ -10,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// still-mapped files is legal, so removal never races a straggling worker's
 /// mappings.
 pub(crate) struct SessionDir {
-    path: PathBuf,
+    dir: tempfile::TempDir,
 }
 
 /// The default root: `/dev/shm` when it exists (a tmpfs, so ring traffic
@@ -26,27 +25,16 @@ fn default_root() -> PathBuf {
 
 impl SessionDir {
     /// Create a fresh, uniquely named session directory under `root` (or the
-    /// default root). The pid plus a process-wide counter keep concurrent
-    /// coordinators in one process apart.
+    /// default root).
     pub(crate) fn create(root: Option<&Path>) -> std::io::Result<Self> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let root = root.map(Path::to_path_buf).unwrap_or_else(default_root);
-        let path = root.join(format!(
-            "metor-fsw-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Relaxed)
-        ));
-        std::fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        let dir = tempfile::Builder::new()
+            .prefix("metor-fsw-")
+            .tempdir_in(root)?;
+        Ok(Self { dir })
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for SessionDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        self.dir.path()
     }
 }

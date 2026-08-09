@@ -51,7 +51,7 @@ fn python_component_id_parity() {
 
 #[cfg(not(miri))]
 mod system {
-    use metor_proto::types::{ComponentId, Msg as _};
+    use metor_proto::types::ComponentId;
     use metor_proto_wkt::PresetDefs;
 
     use super::super::{PresetSystem, PresetsParams};

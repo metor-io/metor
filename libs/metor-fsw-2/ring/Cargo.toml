@@ -11,22 +11,16 @@ authors = ["sascha@metor.io"]
 [lints]
 workspace = true
 
-[features]
-default = ["async"]
-# In-process async wake (data-available / space-available) via a stellarator
-# WaitQueue notifier.
-async = ["dep:stellarator"]
-# mmap-backed shared-memory region (cross-process capable backing store).
-mmap = ["dep:memmap2"]
-# Cross-process wait/wake on a shared AtomicU32 (the `wake` module): a
-# shared-memory futex on Linux, os_sync_wait_on_address on macOS 14.4+.
-futex = ["dep:libc"]
-
 [dependencies]
-libc = { version = "0.2", optional = true }
-memmap2 = { version = "0.9", optional = true }
-stellarator = { path = "../../stellarator", optional = true }
+memmap2 = "0.9"
+stellarator = { path = "../../stellarator" }
 zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.13"
+
+[target.'cfg(ring_loom)'.dev-dependencies]
+loom = "0.7"

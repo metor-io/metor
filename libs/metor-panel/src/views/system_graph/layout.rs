@@ -133,15 +133,14 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
     let mut rep: HashMap<String, SharedString> = HashMap::new();
     // Ordered, de-duplicated node builders keyed by id.
     let mut node_kind: BTreeMap<SharedString, (GraphNodeKind, Option<usize>)> = BTreeMap::new();
-    // First-seen order: declaration order for a flat target, and the layout
-    // engine's tie-break rank.
+    // First-seen order: declaration order for a flat target and layout input.
     let mut first_seen: Vec<SharedString> = Vec::new();
 
     let see = |id: &SharedString,
-                   kind: GraphNodeKind,
-                   src: Option<usize>,
-                   node_kind: &mut BTreeMap<SharedString, (GraphNodeKind, Option<usize>)>,
-                   first_seen: &mut Vec<SharedString>| {
+               kind: GraphNodeKind,
+               src: Option<usize>,
+               node_kind: &mut BTreeMap<SharedString, (GraphNodeKind, Option<usize>)>,
+               first_seen: &mut Vec<SharedString>| {
         if node_kind.insert(id.clone(), (kind, src)).is_none() {
             first_seen.push(id.clone());
         }
@@ -151,18 +150,42 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
         let r = representative(wiring, &sys.name, sys.scope, collapsed);
         rep.insert(sys.name.clone(), r.clone());
         if r == sys.name.as_str() {
-            see(&r, GraphNodeKind::System, Some(i), &mut node_kind, &mut first_seen);
+            see(
+                &r,
+                GraphNodeKind::System,
+                Some(i),
+                &mut node_kind,
+                &mut first_seen,
+            );
         } else {
-            see(&r, GraphNodeKind::ScopeGroup, None, &mut node_kind, &mut first_seen);
+            see(
+                &r,
+                GraphNodeKind::ScopeGroup,
+                None,
+                &mut node_kind,
+                &mut first_seen,
+            );
         }
     }
     for (i, slot) in wiring.slots.iter().enumerate() {
         let r = representative(wiring, &slot.name, slot.scope, collapsed);
         rep.insert(slot.name.clone(), r.clone());
         if r == slot.name.as_str() {
-            see(&r, GraphNodeKind::Slot, Some(i), &mut node_kind, &mut first_seen);
+            see(
+                &r,
+                GraphNodeKind::Slot,
+                Some(i),
+                &mut node_kind,
+                &mut first_seen,
+            );
         } else {
-            see(&r, GraphNodeKind::ScopeGroup, None, &mut node_kind, &mut first_seen);
+            see(
+                &r,
+                GraphNodeKind::ScopeGroup,
+                None,
+                &mut node_kind,
+                &mut first_seen,
+            );
         }
     }
 
@@ -189,8 +212,14 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
     };
 
     let mut edges: Vec<GraphEdge> = Vec::new();
-    let mut seen_edges: BTreeSet<(SharedString, SharedString, SharedString, SharedString, bool, bool)> =
-        BTreeSet::new();
+    let mut seen_edges: BTreeSet<(
+        SharedString,
+        SharedString,
+        SharedString,
+        SharedString,
+        bool,
+        bool,
+    )> = BTreeSet::new();
     for e in &wiring.edges {
         let from_node = resolve(&e.from, &rep, &mut node_kind, &mut first_seen);
         let to_node = resolve(&e.to, &rep, &mut node_kind, &mut first_seen);
@@ -223,8 +252,12 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
 
     // Stable node index space, in first-seen order.
     let ids: Vec<SharedString> = first_seen;
-    let index: HashMap<SharedString, usize> =
-        ids.iter().cloned().enumerate().map(|(i, id)| (id, i)).collect();
+    let index: HashMap<SharedString, usize> = ids
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(i, id)| (id, i))
+        .collect();
 
     let layout_nodes: Vec<LayoutNode> = ids
         .iter()
@@ -245,11 +278,9 @@ pub fn layout(wiring: &Wiring, collapsed: &BTreeSet<String>, direction: Directio
             ranked: e.kind == EdgeKind::Frame && !e.delayed,
         })
         .collect();
-    let tie_break: Vec<usize> = (0..ids.len()).collect();
     let out = graph_layout::compute(&LayoutInput {
         nodes: &layout_nodes,
         edges: &layout_edges,
-        tie_break: &tie_break,
         options: LayoutOptions {
             direction,
             ..LayoutOptions::default()

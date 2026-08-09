@@ -17,11 +17,11 @@ use stellarator::net::TcpStream;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    ClockMode, CoordinatorConfig, CyclicSystem, Input, Out, Output, Shared, System, SystemHealth,
-    SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, TelemetrySystem, UplinkSystem,
+    BuildSystem, ClockMode, CoordinatorConfig, CyclicSystem, DownlinkParams, Input, Out, Output,
+    Shared, System, SystemHealth, SystemInput, SystemOutput, TelemetrySystem, UplinkSystem,
 };
 
-use super::LinkState;
+use super::{LinkState, TelemetryMode};
 use crate::coordinator::PortRef;
 use crate::coordinator::init::cyclic_node;
 use crate::descriptor::PortId;
@@ -152,10 +152,14 @@ fn test_link(start: bool) -> Shared<LinkState> {
 }
 
 fn downlink(link: &Shared<LinkState>, mode: TelemetryMode) -> TelemetrySystem {
-    TelemetrySystem::new(TelemetryConfig {
-        link: link.clone(),
-        mode,
-    })
+    let params = match mode {
+        TelemetryMode::All => DownlinkParams::default(),
+        TelemetryMode::Subset { instances, frames } => DownlinkParams {
+            instances: Some(instances),
+            frames: Some(frames),
+        },
+    };
+    TelemetrySystem::new(params).attach(link.clone())
 }
 
 /// One packet off the wire, owned.

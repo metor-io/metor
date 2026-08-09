@@ -478,6 +478,3 @@ impl SystemSpecBuilder {
         parent
     }
 }
-
-/// Compatibility name for the artifact-backed phase of [`SystemSpecBuilder`].
-pub type ArtifactSystemBuilder = SystemSpecBuilder;

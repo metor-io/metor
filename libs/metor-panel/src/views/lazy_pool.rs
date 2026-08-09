@@ -34,7 +34,11 @@ impl<V: 'static> VisibleEntityCache<V> {
     /// Entity for `id`, created via `make` on a miss. Marks `id` as
     /// most-recently-used. Call [`prune`](Self::prune) once after the render
     /// pass to evict entries that aged out.
-    pub fn get_or_create(&mut self, id: ComponentId, make: impl FnOnce() -> Entity<V>) -> Entity<V> {
+    pub fn get_or_create(
+        &mut self,
+        id: ComponentId,
+        make: impl FnOnce() -> Entity<V>,
+    ) -> Entity<V> {
         let entity = match self.entities.get(&id) {
             Some(entity) => entity.clone(),
             None => {

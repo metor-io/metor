@@ -77,7 +77,7 @@ pub enum NodeSpec {
     Mean,
     Pack,
     Dot,
-    /// Resample onto a clock: Zoh / Linear / LatestAt.
+    /// Resample onto a clock: zero-order hold or linear interpolation.
     Resample {
         mode: ResampleMode,
     },

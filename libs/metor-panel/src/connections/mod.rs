@@ -21,12 +21,12 @@ mod picker;
 mod target;
 
 pub use discovery::mdns_source;
-pub use options::{ConnectionOption, ConnectionOptions, OptionKind, OptionSpec, OptionValue};
 use options::OptionValues;
+pub use options::{ConnectionOption, ConnectionOptions, OptionKind, OptionSpec, OptionValue};
 pub use picker::ConnectionPicker;
 pub use target::{
     AddressResolver, ConnectContext, Connected, ConnectionBackend, ConnectionStatus,
-    ConnectionTarget, StatusHandle, TargetId, Resolved,
+    ConnectionTarget, Resolved, StatusHandle, TargetId,
 };
 
 use std::sync::Arc;
@@ -269,7 +269,11 @@ impl ConnectionsState {
 
     pub fn index(&self) -> persist::ConnectionsIndex {
         persist::ConnectionsIndex {
-            favorites: self.favorites.iter().map(|f| f.as_str().to_string()).collect(),
+            favorites: self
+                .favorites
+                .iter()
+                .map(|f| f.as_str().to_string())
+                .collect(),
             recents: self.recents.clone(),
             options: self
                 .overrides
@@ -414,8 +418,8 @@ impl ConnectionsStore {
 
     fn new(db: Arc<DB>, registry_rx: mpsc::Receiver<RegistryOp>, cx: &mut Context<Self>) -> Self {
         let poll = cx.spawn(async move |this, cx| {
-            let ticks_per_autosave = (AUTOSAVE_INTERVAL.as_millis() / POLL_INTERVAL.as_millis())
-                .max(1) as u32;
+            let ticks_per_autosave =
+                (AUTOSAVE_INTERVAL.as_millis() / POLL_INTERVAL.as_millis()).max(1) as u32;
             let mut tick = 0u32;
             loop {
                 cx.background_executor().timer(POLL_INTERVAL).await;

@@ -54,7 +54,12 @@ fn lifecycle_folds_into_run_state() {
 
     state.apply_event(
         ts(2),
-        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loaded {
+                name: "solar".into(),
+            },
+        ),
     );
     assert_eq!(
         state
@@ -74,7 +79,12 @@ fn lifecycle_folds_into_run_state() {
 
     state.apply_event(
         ts(4),
-        event("deploy", SequenceEventKind::Progress { detail: "step 1".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Progress {
+                detail: "step 1".into(),
+            },
+        ),
     );
     assert_eq!(
         state
@@ -106,14 +116,21 @@ fn refused_reports_without_changing_run_state() {
 
     state.apply_event(
         ts(2),
-        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loaded {
+                name: "solar".into(),
+            },
+        ),
     );
     state.apply_event(ts(3), event("deploy", SequenceEventKind::Started));
     state.apply_event(
         ts(4),
         event(
             "deploy",
-            SequenceEventKind::Refused { reason: "load refused: running".into() },
+            SequenceEventKind::Refused {
+                reason: "load refused: running".into(),
+            },
         ),
     );
     let ch = state.channel("deploy").unwrap();
@@ -134,7 +151,12 @@ fn loading_shows_the_incoming_occupant_until_loaded_resolves_it() {
     // holds a loading status line until the control system reports the bind as `Loaded`.
     state.apply_event(
         ts(2),
-        event("deploy", SequenceEventKind::Loading { name: "solar".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loading {
+                name: "solar".into(),
+            },
+        ),
     );
     let ch = state.channel("deploy").unwrap();
     assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("solar"));
@@ -146,7 +168,12 @@ fn loading_shows_the_incoming_occupant_until_loaded_resolves_it() {
 
     state.apply_event(
         ts(3),
-        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loaded {
+                name: "solar".into(),
+            },
+        ),
     );
     let ch = state.channel("deploy").unwrap();
     assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("solar"));
@@ -160,7 +187,12 @@ fn loading_over_a_terminal_state_rearms_the_channel() {
     state.apply_registry(ts(1), registry(&[("deploy", &["solar", "antenna"])]));
     state.apply_event(
         ts(2),
-        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loaded {
+                name: "solar".into(),
+            },
+        ),
     );
     state.apply_event(ts(3), event("deploy", SequenceEventKind::Started));
     state.apply_event(
@@ -172,7 +204,12 @@ fn loading_over_a_terminal_state_rearms_the_channel() {
     // clears the stale terminal state, like any other event folding unconditionally.
     state.apply_event(
         ts(5),
-        event("deploy", SequenceEventKind::Loading { name: "antenna".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loading {
+                name: "antenna".into(),
+            },
+        ),
     );
     let ch = state.channel("deploy").unwrap();
     assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("antenna"));
@@ -189,7 +226,12 @@ fn registry_update_preserves_runtime_state() {
     state.apply_registry(ts(1), registry(&[("deploy", &["solar"])]));
     state.apply_event(
         ts(2),
-        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loaded {
+                name: "solar".into(),
+            },
+        ),
     );
     state.apply_event(ts(3), event("deploy", SequenceEventKind::Started));
 
@@ -201,6 +243,21 @@ fn registry_update_preserves_runtime_state() {
     assert_eq!(ch.available.len(), 2);
     assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("solar"));
     assert_eq!(ch.run_state, SequenceRunState::Running);
+}
+
+#[test]
+fn registry_update_reorders_preserved_channels() {
+    let mut state = SequenceState::default();
+    state.apply_registry(ts(1), registry(&[("a", &[]), ("b", &[])]));
+    state.apply_event(ts(2), event("a", SequenceEventKind::Started));
+
+    state.apply_registry(ts(3), registry(&[("b", &[]), ("a", &["next"])]));
+
+    let channels = state.channels_ordered();
+    assert_eq!(channels[0].name.as_ref(), "b");
+    assert_eq!(channels[1].name.as_ref(), "a");
+    assert_eq!(channels[1].run_state, SequenceRunState::Running);
+    assert_eq!(channels[1].available[0].as_ref(), "next");
 }
 
 #[test]
@@ -231,7 +288,12 @@ fn history_caps_at_max() {
     for i in 0..(super::MAX_HISTORY + 50) {
         state.apply_event(
             ts(i as i64 + 2),
-            event("a", SequenceEventKind::Progress { detail: format!("{i}") }),
+            event(
+                "a",
+                SequenceEventKind::Progress {
+                    detail: format!("{i}"),
+                },
+            ),
         );
     }
     assert_eq!(state.history().len(), super::MAX_HISTORY);
@@ -243,7 +305,12 @@ fn reset_returns_completed_channel_to_idle() {
     state.apply_registry(ts(1), registry(&[("deploy", &["solar"])]));
     state.apply_event(
         ts(2),
-        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loaded {
+                name: "solar".into(),
+            },
+        ),
     );
     state.apply_event(ts(3), event("deploy", SequenceEventKind::Started));
     state.apply_event(ts(4), event("deploy", SequenceEventKind::Completed));
@@ -256,7 +323,12 @@ fn reset_returns_completed_channel_to_idle() {
     // The control system reports a reset as a fresh `Loaded`, returning the channel to idle.
     state.apply_event(
         ts(5),
-        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+        event(
+            "deploy",
+            SequenceEventKind::Loaded {
+                name: "solar".into(),
+            },
+        ),
     );
     let ch = state.channel("deploy").unwrap();
     assert_eq!(ch.run_state, SequenceRunState::Idle);
@@ -281,7 +353,10 @@ fn count_in_state_tracks_run_states() {
     state.apply_registry(ts(1), registry(&[("a", &[]), ("b", &[]), ("c", &[])]));
     state.apply_event(ts(2), event("a", SequenceEventKind::Started));
     state.apply_event(ts(3), event("b", SequenceEventKind::Started));
-    state.apply_event(ts(4), event("c", SequenceEventKind::Failed { reason: "x".into() }));
+    state.apply_event(
+        ts(4),
+        event("c", SequenceEventKind::Failed { reason: "x".into() }),
+    );
 
     assert_eq!(state.count_in_state(SequenceRunState::Running), 2);
     assert_eq!(state.count_in_state(SequenceRunState::Failed), 1);

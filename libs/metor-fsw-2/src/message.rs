@@ -205,16 +205,10 @@ impl<M: Msg, WD: WakeSource> MsgOut<M, WD> {
 }
 
 impl<M: NamedMsg, WD: WakeSource> MsgOut<M, WD> {
-    /// This port's static descriptor, keyed on `M::ID` and named by
-    /// [`NamedMsg::NAME`].
-    pub fn descriptor() -> PortDesc {
-        PortDesc::msg::<M>()
-    }
-
     /// The port declaration this field contributes to a bundle's `decls`
     /// walk, an ordinary wired port.
     pub fn decl() -> crate::PortDesc {
-        Self::descriptor()
+        PortDesc::msg::<M>()
     }
 }
 
@@ -385,16 +379,10 @@ where
     M: NamedMsg + DeserializeOwned,
     RD: WakeSink,
 {
-    /// This port's static descriptor, sharing its edge key with the
-    /// [`MsgOut<M>`](MsgOut) it consumes.
-    pub fn descriptor() -> PortDesc {
-        PortDesc::msg::<M>()
-    }
-
     /// The port declaration this field contributes to a bundle's `decls`
     /// walk, an ordinary wired port.
     pub fn decl() -> crate::PortDesc {
-        Self::descriptor()
+        PortDesc::msg::<M>()
     }
 }
 
@@ -453,7 +441,7 @@ mod tests {
     };
 
     use super::{LOG_DEPTH, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, split_record};
-    use crate::PortId;
+    use crate::{PortDesc, PortId};
     use crate::port::capacity_for;
     use crate::registry::RegistryEntry;
 
@@ -475,7 +463,7 @@ mod tests {
 
         // The descriptor carries the port's edge key.
         assert_eq!(
-            MsgOut::<SequenceCommand>::descriptor().id(),
+            PortDesc::msg::<SequenceCommand>().id(),
             PortId::Packet(SequenceCommand::ID)
         );
 

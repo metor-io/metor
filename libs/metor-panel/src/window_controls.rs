@@ -64,22 +64,32 @@ pub(crate) fn window_controls(theme: &Theme, window: &Window) -> impl IntoElemen
         .items_center()
         .h_full()
         .child(
-            caption_button("window-minimize", Icon::Subtract, WindowControlArea::Min, theme)
-                .hover(|s| s.bg(theme.bg_primary))
-                .on_mouse_up(MouseButton::Left, |_, window, _| {
-                    if !cfg!(target_os = "windows") {
-                        window.minimize_window();
-                    }
-                }),
+            caption_button(
+                "window-minimize",
+                Icon::Subtract,
+                WindowControlArea::Min,
+                theme,
+            )
+            .hover(|s| s.bg(theme.bg_primary))
+            .on_mouse_up(MouseButton::Left, |_, window, _| {
+                if !cfg!(target_os = "windows") {
+                    window.minimize_window();
+                }
+            }),
         )
         .child(
-            caption_button("window-maximize", maximize_icon, WindowControlArea::Max, theme)
-                .hover(|s| s.bg(theme.bg_primary))
-                .on_mouse_up(MouseButton::Left, |_, window, _| {
-                    if !cfg!(target_os = "windows") {
-                        window.zoom_window();
-                    }
-                }),
+            caption_button(
+                "window-maximize",
+                maximize_icon,
+                WindowControlArea::Max,
+                theme,
+            )
+            .hover(|s| s.bg(theme.bg_primary))
+            .on_mouse_up(MouseButton::Left, |_, window, _| {
+                if !cfg!(target_os = "windows") {
+                    window.zoom_window();
+                }
+            }),
         )
         .child(
             caption_button("window-close", Icon::Close, WindowControlArea::Close, theme)

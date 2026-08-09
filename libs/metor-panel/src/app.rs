@@ -15,10 +15,7 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, AttitudePanel, BrowserPanel, DataTablePanel, GaugePanel, ListPlotPanel, LogPanel,
-    MeterPanel,
-    PlotPanel, SequenceControlPanel, SequenceGridPanel, SequencePanel, StateChipPanel, TablePanel,
-    TextPanel, TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
+    AlarmPanel, BrowserPanel, DataTablePanel, LogPanel, PlotPanel, SequenceGridPanel, SequencePanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -102,7 +99,6 @@ impl AppRoot {
             on_open_inspector,
             cx,
         );
-        crate::node_editor::palette_provider::register(tiles.clone(), cx);
         // Repaint the status bar when alarms change.
         if let Some(store) = crate::alarms::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
@@ -296,15 +292,7 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         if let Some(rows) = crate::inspector::reflect::rows_for_any_entity(entity, &self.db, cx) {
-            let parent_focus = self.focus_handle.clone();
-            let inspector = cx.new(|cx| {
-                let mut insp = Inspector::new(rows, InspectorMode::Anchored(position), cx);
-                insp.set_parent_focus(parent_focus);
-                insp
-            });
-            inspector.focus_handle(cx).focus(window);
-            self.inspector = Some(inspector);
-            cx.notify();
+            self.open_inspector_with(rows, InspectorMode::Anchored(position), window, cx);
         } else {
             tracing::debug!("no inspector rows for entity");
         }
@@ -333,6 +321,7 @@ impl AppRoot {
                     db.clone(),
                     pane.clone(),
                     on_open_inspector.clone(),
+                    _cx,
                 )
             }),
         )));
@@ -904,6 +893,10 @@ pub struct PanelApp {
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
     overlays: Vec<Box<dyn FnOnce(&mut App) -> gpui::AnyView>>,
+    views: Vec<(
+        crate::views::dashboard::WidgetKind,
+        crate::views::dashboard::WidgetSpec,
+    )>,
 }
 
 impl PanelApp {
@@ -920,6 +913,7 @@ impl PanelApp {
             command_providers: Vec::new(),
             init_hooks: Vec::new(),
             overlays: Vec::new(),
+            views: Vec::new(),
         }
     }
 
@@ -987,6 +981,18 @@ impl PanelApp {
         F: FnOnce(&mut App) -> Entity<V> + 'static,
     {
         self.overlays.push(Box::new(move |cx| build(cx).into()));
+        self
+    }
+
+    /// Register a downstream view kind before the application starts.
+    /// Dashboard construction, inspection identity, labeling, and live
+    /// persistence are all supplied by the single [`WidgetSpec`].
+    pub fn view(
+        mut self,
+        kind: crate::views::dashboard::WidgetKind,
+        spec: crate::views::dashboard::WidgetSpec,
+    ) -> Self {
+        self.views.push((kind, spec));
         self
     }
 
@@ -1060,6 +1066,7 @@ impl PanelApp {
             command_providers,
             init_hooks,
             overlays,
+            views,
         } = self;
 
         if let Some(addr) = server_addr {
@@ -1073,14 +1080,6 @@ impl PanelApp {
             });
         }
 
-        let mut targets = Some(targets);
-        let mut connection_sources = Some(connection_sources);
-        let mut auto_connect = Some(auto_connect);
-        let mut address_resolver = Some(address_resolver);
-        let mut default_options = Some(default_options);
-        let mut command_providers = Some(command_providers);
-        let mut init_hooks = Some(init_hooks);
-        let mut overlays = Some(overlays);
         Application::new()
             .with_assets(crate::icons::IconAssets)
             .run(move |cx: &mut App| {
@@ -1113,6 +1112,17 @@ impl PanelApp {
                 crate::plot_events::EventSourceRegistry::init(cx);
                 crate::wiring::WiringStore::init(db.clone(), cx);
                 register_pane_item_deserializers(db.clone(), cx);
+                for (kind, spec) in views {
+                    cx.global_mut::<crate::views::dashboard::WidgetRegistry>()
+                        .register(kind, spec);
+                }
+                let registered_tiles = cx
+                    .global::<crate::views::dashboard::WidgetRegistry>()
+                    .tile_specs();
+                for spec in registered_tiles {
+                    cx.global_mut::<crate::tiles::ItemRegistry>()
+                        .register_view(spec, db.clone());
+                }
 
                 // Connections: seed builder-registered targets, hand the
                 // registry to discovery sources, then fire auto-connects.
@@ -1121,16 +1131,14 @@ impl PanelApp {
                 let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
                 if let Some(store) = crate::connections::try_global(cx) {
                     store.update(cx, |store, cx| {
-                        if let Some(resolver) = address_resolver.take().flatten() {
+                        if let Some(resolver) = address_resolver {
                             store.set_resolver(resolver);
                         }
-                        if let Some(options) = default_options.take() {
-                            store.set_default_options(options);
-                        }
-                        for target in targets.take().unwrap_or_default() {
+                        store.set_default_options(default_options);
+                        for target in targets {
                             store.upsert_target(target, cx);
                         }
-                        for id in auto_connect.take().unwrap_or_default() {
+                        for id in auto_connect {
                             let Some(target) =
                                 store.state().targets().iter().find(|t| t.id == id).cloned()
                             else {
@@ -1141,7 +1149,7 @@ impl PanelApp {
                         }
                     });
                 }
-                for source in connection_sources.take().unwrap_or_default() {
+                for source in connection_sources {
                     source(registry.clone());
                 }
                 register_connection_commands(cx);
@@ -1150,18 +1158,14 @@ impl PanelApp {
                 // init hooks, then build overlays. All happen after the built-in
                 // registries exist so they can call into any of them; overlays
                 // run last so they can rely on anything a hook installed.
-                for (category, provider) in command_providers.take().unwrap_or_default() {
+                for (category, provider) in command_providers {
                     ItemRegistry::register(cx, category, provider);
                 }
-                for hook in init_hooks.take().unwrap_or_default() {
+                for hook in init_hooks {
                     hook(cx);
                 }
-                let built: Vec<gpui::AnyView> = overlays
-                    .take()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|build| build(cx))
-                    .collect();
+                let built: Vec<gpui::AnyView> =
+                    overlays.into_iter().map(|build| build(cx)).collect();
                 cx.set_global(OverlayViews(built));
 
                 set_dock_icon();
@@ -1277,42 +1281,20 @@ fn register_connection_commands(cx: &mut App) {
 }
 
 /// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
-/// every built-in panel kind. One closure per kind, parsing the kind's
-/// `*Config` blob with `facet-json` and constructing the panel via its
-/// `from_config` constructor (or, for [`DashboardPanel`], the dedicated
-/// `deserialize_dashboard` helper). The populated registry is installed as a
-/// gpui `Global` so palette callbacks can fetch it without threading.
+/// specialized built-in panel kinds. Ordinary registered views are adapted
+/// into this registry immediately afterwards; Dashboard retains its dedicated
+/// deserializer because it is itself a host. The populated registry is a gpui
+/// `Global` so palette callbacks can fetch it without threading.
 fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     use crate::tiles::ItemRegistry as PaneItemRegistry;
     let mut reg = PaneItemRegistry::default();
 
-    register_panel::<TextPanel>(&mut reg, db.clone(), TextPanel::from_config);
     register_panel::<AlarmPanel>(&mut reg, db.clone(), AlarmPanel::from_config);
     register_panel::<LogPanel>(&mut reg, db.clone(), LogPanel::from_config);
     register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
     register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
-    register_panel::<TablePanel>(&mut reg, db.clone(), TablePanel::from_config);
     register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
-    register_panel::<PlotPanel>(&mut reg, db.clone(), PlotPanel::from_config);
-    register_panel::<XyPlotPanel>(&mut reg, db.clone(), XyPlotPanel::from_config);
-    register_panel::<ListPlotPanel>(&mut reg, db.clone(), ListPlotPanel::from_config);
-    register_panel::<Viewer3dPanel>(&mut reg, db.clone(), Viewer3dPanel::from_config);
-    register_panel::<TrafficLightPanel>(&mut reg, db.clone(), TrafficLightPanel::from_config);
-    register_panel::<TrafficLightGridPanel>(
-        &mut reg,
-        db.clone(),
-        TrafficLightGridPanel::from_config,
-    );
-    register_panel::<MeterPanel>(&mut reg, db.clone(), MeterPanel::from_config);
-    register_panel::<GaugePanel>(&mut reg, db.clone(), GaugePanel::from_config);
-    register_panel::<StateChipPanel>(&mut reg, db.clone(), StateChipPanel::from_config);
-    register_panel::<AttitudePanel>(&mut reg, db.clone(), AttitudePanel::from_config);
-    register_panel::<SequenceControlPanel>(
-        &mut reg,
-        db.clone(),
-        SequenceControlPanel::from_config,
-    );
     register_panel::<crate::node_editor::pane::NodeEditor>(
         &mut reg,
         db.clone(),

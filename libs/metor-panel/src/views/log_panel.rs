@@ -107,7 +107,11 @@ impl LogView {
             .text_size(px(11.0))
             .cursor_pointer()
             .text_color(color)
-            .child(SharedString::from(format!("{} {}", count, level_label(level))));
+            .child(SharedString::from(format!(
+                "{} {}",
+                count,
+                level_label(level)
+            )));
         if active {
             chip = chip.bg(level_tint(level, theme));
         }

@@ -14,12 +14,14 @@ fn edge(from: usize, to: usize) -> LayoutEdge {
     }
 }
 
-fn compute_with(nodes: &[LayoutNode], edges: &[LayoutEdge], options: LayoutOptions) -> LayoutOutput {
-    let tie: Vec<usize> = (0..nodes.len()).collect();
+fn compute_with(
+    nodes: &[LayoutNode],
+    edges: &[LayoutEdge],
+    options: LayoutOptions,
+) -> LayoutOutput {
     compute(&LayoutInput {
         nodes,
         edges,
-        tie_break: &tie,
         options,
     })
 }
@@ -130,9 +132,7 @@ fn anchors_fan_out_in_heading_order() {
     let sources: Vec<f32> = (0..3).map(|i| out.routes[i].source.1).collect();
     assert!(sources[0] != sources[1] && sources[1] != sources[2]);
     // Anchor order matches target order.
-    let mut expect: Vec<(f32, usize)> = (0..3)
-        .map(|i| (out.positions[edges[i].to].1, i))
-        .collect();
+    let mut expect: Vec<(f32, usize)> = (0..3).map(|i| (out.positions[edges[i].to].1, i)).collect();
     expect.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut anchors: Vec<(f32, usize)> = (0..3).map(|i| (out.routes[i].source.1, i)).collect();
     anchors.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -224,7 +224,14 @@ fn flat_edge_brackets_beside_layer() {
 #[test]
 fn deterministic() {
     let nodes = vec![node(188.0, 62.0); 6];
-    let edges = vec![edge(0, 2), edge(1, 2), edge(2, 3), edge(2, 4), edge(4, 5), edge(0, 5)];
+    let edges = vec![
+        edge(0, 2),
+        edge(1, 2),
+        edge(2, 3),
+        edge(2, 4),
+        edge(4, 5),
+        edge(0, 5),
+    ];
     let a = lr(&nodes, &edges);
     let b = lr(&nodes, &edges);
     assert_eq!(a.positions, b.positions);

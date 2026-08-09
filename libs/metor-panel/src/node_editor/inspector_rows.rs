@@ -351,7 +351,7 @@ pub fn rows_for_node(
             dtype,
             out_shape,
         } => {
-            let shape_label = SharedString::from(waveform_label(*shape));
+            let shape_label = SharedString::from(label_for(WAVEFORMS, *shape, "Sin"));
             let options: Vec<SharedString> = WAVEFORMS
                 .iter()
                 .map(|(_, name)| SharedString::new_static(name))
@@ -365,7 +365,7 @@ pub fn rows_for_node(
                 flow_id.clone(),
                 |s, chosen| {
                     if let (NodeSpec::Waveform { shape, .. }, Some(picked)) =
-                        (s, waveform_from_label(&chosen))
+                        (s, value_for_label(WAVEFORMS, &chosen))
                     {
                         *shape = picked;
                     }
@@ -514,7 +514,7 @@ pub fn rows_for_node(
         }
         NodeSpec::Affine { op, k } => {
             // Op picker (Scale vs Offset).
-            let op_label = SharedString::from(affine_op_label(*op));
+            let op_label = SharedString::from(label_for(AFFINE_OPS, *op, "Scale"));
             let options: Vec<SharedString> = AFFINE_OPS
                 .iter()
                 .map(|(_, name)| SharedString::new_static(name))
@@ -528,7 +528,7 @@ pub fn rows_for_node(
                 flow_id.clone(),
                 |spec, chosen| {
                     if let (NodeSpec::Affine { op, .. }, Some(picked)) =
-                        (spec, affine_op_from_label(&chosen))
+                        (spec, value_for_label(AFFINE_OPS, &chosen))
                     {
                         *op = picked;
                     }
@@ -537,7 +537,7 @@ pub fn rows_for_node(
             // Reconcile the arg's dtype with the parent's promoted dtype on
             // render so re-wiring the upstream picks the right widget next
             // pass. Stays a no-op when there is no built parent.
-            let promoted = parent_dtype(&graph.read(_cx), &flow_id);
+            let promoted = parent_dtype(graph.read(_cx), &flow_id);
             let display_value = match promoted {
                 Some(dt) => k.cast(dt),
                 None => *k,
@@ -560,7 +560,7 @@ pub fn rows_for_node(
             ));
         }
         NodeSpec::Unary { op } => {
-            let op_label = SharedString::from(unary_op_label(*op));
+            let op_label = SharedString::from(label_for(UNARY_OPS, *op, "Abs"));
             let options: Vec<SharedString> = UNARY_OPS
                 .iter()
                 .map(|(_, name)| SharedString::new_static(name))
@@ -574,7 +574,7 @@ pub fn rows_for_node(
                 flow_id.clone(),
                 |spec, chosen| {
                     if let (NodeSpec::Unary { op }, Some(picked)) =
-                        (spec, unary_op_from_label(&chosen))
+                        (spec, value_for_label(UNARY_OPS, &chosen))
                     {
                         *op = picked;
                     }
@@ -582,7 +582,7 @@ pub fn rows_for_node(
             ));
         }
         NodeSpec::Binary { op } => {
-            let op_label = SharedString::from(binary_op_label(*op));
+            let op_label = SharedString::from(label_for(BINARY_OPS, *op, "Add"));
             let options: Vec<SharedString> = BINARY_OPS
                 .iter()
                 .map(|(_, name)| SharedString::new_static(name))
@@ -596,7 +596,7 @@ pub fn rows_for_node(
                 flow_id.clone(),
                 |spec, chosen| {
                     if let (NodeSpec::Binary { op }, Some(picked)) =
-                        (spec, binary_op_from_label(&chosen))
+                        (spec, value_for_label(BINARY_OPS, &chosen))
                     {
                         *op = picked;
                     }
@@ -604,7 +604,8 @@ pub fn rows_for_node(
             ));
         }
         NodeSpec::Resample { mode } => {
-            let mode_label = SharedString::from(resample_mode_label(*mode));
+            let mode_label =
+                SharedString::from(label_for(RESAMPLE_MODES, *mode, "Zero-Order Hold"));
             let options: Vec<SharedString> = RESAMPLE_MODES
                 .iter()
                 .map(|(_, name)| SharedString::new_static(name))
@@ -618,7 +619,7 @@ pub fn rows_for_node(
                 flow_id.clone(),
                 |spec, chosen| {
                     if let (NodeSpec::Resample { mode }, Some(picked)) =
-                        (spec, resample_mode_from_label(&chosen))
+                        (spec, value_for_label(RESAMPLE_MODES, &chosen))
                     {
                         *mode = picked;
                     }
@@ -706,7 +707,7 @@ pub fn rows_for_node(
             // Render `k` in the parent's promoted dtype so the widget
             // matches the runtime comparison (same convention as Scale /
             // Offset above).
-            let promoted = parent_dtype(&graph.read(_cx), &flow_id);
+            let promoted = parent_dtype(graph.read(_cx), &flow_id);
             let display_value = match promoted {
                 Some(dt) => k.cast(dt),
                 None => *k,
@@ -723,7 +724,7 @@ pub fn rows_for_node(
                     }
                 },
             ));
-            let op_label = SharedString::from(threshold_op_label(*op));
+            let op_label = SharedString::from(label_for(THRESHOLD_OPS, *op, ">"));
             let options: Vec<SharedString> = THRESHOLD_OPS
                 .iter()
                 .map(|(_, name)| SharedString::new_static(name))
@@ -737,7 +738,7 @@ pub fn rows_for_node(
                 flow_id.clone(),
                 |spec, chosen| {
                     if let (NodeSpec::Threshold { op, .. }, Some(picked)) =
-                        (spec, threshold_op_from_label(&chosen))
+                        (spec, value_for_label(THRESHOLD_OPS, &chosen))
                     {
                         *op = picked;
                     }
@@ -905,13 +906,13 @@ fn dtype_arg(
         .collect();
     enum_arg(
         label,
-        SharedString::from(dtype_label(selected)),
+        SharedString::from(label_for(DTYPES, selected, "f64")),
         options,
         editor,
         graph,
         flow_id,
         move |spec, chosen| {
-            if let Some(picked) = dtype_from_label(&chosen) {
+            if let Some(picked) = value_for_label(DTYPES, &chosen) {
                 apply(spec, picked);
             }
         },
@@ -1004,16 +1005,21 @@ const DTYPES: &[(PrimType, &str)] = &[
     (PrimType::F64, "f64"),
 ];
 
-fn dtype_label(t: PrimType) -> &'static str {
-    DTYPES
+fn label_for<T: Copy + PartialEq>(
+    choices: &[(T, &'static str)],
+    value: T,
+    fallback: &'static str,
+) -> &'static str {
+    choices
         .iter()
-        .find(|(d, _)| *d == t)
-        .map(|(_, n)| *n)
-        .unwrap_or("f64")
+        .find_map(|(choice, label)| (*choice == value).then_some(*label))
+        .unwrap_or(fallback)
 }
 
-fn dtype_from_label(label: &str) -> Option<PrimType> {
-    DTYPES.iter().find(|(_, n)| *n == label).map(|(d, _)| *d)
+fn value_for_label<T: Copy>(choices: &[(T, &str)], label: &str) -> Option<T> {
+    choices
+        .iter()
+        .find_map(|(value, choice_label)| (*choice_label == label).then_some(*value))
 }
 
 /// Single source of truth for the waveform shape <-> label mapping used by
@@ -1025,21 +1031,6 @@ const WAVEFORMS: &[(Waveform, &str)] = &[
     (Waveform::Sawtooth, "Sawtooth"),
 ];
 
-fn waveform_label(shape: Waveform) -> &'static str {
-    WAVEFORMS
-        .iter()
-        .find(|(s, _)| *s == shape)
-        .map(|(_, name)| *name)
-        .unwrap_or("Sin")
-}
-
-fn waveform_from_label(label: &str) -> Option<Waveform> {
-    WAVEFORMS
-        .iter()
-        .find(|(_, name)| *name == label)
-        .map(|(s, _)| *s)
-}
-
 const THRESHOLD_OPS: &[(ThresholdOp, &str)] = &[
     (ThresholdOp::Gt, ">"),
     (ThresholdOp::Ge, ">="),
@@ -1047,37 +1038,7 @@ const THRESHOLD_OPS: &[(ThresholdOp, &str)] = &[
     (ThresholdOp::Le, "<="),
 ];
 
-fn threshold_op_label(op: ThresholdOp) -> &'static str {
-    THRESHOLD_OPS
-        .iter()
-        .find(|(o, _)| *o == op)
-        .map(|(_, name)| *name)
-        .unwrap_or(">")
-}
-
-fn threshold_op_from_label(label: &str) -> Option<ThresholdOp> {
-    THRESHOLD_OPS
-        .iter()
-        .find(|(_, name)| *name == label)
-        .map(|(o, _)| *o)
-}
-
 const AFFINE_OPS: &[(AffineOp, &str)] = &[(AffineOp::Scale, "Scale"), (AffineOp::Offset, "Offset")];
-
-fn affine_op_label(op: AffineOp) -> &'static str {
-    AFFINE_OPS
-        .iter()
-        .find(|(o, _)| *o == op)
-        .map(|(_, n)| *n)
-        .unwrap_or("Scale")
-}
-
-fn affine_op_from_label(label: &str) -> Option<AffineOp> {
-    AFFINE_OPS
-        .iter()
-        .find(|(_, n)| *n == label)
-        .map(|(o, _)| *o)
-}
 
 const UNARY_OPS: &[(UnaryOp, &str)] = &[
     (UnaryOp::Abs, "Abs"),
@@ -1088,18 +1049,6 @@ const UNARY_OPS: &[(UnaryOp, &str)] = &[
     (UnaryOp::Floor, "Floor"),
 ];
 
-fn unary_op_label(op: UnaryOp) -> &'static str {
-    UNARY_OPS
-        .iter()
-        .find(|(o, _)| *o == op)
-        .map(|(_, n)| *n)
-        .unwrap_or("Abs")
-}
-
-fn unary_op_from_label(label: &str) -> Option<UnaryOp> {
-    UNARY_OPS.iter().find(|(_, n)| *n == label).map(|(o, _)| *o)
-}
-
 const BINARY_OPS: &[(BinaryOp, &str)] = &[
     (BinaryOp::Add, "Add"),
     (BinaryOp::Sub, "Sub"),
@@ -1107,38 +1056,7 @@ const BINARY_OPS: &[(BinaryOp, &str)] = &[
     (BinaryOp::Div, "Div"),
 ];
 
-fn binary_op_label(op: BinaryOp) -> &'static str {
-    BINARY_OPS
-        .iter()
-        .find(|(o, _)| *o == op)
-        .map(|(_, n)| *n)
-        .unwrap_or("Add")
-}
-
-fn binary_op_from_label(label: &str) -> Option<BinaryOp> {
-    BINARY_OPS
-        .iter()
-        .find(|(_, n)| *n == label)
-        .map(|(o, _)| *o)
-}
-
 const RESAMPLE_MODES: &[(ResampleMode, &str)] = &[
     (ResampleMode::Zoh, "Zero-Order Hold"),
     (ResampleMode::Linear, "Linear Interp"),
-    (ResampleMode::LatestAt, "Latest At"),
 ];
-
-fn resample_mode_label(mode: ResampleMode) -> &'static str {
-    RESAMPLE_MODES
-        .iter()
-        .find(|(m, _)| *m == mode)
-        .map(|(_, n)| *n)
-        .unwrap_or("Zero-Order Hold")
-}
-
-fn resample_mode_from_label(label: &str) -> Option<ResampleMode> {
-    RESAMPLE_MODES
-        .iter()
-        .find(|(_, n)| *n == label)
-        .map(|(m, _)| *m)
-}

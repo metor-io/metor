@@ -28,7 +28,7 @@
 //! Unless [`BuildOptions::manifest_sidecar`] is off, each built library also
 //! gets a `<cdylib>.manifest` sidecar next to it: the raw postcard
 //! [`PackManifest`](crate::abi::PackManifest) bytes `fsw_pack_describe`
-//! reports, so downstream consumers (stubgen, cross-arch resolve) can read the
+//! reports, so downstream consumers (pack codegen, cross-arch resolve) can read the
 //! pack's self-description without running the artifact. Sourcing the sidecar
 //! *does* run the crate's `pack()` once, at build time — the same trust model
 //! as a `build.rs`. A cross build (`--target` differing from the host) cannot
@@ -104,7 +104,7 @@ pub enum BuildError {
     },
     /// A cross build's additional host-arch build (the manifest sidecar's
     /// source) failed. Not a silent skip: a missing sidecar would surface
-    /// much later as a stubgen or staleness mystery.
+    /// much later as a codegen or staleness mystery.
     #[error(
         "host-arch build of `{crate_name}` for its manifest sidecar failed; if this pack \
          cannot build for the host, set `BuildOptions::manifest_sidecar = false`"
@@ -746,7 +746,7 @@ mod tests {
     // the same convention as tests/dl_integration.rs.
     // -----------------------------------------------------------------------
 
-    // Shared with the dl and stubgen fixture tests: all three build and
+    // Shared with the dl and pack-codegen fixture tests: all three build and
     // describe the same fixture pack into one target-dir sidecar.
     #[cfg(not(miri))]
     use crate::dl::FIXTURE_LOCK;

@@ -14,7 +14,7 @@
 //! gpui entity that owns it plus the reader tasks; [`GlobalSequenceStore`] hands the entity
 //! to any view via [`try_global`].
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use gpui::{App, Context, Entity, Global, SharedString, Task, prelude::*};
@@ -64,9 +64,8 @@ pub struct SequenceLogEntry {
 /// tested directly.
 #[derive(Default)]
 pub struct SequenceState {
-    channels: HashMap<SharedString, ChannelState>,
-    /// Declaration order from the latest registry, for stable UI ordering.
-    order: Vec<SharedString>,
+    /// Channels in declaration order from the latest registry.
+    channels: Vec<ChannelState>,
     history: VecDeque<SequenceLogEntry>,
     /// Total events ever pushed; a monotonic staleness stamp for observers
     /// (the plot's event overlay) that stays valid as the ring evicts.
@@ -77,43 +76,36 @@ impl SequenceState {
     /// Apply a whole-registry declaration. Channels that persist keep their runtime state
     /// (`loaded`/`run_state`/`last_message`); channels no longer declared are dropped.
     pub fn apply_registry(&mut self, timestamp: Timestamp, registry: SequenceRegistry) {
-        let mut order = Vec::with_capacity(registry.channels.len());
+        let mut previous = std::mem::take(&mut self.channels);
+        self.channels.reserve(registry.channels.len());
         for spec in registry.channels {
             let name = SharedString::from(spec.name);
-            order.push(name.clone());
-            let available = spec
-                .available
-                .into_iter()
-                .map(SharedString::from)
-                .collect();
-            match self.channels.get_mut(&name) {
-                Some(existing) => {
-                    existing.available = available;
-                }
-                None => {
-                    self.channels.insert(
-                        name.clone(),
-                        ChannelState {
-                            name,
-                            available,
-                            loaded: None,
-                            run_state: SequenceRunState::Idle,
-                            last_message: None,
-                            updated_at: timestamp,
-                        },
-                    );
-                }
-            }
+            let available = spec.available.into_iter().map(SharedString::from).collect();
+            let mut channel = previous
+                .iter()
+                .position(|channel| channel.name == name)
+                .map(|index| previous.swap_remove(index))
+                .unwrap_or_else(|| ChannelState {
+                    name,
+                    available: Vec::new(),
+                    loaded: None,
+                    run_state: SequenceRunState::Idle,
+                    last_message: None,
+                    updated_at: timestamp,
+                });
+            channel.available = available;
+            self.channels.push(channel);
         }
-        let incoming: HashSet<&SharedString> = order.iter().collect();
-        self.channels.retain(|name, _| incoming.contains(name));
-        self.order = order;
     }
 
     /// Apply one per-channel lifecycle event. Events for undeclared channels are ignored —
     /// the registry is the source of which channels exist.
     pub fn apply_event(&mut self, timestamp: Timestamp, event: SequenceChannelEvent) {
-        let Some(ch) = self.channels.get_mut(event.channel.as_str()) else {
+        let Some(ch) = self
+            .channels
+            .iter_mut()
+            .find(|channel| channel.name == event.channel.as_str())
+        else {
             return;
         };
         ch.updated_at = timestamp;
@@ -194,14 +186,11 @@ impl SequenceState {
 
     /// Channels in registry declaration order.
     pub fn channels_ordered(&self) -> Vec<&ChannelState> {
-        self.order
-            .iter()
-            .filter_map(|name| self.channels.get(name))
-            .collect()
+        self.channels.iter().collect()
     }
 
     pub fn channel(&self, name: &str) -> Option<&ChannelState> {
-        self.channels.get(name)
+        self.channels.iter().find(|channel| channel.name == name)
     }
 
     pub fn channel_count(&self) -> usize {
@@ -210,7 +199,7 @@ impl SequenceState {
 
     pub fn count_in_state(&self, run_state: SequenceRunState) -> usize {
         self.channels
-            .values()
+            .iter()
             .filter(|c| c.run_state == run_state)
             .count()
     }

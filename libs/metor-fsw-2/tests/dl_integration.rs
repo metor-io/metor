@@ -25,8 +25,8 @@ mod common;
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_fsw_2::{
     BuildSystem, ClockSpec, CoordinatorSpec, CyclicSystem, Delivery, DlPack, FanIn, Frame, Input,
-    MsgIn, Out, Output, ParamSource, StopReason, System, SystemInput, SystemKind, SystemOutput,
-    WiringBuilder,
+    MsgIn, Out, Output, ParamSource, PortId, StopReason, System, SystemInput, SystemKind,
+    SystemOutput, WiringBuilder,
     wiring::{Registry, resolve},
 };
 use postcard_schema::Schema;
@@ -180,7 +180,7 @@ fn dlopen_cyclic_system_end_to_end() {
     // The message port crossed the ABI schema-tagged with its axes intact; a
     // shared object declares a Postcard port exactly like a static system.
     let events = &desc.outputs[1];
-    assert_eq!(events.id().packet().expect("postcard port"), TickEvent::ID);
+    assert_eq!(events.id(), PortId::Packet(TickEvent::ID));
     assert_eq!(
         events.name, "TickEvent",
         "the NamedMsg token survives the wire"

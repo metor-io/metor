@@ -74,7 +74,7 @@ libadcs_systems.so.manifest
 ```
 
 The manifest lets tools inspect a pack without loading target code into the
-current process. Stub generation, wiring checks, and cross-target builds all
+current process. Pack module generation, wiring checks, and cross-target builds all
 use the same description.
 
 A pack manifest must not change by target. The Rust types, params, and ports

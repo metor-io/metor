@@ -7,7 +7,7 @@ use metor_proto::types::ComponentId;
 
 use crate::inspector::rows::PreviewSpec;
 
-use crate::inspector::rows::{BoolRow, InspectorRow, NavRow, RowAction, row_base};
+use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow, NavRow, RowAction, row_base};
 use crate::theme::theme;
 use crate::views::time_series::Trace;
 
@@ -43,6 +43,24 @@ pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
         list
     });
     list.to_vec()
+}
+
+/// Rows listing every known component; selecting one invokes `on_select`.
+pub(crate) fn component_picker_rows(
+    db: Arc<DB>,
+    on_select: impl Fn(ComponentId, String, &mut App) + 'static,
+) -> Vec<Box<dyn InspectorRow>> {
+    let on_select = Arc::new(on_select);
+    list_components(&db)
+        .into_iter()
+        .map(|(id, name)| {
+            let on_select = on_select.clone();
+            Box::new(CommandRow::new(
+                SharedString::from(name.clone()),
+                Arc::new(move |_window, cx| on_select(id, name.clone(), cx)),
+            )) as Box<dyn InspectorRow>
+        })
+        .collect()
 }
 
 /// Element labels for `component_id`, derived from its schema dimension.

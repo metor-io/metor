@@ -13,12 +13,12 @@ One directory per distribution (see `../docs/packaging.md`):
 - `tests/` — the recorder test suite.
 
 ```python
-from metor_config import Target, Alarms, Alarm, Target, band, TcpServer, Uplink, Downlink
+from metor_config import Target
+from adcs_pack import Nav, Plant
 
 m = Target(cycle_rate=120.0, sim_dt=1 / 120)
-adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")
-plant = m.add("plant", adcs.Plant(init_angle=0.5), process=True)
-nav = m.add("nav", adcs.Nav(meas_sigma=0.02))
+plant = m.add("plant", Plant(init_angle=0.5), process=True)
+nav = m.add("nav", Nav(meas_sigma=0.02))
 m.connect(plant.sensors, nav.sensors)
 ```
 

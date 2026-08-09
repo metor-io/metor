@@ -102,11 +102,10 @@ mod registry;
 mod shared;
 mod system;
 mod telemetry;
-mod testbench;
 mod text;
 mod writer;
 
-pub mod clock;
+mod clock;
 pub mod health;
 pub mod logfwd;
 
@@ -120,17 +119,17 @@ pub mod wiring;
 
 pub mod abi;
 pub mod dl;
-pub mod params_docs;
+mod params_docs;
 
 // Cross-process systems need a shared futex (Linux, macOS 14.4+); on other
 // targets the module reduces to a no-op `worker_entry` and `build()` rejects
 // process registrations. See docs/process-systems.md for the platform floor.
 pub mod proc;
 
-pub use dynamic::{FrameList, FrameMap, Slot};
+pub use dynamic::{FrameList, FrameMap};
 pub use frame::Frame;
 pub use text::FrameStr;
-pub use writer::{DynamicWriteError, FrameScratch, FrameWriter, KeyError, ListWriter, MapWriter};
+pub use writer::{DynamicWriteError, FrameWriter, KeyError, ListWriter, MapWriter};
 
 pub use metor_fsw_ring::{ReadError, WriteError};
 
@@ -148,16 +147,13 @@ pub use handler::{
     IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
 };
 pub use pack::{
-    Created, Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StateEntry,
-    StepStatus,
+    Created, Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus,
 };
 pub use registry::{AllOutputs, Registry, RegistryEntry};
-pub use shared::{Shared, SharedGuard, SharedLifecycle};
+pub use shared::{Shared, SharedLifecycle};
 pub use telemetry::{
-    DownlinkParams, LinkParams, LinkState, LinkStats, TelemetryConfig, TelemetryMode,
-    TelemetrySystem, UplinkParams, UplinkSystem,
+    DownlinkParams, LinkParams, LinkState, LinkStats, TelemetrySystem, UplinkParams, UplinkSystem,
 };
-pub use testbench::TestBench;
 
 pub use descriptor::{
     Capability, Declarations, Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema,
@@ -170,7 +166,7 @@ pub use port::{
 
 pub use alarm::{AlarmIn, AlarmOut, AlarmSpec, AlarmSystem, AlarmsParams, BandSpec, TargetSpec};
 
-pub use preset::{PresetIn, PresetOut, PresetSpec, PresetSystem, PresetsParams};
+pub use preset::{PresetOut, PresetSpec, PresetSystem, PresetsParams};
 
 pub use message::{
     CommandOut, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, MsgTable, NamedMsg, split_record,
@@ -182,7 +178,8 @@ pub use system::{
 #[doc(hidden)]
 pub use system::{NoParamsDefault, ParamsDefaultProbe};
 
-pub use params_docs::{ParamsDocEntry, params_docs_for};
+#[doc(hidden)]
+pub use params_docs::ParamsDocEntry;
 
 // Re-exported so `#[derive(inventory-based ParamsDocs)]` can name the crate.
 #[doc(hidden)]
@@ -191,13 +188,13 @@ pub use inventory;
 pub use metor_fsw_ring as ring;
 
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
-pub use metor_fsw_2_macros::{Frame, ParamsDocs, SystemInput, SystemOutput, frame};
+pub use metor_fsw_2_macros::{Frame, ParamsDocs, SystemInput, SystemOutput};
 
 pub use metor_fsw_2_macros::system;
 
 pub use metor_proto::types::Timestamp;
 
-pub use sequence::{CycleClock, Outcome, SequenceStatus, SlotControlIn};
+pub use sequence::{Outcome, SequenceStatus, SlotControlIn};
 
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt, zerocopy};

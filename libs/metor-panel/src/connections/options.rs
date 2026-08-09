@@ -21,10 +21,8 @@ use std::sync::Arc;
 use gpui::{App, Entity, SharedString, Window};
 use smallvec::SmallVec;
 
-use super::{ConnectionsStore, ConnectionTarget};
-use crate::inspector::rows::{
-    BoolRow, EnumRow, InspectorRow, ScalarRow, SliderRow, TextRow,
-};
+use super::{ConnectionTarget, ConnectionsStore};
+use crate::inspector::rows::{BoolRow, EnumRow, InspectorRow, ScalarRow, SliderRow, TextRow};
 
 /// Values for one target, sized for the handful of knobs a connection
 /// realistically has.
@@ -183,7 +181,9 @@ impl OptionValue {
                 .find(|c| c.as_ref() == text)
                 .cloned()
                 .map(OptionValue::Choice),
-            OptionKind::Text { .. } => Some(OptionValue::Text(SharedString::from(text.to_string()))),
+            OptionKind::Text { .. } => {
+                Some(OptionValue::Text(SharedString::from(text.to_string())))
+            }
             OptionKind::Number { .. } => text.parse().ok().map(OptionValue::Number),
         }
     }
@@ -286,8 +286,7 @@ pub(crate) fn option_rows(
                 (OptionKind::Toggle { .. }, _) => {
                     // Read live rather than caching: a reconnect repaints
                     // the dialog, and the row must agree with the store.
-                    let (store, target, read_key) =
-                        (store.clone(), target.clone(), key.clone());
+                    let (store, target, read_key) = (store.clone(), target.clone(), key.clone());
                     Box::new(BoolRow::dynamic(
                         label,
                         Arc::new(move |cx: &App| {
@@ -330,17 +329,20 @@ pub(crate) fn option_rows(
                         OptionValue::Number(v) => v,
                         _ => 0.0,
                     };
-                    let on_change =
-                        Arc::new(move |v: f64, _window: &mut Window, cx: &mut App| {
-                            set(OptionValue::Number(v), cx)
-                        });
+                    let on_change = Arc::new(move |v: f64, _window: &mut Window, cx: &mut App| {
+                        set(OptionValue::Number(v), cx)
+                    });
                     if min.is_finite() && max.is_finite() {
                         let (store, target, read_key) =
                             (store.clone(), target.clone(), key.clone());
                         Box::new(SliderRow {
                             label,
                             read_value: Arc::new(move |cx: &App| {
-                                store.read(cx).state().options_for(&target).number(&read_key)
+                                store
+                                    .read(cx)
+                                    .state()
+                                    .options_for(&target)
+                                    .number(&read_key)
                             }),
                             min: *min,
                             max: *max,

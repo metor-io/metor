@@ -2,10 +2,18 @@ use std::sync::Arc;
 
 use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
+use serde::{Deserialize, Serialize};
 
-use super::format::format_value;
+use super::binding::{StreamUpdate, spawn_seeded_stream};
+use super::format::ValueFormatter;
+use crate::ComponentStreamBuilder;
 use crate::theme::theme;
-use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ComponentTextConfig {
+    pub component: String,
+}
 
 /// Large-text readout for a single component.
 ///
@@ -22,23 +30,21 @@ impl ComponentText {
         source: impl ComponentStreamBuilder + Send + 'static,
         cx: &mut Context<Self>,
     ) -> Self {
-        let task = cx.spawn(async move |this, cx| {
-            let component_id = source.component_id();
-            let mut stream = source.into_stream(&db).await;
-            loop {
-                let s = {
-                    let view = stream.next().await;
-                    format_value(view.as_component_view(), &db, component_id)
-                };
-                let result = this.update(cx, |this, cx| {
-                    this.value = Some(SharedString::from(&s));
+        let task = spawn_seeded_stream(
+            db,
+            source,
+            cx,
+            |db, component_id| {
+                let formatter = ValueFormatter::resolve(db, component_id);
+                ((), move |view| Some(formatter.format(view)))
+            },
+            |this, update, cx| {
+                if let StreamUpdate::Value(value) = update {
+                    this.value = Some(SharedString::from(value));
                     cx.notify();
-                });
-                if result.is_err() {
-                    break;
                 }
-            }
-        });
+            },
+        );
         Self {
             value: None,
             _task: task,

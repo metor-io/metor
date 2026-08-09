@@ -4,7 +4,7 @@
 //! [`ParamsDocEntry`](metor_fsw_2::ParamsDocEntry) submitted into the
 //! crate-local `inventory` collection, keyed by the struct name (which is its
 //! postcard-schema name). The pack's own `.so` reads these back when it builds
-//! its manifest, so `metor-fsw stubgen` can render the units and prose. Docs
+//! its manifest, so pack module generation can render the units and prose. Docs
 //! are optional: a field with no doc comment contributes nothing, and a params
 //! type that skips the derive simply has no entry.
 

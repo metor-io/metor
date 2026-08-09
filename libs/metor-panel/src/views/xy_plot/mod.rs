@@ -14,15 +14,21 @@ use std::sync::Arc;
 
 use gpui::{
     Bounds, Context, Entity, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
-    SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
+    SharedString, Styled, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
+#[allow(unused_imports)]
+use crate::inspect;
+
 use super::time_series::{
-    AxisZone, LABEL_FONT_SIZE, Override, PADDING, PlotBounds, PlotStyle, X_LABEL_HEIGHT,
-    Y_LABEL_WIDTH, axis_zone, format_value_label, plot_area, value_ticks,
+    AxisZone, Override, PADDING, PlotBounds, PlotStyle, X_LABEL_HEIGHT, Y_LABEL_WIDTH, axis_zone,
+    plot_area, value_ticks,
 };
+
+mod config;
+pub use config::{XyPlotPanelConfig, XyTraceConfig};
 
 mod line_plot;
 pub use line_plot::XyLinePlot;
@@ -47,9 +53,11 @@ pub struct XyTrace {
     #[facet(skip)]
     pub y_element_index: usize,
     pub color: Hsla,
+    #[facet(inspect::variants = "Line,Scatter")]
     pub style: PlotStyle,
     pub visible: bool,
     pub label: SharedString,
+    #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
 }
 
@@ -267,73 +275,14 @@ impl Render for XyPlot {
             );
 
         if show_legend {
-            let legend_bg = theme.plot_chrome_bg();
-            let mut legend_row = div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap_1()
-                .gap_y_0()
-                .pl(px(Y_LABEL_WIDTH + PADDING))
-                .pb_1()
-                .bg(legend_bg);
-
-            for trace_entity in trace_entities.iter() {
-                let trace = trace_entity.read(cx);
-                let visible = trace.visible;
-                let opacity = if visible { 1.0 } else { 0.3 };
-                let color = Hsla {
-                    a: opacity,
-                    ..trace.color
-                };
-                let text_color = Hsla {
-                    a: opacity,
-                    ..theme.text_secondary
-                };
-                let label = trace.label.clone();
-                let toggle_target = trace_entity.clone();
-                let inspect_target = trace_entity.clone();
-
-                legend_row = legend_row.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event: &gpui::MouseDownEvent, _window, cx| {
-                                toggle_target.update(cx, |t, cx| {
-                                    t.visible = !t.visible;
-                                    cx.notify();
-                                });
-                                this.line_plot.update(cx, |_, cx| cx.notify());
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |_this, event: &gpui::MouseDownEvent, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(crate::inspector::InspectEntity {
-                                        entity: inspect_target.clone().into_any(),
-                                        position: event.position,
-                                    }),
-                                    cx,
-                                );
-                            }),
-                        )
-                        .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
-                        .child(
-                            div()
-                                .text_size(px(LABEL_FONT_SIZE))
-                                .text_color(text_color)
-                                .child(label),
-                        ),
-                );
-            }
-
-            root = root.child(legend_row);
+            root = root.child(crate::views::plot_common::plot_legend(
+                &trace_entities,
+                self.line_plot.clone(),
+                px(Y_LABEL_WIDTH + PADDING),
+                |trace| (trace.label.clone(), trace.color, trace.visible),
+                |trace| trace.visible = !trace.visible,
+                cx,
+            ));
         }
 
         root
@@ -407,18 +356,6 @@ pub(crate) fn paint_xy_overlay(
 ) {
     let pb = plot_area(outer_bounds, 1);
     let theme = crate::theme::theme(cx);
-    let label_font_size = px(LABEL_FONT_SIZE);
-    let text_style = window.text_style();
-    let font = text_style.font();
-
-    let make_run = |text: &str| TextRun {
-        len: text.len(),
-        font: font.clone(),
-        color: theme.text_secondary,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
 
     let axis_bg = theme.plot_chrome_bg();
     let y_axis_bg = Bounds {
@@ -444,38 +381,26 @@ pub(crate) fn paint_xy_overlay(
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
-        let text = format_value_label(tick);
-        let run = make_run(&text);
-        let shaped = window.text_system().shape_line(
-            SharedString::from(text),
-            label_font_size,
-            &[run],
-            None,
+        crate::views::plot_common::paint_value_label(
+            tick,
+            theme.text_secondary,
+            |width, font_size| point(pb.origin.x - width - px(4.0), y - font_size / 2.0),
+            window,
+            cx,
         );
-        let origin = point(
-            pb.origin.x - shaped.width - px(4.0),
-            y - label_font_size / 2.0,
-        );
-        let _ = shaped.paint(origin, label_font_size, window, cx);
     }
     for tick in value_ticks(view.min_x, view.max_x, 5) {
         let x = view.to_screen(pb, tick, view.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
-        let text = format_value_label(tick);
-        let run = make_run(&text);
-        let shaped = window.text_system().shape_line(
-            SharedString::from(text),
-            label_font_size,
-            &[run],
-            None,
+        crate::views::plot_common::paint_value_label(
+            tick,
+            theme.text_secondary,
+            |width, _| point(x - width / 2.0, pb.origin.y + pb.size.height + px(4.0)),
+            window,
+            cx,
         );
-        let origin = point(
-            x - shaped.width / 2.0,
-            pb.origin.y + pb.size.height + px(4.0),
-        );
-        let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 
     let mut axes = PathBuilder::stroke(px(1.0));

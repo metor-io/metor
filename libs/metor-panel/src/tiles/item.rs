@@ -45,7 +45,7 @@ pub trait PaneItem: Render + Sized + 'static {
 /// Object-safe view of a [`PaneItem`] so heterogeneous panels can share a tab bar.
 pub trait PaneItemHandle: 'static {
     fn tab_title(&self, cx: &App) -> SharedString;
-    fn serialization_key(&self) -> &'static str;
+    fn serialization_key(&self) -> &str;
     fn serialize(&self, cx: &App) -> String;
     fn can_close(&self, cx: &App) -> bool;
     fn view(&self) -> AnyView;
@@ -62,7 +62,7 @@ impl<T: PaneItem> PaneItemHandle for Entity<T> {
         self.read(cx).tab_title(cx)
     }
 
-    fn serialization_key(&self) -> &'static str {
+    fn serialization_key(&self) -> &str {
         T::serialization_key()
     }
 

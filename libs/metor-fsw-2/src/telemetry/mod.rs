@@ -59,13 +59,12 @@ use crate::message::{MsgFanOut, NamedMsg, split_record};
 use crate::registry::{AllOutputs, RegistryEntry};
 use crate::shared::Shared;
 use crate::system::{
-    BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput, Out, System, SystemInput,
-    SystemOutput,
+    BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput, Out, System, SystemOutput,
 };
 
 /// Which registry entries the downlink taps.
 #[derive(Clone, Debug)]
-pub enum TelemetryMode {
+enum TelemetryMode {
     /// Tap every entry: every system's user frames and their implicit
     /// `health`/`log`, plus the coordinator-owned `health`/`log`/`status`.
     All,
@@ -90,16 +89,6 @@ impl TelemetryMode {
             }
         }
     }
-}
-
-/// The link attachment and tap selection a [`TelemetrySystem`] is built from
-/// programmatically; the wiring path builds from [`DownlinkParams`] through
-/// the builtin link pack instead.
-pub struct TelemetryConfig {
-    /// The shared link server to stream through.
-    pub link: Shared<LinkState>,
-    /// Which outputs to tap.
-    pub mode: TelemetryMode,
 }
 
 /// Wiring parameters for the built-in downlink (`type="Downlink"`): an
@@ -251,22 +240,6 @@ impl BindPorts for UplinkOut {
     }
 }
 
-/// The uplink's empty input bundle; commands come off the shared link, not
-/// edges.
-pub struct UplinkIn;
-
-impl SystemInput for UplinkIn {
-    fn decls() -> Declarations {
-        Declarations::default()
-    }
-}
-
-impl BindPorts for UplinkIn {
-    fn bind<S: RingSource>(_src: &mut S) -> Self {
-        UplinkIn
-    }
-}
-
 /// The command ingest system, the read twin of [`TelemetrySystem`]: a
 /// [`CyclicSystem`] attached to the shared [`LinkState`] that drains the
 /// server's inbound queue each cycle and relays each msg onto its matching
@@ -330,7 +303,7 @@ impl UplinkSystem {
 }
 
 impl System for UplinkSystem {
-    type Input = UplinkIn;
+    type Input = ();
     type Output = UplinkOut;
     const NAME: &'static str = "uplink";
 
@@ -374,7 +347,7 @@ impl CyclicSystem for UplinkSystem {
     /// the configured set bumps `uplink_unroutable` (a sender/config
     /// mismatch), a full ring bumps `uplink_dropped`; either way the queue
     /// drains fully so a bad sender cannot wedge it.
-    fn execute(&mut self, _now: Timestamp, _input: &mut UplinkIn, output: &mut UplinkOut) {
+    fn execute(&mut self, _now: Timestamp, _input: &mut (), output: &mut UplinkOut) {
         let (fan, health) = output.split();
         if !self.checked {
             if self.msgs.is_empty() {
@@ -446,22 +419,6 @@ pub struct LinkStatus {
     pub dropped: u64,
 }
 
-/// The downlink's empty input bundle; it pulls outputs through the registry,
-/// not typed edges.
-pub struct TelemetryIn;
-
-impl SystemInput for TelemetryIn {
-    fn decls() -> Declarations {
-        Declarations::default()
-    }
-}
-
-impl BindPorts for TelemetryIn {
-    fn bind<S: RingSource>(_src: &mut S) -> Self {
-        TelemetryIn
-    }
-}
-
 /// A read view into one tapped buffer plus the delivery axis and the [`Wire`]
 /// framing projected from the entry.
 struct Tap {
@@ -516,19 +473,6 @@ pub struct TelemetrySystem {
 }
 
 impl TelemetrySystem {
-    /// A pre-init downlink from its config. Taps are resolved at `init`,
-    /// where the registry handle is reachable.
-    pub fn new(config: TelemetryConfig) -> Self {
-        Self {
-            link: Some(config.link),
-            mode: config.mode,
-            taps: Vec::new(),
-            batch: Vec::new(),
-            retain_scratch: Vec::new(),
-            status: LinkStatus::default(),
-        }
-    }
-
     /// Attach the shared link server this downlink streams through.
     pub fn attach(mut self, link: Shared<LinkState>) -> Self {
         self.link = Some(link);
@@ -537,7 +481,7 @@ impl TelemetrySystem {
 }
 
 impl System for TelemetrySystem {
-    type Input = TelemetryIn;
+    type Input = ();
     type Output = Out<TelemetryPorts>;
     const NAME: &'static str = "telemetry";
 
@@ -699,9 +643,10 @@ impl CyclicSystem for TelemetrySystem {
         for _ in 0..stats.inbound_dropped {
             output.health().error("link_inbound_dropped");
         }
+        let connections = link.connections();
         let status = LinkStatus {
             timestamp: now,
-            connections: link.connections() as u64,
+            connections: connections as u64,
             accepted: self.status.accepted + stats.accepted,
             dropped: self.status.dropped + stats.conn_dropped,
         };
@@ -718,7 +663,7 @@ impl CyclicSystem for TelemetrySystem {
         // undrained tap view stalls its producer's ring and freezes every
         // consumer of that output, not just telemetry.
         self.batch.clear();
-        let mut batch = link.has_connections().then_some(&mut self.batch);
+        let mut batch = (connections != 0).then_some(&mut self.batch);
         for tap in &mut self.taps {
             match tap.delivery {
                 // An unchanged `committed` means no new record this cycle;

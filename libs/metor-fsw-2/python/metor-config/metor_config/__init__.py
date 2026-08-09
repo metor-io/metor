@@ -41,7 +41,9 @@ __version__ = "0.3.0"
 # v5 made attachment explicit: a system names the state it attaches to via the
 # `attach` field (the built-in `Downlink`/`Uplink` take the state handle in
 # their constructor), replacing the host's compiled-in by-type association.
-IR_VERSION = 5
+# v6 removed the redundant empty initial-occupant state; an absent `initial`
+# now exclusively represents an empty slot.
+IR_VERSION = 6
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -148,35 +150,8 @@ def static_system(ty: str, **params: Any) -> Spec:
     return Spec(ty, None, params)
 
 
-class _EntryCallable:
-    """One pack entry; calling it records a spec bound to its artifact."""
-
-    def __init__(self, artifact_id: str, entry: str):
-        self._artifact = artifact_id
-        self._entry = entry
-
-    def __call__(self, **params: Any) -> Spec:
-        return Spec(self._entry, self._artifact, params)
-
-
-class ArtifactHandle:
-    """A declared artifact. Attribute or item access yields an entry callable
-    (``adcs.Plant`` or ``adcs["Plant"]``)."""
-
-    def __init__(self, artifact_id: str):
-        self._id = artifact_id
-
-    def __getattr__(self, entry: str) -> _EntryCallable:
-        if entry.startswith("_"):
-            raise AttributeError(entry)
-        return _EntryCallable(self._id, entry)
-
-    def __getitem__(self, entry: str) -> _EntryCallable:
-        return _EntryCallable(self._id, entry)
-
-
 # ---------------------------------------------------------------------------
-# Typed core for generated packs (`metor-fsw stubgen`)
+# Typed core for generated packs
 #
 # These are the symbols the generated `packs/<id>.py` modules import. At
 # runtime they are thin: `Frame`/`Msg` are empty markers, `InPort`/`OutPort`
@@ -281,11 +256,6 @@ class SystemHandle:
 
     def __init__(self, name: str):
         self.name = name
-
-    def port(self, name: str) -> Any:
-        """The explicit, untyped spelling of ``handle.<name>``, for
-        programmatic generation."""
-        return PortRef(self.name, name)
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -1117,7 +1087,7 @@ def Presets(presets: list[Preset]) -> Spec:  # noqa: N802 - a system-type wrappe
 # The target
 # ---------------------------------------------------------------------------
 
-_INIT_STATES = {"empty": "Empty", "loaded": "Loaded", "running": "Running"}
+_INIT_STATES = {"loaded": "Loaded", "running": "Running"}
 
 
 class Target:
@@ -1154,26 +1124,6 @@ class Target:
         self._names: set[str] = set()
         _targets.append(self)
 
-    # -- artifacts ----------------------------------------------------------
-
-    def artifact(self, id: str, crate: str, lib: str) -> ArtifactHandle:
-        """Declare a loadable pack cdylib and return its entry-callable handle."""
-        self._artifacts.append(
-            {
-                "id": id,
-                "crate_name": crate,
-                "lib": lib,
-                "path": None,
-                "prebuilt_dir": None,
-                "dist": None,
-                # A hand-declared artifact carries no generated-stub hash, so
-                # the host's staleness check skips it (as it does for KDL).
-                "manifest_hash": None,
-                "src": _source_ref(),
-            }
-        )
-        return ArtifactHandle(id)
-
     # -- scopes -------------------------------------------------------------
 
     @contextmanager
@@ -1203,8 +1153,7 @@ class Target:
         self._names.add(name)
 
     def _register_spec_artifact(self, spec: Spec) -> None:
-        """Auto-register a generated :class:`System`'s declaring artifact, so a
-        target never has to spell ``m.artifact(...)`` for a stubbed pack."""
+        """Auto-register a generated :class:`System`'s declaring artifact."""
         decl = getattr(spec, "artifact_decl", None)
         if decl is not None:
             self._register_artifact(decl)
@@ -1354,7 +1303,7 @@ class Target:
         frame parameter ``F`` makes a cross-frame connection a pyright error;
         at runtime both ends are :class:`PortRef`s (same ``instance``/``port``
         fields the annotations declare)."""
-        self._edge(src, dst, "Frame", bool(delayed))
+        self._edge(src, dst, bool(delayed))
 
     def route(self, src: "SystemHandle | Spec", dst: "SystemHandle | Spec", msg: str) -> None:
         """Record a message edge carrying ``msg`` from ``src`` to ``dst``. A
@@ -1375,7 +1324,7 @@ class Target:
             }
         )
 
-    def _edge(self, src: OutPort[F], dst: InPort[F], kind: str, delayed: bool) -> None:
+    def _edge(self, src: OutPort[F], dst: InPort[F], delayed: bool) -> None:
         self._edges.append(
             {
                 "from": src.instance,
@@ -1383,7 +1332,7 @@ class Target:
                 "to": dst.instance,
                 "in_": dst.port,
                 "delayed": delayed,
-                "kind": kind,
+                "kind": "Frame",
                 "src": _source_ref(),
             }
         )

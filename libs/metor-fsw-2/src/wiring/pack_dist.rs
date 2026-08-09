@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! <pack>/.metor/
-//!   <module>/__init__.py            # prebuilt-flavor typed module
+//!   <module>/__init__.py            # typed module
 //!   <module>/py.typed
 //!   <module>/_libs/<triple>/<cdylib>
 //!   <module>/_libs/<triple>/<cdylib>.manifest
@@ -23,8 +23,8 @@
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use super::stubgen::{StubFlavor, render_module};
-use super::{BuildError, BuildOptions, StubgenError, WiringBuilder, provision_artifacts};
+use super::pack_module::render_module;
+use super::{BuildError, BuildOptions, WiringBuilder, provision_artifacts};
 
 /// A pack crate's packaging config: `pyproject.toml`'s `[project]` +
 /// `[tool.metor.pack]`, with the cargo facts defaulted from `Cargo.toml`.
@@ -125,8 +125,8 @@ pub enum PackError {
     #[error(transparent)]
     Build(#[from] BuildError),
     /// Rendering the typed module failed.
-    #[error(transparent)]
-    Stubgen(#[from] StubgenError),
+    #[error("failed to render typed pack module: {0}")]
+    Module(String),
     /// The manifest sidecar the layout ships was not written by the build.
     #[error("no manifest sidecar next to `{so}`; the pack layout requires one")]
     MissingSidecar {
@@ -409,11 +409,11 @@ pub fn pack_dev(dir: &Path, opts: &PackDevOptions) -> Result<PackDevReport, Pack
         &config.crate_name,
         &config.lib,
         &manifest,
-        &StubFlavor::Prebuilt {
-            abi_version: crate::abi::FSW_ABI_VERSION,
-            dist: Some((config.dist_name.clone(), config.dist_version.clone())),
-        },
-    )?;
+        crate::abi::FSW_ABI_VERSION,
+        &config.dist_name,
+        &config.dist_version,
+    )
+    .map_err(PackError::Module)?;
     write(&module_dir.join("__init__.py"), module.as_bytes())?;
     write(&module_dir.join("py.typed"), b"")?;
 
@@ -798,11 +798,11 @@ fn assemble_wheel(
         &config.crate_name,
         &config.lib,
         &manifest,
-        &StubFlavor::Prebuilt {
-            abi_version: crate::abi::FSW_ABI_VERSION,
-            dist: Some((config.dist_name.clone(), config.dist_version.clone())),
-        },
-    )?;
+        crate::abi::FSW_ABI_VERSION,
+        &config.dist_name,
+        &config.dist_version,
+    )
+    .map_err(PackError::Module)?;
     files.push(super::wheel::WheelFile {
         arcname: format!("{}/__init__.py", config.module),
         bytes: module.into_bytes(),
@@ -1264,7 +1264,8 @@ mod integration {
             )
             .build();
         wiring.artifacts[0].prebuilt_dir = Some(report.module_dir.join("_libs"));
-        wiring.artifacts[0].manifest_hash = Some(super::super::stubgen::manifest_hash(&manifest));
+        wiring.artifacts[0].manifest_hash =
+            Some(super::super::pack_module::manifest_hash(&manifest));
         provision_artifacts(&mut wiring, &BuildOptions::default())
             .expect("prebuilt layout provisions without cargo");
         assert_eq!(wiring.artifacts[0].path.as_deref(), Some(&*report.lib_path));

@@ -27,7 +27,6 @@
 //! remains the sole mutable grant of the state struct itself.
 
 use core::cell::{Cell, RefCell, RefMut};
-use core::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 /// Once-per-instance lifecycle of a pack-shared state. Both hooks run on
@@ -78,14 +77,14 @@ impl<S> Shared<S> {
     /// entry create rejects an undeclared state before any system runs, so
     /// reaching that panic means bypassing the wiring path — or on a
     /// re-entrant borrow, which the sequential cycle loop cannot produce.
-    pub fn get(&self) -> SharedGuard<'_, S> {
+    pub fn get(&self) -> RefMut<'_, S> {
         let inner = self.0.state.borrow_mut();
         assert!(
             inner.is_some(),
             "shared state `{}` was never constructed (missing wiring declaration)",
             self.0.name
         );
-        SharedGuard(inner)
+        RefMut::map(inner, |slot| slot.as_mut().expect("checked above"))
     }
 
     /// Construct the instance. Errors if already constructed (a duplicate
@@ -109,22 +108,6 @@ impl<S> Shared<S> {
 
 /// A second construction of an already-constructed shared state.
 pub(crate) struct AlreadySet;
-
-/// The borrow [`Shared::get`] hands out, scoped to one init/step/shutdown.
-pub struct SharedGuard<'a, S>(RefMut<'a, Option<S>>);
-
-impl<S> Deref for SharedGuard<'_, S> {
-    type Target = S;
-    fn deref(&self) -> &S {
-        self.0.as_ref().expect("checked at get")
-    }
-}
-
-impl<S> DerefMut for SharedGuard<'_, S> {
-    fn deref_mut(&mut self) -> &mut S {
-        self.0.as_mut().expect("checked at get")
-    }
-}
 
 /// The type-erased face of a [`SharedCell`], for the attachment machinery:
 /// lifecycle fan-in (start once, shutdown after the last release) and the

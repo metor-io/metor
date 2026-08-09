@@ -3,6 +3,12 @@
 //! unsafe pointer and atomic paths for provenance, leaks, and data races.
 //! `MIRI.md` in the crate root describes the coverage. Loop bounds shrink
 //! under `cfg!(miri)`.
+//!
+//! Two sections are `#[cfg(not(miri))]` because Miri cannot run them: the mmap
+//! tests, which need a real temp directory and a real `mmap`, and the async
+//! tests at the end, which need the executor. The async ones exist because
+//! `View::read` and `View::read_into` are reachable from no other test here,
+//! and Kani and loom cannot reach them either.
 
 use super::*;
 
@@ -474,10 +480,14 @@ fn raw_attach_swap_reacquire() {
     assert_eq!(&buf[..], b"raw-occ2");
 }
 
-// ----- mmap backing (feature-gated) -----
+// ----- mmap backing -----
+//
+// Excluded from Miri: these need a real temp directory and a real `mmap`,
+// neither of which Miri provides. They used to be excluded by a feature gate
+// that no longer exists.
 
-#[cfg(feature = "mmap")]
 #[test]
+#[cfg(not(miri))]
 fn mmap_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ring.bin");
@@ -764,8 +774,8 @@ fn attach_rejects_misaligned() {
 /// `attach_mmap` on a file truncated below its self-declared `total_size` (or
 /// even below the header) fails cleanly instead of mapping short and reading
 /// out of bounds.
-#[cfg(feature = "mmap")]
 #[test]
+#[cfg(not(miri))]
 fn attach_mmap_rejects_truncated_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ring.bin");
@@ -966,4 +976,122 @@ fn reclaim_skips_other_owners() {
         "foreign writer claim survives"
     );
     drop(v);
+}
+
+// ----- Async paths -----
+//
+// Excluded from Miri, which cannot drive the executor. These are the only
+// tests that reach `View::read`, `View::read_into` and `Notifier`; everything
+// above deliberately sticks to `try_*` so it stays Miri-checkable, which left
+// the awaiting paths — and `port.rs`'s `view.read().await` in `metor-fsw-2` —
+// covered only indirectly.
+//
+// Each spawns the peer and yields first, so the waiting side is already armed
+// when the commit lands. That is what puts the wake path, rather than a record
+// that happened to be ready, on the tested route.
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn read_into_awaits_a_commit() {
+    let ring = ring(64, 2);
+    let notifier = Notifier::default();
+    let mut w = ring.writer(notifier.clone()).unwrap();
+    let mut v = ring.view(notifier.clone()).unwrap();
+    assert_eq!(v.committed(), 0);
+
+    let reader = stellarator::spawn(async move {
+        let mut buf = Vec::new();
+        v.read_into(&mut buf).await.expect("never corrupt");
+        (buf, v.cursor())
+    });
+
+    stellarator::yield_now().await;
+    w.try_write(b"awaited!").unwrap();
+
+    let (buf, cursor) = reader.await.unwrap();
+    assert_eq!(&buf[..], b"awaited!");
+    assert_eq!(cursor, frame_len(8) as u64);
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn read_awaits_a_commit_and_the_grant_consumes_it() {
+    let ring = ring(64, 2);
+    let notifier = Notifier::default();
+    let mut w = ring.writer(notifier.clone()).unwrap();
+    let mut v = ring.view(notifier.clone()).unwrap();
+
+    let writer = stellarator::spawn(async move {
+        stellarator::yield_now().await;
+        w.try_write(b"borrowed").unwrap();
+    });
+
+    let grant = v.read().await.expect("never corrupt");
+    assert_eq!(&grant[..], b"borrowed");
+    drop(grant);
+    // Dropping the grant is what advances the cursor past the record.
+    assert_eq!(v.cursor(), frame_len(8) as u64);
+    assert_eq!(v.committed(), frame_len(8) as u64);
+    writer.await.unwrap();
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn read_into_streams_records_in_order() {
+    let ring = ring(64, 2);
+    let notifier = Notifier::default();
+    let mut w = ring.writer(notifier.clone()).unwrap();
+    let mut v = ring.view(notifier.clone()).unwrap();
+
+    let reader = stellarator::spawn(async move {
+        let mut seen = Vec::new();
+        let mut buf = Vec::new();
+        for _ in 0..4u8 {
+            v.read_into(&mut buf).await.expect("never corrupt");
+            seen.push(buf[0]);
+        }
+        seen
+    });
+
+    // One at a time, so the reader waits on every one of them rather than
+    // draining a backlog.
+    for n in 0..4u8 {
+        stellarator::yield_now().await;
+        w.try_write(&[n; 8]).unwrap();
+    }
+
+    assert_eq!(reader.await.unwrap(), vec![0, 1, 2, 3]);
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn read_returns_a_ready_record_without_waiting() {
+    let ring = ring(64, 2);
+    let notifier = Notifier::default();
+    let mut w = ring.writer(notifier.clone()).unwrap();
+    let mut v = ring.view(notifier).unwrap();
+
+    // Committed before the first poll, so the loop returns on its first pass
+    // and never arms the wait.
+    w.try_write(b"ready").unwrap();
+    let mut buf = Vec::new();
+    v.read_into(&mut buf).await.expect("never corrupt");
+    assert_eq!(&buf[..], b"ready");
+}
+
+/// [`NoWake`] resolves as soon as it is polled, which is what makes the async
+/// paths degenerate to caller-driven polling under it. Called directly: a view
+/// using it would spin without yielding, so it never reaches the wait in a
+/// test that has data to find.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn no_wake_resolves_immediately() {
+    let mut polled = false;
+    NoWake
+        .wait_until(|| {
+            polled = true;
+            true
+        })
+        .await;
+    assert!(polled, "NoWake must poll its readiness predicate");
 }

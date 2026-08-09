@@ -31,8 +31,8 @@
 //!
 //! All shared state lives in one contiguous region that holds offsets and
 //! atomics but no pointers, so the same code runs over a heap allocation, a
-//! memory-mapped file (behind the `mmap` feature), or any region the caller
-//! provides ([`RingBuffer::attach_raw`]).
+//! memory-mapped file, or any region the caller provides
+//! ([`RingBuffer::attach_raw`]).
 //!
 //! ```text
 //! 0x00 ┌───────────────────────────┐
@@ -93,30 +93,27 @@
 //!
 //! The shared region carries no wake state. Waking is a pair of traits
 //! injected per handle, [`WakeSource`] to notify and [`WakeSink`] to await.
-//! [`NoWake`] serves synchronous consumers, and [`Notifier`] (behind the
-//! `async` feature) wakes tasks within one process. Only the data direction
-//! wakes: writers use the non-blocking [`Writer::try_write`], so nothing ever
-//! waits for space.
+//! [`NoWake`] serves synchronous consumers, and [`Notifier`] wakes tasks
+//! within one process. Only the data direction wakes: writers use the
+//! non-blocking [`Writer::try_write`], so nothing ever waits for space.
 //!
 //! # Verification
 //!
-//! The synchronous paths, which include all of the unsafe pointer and atomic
-//! code, run under Miri. `MIRI.md` in the crate root describes what is
-//! covered and how to run it.
+//! Three passes, each covering what the others cannot, documented in the crate
+//! root. `MIRI.md`: the synchronous tests under Miri, for provenance, leaks and
+//! data races over real allocations. `KANI.md`: the position arithmetic and the
+//! geometry validation every `unsafe` deref here cites, proved over symbolic
+//! inputs rather than sampled. `LOOM.md`: the atomic orderings below, including
+//! the registration handshake, under every interleaving.
 
-#[cfg(all(
-    feature = "futex",
-    any(target_os = "linux", target_os = "android", target_os = "macos")
-))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod wake;
 
+mod sync;
+
+use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+use crate::sync::{Arc, AtomicU64, fence};
 use std::cell::UnsafeCell;
-use std::sync::Arc;
-use std::sync::atomic::{
-    AtomicU64,
-    Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
-    fence,
-};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 // ---------------------------------------------------------------------------
@@ -183,13 +180,39 @@ struct Control {
 struct ReaderSlot {
     cursor: AtomicU64,
     owner: AtomicU64,
-    _pad: [u8; 48],
+    _pad: [u8; READER_SLOT_PAD],
 }
 
-/// Byte offset of the control block.
+/// Bytes of padding that round a [`ReaderSlot`] out to a cache line. Zero
+/// under loom, whose atomics carry tracking state and blow past 64 bytes on
+/// their own.
+#[cfg(not(ring_loom))]
+const READER_SLOT_PAD: usize = 48;
+#[cfg(ring_loom)]
+const READER_SLOT_PAD: usize = 0;
+
+/// Byte offset of the control block. Cache line 1, after the header.
 const OFF_CONTROL: usize = 0x40;
+
 /// Header plus control block size. The reader table starts here.
+///
+/// Fixed at two cache lines for the real layout, since that is the region
+/// format. Under loom the control block outgrows one line, so the constant is
+/// derived instead and the reader table simply starts further in; nothing but
+/// the loom models ever observes the difference.
+#[cfg(not(ring_loom))]
 const HEADER_SIZE: usize = 0x80;
+#[cfg(ring_loom)]
+const HEADER_SIZE: usize = (OFF_CONTROL + size_of::<Control>()).next_multiple_of(64);
+
+// The shipped region format, pinned so the loom fork above can never move it.
+#[cfg(not(ring_loom))]
+const _: () = {
+    assert!(size_of::<RegionHeader>() <= OFF_CONTROL);
+    assert!(OFF_CONTROL + size_of::<Control>() <= HEADER_SIZE);
+    assert!(size_of::<ReaderSlot>() == 64);
+    assert!(align_of::<ReaderSlot>() == 8);
+};
 /// One reader-table slot's stride.
 const READER_SLOT_SIZE: usize = size_of::<ReaderSlot>();
 
@@ -213,8 +236,17 @@ const fn arch_tag() -> u64 {
 /// alias two claimants across a pid wrap-around, so reclaim promptly after
 /// reaping a dead peer, before spawning replacements.
 #[inline]
+#[cfg(not(kani))]
 fn owner_tag() -> u64 {
     std::process::id() as u64
+}
+
+/// Kani has no process to ask, and the harnesses never depend on the tag's
+/// value, only on it being nonzero.
+#[inline]
+#[cfg(kani)]
+fn owner_tag() -> u64 {
+    1
 }
 
 /// Round `n` up to the next multiple of 8.
@@ -231,6 +263,63 @@ pub const fn round_up8(n: usize) -> usize {
 #[inline]
 pub const fn frame_len(payload_len: usize) -> usize {
     8 + round_up8(payload_len)
+}
+
+// ---------------------------------------------------------------------------
+// Position arithmetic
+//
+// The three predicates below carry the crate's load-bearing invariants:
+// records never straddle the wrap, the writer never laps a reader, and a
+// length read out of the region is bounded before it becomes a slice length.
+// They are free functions over plain integers so `verify.rs` can prove them
+// for every input rather than for the handful the unit tests pick.
+// ---------------------------------------------------------------------------
+
+/// Where a record of `rec` bytes goes when written at absolute position
+/// `committed`, as `(start_abs, gap)`. A nonzero `gap` is the wrap gap left
+/// unused at the end of the current lap because the record would not fit
+/// contiguously.
+///
+/// `capacity` is a power of two and `rec <= capacity`.
+#[inline]
+const fn reserve(committed: u64, rec: u64, capacity: u64) -> (u64, u64) {
+    let phys = committed & (capacity - 1);
+    if phys + rec > capacity {
+        let gap = capacity - phys;
+        (committed + gap, gap)
+    } else {
+        (committed, 0)
+    }
+}
+
+/// Whether a write needing `need` bytes fits without overwriting the slowest
+/// active reader.
+///
+/// Assumes `slowest <= committed`: a cursor is only ever moved to a position
+/// the writer has already published. Violating it costs a wrapped subtraction,
+/// which reads as "full" or overflows the sum, never as space that is not
+/// there — see `KANI.md`. `Writer::fits` checks the assumption under the
+/// verification cfgs.
+#[inline]
+const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> bool {
+    committed.wrapping_sub(slowest) + need <= capacity
+}
+
+/// Whether a record whose length field reads `len` fits inside the data region
+/// when its header starts at physical offset `phys`.
+///
+/// This is the straddle predicate `phys + frame_len(len) <= capacity`, kept in
+/// `u64` and rewritten to avoid overflow. `capacity - 8 - phys` cannot
+/// underflow (`phys <= capacity - 8` for an 8-aligned in-bounds header) and is
+/// a multiple of 8, and for a multiple of 8 `m`, `round_up8(len) > m` exactly
+/// when `len > m` — so comparing the raw length is the same test as comparing
+/// the padded one, without the padding's chance to wrap.
+///
+/// The caller must not convert `len` to `usize` first: on a 32-bit target
+/// `frame_len` of a garbage length wraps and defeats this very check.
+#[inline]
+const fn record_fits(len: u64, phys: u64, capacity: u64) -> bool {
+    len <= capacity - 8 - phys
 }
 
 // ---------------------------------------------------------------------------
@@ -383,61 +472,50 @@ impl std::error::Error for AttachError {}
 #[repr(C, align(8))]
 struct Word(UnsafeCell<u64>);
 
-/// The memory a ring lives in, reduced to a `(base, len)` byte range plus
-/// the destructor that releases it. The kinds of backing memory (heap, mmap,
-/// caller-owned) differ only in how they drop.
+/// The memory a ring lives in, reduced to a `(base, len)` byte range and its
+/// concrete owner.
 ///
 /// Every constructor guarantees the region contract that all of the ring's
 /// `unsafe` relies on. `base..base + len` is a single allocation that is
 /// interior-mutable (writing through pointers derived from `base` is sound),
 /// 8-byte aligned, and stable for the backing's lifetime. The ring forms
 /// `&AtomicU64` references and plain byte slices over it.
-pub struct Backing {
+struct Backing {
     base: *mut u8,
     len: usize,
-    /// Drop context passed through to `drop_fn`. Null for
-    /// [`heap`](Backing::heap) and [`raw`](Backing::raw).
-    ctx: *mut (),
-    /// Destructor. `None` means non-owning, as in
-    /// [`RingBuffer::attach_raw`].
-    drop_fn: Option<unsafe fn(*mut (), *mut u8, usize)>,
+    _owner: BackingOwner,
 }
 
-/// Rebuild and free the `Box<[Word]>` that [`Backing::heap`] leaked into
-/// `base`.
-///
-/// # Safety
-/// `(base, len)` came from `Backing::heap`, so it is a leaked `Box<[Word]>`
-/// of `len/8` words, and this runs exactly once (the `Drop` contract).
-unsafe fn heap_drop(_ctx: *mut (), base: *mut u8, len: usize) {
-    // SAFETY: reconstructs exactly the allocation `heap` leaked, same pointer
-    // and same word count, transferring ownership back for the free.
-    unsafe {
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-            base as *mut Word,
-            len / 8,
-        )))
-    };
+enum BackingOwner {
+    /// The heap allocation, held as a raw pointer rather than a live `Box`.
+    ///
+    /// Retaining the `Box` would be unsound. Moving it into this enum is a
+    /// `Unique` retag, which invalidates every pointer already derived from
+    /// it — and `Backing::base` is derived from it, so every access the ring
+    /// ever makes would be through a dead tag. Miri reports it as the first
+    /// write in `init_region`.
+    Heap { words: *mut [Word] },
+    Mmap { _map: memmap2::MmapMut },
+    Raw,
 }
 
 impl Backing {
     /// Allocate a zeroed heap region of at least `size` bytes.
     ///
-    /// The region is a leaked `Box<[Word]>`, which makes it interior-mutable
-    /// and 8-aligned on every target.
+    /// The region is a `Box<[Word]>` given up to a raw pointer, which makes it
+    /// interior-mutable and 8-aligned on every target. `Drop` reconstructs the
+    /// box to free it.
     pub fn heap(size: usize) -> Self {
-        let words = size.div_ceil(8);
-        let buf: Box<[Word]> = (0..words).map(|_| Word(UnsafeCell::new(0u64))).collect();
+        let count = size.div_ceil(8);
+        let buf: Box<[Word]> = (0..count).map(|_| Word(UnsafeCell::new(0u64))).collect();
         let len = buf.len() * 8;
-        // `into_raw` hands over the whole-allocation pointer and its
-        // provenance. No live `Box` remains, so every later access derives
-        // from this one owning pointer.
-        let base = Box::into_raw(buf) as *mut u8;
+        // Give up the box before deriving `base`, so the pointer the ring uses
+        // is the one that owns the allocation and nothing retags it later.
+        let words = Box::into_raw(buf);
         Self {
-            base,
+            base: words.cast::<u8>(),
             len,
-            ctx: std::ptr::null_mut(),
-            drop_fn: Some(heap_drop),
+            _owner: BackingOwner::Heap { words },
         }
     }
 
@@ -452,81 +530,40 @@ impl Backing {
         Self {
             base,
             len,
-            ctx: std::ptr::null_mut(),
-            drop_fn: None,
+            _owner: BackingOwner::Raw,
         }
     }
 
     /// An mmap-backed region. The mapping is unmapped when the backing drops.
-    #[cfg(feature = "mmap")]
     fn mmap(map: memmap2::MmapMut) -> Self {
-        // # Safety: `ctx` is the `Box<MmapMut>` leaked below; runs exactly once.
-        unsafe fn mmap_drop(ctx: *mut (), _base: *mut u8, _len: usize) {
-            // SAFETY: reconstructs the box `mmap` leaked, transferring
-            // ownership back; `MmapMut::drop` unmaps.
-            unsafe { drop(Box::from_raw(ctx as *mut memmap2::MmapMut)) };
-        }
-        // The mapping itself never moves. Boxing keeps the `MmapMut` value at
-        // a stable heap address for `ctx`.
-        let map = Box::new(map);
         let (base, len) = (map.as_ptr() as *mut u8, map.len());
         Self {
             base,
             len,
-            ctx: Box::into_raw(map) as *mut (),
-            drop_fn: Some(mmap_drop),
-        }
-    }
-
-    /// Assemble a backing from raw parts. This is the extension point for
-    /// custom regions such as a static arena; pair it with
-    /// [`RingBuffer::attach`].
-    ///
-    /// # Safety
-    /// - `base..base + len` satisfies the region contract (see [`Backing`])
-    ///   for the backing's whole lifetime.
-    /// - If `drop_fn` is `Some`, calling it exactly once, from any thread,
-    ///   with exactly `(ctx, base, len)` must be sound, and that call must be
-    ///   the only release of the resources they name.
-    pub unsafe fn from_raw_parts(
-        base: *mut u8,
-        len: usize,
-        ctx: *mut (),
-        drop_fn: Option<unsafe fn(*mut (), *mut u8, usize)>,
-    ) -> Self {
-        Self {
-            base,
-            len,
-            ctx,
-            drop_fn,
+            _owner: BackingOwner::Mmap { _map: map },
         }
     }
 
     /// Base of the region.
     #[inline]
-    pub fn base(&self) -> *mut u8 {
+    fn base(&self) -> *mut u8 {
         self.base
     }
 
     /// Length of the region in bytes.
     #[inline]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.len
-    }
-
-    /// Whether the region is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 }
 
 impl Drop for Backing {
     fn drop(&mut self) {
-        if let Some(f) = self.drop_fn {
-            // SAFETY: the constructor contracts guarantee `f(ctx, base, len)`
-            // is sound to call exactly once with these exact values, and
-            // `Drop` runs at most once.
-            unsafe { f(self.ctx, self.base, self.len) };
+        if let BackingOwner::Heap { words } = self._owner {
+            // SAFETY: `words` came from `Box::into_raw` in `heap`, is the sole
+            // owner of that allocation, and is reconstructed exactly once,
+            // here. The mmap and raw variants free themselves or nothing.
+            drop(unsafe { Box::from_raw(words) });
         }
     }
 }
@@ -534,7 +571,7 @@ impl Drop for Backing {
 // SAFETY: the raw pointers make `Backing` `!Send + !Sync` by default, but the
 // ring upholds both. Region bytes are only touched through atomics or under
 // the `committed` Release/Acquire handshake, and the constructor contracts
-// allow `drop_fn` to run on whichever thread drops the last handle.
+// allow the concrete owner to drop on whichever thread drops the last handle.
 unsafe impl Send for Backing {}
 unsafe impl Sync for Backing {}
 
@@ -575,26 +612,22 @@ impl WakeSink for NoWake {
 
 /// A shared wait queue that wakes tasks within one process. The writer and
 /// its views share clones of a single `Notifier`, so a commit wakes the
-/// awaiting readers. Behind the `async` feature.
-#[cfg(feature = "async")]
+/// awaiting readers.
 #[derive(Clone)]
 pub struct Notifier(Arc<stellarator::sync::WaitQueue>);
 
-#[cfg(feature = "async")]
 impl Default for Notifier {
     fn default() -> Self {
         Self(Arc::new(stellarator::sync::WaitQueue::new()))
     }
 }
 
-#[cfg(feature = "async")]
 impl WakeSource for Notifier {
     fn notify(&self) {
         self.0.wake_all();
     }
 }
 
-#[cfg(feature = "async")]
 impl WakeSink for Notifier {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F) {
         let _ = self.0.wait_for(ready).await;
@@ -703,13 +736,7 @@ impl Inner {
     /// `gap` is a wrap gap left at the end of the current lap.
     #[inline]
     fn reserve(&self, committed: u64, rec: u64) -> (u64, u64) {
-        let phys = committed & self.mask;
-        if phys + rec > self.capacity {
-            let gap = self.capacity - phys;
-            (committed + gap, gap)
-        } else {
-            (committed, 0)
-        }
+        reserve(committed, rec, self.capacity)
     }
 
     /// Write a record's header and payload at physical offset `phys`. Plain
@@ -799,7 +826,6 @@ impl RingBuffer {
 
     /// Create a new mmap-backed region at `path`, truncating any existing
     /// file.
-    #[cfg(feature = "mmap")]
     pub fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
         let (reader_table_offset, data_offset, total) = layout(&cfg);
         let file = std::fs::OpenOptions::new()
@@ -833,7 +859,6 @@ impl RingBuffer {
     /// compatible build and is not being concurrently torn down. The
     /// magic/version/arch handshake guards against accidental misuse but not
     /// deliberate corruption.
-    #[cfg(feature = "mmap")]
     pub unsafe fn attach_mmap(path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -869,17 +894,14 @@ impl RingBuffer {
         unsafe { Self::attach(Backing::raw(base, len)) }
     }
 
-    /// Attach over an already-initialized region held by `backing`,
-    /// validating its header and reading the geometry back out of it. This is
-    /// the shared tail of [`RingBuffer::attach_mmap`] and
-    /// [`RingBuffer::attach_raw`], and the door for custom
-    /// [`Backing::from_raw_parts`] regions.
+    /// Attach over an already-initialized concrete backing, validating its
+    /// header and reading the geometry back out of it.
     ///
     /// # Safety
     /// `backing`'s region is live (all [`Backing::len`] bytes are readable)
     /// and is not being torn down concurrently. `read_header` validates
     /// everything else before any reference is formed into the region.
-    pub unsafe fn attach(backing: Backing) -> Result<Self, AttachError> {
+    unsafe fn attach(backing: Backing) -> Result<Self, AttachError> {
         let base = backing.base();
         // SAFETY: `backing.len()` bytes are readable (caller contract);
         // `read_header` bounds every read against that length.
@@ -1024,8 +1046,9 @@ impl RingBuffer {
     }
 
     /// Number of currently registered views. Test-only introspection into the
-    /// reader table, for the slot-reclamation tests.
-    #[cfg(test)]
+    /// reader table, for the slot-reclamation tests, which the loom models do
+    /// not run.
+    #[cfg(all(test, not(ring_loom)))]
     pub(crate) fn reader_count(&self) -> usize {
         (0..self.inner.max_readers)
             .filter(|&s| self.inner.slot_cursor(s).load(Relaxed) != FREE_SLOT)
@@ -1095,7 +1118,7 @@ unsafe fn init_region(
                 .write(ReaderSlot {
                     cursor: AtomicU64::new(FREE_SLOT),
                     owner: AtomicU64::new(0),
-                    _pad: [0; 48],
+                    _pad: [0; READER_SLOT_PAD],
                 });
         }
     }
@@ -1109,14 +1132,7 @@ struct Geometry {
     max_readers: u32,
 }
 
-/// Validate and read the immutable header fields from an existing region.
-///
-/// After `Ok`, every offset the ring will ever dereference (the control
-/// block, all `max_readers` reader slots, and `data_offset + phys` for
-/// `phys < capacity`) lies inside `[0, region_len)` and is 8-aligned. In
-/// other words, attaching restores the same geometry invariant that `layout`
-/// and `init_region` establish at creation. All arithmetic is checked `u64`,
-/// so a hostile header cannot overflow its way past a bound.
+/// Read and validate the immutable header fields of an existing region.
 ///
 /// # Safety
 /// `base` points at a readable region of at least `region_len` bytes.
@@ -1134,7 +1150,21 @@ unsafe fn read_header(base: *mut u8, region_len: usize) -> Result<Geometry, Atta
     let hdr_bytes =
         unsafe { core::slice::from_raw_parts(base as *const u8, size_of::<RegionHeader>()) };
     let hdr = RegionHeader::read_from_bytes(hdr_bytes).expect("exact-size slice");
+    validate_header(&hdr, region_len)
+}
 
+/// Check a region header against the geometry invariant.
+///
+/// After `Ok`, every offset the ring will ever dereference (the control block,
+/// all `max_readers` reader slots, and `data_offset + phys` for
+/// `phys < capacity`) lies inside `[0, region_len)` and is 8-aligned. In other
+/// words, attaching restores the same geometry invariant that `layout` and
+/// `init_region` establish at creation. All arithmetic is checked `u64`, so a
+/// hostile header cannot overflow its way past a bound.
+///
+/// Split out from `read_header` and free of raw pointers so `verify.rs` can
+/// run it against a fully symbolic header.
+fn validate_header(hdr: &RegionHeader, region_len: usize) -> Result<Geometry, AttachError> {
     if hdr.magic != MAGIC {
         return Err(AttachError::BadMagic);
     }
@@ -1231,7 +1261,17 @@ impl<WD: WakeSource> Writer<WD> {
     #[inline]
     fn fits(&self, committed: u64, need: u64) -> bool {
         let slowest = self.inner.slowest_active_cursor().unwrap_or(committed);
-        committed.wrapping_sub(slowest) + need <= self.inner.capacity
+        // The assumption `fits` is written against. Checked only where it is
+        // being verified: a violation costs a spurious `WouldBlock`, so making
+        // it a panic in every downstream debug build would trade a benign
+        // outcome for a crash. Loom model
+        // `cursor_never_exceeds_committed_at_fits` is what exercises it.
+        #[cfg(any(test, ring_loom))]
+        debug_assert!(
+            slowest <= committed,
+            "cursor {slowest} is ahead of committed {committed}"
+        );
+        fits(committed, slowest, need, self.inner.capacity)
     }
 
     /// Write the record bytes, publish the wrap gap (if any) and the new
@@ -1448,16 +1488,10 @@ impl<RD: WakeSink> View<RD> {
             // guarantees `capacity >= 8`, so `phys <= cap - 8`), and `r < c`
             // orders this read after the record's publication.
             let len = unsafe { self.inner.read_len(phys) };
-            // Bound the length in u64 before converting to usize or doing
-            // pointer math; on a 32-bit target, `frame_len` of a garbage
-            // length would wrap `usize` and defeat this very check. The
-            // comparison is the straddle predicate `phys + rec > cap`
-            // rewritten to avoid overflow (`cap - phys - 8` is a multiple of
-            // 8 and cannot underflow, and for a multiple of 8 `m`,
-            // `round_up8(len) > m` exactly when `len > m`). A real record
-            // never straddles and the writer can never lap a reader, so a hit
-            // means the region is corrupt and must not be borrowed from.
-            if len > cap - 8 - phys as u64 {
+            // A real record never straddles and the writer can never lap a
+            // reader, so a failure here means the region is corrupt and must
+            // not be borrowed from.
+            if !record_fits(len, phys as u64, cap) {
                 return Err(ReadError::Corrupt);
             }
             let len = len as usize;
@@ -1507,5 +1541,13 @@ impl Drop for ReadGrant<'_> {
     }
 }
 
-#[cfg(test)]
+// The std tests drive real threads and mmap; a loom atomic touched outside
+// `loom::model` panics, so the two test modules are mutually exclusive.
+#[cfg(all(test, not(ring_loom)))]
 mod tests;
+
+#[cfg(all(test, ring_loom))]
+mod loom_tests;
+
+#[cfg(kani)]
+mod verify;

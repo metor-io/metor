@@ -1,11 +1,4 @@
-//! Generate typed Python pack modules from pack manifests (`metor-fsw stubgen`).
-//!
-//! A target's `pyproject.toml` lists its loadable artifacts under
-//! `[tool.metor.artifacts]`; for each, `stubgen` reads the pack's manifest
-//! (the `<cdylib>.manifest` sidecar the build driver writes, so nothing is
-//! `dlopen`ed into this process) and emits a `packs/<id>.py` — into the
-//! target tree by default, or into a build directory via `--out-dir` (how
-//! a target's PEP 517 backend keeps stubs venv-only):
+//! Render typed Python pack modules from pack manifests.
 //!
 //! - an `ARTIFACT` constant carrying the artifact id, crate, lib stem, and a
 //!   `sha256:<hex>` hash of the manifest bytes (the staleness anchor
@@ -17,14 +10,12 @@
 //!   blob), plus class-level port annotations;
 //! - a module-level occupant callable for each snake_case entry.
 //!
-//! The generated text is deterministic — stable ordering, no timestamps, no
-//! absolute paths — so `--check` is a byte diff and a bundle stays
-//! reproducible. Type parameters are annotations for the checker and are
-//! erased at runtime.
+//! The generated text is deterministic: stable ordering, no timestamps, and
+//! no absolute paths. Type parameters are annotations for the checker and are
+//! erased at runtime. `pack dev` and `pack build` are the two callers.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -33,338 +24,23 @@ use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
 use crate::abi::{PackEntryDesc, PackManifest};
 use crate::descriptor::{Delivery, FanIn, PortDesc, PortSchema};
 
-use super::model::Wiring;
-use super::{BuildOptions, WiringBuilder, provision_artifacts};
-
-/// Everything a `stubgen` invocation needs: the target directory whose
-/// `pyproject.toml` lists the artifacts, whether to build them first, and
-/// whether to only verify the checked-in stubs.
-#[derive(Clone, Debug)]
-pub struct StubgenOptions {
-    /// The target directory (holds `pyproject.toml`; stubs land in `packs/`).
-    pub target_dir: PathBuf,
-    /// Where to write the `packs` package (default: `<target_dir>/packs`).
-    /// A build front-end (e.g. a PEP 517 backend) points this at its own
-    /// build directory instead of the source tree.
-    pub out_dir: Option<PathBuf>,
-    /// Verify the checked-in stubs are byte-identical instead of writing them.
-    pub check: bool,
-    /// Build the listed crates first (the default). `false` requires them
-    /// prebuilt, locating each `.so` and its sidecar without running cargo.
-    pub build: bool,
-    /// Build the `--release` profile.
-    pub release: bool,
-    /// Extra args appended to every `cargo build`.
-    pub cargo_args: Vec<String>,
-}
-
-/// The outcome of a `stubgen` run.
-#[derive(Debug, Default)]
-pub struct StubgenReport {
-    /// Modules written (generate mode) or found current (check mode).
-    pub modules: Vec<PathBuf>,
-    /// Modules that were missing or out of date (check mode only).
-    pub stale: Vec<PathBuf>,
-}
-
-/// Why a `stubgen` invocation could not complete.
-#[derive(Debug, thiserror::Error)]
-pub enum StubgenError {
-    /// `pyproject.toml` could not be read.
-    #[error("failed to read `{path}`: {source}")]
-    PyprojectRead {
-        /// The `pyproject.toml` path.
-        path: PathBuf,
-        #[source]
-        /// The I/O error.
-        source: std::io::Error,
-    },
-    /// `pyproject.toml` did not parse as TOML.
-    #[error("failed to parse `{path}`: {source}")]
-    PyprojectParse {
-        /// The `pyproject.toml` path.
-        path: PathBuf,
-        #[source]
-        /// The TOML error.
-        source: toml::de::Error,
-    },
-    /// No `[tool.metor.artifacts]` table, or it was empty.
-    #[error(
-        "`{path}` has no `[tool.metor.artifacts]` entries; add one per loadable pack, \
-         e.g. `adcs = {{ crate = \"adcs-systems\", lib = \"adcs_systems\" }}`"
-    )]
-    NoArtifacts {
-        /// The `pyproject.toml` path.
-        path: PathBuf,
-    },
-    /// The build driver failed.
-    #[error(transparent)]
-    Build(#[from] super::BuildError),
-    /// A prebuilt artifact could not be located under `--no-build`.
-    #[error(
-        "could not locate a built `{cdylib}` for artifact `{id}` (crate `{crate_name}`); \
-         run `metor-fsw stubgen` without `--no-build`, or build the crate first"
-    )]
-    NotBuilt {
-        /// The artifact id.
-        id: String,
-        /// The cargo package name.
-        crate_name: String,
-        /// The expected cdylib file name.
-        cdylib: String,
-    },
-    /// The manifest bytes could not be obtained.
-    #[error("failed to read the manifest for artifact `{id}`: {detail}")]
-    Manifest {
-        /// The artifact id.
-        id: String,
-        /// What went wrong.
-        detail: String,
-    },
-    /// A generated module could not be written or a checked file read.
-    #[error("failed to {verb} `{path}`: {source}")]
-    Io {
-        /// `write` or `read`.
-        verb: &'static str,
-        /// The file path.
-        path: PathBuf,
-        #[source]
-        /// The I/O error.
-        source: std::io::Error,
-    },
-    /// `--check` found stale or missing modules.
-    #[error(
-        "stubs are out of date: {}\nregenerate with `metor-fsw stubgen`",
-        .0.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
-    )]
-    CheckFailed(Vec<PathBuf>),
-}
-
-/// One `[tool.metor.artifacts]` entry: the crate that builds the pack cdylib
-/// and its library stem (the `#[lib] name`), exactly the fields the recorder's
-/// `artifact` node carries.
-#[derive(Debug)]
-struct ArtifactEntry {
-    crate_name_field: String,
-    lib: String,
-}
-
-// `crate` is a keyword, so the TOML `crate` key is read by hand rather than
-// via a serde field rename.
-impl ArtifactEntry {
-    fn from_toml(value: &toml::Value) -> Option<Self> {
-        Some(Self {
-            crate_name_field: value.get("crate")?.as_str()?.to_string(),
-            lib: value.get("lib")?.as_str()?.to_string(),
-        })
-    }
-}
-
-/// Read `pyproject.toml`'s `[tool.metor.artifacts]` into `(id, crate, lib)`
-/// triples, in the table's declaration order made deterministic by sorting on
-/// the id.
-fn read_artifacts(pyproject: &Path) -> Result<Vec<(String, ArtifactEntry)>, StubgenError> {
-    let text =
-        std::fs::read_to_string(pyproject).map_err(|source| StubgenError::PyprojectRead {
-            path: pyproject.to_path_buf(),
-            source,
-        })?;
-    let doc: toml::Value = text
-        .parse()
-        .map_err(|source| StubgenError::PyprojectParse {
-            path: pyproject.to_path_buf(),
-            source,
-        })?;
-    let table = doc
-        .get("tool")
-        .and_then(|t| t.get("metor"))
-        .and_then(|m| m.get("artifacts"))
-        .and_then(toml::Value::as_table);
-    let mut out: Vec<(String, ArtifactEntry)> = match table {
-        Some(table) => table
-            .iter()
-            .filter_map(|(id, v)| ArtifactEntry::from_toml(v).map(|e| (id.clone(), e)))
-            .collect(),
-        None => Vec::new(),
-    };
-    if out.is_empty() {
-        return Err(StubgenError::NoArtifacts {
-            path: pyproject.to_path_buf(),
-        });
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
-}
-
-/// Generate (or verify) the pack modules for the target at
-/// [`StubgenOptions::target_dir`].
-pub fn stubgen(opts: &StubgenOptions) -> Result<StubgenReport, StubgenError> {
-    let pyproject = opts.target_dir.join("pyproject.toml");
-    let artifacts = read_artifacts(&pyproject)?;
-
-    // Locate each artifact's cdylib: build via the driver (the default, which
-    // also refreshes the sidecar we hash), or a cargo-free filesystem search.
-    let mut located: Vec<(String, ArtifactEntry, PathBuf)> = Vec::with_capacity(artifacts.len());
-    if opts.build {
-        let mut wiring: Wiring = {
-            let mut b = WiringBuilder::new();
-            for (id, e) in &artifacts {
-                b = b.artifact(id.clone(), e.crate_name_field.clone(), e.lib.clone());
-            }
-            b.build()
-        };
-        provision_artifacts(
-            &mut wiring,
-            &BuildOptions {
-                release: opts.release,
-                extra_args: opts.cargo_args.clone(),
-                manifest_sidecar: true,
-            },
-        )?;
-        for ((id, e), art) in artifacts.into_iter().zip(wiring.artifacts.into_iter()) {
-            let path = art
-                .path
-                .expect("provision_artifacts fills every path or errors");
-            located.push((id, e, path));
-        }
-    } else {
-        for (id, e) in artifacts {
-            let cdylib = super::cdylib_file_name(&e.lib);
-            let path = super::build_driver::locate_built(&opts.target_dir, &cdylib, opts.release)
-                .ok_or_else(|| StubgenError::NotBuilt {
-                    id: id.clone(),
-                    crate_name: e.crate_name_field.clone(),
-                    cdylib: cdylib.clone(),
-                })?;
-            located.push((id, e, path));
-        }
-    }
-
-    // The package files that never vary: an empty `__init__.py` and the
-    // `py.typed` marker, written once so `from packs.<id> import ...` and
-    // pyright both work.
-    let packs_dir = opts
-        .out_dir
-        .clone()
-        .unwrap_or_else(|| opts.target_dir.join("packs"));
-    let mut report = StubgenReport::default();
-    reconcile(&packs_dir.join("__init__.py"), "", opts.check, &mut report)?;
-    reconcile(&packs_dir.join("py.typed"), "", opts.check, &mut report)?;
-
-    for (id, entry, so) in &located {
-        let bytes = manifest_bytes(id, so)?;
-        let module = render_module(
-            id,
-            &entry.crate_name_field,
-            &entry.lib,
-            &bytes,
-            &StubFlavor::Local,
-        )?;
-        reconcile(
-            &packs_dir.join(format!("{id}.py")),
-            &module,
-            opts.check,
-            &mut report,
-        )?;
-    }
-
-    if opts.check && !report.stale.is_empty() {
-        return Err(StubgenError::CheckFailed(report.stale.clone()));
-    }
-    Ok(report)
-}
-
-/// Obtain the raw manifest bytes for a built artifact: the sidecar if present
-/// (no dlopen), else a describe worker, else an in-process describe.
-fn manifest_bytes(id: &str, so: &Path) -> Result<Vec<u8>, StubgenError> {
-    if let Some(bytes) = crate::dl::manifest_sidecar_bytes(so) {
-        return Ok(bytes);
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if crate::proc::worker_guard_installed() {
-        return crate::proc::describe_via_worker(None, so).map_err(|e| StubgenError::Manifest {
-            id: id.to_string(),
-            detail: e.to_string(),
-        });
-    }
-    crate::dl::describe_raw(so).map_err(|e| StubgenError::Manifest {
-        id: id.to_string(),
-        detail: e.to_string(),
-    })
-}
-
-/// Write `contents` to `path` (creating parents), or in `check` mode compare
-/// it against the file on disk, recording the outcome in `report`.
-fn reconcile(
-    path: &Path,
-    contents: &str,
-    check: bool,
-    report: &mut StubgenReport,
-) -> Result<(), StubgenError> {
-    if check {
-        match std::fs::read_to_string(path) {
-            Ok(existing) if existing == contents => report.modules.push(path.to_path_buf()),
-            _ => report.stale.push(path.to_path_buf()),
-        }
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| StubgenError::Io {
-            verb: "write",
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::write(path, contents).map_err(|source| StubgenError::Io {
-        verb: "write",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    report.modules.push(path.to_path_buf());
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Codegen
 // ---------------------------------------------------------------------------
 
-/// Which shape of `ARTIFACT` constant a generated module carries.
-///
-/// A **local** module (target-level `stubgen`) records identity only; the
-/// build driver compiles the crate at build/run time. A **prebuilt** module
-/// (`pack dev`, and the published pack wheel) also locates its own per-triple
-/// library payload (`_libs/` next to the module), stamps the generating ABI
-/// version, and names the distribution it belongs to — the fields the
-/// recorder passes through to [`Artifact`](super::model::Artifact)'s
-/// `prebuilt_dir`/`dist`.
-#[derive(Clone, Debug)]
-pub enum StubFlavor {
-    /// Identity-only `ARTIFACT`; the artifact is crate-built.
-    Local,
-    /// Self-locating `ARTIFACT` over a `_libs/<triple>/` payload.
-    Prebuilt {
-        /// The `FSW_ABI_VERSION` the pack was built against.
-        abi_version: u32,
-        /// The owning distribution's `(name, version)`, from the pack's
-        /// `pyproject.toml` `[project]` table.
-        dist: Option<(String, String)>,
-    },
-}
-
 /// The one-module code generator: decode the manifest, collect frame markers
 /// and nested dataclasses, and render the deterministic module text.
-pub fn render_module(
+pub(super) fn render_module(
     id: &str,
     crate_name: &str,
     lib: &str,
     manifest_bytes: &[u8],
-    flavor: &StubFlavor,
-) -> Result<String, StubgenError> {
-    let msg: PackManifest =
-        postcard::from_bytes(manifest_bytes).map_err(|e| StubgenError::Manifest {
-            id: id.to_string(),
-            detail: format!("manifest does not decode: {e}"),
-        })?;
+    abi_version: u32,
+    dist_name: &str,
+    dist_version: &str,
+) -> Result<String, String> {
+    let msg: PackManifest = postcard::from_bytes(manifest_bytes)
+        .map_err(|e| format!("manifest for pack `{id}` does not decode: {e}"))?;
     let hash = manifest_hash(manifest_bytes);
 
     let mut cg = Codegen::default();
@@ -378,25 +54,19 @@ pub fn render_module(
     }
 
     let mut out = String::new();
-    out.push_str(&header(id, crate_name, flavor));
+    out.push_str(&header(id, crate_name));
     out.push_str("from __future__ import annotations\n\n");
-    if matches!(flavor, StubFlavor::Prebuilt { .. }) {
-        out.push_str("from pathlib import Path\n\n");
-    }
+    out.push_str("from pathlib import Path\n\n");
     out.push_str(&cg.imports());
     out.push('\n');
     out.push_str(&format!(
         "ARTIFACT = Artifact(\n    id=\"{id}\",\n    crate=\"{crate_name}\",\n    lib=\"{lib}\",\n    manifest_hash=\"{hash}\",\n",
     ));
-    if let StubFlavor::Prebuilt { abi_version, dist } = flavor {
-        out.push_str("    prebuilt=str(Path(__file__).resolve().parent / \"_libs\"),\n");
-        out.push_str(&format!("    abi_version={abi_version},\n"));
-        if let Some((name, version)) = dist {
-            out.push_str(&format!(
-                "    dist=\"{name}\",\n    dist_version=\"{version}\",\n"
-            ));
-        }
-    }
+    out.push_str("    prebuilt=str(Path(__file__).resolve().parent / \"_libs\"),\n");
+    out.push_str(&format!("    abi_version={abi_version},\n"));
+    out.push_str(&format!(
+        "    dist=\"{dist_name}\",\n    dist_version=\"{dist_version}\",\n"
+    ));
     out.push_str(")\n");
 
     for (name, base) in &cg.frames {
@@ -416,7 +86,7 @@ pub fn render_module(
 }
 
 /// The `sha256:<hex>` hash of the manifest postcard bytes — pure code changes
-/// leave the manifest (and this hash) unchanged, so stubs never churn on them.
+/// leave the manifest (and this hash) unchanged, so generated modules do not churn.
 /// Shared with the resolve-time staleness check.
 pub(super) fn manifest_hash(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -431,28 +101,16 @@ pub(super) fn manifest_hash(bytes: &[u8]) -> String {
 /// The generated-file header: a provenance line and the regenerate/verify
 /// commands, deliberately free of timestamps and absolute paths so `--check`
 /// is a byte diff.
-fn header(id: &str, crate_name: &str, flavor: &StubFlavor) -> String {
-    match flavor {
-        StubFlavor::Local => format!(
-            "# @generated by `metor-fsw stubgen` from the `{id}` pack manifest (crate `{crate_name}`).\n\
-             # Do not edit by hand.\n\
-             #\n\
-             # Regenerate after changing the pack's params or ports:\n\
-             #     metor-fsw stubgen\n\
-             # Verify the checked-in stubs are current (CI):\n\
-             #     metor-fsw stubgen --check\n\
-             \"\"\"Typed pack module for artifact `{id}`.\"\"\"\n\n",
-        ),
-        StubFlavor::Prebuilt { .. } => format!(
-            "# @generated by `metor-fsw pack dev` from the `{id}` pack manifest (crate `{crate_name}`).\n\
-             # Do not edit by hand.\n\
-             #\n\
-             # Regenerate after changing the pack's params or ports:\n\
-             #     metor-fsw pack dev\n\
-             # (a `uv sync` of a target depending on this pack runs it for you)\n\
-             \"\"\"Typed pack module for artifact `{id}`.\"\"\"\n\n",
-        ),
-    }
+fn header(id: &str, crate_name: &str) -> String {
+    format!(
+        "# @generated by `metor-fsw pack dev` from the `{id}` pack manifest (crate `{crate_name}`).\n\
+         # Do not edit by hand.\n\
+         #\n\
+         # Regenerate after changing the pack's params or ports:\n\
+         #     metor-fsw pack dev\n\
+         # (a `uv sync` of a target depending on this pack runs it for you)\n\
+         \"\"\"Typed pack module for artifact `{id}`.\"\"\"\n\n",
+    )
 }
 
 /// The mutable state a module's codegen threads: collected frame markers,
@@ -1245,7 +903,9 @@ mod tests {
             "demo-systems",
             "demo_systems",
             &bytes,
-            &StubFlavor::Local,
+            crate::abi::FSW_ABI_VERSION,
+            "demo-pack",
+            "1.2.0",
         )
         .unwrap();
         let b = render_module(
@@ -1253,12 +913,14 @@ mod tests {
             "demo-systems",
             "demo_systems",
             &bytes,
-            &StubFlavor::Local,
+            crate::abi::FSW_ABI_VERSION,
+            "demo-pack",
+            "1.2.0",
         )
         .unwrap();
         assert_eq!(a, b, "codegen is deterministic");
 
-        assert!(a.contains("@generated by `metor-fsw stubgen`"));
+        assert!(a.contains("@generated by `metor-fsw pack dev`"));
         assert!(!a.contains("202"), "no timestamps in the header");
         assert!(a.contains("ARTIFACT = Artifact("));
         assert!(a.contains("manifest_hash=\"sha256:"));
@@ -1278,17 +940,21 @@ mod tests {
         assert!(a.contains("limit: int | None = None"));
     }
 
-    /// The prebuilt flavor self-locates its `_libs` payload and carries the
-    /// generating ABI version plus dist provenance; the local flavor carries
-    /// none of that.
+    /// Generated modules self-locate their `_libs` payload and carry the
+    /// generating ABI version plus distribution provenance.
     #[test]
-    fn prebuilt_flavor_locates_and_stamps() {
+    fn module_locates_and_stamps() {
         let bytes = demo_manifest();
-        let flavor = StubFlavor::Prebuilt {
-            abi_version: crate::abi::FSW_ABI_VERSION,
-            dist: Some(("demo-pack".into(), "1.2.0".into())),
-        };
-        let a = render_module("demo", "demo-systems", "demo_systems", &bytes, &flavor).unwrap();
+        let a = render_module(
+            "demo",
+            "demo-systems",
+            "demo_systems",
+            &bytes,
+            crate::abi::FSW_ABI_VERSION,
+            "demo-pack",
+            "1.2.0",
+        )
+        .unwrap();
 
         assert!(a.contains("@generated by `metor-fsw pack dev`"));
         assert!(a.contains("from pathlib import Path"));
@@ -1296,18 +962,6 @@ mod tests {
         assert!(a.contains(&format!("abi_version={},", crate::abi::FSW_ABI_VERSION)));
         assert!(a.contains("dist=\"demo-pack\","));
         assert!(a.contains("dist_version=\"1.2.0\","));
-
-        let local = render_module(
-            "demo",
-            "demo-systems",
-            "demo_systems",
-            &bytes,
-            &StubFlavor::Local,
-        )
-        .unwrap();
-        assert!(!local.contains("prebuilt="));
-        assert!(!local.contains("abi_version="));
-        assert!(!local.contains("pathlib"));
     }
 
     /// One fixture, two consumers: the checked-in `python/tests/data/demo.py`
@@ -1320,7 +974,9 @@ mod tests {
             "demo-systems",
             "demo_systems",
             &demo_manifest(),
-            &StubFlavor::Local,
+            crate::abi::FSW_ABI_VERSION,
+            "demo-pack",
+            "1.2.0",
         )
         .unwrap();
         let checked_in = include_str!("../../python/tests/data/demo.py");
@@ -1358,116 +1014,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(miri)))]
-mod integration {
-    //! End-to-end over the dl fixture pack, following the build_driver test
-    //! convention: build via cargo, skip (with a note) where that is
-    //! unavailable, and serialize on one lock since these share the fixture's
-    //! target-dir sidecar.
-    use super::*;
-
-    // Shared with the build_driver and dl fixture tests: one target-dir
-    // sidecar, so they must serialize.
-    use crate::dl::FIXTURE_LOCK;
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        FIXTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn target_dir() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("pyproject.toml"),
-            "[tool.metor.artifacts]\n\
-             fixture = { crate = \"metor-fsw-2-dl-fixture\", lib = \"metor_fsw_2_dl_fixture\" }\n",
-        )
-        .unwrap();
-        dir
-    }
-
-    fn opts(dir: &std::path::Path, check: bool) -> StubgenOptions {
-        StubgenOptions {
-            target_dir: dir.to_path_buf(),
-            out_dir: None,
-            check,
-            build: true,
-            release: false,
-            cargo_args: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn generate_then_check_roundtrips() {
-        let _guard = lock();
-        let dir = target_dir();
-        if let Err(e) = stubgen(&opts(dir.path(), false)) {
-            eprintln!("skipping: stubgen build failed: {e}");
-            return;
-        }
-        let module = dir.path().join("packs").join("fixture.py");
-        let text = std::fs::read_to_string(&module).unwrap();
-        assert!(text.contains("class DlCounter(System):"), "{text}");
-        assert!(text.contains("class DlEcho(System):"));
-        assert!(text.contains("manifest_hash=\"sha256:"));
-        assert!(dir.path().join("packs").join("py.typed").exists());
-        assert!(dir.path().join("packs").join("__init__.py").exists());
-
-        // Idempotent: --check is clean immediately after generating.
-        stubgen(&opts(dir.path(), true)).expect("check clean after generate");
-
-        // Tampering the checked-in module makes --check fail.
-        std::fs::write(&module, format!("{text}\n# edited\n")).unwrap();
-        let err = stubgen(&opts(dir.path(), true)).expect_err("edited stub is stale");
-        assert!(matches!(err, StubgenError::CheckFailed(_)), "{err}");
-    }
-
-    #[test]
-    fn stale_manifest_hash_is_rejected_at_resolve() {
-        let _guard = lock();
-        let mut wiring = WiringBuilder::new()
-            .artifact(
-                "fixture",
-                "metor-fsw-2-dl-fixture",
-                "metor_fsw_2_dl_fixture",
-            )
-            .build();
-        if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
-            eprintln!("skipping: build failed: {e}");
-            return;
-        }
-        // A wrong recorded hash is a stale stub.
-        wiring.artifacts[0].manifest_hash = Some("sha256:0000".to_string());
-        match super::super::resolve(&wiring, &super::super::Registry::with_builtins()) {
-            Err(e) if matches!(e.kind, super::super::LoadErrorKind::StaleStubs { .. }) => {}
-            Err(other) => panic!("expected StaleStubs, got {other:?}"),
-            Ok(_) => panic!("expected StaleStubs, resolve succeeded"),
-        }
-
-        // The real hash passes the freshness gate (resolve then proceeds past
-        // the check; it need not fully succeed for this assertion).
-        let so = wiring.artifacts[0].path.clone().unwrap();
-        let bytes = crate::dl::manifest_sidecar_bytes(&so).expect("sidecar present after build");
-        wiring.artifacts[0].manifest_hash = Some(manifest_hash(&bytes));
-        if let Err(e) = super::super::resolve(&wiring, &super::super::Registry::with_builtins())
-            && matches!(e.kind, super::super::LoadErrorKind::StaleStubs { .. })
-        {
-            panic!("fresh hash wrongly rejected");
-        }
-
-        // Sidecar-absent fallback: copy the object to a fresh dir with no
-        // sidecar next to it (leaving the shared one intact), so `manifest_bytes`
-        // falls through to an in-process describe — this libtest binary is not a
-        // describe worker — and the bytes still equal the sidecar's.
-        let iso = tempfile::tempdir().unwrap();
-        let iso_so = iso.path().join(so.file_name().unwrap());
-        std::fs::copy(&so, &iso_so).unwrap();
-        let described = manifest_bytes("fixture", &iso_so).expect("describe fallback");
-        assert_eq!(described, bytes, "describe ≡ sidecar bytes");
-    }
-}
-
 #[cfg(test)]
 mod fixture_dump {
     //! Writes the shared demo fixture module to the Python test-data tree; run
@@ -1483,7 +1029,9 @@ mod fixture_dump {
             "demo-systems",
             "demo_systems",
             &demo_manifest(),
-            &super::StubFlavor::Local,
+            crate::abi::FSW_ABI_VERSION,
+            "demo-pack",
+            "1.2.0",
         )
         .unwrap();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/python/tests/data/demo.py");

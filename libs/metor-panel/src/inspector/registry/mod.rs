@@ -15,7 +15,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use facet::{ConstTypeId, Facet, Peek, Poke};
+use facet::{ConstTypeId, Facet, Field, Peek, Poke};
 use gpui::{AnyEntity, App, AppContext, Entity, Global, SharedString};
 use metor_db::DB;
 
@@ -30,6 +30,7 @@ pub struct FieldBuildCtx<'a> {
     pub db: &'a Arc<DB>,
     pub label: SharedString,
     pub field_name: &'static str,
+    pub field_def: &'static Field,
 }
 
 /// Builds a single inspector row for one field.
@@ -56,18 +57,6 @@ pub struct EntityAdapter {
     pub(crate) peek: Arc<dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>)>,
     pub(crate) poke: Arc<dyn for<'v> Fn(&AnyEntity, &mut App, &mut PokeAdapterVisitor<'v>)>,
     pub shape_id: ConstTypeId,
-}
-
-/// Non-Facet field metadata that still needs to affect rendering.
-///
-/// Carries slider ranges (Facet attributes can't take non-string literal
-/// ranges without parse support at the grammar level) and an
-/// allowed-variant list for enums where the view wants to hide some
-/// variants from the inspector picker (e.g. `Bar` on XY plots).
-#[derive(Clone, Default)]
-pub struct FieldOverride {
-    pub range: Option<(f64, f64)>,
-    pub enum_allowed: Option<&'static [&'static str]>,
 }
 
 /// Builds the nav row for a `Vec<Entity<T>>` field.
@@ -100,7 +89,6 @@ impl<T: 'static> Clone for AddBehavior<T> {
 pub struct InspectorRegistry {
     field_widgets: HashMap<ConstTypeId, FieldWidgetFactory>,
     type_builders: HashMap<TypeId, TypeRowBuilder>,
-    field_overrides: HashMap<(ConstTypeId, &'static str), FieldOverride>,
     /// Keyed by the `ConstTypeId` of `Vec<Entity<T>>` itself, not of `T`.
     entity_list_handlers: HashMap<ConstTypeId, EntityListHandler>,
     entity_adapters: HashMap<TypeId, Arc<EntityAdapter>>,
@@ -113,7 +101,6 @@ impl InspectorRegistry {
         let mut reg = Self {
             field_widgets: HashMap::new(),
             type_builders: HashMap::new(),
-            field_overrides: HashMap::new(),
             entity_list_handlers: HashMap::new(),
             entity_adapters: HashMap::new(),
         };
@@ -128,14 +115,6 @@ impl InspectorRegistry {
 
     pub fn type_builder(&self, type_id: TypeId) -> Option<&TypeRowBuilder> {
         self.type_builders.get(&type_id)
-    }
-
-    pub fn field_override(
-        &self,
-        type_id: ConstTypeId,
-        field_name: &'static str,
-    ) -> Option<&FieldOverride> {
-        self.field_overrides.get(&(type_id, field_name))
     }
 
     pub fn register_field_widget<T: Facet<'static>>(&mut self, factory: FieldWidgetFactory) {
@@ -301,14 +280,5 @@ impl InspectorRegistry {
                 ))
             }),
         );
-    }
-
-    pub fn register_field_override<T: Facet<'static> + 'static>(
-        &mut self,
-        field_name: &'static str,
-        over: FieldOverride,
-    ) {
-        self.register_inspectable::<T>();
-        self.field_overrides.insert((T::SHAPE.id, field_name), over);
     }
 }

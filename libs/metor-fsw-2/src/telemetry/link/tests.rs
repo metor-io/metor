@@ -166,9 +166,9 @@ fn closed_connections_prune() {
     let seeded = a.pending_bytes().len();
     state.broadcast(&[1, 2, 3]);
     assert_eq!(a.pending_bytes()[seeded..], [1, 2, 3]);
-    assert!(state.has_connections());
+    assert_ne!(state.connections(), 0);
     a.close();
-    assert!(!state.has_connections());
+    assert_eq!(state.connections(), 0);
 }
 
 /// One real loopback connection: the announce replay arrives first, then

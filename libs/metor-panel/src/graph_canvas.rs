@@ -36,6 +36,7 @@ pub(crate) struct LineStyle {
 /// Dash pattern for a dashed connector: long enough to read as intent
 /// (planned, inactive) rather than as a rendering artifact.
 const DASH: [Pixels; 2] = [px(6.0), px(4.0)];
+const CURVE_SAMPLES_PER_SEGMENT: usize = 8;
 
 /// A wire's canvas-local polyline: source anchor, interior waypoints, target
 /// anchor.
@@ -148,6 +149,38 @@ fn to_f32(route: &[Point<Pixels>]) -> SmallVec<[(f32, f32); 6]> {
         .collect()
 }
 
+fn curve_segments(route: &[Point<Pixels>], flow: Axis) -> SmallVec<[Segment; 4]> {
+    route_segments(&to_f32(route), flow)
+}
+
+fn append_curve(path: &mut PathBuilder, canvas_origin: Point<Pixels>, segments: &[Segment]) {
+    let (ox, oy) = (f32::from(canvas_origin.x), f32::from(canvas_origin.y));
+    path.move_to(point(px(ox + segments[0].p0.0), px(oy + segments[0].p0.1)));
+    for segment in segments {
+        path.cubic_bezier_to(
+            point(px(ox + segment.p1.0), px(oy + segment.p1.1)),
+            point(px(ox + segment.c1.0), px(oy + segment.c1.1)),
+            point(px(ox + segment.c2.0), px(oy + segment.c2.1)),
+        );
+    }
+}
+
+fn sample_curve(segments: &[Segment]) -> SmallVec<[(f32, f32); 24]> {
+    let mut points = SmallVec::new();
+    if let Some(first) = segments.first() {
+        points.push(first.p0);
+    }
+    for segment in segments {
+        for sample in 1..=CURVE_SAMPLES_PER_SEGMENT {
+            let t = sample as f32 / CURVE_SAMPLES_PER_SEGMENT as f32;
+            points.push(cubic_bezier_point(
+                t, segment.p0, segment.c1, segment.c2, segment.p1,
+            ));
+        }
+    }
+    points
+}
+
 /// Paint a route (canvas-local points) as a smooth cubic chain, shifted by
 /// `canvas_origin` into window space. `dashed` selects the thinner stroke
 /// used for drafts and delayed edges.
@@ -159,21 +192,13 @@ pub(crate) fn paint_route(
     dashed: bool,
     window: &mut Window,
 ) {
-    let (ox, oy) = (f32::from(canvas_origin.x), f32::from(canvas_origin.y));
-    let segments = route_segments(&to_f32(route), flow);
+    let segments = curve_segments(route, flow);
     if segments.is_empty() {
         return;
     }
     let stroke = if dashed { px(1.0) } else { px(1.5) };
     let mut path = PathBuilder::stroke(stroke);
-    path.move_to(point(px(ox + segments[0].p0.0), px(oy + segments[0].p0.1)));
-    for s in &segments {
-        path.cubic_bezier_to(
-            point(px(ox + s.p1.0), px(oy + s.p1.1)),
-            point(px(ox + s.c1.0), px(oy + s.c1.1)),
-            point(px(ox + s.c2.0), px(oy + s.c2.1)),
-        );
-    }
+    append_curve(&mut path, canvas_origin, &segments);
     if let Ok(p) = path.build() {
         window.paint_path(p, color);
     }
@@ -209,12 +234,11 @@ pub(crate) fn hit_test_edges<E: Clone>(
     pointer: Point<Pixels>,
     flow: Axis,
 ) -> Option<E> {
-    const SAMPLES_PER_SEGMENT: usize = 8;
     const HIT_RADIUS: f32 = 6.0;
     let p = (f32::from(pointer.x), f32::from(pointer.y));
     let mut best: Option<(f32, E)> = None;
     for (edge, route) in edges {
-        let segments = route_segments(&to_f32(route), flow);
+        let segments = curve_segments(route, flow);
         if segments.is_empty() {
             continue;
         }
@@ -236,16 +260,10 @@ pub(crate) fn hit_test_edges<E: Clone>(
             continue;
         }
 
-        let mut min_dist = f32::INFINITY;
-        for s in &segments {
-            let mut prev = s.p0;
-            for k in 1..=SAMPLES_PER_SEGMENT {
-                let t = k as f32 / SAMPLES_PER_SEGMENT as f32;
-                let q = cubic_bezier_point(t, s.p0, s.c1, s.c2, s.p1);
-                min_dist = min_dist.min(point_segment_distance(p, prev, q));
-                prev = q;
-            }
-        }
+        let min_dist = sample_curve(&segments)
+            .windows(2)
+            .map(|points| point_segment_distance(p, points[0], points[1]))
+            .fold(f32::INFINITY, f32::min);
         if min_dist <= HIT_RADIUS {
             match &best {
                 Some((d, _)) if *d <= min_dist => {}
@@ -345,8 +363,7 @@ fn paint_curve(
     color: Hsla,
     window: &mut Window,
 ) {
-    let (ox, oy) = (f32::from(canvas_origin.x), f32::from(canvas_origin.y));
-    let segments = route_segments(&to_f32(route), Axis::Horizontal);
+    let segments = curve_segments(route, Axis::Horizontal);
     if segments.is_empty() {
         return;
     }
@@ -354,14 +371,7 @@ fn paint_curve(
     if style.dashed {
         path = path.dash_array(&DASH);
     }
-    path.move_to(point(px(ox + segments[0].p0.0), px(oy + segments[0].p0.1)));
-    for s in &segments {
-        path.cubic_bezier_to(
-            point(px(ox + s.p1.0), px(oy + s.p1.1)),
-            point(px(ox + s.c1.0), px(oy + s.c1.1)),
-            point(px(ox + s.c2.0), px(oy + s.c2.1)),
-        );
-    }
+    append_curve(&mut path, canvas_origin, &segments);
     if let Ok(p) = path.build() {
         window.paint_path(p, color);
     }
@@ -414,22 +424,10 @@ pub(crate) fn drawn_polyline(
     shape: LineShape,
 ) -> SmallVec<[Point<Pixels>; 24]> {
     match shape {
-        LineShape::Curved => {
-            const SAMPLES_PER_SEGMENT: usize = 8;
-            let segments = route_segments(&to_f32(points), Axis::Horizontal);
-            let mut out: SmallVec<[Point<Pixels>; 24]> = SmallVec::new();
-            if let Some(first) = segments.first() {
-                out.push(point(px(first.p0.0), px(first.p0.1)));
-            }
-            for s in &segments {
-                for k in 1..=SAMPLES_PER_SEGMENT {
-                    let t = k as f32 / SAMPLES_PER_SEGMENT as f32;
-                    let (x, y) = cubic_bezier_point(t, s.p0, s.c1, s.c2, s.p1);
-                    out.push(point(px(x), px(y)));
-                }
-            }
-            out
-        }
+        LineShape::Curved => sample_curve(&curve_segments(points, Axis::Horizontal))
+            .into_iter()
+            .map(|(x, y)| point(px(x), px(y)))
+            .collect(),
         LineShape::Orthogonal => orthogonal_points(points).into_iter().collect(),
         LineShape::Straight => points.iter().copied().collect(),
     }

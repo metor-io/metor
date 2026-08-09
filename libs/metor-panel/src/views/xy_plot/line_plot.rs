@@ -353,12 +353,10 @@ impl Render for XyLinePlot {
                                     let y_component = tracking.y_component.as_ref()?;
                                     Some(LineDraw {
                                         x: AxisSource::Element {
-                                            component_id: config.x_component_id,
                                             component: x_component,
                                             element_index: config.x_element_index,
                                         },
                                         y: AxisSource::Element {
-                                            component_id: config.y_component_id,
                                             component: y_component,
                                             element_index: config.y_element_index,
                                         },

@@ -279,9 +279,9 @@ pub fn fft(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildErr
                     scratch.clear();
                     for g in 0..groups {
                         let base = g * last;
-                        for k in 0..last {
+                        for (k, slot) in buf.iter_mut().enumerate().take(last) {
                             let v = read_f64_at(value, in_dtype, base + k);
-                            buf[k] = Complex::new(v, 0.0);
+                            *slot = Complex::new(v, 0.0);
                         }
                         plan.process(&mut buf);
                         for c in buf.iter().take(out_last) {
@@ -539,13 +539,13 @@ pub fn delta(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildE
                     if value.len() != in_value_size {
                         continue;
                     }
-                    for i in 0..n_elems {
-                        curr[i] = read_f64_at(value, in_dtype, i);
+                    for (i, slot) in curr.iter_mut().enumerate().take(n_elems) {
+                        *slot = read_f64_at(value, in_dtype, i);
                     }
                     if have_prev {
                         scratch.clear();
-                        for i in 0..n_elems {
-                            scratch.extend_from_slice(&(curr[i] - prev[i]).to_le_bytes());
+                        for (current, previous) in curr.iter().zip(&prev) {
+                            scratch.extend_from_slice(&(current - previous).to_le_bytes());
                         }
                         write_sample(&output, ts, &scratch);
                     }

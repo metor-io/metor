@@ -199,8 +199,8 @@ impl LinePlot {
     /// Called by pan/zoom handlers. Uses a bit-pattern compare to dodge
     /// the lack of `PartialEq` on `f64`-containing [`PlotView`].
     pub fn set_view_override(&mut self, view: Option<PlotView>, cx: &mut Context<Self>) {
-        let changed = self.view_override.as_ref().map(PlotView::bits)
-            != view.as_ref().map(PlotView::bits);
+        let changed =
+            self.view_override.as_ref().map(PlotView::bits) != view.as_ref().map(PlotView::bits);
         if changed {
             self.view_override = view;
             cx.notify();
@@ -334,9 +334,7 @@ impl LinePlot {
         let mut merged: smallvec::SmallVec<[(f32, f32); 4]> = smallvec::SmallVec::new();
         for (start, width) in bands {
             match merged.last_mut() {
-                Some((last_start, last_width))
-                    if start - (*last_start + *last_width) < 0.0005 =>
-                {
+                Some((last_start, last_width)) if start - (*last_start + *last_width) < 0.0005 => {
                     *last_width = (start + width - *last_start).max(*last_width);
                 }
                 _ => merged.push((start, width)),
@@ -609,11 +607,8 @@ impl LinePlot {
         let data = node.data.data();
         let base = sample_idx * elem_size;
         let buf = data.get(base..base + elem_size)?;
-        let value = crate::dynamic::tensor::read_f64_at(
-            buf,
-            component.schema.prim_type,
-            cfg.element_index,
-        );
+        let value =
+            crate::dynamic::tensor::read_f64_at(buf, component.schema.prim_type, cfg.element_index);
         Some((sample_ts, value))
     }
 
@@ -685,8 +680,7 @@ impl LinePlot {
                     let lod_cache = std::mem::take(&mut tracking.lod_node_bounds);
                     Some((comp, element_index, cache, lod, lod_cache))
                 });
-                let Ok(Some((comp, element_index, mut cache, lod, mut lod_cache))) = inputs
-                else {
+                let Ok(Some((comp, element_index, mut cache, lod, mut lod_cache))) = inputs else {
                     break;
                 };
 
@@ -718,9 +712,7 @@ impl LinePlot {
                     if tracking.cached_element_index == Some(element_index) {
                         tracking.node_bounds = cache;
                         tracking.y_bounds = bounds;
-                        if tracking.lod_cache_key
-                            == lod_for_wait.as_ref().map(|l| l.component_id)
-                        {
+                        if tracking.lod_cache_key == lod_for_wait.as_ref().map(|l| l.component_id) {
                             tracking.lod_node_bounds = lod_cache;
                             tracking.lod_y_bounds = lod_bounds;
                         }
@@ -785,7 +777,6 @@ impl Render for LinePlot {
                                     draws.push(LineDraw {
                                         x: AxisSource::Timestamps,
                                         y: AxisSource::MinMax {
-                                            component_id: lod.component_id,
                                             component: lod,
                                             element_index: config.element_index,
                                         },
@@ -808,7 +799,6 @@ impl Render for LinePlot {
                                 draws.push(LineDraw {
                                     x: AxisSource::Timestamps,
                                     y: AxisSource::Element {
-                                        component_id: config.component_id,
                                         component,
                                         element_index: config.element_index,
                                     },
@@ -825,7 +815,8 @@ impl Render for LinePlot {
                             let gpu_view = view.x_bounds();
                             if !draws.is_empty()
                                 && let Some(handle) =
-                                    lp.gpu_state.render(cx, bounds, scale_factor, gpu_view, &draws)
+                                    lp.gpu_state
+                                        .render(cx, bounds, scale_factor, gpu_view, &draws)
                             {
                                 handle.spawn_and_set(cx, line_plot_gpu_state);
                             }

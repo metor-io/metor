@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use facet::{ConstTypeId, Facet, Peek, ScalarType};
+use facet::{Facet, Peek, ScalarType};
 use gpui::{AnyEntity, App, SharedString};
 
 use crate::inspector::rows::{BoolRow, EnumRow, InspectorRow, ScalarRow, SliderRow, TextRow};
 
-use super::{FieldBuildCtx, FieldOverride, InspectorRegistry, builders};
+use super::{FieldBuildCtx, InspectorRegistry, builders};
 
 impl InspectorRegistry {
     /// Resolve the row for one struct field.
@@ -23,7 +23,6 @@ impl InspectorRegistry {
         peek: &Peek<'_, '_>,
         any_entity: &AnyEntity,
         field_idx: usize,
-        parent_shape_id: ConstTypeId,
         cx: &App,
     ) -> Option<Box<dyn InspectorRow>> {
         let field_shape = peek.shape();
@@ -36,22 +35,19 @@ impl InspectorRegistry {
             return Some(handler(any_entity.clone(), ctx.label.clone(), ctx.db, cx));
         }
 
-        let field_override = self.field_override(parent_shape_id, ctx.field_name);
-        self.default_row_for_shape(ctx, peek, any_entity, field_idx, field_override)
+        self.default_row_for_shape(ctx, peek, any_entity, field_idx)
     }
 
     /// Shape-driven defaults for fields with no registered override.
     ///
-    /// Handles `bool`, numeric scalars (with an optional slider range from
-    /// [`FieldOverride`]), `String`, `Option`, and `enum`. Everything else
-    /// returns `None` so the walker can skip the field silently.
+    /// Handles `bool`, numeric scalars, `String`, `Option`, and `enum`.
+    /// Everything else returns `None` so the walker can skip the field silently.
     pub fn default_row_for_shape(
         &self,
         ctx: &FieldBuildCtx,
         peek: &Peek<'_, '_>,
         any_entity: &AnyEntity,
         field_idx: usize,
-        field_override: Option<&FieldOverride>,
     ) -> Option<Box<dyn InspectorRow>> {
         let shape = peek.shape();
 
@@ -71,7 +67,7 @@ impl InspectorRegistry {
             && let Some(val) = scalar_as_f64(peek, scalar)
         {
             let label = ctx.label.clone();
-            if let Some((min, max)) = field_override.and_then(|o| o.range) {
+            if let Some((min, max)) = crate::inspect::field_range(ctx.field_def) {
                 let write_entity = any_entity.clone();
                 let read_entity = any_entity.clone();
                 return Some(Box::new(SliderRow {
@@ -122,11 +118,14 @@ impl InspectorRegistry {
                 .variant_name_active()
                 .unwrap_or("unknown")
                 .to_string();
-            let allowed = field_override.and_then(|o| o.enum_allowed);
+            let allowed = crate::inspect::field_variants(ctx.field_def);
             let options: Vec<SharedString> = peek_enum
                 .variants()
                 .iter()
-                .filter(|v| allowed.is_none_or(|a| a.contains(&v.name)))
+                .filter(|v| {
+                    allowed
+                        .is_none_or(|allowed| allowed.split(',').any(|name| name.trim() == v.name))
+                })
                 .map(|v| SharedString::from(v.name))
                 .collect();
             let any_entity = any_entity.clone();
