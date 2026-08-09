@@ -53,7 +53,7 @@ pub enum KeyError {
 }
 
 /// A dynamic member exceeded the bounds used to compute its frame's
-/// [`Componentize::MAX_SIZE`](metor_fsw::Componentize::MAX_SIZE). The member
+/// [`Componentize::MAX_SIZE`](metor_component::Componentize::MAX_SIZE). The member
 /// is rolled back before this is returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DynamicWriteError {

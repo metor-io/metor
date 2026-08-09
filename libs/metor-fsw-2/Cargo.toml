@@ -17,8 +17,8 @@ metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["nox", "std"] }
 metor-proto-stellar = { path = "../metor-proto/stellar" }
 
-# fsw
-metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"] }
+# component model — the frame traits and derives this crate re-exports
+metor-component = { workspace = true }
 metor-fsw-2-macros = { path = "macros" }
 
 # channels

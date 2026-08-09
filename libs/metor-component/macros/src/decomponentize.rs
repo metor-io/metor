@@ -7,7 +7,7 @@ use quote::quote;
 use syn::{DeriveInput, Generics, Ident};
 
 #[derive(Debug, FromDeriveInput)]
-#[darling(attributes(metor_fsw), supports(struct_named))]
+#[darling(attributes(fsw, metor_fsw), supports(struct_named))]
 pub struct Decomponentize {
     ident: Ident,
     generics: Generics,
@@ -18,7 +18,7 @@ pub struct Decomponentize {
 
 pub fn decomponentize(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    decomponentize_impl(&input, &crate::metor_fsw_crate_name()).into()
+    decomponentize_impl(&input, &crate::metor_component_crate_name()).into()
 }
 
 /// See [`componentize_impl`](crate::componentize::componentize_impl) for the

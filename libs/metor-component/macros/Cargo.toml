@@ -1,10 +1,13 @@
 [package]
-name = "metor-fsw-macros"
+name = "metor-component-macros"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition = "2024"
-description = "Macros for metor-fsw."
+description = "Derives for the metor component model."
 repository = "https://github.com/metor-sys/metor"
+
+[lints]
+workspace = true
 
 [lib]
 proc-macro = true

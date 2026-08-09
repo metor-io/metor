@@ -25,7 +25,7 @@
 
 use core::marker::PhantomData;
 
-use metor_fsw::Decomponentize;
+use metor_component::Decomponentize;
 use metor_fsw_ring::{NoWake, ReadError, ReadGrant, View, WakeSink, WakeSource, Writer, frame_len};
 use metor_proto::error::Error as ProtoError;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};

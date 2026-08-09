@@ -1,6 +1,6 @@
 //! The [`Frame`] trait, implemented via `#[derive(Frame)]`.
 
-use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
+use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
 use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 

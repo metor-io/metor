@@ -8,7 +8,7 @@ use syn::{DeriveInput, Generics, Ident};
 
 #[derive(Debug, FromDeriveInput)]
 #[darling(
-    attributes(metor_fsw),
+    attributes(fsw, metor_fsw),
     supports(struct_named, enum_unit),
     forward_attrs(allow, doc, cfg)
 )]
@@ -25,12 +25,12 @@ pub struct AsVTable {
 
 fn extract_repr_type(attrs: &[Attribute]) -> Option<Ident> {
     for attr in attrs {
-        if attr.path().is_ident("repr") {
-            if let Meta::List(meta_list) = attr.meta.clone() {
-                for token in meta_list.tokens {
-                    if let Ok(ident) = syn::parse2::<Ident>(token.into()) {
-                        return Some(ident);
-                    }
+        if attr.path().is_ident("repr")
+            && let Meta::List(meta_list) = attr.meta.clone()
+        {
+            for token in meta_list.tokens {
+                if let Ok(ident) = syn::parse2::<Ident>(token.into()) {
+                    return Some(ident);
                 }
             }
         }
@@ -40,7 +40,7 @@ fn extract_repr_type(attrs: &[Attribute]) -> Option<Ident> {
 
 pub fn as_vtable(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    as_vtable_impl(&input, None, &crate::metor_fsw_crate_name()).into()
+    as_vtable_impl(&input, None, &crate::metor_component_crate_name()).into()
 }
 
 /// Shared `AsVTable` code generator.

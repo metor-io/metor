@@ -3,8 +3,6 @@
 #[derive(
     zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout, Clone,
 )]
-#[cfg_attr(feature = "metor_fsw", derive(metor_fsw::AsVTable, metor_fsw::Metadatatize))]
-#[cfg_attr(feature = "metor_fsw", metor_fsw(parent = "aleph"))]
 #[repr(C)]
 pub struct Record {
     pub ts: u32, // in milliseconds

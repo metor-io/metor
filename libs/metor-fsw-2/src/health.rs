@@ -228,7 +228,7 @@ mod tests {
     use super::*;
     use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn};
     use crate::port::{Input, buffer_capacity, capacity_for};
-    use metor_fsw::Decomponentize;
+    use metor_component::Decomponentize;
     use metor_fsw_ring::{Config, RingBuffer};
     use metor_proto::types::{ComponentId, ComponentView};
 

@@ -75,7 +75,7 @@ name = "adcs-contracts"
 version = "0.14.2"
 dependencies = [
  "hifitime",
- "metor-fsw",
+ "metor-component",
  "metor-fsw-2",
  "nox",
  "nox-frames",
@@ -114,8 +114,8 @@ name = "adcs-systems"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts",
+ "metor-adcs",
  "metor-fsw-2",
- "metor-fsw-adcs",
  "nox",
  "rand 0.9.5",
  "rand_distr 0.5.1",
@@ -4750,29 +4750,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cube-sat"
-version = "0.14.2"
-dependencies = [
- "anyhow",
- "clap 4.6.3",
- "fastrand 2.5.0",
- "maitake",
- "metor-db",
- "metor-fsw",
- "metor-fsw-adcs",
- "metor-proto",
- "metor-proto-bbq",
- "metor-proto-stellar",
- "metor-proto-wkt",
- "nox",
- "rand 0.9.5",
- "rand_distr 0.5.1",
- "stellarator",
- "tracing-subscriber",
- "zerocopy",
-]
-
-[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9205,6 +9182,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "metor-adcs"
+version = "0.14.2"
+dependencies = [
+ "approx",
+ "metor-component",
+ "nox",
+ "zerocopy",
+]
+
+[[package]]
+name = "metor-component"
+version = "0.14.2"
+dependencies = [
+ "metor-component-macros",
+ "metor-proto",
+ "metor-proto-wkt",
+ "nox",
+ "zerocopy",
+]
+
+[[package]]
+name = "metor-component-macros"
+version = "0.14.2"
+dependencies = [
+ "convert_case 0.6.0",
+ "darling 0.20.11",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "metor-db"
 version = "0.14.2"
 dependencies = [
@@ -9268,32 +9278,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "metor-fsw"
-version = "0.14.2"
-dependencies = [
- "anyhow",
- "bbq2",
- "csv",
- "fastrand 2.5.0",
- "heapless 0.8.0",
- "metor-fsw-macros",
- "metor-proto",
- "metor-proto-bbq",
- "metor-proto-stellar",
- "metor-proto-wkt",
- "nix 0.29.0",
- "nox",
- "postcard",
- "postcard-schema",
- "serde",
- "stellarator",
- "thingbuf",
- "tracing",
- "tracing-subscriber",
- "zerocopy",
-]
-
-[[package]]
 name = "metor-fsw-2"
 version = "0.14.2"
 dependencies = [
@@ -9306,7 +9290,7 @@ dependencies = [
  "libloading",
  "mdns-sd",
  "memmap2",
- "metor-fsw",
+ "metor-component",
  "metor-fsw-2-macros",
  "metor-fsw-ring",
  "metor-proto",
@@ -9372,28 +9356,6 @@ dependencies = [
  "postcard-schema",
  "serde",
  "zerocopy",
-]
-
-[[package]]
-name = "metor-fsw-adcs"
-version = "0.1.0"
-dependencies = [
- "approx",
- "metor-fsw",
- "nox",
- "zerocopy",
-]
-
-[[package]]
-name = "metor-fsw-macros"
-version = "0.14.2"
-dependencies = [
- "convert_case 0.6.0",
- "darling 0.20.11",
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]

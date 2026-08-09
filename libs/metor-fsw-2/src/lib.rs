@@ -187,7 +187,7 @@ pub use inventory;
 
 pub use metor_fsw_ring as ring;
 
-pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
+pub use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_2_macros::{Frame, ParamsDocs, SystemInput, SystemOutput};
 
 pub use metor_fsw_2_macros::system;
@@ -196,7 +196,7 @@ pub use metor_proto::types::Timestamp;
 
 pub use sequence::{Outcome, SequenceStatus, SlotControlIn};
 
-pub use metor_fsw::path;
+pub use metor_component::path;
 pub use {metor_proto, metor_proto_wkt, zerocopy};
 
 pub use dl::{DlError, DlPack, DlSystem};

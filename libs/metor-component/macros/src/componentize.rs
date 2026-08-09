@@ -6,7 +6,7 @@ use quote::quote;
 use syn::{DeriveInput, Generics, Ident};
 
 #[derive(Debug, FromDeriveInput)]
-#[darling(attributes(metor_fsw), supports(struct_named))]
+#[darling(attributes(fsw, metor_fsw), supports(struct_named))]
 pub struct Componentize {
     ident: Ident,
     generics: Generics,
@@ -17,7 +17,7 @@ pub struct Componentize {
 
 pub fn componentize(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    componentize_impl(&input, &crate::metor_fsw_crate_name()).into()
+    componentize_impl(&input, &crate::metor_component_crate_name()).into()
 }
 
 /// `crate_name` is the path to the crate that re-exports the trait surface the

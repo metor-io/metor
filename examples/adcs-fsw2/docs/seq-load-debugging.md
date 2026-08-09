@@ -48,7 +48,8 @@ Reported in BOTH startup orders:
    `SequenceCommandKind` (the design doc has it; the wire enum never grew it),
    so from `Loaded` the only exits are Start or Reset (same occupant).
 3. **Old cube-sat sequencer allowed Load from any non-Running state**
-   (`examples/cube-sat/src/sequencer.rs:264` — only gate is `running`). The
+   (`examples/cube-sat/src/sequencer.rs:264`, since deleted — only gate is
+   `running`). The
    panel was built against those semantics. fsw-2's SlotRunner tightened this.
 4. **Panel Load button sends nothing directly** — it opens a picker over the
    channel's `available` list (`libs/metor-panel/src/views/sequence_panel.rs:376`).

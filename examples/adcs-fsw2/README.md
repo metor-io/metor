@@ -2,7 +2,7 @@
 
 A self-contained spacecraft attitude-determination-and-control target built on the
 `metor-fsw-2` framework: a plant/dynamics system, an MEKF navigation filter, and a
-Yang-LQR controller in a closed feedback loop (reusing the `metor-fsw/adcs` math and
+Yang-LQR controller in a closed feedback loop (reusing the `metor-adcs` math and
 `nox` six-dof dynamics), commissioned by a runtime **sequence slot**.
 
 ```text

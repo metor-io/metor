@@ -3,7 +3,7 @@
 use core::mem::offset_of;
 use std::collections::HashMap;
 
-use metor_fsw::{AsVTable, Componentize, Metadatatize};
+use metor_component::{AsVTable, Componentize, Metadatatize};
 use metor_fsw_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -20,7 +20,7 @@ struct RecSink {
     timestamps: HashMap<ComponentId, Option<Timestamp>>,
 }
 
-impl metor_fsw::Decomponentize for RecSink {
+impl metor_component::Decomponentize for RecSink {
     type Error = core::convert::Infallible;
     fn apply_value(
         &mut self,
@@ -124,7 +124,7 @@ struct VecSink {
     values: HashMap<ComponentId, Vec<f64>>,
 }
 
-impl metor_fsw::Decomponentize for VecSink {
+impl metor_component::Decomponentize for VecSink {
     type Error = core::convert::Infallible;
     fn apply_value(
         &mut self,
@@ -261,7 +261,7 @@ fn skip_attribute_overrides_default() {
     AsVTable,
     Metadatatize,
     Componentize,
-    metor_fsw::Decomponentize,
+    metor_component::Decomponentize,
     IntoBytes,
     Immutable,
     KnownLayout,

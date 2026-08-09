@@ -1,7 +1,7 @@
 use nox::{
     ArrayBuf, ArrayRepr, Field, Matrix, Matrix3, Matrix3x6, Matrix6, Quaternion, Vector, tensor,
 };
-use metor_fsw::{AsVTable, Metadatatize};
+use metor_component::{AsVTable, Metadatatize};
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
 pub fn calculate_covariance(

@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use metor_fsw::Metadatatize;
+use metor_component::Metadatatize;
 use metor_proto::types::{ComponentId, PacketId, PrimType};
 use metor_proto::vtable::{Op, VTable};
 use metor_proto_wkt::ComponentMetadata;
@@ -241,7 +241,7 @@ pub struct PortDesc {
 /// the announce-equivalence tests compare [`PortDesc::announce`] against.
 #[cfg(test)]
 pub(crate) fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
-    use metor_fsw::AsVTable;
+    use metor_component::AsVTable;
     let vt = metor_proto::vtable::builder::vtable(<F as AsVTable>::vtable_fields(prefix));
     let metadata = <F as Metadatatize>::metadata(prefix).collect();
     (vt, metadata)

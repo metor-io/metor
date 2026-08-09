@@ -7,7 +7,7 @@ use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
 #[derive(Debug, FromDeriveInput)]
-#[darling(attributes(metor_fsw), supports(struct_named, enum_unit))]
+#[darling(attributes(fsw, metor_fsw), supports(struct_named, enum_unit))]
 pub struct Metadatatize {
     ident: Ident,
     generics: Generics,
@@ -22,7 +22,7 @@ pub struct Metadatatize {
 
 pub fn metadatatize(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    metadatatize_impl(&input, &crate::metor_fsw_crate_name()).into()
+    metadatatize_impl(&input, &crate::metor_component_crate_name()).into()
 }
 
 /// See [`componentize_impl`](crate::componentize::componentize_impl) for the

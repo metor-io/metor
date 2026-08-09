@@ -7,7 +7,7 @@
 use core::mem::offset_of;
 use std::collections::HashMap;
 
-use metor_fsw::Decomponentize;
+use metor_component::Decomponentize;
 use metor_fsw_ring::{Config, NoWake, Notifier, RingBuffer, WriteError};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};

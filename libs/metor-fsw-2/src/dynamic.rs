@@ -28,8 +28,8 @@
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
 
-use metor_fsw::path::ComponentPath;
-use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
+use metor_component::path::ComponentPath;
+use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use metor_proto::vtable::builder::{FieldBuilder, list, map, raw_field};
 use metor_proto_wkt::ComponentMetadata;

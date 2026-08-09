@@ -24,7 +24,7 @@ use metor_fsw_2::{Input, Output, Timestamp, system};
 use nox::{Quaternion, tensor};
 
 pub struct CtrlSystem {
-    lqr: metor_fsw_adcs::yang_lqr::YangLQR,
+    lqr: metor_adcs::yang_lqr::YangLQR,
     /// The latest commanded pointing law (`None` until the first `ModeCmd`).
     law: Option<u8>,
     k_desat: f64,
@@ -46,7 +46,7 @@ impl CtrlSystem {
     pub fn new(p: CtrlParams) -> Self {
         let q = tensor![p.q_weight, p.q_weight, p.q_weight];
         let r = tensor![p.r_weight, p.r_weight, p.r_weight];
-        let lqr = metor_fsw_adcs::yang_lqr::YangLQR::new(inertia_diag(), q, q, r);
+        let lqr = metor_adcs::yang_lqr::YangLQR::new(inertia_diag(), q, q, r);
         Self {
             lqr,
             law: None,

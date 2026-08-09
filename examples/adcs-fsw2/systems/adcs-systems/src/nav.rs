@@ -1,5 +1,5 @@
 //! The MEKF **navigation filter** of the `adcs-fsw2` target. It wraps
-//! [`metor_fsw_adcs::mekf::State`] (a multiplicative EKF), reconstructing the sun
+//! [`metor_adcs::mekf::State`] (a multiplicative EKF), reconstructing the sun
 //! observation from the six raw CSS head readings ([`sun_from_css`]) and modeling the
 //! inertial **references** itself (cube-sat's `Nav::from_sensors`): the sun direction from
 //! the Vallado ephemeris at its own sim-time epoch, and the magnetic field from the NOAA
@@ -36,7 +36,7 @@ pub fn sun_from_css(css: &[f64; 6]) -> Option<V3> {
 
 /// The filter's state: the MEKF itself plus the reference models it evaluates each cycle.
 pub struct NavState {
-    state: metor_fsw_adcs::mekf::State,
+    state: metor_adcs::mekf::State,
     sigma: f64,
     /// The NOAA WMM handle for the reference magnetic field (built once — holds C-library state).
     mag_model: MagneticModel,
@@ -53,7 +53,7 @@ pub struct NavState {
 
 impl NavState {
     pub fn new(p: NavParams) -> NavState {
-        let state = metor_fsw_adcs::mekf::State::new(
+        let state = metor_adcs::mekf::State::new(
             tensor![0.01, 0.01, 0.01],
             tensor![0.01, 0.01, 0.01],
             DT,

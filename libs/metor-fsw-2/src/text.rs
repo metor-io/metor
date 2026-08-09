@@ -12,8 +12,8 @@
 
 use core::mem::size_of;
 
-use metor_fsw::path::ComponentPath;
-use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
+use metor_component::path::ComponentPath;
+use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
 use metor_proto::types::{ComponentId, ComponentView, PrimType, Timestamp};
 use metor_proto::vtable::builder::{self, FieldBuilder, raw_field, schema};
 use metor_proto_wkt::ComponentMetadata;

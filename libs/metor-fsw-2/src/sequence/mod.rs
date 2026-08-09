@@ -257,7 +257,7 @@ pub const MAX_PROGRESS: usize = 16;
 
 /// A fixed-size text cell carrying one status message, stored as a used
 /// length plus a [`PROGRESS_MSG_CAP`]-byte buffer.
-#[derive(metor_fsw::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
+#[derive(metor_component::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[repr(C)]
 pub struct ProgressLine {
     pub len: u8,
