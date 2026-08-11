@@ -16,7 +16,7 @@ use adcs_contracts::{
     AttitudeEstimate, CSS_THRESHOLD, DT, Gps, MagneticModel, NavParams, Sensors, V3, epoch_at,
     mag_field_eci, sun_dir_eci,
 };
-use metor_fsw_2::{Input, Output, Timestamp};
+use metor_fsw_2_core::{Input, Output, Timestamp};
 use nox::tensor;
 
 /// The sun vector reconstructed from the six face-mounted CSS readings (frame order
@@ -53,11 +53,8 @@ pub struct NavState {
 
 impl NavState {
     pub fn new(p: NavParams) -> NavState {
-        let state = metor_adcs::mekf::State::new(
-            tensor![0.01, 0.01, 0.01],
-            tensor![0.01, 0.01, 0.01],
-            DT,
-        );
+        let state =
+            metor_adcs::mekf::State::new(tensor![0.01, 0.01, 0.01], tensor![0.01, 0.01, 0.01], DT);
         NavState {
             state,
             sigma: p.meas_sigma,

@@ -57,9 +57,8 @@ pub(crate) fn pack_mode() -> bool {
 pub fn init_pack_tracing() {
     PACK_MODE.store(true, Relaxed);
     use tracing_subscriber::layer::SubscriberExt;
-    let subscriber = tracing_subscriber::registry().with(
-        ForwardLayer.with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(ForwardLayer.with_filter(tracing_subscriber::filter::LevelFilter::INFO));
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
@@ -149,7 +148,7 @@ where
 
 /// Drain every queued event into `f` and return the drop count accumulated
 /// since the last call. The coordinator's per-cycle (and shutdown) hook.
-pub(crate) fn drain(mut f: impl FnMut(LogEvent)) -> u64 {
+pub fn drain(mut f: impl FnMut(LogEvent)) -> u64 {
     let mut q = QUEUE.lock().expect("log queue lock is never poisoned");
     while let Some(ev) = q.pop_front() {
         f(ev);

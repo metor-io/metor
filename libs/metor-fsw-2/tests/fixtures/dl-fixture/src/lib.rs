@@ -1,7 +1,7 @@
 //! A two-entry pack compiled as a shared library and driven over the C ABI.
 //!
 //! This crate builds as a `cdylib` whose only export surface is the
-//! [`export_pack!`](metor_fsw_2::export_pack) invocation at the bottom. A
+//! [`export_pack!`](metor_fsw_2_core::export_pack) invocation at the bottom. A
 //! host process `dlopen`s the produced library, reads the pack manifest from
 //! `fsw_pack_describe`, constructs an entry through `fsw_pack_create` from
 //! postcard-encoded params, and steps it cycle by cycle.
@@ -21,8 +21,8 @@
 //! The host declares byte-identical twins of the frame types, and the layout
 //! check in the wiring step verifies that the two sides agree.
 
-use metor_fsw_2::metor_proto::types::Timestamp;
-use metor_fsw_2::{
+use metor_fsw_2_core::metor_proto::types::Timestamp;
+use metor_fsw_2_core::{
     BuildSystem, CyclicSystem, Input, MsgOut, NamedMsg, Out, Output, Pack, System, SystemInput,
     SystemOutput,
 };
@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Input frame the host writes each cycle.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "tick_in")]
 pub struct TickIn {
@@ -41,7 +41,7 @@ pub struct TickIn {
 }
 
 /// Output frame [`DlCounter`] publishes each cycle.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "tick_out")]
 pub struct TickOut {
@@ -68,7 +68,7 @@ impl NamedMsg for TickEvent {
 ///
 /// The mix of an integer and a float keeps parameter round-trip checks honest
 /// beyond a single-value encoding.
-#[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
+#[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq, metor_fsw_2_core::ParamsDocs)]
 pub struct CounterParams {
     pub start: u64,
     pub scale: f64,
@@ -137,7 +137,7 @@ impl BuildSystem for DlCounter {
 
 /// Output frame [`DlEcho`] publishes each cycle, named apart from `tick_out`
 /// so the pack's two entries have distinct output components.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "echo_out")]
 pub struct EchoOut {
@@ -191,4 +191,4 @@ pub fn pack() -> Pack {
 }
 
 // Exports the `fsw_*` C symbols the host resolves after `dlopen`.
-metor_fsw_2::export_pack!(pack);
+metor_fsw_2_core::export_pack!(pack);

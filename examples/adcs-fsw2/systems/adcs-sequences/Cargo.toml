@@ -15,5 +15,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 adcs-contracts = { path = "../../contracts" }
-metor-fsw-2 = { path = "../../../../libs/metor-fsw-2" }
+metor-fsw-2-core = { path = "../../../../libs/metor-fsw-2/core" }
 tracing = "0.1"

@@ -495,6 +495,7 @@ enum BackingOwner {
     /// ever makes would be through a dead tag. Miri reports it as the first
     /// write in `init_region`.
     Heap { words: *mut [Word] },
+    #[cfg(feature = "mmap")]
     Mmap { _map: memmap2::MmapMut },
     Raw,
 }
@@ -535,6 +536,7 @@ impl Backing {
     }
 
     /// An mmap-backed region. The mapping is unmapped when the backing drops.
+    #[cfg(feature = "mmap")]
     fn mmap(map: memmap2::MmapMut) -> Self {
         let (base, len) = (map.as_ptr() as *mut u8, map.len());
         Self {
@@ -613,21 +615,25 @@ impl WakeSink for NoWake {
 /// A shared wait queue that wakes tasks within one process. The writer and
 /// its views share clones of a single `Notifier`, so a commit wakes the
 /// awaiting readers.
+#[cfg(feature = "notify")]
 #[derive(Clone)]
 pub struct Notifier(Arc<stellarator::sync::WaitQueue>);
 
+#[cfg(feature = "notify")]
 impl Default for Notifier {
     fn default() -> Self {
         Self(Arc::new(stellarator::sync::WaitQueue::new()))
     }
 }
 
+#[cfg(feature = "notify")]
 impl WakeSource for Notifier {
     fn notify(&self) {
         self.0.wake_all();
     }
 }
 
+#[cfg(feature = "notify")]
 impl WakeSink for Notifier {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F) {
         let _ = self.0.wait_for(ready).await;
@@ -826,6 +832,7 @@ impl RingBuffer {
 
     /// Create a new mmap-backed region at `path`, truncating any existing
     /// file.
+    #[cfg(feature = "mmap")]
     pub fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
         let (reader_table_offset, data_offset, total) = layout(&cfg);
         let file = std::fs::OpenOptions::new()
@@ -859,6 +866,7 @@ impl RingBuffer {
     /// compatible build and is not being concurrently torn down. The
     /// magic/version/arch handshake guards against accidental misuse but not
     /// deliberate corruption.
+    #[cfg(feature = "mmap")]
     pub unsafe fn attach_mmap(path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)

@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use metor_fsw_ring::wake;
 use metor_proto::types::Timestamp;
 
-use crate::abi::FswStatus;
+use metor_fsw_2_core::abi::FswStatus;
 
 /// Control-block magic, the bytes `b"MFC1"` read as a native `u32`.
 const MAGIC: u32 = u32::from_ne_bytes(*b"MFC1");

@@ -33,7 +33,9 @@
 //! (serde, field defaults honored). A loaded system's `Params` type is never
 //! linked into the host, so a value tree is conformed against the artifact's
 //! exported `Params` schema and encoded to postcard bytes
-//! ([`encode_value_params`]); pre-encoded bytes pass straight through.
+//! ([`encode_value_params`]); pre-encoded bytes pass straight through. Both
+//! decodes live in [`metor_fsw_2_core::params`], because a pack entry runs
+//! them itself with no host in the loop.
 
 // The `Wiring` data model's two front-ends (the Python-eval path and the Rust
 // builder), the registry and resolver split below, and the supporting bundle,
@@ -44,7 +46,6 @@ mod bundle;
 mod error;
 mod pack_dist;
 mod pack_module;
-mod params;
 mod py;
 mod registry;
 mod resolve;
@@ -63,7 +64,7 @@ pub use bundle::{
     BundleError, BundleMeta, METOR_EXTENSION, PackProvenance, PackSourceKind, PackageOptions,
     WIRING_FILE_NAME, load_bundle, unpack_metor, write_bundle,
 };
-pub use error::{Anchor, LoadError, LoadErrorKind};
+pub use error::{LoadError, LoadErrorKind};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, EdgeKind, EdgeSpec,
     IR_VERSION, InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef,
@@ -74,14 +75,14 @@ pub use pack_dist::{
     PackDevReport, PackError, dev_pack_roots, pack_assemble, pack_build, pack_dev, pack_publish,
     read_pack_config, refresh_dev_packs,
 };
-pub use params::encode_value_params;
 pub use py::eval_python_target;
-pub(crate) use registry::NoParams;
 pub use registry::{AsyncKind, CyclicKind, IntoNode, Registry};
 pub use resolve::{ResolveOptions, resolve, resolve_with};
 
-// The typed value-tree param decode, shared with the `pack` bind path.
-pub(crate) use registry::decode_value_params;
+// The params codec is `metor-fsw-2-core`'s, since a pack entry decodes its own
+// params with no host in the loop. Re-exported here because the resolver's
+// documented params story ends in it.
+pub use metor_fsw_2_core::params::{Anchor, encode_value_params};
 
 /// The shared-object file name for a library `stem` on the host platform
 /// (`libfoo.so`, `libfoo.dylib`, `foo.dll`), used by the build driver to locate

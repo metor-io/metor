@@ -1,4 +1,4 @@
-//! Proc macros behind the `metor_fsw_2` authoring surface.
+//! Proc macros behind the `metor_fsw_2_core` authoring surface.
 //!
 //! User code never depends on this crate directly. Every macro is re-exported
 //! by the framework crate, and every expansion refers back to that crate
@@ -157,18 +157,49 @@ pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// The path generated code uses to reach the framework crate: the name the
 /// consumer depends on it under, or `crate` when the framework crate is
-/// compiling its own tests. A consumer without the dependency cannot use any
-/// of these macros, so that case is a hard panic.
+/// compiling its own tests.
+///
+/// Everything these macros expand to lives in `metor-fsw-2-core`, so that is
+/// the first name probed — a pack or contract crate depends on it directly.
+/// A target crate depends only on the host `metor-fsw-2`, which re-exports
+/// core whole, so the same paths resolve through it. A consumer with neither
+/// cannot use any of these macros, so that case is a hard panic.
 pub(crate) fn metor_fsw_2_crate_name() -> proc_macro2::TokenStream {
+    for name in ["metor-fsw-2-core", "metor-fsw-2"] {
+        match crate_name(name) {
+            Ok(FoundCrate::Itself) => return quote!(crate),
+            Ok(FoundCrate::Name(name)) => {
+                let ident = Ident::new(&name, Span::call_site());
+                return quote!( #ident );
+            }
+            Err(_) => continue,
+        }
+    }
+    // This crate's own expansion unit tests run without a consumer manifest
+    // to resolve against.
+    if cfg!(test) {
+        return quote!(metor_fsw_2_core);
+    }
+    panic!("metor-fsw-2 macros require `metor-fsw-2-core` (or `metor-fsw-2`) in [dependencies]")
+}
+
+/// The path to the *host* crate, for the one construct that only exists
+/// there: an `AsyncSystem`, whose cancellation context is owned by the
+/// coordinator's runtime. A crate that depends on `metor-fsw-2-core` alone can
+/// author every other system form but not this one, which is the boundary
+/// working as intended.
+pub(crate) fn metor_fsw_2_host_crate_name() -> proc_macro2::TokenStream {
     match crate_name("metor-fsw-2") {
         Ok(FoundCrate::Itself) => quote!(crate),
         Ok(FoundCrate::Name(name)) => {
             let ident = Ident::new(&name, Span::call_site());
             quote!( #ident )
         }
-        // This crate's own expansion unit tests run without a consumer
-        // manifest to resolve against.
         Err(_) if cfg!(test) => quote!(metor_fsw_2),
-        Err(e) => panic!("metor-fsw-2 macros require `metor-fsw-2` in [dependencies]: {e}"),
+        Err(_) => panic!(
+            "an `async fn run` system is driven by the coordinator's runtime, so it needs \
+             `metor-fsw-2` in [dependencies] (`metor-fsw-2-core` alone carries the cyclic, \
+             fn, and task forms)"
+        ),
     }
 }

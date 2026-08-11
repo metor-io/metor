@@ -55,9 +55,9 @@ use libloading::{Library, Symbol};
 use metor_proto::types::Timestamp;
 use postcard_schema::schema::owned::OwnedNamedType;
 
-use crate::abi::{self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, PackEntryDesc};
-use crate::coordinator::{CyclicSlot, SlotState, StopReason};
-use crate::descriptor::SystemDescriptor;
+use metor_fsw_2_core::SystemDescriptor;
+use metor_fsw_2_core::abi::{self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, PackEntryDesc};
+use metor_fsw_2_core::{CyclicSlot, SlotState, StopReason};
 
 // ---------------------------------------------------------------------------
 // Resolved C-ABI function-pointer types

@@ -12,7 +12,7 @@
 //! `execute` and drives [`HealthPort::end_cycle`] afterwards, which stamps the
 //! standard counters (cycle count, total errors, execute duration) and
 //! publishes one health record plus one [`LogEvent`] per queued line.
-//! A free-running [`AsyncSystem`](crate::AsyncSystem) owns its health timing
+//! A free-running `AsyncSystem` owns its health timing
 //! and must choose when to send its queued state.
 //!
 //! Named error counters ride the dynamic [`FrameMap`] tail of the health
@@ -107,7 +107,7 @@ where
     }
 
     /// Sets the instance name stamped into emitted [`LogEvent`]s as `source`.
-    pub(crate) fn set_instance(&mut self, name: &str) {
+    pub fn set_instance(&mut self, name: &str) {
         self.instance = Arc::from(name);
     }
 
@@ -145,7 +145,7 @@ where
 
     /// Emits one pre-built [`LogEvent`] directly, bypassing the pending queue
     /// so the event keeps its own timestamp and fields. The tracing drain path.
-    pub(crate) fn emit_event(&mut self, ev: &LogEvent) {
+    pub fn emit_event(&mut self, ev: &LogEvent) {
         if self.log.emit(ev).is_err() {
             self.error("log_dropped");
         }

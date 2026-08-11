@@ -13,5 +13,5 @@ description = "A slots/sequences integration-test fixture: one sequence body exp
 crate-type = ["cdylib"]
 
 [dependencies]
-metor-fsw-2 = { path = "../../.." }
+metor-fsw-2-core = { path = "../../../core" }
 zerocopy = { version = "0.8.2", features = ["derive"] }

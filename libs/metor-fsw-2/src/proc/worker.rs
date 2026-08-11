@@ -24,7 +24,7 @@
 //!
 //! Everything downstream of the manifest reuses the dl machinery verbatim:
 //! the ring files attach as regions, regions become positional
-//! [`FswRing`](crate::abi::FswRing) handles, and the slot binds exactly as
+//! [`FswRing`](metor_fsw_2_core::abi::FswRing) handles, and the slot binds exactly as
 //! it would in-process. The maps outlive the slot (drop order below), so the
 //! dl teardown-ordering contract holds unchanged.
 
@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use metor_fsw_ring::RingBuffer;
 use serde::{Deserialize, Serialize};
 
-use crate::abi::{FSW_ABI_VERSION, FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT};
-use crate::coordinator::{CyclicSlot, StopReason};
+use metor_fsw_2_core::abi::{FSW_ABI_VERSION, FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT};
+use metor_fsw_2_core::{CyclicSlot, StopReason};
 
 use super::ctl::{CtlWorker, WorkerCmd, WorkerState};
 
@@ -49,7 +49,7 @@ pub enum WorkerManifest {
     Describe {
         /// The pack cdylib to describe.
         artifact: PathBuf,
-        /// Where to write the postcard [`PackManifest`](crate::abi::PackManifest) bytes.
+        /// Where to write the postcard [`PackManifest`](metor_fsw_2_core::abi::PackManifest) bytes.
         out: PathBuf,
     },
     /// Drive one system instance until told to shut down.

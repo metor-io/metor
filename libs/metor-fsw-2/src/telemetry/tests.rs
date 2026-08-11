@@ -24,8 +24,8 @@ use crate::{
 use super::{LinkState, TelemetryMode};
 use crate::coordinator::PortRef;
 use crate::coordinator::init::cyclic_node;
-use crate::descriptor::PortId;
-use crate::frame::Frame as _;
+use metor_fsw_2_core::Frame as _;
+use metor_fsw_2_core::PortId;
 
 // ---------------------------------------------------------------------------
 // Frames and systems under test (a producer -> consumer chain).
@@ -393,7 +393,11 @@ async fn namespace_prefixes_registry_keys_and_announce() {
             .get(ComponentId::new("sat1.coordinator.health"))
             .is_some()
     );
-    assert!(registry.get(ComponentId::new("coordinator.health")).is_none());
+    assert!(
+        registry
+            .get(ComponentId::new("coordinator.health"))
+            .is_none()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -434,11 +438,8 @@ async fn telemetry_end_to_end_all() {
         .filter(|e| matches!(e.desc.schema, crate::PortSchema::Table { .. }))
         .count();
     coord.run_for(30).await;
-    tap.settle(|pkts| {
-        pkts.iter()
-            .any(|p| matches!(p, WirePkt::Table { .. }))
-    })
-    .await;
+    tap.settle(|pkts| pkts.iter().any(|p| matches!(p, WirePkt::Table { .. })))
+        .await;
 
     let announces = tap.announces();
 
@@ -754,7 +755,7 @@ async fn drop_policy_never_blocks_and_counts() {
     let last_angle = Rc::new(RefCell::new(0.0f64));
     let captured = last_angle.clone();
     let sampler = stellarator::spawn(async move {
-        let mut nav: crate::port::Input<Nav> = crate::port::Input::new(nav_view);
+        let mut nav: metor_fsw_2_core::Input<Nav> = metor_fsw_2_core::Input::new(nav_view);
         loop {
             stellarator::yield_now().await;
             if let Ok(Some(n)) = nav.latest() {
@@ -828,9 +829,9 @@ async fn message_downlink_fifo_no_coalesce() {
     };
     use std::sync::Arc;
 
-    use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
-    use crate::port::capacity_for;
-    use crate::registry::RegistryEntry;
+    use metor_fsw_2_core::RegistryEntry;
+    use metor_fsw_2_core::capacity_for;
+    use metor_fsw_2_core::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
 
     use super::{Wire, append_record};
 
@@ -840,12 +841,12 @@ async fn message_downlink_fifo_no_coalesce() {
         capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
         max_readers: 4,
     });
-    let entry = RegistryEntry {
-        key: ComponentId::new("mode.events"),
-        instance: Arc::from("mode"),
-        desc: crate::PortDesc::msg_named::<SequenceRegistry>("events"),
-        ring: ring.clone(),
-    };
+    let entry = RegistryEntry::new(
+        ComponentId::new("mode.events"),
+        Arc::from("mode"),
+        crate::PortDesc::msg_named::<SequenceRegistry>("events"),
+        ring.clone(),
+    );
     // Claim the tap before any write (an overwrite-ring view starts at the live edge).
     let mut view = entry.view().expect("reader slot");
     // The ring enforces a single live writer, so the typed ports take it in turn
@@ -1053,12 +1054,7 @@ async fn table_log_entry_downlinks_every_record() {
     let omegas: Vec<f64> = tap
         .tables(packet_id)
         .iter()
-        .map(|payload| {
-            Imu::read_from_prefix(payload)
-                .expect("imu bytes")
-                .0
-                .omega
-        })
+        .map(|payload| Imu::read_from_prefix(payload).expect("imu bytes").0.omega)
         .collect();
     // The connection joins a cycle or two into the run (batches are only
     // framed for live connections), so the stream is a contiguous tail:
@@ -1069,9 +1065,17 @@ async fn table_log_entry_downlinks_every_record() {
         "at least one full cycle downlinked: {omegas:?}"
     );
     for pair in omegas.windows(2) {
-        assert_eq!(pair[1] - pair[0], 1.0, "no coalescing within the tail: {omegas:?}");
+        assert_eq!(
+            pair[1] - pair[0],
+            1.0,
+            "no coalescing within the tail: {omegas:?}"
+        );
     }
-    assert_eq!(*omegas.last().unwrap(), (3 * cycles) as f64, "runs to the last record");
+    assert_eq!(
+        *omegas.last().unwrap(),
+        (3 * cycles) as f64,
+        "runs to the last record"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,7 +1138,9 @@ async fn uplink_routes_and_survives_garbage() {
     // cycle they are republished.
     let uplink = b.push_node(cyclic_node(
         "uplink".into(),
-        UplinkSystem::new().attach(link.clone()).with_msg::<AlarmAck>(),
+        UplinkSystem::new()
+            .attach(link.clone())
+            .with_msg::<AlarmAck>(),
     ));
     let sink = b.push_node(cyclic_node(
         AckSink::NAME.into(),
@@ -1223,14 +1229,18 @@ async fn uplink_relays_arbitrary_user_msgs() {
     }
 
     let link = test_link(false);
-    link.get()
-        .push_inbound(SetGain::ID, &postcard::to_allocvec(&SetGain { gain: 7 }).unwrap());
+    link.get().push_inbound(
+        SetGain::ID,
+        &postcard::to_allocvec(&SetGain { gain: 7 }).unwrap(),
+    );
 
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = crate::coordinator::init::InitGraph::new(sim_config());
     let uplink = b.push_node(cyclic_node(
         "uplink".into(),
-        UplinkSystem::new().attach(link.clone()).with_msg::<SetGain>(),
+        UplinkSystem::new()
+            .attach(link.clone())
+            .with_msg::<SetGain>(),
     ));
     let sink = b.push_node(cyclic_node(
         GainSink::NAME.into(),

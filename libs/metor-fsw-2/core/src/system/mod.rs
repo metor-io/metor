@@ -5,7 +5,7 @@
 //! [`System`] carries the surface every system shares (the bundle types, the
 //! wiring name, and the init/shutdown hooks), and a user implements exactly
 //! one of two leaf traits on top of it. A [`CyclicSystem`] is driven by the
-//! coordinator, which calls `execute` once per cycle. An [`AsyncSystem`] owns
+//! coordinator, which calls `execute` once per cycle. An `AsyncSystem` owns
 //! its own `run` loop and paces itself by awaiting its inputs or a timer.
 //!
 //! Outputs are never handed to a system bare. The framework wraps the user's
@@ -20,48 +20,26 @@
 //! `impl System` binds over heap rings or over memory regions a host maps in,
 //! with no backing generic anywhere.
 //!
+//! The fourth authoring form, `AsyncSystem`, lives in the host crate: it is a
+//! free-running task the coordinator's executor owns, and no pack can build
+//! one.
+//!
 //! [`CyclicRunner`] is the framework shim between the coordinator and a
 //! cyclic system. It owns the bundles between cycles, times each `execute`,
 //! and publishes the standard health record per cycle.
 
-use core::future::Future;
 use core::ops::{Deref, DerefMut};
 
 use metor_fsw_ring::{NoWake, WakeSource};
 use metor_proto::types::Timestamp;
 
 use crate::binder::{BindPorts, RingSource};
-use crate::coordinator::{CyclicSlot, SlotState};
 use crate::descriptor::{Declarations, PortDesc, SystemDescriptor, SystemKind};
 use crate::health::{HealthPort, LogEvent, SystemHealth};
 use crate::message::MsgOut;
 use crate::message::MsgTable;
 use crate::port::Output;
-
-/// Cancellation-aware waits for an [`AsyncSystem`]'s run loop.
-pub struct AsyncContext {
-    pub(crate) cancel: stellarator::util::CancelToken,
-}
-
-impl AsyncContext {
-    /// Runs `future` until it completes or coordinator shutdown begins.
-    /// `None` means the future was cancelled and the run loop should return.
-    pub async fn until_cancelled<F: Future>(&self, future: F) -> Option<F::Output> {
-        if self.cancel.is_cancelled() {
-            return None;
-        }
-        futures_lite::future::race(async { Some(future.await) }, async {
-            self.cancel.wait().await;
-            None
-        })
-        .await
-    }
-
-    /// Whether coordinator shutdown has begun.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
-    }
-}
+use crate::slot::{CyclicSlot, SlotState};
 
 /// The read side of a system, a struct whose fields are
 /// [`Input<F>`](crate::Input) ports. Derive with `#[derive(SystemInput)]` to
@@ -292,7 +270,7 @@ pub enum ConfigureError {
 
 /// The surface every system shares: the typed input/output bundle types, the
 /// wiring name, and the once-each lifecycle hooks. Implement one of
-/// [`CyclicSystem`] or [`AsyncSystem`], both of which require this.
+/// [`CyclicSystem`] or `AsyncSystem`, both of which require this.
 pub trait System {
     /// The read-only inputs this system consumes.
     type Input: SystemInput + BindPorts;
@@ -315,7 +293,7 @@ pub trait System {
 /// The self-description shared by both leaf traits' `descriptor` defaults: the
 /// wired ports per direction plus the merged capability set of both bundles,
 /// tagged with the system's [`SystemKind`].
-fn descriptor_for<I: SystemInput, O: SystemOutput>(
+pub fn descriptor_for<I: SystemInput, O: SystemOutput>(
     name: &'static str,
     kind: SystemKind,
 ) -> SystemDescriptor {
@@ -364,38 +342,6 @@ pub trait CyclicSystem: System {
     }
 }
 
-/// A self-driven system. The coordinator spawns [`run`](Self::run) once and
-/// never ticks it; the system paces itself with a timer or by awaiting its
-/// inputs through the ring `Notifier`.
-#[allow(async_fn_in_trait)]
-pub trait AsyncSystem: System {
-    /// The system's own loop; returns when shutting down. It awaits inputs
-    /// (`Input::recv`) or sleeps on a timer, doing its work on each wake, and
-    /// publishes through the non-blocking output path (a full ring drops the
-    /// record rather than suspending the loop).
-    /// `input` is `&mut` for the same reason as [`CyclicSystem::execute`].
-    async fn run(
-        &mut self,
-        context: &AsyncContext,
-        input: &mut Self::Input,
-        output: &mut Self::Output,
-    );
-
-    /// This system's self-description for wiring: the wired ports per
-    /// direction, plus the merged capability set of both bundles.
-    fn descriptor() -> SystemDescriptor {
-        descriptor_for::<Self::Input, Self::Output>(Self::NAME, SystemKind::Async)
-    }
-
-    /// This instance's descriptor. Override it when the port set depends on
-    /// the instance's config, such as minting one output per configured
-    /// message. The builder registers this value, so a config-derived port is
-    /// sized, wired, and telemetered like any static one.
-    fn instance_descriptor(&self) -> SystemDescriptor {
-        Self::descriptor()
-    }
-}
-
 /// The framework tail every cyclic output bundle carries: the health port
 /// the runner times and publishes through. [`Out`] is the standard carrier;
 /// a hand-written bundle (one whose config-minted ports must trail the
@@ -431,7 +377,11 @@ where
     /// Assemble a runner from a constructed system and its bound port
     /// bundles.
     pub fn new(system: S, input: S::Input, output: S::Output) -> Self {
-        Self { system, input, output }
+        Self {
+            system,
+            input,
+            output,
+        }
     }
 
     /// Run the system's `init` once.

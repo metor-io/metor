@@ -18,8 +18,8 @@ A task takes ports by value and returns `Outcome`:
 
 ```rust
 use core::time::Duration;
-use metor_fsw_2::sequence::{now, progress, wait};
-use metor_fsw_2::{Input, Outcome, Output, Pack};
+use metor_fsw_2_core::sequence::{now, progress, wait};
+use metor_fsw_2_core::{Input, Outcome, Output, Pack};
 
 async fn deploy(
     mut sensor: Input<SensorState>,
@@ -86,7 +86,7 @@ A repeated timestamp does not complete `cycle()`. Normal simulated clocks use a 
 Most task phases have the same shape: hold a condition for a dwell, and give up after a budget. `check` is that shape as one suspension point.
 
 ```rust
-use metor_fsw_2::sequence::{check, Check};
+use metor_fsw_2_core::sequence::{check, Check};
 
 let outcome = check(
     || sensor.latest().is_ok_and(|s| s.is_some_and(|s| s.temp_c > 60.0)),

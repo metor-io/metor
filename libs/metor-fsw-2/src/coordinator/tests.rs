@@ -21,8 +21,8 @@ use crate::{
 use super::PortRef;
 use super::init::{async_node, cyclic_node};
 use super::slot::plan_slot;
-use crate::descriptor::PortId;
-use crate::frame::Frame as _;
+use metor_fsw_2_core::Frame as _;
+use metor_fsw_2_core::PortId;
 
 // ---------------------------------------------------------------------------
 // Frames under test.
@@ -906,7 +906,8 @@ fn run_for_twice_panics() {
 
 #[test]
 fn stopped_set_change_detection_compares_membership() {
-    use super::{StoppedSystem, stopped_set_changed};
+    use super::stopped_set_changed;
+    use metor_fsw_2_core::StoppedSystem;
     let a = StoppedSystem {
         name: std::sync::Arc::from("a"),
         reason: StopReason::Panicked,
@@ -1856,8 +1857,8 @@ fn in_process_slot_stays_heap() {
 /// is a keyspace/ABI change, never a refactor.
 #[test]
 fn registered_slot_descriptor_snapshot() {
-    use crate::sequence::{SequenceStatus, SlotControlIn};
     use crate::{Frame, PortConn, PortDesc, PortId, SlotStatus};
+    use metor_fsw_2_core::sequence::{SequenceStatus, SlotControlIn};
     use metor_proto_wkt::{ReloadSequences, SequenceChannelEvent, SequenceCommand};
 
     let occ = crate::AllowedOccupant {
@@ -1944,8 +1945,8 @@ fn registered_slot_descriptor_snapshot() {
 /// there.)
 #[test]
 fn add_slot_rejects_contract_violations() {
-    use crate::sequence::SlotControlIn;
     use crate::{PortDesc, SlotConfigError};
+    use metor_fsw_2_core::sequence::SlotControlIn;
 
     fn art_occ(name: &str, inputs: Vec<PortDesc>) -> crate::AllowedOccupant {
         crate::AllowedOccupant {
@@ -2002,17 +2003,17 @@ mod proc_slot {
         SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
     };
 
-    use crate::abi::FswStatus;
     use crate::coordinator::slot::{
         AllowedOccupant, OccupantBacking, ProcParts, SlotRunner, slot_writer,
     };
-    use crate::coordinator::{CyclicSlot, SlotState, StopReason, WorkerRunState};
-    use crate::dynamic::FrameList;
-    use crate::message::{MsgIn, MsgOut};
-    use crate::port::{Input, Output};
     use crate::proc::{CtlWorker, WorkerCmd, WorkerState};
-    use crate::sequence::{SequenceStatus, SlotControlIn};
     use crate::{Delivery, SlotStatus};
+    use metor_fsw_2_core::FrameList;
+    use metor_fsw_2_core::abi::FswStatus;
+    use metor_fsw_2_core::sequence::{SequenceStatus, SlotControlIn};
+    use metor_fsw_2_core::{CyclicSlot, SlotState, StopReason, WorkerRunState};
+    use metor_fsw_2_core::{Input, Output};
+    use metor_fsw_2_core::{MsgIn, MsgOut};
 
     /// Room enough for the runner's frames; sizing is not under test.
     const READERS: usize = 4;
@@ -2440,7 +2441,7 @@ fn drain_wiring(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake>) -> Vec<
     let mut out = Vec::new();
     let mut buf = Vec::new();
     while view.try_read_into(&mut buf).expect("readable wiring ring") {
-        let (id, payload) = crate::message::split_record(&buf).expect("id-prefixed record");
+        let (id, payload) = metor_fsw_2_core::split_record(&buf).expect("id-prefixed record");
         assert_eq!(id, WiringManifest::ID, "only WiringManifest on `wiring`");
         out.push(postcard::from_bytes(payload).expect("decode WiringManifest"));
     }
@@ -2544,10 +2545,10 @@ async fn wiring_manifest_emits_oversized_payload_intact() {
     // limit and nothing raised the global one.
     let mut b = crate::coordinator::init::InitGraph::new(config());
     b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
-    let big = "x".repeat(crate::message::MAX_MSG_BYTES + 4000);
+    let big = "x".repeat(metor_fsw_2_core::MAX_MSG_BYTES + 4000);
     let json = format!("{{\"ir_version\":1,\"blob\":\"{big}\"}}");
     assert!(
-        json.len() > crate::message::MAX_MSG_BYTES,
+        json.len() > metor_fsw_2_core::MAX_MSG_BYTES,
         "payload overruns the cap"
     );
     b.set_wiring_manifest(WiringManifest {

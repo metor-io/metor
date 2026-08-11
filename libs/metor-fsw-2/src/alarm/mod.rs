@@ -57,9 +57,9 @@ use metor_proto_wkt::{
 };
 use serde::Deserialize;
 
-use crate::message::{MsgIn, MsgOut};
-use crate::registry::AllOutputs;
-use crate::system::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, System};
+use metor_fsw_2_core::AllOutputs;
+use metor_fsw_2_core::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, System};
+use metor_fsw_2_core::{MsgIn, MsgOut};
 
 /// The set of alarms one [`AlarmSystem`] instance evaluates, one
 /// [`AlarmSpec`] per repeated `alarm` child node. An alarm-less instance is
@@ -731,7 +731,7 @@ impl AlarmSystem {
         for (kind, line) in failures {
             let health = output.health();
             health.error(kind);
-            health.log(crate::health::LogLevel::Warn, &line);
+            health.log(metor_fsw_2_core::health::LogLevel::Warn, &line);
         }
     }
 }

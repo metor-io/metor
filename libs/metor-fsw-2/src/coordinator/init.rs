@@ -72,23 +72,25 @@ use metor_proto_wkt::{
     ReloadSequences, SequenceChannelSpec, SequenceCommand, SequenceRegistry, WiringManifest,
 };
 
-use crate::binder::{AnySource, BindPorts, Binder};
-use crate::descriptor::{
+use crate::async_system::AsyncSystem;
+use crate::proc::session::SessionDir;
+use metor_fsw_2_core::capacity_for;
+use metor_fsw_2_core::{AnySource, BindPorts, Binder};
+use metor_fsw_2_core::{CyclicRunner, CyclicSystem, HealthOutput};
+use metor_fsw_2_core::{
     Delivery, FanIn, PortConn, PortDesc, PortSchema, SystemDescriptor, SystemKind, compatible,
 };
-use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
-use crate::port::capacity_for;
-use crate::proc::session::SessionDir;
-use crate::registry::{Registry, RegistryEntry};
-use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, HealthOutput};
+use metor_fsw_2_core::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
+use metor_fsw_2_core::{Registry, RegistryEntry};
 
 use super::bind::{ProcBindCtx, bind_systems};
 use super::slot::SlotReg;
 use super::{
     AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, ClockMode, CoordChannels, Coordinator,
-    CoordinatorConfig, CoordinatorStatus, CopyIn, CyclicSlot, NAME_CAP, PortRef, RingEntry,
-    RingTable, SlotState, SystemHandle, WireError,
+    CoordinatorConfig, CoordinatorStatus, CopyIn, PortRef, RingEntry, RingTable, SystemHandle,
+    WireError,
 };
+use metor_fsw_2_core::{CyclicSlot, NAME_CAP, SlotState};
 
 // ---------------------------------------------------------------------------
 // Registration (type erasure of the boxed systems)
@@ -141,19 +143,19 @@ where
 }
 
 /// A pack entry as a cyclic registration: the bind-phase
-/// [`Pending`](crate::pack::Pending) plus the entry's static display name, so a
+/// [`Pending`](metor_fsw_2_core::Pending) plus the entry's static display name, so a
 /// pack entry rides the ordinary cyclic path with no dedicated `SystemBind`
 /// variant.
 struct PendingDriver {
-    pending: crate::pack::Pending,
+    pending: metor_fsw_2_core::Pending,
     entry_name: &'static str,
 }
 
 impl CyclicRegistration for PendingDriver {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
         let mut src = AnySource::Host(binder);
-        let driver = (self.pending)(&mut src, crate::pack::Mount::Wired);
-        Box::new(crate::pack::DriverSlot {
+        let driver = (self.pending)(&mut src, metor_fsw_2_core::Mount::Wired);
+        Box::new(metor_fsw_2_core::DriverSlot {
             driver,
             name: self.entry_name,
             state: SlotState::Running,
@@ -243,9 +245,9 @@ where
 /// runs at [`build`](InitGraph::build) along the ordinary cyclic path (via [`PendingDriver`]).
 pub(crate) fn pending_node(
     name: String,
-    entry: &mut crate::pack::PackEntry,
-    params: crate::pack::EntryParams<'_>,
-) -> Result<Node, crate::pack::MakeError> {
+    entry: &mut metor_fsw_2_core::PackEntry,
+    params: metor_fsw_2_core::EntryParams<'_>,
+) -> Result<Node, metor_fsw_2_core::MakeError> {
     let created = entry.create(params)?;
     let desc = created
         .instance_desc
@@ -1236,10 +1238,10 @@ const COORDINATOR_INSTANCE: &str = "coordinator";
 /// Build a [`RegistryEntry`] for one buffer: the instance-qualified key over a
 /// clone of the port's descriptor and a clone of the ring as the read source.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer) -> RegistryEntry {
-    RegistryEntry {
-        key: ComponentId::new(&format!("{instance}.{}", port.name)),
-        instance: Arc::from(instance),
-        desc: port.clone(),
+    RegistryEntry::new(
+        ComponentId::new(&format!("{instance}.{}", port.name)),
+        Arc::from(instance),
+        port.clone(),
         ring,
-    }
+    )
 }

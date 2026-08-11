@@ -12,6 +12,9 @@ authors = ["sascha@metor.io"]
 workspace = true
 
 [dependencies]
+# The authoring surface, re-exported whole from `lib.rs`.
+metor-fsw-2-core = { path = "core" }
+
 # metor-proto
 metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["nox", "std"] }
@@ -21,7 +24,8 @@ metor-proto-stellar = { path = "../metor-proto/stellar" }
 metor-component = { workspace = true }
 metor-fsw-2-macros = { path = "macros" }
 
-# channels
+# channels, with `mmap` and `notify` on: the host maps process-system regions
+# and owns the in-process wake endpoint.
 metor-fsw-ring = { path = "ring" }
 memmap2 = "0.9"
 
@@ -39,7 +43,6 @@ postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 postcard-dyn = { version = "0.2" }
 serde_json = { version = "1.0" }
-serde_ignored = { version = "0.1" }
 toml = { version = "0.8" }
 sha2 = { version = "0.10" }
 # The pack-wheel writer's RECORD digests and zip CRCs (both already in the
@@ -49,10 +52,6 @@ crc32fast = { version = "1.5" }
 zerocopy = { version = "0.8.2", features = ["derive"] }
 
 libloading = { version = "0.8" }
-
-# Pack-crate-local collection of per-field params docs (ABI v6): a
-# `#[derive(ParamsDocs)]` submits entries the in-`.so` describe path collects.
-inventory = "0.3"
 
 # errors
 miette = { version = "7.0", features = ["fancy"] }

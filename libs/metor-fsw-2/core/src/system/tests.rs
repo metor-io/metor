@@ -1,22 +1,21 @@
-//! Tests for the system layer. They cover the cyclic and async execution
-//! paths, the self-describing descriptor and its compatibility check, the
-//! standard health counters, and the backpressure a slow reader applies to a
-//! writer. Every port is built by hand on in-memory rings, with no
-//! coordinator involved.
+//! Tests for the system layer. They cover the cyclic execution path, the
+//! self-describing descriptor and its compatibility check, the standard
+//! health counters, and the backpressure a slow reader applies to a writer.
+//! Every port is built by hand on in-memory rings, with no coordinator
+//! involved.
 
 use core::mem::offset_of;
 use std::collections::HashMap;
 
 use metor_component::Decomponentize;
-use metor_fsw_ring::{Config, NoWake, Notifier, RingBuffer, WriteError};
+use metor_fsw_ring::{Config, NoWake, RingBuffer, WriteError};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::descriptor::compatible;
 use crate::{
-    AsyncSystem, CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, Out, Output,
-    LogEvent, MsgOut, PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemOutput,
-    buffer_capacity,
+    CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, LogEvent, MsgOut, Out, Output,
+    PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemOutput, buffer_capacity,
 };
 
 // ---------------------------------------------------------------------------
@@ -377,114 +376,6 @@ fn health_counters_published() {
         3.0,
         "named domain counter lands via the dynamic-frame path"
     );
-}
-
-// ---------------------------------------------------------------------------
-// A sample async system: awaits one IMU via the ring `Notifier`, produces a nav.
-// ---------------------------------------------------------------------------
-
-struct AsyncFilter;
-
-#[derive(SystemInput)]
-struct AsyncIn {
-    imu: Input<Imu, Notifier>,
-}
-
-#[derive(SystemOutput)]
-struct AsyncOut {
-    nav: Output<NavEstimate, Notifier>,
-}
-
-impl System for AsyncFilter {
-    type Input = AsyncIn;
-    type Output = Out<AsyncOut, Notifier>;
-    const NAME: &'static str = "async_filter";
-}
-
-impl AsyncSystem for AsyncFilter {
-    async fn run(
-        &mut self,
-        context: &crate::AsyncContext,
-        input: &mut Self::Input,
-        output: &mut Self::Output,
-    ) {
-        loop {
-            let Some(Ok(imu)) = context.until_cancelled(input.imu.recv()).await else {
-                return;
-            };
-            let s = imu.get();
-            let nav = NavEstimate {
-                timestamp: s.timestamp,
-                angle: s.omega,
-                residuals: FrameList::EMPTY,
-            };
-            let _ = output.nav.write(&nav);
-        }
-    }
-}
-
-#[cfg(not(miri))]
-#[stellarator::test]
-async fn async_filter_one_cycle() {
-    let imu_ring = ring_for::<Imu>(8, 2);
-    let nav_ring = ring_for::<NavEstimate>(8, 2);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
-    let log_ring = log_ring_for(1);
-
-    let imu_data = Notifier::default();
-    let nav_data = Notifier::default();
-
-    let mut input = AsyncIn {
-        imu: Input::new(imu_ring.view(imu_data.clone()).unwrap()),
-    };
-    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake).unwrap());
-    let health = HealthPort::new(
-        Output::new(health_ring.writer(Notifier::default()).unwrap()),
-        MsgOut::<LogEvent, Notifier>::new(log_ring.writer(Notifier::default()).unwrap()),
-    );
-    let mut output = Out::new(
-        AsyncOut {
-            nav: Output::new(nav_ring.writer(nav_data.clone()).unwrap()),
-        },
-        health,
-    );
-
-    // Feed one IMU sample from a spawned task; the system's `run` awaits it.
-    let writer = {
-        let imu_ring = imu_ring.clone();
-        let imu_data = imu_data.clone();
-        stellarator::spawn(async move {
-            let mut w = imu_ring.writer(imu_data).unwrap();
-            w.try_write(
-                Imu {
-                    timestamp: Timestamp(7),
-                    omega: 2.0,
-                    accel: 0.0,
-                }
-                .as_bytes(),
-            )
-            .unwrap();
-        })
-    };
-
-    let cancel = stellarator::util::CancelToken::new();
-    let cancel_after_one = cancel.clone();
-    let canceller = stellarator::spawn(async move {
-        stellarator::yield_now().await;
-        cancel_after_one.cancel();
-    });
-    let context = crate::AsyncContext { cancel };
-    let mut sys = AsyncFilter;
-    sys.run(&context, &mut input, &mut output).await;
-    let _ = canceller.await;
-    let _ = writer.await;
-
-    let nav = nav_in
-        .latest()
-        .expect("ring readable")
-        .expect("async system produced a nav");
-    assert_eq!(nav.get().angle, 2.0);
-    assert_eq!(nav.get().timestamp, Timestamp(7));
 }
 
 // ---------------------------------------------------------------------------

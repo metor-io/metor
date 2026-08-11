@@ -13,7 +13,7 @@
 //! a frame or param Rust type.
 
 use hifitime::{Duration, Epoch};
-use metor_fsw_2::metor_proto::types::Timestamp;
+use metor_fsw_2_core::metor_proto::types::Timestamp;
 use nox::{ArrayRepr, Quaternion, Vector, tensor};
 use nox_frames::earth::{ecef_to_eci, eci_to_ecef, ned_to_ecef};
 use postcard_schema::Schema;
@@ -178,7 +178,7 @@ pub const CSS_THRESHOLD: f64 = 0.1;
 /// frame. The inertial **references** for the vector observations are modeled by nav from
 /// the orbit state (cube-sat's `Nav::from_sensors`), not handed over here — and the sun
 /// **vector** is nav's to reconstruct from the raw CSS readings, never the plant's to leak.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "sensors")]
 pub struct Sensors {
@@ -200,7 +200,7 @@ pub struct Sensors {
 /// noise). This is the noisy orbit state the flight software actually flies on (cube-sat's
 /// `GPS` sensor, now with noise): the controller derives its pointing-law target from it, and
 /// nav evaluates its sun/magnetic references at it.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "gps")]
 pub struct Gps {
@@ -213,7 +213,7 @@ pub struct Gps {
 }
 
 /// The navigation filter's attitude estimate.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "attitude_estimate")]
 pub struct AttitudeEstimate {
@@ -233,7 +233,7 @@ pub struct AttitudeEstimate {
 /// `.so`'s statics never reach the host with, tapped from the registry to measure convergence.
 /// The flight software does not consume it — nav and the controller fly on the noisy [`Gps`]
 /// measurement instead — so it is truth telemetry only.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "body")]
 pub struct BodyState {
@@ -256,10 +256,10 @@ pub struct BodyState {
 /// and the constructors; the dynamics that fill it in (bearing friction, the saturation
 /// foldback) are `adcs-systems`' `WheelDynamics`.
 #[derive(
-    metor_fsw_2::AsVTable,
-    metor_fsw_2::Metadatatize,
-    metor_fsw_2::Componentize,
-    metor_fsw_2::Decomponentize,
+    metor_fsw_2_core::AsVTable,
+    metor_fsw_2_core::Metadatatize,
+    metor_fsw_2_core::Componentize,
+    metor_fsw_2_core::Decomponentize,
     IntoBytes,
     Immutable,
     KnownLayout,
@@ -311,7 +311,7 @@ impl ReactionWheel {
 /// Reaction-wheel telemetry: the three wheels themselves (each body-axis-aligned, element i on
 /// body axis i). The wheels are the plant's actuator; this is the same `[ReactionWheel; 3]` the
 /// plant integrates, telemetered directly so the panel can plot each wheel's momentum/torque.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "wheels")]
 pub struct Wheels {
@@ -326,7 +326,7 @@ pub struct Wheels {
 /// knows the true epoch + position). Truth telemetry only — nav no longer consumes it (it
 /// models its own references from the GPS position), so this is what makes the real ECI
 /// sun/field visible in the panel next to nav's noisy estimate.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "world")]
 pub struct World {
@@ -354,7 +354,7 @@ impl World {
 /// their sum, and the applied magnetorquer torque (control, so excluded from `total_b` —
 /// telemetered here so the desat demo can plot authority against the environment). Truth
 /// telemetry from the plant; the flight software does not consume it.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "disturb")]
 pub struct Disturbances {
@@ -377,7 +377,7 @@ pub struct Disturbances {
 /// The commanded magnetorquer dipole (the second actuator back-edge into the plant, beside
 /// [`TorqueCmd`]): desaturation dumps wheel momentum through it, detumble damps body rate.
 /// The plant clamps each axis to its `mtq_max_dipole` param and applies `τ = m × B_true`.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "mtq_cmd")]
 pub struct MtqCmd {
@@ -392,7 +392,7 @@ pub struct MtqCmd {
 /// occupant (`adcs-sequences`' `commissioning` / `safe_mode`) and consumed by the controller, which
 /// selects its target attitude from `law`. `_pad` keeps the `#[repr(C)]` layout padding-free
 /// (zerocopy `IntoBytes` requires it).
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "mode_cmd")]
 pub struct ModeCmd {
@@ -459,7 +459,7 @@ impl ModeCmd {
 }
 
 /// The commanded body-frame control torque (the feedback back-edge into the plant).
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "torque_cmd")]
 pub struct TorqueCmd {
@@ -579,7 +579,7 @@ pub fn tracking_sample(body: &BodyState, law: u8) -> (f64, f64) {
 /// environment. The disturbance defaults are physically honest for a ~3 kg spacecraft at
 /// 400 km (secular torques ~1e-7 N·m — days to load a wheel); tests and demos crank them so
 /// momentum management is visible in seconds.
-#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2_core::ParamsDocs)]
 pub struct PlantParams {
     /// Initial attitude offset from the target, radians about the [1,1,1] axis.
     pub init_angle: f64,
@@ -654,14 +654,14 @@ fn default_mtq_max() -> f64 {
 }
 
 /// Navigation-filter (MEKF) parameters.
-#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2_core::ParamsDocs)]
 pub struct NavParams {
     /// MEKF measurement 1-sigma for the two vector observations.
     pub meas_sigma: f64,
 }
 
 /// Controller (Yang-LQR + magnetorquer laws) parameters.
-#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2_core::ParamsDocs)]
 pub struct CtrlParams {
     /// LQR attitude/rate state weight (q) and control weight (r).
     pub q_weight: f64,
@@ -699,10 +699,10 @@ impl Default for CtrlParams {
 
 /// The commissioning sequence's gates and budgets — every phase transition is
 /// condition-based, and every phase has a timeout that safes the spacecraft
-/// ([`Outcome::Failed`](metor_fsw_2::Outcome)). Spelled out in full on the target's
+/// ([`Outcome::Failed`](metor_fsw_2_core::Outcome)). Spelled out in full on the target's
 /// `allow occupant="commissioning"` line (the dlopen occupant encoder has no serde
 /// defaults), which is also how tests patch individual gates.
-#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2_core::ParamsDocs)]
 pub struct CommissioningParams {
     /// Enter the detumble phase only above this estimated rate (rad/s). Sized by wheel
     /// capture: absorbing 1.0 rad/s loads the worst axis to ≈38% of the momentum limit, so

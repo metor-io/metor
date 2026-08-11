@@ -10,12 +10,17 @@ statically linking every possible system into the host.
 Each load calls the crate's `pack()` function once. The returned `Pack` holds
 entry descriptions and constructors.
 
+A pack crate depends on `metor-fsw-2-core`, not on the host. Everything a pack
+entry touches — ports, frames, messages, health, the ABI — is in that crate,
+and keeping the host out is what lets a pack build for a target the host
+cannot, such as `wasm32-unknown-unknown`.
+
 ## Writing a pack
 
 A pack can mix function-based systems, struct-based systems, and async tasks:
 
 ```rust
-use metor_fsw_2::{Pack, system};
+use metor_fsw_2_core::{Pack, system};
 
 pub fn pack() -> Pack {
     Pack::new()
@@ -24,7 +29,7 @@ pub fn pack() -> Pack {
         .task("safe_mode", safe_mode)
 }
 
-metor_fsw_2::export_pack!(pack);
+metor_fsw_2_core::export_pack!(pack);
 ```
 
 `system` registers a function-based cyclic system. An `init` function makes
@@ -39,7 +44,7 @@ finished task reports `Done` and is not polled again.
 Use the feature form when the same crate also ships an `rlib`:
 
 ```rust
-metor_fsw_2::export_pack!(pack, feature = "export");
+metor_fsw_2_core::export_pack!(pack, feature = "export");
 ```
 
 This keeps the fixed C symbol names out of a host that links the `rlib`.

@@ -29,8 +29,8 @@ use crate::coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, OccupantBacking,
     PortRef, SlotConfigError, SystemHandle,
 };
-use crate::descriptor::{PortId, SystemDescriptor};
 use crate::dl::DlSystem;
+use metor_fsw_2_core::{PortId, SystemDescriptor};
 
 use super::error::{LoadError, LoadErrorKind};
 use super::model::{
@@ -143,7 +143,7 @@ pub fn resolve_with(
     //     an attached entry's create finds its instance in place. Each
     //     construction yields the token a by-name attach downcasts, keyed by
     //     the state's declaration name for the systems pass.
-    let mut state_tokens: HashMap<&str, crate::pack::AttachTarget> = HashMap::new();
+    let mut state_tokens: HashMap<&str, metor_fsw_2_core::AttachTarget> = HashMap::new();
     for spec in &wiring.states {
         let target = resolve_state(spec, registry)?;
         state_tokens.insert(spec.name.as_str(), target);
@@ -264,11 +264,11 @@ pub fn resolve_with(
 /// [`StateEntry`](crate::StateEntry): decode the spec's params off the value
 /// surface and run the state's init fn. Construction failure (a listener
 /// bind) is a spanned load error, not a runtime one. Returns the
-/// [`AttachTarget`](crate::pack::AttachTarget) a by-name attach downcasts.
+/// [`AttachTarget`](metor_fsw_2_core::AttachTarget) a by-name attach downcasts.
 fn resolve_state(
     spec: &StateSpec,
     registry: &Registry,
-) -> Result<crate::pack::AttachTarget, LoadError> {
+) -> Result<metor_fsw_2_core::AttachTarget, LoadError> {
     let Some(entry) = registry.states.get(spec.ty.as_str()) else {
         let mut available: Vec<&str> = registry.states.keys().copied().collect();
         available.sort_unstable();
@@ -290,7 +290,7 @@ fn resolve_state(
         ParamSource::Value(value) => value,
         ParamSource::None => &empty,
     };
-    let params = crate::pack::EntryParams::Value {
+    let params = metor_fsw_2_core::EntryParams::Value {
         value,
         src: &snippet,
         name: &spec.name,
@@ -298,7 +298,7 @@ fn resolve_state(
         attach: None,
     };
     entry.borrow_mut().create(params).map_err(|e| match e {
-        crate::pack::MakeError::Params(e) => *e,
+        metor_fsw_2_core::MakeError::Params(e) => (*e).into(),
         other => LoadErrorKind::StateInit {
             name: spec.name.clone(),
             ty: spec.ty.clone(),
@@ -307,7 +307,7 @@ fn resolve_state(
         .whole(snippet.clone()),
     })?;
     let entry = entry.borrow();
-    Ok(crate::pack::AttachTarget {
+    Ok(metor_fsw_2_core::AttachTarget {
         ty: entry.name(),
         token: entry.token.clone(),
     })
@@ -331,7 +331,7 @@ pub(super) fn state_src(spec: &StateSpec) -> String {
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
-    state_tokens: &HashMap<&str, crate::pack::AttachTarget>,
+    state_tokens: &HashMap<&str, metor_fsw_2_core::AttachTarget>,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     // `type=` and non-postcard params are guaranteed for a static system by
@@ -444,7 +444,7 @@ pub(super) enum EntrySource<'a> {
     },
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Described {
-        entries: &'a [crate::abi::PackEntryDesc],
+        entries: &'a [metor_fsw_2_core::abi::PackEntryDesc],
         artifact: &'a str,
     },
 }
@@ -706,7 +706,7 @@ fn resolve_proc(
     };
     let bytes = crate::proc::host::describe_via_worker(None, path)
         .map_err(|e| proc_describe(e.to_string()))?;
-    let entries: Vec<crate::abi::PackEntryDesc> =
+    let entries: Vec<metor_fsw_2_core::abi::PackEntryDesc> =
         crate::dl::decode_pack_manifest(&bytes).map_err(|e| proc_describe(e.to_string()))?;
     let source = EntrySource::Described {
         entries: &entries,
@@ -867,13 +867,11 @@ pub(super) fn slot_config_error(
         // slot's contract as declared.
         SlotConfigError::OccupantMismatch { occupant, .. }
         | SlotConfigError::ReservedPort { occupant, .. }
-        | SlotConfigError::CapabilityOccupant { occupant } => {
-            LoadErrorKind::SlotOccupantMismatch {
-                slot: name,
-                occupant,
-            }
-            .at(src, span)
+        | SlotConfigError::CapabilityOccupant { occupant } => LoadErrorKind::SlotOccupantMismatch {
+            slot: name,
+            occupant,
         }
+        .at(src, span),
         SlotConfigError::MixedBacking => {
             unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
         }
@@ -959,7 +957,7 @@ fn resolve_slot(
     // sequence channels) is not part of the user contract; the edge outputs
     // do include the implicit status and log tail, which a declaration may
     // name but need not.
-    use crate::descriptor::PortConn;
+    use metor_fsw_2_core::PortConn;
     for frame in &slot.inputs {
         if !desc
             .inputs
@@ -1006,9 +1004,9 @@ fn describe_occupants(
 ) -> Result<Vec<AllowedOccupant>, LoadError> {
     // Manifests by artifact id, so a slot allowing several entries of one
     // pack runs one describe worker for it, not one per occupant.
-    let mut manifests: HashMap<String, Vec<crate::abi::PackEntryDesc>> = HashMap::new();
+    let mut manifests: HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>> = HashMap::new();
     fn describe(
-        manifests: &mut HashMap<String, Vec<crate::abi::PackEntryDesc>>,
+        manifests: &mut HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>>,
         wiring: &Wiring,
         slot: &SlotSpec,
         artifact_id: &str,
@@ -1163,13 +1161,13 @@ fn resolve_msg_edge(
     let prod = inst(&edge.from)?;
     let cons = inst(&edge.to)?;
 
-    let by_name = |ports: &[crate::descriptor::PortDesc], token: &str| {
+    let by_name = |ports: &[metor_fsw_2_core::PortDesc], token: &str| {
         ports
             .iter()
             .find(|p| matches!(p.id(), PortId::Packet(_)) && p.name == token)
             .map(|p| p.id())
     };
-    let by_id = |ports: &[crate::descriptor::PortDesc], id: PortId| {
+    let by_id = |ports: &[metor_fsw_2_core::PortDesc], id: PortId| {
         ports.iter().find(|p| p.id() == id).map(|p| p.id())
     };
     let unknown = |instance: &str, msg: &str| {

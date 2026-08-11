@@ -22,8 +22,8 @@
 use core::time::Duration;
 
 use adcs_contracts::{AttitudeEstimate, CommissioningParams, Gps, ModeCmd, target_for};
-use metor_fsw_2::sequence::{check, now, progress};
-use metor_fsw_2::{Input, Outcome, Output, Params};
+use metor_fsw_2_core::sequence::{check, now, progress};
+use metor_fsw_2_core::{Input, Outcome, Output, Params};
 
 /// Walk the commissioning ladder, safing the spacecraft on any non-nominal exit.
 pub(crate) async fn commissioning(

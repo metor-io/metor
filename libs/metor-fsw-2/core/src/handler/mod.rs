@@ -27,9 +27,6 @@ mod param;
 mod task;
 mod tuples;
 
-#[cfg(test)]
-mod tests;
-
 use core::marker::PhantomData;
 
 use postcard_schema::Schema;

@@ -7,15 +7,15 @@
 
 use core::time::Duration;
 
-use metor_fsw_2::metor_proto::types::Timestamp;
-use metor_fsw_2::sequence::{progress, wait};
-use metor_fsw_2::{Outcome, Output, Pack, Params};
+use metor_fsw_2_core::metor_proto::types::Timestamp;
+use metor_fsw_2_core::sequence::{progress, wait};
+use metor_fsw_2_core::{Outcome, Output, Pack, Params};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The output frame carrying the gain the sequence was configured with.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "gain_out")]
 pub struct GainOut {
@@ -52,4 +52,4 @@ pub fn pack() -> Pack {
     Pack::new().task("gainer", gainer)
 }
 
-metor_fsw_2::export_pack!(pack);
+metor_fsw_2_core::export_pack!(pack);

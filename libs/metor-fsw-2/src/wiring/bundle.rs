@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::abi::FSW_ABI_VERSION;
+use metor_fsw_2_core::abi::FSW_ABI_VERSION;
 
 use super::model::Wiring;
 

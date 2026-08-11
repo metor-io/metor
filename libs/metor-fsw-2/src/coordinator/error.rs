@@ -1,8 +1,8 @@
 //! The [`WireError`] graph-defect vocabulary, reported before any byte flows.
 
-use crate::descriptor::{Hz, PortId};
+use metor_fsw_2_core::{Hz, PortId};
 
-use super::NAME_CAP;
+use metor_fsw_2_core::NAME_CAP;
 
 /// A defect in the declared graph, reported during graph build before any
 /// byte flows.

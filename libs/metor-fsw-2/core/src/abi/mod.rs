@@ -141,7 +141,7 @@ impl FswStatus {
     /// cannot make Rust trust; a stale build or a hand-rolled exporter could
     /// hand back anything. Callers that read the word off a resolved symbol must
     /// route it through here.
-    pub(crate) fn from_raw(raw: u32) -> Self {
+    pub fn from_raw(raw: u32) -> Self {
         match raw {
             0 => FswStatus::Running,
             1 => FswStatus::Panicked,

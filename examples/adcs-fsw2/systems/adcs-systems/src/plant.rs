@@ -25,7 +25,7 @@ use adcs_contracts::{
     Wheels, World, clamp_dipole, epoch_at, in_earth_shadow, inertia_diag, mag_field_eci,
     sun_dir_eci,
 };
-use metor_fsw_2::{Input, Output, Timestamp};
+use metor_fsw_2_core::{Input, Output, Timestamp};
 use nox::{
     Body, Quaternion, SpatialForce, SpatialInertia, SpatialMotion, SpatialTransform, six_dof_rk4,
     tensor,

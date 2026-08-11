@@ -12,13 +12,13 @@ use metor_proto_wkt::{
 };
 
 use crate::Frame;
-use crate::binder::{Binder, BoundInput, BoundPort};
-use crate::descriptor::{FanIn, PortConn, PortId, SystemDescriptor};
-use crate::health::{HealthPort, LogEvent, SystemHealth};
-use crate::message::MsgIn;
-use crate::port::Input;
-use crate::registry::Registry;
-use crate::sequence::{SequenceStatus, SlotControlIn};
+use metor_fsw_2_core::Input;
+use metor_fsw_2_core::MsgIn;
+use metor_fsw_2_core::Registry;
+use metor_fsw_2_core::health::{HealthPort, LogEvent, SystemHealth};
+use metor_fsw_2_core::sequence::{SequenceStatus, SlotControlIn};
+use metor_fsw_2_core::{Binder, BoundInput, BoundPort};
+use metor_fsw_2_core::{FanIn, PortConn, PortId, SystemDescriptor};
 
 use super::init::{
     AsyncPlumbing, ConsEdges, DlReg, Node, ProcReg, RingAlloc, SystemBind, owned_writer,
@@ -26,9 +26,8 @@ use super::init::{
 use super::slot::{
     self, AllowedOccupant, OccupantBacking, SlotReg, SlotRunner, SlotStatus, slot_writer,
 };
-use super::{
-    BoundSystems, CoordinatorPorts, CoordinatorStatus, CyclicSlot, PendingAsync, WireError,
-};
+use super::{BoundSystems, CoordinatorPorts, CoordinatorStatus, PendingAsync, WireError};
+use metor_fsw_2_core::CyclicSlot;
 
 /// What the proc bind arm needs beyond the shared alloc products: the step
 /// deadline and the worker-executable override, both builder-scoped.
@@ -229,7 +228,7 @@ fn bind_dl(
     cons_edges: &ConsEdges,
     output_rings: &[Vec<RingBuffer>],
 ) -> crate::dl::DlSlot {
-    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+    use metor_fsw_2_core::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
     let outputs: Vec<FswRing> = (0..desc.outputs.len())
         .map(|out_idx| {
             let (base, len) = output_rings[id][out_idx].region();
@@ -360,7 +359,7 @@ fn bind_slot(
     alloc: &RingAlloc,
     proc_ctx: &ProcBindCtx,
 ) -> Result<SlotRunner, WireError> {
-    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+    use metor_fsw_2_core::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
     let SlotReg {
         allowed,
         initial,
@@ -542,7 +541,7 @@ fn slot_proc_parts(
                 unreachable!("add_slot pins a process slot's occupants to artifact backings");
             };
             let manifest = WorkerManifest::Run {
-                abi_version: crate::abi::FSW_ABI_VERSION,
+                abi_version: metor_fsw_2_core::abi::FSW_ABI_VERSION,
                 mode: RunMode::Sequence,
                 // The worker-side identity is the slot's, whoever occupies it,
                 // matching the in-process `make_slot(.., self.name)`.

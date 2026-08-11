@@ -27,7 +27,7 @@
 //!
 //! Unless [`BuildOptions::manifest_sidecar`] is off, each built library also
 //! gets a `<cdylib>.manifest` sidecar next to it: the raw postcard
-//! [`PackManifest`](crate::abi::PackManifest) bytes `fsw_pack_describe`
+//! [`PackManifest`](metor_fsw_2_core::abi::PackManifest) bytes `fsw_pack_describe`
 //! reports, so downstream consumers (pack codegen, cross-arch resolve) can read the
 //! pack's self-description without running the artifact. Sourcing the sidecar
 //! *does* run the crate's `pack()` once, at build time — the same trust model
@@ -53,7 +53,7 @@ pub struct BuildOptions {
     pub extra_args: Vec<String>,
     /// Write a `<cdylib>.manifest` sidecar next to each built library
     /// (default `true`): the raw postcard
-    /// [`PackManifest`](crate::abi::PackManifest) bytes from describing
+    /// [`PackManifest`](metor_fsw_2_core::abi::PackManifest) bytes from describing
     /// a host-runnable build of the pack.
     ///
     /// Sidecar generation executes the crate's `pack()` at build time, the

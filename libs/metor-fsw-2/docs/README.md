@@ -13,6 +13,19 @@ Target code can link systems into the host, load them from a pack library, or
 run them in a worker process. All three forms use the same port descriptions
 and wiring checks.
 
+## Two crates
+
+`metor-fsw-2-core` is the authoring surface: frames, ports, messages, health,
+systems, packs, sequences, and the pack ABI. A pack, sequence, or contract
+crate depends on it alone. It compiles for `wasm32-unknown-unknown`.
+
+`metor-fsw-2` is the host. It adds the coordinator, the wiring resolver, the
+loaders, the built-in services, and the CLI, and re-exports the core surface,
+so a target crate depends on it alone and sees one framework.
+
+The split is a build boundary. Everything a system reaches at run time is in
+core; everything that decides what runs, and when, is in the host.
+
 ## One FSW cycle
 
 The resolver checks the target before it runs. It loads each system
@@ -59,7 +72,9 @@ The driver polls it once per cycle. Sequences use this form.
 
 Use a `CyclicSystem` struct when state and port bundles need named types. Use an
 `AsyncSystem` struct for a free-running task that waits on I/O or host time.
-The coordinator does not poll that task once per cycle.
+The coordinator does not poll that task once per cycle. An `AsyncSystem` is the
+one form the host owns: it needs a runtime to spawn it, so it is registered
+statically and cannot come out of a pack.
 
 See [Systems](system.md) and [Coordinator](coordinator.md).
 

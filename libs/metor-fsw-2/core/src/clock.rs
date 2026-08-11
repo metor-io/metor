@@ -28,7 +28,7 @@ static NOW: AtomicI64 = AtomicI64::new(UNSET);
 
 /// Publish the current cycle's timestamp: the coordinator at the top of each
 /// cycle, and the ABI shim before each `fsw_pack_execute` step.
-pub(crate) fn set_now(now: Timestamp) {
+pub fn set_now(now: Timestamp) {
     NOW.store(now.0, Relaxed);
 }
 
@@ -42,6 +42,6 @@ fn now() -> Option<Timestamp> {
 }
 
 /// [`now`], falling back to wall time before the first cycle.
-pub(crate) fn now_or_wall() -> Timestamp {
+pub fn now_or_wall() -> Timestamp {
     now().unwrap_or_else(Timestamp::now)
 }

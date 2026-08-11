@@ -9,7 +9,7 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 
 use super::ctl::{CtlError, CtlHost, CtlWorker, StepOutcome, WorkerCmd, WorkerState};
-use crate::abi::FswStatus;
+use metor_fsw_2_core::abi::FswStatus;
 
 const GENEROUS: Duration = Duration::from_secs(10);
 

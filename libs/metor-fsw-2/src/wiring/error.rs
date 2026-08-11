@@ -1,5 +1,6 @@
 //! Errors raised while loading and resolving a wiring document.
 
+use metor_fsw_2_core::params::{Anchor, ParamError, ParamErrorKind};
 use miette::{Diagnostic, LabeledSpan, SourceCode, SourceSpan};
 use thiserror::Error;
 
@@ -35,15 +36,6 @@ impl std::error::Error for LoadError {
     }
 }
 
-/// The source snippet a spanned [`LoadError`] renders and the span of the
-/// offending node within it. The span is a real field, not derived from the
-/// snippet: params errors anchor at a value's own document span.
-#[derive(Debug)]
-pub struct Anchor {
-    pub src: String,
-    pub span: SourceSpan,
-}
-
 impl Diagnostic for LoadError {
     fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
         Some(Box::new(self.kind.code()))
@@ -66,6 +58,15 @@ impl Diagnostic for LoadError {
             Some(label),
             anchor.span,
         ))))
+    }
+}
+
+impl From<ParamError> for LoadError {
+    fn from(e: ParamError) -> Self {
+        LoadError {
+            kind: LoadErrorKind::Params(e.kind),
+            anchor: e.anchor,
+        }
     }
 }
 
@@ -112,9 +113,7 @@ impl LoadErrorKind {
             ProcessUnsupported { .. } => "fsw_wiring::process_unsupported",
             ProcDescribe { .. } => "fsw_wiring::proc_describe",
             DuplicateInstance { .. } => "fsw_wiring::duplicate_instance",
-            MissingParam { .. } => "fsw_wiring::missing_param",
-            InvalidParam { .. } => "fsw_wiring::invalid_param",
-            UnknownParam { .. } => "fsw_wiring::unknown_param",
+            Params(kind) => kind.code(),
             UnknownInstance { .. } => "fsw_wiring::unknown_instance",
             UnknownFrame { .. } => "fsw_wiring::unknown_frame",
             UnknownMsg { .. } => "fsw_wiring::unknown_msg",
@@ -124,8 +123,6 @@ impl LoadErrorKind {
             StaleStubs { .. } => "fsw_wiring::stale_stubs",
             ArtifactNotBuilt { .. } => "fsw_wiring::artifact_not_built",
             DlOpen { .. } => "fsw_wiring::dl_open",
-            DlParamEncode { .. } => "fsw_wiring::dl_param_encode",
-            ValueParams { .. } => "fsw_wiring::value_params",
             StaticPostcardParams { .. } => "fsw_wiring::static_postcard_params",
             PackCreate { .. } => "fsw_wiring::pack_create",
             UnknownStateType { .. } => "fsw_wiring::unknown_state_type",
@@ -180,9 +177,7 @@ impl LoadErrorKind {
             ProcDescribe { .. } => "describing this artifact failed".into(),
             DuplicateInstance { .. } => "instance names must be unique".into(),
             DuplicateArtifact { .. } => "artifact ids must be unique".into(),
-            MissingParam { .. } => "this node is missing the param".into(),
-            InvalidParam { .. } => "invalid value here".into(),
-            UnknownParam { .. } => "no params field is named this".into(),
+            Params(kind) => kind.label(),
             UnknownInstance { .. } => "no `system` declares this instance".into(),
             UnknownFrame { .. } => "misspelled or wrong-direction frame".into(),
             UnknownMsg { .. } => "misspelled or wrong-direction message type".into(),
@@ -195,10 +190,6 @@ impl LoadErrorKind {
                 "`provision_artifacts` must set this artifact's `path` before `resolve`".into()
             }
             DlOpen { .. } => "this dl system failed to load".into(),
-            DlParamEncode { .. } => {
-                "these params could not be encoded against the `Params` schema".into()
-            }
-            ValueParams { .. } => "these params".into(),
             StaticPostcardParams { .. } => {
                 "typed `params(...)` cannot reach a static system".into()
             }
@@ -297,25 +288,12 @@ pub enum LoadErrorKind {
     #[error("duplicate instance name `{name}`")]
     DuplicateInstance { name: String },
 
-    /// A required params field has no matching property or child on the node.
-    #[error("missing required param `{property}` for system `{system}`")]
-    MissingParam { property: String, system: String },
-
-    /// A params value that does not decode as the field's type, or a malformed
-    /// params surface such as a stray positional argument or a repeated
-    /// property.
-    #[error("invalid value for `{property}` on system `{system}`: expected {expected}")]
-    InvalidParam {
-        property: String,
-        system: String,
-        expected: String,
-    },
-
-    /// A property or child with no matching params field, usually a typo or a
-    /// stale config. Both the typed deserializer and the dynamic schema
-    /// validation raise this same variant.
-    #[error("unknown param `{property}` for system `{system}`")]
-    UnknownParam { property: String, system: String },
+    /// A params surface that did not decode or encode as the system's typed
+    /// `Params`. The codec is `metor-fsw-2-core`'s, since a pack entry decodes
+    /// its own params with no host in the loop; its diagnostic code and label
+    /// come straight off the kind.
+    #[error(transparent)]
+    Params(ParamErrorKind),
 
     #[error("unknown instance `{name}` referenced in a `connect`")]
     UnknownInstance { name: String },
@@ -370,18 +348,6 @@ pub enum LoadErrorKind {
         #[source]
         source: Box<DlError>,
     },
-
-    /// The dl system's params could not be encoded against its `Params`
-    /// schema, either because the schema has an unsupported shape or because
-    /// the dynamic encoder rejected a value.
-    #[error("dl system `{system}` params could not be schema-encoded: {reason}")]
-    DlParamEncode { system: String, reason: String },
-
-    /// A static system's value-tree params did not deserialize as its typed
-    /// `Params`. The reason is serde's own message; a value tree carries no
-    /// document spans, so the label covers the whole diagnostic snippet.
-    #[error("system `{system}` value params did not deserialize: {reason}")]
-    ValueParams { system: String, reason: String },
 
     /// A static system was given typed builder params. The static path has no
     /// postcard decoder; its registered factory deserializes params from a

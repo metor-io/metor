@@ -50,6 +50,17 @@ pub struct RegistryEntry {
 }
 
 impl RegistryEntry {
+    /// One registered buffer. The key is the instance-qualified id, which is
+    /// also the on-wire prefix id.
+    pub fn new(key: ComponentId, instance: Arc<str>, desc: PortDesc, ring: RingBuffer) -> Self {
+        Self {
+            key,
+            instance,
+            desc,
+            ring,
+        }
+    }
+
     /// The port name within the instance, taken from `F::NAME`, `M::NAME`,
     /// or an explicit coordinator channel string such as `"sequences"`.
     pub fn name(&self) -> &str {
@@ -102,7 +113,7 @@ pub struct Registry {
 impl Registry {
     /// Assemble the registry from the build-order entries the coordinator
     /// collected. `build()` has already rejected duplicate keys.
-    pub(crate) fn new(entries: Vec<RegistryEntry>) -> Self {
+    pub fn new(entries: Vec<RegistryEntry>) -> Self {
         let by_key = entries
             .iter()
             .enumerate()

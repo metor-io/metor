@@ -324,7 +324,7 @@ mod system {
 
     use crate::coordinator::PortRef;
     use crate::coordinator::init::cyclic_node;
-    use crate::descriptor::PortId;
+    use metor_fsw_2_core::PortId;
     use metor_proto::types::Msg as _;
 
     use super::super::{AlarmSpec, BandSpec, RawAlarmSpec, TargetSpec};
@@ -679,11 +679,8 @@ mod system {
         let script = vec![0.7, 0.7, 1.5];
         let cycles = script.len();
         b.push_node(cyclic_node(Plant::NAME.into(), Plant { script, cycle: 0 }));
-        let mut alarms = AlarmSystem::new(params(vec![alarm(
-            "RATE_HIGH",
-            "plant.gyro.rates.1",
-            None,
-        )]));
+        let mut alarms =
+            AlarmSystem::new(params(vec![alarm("RATE_HIGH", "plant.gyro.rates.1", None)]));
         // The front-end applies the namespace here (the static factory's
         // `configure` call); the graph seam qualifies the Plant's registry
         // keys to match.
@@ -720,11 +717,7 @@ mod system {
             "the namespaced target resolved and raised"
         );
         assert!(got_raised.iter().all(|r| r.def_id == "RATE_HIGH"));
-        assert!(
-            got_raised[0]
-                .message
-                .starts_with("sat1.plant.gyro.rates.1")
-        );
+        assert!(got_raised[0].message.starts_with("sat1.plant.gyro.rates.1"));
     }
 
     /// Misconfigured targets disable their alarms and surface through health.

@@ -651,11 +651,12 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
             }
         }
     } else {
+        let host = crate::metor_fsw_2_host_crate_name();
         quote! {
-            impl #fsw2::AsyncSystem for #self_ty {
+            impl #host::AsyncSystem for #self_ty {
                 async fn run(
                     &mut self,
-                    __context: &#fsw2::AsyncContext,
+                    __context: &#host::AsyncContext,
                     __input: &mut Self::Input,
                     __output: &mut Self::Output,
                 ) {
@@ -887,12 +888,18 @@ mod tests {
         // The hidden bundles carry the real derives.
         assert!(out.contains("struct __EchoSystemIn"), "{out}");
         assert!(out.contains("struct __EchoSystemOut"), "{out}");
-        assert!(out.contains("pub ping: metor_fsw_2::Input<Ping>"), "{out}");
-        assert!(out.contains("pub pong: metor_fsw_2::Output<Pong>"), "{out}");
+        assert!(
+            out.contains("pub ping: metor_fsw_2_core::Input<Ping>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("pub pong: metor_fsw_2_core::Output<Pong>"),
+            "{out}"
+        );
         // `Out<>` appears only in generated code, delegation goes through
         // `Out::split`, and construction falls back to `Default`.
         assert!(
-            out.contains("type Output = metor_fsw_2::Out<__EchoSystemOut>"),
+            out.contains("type Output = metor_fsw_2_core::Out<__EchoSystemOut>"),
             "{out}"
         );
         assert!(out.contains("Out::split"), "{out}");
@@ -944,7 +951,7 @@ mod tests {
         assert!(out.contains("fn params_default_blob"), "{out}");
         assert!(out.contains("ParamsDefaultProbe::<NavParams>"), "{out}");
         assert!(
-            out.contains("use metor_fsw_2::NoParamsDefault as _;"),
+            out.contains("use metor_fsw_2_core::NoParamsDefault as _;"),
             "{out}"
         );
 
@@ -990,7 +997,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("pub cmds: metor_fsw_2::MsgIn<GroundCmd>"),
+            out.contains("pub cmds: metor_fsw_2_core::MsgIn<GroundCmd>"),
             "{out}"
         );
     }
@@ -1185,10 +1192,7 @@ mod tests {
             quote!(export),
             quote! { impl A { async fn run(&mut self) {} } },
         );
-        assert!(
-            msgs.iter().any(|m| m.contains("export_pack!")),
-            "{msgs:?}"
-        );
+        assert!(msgs.iter().any(|m| m.contains("export_pack!")), "{msgs:?}");
 
         // unknown arg
         let msgs = expand_err(quote!(frobnicate), minimal());

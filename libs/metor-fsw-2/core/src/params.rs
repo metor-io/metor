@@ -1,34 +1,227 @@
-//! Schema-guided encoding of a dl system's params into postcard bytes.
+//! Two ways to turn a params value tree into a system's typed `Params`, and
+//! the diagnostics both raise.
 //!
-//! A dynamically loaded system's `Params` type is never linked into the host.
-//! What the host has instead is the postcard schema the shared library exports
-//! ([`DlSystem::params_schema`](crate::dl::DlSystem::params_schema)). This
-//! module walks that schema to turn a params value tree into the exact bytes
-//! the `Params` struct itself would postcard-encode to, so the loaded side can
-//! decode them as its own type.
+//! A statically linked system has its `Params` type in hand, so
+//! [`decode_value_params`] is plain serde: `#[serde(default)]` is honoured and
+//! `serde_ignored` supplies the typo guard serde_json lacks.
 //!
-//! [`encode_value_params`] starts from the
-//! [`ParamSource::Value`](super::ParamSource::Value) tree the Python front-end
-//! emits and runs the [`conform_and_encode`] tail: overlay the entry's
-//! declared defaults, check the value against the schema — [`conform_to_schema`]
-//! turns unknown keys, missing fields, and type mismatches into [`LoadError`]s
-//! and inserts an explicit `Null` for every absent `Option` field, since
-//! postcard-dyn requires the key to be present — and emit the bytes with
+//! A dynamically loaded one does not. Its `Params` type is never linked into
+//! the host; what the host has instead is the postcard schema the shared
+//! library exports. [`encode_value_params`] walks that schema to produce the
+//! exact bytes the `Params` struct itself would postcard-encode to, so the
+//! loaded side decodes them as its own type. It overlays the entry's declared
+//! defaults, conforms the value to the schema — [`conform_to_schema`] turns
+//! unknown keys, missing fields, and type mismatches into [`ParamError`]s and
+//! inserts an explicit `Null` for every absent `Option` field, since
+//! postcard-dyn requires the key to be present — and emits the bytes with
 //! [`postcard_dyn::to_stdvec_dyn`].
 //!
 //! One property of the conformance walk is worth knowing: any schema shape the
 //! walk does not model (tuples, maps, enums) passes through unchecked; if
 //! postcard-dyn cannot encode it, the failure surfaces as
-//! [`LoadErrorKind::DlParamEncode`] rather than as silently wrong bytes. Errors
-//! anchor to the whole value-tree surface, which carries no document spans.
+//! [`ParamErrorKind::DlParamEncode`] rather than as silently wrong bytes.
+//! Errors anchor to the whole value-tree surface, which carries no document
+//! spans.
+//!
+//! The errors stop here rather than at a `miette::Diagnostic`: the host owns
+//! the wiring diagnostic (`LoadError`), which absorbs a [`ParamErrorKind`] as
+//! one of its variants and reads [`code`](ParamErrorKind::code),
+//! [`label`](ParamErrorKind::label), and the [`Anchor`] back off it. This
+//! crate carries no reporter.
 
 use std::collections::HashMap;
 
 use miette::SourceSpan;
 use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
 use serde_json::{Map, Value};
+use thiserror::Error;
 
-use super::{LoadError, LoadErrorKind};
+/// The source snippet a spanned params error renders and the span of the
+/// offending node within it. The span is a real field, not derived from the
+/// snippet: params errors anchor at a value's own document span.
+#[derive(Debug)]
+pub struct Anchor {
+    pub src: String,
+    pub span: SourceSpan,
+}
+
+/// A params failure with the snippet and span it points at.
+#[derive(Debug)]
+pub struct ParamError {
+    pub kind: ParamErrorKind,
+    pub anchor: Option<Anchor>,
+}
+
+impl std::fmt::Display for ParamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.kind, f)
+    }
+}
+
+impl std::error::Error for ParamError {}
+
+/// What went wrong decoding or encoding a system's params.
+#[derive(Error, Debug)]
+pub enum ParamErrorKind {
+    /// A required params field has no matching property or child on the node.
+    #[error("missing required param `{property}` for system `{system}`")]
+    MissingParam { property: String, system: String },
+
+    /// A params value that does not decode as the field's type, or a malformed
+    /// params surface such as a stray positional argument or a repeated
+    /// property.
+    #[error("invalid value for `{property}` on system `{system}`: expected {expected}")]
+    InvalidParam {
+        property: String,
+        system: String,
+        expected: String,
+    },
+
+    /// A property or child with no matching params field, usually a typo or a
+    /// stale config. Both the typed deserializer and the dynamic schema
+    /// validation raise this same variant.
+    #[error("unknown param `{property}` for system `{system}`")]
+    UnknownParam { property: String, system: String },
+
+    /// A static system's value-tree params did not deserialize as its typed
+    /// `Params`. The reason is serde's own message; a value tree carries no
+    /// document spans, so the label covers the whole diagnostic snippet.
+    #[error("system `{system}` value params did not deserialize: {reason}")]
+    ValueParams { system: String, reason: String },
+
+    /// The dl system's params could not be encoded against its `Params`
+    /// schema, either because the schema has an unsupported shape or because
+    /// the dynamic encoder rejected a value.
+    #[error("dl system `{system}` params could not be schema-encoded: {reason}")]
+    DlParamEncode { system: String, reason: String },
+}
+
+impl ParamErrorKind {
+    /// Anchor this kind to a source snippet and the span of the offending node.
+    pub fn at(self, src: impl Into<String>, span: SourceSpan) -> ParamError {
+        ParamError {
+            kind: self,
+            anchor: Some(Anchor {
+                src: src.into(),
+                span,
+            }),
+        }
+    }
+
+    /// Anchor this kind to a snippet whose whole extent is the label span, the
+    /// common case for resolve-time snippets that carry no interior spans.
+    pub fn whole(self, src: impl Into<String>) -> ParamError {
+        let src = src.into();
+        let span = (0, src.len()).into();
+        self.at(src, span)
+    }
+
+    /// This kind's stable diagnostic code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ParamErrorKind::MissingParam { .. } => "fsw_wiring::missing_param",
+            ParamErrorKind::InvalidParam { .. } => "fsw_wiring::invalid_param",
+            ParamErrorKind::UnknownParam { .. } => "fsw_wiring::unknown_param",
+            ParamErrorKind::ValueParams { .. } => "fsw_wiring::value_params",
+            ParamErrorKind::DlParamEncode { .. } => "fsw_wiring::dl_param_encode",
+        }
+    }
+
+    /// The label pointing at the offending span.
+    pub fn label(&self) -> String {
+        match self {
+            ParamErrorKind::MissingParam { .. } => "this node is missing the param".into(),
+            ParamErrorKind::InvalidParam { .. } => "invalid value here".into(),
+            ParamErrorKind::UnknownParam { .. } => "no params field is named this".into(),
+            ParamErrorKind::ValueParams { .. } => "these params".into(),
+            ParamErrorKind::DlParamEncode { .. } => {
+                "these params could not be encoded against the `Params` schema".into()
+            }
+        }
+    }
+}
+
+/// A serde deserializer for a params surface that carries no fields: it yields
+/// the unit value for `()` and an empty map for a struct (so `#[serde(default)]`
+/// fields fill in and a required field is a clean missing-field error). A
+/// `serde_json::Value` alone cannot serve both, since `()` needs `Null` and a
+/// defaulted struct needs `{}`.
+pub struct NoParams;
+
+impl<'de> serde::Deserializer<'de> for NoParams {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        // Default to an empty map, so a struct with defaulted fields decodes.
+        v.visit_map(serde::de::value::MapDeserializer::new(std::iter::empty::<(
+            &str,
+            &str,
+        )>()))
+    }
+
+    fn deserialize_unit<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        v.visit_unit()
+    }
+
+    fn deserialize_unit_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        v: V,
+    ) -> Result<V::Value, Self::Error> {
+        v.visit_unit()
+    }
+
+    fn deserialize_option<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
+        v.visit_none()
+    }
+
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        v: V,
+    ) -> Result<V::Value, Self::Error> {
+        v.visit_newtype_struct(self)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf seq tuple tuple_struct map struct enum identifier ignored_any
+    }
+}
+
+/// Deserialize a typed `Params` from a value tree.
+///
+/// Unlike the dl path's schema conformance, this is plain serde, so
+/// `#[serde(default)]` field attributes are honored. `serde_ignored` supplies
+/// the typo guard serde_json's deserializer lacks: a key no field consumed is
+/// an [`UnknownParam`](ParamErrorKind::UnknownParam), and any other decode
+/// failure is a [`ValueParams`](ParamErrorKind::ValueParams) carrying serde's
+/// own message.
+pub fn decode_value_params<P: serde::de::DeserializeOwned>(
+    value: &serde_json::Value,
+    system: &str,
+    src: &str,
+) -> Result<P, ParamError> {
+    let mut unknown: Option<String> = None;
+    let params = serde_ignored::deserialize(value, |path: serde_ignored::Path<'_>| {
+        unknown.get_or_insert_with(|| path.to_string());
+    })
+    .map_err(|e| {
+        ParamErrorKind::ValueParams {
+            system: system.to_string(),
+            reason: e.to_string(),
+        }
+        .whole(src)
+    })?;
+    if let Some(property) = unknown {
+        return Err(ParamErrorKind::UnknownParam {
+            property,
+            system: system.to_string(),
+        }
+        .whole(src));
+    }
+    Ok(params)
+}
 
 /// Encodes a params value tree into the postcard bytes described by `schema`,
 /// with the module's schema conformance rules.
@@ -40,7 +233,7 @@ pub fn encode_value_params(
     schema: &OwnedNamedType,
     system: &str,
     defaults: Option<&[u8]>,
-) -> Result<Vec<u8>, LoadError> {
+) -> Result<Vec<u8>, ParamError> {
     let src = value.to_string();
     let span: SourceSpan = (0, src.len()).into();
     conform_and_encode(
@@ -66,9 +259,9 @@ fn conform_and_encode(
     defaults: Option<&[u8]>,
     src: &str,
     node_span: SourceSpan,
-) -> Result<Vec<u8>, LoadError> {
+) -> Result<Vec<u8>, ParamError> {
     let encode_err = |reason: String| {
-        LoadErrorKind::DlParamEncode {
+        ParamErrorKind::DlParamEncode {
             system: system.to_string(),
             reason,
         }
@@ -85,7 +278,7 @@ fn conform_and_encode(
     };
     let value = conform_to_schema(&schema.ty, value, spans, system, src, node_span).map_err(
         |e| match e {
-            Conform::Load(err) => *err,
+            Conform::Param(err) => *err,
             Conform::Shape(reason) => encode_err(reason),
         },
     )?;
@@ -110,15 +303,15 @@ fn merge_onto_defaults(base: Value, config: Value) -> Result<Value, String> {
 
 /// What the schema walk reports when a value does not fit, either a spanned
 /// params diagnostic ready to surface as-is or a description of a schema shape
-/// the walk cannot express (reported as [`LoadErrorKind::DlParamEncode`]).
+/// the walk cannot express (reported as [`ParamErrorKind::DlParamEncode`]).
 enum Conform {
-    Load(Box<LoadError>),
+    Param(Box<ParamError>),
     Shape(String),
 }
 
-impl From<LoadError> for Conform {
-    fn from(e: LoadError) -> Self {
-        Conform::Load(Box::new(e))
+impl From<ParamError> for Conform {
+    fn from(e: ParamError) -> Self {
+        Conform::Param(Box::new(e))
     }
 }
 
@@ -158,7 +351,7 @@ fn conform_to_schema(
     // The typo guard, with the offending entry's own span when we have one.
     for key in obj.keys() {
         if !fields.iter().any(|f| f.name == *key) {
-            return Err(LoadErrorKind::UnknownParam {
+            return Err(ParamErrorKind::UnknownParam {
                 property: key.clone(),
                 system: system.to_string(),
             }
@@ -180,7 +373,7 @@ fn conform_to_schema(
                 out.insert(field.name.clone(), Value::Null);
             }
             None => {
-                return Err(LoadErrorKind::MissingParam {
+                return Err(ParamErrorKind::MissingParam {
                     property: field.name.clone(),
                     system: system.to_string(),
                 }
@@ -207,7 +400,7 @@ fn conform_value(
 ) -> Result<Value, Conform> {
     use OwnedDataModelType as T;
     let mismatch = || -> Conform {
-        LoadErrorKind::InvalidParam {
+        ParamErrorKind::InvalidParam {
             property: property.to_string(),
             system: system.to_string(),
             expected: leaf_expected(ty),
@@ -290,7 +483,7 @@ fn conform_value(
 }
 
 /// The wording for the `expected` field of an
-/// [`InvalidParam`](LoadErrorKind::InvalidParam) diagnostic.
+/// [`InvalidParam`](ParamErrorKind::InvalidParam) diagnostic.
 fn leaf_expected(ty: &OwnedDataModelType) -> String {
     use OwnedDataModelType as T;
     match ty {

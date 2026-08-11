@@ -121,7 +121,7 @@ pub const MAX_MSG_BYTES: usize = 4096;
 /// ring. Deep, because a log ring must hold every record its slowest reader
 /// has not yet seen, unlike a one-deep snapshot. Size a ring by hand via
 /// [`capacity_for`](crate::capacity_for).
-pub(crate) const LOG_DEPTH: usize = 64;
+pub const LOG_DEPTH: usize = 64;
 
 /// Split a raw message record into its `(id, payload)` halves, the inverse
 /// of an [`emit`](MsgOut::emit). Returns `None` if the record is too short
@@ -441,9 +441,9 @@ mod tests {
     };
 
     use super::{LOG_DEPTH, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, split_record};
-    use crate::{PortDesc, PortId};
     use crate::port::capacity_for;
     use crate::registry::RegistryEntry;
+    use crate::{PortDesc, PortId};
 
     /// Two typed ports emit distinct message types onto one ring; a raw view
     /// reads the records back, `split_record` recovers each id, and the

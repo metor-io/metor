@@ -528,8 +528,8 @@ fn prefix_dynamic_names(vt: &mut VTable, prefix: &str) {
 
 /// How the coordinator drives a system. Carried on the descriptor as
 /// metadata; the trait a system implements
-/// ([`CyclicSystem`](crate::CyclicSystem) or
-/// [`AsyncSystem`](crate::AsyncSystem)) is the real distinction.
+/// ([`CyclicSystem`](crate::CyclicSystem) or the host crate's `AsyncSystem`)
+/// is the real distinction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum SystemKind {
     /// Driven by the coordinator, `execute` once per cycle.

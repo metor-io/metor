@@ -43,7 +43,7 @@ pub trait SharedLifecycle: 'static {
 /// The one instance of a pack-shared state: empty until its wiring
 /// declaration constructs it, then granted to attached systems one scoped
 /// borrow at a time.
-pub(crate) struct SharedCell<S> {
+pub struct SharedCell<S> {
     /// The pack-declared state name (the wiring `state` type key), for
     /// diagnostics.
     name: &'static str,
@@ -64,7 +64,7 @@ impl<S> Clone for Shared<S> {
 }
 
 impl<S> Shared<S> {
-    pub(crate) fn new(name: &'static str) -> Self {
+    pub fn new(name: &'static str) -> Self {
         Self(Rc::new(SharedCell {
             name,
             state: RefCell::new(None),
@@ -89,7 +89,7 @@ impl<S> Shared<S> {
 
     /// Construct the instance. Errors if already constructed (a duplicate
     /// wiring declaration).
-    pub(crate) fn set(&self, state: S) -> Result<(), AlreadySet> {
+    pub fn set(&self, state: S) -> Result<(), AlreadySet> {
         let mut slot = self.0.state.borrow_mut();
         if slot.is_some() {
             return Err(AlreadySet);
@@ -98,7 +98,7 @@ impl<S> Shared<S> {
         Ok(())
     }
 
-    pub(crate) fn erased(&self) -> Rc<dyn ErasedShared>
+    pub fn erased(&self) -> Rc<dyn ErasedShared>
     where
         S: SharedLifecycle,
     {
@@ -107,12 +107,12 @@ impl<S> Shared<S> {
 }
 
 /// A second construction of an already-constructed shared state.
-pub(crate) struct AlreadySet;
+pub struct AlreadySet;
 
 /// The type-erased face of a [`SharedCell`], for the attachment machinery:
 /// lifecycle fan-in (start once, shutdown after the last release) and the
 /// construction checks entry create runs.
-pub(crate) trait ErasedShared {
+pub trait ErasedShared {
     fn name(&self) -> &'static str;
     fn is_constructed(&self) -> bool;
     /// Count an attached entry in (at entry create, so the wiring's

@@ -65,7 +65,7 @@ pub fn buffer_capacity<F: Frame>(depth: usize) -> usize {
 /// drain, in order. Each grant drops, freeing its record for the writer,
 /// before the next is taken. [`ReadError::Corrupt`] stops the drain and
 /// propagates.
-pub(crate) fn drain_view<RD>(view: &mut View<RD>, mut f: impl FnMut(&[u8])) -> Result<(), ReadError>
+pub fn drain_view<RD>(view: &mut View<RD>, mut f: impl FnMut(&[u8])) -> Result<(), ReadError>
 where
     RD: WakeSink,
 {
@@ -81,7 +81,7 @@ where
 /// `slot_off` and copying each element out of the trailer. The interim decode
 /// for a fixed-struct list until the frame derive emits per-member accessors
 /// on the grant (see `docs/frames.md`); flat consumers use the `apply` path.
-pub(crate) fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
+pub fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
     table: &[u8],
     slot_off: usize,
 ) -> impl Iterator<Item = T> + '_ {

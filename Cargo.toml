@@ -32,6 +32,7 @@ members = [
     "libs/metor-proto/kdl",
     "libs/metor-panel",
     "libs/metor-fsw-2",
+    "libs/metor-fsw-2/core",
     "libs/metor-fsw-2/macros",
     "libs/metor-fsw-2/ring",
     "libs/metor-fsw-2/tests/fixtures/dl-fixture",

@@ -7,8 +7,9 @@ publish = false
 description = "Shared compile-time contracts (frames + per-system Params) for the adcs-fsw2 dlopen target"
 
 [dependencies]
-# `#[derive(Frame)]` is self-contained — it expands to `::metor_fsw_2::…` paths.
-metor-fsw-2 = { path = "../../../libs/metor-fsw-2" }
+# The authoring surface only: `#[derive(Frame)]` is self-contained and expands to
+# `metor_fsw_2_core::…` paths. Contracts never touch the host runtime.
+metor-fsw-2-core = { path = "../../../libs/metor-fsw-2/core" }
 # The standalone component derives (AsVTable/Componentize/… on the nested `ReactionWheel`,
 # which is not a top-level `Frame`) live in metor-component and expand to
 # `::metor_component::…` paths, so it has to be in scope too — metor-fsw-2 re-bundles

@@ -79,18 +79,18 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_ring::NoWake;
 
-use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus};
 use crate::FrameStr;
-use crate::abi::FswStatus;
-use crate::descriptor::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind, compatible};
 use crate::dl::{DlSlot, DlSystem};
-use crate::message::{MsgIn, MsgOut};
-use crate::port::{Input, Output, frame_list_iter};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::proc::StepOutcome;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::proc::host::{LoadPoll, SeqWorker};
-use crate::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus, SlotControlIn};
+use metor_fsw_2_core::abi::FswStatus;
+use metor_fsw_2_core::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus, SlotControlIn};
+use metor_fsw_2_core::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus};
+use metor_fsw_2_core::{Input, Output, frame_list_iter};
+use metor_fsw_2_core::{MsgIn, MsgOut};
+use metor_fsw_2_core::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind, compatible};
 
 // ---------------------------------------------------------------------------
 // Host telemetry / control frames
@@ -99,7 +99,7 @@ use crate::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus, SlotContro
 /// A fixed frame the host publishes every cycle carrying the slot phase and
 /// the selected occupant's name. Occupant-side detail such as progress lines
 /// and the terminal outcome rides the occupant's own
-/// [`SequenceStatus`](crate::sequence::SequenceStatus) frame.
+/// [`SequenceStatus`](metor_fsw_2_core::sequence::SequenceStatus) frame.
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "slot_status")]
@@ -459,7 +459,7 @@ pub(crate) struct ProcParts {
 
 /// A slot runner drives one swappable position in the coordinator's schedule,
 /// creating, polling, and destroying occupants in response to runtime
-/// commands. It holds the per-port [`FswRing`](crate::abi::FswRing) templates,
+/// commands. It holds the per-port [`FswRing`](metor_fsw_2_core::abi::FswRing) templates,
 /// the [`AllowedOccupant`] set, the live occupant, the [`SlotState`], and the
 /// host-owned control and status writers. No occupant exists after `build()`;
 /// the first one is created at `init` or by a runtime `Load`.
@@ -476,9 +476,9 @@ pub(crate) struct SlotRunner {
     /// Ring templates for the occupant inputs, in occupant input order,
     /// ending with the control ring. Cloned per occupant; the regions are
     /// stable and the descriptors are `Copy`.
-    input_regions: Vec<crate::abi::FswRing>,
+    input_regions: Vec<metor_fsw_2_core::abi::FswRing>,
     /// Ring templates for the occupant outputs, in occupant output order.
-    output_regions: Vec<crate::abi::FswRing>,
+    output_regions: Vec<metor_fsw_2_core::abi::FswRing>,
     /// Host writer over the control ring; `Abort` writes a cancel frame here.
     control: Output<SlotControlIn>,
     /// Host writer over the [`SlotStatus`] ring, written each `step`.
@@ -533,8 +533,8 @@ impl SlotRunner {
         name: Arc<str>,
         allowed: Vec<AllowedOccupant>,
         initial: Option<InitialOccupant>,
-        input_regions: Vec<crate::abi::FswRing>,
-        output_regions: Vec<crate::abi::FswRing>,
+        input_regions: Vec<metor_fsw_2_core::abi::FswRing>,
+        output_regions: Vec<metor_fsw_2_core::abi::FswRing>,
         control: Output<SlotControlIn>,
         status_out: Output<SlotStatus>,
         events: MsgOut<SequenceChannelEvent>,

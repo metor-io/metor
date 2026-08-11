@@ -20,7 +20,7 @@ use adcs_contracts::{
     AttitudeEstimate, CtrlParams, Gps, MTQ_MAX_DIPOLE, ModeCmd, MtqCmd, RW_TORQUE_MAX, Sensors,
     TorqueCmd, V3, Wheels, clamp_dipole, desat_dipole, detumble_dipole, inertia_diag, target_for,
 };
-use metor_fsw_2::{Input, Output, Timestamp, system};
+use metor_fsw_2_core::{Input, Output, Timestamp, system};
 use nox::{Quaternion, tensor};
 
 pub struct CtrlSystem {

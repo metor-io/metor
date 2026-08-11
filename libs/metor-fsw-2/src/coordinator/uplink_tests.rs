@@ -24,15 +24,15 @@ use metor_proto_wkt::{
 };
 
 use crate::{
-    AllowedOccupant, ClockMode, CoordinatorConfig, CyclicSystem, DlPack, DlSystem, Input, LinkState,
-    MsgIn, Out, Shared, SlotStatus, System, SystemHealth, SystemInput, SystemOutput, Timestamp,
-    UplinkSystem, split_record,
+    AllowedOccupant, ClockMode, CoordinatorConfig, CyclicSystem, DlPack, DlSystem, Input,
+    LinkState, MsgIn, Out, Shared, SlotStatus, System, SystemHealth, SystemInput, SystemOutput,
+    Timestamp, UplinkSystem, split_record,
 };
 
 use super::PortRef;
 use super::init::{Node, SystemBind, cyclic_node};
 use super::slot::{SlotReg, plan_slot};
-use crate::descriptor::PortId;
+use metor_fsw_2_core::PortId;
 
 // ---------------------------------------------------------------------------
 // Fixture build/locate and shared config

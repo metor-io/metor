@@ -100,7 +100,7 @@ pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
         .env("METOR_IR_OUT", ir_file.path())
         .env(
             "METOR_EXPECTED_ABI",
-            crate::abi::FSW_ABI_VERSION.to_string(),
+            metor_fsw_2_core::abi::FSW_ABI_VERSION.to_string(),
         )
         .status()
         .map_err(|e| miette!("failed to run `{}`: {e}", python.display()))?;

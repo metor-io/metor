@@ -17,6 +17,7 @@ use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
 use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
+use metor_fsw_2::params::ParamErrorKind;
 use metor_fsw_2::{
     ClockSpec, Frame, Input, SlotInitState, SlotStatus, WiringBuilder, split_record,
     wiring::{BuildOptions, LoadErrorKind, Registry, provision_artifacts, resolve},
@@ -385,7 +386,7 @@ fn slot_allow_unknown_param_is_a_clean_error() {
         Err(e) => e,
     };
     assert!(
-        matches!(err.kind, LoadErrorKind::UnknownParam { ref property, .. } if property == "gian"),
+        matches!(err.kind, LoadErrorKind::Params(ParamErrorKind::UnknownParam { ref property, .. }) if property == "gian"),
         "{err:?}"
     );
 }

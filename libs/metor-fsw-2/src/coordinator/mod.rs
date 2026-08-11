@@ -32,27 +32,25 @@ use stellarator::sync::WaitQueue;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::DEFAULT_DEPTH;
-use crate::descriptor::{Hz, PortId};
 use crate::FrameStr;
-use crate::dynamic::FrameList;
-use crate::health::{HealthPort, LogLevel};
-use crate::message::{MsgIn, MsgOut};
-use crate::port::Output;
+use crate::async_system::{AsyncContext, AsyncSystem};
 use crate::proc::session::SessionDir;
-use crate::registry::Registry;
-use crate::system::{AsyncContext, AsyncSystem};
+use metor_fsw_2_core::FrameList;
+use metor_fsw_2_core::Output;
+use metor_fsw_2_core::Registry;
+use metor_fsw_2_core::health::{HealthPort, LogLevel};
+use metor_fsw_2_core::{CyclicSlot, NAME_CAP, StoppedSystem, WorkerStatus};
+use metor_fsw_2_core::{Hz, PortId};
+use metor_fsw_2_core::{MsgIn, MsgOut};
 
 mod bind;
 mod error;
 pub(crate) mod init;
 pub(crate) mod slot;
-mod status;
 
 pub use error::WireError;
 pub(crate) use slot::validate_slot_spec;
 pub use slot::{AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError, SlotStatus};
-pub(crate) use status::CyclicSlot;
-pub use status::{NAME_CAP, SlotState, StopReason, StoppedSystem, WorkerRunState, WorkerStatus};
 
 /// The default [`CoordinatorConfig::reader_slack`].
 const READER_SLACK: usize = 4;
@@ -624,7 +622,7 @@ impl Coordinator {
             // Publish to the ambient FSW clock before anything steps, so
             // out-of-port stamps (tracing events, async health) land on the
             // cycle timeline.
-            crate::clock::set_now(now);
+            metor_fsw_2_core::set_now(now);
             // A reload request re-emits the registry and manifest for consumers
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.
@@ -842,7 +840,7 @@ impl Coordinator {
     /// once per cycle (after the slots step) and once more at shutdown;
     /// events fired before the first cycle (build, init) flush here too.
     fn drain_forwarded_logs(&mut self, now: Timestamp) {
-        let dropped = crate::logfwd::drain(|ev| self.coord_health.emit_event(&ev));
+        let dropped = metor_fsw_2_core::logfwd::drain(|ev| self.coord_health.emit_event(&ev));
         if dropped > 0 {
             for _ in 0..dropped {
                 self.coord_health.error("log_dropped");

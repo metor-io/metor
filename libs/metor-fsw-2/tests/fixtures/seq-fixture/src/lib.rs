@@ -18,8 +18,8 @@
 
 use core::time::Duration;
 
-use metor_fsw_2::sequence::{progress, wait};
-use metor_fsw_2::{Outcome, Pack, Timestamp, system};
+use metor_fsw_2_core::sequence::{progress, wait};
+use metor_fsw_2_core::{Outcome, Pack, Timestamp, system};
 
 /// Load-time canary for the process-slot isolation tests: when
 /// `SEQ_FIXTURE_CANARY` names a file, mapping this object appends the loading
@@ -76,4 +76,4 @@ pub fn pack() -> Pack {
         .system("beater", system(beat))
 }
 
-metor_fsw_2::export_pack!(pack);
+metor_fsw_2_core::export_pack!(pack);

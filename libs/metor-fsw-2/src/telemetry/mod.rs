@@ -52,15 +52,15 @@ use metor_proto::vtable::VTable;
 use metor_proto_wkt::{ComponentMetadata, MsgMetadata, SetMsgMetadata};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::binder::{BindPorts, RingSource};
-use crate::descriptor::{Declarations, Delivery, PortDesc, SystemDescriptor};
-use crate::health::HealthPort;
-use crate::message::{MsgFanOut, NamedMsg, split_record};
-use crate::registry::{AllOutputs, RegistryEntry};
-use crate::shared::Shared;
-use crate::system::{
+use metor_fsw_2_core::Shared;
+use metor_fsw_2_core::health::HealthPort;
+use metor_fsw_2_core::{AllOutputs, RegistryEntry};
+use metor_fsw_2_core::{BindPorts, RingSource};
+use metor_fsw_2_core::{
     BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput, Out, System, SystemOutput,
 };
+use metor_fsw_2_core::{Declarations, Delivery, PortDesc, SystemDescriptor};
+use metor_fsw_2_core::{MsgFanOut, NamedMsg, split_record};
 
 /// Which registry entries the downlink taps.
 #[derive(Clone, Debug)]
@@ -232,7 +232,7 @@ impl HealthOutput for UplinkOut {
 impl BindPorts for UplinkOut {
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let health = crate::Output::bind(src);
-        let log = crate::message::MsgOut::bind(src);
+        let log = metor_fsw_2_core::MsgOut::bind(src);
         let fan = MsgFanOut::bind(src);
         let mut health = HealthPort::new(health, log);
         health.set_instance(src.instance_name());
@@ -322,7 +322,7 @@ impl System for UplinkSystem {
             let health = output.health();
             health.error("uplink_announced_late");
             health.log(
-                crate::health::LogLevel::Warn,
+                metor_fsw_2_core::health::LogLevel::Warn,
                 "uplink registered after the downlink; its command set is not advertised to clients",
             );
         }
@@ -352,7 +352,7 @@ impl CyclicSystem for UplinkSystem {
         if !self.checked {
             if self.msgs.is_empty() {
                 health.log(
-                    crate::health::LogLevel::Warn,
+                    metor_fsw_2_core::health::LogLevel::Warn,
                     "uplink has no msgs configured; it will relay nothing",
                 );
             } else if fan.len() != self.msgs.len() {
@@ -368,16 +368,16 @@ impl CyclicSystem for UplinkSystem {
             .as_ref()
             .expect("uplink attached to a TcpServer state (the builtin link pack's ctor)");
         let msgs = &self.msgs;
-        link.get().drain_inbound(|id, payload| {
-            match msgs.iter().position(|&(_, mid)| mid == id) {
+        link.get().drain_inbound(
+            |id, payload| match msgs.iter().position(|&(_, mid)| mid == id) {
                 Some(idx) => {
                     if fan.write_raw(idx, id, payload).is_err() {
                         health.error("uplink_dropped");
                     }
                 }
                 None => health.error("uplink_unroutable"),
-            }
-        });
+            },
+        );
     }
 }
 
@@ -399,7 +399,7 @@ pub(crate) enum Announce {
 /// pulls the host registry rather than consuming a ring.
 #[derive(crate::SystemOutput)]
 pub struct TelemetryPorts {
-    status: crate::port::Output<LinkStatus>,
+    status: metor_fsw_2_core::Output<LinkStatus>,
     all: AllOutputs,
 }
 
@@ -551,13 +551,12 @@ impl System for TelemetrySystem {
                     Wire::Msg
                 }
             };
-            let retain_slot = (entry.delivery() == Delivery::Snapshot
-                && matches!(wire, Wire::Msg))
-            .then(|| {
-                let slot = n_retained;
-                n_retained += 1;
-                slot
-            });
+            let retain_slot = (entry.delivery() == Delivery::Snapshot && matches!(wire, Wire::Msg))
+                .then(|| {
+                    let slot = n_retained;
+                    n_retained += 1;
+                    slot
+                });
             taps.push(Tap {
                 view,
                 delivery: entry.delivery(),
@@ -571,7 +570,7 @@ impl System for TelemetrySystem {
             let health = output.health();
             health.error("telemetry_reader_slot");
             health.log(
-                crate::health::LogLevel::Warn,
+                metor_fsw_2_core::health::LogLevel::Warn,
                 &format!("no reader slot left on `{key}` — raise CoordinatorConfig::reader_slack"),
             );
         }
@@ -587,7 +586,7 @@ impl System for TelemetrySystem {
             let health = output.health();
             health.error("link_announce_conflict");
             health.log(
-                crate::health::LogLevel::Warn,
+                metor_fsw_2_core::health::LogLevel::Warn,
                 "another downlink already announced on this link; this instance streams nothing",
             );
             self.link = None;
@@ -702,7 +701,7 @@ impl CyclicSystem for TelemetrySystem {
                 Delivery::Log => {
                     let wire = &tap.wire;
                     let batch = &mut batch;
-                    let result = crate::port::drain_view(&mut tap.view, |rec| {
+                    let result = metor_fsw_2_core::drain_view(&mut tap.view, |rec| {
                         if let Some(batch) = batch.as_mut() {
                             append_record(batch, wire, rec);
                         }

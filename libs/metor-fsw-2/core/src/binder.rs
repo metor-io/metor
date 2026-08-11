@@ -41,12 +41,12 @@ pub struct BoundPort {
 
 impl BoundPort {
     /// A port whose wake endpoints are default-constructed at bind time.
-    pub(crate) fn new(ring: RingBuffer) -> Self {
+    pub fn new(ring: RingBuffer) -> Self {
         Self { ring, data: None }
     }
 
     /// A port carrying a pre-created, matched data-wake endpoint.
-    pub(crate) fn matched(ring: RingBuffer, data: Box<dyn Any>) -> Self {
+    pub fn matched(ring: RingBuffer, data: Box<dyn Any>) -> Self {
         Self {
             ring,
             data: Some(data),
@@ -88,7 +88,7 @@ pub struct Binder<'a> {
 }
 
 impl<'a> Binder<'a> {
-    pub(crate) fn new(
+    pub fn new(
         outputs: &'a [BoundPort],
         inputs: &'a [BoundInput],
         registry: Arc<Registry>,

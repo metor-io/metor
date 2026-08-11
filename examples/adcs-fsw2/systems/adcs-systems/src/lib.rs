@@ -17,7 +17,7 @@ pub use ctrl::CtrlSystem;
 pub use nav::sun_from_css;
 pub use plant::{DisturbanceTorques, WheelDynamics, css_readings, disturbance_torques, propagate};
 
-use metor_fsw_2::{Pack, system};
+use metor_fsw_2_core::{Pack, system};
 
 use crate::{nav::NavState, plant::PlantState};
 
@@ -30,7 +30,7 @@ pub fn pack() -> Pack {
         // Deliberately struct-authored (`#[system]`), so the pack exercises both styles.
         .system_type::<CtrlSystem>("Ctrl")
 }
-metor_fsw_2::export_pack!(pack, feature = "export");
+metor_fsw_2_core::export_pack!(pack, feature = "export");
 
 #[cfg(test)]
 mod tests {

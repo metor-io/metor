@@ -1,6 +1,11 @@
-//! Cyclic-slot status vocabulary: lifecycle states, stop reasons, and the
-//! worker facts the coordinator publishes, plus the fixed-cap name packing the
-//! status frames share.
+//! Cyclic-slot vocabulary: the one-position-in-the-step-loop interface, the
+//! lifecycle states and stop reasons, the worker facts the coordinator
+//! publishes, and the fixed-cap name packing the status frames share.
+//!
+//! [`CyclicSlot`] is the seam between the two crates. A `DriverSlot` over a
+//! pack entry implements it here; the host's static runner, its dlopen slot,
+//! and its process slot implement it there. The coordinator inits, steps, and
+//! shuts one down without knowing which.
 
 use std::sync::Arc;
 
@@ -22,7 +27,7 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    pub(super) fn code(self) -> u8 {
+    pub fn code(self) -> u8 {
         match self {
             StopReason::Panicked => 0,
             StopReason::ProcessDied => 1,
@@ -77,7 +82,7 @@ impl SlotState {
         }
     }
 
-    /// The wire phase code published in [`crate::SlotStatus::phase`], in lifecycle
+    /// The wire phase code published in the host's `SlotStatus::phase`, in lifecycle
     /// order (Empty=0/Loaded=1/Loading=2/Running=3/Done=4/Stopped=5).
     pub fn code(&self) -> u8 {
         match self {
@@ -108,7 +113,7 @@ impl SlotState {
 }
 
 /// The name and stop reason of one hard-stopped cyclic system, surfaced
-/// through [`crate::Coordinator::stopped`] and the coordinator status frame.
+/// through the host's `Coordinator::stopped` and the coordinator status frame.
 #[derive(Clone, Debug)]
 pub struct StoppedSystem {
     pub name: Arc<str>,
@@ -118,7 +123,7 @@ pub struct StoppedSystem {
 /// One position in the cyclic step loop. The coordinator inits, steps, and
 /// shuts it down without knowing the concrete system inside;
 /// [`CyclicRunner`](crate::CyclicRunner) is the typed implementation.
-pub(crate) trait CyclicSlot {
+pub trait CyclicSlot {
     fn init(&mut self);
     fn step(&mut self, now: Timestamp);
     fn shutdown(&mut self);
@@ -146,7 +151,7 @@ pub(crate) trait CyclicSlot {
 }
 
 /// Where a process system's worker is in its life, as telemetered in the
-/// status frame's worker list and [`crate::Coordinator::workers`].
+/// status frame's worker list and the host's `Coordinator::workers`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerRunState {
     /// Dead past the restart budget; the stop is permanent.
@@ -170,7 +175,7 @@ impl WorkerRunState {
 }
 
 /// One process system's worker facts, as reported by
-/// [`crate::Coordinator::workers`]: the instance name, the worker pid (this is how
+/// the host's `Coordinator::workers`: the instance name, the worker pid (this is how
 /// an operator learns a system runs out-of-process, and where), the restart
 /// count, and the run state. The same facts ride the status frame's
 /// `workers` list.
@@ -185,7 +190,7 @@ pub struct WorkerStatus {
 
 /// The one shared byte cap on every name packed into a fixed-size host frame
 /// (a stopped system in the coordinator status frame, the occupant in
-/// [`crate::SlotStatus`])
+/// the host's `SlotStatus`)
 /// and the validated cap on slot instance names, which double as the sequence
 /// channels' wire address (`SequenceCommand::channel`). Matches
 /// [`SEQUENCE_CHANNEL_NAME_CAP`](metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP).

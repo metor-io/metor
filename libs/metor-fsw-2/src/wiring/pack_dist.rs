@@ -409,7 +409,7 @@ pub fn pack_dev(dir: &Path, opts: &PackDevOptions) -> Result<PackDevReport, Pack
         &config.crate_name,
         &config.lib,
         &manifest,
-        crate::abi::FSW_ABI_VERSION,
+        metor_fsw_2_core::abi::FSW_ABI_VERSION,
         &config.dist_name,
         &config.dist_version,
     )
@@ -798,7 +798,7 @@ fn assemble_wheel(
         &config.crate_name,
         &config.lib,
         &manifest,
-        crate::abi::FSW_ABI_VERSION,
+        metor_fsw_2_core::abi::FSW_ABI_VERSION,
         &config.dist_name,
         &config.dist_version,
     )
@@ -848,7 +848,10 @@ fn injected_requires(config: &PackConfig) -> Vec<String> {
             .any(|dep| dep.trim_start().starts_with(name))
     };
     if !declares("metor-fsw-abi") {
-        requires.push(format!("metor-fsw-abi=={}", crate::abi::FSW_ABI_VERSION));
+        requires.push(format!(
+            "metor-fsw-abi=={}",
+            metor_fsw_2_core::abi::FSW_ABI_VERSION
+        ));
     }
     if !declares("metor-config") {
         let version = super::py::metor_config_version();
@@ -1145,7 +1148,7 @@ mod tests {
         let requires = injected_requires(&config);
         assert_eq!(
             requires[0],
-            format!("metor-fsw-abi=={}", crate::abi::FSW_ABI_VERSION)
+            format!("metor-fsw-abi=={}", metor_fsw_2_core::abi::FSW_ABI_VERSION)
         );
         assert!(
             requires[1].starts_with("metor-config>=") && requires[1].contains(",<"),

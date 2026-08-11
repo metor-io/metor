@@ -20,10 +20,10 @@ use postcard_schema::schema::NamedType;
 use serde::de::DeserializeOwned;
 
 use crate::binder::AnySource;
-use crate::coordinator::{CyclicSlot, SlotState};
 use crate::descriptor::SystemDescriptor;
 use crate::handler::IntoPackEntry;
 use crate::sequence::Outcome;
+use crate::slot::{CyclicSlot, SlotState};
 
 /// One runnable system instance, whatever style authored it. The pack-side
 /// convergence of [`CyclicRunner`](crate::CyclicRunner) and the sequence
@@ -58,18 +58,16 @@ pub enum Mount {
 pub enum EntryParams<'a> {
     /// Canonical postcard bytes (the dl / process-worker path).
     Postcard(&'a [u8]),
-    /// A params value tree (the static [`ParamSource::Value`] path). `src`
+    /// A params value tree (the static `ParamSource::Value` path). `src`
     /// is the diagnostic snippet errors anchor on; a value tree carries no
     /// spans of its own.
-    ///
-    /// [`ParamSource::Value`]: crate::wiring::ParamSource::Value
     Value {
         value: &'a serde_json::Value,
         src: &'a str,
         name: &'a str,
         msgs: &'a crate::message::MsgTable,
         /// The shared state this system attaches to, resolved by name from
-        /// [`SystemSpec::attach`](crate::wiring::SystemSpec) during the states
+        /// the target's `SystemSpec::attach` during the states
         /// pass. `None` for an ordinary system; a shared-state entry's create
         /// requires it.
         attach: Option<&'a AttachTarget>,
@@ -81,8 +79,8 @@ pub enum EntryParams<'a> {
 /// key for the mismatch diagnostic. Built by the resolver's states pass and
 /// threaded through [`EntryParams::Value`]; its fields are crate-internal.
 pub struct AttachTarget {
-    pub(crate) ty: &'static str,
-    pub(crate) token: std::rc::Rc<dyn core::any::Any>,
+    pub ty: &'static str,
+    pub token: std::rc::Rc<dyn core::any::Any>,
 }
 
 /// A create-phase failure: bad params, or a moved-in state already taken.
@@ -93,7 +91,7 @@ pub enum MakeError {
     Postcard(#[from] postcard::Error),
     /// The value params surface did not deserialize (spans inside).
     #[error(transparent)]
-    Params(Box<crate::wiring::LoadError>),
+    Params(Box<crate::params::ParamError>),
     /// A `configure` step failed to resolve a config reference.
     #[error(transparent)]
     Configure(#[from] crate::system::ConfigureError),
@@ -127,7 +125,7 @@ pub enum MakeError {
 }
 
 /// Decode an entry's typed params from any params surface.
-pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Result<P, MakeError> {
+pub fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Result<P, MakeError> {
     match params {
         EntryParams::Postcard(bytes) => Ok(postcard::from_bytes(bytes)?),
         EntryParams::Value {
@@ -139,11 +137,11 @@ pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Res
             // path uses. A required field still falls through to the spanned
             // value decode for its missing-field error.
             if value.as_object().is_some_and(|m| m.is_empty())
-                && let Ok(p) = P::deserialize(crate::wiring::NoParams)
+                && let Ok(p) = P::deserialize(crate::params::NoParams)
             {
                 return Ok(p);
             }
-            crate::wiring::decode_value_params(value, name, src)
+            crate::params::decode_value_params(value, name, src)
                 .map_err(|e| MakeError::Params(Box::new(e)))
         }
     }
@@ -153,7 +151,7 @@ pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Res
 /// entry declared defaults: an absent config uses the defaults verbatim, a
 /// value surface is schema-encoded over the decoded default base (top-level
 /// overrides), and explicit postcard bytes pass through complete.
-pub(crate) fn resolve_defaults(
+pub fn resolve_defaults(
     params: EntryParams<'_>,
     defaults: &[u8],
     schema: &'static NamedType,
@@ -163,7 +161,7 @@ pub(crate) fn resolve_defaults(
         EntryParams::Postcard(bytes) => Ok(bytes.to_vec()),
         EntryParams::Value { value, name, .. } => {
             let owned = postcard_schema::schema::owned::OwnedNamedType::from(schema);
-            crate::wiring::encode_value_params(value, &owned, name, Some(defaults))
+            crate::params::encode_value_params(value, &owned, name, Some(defaults))
                 .map_err(|e| MakeError::Params(Box::new(e)))
         }
     }
@@ -180,8 +178,8 @@ pub type Pending =
 /// the instance descriptor; the positional ABI, which binds against the
 /// exported static manifest, rejects the divergence instead.
 pub struct Created {
-    pub(crate) pending: Pending,
-    pub(crate) instance_desc: Option<SystemDescriptor>,
+    pub pending: Pending,
+    pub instance_desc: Option<SystemDescriptor>,
 }
 
 impl From<Pending> for Created {
@@ -193,13 +191,13 @@ impl From<Pending> for Created {
     }
 }
 
-pub(crate) type CreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<Created, MakeError>>;
+pub type CreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<Created, MakeError>>;
 
 /// One erased system entry of a [`Pack`]: its name (the registry `type=` /
 /// manifest key), its descriptor (computed from parameter types, no instance
 /// needed), its params schema, and the two-phase constructor.
 pub struct PackEntry {
-    pub(crate) name: &'static str,
+    pub name: &'static str,
     pub(crate) descriptor: SystemDescriptor,
     pub(crate) params_schema: &'static NamedType,
     /// Canonical postcard bytes of the entry's declared default params, the
@@ -212,8 +210,8 @@ pub struct PackEntry {
     /// ([`system_type_shared`](Pack::system_type_shared)): its wiring must
     /// carry an `attach`, and a plain entry must not. Drives the resolver's
     /// attach/shared consistency checks.
-    pub(crate) shared: bool,
-    pub(crate) create: CreateFn,
+    pub shared: bool,
+    pub create: CreateFn,
 }
 
 impl PackEntry {
@@ -245,7 +243,7 @@ impl PackEntry {
 
     /// Route this entry's create through [`resolve_defaults`], so its own
     /// decode honors the declared defaults on every params surface.
-    pub(crate) fn wrap_create_with_defaults(&mut self) {
+    pub fn wrap_create_with_defaults(&mut self) {
         let defaults = self
             .params_default
             .clone()
@@ -270,23 +268,23 @@ pub(crate) type StateCreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result
 /// One pack-declared shared state: its name (the wiring `state` type key),
 /// its params schema, its construction fn, and the erased cell the resolve
 /// passes check construction/attachment against.
-pub(crate) struct StateEntry {
-    pub(crate) name: &'static str,
-    pub(crate) cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
+pub struct StateEntry {
+    pub name: &'static str,
+    pub cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
     /// The `Shared<St>` token, erased as `Rc<dyn Any>`, so a system attaching
     /// by name can downcast it back to the concrete `Shared<St>` at create.
     /// Cloned into the resolver's name→[`AttachTarget`] map each states pass.
-    pub(crate) token: std::rc::Rc<dyn core::any::Any>,
-    pub(crate) create: StateCreateFn,
+    pub token: std::rc::Rc<dyn core::any::Any>,
+    pub create: StateCreateFn,
 }
 
 impl StateEntry {
-    pub(crate) fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         self.name
     }
 
     /// Construct the state from its wiring declaration's params.
-    pub(crate) fn create(&mut self, params: EntryParams<'_>) -> Result<(), MakeError> {
+    pub fn create(&mut self, params: EntryParams<'_>) -> Result<(), MakeError> {
         (self.create)(params)
     }
 }
@@ -346,7 +344,7 @@ impl Pack {
     }
 
     /// Register a struct-authored system that attaches to a pack-shared state
-    /// *by name*: the target's [`SystemSpec::attach`](crate::wiring::SystemSpec)
+    /// *by name*: the target's `SystemSpec::attach`
     /// picks which state instance, and the resolver hands `ctor` the resolved
     /// [`Shared`](crate::Shared) token (the second argument) at create time.
     /// `St` is the concrete shared type the entry binds — a target naming a
@@ -607,17 +605,16 @@ impl Pack {
 
     /// The shared-state entry named `name`, for direct construction in
     /// tests and the wiring states pass.
-    #[cfg(test)]
-    pub(crate) fn state_entry_mut(&mut self, name: &str) -> Option<&mut StateEntry> {
+    pub fn state_entry_mut(&mut self, name: &str) -> Option<&mut StateEntry> {
         self.states.iter_mut().find(|s| s.name == name)
     }
 
-    pub(crate) fn state_entries(&self) -> impl Iterator<Item = &StateEntry> {
+    pub fn state_entries(&self) -> impl Iterator<Item = &StateEntry> {
         self.states.iter()
     }
 
     /// The entry at manifest position `index`, the ABI's addressing.
-    pub(crate) fn entry_at_mut(&mut self, index: usize) -> Option<&mut PackEntry> {
+    pub fn entry_at_mut(&mut self, index: usize) -> Option<&mut PackEntry> {
         self.entries.get_mut(index)
     }
 
@@ -631,7 +628,7 @@ impl Pack {
 
     /// Split into system entries and shared-state entries, for hosts that
     /// index both (the static registry).
-    pub(crate) fn into_parts(self) -> (Vec<PackEntry>, Vec<StateEntry>) {
+    pub fn into_parts(self) -> (Vec<PackEntry>, Vec<StateEntry>) {
         (self.entries, self.states)
     }
 }
@@ -742,10 +739,7 @@ pub(crate) struct AttachedDriver {
 impl AttachedDriver {
     /// The attach count was taken at entry create (where the wiring's
     /// unused-state check reads it); this pairs the release with it.
-    pub(crate) fn new(
-        inner: Box<dyn Driver>,
-        cell: std::rc::Rc<dyn crate::shared::ErasedShared>,
-    ) -> Self {
+    pub fn new(inner: Box<dyn Driver>, cell: std::rc::Rc<dyn crate::shared::ErasedShared>) -> Self {
         Self { inner, cell }
     }
 }
@@ -770,10 +764,10 @@ impl Driver for AttachedDriver {
 /// [`CyclicRunner`](crate::CyclicRunner)'s slot impl. `Done` latches
 /// [`SlotState::Done`] and stops stepping, the same terminal handling a
 /// sequence-mode dl slot applies.
-pub(crate) struct DriverSlot {
-    pub(crate) driver: Box<dyn Driver>,
-    pub(crate) name: &'static str,
-    pub(crate) state: SlotState,
+pub struct DriverSlot {
+    pub driver: Box<dyn Driver>,
+    pub name: &'static str,
+    pub state: SlotState,
 }
 
 impl CyclicSlot for DriverSlot {

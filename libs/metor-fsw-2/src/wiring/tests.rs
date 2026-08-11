@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use metor_fsw_2_core::params::ParamErrorKind;
 use metor_fsw_ring::Notifier;
 use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -423,7 +424,7 @@ async fn resolve_broadcasts_the_wiring_manifest() {
         view.try_read_into(&mut buf).expect("readable ring"),
         "boot manifest present"
     );
-    let (id, payload) = crate::message::split_record(&buf).expect("id-prefixed record");
+    let (id, payload) = metor_fsw_2_core::split_record(&buf).expect("id-prefixed record");
     assert_eq!(id, WiringManifest::ID);
     let manifest: WiringManifest = postcard::from_bytes(payload).expect("decode manifest");
     assert_eq!(manifest.ir_version, wiring.ir_version);
@@ -715,7 +716,7 @@ fn err_value_params_unknown_key() {
     assert!(
         matches!(
             err.kind,
-            LoadErrorKind::UnknownParam { ref property, ref system, .. }
+            LoadErrorKind::Params(ParamErrorKind::UnknownParam { ref property, ref system })
                 if property == "gian" && system == "nav"
         ),
         "{err:?}"
@@ -738,7 +739,7 @@ fn err_value_params_missing_required() {
         Err(e) => e,
     };
     match err.kind {
-        LoadErrorKind::ValueParams { system, reason, .. } => {
+        LoadErrorKind::Params(ParamErrorKind::ValueParams { system, reason }) => {
             assert_eq!(system, "nav");
             assert!(reason.contains("gain"), "names the missing field: {reason}");
         }
@@ -763,7 +764,7 @@ fn err_value_params_out_of_range_int() {
         Err(e) => e,
     };
     assert!(
-        matches!(err.kind, LoadErrorKind::ValueParams { ref system, .. } if system == "imu"),
+        matches!(err.kind, LoadErrorKind::Params(ParamErrorKind::ValueParams { ref system, .. }) if system == "imu"),
         "{err:?}"
     );
 }
@@ -773,7 +774,8 @@ fn err_value_params_out_of_range_int() {
 #[test]
 fn value_params_honor_serde_field_defaults() {
     let value = serde_json::json!({ "count": 3, "rate": 1.5, "label": "hi" });
-    let got: RoundTrip = super::decode_value_params(&value, "params", "snippet").unwrap();
+    let got: RoundTrip =
+        metor_fsw_2_core::params::decode_value_params(&value, "params", "snippet").unwrap();
     assert_eq!(
         got,
         RoundTrip {
@@ -847,8 +849,7 @@ async fn pack_entry_defaults_overlay_value_overrides() {
 /// variant survives a serde round-trip of each spec.
 #[test]
 fn builtin_link_specs_carry_value_params() {
-    let state =
-        crate::wiring::StateSpec::tcp_server("link", "127.0.0.1:2240".parse().unwrap());
+    let state = crate::wiring::StateSpec::tcp_server("link", "127.0.0.1:2240".parse().unwrap());
     match &state.params {
         ParamSource::Value(v) => {
             assert_eq!(v, &serde_json::json!({ "addr": "127.0.0.1:2240" }))
@@ -1133,8 +1134,8 @@ fn wiring_json_without_provenance_fields_deserializes() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn reloadable_is_required_for_slot_occupants_only() {
-    let meta = crate::abi::PackEntryDesc {
-        descriptor: crate::descriptor::SystemDescriptor {
+    let meta = metor_fsw_2_core::abi::PackEntryDesc {
+        descriptor: metor_fsw_2_core::SystemDescriptor {
             name: "Stateful".into(),
             kind: crate::SystemKind::Cyclic,
             inputs: Vec::new(),
@@ -1681,7 +1682,10 @@ fn err_state_with_postcard_params() {
         Ok(_) => panic!("expected StateInit"),
         Err(e) => e,
     };
-    assert!(matches!(err.kind, LoadErrorKind::StateInit { .. }), "{err:?}");
+    assert!(
+        matches!(err.kind, LoadErrorKind::StateInit { .. }),
+        "{err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,7 +1789,9 @@ fn err_attach_type_mismatch() {
     dl.attach = Some("other".into());
     wiring.systems.push(dl);
     // Keep `link` attached so we reach the mismatch, not the unused check.
-    wiring.systems.push(crate::wiring::SystemSpec::uplink("uplink", &[]));
+    wiring
+        .systems
+        .push(crate::wiring::SystemSpec::uplink("uplink", &[]));
 
     let err = match resolve(&wiring, &r) {
         Ok(_) => panic!("expected AttachTypeMismatch"),

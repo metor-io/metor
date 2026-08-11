@@ -91,6 +91,11 @@ Use a cyclic system when the work belongs at one fixed point in each cycle.
 
 A struct async system implements `System` and `AsyncSystem`. The coordinator spawns `run` once. The task sets its own pace.
 
+`AsyncSystem` and its `AsyncContext` live in the host crate, not in
+`metor-fsw-2-core`: the task is owned by the coordinator's runtime, so it is
+registered statically and a pack cannot export one. Every other form works from
+core alone.
+
 ```rust
 impl AsyncSystem for LinkReader {
     async fn run(
