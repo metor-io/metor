@@ -1,0 +1,17 @@
+[package]
+name = "wasm-poll-guest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike guest: a commissioning-shaped sequence polled once per cycle, built for wasm32"
+
+[lib]
+# `cdylib` is the wasm module the host loads; `rlib` lets the host link the very
+# same ladder natively for the baseline measurement.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The only guest dependency, and the reason this spike is viable: `nox` compiles
+# to `wasm32-unknown-unknown` unchanged. Its default feature set is empty, so
+# the guest gets the `ArrayRepr` math and no std plumbing.
+nox = { path = "../../../../nox", default-features = false }
