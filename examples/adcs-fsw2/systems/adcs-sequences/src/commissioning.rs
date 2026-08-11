@@ -6,10 +6,14 @@
 //! ```
 //!
 //! Every transition is gated on what the FSW observes (the attitude estimate and the GPS
-//! orbit state — never truth), every phase has a timeout that safes the spacecraft and
-//! fails the sequence, and a cooperative `Abort` (latched at any `wait`) safes and bails
-//! out `Aborted`. The gates and budgets ride [`CommissioningParams`] off the target's
-//! `allow` line, which is also how tests patch them.
+//! orbit state — never truth) through [`check`], which holds each phase's predicate for a
+//! dwell and gives up on a budget. The gates and budgets ride [`CommissioningParams`] off
+//! the target's `allow` line, which is also how tests patch them.
+//!
+//! [`ladder`] carries the phases and returns `Result<(), Outcome>`, so a timeout or a
+//! cooperative `Abort` unwinds through `?` to the single safing site in
+//! [`commissioning`] — the spacecraft is safed in exactly one place rather than at every
+//! suspension point.
 //!
 //! *Detumble (magnetorquer-only rate damping, `LAW_DETUMBLE`) is entered only when the
 //! estimated rate is beyond what the reaction wheels should capture — the boot tumble is
@@ -18,88 +22,74 @@
 use core::time::Duration;
 
 use adcs_contracts::{AttitudeEstimate, CommissioningParams, Gps, ModeCmd, target_for};
-use metor_fsw_2::metor_proto::types::Timestamp;
-use metor_fsw_2::sequence::{now, progress, wait};
+use metor_fsw_2::sequence::{check, now, progress};
 use metor_fsw_2::{Input, Outcome, Output, Params};
 
-/// One coordinator cycle: under the `Simulated` clock `now` advances ≥ one cycle's worth of
-/// microseconds per poll, so a 1 µs wait is pending this poll and ready the next — the
-/// per-cycle yield primitive (`wait(Duration::ZERO)` resolves within the same poll and
-/// would spin).
-const NEXT_CYCLE: Duration = Duration::from_micros(1);
-
-/// Seconds of sequence-clock time since `t0`.
-fn secs_since(t0: Timestamp) -> f64 {
-    (now().0 - t0.0) as f64 / 1e6
-}
-
-/// Walk the commissioning ladder, gated on the live estimate + GPS orbit state.
+/// Walk the commissioning ladder, safing the spacecraft on any non-nominal exit.
 pub(crate) async fn commissioning(
     mut att: Input<AttitudeEstimate>,
     mut gps: Input<Gps>,
     Params(params): Params<CommissioningParams>,
     mut mode: Output<ModeCmd>,
 ) -> Outcome {
+    match ladder(&mut att, &mut gps, &params, &mut mode).await {
+        Ok(()) => {
+            progress("commissioned");
+            tracing::info!("commissioned");
+            Outcome::Completed
+        }
+        Err(outcome) => {
+            mode.publish(&ModeCmd::safe().stamped(now()));
+            tracing::warn!(?outcome, "commissioning ended early; safing");
+            outcome
+        }
+    }
+}
+
+/// The phases, gated on the live estimate + GPS orbit state.
+async fn ladder(
+    att: &mut Input<AttitudeEstimate>,
+    gps: &mut Input<Gps>,
+    params: &CommissioningParams,
+    mode: &mut Output<ModeCmd>,
+) -> Result<(), Outcome> {
     // --- Phase 0: estimator warm-up ---------------------------------------------------
     // No mode commanded (ctrl holds its identity reference, as it always has before the
     // first ModeCmd); complete when successive q̂ deltas stay small for the dwell.
     progress("estimator warm-up");
     tracing::info!("commissioning started; estimator warm-up");
-    let t0 = now();
     let mut last_q = None;
-    let mut settled_since: Option<Timestamp> = None;
-    let mut rate;
-    loop {
-        if wait(NEXT_CYCLE).await.aborted() {
-            mode.publish(&ModeCmd::safe().stamped(now()));
-            return Outcome::Aborted;
-        }
-        if secs_since(t0) > params.warmup_timeout_s {
-            mode.publish(&ModeCmd::safe().stamped(now()));
-            progress("timeout in warm-up");
-            tracing::warn!(budget_s = params.warmup_timeout_s, "warm-up timed out; safing");
-            return Outcome::Failed;
-        }
-        let Ok(Some(e)) = att.latest() else { continue };
-        let q = e.q_hat_b_eci;
-        rate = e.omega_b.norm().into_buf();
-        if let Some(prev) = last_q {
-            let delta: f64 = q.angular_distance(&prev).into_buf().abs();
-            if delta < params.est_delta_rad {
-                let since = *settled_since.get_or_insert(now());
-                if (now().0 - since.0) as f64 / 1e6 >= params.est_dwell_s {
-                    break;
-                }
-            } else {
-                settled_since = None;
-            }
-        }
-        last_q = Some(q);
-    }
+    check(
+        || {
+            let Ok(Some(e)) = att.latest() else {
+                return false;
+            };
+            let q = e.q_hat_b_eci;
+            let settled = last_q.is_some_and(|prev| {
+                q.angular_distance(&prev).into_buf().abs() < params.est_delta_rad
+            });
+            last_q = Some(q);
+            settled
+        },
+        secs(params.est_dwell_s),
+        secs(params.warmup_timeout_s),
+    )
+    .await
+    .or_fail("warm-up")?;
 
     // --- Phase 1: detumble (only for tumbles the wheels shouldn't capture) -------------
-    if rate > params.rate_detumble_enter {
+    let boot_rate = rate(att);
+    if boot_rate > params.rate_detumble_enter {
         mode.publish(&ModeCmd::detumble().stamped(now()));
         progress("detumbling");
-        tracing::warn!(rate, "boot tumble beyond wheel capture; detumbling");
-        let t0 = now();
-        loop {
-            if wait(NEXT_CYCLE).await.aborted() {
-                mode.publish(&ModeCmd::safe().stamped(now()));
-                return Outcome::Aborted;
-            }
-            if secs_since(t0) > params.detumble_timeout_s {
-                mode.publish(&ModeCmd::safe().stamped(now()));
-                progress("timeout in detumble");
-                tracing::warn!(budget_s = params.detumble_timeout_s, "detumble timed out; safing");
-                return Outcome::Failed;
-            }
-            let Ok(Some(e)) = att.latest() else { continue };
-            let rate: f64 = e.omega_b.norm().into_buf();
-            if rate < params.rate_detumble_exit {
-                break;
-            }
-        }
+        tracing::warn!(boot_rate, "boot tumble beyond wheel capture; detumbling");
+        check(
+            || rate(att) < params.rate_detumble_exit,
+            Duration::ZERO,
+            secs(params.detumble_timeout_s),
+        )
+        .await
+        .or_fail("detumble")?;
     }
 
     // --- Phase 2: coarse pointing ------------------------------------------------------
@@ -107,63 +97,47 @@ pub(crate) async fn commissioning(
     // holds under the coarse gate for the dwell.
     mode.publish(&ModeCmd::settling().stamped(now()));
     progress("coarse pointing");
-    tracing::info!(rate, "estimator settled; slewing onto the velocity-vector target");
-    let t0 = now();
-    let mut ok_since: Option<Timestamp> = None;
-    loop {
-        if wait(NEXT_CYCLE).await.aborted() {
-            mode.publish(&ModeCmd::safe().stamped(now()));
-            return Outcome::Aborted;
-        }
-        if secs_since(t0) > params.settle_timeout_s {
-            mode.publish(&ModeCmd::safe().stamped(now()));
-            progress("timeout in coarse pointing");
-            tracing::warn!(budget_s = params.settle_timeout_s, "coarse pointing timed out; safing");
-            return Outcome::Failed;
-        }
-        match tracking_error(&mut att, &mut gps) {
-            Some(err) if err < params.coarse_err_rad => {
-                let since = *ok_since.get_or_insert(now());
-                if (now().0 - since.0) as f64 / 1e6 >= params.coarse_dwell_s {
-                    break;
-                }
-            }
-            _ => ok_since = None,
-        }
-    }
+    tracing::info!(
+        boot_rate,
+        "estimator settled; slewing onto the velocity-vector target"
+    );
+    check(
+        || tracking_error(att, gps).is_some_and(|err| err < params.coarse_err_rad),
+        secs(params.coarse_dwell_s),
+        secs(params.settle_timeout_s),
+    )
+    .await
+    .or_fail("coarse pointing")?;
 
     // --- Phase 3: fine pointing ---------------------------------------------------------
     // Declare the spacecraft commissioned once the error HOLDS for the confirm dwell (a
-    // breach resets the dwell; the phase timeout catches a loop that cannot hold).
+    // breach resets the dwell; the phase budget catches a loop that cannot hold).
     mode.publish(&ModeCmd::pointing().stamped(now()));
     progress("pointing");
-    tracing::info!(gate_rad = params.coarse_err_rad, "coarse gate held; confirming fine pointing");
-    let t0 = now();
-    let mut ok_since: Option<Timestamp> = None;
-    loop {
-        if wait(NEXT_CYCLE).await.aborted() {
-            mode.publish(&ModeCmd::safe().stamped(now()));
-            return Outcome::Aborted;
-        }
-        if secs_since(t0) > params.confirm_timeout_s {
-            mode.publish(&ModeCmd::safe().stamped(now()));
-            progress("timeout in pointing confirm");
-            tracing::warn!(budget_s = params.confirm_timeout_s, "pointing confirm timed out; safing");
-            return Outcome::Failed;
-        }
-        match tracking_error(&mut att, &mut gps) {
-            Some(err) if err < params.coarse_err_rad => {
-                let since = *ok_since.get_or_insert(now());
-                if (now().0 - since.0) as f64 / 1e6 >= params.confirm_dwell_s {
-                    break;
-                }
-            }
-            _ => ok_since = None,
-        }
-    }
-    progress("commissioned");
-    tracing::info!("commissioned");
-    Outcome::Completed
+    tracing::info!(
+        gate_rad = params.coarse_err_rad,
+        "coarse gate held; confirming fine pointing"
+    );
+    check(
+        || tracking_error(att, gps).is_some_and(|err| err < params.coarse_err_rad),
+        secs(params.confirm_dwell_s),
+        secs(params.confirm_timeout_s),
+    )
+    .await
+    .or_fail("pointing confirm")
+}
+
+/// A params budget or dwell, which the target spells in seconds.
+fn secs(s: f64) -> Duration {
+    Duration::from_secs_f64(s)
+}
+
+/// The estimated body rate (rad/s), or zero before the first estimate.
+fn rate(att: &mut Input<AttitudeEstimate>) -> f64 {
+    att.latest()
+        .ok()
+        .flatten()
+        .map_or(0.0, |e| e.omega_b.norm().into_buf())
 }
 
 /// The estimated tracking error (rad) to the velocity-vector target — `q̂` against

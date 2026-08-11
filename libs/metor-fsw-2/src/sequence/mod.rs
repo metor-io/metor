@@ -25,6 +25,12 @@
 //! [`NextCycle`]) simply stays pending until the next cycle's poll observes a
 //! later `now`, because the host re-polls unconditionally every cycle.
 //!
+//! On top of those primitives sits [`check`], the condition combinator a body
+//! actually reaches for: *hold this predicate for a dwell, give up after a
+//! budget*. Together with [`Check::or_fail`] it turns a phase into one `?`-able
+//! line, which leaves a body with a single place to publish its safing rather
+//! than one branch per suspension point.
+//!
 //! Port order, ring sizing, and compatibility come from the entry's
 //! descriptor, computed from the fn's parameter types (`crate::handler`);
 //! the [`SlotControlIn`] input and [`SequenceStatus`] output are appended by
@@ -243,6 +249,89 @@ impl Future for NextCycle {
         } else {
             Poll::Pending
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Condition combinators
+// ---------------------------------------------------------------------------
+
+/// How a [`check`] resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Check {
+    /// The predicate held for the whole dwell.
+    Held,
+    /// The budget ran out first.
+    TimedOut,
+    /// The sequence was cancelled.
+    Aborted,
+}
+
+impl Check {
+    /// Whether the predicate held.
+    pub fn held(self) -> bool {
+        matches!(self, Check::Held)
+    }
+
+    /// The `?`-able form: `Ok` when held, otherwise the [`Outcome`] to end on,
+    /// recording a progress line naming the phase that timed out.
+    ///
+    /// This is what lets a body put its safing in one place — the phases read
+    /// `check(..).await.or_fail("warm-up")?` and a single `Err` arm publishes
+    /// the safe command.
+    pub fn or_fail(self, phase: &str) -> Result<(), Outcome> {
+        match self {
+            Check::Held => Ok(()),
+            Check::TimedOut => {
+                progress(format!("timeout in {phase}"));
+                Err(Outcome::Failed)
+            }
+            Check::Aborted => Err(Outcome::Aborted),
+        }
+    }
+}
+
+/// The deadline `budget` from `start`, saturating rather than wrapping so a
+/// caller can spell "no timeout" as a very large [`Duration`].
+fn deadline_at(start: Timestamp, budget: Duration) -> Timestamp {
+    let micros = budget.as_micros().min(i64::MAX as u128) as i64;
+    Timestamp(start.0.saturating_add(micros))
+}
+
+/// Suspend until `pred` has held continuously for `hold`, giving up after
+/// `timeout`.
+///
+/// The predicate runs once per cycle against that cycle's data, starting with
+/// the cycle `check` is called on — so a condition already true resolves
+/// without suspending when `hold` is [`Duration::ZERO`]. A cycle where the
+/// predicate goes false restarts the dwell. Cancellation wins over both, and
+/// the budget is measured from the call, not from when the predicate first
+/// went true.
+///
+/// This is the shape flight sequencing languages converge on (F Prime's
+/// `check … timeout … persist …`, FlightJAS's `CHECK`, VML's `WAIT … TIMEOUT`):
+/// it collapses the usual hand-rolled deadline/dwell bookkeeping into one
+/// suspension point.
+pub async fn check(mut pred: impl FnMut() -> bool, hold: Duration, timeout: Duration) -> Check {
+    let deadline = deadline_at(now(), timeout);
+    let mut held_since: Option<Timestamp> = None;
+    loop {
+        if aborted() {
+            return Check::Aborted;
+        }
+        let t = now();
+        if pred() {
+            let since = *held_since.get_or_insert(t);
+            if t - since >= hold {
+                return Check::Held;
+            }
+        } else {
+            held_since = None;
+        }
+        if t >= deadline {
+            return Check::TimedOut;
+        }
+        cycle().await;
     }
 }
 

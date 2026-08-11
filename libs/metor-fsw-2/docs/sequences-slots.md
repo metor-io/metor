@@ -58,6 +58,7 @@ Task helpers read the current poll's `CycleClock`:
 - `now()` returns the timestamp for this FSW cycle.
 - `wait(duration)` waits for FSW time, not wall time.
 - `cycle()` waits until a later poll has a greater timestamp.
+- `check(pred, hold, timeout)` waits for a condition (see [Conditions](#conditions)).
 - `progress(text)` adds a status line for this cycle.
 - `aborted()` reads the latched cancel flag.
 
@@ -79,6 +80,64 @@ loop {
 ```
 
 A repeated timestamp does not complete `cycle()`. Normal simulated clocks use a nonzero step.
+
+## Conditions
+
+Most task phases have the same shape: hold a condition for a dwell, and give up after a budget. `check` is that shape as one suspension point.
+
+```rust
+use metor_fsw_2::sequence::{check, Check};
+
+let outcome = check(
+    || sensor.latest().is_ok_and(|s| s.is_some_and(|s| s.temp_c > 60.0)),
+    Duration::from_secs(2),   // hold: the condition must stay true this long
+    Duration::from_secs(30),  // timeout: the budget for the whole phase
+).await;
+```
+
+The predicate runs once per cycle, starting with the cycle `check` is called on. A condition that is already true resolves without suspending when the dwell is `Duration::ZERO`. A cycle where the predicate goes false restarts the dwell. The budget runs from the call, not from when the condition first went true, so a dwell that cannot finish inside the budget times out.
+
+`check` returns one of:
+
+- `Check::Held` — the condition held for the dwell
+- `Check::TimedOut` — the budget ran out first
+- `Check::Aborted` — slot cancel arrived, which wins over both
+
+Spell "no timeout" as a very large `Duration`. The deadline saturates rather than overflowing.
+
+### One safing site
+
+`Check::or_fail` maps those three onto `?`. Write the phases in a helper that returns `Result<(), Outcome>` and the task body keeps a single place to safe the vehicle:
+
+```rust
+async fn deploy(mut sensor: Input<SensorState>, mut command: Output<DeployCommand>) -> Outcome {
+    match phases(&mut sensor, &mut command).await {
+        Ok(()) => Outcome::Completed,
+        Err(outcome) => {
+            command.publish(&DeployCommand::safe(now()));
+            outcome
+        }
+    }
+}
+
+async fn phases(
+    sensor: &mut Input<SensorState>,
+    command: &mut Output<DeployCommand>,
+) -> Result<(), Outcome> {
+    progress("warming");
+    check(|| warm(sensor), Duration::from_secs(2), Duration::from_secs(30))
+        .await
+        .or_fail("warm-up")?;
+
+    command.publish(&DeployCommand::release(now()));
+    check(|| released(sensor), Duration::ZERO, Duration::from_secs(5))
+        .await
+        .or_fail("release")?;
+    Ok(())
+}
+```
+
+A timeout adds a `timeout in <phase>` progress line and fails the task. A cancel returns `Outcome::Aborted`. Either way the safing publish happens once, in the `Err` arm, instead of at every suspension point.
 
 ## Wired tasks
 
