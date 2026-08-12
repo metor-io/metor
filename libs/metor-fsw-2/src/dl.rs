@@ -56,7 +56,7 @@ use metor_proto::types::Timestamp;
 use postcard_schema::schema::owned::OwnedNamedType;
 
 use metor_fsw_2_core::SystemDescriptor;
-use metor_fsw_2_core::abi::{self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, PackEntryDesc};
+use metor_fsw_2_core::abi::{self, FSW_ABI_VERSION, FswRing, FswStatus, PackEntryDesc};
 use metor_fsw_2_core::{CyclicSlot, SlotState, StopReason};
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,8 @@ use metor_fsw_2_core::{CyclicSlot, SlotState, StopReason};
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type PackOpenFn = unsafe extern "C" fn() -> *mut c_void;
-type PackDescribeFn = unsafe extern "C" fn(*mut c_void, ByteSink, *mut c_void) -> i32;
+type PackDescribeFn = unsafe extern "C" fn(*mut c_void) -> i64;
+type ManifestPtrFn = unsafe extern "C" fn(*mut c_void) -> *const u8;
 type PackCreateFn = unsafe extern "C" fn(*mut c_void, u32, u32, *const u8, usize) -> *mut c_void;
 type BindInitFn = unsafe extern "C" fn(
     *mut c_void,
@@ -188,17 +189,6 @@ impl PackLib {
 // Open + describe
 // ---------------------------------------------------------------------------
 
-/// The [`ByteSink`] handed to `fsw_pack_describe`; appends the callee's bytes
-/// to the `Vec<u8>` passed as `ctx`. The shared object keeps ownership of its
-/// buffer and the host only copies, so no allocation crosses the boundary.
-extern "C" fn collect_sink(ctx: *mut c_void, buf: *const u8, len: usize) {
-    // SAFETY: `open` passes `&mut Vec<u8>` as `ctx`; `buf`/`len` is the
-    // manifest buffer the shared object owns for the duration of this call.
-    let out = unsafe { &mut *(ctx as *mut Vec<u8>) };
-    let bytes = unsafe { slice::from_raw_parts(buf, len) };
-    out.extend_from_slice(bytes);
-}
-
 /// Resolves a required symbol by its NUL-terminated name, mapping a miss to
 /// [`DlError::MissingSymbol`].
 ///
@@ -267,22 +257,30 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
     }
 
     // --- Describe --------------------------------------------------------
-    // SAFETY: the export is `fsw_pack_describe(pack, sink, ctx) -> i32`.
+    // Two calls: the length, then the base of the bytes the pack keeps alive
+    // until it closes. The host only copies, so no allocation crosses.
+    // SAFETY: the export is `fsw_pack_describe(pack) -> i64`.
     let describe: Symbol<PackDescribeFn> =
         unsafe { resolve(&pack_lib.lib, abi::SYM_PACK_DESCRIBE, "fsw_pack_describe")? };
-    let mut buf: Vec<u8> = Vec::new();
-    // SAFETY: `collect_sink` and `&mut buf` form a matching callback pair;
-    // the shared object calls the sink with a buffer it owns for the call.
-    let rc = unsafe {
-        describe(
-            pack_lib.pack_ptr(),
-            collect_sink,
-            &mut buf as *mut Vec<u8> as *mut c_void,
-        )
+    // SAFETY: the export is `fsw_pack_manifest_ptr(pack) -> *const u8`.
+    let manifest_ptr: Symbol<ManifestPtrFn> = unsafe {
+        resolve(
+            &pack_lib.lib,
+            abi::SYM_PACK_MANIFEST_PTR,
+            "fsw_pack_manifest_ptr",
+        )?
     };
-    if rc != 0 {
-        return Err(DlError::Describe(rc));
+    // SAFETY: a live pack pointer from `fsw_pack_open`.
+    let len = unsafe { describe(pack_lib.pack_ptr()) };
+    let len = usize::try_from(len).map_err(|_| DlError::Describe(-1))?;
+    // SAFETY: same live pack; describe just stashed `len` bytes on it.
+    let base = unsafe { manifest_ptr(pack_lib.pack_ptr()) };
+    if base.is_null() {
+        return Err(DlError::Describe(-1));
     }
+    // SAFETY: the pack owns `len` bytes at `base` until it closes, which the
+    // `PackLib` guard defers past this copy.
+    let buf = unsafe { slice::from_raw_parts(base, len) }.to_vec();
     Ok((pack_lib, buf))
 }
 

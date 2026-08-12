@@ -14,7 +14,8 @@
 //! ----                                     --------
 //! fsw_abi_version             ---------->  FSW_ABI_VERSION (checked first)
 //! fsw_pack_open               ---------->  run_pack_open      (pack() once, opaque pack)
-//! fsw_pack_describe(sink)     ---------->  run_pack_describe  (manifest bytes via ByteSink)
+//! fsw_pack_describe           ---------->  run_pack_describe  (encode manifest, byte length)
+//! fsw_pack_manifest_ptr       ---------->  run_pack_manifest_ptr (bytes the pack still owns)
 //! fsw_pack_create(idx, mount) ---------->  run_pack_create    (per-instance state pointer)
 //! fsw_pack_bind_init(rings)   ---------->  run_pack_bind_init (attach rings, driver init)
 //! fsw_pack_execute(now)       --(loop)-->  run_pack_execute   (one step, FswStatus word)
@@ -39,8 +40,9 @@
 //!   non-zero `describe` code, or [`FswStatus::Panicked`]. An escaping unwind
 //!   would be undefined behavior.
 //! - **Each side frees only what it allocated.** The pack and instance boxes are
-//!   created and dropped inside the same `.so`, and [`run_pack_describe`] hands
-//!   its bytes to a host-owned [`ByteSink`] so the host copies rather than frees.
+//!   created and dropped inside the same `.so`, and the manifest
+//!   [`run_pack_describe`] encodes stays on the pack until [`run_pack_close`],
+//!   so the host copies out of it rather than freeing it.
 //!
 //! Ports bind positionally. The host sends [`FswRing`] handles in the order the
 //! entry's descriptor lists the ports, and [`RawBinder`] walks them in the same
@@ -80,10 +82,12 @@ use crate::descriptor::SystemDescriptor;
 /// their `source`) and carries the implicit log port as a message channel
 /// instead of a frame. Version 10 carries each Postcard port's payload
 /// schema in the descriptor, so the downlink can announce message schemas
-/// to the ground.
+/// to the ground. Version 11 replaces the `describe` host callback with the
+/// two-call `fsw_pack_describe`/`fsw_pack_manifest_ptr` pair, which a wasm
+/// host can drive (a guest cannot be handed a function pointer).
 ///
 /// [`LogEvent`]: crate::LogEvent
-pub const FSW_ABI_VERSION: u32 = 10;
+pub const FSW_ABI_VERSION: u32 = 11;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles
@@ -151,11 +155,6 @@ impl FswStatus {
     }
 }
 
-/// A byte sink is the host callback a describe export feeds its serialized
-/// descriptor through. The system keeps ownership of its buffer and the host
-/// copies out of it, so no allocation crosses the boundary.
-pub type ByteSink = extern "C" fn(ctx: *mut c_void, buf: *const u8, len: usize);
-
 // ---------------------------------------------------------------------------
 // Symbol-name constants
 // ---------------------------------------------------------------------------
@@ -165,9 +164,12 @@ pub const SYM_ABI_VERSION: &[u8] = b"fsw_abi_version\0";
 /// `fsw_pack_open` constructs the crate's [`Pack`](crate::Pack) once and
 /// returns it as an opaque pointer (null if `pack()` panicked).
 pub const SYM_PACK_OPEN: &[u8] = b"fsw_pack_open\0";
-/// `fsw_pack_describe` sends the serialized [`PackManifest`] via a
-/// [`ByteSink`].
+/// `fsw_pack_describe` encodes the [`PackManifest`], stashes the bytes on the
+/// pack, and returns their length (`-1` on failure).
 pub const SYM_PACK_DESCRIBE: &[u8] = b"fsw_pack_describe\0";
+/// `fsw_pack_manifest_ptr` returns the base of the bytes the preceding
+/// `fsw_pack_describe` stashed, which stay valid until `fsw_pack_close`.
+pub const SYM_PACK_MANIFEST_PTR: &[u8] = b"fsw_pack_manifest_ptr\0";
 /// `fsw_pack_create` runs entry `index`'s create phase (decode params, build
 /// state) and boxes the opaque per-instance state.
 pub const SYM_PACK_CREATE: &[u8] = b"fsw_pack_create\0";
@@ -297,6 +299,12 @@ pub struct PackManifest {
 /// constructed once by [`run_pack_open`] and dropped by [`run_pack_close`].
 struct PackHost {
     pack: crate::Pack,
+    /// The encoded manifest [`run_pack_describe`] stashed, read out through
+    /// [`run_pack_manifest_ptr`] and freed with the pack. Keeping it here is
+    /// what lets describe return plain scalars: a wasm host has no way to
+    /// receive a callback, and no way to allocate guest memory before the
+    /// manifest has named the allocator.
+    manifest: Option<Vec<u8>>,
 }
 
 /// The heap allocation behind one instance's opaque state pointer.
@@ -352,24 +360,27 @@ fn mount_from_raw(raw: u32) -> crate::Mount {
 /// its `pack()` fn once and box it. Returns null if construction panics.
 pub fn run_pack_open(pack_fn: fn() -> crate::Pack) -> *mut c_void {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        Box::into_raw(Box::new(PackHost { pack: pack_fn() })) as *mut c_void
+        Box::into_raw(Box::new(PackHost {
+            pack: pack_fn(),
+            manifest: None,
+        })) as *mut c_void
     }));
     outcome.unwrap_or(core::ptr::null_mut())
 }
 
 /// `fsw_pack_describe`: assemble the [`PackManifest`] off the entries,
-/// postcard-encode it, and hand the bytes to the host [`ByteSink`]. Returns
-/// `0` on success, `-1` if the pack pointer is null or anything panics.
+/// postcard-encode it, and stash the bytes on the pack. Returns their length,
+/// or `-1` if the pack pointer is null or anything panics; the bytes
+/// themselves come back through [`run_pack_manifest_ptr`].
 ///
 /// # Safety
-/// `pack` is a live pointer from [`run_pack_open`]; `sink`/`ctx` form a valid
-/// host callback, called once with a buffer the `.so` owns for the call.
-pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_void) -> i32 {
+/// `pack` is a live pointer from [`run_pack_open`].
+pub unsafe fn run_pack_describe(pack: *mut c_void) -> i64 {
     if pack.is_null() {
         return -1;
     }
     // SAFETY: caller asserts `pack` is a live `PackHost` from `run_pack_open`.
-    let host = unsafe { &*(pack as *mut PackHost) };
+    let host = unsafe { &mut *(pack as *mut PackHost) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         // Shared state and capabilities stay on the static registry: a
         // loaded artifact gets neither a cross-FFI state-construction call
@@ -407,11 +418,29 @@ pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_v
     }));
     match outcome {
         Ok(bytes) => {
-            sink(ctx, bytes.as_ptr(), bytes.len());
-            0
+            let len = bytes.len() as i64;
+            host.manifest = Some(bytes);
+            len
         }
         Err(_) => -1,
     }
+}
+
+/// `fsw_pack_manifest_ptr`: the base of the bytes the last
+/// [`run_pack_describe`] stashed, null if describe never succeeded. The pack
+/// owns them until [`run_pack_close`], so the host copies rather than frees.
+///
+/// # Safety
+/// `pack` is a live pointer from [`run_pack_open`].
+pub unsafe fn run_pack_manifest_ptr(pack: *mut c_void) -> *const u8 {
+    if pack.is_null() {
+        return core::ptr::null();
+    }
+    // SAFETY: caller asserts `pack` is a live `PackHost` from `run_pack_open`.
+    let host = unsafe { &*(pack as *mut PackHost) };
+    host.manifest
+        .as_ref()
+        .map_or(core::ptr::null(), |bytes| bytes.as_ptr())
 }
 
 /// `fsw_pack_create`: run entry `index`'s create phase — decode the postcard
@@ -600,7 +629,7 @@ pub unsafe fn run_pack_close(pack: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| drop(host)));
 }
 
-/// Emit the nine `extern "C"` exports of the pack ABI, delegating to the
+/// Emit the `extern "C"` exports of the pack ABI, delegating to the
 /// `run_pack_*` helpers over the crate's `pack()` fn:
 ///
 /// ```ignore
@@ -644,13 +673,16 @@ macro_rules! export_pack {
 
             #[unsafe(no_mangle)]
             #[allow(clippy::not_unsafe_ptr_arg_deref)]
-            pub extern "C" fn fsw_pack_describe(
-                pack: *mut c_void,
-                sink: abi::ByteSink,
-                ctx: *mut c_void,
-            ) -> i32 {
+            pub extern "C" fn fsw_pack_describe(pack: *mut c_void) -> i64 {
                 // SAFETY: the host upholds run_pack_describe's contract.
-                unsafe { abi::run_pack_describe(pack, sink, ctx) }
+                unsafe { abi::run_pack_describe(pack) }
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_manifest_ptr(pack: *mut c_void) -> *const u8 {
+                // SAFETY: the host upholds run_pack_manifest_ptr's contract.
+                unsafe { abi::run_pack_manifest_ptr(pack) }
             }
 
             #[unsafe(no_mangle)]

@@ -27,7 +27,8 @@ use crate::PortSchema;
 
 use crate::abi::{
     FswRing, FswStatus, PackManifest, ROLE_INPUT, ROLE_OUTPUT, run_pack_bind_init, run_pack_close,
-    run_pack_create, run_pack_describe, run_pack_destroy, run_pack_execute, run_pack_open,
+    run_pack_create, run_pack_describe, run_pack_destroy, run_pack_execute,
+    run_pack_manifest_ptr, run_pack_open,
     run_pack_shutdown,
 };
 use crate::sequence::{Outcome, SequenceStatus, SlotControlIn, wait};
@@ -323,27 +324,22 @@ fn pack_create_bounds_and_reuse() {
 // Manifest round-trip through fsw_pack_describe and postcard.
 // ---------------------------------------------------------------------------
 
-extern "C" fn collect_bytes(ctx: *mut c_void, buf: *const u8, len: usize) {
-    // SAFETY: the test passes a `&mut Vec<u8>` as `ctx`, and `buf`/`len` is
-    // the descriptor buffer the export owns for the duration of the call.
-    let sink = unsafe { &mut *(ctx as *mut Vec<u8>) };
-    let bytes = unsafe { slice::from_raw_parts(buf, len) };
-    sink.extend_from_slice(bytes);
+/// Read the manifest back the way a host does: describe for the length, then
+/// copy that many bytes from the pointer the pack still owns.
+fn describe(pack: *mut c_void) -> Vec<u8> {
+    // SAFETY: live pack from `OpenPack::new`.
+    let len = unsafe { run_pack_describe(pack) };
+    assert!(len >= 0, "fsw_pack_describe succeeded");
+    // SAFETY: describe stashed `len` bytes and the pack outlives this copy.
+    let base = unsafe { run_pack_manifest_ptr(pack) };
+    assert!(!base.is_null(), "a described pack hands back its bytes");
+    unsafe { slice::from_raw_parts(base, len as usize) }.to_vec()
 }
 
 #[test]
 fn abi_describe_round_trips() {
     let pack = OpenPack::new();
-    let mut buf: Vec<u8> = Vec::new();
-    // SAFETY: live pack; the sink/ctx pair matches.
-    let rc = unsafe {
-        run_pack_describe(
-            pack.0,
-            collect_bytes,
-            &mut buf as *mut Vec<u8> as *mut c_void,
-        )
-    };
-    assert_eq!(rc, 0, "fsw_pack_describe succeeded");
+    let buf = describe(pack.0);
 
     let manifest: PackManifest = postcard::from_bytes(&buf).expect("manifest decodes");
     assert_eq!(manifest.systems.len(), 4, "one entry per pack registration");
