@@ -66,14 +66,26 @@ Options considered:
   losing the closed-artifact property above.
 - **(b) Add a second, wasm-only describe entry point.** Cheap, but it is exactly
   the bespoke carve-out this codebase avoids; two describe paths would drift.
-- **(c) Replace `ByteSink` with a buffer return, on both paths.** The guest
-  postcard-encodes the manifest as it already does, leaks it as a boxed slice,
-  and returns `(ptr, len)`; the host copies and calls a new
-  `fsw_pack_free_bytes(ptr, len)`. One path, native and wasm.
+- **(c) Replace `ByteSink` with a buffer the pack owns, on both paths.** One
+  path, native and wasm.
 
-**Take (c).** It removes a callback from the ABI rather than adding a special
-case, and the "each side frees only what it allocated" rule is preserved by the
-explicit free. This bumps `FSW_ABI_VERSION` (10 → 11).
+**Take (c)**, in a two-call form:
+
+```
+fsw_pack_describe(pack)     -> i64   // encode + stash; byte length, or -1
+fsw_pack_manifest_ptr(pack) -> *const u8
+```
+
+The obvious single-call shape — return a `repr(C) { ptr, len }` — does not work
+here. Rust returns an aggregate through a caller-supplied out-pointer, so the
+host would need to allocate *guest* memory to receive it, and it cannot: the
+allocator entry point is discovered from the manifest that describe has not
+handed over yet. Splitting the call breaks that circularity, and both halves are
+plain scalars.
+
+The pack keeps the encoded bytes alive until `fsw_pack_close`, so "each side
+frees only what it allocated" still holds without an explicit free. This bumps
+`FSW_ABI_VERSION` (10 → 11).
 
 ### 2. Where the rings live — **inside guest linear memory**
 
