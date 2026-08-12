@@ -1,7 +1,26 @@
 # Phase 1 — running a sequence as a WASM slot occupant
 
-Status: **design settled, implementation in progress.** Phase 0 is done
+Status: **Stage A mostly landed; one blocker open.** Phase 0 is done
 (`spikes/wasm-poll/README.md`) and the core split landed in `89c58b33`.
+
+Done: the describe redesign, the guest allocator, `RingBuffer::create_raw`, and
+the `WasmPack` loader with fuel and trap handling. A wasm pack loads, reports
+its ABI, and its manifest decodes; **fuel exhaustion and sandbox containment
+are both proven by tests**. Open: `fsw_pack_bind_init` traps, so the lifecycle
+test is `#[ignore]`d — see the notes on it in `src/wasm/tests.rs` for what has
+been ruled out.
+
+Two facts about wasm that the rest of this document assumed away, and which the
+next attempt should keep in mind:
+
+- **`catch_unwind` does not work in the guest.** `wasm32-unknown-unknown`
+  aborts rather than unwinds, so the ABI's "a caught panic becomes a status
+  word" rule degrades to "a panic becomes a trap". That is fine for
+  containment — the trap is reported, not propagated — but it means an
+  occupant can never report `FswStatus::Panicked`, only fail.
+- **A guest panic is silent.** The module imports nothing, so a panic message
+  has nowhere to go. Diagnosing anything inside the guest needs a probe export
+  that returns an error discriminant, not inference from the host.
 
 ## Why
 
@@ -137,7 +156,18 @@ Exhaustion is a trap, and a trap is a clean terminal state — never a host cras
 - **Stage A** — the ABI change (1), the allocator entry point (2), and a host
   loader that drives `open → describe → create → bind_init → execute →
   shutdown → destroy → close` against the real `seq-fixture` module, proven by a
-  test that reaches a terminal run state.
+  test that reaches a terminal run state. *Bind is the open blocker.*
+
+  Design point (3) needed one correction in practice: **the guest must format
+  its own ring regions**, via a new `fsw_pack_ring_init`. A region header
+  records the writing target's pointer width, and a wasm guest's `usize` is
+  four bytes where its 64-bit host's is eight, so a host-formatted region is
+  rejected on attach as `ArchMismatch`. This also means the host cannot
+  currently attach to a guest-formatted region either — reading a guest's
+  output rings host-side is unsolved, and Stage B needs it. The likely
+  resolution is narrowing the architecture tag to what actually affects the
+  layout (endianness), since every header field is explicit-width and the
+  capacity-fits-`usize` case is already caught separately as `BadGeometry`.
 - **Stage B** — that loader as a third `OccupantBacking` beside in-process and
   `Artifact`; fuel as a slot knob; trap and exhaustion mapped to
   `SlotState::Stopped` / `Outcome::Failed` with a `SequenceChannelEvent`;

@@ -191,6 +191,9 @@ pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
 pub const SYM_PACK_ALLOC: &[u8] = b"fsw_pack_alloc\0";
 /// `fsw_pack_free` releases a region from `fsw_pack_alloc`.
 pub const SYM_PACK_FREE: &[u8] = b"fsw_pack_free\0";
+/// `fsw_pack_ring_init` formats a ring into a region, on the side whose
+/// pointer width the region header will record.
+pub const SYM_PACK_RING_INIT: &[u8] = b"fsw_pack_ring_init\0";
 
 // ---------------------------------------------------------------------------
 // RawBinder
@@ -664,6 +667,43 @@ pub fn run_pack_alloc(len: usize) -> *mut u8 {
     unsafe { std::alloc::alloc_zeroed(layout) }
 }
 
+/// `fsw_pack_ring_init`: format a ring into a region from [`run_pack_alloc`].
+/// Returns `0`, or `-1` on a bad region or config.
+///
+/// The guest must do this itself rather than let the host format the region
+/// for it. A region header carries an architecture tag encoding the writing
+/// target's pointer width, and a wasm guest's `usize` is four bytes where its
+/// 64-bit host's is eight — so a region formatted across the boundary is
+/// rejected on attach as `ArchMismatch`. Formatting on the side that will
+/// attach keeps the tag honest.
+///
+/// # Safety
+/// `ptr`/`len` name a live region from [`run_pack_alloc`] that nothing else
+/// is reading.
+pub unsafe fn run_pack_ring_init(ptr: *mut u8, len: usize, capacity: u32, max_readers: u32) -> i32 {
+    if ptr.is_null() {
+        return -1;
+    }
+    let cfg = metor_fsw_ring::Config {
+        capacity: capacity as usize,
+        max_readers: max_readers as usize,
+    };
+    // `create_raw` asserts on an invalid config, and an unwind must not cross
+    // the boundary — on wasm it cannot even be caught, since that target
+    // aborts rather than unwinds.
+    let formatted = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: caller asserts a live, exclusively-owned region.
+        unsafe { metor_fsw_ring::RingBuffer::create_raw(ptr, len, cfg) }
+    }));
+    match formatted {
+        Ok(Ok(ring)) => {
+            drop(ring);
+            0
+        }
+        _ => -1,
+    }
+}
+
 /// `fsw_pack_free`: release a region from [`run_pack_alloc`]. Idempotent on
 /// null.
 ///
@@ -798,6 +838,18 @@ macro_rules! export_pack {
             #[unsafe(no_mangle)]
             pub extern "C" fn fsw_pack_alloc(len: usize) -> *mut u8 {
                 abi::run_pack_alloc(len)
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_ring_init(
+                ptr: *mut u8,
+                len: usize,
+                capacity: u32,
+                max_readers: u32,
+            ) -> i32 {
+                // SAFETY: the host upholds run_pack_ring_init's contract.
+                unsafe { abi::run_pack_ring_init(ptr, len, capacity, max_readers) }
             }
 
             #[unsafe(no_mangle)]

@@ -53,6 +53,10 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 
 libloading = { version = "0.8" }
 
+# The wasm occupant backing: a pure-Rust interpreter with fuel metering, so a
+# guest poll is bounded rather than able to stall the cycle (docs/plans/wasm-occupant.md).
+wasmi = { version = "1.1", default-features = false, features = ["std"] }
+
 # errors
 miette = { version = "7.0", features = ["fancy"] }
 thiserror = { version = "2.0" }
@@ -80,6 +84,8 @@ name = "metor-fsw"
 path = "src/bin/metor-fsw.rs"
 
 [dev-dependencies]
+# Assembles the tiny out-of-bounds module the wasm sandbox test needs.
+wat = "1"
 tempfile = "3.13"
 trybuild = "1"
 serde_json = "1.0"

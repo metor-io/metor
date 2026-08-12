@@ -100,6 +100,7 @@ pub mod ir;
 pub mod wiring;
 
 pub mod dl;
+pub mod wasm;
 
 // Cross-process systems need a shared futex (Linux, macOS 14.4+); on other
 // targets the module reduces to a no-op `worker_entry` and `build()` rejects
