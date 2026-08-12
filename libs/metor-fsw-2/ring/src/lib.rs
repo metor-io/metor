@@ -830,6 +830,39 @@ impl RingBuffer {
         }
     }
 
+    /// Format a ring into a region the caller owns, then attach to it.
+    ///
+    /// The counterpart to [`create_in_memory`](Self::create_in_memory) for a
+    /// host that must place the region somewhere specific rather than on its
+    /// own heap — a wasm host puts rings inside the guest's linear memory so
+    /// the guest can attach to them by offset, since a guest cannot follow a
+    /// pointer into the host.
+    ///
+    /// `len` must be at least [`region_len`] for `cfg`, and `base` must be
+    /// 8-aligned; both are checked. The region is left formatted, so a later
+    /// [`attach_raw`](Self::attach_raw) over the same bytes reads the same
+    /// geometry back.
+    ///
+    /// # Safety
+    /// `base..base + len` is a live, exclusively-owned region that outlives
+    /// every [`Writer`] and [`View`] produced here, and nothing else is
+    /// reading it while this formats it.
+    pub unsafe fn create_raw(base: *mut u8, len: usize, cfg: Config) -> Result<Self, AttachError> {
+        if !(base as usize).is_multiple_of(8) {
+            return Err(AttachError::Misaligned);
+        }
+        let (reader_table_offset, data_offset, total) = layout(&cfg);
+        if len < total {
+            return Err(AttachError::TooSmall);
+        }
+        let backing = Backing::raw(base, total);
+        // SAFETY: caller asserts an exclusively-owned live region of `len`
+        // bytes, and `total <= len` was just checked.
+        unsafe { init_region(&backing, &cfg, reader_table_offset, data_offset, total) };
+        // SAFETY: the region was just formatted, so its header is valid.
+        unsafe { Self::attach_raw(base, total) }
+    }
+
     /// Create a new mmap-backed region at `path`, truncating any existing
     /// file.
     #[cfg(feature = "mmap")]
@@ -1062,6 +1095,14 @@ impl RingBuffer {
             .filter(|&s| self.inner.slot_cursor(s).load(Relaxed) != FREE_SLOT)
             .count()
     }
+}
+
+/// The number of bytes a ring with `cfg` occupies, for a caller that has to
+/// allocate the region itself before [`RingBuffer::create_raw`] formats it.
+///
+/// Panics on the same invalid configs [`RingBuffer::create_in_memory`] does.
+pub fn region_len(cfg: &Config) -> usize {
+    layout(cfg).2
 }
 
 /// Compute `(reader_table_offset, data_offset, total_size)` and validate the
