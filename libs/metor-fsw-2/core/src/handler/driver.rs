@@ -88,7 +88,7 @@ where
     fn init(&mut self) {}
 
     fn step(&mut self, now: Timestamp) -> StepStatus {
-        let start = std::time::Instant::now();
+        let start = crate::clock::ExecTimer::start();
         {
             let Self {
                 state,
@@ -106,7 +106,7 @@ where
                 execute.call(state, items);
             });
         }
-        let micros = start.elapsed().as_micros() as u64;
+        let micros = start.elapsed_micros();
         if <F::Params as ExecParamSet>::take_dropped(&mut self.ports) > 0 {
             self.health.error("publish_dropped");
         }
@@ -153,13 +153,13 @@ impl FutureDriver {
     fn poll_once(&mut self, now: Timestamp) -> core::task::Poll<crate::sequence::Outcome> {
         use core::task::{Context, Waker};
         self.clock.now.set(now);
-        let start = std::time::Instant::now();
+        let start = crate::clock::ExecTimer::start();
         let poll = crate::sequence::with_clock(&self.clock, || {
             self.future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
         });
-        let micros = start.elapsed().as_micros() as u64;
+        let micros = start.elapsed_micros();
         if self.drops.swap(0, core::sync::atomic::Ordering::Relaxed) > 0 {
             self.health.error("publish_dropped");
         }

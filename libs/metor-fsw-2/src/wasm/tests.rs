@@ -78,38 +78,18 @@ fn wasm_pack_loads_and_describes() {
 /// The full lifecycle: create the `waiter` entry as a slot occupant, bind its
 /// ports to rings living inside guest memory, and cycle it until it finishes.
 ///
-/// **Ignored: `bind_init` traps and the cause is not yet found.** What is
-/// known, so the next attempt does not repeat the search:
+/// `waiter` declares no user ports, so its contract is the mount-appended
+/// slot-control input plus the status, health, and log outputs every occupant
+/// carries.
 ///
-/// - It is not the port counts. The descriptor carries 0 inputs and 2 outputs
-///   (health, log); the occupant mount appends the control input and the
-///   status output, giving the 1-in/3-out contract
-///   `abi::tests::seq_abi_runs_to_done` binds natively.
-/// - It is not the occupant tail. The same entry at the *wired* mount, whose
-///   contract is exactly the descriptor, traps identically.
-/// - It is not the region geometry. `HEADER_SIZE` and `READER_SLOT_SIZE` are
-///   gated on `ring_loom`, not on the target, so host and guest compute the
-///   same `region_len`.
-/// - It is not the regions. `arch_tag` no longer encodes pointer width, so the
-///   host can attach to a guest-formatted region; `add_ring` now verifies
-///   exactly that before returning, and every ring attaches cleanly.
-/// - It is not the port walk. Binding with *eight* rings on each side — far
-///   more than the contract asks for — traps identically, so `RawBinder`
-///   running out of handles is not the panic.
-///
-/// What is left, by elimination, is inside `run_pack_bind_init` after the
-/// binder is built: either the `pending.take().expect(...)` (i.e. the guest's
-/// `create` did not leave a pending entry, despite returning a non-null state)
-/// or the driver's own `init()`.
-///
-/// The search is slow because a guest panic is invisible: the module imports
-/// nothing, so a panic message has nowhere to go, and `wasm32-unknown-unknown`
-/// aborts rather than unwinds, so the `catch_unwind` in `run_pack_bind_init`
-/// cannot convert it into a status word. The next step is a guest-side probe
-/// that attaches a region and returns the `AttachError` discriminant, rather
-/// than more inference from the host side.
+/// Two things had to be fixed on the guest side before this could pass, both
+/// the same shape: `wasm32-unknown-unknown` has no operating system, and the
+/// ring and driver reached for one. Claiming a ring slot stamped
+/// `std::process::id`, and every execute timed itself with `Instant::now`;
+/// both are unsupported on that target and panic, which surfaces only as an
+/// opaque trap because the module imports nothing and the target aborts rather
+/// than unwinds, so `catch_unwind` cannot turn the panic into a status word.
 #[test]
-#[ignore = "bind_init traps; see the doc comment for what has been ruled out"]
 fn wasm_occupant_runs_to_a_terminal_state() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
     let index = entry(&pack, "waiter");
@@ -238,5 +218,6 @@ fn entry(pack: &WasmPack, name: &str) -> u32 {
         .position(|s| s.descriptor.name == name)
         .unwrap_or_else(|| panic!("no `{name}` entry")) as u32
 }
+
 
 

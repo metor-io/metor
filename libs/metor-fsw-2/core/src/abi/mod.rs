@@ -194,6 +194,9 @@ pub const SYM_PACK_FREE: &[u8] = b"fsw_pack_free\0";
 /// `fsw_pack_ring_init` formats a ring into a region, on the side whose
 /// pointer width the region header will record.
 pub const SYM_PACK_RING_INIT: &[u8] = b"fsw_pack_ring_init\0";
+/// `fsw_pack_set_now` publishes a cycle timestamp on the callee's ambient
+/// clock, so `bind`/`init` need not fall back to wall time.
+pub const SYM_PACK_SET_NOW: &[u8] = b"fsw_pack_set_now\0";
 
 // ---------------------------------------------------------------------------
 // RawBinder
@@ -667,6 +670,21 @@ pub fn run_pack_alloc(len: usize) -> *mut u8 {
     unsafe { std::alloc::alloc_zeroed(layout) }
 }
 
+/// `fsw_pack_set_now`: publish a cycle timestamp on the callee's own copy of
+/// the ambient clock, before a phase that would otherwise fall back to wall
+/// time.
+///
+/// A linkage unit's clock is unset until the first `fsw_pack_execute`
+/// republishes it, so anything stamped during `bind`/`init` — a `LogEvent`
+/// from the forward layer, say — reaches for [`Timestamp::now`]. That is
+/// merely inaccurate in a `.so` (wall time instead of the cycle's) and fatal
+/// in wasm, where `wasm32-unknown-unknown` has no wall clock at all and
+/// `SystemTime::now` panics. Calling this first gives init the same time axis
+/// every later cycle uses.
+pub fn run_pack_set_now(now: u64) {
+    crate::clock::set_now(Timestamp(now as i64));
+}
+
 /// `fsw_pack_ring_init`: format a ring into a region from [`run_pack_alloc`].
 /// Returns `0`, or `-1` on a bad region or config.
 ///
@@ -838,6 +856,11 @@ macro_rules! export_pack {
             #[unsafe(no_mangle)]
             pub extern "C" fn fsw_pack_alloc(len: usize) -> *mut u8 {
                 abi::run_pack_alloc(len)
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn fsw_pack_set_now(now: u64) {
+                abi::run_pack_set_now(now)
             }
 
             #[unsafe(no_mangle)]

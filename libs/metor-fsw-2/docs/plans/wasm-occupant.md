@@ -1,26 +1,37 @@
 # Phase 1 — running a sequence as a WASM slot occupant
 
-Status: **Stage A mostly landed; one blocker open.** Phase 0 is done
-(`spikes/wasm-poll/README.md`) and the core split landed in `89c58b33`.
+Status: **Stage A done.** Phase 0 is done (`spikes/wasm-poll/README.md`) and
+the core split landed in `89c58b33`.
 
-Done: the describe redesign, the guest allocator, `RingBuffer::create_raw`, and
-the `WasmPack` loader with fuel and trap handling. A wasm pack loads, reports
-its ABI, and its manifest decodes; **fuel exhaustion and sandbox containment
-are both proven by tests**. Open: `fsw_pack_bind_init` traps, so the lifecycle
-test is `#[ignore]`d — see the notes on it in `src/wasm/tests.rs` for what has
-been ruled out.
+A real sequence pack, compiled to wasm, now runs the whole ABI lifecycle to a
+terminal state under an interpreter, and **fuel exhaustion and sandbox
+containment are both proven by tests** — the two properties the substrate
+exists for. Stage B (the third `OccupantBacking`, the slot knob, slot tests) is
+next.
 
-Two facts about wasm that the rest of this document assumed away, and which the
-next attempt should keep in mind:
+### What wasm actually cost, beyond the design below
 
-- **`catch_unwind` does not work in the guest.** `wasm32-unknown-unknown`
-  aborts rather than unwinds, so the ABI's "a caught panic becomes a status
-  word" rule degrades to "a panic becomes a trap". That is fine for
-  containment — the trap is reported, not propagated — but it means an
-  occupant can never report `FswStatus::Panicked`, only fail.
-- **A guest panic is silent.** The module imports nothing, so a panic message
-  has nowhere to go. Diagnosing anything inside the guest needs a probe export
-  that returns an error discriminant, not inference from the host.
+Three guest-side assumptions had to go, all the same shape: the target has no
+operating system, and the framework quietly assumed one.
+
+- **`std::process::id`** stamps a ring's writer and reader claims
+  (`owner_tag`). Unsupported on wasm, so *every* port bind panicked. A guest is
+  not a process anyway — its regions live and die with the instance, so there
+  is no peer to outlive them and nothing to reclaim.
+- **`Instant::now`** timed every execute for `SystemHealth`. Unsupported, so
+  every cycle panicked. A guest now reports zero; a sandboxed occupant's real
+  cost is better read from its fuel draw, which the host meters anyway.
+- **`Timestamp::now`** is the fallback when the ambient clock is unset, which
+  it is during `bind`/`init`. Merely inaccurate in a `.so`, fatal in wasm.
+  Hence `fsw_pack_set_now`, which the host calls before bind.
+
+None of these were visible as themselves. A guest panic surfaces only as
+`unreachable`: the module imports nothing, so a panic message has nowhere to
+go, and `wasm32-unknown-unknown` aborts rather than unwinds, so the
+`catch_unwind` in `run_pack_bind_init` cannot convert it into a status word.
+Diagnosis was by elimination — bisecting on mount kind, on entry, and on
+oversupplied rings — and **that is the technique to reach for first next time**,
+not host-side inference.
 
 ## Why
 

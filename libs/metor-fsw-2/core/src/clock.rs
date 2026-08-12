@@ -45,3 +45,37 @@ fn now() -> Option<Timestamp> {
 pub fn now_or_wall() -> Timestamp {
     now().unwrap_or_else(Timestamp::now)
 }
+
+/// A stopwatch for the per-execute timing that feeds
+/// [`SystemHealth`](crate::SystemHealth)'s `last_execute_micros`.
+///
+/// `wasm32-unknown-unknown` has no monotonic clock — `Instant::now` is
+/// unsupported there and panics — so a guest reports zero rather than trapping
+/// mid-cycle. The measurement is diagnostic, and a sandboxed occupant's real
+/// cost is better read from its fuel draw anyway, which the host meters.
+pub(crate) struct ExecTimer {
+    #[cfg(not(target_arch = "wasm32"))]
+    start: std::time::Instant,
+}
+
+impl ExecTimer {
+    /// Start timing an execute.
+    pub(crate) fn start() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            start: std::time::Instant::now(),
+        }
+    }
+
+    /// Microseconds since [`start`](Self::start); always zero on wasm.
+    pub(crate) fn elapsed_micros(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.start.elapsed().as_micros() as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
+}

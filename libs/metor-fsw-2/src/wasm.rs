@@ -137,19 +137,27 @@ pub struct GuestRing {
     pub role: u8,
 }
 
+/// `fsw_pack_create`'s signature: `(pack, index, mount, params, params_len)`.
+type CreateFn = TypedFunc<(i32, i32, i32, i32, i32), i32>;
+/// `fsw_pack_bind_init`'s: `(state, inputs, n_in, outputs, n_out, name, len)`.
+type BindInitFn = TypedFunc<(i32, i32, i32, i32, i32, i32, i32), ()>;
+/// `fsw_pack_ring_init`'s: `(ptr, len, capacity, max_readers)`.
+type RingInitFn = TypedFunc<(i32, i32, i32, i32), i32>;
+
 /// The `fsw_pack_*` exports, resolved once at load.
 struct Exports {
     open: TypedFunc<(), i32>,
     describe: TypedFunc<i32, i64>,
     manifest_ptr: TypedFunc<i32, i32>,
-    create: TypedFunc<(i32, i32, i32, i32, i32), i32>,
-    bind_init: TypedFunc<(i32, i32, i32, i32, i32, i32, i32), ()>,
+    create: CreateFn,
+    bind_init: BindInitFn,
     execute: TypedFunc<(i32, i64), i32>,
     shutdown: TypedFunc<i32, ()>,
     destroy: TypedFunc<i32, ()>,
     close: TypedFunc<i32, ()>,
     alloc: TypedFunc<i32, i32>,
-    ring_init: TypedFunc<(i32, i32, i32, i32), i32>,
+    ring_init: RingInitFn,
+    set_now: TypedFunc<i64, ()>,
 }
 
 /// A loaded wasm pack: the instantiated module plus its opened pack pointer
@@ -213,6 +221,7 @@ impl WasmPack {
             close: typed(&instance, &store, "fsw_pack_close")?,
             alloc: typed(&instance, &store, "fsw_pack_alloc")?,
             ring_init: typed(&instance, &store, "fsw_pack_ring_init")?,
+            set_now: typed(&instance, &store, "fsw_pack_set_now")?,
         };
 
         let mut this = Self {
@@ -319,6 +328,17 @@ impl WasmPack {
         Ok(GuestRing { offset, len, role })
     }
 
+    /// Publish a cycle timestamp on the guest's ambient clock.
+    ///
+    /// Required before [`bind_init`](Self::bind_init): the guest's clock is
+    /// unset until the first `execute` republishes it, and anything init
+    /// stamps would otherwise reach for wall time — which
+    /// `wasm32-unknown-unknown` does not have, so `SystemTime::now` panics
+    /// and the guest traps.
+    pub fn set_now(&mut self, now: u64) -> Result<(), WasmError> {
+        self.call(|e| e.set_now, now as i64)
+    }
+
     /// Bind `state`'s ports to `rings` and run its init phase.
     ///
     /// The `FswRing` array is itself staged in guest memory, since the guest
@@ -331,6 +351,8 @@ impl WasmPack {
         outputs: &[GuestRing],
         name: &str,
     ) -> Result<(), WasmError> {
+        // Give init the cycle's time axis before it can reach for wall time.
+        self.set_now(0)?;
         let inputs_at = self.stage_rings(inputs)?;
         let outputs_at = self.stage_rings(outputs)?;
         let name_at = if name.is_empty() {

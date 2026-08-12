@@ -247,9 +247,19 @@ const fn arch_tag() -> u64 {
 /// alias two claimants across a pid wrap-around, so reclaim promptly after
 /// reaping a dead peer, before spawning replacements.
 #[inline]
-#[cfg(not(kani))]
+#[cfg(all(not(kani), not(target_arch = "wasm32")))]
 fn owner_tag() -> u64 {
     std::process::id() as u64
+}
+
+/// Wasm has no process id — `std::process::id` is unsupported there and
+/// panics — and a guest is not a process anyway: its regions live and die with
+/// the instance, so there is no peer to outlive them and nothing to reclaim.
+/// A fixed non-zero tag keeps the "never `0`" invariant.
+#[inline]
+#[cfg(all(not(kani), target_arch = "wasm32"))]
+fn owner_tag() -> u64 {
+    1
 }
 
 /// Kani has no process to ask, and the harnesses never depend on the tag's
@@ -866,9 +876,11 @@ impl RingBuffer {
         if len < total {
             return Err(AttachError::TooSmall);
         }
-        let backing = Backing::raw(base, total);
-        // SAFETY: caller asserts an exclusively-owned live region of `len`
-        // bytes, and `total <= len` was just checked.
+        // SAFETY: caller asserts a live region of at least `len` bytes, and
+        // `total <= len` was just checked.
+        let backing = unsafe { Backing::raw(base, total) };
+        // SAFETY: same region, exclusively owned by the caller, and nothing
+        // else observes it until this returns.
         unsafe { init_region(&backing, &cfg, reader_table_offset, data_offset, total) };
         // SAFETY: the region was just formatted, so its header is valid.
         unsafe { Self::attach_raw(base, total) }

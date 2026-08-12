@@ -392,9 +392,9 @@ where
     /// Run one cycle: time `execute`, then publish health. `now` is threaded
     /// from the cycle loop so every system in a cycle shares one timestamp.
     pub fn step(&mut self, now: Timestamp) {
-        let start = std::time::Instant::now();
+        let start = crate::clock::ExecTimer::start();
         self.system.execute(now, &mut self.input, &mut self.output);
-        let micros = start.elapsed().as_micros() as u64;
+        let micros = start.elapsed_micros();
         // Publish is infallible, so a dropped write can only surface here: a
         // nonzero sum means an undersized ring or a backpressuring reader.
         if self.output.take_dropped() > 0 {
