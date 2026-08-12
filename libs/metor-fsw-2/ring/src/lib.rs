@@ -222,12 +222,23 @@ const FREE_SLOT: u64 = u64::MAX;
 /// `high_water_mark` value meaning no wrap gap is pending.
 const HWM_NONE: u64 = u64::MAX;
 
-/// A tag identifying the architecture that wrote a region. The byte pattern
-/// of this native `u64` differs across endianness and the low word carries
-/// the pointer width, so comparing tags on attach rejects a region written by
-/// an incompatible target.
+/// A tag identifying the architecture that wrote a region: the byte pattern of
+/// this native `u64` differs across endianness, so comparing tags on attach
+/// rejects a region written by an incompatible target.
+///
+/// Pointer width is deliberately *not* encoded. Nothing in the region format
+/// is `usize`-shaped — every header, control, and reader-slot field is an
+/// explicit width — and the one place pointer width genuinely matters, a
+/// capacity too large for the attaching target's `usize`, is already caught
+/// as [`AttachError::BadGeometry`], which is both narrower and more accurate
+/// than refusing the region outright.
+///
+/// Encoding it would therefore reject a compatible region for no reason, and
+/// the case is not hypothetical: a wasm guest's `usize` is four bytes where
+/// its 64-bit host's is eight, and the two share ring regions in the guest's
+/// linear memory (`metor_fsw_2::wasm`).
 const fn arch_tag() -> u64 {
-    ((0x0102_0304u32 as u64) << 32) | (core::mem::size_of::<usize>() as u64)
+    (0x0102_0304u32 as u64) << 32
 }
 
 /// The tag stamped on writer and reader claims: the claiming process's id,

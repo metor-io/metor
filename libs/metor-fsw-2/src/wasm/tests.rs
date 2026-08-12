@@ -90,11 +90,17 @@ fn wasm_pack_loads_and_describes() {
 /// - It is not the region geometry. `HEADER_SIZE` and `READER_SLOT_SIZE` are
 ///   gated on `ring_loom`, not on the target, so host and guest compute the
 ///   same `region_len`.
-/// - It *was* partly the architecture tag: a region carries the writing
-///   target's pointer width, so a host-formatted region is rejected by a
-///   wasm32 guest as `ArchMismatch`. Hence `fsw_pack_ring_init` — the guest
-///   now formats its own regions, and `add_ring` no longer fails, but bind
-///   still traps afterwards.
+/// - It is not the regions. `arch_tag` no longer encodes pointer width, so the
+///   host can attach to a guest-formatted region; `add_ring` now verifies
+///   exactly that before returning, and every ring attaches cleanly.
+/// - It is not the port walk. Binding with *eight* rings on each side — far
+///   more than the contract asks for — traps identically, so `RawBinder`
+///   running out of handles is not the panic.
+///
+/// What is left, by elimination, is inside `run_pack_bind_init` after the
+/// binder is built: either the `pending.take().expect(...)` (i.e. the guest's
+/// `create` did not leave a pending entry, despite returning a non-null state)
+/// or the driver's own `init()`.
 ///
 /// The search is slow because a guest panic is invisible: the module imports
 /// nothing, so a panic message has nowhere to go, and `wasm32-unknown-unknown`
@@ -232,4 +238,5 @@ fn entry(pack: &WasmPack, name: &str) -> u32 {
         .position(|s| s.descriptor.name == name)
         .unwrap_or_else(|| panic!("no `{name}` entry")) as u32
 }
+
 

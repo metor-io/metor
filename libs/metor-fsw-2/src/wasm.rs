@@ -54,7 +54,7 @@
 //! instead of propagating.
 
 use metor_fsw_2_core::abi::{FSW_ABI_VERSION, FswStatus, PackManifest};
-use metor_fsw_ring::{Config, region_len};
+use metor_fsw_ring::{Config, RingBuffer, region_len};
 use wasmi::{Config as WasmConfig, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
 /// What can go wrong loading or driving a wasm pack.
@@ -100,6 +100,9 @@ pub enum WasmError {
         /// Length requested.
         len: usize,
     },
+    /// A guest-formatted region did not attach.
+    #[error("guest ring region did not attach: {0}")]
+    Ring(metor_fsw_ring::AttachError),
     /// The guest refused to format a ring into the region.
     #[error("guest could not format a ring at {offset} ({len} bytes)")]
     RingInit {
@@ -300,6 +303,18 @@ impl WasmPack {
         )?;
         if rc != 0 {
             return Err(WasmError::RingInit { offset, len });
+        }
+        // The host and guest now agree on the region format, so verify the
+        // region attaches here rather than letting a bad one surface as an
+        // opaque guest trap at bind.
+        let slice = self.slice_mut(offset, len)?;
+        let base = slice.as_mut_ptr();
+        // SAFETY: the guest just formatted this region and nothing is reading
+        // it; the handle is dropped before this returns.
+        let probe = unsafe { RingBuffer::attach_raw(base, len) };
+        match probe {
+            Ok(ring) => drop(ring),
+            Err(e) => return Err(WasmError::Ring(e)),
         }
         Ok(GuestRing { offset, len, role })
     }
