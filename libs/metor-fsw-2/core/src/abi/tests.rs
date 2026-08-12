@@ -27,7 +27,8 @@ use crate::PortSchema;
 
 use crate::abi::{
     FswRing, FswStatus, PackManifest, ROLE_INPUT, ROLE_OUTPUT, run_pack_bind_init, run_pack_close,
-    run_pack_create, run_pack_describe, run_pack_destroy, run_pack_execute,
+    RING_ALIGN, run_pack_alloc, run_pack_create, run_pack_describe, run_pack_destroy,
+    run_pack_execute, run_pack_free,
     run_pack_manifest_ptr, run_pack_open,
     run_pack_shutdown,
 };
@@ -898,4 +899,39 @@ fn port_desc_round_trips_both_arms() {
         &rd,
         &PortDesc::of::<TickOut>()
     ));
+}
+
+// ---------------------------------------------------------------------------
+// The allocator entry points a wasm host places ring regions through.
+// ---------------------------------------------------------------------------
+
+/// A region has to be attachable as a ring, so it must come back 8-aligned and
+/// zeroed. `attach_raw` rejects a misaligned base outright.
+#[test]
+fn alloc_is_ring_aligned_and_zeroed() {
+    let len = 4096;
+    let p = run_pack_alloc(len);
+    assert!(!p.is_null(), "a plain allocation succeeds");
+    assert!(
+        (p as usize).is_multiple_of(RING_ALIGN),
+        "attach_raw rejects a base that is not {RING_ALIGN}-aligned"
+    );
+    // SAFETY: `run_pack_alloc` just handed back `len` readable bytes.
+    let bytes = unsafe { slice::from_raw_parts(p, len) };
+    assert!(bytes.iter().all(|&b| b == 0), "regions start zeroed");
+    // SAFETY: same pointer and length, used once.
+    unsafe { run_pack_free(p, len) };
+}
+
+/// The degenerate cases are null rather than a panic, because they cross an
+/// `extern "C"` boundary where an unwind would be undefined behavior.
+#[test]
+fn alloc_rejects_a_zero_length() {
+    assert!(run_pack_alloc(0).is_null());
+    // Freeing null, or a zero length, is a no-op rather than a fault.
+    // SAFETY: both are the documented idempotent cases.
+    unsafe {
+        run_pack_free(core::ptr::null_mut(), 0);
+        run_pack_free(core::ptr::null_mut(), 16);
+    }
 }

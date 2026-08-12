@@ -22,6 +22,7 @@
 //! fsw_pack_shutdown           ---------->  run_pack_shutdown
 //! fsw_pack_destroy            ---------->  run_pack_destroy   (drop the instance state)
 //! fsw_pack_close              ---------->  run_pack_close     (drop the Pack, last)
+//! fsw_pack_alloc/free         ---------->  run_pack_alloc/free (ring regions, host-driven)
 //! ```
 //!
 //! `create`..`destroy` repeat per instance (two `system` nodes over one entry,
@@ -185,6 +186,11 @@ pub const SYM_PACK_DESTROY: &[u8] = b"fsw_pack_destroy\0";
 /// `fsw_pack_close` drops the [`Pack`](crate::Pack) itself, after every
 /// instance state has been destroyed.
 pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
+/// `fsw_pack_alloc` hands out ring-aligned bytes from the pack's allocator,
+/// so a wasm host can place ring regions inside guest linear memory.
+pub const SYM_PACK_ALLOC: &[u8] = b"fsw_pack_alloc\0";
+/// `fsw_pack_free` releases a region from `fsw_pack_alloc`.
+pub const SYM_PACK_FREE: &[u8] = b"fsw_pack_free\0";
 
 // ---------------------------------------------------------------------------
 // RawBinder
@@ -629,6 +635,52 @@ pub unsafe fn run_pack_close(pack: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| drop(host)));
 }
 
+/// The alignment every [`RING_ALIGN`]-allocated region carries.
+///
+/// [`RingBuffer::attach_raw`] rejects a base that is not 8-aligned, so the
+/// allocator entry points promise at least that.
+///
+/// [`RingBuffer::attach_raw`]: metor_fsw_ring::RingBuffer::attach_raw
+pub const RING_ALIGN: usize = 8;
+
+/// `fsw_pack_alloc`: hand the host `len` bytes out of the pack's own
+/// allocator, aligned for a ring region. Null on a zero length, a bad layout,
+/// or allocation failure.
+///
+/// A wasm host needs this because it cannot safely carve regions out of guest
+/// memory itself: Rust's wasm allocator discovers its heap through
+/// `memory.size`, so pages the host grows behind its back can later be handed
+/// out again by the guest's own allocator. Asking the guest to allocate keeps
+/// ownership on the side that manages the heap, and keeps "each side frees
+/// only what it allocated" true across the boundary.
+pub fn run_pack_alloc(len: usize) -> *mut u8 {
+    if len == 0 {
+        return core::ptr::null_mut();
+    }
+    let Ok(layout) = std::alloc::Layout::from_size_align(len, RING_ALIGN) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `layout` is non-zero-sized and well-formed.
+    unsafe { std::alloc::alloc_zeroed(layout) }
+}
+
+/// `fsw_pack_free`: release a region from [`run_pack_alloc`]. Idempotent on
+/// null.
+///
+/// # Safety
+/// `ptr` came from [`run_pack_alloc`] with this same `len` and is not used
+/// afterward.
+pub unsafe fn run_pack_free(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let Ok(layout) = std::alloc::Layout::from_size_align(len, RING_ALIGN) else {
+        return;
+    };
+    // SAFETY: caller asserts `ptr`/`len` came from `run_pack_alloc`.
+    unsafe { std::alloc::dealloc(ptr, layout) }
+}
+
 /// Emit the `extern "C"` exports of the pack ABI, delegating to the
 /// `run_pack_*` helpers over the crate's `pack()` fn:
 ///
@@ -741,6 +793,18 @@ macro_rules! export_pack {
             pub extern "C" fn fsw_pack_close(pack: *mut c_void) {
                 // SAFETY: the host upholds run_pack_close's contract.
                 unsafe { abi::run_pack_close(pack) }
+            }
+
+            #[unsafe(no_mangle)]
+            pub extern "C" fn fsw_pack_alloc(len: usize) -> *mut u8 {
+                abi::run_pack_alloc(len)
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_free(ptr: *mut u8, len: usize) {
+                // SAFETY: the host upholds run_pack_free's contract.
+                unsafe { abi::run_pack_free(ptr, len) }
             }
         };
     };
