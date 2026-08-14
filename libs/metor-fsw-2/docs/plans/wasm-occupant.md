@@ -183,27 +183,43 @@ its backing buffer on `memory.grow`, and a guest's allocator will grow if it
 needs heap — a sequence calling `progress()` allocates a `String`, so this is
 not hypothetical.
 
-Two ways forward, both requiring that memory be pinned:
+### Can a guest be given host memory? No — and the asymmetry decides this
 
-- **(a) Copy bridge.** The coordinator keeps its own host rings; each cycle the
+A wasm guest can address only its own linear memory; nothing maps host memory
+into it. The privilege runs one way: the *host* can read and write the guest's
+entire memory (`Memory::data_mut`), which is how `WasmPack` stages rings and
+reads the manifest already.
+
+So the two shapes are:
+
+- **(a) Copy bridge.** The coordinator keeps its own host rings. Each cycle the
   host drains new records from a host input ring into the guest's, and from the
-  guest's output rings back out. Persistent handles on both sides. Costs a copy
-  per record per cycle, and duplicates every ring.
-- **(b) The slot's rings *are* guest regions.** No host rings and no copy: the
-  coordinator's producers and consumers attach directly to regions inside the
-  guest's memory. This is only legal because `arch_tag` no longer encodes
-  pointer width (`a7a28986`), and it makes the guest's linear memory the shared
-  medium in the literal sense the design intended.
+  guest's output rings back out. Persistent handles both sides; a copy per
+  record; every ring duplicated.
+- **(b) The slot's rings *are* guest regions.** The guest allocates them and
+  attaches normally; the host attaches to the same bytes through the backing
+  buffer, and coordinator-side systems read and write them directly. No copy.
+  Legal only because `arch_tag` stopped encoding pointer width (`a7a28986`).
 
-**(b) is the better shape** — it is the one that keeps "the ring is the shared
-medium" true rather than nearly true — but both stand or fall on pinning. The
-honest way to pin is to give a pack module a large enough initial memory that
-its allocator never grows (a link argument on pack crates, declared rather than
-hoped for), and to have the host verify at bind that the memory size it
-recorded still matches before trusting a handle.
+**Take (a).** (b) is the more elegant shape and was the initial preference, but
+it puts the rings *inside the sandbox*: a buggy or hostile guest can corrupt
+headers and cursors that native systems are consuming. Reads stay bounds-checked
+against the region, so it is not host memory-unsafe, but data integrity is gone
+and a corrupted cursor feeds garbage downstream. That trades away the property
+the substrate exists for — a fault contained to the faulting occupant. Under (a)
+the coordinator's rings are host-owned, a guest can corrupt only its own copy,
+and the host validates at the copy boundary.
 
-This is a decision with a build-flag consequence for every pack, so it wants a
-deliberate choice rather than an inference.
+The same objection sinks the variant where the host creates a `Memory` and the
+module imports it: still a guest-addressable memory, same exposure, and it costs
+the closed-artifact property (the module currently imports nothing).
+
+The copy is affordable. Phase 0 measured marshalling at 7 ns against a 2,873 ns
+cycle.
+
+Either way the guard from `dfde295f` is required, since (a)'s guest-side handles
+must persist too. A pack built with a large enough initial memory would never
+trip it, which is the hardening to reach for if growth shows up in practice.
 
 ## Staging
 
