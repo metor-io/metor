@@ -221,3 +221,42 @@ fn entry(pack: &WasmPack, name: &str) -> u32 {
 
 
 
+
+/// The guard that makes holding a handle over guest memory sound at all.
+///
+/// A host handle into the interpreter's backing buffer dangles the moment the
+/// guest grows its memory, so the host records the size once the regions exist
+/// and refuses to trust a handle after that changes. Allocating enough to
+/// force growth must be *noticed*, not silently tolerated — the alternative to
+/// noticing is reading freed memory.
+#[test]
+fn growing_guest_memory_invalidates_held_handles() {
+    let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    pack.pin_memory();
+    pack.check_memory_stable().expect("stable before any growth");
+
+    // Ask the guest's own allocator for far more than a fresh module has
+    // spare, so its allocator must grow the linear memory.
+    let before = pack.memory_len();
+    let mut asked = 0usize;
+    for _ in 0..64 {
+        asked += 1 << 20;
+        pack.alloc_for_test(1 << 20).expect("guest allocates");
+        if pack.memory_len() != before {
+            break;
+        }
+    }
+    assert_ne!(
+        pack.memory_len(),
+        before,
+        "allocating {asked} bytes should have grown a fresh module's memory"
+    );
+
+    let err = pack
+        .check_memory_stable()
+        .expect_err("growth must invalidate held handles");
+    assert!(
+        matches!(err, WasmError::MemoryMoved { .. }),
+        "expected MemoryMoved, got {err:?}"
+    );
+}

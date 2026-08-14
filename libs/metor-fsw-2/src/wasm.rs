@@ -114,6 +114,15 @@ pub enum WasmError {
     /// The guest trapped — including exhausting its fuel budget.
     #[error("wasm trap: {0}")]
     Trap(String),
+    /// The guest's linear memory grew, so any handle the host holds over a
+    /// region inside it may now dangle.
+    #[error("guest memory moved ({was} -> {now} bytes); ring handles are stale")]
+    MemoryMoved {
+        /// Size recorded when the handles were taken.
+        was: usize,
+        /// Size observed now.
+        now: usize,
+    },
 }
 
 /// Whether a [`WasmError::Trap`] was the fuel budget running out, as opposed
@@ -169,6 +178,16 @@ pub struct WasmPack {
     pack: i32,
     manifest: PackManifest,
     fuel_per_call: u64,
+    /// Size of the guest's linear memory when its ring regions were taken.
+    ///
+    /// A host handle over a guest region is a raw pointer into the
+    /// interpreter's backing buffer, and `memory.grow` reallocates that
+    /// buffer. A guest's allocator grows when it needs heap — a sequence
+    /// calling `progress` allocates a `String` — so growth is not
+    /// hypothetical, and a stale handle would be a use-after-free rather than
+    /// a wrong answer. [`check_memory_stable`](Self::check_memory_stable)
+    /// turns that into a clean occupant failure.
+    pinned_len: usize,
 }
 
 impl WasmPack {
@@ -233,6 +252,7 @@ impl WasmPack {
                 systems: Vec::new(),
             },
             fuel_per_call,
+            pinned_len: 0,
         };
 
         this.pack = this.call(|e| e.open, ())?;
@@ -241,6 +261,43 @@ impl WasmPack {
         }
         this.manifest = this.read_manifest()?;
         Ok(this)
+    }
+
+    /// Record the guest's current memory size as the baseline every later
+    /// [`check_memory_stable`](Self::check_memory_stable) compares against.
+    ///
+    /// Called once the occupant's regions exist, i.e. after bind.
+    pub fn pin_memory(&mut self) {
+        self.pinned_len = self.memory.data(&self.store).len();
+    }
+
+    /// Whether the guest's memory is still where it was when
+    /// [`pin_memory`](Self::pin_memory) ran.
+    ///
+    /// The host must call this before touching a region through a held handle.
+    /// Failing loudly is the point: the alternative to noticing growth is
+    /// reading freed memory.
+    pub fn check_memory_stable(&self) -> Result<(), WasmError> {
+        let now = self.memory.data(&self.store).len();
+        if now != self.pinned_len {
+            return Err(WasmError::MemoryMoved {
+                was: self.pinned_len,
+                now,
+            });
+        }
+        Ok(())
+    }
+
+    /// The guest's current linear-memory size.
+    pub fn memory_len(&self) -> usize {
+        self.memory.data(&self.store).len()
+    }
+
+    /// Ask the guest's allocator for `len` bytes, for tests that need to move
+    /// its memory on purpose.
+    #[cfg(test)]
+    pub(crate) fn alloc_for_test(&mut self, len: usize) -> Result<u32, WasmError> {
+        self.alloc(len)
     }
 
     /// The decoded manifest: one entry per pack registration, exactly what the
