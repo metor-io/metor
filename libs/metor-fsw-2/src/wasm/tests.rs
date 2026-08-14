@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use metor_fsw_2_core::abi::{ROLE_INPUT, ROLE_OUTPUT};
 use metor_fsw_2_core::{SequenceStatus, SlotControlIn, capacity_for};
-use metor_fsw_ring::Config;
+use metor_fsw_ring::{Config, NoWake, RingBuffer};
 
 use super::*;
 
@@ -259,4 +259,98 @@ fn growing_guest_memory_invalidates_held_handles() {
         matches!(err, WasmError::MemoryMoved { .. }),
         "expected MemoryMoved, got {err:?}"
     );
+}
+
+/// The bridge carries records both ways, and — the part that motivated holding
+/// handles at all — it carries a *backlog*, not just the newest record.
+///
+/// A view re-attached each cycle would rejoin at the live edge and lose
+/// everything written since the last pump, so this writes several records
+/// before pumping and insists all of them arrive, in order.
+#[test]
+fn the_bridge_carries_a_backlog_both_ways() {
+    let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    let cfg = Config {
+        capacity: capacity_for(64, 16),
+        max_readers: 4,
+    };
+
+    // One guest region each way, and a coordinator-owned host ring each way.
+    let g_in = pack.add_ring(cfg, ROLE_INPUT).expect("guest input");
+    let g_out = pack.add_ring(cfg, ROLE_OUTPUT).expect("guest output");
+    let h_in = RingBuffer::create_in_memory(cfg);
+    let h_out = RingBuffer::create_in_memory(cfg);
+    pack.pin_memory();
+
+    let base = pack.memory_base();
+
+    // Register the guest-side reader *before* the first pump: a slot joins at
+    // the live edge, so a view taken afterwards would see nothing. This is the
+    // same ordering the real occupant gets, since it binds before any cycle.
+    // SAFETY: the guest region is live, and `pin_memory`/`check_memory_stable`
+    // bracket every use below; nothing grows the guest in between.
+    let g_in_ring =
+        unsafe { RingBuffer::attach_raw(base.add(g_in.offset as usize), g_in.len) }.expect("attach");
+    let mut guest_reader = g_in_ring.view(NoWake).expect("reader slot");
+
+    // SAFETY: as above, for every region the bridge attaches.
+    let mut bridge = unsafe {
+        RingBridge::new(
+            base,
+            &[h_in.region()],
+            &[g_in],
+            &[h_out.region()],
+            &[g_out],
+        )
+    }
+    .expect("bridge builds");
+
+    // A producer writes three records before the first pump: the backlog case.
+    let mut producer = h_in.writer(NoWake).expect("sole host writer");
+    for i in 0..3u8 {
+        producer.try_write(&[i; 8]).expect("host ring takes it");
+    }
+
+    pack.check_memory_stable().expect("guest has not moved");
+    bridge.pump_in();
+
+    // All three crossed inbound, in order — not just the newest.
+    for expect in 0..3u8 {
+        let got = guest_reader
+            .try_read()
+            .expect("readable")
+            .expect("a forwarded record");
+        assert_eq!(&got[..], &[expect; 8], "inbound records arrive in order");
+    }
+    assert!(
+        guest_reader.try_read().expect("readable").is_none(),
+        "exactly the three written records crossed inbound"
+    );
+
+    // Now the reverse leg: a guest-side producer, pumped out to the host.
+    // SAFETY: same live, pinned region.
+    let g_out_ring =
+        unsafe { RingBuffer::attach_raw(base.add(g_out.offset as usize), g_out.len) }
+            .expect("attach");
+    let mut host_reader = h_out.view(NoWake).expect("reader slot");
+    let mut guest_producer = g_out_ring.writer(NoWake).expect("sole guest writer");
+    for i in 10..13u8 {
+        guest_producer.try_write(&[i; 8]).expect("guest ring takes it");
+    }
+
+    pack.check_memory_stable().expect("guest has not moved");
+    bridge.pump_out();
+
+    for expect in 10..13u8 {
+        let got = host_reader
+            .try_read()
+            .expect("readable")
+            .expect("a forwarded record");
+        assert_eq!(&got[..], &[expect; 8], "records arrive in order");
+    }
+    assert!(
+        host_reader.try_read().expect("readable").is_none(),
+        "exactly the three written records crossed"
+    );
+    assert_eq!(bridge.dropped(), 0, "nothing was dropped");
 }

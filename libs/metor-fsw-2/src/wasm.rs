@@ -114,6 +114,12 @@ pub enum WasmError {
     /// The guest trapped — including exhausting its fuel budget.
     #[error("wasm trap: {0}")]
     Trap(String),
+    /// A ring's reader table was full, so the bridge could not register.
+    #[error("ring has no free reader slot for the bridge")]
+    NoSlot,
+    /// A ring already had a writer, so the bridge could not claim it.
+    #[error("ring writer already claimed")]
+    WriterClaimed,
     /// The guest's linear memory grew, so any handle the host holds over a
     /// region inside it may now dangle.
     #[error("guest memory moved ({was} -> {now} bytes); ring handles are stale")]
@@ -286,6 +292,14 @@ impl WasmPack {
             });
         }
         Ok(())
+    }
+
+    /// The base of the guest's linear memory.
+    ///
+    /// Only valid while the memory does not move; every consumer must pair it
+    /// with [`check_memory_stable`](Self::check_memory_stable).
+    pub fn memory_base(&mut self) -> *mut u8 {
+        self.memory.data_mut(&mut self.store).as_mut_ptr()
     }
 
     /// The guest's current linear-memory size.
@@ -543,6 +557,9 @@ where
         .get_typed_func(store, name)
         .map_err(|_| WasmError::MissingExport(name))
 }
+
+mod bridge;
+pub use bridge::RingBridge;
 
 #[cfg(test)]
 mod tests;
