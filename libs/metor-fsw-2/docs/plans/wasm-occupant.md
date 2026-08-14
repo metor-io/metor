@@ -162,6 +162,49 @@ ladder. The slot's default budget should sit well above that with room for a
 much heavier sequence; the knob exists so an operator can tighten it per slot.
 Exhaustion is a trap, and a trap is a clean terminal state — never a host crash.
 
+## Stage B's crux: connecting a guest occupant to the graph
+
+Stage A bound an occupant to rings in its *own* linear memory and cycled it in
+isolation. Stage B has to join it to the rest of the target, and that turns out
+to be the hard part — harder than the design above assumed.
+
+**The "re-derive per access" resolution of §3 is only half right.** It holds for
+writes. It does not hold for reads: a `View` claims a reader slot, its `Drop`
+frees it, and a freshly attached view **joins at the live edge** rather than
+replaying a backlog (`ring::tests::create_raw_formats_a_caller_owned_region`
+pins exactly this). A reader's cursor is slot state, so re-attaching each cycle
+silently drops every record written since the last one. Handles that read must
+therefore persist across calls.
+
+That rules out the obvious shape and leaves one real constraint: **the host must
+hold `RingBuffer` handles over guest linear memory for the occupant's whole
+life**, which is sound only while that memory does not move. `wasmi` reallocates
+its backing buffer on `memory.grow`, and a guest's allocator will grow if it
+needs heap — a sequence calling `progress()` allocates a `String`, so this is
+not hypothetical.
+
+Two ways forward, both requiring that memory be pinned:
+
+- **(a) Copy bridge.** The coordinator keeps its own host rings; each cycle the
+  host drains new records from a host input ring into the guest's, and from the
+  guest's output rings back out. Persistent handles on both sides. Costs a copy
+  per record per cycle, and duplicates every ring.
+- **(b) The slot's rings *are* guest regions.** No host rings and no copy: the
+  coordinator's producers and consumers attach directly to regions inside the
+  guest's memory. This is only legal because `arch_tag` no longer encodes
+  pointer width (`a7a28986`), and it makes the guest's linear memory the shared
+  medium in the literal sense the design intended.
+
+**(b) is the better shape** — it is the one that keeps "the ring is the shared
+medium" true rather than nearly true — but both stand or fall on pinning. The
+honest way to pin is to give a pack module a large enough initial memory that
+its allocator never grows (a link argument on pack crates, declared rather than
+hoped for), and to have the host verify at bind that the memory size it
+recorded still matches before trusting a handle.
+
+This is a decision with a build-flag consequence for every pack, so it wants a
+deliberate choice rather than an inference.
+
 ## Staging
 
 - **Stage A** — the ABI change (1), the allocator entry point (2), and a host
