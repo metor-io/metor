@@ -29,33 +29,75 @@
 
 use metor_fsw_ring::{NoWake, RingBuffer, View, Writer};
 
+use metor_fsw_2_core::Delivery;
+
 use super::{GuestRing, WasmError};
 
 /// One direction of one port: read from `from`, write to `to`.
+///
+/// The forwarding policy follows the port's delivery mode, which is the same
+/// split the coordinator already makes for async systems: `CopyIn`
+/// (`coordinator::CopyIn`) mirrors only the newest record and exists *only*
+/// for snapshot inputs, because a log consumer there attaches to the
+/// producer's ring directly and takes the whole backlog. A guest can attach to
+/// nothing, so both modes cross here — each with the policy that mode wants.
 struct Leg {
     from: View<NoWake>,
     to: Writer<NoWake>,
+    delivery: Delivery,
+    /// `from`'s `committed` at the last forward, for snapshot legs.
+    ///
+    /// `try_latest` re-serves the pinned newest record when nothing new has
+    /// arrived, so without this a snapshot leg would re-forward the same
+    /// record every cycle. `u64::MAX` means nothing forwarded yet — the same
+    /// sentinel and the same reason as `CopyIn::last_committed`.
+    last_committed: u64,
 }
 
 impl Leg {
-    /// Forward every record waiting on `from`.
+    fn new(from: View<NoWake>, to: Writer<NoWake>, delivery: Delivery) -> Self {
+        Self {
+            from,
+            to,
+            delivery,
+            last_committed: u64::MAX,
+        }
+    }
+
+    /// Forward this cycle's records, by the port's delivery mode.
     ///
-    /// Every record, not just the newest: a snapshot consumer collapses to
-    /// latest-wins on its own, and a log consumer needs the backlog, so
-    /// forwarding faithfully is what keeps both delivery modes intact across
-    /// the boundary.
+    /// A log leg drains: every record matters and the consumer needs the
+    /// backlog. A snapshot leg forwards only the newest, and only when the
+    /// upstream has actually committed something — mirroring a backlog into a
+    /// latest-wins port would just relocate it.
     ///
     /// A record the destination cannot take is dropped and counted rather than
-    /// failing the cycle, which matches what the lossless ring already does to
-    /// a producer that outruns its consumer.
+    /// failing the cycle, which matches what the ring already does to a
+    /// producer that outruns its consumer.
     fn pump(&mut self) -> u64 {
-        let mut dropped = 0;
-        while let Ok(Some(grant)) = self.from.try_read() {
-            if self.to.try_write(&grant).is_err() {
-                dropped += 1;
+        match self.delivery {
+            Delivery::Log => {
+                let mut dropped = 0;
+                while let Ok(Some(grant)) = self.from.try_read() {
+                    if self.to.try_write(&grant).is_err() {
+                        dropped += 1;
+                    }
+                }
+                dropped
+            }
+            Delivery::Snapshot => {
+                let committed = self.from.committed();
+                if committed == self.last_committed {
+                    return 0;
+                }
+                self.last_committed = committed;
+                match self.from.try_latest() {
+                    Ok(Some(grant)) => u64::from(self.to.try_write(&grant).is_err()),
+                    // A corrupt read is "nothing new", as in `run_copy_ins`.
+                    _ => 0,
+                }
             }
         }
-        dropped
     }
 }
 
@@ -84,8 +126,10 @@ impl RingBridge {
         guest_base: *mut u8,
         host_inputs: &[(*mut u8, usize)],
         guest_inputs: &[GuestRing],
+        input_delivery: &[Delivery],
         host_outputs: &[(*mut u8, usize)],
         guest_outputs: &[GuestRing],
+        output_delivery: &[Delivery],
     ) -> Result<Self, WasmError> {
         // SAFETY: the caller asserts every region is live and stays put.
         let attach_guest = |g: &GuestRing| unsafe {
@@ -98,25 +142,29 @@ impl RingBridge {
         };
 
         let mut inputs = Vec::with_capacity(guest_inputs.len());
-        for (host, guest) in host_inputs.iter().zip(guest_inputs) {
-            inputs.push(Leg {
-                from: attach_host(host)?.view(NoWake).map_err(|_| WasmError::NoSlot)?,
-                to: attach_guest(guest)?
+        for ((host, guest), &delivery) in host_inputs.iter().zip(guest_inputs).zip(input_delivery) {
+            inputs.push(Leg::new(
+                attach_host(host)?.view(NoWake).map_err(|_| WasmError::NoSlot)?,
+                attach_guest(guest)?
                     .writer(NoWake)
                     .map_err(|_| WasmError::WriterClaimed)?,
-            });
+                delivery,
+            ));
         }
 
         let mut outputs = Vec::with_capacity(guest_outputs.len());
-        for (host, guest) in host_outputs.iter().zip(guest_outputs) {
-            outputs.push(Leg {
-                from: attach_guest(guest)?
+        for ((host, guest), &delivery) in
+            host_outputs.iter().zip(guest_outputs).zip(output_delivery)
+        {
+            outputs.push(Leg::new(
+                attach_guest(guest)?
                     .view(NoWake)
                     .map_err(|_| WasmError::NoSlot)?,
-                to: attach_host(host)?
+                attach_host(host)?
                     .writer(NoWake)
                     .map_err(|_| WasmError::WriterClaimed)?,
-            });
+                delivery,
+            ));
         }
 
         Ok(Self {

@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use metor_fsw_2_core::abi::{ROLE_INPUT, ROLE_OUTPUT};
-use metor_fsw_2_core::{SequenceStatus, SlotControlIn, capacity_for};
+use metor_fsw_2_core::{Delivery, SequenceStatus, SlotControlIn, capacity_for};
 use metor_fsw_ring::{Config, NoWake, RingBuffer};
 
 use super::*;
@@ -299,8 +299,10 @@ fn the_bridge_carries_a_backlog_both_ways() {
             base,
             &[h_in.region()],
             &[g_in],
+            &[Delivery::Log],
             &[h_out.region()],
             &[g_out],
+            &[Delivery::Log],
         )
     }
     .expect("bridge builds");
@@ -351,6 +353,88 @@ fn the_bridge_carries_a_backlog_both_ways() {
     assert!(
         host_reader.try_read().expect("readable").is_none(),
         "exactly the three written records crossed"
+    );
+    assert_eq!(bridge.dropped(), 0, "nothing was dropped");
+}
+
+/// A snapshot leg forwards the newest record and nothing else, and — the part
+/// worth pinning — forwards it *once*.
+///
+/// `try_latest` re-serves the pinned newest record when nothing new has
+/// arrived, so a snapshot leg without the `last_committed` skip would re-send
+/// the same record every cycle: the consumer would see a stream of duplicates
+/// and, on a shallow ring, real records would be dropped to make room for
+/// them. `coordinator::CopyIn` carries the same guard for the same reason.
+#[test]
+fn a_snapshot_leg_forwards_the_newest_once() {
+    let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    let cfg = Config {
+        capacity: capacity_for(64, 16),
+        max_readers: 4,
+    };
+    let g_in = pack.add_ring(cfg, ROLE_INPUT).expect("guest input");
+    let h_in = RingBuffer::create_in_memory(cfg);
+    pack.pin_memory();
+    let base = pack.memory_base();
+
+    // SAFETY: live, pinned regions; `check_memory_stable` guards every use.
+    let g_ring =
+        unsafe { RingBuffer::attach_raw(base.add(g_in.offset as usize), g_in.len) }.expect("attach");
+    let mut guest_reader = g_ring.view(NoWake).expect("reader slot");
+    // SAFETY: as above.
+    let mut bridge = unsafe {
+        RingBridge::new(
+            base,
+            &[h_in.region()],
+            &[g_in],
+            &[Delivery::Snapshot],
+            &[],
+            &[],
+            &[],
+        )
+    }
+    .expect("bridge builds");
+
+    // Three records upstream, but a snapshot consumer wants only the newest.
+    let mut producer = h_in.writer(NoWake).expect("sole host writer");
+    for i in 0..3u8 {
+        producer.try_write(&[i; 8]).expect("host ring takes it");
+    }
+    bridge.pump_in();
+
+    assert_eq!(
+        &guest_reader
+            .try_read()
+            .expect("readable")
+            .expect("the newest record")[..],
+        &[2u8; 8],
+        "a snapshot leg collapses the backlog to the newest record"
+    );
+    assert!(
+        guest_reader.try_read().expect("readable").is_none(),
+        "and forwards only that one"
+    );
+
+    // Pump repeatedly with nothing new upstream: the pinned record must not be
+    // forwarded again.
+    for _ in 0..5 {
+        bridge.pump_in();
+    }
+    assert!(
+        guest_reader.try_read().expect("readable").is_none(),
+        "an idle snapshot leg re-forwards nothing"
+    );
+
+    // A genuinely new record still crosses.
+    producer.try_write(&[9u8; 8]).expect("host ring takes it");
+    bridge.pump_in();
+    assert_eq!(
+        &guest_reader
+            .try_read()
+            .expect("readable")
+            .expect("the new record")[..],
+        &[9u8; 8],
+        "a new commit still crosses"
     );
     assert_eq!(bridge.dropped(), 0, "nothing was dropped");
 }
