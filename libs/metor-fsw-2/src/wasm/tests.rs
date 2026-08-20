@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use metor_fsw_2_core::abi::{ROLE_INPUT, ROLE_OUTPUT};
-use metor_fsw_2_core::{Delivery, SequenceStatus, SlotControlIn, capacity_for};
+use metor_fsw_2_core::abi::{FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT};
+use metor_fsw_2_core::{Delivery, SequenceStatus, SlotControlIn, Timestamp, capacity_for};
 use metor_fsw_ring::{Config, NoWake, RingBuffer};
 
 use super::*;
@@ -437,4 +437,94 @@ fn a_snapshot_leg_forwards_the_newest_once() {
         "a new commit still crosses"
     );
     assert_eq!(bridge.dropped(), 0, "nothing was dropped");
+}
+
+/// A slot's ring templates for the `waiter` contract: one control input, and
+/// health, log and status outputs. Returns the rings (which must outlive the
+/// occupant) alongside the `FswRing` handles a slot hands its occupant.
+fn slot_rings() -> (Vec<RingBuffer>, Vec<FswRing>, Vec<FswRing>) {
+    let make = |max_size: usize, role: u8| {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: capacity_for(max_size, 8),
+            max_readers: 4,
+        });
+        let (base, len) = ring.region();
+        (ring, FswRing { base, len, role })
+    };
+    // Occupant-mount order: inputs [control]; outputs [health, log, status].
+    let (c, ch) = make(size_of::<SlotControlIn>(), ROLE_INPUT);
+    let (h, hh) = make(1024, ROLE_OUTPUT);
+    let (l, lh) = make(4096, ROLE_OUTPUT);
+    let (s, sh) = make(size_of::<SequenceStatus>(), ROLE_OUTPUT);
+    (vec![c, h, l, s], vec![ch], vec![hh, lh, sh])
+}
+
+/// The whole point of Stage B: a wasm occupant bound to a *slot's* rings,
+/// cycled by the slot's driver, reaching a terminal state — with its status
+/// arriving on the host side of the bridge rather than staying in the guest.
+#[test]
+fn a_wasm_occupant_drives_a_slot_to_done() {
+    let (rings, host_in, host_out) = slot_rings();
+    // Tap the status ring before the run: a reader joins at the live edge, so
+    // one opened afterwards would see nothing.
+    let mut status_tap = rings[3].view(NoWake).expect("status reader slot");
+
+    let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    let entry = entry(&pack, "waiter");
+    drop(pack);
+
+    let mut slot = WasmSlot::bind(fixture(), entry, &[], "inst", &host_in, &host_out, AMPLE_FUEL)
+        .expect("binds to the slot's rings");
+
+    // The body waits two simulated microseconds.
+    let mut last = FswStatus::Running;
+    for cycle in 0..64u64 {
+        last = slot.execute_raw(Timestamp(cycle as i64));
+        if last != FswStatus::Running {
+            break;
+        }
+    }
+    assert_eq!(last, FswStatus::Done, "the occupant reaches a terminal state");
+    assert_eq!(slot.dropped(), 0, "the bridge delivered everything");
+
+    // The status the guest wrote crossed the bridge onto the slot's own ring,
+    // which is what makes an occupant observable to the rest of the target.
+    assert!(
+        status_tap.try_latest().expect("readable").is_some(),
+        "a SequenceStatus record reached the host side of the bridge"
+    );
+}
+
+/// A runaway occupant is stopped by its fuel budget and reported as
+/// `Panicked` — the status the runner already maps to `SlotState::Stopped` for
+/// a `.so` panic, so no wasm-specific handling is needed downstream.
+///
+/// This is the property a natively linked occupant cannot offer at all: the
+/// same runaway in a `.so` never returns and stalls the cycle.
+#[test]
+fn a_starved_wasm_occupant_stops_instead_of_stalling() {
+    let (_rings, host_in, host_out) = slot_rings();
+    // Bind generously — binding costs far more fuel than a cycle — then apply
+    // a per-poll budget too small to finish one.
+    let mut slot = WasmSlot::bind(
+        fixture(),
+        0,
+        &[],
+        "inst",
+        &host_in,
+        &host_out,
+        AMPLE_FUEL,
+    )
+    .expect("binds under an ample budget");
+    slot.set_fuel_per_call(500);
+    assert_eq!(
+        slot.execute_raw(Timestamp(0)),
+        FswStatus::Panicked,
+        "an exhausted budget is terminal, not a stall"
+    );
+    assert_eq!(
+        slot.execute_raw(Timestamp(1)),
+        FswStatus::Panicked,
+        "and it is latched — a dead occupant is never re-entered"
+    );
 }

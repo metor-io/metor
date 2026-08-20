@@ -294,6 +294,15 @@ impl WasmPack {
         Ok(())
     }
 
+    /// Change the budget granted to each subsequent guest call.
+    ///
+    /// Binding an occupant costs far more fuel than running one cycle of it,
+    /// so a budget tight enough to bound a *poll* would refuse the bind. The
+    /// two are set separately for that reason.
+    pub fn set_fuel_per_call(&mut self, fuel: u64) {
+        self.fuel_per_call = fuel;
+    }
+
     /// The base of the guest's linear memory.
     ///
     /// Only valid while the memory does not move; every consumer must pair it
@@ -559,7 +568,9 @@ where
 }
 
 mod bridge;
+mod slot;
 pub use bridge::RingBridge;
+pub use slot::WasmSlot;
 
 #[cfg(test)]
 mod tests;

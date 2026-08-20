@@ -124,12 +124,29 @@ pub enum OccupantBacking {
     /// An opened library in this process; `Load` runs `fsw_pack_create` over the
     /// handle, which stays loaded across swaps.
     Dl(Box<DlSystem>),
+    /// A WebAssembly module driven under an interpreter in this process, its
+    /// ports joined to the slot's rings by a copy (`crate::wasm`). Bounded by
+    /// fuel and sandboxed from the host, which is what neither other backing
+    /// offers.
+    ///
+    /// `entry` is the occupant's index in the *module's* manifest, which the
+    /// slot cannot infer: its own allow-set order is a target-level choice and
+    /// several occupants may come from one module.
+    Wasm { path: PathBuf, entry: u32 },
     /// A built cdylib the occupant's **worker process** opens
     /// (`docs/process-systems.md`); the host keeps only the path and never
     /// loads the artifact itself. Slots mix backings never: `plan_slot`
     /// requires the whole allowed set on one side of the seam.
     Artifact(PathBuf),
 }
+
+/// Fuel granted to each guest call when a slot does not choose its own.
+///
+/// The Phase 0 spike measured a math-heavy commissioning poll at 7,449 units,
+/// so this leaves roughly four orders of magnitude of headroom: generous enough
+/// that a legitimate sequence never trips it, small enough that a runaway is
+/// stopped inside one cycle rather than wedging the vehicle.
+pub const DEFAULT_FUEL_PER_CALL: u64 = 100_000_000;
 
 /// A candidate occupant a slot is allowed to load, validated at build time.
 /// `Load` selects it by `name`; `descriptor` is the self-description the
@@ -247,7 +264,15 @@ pub(crate) fn plan_slot(
         .iter()
         .filter(|a| matches!(a.backing, OccupantBacking::Artifact(_)))
         .count();
-    if n_proc != 0 && n_proc != allowed.len() {
+    let n_wasm = allowed
+        .iter()
+        .filter(|a| matches!(a.backing, OccupantBacking::Wasm { .. }))
+        .count();
+    // Per-slot means all-occupants for each backing, not just for process:
+    // `Load` must never silently move the fault domain, and the three differ
+    // in exactly that (address space, and whether a poll is bounded).
+    let n = allowed.len();
+    if (n_proc != 0 && n_proc != n) || (n_wasm != 0 && n_wasm != n) {
         return Err(SlotConfigError::MixedBacking);
     }
     if let Some(occ) = allowed
@@ -438,6 +463,7 @@ pub(crate) struct SlotReg {
 /// reclaims — so `None`-ing the field is the one teardown spelling for both.
 enum Occupant {
     Dl(DlSlot),
+    Wasm(Box<crate::wasm::WasmSlot>),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Proc(SeqWorker),
 }
@@ -479,6 +505,13 @@ pub(crate) struct SlotRunner {
     input_regions: Vec<metor_fsw_2_core::abi::FswRing>,
     /// Ring templates for the occupant outputs, in occupant output order.
     output_regions: Vec<metor_fsw_2_core::abi::FswRing>,
+    /// Interpreter fuel granted to each guest call, for a wasm-backed slot.
+    ///
+    /// This is the knob that makes a poll *bounded*: a guest that will not stop
+    /// is cut off mid-instruction and reported, where a natively linked
+    /// occupant would simply never return and stall the cycle. Unused by the
+    /// other backings.
+    fuel_per_call: u64,
     /// Host writer over the control ring; `Abort` writes a cancel frame here.
     control: Output<SlotControlIn>,
     /// Host writer over the [`SlotStatus`] ring, written each `step`.
@@ -548,6 +581,7 @@ impl SlotRunner {
             initial,
             input_regions,
             output_regions,
+            fuel_per_call: DEFAULT_FUEL_PER_CALL,
             control,
             status_out,
             events,
@@ -600,6 +634,29 @@ impl SlotRunner {
                 let name = self.allowed[idx].name.clone();
                 self.emit_event(SequenceEventKind::Loaded { name });
             }
+            OccupantBacking::Wasm { path, entry } => {
+                let (path, entry) = (path.clone(), *entry);
+                let name = occ.name.clone();
+                let params = occ.params.clone();
+                match self.build_wasm(&path, entry, &params) {
+                    Ok(slot) => {
+                        self.slot = Some(Occupant::Wasm(Box::new(slot)));
+                        self.state = SlotState::Loaded;
+                        self.emit_event(SequenceEventKind::Loaded { name });
+                    }
+                    Err(detail) => {
+                        // A module that cannot be loaded or bound is a load
+                        // failure, not a running occupant that died: the slot
+                        // stays empty and the operator is told why.
+                        self.slot = None;
+                        self.state = SlotState::Empty;
+                        tracing::error!(occupant = %name, error = %detail, "wasm occupant failed to load");
+                        self.emit_event(SequenceEventKind::Failed {
+                            reason: format!("wasm load failed: {detail}"),
+                        });
+                    }
+                }
+            }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             OccupantBacking::Artifact(_) => {
                 let parts = self
@@ -627,6 +684,31 @@ impl SlotRunner {
                 unreachable!("build() rejects process slots on targets without a shared futex")
             }
         }
+    }
+
+    /// Load a wasm module and bind entry `idx` to the slot's rings.
+    ///
+    /// The module is read fresh on every `Load`, unlike the dl backing which
+    /// keeps its library open across swaps: a `.wasm` is bytes rather than a
+    /// mapped object, so re-reading costs a file read and buys the operator a
+    /// genuinely fresh instance.
+    fn build_wasm(
+        &mut self,
+        path: &std::path::Path,
+        entry: u32,
+        params: &[u8],
+    ) -> Result<crate::wasm::WasmSlot, String> {
+        let wasm = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        crate::wasm::WasmSlot::bind(
+            &wasm,
+            entry,
+            params,
+            &self.name,
+            &self.input_regions,
+            &self.output_regions,
+            self.fuel_per_call,
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// A worker failed the slot — mid-pipeline or mid-run: land the terminal
@@ -984,6 +1066,7 @@ impl CyclicSlot for SlotRunner {
             let mut worker_died = false;
             match self.slot.as_mut() {
                 Some(Occupant::Dl(slot)) => status = Some(slot.execute_raw(now)),
+                Some(Occupant::Wasm(slot)) => status = Some(slot.execute_raw(now)),
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 Some(Occupant::Proc(worker)) => match worker.step(now) {
                     StepOutcome::Acked(st) => status = Some(st),

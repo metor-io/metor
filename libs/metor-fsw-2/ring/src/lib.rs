@@ -1120,6 +1120,25 @@ impl RingBuffer {
     }
 }
 
+/// The [`Config`] an existing region was formatted with, read back out of its
+/// header.
+///
+/// For a caller that must build a *second* ring matching a first — a wasm host
+/// giving its guest a region mirroring the coordinator's, so the two sides of
+/// a copy always agree on what a record can be.
+///
+/// # Safety
+/// `base..base + len` is a live, header-valid ring region.
+pub unsafe fn config_of(base: *mut u8, len: usize) -> Result<Config, AttachError> {
+    // SAFETY: caller asserts a live, header-valid region; `attach_raw`
+    // validates before forming any reference into it.
+    let ring = unsafe { RingBuffer::attach_raw(base, len) }?;
+    Ok(Config {
+        capacity: ring.inner.capacity as usize,
+        max_readers: ring.inner.max_readers as usize,
+    })
+}
+
 /// The number of bytes a ring with `cfg` occupies, for a caller that has to
 /// allocate the region itself before [`RingBuffer::create_raw`] formats it.
 ///
