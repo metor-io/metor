@@ -142,6 +142,11 @@ pub trait CyclicSlot {
     fn drain_restarts(&mut self) -> u64 {
         0
     }
+    /// Records an isolated boundary could not copy since the last drain.
+    /// Async boundaries override this; ordinary cyclic slots have no bridge.
+    fn drain_boundary_drops(&mut self) -> u64 {
+        0
+    }
     /// The worker-process facts behind this slot, for the status frame's
     /// worker list: `None` for every in-process slot, `Some` from `ProcSlot`
     /// and the process-mode `SlotRunner`.

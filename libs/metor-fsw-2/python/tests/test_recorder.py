@@ -338,9 +338,9 @@ class DashboardTest(unittest.TestCase):
         )
         self.assertEqual(state["title"], "ADCS")
         self.assertEqual([w["kind"] for w in state["widgets"]], ["meter", "gauge"])
-        # Ids are assigned in placement order and the counter clears them.
+        # Ids are assigned in placement order; the panel derives the next id.
         self.assertEqual([w["id"] for w in state["widgets"]], [1, 2])
-        self.assertEqual(state["next_id"], 3)
+        self.assertNotIn("next_id", state)
 
         meter = json.loads(state["widgets"][0]["config"])
         self.assertEqual(meter["component"], "sat1.plant.wheels.h")
@@ -410,7 +410,7 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(style["label"], "leader")
         self.assertEqual(style["bind"]["component"], "sat1.plant.wheels.arm")
         self.assertEqual(style["bind"]["threshold"], 0.5)
-        self.assertEqual(state["next_connector_id"], 2)
+        self.assertNotIn("next_connector_id", state)
 
     def test_a_plot_placed_on_a_dashboard_uses_the_widget_kind(self):
         plot = mc.Place(mc.TimeSeriesPlot([mc.Trace("plant.gyro.rates")]), 0, 0)

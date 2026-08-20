@@ -924,10 +924,8 @@ class Dashboard:
 
         return {
             "title": self.title,
-            "next_id": len(entries) + 1,
             "widgets": entries,
             "connectors": lines,
-            "next_connector_id": len(lines) + 1,
         }
 
     def _connector(

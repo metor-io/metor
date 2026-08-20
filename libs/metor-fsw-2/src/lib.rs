@@ -90,6 +90,7 @@
 mod alarm;
 mod async_system;
 mod coordinator;
+mod io_bridge;
 mod preset;
 mod telemetry;
 

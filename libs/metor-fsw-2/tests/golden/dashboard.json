@@ -1,6 +1,5 @@
 {
   "title": "Golden",
-  "next_id": 11,
   "widgets": [
     {
       "id": 1,
@@ -206,6 +205,5 @@
         "on_top": false
       }
     }
-  ],
-  "next_connector_id": 4
+  ]
 }

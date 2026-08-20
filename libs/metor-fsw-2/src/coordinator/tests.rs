@@ -1,7 +1,7 @@
 //! Coordinator acceptance tests: a two-cyclic-system pipeline end to end,
-//! backpressure from an idle consumer, an async system fed through its private
-//! copy-in buffer, build-time wiring validation, and the init barrier. Every
-//! graph here is registered and wired through the [`Coordinator`] builder.
+//! backpressure from an idle consumer, an async system behind its ordered
+//! private I/O boundary, build-time wiring validation, and the init barrier.
+//! Every graph here is registered and wired through the [`Coordinator`] builder.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -239,7 +239,7 @@ async fn idle_consumer_backpressures_producer() {
 }
 
 // ---------------------------------------------------------------------------
-// Async system wired through a private copy-in buffer.
+// Async system wired through a private cycle boundary.
 // ---------------------------------------------------------------------------
 
 struct AsyncConsumer {
@@ -282,12 +282,12 @@ impl AsyncSystem for AsyncConsumer {
 
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn async_through_copy_in() {
+async fn async_through_cycle_boundary() {
     let count = Arc::new(AtomicU64::new(0));
     let last = Arc::new(AtomicU64::new(0));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut producer = Producer::new();
-    producer.burst = 8; // burst past the copy-in's per-cycle mirror (latest-wins)
+    producer.burst = 8; // burst past the boundary's per-cycle mirror (latest-wins)
 
     let mut b = crate::coordinator::init::InitGraph::new(config());
     let prod = b.push_node(cyclic_node(Producer::NAME.into(), producer));
@@ -311,16 +311,117 @@ async fn async_through_copy_in() {
     );
     let mut coord = b.build().unwrap();
 
-    // Completes without blocking despite the burst; the copy-in mirrors only the
+    // Completes without blocking despite the burst; the import mirrors only the
     // newest record per cycle, and a full private ring skips rather than suspends.
     coord.run_for(30).await;
 
     assert!(
         count.load(Relaxed) >= 1,
-        "async system received via recv through the copy-in"
+        "async system received via recv through its cycle boundary"
     );
     assert!(last.load(Relaxed) > 0, "received a real sample");
     assert!(shutdown.load(Relaxed), "recv cancellation ran shutdown");
+}
+
+// An async transform owns only private ports. Its boundary imports an Imu and
+// exports the Nav produced after the preceding boundary.
+struct AsyncTransform;
+
+#[derive(SystemOutput)]
+struct AsyncTransformOut {
+    nav: Output<Nav, Notifier>,
+}
+
+impl System for AsyncTransform {
+    type Input = AsyncIn;
+    type Output = Out<AsyncTransformOut, Notifier>;
+    const NAME: &'static str = "async_transform";
+}
+
+impl AsyncSystem for AsyncTransform {
+    async fn run(
+        &mut self,
+        context: &crate::AsyncContext,
+        input: &mut Self::Input,
+        output: &mut Self::Output,
+    ) {
+        while let Some(Ok(imu)) = context.until_cancelled(input.imu.recv()).await {
+            let imu = imu.get();
+            let _ = output.nav.write(&Nav {
+                timestamp: imu.timestamp,
+                angle: imu.omega,
+            });
+        }
+    }
+}
+
+struct NavConsumer {
+    seen: Rc<RefCell<Vec<f64>>>,
+}
+
+#[derive(SystemInput)]
+struct NavIn {
+    nav: Input<Nav>,
+}
+
+impl System for NavConsumer {
+    type Input = NavIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "nav_consumer";
+}
+
+impl CyclicSystem for NavConsumer {
+    fn execute(&mut self, _now: Timestamp, input: &mut NavIn, _output: &mut Self::Output) {
+        if let Ok(Some(nav)) = input.nav.latest() {
+            self.seen.borrow_mut().push(nav.get().angle);
+        }
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn async_import_then_export_is_one_cycle_deterministic() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut cfg = config();
+    cfg.clock = ClockMode::Simulated {
+        dt: Duration::from_millis(1),
+    };
+    let mut b = crate::coordinator::init::InitGraph::new(cfg);
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let asy = b.push_node(async_node(AsyncTransform::NAME.into(), AsyncTransform));
+    let cons = b.push_node(cyclic_node(
+        NavConsumer::NAME.into(),
+        NavConsumer { seen: seen.clone() },
+    ));
+    b.connect(
+        PortRef {
+            system: prod,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+        PortRef {
+            system: asy,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+    );
+    b.connect(
+        PortRef {
+            system: asy,
+            port: PortId::Component(Nav::FRAME_ID),
+        },
+        PortRef {
+            system: cons,
+            port: PortId::Component(Nav::FRAME_ID),
+        },
+    );
+    let mut coord = b.build().expect("ordered async pipeline builds");
+
+    coord.run_for(5).await;
+
+    assert_eq!(
+        *seen.borrow(),
+        vec![1.0, 2.0, 3.0, 4.0],
+        "input from cycle N first becomes graph-visible output in cycle N+1"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -845,12 +946,8 @@ async fn backward_frame_edge_allowed_when_delayed() {
     assert_eq!(*seen.borrow(), vec![1.0, 2.0, 3.0, 4.0]);
 }
 
-#[cfg(not(miri))]
-#[stellarator::test]
-async fn backward_edge_to_async_consumer_is_allowed() {
-    // Registration order carries no execution-order meaning for an async consumer,
-    // which reads through the post-step copy-in, so registering it before its
-    // producer is fine; the StaleFrameEdge check only covers cyclic-to-cyclic edges.
+#[test]
+fn backward_edge_to_async_consumer_requires_delay() {
     let count = Arc::new(AtomicU64::new(0));
     let last = Arc::new(AtomicU64::new(0));
     let mut b = crate::coordinator::init::InitGraph::new(config());
@@ -873,9 +970,85 @@ async fn backward_edge_to_async_consumer_is_allowed() {
             port: PortId::Component(Imu::FRAME_ID),
         },
     );
-    let mut coord = b
-        .build()
-        .expect("async endpoints are exempt from the registration-order check");
+    let err = b.build().err().expect("backward async input is stale");
+    assert!(matches!(
+        err,
+        WireError::StaleFrameEdge {
+            ref producer,
+            ref consumer,
+            ..
+        } if producer == Producer::NAME && consumer == AsyncConsumer::NAME
+    ));
+}
+
+#[test]
+fn backward_edge_from_async_producer_requires_delay() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut b = crate::coordinator::init::InitGraph::new(config());
+    let source = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    let consumer = b.push_node(cyclic_node(
+        NavConsumer::NAME.into(),
+        NavConsumer { seen: seen.clone() },
+    ));
+    let producer = b.push_node(async_node(AsyncTransform::NAME.into(), AsyncTransform));
+    b.connect(
+        PortRef {
+            system: source,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+        PortRef {
+            system: producer,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+    );
+    b.connect(
+        PortRef {
+            system: producer,
+            port: PortId::Component(Nav::FRAME_ID),
+        },
+        PortRef {
+            system: consumer,
+            port: PortId::Component(Nav::FRAME_ID),
+        },
+    );
+
+    let err = b.build().err().expect("backward async output is stale");
+    assert!(matches!(
+        err,
+        WireError::StaleFrameEdge {
+            ref producer,
+            ref consumer,
+            ..
+        } if producer == AsyncTransform::NAME && consumer == NavConsumer::NAME
+    ));
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn delayed_backward_edge_to_async_consumer_runs() {
+    let count = Arc::new(AtomicU64::new(0));
+    let last = Arc::new(AtomicU64::new(0));
+    let mut b = crate::coordinator::init::InitGraph::new(config());
+    let asy = b.push_node(async_node(
+        AsyncConsumer::NAME.into(),
+        AsyncConsumer {
+            count: count.clone(),
+            last: last.clone(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        },
+    ));
+    let prod = b.push_node(cyclic_node(Producer::NAME.into(), Producer::new()));
+    b.connect_delayed(
+        PortRef {
+            system: prod,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+        PortRef {
+            system: asy,
+            port: PortId::Component(Imu::FRAME_ID),
+        },
+    );
+    let mut coord = b.build().expect("the delayed boundary is explicit");
 
     coord.run_for(30).await;
 
@@ -1079,6 +1252,65 @@ impl CyclicSystem for MsgConsumer {
     }
 }
 
+/// A polling async relay used to exercise log import, fan-in, and log export.
+struct AsyncMsgRelay;
+
+#[derive(SystemInput)]
+struct AsyncMsgIn {
+    events: MsgIn<TestEvent>,
+}
+
+#[derive(SystemOutput)]
+struct AsyncMsgOut {
+    events: MsgOut<TestEvent, Notifier>,
+}
+
+impl System for AsyncMsgRelay {
+    type Input = AsyncMsgIn;
+    type Output = Out<AsyncMsgOut, Notifier>;
+    const NAME: &'static str = "async_msg_relay";
+}
+
+impl AsyncSystem for AsyncMsgRelay {
+    async fn run(
+        &mut self,
+        context: &crate::AsyncContext,
+        input: &mut Self::Input,
+        output: &mut Self::Output,
+    ) {
+        while !context.is_cancelled() {
+            let events = &mut output.events;
+            input
+                .events
+                .drain(|event| {
+                    let _ = events.emit(&event);
+                })
+                .unwrap();
+            stellarator::yield_now().await;
+        }
+    }
+}
+
+/// An async log consumer that intentionally never drains its private input.
+struct IdleAsyncMsgConsumer;
+
+impl System for IdleAsyncMsgConsumer {
+    type Input = AsyncMsgIn;
+    type Output = Out<AsyncNoOut, Notifier>;
+    const NAME: &'static str = "idle_async_msg_consumer";
+}
+
+impl AsyncSystem for IdleAsyncMsgConsumer {
+    async fn run(
+        &mut self,
+        context: &crate::AsyncContext,
+        _input: &mut Self::Input,
+        _output: &mut Self::Output,
+    ) {
+        let _ = context.until_cancelled(std::future::pending::<()>()).await;
+    }
+}
+
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn msg_edge_two_cyclic_systems() {
@@ -1147,6 +1379,90 @@ async fn msg_fanin_two_emitters_one_consumer() {
     let mut got = seen.borrow().clone();
     got.sort_unstable();
     assert_eq!(got, vec![1, 2, 101, 102]);
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn async_log_boundary_preserves_fanin_and_one_cycle_latency() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut cfg = config();
+    cfg.clock = ClockMode::Simulated {
+        dt: Duration::from_millis(1),
+    };
+    let mut b = crate::coordinator::init::InitGraph::new(cfg);
+    let prod_a = b.push_node(cyclic_node("emitter_a".into(), MsgProducer { n: 0 }));
+    let prod_b = b.push_node(cyclic_node("emitter_b".into(), MsgProducer { n: 100 }));
+    let relay = b.push_node(async_node(AsyncMsgRelay::NAME.into(), AsyncMsgRelay));
+    let cons = b.push_node(cyclic_node(
+        MsgConsumer::NAME.into(),
+        MsgConsumer { seen: seen.clone() },
+    ));
+    for producer in [prod_a, prod_b] {
+        b.connect(
+            PortRef {
+                system: producer,
+                port: PortId::Packet(TestEvent::ID),
+            },
+            PortRef {
+                system: relay,
+                port: PortId::Packet(TestEvent::ID),
+            },
+        );
+    }
+    b.connect(
+        PortRef {
+            system: relay,
+            port: PortId::Packet(TestEvent::ID),
+        },
+        PortRef {
+            system: cons,
+            port: PortId::Packet(TestEvent::ID),
+        },
+    );
+    let mut coord = b.build().expect("async log fan-in builds");
+
+    coord.run_for(5).await;
+
+    let mut got = seen.borrow().clone();
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 2, 3, 4, 101, 102, 103, 104]);
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn stalled_async_log_input_isolated_from_other_consumers() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut cfg = config();
+    cfg.clock = ClockMode::Simulated {
+        dt: Duration::from_millis(1),
+    };
+    let mut b = crate::coordinator::init::InitGraph::new(cfg);
+    let prod = b.push_node(cyclic_node(MsgProducer::NAME.into(), MsgProducer { n: 0 }));
+    let cyclic = b.push_node(cyclic_node(
+        MsgConsumer::NAME.into(),
+        MsgConsumer { seen: seen.clone() },
+    ));
+    let idle = b.push_node(async_node(
+        IdleAsyncMsgConsumer::NAME.into(),
+        IdleAsyncMsgConsumer,
+    ));
+    for consumer in [cyclic, idle] {
+        b.connect(
+            PortRef {
+                system: prod,
+                port: PortId::Packet(TestEvent::ID),
+            },
+            PortRef {
+                system: consumer,
+                port: PortId::Packet(TestEvent::ID),
+            },
+        );
+    }
+    let mut coord = b.build().expect("async input is isolated");
+
+    coord.run_for(30).await;
+
+    assert_eq!(*seen.borrow(), (1..=30).collect::<Vec<_>>());
 }
 
 #[test]
@@ -1378,6 +1694,34 @@ async fn all_outputs_taps_the_whole_graph() {
         "sees frame outputs: {}",
         frame_outs.get()
     );
+}
+
+#[test]
+fn async_boundary_after_receive_all_is_a_build_error() {
+    let mut b = crate::coordinator::init::InitGraph::new(config());
+    b.push_node(cyclic_node(
+        AllTap::NAME.into(),
+        AllTap {
+            frame_outs: Rc::new(std::cell::Cell::new(0)),
+            msg_chans: Rc::new(std::cell::Cell::new(0)),
+        },
+    ));
+    b.push_node(async_node(
+        IdleAsyncMsgConsumer::NAME.into(),
+        IdleAsyncMsgConsumer,
+    ));
+
+    let err = b
+        .build()
+        .err()
+        .expect("an async boundary after receive-all is stale");
+    assert!(matches!(
+        err,
+        WireError::ReceiveAllNotLast {
+            ref system,
+            ref receive_all,
+        } if system == IdleAsyncMsgConsumer::NAME && receive_all == AllTap::NAME
+    ));
 }
 
 // ---------------------------------------------------------------------------

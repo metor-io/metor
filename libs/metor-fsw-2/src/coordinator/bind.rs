@@ -40,14 +40,14 @@ pub(super) struct ProcBindCtx {
 
 /// Build the typed `BoundPort`s a static (host-side) registration binds over:
 /// the system's own output buffers, and its inputs in `descriptors()` order. A
-/// `One` input views its producer's output (or its private copy-in buffer); a
-/// `Many` input is a multi-view over every wired producer ring.
+/// `One` input views its producer's output; a `Many` input is a multi-view over
+/// every wired producer ring. Async registrations use their prebuilt private
+/// I/O plan instead of this direct path.
 fn bind_static_io(
     id: usize,
     desc: &SystemDescriptor,
     cons_edges: &ConsEdges,
     alloc: &RingAlloc,
-    plumbing: &AsyncPlumbing,
 ) -> (Vec<BoundPort>, Vec<BoundInput>) {
     let outs: Vec<BoundPort> = (0..desc.outputs.len())
         .map(|out_idx| BoundPort::new(alloc.output_rings[id][out_idx].clone()))
@@ -56,11 +56,7 @@ fn bind_static_io(
         .map(|in_idx| match desc.inputs[in_idx].fan_in {
             FanIn::One => {
                 let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
-                let port = match plumbing.private_inputs.get(&(id, in_idx)) {
-                    Some((ring, data)) => BoundPort::matched(ring.clone(), Box::new(data.clone())),
-                    None => BoundPort::new(alloc.output_rings[prod_id][out_idx].clone()),
-                };
-                BoundInput::One(port)
+                BoundInput::One(BoundPort::new(alloc.output_rings[prod_id][out_idx].clone()))
             }
             FanIn::Many => {
                 let ports = cons_edges
@@ -123,17 +119,26 @@ pub(super) fn bind_systems(
             // (`bind_static_io`) and walk them with a `Binder`. A pack entry
             // rides this arm too (via `PendingDriver`).
             SystemBind::Cyclic(r) => {
-                let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
+                let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc);
                 let mut binder = Binder::new(&outs, &ins, registry.clone(), &name);
                 cyclic.push(r.bind(&mut binder));
             }
             SystemBind::Async(r) => {
-                let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
+                let plan = plumbing
+                    .plans
+                    .remove(&id)
+                    .expect("every async registration has one I/O plan");
+                let super::init::AsyncIoPlan {
+                    inputs: ins,
+                    outputs: outs,
+                    boundary,
+                } = plan;
                 let launcher = {
                     let mut binder = Binder::new(&outs, &ins, registry.clone(), &name);
                     r.bind(&mut binder)
                 };
                 pending_async.push(PendingAsync { name, launcher });
+                cyclic.push(Box::new(boundary));
             }
         }
     }

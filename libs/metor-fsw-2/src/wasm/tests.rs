@@ -364,7 +364,7 @@ fn the_bridge_carries_a_backlog_both_ways() {
 /// arrived, so a snapshot leg without the `last_committed` skip would re-send
 /// the same record every cycle: the consumer would see a stream of duplicates
 /// and, on a shallow ring, real records would be dropped to make room for
-/// them. `coordinator::CopyIn` carries the same guard for the same reason.
+/// them. The shared snapshot ring pump carries this guard for the same reason.
 #[test]
 fn a_snapshot_leg_forwards_the_newest_once() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");

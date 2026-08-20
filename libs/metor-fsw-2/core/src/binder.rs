@@ -2,8 +2,8 @@
 //!
 //! Each output gets one [`RingBuffer`]. A frame input often gets a view into
 //! its producer's output ring. A message input may get one ring per producer.
-//! An async snapshot input gets a private copy-in ring. Binding walks each
-//! bundle in descriptor order, so the ring plan and generated
+//! An async input gets a private import ring. Binding walks each bundle in
+//! descriptor order, so the ring plan and generated
 //! [`BindPorts::bind`] code must use the same order.
 //!
 //! ## Matched wake endpoints
@@ -13,8 +13,8 @@
 //! Most edges never need the match. Cyclic consumers sample their inputs every
 //! cycle and can use a fresh default endpoint, and every writer uses the
 //! non-blocking `try_write`, so only the data direction ever wakes. The one
-//! load-bearing match is the private copy-in buffer that feeds an async
-//! input. There the builder pre-creates the data endpoint, stores it
+//! load-bearing match is a private input ring feeding an async input. There
+//! the builder pre-creates the data endpoint, stores it
 //! type-erased on the port's [`BoundPort`], and the binder hands the matched
 //! clone to the async view. Every other endpoint is default-constructed at
 //! bind time.
@@ -23,14 +23,14 @@ use std::any::Any;
 use std::slice;
 use std::sync::Arc;
 
-use metor_fsw_ring::{RingBuffer, WakeSink, WakeSource};
+use metor_fsw_ring::{NoWake, RingBuffer, WakeSink, WakeSource};
 
 use crate::registry::Registry;
 
 /// A pre-allocated [`RingBuffer`] plus an optional matched data-wake
 /// endpoint.
 ///
-/// `data` is `Some` only for the copy-in buffer feeding an async input, where
+/// `data` is `Some` only for a private ring feeding an async input, where
 /// the reader must hold the writer's endpoint to be woken (see the module
 /// doc). There is no space endpoint at all, since writers use the
 /// non-blocking `try_write` and nothing ever listens for space.
@@ -55,10 +55,17 @@ impl BoundPort {
 
     fn wake<T: Default + Clone + 'static>(slot: &Option<Box<dyn Any>>) -> T {
         match slot {
-            Some(b) => b
-                .downcast_ref::<T>()
-                .expect("wake endpoint type matches the port")
-                .clone(),
+            // An async private ring carries a `Notifier`, but a polling input
+            // may deliberately bind with `NoWake`. Only the matching reader
+            // receives the endpoint; other wake types retain their ordinary
+            // default behavior.
+            Some(b) => match b.downcast_ref::<T>() {
+                Some(wake) => wake.clone(),
+                None if std::any::TypeId::of::<T>() == std::any::TypeId::of::<NoWake>() => {
+                    T::default()
+                }
+                None => panic!("wake endpoint type matches the port"),
+            },
             None => T::default(),
         }
     }

@@ -27,89 +27,18 @@
 //! [`WasmPack::check_memory_stable`](super::WasmPack::check_memory_stable),
 //! which every pump runs before touching them.
 
-use metor_fsw_ring::{NoWake, RingBuffer, View, Writer};
+use metor_fsw_ring::{NoWake, RingBuffer};
 
 use metor_fsw_2_core::Delivery;
 
+use crate::io_bridge::{IoBridge, RingPump};
+
 use super::{GuestRing, WasmError};
-
-/// One direction of one port: read from `from`, write to `to`.
-///
-/// The forwarding policy follows the port's delivery mode, which is the same
-/// split the coordinator already makes for async systems: `CopyIn`
-/// (`coordinator::CopyIn`) mirrors only the newest record and exists *only*
-/// for snapshot inputs, because a log consumer there attaches to the
-/// producer's ring directly and takes the whole backlog. A guest can attach to
-/// nothing, so both modes cross here — each with the policy that mode wants.
-struct Leg {
-    from: View<NoWake>,
-    to: Writer<NoWake>,
-    delivery: Delivery,
-    /// `from`'s `committed` at the last forward, for snapshot legs.
-    ///
-    /// `try_latest` re-serves the pinned newest record when nothing new has
-    /// arrived, so without this a snapshot leg would re-forward the same
-    /// record every cycle. `u64::MAX` means nothing forwarded yet — the same
-    /// sentinel and the same reason as `CopyIn::last_committed`.
-    last_committed: u64,
-}
-
-impl Leg {
-    fn new(from: View<NoWake>, to: Writer<NoWake>, delivery: Delivery) -> Self {
-        Self {
-            from,
-            to,
-            delivery,
-            last_committed: u64::MAX,
-        }
-    }
-
-    /// Forward this cycle's records, by the port's delivery mode.
-    ///
-    /// A log leg drains: every record matters and the consumer needs the
-    /// backlog. A snapshot leg forwards only the newest, and only when the
-    /// upstream has actually committed something — mirroring a backlog into a
-    /// latest-wins port would just relocate it.
-    ///
-    /// A record the destination cannot take is dropped and counted rather than
-    /// failing the cycle, which matches what the ring already does to a
-    /// producer that outruns its consumer.
-    fn pump(&mut self) -> u64 {
-        match self.delivery {
-            Delivery::Log => {
-                let mut dropped = 0;
-                while let Ok(Some(grant)) = self.from.try_read() {
-                    if self.to.try_write(&grant).is_err() {
-                        dropped += 1;
-                    }
-                }
-                dropped
-            }
-            Delivery::Snapshot => {
-                let committed = self.from.committed();
-                if committed == self.last_committed {
-                    return 0;
-                }
-                self.last_committed = committed;
-                match self.from.try_latest() {
-                    Ok(Some(grant)) => u64::from(self.to.try_write(&grant).is_err()),
-                    // A corrupt read is "nothing new", as in `run_copy_ins`.
-                    _ => 0,
-                }
-            }
-        }
-    }
-}
 
 /// The per-cycle record pump between a slot's host rings and its occupant's
 /// guest rings.
 pub struct RingBridge {
-    /// Coordinator ring → guest ring, one per input port, in descriptor order.
-    inputs: Vec<Leg>,
-    /// Guest ring → coordinator ring, one per output port, in descriptor order.
-    outputs: Vec<Leg>,
-    /// Records dropped because a destination ring was full.
-    dropped: u64,
+    io: IoBridge<NoWake, NoWake>,
 }
 
 impl RingBridge {
@@ -143,8 +72,10 @@ impl RingBridge {
 
         let mut inputs = Vec::with_capacity(guest_inputs.len());
         for ((host, guest), &delivery) in host_inputs.iter().zip(guest_inputs).zip(input_delivery) {
-            inputs.push(Leg::new(
-                attach_host(host)?.view(NoWake).map_err(|_| WasmError::NoSlot)?,
+            inputs.push(RingPump::new(
+                attach_host(host)?
+                    .view(NoWake)
+                    .map_err(|_| WasmError::NoSlot)?,
                 attach_guest(guest)?
                     .writer(NoWake)
                     .map_err(|_| WasmError::WriterClaimed)?,
@@ -156,7 +87,7 @@ impl RingBridge {
         for ((host, guest), &delivery) in
             host_outputs.iter().zip(guest_outputs).zip(output_delivery)
         {
-            outputs.push(Leg::new(
+            outputs.push(RingPump::new(
                 attach_guest(guest)?
                     .view(NoWake)
                     .map_err(|_| WasmError::NoSlot)?,
@@ -168,29 +99,23 @@ impl RingBridge {
         }
 
         Ok(Self {
-            inputs,
-            outputs,
-            dropped: 0,
+            io: IoBridge::new(inputs, outputs),
         })
     }
 
     /// Carry this cycle's inputs into the guest, before its `execute`.
     pub fn pump_in(&mut self) {
-        for leg in &mut self.inputs {
-            self.dropped += leg.pump();
-        }
+        self.io.import();
     }
 
     /// Carry what the guest produced back out, after its `execute`.
     pub fn pump_out(&mut self) {
-        for leg in &mut self.outputs {
-            self.dropped += leg.pump();
-        }
+        self.io.export();
     }
 
     /// Records dropped because a destination ring was full, for the slot's
     /// health.
     pub fn dropped(&self) -> u64 {
-        self.dropped
+        self.io.dropped()
     }
 }
