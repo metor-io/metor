@@ -145,7 +145,11 @@ fn wasm_occupant_runs_to_a_terminal_state() {
             break;
         }
     }
-    assert_eq!(status, FswStatus::Done, "the waiter reaches a terminal state");
+    assert_eq!(
+        status,
+        FswStatus::Done,
+        "the waiter reaches a terminal state"
+    );
 
     pack.shutdown(state).expect("shuts down");
     pack.destroy(state).expect("destroys");
@@ -219,9 +223,6 @@ fn entry(pack: &WasmPack, name: &str) -> u32 {
         .unwrap_or_else(|| panic!("no `{name}` entry")) as u32
 }
 
-
-
-
 /// The guard that makes holding a handle over guest memory sound at all.
 ///
 /// A host handle into the interpreter's backing buffer dangles the moment the
@@ -230,35 +231,38 @@ fn entry(pack: &WasmPack, name: &str) -> u32 {
 /// force growth must be *noticed*, not silently tolerated — the alternative to
 /// noticing is reading freed memory.
 #[test]
-fn growing_guest_memory_invalidates_held_handles() {
+fn guest_memory_is_frozen_after_handles_are_pinned() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
     pack.pin_memory();
-    pack.check_memory_stable().expect("stable before any growth");
+    pack.check_memory_stable()
+        .expect("stable before any growth");
 
-    // Ask the guest's own allocator for far more than a fresh module has
-    // spare, so its allocator must grow the linear memory.
+    // Ask the guest allocator for enough bytes to require memory.grow. The
+    // store limiter must trap that request rather than moving the backing
+    // allocation out from under retained bridge handles.
     let before = pack.memory_len();
-    let mut asked = 0usize;
+    let mut refused = None;
     for _ in 0..64 {
-        asked += 1 << 20;
-        pack.alloc_for_test(1 << 20).expect("guest allocates");
-        if pack.memory_len() != before {
+        if let Err(err) = pack.alloc_for_test(1 << 20) {
+            refused = Some(err);
             break;
         }
     }
-    assert_ne!(
-        pack.memory_len(),
-        before,
-        "allocating {asked} bytes should have grown a fresh module's memory"
-    );
-
-    let err = pack
-        .check_memory_stable()
-        .expect_err("growth must invalidate held handles");
     assert!(
-        matches!(err, WasmError::MemoryMoved { .. }),
-        "expected MemoryMoved, got {err:?}"
+        matches!(refused, Some(WasmError::Trap(_))),
+        "post-bind growth must trap, got {refused:?}"
     );
+    assert_eq!(pack.memory_len(), before, "linear memory never moved");
+    pack.check_memory_stable().expect("handles remain valid");
+}
+
+#[test]
+fn initial_memory_over_the_host_limit_is_rejected() {
+    let wasm = wat::parse_str("(module (memory (export \"memory\") 2))").expect("valid module");
+    let err = WasmPack::open_with_memory_limit(&wasm, AMPLE_FUEL, 64 * 1024)
+        .err()
+        .expect("two pages exceed a one-page host limit");
+    assert!(matches!(err, WasmError::Instantiate(_)), "got {err:?}");
 }
 
 /// The bridge carries records both ways, and — the part that motivated holding
@@ -289,8 +293,8 @@ fn the_bridge_carries_a_backlog_both_ways() {
     // same ordering the real occupant gets, since it binds before any cycle.
     // SAFETY: the guest region is live, and `pin_memory`/`check_memory_stable`
     // bracket every use below; nothing grows the guest in between.
-    let g_in_ring =
-        unsafe { RingBuffer::attach_raw(base.add(g_in.offset as usize), g_in.len) }.expect("attach");
+    let g_in_ring = unsafe { RingBuffer::attach_raw(base.add(g_in.offset as usize), g_in.len) }
+        .expect("attach");
     let mut guest_reader = g_in_ring.view(NoWake).expect("reader slot");
 
     // SAFETY: as above, for every region the bridge attaches.
@@ -314,7 +318,7 @@ fn the_bridge_carries_a_backlog_both_ways() {
     }
 
     pack.check_memory_stable().expect("guest has not moved");
-    bridge.pump_in();
+    bridge.pump_in().expect("input pump");
 
     // All three crossed inbound, in order — not just the newest.
     for expect in 0..3u8 {
@@ -331,17 +335,18 @@ fn the_bridge_carries_a_backlog_both_ways() {
 
     // Now the reverse leg: a guest-side producer, pumped out to the host.
     // SAFETY: same live, pinned region.
-    let g_out_ring =
-        unsafe { RingBuffer::attach_raw(base.add(g_out.offset as usize), g_out.len) }
-            .expect("attach");
+    let g_out_ring = unsafe { RingBuffer::attach_raw(base.add(g_out.offset as usize), g_out.len) }
+        .expect("attach");
     let mut host_reader = h_out.view(NoWake).expect("reader slot");
     let mut guest_producer = g_out_ring.writer(NoWake).expect("sole guest writer");
     for i in 10..13u8 {
-        guest_producer.try_write(&[i; 8]).expect("guest ring takes it");
+        guest_producer
+            .try_write(&[i; 8])
+            .expect("guest ring takes it");
     }
 
     pack.check_memory_stable().expect("guest has not moved");
-    bridge.pump_out();
+    bridge.pump_out().expect("output pump");
 
     for expect in 10..13u8 {
         let got = host_reader
@@ -378,8 +383,8 @@ fn a_snapshot_leg_forwards_the_newest_once() {
     let base = pack.memory_base();
 
     // SAFETY: live, pinned regions; `check_memory_stable` guards every use.
-    let g_ring =
-        unsafe { RingBuffer::attach_raw(base.add(g_in.offset as usize), g_in.len) }.expect("attach");
+    let g_ring = unsafe { RingBuffer::attach_raw(base.add(g_in.offset as usize), g_in.len) }
+        .expect("attach");
     let mut guest_reader = g_ring.view(NoWake).expect("reader slot");
     // SAFETY: as above.
     let mut bridge = unsafe {
@@ -400,7 +405,7 @@ fn a_snapshot_leg_forwards_the_newest_once() {
     for i in 0..3u8 {
         producer.try_write(&[i; 8]).expect("host ring takes it");
     }
-    bridge.pump_in();
+    bridge.pump_in().expect("first snapshot pump");
 
     assert_eq!(
         &guest_reader
@@ -418,7 +423,7 @@ fn a_snapshot_leg_forwards_the_newest_once() {
     // Pump repeatedly with nothing new upstream: the pinned record must not be
     // forwarded again.
     for _ in 0..5 {
-        bridge.pump_in();
+        bridge.pump_in().expect("idle snapshot pump");
     }
     assert!(
         guest_reader.try_read().expect("readable").is_none(),
@@ -427,7 +432,7 @@ fn a_snapshot_leg_forwards_the_newest_once() {
 
     // A genuinely new record still crosses.
     producer.try_write(&[9u8; 8]).expect("host ring takes it");
-    bridge.pump_in();
+    bridge.pump_in().expect("new snapshot pump");
     assert_eq!(
         &guest_reader
             .try_read()
@@ -473,8 +478,16 @@ fn a_wasm_occupant_drives_a_slot_to_done() {
     let entry = entry(&pack, "waiter");
     drop(pack);
 
-    let mut slot = WasmSlot::bind(fixture(), entry, &[], "inst", &host_in, &host_out, AMPLE_FUEL)
-        .expect("binds to the slot's rings");
+    let mut slot = WasmSlot::bind(
+        fixture(),
+        entry,
+        &[],
+        "inst",
+        &host_in,
+        &host_out,
+        AMPLE_FUEL,
+    )
+    .expect("binds to the slot's rings");
 
     // The body waits two simulated microseconds.
     let mut last = FswStatus::Running;
@@ -484,7 +497,11 @@ fn a_wasm_occupant_drives_a_slot_to_done() {
             break;
         }
     }
-    assert_eq!(last, FswStatus::Done, "the occupant reaches a terminal state");
+    assert_eq!(
+        last,
+        FswStatus::Done,
+        "the occupant reaches a terminal state"
+    );
     assert_eq!(slot.dropped(), 0, "the bridge delivered everything");
 
     // The status the guest wrote crossed the bridge onto the slot's own ring,
@@ -493,6 +510,130 @@ fn a_wasm_occupant_drives_a_slot_to_done() {
         status_tap.try_latest().expect("readable").is_some(),
         "a SequenceStatus record reached the host side of the bridge"
     );
+}
+
+#[test]
+fn dropping_a_wasm_slot_releases_host_ring_roles_before_memory() {
+    let (_rings, host_in, host_out) = slot_rings();
+    let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    let entry = entry(&pack, "waiter");
+    drop(pack);
+
+    for _ in 0..3 {
+        let slot = WasmSlot::bind(
+            fixture(),
+            entry,
+            &[],
+            "inst",
+            &host_in,
+            &host_out,
+            AMPLE_FUEL,
+        )
+        .expect("the previous bridge released every host claim");
+        drop(slot);
+    }
+}
+
+#[test]
+fn wasm_bridge_drops_are_drained_once() {
+    let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    let cfg = Config {
+        capacity: 16,
+        max_readers: 2,
+    };
+    let guest = pack.add_ring(cfg, ROLE_OUTPUT).expect("guest output");
+    pack.pin_memory();
+    let base = pack.memory_base();
+
+    let host = RingBuffer::create_in_memory(cfg);
+    let _blocked = host.view(NoWake).expect("host reader");
+    let (host_base, host_len) = host.region();
+    let mut bridge = unsafe {
+        RingBridge::new(
+            base,
+            &[],
+            &[],
+            &[],
+            &[(host_base, host_len)],
+            &[guest],
+            &[Delivery::Log],
+        )
+    }
+    .expect("bridge");
+    let guest_ring = unsafe { RingBuffer::attach_raw(base.add(guest.offset as usize), guest.len) }
+        .expect("guest ring");
+    let mut guest_writer = guest_ring.writer(NoWake).expect("guest writer");
+
+    guest_writer.try_write(&[1; 8]).expect("first record");
+    bridge.pump_out().expect("first pump");
+    guest_writer.try_write(&[2; 8]).expect("second record");
+    bridge.pump_out().expect("second pump");
+    assert_eq!(bridge.drain_dropped(), 1);
+    assert_eq!(bridge.drain_dropped(), 0);
+}
+
+#[test]
+fn compatible_hot_reload_accepts_changed_module_bytes() {
+    let (rings, host_in, host_out) = slot_rings();
+    let _keep_rings_alive = rings;
+    let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    let entry = pack
+        .manifest()
+        .systems
+        .iter()
+        .find(|entry| entry.descriptor.name == "waiter")
+        .expect("waiter entry");
+    let identity = entry_identity(entry);
+    drop(pack);
+
+    // Append a valid custom section. The code bytes change while the pack ABI
+    // and selected entry manifest remain identical.
+    let mut changed = fixture().to_vec();
+    changed.extend_from_slice(&[0, 3, 1, b'x', 1]);
+    let slot = WasmSlot::bind_compatible(
+        &changed,
+        "waiter",
+        &identity,
+        &[],
+        "inst",
+        &host_in,
+        &host_out,
+        AMPLE_FUEL,
+        AMPLE_FUEL,
+        DEFAULT_MAX_MEMORY_BYTES,
+    )
+    .expect("interface-compatible bytes reload");
+    drop(slot);
+}
+
+#[test]
+fn incompatible_hot_reload_is_rejected_before_binding() {
+    let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    let mut identity = entry_identity(
+        pack.manifest()
+            .systems
+            .iter()
+            .find(|entry| entry.descriptor.name == "waiter")
+            .expect("waiter entry"),
+    );
+    identity[0] ^= 1;
+    drop(pack);
+
+    let err = WasmSlot::bind_compatible(
+        fixture(),
+        "waiter",
+        &identity,
+        &[],
+        "inst",
+        &[],
+        &[],
+        AMPLE_FUEL,
+        AMPLE_FUEL,
+        DEFAULT_MAX_MEMORY_BYTES,
+    )
+    .err()
+    .expect("changed entry identity is rejected");
+    assert!(matches!(err, WasmError::EntryChanged(name) if name == "waiter"));
 }
 
 /// A runaway occupant is stopped by its fuel budget and reported as
@@ -506,16 +647,8 @@ fn a_starved_wasm_occupant_stops_instead_of_stalling() {
     let (_rings, host_in, host_out) = slot_rings();
     // Bind generously — binding costs far more fuel than a cycle — then apply
     // a per-poll budget too small to finish one.
-    let mut slot = WasmSlot::bind(
-        fixture(),
-        0,
-        &[],
-        "inst",
-        &host_in,
-        &host_out,
-        AMPLE_FUEL,
-    )
-    .expect("binds under an ample budget");
+    let mut slot = WasmSlot::bind(fixture(), 0, &[], "inst", &host_in, &host_out, AMPLE_FUEL)
+        .expect("binds under an ample budget");
     slot.set_fuel_per_call(500);
     assert_eq!(
         slot.execute_raw(Timestamp(0)),

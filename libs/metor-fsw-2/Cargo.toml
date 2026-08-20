@@ -56,6 +56,7 @@ libloading = { version = "0.8" }
 # The wasm occupant backing: a pure-Rust interpreter with fuel metering, so a
 # guest poll is bounded rather than able to stall the cycle (docs/plans/wasm-occupant.md).
 wasmi = { version = "1.1", default-features = false, features = ["std"] }
+wasmi_core = "1.1"
 
 # errors
 miette = { version = "7.0", features = ["fancy"] }

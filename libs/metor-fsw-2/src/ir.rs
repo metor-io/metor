@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 6;
+pub const IR_VERSION: u32 = 7;
 
 /// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
@@ -152,6 +152,13 @@ pub struct CoordinatorSpec {
     /// regardless; the prefix rides only the registry/announce seam.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Fuel granted to one wasm occupant poll. `None` selects the framework
+    /// default of 100,000,000.
+    #[serde(default)]
+    pub wasm_fuel_per_poll: Option<u64>,
+    /// Maximum guest linear memory during load and bind. `None` selects 64 MiB.
+    #[serde(default)]
+    pub wasm_memory_limit_bytes: Option<u64>,
 }
 
 /// Which clock drives the run loop, the serializable mirror of

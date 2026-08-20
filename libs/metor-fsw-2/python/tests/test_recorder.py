@@ -32,10 +32,25 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(wall["clock"], "Wall")
         self.assertEqual(wall["cycle_rate"], 100.0)
         self.assertIsNone(wall["default_depth"])
+        self.assertIsNone(wall["wasm_fuel_per_poll"])
+        self.assertIsNone(wall["wasm_memory_limit_bytes"])
 
-        sim = Target(cycle_rate=120.0, sim_dt=0.5, default_depth=8).to_ir()["coordinator"]
+        sim = Target(
+            cycle_rate=120.0,
+            sim_dt=0.5,
+            default_depth=8,
+            wasm_fuel_per_poll=50_000_000,
+            wasm_memory_limit_bytes=32 * 1024 * 1024,
+        ).to_ir()["coordinator"]
         self.assertEqual(sim["clock"], {"Simulated": {"dt_secs": 0.5}})
         self.assertEqual(sim["default_depth"], 8)
+        self.assertEqual(sim["wasm_fuel_per_poll"], 50_000_000)
+        self.assertEqual(sim["wasm_memory_limit_bytes"], 32 * 1024 * 1024)
+
+        for field in ("wasm_fuel_per_poll", "wasm_memory_limit_bytes"):
+            mc._targets.clear()
+            with self.assertRaises(ValueError):
+                Target(cycle_rate=100.0, **{field: 0})
 
     def test_namespace_emission_and_validation(self):
         # Absent by default: an un-namespaced target emits a null namespace,

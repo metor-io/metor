@@ -894,6 +894,7 @@ fn resolve_wasm_occupant(
     slot: &str,
     src: &str,
     span: SourceSpan,
+    max_memory: usize,
 ) -> Result<AllowedOccupant, LoadError> {
     let bad = |detail: String| {
         LoadErrorKind::WasmOccupant(
@@ -909,10 +910,13 @@ fn resolve_wasm_occupant(
         .path
         .as_ref()
         .ok_or_else(|| bad("wasm artifact has no path".into()))?;
-    let bytes = std::fs::read(path)
-        .map_err(|e| bad(format!("reading {}: {e}", path.display())))?;
-    let pack = crate::wasm::WasmPack::open(&bytes, crate::coordinator::slot::DEFAULT_FUEL_PER_CALL)
-        .map_err(|e| bad(e.to_string()))?;
+    let bytes = std::fs::read(path).map_err(|e| bad(format!("reading {}: {e}", path.display())))?;
+    let pack = crate::wasm::WasmPack::open_with_memory_limit(
+        &bytes,
+        crate::coordinator::slot::WASM_SETUP_FUEL,
+        max_memory,
+    )
+    .map_err(|e| bad(e.to_string()))?;
     let (entry, desc) = pack
         .manifest()
         .systems
@@ -944,7 +948,7 @@ fn resolve_wasm_occupant(
         descriptor: desc,
         backing: OccupantBacking::Wasm {
             path: path.clone(),
-            entry,
+            entry_identity: crate::wasm::entry_identity(e),
         },
     })
 }
@@ -974,7 +978,14 @@ fn resolve_slot(
             if let Some(art) = wiring.artifacts.iter().find(|a| a.id == artifact_id)
                 && art.kind == crate::ir::ArtifactKind::Wasm
             {
-                allowed.push(resolve_wasm_occupant(art, occ, &slot.name, &src, span)?);
+                allowed.push(resolve_wasm_occupant(
+                    art,
+                    occ,
+                    &slot.name,
+                    &src,
+                    span,
+                    graph.config.wasm_memory_limit_bytes,
+                )?);
                 continue;
             }
             let pack = packs.open(wiring, &artifact_id, &slot.name, &src, span)?;
@@ -1196,6 +1207,20 @@ fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadE
     };
     if let Some(depth) = spec.default_depth {
         config.default_depth = depth;
+    }
+    if let Some(fuel) = spec.wasm_fuel_per_poll {
+        if fuel == 0 {
+            return Err(LoadErrorKind::InvalidWasmFuel.bare());
+        }
+        config.wasm_fuel_per_poll = fuel;
+    }
+    if let Some(bytes) = spec.wasm_memory_limit_bytes {
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| LoadErrorKind::InvalidWasmMemory { bytes }.bare())?;
+        if bytes == 0 {
+            return Err(LoadErrorKind::InvalidWasmMemory { bytes: 0 }.bare());
+        }
+        config.wasm_memory_limit_bytes = bytes;
     }
     config.clock = match spec.clock {
         ClockSpec::Wall => ClockMode::Wall,

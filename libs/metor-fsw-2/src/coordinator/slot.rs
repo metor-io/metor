@@ -129,10 +129,13 @@ pub enum OccupantBacking {
     /// fuel and sandboxed from the host, which is what neither other backing
     /// offers.
     ///
-    /// `entry` is the occupant's index in the *module's* manifest, which the
-    /// slot cannot infer: its own allow-set order is a target-level choice and
-    /// several occupants may come from one module.
-    Wasm { path: PathBuf, entry: u32 },
+    /// `entry_identity` is the resolved manifest entry's ABI/schema identity.
+    /// `Load` re-reads `path`, finds the entry by occupant name, and accepts
+    /// changed module bytes only while that identity remains compatible.
+    Wasm {
+        path: PathBuf,
+        entry_identity: Vec<u8>,
+    },
     /// A built cdylib the occupant's **worker process** opens
     /// (`docs/process-systems.md`); the host keeps only the path and never
     /// loads the artifact itself. Slots mix backings never: `plan_slot`
@@ -147,6 +150,9 @@ pub enum OccupantBacking {
 /// that a legitimate sequence never trips it, small enough that a runaway is
 /// stopped inside one cycle rather than wedging the vehicle.
 pub const DEFAULT_FUEL_PER_CALL: u64 = 100_000_000;
+/// Generous fixed budget for module setup; the target-configured budget applies
+/// only after the occupant has bound successfully.
+pub const WASM_SETUP_FUEL: u64 = 100_000_000;
 
 /// A candidate occupant a slot is allowed to load, validated at build time.
 /// `Load` selects it by `name`; `descriptor` is the self-description the
@@ -512,6 +518,8 @@ pub(crate) struct SlotRunner {
     /// occupant would simply never return and stall the cycle. Unused by the
     /// other backings.
     fuel_per_call: u64,
+    /// Maximum guest linear memory during setup; memory is frozen after bind.
+    max_wasm_memory: usize,
     /// Host writer over the control ring; `Abort` writes a cancel frame here.
     control: Output<SlotControlIn>,
     /// Host writer over the [`SlotStatus`] ring, written each `step`.
@@ -574,6 +582,8 @@ impl SlotRunner {
         seq_status: Input<SequenceStatus>,
         commands: MsgIn<SequenceCommand>,
         proc: Option<ProcParts>,
+        fuel_per_call: u64,
+        max_wasm_memory: usize,
     ) -> Self {
         Self {
             name,
@@ -581,7 +591,8 @@ impl SlotRunner {
             initial,
             input_regions,
             output_regions,
-            fuel_per_call: DEFAULT_FUEL_PER_CALL,
+            fuel_per_call,
+            max_wasm_memory,
             control,
             status_out,
             events,
@@ -634,11 +645,15 @@ impl SlotRunner {
                 let name = self.allowed[idx].name.clone();
                 self.emit_event(SequenceEventKind::Loaded { name });
             }
-            OccupantBacking::Wasm { path, entry } => {
-                let (path, entry) = (path.clone(), *entry);
+            OccupantBacking::Wasm {
+                path,
+                entry_identity,
+            } => {
+                let path = path.clone();
+                let entry_identity = entry_identity.clone();
                 let name = occ.name.clone();
                 let params = occ.params.clone();
-                match self.build_wasm(&path, entry, &params) {
+                match self.build_wasm(&path, &name, &entry_identity, &params) {
                     Ok(slot) => {
                         self.slot = Some(Occupant::Wasm(Box::new(slot)));
                         self.state = SlotState::Loaded;
@@ -695,18 +710,22 @@ impl SlotRunner {
     fn build_wasm(
         &mut self,
         path: &std::path::Path,
-        entry: u32,
+        entry_name: &str,
+        entry_identity: &[u8],
         params: &[u8],
     ) -> Result<crate::wasm::WasmSlot, String> {
         let wasm = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-        crate::wasm::WasmSlot::bind(
+        crate::wasm::WasmSlot::bind_compatible(
             &wasm,
-            entry,
+            entry_name,
+            entry_identity,
             params,
             &self.name,
             &self.input_regions,
             &self.output_regions,
+            WASM_SETUP_FUEL,
             self.fuel_per_call,
+            self.max_wasm_memory,
         )
         .map_err(|e| e.to_string())
     }
@@ -1115,6 +1134,24 @@ impl CyclicSlot for SlotRunner {
 
     fn drain_timeouts(&mut self) -> u64 {
         std::mem::take(&mut self.timeouts)
+    }
+
+    fn drain_boundary_drops(&mut self) -> u64 {
+        match self.slot.as_mut() {
+            Some(Occupant::Wasm(slot)) => slot.drain_dropped(),
+            _ => 0,
+        }
+    }
+
+    fn boundary_drop_health_key(&self) -> &'static str {
+        "wasm_boundary_dropped"
+    }
+
+    fn drain_boundary_corruptions(&mut self) -> u64 {
+        match self.slot.as_mut() {
+            Some(Occupant::Wasm(slot)) => slot.drain_corruptions(),
+            _ => 0,
+        }
     }
 
     fn worker_status(&self) -> Option<WorkerStatus> {

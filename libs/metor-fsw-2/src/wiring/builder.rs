@@ -65,6 +65,8 @@ impl WiringBuilder {
                     default_depth: None,
                     clock: ClockSpec::Wall,
                     namespace: None,
+                    wasm_fuel_per_poll: None,
+                    wasm_memory_limit_bytes: None,
                 },
                 artifacts: Vec::new(),
                 states: Vec::new(),
@@ -84,6 +86,8 @@ impl WiringBuilder {
             default_depth: self.wiring.coordinator.default_depth,
             clock,
             namespace: self.wiring.coordinator.namespace.clone(),
+            wasm_fuel_per_poll: self.wiring.coordinator.wasm_fuel_per_poll,
+            wasm_memory_limit_bytes: self.wiring.coordinator.wasm_memory_limit_bytes,
         };
         self
     }
@@ -110,7 +114,11 @@ impl WiringBuilder {
     /// Unlike [`artifact`](Self::artifact) there is no crate or library stem
     /// to build per triple: a `.wasm` is one arch-neutral file, which is the
     /// property that makes it cheap to uplink.
-    pub fn wasm_artifact(mut self, id: impl Into<String>, path: impl Into<std::path::PathBuf>) -> Self {
+    pub fn wasm_artifact(
+        mut self,
+        id: impl Into<String>,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Self {
         let id = id.into();
         validate::check_artifact_id_available(&self.wiring, &id).unwrap_or_else(|e| panic!("{e}"));
         self.wiring.artifacts.push(Artifact {

@@ -36,6 +36,8 @@ pub(super) struct ProcBindCtx {
     pub(super) worker_exe: Option<PathBuf>,
     pub(super) max_restarts: u32,
     pub(super) restart_backoff: Duration,
+    pub(super) wasm_fuel_per_poll: u64,
+    pub(super) wasm_memory_limit_bytes: usize,
 }
 
 /// Build the typed `BoundPort`s a static (host-side) registration binds over:
@@ -480,6 +482,8 @@ fn bind_slot(
         seq_status,
         commands,
         proc,
+        proc_ctx.wasm_fuel_per_poll,
+        proc_ctx.wasm_memory_limit_bytes,
     ))
 }
 

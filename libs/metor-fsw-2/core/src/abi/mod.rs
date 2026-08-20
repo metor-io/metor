@@ -191,8 +191,7 @@ pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
 pub const SYM_PACK_ALLOC: &[u8] = b"fsw_pack_alloc\0";
 /// `fsw_pack_free` releases a region from `fsw_pack_alloc`.
 pub const SYM_PACK_FREE: &[u8] = b"fsw_pack_free\0";
-/// `fsw_pack_ring_init` formats a ring into a region, on the side whose
-/// pointer width the region header will record.
+/// `fsw_pack_ring_init` formats a ring into a guest-allocated region.
 pub const SYM_PACK_RING_INIT: &[u8] = b"fsw_pack_ring_init\0";
 /// `fsw_pack_set_now` publishes a cycle timestamp on the callee's ambient
 /// clock, so `bind`/`init` need not fall back to wall time.
@@ -688,12 +687,9 @@ pub fn run_pack_set_now(now: u64) {
 /// `fsw_pack_ring_init`: format a ring into a region from [`run_pack_alloc`].
 /// Returns `0`, or `-1` on a bad region or config.
 ///
-/// The guest must do this itself rather than let the host format the region
-/// for it. A region header carries an architecture tag encoding the writing
-/// target's pointer width, and a wasm guest's `usize` is four bytes where its
-/// 64-bit host's is eight — so a region formatted across the boundary is
-/// rejected on attach as `ArchMismatch`. Formatting on the side that will
-/// attach keeps the tag honest.
+/// The guest does this itself because the region came from its allocator and
+/// remains guest-owned. The ring header uses explicit-width fields, so the
+/// wasm guest and a 64-bit host can both attach to the same bytes.
 ///
 /// # Safety
 /// `ptr`/`len` name a live region from [`run_pack_alloc`] that nothing else

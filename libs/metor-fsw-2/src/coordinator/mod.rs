@@ -113,6 +113,12 @@ pub struct CoordinatorConfig {
     /// How long a dead worker's slot waits before respawning, so a
     /// crash-looping artifact cannot busy-spin the spawn path. Default 500 ms.
     pub proc_restart_backoff: Duration,
+    /// Fuel granted to one wasm occupant poll. Default 100,000,000.
+    pub wasm_fuel_per_poll: u64,
+    /// Maximum linear memory one wasm occupant may allocate while loading and
+    /// binding. Memory is frozen at its bound size before execution.
+    /// Default 64 MiB.
+    pub wasm_memory_limit_bytes: usize,
 }
 
 impl Default for CoordinatorConfig {
@@ -125,6 +131,8 @@ impl Default for CoordinatorConfig {
             proc_step_timeout: Duration::from_millis(100),
             proc_max_restarts: 3,
             proc_restart_backoff: Duration::from_millis(500),
+            wasm_fuel_per_poll: crate::coordinator::slot::DEFAULT_FUEL_PER_CALL,
+            wasm_memory_limit_bytes: crate::wasm::DEFAULT_MAX_MEMORY_BYTES,
         }
     }
 }
@@ -241,6 +249,7 @@ pub(crate) struct RingTable {
 pub(crate) struct AsyncBoundary {
     name: Arc<str>,
     io: IoBridge<Notifier, NoWake>,
+    corruptions: u64,
 }
 
 impl AsyncBoundary {
@@ -248,6 +257,7 @@ impl AsyncBoundary {
         Self {
             name: name.into(),
             io,
+            corruptions: 0,
         }
     }
 }
@@ -259,8 +269,8 @@ impl CyclicSlot for AsyncBoundary {
         // Waking an input only schedules the local task. The coordinator does
         // not yield here, so export still observes work from before this
         // boundary, never work caused by the just-imported records.
-        self.io.import();
-        self.io.export();
+        self.corruptions += u64::from(self.io.import().is_err());
+        self.corruptions += u64::from(self.io.export().is_err());
     }
 
     fn shutdown(&mut self) {}
@@ -275,6 +285,10 @@ impl CyclicSlot for AsyncBoundary {
 
     fn drain_boundary_drops(&mut self) -> u64 {
         self.io.drain_dropped()
+    }
+
+    fn drain_boundary_corruptions(&mut self) -> u64 {
+        std::mem::take(&mut self.corruptions)
     }
 }
 
@@ -736,12 +750,23 @@ impl Coordinator {
         for slot in &mut self.cyclic {
             let boundary_drops = slot.drain_boundary_drops();
             if boundary_drops > 0 {
-                self.coord_health.error("async_boundary_dropped");
+                self.coord_health.error(slot.boundary_drop_health_key());
                 self.coord_health.log(LogLevel::Warn, slot.name());
                 tracing::warn!(
                     system = slot.name(),
                     dropped = boundary_drops,
                     "async boundary dropped records"
+                );
+                coord_event = true;
+            }
+            let boundary_corruptions = slot.drain_boundary_corruptions();
+            if boundary_corruptions > 0 {
+                self.coord_health.error("boundary_corrupt");
+                self.coord_health.log(LogLevel::Error, slot.name());
+                tracing::error!(
+                    system = slot.name(),
+                    corruptions = boundary_corruptions,
+                    "isolated boundary read corrupt"
                 );
                 coord_event = true;
             }

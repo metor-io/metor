@@ -43,7 +43,7 @@ __version__ = "0.3.0"
 # their constructor), replacing the host's compiled-in by-type association.
 # v6 removed the redundant empty initial-occupant state; an absent `initial`
 # now exclusively represents an empty slot.
-IR_VERSION = 6
+IR_VERSION = 7
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -1097,7 +1097,9 @@ class Target:
     prefix (``"sat1"``) stamped onto every component name this target registers
     and announces, so several targets sharing one db keep disjoint id spaces;
     ``None`` leaves names and ids identical to an un-namespaced target. These
-    are the only knobs ``CoordinatorSpec`` carries.
+    ``wasm_fuel_per_poll`` bounds one guest poll and
+    ``wasm_memory_limit_bytes`` bounds guest memory during load and bind;
+    omitted values select 100,000,000 fuel and 64 MiB.
     """
 
     def __init__(
@@ -1106,11 +1108,19 @@ class Target:
         sim_dt: float | None = None,
         default_depth: int | None = None,
         namespace: str | None = None,
+        wasm_fuel_per_poll: int | None = None,
+        wasm_memory_limit_bytes: int | None = None,
     ):
         self.cycle_rate = float(cycle_rate)
         self.sim_dt = sim_dt
         self.default_depth = default_depth
         self.namespace = _validate_namespace(namespace)
+        if wasm_fuel_per_poll is not None and wasm_fuel_per_poll <= 0:
+            raise ValueError("wasm_fuel_per_poll must be greater than zero")
+        if wasm_memory_limit_bytes is not None and wasm_memory_limit_bytes <= 0:
+            raise ValueError("wasm_memory_limit_bytes must be greater than zero")
+        self.wasm_fuel_per_poll = wasm_fuel_per_poll
+        self.wasm_memory_limit_bytes = wasm_memory_limit_bytes
         self.coordinator = SystemHandle(COORDINATOR)
         self._artifacts: list[dict[str, Any]] = []
         self._states: list[dict[str, Any]] = []
@@ -1352,6 +1362,8 @@ class Target:
                 "default_depth": self.default_depth,
                 "clock": self._clock(),
                 "namespace": self.namespace,
+                "wasm_fuel_per_poll": self.wasm_fuel_per_poll,
+                "wasm_memory_limit_bytes": self.wasm_memory_limit_bytes,
             },
             "artifacts": self._artifacts,
             "states": self._states,

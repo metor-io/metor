@@ -28,21 +28,18 @@
 //! pages: Rust's wasm allocator finds its heap through `memory.size`, so pages
 //! the host grows behind its back can later be handed out again by the guest.
 //!
-//! There is therefore **no per-cycle marshalling protocol**. The ring is still
-//! the shared medium it always was; it has merely moved into the guest's
-//! address space, and the host reads and writes the same records through
-//! [`Memory::data_mut`].
+//! The host keeps matching rings on both sides and pumps records across the
+//! boundary once per cycle. The ring format stays unchanged; only the copy
+//! between host and guest address spaces is new.
 //!
-//! ## Borrowing, and why regions are re-derived
+//! ## Stable memory and persistent ring roles
 //!
-//! The interpreter lends guest memory out of its `Store`, so a `RingBuffer`
-//! cannot be held across calls the way the native path holds one over a mapped
-//! region — the borrow would conflict with the next `call`. The host therefore
-//! keeps only each port's `(offset, len, role)` and re-derives the region for
-//! the duration of one access. That is affordable because the ring's cursors
-//! live in the region header rather than in the `Writer`, so nothing is lost
-//! by rebuilding the handle; and a full port copy measured 7 ns against a
-//! 2,873 ns cycle in the Phase 0 spike, far below the noise floor.
+//! A ring reader owns a persistent slot in the region header, so rebuilding it
+//! each cycle would rejoin at the live edge and lose queued records. The host
+//! therefore retains bridge handles over guest memory. The store enforces the
+//! target's memory ceiling during load and bind, then freezes linear memory
+//! before those handles are constructed. A later `memory.grow` traps, and the
+//! bridge is explicitly dropped before the store releases the backing bytes.
 //!
 //! ## The trust boundary
 //!
@@ -53,9 +50,65 @@
 //! every trap — including running out of fuel — becomes an [`WasmError`]
 //! instead of propagating.
 
-use metor_fsw_2_core::abi::{FSW_ABI_VERSION, FswStatus, PackManifest};
+use metor_fsw_2_core::abi::{FSW_ABI_VERSION, FswStatus, PackEntryDesc, PackManifest};
 use metor_fsw_ring::{Config, RingBuffer, region_len};
-use wasmi::{Config as WasmConfig, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
+use wasmi::{
+    Config as WasmConfig, Engine, Instance, Linker, Memory, Module, ResourceLimiter, Store,
+    TypedFunc,
+};
+use wasmi_core::LimiterError;
+
+/// Default maximum linear-memory footprint of one wasm occupant.
+pub const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Store-owned resource policy. Memory may grow during load and bind up to
+/// `max_memory`, then is frozen before any host ring handle is retained.
+struct StoreState {
+    max_memory: usize,
+    frozen_memory: Option<usize>,
+}
+
+impl ResourceLimiter for StoreState {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool, LimiterError> {
+        let over_module_max = maximum.is_some_and(|maximum| desired > maximum);
+        let over_host_max = desired > self.max_memory;
+        let grew_after_bind = self.frozen_memory.is_some_and(|frozen| desired > frozen);
+        if over_module_max || over_host_max || grew_after_bind {
+            return Err(LimiterError::ResourceLimiterDeniedAllocation);
+        }
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool, LimiterError> {
+        const MAX_TABLE_ELEMENTS: usize = 65_536;
+        if desired > MAX_TABLE_ELEMENTS || maximum.is_some_and(|maximum| desired > maximum) {
+            return Err(LimiterError::ResourceLimiterDeniedAllocation);
+        }
+        Ok(true)
+    }
+
+    fn instances(&self) -> usize {
+        1
+    }
+
+    fn tables(&self) -> usize {
+        1
+    }
+
+    fn memories(&self) -> usize {
+        1
+    }
+}
 
 /// What can go wrong loading or driving a wasm pack.
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +142,12 @@ pub enum WasmError {
     /// `fsw_pack_create` returned null for this entry.
     #[error("fsw_pack_create failed for entry {0}")]
     Create(u32),
+    /// A runtime-reloaded module no longer exports the allowed entry.
+    #[error("wasm module no longer exports entry `{0}`")]
+    EntryMissing(String),
+    /// A runtime-reloaded entry changed the contract validated at build.
+    #[error("wasm entry `{0}` changed its descriptor, params schema, or reloadability")]
+    EntryChanged(String),
     /// The guest's allocator refused a ring region.
     #[error("guest allocator returned null for {0} bytes")]
     Alloc(usize),
@@ -120,6 +179,9 @@ pub enum WasmError {
     /// A ring already had a writer, so the bridge could not claim it.
     #[error("ring writer already claimed")]
     WriterClaimed,
+    /// A ring owned by the guest was structurally corrupted.
+    #[error("guest ring is corrupt: {0}")]
+    RingRead(metor_fsw_ring::ReadError),
     /// The guest's linear memory grew, so any handle the host holds over a
     /// region inside it may now dangle.
     #[error("guest memory moved ({was} -> {now} bytes); ring handles are stale")]
@@ -140,8 +202,8 @@ pub fn is_out_of_fuel(err: &WasmError) -> bool {
 
 /// One port's ring region inside guest memory.
 ///
-/// Deliberately just the geometry: see the module docs on why a `RingBuffer`
-/// is re-derived per access rather than held.
+/// Deliberately just the geometry used while constructing the persistent
+/// bridge handles described in the module documentation.
 #[derive(Clone, Copy, Debug)]
 pub struct GuestRing {
     /// Offset of the region within the guest's linear memory.
@@ -150,6 +212,14 @@ pub struct GuestRing {
     pub len: usize,
     /// `ROLE_INPUT` or `ROLE_OUTPUT` from the pack ABI.
     pub role: u8,
+}
+
+/// Stable identity of the ABI-relevant parts of one manifest entry.
+/// Documentation and default values may change across a compatible hot reload;
+/// positional ports, parameter encoding, and reloadability may not.
+pub(crate) fn entry_identity(entry: &PackEntryDesc) -> Vec<u8> {
+    postcard::to_allocvec(&(&entry.descriptor, &entry.params_schema, entry.reloadable))
+        .expect("pack entry identity encodes")
 }
 
 /// `fsw_pack_create`'s signature: `(pack, index, mount, params, params_len)`.
@@ -178,7 +248,7 @@ struct Exports {
 /// A loaded wasm pack: the instantiated module plus its opened pack pointer
 /// and decoded manifest.
 pub struct WasmPack {
-    store: Store<()>,
+    store: Store<StoreState>,
     memory: Memory,
     exports: Exports,
     pack: i32,
@@ -204,15 +274,31 @@ impl WasmPack {
     /// before instantiation too, because the module's start section is itself
     /// metered and an ungranted store traps immediately.
     pub fn open(wasm: &[u8], fuel_per_call: u64) -> Result<Self, WasmError> {
+        Self::open_with_memory_limit(wasm, fuel_per_call, DEFAULT_MAX_MEMORY_BYTES)
+    }
+
+    /// [`open`](Self::open) with an explicit linear-memory ceiling.
+    pub fn open_with_memory_limit(
+        wasm: &[u8],
+        fuel_per_call: u64,
+        max_memory: usize,
+    ) -> Result<Self, WasmError> {
         let mut config = WasmConfig::default();
         config.consume_fuel(true);
         let engine = Engine::new(&config);
         let module = Module::new(&engine, wasm).map_err(|e| WasmError::Module(e.to_string()))?;
-        let mut store = Store::new(&engine, ());
+        let mut store = Store::new(
+            &engine,
+            StoreState {
+                max_memory,
+                frozen_memory: None,
+            },
+        );
+        store.limiter(|state| state);
         store
             .set_fuel(fuel_per_call)
             .map_err(|e| WasmError::Instantiate(e.to_string()))?;
-        let linker: Linker<()> = Linker::new(&engine);
+        let linker: Linker<StoreState> = Linker::new(&engine);
         let instance: Instance = linker
             .instantiate_and_start(&mut store, &module)
             .map_err(|e| WasmError::Instantiate(e.to_string()))?;
@@ -275,6 +361,7 @@ impl WasmPack {
     /// Called once the occupant's regions exist, i.e. after bind.
     pub fn pin_memory(&mut self) {
         self.pinned_len = self.memory.data(&self.store).len();
+        self.store.data_mut().frozen_memory = Some(self.pinned_len);
     }
 
     /// Whether the guest's memory is still where it was when
@@ -377,10 +464,9 @@ impl WasmPack {
     pub fn add_ring(&mut self, cfg: Config, role: u8) -> Result<GuestRing, WasmError> {
         let len = region_len(&cfg);
         let offset = self.alloc(len)?;
-        // The *guest* formats the region, not the host: the header records the
-        // writing target's pointer width, and a wasm guest's `usize` is four
-        // bytes where this host's is eight, so a host-formatted region would
-        // be rejected on attach as `ArchMismatch`.
+        // The guest formats the region allocated by its own allocator. The
+        // ring format itself uses explicit-width fields and is compatible
+        // across the guest and host pointer widths.
         let rc = self.call(
             |e| e.ring_init,
             (
@@ -555,7 +641,7 @@ impl WasmPack {
 /// Resolve one typed export, naming it when it is missing.
 fn typed<P, R>(
     instance: &Instance,
-    store: &Store<()>,
+    store: &Store<StoreState>,
     name: &'static str,
 ) -> Result<TypedFunc<P, R>, WasmError>
 where

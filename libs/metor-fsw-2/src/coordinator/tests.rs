@@ -2441,6 +2441,8 @@ mod proc_slot {
                 rings: Vec::new(),
                 step_timeout: Duration::from_millis(200),
             }),
+            crate::coordinator::slot::DEFAULT_FUEL_PER_CALL,
+            crate::wasm::DEFAULT_MAX_MEMORY_BYTES,
         );
         Harness {
             runner,

@@ -158,9 +158,10 @@ be granted **before instantiation** — the start section is itself metered, and
 an ungranted store traps immediately (this cost the Phase 0 spike three runs).
 
 Phase 0 measured **7,449 units for one poll** of a math-heavy commissioning
-ladder. The slot's default budget should sit well above that with room for a
-much heavier sequence; the knob exists so an operator can tighten it per slot.
-Exhaustion is a trap, and a trap is a clean terminal state — never a host crash.
+ladder. The target's `wasm_fuel_per_poll` default sits well above that with room
+for a much heavier sequence; an operator can tighten it for the target without
+also constraining module setup, which uses a separate fixed budget. Exhaustion
+is a trap, and a trap is a clean terminal state — never a host crash.
 
 ## Stage B's crux: connecting a guest occupant to the graph
 
@@ -178,10 +179,11 @@ therefore persist across calls.
 
 That rules out the obvious shape and leaves one real constraint: **the host must
 hold `RingBuffer` handles over guest linear memory for the occupant's whole
-life**, which is sound only while that memory does not move. `wasmi` reallocates
-its backing buffer on `memory.grow`, and a guest's allocator will grow if it
-needs heap — a sequence calling `progress()` allocates a `String`, so this is
-not hypothetical.
+life**, which is sound only while that memory does not move. The store therefore
+applies the target's memory ceiling while loading and binding, then freezes
+linear memory before constructing the bridge. A later `memory.grow` traps and
+stops the occupant without invalidating a host pointer. Teardown drops the
+bridge while the store still owns the linear memory.
 
 ### Can a guest be given host memory? No — and the asymmetry decides this
 

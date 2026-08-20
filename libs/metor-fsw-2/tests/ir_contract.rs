@@ -34,6 +34,8 @@ fn maximal() -> Wiring {
             default_depth: Some(8),
             clock: ClockSpec::Simulated { dt_secs: 0.5 },
             namespace: None,
+            wasm_fuel_per_poll: Some(50_000_000),
+            wasm_memory_limit_bytes: Some(32 * 1024 * 1024),
         },
         artifacts: vec![
             Artifact {
@@ -184,6 +186,11 @@ fn representation_is_externally_tagged() {
     assert_eq!(
         v["coordinator"]["clock"],
         json!({ "Simulated": { "dt_secs": 0.5 } })
+    );
+    assert_eq!(v["coordinator"]["wasm_fuel_per_poll"], json!(50_000_000));
+    assert_eq!(
+        v["coordinator"]["wasm_memory_limit_bytes"],
+        json!(32 * 1024 * 1024)
     );
     assert_eq!(
         v["systems"][0]["params"],

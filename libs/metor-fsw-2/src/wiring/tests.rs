@@ -485,6 +485,8 @@ fn err_static_system_with_typed_params() {
             default_depth: None,
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         },
         artifacts: Vec::new(),
         states: Vec::new(),
@@ -944,6 +946,26 @@ fn resolve_rejects_invalid_simulated_steps_without_panicking() {
     }
 }
 
+#[test]
+fn resolve_rejects_zero_wasm_limits() {
+    let mut wiring = equiv_builder().build();
+    wiring.coordinator.wasm_fuel_per_poll = Some(0);
+    let err = resolve(&wiring, &registry())
+        .err()
+        .expect("zero fuel fails");
+    assert!(matches!(err.kind, LoadErrorKind::InvalidWasmFuel));
+
+    let mut wiring = equiv_builder().build();
+    wiring.coordinator.wasm_memory_limit_bytes = Some(0);
+    let err = resolve(&wiring, &registry())
+        .err()
+        .expect("zero memory fails");
+    assert!(matches!(
+        err.kind,
+        LoadErrorKind::InvalidWasmMemory { bytes: 0 }
+    ));
+}
+
 /// A bundle whose artifact records a `manifest_hash` verifies it against the
 /// copied sidecar at load: a matching bundle loads, a tampered sidecar fails
 /// with [`BundleError::ManifestHashMismatch`] before any dlopen. Built over the
@@ -1238,6 +1260,8 @@ fn bare_wiring() -> Wiring {
             default_depth: None,
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         },
         artifacts: Vec::new(),
         states: Vec::new(),

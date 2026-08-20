@@ -104,18 +104,23 @@ impl RingBridge {
     }
 
     /// Carry this cycle's inputs into the guest, before its `execute`.
-    pub fn pump_in(&mut self) {
-        self.io.import();
+    pub fn pump_in(&mut self) -> Result<(), WasmError> {
+        self.io.import().map_err(WasmError::RingRead)
     }
 
     /// Carry what the guest produced back out, after its `execute`.
-    pub fn pump_out(&mut self) {
-        self.io.export();
+    pub fn pump_out(&mut self) -> Result<(), WasmError> {
+        self.io.export().map_err(WasmError::RingRead)
     }
 
     /// Records dropped because a destination ring was full, for the slot's
     /// health.
     pub fn dropped(&self) -> u64 {
         self.io.dropped()
+    }
+
+    /// Drain records dropped since the last health scan.
+    pub fn drain_dropped(&mut self) -> u64 {
+        self.io.drain_dropped()
     }
 }

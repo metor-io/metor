@@ -240,6 +240,8 @@ fn lockstep_end_to_end(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Simulated { dt_secs: 0.005 },
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         })
         .artifact(
             "counter",
@@ -402,6 +404,8 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         })
         .artifact(
             "counter",
@@ -509,6 +513,8 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         })
         .artifact(
             "counter",
@@ -736,6 +742,8 @@ fn slow_sim_coordinator() -> metor_fsw_2::CoordinatorSpec {
         default_depth: Some(8),
         clock: metor_fsw_2::ClockSpec::Simulated { dt_secs: 1e-9 },
         namespace: None,
+        wasm_fuel_per_poll: None,
+        wasm_memory_limit_bytes: None,
     }
 }
 

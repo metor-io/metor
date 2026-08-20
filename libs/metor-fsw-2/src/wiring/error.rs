@@ -112,6 +112,8 @@ impl LoadErrorKind {
             UnknownType { .. } => "fsw_wiring::unknown_type",
             ProcessNeedsArtifact { .. } => "fsw_wiring::process_needs_artifact",
             ProcessUnsupported { .. } => "fsw_wiring::process_unsupported",
+            InvalidWasmFuel => "fsw_wiring::invalid_wasm_fuel",
+            InvalidWasmMemory { .. } => "fsw_wiring::invalid_wasm_memory",
             ProcDescribe { .. } => "fsw_wiring::proc_describe",
             DuplicateInstance { .. } => "fsw_wiring::duplicate_instance",
             Params(kind) => kind.code(),
@@ -218,6 +220,8 @@ impl LoadErrorKind {
             }
             IrVersionMismatch { .. }
             | InvalidSimulatedStep { .. }
+            | InvalidWasmFuel
+            | InvalidWasmMemory { .. }
             | BadScopeRef { .. }
             | StaleStubs { .. } => return None,
         })
@@ -276,6 +280,12 @@ pub enum LoadErrorKind {
     /// support. `name` is the instance name of either.
     #[error("`{name}` sets `process=#true`, unsupported on this target")]
     ProcessUnsupported { name: String },
+
+    #[error("wasm_fuel_per_poll must be greater than zero")]
+    InvalidWasmFuel,
+
+    #[error("wasm_memory_limit_bytes must be nonzero and fit this host (got {bytes})")]
+    InvalidWasmMemory { bytes: u64 },
 
     /// A resolve-time describe worker failed. `system` names the owning
     /// `system` or `slot` instance; for a slot, `artifact` is the allowed

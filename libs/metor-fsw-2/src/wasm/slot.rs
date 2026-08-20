@@ -26,7 +26,11 @@ pub struct WasmSlot {
     pack: WasmPack,
     /// The guest's instance pointer from `fsw_pack_create`.
     state: i32,
-    bridge: RingBridge,
+    bridge: Option<RingBridge>,
+    /// Structurally corrupt bridge reads waiting for the coordinator's health
+    /// scan. A corruption also stops the occupant; this counter preserves the
+    /// specific cause instead of reporting only the generic panic fold.
+    boundary_corruptions: u64,
     /// Latched once a cycle has failed, so a dead occupant is never re-entered.
     dead: bool,
 }
@@ -47,14 +51,92 @@ impl WasmSlot {
         host_outputs: &[FswRing],
         fuel_per_call: u64,
     ) -> Result<Self, WasmError> {
-        let mut pack = WasmPack::open(wasm, fuel_per_call)?;
+        Self::bind_with_memory_limit(
+            wasm,
+            index,
+            params,
+            instance,
+            host_inputs,
+            host_outputs,
+            fuel_per_call,
+            super::DEFAULT_MAX_MEMORY_BYTES,
+        )
+    }
+
+    /// [`bind`](Self::bind) with an explicit guest-memory ceiling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_with_memory_limit(
+        wasm: &[u8],
+        index: u32,
+        params: &[u8],
+        instance: &str,
+        host_inputs: &[FswRing],
+        host_outputs: &[FswRing],
+        fuel_per_call: u64,
+        max_memory: usize,
+    ) -> Result<Self, WasmError> {
+        let pack = WasmPack::open_with_memory_limit(wasm, fuel_per_call, max_memory)?;
+        Self::bind_opened(pack, index, params, instance, host_inputs, host_outputs)
+    }
+
+    /// Bind a freshly read module by entry name after proving its ABI-relevant
+    /// manifest identity still matches the one resolved into the target.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_compatible(
+        wasm: &[u8],
+        entry_name: &str,
+        expected_identity: &[u8],
+        params: &[u8],
+        instance: &str,
+        host_inputs: &[FswRing],
+        host_outputs: &[FswRing],
+        setup_fuel: u64,
+        poll_fuel: u64,
+        max_memory: usize,
+    ) -> Result<Self, WasmError> {
+        let pack = WasmPack::open_with_memory_limit(wasm, setup_fuel, max_memory)?;
+        let (index, entry) = pack
+            .manifest()
+            .systems
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.descriptor.name == entry_name)
+            .ok_or_else(|| WasmError::EntryMissing(entry_name.to_string()))?;
+        if super::entry_identity(entry) != expected_identity {
+            return Err(WasmError::EntryChanged(entry_name.to_string()));
+        }
+        let mut slot = Self::bind_opened(
+            pack,
+            index as u32,
+            params,
+            instance,
+            host_inputs,
+            host_outputs,
+        )?;
+        slot.set_fuel_per_call(poll_fuel);
+        Ok(slot)
+    }
+
+    fn bind_opened(
+        mut pack: WasmPack,
+        index: u32,
+        params: &[u8],
+        instance: &str,
+        host_inputs: &[FswRing],
+        host_outputs: &[FswRing],
+    ) -> Result<Self, WasmError> {
         let entry = pack
             .manifest()
             .systems
             .get(index as usize)
             .ok_or(WasmError::Create(index))?;
         let in_delivery: Vec<_> = entry.descriptor.inputs.iter().map(|p| p.delivery).collect();
-        let out_delivery: Vec<_> = entry.descriptor.outputs.iter().map(|p| p.delivery).collect();
+        let out_delivery: Vec<_> = entry
+            .descriptor
+            .outputs
+            .iter()
+            .map(|p| p.delivery)
+            .collect();
 
         // Mount 1 is the slot-occupant mount, which appends the control input
         // and the status output the entry never declares.
@@ -97,7 +179,8 @@ impl WasmSlot {
         Ok(Self {
             pack,
             state,
-            bridge,
+            bridge: Some(bridge),
+            boundary_corruptions: 0,
             dead: false,
         })
     }
@@ -143,6 +226,9 @@ impl WasmSlot {
         match self.cycle(now) {
             Ok(status) => status,
             Err(e) => {
+                if matches!(&e, WasmError::RingRead(_)) {
+                    self.boundary_corruptions += 1;
+                }
                 tracing::warn!(error = %e, "wasm occupant failed; stopping it");
                 self.dead = true;
                 FswStatus::Panicked
@@ -153,12 +239,14 @@ impl WasmSlot {
     fn cycle(&mut self, now: Timestamp) -> Result<FswStatus, WasmError> {
         // Before any handle is touched: a grown guest invalidates all of them.
         self.pack.check_memory_stable()?;
-        self.bridge.pump_in();
+        let bridge = self.bridge.as_mut().expect("a live wasm slot has a bridge");
+        bridge.pump_in()?;
         let status = self.pack.execute(self.state, now.0 as u64)?;
         // Out even on a terminal status: the last cycle's status frame and log
         // records are what tell an operator how the sequence ended.
         self.pack.check_memory_stable()?;
-        self.bridge.pump_out();
+        let bridge = self.bridge.as_mut().expect("a live wasm slot has a bridge");
+        bridge.pump_out()?;
         Ok(status)
     }
 
@@ -173,7 +261,17 @@ impl WasmSlot {
 
     /// Records the bridge could not deliver, for the slot's health.
     pub fn dropped(&self) -> u64 {
-        self.bridge.dropped()
+        self.bridge.as_ref().map_or(0, RingBridge::dropped)
+    }
+
+    /// Drain bridge drops for coordinator health.
+    pub fn drain_dropped(&mut self) -> u64 {
+        self.bridge.as_mut().map_or(0, RingBridge::drain_dropped)
+    }
+
+    /// Drain structurally corrupt bridge reads for coordinator health.
+    pub fn drain_corruptions(&mut self) -> u64 {
+        std::mem::take(&mut self.boundary_corruptions)
     }
 }
 
@@ -183,6 +281,9 @@ impl Drop for WasmSlot {
             let _ = self.pack.shutdown(self.state);
             let _ = self.pack.destroy(self.state);
         }
+        // The bridge's guest-side handles release claims through pointers into
+        // linear memory, so it must die while the store still owns that memory.
+        drop(self.bridge.take());
         let _ = self.pack.close();
     }
 }

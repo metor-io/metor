@@ -147,6 +147,15 @@ pub trait CyclicSlot {
     fn drain_boundary_drops(&mut self) -> u64 {
         0
     }
+    /// Health key used when [`drain_boundary_drops`](Self::drain_boundary_drops)
+    /// reports loss.
+    fn boundary_drop_health_key(&self) -> &'static str {
+        "async_boundary_dropped"
+    }
+    /// Structurally corrupt boundary reads since the last drain.
+    fn drain_boundary_corruptions(&mut self) -> u64 {
+        0
+    }
     /// The worker-process facts behind this slot, for the status frame's
     /// worker list: `None` for every in-process slot, `Some` from `ProcSlot`
     /// and the process-mode `SlotRunner`.

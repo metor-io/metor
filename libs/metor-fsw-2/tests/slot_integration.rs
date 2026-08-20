@@ -82,6 +82,8 @@ fn seq_coordinator() -> CoordinatorSpec {
         default_depth: Some(8),
         clock: ClockSpec::Simulated { dt_secs: 0.000_002 },
         namespace: None,
+        wasm_fuel_per_poll: None,
+        wasm_memory_limit_bytes: None,
     }
 }
 

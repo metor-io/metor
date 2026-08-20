@@ -1063,6 +1063,8 @@ impl InitGraph {
             worker_exe,
             max_restarts: config.proc_max_restarts,
             restart_backoff: config.proc_restart_backoff,
+            wasm_fuel_per_poll: config.wasm_fuel_per_poll,
+            wasm_memory_limit_bytes: config.wasm_memory_limit_bytes,
         };
         let BoundSystems {
             cyclic,
