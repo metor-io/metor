@@ -37,6 +37,7 @@ fn maximal() -> Wiring {
         },
         artifacts: vec![
             Artifact {
+                kind: Default::default(),
                 id: "adcs".into(),
                 crate_name: "adcs-systems".into(),
                 lib: "adcs_systems".into(),
@@ -47,6 +48,7 @@ fn maximal() -> Wiring {
                 src: src(3),
             },
             Artifact {
+                kind: Default::default(),
                 id: "gnc".into(),
                 crate_name: "gnc-systems".into(),
                 lib: "gnc_systems".into(),

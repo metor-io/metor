@@ -105,6 +105,28 @@ impl WiringBuilder {
     /// in.
     ///
     /// Panics on a duplicate `id`.
+    /// Declare a WebAssembly artifact at `path`.
+    ///
+    /// Unlike [`artifact`](Self::artifact) there is no crate or library stem
+    /// to build per triple: a `.wasm` is one arch-neutral file, which is the
+    /// property that makes it cheap to uplink.
+    pub fn wasm_artifact(mut self, id: impl Into<String>, path: impl Into<std::path::PathBuf>) -> Self {
+        let id = id.into();
+        validate::check_artifact_id_available(&self.wiring, &id).unwrap_or_else(|e| panic!("{e}"));
+        self.wiring.artifacts.push(Artifact {
+            id,
+            kind: crate::ir::ArtifactKind::Wasm,
+            crate_name: String::new(),
+            lib: String::new(),
+            path: Some(path.into()),
+            prebuilt_dir: None,
+            dist: None,
+            manifest_hash: None,
+            src: None,
+        });
+        self
+    }
+
     pub fn artifact(
         mut self,
         id: impl Into<String>,
@@ -115,6 +137,7 @@ impl WiringBuilder {
         validate::check_artifact_id_available(&self.wiring, &id).unwrap_or_else(|e| panic!("{e}"));
         self.wiring.artifacts.push(Artifact {
             id,
+            kind: crate::ir::ArtifactKind::Cdylib,
             crate_name: crate_name.into(),
             lib: lib_stem.as_ref().to_string(),
             path: None,

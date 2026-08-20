@@ -1321,6 +1321,7 @@ fn validate_rejects_a_system_and_slot_name_collision() {
 fn validate_rejects_duplicate_artifact_ids() {
     let mut w = bare_wiring();
     let art = |id: &str| Artifact {
+        kind: Default::default(),
         id: id.into(),
         crate_name: "c".into(),
         lib: "c".into(),

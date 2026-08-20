@@ -108,6 +108,7 @@ impl LoadErrorKind {
             BadScopeRef { .. } => "fsw_wiring::bad_scope_ref",
             MissingType { .. } => "fsw_wiring::missing_type",
             DuplicateArtifact { .. } => "fsw_wiring::duplicate_artifact",
+            WasmOccupant { .. } => "fsw_wiring::wasm_occupant",
             UnknownType { .. } => "fsw_wiring::unknown_type",
             ProcessNeedsArtifact { .. } => "fsw_wiring::process_needs_artifact",
             ProcessUnsupported { .. } => "fsw_wiring::process_unsupported",
@@ -175,6 +176,7 @@ impl LoadErrorKind {
             ProcessNeedsArtifact { .. } => "set an `artifact` or drop `process`".into(),
             ProcessUnsupported { .. } => "this instance cannot run cross-process here".into(),
             ProcDescribe { .. } => "describing this artifact failed".into(),
+            WasmOccupant { .. } => "this wasm occupant could not be loaded".into(),
             DuplicateInstance { .. } => "instance names must be unique".into(),
             DuplicateArtifact { .. } => "artifact ids must be unique".into(),
             Params(kind) => kind.label(),
@@ -348,6 +350,15 @@ pub enum LoadErrorKind {
         #[source]
         source: Box<DlError>,
     },
+
+    /// A wasm occupant could not be read, described, or matched to an entry.
+    ///
+    /// Carries one boxed message rather than the slot, occupant, artifact and
+    /// cause as separate fields: four `String`s would make this the largest
+    /// variant and bloat every `LoadError`, the same `result_large_err` reason
+    /// [`DlOpen`](Self::DlOpen) boxes its source.
+    #[error("{0}")]
+    WasmOccupant(Box<str>),
 
     /// A static system was given typed builder params. The static path has no
     /// postcard decoder; its registered factory deserializes params from a

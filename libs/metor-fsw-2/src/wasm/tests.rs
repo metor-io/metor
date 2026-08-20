@@ -528,3 +528,62 @@ fn a_starved_wasm_occupant_stops_instead_of_stalling() {
         "and it is latched — a dead occupant is never re-entered"
     );
 }
+
+/// A target can *declare* a wasm occupant, and `resolve` describes it without
+/// ever loading it into this process.
+///
+/// This is the step between "the runtime works" and "a target can use it":
+/// until resolve understands a wasm artifact, `OccupantBacking::Wasm` is
+/// reachable only from inside the crate.
+#[test]
+fn resolve_accepts_a_wasm_occupant_declared_in_a_target() {
+    use crate::wiring::{Registry, resolve};
+    use crate::{ClockSpec, WiringBuilder};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("seq.wasm");
+    std::fs::write(&path, fixture()).expect("write module");
+
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.000002 })
+        .wasm_artifact("seqs", &path)
+        .slot("mode")
+        .allow_from("waiter", "seqs")
+        .allow_from("napper", "seqs")
+        .end()
+        .build();
+
+    let coord = resolve(&wiring, &Registry::with_builtins());
+    let coord = coord.unwrap_or_else(|e| panic!("a wasm-backed slot resolves: {e:?}"));
+    drop(coord);
+}
+
+/// A wasm allow line naming an entry the module does not export fails at
+/// build time with a diagnostic that names it, rather than at the first
+/// `Load` in flight.
+#[test]
+fn resolve_rejects_an_unknown_wasm_entry() {
+    use crate::wiring::{Registry, resolve};
+    use crate::{ClockSpec, WiringBuilder};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("seq.wasm");
+    std::fs::write(&path, fixture()).expect("write module");
+
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.000002 })
+        .wasm_artifact("seqs", &path)
+        .slot("mode")
+        .allow_from("nope", "seqs")
+        .end()
+        .build();
+
+    let err = resolve(&wiring, &Registry::with_builtins())
+        .err()
+        .expect("an entry the module does not export is a build error");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("nope"),
+        "the diagnostic names the missing entry, got: {rendered}"
+    );
+}

@@ -883,6 +883,72 @@ pub(super) fn slot_config_error(
 /// [`describe_occupants`]), and the descriptor returned for the edges pass is
 /// the one [`plan_slot`](crate::coordinator::slot::plan_slot) derives, not a
 /// raw occupant descriptor.
+/// Describe one wasm occupant: open the module under the interpreter, find the
+/// named entry in its manifest, and encode its params.
+///
+/// The module is opened only to be *described* — the returned backing carries
+/// its path, and the slot loads a fresh instance per `Load`.
+fn resolve_wasm_occupant(
+    art: &crate::ir::Artifact,
+    occ: &crate::ir::AllowedOccupantSpec,
+    slot: &str,
+    src: &str,
+    span: SourceSpan,
+) -> Result<AllowedOccupant, LoadError> {
+    let bad = |detail: String| {
+        LoadErrorKind::WasmOccupant(
+            format!(
+                "slot `{slot}`: wasm occupant `{}` from artifact `{}`: {detail}",
+                occ.occupant, art.id
+            )
+            .into_boxed_str(),
+        )
+        .at(src.to_string(), span)
+    };
+    let path = art
+        .path
+        .as_ref()
+        .ok_or_else(|| bad("wasm artifact has no path".into()))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| bad(format!("reading {}: {e}", path.display())))?;
+    let pack = crate::wasm::WasmPack::open(&bytes, crate::coordinator::slot::DEFAULT_FUEL_PER_CALL)
+        .map_err(|e| bad(e.to_string()))?;
+    let (entry, desc) = pack
+        .manifest()
+        .systems
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.descriptor.name == occ.occupant)
+        .map(|(i, e)| (i as u32, e.descriptor.clone()))
+        .ok_or_else(|| {
+            bad(format!(
+                "module exports no `{}` entry (slot `{slot}`)",
+                occ.occupant
+            ))
+        })?;
+    let e = &pack.manifest().systems[entry as usize];
+    let params = match &occ.params {
+        ParamSource::None => e.params_default.clone().unwrap_or_default(),
+        ParamSource::Postcard(bytes) => bytes.clone(),
+        ParamSource::Value(value) => metor_fsw_2_core::params::encode_value_params(
+            value,
+            &e.params_schema,
+            &occ.occupant,
+            e.params_default.as_deref(),
+        )
+        .map_err(|err| bad(err.to_string()))?,
+    };
+    Ok(AllowedOccupant {
+        name: occ.occupant.clone(),
+        params,
+        descriptor: desc,
+        backing: OccupantBacking::Wasm {
+            path: path.clone(),
+            entry,
+        },
+    })
+}
+
 fn resolve_slot(
     slot: &SlotSpec,
     wiring: &Wiring,
@@ -902,6 +968,15 @@ fn resolve_slot(
         let mut allowed = Vec::with_capacity(slot.allow.len());
         for occ in &slot.allow {
             let artifact_id = occupant_artifact(wiring, packs, occ, &slot.name, &src, span)?;
+            // A wasm artifact is read as bytes and described through the
+            // interpreter, not `dlopen`ed: its manifest comes from the module
+            // itself, so nothing about it enters this process's address space.
+            if let Some(art) = wiring.artifacts.iter().find(|a| a.id == artifact_id)
+                && art.kind == crate::ir::ArtifactKind::Wasm
+            {
+                allowed.push(resolve_wasm_occupant(art, occ, &slot.name, &src, span)?);
+                continue;
+            }
             let pack = packs.open(wiring, &artifact_id, &slot.name, &src, span)?;
             let source = EntrySource::Opened {
                 pack,

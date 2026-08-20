@@ -168,6 +168,29 @@ pub enum ClockSpec {
     },
 }
 
+/// What a loadable artifact actually is.
+///
+/// The distinction is not cosmetic: a cdylib is per-triple and needs a
+/// matching toolchain to produce, which is what makes uplinking one expensive;
+/// a wasm module is one arch-neutral file that runs anywhere the interpreter
+/// does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    /// A native shared object, loaded with `dlopen` into this process.
+    #[default]
+    Cdylib,
+    /// A WebAssembly module, run under an interpreter and bounded by fuel.
+    Wasm,
+}
+
+impl ArtifactKind {
+    /// Whether this is the default native cdylib, for skipping it on the wire.
+    pub fn is_cdylib(&self) -> bool {
+        matches!(self, ArtifactKind::Cdylib)
+    }
+}
+
 /// A loadable pack shared object and the crate it comes from.
 ///
 /// Each cdylib exports one **pack** — any number of system types — through
@@ -179,6 +202,14 @@ pub enum ClockSpec {
 pub struct Artifact {
     /// The id that [`SystemSpec::artifact`] references.
     pub id: String,
+    /// What kind of loadable this is.
+    ///
+    /// Defaults to a native cdylib and is omitted when it is one, so the wire
+    /// format is purely additive: an IR written before this field existed still
+    /// reads, and one written now is byte-identical unless a wasm artifact is
+    /// actually present.
+    #[serde(default, skip_serializing_if = "ArtifactKind::is_cdylib")]
+    pub kind: ArtifactKind,
     /// The cargo package name, used by the build driver as
     /// `cargo build -p <crate_name>`.
     pub crate_name: String,
