@@ -60,13 +60,13 @@ struct BundleField {
 impl BundleField {
     /// Whether this field is a `PhantomData` anchor rather than a port.
     fn is_phantom(&self) -> bool {
-        crate::sig::type_head(&self.ty).is_some_and(|h| h == "PhantomData")
+        type_head(&self.ty).is_some_and(|h| h == "PhantomData")
     }
 
     /// Whether the field's type token is the `CommandOut` sugar for an
     /// untelemetered `MsgOut`.
     fn is_command_out(&self) -> bool {
-        crate::sig::type_head(&self.ty).is_some_and(|h| h == "CommandOut")
+        type_head(&self.ty).is_some_and(|h| h == "CommandOut")
     }
 
     /// Validate the attributes against the derive direction.
@@ -86,6 +86,13 @@ impl BundleField {
         }
         Ok(())
     }
+}
+
+fn type_head(ty: &syn::Type) -> Option<&Ident> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    path.path.segments.last().map(|segment| &segment.ident)
 }
 
 /// The struct being derived, reduced to its name, generics, and

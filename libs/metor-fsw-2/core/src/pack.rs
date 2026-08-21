@@ -425,8 +425,7 @@ impl Pack {
             name,
             descriptor,
             params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
-            params_default: <T as crate::BuildSystem>::params_default_blob()
-                .filter(|b| !b.is_empty()),
+            params_default: None,
             reloadable: false,
             shared: true,
             create,
@@ -443,62 +442,6 @@ impl Pack {
     /// `.init(...)` or `.state(...)`.
     pub fn system(mut self, name: &'static str, def: impl IntoPackEntry) -> Self {
         self.entries.push(def.into_entry(name));
-        self
-    }
-
-    /// Register a struct-authored system type (a
-    /// [`#[system]`](macro@crate::system)
-    /// impl or hand-written trait impls) under `name`. The struct's
-    /// `BuildSystem` supplies params and construction; the entry's descriptor
-    /// is the type's static one, so config-minted ports and capabilities are
-    /// rejected here rather than misbound later.
-    ///
-    /// A `#[system]` type whose params implement `Default + Serialize`
-    /// declares those defaults for the entry automatically (via
-    /// [`BuildSystem::params_default_blob`](crate::BuildSystem::params_default_blob)),
-    /// so a dl/pack config need spell only its overrides. A hand-written
-    /// `BuildSystem` impl declares none this way; use
-    /// [`system_type_with_defaults`](Self::system_type_with_defaults).
-    pub fn system_type<T>(mut self, name: &'static str) -> Self
-    where
-        T: crate::CyclicSystem + crate::BuildSystem + 'static,
-        T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
-        T::Input: crate::BindPorts + 'static,
-        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
-    {
-        let mut entry = system_type_entry::<T>(name);
-        // An empty blob (unit-like params) declares no defaults, matching
-        // the empty-params guards on the decode paths.
-        if let Some(blob) =
-            <T as crate::BuildSystem>::params_default_blob().filter(|b| !b.is_empty())
-        {
-            entry.params_default = Some(blob);
-            entry.wrap_create_with_defaults();
-        }
-        self.entries.push(entry);
-        self
-    }
-
-    /// As [`system_type`](Self::system_type), with explicitly declared
-    /// default params: a config need spell only its overrides, on every
-    /// loading path. This is the surface for types the automatic hook cannot
-    /// see through — hand-written [`BuildSystem`](crate::BuildSystem) impls
-    /// and generic systems. The typed `defaults` argument is the schema
-    /// check: a defaults value of the wrong type does not compile.
-    pub fn system_type_with_defaults<T>(mut self, name: &'static str, defaults: T::Params) -> Self
-    where
-        T: crate::CyclicSystem + crate::BuildSystem + 'static,
-        T::Params: serde::Serialize + DeserializeOwned + postcard_schema::Schema + 'static,
-        T::Input: crate::BindPorts + 'static,
-        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
-    {
-        let mut entry = system_type_entry::<T>(name);
-        entry.params_default = Some(
-            postcard::to_allocvec(&defaults)
-                .expect("params postcard-encode (Serialize is infallible)"),
-        );
-        entry.wrap_create_with_defaults();
-        self.entries.push(entry);
         self
     }
 
@@ -630,60 +573,6 @@ impl Pack {
     /// index both (the static registry).
     pub fn into_parts(self) -> (Vec<PackEntry>, Vec<StateEntry>) {
         (self.entries, self.states)
-    }
-}
-
-/// The [`Pack::system_type`] entry body, shared with the explicit-defaults
-/// variant so the two differ only in where the defaults blob comes from.
-fn system_type_entry<T>(name: &'static str) -> PackEntry
-where
-    T: crate::CyclicSystem + crate::BuildSystem + 'static,
-    T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
-    T::Input: crate::BindPorts + 'static,
-    T::Output: crate::HealthOutput + crate::BindPorts + 'static,
-{
-    let mut descriptor = <T as crate::CyclicSystem>::descriptor();
-    descriptor.name = name.into();
-    let static_desc = descriptor.clone();
-    let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
-        let msgs = match &params {
-            EntryParams::Value { msgs, .. } => Some(*msgs),
-            _ => None,
-        };
-        let p: T::Params = decode_params(params)?;
-        let mut system = T::new(p);
-        // The host-context configure phase runs only where a message
-        // table exists (the static path); the postcard path is the dl
-        // parity path, where configure never runs.
-        if let Some(msgs) = msgs {
-            system.configure(&crate::BuildCtx {
-                msgs,
-                namespace: None,
-            })?;
-        }
-        let instance_desc = instance_desc_if_minted(&system, &static_desc, name);
-        let pending: Pending = Box::new(move |src, mount| {
-            crate::handler::mount_driver(src, mount, move |src| {
-                let input = <T::Input as crate::BindPorts>::bind(src);
-                let output = <T::Output as crate::BindPorts>::bind(src);
-                Box::new(RunnerDriver(crate::CyclicRunner::new(
-                    system, input, output,
-                )))
-            })
-        });
-        Ok(Created {
-            pending,
-            instance_desc,
-        })
-    });
-    PackEntry {
-        name,
-        descriptor,
-        params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
-        params_default: None,
-        reloadable: true,
-        shared: false,
-        create,
     }
 }
 

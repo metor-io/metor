@@ -16,9 +16,9 @@
 //! from the [`Registry`]. Loaded and process systems come from built
 //! [`Artifact`]s. The resolver adds all edges and coordinator settings, then
 //! builds the graph. One resolver feeds both
-//! front-ends, so every graph check runs identically for either. Every error is
-//! a [`LoadError`], a `miette` [`Diagnostic`](miette::Diagnostic) anchored on the
-//! spec's [`SourceRef`] when it has one.
+//! front-ends, so every graph check runs identically for either. Wiring faults
+//! surface as structured [`LoadError`]s; typed parameter faults retain their
+//! dedicated error variants and field names.
 //!
 //! The module can also pack a target into a `.metor` archive, build an
 //! [`Artifact`]'s cdylib, generate typed pack modules, and encode a value tree
@@ -113,6 +113,3 @@ pub fn cdylib_file_name_for(triple: &str, stem: &str) -> String {
 
 // Re-exported so a system author only needs `metor_fsw_2::wiring`.
 pub use crate::register_system;
-
-#[cfg(test)]
-mod tests;

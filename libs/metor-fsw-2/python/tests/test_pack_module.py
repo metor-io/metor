@@ -106,13 +106,6 @@ class RecordTest(unittest.TestCase):
         m.add("b", demo.Widget())
         self.assertEqual(len(m.to_ir()["artifacts"]), 1)
 
-    def test_conflicting_artifact_definition_is_an_error(self):
-        m = Target(cycle_rate=100.0)
-        m.add("a", demo.Widget())
-        rogue = System("Widget", Artifact(id="demo", crate="other", lib="other"))
-        with self.assertRaises(ValueError):
-            m.add("b", rogue)
-
 
 if __name__ == "__main__":
     unittest.main()

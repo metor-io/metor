@@ -112,9 +112,9 @@ exactly the dependency that breaks wasm.
 Moving it down is right rather than expedient. An `AsyncSystem` is a
 free-running task the coordinator's executor owns; it is registered only
 through the static registry (`wiring/registry.rs`), driven only by
-`coordinator::AsyncSlot`, and **no `Pack` entry can construct one** — the pack
-authoring forms are the cyclic system, the `#[system]` fn, and the
-`Pack::task` future. It cannot exist in a `.so` or a wasm guest. So it moves
+`coordinator::AsyncSlot`, and **no `Pack` entry can construct one** — pack
+entries are function systems or `Pack::task` futures. It cannot exist in a
+`.so` or a wasm guest. So it moves
 to `src/async_system.rs` with its own test, and `system/mod.rs` keeps
 `System`, `CyclicSystem`, `BuildSystem`, `Out`, `HealthOutput`, `CyclicRunner`
 and the bundle traits.
@@ -144,28 +144,10 @@ default. Nothing else changes.
 
 ## The macro crate
 
-`macros/src/lib.rs::metor_fsw_2_crate_name()` resolves the framework path at
-expansion time through `proc_macro_crate::crate_name("metor-fsw-2")` — it does
-*not* hardcode `::metor_fsw_2::` (the comment in
-`examples/adcs-fsw2/contracts/Cargo.toml` overstates it). It becomes a
-two-name probe, core first:
-
-```rust
-for name in ["metor-fsw-2-core", "metor-fsw-2"] { … }
-```
-
-so a crate depending only on core expands to `metor_fsw_2_core::…`, a crate
-depending only on the host expands to `metor_fsw_2::…` (which re-exports
-core), core compiling itself gets `crate`, and the host — which depends on
-core — gets `metor_fsw_2_core`. The `cfg!(test)` fallback and the three
-expansion assertions in `system_attr.rs` move to the core spelling.
-
-One expansion cannot use that path: `#[system]` over an `async fn run` emits
-`impl AsyncSystem`, which now lives in the host. It gets a second probe,
-`metor_fsw_2_host_crate_name()`, that resolves `metor-fsw-2` only and panics
-with a message naming the missing dependency. A core-only crate therefore
-cannot author a free-running async system — which is the boundary stating
-itself, since such a system needs the coordinator's runtime to exist.
+Derive macros resolve `metor-fsw-2-core` first and fall back to the host crate,
+which re-exports core. Free-running `AsyncSystem` implementations stay
+hand-written in host-dependent crates; this keeps their runtime boundary
+explicit and the pack macro surface small.
 
 ## Re-exports
 

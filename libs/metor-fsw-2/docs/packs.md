@@ -17,7 +17,7 @@ cannot, such as `wasm32-unknown-unknown`.
 
 ## Writing a pack
 
-A pack can mix function-based systems, struct-based systems, and async tasks:
+A pack can mix function-based cyclic systems and cycle-polled async tasks:
 
 ```rust
 use metor_fsw_2_core::{Pack, system};
@@ -25,7 +25,7 @@ use metor_fsw_2_core::{Pack, system};
 pub fn pack() -> Pack {
     Pack::new()
         .system("Plant", system(plant::execute).init(PlantState::new))
-        .system_type::<NavSystem>("Nav")
+        .system("Nav", system(nav::execute).init(NavState::new))
         .task("safe_mode", safe_mode)
 }
 
@@ -35,11 +35,11 @@ metor_fsw_2_core::export_pack!(pack);
 `system` registers a function-based cyclic system. An `init` function makes
 its state from params.
 
-`system_type` registers a type that implements the system traits, often through
-`#[system]`.
-
 `task` registers an async function. The coordinator polls it once per cycle. A
 finished task reports `Done` and is not polled again.
+
+Free-running `AsyncSystem` implementations are intentionally different: the
+host registers and spawns them directly, and packs do not construct them.
 
 Use the feature form when the same crate also ships an `rlib`:
 

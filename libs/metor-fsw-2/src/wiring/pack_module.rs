@@ -57,8 +57,11 @@ pub(super) fn render_module(
     out.push_str(&header(id, crate_name));
     out.push_str("from __future__ import annotations\n\n");
     out.push_str("from pathlib import Path\n\n");
-    out.push_str(&cg.imports());
-    out.push('\n');
+    out.push_str(
+        "from dataclasses import dataclass\n\
+         from typing import Literal, Sequence\n\n\
+         from metor_config import Artifact, Frame, InPort, Msg, OutPort, System\n\n",
+    );
     out.push_str(&format!(
         "ARTIFACT = Artifact(\n    id=\"{id}\",\n    crate=\"{crate_name}\",\n    lib=\"{lib}\",\n    manifest_hash=\"{hash}\",\n",
     ));
@@ -127,56 +130,9 @@ struct Codegen {
     dataclasses: Vec<String>,
     /// Nested dataclass names already emitted.
     dataclass_names: HashSet<String>,
-    used_sequence: bool,
-    used_literal: bool,
-    used_msg: bool,
-    used_inport: bool,
-    used_outport: bool,
-    used_system: bool,
 }
 
 impl Codegen {
-    /// The `from typing`/`from metor_config` import block, naming only the
-    /// symbols the module actually uses.
-    fn imports(&self) -> String {
-        let mut typing: Vec<&str> = Vec::new();
-        if self.used_literal {
-            typing.push("Literal");
-        }
-        if self.used_sequence {
-            typing.push("Sequence");
-        }
-        let mut core: Vec<&str> = vec!["Artifact"];
-        if !self.frames.is_empty() {
-            core.push("Frame");
-        }
-        if self.used_inport {
-            core.push("InPort");
-        }
-        if self.used_msg {
-            core.push("Msg");
-        }
-        if self.used_outport {
-            core.push("OutPort");
-        }
-        if self.used_system {
-            core.push("System");
-        }
-        core.sort_unstable();
-        let mut out = String::new();
-        if !self.dataclasses.is_empty() {
-            out.push_str("from dataclasses import dataclass\n");
-        }
-        if !typing.is_empty() {
-            out.push_str(&format!("from typing import {}\n", typing.join(", ")));
-        }
-        if !self.dataclasses.is_empty() || !typing.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("from metor_config import {}\n", core.join(", ")));
-        out
-    }
-
     /// Render one manifest entry: a `System` subclass for a CapWords name, a
     /// module-level occupant callable for a snake_case (sequence task) name.
     fn entry(&mut self, entry: &PackEntryDesc) -> String {
@@ -197,7 +153,6 @@ impl Codegen {
     /// A `System` subclass: a typed keyword-only `__init__` plus class-level
     /// port annotations (checker-only; runtime access returns handles).
     fn render_class(&mut self, entry: &PackEntryDesc, params: &[Param]) -> String {
-        self.used_system = true;
         let desc = &entry.descriptor;
         let name = &desc.name;
         let mut out = format!("class {name}(System):\n");
@@ -224,7 +179,6 @@ impl Codegen {
     /// A sequence occupant: a module-level function with the same typed kwargs,
     /// returning an occupant spec bound to this artifact.
     fn render_occupant(&mut self, entry: &PackEntryDesc, params: &[Param]) -> String {
-        self.used_system = true;
         let name = &entry.descriptor.name;
         let sig = occupant_signature(name, params);
         let doc = docstring(
@@ -251,13 +205,7 @@ impl Codegen {
 
     fn port_line(&mut self, port: &PortDesc, input: bool) -> String {
         let marker = self.marker_name(port);
-        let wrapper = if input {
-            self.used_inport = true;
-            "InPort"
-        } else {
-            self.used_outport = true;
-            "OutPort"
-        };
+        let wrapper = if input { "InPort" } else { "OutPort" };
         let mut notes: Vec<String> = Vec::new();
         notes.push(if input {
             "input".into()
@@ -310,10 +258,7 @@ impl Codegen {
                 self.frame_by_id.push((id, name.clone()));
                 name
             }
-            PortSchema::Postcard { .. } => {
-                self.used_msg = true;
-                "Msg".to_string()
-            }
+            PortSchema::Postcard { .. } => "Msg".to_string(),
         }
     }
 
@@ -382,10 +327,7 @@ impl Codegen {
             T::Char | T::String => "str".into(),
             T::ByteArray => "bytes".into(),
             T::Option(inner) => format!("{} | None", self.py_type(inner)),
-            T::Seq(inner) => {
-                self.used_sequence = true;
-                format!("Sequence[{}]", self.py_type(inner))
-            }
+            T::Seq(inner) => format!("Sequence[{}]", self.py_type(inner)),
             T::Tuple(items) | T::TupleStruct(items) => {
                 if items.is_empty() {
                     "tuple[()]".into()
@@ -440,7 +382,6 @@ impl Codegen {
     ) -> String {
         use postcard_schema::schema::owned::OwnedDataModelVariant as V;
         if variants.iter().all(|v| matches!(v.ty, V::UnitVariant)) {
-            self.used_literal = true;
             let names: Vec<String> = variants.iter().map(|v| format!("\"{}\"", v.name)).collect();
             return format!("Literal[{}]", names.join(", "));
         }

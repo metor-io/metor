@@ -17,6 +17,8 @@ fn base_wiring() -> Wiring {
             default_depth: None,
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         },
         artifacts: Vec::new(),
         states: Vec::new(),

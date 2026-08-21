@@ -9,16 +9,9 @@
 //! (unknown types, manifest freshness, occupant/entry resolution, a built
 //! artifact path) stays in resolve, next to what it needs.
 //!
-//! The per-item helpers are `pub(crate)` so the builder can call the same
-//! logic at insert time and panic on violation: a builder-produced `Wiring`
-//! always passes [`validate`], so the panic can never fire on a wiring that
-//! reached resolve through the builder.
-
-use miette::SourceSpan;
-
 use super::model::IR_VERSION;
-use super::model::{Artifact, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
-use super::resolve::{slot_config_error, slot_src, src_anchor, state_src, system_src};
+use super::model::{ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
+use super::resolve::slot_config_error;
 use super::{LoadError, LoadErrorKind};
 use crate::coordinator::validate_slot_spec;
 
@@ -89,7 +82,7 @@ fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
             return Err(LoadErrorKind::DuplicateInstance {
                 name: spec.name.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         seen.push(&spec.name);
     }
@@ -98,7 +91,7 @@ fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
             return Err(LoadErrorKind::DuplicateInstance {
                 name: slot.name.clone(),
             }
-            .whole(slot_src(slot)));
+            .bare());
         }
         seen.push(&slot.name);
     }
@@ -114,7 +107,7 @@ fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
             return Err(LoadErrorKind::DuplicateArtifact {
                 id: artifact.id.clone(),
             }
-            .whole(artifact_src(artifact)));
+            .bare());
         }
         seen.push(&artifact.id);
     }
@@ -132,7 +125,7 @@ fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
             return Err(LoadErrorKind::DuplicateState {
                 name: state.name.clone(),
             }
-            .whole(state_src(state)));
+            .bare());
         }
         names.push(&state.name);
         types.push(&state.ty);
@@ -142,7 +135,7 @@ fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
 
 /// One state spec's structural rules: states construct on the static value
 /// path only, so typed postcard params cannot reach one.
-pub(crate) fn check_state(state: &StateSpec) -> Result<(), LoadError> {
+fn check_state(state: &StateSpec) -> Result<(), LoadError> {
     if matches!(state.params, ParamSource::Postcard(_)) {
         return Err(LoadErrorKind::StateInit {
             name: state.name.clone(),
@@ -150,7 +143,7 @@ pub(crate) fn check_state(state: &StateSpec) -> Result<(), LoadError> {
             message: "typed postcard params cannot construct a state (states decode value trees)"
                 .into(),
         }
-        .whole(state_src(state)));
+        .bare());
     }
     Ok(())
 }
@@ -158,7 +151,7 @@ pub(crate) fn check_state(state: &StateSpec) -> Result<(), LoadError> {
 /// One system spec's structural rules: a named artifact must exist, a
 /// `process` system must name one, and a static system must carry a `type` and
 /// no [`ParamSource::Postcard`] (the static path has no postcard decoder).
-pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
+fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
     // An `attach` must name a declared state, and only a static system can hold
     // one — a loaded/process pack cannot own shared state (the pack ABI forbids
     // it). The static shared-vs-plain check needs the registry and lives in
@@ -169,14 +162,14 @@ pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), Loa
                 system: spec.name.clone(),
                 attach: attach.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         if spec.artifact.is_some() {
             return Err(LoadErrorKind::AttachOnNonSharedSystem {
                 system: spec.name.clone(),
                 attach: attach.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
     }
     match (&spec.artifact, spec.process) {
@@ -186,28 +179,28 @@ pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), Loa
                     system: spec.name.clone(),
                     artifact: artifact.clone(),
                 }
-                .whole(system_src(spec)));
+                .bare());
             }
         }
         (None, true) => {
             return Err(LoadErrorKind::ProcessNeedsArtifact {
                 name: spec.name.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         (None, false) => {
             let Some(ty) = spec.ty.as_deref() else {
                 return Err(LoadErrorKind::MissingType {
                     name: spec.name.clone(),
                 }
-                .whole(system_src(spec)));
+                .bare());
             };
             if matches!(spec.params, ParamSource::Postcard(_)) {
                 return Err(LoadErrorKind::StaticPostcardParams {
                     system: spec.name.clone(),
                     ty: ty.to_string(),
                 }
-                .whole(system_src(spec)));
+                .bare());
             }
         }
     }
@@ -217,10 +210,10 @@ pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), Loa
 /// One slot spec's structural rules: a non-empty allow set with the `initial`
 /// name inside it ([`validate_slot_spec`]), and every `allow` that names an
 /// artifact references a declared one.
-pub(crate) fn check_slot(slot: &SlotSpec, wiring: &Wiring) -> Result<(), LoadError> {
-    check_slot_spec(slot)?;
-    let src = slot_src(slot);
-    let span: SourceSpan = (0, src.len()).into();
+fn check_slot(slot: &SlotSpec, wiring: &Wiring) -> Result<(), LoadError> {
+    let names: Vec<&str> = slot.allow.iter().map(|a| a.occupant.as_str()).collect();
+    validate_slot_spec(&names, slot.initial.as_ref().map(|i| i.occupant.as_str()))
+        .map_err(|e| slot_config_error(e, slot))?;
     for occ in &slot.allow {
         if let Some(artifact) = &occ.artifact
             && !artifact_exists(wiring, artifact)
@@ -229,77 +222,13 @@ pub(crate) fn check_slot(slot: &SlotSpec, wiring: &Wiring) -> Result<(), LoadErr
                 system: slot.name.clone(),
                 artifact: artifact.clone(),
             }
-            .at(src.clone(), span));
+            .bare());
         }
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Per-item helpers the builder calls at insert time.
-// ---------------------------------------------------------------------------
-
-/// A new instance `name` must not collide with an existing system, slot, or
-/// the reserved coordinator. Spanless: the builder formats it into a panic.
-pub(crate) fn check_instance_available(wiring: &Wiring, name: &str) -> Result<(), LoadError> {
-    if name == RESERVED_INSTANCE
-        || wiring.systems.iter().any(|s| s.name == name)
-        || wiring.slots.iter().any(|s| s.name == name)
-    {
-        return Err(LoadErrorKind::DuplicateInstance {
-            name: name.to_string(),
-        }
-        .bare());
-    }
-    Ok(())
-}
-
-/// A new artifact `id` must not duplicate a declared one.
-pub(crate) fn check_artifact_id_available(wiring: &Wiring, id: &str) -> Result<(), LoadError> {
-    if artifact_exists(wiring, id) {
-        return Err(LoadErrorKind::DuplicateArtifact { id: id.to_string() }.bare());
-    }
-    Ok(())
-}
-
-/// An `artifact=`/`allow_from` reference must name a declared artifact. `owner`
-/// is the referencing system or slot, for the message.
-pub(crate) fn check_artifact_declared(
-    wiring: &Wiring,
-    owner: &str,
-    id: &str,
-) -> Result<(), LoadError> {
-    if !artifact_exists(wiring, id) {
-        return Err(LoadErrorKind::UnknownArtifact {
-            system: owner.to_string(),
-            artifact: id.to_string(),
-        }
-        .bare());
-    }
-    Ok(())
-}
-
-/// The pure-spec half of slot validation ([`validate_slot_spec`]): a non-empty
-/// allow set with the `initial` name inside it. Shared by [`check_slot`] and
-/// the builder's `slot(..).end()`.
-pub(crate) fn check_slot_spec(slot: &SlotSpec) -> Result<(), LoadError> {
-    let src = slot_src(slot);
-    let span: SourceSpan = (0, src.len()).into();
-    let names: Vec<&str> = slot.allow.iter().map(|a| a.occupant.as_str()).collect();
-    validate_slot_spec(&names, slot.initial.as_ref().map(|i| i.occupant.as_str()))
-        .map_err(|e| slot_config_error(e, slot, &src, span))
 }
 
 /// Whether `id` names a declared artifact.
 fn artifact_exists(wiring: &Wiring, id: &str) -> bool {
     wiring.artifacts.iter().any(|a| a.id == id)
-}
-
-/// A best-effort source snippet for an artifact's structural errors.
-fn artifact_src(artifact: &Artifact) -> String {
-    format!(
-        "artifact \"{}\"{}",
-        artifact.id,
-        src_anchor(artifact.src.as_ref())
-    )
 }

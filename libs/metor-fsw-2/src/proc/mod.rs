@@ -27,8 +27,6 @@ pub(crate) mod worker;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use ctl::StepOutcome;
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) use ctl::{CtlWorker, WorkerCmd, WorkerState};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use host::{ProcError, describe_via_worker};
 #[cfg(any(target_os = "linux", target_os = "macos"))]

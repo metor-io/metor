@@ -233,8 +233,8 @@ where
 /// echo inbound commands back out.
 ///
 /// This is an alias, not a distinct type; the flag lives on the descriptor.
-/// The `SystemInput`/`SystemOutput` derives and `#[system]` recognize the
-/// `CommandOut` token and lower it to a `MsgOut` whose [`PortDesc`] is
+/// The `SystemInput`/`SystemOutput` derives recognize the `CommandOut` token
+/// and lower it to a `MsgOut` whose [`PortDesc`] is
 /// [`untelemetered`](PortDesc::untelemetered), identical to spelling
 /// `#[fsw(telemetered = false)]` on a `MsgOut` field. A hand-written
 /// `SystemOutput` impl must build that descriptor itself

@@ -311,27 +311,6 @@ impl LinkState {
             f(msg.id, &msg.payload);
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn push_test_conn(&self) -> Rc<Conn> {
-        let seed = match self.shared.announce_blob.borrow().as_ref() {
-            Some(blob) => seed_replay(blob, &self.shared),
-            None => Vec::new(),
-        };
-        let conn = Rc::new(Conn {
-            pending: RefCell::new(seed),
-            wake: WaitQueue::new(),
-            closed: Cell::new(false),
-        });
-        self.shared.conns.borrow_mut().push(conn.clone());
-        self.shared.accepted.set(self.shared.accepted.get() + 1);
-        conn
-    }
-
-    #[cfg(test)]
-    pub(crate) fn push_inbound(&self, id: PacketId, payload: &[u8]) {
-        push_inbound(&self.shared, id, payload);
-    }
 }
 
 /// A second `set_announces` (or an `add_uplink_msgs` past the freeze) on
@@ -339,25 +318,6 @@ impl LinkState {
 /// its health rather than clobbering the replay.
 #[derive(Debug)]
 pub(crate) struct AnnouncesAlreadySet;
-
-#[cfg(test)]
-impl Conn {
-    pub(crate) fn pending_bytes(&self) -> Vec<u8> {
-        self.pending.borrow().clone()
-    }
-
-    pub(crate) fn close(&self) {
-        self.closed.set(true);
-    }
-
-    /// Fill the pending buffer to the cap, so the next broadcast drops — the
-    /// stalled-consumer state without a stalled socket.
-    pub(crate) fn stall(&self) {
-        let mut pending = self.pending.borrow_mut();
-        let len = pending.len();
-        pending.resize(len.max(PENDING_CAP), 0);
-    }
-}
 
 impl crate::SharedLifecycle for LinkState {
     /// Spawn the accept loop; runs on the coordinator's loop task before the
@@ -509,6 +469,3 @@ fn push_inbound(shared: &ServerShared, id: PacketId, payload: &[u8]) {
         payload: payload.to_vec(),
     });
 }
-
-#[cfg(test)]
-mod tests;

@@ -12,8 +12,6 @@
 //!   annotation.
 //! - [`#[derive(SystemInput)]`](derive@SystemInput) /
 //!   [`#[derive(SystemOutput)]`](derive@SystemOutput) describe port bundles.
-//! - [`#[system]`](macro@system) builds a whole system from an inherent impl
-//!   block.
 //!
 //! Field and struct attributes live under `#[fsw(...)]`; the longer
 //! `#[metor_fsw(...)]` spelling is accepted as an alias.
@@ -31,9 +29,7 @@ mod decomponentize;
 mod frame;
 mod metadatatize;
 mod params_docs;
-mod sig;
 mod system;
-mod system_attr;
 
 /// A single struct field as parsed by the frame derives, pairing its ident
 /// and type with the `#[fsw(...)]` attributes they all share.
@@ -131,30 +127,6 @@ pub fn system_output(input: TokenStream) -> TokenStream {
     system::system_output(input)
 }
 
-/// Builds a complete system from a type's inherent impl block, deriving
-/// everything from the method signatures.
-///
-/// - `fn execute(&mut self, now: Timestamp, …ports)` produces a
-///   `CyclicSystem`; `async fn run(&mut self, context: &AsyncContext, …ports)` produces an
-///   `AsyncSystem`. Exactly one of the two must be present.
-/// - Port parameters are `&mut Input<T>`, `&mut MsgIn<M>`, `&mut Output<T>`,
-///   `&mut MsgOut<M>`, or `&mut CommandOut<M>`, plus at most one
-///   `&mut HealthPort`. Descriptors keep signature order within each
-///   direction.
-/// - `fn new(params: P) -> Self`, `fn new() -> Self`, or, when absent, a
-///   `Default` bound on the type drives the generated `BuildSystem` impl.
-/// - Optional `fn init` and `fn shutdown` may take output ports (matched by
-///   name) and/or `&mut HealthPort`.
-///
-/// `#[system(name = "…")]` overrides the wiring name, which defaults to the
-/// snake_cased type ident with any `System` suffix stripped. It is the only
-/// argument: there is no per-system export — a system reaches a cdylib
-/// through its crate's pack (`Pack::system_type` + `export_pack!`).
-#[proc_macro_attribute]
-pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
-    system_attr::system_impl(attr.into(), item.into()).into()
-}
-
 /// The path generated code uses to reach the framework crate: the name the
 /// consumer depends on it under, or `crate` when the framework crate is
 /// compiling its own tests.
@@ -181,25 +153,4 @@ pub(crate) fn metor_fsw_2_crate_name() -> proc_macro2::TokenStream {
         return quote!(metor_fsw_2_core);
     }
     panic!("metor-fsw-2 macros require `metor-fsw-2-core` (or `metor-fsw-2`) in [dependencies]")
-}
-
-/// The path to the *host* crate, for the one construct that only exists
-/// there: an `AsyncSystem`, whose cancellation context is owned by the
-/// coordinator's runtime. A crate that depends on `metor-fsw-2-core` alone can
-/// author every other system form but not this one, which is the boundary
-/// working as intended.
-pub(crate) fn metor_fsw_2_host_crate_name() -> proc_macro2::TokenStream {
-    match crate_name("metor-fsw-2") {
-        Ok(FoundCrate::Itself) => quote!(crate),
-        Ok(FoundCrate::Name(name)) => {
-            let ident = Ident::new(&name, Span::call_site());
-            quote!( #ident )
-        }
-        Err(_) if cfg!(test) => quote!(metor_fsw_2),
-        Err(_) => panic!(
-            "an `async fn run` system is driven by the coordinator's runtime, so it needs \
-             `metor-fsw-2` in [dependencies] (`metor-fsw-2-core` alone carries the cyclic, \
-             fn, and task forms)"
-        ),
-    }
 }

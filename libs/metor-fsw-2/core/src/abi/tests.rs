@@ -26,16 +26,14 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::PortSchema;
 
 use crate::abi::{
-    FswRing, FswStatus, PackManifest, ROLE_INPUT, ROLE_OUTPUT, run_pack_bind_init, run_pack_close,
-    RING_ALIGN, run_pack_alloc, run_pack_create, run_pack_describe, run_pack_destroy,
-    run_pack_execute, run_pack_free,
-    run_pack_manifest_ptr, run_pack_open,
-    run_pack_shutdown,
+    FswRing, FswStatus, PackManifest, RING_ALIGN, ROLE_INPUT, ROLE_OUTPUT, run_pack_alloc,
+    run_pack_bind_init, run_pack_close, run_pack_create, run_pack_describe, run_pack_destroy,
+    run_pack_execute, run_pack_free, run_pack_manifest_ptr, run_pack_open, run_pack_shutdown,
 };
 use crate::sequence::{Outcome, SequenceStatus, SlotControlIn, wait};
 use crate::{
-    BuildSystem, CyclicSystem, Frame, Input, Out, Output, Pack, System, SystemHealth, SystemInput,
-    SystemKind, SystemOutput, buffer_capacity,
+    BuildSystem, CyclicSystem, Frame, HealthPort, Input, Out, Output, Pack, System, SystemHealth,
+    SystemInput, SystemKind, SystemOutput, buffer_capacity,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,8 +113,7 @@ impl BuildSystem for Counter {
     }
 }
 
-/// Params with a non-trivial `Default`, so [`Trim`]'s `#[system]` expansion
-/// declares the entry defaults blob the pack manifest reports.
+/// Params with a non-trivial default blob reported by the pack manifest.
 #[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
 struct TrimParams {
     gain: f64,
@@ -128,37 +125,76 @@ impl Default for TrimParams {
     }
 }
 
-/// A `#[system]`-authored entry, so the manifest tests cover the macro's
-/// automatic `params_default_blob` path next to [`Counter`]'s hand-written
-/// `BuildSystem` (which declares no defaults).
 struct Trim {
     gain: f64,
 }
 
-#[crate::system(name = "trim")]
-impl Trim {
-    fn new(p: TrimParams) -> Self {
-        Self { gain: p.gain }
-    }
+#[derive(SystemOutput)]
+struct TrimOut {
+    out: Output<TickOut>,
+}
 
-    fn execute(&mut self, now: Timestamp, out: &mut Output<TickOut>) {
-        let _ = out.write(&TickOut {
+impl System for Trim {
+    type Input = ();
+    type Output = Out<TrimOut>;
+    const NAME: &'static str = "trim";
+}
+
+impl CyclicSystem for Trim {
+    fn execute(&mut self, now: Timestamp, (): &mut (), output: &mut Self::Output) {
+        let _ = output.out.write(&TickOut {
             timestamp: now,
             count: self.gain as u64,
         });
     }
 }
 
-/// The test pack: the struct systems (hand-written and `#[system]`-authored),
-/// the panicking system, and a sequence entry — the entry shapes the ABI
-/// drives. `run_pack_open` takes this fn exactly as `export_pack!` would
-/// reference it.
+impl BuildSystem for Trim {
+    type Params = TrimParams;
+    fn new(p: TrimParams) -> Self {
+        Self { gain: p.gain }
+    }
+}
+
+/// The test pack: cyclic systems, a panicking system, and a sequence entry.
 fn test_pack() -> Pack {
     Pack::new()
-        .system_type::<Counter>("counter")
-        .system_type::<Boom>("boom")
+        .system("counter", crate::system(counter_entry).init(Counter::new))
+        .system("boom", crate::system(boom_entry))
         .task("wait_seq", wait_seq)
-        .system_type::<Trim>("trim")
+        .system(
+            "trim",
+            crate::system(trim_entry)
+                .init(Trim::new)
+                .defaults(TrimParams::default()),
+        )
+}
+
+fn counter_entry(
+    state: &mut Counter,
+    now: Timestamp,
+    tick: &mut Input<TickIn>,
+    out: &mut Output<TickOut>,
+    health: &mut HealthPort,
+) {
+    let value = match tick.latest() {
+        Ok(Some(t)) => t.get().value,
+        _ => {
+            health.error("no_tick");
+            return;
+        }
+    };
+    let _ = out.write(&TickOut {
+        timestamp: now,
+        count: state.start + value,
+    });
+}
+
+fn trim_entry(state: &mut Trim, now: Timestamp, out: &mut Output<TickOut>) {
+    let _ = out.write(&TickOut {
+        timestamp: now,
+        count: state.gain as u64,
+    });
 }
 
 /// Entry indices in [`test_pack`]'s manifest order.
@@ -346,9 +382,8 @@ fn abi_describe_round_trips() {
     assert_eq!(manifest.systems.len(), 4, "one entry per pack registration");
     assert!(manifest.systems.iter().all(|s| s.reloadable));
 
-    // Only the `#[system]`-authored entry with `Params: Default` declares an
-    // entry defaults blob; a hand-written `BuildSystem` (Counter, despite its
-    // params deriving `Default`) and unit-params entries declare none.
+    // Only the entry with an explicit `.defaults(...)` declaration carries a
+    // defaults blob. A params type deriving `Default` is not enough by itself.
     let defaults = |i: u32| manifest.systems[i as usize].params_default.as_deref();
     assert_eq!(defaults(COUNTER), None);
     assert_eq!(defaults(BOOM), None);
@@ -360,7 +395,7 @@ fn abi_describe_round_trips() {
                 .unwrap()
                 .as_slice()
         ),
-        "the macro's defaults probe rides the manifest"
+        "explicit defaults ride the manifest"
     );
 
     let entry = &manifest.systems[COUNTER as usize];
@@ -470,6 +505,7 @@ fn dl_announce_prefixes_vtable_ids() {
 // Panic containment: a panicking execute returns Panicked, never unwinds.
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct Boom;
 
 #[derive(SystemInput)]
@@ -504,6 +540,10 @@ impl BuildSystem for Boom {
     fn new(_params: ()) -> Self {
         Boom
     }
+}
+
+fn boom_entry(_state: &mut Boom, _tick: &mut Input<TickIn>, _out: &mut Output<TickOut>) {
+    panic!("boom: execute panicked across the ABI");
 }
 
 /// An `extern "C"` frame over `run_pack_execute`, the exact shape

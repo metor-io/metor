@@ -378,144 +378,6 @@ fn health_counters_published() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// #[system] parity: the hand-written trait impls and the attribute macro
-// produce an identical descriptor and identical run behavior.
-// ---------------------------------------------------------------------------
-
-/// A cyclic system that scales IMU omega into a nav angle, with the port
-/// bundles and every trait impl spelled out by hand.
-struct HandDoubler {
-    gain: f64,
-}
-
-#[derive(SystemInput)]
-struct HandDoublerIn {
-    imu: Input<Imu>,
-}
-
-#[derive(SystemOutput)]
-struct HandDoublerOut {
-    nav: Output<NavEstimate>,
-}
-
-impl System for HandDoubler {
-    type Input = HandDoublerIn;
-    type Output = Out<HandDoublerOut>;
-    const NAME: &'static str = "doubler";
-}
-
-impl CyclicSystem for HandDoubler {
-    fn execute(&mut self, now: Timestamp, input: &mut HandDoublerIn, output: &mut Self::Output) {
-        match input.imu.latest() {
-            Ok(Some(imu)) => {
-                let angle = imu.get().omega * self.gain;
-                output.nav.publish(&NavEstimate {
-                    timestamp: now,
-                    angle,
-                    residuals: FrameList::EMPTY,
-                });
-            }
-            _ => output.health().error("imu_missing"),
-        }
-    }
-}
-
-impl crate::BuildSystem for HandDoubler {
-    type Params = f64;
-    fn new(gain: f64) -> Self {
-        Self { gain }
-    }
-}
-
-/// The same system as [`HandDoubler`], declared through the `#[system]`
-/// attribute. Same name, same ports in the same order, same body; everything
-/// else is generated.
-struct MacroDoubler {
-    gain: f64,
-}
-
-#[crate::system(name = "doubler")]
-impl MacroDoubler {
-    fn new(gain: f64) -> Self {
-        Self { gain }
-    }
-
-    fn execute(
-        &mut self,
-        now: Timestamp,
-        imu: &mut Input<Imu>,
-        nav: &mut Output<NavEstimate>,
-        health: &mut HealthPort,
-    ) {
-        match imu.latest() {
-            Ok(Some(imu)) => {
-                let angle = imu.get().omega * self.gain;
-                nav.publish(&NavEstimate {
-                    timestamp: now,
-                    angle,
-                    residuals: FrameList::EMPTY,
-                });
-            }
-            _ => health.error("imu_missing"),
-        }
-    }
-}
-
-/// Runs `system` for one cycle per sample (`None` starves the cycle) and
-/// returns every produced angle plus the final health record's scalar
-/// components.
-fn run_doubler<S, O>(system: S, samples: &[Option<f64>]) -> (Vec<f64>, HashMap<ComponentId, f64>)
-where
-    S: CyclicSystem<Output = Out<O>>,
-    S::Input: crate::BindPorts,
-    O: SystemOutput + crate::BindPorts,
-{
-    let imu_ring = ring_for::<Imu>(8, 2);
-    let nav_ring = ring_for::<NavEstimate>(8, 2);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
-    let log_ring = log_ring_for(1);
-
-    let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake).unwrap());
-    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake).unwrap());
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
-
-    let input = crate::BindPorts::bind(&mut TestSource {
-        rings: vec![imu_ring.clone()],
-        next: 0,
-    });
-    let output = crate::BindPorts::bind(&mut TestSource {
-        rings: vec![nav_ring.clone(), health_ring.clone(), log_ring.clone()],
-        next: 0,
-    });
-
-    let mut runner = CyclicRunner::new(system, input, output);
-    let mut angles = Vec::new();
-    for (i, s) in samples.iter().enumerate() {
-        if let Some(omega) = s {
-            imu_w
-                .write(&Imu {
-                    timestamp: Timestamp(i as i64),
-                    omega: *omega,
-                    accel: 0.0,
-                })
-                .unwrap();
-        }
-        runner.step(Timestamp(i as i64));
-        if let Ok(Some(nav)) = nav_in.latest() {
-            angles.push(nav.get().angle);
-        }
-    }
-
-    let record = health_in
-        .latest()
-        .expect("ring readable")
-        .expect("health published");
-    let mut sink = RecSink::default();
-    record.apply(&mut sink).unwrap().unwrap();
-    (angles, sink.values)
-}
-
 /// A [`RingSource`](crate::RingSource) that hands out pre-created rings in
 /// order, standing in for a coordinator.
 struct TestSource {
@@ -555,38 +417,6 @@ impl crate::RingSource for TestSource {
     }
 }
 
-#[test]
-fn system_macro_matches_hand_written() {
-    // 1. Identical descriptors: name, kind, port order, ids, and sizes. They
-    //    are compared through the Debug rendering because PortDesc carries a
-    //    non-Eq VTable.
-    let hand = <HandDoubler as CyclicSystem>::descriptor();
-    let mac = <MacroDoubler as CyclicSystem>::descriptor();
-    assert_eq!(format!("{hand:?}"), format!("{mac:?}"));
-
-    // 2. Identical BuildSystem params + construction.
-    let h: HandDoubler = crate::BuildSystem::new(2.0);
-    let m: MacroDoubler = crate::BuildSystem::new(2.0);
-
-    // 3. Identical behavior over 3 cycles, including the starved first cycle's
-    //    health error (later cycles re-serve the freshest read record, so only a
-    //    never-fed input counts as missing).
-    let samples = [None, Some(1.5), Some(-2.0)];
-    let (ha, mut hh) = run_doubler(h, &samples);
-    let (ma, mut mh) = run_doubler(m, &samples);
-    assert_eq!(ha, ma, "same outputs");
-    assert_eq!(ha, vec![3.0, -4.0], "gain applied once samples flow");
-    // The execute duration is wall time, the one legitimately different component.
-    hh.remove(&ComponentId::new("health.last_execute_micros"));
-    mh.remove(&ComponentId::new("health.last_execute_micros"));
-    assert_eq!(hh, mh, "same health counters");
-    assert_eq!(hh[&ComponentId::new("health.cycles")], 3.0);
-    assert_eq!(
-        hh[&ComponentId::new("health.error_counts.imu_missing")],
-        1.0
-    );
-}
-
 // ---------------------------------------------------------------------------
 // An infallible publish onto an undersized ring counts the drop, and the
 // runner folds it into a `publish_dropped` health error.
@@ -595,13 +425,23 @@ fn system_macro_matches_hand_written() {
 #[derive(Default)]
 struct Chatter;
 
-#[crate::system(name = "chatter")]
-impl Chatter {
-    fn execute(&mut self, now: Timestamp, imu: &mut Output<Imu>) {
+#[derive(SystemOutput)]
+struct ChatterOut {
+    imu: Output<Imu>,
+}
+
+impl System for Chatter {
+    type Input = ();
+    type Output = Out<ChatterOut>;
+    const NAME: &'static str = "chatter";
+}
+
+impl CyclicSystem for Chatter {
+    fn execute(&mut self, now: Timestamp, (): &mut (), output: &mut Self::Output) {
         // An `Imu` record can never fit the 16-byte ring below, so every
         // publish fails with `InsufficientCapacity` (a sizing bug) and is
         // counted rather than returned.
-        imu.publish(&Imu {
+        output.imu.publish(&Imu {
             timestamp: now,
             omega: 1.0,
             accel: 0.0,

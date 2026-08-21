@@ -53,26 +53,11 @@ pub(crate) struct LoadCtx<'a> {
 /// The params surface a static-path factory decodes, the typed twin of the dl
 /// path's [`ParamSource`](super::ParamSource) reduction.
 pub(crate) enum StaticParams<'a> {
-    /// A params value tree. `src` is the best-available diagnostic snippet
-    /// (a value tree carries no spans of its own), anchored by the spec's
-    /// [`SourceRef`](super::SourceRef) when it has one.
-    Value {
-        value: &'a serde_json::Value,
-        src: &'a str,
-    },
+    /// A params value tree.
+    Value(&'a serde_json::Value),
     /// No params. Decodes as an all-defaults value, so a required field is
     /// reported as the same missing param an empty params object raises.
     None,
-}
-
-impl StaticParams<'_> {
-    /// The diagnostic source text, for errors outside the params surface.
-    fn diag_src(&self, name: &str) -> String {
-        match self {
-            StaticParams::Value { src, .. } => (*src).to_string(),
-            StaticParams::None => format!("system \"{name}\""),
-        }
-    }
 }
 
 /// A registered factory: decode `ctx.params`, construct the system, run its
@@ -158,7 +143,7 @@ where
                 msg: name,
                 available: available.join(", "),
             }
-            .whole(ctx.params.diag_src(ctx.name)),
+            .bare(),
         })?;
     Ok(system.into_node(ctx.name.to_string()))
 }
@@ -171,9 +156,7 @@ fn decode_static_params<P: serde::de::DeserializeOwned>(
     name: &str,
 ) -> Result<P, LoadError> {
     match params {
-        StaticParams::Value { value, src } => {
-            decode_value_params(value, name, src).map_err(LoadError::from)
-        }
+        StaticParams::Value(value) => decode_value_params(value, name, "").map_err(LoadError::from),
         StaticParams::None => P::deserialize(NoParams).map_err(|e| {
             ParamErrorKind::ValueParams {
                 system: name.to_string(),
@@ -336,13 +319,9 @@ impl Registry {
                 // entry's schema, so its declared defaults fill in — the pack
                 // twin of the static `NoParams` decode.
                 let empty = serde_json::Value::Object(serde_json::Map::new());
-                let synthesized_src;
                 let (value, src) = match &ctx.params {
-                    StaticParams::Value { value, src } => (*value, *src),
-                    StaticParams::None => {
-                        synthesized_src = ctx.params.diag_src(ctx.name);
-                        (&empty, synthesized_src.as_str())
-                    }
+                    StaticParams::Value(value) => (*value, ""),
+                    StaticParams::None => (&empty, ""),
                 };
                 let params = metor_fsw_2_core::EntryParams::Value {
                     value,
@@ -354,7 +333,7 @@ impl Registry {
                 // The create phase runs here (a bad config fails at registration);
                 // the returned node rides the ordinary cyclic bind path.
                 init::pending_node(ctx.name.to_string(), &mut entry, params).map_err(|e| match e {
-                    // The params decode already carries its span; unwrap it.
+                    // Preserve the params-specific error kind.
                     metor_fsw_2_core::MakeError::Params(e) => (*e).into(),
                     // A by-name attach that named a wrong-typed state: refine
                     // the generic create error into the attach diagnostic.
@@ -363,22 +342,22 @@ impl Registry {
                             system: system.to_string(),
                             attach: state.to_string(),
                         }
-                        .whole(ctx.params.diag_src(ctx.name))
+                        .bare()
                     }
                     // Reached only when a shared entry's create runs without a
                     // resolved attach; the resolver's pre-check normally
-                    // pre-empts it with the spanned `MissingAttach`.
+                    // pre-empts it with `MissingAttach`.
                     metor_fsw_2_core::MakeError::MissingAttach { system } => {
                         LoadErrorKind::MissingAttach {
                             system: system.to_string(),
                         }
-                        .whole(ctx.params.diag_src(ctx.name))
+                        .bare()
                     }
                     other => LoadErrorKind::PackCreate {
                         system: ctx.name.to_string(),
                         message: other.to_string(),
                     }
-                    .whole(ctx.params.diag_src(ctx.name)),
+                    .bare(),
                 })
             });
             self.factories.insert(

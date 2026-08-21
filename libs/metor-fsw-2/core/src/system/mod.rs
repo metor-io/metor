@@ -15,8 +15,8 @@
 //!
 //! Construction is split from wiring. [`BuildSystem`] says how a system is
 //! made from a decoded params value and knows nothing about config formats,
-//! so the same impl serves a statically registered system and one exported
-//! from a shared library. Rings are likewise backing-erased: one
+//! so the same impl can serve statically registered systems. Rings are
+//! likewise backing-erased: one
 //! `impl System` binds over heap rings or over memory regions a host maps in,
 //! with no backing generic anywhere.
 //!
@@ -169,13 +169,9 @@ where
 
 /// How a concrete system is constructed from its typed params.
 ///
-/// The trait carries no config-format coupling. A struct system riding a
-/// pack ([`Pack::system_type`](crate::Pack::system_type)) needs only
-/// `BuildSystem`; the entry's create phase decodes `Params` from postcard
-/// bytes and calls [`new`](Self::new). The static registry adds only a
-/// `Params: serde::de::DeserializeOwned` bound, satisfied by the same derive
-/// the postcard contract already needs, so implementing `BuildSystem` alone
-/// is enough to register a system either way.
+/// The trait carries no config-format coupling. The static registry decodes
+/// `Params` and calls [`new`](Self::new), adding only a
+/// `Params: serde::de::DeserializeOwned` bound.
 pub trait BuildSystem: Sized {
     /// The value the system is constructed from. A paramless system uses
     /// `type Params = ()`.
@@ -188,54 +184,9 @@ pub trait BuildSystem: Sized {
     /// registry's [`MsgTable`]. The registry factory calls it between
     /// [`new`](Self::new) and registration. A system constructed inside a
     /// shared library never sees it, since its params are decoded in
-    /// isolation and host tables are out of reach; a system that must load
-    /// that way keeps its `Params` self-contained. Defaults to a no-op.
+    /// isolation and host tables are out of reach. Defaults to a no-op.
     fn configure(&mut self, _ctx: &BuildCtx) -> Result<(), ConfigureError> {
         Ok(())
-    }
-
-    /// Postcard bytes of this type's default params, or `None` when it
-    /// declares none. [`Pack::system_type`](crate::Pack::system_type)
-    /// consults this to declare entry defaults on the dl/pack params path,
-    /// where a config then need spell only its overrides.
-    ///
-    /// The `#[system]` macro overrides it when the concrete params type
-    /// implements `Default + Serialize` (via [`ParamsDefaultProbe`]); a
-    /// hand-written impl or a generic system keeps this `None` default and
-    /// declares defaults explicitly through
-    /// [`Pack::system_type_with_defaults`](crate::Pack::system_type_with_defaults).
-    /// The static registry decode path is unaffected either way: it
-    /// deserializes params with serde, where `#[serde(default)]` field
-    /// attributes already apply.
-    fn params_default_blob() -> Option<Vec<u8>> {
-        None
-    }
-}
-
-/// Autoref-specialization probe behind the `#[system]` macro's
-/// [`BuildSystem::params_default_blob`] override. The macro emits a method
-/// call on `&ParamsDefaultProbe::<P>` with the concrete params type spelled
-/// at the expansion site: when `P: Default + Serialize` the inherent impl
-/// below applies and wins, otherwise resolution falls back to the blanket
-/// [`NoParamsDefault`] method and yields `None`.
-#[doc(hidden)]
-pub struct ParamsDefaultProbe<P>(pub core::marker::PhantomData<P>);
-
-/// The probe's fallback arm; see [`ParamsDefaultProbe`].
-#[doc(hidden)]
-pub trait NoParamsDefault {
-    fn probe_params_default_blob(&self) -> Option<Vec<u8>> {
-        None
-    }
-}
-
-impl<P> NoParamsDefault for ParamsDefaultProbe<P> {}
-
-impl<P: Default + serde::Serialize> ParamsDefaultProbe<P> {
-    pub fn probe_params_default_blob(&self) -> Option<Vec<u8>> {
-        let blob = postcard::to_allocvec(&P::default())
-            .expect("params postcard-encode (Serialize is infallible)");
-        Some(blob)
     }
 }
 

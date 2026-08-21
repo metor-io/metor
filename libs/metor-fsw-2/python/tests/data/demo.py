@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from dataclasses import dataclass
+from typing import Literal, Sequence
+
 from metor_config import Artifact, Frame, InPort, Msg, OutPort, System
 
 ARTIFACT = Artifact(

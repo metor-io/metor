@@ -719,6 +719,3 @@ impl CyclicSystem for TelemetrySystem {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

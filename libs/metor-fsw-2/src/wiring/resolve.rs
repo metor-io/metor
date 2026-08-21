@@ -19,8 +19,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use miette::SourceSpan;
-
 use metor_proto::types::ComponentId;
 
 use crate::coordinator::init::{InitGraph, Node, SystemBind};
@@ -35,7 +33,7 @@ use metor_fsw_2_core::{PortId, SystemDescriptor};
 use super::error::{LoadError, LoadErrorKind};
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, ParamSource,
-    SlotInitState, SlotSpec, SourceRef, StateSpec, SystemSpec, Wiring,
+    SlotInitState, SlotSpec, StateSpec, SystemSpec, Wiring,
 };
 use super::registry::{LoadCtx, Registry, StaticParams};
 use super::{encode_value_params, pack_module, validate};
@@ -98,9 +96,8 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 /// is instantiated through the [`Registry`] factory; a dl system is opened
 /// from its built [`Artifact::path`] and registered as a loaded cyclic node.
 ///
-/// A `Wiring` carries no source text (a builder-origin one never had any), so
-/// resolve-time [`LoadError`]s hold a best-effort snippet rather than original
-/// document spans. The error variants are the same either way.
+/// Wiring faults are structured [`LoadError`] variants. Parameter decoding has
+/// its own field-aware error variants.
 pub fn resolve_with(
     wiring: &Wiring,
     registry: &Registry,
@@ -217,28 +214,18 @@ pub fn resolve_with(
                 name: spec.name.clone(),
                 ty: spec.ty.clone(),
             }
-            .whole(state_src(spec)));
+            .bare());
         }
     }
 
     // --- Edges pass ------------------------------------------------------
     for edge in &wiring.edges {
-        let arrow = if edge.delayed { "~>" } else { "->" };
-        let src = format!(
-            "connect \"{}\" {arrow} \"{}\" out=\"{}\" in=\"{}\"{}",
-            edge.from,
-            edge.to,
-            edge.out,
-            edge.in_,
-            src_anchor(edge.src.as_ref())
-        );
-        let span: SourceSpan = (0, src.len()).into();
         let (producer, consumer) = match edge.kind {
             EdgeKind::Frame => (
-                resolve_endpoint(&instances, &src, &edge.from, &edge.out, Dir::Out, span)?,
-                resolve_endpoint(&instances, &src, &edge.to, &edge.in_, Dir::In, span)?,
+                resolve_endpoint(&instances, &edge.from, &edge.out, Dir::Out)?,
+                resolve_endpoint(&instances, &edge.to, &edge.in_, Dir::In)?,
             ),
-            EdgeKind::Msg => resolve_msg_edge(&instances, &src, edge, span)?,
+            EdgeKind::Msg => resolve_msg_edge(&instances, edge)?,
         };
         // One `connect` entry point for every edge; its behavior is inferred
         // from the connected ports' descriptors, and `EdgeKind` only picked
@@ -252,18 +239,15 @@ pub fn resolve_with(
         }
     }
 
-    // A `Wiring` is format-independent, so a build-time `WireError` uses its own
-    // rendered message as the diagnostic snippet, not original document spans.
-    graph.build().map_err(|err| {
-        let src = err.to_string();
-        LoadErrorKind::Wire { source: err }.whole(src)
-    })
+    graph
+        .build()
+        .map_err(|source| LoadErrorKind::Wire { source }.bare())
 }
 
 /// Construct one pack-shared state through its registered
 /// [`StateEntry`](crate::StateEntry): decode the spec's params off the value
 /// surface and run the state's init fn. Construction failure (a listener
-/// bind) is a spanned load error, not a runtime one. Returns the
+/// bind) is a load error, not a runtime one. Returns the
 /// [`AttachTarget`](metor_fsw_2_core::AttachTarget) a by-name attach downcasts.
 fn resolve_state(
     spec: &StateSpec,
@@ -277,9 +261,8 @@ fn resolve_state(
             ty: spec.ty.clone(),
             available: available.join(", "),
         }
-        .whole(state_src(spec)));
+        .bare());
     };
-    let snippet = state_src(spec);
     // A paramless spec conforms an empty object against the state's schema,
     // the same all-defaults decode a paramless pack entry gets.
     let empty = serde_json::Value::Object(serde_json::Map::new());
@@ -292,7 +275,7 @@ fn resolve_state(
     };
     let params = metor_fsw_2_core::EntryParams::Value {
         value,
-        src: &snippet,
+        src: "",
         name: &spec.name,
         msgs: &registry.msgs,
         attach: None,
@@ -304,23 +287,13 @@ fn resolve_state(
             ty: spec.ty.clone(),
             message: other.to_string(),
         }
-        .whole(snippet.clone()),
+        .bare(),
     })?;
     let entry = entry.borrow();
     Ok(metor_fsw_2_core::AttachTarget {
         ty: entry.name(),
         token: entry.token.clone(),
     })
-}
-
-/// A best-effort source snippet for a state spec's errors.
-pub(super) fn state_src(spec: &StateSpec) -> String {
-    format!(
-        "state \"{}\" type=\"{}\"{}",
-        spec.name,
-        spec.ty,
-        src_anchor(spec.src.as_ref())
-    )
 }
 
 /// Instantiate a static system through the [`Registry`] factory.
@@ -343,7 +316,7 @@ fn resolve_static(
     let factory = registry
         .factories
         .get(ty)
-        .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.whole(system_src(spec)))?;
+        .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.bare())?;
 
     // Attach/shared consistency: a shared-state entry needs an `attach`, and a
     // plain entry must not carry one. `validate` already proved a present
@@ -358,30 +331,23 @@ fn resolve_static(
             return Err(LoadErrorKind::MissingAttach {
                 system: spec.name.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         (false, Some(attach)) => {
             return Err(LoadErrorKind::AttachOnNonSharedSystem {
                 system: spec.name.clone(),
                 attach: attach.to_string(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         (false, None) => None,
     };
 
-    let snippet;
     let params = match &spec.params {
         ParamSource::Postcard(_) => {
             unreachable!("validate() rejects postcard params on a static system")
         }
-        ParamSource::Value(value) => {
-            snippet = system_src(spec);
-            StaticParams::Value {
-                value,
-                src: &snippet,
-            }
-        }
+        ParamSource::Value(value) => StaticParams::Value(value),
         ParamSource::None => StaticParams::None,
     };
     let node = (factory.factory)(&mut LoadCtx {
@@ -411,11 +377,9 @@ impl PackCache {
         wiring: &Wiring,
         artifact_id: &str,
         owner: &str,
-        src: &str,
-        span: SourceSpan,
     ) -> Result<&crate::dl::DlPack, LoadError> {
         if !self.packs.contains_key(artifact_id) {
-            let artifact = find_built_artifact(wiring, artifact_id, owner, src, span)?;
+            let artifact = find_built_artifact(wiring, artifact_id, owner)?;
             let path = artifact
                 .path
                 .as_ref()
@@ -426,7 +390,7 @@ impl PackCache {
                     artifact: artifact_id.to_string(),
                     source: Box::new(source),
                 }
-                .at(src, span)
+                .bare()
             })?;
             self.packs.insert(artifact_id.to_string(), pack);
         }
@@ -529,8 +493,6 @@ pub(super) fn resolve_occupant(
     params: &ParamSource,
     owner: &str,
     require_reloadable: bool,
-    src: &str,
-    span: SourceSpan,
 ) -> Result<(OccupantEntry, Vec<u8>), LoadError> {
     let name = match entry {
         Some(name) => name,
@@ -540,7 +502,7 @@ pub(super) fn resolve_occupant(
                 artifact: source.artifact().to_string(),
                 available: source.entry_names().join(", "),
             }
-            .at(src, span)
+            .bare()
         })?,
     };
     let pack_system = |source: crate::dl::DlError| {
@@ -548,14 +510,14 @@ pub(super) fn resolve_occupant(
             system: owner.to_string(),
             source: Box::new(source),
         }
-        .at(src, span)
+        .bare()
     };
     let not_reloadable = || {
         LoadErrorKind::OccupantNotReloadable {
             slot: owner.to_string(),
             occupant: name.to_string(),
         }
-        .at(src, span)
+        .bare()
     };
     match source {
         EntrySource::Opened { pack, .. } => {
@@ -625,22 +587,13 @@ fn resolve_dl(
     packs: &mut PackCache,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    let src = system_src(spec);
-    let span: SourceSpan = (0, src.len()).into();
-    let pack = packs.open(wiring, artifact_id, &spec.name, &src, span)?;
+    let pack = packs.open(wiring, artifact_id, &spec.name)?;
     let source = EntrySource::Opened {
         pack,
         artifact: artifact_id,
     };
-    let (entry, params) = resolve_occupant(
-        &source,
-        spec.ty.as_deref(),
-        &spec.params,
-        &spec.name,
-        false,
-        &src,
-        span,
-    )?;
+    let (entry, params) =
+        resolve_occupant(&source, spec.ty.as_deref(), &spec.params, &spec.name, false)?;
     let loaded = entry.opened();
     let desc = loaded.descriptor().clone();
     let handle = graph.add_dl_cyclic(&spec.name, loaded, params);
@@ -653,8 +606,6 @@ fn find_built_artifact<'w>(
     wiring: &'w Wiring,
     artifact_id: &str,
     owner: &str,
-    src: &str,
-    span: SourceSpan,
 ) -> Result<&'w Artifact, LoadError> {
     let artifact = wiring
         .artifacts
@@ -665,13 +616,13 @@ fn find_built_artifact<'w>(
                 system: owner.to_string(),
                 artifact: artifact_id.to_string(),
             }
-            .at(src, span)
+            .bare()
         })?;
     if artifact.path.is_none() {
         return Err(LoadErrorKind::ArtifactNotBuilt {
             artifact: artifact_id.to_string(),
         }
-        .at(src, span));
+        .bare());
     }
     Ok(artifact)
 }
@@ -689,9 +640,7 @@ fn resolve_proc(
     wiring: &Wiring,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    let src = system_src(spec);
-    let span: SourceSpan = (0, src.len()).into();
-    let artifact = find_built_artifact(wiring, artifact_id, &spec.name, &src, span)?;
+    let artifact = find_built_artifact(wiring, artifact_id, &spec.name)?;
     let path = artifact
         .path
         .as_ref()
@@ -702,7 +651,7 @@ fn resolve_proc(
             artifact: artifact_id.to_string(),
             detail,
         }
-        .at(src.clone(), span)
+        .bare()
     };
     let bytes = crate::proc::host::describe_via_worker(None, path)
         .map_err(|e| proc_describe(e.to_string()))?;
@@ -712,15 +661,8 @@ fn resolve_proc(
         entries: &entries,
         artifact: artifact_id,
     };
-    let (entry, params) = resolve_occupant(
-        &source,
-        spec.ty.as_deref(),
-        &spec.params,
-        &spec.name,
-        false,
-        &src,
-        span,
-    )?;
+    let (entry, params) =
+        resolve_occupant(&source, spec.ty.as_deref(), &spec.params, &spec.name, false)?;
     let desc = entry.described();
     let entry_name = desc.name.to_string();
     let handle = graph.add_proc_cyclic(&spec.name, desc.clone(), path.clone(), entry_name, params);
@@ -738,7 +680,7 @@ fn resolve_proc(
     Err(LoadErrorKind::ProcessUnsupported {
         name: spec.name.clone(),
     }
-    .whole(system_src(spec)))
+    .bare())
 }
 
 /// Enforce generated-stub freshness: for each artifact whose stub module
@@ -776,39 +718,6 @@ fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// The ` @ file:line:col` suffix locating a spec in its source document, or
-/// nothing for a spec with no recorded [`SourceRef`] (the Rust builder).
-pub(super) fn src_anchor(src: Option<&SourceRef>) -> String {
-    match src {
-        Some(SourceRef {
-            file: Some(file),
-            line,
-            col,
-        }) => format!("  @ {file}:{line}:{col}"),
-        Some(SourceRef {
-            file: None,
-            line,
-            col,
-        }) => format!("  @ {line}:{col}"),
-        None => String::new(),
-    }
-}
-
-/// A best-effort source snippet for a system's resolve-time errors (a
-/// [`Wiring`] carries no original document text, only [`SourceRef`] anchors).
-pub(super) fn system_src(spec: &SystemSpec) -> String {
-    let anchor = src_anchor(spec.src.as_ref());
-    match &spec.ty {
-        Some(ty) => format!("system \"{}\" type=\"{}\"{anchor}", spec.name, ty),
-        None => format!("system \"{}\"{anchor}", spec.name),
-    }
-}
-
-/// A best-effort source snippet for a slot's resolve-time errors.
-pub(super) fn slot_src(slot: &SlotSpec) -> String {
-    format!("slot \"{}\"{}", slot.name, src_anchor(slot.src.as_ref()))
-}
-
 /// The artifact whose pack exports `occ.occupant`: the `artifact=` the allow
 /// line named, or (absent one) the unique artifact exporting an entry of
 /// that name. No match or more than one is a clean error either way.
@@ -817,15 +726,13 @@ fn occupant_artifact(
     packs: &mut PackCache,
     occ: &AllowedOccupantSpec,
     slot: &str,
-    src: &str,
-    span: SourceSpan,
 ) -> Result<String, LoadError> {
     if let Some(artifact) = &occ.artifact {
         return Ok(artifact.clone());
     }
     let mut matches: Vec<String> = Vec::new();
     for artifact in &wiring.artifacts {
-        let pack = packs.open(wiring, &artifact.id, slot, src, span)?;
+        let pack = packs.open(wiring, &artifact.id, slot)?;
         if pack.system_names().any(|n| n == occ.occupant) {
             matches.push(artifact.id.clone());
         }
@@ -837,30 +744,24 @@ fn occupant_artifact(
             occupant: occ.occupant.clone(),
             matches,
         }
-        .at(src, span)),
+        .bare()),
     }
 }
 
 /// Map a [`SlotConfigError`] — from the shared pure-spec validation or from
-/// [`plan_slot`](crate::coordinator::slot::plan_slot) — onto this front-end's spanned slot
-/// diagnostics.
-pub(super) fn slot_config_error(
-    err: SlotConfigError,
-    slot: &SlotSpec,
-    src: &str,
-    span: SourceSpan,
-) -> LoadError {
+/// [`plan_slot`](crate::coordinator::slot::plan_slot) — onto the resolver's
+/// public error variants.
+pub(super) fn slot_config_error(err: SlotConfigError, slot: &SlotSpec) -> LoadError {
     let name = slot.name.clone();
-    let src = src.to_string();
     match err {
-        SlotConfigError::Empty => LoadErrorKind::EmptySlot { slot: name }.at(src, span),
+        SlotConfigError::Empty => LoadErrorKind::EmptySlot { slot: name }.bare(),
         SlotConfigError::UnknownInitial { occupant, allowed } => {
             LoadErrorKind::UnknownInitialOccupant {
                 slot: name,
                 occupant,
                 allowed,
             }
-            .at(src, span)
+            .bare()
         }
         // A mount-reserved port and a declared capability are
         // occupant-contract defects too: the occupant cannot honor the
@@ -871,7 +772,7 @@ pub(super) fn slot_config_error(
             slot: name,
             occupant,
         }
-        .at(src, span),
+        .bare(),
         SlotConfigError::MixedBacking => {
             unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
         }
@@ -892,8 +793,6 @@ fn resolve_wasm_occupant(
     art: &crate::ir::Artifact,
     occ: &crate::ir::AllowedOccupantSpec,
     slot: &str,
-    src: &str,
-    span: SourceSpan,
     max_memory: usize,
 ) -> Result<AllowedOccupant, LoadError> {
     let bad = |detail: String| {
@@ -904,7 +803,7 @@ fn resolve_wasm_occupant(
             )
             .into_boxed_str(),
         )
-        .at(src.to_string(), span)
+        .bare()
     };
     let path = art
         .path
@@ -959,19 +858,16 @@ fn resolve_slot(
     packs: &mut PackCache,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    let src = slot_src(slot);
-    let span: SourceSpan = (0, src.len()).into();
-
     // The pure-spec checks (non-empty allow set, `initial` inside it) ran in
     // `validate` before any artifact was opened. Open and param-encode each
     // allowed occupant; a process slot takes the describe-worker path instead,
     // and the backing decides the slot's mode in `plan_slot`.
     let allowed: Vec<AllowedOccupant> = if slot.process {
-        describe_occupants(slot, wiring, &src, span)?
+        describe_occupants(slot, wiring)?
     } else {
         let mut allowed = Vec::with_capacity(slot.allow.len());
         for occ in &slot.allow {
-            let artifact_id = occupant_artifact(wiring, packs, occ, &slot.name, &src, span)?;
+            let artifact_id = occupant_artifact(wiring, packs, occ, &slot.name)?;
             // A wasm artifact is read as bytes and described through the
             // interpreter, not `dlopen`ed: its manifest comes from the module
             // itself, so nothing about it enters this process's address space.
@@ -982,26 +878,17 @@ fn resolve_slot(
                     art,
                     occ,
                     &slot.name,
-                    &src,
-                    span,
                     graph.config.wasm_memory_limit_bytes,
                 )?);
                 continue;
             }
-            let pack = packs.open(wiring, &artifact_id, &slot.name, &src, span)?;
+            let pack = packs.open(wiring, &artifact_id, &slot.name)?;
             let source = EntrySource::Opened {
                 pack,
                 artifact: &artifact_id,
             };
-            let (entry, params) = resolve_occupant(
-                &source,
-                Some(&occ.occupant),
-                &occ.params,
-                &slot.name,
-                true,
-                &src,
-                span,
-            )?;
+            let (entry, params) =
+                resolve_occupant(&source, Some(&occ.occupant), &occ.params, &slot.name, true)?;
             allowed.push(AllowedOccupant::dl(
                 occ.occupant.clone(),
                 entry.opened(),
@@ -1025,7 +912,7 @@ fn resolve_slot(
     // `plan_slot` is the one place the registered contract is derived and the
     // descriptor-level checks run, so this front-end cannot drift from it.
     let (registered, ports, process) =
-        plan_slot(&slot.name, &allowed).map_err(|e| slot_config_error(e, slot, &src, span))?;
+        plan_slot(&slot.name, &allowed).map_err(|e| slot_config_error(e, slot))?;
     let desc = registered.clone();
     let handle = graph.push_node(Node {
         name: slot.name.clone(),
@@ -1055,7 +942,7 @@ fn resolve_slot(
                 dir: "input",
                 frame: frame.clone(),
             }
-            .at(src.clone(), span));
+            .bare());
         }
     }
     for frame in &slot.outputs {
@@ -1069,7 +956,7 @@ fn resolve_slot(
                 dir: "output",
                 frame: frame.clone(),
             }
-            .at(src.clone(), span));
+            .bare());
         }
     }
 
@@ -1082,12 +969,7 @@ fn resolve_slot(
 /// [`OccupantBacking::Artifact`], which is what makes [`plan_slot`] register
 /// the slot process-mode.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn describe_occupants(
-    slot: &SlotSpec,
-    wiring: &Wiring,
-    src: &str,
-    span: SourceSpan,
-) -> Result<Vec<AllowedOccupant>, LoadError> {
+fn describe_occupants(slot: &SlotSpec, wiring: &Wiring) -> Result<Vec<AllowedOccupant>, LoadError> {
     // Manifests by artifact id, so a slot allowing several entries of one
     // pack runs one describe worker for it, not one per occupant.
     let mut manifests: HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>> = HashMap::new();
@@ -1096,13 +978,11 @@ fn describe_occupants(
         wiring: &Wiring,
         slot: &SlotSpec,
         artifact_id: &str,
-        src: &str,
-        span: SourceSpan,
     ) -> Result<(), LoadError> {
         if manifests.contains_key(artifact_id) {
             return Ok(());
         }
-        let artifact = find_built_artifact(wiring, artifact_id, &slot.name, src, span)?;
+        let artifact = find_built_artifact(wiring, artifact_id, &slot.name)?;
         let path = artifact
             .path
             .as_ref()
@@ -1113,7 +993,7 @@ fn describe_occupants(
                 artifact: artifact_id.to_string(),
                 detail,
             }
-            .at(src, span)
+            .bare()
         };
         let bytes = crate::proc::host::describe_via_worker(None, path)
             .map_err(|e| proc_describe(e.to_string()))?;
@@ -1132,7 +1012,7 @@ fn describe_occupants(
             Some(id) => id.clone(),
             None => {
                 for artifact in &wiring.artifacts {
-                    describe(&mut manifests, wiring, slot, &artifact.id, src, span)?;
+                    describe(&mut manifests, wiring, slot, &artifact.id)?;
                 }
                 let matches: Vec<String> = manifests
                     .iter()
@@ -1149,26 +1029,19 @@ fn describe_occupants(
                             occupant: occ.occupant.clone(),
                             matches,
                         }
-                        .at(src, span));
+                        .bare());
                     }
                 }
             }
         };
-        describe(&mut manifests, wiring, slot, &artifact_id, src, span)?;
+        describe(&mut manifests, wiring, slot, &artifact_id)?;
         let source = EntrySource::Described {
             entries: &manifests[&artifact_id],
             artifact: &artifact_id,
         };
-        let (entry, params) = resolve_occupant(
-            &source,
-            Some(&occ.occupant),
-            &occ.params,
-            &slot.name,
-            true,
-            src,
-            span,
-        )?;
-        let artifact = find_built_artifact(wiring, &artifact_id, &slot.name, src, span)?;
+        let (entry, params) =
+            resolve_occupant(&source, Some(&occ.occupant), &occ.params, &slot.name, true)?;
+        let artifact = find_built_artifact(wiring, &artifact_id, &slot.name)?;
         let path = artifact
             .path
             .as_ref()
@@ -1189,13 +1062,11 @@ fn describe_occupants(
 fn describe_occupants(
     slot: &SlotSpec,
     _wiring: &Wiring,
-    src: &str,
-    span: SourceSpan,
 ) -> Result<Vec<AllowedOccupant>, LoadError> {
     Err(LoadErrorKind::ProcessUnsupported {
         name: slot.name.clone(),
     }
-    .at(src, span))
+    .bare())
 }
 
 /// Convert the serializable [`CoordinatorSpec`] into the runtime
@@ -1246,16 +1117,14 @@ fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadE
 /// [`UnknownMsg`](LoadErrorKind::UnknownMsg).
 fn resolve_msg_edge(
     instances: &HashMap<String, Instance>,
-    src: &str,
     edge: &EdgeSpec,
-    span: SourceSpan,
 ) -> Result<(PortRef, PortRef), LoadError> {
     let inst = |name: &str| {
         instances.get(name).ok_or_else(|| {
             LoadErrorKind::UnknownInstance {
                 name: name.to_string(),
             }
-            .at(src, span)
+            .bare()
         })
     };
     let prod = inst(&edge.from)?;
@@ -1275,7 +1144,7 @@ fn resolve_msg_edge(
             instance: instance.to_string(),
             msg: msg.to_string(),
         }
-        .at(src, span)
+        .bare()
     };
 
     let p_named = by_name(&prod.desc.outputs, &edge.out);
@@ -1308,17 +1177,15 @@ fn resolve_msg_edge(
 /// name against the instance descriptor's port list so a typo is a load error.
 fn resolve_endpoint(
     instances: &HashMap<String, Instance>,
-    src: &str,
     name: &str,
     port_name: &str,
     dir: Dir,
-    span: SourceSpan,
 ) -> Result<PortRef, LoadError> {
     let inst = instances.get(name).ok_or_else(|| {
         LoadErrorKind::UnknownInstance {
             name: name.to_string(),
         }
-        .at(src, span)
+        .bare()
     })?;
     let ports = match dir {
         Dir::Out => &inst.desc.outputs,
@@ -1330,7 +1197,7 @@ fn resolve_endpoint(
             instance: name.to_string(),
             frame: port_name.to_string(),
         }
-        .at(src, span));
+        .bare());
     }
     Ok(PortRef {
         system: inst.handle,

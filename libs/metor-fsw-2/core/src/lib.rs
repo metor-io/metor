@@ -115,9 +115,6 @@ pub use writer::{DynamicWriteError, FrameWriter, KeyError, ListWriter, MapWriter
 pub use metor_fsw_ring::{ReadError, WriteError};
 
 pub use binder::{AnySource, BindPorts, Binder, BoundInput, BoundPort, RingSource};
-// `system` the fn (value namespace) coexists with `system` the attribute
-// macro (macro namespace) at the root: `system(nav_execute)` and
-// `#[metor_fsw_2_core::system]` resolve independently.
 pub use handler::{
     AsyncSystemFn, BindCx, CycleCx, DeclSink, ExecParam, ExecParamSet, ExecuteFn, InitFn,
     IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
@@ -146,15 +143,12 @@ pub use port::{
 pub use message::{
     CommandOut, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, MsgTable, NamedMsg, split_record,
 };
+#[doc(hidden)]
+pub use params_docs::ParamsDocEntry;
 pub use system::{
     BuildCtx, BuildSystem, ConfigureError, CyclicRunner, CyclicSystem, HealthOutput, Out, System,
     SystemInput, SystemOutput, descriptor_for,
 };
-#[doc(hidden)]
-pub use system::{NoParamsDefault, ParamsDefaultProbe};
-
-#[doc(hidden)]
-pub use params_docs::ParamsDocEntry;
 
 // The seams the host crate binds against: the pack runtime's slot adapter and
 // state table, the registry the coordinator assembles, the frame helpers its
@@ -178,8 +172,6 @@ pub use metor_fsw_ring as ring;
 
 pub use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_2_macros::{Frame, ParamsDocs, SystemInput, SystemOutput};
-
-pub use metor_fsw_2_macros::system;
 
 pub use metor_proto::types::Timestamp;
 

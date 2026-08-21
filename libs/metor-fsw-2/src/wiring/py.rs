@@ -9,8 +9,7 @@
 //!
 //! Errors keep their native surface: a Python-level failure prints CPython's
 //! own traceback (the target file is just a script, so `pdb` and IDE debuggers
-//! work), and the host's [`LoadError`] anchors resolve-time failures via the
-//! `src` fields the recorder fills.
+//! work). The recorder's `src` fields remain IR provenance for tooling.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -98,10 +97,6 @@ pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
         .arg(path)
         .env("PYTHONPATH", prepend_pythonpath(&roots))
         .env("METOR_IR_OUT", ir_file.path())
-        .env(
-            "METOR_EXPECTED_ABI",
-            metor_fsw_2_core::abi::FSW_ABI_VERSION.to_string(),
-        )
         .status()
         .map_err(|e| miette!("failed to run `{}`: {e}", python.display()))?;
 

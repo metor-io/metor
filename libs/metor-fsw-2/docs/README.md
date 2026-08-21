@@ -80,7 +80,7 @@ See [Systems](system.md) and [Coordinator](coordinator.md).
 
 ## Target input
 
-A `target.py` file and the Rust `WiringBuilder` both produce wiring IR v4.
+A `target.py` file and the Rust `WiringBuilder` both produce wiring IR v8.
 The IR holds shared states, systems, runtime slots, edges, artifacts, and
 coordinator settings.
 

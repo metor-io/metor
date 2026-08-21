@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 7;
+pub const IR_VERSION: u32 = 8;
 
 /// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.

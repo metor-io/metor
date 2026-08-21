@@ -683,9 +683,8 @@ fn default_k_detumble() -> f64 {
     5e-5
 }
 
-/// The target's flight gains. `Ctrl` is `#[system]`-authored, so this
-/// `Default` also becomes the pack entry's declared defaults blob on the
-/// dlopen path — a `system` node may spell only its overrides.
+/// The target's flight gains. The `Ctrl` pack entry explicitly registers this
+/// `Default` as its defaults blob, so a system node may spell only overrides.
 impl Default for CtrlParams {
     fn default() -> Self {
         Self {

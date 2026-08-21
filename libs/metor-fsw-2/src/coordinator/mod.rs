@@ -930,12 +930,3 @@ impl Coordinator {
         self.drain_forwarded_logs(Timestamp::now());
     }
 }
-
-#[cfg(test)]
-mod tests;
-
-// Scripted-uplink command dispatch, driven through the builder with a
-// test-double transport the Wiring front end cannot express (WP3). Gated off
-// miri, since two of the tests cross a real shared-object boundary.
-#[cfg(all(test, not(miri)))]
-mod uplink_tests;

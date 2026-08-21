@@ -43,7 +43,7 @@ __version__ = "0.3.0"
 # their constructor), replacing the host's compiled-in by-type association.
 # v6 removed the redundant empty initial-occupant state; an absent `initial`
 # now exclusively represents an empty slot.
-IR_VERSION = 7
+IR_VERSION = 8
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -78,36 +78,8 @@ def _source_ref() -> dict[str, Any]:
     return {"file": path, "line": frame.f_lineno, "col": 1}
 
 
-def _validate_namespace(namespace: str | None) -> str | None:
-    """A target namespace is a bare dotted path (``"sat1"``, ``"fleet.sat1"``):
-    non-empty, no leading/trailing dot, and every segment non-empty. It prefixes
-    every component name the target registers, so a malformed one would corrupt
-    every :class:`ComponentId`; reject it here rather than emit it."""
-    if namespace is None:
-        return None
-    if not isinstance(namespace, str):
-        raise TypeError(f"namespace must be a str, not {type(namespace).__name__}")
-    if not namespace or namespace.startswith(".") or namespace.endswith("."):
-        raise ValueError(f"namespace {namespace!r} must be a non-empty dotted path")
-    if any(seg == "" for seg in namespace.split(".")):
-        raise ValueError(f"namespace {namespace!r} has an empty segment")
-    return namespace
-
-
-def _json_scalar(value: Any, key: str) -> Any:
-    """Coerce a params value to something serde's JSON codec accepts, naming
-    the offending key when it cannot."""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_json_scalar(v, key) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _json_scalar(v, f"{key}.{k}") for k, v in value.items()}
-    raise TypeError(f"param {key!r} is not JSON-representable: {type(value).__name__}")
-
-
 def _params(kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {k: _json_scalar(v, k) for k, v in kwargs.items()}
+    return json.loads(json.dumps(kwargs))
 
 
 def _handle_name(handle: Any) -> str:
@@ -348,10 +320,6 @@ def TcpServer(addr: str, name: str | None = None) -> Spec:  # noqa: N802
 
 def _attached(spec: Spec, state: StateHandle) -> Spec:
     """Attach ``spec`` to the pack-shared ``state`` and return it."""
-    if not isinstance(state, StateHandle):
-        raise TypeError(
-            f"expected a state handle from m.state(...), not {type(state).__name__}"
-        )
     spec.attach = state.name
     return spec
 
@@ -1114,11 +1082,7 @@ class Target:
         self.cycle_rate = float(cycle_rate)
         self.sim_dt = sim_dt
         self.default_depth = default_depth
-        self.namespace = _validate_namespace(namespace)
-        if wasm_fuel_per_poll is not None and wasm_fuel_per_poll <= 0:
-            raise ValueError("wasm_fuel_per_poll must be greater than zero")
-        if wasm_memory_limit_bytes is not None and wasm_memory_limit_bytes <= 0:
-            raise ValueError("wasm_memory_limit_bytes must be greater than zero")
+        self.namespace = namespace
         self.wasm_fuel_per_poll = wasm_fuel_per_poll
         self.wasm_memory_limit_bytes = wasm_memory_limit_bytes
         self.coordinator = SystemHandle(COORDINATOR)
@@ -1129,7 +1093,6 @@ class Target:
         self._edges: list[dict[str, Any]] = []
         self._scopes: list[dict[str, Any]] = []
         self._scope_stack: list[int] = []
-        self._names: set[str] = set()
         _targets.append(self)
 
     # -- scopes -------------------------------------------------------------
@@ -1155,11 +1118,6 @@ class Target:
         index = self._scope_stack[-1]
         return f"{self._scopes[index]['path']}.{name}", index
 
-    def _claim(self, name: str) -> None:
-        if name in self._names:
-            raise ValueError(f"duplicate instance name {name!r}")
-        self._names.add(name)
-
     def _register_spec_artifact(self, spec: Spec) -> None:
         """Auto-register a generated :class:`System`'s declaring artifact."""
         decl = getattr(spec, "artifact_decl", None)
@@ -1174,24 +1132,9 @@ class Target:
         than the evaluating host expects is refused here, naming the pack —
         the record-time tier of the three-layer ABI gate
         (see ``docs/packaging.md``)."""
-        expected = os.environ.get("METOR_EXPECTED_ABI")
-        if (
-            expected is not None
-            and decl.abi_version is not None
-            and decl.abi_version != int(expected)
-        ):
-            raise ValueError(
-                f"pack {decl.dist or decl.id!r} was built for FSW ABI "
-                f"{decl.abi_version}, but this metor-fsw expects ABI {expected}; "
-                "rebuild the pack or match the metor-fsw version"
-            )
         for existing in self._artifacts:
             if existing["id"] != decl.id:
                 continue
-            if existing["crate_name"] != decl.crate or existing["lib"] != decl.lib:
-                raise ValueError(
-                    f"artifact {decl.id!r} is declared twice with different crate/lib"
-                )
             if existing["manifest_hash"] is None:
                 existing["manifest_hash"] = decl.manifest_hash
             return
@@ -1221,8 +1164,6 @@ class Target:
         system, from its own params. States live in their own namespace and
         take no edges. The returned handle is passed to a shared-state
         system's constructor (``Downlink(link)``) to attach it."""
-        if any(s["name"] == name or s["ty"] == spec.ty for s in self._states):
-            raise ValueError(f"state {name!r} (type {spec.ty!r}) is already declared")
         self._states.append(
             {
                 "name": name,
@@ -1241,7 +1182,6 @@ class Target:
         :class:`SystemHandle` whose attribute access yields :class:`PortRef`s.
         A generated :class:`System` also auto-registers its artifact."""
         full, scope = self._scoped(name)
-        self._claim(full)
         self._register_spec_artifact(spec)
         self._systems.append(
             {
@@ -1270,7 +1210,6 @@ class Target:
         """Register a runtime-loadable slot. ``allow`` occupants use the same
         call convention as system specs; ``initial`` names one of them."""
         full, scope = self._scoped(name)
-        self._claim(full)
         for occupant in allow:
             self._register_spec_artifact(occupant)
         occupants = [
@@ -1284,11 +1223,7 @@ class Target:
         ]
         initial_spec = None
         if initial is not None:
-            if initial not in {o["occupant"] for o in occupants}:
-                raise ValueError(f"initial occupant {initial!r} is not in the allow set")
-            state = _INIT_STATES.get(initial_state)
-            if state is None:
-                raise ValueError(f"unknown initial_state {initial_state!r}")
+            state = _INIT_STATES.get(initial_state, initial_state.capitalize())
             initial_spec = {"occupant": initial, "state": state}
         self._slots.append(
             {
