@@ -167,25 +167,12 @@ impl LinkState {
         })
     }
 
-    /// The bound address — the advertised port when the config said port 0.
-    pub fn local_addr(&self) -> std::net::SocketAddr {
-        self.local_addr
-    }
-
     /// Set the configured node name (from [`LinkParams::name`]). A builder
     /// step off [`bind`](Self::bind) so the registry factory threads it in
     /// without changing `bind`'s signature.
     pub fn with_name(mut self, name: Option<String>) -> Self {
         self.name = name;
         self
-    }
-
-    /// The effective node name advertised over mDNS: the configured name, or
-    /// the OS hostname when unset.
-    pub fn node_name(&self) -> String {
-        self.name
-            .clone()
-            .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned())
     }
 
     /// Advertise the uplink's command set for the identity packet. Runs
@@ -316,7 +303,6 @@ impl LinkState {
 /// A second `set_announces` (or an `add_uplink_msgs` past the freeze) on
 /// one server: a mis-ordered link pack, which the caller reports through
 /// its health rather than clobbering the replay.
-#[derive(Debug)]
 pub(crate) struct AnnouncesAlreadySet;
 
 impl crate::SharedLifecycle for LinkState {
@@ -324,7 +310,10 @@ impl crate::SharedLifecycle for LinkState {
     /// first attached system's init, so a runtime is up and connections can
     /// arrive before the downlink announces (they park on the replay).
     fn start(&mut self) {
-        let name = self.node_name();
+        let name = self
+            .name
+            .clone()
+            .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
         self.advertiser = super::discovery::advertise(&name, self.local_addr);
         let listener = self.listener.take().expect("start runs once");
         let shared = self.shared.clone();

@@ -9,6 +9,8 @@
 //! (unknown types, manifest freshness, occupant/entry resolution, a built
 //! artifact path) stays in resolve, next to what it needs.
 //!
+use std::collections::HashSet;
+
 use super::model::IR_VERSION;
 use super::model::{ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
 use super::resolve::slot_config_error;
@@ -73,27 +75,18 @@ fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
 }
 
 /// Instance names — systems and slots in one flat namespace, plus the reserved
-/// coordinator — must be unique. This is the whole-wiring twin of
-/// [`check_instance_available`], which the builder runs per insert.
+/// coordinator — must be unique.
 fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
-    let mut seen: Vec<&str> = vec![RESERVED_INSTANCE];
-    for spec in &wiring.systems {
-        if seen.contains(&spec.name.as_str()) {
-            return Err(LoadErrorKind::DuplicateInstance {
-                name: spec.name.clone(),
-            }
-            .bare());
+    let mut seen = HashSet::from([RESERVED_INSTANCE]);
+    for name in wiring
+        .systems
+        .iter()
+        .map(|spec| &spec.name)
+        .chain(wiring.slots.iter().map(|slot| &slot.name))
+    {
+        if !seen.insert(name) {
+            return Err(LoadErrorKind::DuplicateInstance { name: name.clone() }.bare());
         }
-        seen.push(&spec.name);
-    }
-    for slot in &wiring.slots {
-        if seen.contains(&slot.name.as_str()) {
-            return Err(LoadErrorKind::DuplicateInstance {
-                name: slot.name.clone(),
-            }
-            .bare());
-        }
-        seen.push(&slot.name);
     }
     Ok(())
 }
@@ -101,15 +94,14 @@ fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
 /// Artifact ids must be unique: a system's `artifact=` and a slot's `allow`
 /// address a pack by id, so a duplicate would silently shadow.
 fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen = HashSet::new();
     for artifact in &wiring.artifacts {
-        if seen.contains(&artifact.id.as_str()) {
+        if !seen.insert(&artifact.id) {
             return Err(LoadErrorKind::DuplicateArtifact {
                 id: artifact.id.clone(),
             }
             .bare());
         }
-        seen.push(&artifact.id);
     }
     Ok(())
 }
@@ -118,17 +110,15 @@ fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
 /// instance (the pack declared one cell), so a second spec of either kind
 /// could only shadow or double-construct.
 fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
-    let mut names: Vec<&str> = Vec::new();
-    let mut types: Vec<&str> = Vec::new();
+    let mut names = HashSet::new();
+    let mut types = HashSet::new();
     for state in &wiring.states {
-        if names.contains(&state.name.as_str()) || types.contains(&state.ty.as_str()) {
+        if !names.insert(&state.name) || !types.insert(&state.ty) {
             return Err(LoadErrorKind::DuplicateState {
                 name: state.name.clone(),
             }
             .bare());
         }
-        names.push(&state.name);
-        types.push(&state.ty);
     }
     Ok(())
 }

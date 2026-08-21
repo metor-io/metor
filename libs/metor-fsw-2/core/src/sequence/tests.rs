@@ -52,7 +52,6 @@ fn poll(w: &mut Wait) -> Poll<Step> {
 #[test]
 fn wait_elapses_at_deadline() {
     let clock = Rc::new(CycleClock::default());
-    clock.now.set(Timestamp(0));
     with_clock(&clock, || {
         // Timestamp is in microseconds, so the deadline is now(0) + 5.
         let mut w = wait(Duration::from_micros(5));
@@ -71,7 +70,6 @@ fn wait_elapses_at_deadline() {
 #[test]
 fn cancel_short_circuits_wait() {
     let clock = Rc::new(CycleClock::default());
-    clock.now.set(Timestamp(0));
     with_clock(&clock, || {
         let mut w = wait(Duration::from_micros(100));
         assert_eq!(poll(&mut w), Poll::Pending, "far from the deadline");
@@ -121,9 +119,7 @@ fn now_reads_the_stepped_ambient_clock() {
     // time, so a sequence stamps its emitted frames deterministically.
     let clock = Rc::new(CycleClock::default());
     clock.now.set(Timestamp(42));
-    with_clock(&clock, || {
-        assert_eq!(super::now(), Timestamp(42));
-    });
+    with_clock(&clock, || assert_eq!(super::now(), Timestamp(42)));
     // A refresh between polls is observed by the next poll.
     clock.now.set(Timestamp(43));
     with_clock(&clock, || assert_eq!(super::now(), Timestamp(43)));

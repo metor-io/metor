@@ -122,6 +122,18 @@ fn consume(s: &mut ConsState, imu: &mut Input<PkImu>, health: &mut HealthPort) {
     }
 }
 
+struct NavWatch {
+    seen: Rc<RefCell<Vec<f64>>>,
+}
+
+fn watch_nav(s: &mut NavWatch, nav: &mut Input<PkNav>) {
+    if let Ok(Some(r)) = nav.latest()
+        && s.seen.borrow().last() != Some(&r.angle)
+    {
+        s.seen.borrow_mut().push(r.angle);
+    }
+}
+
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn pack_entries_flow_and_share_state() {
@@ -216,20 +228,9 @@ async fn task_entry_runs_as_wired_sequence() {
     }
 
     let seen = Rc::new(RefCell::new(Vec::new()));
-    struct WatchState {
-        seen: Rc<RefCell<Vec<f64>>>,
-    }
-    fn watch(s: &mut WatchState, nav: &mut Input<PkNav>) {
-        if let Ok(Some(r)) = nav.latest()
-            && s.seen.borrow().last() != Some(&r.angle)
-        {
-            s.seen.borrow_mut().push(r.angle);
-        }
-    }
-
     let mut pack = Pack::new().task("point", point).system(
         "watch",
-        system(watch).state(WatchState { seen: seen.clone() }),
+        system(watch_nav).state(NavWatch { seen: seen.clone() }),
     );
 
     let params = postcard::to_allocvec(&SeqParams { target: 7.0 }).unwrap();
@@ -451,20 +452,9 @@ async fn task_cycles_every_cycle_and_folds_drops() {
     }
 
     let seen = Rc::new(RefCell::new(Vec::new()));
-    struct WatchState {
-        seen: Rc<RefCell<Vec<f64>>>,
-    }
-    fn watch(s: &mut WatchState, nav: &mut Input<PkNav>) {
-        if let Ok(Some(r)) = nav.latest()
-            && s.seen.borrow().last() != Some(&r.angle)
-        {
-            s.seen.borrow_mut().push(r.angle);
-        }
-    }
-
     let mut pack = Pack::new().task("beat", beat).system(
         "watch",
-        system(watch).state(WatchState { seen: seen.clone() }),
+        system(watch_nav).state(NavWatch { seen: seen.clone() }),
     );
 
     let mut b = crate::coordinator::init::InitGraph::new(CoordinatorConfig {
@@ -606,22 +596,27 @@ fn system_type_shared_registers_instance_descriptor() {
         }
     }
 
+    fn mint_pack() -> (Pack, AttachTarget) {
+        let mut pack = Pack::new();
+        let tally = pack.shared_state("Tally", |(): ()| {
+            Ok::<_, std::convert::Infallible>(Tally::default())
+        });
+        let attach = AttachTarget {
+            ty: "Tally",
+            token: std::rc::Rc::new(tally.clone()),
+        };
+        let mut pack = pack.system_type_shared::<MintSys, Tally>("Mint", |p, _tally| {
+            <MintSys as crate::BuildSystem>::new(p)
+        });
+        pack.state_entry_mut("Tally")
+            .unwrap()
+            .create(EntryParams::Postcard(&[]))
+            .unwrap();
+        (pack, attach)
+    }
+
     let msgs = MsgTable::default();
-    let mut pack = Pack::new();
-    let tally = pack.shared_state("Tally", |(): ()| {
-        Ok::<_, std::convert::Infallible>(Tally::default())
-    });
-    let attach = AttachTarget {
-        ty: "Tally",
-        token: std::rc::Rc::new(tally.clone()),
-    };
-    let mut pack = pack.system_type_shared::<MintSys, Tally>("Mint", |p, _tally| {
-        <MintSys as crate::BuildSystem>::new(p)
-    });
-    pack.state_entry_mut("Tally")
-        .unwrap()
-        .create(EntryParams::Postcard(&[]))
-        .unwrap();
+    let (mut pack, attach) = mint_pack();
 
     // A non-minting instance stands on the static descriptor.
     let plain = serde_json::json!({ "mint": false });
@@ -633,21 +628,7 @@ fn system_type_shared_registers_instance_descriptor() {
     assert!(matches!(created.instance_desc, None));
 
     // A second instantiation is rejected, so re-register for the minting one.
-    let mut pack = Pack::new();
-    let tally = pack.shared_state("Tally", |(): ()| {
-        Ok::<_, std::convert::Infallible>(Tally::default())
-    });
-    let attach = AttachTarget {
-        ty: "Tally",
-        token: std::rc::Rc::new(tally.clone()),
-    };
-    let mut pack = pack.system_type_shared::<MintSys, Tally>("Mint", |p, _tally| {
-        <MintSys as crate::BuildSystem>::new(p)
-    });
-    pack.state_entry_mut("Tally")
-        .unwrap()
-        .create(EntryParams::Postcard(&[]))
-        .unwrap();
+    let (mut pack, attach) = mint_pack();
     let minting = serde_json::json!({ "mint": true });
     let node = pending_node(
         "mint".into(),

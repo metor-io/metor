@@ -268,11 +268,6 @@ pub enum Check {
 }
 
 impl Check {
-    /// Whether the predicate held.
-    pub fn held(self) -> bool {
-        matches!(self, Check::Held)
-    }
-
     /// The `?`-able form: `Ok` when held, otherwise the [`Outcome`] to end on,
     /// recording a progress line naming the phase that timed out.
     ///

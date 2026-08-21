@@ -203,7 +203,11 @@ pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(
             Some(triple) => super::cdylib_file_name_for(triple, &artifact.lib),
             None => super::cdylib_file_name(&artifact.lib),
         };
-        let path = build_one(&artifact.crate_name, &cdylib, opts)?;
+        let label = match target.as_deref() {
+            Some(triple) => format!("{} ({triple})", artifact.crate_name),
+            None => artifact.crate_name.clone(),
+        };
+        let path = build_cdylib("build", &artifact.crate_name, &cdylib, opts, &label)?;
         if opts.manifest_sidecar {
             write_manifest_sidecar(&artifact.crate_name, &artifact.lib, &path, opts, cross)?;
         }
@@ -220,13 +224,10 @@ fn select_prebuilt(
     dir: &Path,
     target: Option<&str>,
 ) -> Result<PathBuf, BuildError> {
-    let triple = match target.map(str::to_string).or_else(host_triple) {
-        Some(triple) => triple,
-        None => {
-            return Err(BuildError::HostTripleUnknown {
-                artifact: artifact.id.clone(),
-            });
-        }
+    let Some(triple) = target.map(str::to_string).or_else(host_triple) else {
+        return Err(BuildError::HostTripleUnknown {
+            artifact: artifact.id.clone(),
+        });
     };
     let so = dir
         .join(&triple)
@@ -257,17 +258,9 @@ fn shipped_triples(dir: &Path) -> Vec<String> {
     triples
 }
 
-/// Runs `cargo build -p <crate_name>` and returns the located cdylib path.
-fn build_one(crate_name: &str, cdylib: &str, opts: &BuildOptions) -> Result<PathBuf, BuildError> {
-    let label = match requested_target(&opts.extra_args) {
-        Some(triple) => format!("{crate_name} ({triple})"),
-        None => crate_name.to_string(),
-    };
-    build_cdylib("build", crate_name, cdylib, opts, &label)
-}
-
-/// [`build_one`] with the cargo subcommand parameterized — `"zigbuild"` runs
-/// the `cargo-zigbuild` cross builder with the same output-location scan.
+/// Runs a cargo-family build and returns the located cdylib path.
+/// `"zigbuild"` runs the `cargo-zigbuild` cross builder with the same
+/// output-location scan.
 ///
 /// The build reports through tracing: a `build`-target span for its whole
 /// duration (the CLI renders active spans as a pinned progress line, keyed on
@@ -288,9 +281,7 @@ pub(super) fn build_cdylib(
     if opts.release {
         cmd.arg("--release");
     }
-    for arg in &opts.extra_args {
-        cmd.arg(arg);
-    }
+    cmd.args(&opts.extra_args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let span = tracing::info_span!(target: "build", "build", %label);
@@ -512,10 +503,7 @@ pub fn build_target(extra_args: &[String]) -> Option<String> {
 /// undeterminable host reads as cross: the sidecar is then sourced from an
 /// explicit host-arch build, which is correct either way.
 fn is_cross(extra_args: &[String]) -> bool {
-    match requested_target(extra_args) {
-        Some(triple) => host_triple().as_deref() != Some(triple),
-        None => false,
-    }
+    requested_target(extra_args).is_some_and(|triple| host_triple().as_deref() != Some(triple))
 }
 
 /// The `--target` triple `extra_args` carries, in either `--target <t>` or

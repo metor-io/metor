@@ -696,17 +696,13 @@ fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
         let Some(path) = artifact.path.as_deref() else {
             continue;
         };
-        // The live manifest is the sidecar the build driver wrote (no dlopen);
-        // absent that, describe the built object in process — resolve dlopens
-        // it momentarily anyway.
-        let bytes = match crate::dl::manifest_sidecar_bytes(path) {
-            Some(bytes) => bytes,
-            None => match crate::dl::describe_raw(path) {
-                Ok(bytes) => bytes,
-                // A describe failure is not a staleness verdict; let the
-                // dlopen path surface the real load error.
-                Err(_) => continue,
-            },
+        // Prefer the build driver's sidecar (no dlopen); otherwise describe in
+        // process. A describe failure is not a staleness verdict, so let the
+        // later dlopen path surface it.
+        let Some(bytes) =
+            crate::dl::manifest_sidecar_bytes(path).or_else(|| crate::dl::describe_raw(path).ok())
+        else {
+            continue;
         };
         if pack_module::manifest_hash(&bytes) != recorded {
             return Err(LoadErrorKind::StaleStubs {
@@ -898,15 +894,9 @@ fn resolve_slot(
         allowed
     };
 
-    let initial = slot.initial.as_ref().map(|i| match i.state {
-        SlotInitState::Loaded => InitialOccupant {
-            occupant: i.occupant.clone(),
-            start: false,
-        },
-        SlotInitState::Running => InitialOccupant {
-            occupant: i.occupant.clone(),
-            start: true,
-        },
+    let initial = slot.initial.as_ref().map(|i| InitialOccupant {
+        occupant: i.occupant.clone(),
+        start: i.state == SlotInitState::Running,
     });
 
     // `plan_slot` is the one place the registered contract is derived and the
@@ -931,32 +921,22 @@ fn resolve_slot(
     // do include the implicit status and log tail, which a declaration may
     // name but need not.
     use metor_fsw_2_core::PortConn;
-    for frame in &slot.inputs {
-        if !desc
-            .inputs
-            .iter()
-            .any(|p| p.conn == PortConn::Edge && &p.name == frame)
-        {
-            return Err(LoadErrorKind::SlotContractMismatch {
-                slot: slot.name.clone(),
-                dir: "input",
-                frame: frame.clone(),
+    for (dir, frames, ports) in [
+        ("input", &slot.inputs, &desc.inputs),
+        ("output", &slot.outputs, &desc.outputs),
+    ] {
+        for frame in frames {
+            if !ports
+                .iter()
+                .any(|p| p.conn == PortConn::Edge && &p.name == frame)
+            {
+                return Err(LoadErrorKind::SlotContractMismatch {
+                    slot: slot.name.clone(),
+                    dir,
+                    frame: frame.clone(),
+                }
+                .bare());
             }
-            .bare());
-        }
-    }
-    for frame in &slot.outputs {
-        if !desc
-            .outputs
-            .iter()
-            .any(|p| p.conn == PortConn::Edge && &p.name == frame)
-        {
-            return Err(LoadErrorKind::SlotContractMismatch {
-                slot: slot.name.clone(),
-                dir: "output",
-                frame: frame.clone(),
-            }
-            .bare());
         }
     }
 

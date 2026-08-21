@@ -68,7 +68,6 @@ impl PortId {
             PortId::Packet(_) => None,
         }
     }
-
 }
 
 /// What one record is and how it is described (the schema axis).
@@ -275,7 +274,9 @@ impl PortDesc {
             max_size: MAX_MSG_BYTES,
             schema: PortSchema::Postcard {
                 id: M::ID,
-                schema: Some(Box::new(OwnedNamedType::from(<M as postcard_schema::Schema>::SCHEMA))),
+                schema: Some(Box::new(OwnedNamedType::from(
+                    <M as postcard_schema::Schema>::SCHEMA,
+                ))),
             },
             delivery: Delivery::Log,
             fan_in: FanIn::Many,
@@ -587,10 +588,7 @@ pub fn compatible(producer: &PortDesc, consumer: &PortDesc) -> bool {
         (PortSchema::Table { vtable: pv, .. }, PortSchema::Table { vtable: cv, .. }) => {
             let prod = realize_set(pv);
             let cons = realize_set(cv);
-            cons.iter().all(|(id, want)| match prod.get(id) {
-                Some(have) => have == want,
-                None => false,
-            })
+            cons.iter().all(|(id, want)| prod.get(id) == Some(want))
         }
         (PortSchema::Postcard { .. }, PortSchema::Postcard { .. }) => true,
         _ => false,
@@ -692,7 +690,7 @@ mod tests {
         let log_f = PortDesc::of::<AxisProbe>().with_delivery(Delivery::Log);
         assert!(!compatible(&f, &log_f));
         assert!(!compatible(&log_f, &f));
-        assert!(compatible(&log_f, &log_f.clone()));
+        assert!(compatible(&log_f, &log_f));
     }
 
     /// A descriptor round-trips through postcard, with the host-only `conn`

@@ -53,7 +53,7 @@ use metor_proto_wkt::{ComponentMetadata, MsgMetadata, SetMsgMetadata};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_2_core::Shared;
-use metor_fsw_2_core::health::HealthPort;
+use metor_fsw_2_core::health::{HealthPort, LogLevel};
 use metor_fsw_2_core::{AllOutputs, RegistryEntry};
 use metor_fsw_2_core::{BindPorts, RingSource};
 use metor_fsw_2_core::{
@@ -63,7 +63,6 @@ use metor_fsw_2_core::{Declarations, Delivery, PortDesc, SystemDescriptor};
 use metor_fsw_2_core::{MsgFanOut, NamedMsg, split_record};
 
 /// Which registry entries the downlink taps.
-#[derive(Clone, Debug)]
 enum TelemetryMode {
     /// Tap every entry: every system's user frames and their implicit
     /// `health`/`log`, plus the coordinator-owned `health`/`log`/`status`.
@@ -111,28 +110,22 @@ pub struct DownlinkParams {
     pub frames: Option<Vec<String>>,
 }
 
-impl DownlinkParams {
-    /// Project the two optional subset lists onto a [`TelemetryMode`].
-    fn mode(&self) -> TelemetryMode {
-        match (&self.instances, &self.frames) {
-            (None, None) => TelemetryMode::All,
-            (instances, frames) => TelemetryMode::Subset {
-                instances: instances.clone().unwrap_or_default(),
-                frames: frames.clone().unwrap_or_default(),
-            },
-        }
-    }
-}
-
 impl BuildSystem for TelemetrySystem {
     type Params = DownlinkParams;
 
     /// Construct detached: the builtin link pack's ctor attaches the shared
     /// server ([`attach`](TelemetrySystem::attach)) right after.
     fn new(params: DownlinkParams) -> Self {
+        let mode = match (params.instances, params.frames) {
+            (None, None) => TelemetryMode::All,
+            (instances, frames) => TelemetryMode::Subset {
+                instances: instances.unwrap_or_default(),
+                frames: frames.unwrap_or_default(),
+            },
+        };
         Self {
             link: None,
-            mode: params.mode(),
+            mode,
             taps: Vec::new(),
             batch: Vec::new(),
             retain_scratch: Vec::new(),
@@ -164,9 +157,10 @@ impl BuildSystem for UplinkSystem {
 
     /// Construct detached, like the downlink's.
     fn new(params: UplinkParams) -> Self {
-        let mut system = Self::new();
-        system.unresolved = params.msgs.unwrap_or_default();
-        system
+        Self {
+            unresolved: params.msgs.unwrap_or_default(),
+            ..Self::new()
+        }
     }
 
     fn configure(&mut self, ctx: &BuildCtx) -> Result<(), ConfigureError> {
@@ -263,8 +257,6 @@ pub struct UplinkSystem {
     /// [`configure`](BuildSystem::configure); [`with_msg`](Self::with_msg)
     /// resolves statically instead.
     unresolved: Vec<String>,
-    /// The one-time first-cycle config checks ran.
-    checked: bool,
 }
 
 impl Default for UplinkSystem {
@@ -282,7 +274,6 @@ impl UplinkSystem {
             link: None,
             msgs: Vec::new(),
             unresolved: Vec::new(),
-            checked: false,
         }
     }
 
@@ -313,6 +304,18 @@ impl System for UplinkSystem {
     /// last by its `ReceiveAll` capability); a late registration is a
     /// config defect reported here rather than silently unadvertised.
     fn init(&mut self, output: &mut UplinkOut) {
+        let (fan, health) = output.split();
+        if self.msgs.is_empty() {
+            health.log(
+                LogLevel::Warn,
+                "uplink has no msgs configured; it will relay nothing",
+            );
+        } else if fan.len() != self.msgs.len() {
+            // One writer per configured msg is the bind contract; a mismatch
+            // means the registered descriptor and this instance diverged.
+            health.error("uplink_bind_mismatch");
+        }
+
         let link = self
             .link
             .as_ref()
@@ -322,7 +325,7 @@ impl System for UplinkSystem {
             let health = output.health();
             health.error("uplink_announced_late");
             health.log(
-                metor_fsw_2_core::health::LogLevel::Warn,
+                LogLevel::Warn,
                 "uplink registered after the downlink; its command set is not advertised to clients",
             );
         }
@@ -349,20 +352,6 @@ impl CyclicSystem for UplinkSystem {
     /// drains fully so a bad sender cannot wedge it.
     fn execute(&mut self, _now: Timestamp, _input: &mut (), output: &mut UplinkOut) {
         let (fan, health) = output.split();
-        if !self.checked {
-            if self.msgs.is_empty() {
-                health.log(
-                    metor_fsw_2_core::health::LogLevel::Warn,
-                    "uplink has no msgs configured; it will relay nothing",
-                );
-            } else if fan.len() != self.msgs.len() {
-                // One writer per configured msg is the bind contract; a
-                // mismatch means the registered descriptor and this instance
-                // diverged.
-                health.error("uplink_bind_mismatch");
-            }
-            self.checked = true;
-        }
         let link = self
             .link
             .as_ref()
@@ -570,7 +559,7 @@ impl System for TelemetrySystem {
             let health = output.health();
             health.error("telemetry_reader_slot");
             health.log(
-                metor_fsw_2_core::health::LogLevel::Warn,
+                LogLevel::Warn,
                 &format!("no reader slot left on `{key}` — raise CoordinatorConfig::reader_slack"),
             );
         }
@@ -586,7 +575,7 @@ impl System for TelemetrySystem {
             let health = output.health();
             health.error("link_announce_conflict");
             health.log(
-                metor_fsw_2_core::health::LogLevel::Warn,
+                LogLevel::Warn,
                 "another downlink already announced on this link; this instance streams nothing",
             );
             self.link = None;

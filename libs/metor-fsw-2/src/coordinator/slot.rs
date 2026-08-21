@@ -263,22 +263,11 @@ pub(crate) fn plan_slot(
     name: &str,
     allowed: &[AllowedOccupant],
 ) -> Result<(SystemDescriptor, SlotPorts, bool), SlotConfigError> {
-    // Per-slot means all-occupants: the isolation boundary is the slot's
-    // position in the cycle, and a mixed allow set would make `Load` silently
-    // change the fault domain.
-    let n_proc = allowed
+    let backing = core::mem::discriminant(&allowed[0].backing);
+    if allowed
         .iter()
-        .filter(|a| matches!(a.backing, OccupantBacking::Artifact(_)))
-        .count();
-    let n_wasm = allowed
-        .iter()
-        .filter(|a| matches!(a.backing, OccupantBacking::Wasm { .. }))
-        .count();
-    // Per-slot means all-occupants for each backing, not just for process:
-    // `Load` must never silently move the fault domain, and the three differ
-    // in exactly that (address space, and whether a poll is bounded).
-    let n = allowed.len();
-    if (n_proc != 0 && n_proc != n) || (n_wasm != 0 && n_wasm != n) {
+        .any(|a| core::mem::discriminant(&a.backing) != backing)
+    {
         return Err(SlotConfigError::MixedBacking);
     }
     if let Some(occ) = allowed
@@ -289,7 +278,7 @@ pub(crate) fn plan_slot(
             occupant: occ.name.clone(),
         });
     }
-    let process = n_proc == allowed.len();
+    let process = matches!(&allowed[0].backing, OccupantBacking::Artifact(_));
     // Every allowed occupant must share the contract; the slot sizes and
     // validates to the first occupant's descriptor (mutual subset).
     let base = &allowed[0].descriptor;
@@ -409,36 +398,6 @@ impl SlotPorts {
             // Sequence occupants declare wired ports only (ReceiveAll is host-only).
             capabilities: Vec::new(),
         }
-    }
-
-    /// Registered-input index of the mount-appended [`SlotControlIn`], the
-    /// last port of the occupant input prefix.
-    pub(crate) fn control_in_idx(&self) -> usize {
-        self.occupant_inputs.len() - 1
-    }
-
-    /// Registered-input index of the runner's `commands` fan-in, the first
-    /// tail input.
-    pub(crate) fn commands_in_idx(&self) -> usize {
-        self.occupant_inputs.len()
-    }
-
-    /// Registered-output index of the mount-appended [`SequenceStatus`], the
-    /// last port of the occupant output prefix (and the self-tap's target).
-    pub(crate) fn seq_status_out_idx(&self) -> usize {
-        self.occupant_outputs.len() - 1
-    }
-
-    /// Registered-output index of the runner's [`SlotStatus`], the first
-    /// tail output.
-    pub(crate) fn status_out_idx(&self) -> usize {
-        self.occupant_outputs.len()
-    }
-
-    /// Registered-output index of the runner's `"sequences"` events channel,
-    /// the second tail output.
-    pub(crate) fn events_out_idx(&self) -> usize {
-        self.occupant_outputs.len() + 1
     }
 }
 
@@ -968,21 +927,6 @@ impl SlotRunner {
         self.detail_scratch = details;
     }
 
-    /// Emit the terminal event for a done fold from the latched `run_state`.
-    /// A value of 1 means completed and 2 means aborted; anything else is a
-    /// failure, and since [`SequenceStatus`] carries no reason string the
-    /// reason is generic.
-    fn emit_terminal_done(&mut self) {
-        let kind = match self.last_run_state {
-            1 => SequenceEventKind::Completed,
-            2 => SequenceEventKind::Aborted,
-            _ => SequenceEventKind::Failed {
-                reason: "failed".to_string(),
-            },
-        };
-        self.emit_event(kind);
-    }
-
     /// Fold one polled status word into the slot state — the shared tail of
     /// both backings' step. Drains what the occupant just published before
     /// folding the terminal event, so observers see the final Progress lines
@@ -996,7 +940,14 @@ impl SlotRunner {
             // status frames. A Done proc occupant's worker stays up, holding
             // its ring roles until Reset/Load/Unload like an in-process one.
             FswStatus::Done => {
-                self.emit_terminal_done();
+                let kind = match self.last_run_state {
+                    1 => SequenceEventKind::Completed,
+                    2 => SequenceEventKind::Aborted,
+                    _ => SequenceEventKind::Failed {
+                        reason: "failed".to_string(),
+                    },
+                };
+                self.emit_event(kind);
                 SlotState::Done {
                     outcome: self.last_run_state,
                 }

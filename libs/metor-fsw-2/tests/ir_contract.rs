@@ -251,7 +251,7 @@ fn golden_fixture_round_trips() {
 /// (line numbers track the emitting source) and each artifact's `path` and
 /// `prebuilt_dir` (both machine-located). The `lib` stem is arch-neutral and
 /// stays in the comparison.
-pub fn normalize(mut v: Value) -> Value {
+fn normalize(mut v: Value) -> Value {
     strip_key(&mut v, "src");
     if let Some(artifacts) = v.get_mut("artifacts").and_then(Value::as_array_mut) {
         for a in artifacts {

@@ -129,7 +129,6 @@ impl<T, const MAX: usize> FrameList<T, MAX> {
         },
         _ty: PhantomData,
     };
-
 }
 
 fn list_fields<T: AsVTable>(prefix: String) -> impl Iterator<Item = FieldBuilder> {
@@ -213,7 +212,6 @@ impl<V, const MAX: usize, const MAX_KEY: usize> FrameMap<V, MAX, MAX_KEY> {
         },
         _kv: PhantomData,
     };
-
 }
 
 fn map_fields<V: AsVTable>(prefix: String) -> impl Iterator<Item = FieldBuilder> {

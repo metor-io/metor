@@ -149,7 +149,6 @@ impl FswStatus {
     pub fn from_raw(raw: u32) -> Self {
         match raw {
             0 => FswStatus::Running,
-            1 => FswStatus::Panicked,
             2 => FswStatus::Done,
             _ => FswStatus::Panicked,
         }

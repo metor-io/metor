@@ -408,21 +408,6 @@ fn simulated_now(epoch: Timestamp, dt: Duration, k: u64) -> Timestamp {
     }
 }
 
-/// Whether the freshly scanned stopped set differs from the previously
-/// published one. Both slices come from the same in-order scan of the cyclic
-/// slots, so an element-wise `(name, reason)` compare is an exact membership
-/// compare, with no set structure and no allocation. A length-only check is
-/// not enough: stops are not monotonic (a slot recovers via `Load`/`Reset`),
-/// so slot A can recover the same cycle slot B stops, changing the membership
-/// while the count stays put.
-fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
-    cur.len() != prev.len()
-        || cur
-            .iter()
-            .zip(prev)
-            .any(|(a, b)| a.name != b.name || a.reason != b.reason)
-}
-
 // ---------------------------------------------------------------------------
 // Coordinator
 // ---------------------------------------------------------------------------
@@ -455,26 +440,12 @@ struct CoordChannels {
 }
 
 impl CoordChannels {
-    /// Emit the boot [`SequenceRegistry`] on the coordinator's message channel:
-    /// the slots and their allowed occupants.
-    fn emit_sequence_registry(&mut self) {
+    /// Emit the registry and manifest at boot or after a reload request.
+    fn emit_registry_and_manifest(&mut self) {
         let _ = self.seq_registry_out.emit(&self.seq_registry);
-    }
-
-    /// Emit the full target IR on the `wiring` channel — the live/historical
-    /// topology the panel graph tile consumes. A no-op when no front-end set a
-    /// manifest.
-    fn emit_wiring_manifest(&mut self) {
         if let (Some(out), Some(manifest)) = (&mut self.wiring_out, &self.wiring_manifest) {
             let _ = out.emit(manifest);
         }
-    }
-
-    /// Emit the boot registry and manifest at the head of the one permitted
-    /// run, so a tap claimed after `build()` observes them first.
-    fn emit_boot(&mut self) {
-        self.emit_sequence_registry();
-        self.emit_wiring_manifest();
     }
 
     /// Drain the cycle's reload requests; on any request re-emit the registry
@@ -484,8 +455,7 @@ impl CoordChannels {
         let mut reload = false;
         self.reload_in.drain(|ReloadSequences {}| reload = true)?;
         if reload {
-            self.emit_sequence_registry();
-            self.emit_wiring_manifest();
+            self.emit_registry_and_manifest();
         }
         Ok(())
     }
@@ -634,7 +604,7 @@ impl Coordinator {
             "target starting"
         );
         let tasks = self.start().await;
-        self.channels.emit_boot();
+        self.channels.emit_registry_and_manifest();
         // The Wall pacing budget. Only computed under a `Wall` clock, since
         // `cycle_rate` is documented ignored under `Simulated` and an unusable
         // rate must not panic there; under `Wall` the rate was validated at
@@ -801,7 +771,7 @@ impl Coordinator {
                 self.workers_scratch.push(status);
             }
         }
-        let stopped_changed = stopped_set_changed(&self.stopped_scratch, &self.stopped);
+        let stopped_changed = self.stopped_scratch != self.stopped;
         // Worker changes (a pid after a restart, a run-state transition) also
         // re-publish, so the wire always names the current process.
         let workers_changed = self.workers_scratch != self.workers;

@@ -833,32 +833,21 @@ impl InitGraph {
                 } else {
                     alloc_ring(port.delivery, port.max_size, depth, readers)
                 };
-                match &port.schema {
-                    PortSchema::Table { .. } => {
-                        alloc
-                            .reg_entries
-                            .push(registry_entry(&instance, port, ring.clone()));
-                        alloc.table.rings.push(RingEntry {
-                            ring: ring.clone(),
-                            frame_id: port
-                                .id()
-                                .component()
-                                .expect("table port keys on a ComponentId"),
-                            role,
-                            instance: Some(instance),
-                        });
-                    }
-                    PortSchema::Postcard { .. } => {
-                        let entry = registry_entry(&instance, port, ring.clone());
-                        alloc.table.rings.push(RingEntry {
-                            ring: ring.clone(),
-                            frame_id: entry.key,
-                            role,
-                            instance: Some(instance),
-                        });
-                        alloc.reg_entries.push(entry);
-                    }
-                }
+                let entry = registry_entry(&instance, port, ring.clone());
+                let frame_id = match &port.schema {
+                    PortSchema::Table { .. } => port
+                        .id()
+                        .component()
+                        .expect("table port keys on a ComponentId"),
+                    PortSchema::Postcard { .. } => entry.key,
+                };
+                alloc.table.rings.push(RingEntry {
+                    ring: ring.clone(),
+                    frame_id,
+                    role,
+                    instance: Some(instance),
+                });
+                alloc.reg_entries.push(entry);
                 row.push(ring);
             }
             alloc.output_rings.push(row);

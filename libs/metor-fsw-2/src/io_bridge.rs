@@ -32,14 +32,10 @@ impl<W: WakeSource> RingPump<W> {
         match self.delivery {
             Delivery::Log => {
                 let mut dropped = 0;
-                loop {
-                    match self.from.try_read()? {
-                        Some(grant) => {
-                            dropped += u64::from(self.to.try_write(&grant).is_err());
-                        }
-                        None => return Ok(dropped),
-                    }
+                while let Some(grant) = self.from.try_read()? {
+                    dropped += u64::from(self.to.try_write(&grant).is_err());
                 }
+                Ok(dropped)
             }
             Delivery::Snapshot => {
                 let committed = self.from.committed();

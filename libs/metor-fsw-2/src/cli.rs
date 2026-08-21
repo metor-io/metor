@@ -339,8 +339,8 @@ fn refresh_source_packs(target: &Path, release: bool, cargo_args: &[String]) -> 
             cargo_args: cargo_args.to_vec(),
         },
     )
-    .into_diagnostic()?;
-    Ok(())
+    .into_diagnostic()
+    .map(|_| ())
 }
 
 /// `build`: load the wiring, provision every artifact's `.so`, print them.
@@ -496,16 +496,14 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     };
     refresh_run_packs(&target, &args)?;
     let mut wiring = load_run_wiring(&target)?;
-    apply_overrides(&mut wiring, &args)?;
+    apply_overrides(&mut wiring, &args);
     ui::print_preflight(&wiring, &target);
     provision_run_artifacts(&mut wiring, &target, &args)?;
 
     let cycles = args.cycles.unwrap_or(usize::MAX);
     let mut coord = resolve(&wiring, &Registry::with_builtins())?;
 
-    // Enter the async runtime at the leaf; `run_for` does init, the cycle loop,
-    // and shutdown. The heartbeat is a side task reading the shared progress
-    // counter, since the loop holds `&mut coord` for its whole life.
+    // `run_for` does init, the cycle loop, and shutdown.
     coord.run_for(cycles).await;
 
     // A hard-stopped system is a failed run: name each one and exit non-zero,
@@ -602,7 +600,7 @@ fn is_bundle(path: &Path) -> bool {
 
 /// Apply `run`'s override flags onto the loaded [`Wiring`] before [`resolve`].
 /// A flag always beats the target's own setting.
-fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
+fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) {
     if args.wall {
         wiring.coordinator.clock = ClockSpec::Wall;
     } else if let Some(dt_secs) = args.sim_dt {
@@ -634,7 +632,6 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
             }
         }
     }
-    Ok(())
 }
 
 /// Build the [`BuildOptions`] from the shared

@@ -34,6 +34,12 @@ impl metor_component::Decomponentize for RecSink {
     }
 }
 
+fn components<F: Frame>(table: &[u8]) -> RecSink {
+    let mut sink = RecSink::default();
+    F::as_vtable().apply(table, &mut sink).unwrap().unwrap();
+    sink
+}
+
 // --- Frame tag, shared timestamp, and timestamp suppression ---
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -203,11 +209,7 @@ fn underscore_pad_field_skipped() {
         _pad: [0; 7],
         value: 2.5,
     };
-    let mut sink = RecSink::default();
-    PadFrame::as_vtable()
-        .apply(frame.as_bytes(), &mut sink)
-        .unwrap()
-        .unwrap();
+    let sink = components::<PadFrame>(frame.as_bytes());
     assert!(sink.values.contains_key(&ComponentId::new("padf.flag")));
     assert!(sink.values.contains_key(&ComponentId::new("padf.value")));
     // The `[u8; 7]` blanket impl would expand `_pad` into seven indexed leaves.
@@ -245,11 +247,7 @@ fn skip_attribute_overrides_default() {
         hidden: 2.0,
         plain: 3.0,
     };
-    let mut sink = RecSink::default();
-    SkipOverrideFrame::as_vtable()
-        .apply(frame.as_bytes(), &mut sink)
-        .unwrap()
-        .unwrap();
+    let sink = components::<SkipOverrideFrame>(frame.as_bytes());
     assert!(sink.values.contains_key(&ComponentId::new("ovr._shown")));
     assert!(sink.values.contains_key(&ComponentId::new("ovr.plain")));
     assert!(!sink.values.contains_key(&ComponentId::new("ovr.hidden")));
@@ -297,11 +295,7 @@ fn nested_struct_pad_field_skipped() {
             _pad: [0; 7],
         }; 2],
     };
-    let mut sink = RecSink::default();
-    PadWheelFrame::as_vtable()
-        .apply(frame.as_bytes(), &mut sink)
-        .unwrap()
-        .unwrap();
+    let sink = components::<PadWheelFrame>(frame.as_bytes());
     assert!(
         sink.values
             .contains_key(&ComponentId::new("wheelf.wheels.0.speed"))
@@ -332,6 +326,10 @@ struct Process {
     cpu_usage: f64,
 }
 
+fn process(pid: u64, cpu_usage: f64) -> Process {
+    Process { pid, cpu_usage }
+}
+
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 struct SysList {
@@ -348,22 +346,12 @@ fn frame_list_build_and_apply() {
     };
     let mut w = FrameWriter::new(&frame);
     w.list(&frame.processes, offset_of!(SysList, processes), |l| {
-        l.push(Process {
-            pid: 1001,
-            cpu_usage: 0.5,
-        });
-        l.push(Process {
-            pid: 1002,
-            cpu_usage: 0.25,
-        });
+        l.push(process(1001, 0.5));
+        l.push(process(1002, 0.25));
     })
     .unwrap();
 
-    let mut sink = RecSink::default();
-    SysList::as_vtable()
-        .apply(w.table(), &mut sink)
-        .unwrap()
-        .unwrap();
+    let sink = components::<SysList>(w.table());
 
     assert_eq!(sink.values[&ComponentId::new("processes.0.pid")], 1001.0);
     assert_eq!(sink.values[&ComponentId::new("processes.0.cpu_usage")], 0.5);
@@ -395,28 +383,12 @@ fn frame_map_build_and_apply() {
     };
     let mut w = FrameWriter::new(&frame);
     w.map(&frame.processes, offset_of!(SysMap, processes), |m| {
-        m.insert(
-            "htop",
-            Process {
-                pid: 1001,
-                cpu_usage: 0.5,
-            },
-        );
-        m.insert(
-            "init",
-            Process {
-                pid: 1002,
-                cpu_usage: 0.25,
-            },
-        );
+        m.insert("htop", process(1001, 0.5));
+        m.insert("init", process(1002, 0.25));
     })
     .unwrap();
 
-    let mut sink = RecSink::default();
-    SysMap::as_vtable()
-        .apply(w.table(), &mut sink)
-        .unwrap()
-        .unwrap();
+    let sink = components::<SysMap>(w.table());
 
     assert_eq!(sink.values[&ComponentId::new("processes.htop.pid")], 1001.0);
     assert_eq!(
@@ -438,13 +410,7 @@ fn frame_map_rejects_dot_key_at_write_time() {
     };
     let mut w = FrameWriter::new(&frame);
     let res = w.map(&frame.processes, offset_of!(SysMap, processes), |m| {
-        m.insert(
-            "a.b",
-            Process {
-                pid: 1,
-                cpu_usage: 0.0,
-            },
-        );
+        m.insert("a.b", process(1, 0.0));
     });
     assert_eq!(res, Err(DynamicWriteError::Key(KeyError::DotInKey)));
 }
@@ -460,10 +426,7 @@ fn dynamic_writers_enforce_declared_bounds_and_roll_back() {
     let err = writer
         .list(&list.processes, offset_of!(SysList, processes), |items| {
             for pid in 0..=8 {
-                items.push(Process {
-                    pid,
-                    cpu_usage: 0.0,
-                });
+                items.push(process(pid, 0.0));
             }
         })
         .unwrap_err();
@@ -477,13 +440,7 @@ fn dynamic_writers_enforce_declared_bounds_and_roll_back() {
     let mut writer = FrameWriter::new(&map);
     let err = writer
         .map(&map.processes, offset_of!(SysMap, processes), |entries| {
-            entries.insert(
-                &"x".repeat(33),
-                Process {
-                    pid: 1,
-                    cpu_usage: 0.0,
-                },
-            );
+            entries.insert(&"x".repeat(33), process(1, 0.0));
         })
         .unwrap_err();
     assert_eq!(err, DynamicWriteError::KeyTooLong { len: 33, max: 32 });
@@ -492,13 +449,7 @@ fn dynamic_writers_enforce_declared_bounds_and_roll_back() {
     let err = writer
         .map(&map.processes, offset_of!(SysMap, processes), |entries| {
             for pid in 0..=8 {
-                entries.insert(
-                    &format!("p{pid}"),
-                    Process {
-                        pid,
-                        cpu_usage: 0.0,
-                    },
-                );
+                entries.insert(&format!("p{pid}"), process(pid, 0.0));
             }
         })
         .unwrap_err();
@@ -520,10 +471,7 @@ fn output_rejects_dynamic_overflow_before_ring_write() {
         .write_with(&frame, |writer| {
             let _ = writer.list(&frame.processes, offset_of!(SysList, processes), |items| {
                 for pid in 0..=8 {
-                    items.push(Process {
-                        pid,
-                        cpu_usage: 0.0,
-                    });
+                    items.push(process(pid, 0.0));
                 }
             });
         })
@@ -547,20 +495,8 @@ fn frame_map_exact_byte_layout() {
     };
     let mut w = FrameWriter::new(&frame);
     w.map(&frame.processes, offset_of!(SysMap, processes), |m| {
-        m.insert(
-            "htop",
-            Process {
-                pid: 1001,
-                cpu_usage: 0.5,
-            },
-        );
-        m.insert(
-            "init",
-            Process {
-                pid: 1002,
-                cpu_usage: 0.25,
-            },
-        );
+        m.insert("htop", process(1001, 0.5));
+        m.insert("init", process(1002, 0.25));
     })
     .unwrap();
 
@@ -601,29 +537,14 @@ fn frame_map_key_error_rolls_the_member_back() {
     };
     let mut w = FrameWriter::new(&frame);
     w.list(&frame.procs, offset_of!(SysBoth, procs), |l| {
-        l.push(Process {
-            pid: 1,
-            cpu_usage: 1.0,
-        });
+        l.push(process(1, 1.0));
     })
     .unwrap();
     let len_after_list = w.table().len();
 
     let res = w.map(&frame.hosts, offset_of!(SysBoth, hosts), |m| {
-        m.insert(
-            "ok",
-            Process {
-                pid: 2,
-                cpu_usage: 2.0,
-            },
-        );
-        m.insert(
-            "bad.key",
-            Process {
-                pid: 3,
-                cpu_usage: 3.0,
-            },
-        );
+        m.insert("ok", process(2, 2.0));
+        m.insert("bad.key", process(3, 3.0));
     });
     assert_eq!(res, Err(DynamicWriteError::Key(KeyError::DotInKey)));
     assert_eq!(
@@ -634,21 +555,11 @@ fn frame_map_key_error_rolls_the_member_back() {
 
     // A retry with valid keys lands at the same trailer position.
     w.map(&frame.hosts, offset_of!(SysBoth, hosts), |m| {
-        m.insert(
-            "ok",
-            Process {
-                pid: 2,
-                cpu_usage: 2.0,
-            },
-        );
+        m.insert("ok", process(2, 2.0));
     })
     .unwrap();
 
-    let mut sink = RecSink::default();
-    SysBoth::as_vtable()
-        .apply(w.table(), &mut sink)
-        .unwrap()
-        .unwrap();
+    let sink = components::<SysBoth>(w.table());
     assert_eq!(sink.values[&ComponentId::new("procs.0.pid")], 1.0);
     assert_eq!(sink.values[&ComponentId::new("hosts.ok.pid")], 2.0);
     assert_eq!(
@@ -668,13 +579,7 @@ fn frame_scratch_reuse_is_byte_identical() {
     };
     let build = |w: &mut FrameWriter<SysMap>| {
         w.map(&frame.processes, offset_of!(SysMap, processes), |m| {
-            m.insert(
-                "htop",
-                Process {
-                    pid: 1001,
-                    cpu_usage: 0.5,
-                },
-            );
+            m.insert("htop", process(1001, 0.5));
         })
         .unwrap();
     };
@@ -688,13 +593,7 @@ fn frame_scratch_reuse_is_byte_identical() {
     let mut big = FrameWriter::from_scratch(fresh.finish(), &frame);
     big.map(&frame.processes, offset_of!(SysMap, processes), |m| {
         for i in 0..8 {
-            m.insert(
-                &format!("proc_{i}"),
-                Process {
-                    pid: i,
-                    cpu_usage: 0.0,
-                },
-            );
+            m.insert(&format!("proc_{i}"), process(i, 0.0));
         }
     })
     .unwrap();

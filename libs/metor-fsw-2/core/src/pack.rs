@@ -249,11 +249,10 @@ impl PackEntry {
             .clone()
             .expect("defaults declared before wrapping");
         let schema = self.params_schema;
-        let inner = std::mem::replace(
+        let mut inner = std::mem::replace(
             &mut self.create,
             Box::new(|_| unreachable!("replaced below")),
         );
-        let mut inner = inner;
         self.create = Box::new(move |params: EntryParams<'_>| {
             let bytes = resolve_defaults(params, &defaults, schema)?;
             inner(EntryParams::Postcard(&bytes))
@@ -421,7 +420,7 @@ impl Pack {
                 })
             }
         });
-        let mut entry = PackEntry {
+        let entry = PackEntry {
             name,
             descriptor,
             params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
@@ -430,9 +429,6 @@ impl Pack {
             shared: true,
             create,
         };
-        if entry.params_default.is_some() {
-            entry.wrap_create_with_defaults();
-        }
         self.entries.push(entry);
         self
     }

@@ -83,7 +83,6 @@ where
     instance: Arc<str>,
     cycles: u64,
     errors: u64,
-    last_execute_micros: u64,
     error_counts: Vec<(String, u64)>,
     pending: Vec<(LogLevel, String)>,
 }
@@ -100,7 +99,6 @@ where
             instance: Arc::from(""),
             cycles: 0,
             errors: 0,
-            last_execute_micros: 0,
             error_counts: Vec::new(),
             pending: Vec::new(),
         }
@@ -155,8 +153,7 @@ where
     /// publishing one health record plus one [`LogEvent`] per queued line.
     pub fn end_cycle(&mut self, timestamp: Timestamp, execute_micros: u64) {
         self.cycles += 1;
-        self.last_execute_micros = execute_micros;
-        self.publish_health(timestamp);
+        self.publish_health(timestamp, execute_micros);
         self.flush_logs(timestamp);
         // Inside a pack dylib the tracing forward queue is per-dylib and the
         // loop is single-threaded, so everything queued since the last drain
@@ -175,12 +172,12 @@ where
         }
     }
 
-    fn publish_health(&mut self, timestamp: Timestamp) {
+    fn publish_health(&mut self, timestamp: Timestamp, execute_micros: u64) {
         let frame = SystemHealth {
             timestamp,
             cycles: self.cycles,
             errors: self.errors,
-            last_execute_micros: self.last_execute_micros,
+            last_execute_micros: execute_micros,
             error_counts: FrameMap::EMPTY,
         };
         let counts = &self.error_counts;

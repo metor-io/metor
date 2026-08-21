@@ -310,9 +310,7 @@ fn run_system(
 
         let mut last = 0u32;
         while let WorkerCmd::Step { seq, now } = ctl.next(last) {
-            // A panicked or `Done` occupant keeps serving terminal acks (and
-            // holding its ring roles) until shutdown; its latched slot state
-            // early-returns every further step.
+            // Latched terminal states keep serving acks until shutdown.
             let status = match mode {
                 RunMode::Cyclic => {
                     slot.step(now);

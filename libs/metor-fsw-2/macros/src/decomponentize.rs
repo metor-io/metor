@@ -35,11 +35,7 @@ pub fn decomponentize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> Token
             .expect("only named field allowed")
             .to_string()
             .to_case(Case::UpperSnake);
-        let component_id = field.component_name();
-        let component_id = match parent {
-            Some(parent) => format!("{parent}.{component_id}"),
-            None => component_id,
-        };
+        let component_id = field.qualified_component_name(parent.as_deref());
         let component_id = quote! { #impeller::types::ComponentId::new(#component_id) };
         let const_name = syn::Ident::new(&format!("{name}_ID"), Span::call_site());
         quote! {

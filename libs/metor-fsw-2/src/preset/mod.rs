@@ -76,13 +76,12 @@ impl CyclicSystem for PresetSystem {
         };
         let presets = presets
             .into_iter()
-            .map(|spec| {
-                let mut layout = spec.layout;
+            .map(|PresetSpec { name, mut layout }| {
                 if layout.version == 0 {
                     layout.version = TILE_LAYOUT_VERSION;
                 }
                 Preset {
-                    name: spec.name,
+                    name,
                     layout: serde_json::to_string(&layout).expect("tile layout always serializes"),
                 }
             })

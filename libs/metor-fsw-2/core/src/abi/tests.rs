@@ -20,6 +20,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto::vtable::VTable;
 use postcard_schema::Schema;
 use postcard_schema::schema::owned::OwnedNamedType;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -254,6 +255,11 @@ fn handle(ring: &RingBuffer, role: u8) -> FswRing {
     FswRing { base, len, role }
 }
 
+fn postcard_round_trip<T: Serialize + DeserializeOwned>(value: &T) -> T {
+    let bytes = postcard::to_allocvec(value).expect("test value encodes");
+    postcard::from_bytes(&bytes).expect("test value decodes")
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle end-to-end: create, bind, write, execute, read back.
 // ---------------------------------------------------------------------------
@@ -462,8 +468,7 @@ fn dl_announce_prefixes_vtable_ids() {
     // Round-trip the descriptor through postcard, exactly as a host loading
     // it from a manifest would.
     let desc = <Counter as CyclicSystem>::descriptor();
-    let bytes = postcard::to_allocvec(&desc).expect("descriptor encodes");
-    let rebuilt: crate::SystemDescriptor = postcard::from_bytes(&bytes).expect("decodes");
+    let rebuilt: crate::SystemDescriptor = postcard_round_trip(&desc);
 
     // The user output `out` (frame `tick_out`, field `count`) is outputs[0].
     let port = &rebuilt.outputs[0];
@@ -608,13 +613,12 @@ fn abi_panic_is_contained() {
 #[test]
 fn from_raw_folds_out_of_range_to_panicked() {
     assert_eq!(FswStatus::from_raw(0), FswStatus::Running);
-    assert_eq!(FswStatus::from_raw(1), FswStatus::Panicked);
     assert_eq!(FswStatus::from_raw(2), FswStatus::Done);
     // A well-behaved export never sends these, but a stale build, a
     // hand-rolled exporter, or memory corruption could hand back any word.
-    assert_eq!(FswStatus::from_raw(3), FswStatus::Panicked);
-    assert_eq!(FswStatus::from_raw(255), FswStatus::Panicked);
-    assert_eq!(FswStatus::from_raw(u32::MAX), FswStatus::Panicked);
+    for raw in [1, 3, 255, u32::MAX] {
+        assert_eq!(FswStatus::from_raw(raw), FswStatus::Panicked);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,20 +709,13 @@ fn seq_abi_runs_to_done() {
 // comparing its serialized bytes.
 // ---------------------------------------------------------------------------
 
-/// The static announce of `F` under `prefix`: what a statically linked system
-/// bakes into its output vtable and metadata.
-fn static_announce<F: Frame>(prefix: &str) -> (VTable, Vec<metor_proto_wkt::ComponentMetadata>) {
-    crate::descriptor::announce_of::<F>(prefix)
-}
-
 /// The data announce of `F` under `prefix`: the port carries the unprefixed
 /// vtable and metadata (round-tripped through postcard, exactly as a loaded
 /// pack's port crosses the boundary), and the prefixed form is re-derived
 /// with no static frame type.
 fn data_announce<F: Frame>(prefix: &str) -> (VTable, Vec<metor_proto_wkt::ComponentMetadata>) {
     let desc = crate::PortDesc::of::<F>();
-    let bytes = postcard::to_allocvec(&desc).expect("port desc encodes");
-    let rd: crate::PortDesc = postcard::from_bytes(&bytes).expect("port desc decodes");
+    let rd: crate::PortDesc = postcard_round_trip(&desc);
     rd.announce(prefix).expect("a Table port announces")
 }
 
@@ -838,7 +835,7 @@ fn dynamic_terminal_names(vt: &VTable) -> Vec<String> {
 /// `F`: the full realized field set, the metadata vector, and the resolved
 /// dynamic path strings.
 fn assert_announce_eq<F: Frame>(prefix: &str) {
-    let (svt, smeta) = static_announce::<F>(prefix);
+    let (svt, smeta) = crate::descriptor::announce_of::<F>(prefix);
     let (dvt, dmeta) = data_announce::<F>(prefix);
     assert_eq!(
         realized_shapes(&svt),
@@ -905,8 +902,7 @@ fn port_desc_round_trips_both_arms() {
     // Postcard arm, with a non-default telemetry flag so the override rides
     // the wire too.
     let d = PortDesc::msg::<SequenceCommand>().untelemetered();
-    let bytes = postcard::to_allocvec(&d).expect("encodes");
-    let rd: PortDesc = postcard::from_bytes(&bytes).expect("decodes");
+    let rd: PortDesc = postcard_round_trip(&d);
     assert_eq!(rd.id(), PortId::Packet(SequenceCommand::ID));
     assert_eq!(rd.name, "SequenceCommand");
     assert_eq!(rd.max_size, d.max_size);
@@ -922,8 +918,7 @@ fn port_desc_round_trips_both_arms() {
 
     // Table arm, axes at their frame defaults.
     let d = PortDesc::of::<TickOut>();
-    let bytes = postcard::to_allocvec(&d).expect("encodes");
-    let rd: PortDesc = postcard::from_bytes(&bytes).expect("decodes");
+    let rd: PortDesc = postcard_round_trip(&d);
     assert_eq!(rd.id(), PortId::Component(TickOut::FRAME_ID));
     assert_eq!(rd.name, "tick_out");
     assert_eq!(rd.delivery, Delivery::Snapshot);

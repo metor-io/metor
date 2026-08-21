@@ -28,15 +28,15 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod common;
-use common::locate_fixture;
+use common::{drain_msgs, locate_fixture};
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
+use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use metor_fsw_2::{
     BuildSystem, CyclicSystem, Frame, Input, MsgIn, Out, Output, SequenceStatus, SlotStatus,
-    StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState, split_record,
+    StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -659,23 +659,6 @@ fn seq_load(ch: &str, occupant: &str) -> SequenceCommand {
             name: occupant.to_string(),
         },
     )
-}
-
-/// Drain a message ring, decoding every record as one `Msg` type.
-fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
-    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake>,
-) -> Vec<M> {
-    let mut out = Vec::new();
-    let mut buf = Vec::new();
-    while view
-        .try_read_into(&mut buf)
-        .expect("no lap on the message tap")
-    {
-        let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
-        assert_eq!(id, M::ID, "every record on this channel carries M::ID");
-        out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
-    }
-    out
 }
 
 /// Await phase `want` on the slot's status stream, appending every newly

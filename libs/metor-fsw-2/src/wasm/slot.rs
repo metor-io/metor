@@ -15,6 +15,7 @@
 //! [`FswStatus::Panicked`], which the runner already maps onto
 //! `SlotState::Stopped` exactly as it does a `.so` panic.
 
+use metor_fsw_2_core::Delivery;
 use metor_fsw_2_core::abi::{FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT};
 use metor_proto::types::Timestamp;
 
@@ -203,11 +204,8 @@ impl WasmSlot {
 
     /// Extend a per-declared-port delivery list to cover the mount tail, which
     /// is snapshot on both sides.
-    fn pad_delivery(
-        mut d: Vec<metor_fsw_2_core::Delivery>,
-        len: usize,
-    ) -> Vec<metor_fsw_2_core::Delivery> {
-        d.resize(len, metor_fsw_2_core::Delivery::Snapshot);
+    fn pad_delivery(mut d: Vec<Delivery>, len: usize) -> Vec<Delivery> {
+        d.resize(len, Delivery::Snapshot);
         d
     }
 

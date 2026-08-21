@@ -44,41 +44,29 @@ pub trait NamedMsg: Msg + postcard_schema::Schema {
     const NAME: &'static str;
 }
 
-impl NamedMsg for SequenceCommand {
-    const NAME: &'static str = "SequenceCommand";
+macro_rules! named_msgs {
+    ($($ty:ty => $name:literal),* $(,)?) => {
+        $(
+            impl NamedMsg for $ty {
+                const NAME: &'static str = $name;
+            }
+        )*
+    };
 }
-impl NamedMsg for SequenceRegistry {
-    const NAME: &'static str = "SequenceRegistry";
-}
-impl NamedMsg for SequenceChannelEvent {
-    const NAME: &'static str = "SequenceChannelEvent";
-}
-impl NamedMsg for ReloadSequences {
-    const NAME: &'static str = "ReloadSequences";
-}
-impl NamedMsg for AlarmDef {
-    const NAME: &'static str = "AlarmDef";
-}
-impl NamedMsg for AlarmDefs {
-    const NAME: &'static str = "AlarmDefs";
-}
-impl NamedMsg for AlarmRaised {
-    const NAME: &'static str = "AlarmRaised";
-}
-impl NamedMsg for AlarmCleared {
-    const NAME: &'static str = "AlarmCleared";
-}
-impl NamedMsg for AlarmAck {
-    const NAME: &'static str = "AlarmAck";
-}
-impl NamedMsg for WiringManifest {
-    const NAME: &'static str = "WiringManifest";
-}
-impl NamedMsg for PresetDefs {
-    const NAME: &'static str = "PresetDefs";
-}
-impl NamedMsg for LogEvent {
-    const NAME: &'static str = "LogEvent";
+
+named_msgs! {
+    SequenceCommand => "SequenceCommand",
+    SequenceRegistry => "SequenceRegistry",
+    SequenceChannelEvent => "SequenceChannelEvent",
+    ReloadSequences => "ReloadSequences",
+    AlarmDef => "AlarmDef",
+    AlarmDefs => "AlarmDefs",
+    AlarmRaised => "AlarmRaised",
+    AlarmCleared => "AlarmCleared",
+    AlarmAck => "AlarmAck",
+    WiringManifest => "WiringManifest",
+    PresetDefs => "PresetDefs",
+    LogEvent => "LogEvent",
 }
 
 /// A lookup from message name tokens to packet ids.
@@ -286,11 +274,6 @@ impl MsgFanOut {
     /// The bound writer count, one per port the owner's config minted.
     pub fn len(&self) -> usize {
         self.writers.len()
-    }
-
-    /// Whether the config minted no ports.
-    pub fn is_empty(&self) -> bool {
-        self.writers.is_empty()
     }
 
     /// Write one already-encoded record, `id` then `payload` verbatim, onto

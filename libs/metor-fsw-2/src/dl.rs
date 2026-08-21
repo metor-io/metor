@@ -671,10 +671,7 @@ impl CyclicSlot for DlSlot {
         if self.slot_state.is_stopped() || self.state.is_null() {
             return;
         }
-        // SAFETY: `state` is the live, bound `fsw_pack_create` pointer.
-        let raw = unsafe { (self.execute)(self.state, now.0 as u64) };
-        // Untrusted word from foreign code; see the module trust boundary note.
-        let status = FswStatus::from_raw(raw);
+        let status = self.execute_raw(now);
         self.slot_state = match status {
             FswStatus::Running => SlotState::Running,
             FswStatus::Panicked => SlotState::Stopped {

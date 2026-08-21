@@ -11,7 +11,6 @@
 //! own traceback (the target file is just a script, so `pdb` and IDE debuggers
 //! work). The recorder's `src` fields remain IR provenance for tooling.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -239,8 +238,7 @@ fn materialize_recorder() -> miette::Result<tempfile::TempDir> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).into_diagnostic()?;
         }
-        let mut f = std::fs::File::create(&target).into_diagnostic()?;
-        f.write_all(contents.as_bytes()).into_diagnostic()?;
+        std::fs::write(&target, contents).into_diagnostic()?;
     }
     Ok(dir)
 }

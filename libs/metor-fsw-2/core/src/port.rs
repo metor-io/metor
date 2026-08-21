@@ -69,12 +69,10 @@ pub fn drain_view<RD>(view: &mut View<RD>, mut f: impl FnMut(&[u8])) -> Result<(
 where
     RD: WakeSink,
 {
-    loop {
-        match view.try_read()? {
-            Some(grant) => f(&grant),
-            None => return Ok(()),
-        }
+    while let Some(grant) = view.try_read()? {
+        f(&grant);
     }
+    Ok(())
 }
 
 /// Iterate the `T` elements of a dynamic list member, reading the [`Slot`] at
@@ -123,9 +121,7 @@ impl Drops {
         use core::sync::atomic::Ordering::Relaxed;
         match self {
             Drops::Local(n) => *n += 1,
-            Drops::Shared(cell) => {
-                cell.fetch_add(1, Relaxed);
-            }
+            Drops::Shared(cell) => _ = cell.fetch_add(1, Relaxed),
         }
     }
 

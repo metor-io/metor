@@ -32,18 +32,14 @@ pub fn set_now(now: Timestamp) {
     NOW.store(now.0, Relaxed);
 }
 
-/// The current cycle's timestamp, or `None` before the first cycle reaches
-/// this linkage unit.
-fn now() -> Option<Timestamp> {
+/// The current cycle timestamp, falling back to wall time before the first
+/// cycle reaches this linkage unit.
+pub fn now_or_wall() -> Timestamp {
     match NOW.load(Relaxed) {
         UNSET => None,
         v => Some(Timestamp(v)),
     }
-}
-
-/// [`now`], falling back to wall time before the first cycle.
-pub fn now_or_wall() -> Timestamp {
-    now().unwrap_or_else(Timestamp::now)
+    .unwrap_or_else(Timestamp::now)
 }
 
 /// A stopwatch for the per-execute timing that feeds

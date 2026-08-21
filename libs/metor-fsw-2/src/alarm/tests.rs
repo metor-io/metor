@@ -312,8 +312,9 @@ fn spec_defaults() {
 
 #[cfg(not(miri))]
 mod system {
-    use metor_proto::types::{ComponentId, Timestamp};
+    use metor_proto::types::{ComponentId, Msg, Timestamp};
     use metor_proto_wkt::{AlarmAck, AlarmCleared, AlarmDefs, AlarmRaised, LimitKind, Severity};
+    use serde::de::DeserializeOwned;
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use crate::{
@@ -325,7 +326,6 @@ mod system {
     use crate::coordinator::PortRef;
     use crate::coordinator::init::cyclic_node;
     use metor_fsw_2_core::PortId;
-    use metor_proto::types::Msg as _;
 
     use super::super::{AlarmSpec, BandSpec, RawAlarmSpec, TargetSpec};
 
@@ -491,6 +491,12 @@ mod system {
         MsgIn::new(entry.view().expect("reader slot"))
     }
 
+    fn drain<M: Msg + DeserializeOwned>(input: &mut MsgIn<M>) -> Vec<M> {
+        let mut messages = Vec::new();
+        input.drain(|message| messages.push(message)).unwrap();
+        messages
+    }
+
     /// The headline path. A def at the first cycle, a debounced warning raise,
     /// an escalation to critical on the same occurrence, a hysteresis
     /// dead-zone hold, and a debounced clear, while a second alarm on the same
@@ -545,8 +551,7 @@ mod system {
         );
 
         // Cycle 2 raises at warning (debounce 2), cycle 3 escalates in place.
-        let mut got_raised = Vec::new();
-        raised.drain(|r| got_raised.push(r)).unwrap();
+        let got_raised = drain(&mut raised);
         assert_eq!(got_raised.len(), 2, "{got_raised:?}");
         assert!(got_raised.iter().all(|r| r.def_id == "RATE_HIGH"));
         assert_eq!(got_raised[0].severity, Severity::Warning);
@@ -560,8 +565,7 @@ mod system {
         );
 
         // Cycle 4 is the dead zone (needs <= 0.4 to count); 5-6 clear (debounce 2).
-        let mut got_cleared = Vec::new();
-        cleared.drain(|c| got_cleared.push(c)).unwrap();
+        let got_cleared = drain(&mut cleared);
         assert_eq!(got_cleared.len(), 1);
         assert_eq!(got_cleared[0].occurrence, got_raised[0].occurrence);
     }
@@ -617,9 +621,7 @@ mod system {
             let mut cleared = tap::<AlarmCleared>(&coord, "alarms.AlarmCleared");
             let mut coord = coord;
             coord.run_for(cycles).await;
-            let mut got = Vec::new();
-            cleared.drain(|c| got.push(c)).unwrap();
-            got.len()
+            drain(&mut cleared).len()
         };
 
         // Never acked (delay beyond the run): recovered by cycle 2, still no clear.
@@ -657,8 +659,7 @@ mod system {
         let mut coord = coord;
         coord.run_for(3).await;
 
-        let mut got = Vec::new();
-        raised.drain(|r| got.push(r)).unwrap();
+        let got = drain(&mut raised);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].def_id, "DEGRADED");
         assert_eq!(got[0].severity, Severity::Critical);
@@ -710,8 +711,7 @@ mod system {
 
         // The alarm resolved the prefixed target against the qualified
         // registry entry and raised; its message names the qualified component.
-        let mut got_raised = Vec::new();
-        raised.drain(|r| got_raised.push(r)).unwrap();
+        let got_raised = drain(&mut raised);
         assert!(
             !got_raised.is_empty(),
             "the namespaced target resolved and raised"
@@ -757,8 +757,7 @@ mod system {
         assert_eq!(n_defs, 4, "defs broadcast even for disabled alarms");
 
         // Only the first DUP survives resolution, and it raises; the rest stay dark.
-        let mut got = Vec::new();
-        raised.drain(|r| got.push(r)).unwrap();
+        let got = drain(&mut raised);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].def_id, "DUP");
 

@@ -93,12 +93,7 @@ pub(super) fn render_module(
 /// Shared with the resolve-time staleness check.
 pub(super) fn manifest_hash(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(7 + digest.len() * 2);
-    hex.push_str("sha256:");
-    for b in digest {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    hex
+    format!("sha256:{digest:x}")
 }
 
 /// The generated-file header: a provenance line and the regenerate/verify
@@ -350,11 +345,10 @@ impl Codegen {
     /// Register (once) a frozen kw_only dataclass for a nested struct and
     /// return its name.
     fn nested_struct(&mut self, nt: &OwnedNamedType) -> String {
-        let name = pascal_case(&type_ident(&nt.name));
-        if self.dataclass_names.contains(&name) {
+        let name = pascal_case(type_ident(&nt.name));
+        if !self.dataclass_names.insert(name.clone()) {
             return name;
         }
-        self.dataclass_names.insert(name.clone());
         let OwnedDataModelType::Struct(fields) = &nt.ty else {
             return name;
         };
@@ -386,15 +380,14 @@ impl Codegen {
             return format!("Literal[{}]", names.join(", "));
         }
         // Enum with data: one frozen dataclass per variant, unioned.
-        let prefix = pascal_case(&type_ident(&nt.name));
+        let prefix = pascal_case(type_ident(&nt.name));
         let mut union: Vec<String> = Vec::new();
         for v in variants {
             let vname = format!("{prefix}{}", pascal_case(&v.name));
             union.push(vname.clone());
-            if self.dataclass_names.contains(&vname) {
+            if !self.dataclass_names.insert(vname.clone()) {
                 continue;
             }
-            self.dataclass_names.insert(vname.clone());
             let mut lines = String::new();
             match &v.ty {
                 V::UnitVariant => {}
@@ -662,9 +655,9 @@ fn py_str(s: &str) -> String {
 
 /// The trailing identifier of a (possibly path- or generic-qualified) Rust type
 /// name, e.g. `foo::Bar<T>` → `Bar`.
-fn type_ident(name: &str) -> String {
+fn type_ident(name: &str) -> &str {
     let name = name.split('<').next().unwrap_or(name);
-    name.rsplit("::").next().unwrap_or(name).trim().to_string()
+    name.rsplit("::").next().unwrap_or(name).trim()
 }
 
 /// Convert a snake_case or lowercase name to PascalCase for a class name.

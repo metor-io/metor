@@ -319,13 +319,13 @@ impl Registry {
                 // entry's schema, so its declared defaults fill in — the pack
                 // twin of the static `NoParams` decode.
                 let empty = serde_json::Value::Object(serde_json::Map::new());
-                let (value, src) = match &ctx.params {
-                    StaticParams::Value(value) => (*value, ""),
-                    StaticParams::None => (&empty, ""),
+                let value = match &ctx.params {
+                    StaticParams::Value(value) => *value,
+                    StaticParams::None => &empty,
                 };
                 let params = metor_fsw_2_core::EntryParams::Value {
                     value,
-                    src,
+                    src: "",
                     name: ctx.name,
                     msgs: ctx.msgs,
                     attach: ctx.attach,

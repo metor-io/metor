@@ -109,14 +109,13 @@ struct Bundle {
 impl Bundle {
     /// The port fields in declaration order, with `PhantomData` anchors
     /// skipped.
-    fn ports(&self) -> Vec<&BundleField> {
+    fn ports(&self) -> impl Iterator<Item = &BundleField> {
         self.data
             .as_ref()
             .take_struct()
             .expect("named struct")
             .into_iter()
             .filter(|f| !f.is_phantom())
-            .collect()
     }
 
     /// Validate every field's attributes for this direction, folding all
@@ -142,7 +141,7 @@ impl Bundle {
 /// the telemetry override chained on where the attribute or the `CommandOut`
 /// sugar asks for it.
 fn decls_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
-    let calls = bundle.ports().into_iter().map(|f| {
+    let calls = bundle.ports().map(|f| {
         let ty = &f.ty;
         let mut decl = quote! { <#ty>::decl() };
         if f.is_command_out() || f.telemetered == Some(false) {
@@ -164,7 +163,7 @@ fn decls_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
 /// order, mirroring [`decls_body`] so positional binding lines up (see the
 /// module doc). `PhantomData` anchors are default-constructed and consume no
 /// ring.
-fn bind_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
+fn bind_body(bundle: &Bundle) -> TokenStream2 {
     let fields = bundle.data.as_ref().take_struct().expect("named struct");
     let binds = fields.iter().map(|f| {
         let id = f.ident.as_ref().expect("named field");
@@ -215,7 +214,7 @@ fn expand_input(parsed: DeriveInput) -> TokenStream2 {
     let ident = &bundle.ident;
     let (impl_generics, ty_generics, where_clause) = bundle.generics.split_for_impl();
     let decls = decls_body(&bundle, &fsw2);
-    let bind = bind_body(&bundle, &fsw2);
+    let bind = bind_body(&bundle);
     let bind_ports = bind_ports_impl(&bundle, &fsw2, &bind);
 
     quote! {
@@ -248,11 +247,11 @@ fn expand_output(parsed: DeriveInput) -> TokenStream2 {
     let ident = &bundle.ident;
     let (impl_generics, ty_generics, where_clause) = bundle.generics.split_for_impl();
     let decls = decls_body(&bundle, &fsw2);
-    let bind = bind_body(&bundle, &fsw2);
+    let bind = bind_body(&bundle);
     let bind_ports = bind_ports_impl(&bundle, &fsw2, &bind);
 
     // take_dropped sums and clears every output port's publish-drop counter.
-    let dropped = bundle.ports().into_iter().map(|f| {
+    let dropped = bundle.ports().map(|f| {
         let id = f.ident.as_ref().expect("named field");
         quote! { + self.#id.take_dropped() }
     });

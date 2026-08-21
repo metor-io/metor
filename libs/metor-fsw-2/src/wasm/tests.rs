@@ -223,6 +223,17 @@ fn entry(pack: &WasmPack, name: &str) -> u32 {
         .unwrap_or_else(|| panic!("no `{name}` entry")) as u32
 }
 
+fn waiter_identity() -> Vec<u8> {
+    let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
+    let entry = pack
+        .manifest()
+        .systems
+        .iter()
+        .find(|entry| entry.descriptor.name == "waiter")
+        .expect("waiter entry");
+    entry_identity(entry)
+}
+
 /// The guard that makes holding a handle over guest memory sound at all.
 ///
 /// A host handle into the interpreter's backing buffer dangles the moment the
@@ -574,17 +585,8 @@ fn wasm_bridge_drops_are_drained_once() {
 
 #[test]
 fn compatible_hot_reload_accepts_changed_module_bytes() {
-    let (rings, host_in, host_out) = slot_rings();
-    let _keep_rings_alive = rings;
-    let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
-    let entry = pack
-        .manifest()
-        .systems
-        .iter()
-        .find(|entry| entry.descriptor.name == "waiter")
-        .expect("waiter entry");
-    let identity = entry_identity(entry);
-    drop(pack);
+    let (_rings, host_in, host_out) = slot_rings();
+    let identity = waiter_identity();
 
     // Append a valid custom section. The code bytes change while the pack ABI
     // and selected entry manifest remain identical.
@@ -608,16 +610,8 @@ fn compatible_hot_reload_accepts_changed_module_bytes() {
 
 #[test]
 fn incompatible_hot_reload_is_rejected_before_binding() {
-    let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
-    let mut identity = entry_identity(
-        pack.manifest()
-            .systems
-            .iter()
-            .find(|entry| entry.descriptor.name == "waiter")
-            .expect("waiter entry"),
-    );
+    let mut identity = waiter_identity();
     identity[0] ^= 1;
-    drop(pack);
 
     let err = WasmSlot::bind_compatible(
         fixture(),

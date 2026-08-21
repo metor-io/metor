@@ -25,9 +25,7 @@
 //!
 //! The errors stop here rather than at a `miette::Diagnostic`: the host owns
 //! the wiring diagnostic (`LoadError`), which absorbs a [`ParamErrorKind`] as
-//! one of its variants and reads [`code`](ParamErrorKind::code),
-//! [`label`](ParamErrorKind::label), and the [`Anchor`] back off it. This
-//! crate carries no reporter.
+//! one of its variants. This crate carries no reporter.
 
 use std::collections::HashMap;
 
@@ -46,19 +44,12 @@ pub struct Anchor {
 }
 
 /// A params failure with the snippet and span it points at.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{kind}")]
 pub struct ParamError {
     pub kind: ParamErrorKind,
     pub anchor: Option<Anchor>,
 }
-
-impl std::fmt::Display for ParamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.kind, f)
-    }
-}
-
-impl std::error::Error for ParamError {}
 
 /// What went wrong decoding or encoding a system's params.
 #[derive(Error, Debug)]
@@ -114,30 +105,6 @@ impl ParamErrorKind {
         let src = src.into();
         let span = (0, src.len()).into();
         self.at(src, span)
-    }
-
-    /// This kind's stable diagnostic code.
-    pub fn code(&self) -> &'static str {
-        match self {
-            ParamErrorKind::MissingParam { .. } => "fsw_wiring::missing_param",
-            ParamErrorKind::InvalidParam { .. } => "fsw_wiring::invalid_param",
-            ParamErrorKind::UnknownParam { .. } => "fsw_wiring::unknown_param",
-            ParamErrorKind::ValueParams { .. } => "fsw_wiring::value_params",
-            ParamErrorKind::DlParamEncode { .. } => "fsw_wiring::dl_param_encode",
-        }
-    }
-
-    /// The label pointing at the offending span.
-    pub fn label(&self) -> String {
-        match self {
-            ParamErrorKind::MissingParam { .. } => "this node is missing the param".into(),
-            ParamErrorKind::InvalidParam { .. } => "invalid value here".into(),
-            ParamErrorKind::UnknownParam { .. } => "no params field is named this".into(),
-            ParamErrorKind::ValueParams { .. } => "these params".into(),
-            ParamErrorKind::DlParamEncode { .. } => {
-                "these params could not be encoded against the `Params` schema".into()
-            }
-        }
     }
 }
 
@@ -295,9 +262,7 @@ fn merge_onto_defaults(base: Value, config: Value) -> Result<Value, String> {
     let Value::Object(config) = config else {
         return Err(format!("expected a params object, got `{config}`"));
     };
-    for (key, value) in config {
-        base.insert(key, value);
-    }
+    base.extend(config);
     Ok(Value::Object(base))
 }
 
@@ -467,13 +432,12 @@ fn conform_value(
             conform_to_schema(ty, value, &HashMap::new(), system, src, span)
         }
         T::Seq(inner) => match value {
-            Value::Array(items) => {
-                let items = items
+            Value::Array(items) => Ok(Value::Array(
+                items
                     .into_iter()
                     .map(|v| conform_value(&inner.ty, v, property, span, system, src))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Value::Array(items))
-            }
+                    .collect::<Result<_, _>>()?,
+            )),
             _ => Err(mismatch()),
         },
         T::NewtypeStruct(inner) => conform_value(&inner.ty, value, property, span, system, src),

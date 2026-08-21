@@ -235,26 +235,9 @@ pub fn read_pack_config(dir: &Path) -> Result<PackConfig, PackError> {
     let lib = get_str(pack, "lib")
         .or(cargo_lib)
         .unwrap_or_else(|| crate_name.replace('-', "_"));
-    let targets = pack
-        .and_then(|p| p.get("targets"))
-        .and_then(|t| t.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
+    let targets = get_strings(pack, "targets")
         .unwrap_or_else(|| DEFAULT_TARGETS.iter().map(|s| s.to_string()).collect());
-    let dependencies = project
-        .and_then(|p| p.get("dependencies"))
-        .and_then(|d| d.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let dependencies = get_strings(project, "dependencies").unwrap_or_default();
     let requires_python = get_str(project, "requires-python");
     let builder = read_builder(&pyproject, pack)?;
 
@@ -282,16 +265,7 @@ fn read_builder(pyproject: &Path, pack: Option<&toml::Value>) -> Result<Builder,
         Some("cargo") | None => Ok(Builder::Cargo),
         Some("zigbuild") => Ok(Builder::Zigbuild),
         Some("command") => {
-            let argv: Vec<String> = builder
-                .get("command")
-                .and_then(|c| c.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let argv = get_strings(Some(builder), "command").unwrap_or_default();
             if argv.is_empty() {
                 return Err(PackError::MissingField {
                     path: pyproject.to_path_buf(),
@@ -329,6 +303,15 @@ fn read_toml(path: &Path) -> Result<toml::Value, PackError> {
 
 fn get_str(table: Option<&toml::Value>, key: &str) -> Option<String> {
     table?.get(key)?.as_str().map(str::to_string)
+}
+
+fn get_strings(table: Option<&toml::Value>, key: &str) -> Option<Vec<String>> {
+    table?.get(key)?.as_array().map(|values| {
+        values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    })
 }
 
 /// Knobs for [`pack_dev`].

@@ -26,8 +26,7 @@ fn have_python() -> bool {
             "import sys;sys.exit(0 if sys.version_info[:2]>=(3,10) else 1)",
         ])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 #[test]

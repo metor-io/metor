@@ -83,6 +83,27 @@ fn log_ring_for(readers: usize) -> RingBuffer {
     })
 }
 
+fn write_until_block(mut write: impl FnMut(u32) -> Result<(), WriteError>) -> u32 {
+    for count in 0.. {
+        match write(count) {
+            Ok(()) => {}
+            Err(WriteError::WouldBlock) => return count,
+            Err(error) => panic!("unexpected {error:?}"),
+        }
+    }
+    unreachable!()
+}
+
+fn latest_health(input: &mut Input<SystemHealth>) -> RecSink {
+    let record = input
+        .latest()
+        .expect("ring readable")
+        .expect("health published");
+    let mut sink = RecSink::default();
+    record.apply(&mut sink).unwrap().unwrap();
+    sink
+}
+
 // ---------------------------------------------------------------------------
 // A sample cyclic system: a unit-gain filter consuming `Imu`, producing `NavEstimate`.
 // ---------------------------------------------------------------------------
@@ -219,14 +240,7 @@ fn idle_input_backpressures_writer_and_latest_frees() {
     };
 
     // Fill until the idle view stalls the writer.
-    let mut wrote = 0u32;
-    loop {
-        match w.write(&imu(wrote as f64)) {
-            Ok(()) => wrote += 1,
-            Err(WriteError::WouldBlock) => break,
-            Err(e) => panic!("unexpected {e:?}"),
-        }
-    }
+    let wrote = write_until_block(|i| w.write(&imu(i as f64)));
     assert!(wrote >= 2, "the depth-2 ring holds at least two records");
 
     // `latest()` serves the newest committed record, consuming the older ones...
@@ -242,14 +256,7 @@ fn idle_input_backpressures_writer_and_latest_frees() {
     );
     // ...which frees room for the writer, but only up to the pinned newest
     // record, which keeps its slot until the next read.
-    let mut wrote2 = 0u32;
-    loop {
-        match w.write(&imu(100.0 + wrote2 as f64)) {
-            Ok(()) => wrote2 += 1,
-            Err(WriteError::WouldBlock) => break,
-            Err(e) => panic!("unexpected {e:?}"),
-        }
-    }
+    let wrote2 = write_until_block(|i| w.write(&imu(100.0 + i as f64)));
     assert!(wrote2 >= 1, "the freed records admitted new writes");
     assert!(wrote2 < wrote, "the pinned record still holds its slot");
     assert_eq!(
@@ -362,12 +369,7 @@ fn health_counters_published() {
     }
 
     // Read the freshest health record and apply its vtable.
-    let record = health_in
-        .latest()
-        .expect("ring readable")
-        .expect("health published");
-    let mut sink = RecSink::default();
-    record.apply(&mut sink).unwrap().unwrap();
+    let sink = latest_health(&mut health_in);
 
     assert_eq!(sink.values[&ComponentId::new("health.cycles")], 3.0);
     assert_eq!(sink.values[&ComponentId::new("health.errors")], 3.0);
@@ -471,12 +473,7 @@ fn publish_drop_folds_to_health() {
     let mut runner = CyclicRunner::new(Chatter, input, output);
     runner.step(Timestamp(1));
 
-    let record = health_in
-        .latest()
-        .expect("ring readable")
-        .expect("health published");
-    let mut sink = RecSink::default();
-    record.apply(&mut sink).unwrap().unwrap();
+    let sink = latest_health(&mut health_in);
     assert_eq!(sink.values[&ComponentId::new("health.errors")], 1.0);
     assert_eq!(
         sink.values[&ComponentId::new("health.error_counts.publish_dropped")],
@@ -571,14 +568,7 @@ fn msg_log_never_loses_records() {
     let mut w: crate::MsgOut<SequenceCommand> = crate::MsgOut::new(ring.writer(NoWake).unwrap());
 
     // Fill until the idle inbox stalls the emitter.
-    let mut sent = 0u32;
-    loop {
-        match w.emit(&cmd(&format!("c{sent}"))) {
-            Ok(()) => sent += 1,
-            Err(WriteError::WouldBlock) => break,
-            Err(e) => panic!("unexpected {e:?}"),
-        }
-    }
+    let sent = write_until_block(|i| w.emit(&cmd(&format!("c{i}"))));
     assert!(sent >= 1);
 
     // Every accepted record arrives in order; nothing was overwritten.

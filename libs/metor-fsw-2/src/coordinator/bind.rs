@@ -422,7 +422,7 @@ fn bind_slot(
 
     // --- The runner's tail ports, read straight off the port plan --------------
     // Host cancel writer over the SlotControlIn input's dedicated ring.
-    let control_in_idx = ports.control_in_idx();
+    let control_in_idx = n_occ_inputs - 1;
     debug_assert_eq!(
         desc.inputs[control_in_idx].conn,
         PortConn::Host,
@@ -431,7 +431,7 @@ fn bind_slot(
     let control = slot_writer::<SlotControlIn>(&alloc.host_input_rings[&(id, control_in_idx)]);
     // The slot's command fan-in: one view per producer explicitly edged into
     // the declared `commands` input (zero edges is a legal, command-less slot).
-    let cmd_in_idx = ports.commands_in_idx();
+    let cmd_in_idx = n_occ_inputs;
     debug_assert_eq!(
         desc.inputs[cmd_in_idx].id(),
         PortId::Packet(SequenceCommand::ID),
@@ -454,7 +454,7 @@ fn bind_slot(
     );
     // The declared self-tap over the occupant's own SequenceStatus output (+1
     // fan-out counted at sizing): Progress plus outcome.
-    let seq_out_idx = ports.seq_status_out_idx();
+    let seq_out_idx = n_occ_outputs - 1;
     debug_assert_eq!(
         desc.outputs[seq_out_idx].id(),
         PortId::Component(SequenceStatus::FRAME_ID),
@@ -467,8 +467,8 @@ fn bind_slot(
     );
     // Host writers over the runner's output tail: SlotStatus plus the
     // "sequences" events channel (real output indices, no side allocation).
-    let status_out = slot_writer::<SlotStatus>(&output_rings[id][ports.status_out_idx()]);
-    let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][ports.events_out_idx()]);
+    let status_out = slot_writer::<SlotStatus>(&output_rings[id][n_occ_outputs]);
+    let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][n_occ_outputs + 1]);
 
     Ok(SlotRunner::new(
         Arc::from(desc.name.as_str()),

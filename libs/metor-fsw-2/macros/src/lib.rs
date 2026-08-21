@@ -54,7 +54,7 @@ struct Field {
 
 impl Field {
     /// The field's component id, defaulting to the field name.
-    pub fn component_name(&self) -> String {
+    fn component_name(&self) -> String {
         match &self.component_id {
             Some(c) => c.clone(),
             None => {
@@ -64,10 +64,19 @@ impl Field {
         }
     }
 
+    /// The component id under an optional frame prefix.
+    fn qualified_component_name(&self, parent: Option<&str>) -> String {
+        let name = self.component_name();
+        match parent {
+            Some(parent) => format!("{parent}.{name}"),
+            None => name,
+        }
+    }
+
     /// Whether the field is omitted from telemetry: never becomes a component
     /// and never round-trips through encode/decode. `_`-prefixed fields skip by
     /// default (padding), overridable in either direction with `#[fsw(skip)]`.
-    pub fn skipped(&self) -> bool {
+    fn skipped(&self) -> bool {
         self.skip.unwrap_or_else(|| {
             self.ident
                 .as_ref()
@@ -78,7 +87,7 @@ impl Field {
     /// Whether the field recurses through the component traits rather than
     /// emitting a scalar leaf, either explicitly via `#[fsw(nest)]` or
     /// implicitly because it is dynamic.
-    pub fn is_nested(&self) -> bool {
+    fn is_nested(&self) -> bool {
         self.nest || self.is_dynamic()
     }
 
@@ -86,7 +95,7 @@ impl Field {
     /// `FrameMap`. Such fields carry no in-struct value, so the scalar
     /// encode/decode paths skip them and `MAX_SIZE` sizes their trailer
     /// instead.
-    pub fn is_dynamic(&self) -> bool {
+    fn is_dynamic(&self) -> bool {
         if let syn::Type::Path(p) = &self.ty
             && let Some(seg) = p.path.segments.last()
         {

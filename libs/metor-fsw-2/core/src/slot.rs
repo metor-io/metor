@@ -114,7 +114,7 @@ impl SlotState {
 
 /// The name and stop reason of one hard-stopped cyclic system, surfaced
 /// through the host's `Coordinator::stopped` and the coordinator status frame.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoppedSystem {
     pub name: Arc<str>,
     pub reason: StopReason,

@@ -48,6 +48,8 @@
 //! duplicate alarm id, no reader slot left) disables that alarm and reports
 //! through health; it never panics the target.
 
+use std::collections::HashSet;
+
 use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto::vtable::VTable;
@@ -633,10 +635,9 @@ impl AlarmSystem {
 
         // Duplicate ids would collide on the ack path, so keep the first and
         // disable the rest.
-        for i in 0..self.alarms.len() {
-            let (head, tail) = self.alarms.split_at_mut(i);
-            let rt = &mut tail[0];
-            if rt.enabled && head.iter().any(|o| o.enabled && o.spec.id == rt.spec.id) {
+        let mut ids = HashSet::new();
+        for rt in &mut self.alarms {
+            if rt.enabled && !ids.insert(rt.spec.id.clone()) {
                 rt.enabled = false;
                 failures.push((
                     "alarms_duplicate_id",
@@ -710,10 +711,10 @@ impl AlarmSystem {
         }
         self.watches = watches;
 
-        let watched: Vec<usize> = self
+        let watched: HashSet<usize> = self
             .watches
             .iter()
-            .flat_map(|w| w.members.clone())
+            .flat_map(|w| w.members.iter().copied())
             .collect();
         for (m, rt) in self.alarms.iter_mut().enumerate() {
             if rt.enabled && !watched.contains(&m) {

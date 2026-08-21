@@ -395,12 +395,7 @@ pub enum ReadError {
 
 impl core::fmt::Display for ReadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ReadError::Corrupt => write!(
-                f,
-                "ring region violates a structural invariant (possible external corruption)"
-            ),
-        }
+        f.write_str("ring region violates a structural invariant (possible external corruption)")
     }
 }
 
@@ -412,10 +407,7 @@ pub struct FullReaderTable;
 
 impl core::fmt::Display for FullReaderTable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "the ring's reader table is full; no free slot for another view"
-        )
+        f.write_str("the ring's reader table is full; no free slot for another view")
     }
 }
 
@@ -428,10 +420,7 @@ pub struct WriterClaimed;
 
 impl core::fmt::Display for WriterClaimed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "a writer already exists for this ring (or a crashed process leaked its claim)"
-        )
+        f.write_str("a writer already exists for this ring (or a crashed process leaked its claim)")
     }
 }
 
@@ -460,22 +449,20 @@ pub enum AttachError {
 impl core::fmt::Display for AttachError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            AttachError::BadMagic => write!(f, "region header has the wrong magic"),
+            AttachError::BadMagic => f.write_str("region header has the wrong magic"),
             AttachError::BadVersion => {
-                write!(f, "region was written by an incompatible ring version")
+                f.write_str("region was written by an incompatible ring version")
             }
-            AttachError::ArchMismatch => write!(
-                f,
-                "region was written by a different pointer width or endianness"
-            ),
-            AttachError::TooSmall => write!(f, "region is shorter than the fixed header"),
-            AttachError::Misaligned => write!(f, "region base pointer is not 8-byte aligned"),
+            AttachError::ArchMismatch => {
+                f.write_str("region was written by a different pointer width or endianness")
+            }
+            AttachError::TooSmall => f.write_str("region is shorter than the fixed header"),
+            AttachError::Misaligned => f.write_str("region base pointer is not 8-byte aligned"),
             AttachError::BadGeometry => {
-                write!(f, "region header fields are internally inconsistent")
+                f.write_str("region header fields are internally inconsistent")
             }
-            AttachError::RegionTruncated => write!(
-                f,
-                "region header's total_size exceeds the backing region (truncated file?)"
+            AttachError::RegionTruncated => f.write_str(
+                "region header's total_size exceeds the backing region (truncated file?)",
             ),
         }
     }
@@ -748,14 +735,10 @@ impl Inner {
         // so either the scan observes a new reader's claim or that reader's
         // registration recheck observes the store.
         fence(SeqCst);
-        let mut slowest: Option<u64> = None;
-        for slot in 0..self.max_readers {
-            let v = self.slot_cursor(slot).load(Acquire);
-            if v != FREE_SLOT {
-                slowest = Some(slowest.map_or(v, |s| s.min(v)));
-            }
-        }
-        slowest
+        (0..self.max_readers)
+            .map(|slot| self.slot_cursor(slot).load(Acquire))
+            .filter(|&cursor| cursor != FREE_SLOT)
+            .min()
     }
 
     /// Compute the wrap for a record of `rec` bytes written at absolute

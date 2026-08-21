@@ -75,10 +75,10 @@ impl ResourceLimiter for StoreState {
         desired: usize,
         maximum: Option<usize>,
     ) -> Result<bool, LimiterError> {
-        let over_module_max = maximum.is_some_and(|maximum| desired > maximum);
-        let over_host_max = desired > self.max_memory;
-        let grew_after_bind = self.frozen_memory.is_some_and(|frozen| desired > frozen);
-        if over_module_max || over_host_max || grew_after_bind {
+        if maximum.is_some_and(|maximum| desired > maximum)
+            || desired > self.max_memory
+            || self.frozen_memory.is_some_and(|frozen| desired > frozen)
+        {
             return Err(LimiterError::ResourceLimiterDeniedAllocation);
         }
         Ok(true)
@@ -425,8 +425,7 @@ impl WasmPack {
         if base == 0 {
             return Err(WasmError::Describe);
         }
-        let bytes = self.read(base as u32, len)?;
-        postcard::from_bytes(&bytes).map_err(WasmError::Manifest)
+        postcard::from_bytes(&self.read(base as u32, len)?).map_err(WasmError::Manifest)
     }
 
     /// Create entry `index` with `params`, returning the guest's instance
@@ -486,11 +485,7 @@ impl WasmPack {
         let base = slice.as_mut_ptr();
         // SAFETY: the guest just formatted this region and nothing is reading
         // it; the handle is dropped before this returns.
-        let probe = unsafe { RingBuffer::attach_raw(base, len) };
-        match probe {
-            Ok(ring) => drop(ring),
-            Err(e) => return Err(WasmError::Ring(e)),
-        }
+        drop(unsafe { RingBuffer::attach_raw(base, len) }.map_err(WasmError::Ring)?);
         Ok(GuestRing { offset, len, role })
     }
 
@@ -564,11 +559,6 @@ impl WasmPack {
         let pack = self.pack;
         self.pack = 0;
         self.call(|e| e.close, pack)
-    }
-
-    /// Read `len` bytes of a guest ring region, for a host-side consumer.
-    pub fn ring_bytes(&mut self, ring: &GuestRing) -> Result<Vec<u8>, WasmError> {
-        self.read(ring.offset, ring.len)
     }
 
     // --- guest memory and calls -------------------------------------------

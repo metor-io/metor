@@ -76,14 +76,8 @@ impl WiringBuilder {
     /// Sets the cycle rate and clock, leaving `default_depth` untouched. Use
     /// [`coordinator_spec`](Self::coordinator_spec) to set everything at once.
     pub fn coordinator(mut self, cycle_rate: f64, clock: ClockSpec) -> Self {
-        self.wiring.coordinator = CoordinatorSpec {
-            cycle_rate,
-            default_depth: self.wiring.coordinator.default_depth,
-            clock,
-            namespace: self.wiring.coordinator.namespace.clone(),
-            wasm_fuel_per_poll: self.wiring.coordinator.wasm_fuel_per_poll,
-            wasm_memory_limit_bytes: self.wiring.coordinator.wasm_memory_limit_bytes,
-        };
+        self.wiring.coordinator.cycle_rate = cycle_rate;
+        self.wiring.coordinator.clock = clock;
         self
     }
 
@@ -113,9 +107,8 @@ impl WiringBuilder {
         id: impl Into<String>,
         path: impl Into<std::path::PathBuf>,
     ) -> Self {
-        let id = id.into();
         self.wiring.artifacts.push(Artifact {
-            id,
+            id: id.into(),
             kind: crate::ir::ArtifactKind::Wasm,
             crate_name: String::new(),
             lib: String::new(),
@@ -134,9 +127,8 @@ impl WiringBuilder {
         crate_name: impl Into<String>,
         lib_stem: impl AsRef<str>,
     ) -> Self {
-        let id = id.into();
         self.wiring.artifacts.push(Artifact {
-            id,
+            id: id.into(),
             kind: crate::ir::ArtifactKind::Cdylib,
             crate_name: crate_name.into(),
             lib: lib_stem.as_ref().to_string(),
@@ -319,8 +311,7 @@ impl WiringBuilder {
     }
 
     /// Pushes a fully built [`SlotSpec`], for slots assembled outside the
-    /// fluent chain. Panics on a name collision; the spec's own occupant set
-    /// is trusted (unlike [`SlotSpecBuilder::end`], which checks it).
+    /// fluent chain.
     pub fn add_slot_spec(mut self, spec: SlotSpec) -> Self {
         self.wiring.slots.push(spec);
         self
@@ -331,8 +322,7 @@ impl WiringBuilder {
         self.wiring
     }
 
-    /// Push a well-formed system spec, checking only its name (the built-in
-    /// link specs are valid by construction).
+    /// Push a built-in system spec.
     fn push_system(&mut self, spec: SystemSpec) {
         self.wiring.systems.push(spec);
     }
@@ -408,8 +398,6 @@ impl SlotSpecBuilder {
     }
 
     /// Pushes this slot onto the [`Wiring`] and returns the parent builder.
-    /// Panics on a name collision, an empty allow set, or an `initial` outside
-    /// the allow set.
     pub fn end(mut self) -> WiringBuilder {
         self.parent.wiring.slots.push(self.spec);
         self.parent
@@ -479,9 +467,8 @@ impl SystemSpecBuilder {
     }
 
     /// Adds the system and returns the parent builder.
-    pub fn end(self) -> WiringBuilder {
-        let mut parent = self.parent;
-        parent.wiring.systems.push(self.spec);
-        parent
+    pub fn end(mut self) -> WiringBuilder {
+        self.parent.wiring.systems.push(self.spec);
+        self.parent
     }
 }

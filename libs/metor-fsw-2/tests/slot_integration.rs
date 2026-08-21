@@ -30,8 +30,9 @@
 use std::path::{Path, PathBuf};
 
 mod common;
+use common::drain_msgs;
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
+use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
@@ -40,7 +41,7 @@ use metor_fsw_2::{
     AllowedOccupantSpec, BuildSystem, ClockSpec, CommandOut, Coordinator, CoordinatorSpec,
     CyclicSystem, InitialOccupantSpec, Input, NAME_CAP, Out, ParamSource, SequenceStatus,
     SlotInitState, SlotSpec, SlotStatus, System, SystemInput, SystemOutput, Timestamp, WireError,
-    Wiring, WiringBuilder, split_record,
+    Wiring, WiringBuilder,
 };
 
 /// The seq fixture's cargo crate name and cdylib library stem.
@@ -49,12 +50,12 @@ const FIXTURE_STEM: &str = "metor_fsw_2_seq_fixture";
 
 /// A `Load { occupant }` command addressed to the channel named `ch`.
 fn load(ch: &str, occupant: &str) -> SequenceCommand {
-    SequenceCommand {
-        channel: ch.to_string(),
-        command: SequenceCommandKind::Load {
+    cmd(
+        ch,
+        SequenceCommandKind::Load {
             name: occupant.to_string(),
         },
-    }
+    )
 }
 
 /// Any other command addressed to the channel named `ch`.
@@ -593,24 +594,6 @@ fn load_while_running_is_refused() {
 // ---------------------------------------------------------------------------
 // Sequence events and the boot registry
 // ---------------------------------------------------------------------------
-
-/// Drain a message ring, decoding every record as `M` after checking its
-/// 2-byte id.
-fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
-    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake>,
-) -> Vec<M> {
-    let mut out = Vec::new();
-    let mut buf = Vec::new();
-    while view
-        .try_read_into(&mut buf)
-        .expect("no lap on the message tap")
-    {
-        let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
-        assert_eq!(id, M::ID, "every record on this channel carries M::ID");
-        out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
-    }
-    out
-}
 
 /// The slot's message channel publishes ordered [`SequenceChannelEvent`]s with
 /// no coalescing, and the coordinator publishes a boot [`SequenceRegistry`]

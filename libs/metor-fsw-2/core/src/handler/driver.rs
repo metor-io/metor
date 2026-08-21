@@ -241,32 +241,19 @@ impl Driver for OccupantFuture {
         }
         let poll = self.inner.poll_once(now);
         let lines = self.inner.clock.drain_progress();
-        match poll {
-            Poll::Ready(outcome) => {
-                let outcome = if crate::sequence::publish_status(
-                    &mut self.status,
-                    now,
-                    outcome.run_state(),
-                    &lines,
-                )
-                .is_err()
-                {
-                    crate::sequence::Outcome::Failed
-                } else {
-                    outcome
-                };
-                self.inner.done = Some(outcome);
-                StepStatus::Done(outcome)
-            }
-            Poll::Pending => {
-                if crate::sequence::publish_status(&mut self.status, now, 0, &lines).is_err() {
-                    let outcome = crate::sequence::Outcome::Failed;
-                    self.inner.done = Some(outcome);
-                    StepStatus::Done(outcome)
-                } else {
-                    StepStatus::Running
-                }
-            }
+        let mut outcome = match poll {
+            Poll::Ready(outcome) => Some(outcome),
+            Poll::Pending => None,
+        };
+        let run_state = outcome.map_or(0, crate::sequence::Outcome::run_state);
+        if crate::sequence::publish_status(&mut self.status, now, run_state, &lines).is_err() {
+            outcome = Some(crate::sequence::Outcome::Failed);
+        }
+        if let Some(outcome) = outcome {
+            self.inner.done = Some(outcome);
+            StepStatus::Done(outcome)
+        } else {
+            StepStatus::Running
         }
     }
 
@@ -295,49 +282,24 @@ impl Driver for OccupantCyclic {
         if let Some(outcome) = self.done {
             return StepStatus::Done(outcome);
         }
-        match self.control.latest() {
+        let mut status = match self.control.latest() {
             Err(_) => {
                 let outcome = Outcome::Failed;
                 self.done = Some(outcome);
                 return StepStatus::Done(outcome);
             }
-            Ok(Some(f)) if f.cancel != 0 => {
-                let mut outcome = Outcome::Aborted;
-                if crate::sequence::publish_status(&mut self.status, now, outcome.run_state(), &[])
-                    .is_err()
-                {
-                    outcome = Outcome::Failed;
-                }
-                self.done = Some(outcome);
-                return StepStatus::Done(outcome);
-            }
-            _ => {}
+            Ok(Some(f)) if f.cancel != 0 => StepStatus::Done(Outcome::Aborted),
+            _ => self.inner.step(now),
+        };
+        let run_state = match &status {
+            StepStatus::Running => 0,
+            StepStatus::Done(outcome) => outcome.run_state(),
+        };
+        if crate::sequence::publish_status(&mut self.status, now, run_state, &[]).is_err() {
+            status = StepStatus::Done(Outcome::Failed);
         }
-        let status = self.inner.step(now);
-        match status {
-            StepStatus::Done(outcome) => {
-                let outcome = if crate::sequence::publish_status(
-                    &mut self.status,
-                    now,
-                    outcome.run_state(),
-                    &[],
-                )
-                .is_err()
-                {
-                    Outcome::Failed
-                } else {
-                    outcome
-                };
-                self.done = Some(outcome);
-                return StepStatus::Done(outcome);
-            }
-            StepStatus::Running => {
-                if crate::sequence::publish_status(&mut self.status, now, 0, &[]).is_err() {
-                    let outcome = Outcome::Failed;
-                    self.done = Some(outcome);
-                    return StepStatus::Done(outcome);
-                }
-            }
+        if let StepStatus::Done(outcome) = status {
+            self.done = Some(outcome);
         }
         status
     }
