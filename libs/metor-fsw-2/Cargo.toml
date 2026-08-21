@@ -34,8 +34,10 @@ gethostname = "1.1"
 mdns-sd = "0.13"
 
 # async
+bbqueue = { version = "0.7", default-features = false, features = ["alloc", "maitake-sync-0_3"] }
 futures-lite = "2.5.0"
 stellarator = { path = "../stellarator" }
+thingbuf = "0.1.6"
 
 # serialization
 postcard = { version = "1.1", features = ["alloc"] }

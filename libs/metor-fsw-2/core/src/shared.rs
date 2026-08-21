@@ -22,9 +22,9 @@
 //! but an async system's state moves into its own task and lives across
 //! awaits, where a held borrow would collide with the very interleaving the
 //! executor exists to provide. A state that needs background tasks (a
-//! server's accept loop) spawns them in `start` over an `Rc`'d interior of
-//! its own, with borrows that never cross an await; the systems' `&mut S`
-//! remains the sole mutable grant of the state struct itself.
+//! server's accept loop) can instead move the task-owned portion into those
+//! tasks and communicate over channels. The systems' `&mut S` remains the
+//! sole mutable grant of the shared state struct itself.
 
 use core::cell::{Cell, RefCell, RefMut};
 use std::rc::Rc;

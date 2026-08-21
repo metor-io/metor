@@ -568,7 +568,6 @@ impl System for TelemetrySystem {
             .link
             .as_ref()
             .expect("downlink attached to a TcpServer state (the builtin link pack's ctor)");
-        link.get().set_retained_slots(n_retained);
         if link.get().set_announces(&announces).is_err() {
             // A second downlink on one server would corrupt the replay every
             // connection decodes against.
@@ -581,6 +580,7 @@ impl System for TelemetrySystem {
             self.link = None;
             return;
         }
+        link.get().set_retained_slots(n_retained);
         self.taps = taps;
     }
 }
@@ -618,7 +618,7 @@ impl CyclicSystem for TelemetrySystem {
         let Some(link_token) = &self.link else {
             return;
         };
-        let link = link_token.get();
+        let mut link = link_token.get();
 
         // Fold the server's counters into this cycle's health and the gauge.
         let stats = link.take_stats();
@@ -650,7 +650,7 @@ impl CyclicSystem for TelemetrySystem {
         // still drain below — records are consumed and DISCARDED — because an
         // undrained tap view stalls its producer's ring and freezes every
         // consumer of that output, not just telemetry.
-        self.batch.clear();
+        link.prepare_batch(&mut self.batch);
         let mut batch = (connections != 0).then_some(&mut self.batch);
         for tap in &mut self.taps {
             match tap.delivery {
@@ -671,10 +671,10 @@ impl CyclicSystem for TelemetrySystem {
                             Some(slot) => {
                                 self.retain_scratch.clear();
                                 append_record(&mut self.retain_scratch, &tap.wire, &grant);
-                                link.retain(slot, &self.retain_scratch);
                                 if let Some(batch) = &mut batch {
                                     batch.extend_from_slice(&self.retain_scratch);
                                 }
+                                link.retain(slot, &mut self.retain_scratch);
                             }
                             None => {
                                 if let Some(batch) = &mut batch {
@@ -704,7 +704,8 @@ impl CyclicSystem for TelemetrySystem {
         if let Some(batch) = batch
             && !batch.is_empty()
         {
-            link.broadcast(batch);
+            link.broadcast_buffer(batch);
         }
+        link.flush();
     }
 }
