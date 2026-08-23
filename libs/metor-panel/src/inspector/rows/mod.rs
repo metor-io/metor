@@ -30,7 +30,7 @@ pub use color::ColorRow;
 pub use command::CommandRow;
 pub use default_action::DefaultActionRow;
 pub use enum_::EnumRow;
-pub use expression::ExpressionRow;
+pub use expression::{ExpressionRow, OnExpression};
 pub use header::HeaderRow;
 pub use nav::NavRow;
 pub use scalar::ScalarRow;

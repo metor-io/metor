@@ -28,16 +28,21 @@ use crate::theme::theme;
 /// [`consumes_search`]: InspectorRow::consumes_search
 pub struct ExpressionRow {
     db: Arc<DB>,
-    on_select: Arc<dyn Fn(ComponentId, String, &mut App)>,
+    on_select: OnExpression,
     /// What the last commit made of the query, if there has been one.
     status: Option<String>,
 }
 
+/// What a picker does with a committed expression.
+///
+/// It receives the hidden component the expression publishes into and the text
+/// that produced it, and decides what happens next — most callers dismiss,
+/// while a multi-select wizard hands back a trace and closes itself.
+pub type OnExpression =
+    Arc<dyn Fn(ComponentId, String, &mut Window, &mut App) -> RowAction>;
+
 impl ExpressionRow {
-    pub fn new(
-        db: Arc<DB>,
-        on_select: Arc<dyn Fn(ComponentId, String, &mut App)>,
-    ) -> Self {
+    pub fn new(db: Arc<DB>, on_select: OnExpression) -> Self {
         Self {
             db,
             on_select,
@@ -96,7 +101,7 @@ impl InspectorRow for ExpressionRow {
     fn activate_with_search(
         &mut self,
         search: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> RowAction {
         if !expressions::is_expression(search) {
@@ -105,8 +110,7 @@ impl InspectorRow for ExpressionRow {
         match expressions::resolve(search, &self.db, cx) {
             Ok(expression) => {
                 self.status = None;
-                (self.on_select)(expression.component_id(), search.to_string(), cx);
-                RowAction::Dismiss
+                (self.on_select)(expression.component_id(), search.to_string(), window, cx)
             }
             // Staying open leaves the text where it can be fixed, with the
             // compiler's first complaint next to it.

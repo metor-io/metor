@@ -390,36 +390,59 @@ candidates, while a saved binding keeps reading exactly what it read
 before. Nothing re-runs the suffix search, which is the point of
 recording the resolution rather than the text.
 
-**Monitor bindings work; plot series cannot, and the plan is why.**
-Monitor takes `impl ComponentStreamBuilder`, which `Arc<dyn DynamicNode>`
-already implements, so a view-owned expression feeds it with no db
-registration exactly as specified. The time-series plot does not read a
-stream: `line_plot.rs` calls `wait_for_component(&db, trace_id).await`
-and then reads `component.time_series`, the *history* store. A view-owned
-node has a ring and no history, so a trace bound to one waits forever and
-draws nothing.
+**Ephemeral means hidden, not unregistered — the decision, as taken.**
+The plan said `=` expressions run view-owned with "no db registration",
+and named plot series among P5's first consumers. Those two cannot both
+hold. The time-series plot does not read a stream: `line_plot.rs` calls
+`wait_for_component(&db, trace_id).await` and then reads
+`component.time_series`, the *history* store. A view-owned node has a
+ring and no history, so a trace bound to one waits forever and draws
+nothing — and the monitor's own sparkline, being a `LinePlot`, came up
+blank for the same reason. Unregistered expressions only ever served
+instantaneous readouts: value strips, traffic lights, text.
 
-The two requirements — "no db registration" and "plot series as a first
-consumer" — are therefore incompatible as written, and the general shape
-is that **view-owned-and-unregistered only serves instantaneous
-readouts**: value strips, traffic lights, text. Even the monitor's own
-sparkline is a `LinePlot` and comes up blank for the same reason. This
-needs a decision rather than an improvisation, and the two candidates
-are:
+Two ways out were written up. The one **chosen** is hidden components:
 
-1. Register `=` outputs as *hidden* db components, content-hash named.
-   `hidden` already exists for exactly this ("derived series: queryable
-   by id, excluded from live streams and UI listings"), it gives
-   history, LoD, and alarms for free, and every existing view works
-   unchanged. Ephemerality becomes a *lifetime* question — drop the
-   component when no view references it — rather than a registration
-   one. This is also what the codebase already says: `Persist` exists
-   precisely so a node's output can be plotted.
-2. Give the plot an in-memory trace source. A new data path, much
-   larger, duplicating what the time series already does.
+1. **Register `=` outputs as hidden db components, content-hash named.**
+   `hidden` is the flag the db already has for "queryable by id, absent
+   from live streams and UI listings", so the design's intent —
+   ephemeral, never visible as a component — is preserved by
+   *hiddenness* rather than by absence. It buys history, LoD, and alarms
+   for free, and every existing view works through the ordinary path
+   with no changes at all. It is also what the codebase already says:
+   `Persist` exists precisely so a node's output can be plotted.
+2. Give the plot an in-memory trace source — a new data path, much
+   larger, duplicating what the time series already does. Not taken.
 
-(1) is the recommendation. Until it is settled, P5 ships the picker, the
-lifetime rule, the stability test, and the monitor consumer.
+As implemented: the component id derives from the expression's content
+hash (source region, resolved bindings, and port identities), by way of
+a `expr.<hash>` name that `persist` hashes into an id — so the same
+computation lands on the same component however many views ask for it,
+and dedup falls out. `persist` runs unchanged, then the metadata is
+rewritten to label the component with the text the operator typed
+(useful in a legend, where a hash is not), to mark it `hidden`, and to
+attribute it `source=dynamic` like any other dynamic output. Neither
+touches the id.
+
+**The component outlives the expression, deliberately.** The db is
+insert-only — there is no `remove_component` — so when the last view
+drops an expression its task stops and its ring goes quiet while the
+component record stays, holding whatever history it accumulated.
+Immediate removal is therefore not available, and inventing it is the
+wrong direction to be wrong in: a stale hidden component is invisible
+and costs a directory, whereas removing one out from under a view still
+reading it would not be recoverable. Reclamation belongs in a sweep at
+startup, when nothing can hold a reference. The registry keeps `Weak`
+handles to all three nodes of a live expression, so `is_live` separates
+"still computing" from "a record a previous session left behind".
+
+`an_expression_publishes_a_real_but_hidden_component` pins the whole
+chain: the component exists with the schema the expression computes, is
+labelled by its text, is marked hidden, is absent from
+`list_components`, and accumulates the history a plot reads. Plot series
+gained expression mode through the trace wizard — an expression is
+already exactly one channel, so it commits one trace on its own rather
+than joining the multi-select.
 
 ### P6 — read-only projection
 

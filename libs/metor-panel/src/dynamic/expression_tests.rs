@@ -139,6 +139,16 @@ fn the_sigil_is_what_separates_a_binding_from_an_expression() {
     assert_eq!(expressions::body("rpm * 2.0"), "rpm * 2.0");
 }
 
+/// An expression's component id comes from its content hash, so the same
+/// computation lands on the same component however many views ask for it, and
+/// a different one never collides.
+#[test]
+fn the_component_is_named_by_the_content_hash() {
+    let a = expressions::component_name(crate::dynamic::NodeId(0x1234_5678_9abc_def0));
+    assert_eq!(a, "expr.123456789abcdef0");
+    assert_ne!(a, expressions::component_name(crate::dynamic::NodeId(1)));
+}
+
 /// Two views typing the same expression against the same components reach the
 /// same content hash, and therefore share one running system rather than each
 /// starting a copy of it.
@@ -155,4 +165,81 @@ fn the_same_expression_hashes_the_same_way() {
     };
     assert_eq!(compile("rpm * 2.0"), compile("rpm * 2.0"));
     assert_ne!(compile("rpm * 2.0").0, compile("rpm * 3.0").0);
+}
+
+/// The decision this phase took, verified end to end: an expression's output
+/// is a *real* component, so every view that reads history — a plot's traces,
+/// a monitor's sparkline — reaches it through the ordinary path.
+///
+/// Before this, a view-owned expression had a ring and no time series, and a
+/// trace bound to one waited on `wait_for_component` forever. What follows is
+/// exactly what that trace needs to exist.
+#[stellarator::test]
+async fn an_expression_publishes_a_real_but_hidden_component() {
+    use crate::dynamic::ops::{db_source, program};
+    use metor_proto::types::Timestamp;
+
+    let (db, _temp) = db_with(&[("wheels.rpm", PrimType::F64, &[])]);
+    let resolver = DbResolver::snapshot(&db);
+    let compiled =
+        std::sync::Arc::new(program::Compiled::expression("wheels.rpm * 2.0", &resolver).unwrap());
+
+    let source_id = ComponentId(component_id_for_name("wheels.rpm"));
+    let name = expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    ));
+    let component = ComponentId(component_id_for_name(&name));
+
+    let system = program::system(
+        &compiled,
+        0,
+        vec![db_source::from_db(&db, source_id).unwrap()],
+        program::DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let _published = expressions::publish(&db, &name, field, "wheels.rpm * 2.0").unwrap();
+
+    // The component exists, with the schema the expression computes.
+    let live = db
+        .with_state(|s| s.get_component(component).cloned())
+        .expect("an expression registers a component");
+    assert_eq!(live.schema, ComponentSchema::new(PrimType::F64, &[]));
+
+    // ...it is labelled by the text, marked hidden, and attributed like any
+    // other dynamic output...
+    db.with_state(|s| {
+        let meta = s.get_component_metadata(component).expect("metadata");
+        assert_eq!(meta.name, "wheels.rpm * 2.0");
+        assert!(meta.is_hidden(), "an expression must not appear in pickers");
+        assert_eq!(meta.metadata.get("source").map(String::as_str), Some("dynamic"));
+    });
+
+    // ...and it is absent from every picker and browser, which is what makes
+    // "ephemeral" mean hidden rather than unregistered.
+    let listed = crate::inspector::trace_picker::list_components(&db);
+    assert!(
+        !listed.iter().any(|(id, _)| *id == component),
+        "a hidden component must not be offered for picking"
+    );
+
+    // Finally, what a plot actually reads: history accumulating behind the id.
+    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+    for step in 1..=4 {
+        source
+            .push_buf(Timestamp(step), &f64::from(step as i32).to_le_bytes())
+            .unwrap();
+    }
+    for _ in 0..200 {
+        if live.time_series.latest().is_some() {
+            break;
+        }
+        stellarator::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        live.time_series.latest().is_some(),
+        "an expression's component must accumulate the history a plot reads"
+    );
 }

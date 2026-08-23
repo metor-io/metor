@@ -58,8 +58,13 @@ pub(crate) fn component_picker_rows(
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
 ) -> Vec<Box<dyn InspectorRow>> {
     let on_select = Arc::new(on_select);
-    let mut rows: Vec<Box<dyn InspectorRow>> =
-        vec![Box::new(ExpressionRow::new(db.clone(), on_select.clone()))];
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(db.clone(), {
+        let on_select = on_select.clone();
+        Arc::new(move |id, text, _window, cx| {
+            on_select(id, text, cx);
+            RowAction::Dismiss
+        })
+    }))];
     rows.extend(list_components(&db).into_iter().map(|(id, name)| {
         let on_select = on_select.clone();
         Box::new(CommandRow::new(
@@ -198,6 +203,7 @@ pub fn select_traces_wizard_view(
 }
 
 /// What the wizard's pinned "Continue" row does when the user commits.
+#[derive(Clone)]
 enum ContinueAction {
     /// Hand traces to a callback and dismiss the inspector.
     Dismiss(OnTracesSelected),
@@ -221,11 +227,34 @@ fn component_list_rows(
 
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
+    // Typing `=` commits one computed trace on its own, rather than joining
+    // the multi-select: an expression is already exactly one channel, so
+    // there is nothing to check off.
+    rows.push(Box::new(ExpressionRow::new(db.clone(), {
+        let on_continue = on_continue.clone();
+        let color_basis = color_basis.clone();
+        Arc::new(move |component, text, window, cx| {
+            let color = {
+                let theme = theme(cx);
+                theme.line_colors[(color_basis)(cx) % theme.line_colors.len()]
+            };
+            let mut trace = Trace::new(component, 0, color);
+            trace.label = SharedString::from(crate::dynamic::expressions::body(&text).to_string());
+            match &on_continue {
+                ContinueAction::Dismiss(on_select) => {
+                    on_select(vec![trace], window, cx);
+                    RowAction::Dismiss
+                }
+                ContinueAction::CascadeView(build) => RowAction::CascadeView(build(vec![trace], cx)),
+            }
+        })
+    })));
+
     rows.push(Box::new(ContinueRow {
         selection: selection.clone(),
         db: db.clone(),
-        color_basis,
-        on_continue,
+        color_basis: color_basis.clone(),
+        on_continue: on_continue.clone(),
     }));
 
     for (comp_id, comp_name, elem_count) in components {

@@ -1054,7 +1054,7 @@ fn component_picker_rows(
         let dashboard = dashboard.clone();
         rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(
             db.clone(),
-            Arc::new(move |_id, text, cx| {
+            Arc::new(move |_id, text, _window, cx| {
                 let config = serde_json::to_string(&widgets::MonitorWidgetConfig {
                     component: text,
                     ..Default::default()
@@ -1063,6 +1063,7 @@ fn component_picker_rows(
                 dashboard.update(cx, |this, cx| {
                     this.add_widget(WidgetKind::monitor(), config, cx);
                 });
+                crate::inspector::rows::RowAction::Dismiss
             }),
         )));
     }
