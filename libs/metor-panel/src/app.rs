@@ -15,7 +15,8 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, BrowserPanel, DataTablePanel, LogPanel, PlotPanel, SequenceGridPanel, SequencePanel,
+    AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, DataTablePanel, LogPanel,
+    PlotPanel, SequenceGridPanel, SequencePanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -1305,6 +1306,17 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         db.clone(),
         crate::views::system_graph::SystemGraphPanel::from_config,
     );
+
+    // Layouts written before the annunciator rename still name it
+    // `traffic_light_grid`; the alias rehydrates them and they re-save under
+    // the new key.
+    let db_annunciator = db.clone();
+    reg.register_erased("traffic_light_grid", move |state, cx| {
+        let cfg: AnnunciatorPanelConfig = serde_json::from_str(state).unwrap_or_default();
+        let db = db_annunciator.clone();
+        let entity = cx.new(|cx| AnnunciatorPanel::from_config(cfg, db, cx));
+        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
+    });
 
     // Dashboard's deserializer returns a fully-constructed entity rather
     // than a `Self`, so it doesn't fit the generic helper.

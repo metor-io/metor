@@ -23,6 +23,8 @@ use metor_proto_wkt::{
 
 use crate::msg_ingest::{IngestSource, ingest_all};
 
+pub mod latch;
+
 #[cfg(test)]
 mod tests;
 

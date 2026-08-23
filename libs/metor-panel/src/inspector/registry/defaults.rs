@@ -36,7 +36,7 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::AlarmView>();
         self.register_inspectable::<crate::views::SequenceView>();
         self.register_inspectable::<crate::views::TrafficLight>();
-        self.register_inspectable::<crate::views::TrafficLightGrid>();
+        self.register_inspectable::<crate::views::Annunciator>();
         self.register_inspectable::<crate::views::Meter>();
         self.register_inspectable::<crate::views::Gauge>();
         self.register_inspectable::<crate::views::SequenceControl>();

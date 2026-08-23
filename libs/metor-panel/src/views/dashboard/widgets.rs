@@ -19,9 +19,9 @@ use crate::theme::theme;
 use crate::views::time_series::{PlotPanelConfig, TimeSeriesPlot};
 use crate::views::viewer_3d::{Viewer3d, Viewer3dPanelConfig};
 use crate::views::{
-    AttitudeConfig, AttitudeIndicator, ComponentText, Gauge, GaugeConfig, Meter, MeterConfig,
-    Monitor, SequenceControl, SequenceControlConfig, StateChip, StateChipConfig, TrafficLight,
-    TrafficLightGrid, new_component_table,
+    Annunciator, AttitudeConfig, AttitudeIndicator, ComponentText, Gauge, GaugeConfig, Meter,
+    MeterConfig, Monitor, SequenceControl, SequenceControlConfig, StateChip, StateChipConfig,
+    TrafficLight, new_component_table,
 };
 use crate::views::{ListPlot, ListPlotPanelConfig, XyPlot, XyPlotPanelConfig};
 
@@ -352,24 +352,27 @@ impl WidgetRegistry {
                     .into()
             }),
         );
-        self.register(
-            WidgetKind::traffic_light_grid(),
+        // Registered under both kinds: `traffic_light_grid` is the pre-rename
+        // on-disk id, and a saved dashboard keeps naming it that.
+        let annunciator = Arc::new(
             WidgetSpec::new(
                 (360.0, 200.0),
                 |w| {
-                    let cfg = parse_or_default::<TrafficLightGridWidgetConfig>(&w.config);
+                    let cfg = parse_or_default::<AnnunciatorWidgetConfig>(&w.config);
                     let label = if cfg.pattern.is_empty() {
                         "?".to_string()
                     } else {
                         cfg.pattern
                     };
-                    SharedString::from(format!("Traffic Lights: {}", label))
+                    SharedString::from(format!("Annunciator: {}", label))
                 },
-                build_traffic_light_grid,
-                snapshot_traffic_light_grid,
+                build_annunciator,
+                snapshot_annunciator,
             )
-            .with_tile("traffic_light_grid", |_| "Traffic Lights".into()),
+            .with_tile("annunciator", |_| "Annunciator".into()),
         );
+        self.register_shared(WidgetKind::annunciator(), annunciator.clone());
+        self.register_shared(WidgetKind::traffic_light_grid(), annunciator);
         self.register(
             WidgetKind::meter(),
             WidgetSpec::new(
@@ -485,8 +488,8 @@ pub struct MonitorWidgetConfig {
     pub show_sparkline: Option<bool>,
 }
 
+pub use crate::views::AnnunciatorConfig as AnnunciatorWidgetConfig;
 pub use crate::views::TrafficLightConfig as TrafficLightWidgetConfig;
-pub use crate::views::TrafficLightGridConfig as TrafficLightGridWidgetConfig;
 
 /// Parse a widget's JSON blob into its expected config type, falling
 /// back to `Default` on any parse error so labels and builders degrade
@@ -546,18 +549,9 @@ fn snapshot_traffic_light(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> 
     .ok()
 }
 
-fn snapshot_traffic_light_grid(
-    entity: &gpui::AnyEntity,
-    _config: &str,
-    cx: &App,
-) -> Option<String> {
-    let grid = entity.clone().downcast::<TrafficLightGrid>().ok()?;
-    let v = grid.read(cx);
-    serde_json::to_string(&TrafficLightGridWidgetConfig {
-        pattern: v.pattern().to_string(),
-        color: Some(v.color()),
-    })
-    .ok()
+fn snapshot_annunciator(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
+    let annunciator = entity.clone().downcast::<Annunciator>().ok()?;
+    serde_json::to_string(&annunciator.read(cx).to_config()).ok()
 }
 
 fn snapshot_typed<T>(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String>
@@ -790,14 +784,9 @@ fn build_sequence_control(config: &str, _db: &Arc<DB>, cx: &mut App) -> WidgetLi
     as_live(cx.new(|cx| SequenceControl::from_config(&cfg, cx)))
 }
 
-fn build_traffic_light_grid(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    let cfg = parse_or_default::<TrafficLightGridWidgetConfig>(config);
-    let pattern = SharedString::from(cfg.pattern);
-    let entity = cx.new(|cx| TrafficLightGrid::new(db.clone(), pattern, cx));
-    if let Some(color) = cfg.color {
-        entity.update(cx, |g, cx| g.set_color(color, cx));
-    }
-    as_live(entity)
+fn build_annunciator(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
+    let cfg = parse_or_default::<AnnunciatorWidgetConfig>(config);
+    as_live(cx.new(|cx| Annunciator::from_config(cfg, db.clone(), cx)))
 }
 
 /// Widget that decodes an image and paints it into its bounds.

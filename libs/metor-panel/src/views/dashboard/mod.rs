@@ -91,6 +91,11 @@ impl WidgetKind {
     pub fn traffic_light() -> Self {
         Self(SharedString::new_static("traffic_light"))
     }
+    pub fn annunciator() -> Self {
+        Self(SharedString::new_static("annunciator"))
+    }
+    /// The annunciator's pre-rename on-disk id, kept so saved dashboards and
+    /// target-shipped presets keep resolving.
     pub fn traffic_light_grid() -> Self {
         Self(SharedString::new_static("traffic_light_grid"))
     }
@@ -901,11 +906,11 @@ fn add_widget_rows(
         },
     )));
     rows.push(Box::new(NavRow::new(
-        "Traffic Light Grid",
+        "Annunciator",
         SharedString::new_static(""),
         {
             let dashboard = dashboard.clone();
-            Box::new(move |_cx| traffic_light_grid_pattern_rows(dashboard.clone()))
+            Box::new(move |_cx| annunciator_pattern_rows(dashboard.clone()))
         },
     )));
     rows.push(Box::new(NavRow::new(
@@ -1102,22 +1107,16 @@ fn instrument_widget_rows(
     )
 }
 
-/// Single-question wizard for "+ widget → Traffic Light Grid": prompts for
-/// a glob pattern, then adds a `traffic_light_grid` widget with that
-/// pattern. Mirrors [`image_path_rows`].
-fn traffic_light_grid_pattern_rows(
-    dashboard: Entity<DashboardPanel>,
-) -> Vec<Box<dyn InspectorRow>> {
-    vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
+/// Single-question wizard for "+ widget → Annunciator": prompts for a glob
+/// pattern, then adds an `annunciator` widget with that pattern. Mirrors
+/// [`image_path_rows`].
+fn annunciator_pattern_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
+    vec![crate::views::annunciator::glob_prompt_row(Arc::new(
         move |input, _window, cx| {
-            let cfg = widgets::TrafficLightGridWidgetConfig {
-                pattern: input.to_string(),
-                color: None,
-            };
-            let config =
-                serde_json::to_string(&cfg).expect("traffic light grid widget config serializes");
+            let cfg = crate::views::annunciator::seeded_config(&input);
+            let config = serde_json::to_string(&cfg).expect("annunciator widget config serializes");
             dashboard.update(cx, |this, cx| {
-                this.add_widget(WidgetKind::traffic_light_grid(), config, cx);
+                this.add_widget(WidgetKind::annunciator(), config, cx);
             });
         },
     ))]
