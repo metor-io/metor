@@ -100,7 +100,7 @@ async fn keystroke_to_updated_output() {
 
     let build_start = Instant::now();
     let system =
-        program::system(&compiled, 0, vec![bench.source()], DEFAULT_FUEL, None).unwrap();
+        program::system(&compiled, 0, vec![program::PortSource::live(bench.source())], DEFAULT_FUEL, None).unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
     let build = build_start.elapsed();
 
@@ -148,7 +148,7 @@ async fn rebuild_with_state() {
 
     let first_build = Arc::new(Compiled::module(&lowpass("0.5"), &resolver).unwrap());
     let running =
-        program::system(&first_build, 0, vec![bench.source()], DEFAULT_FUEL, None).unwrap();
+        program::system(&first_build, 0, vec![program::PortSource::live(bench.source())], DEFAULT_FUEL, None).unwrap();
     let field = program::field(&first_build, 0, 0, running.node.clone()).unwrap();
     let mut out = field.subscribe();
     bench.push(1, 100.0);
@@ -160,7 +160,7 @@ async fn rebuild_with_state() {
     let rebuilt = program::system(
         &second,
         0,
-        vec![bench.source()],
+        vec![program::PortSource::live(bench.source())],
         DEFAULT_FUEL,
         Some(&snapshot),
     )
@@ -202,7 +202,7 @@ async fn a_three_system_chain_against_three_legacy_nodes() {
         .unwrap(),
     );
     let system =
-        program::system(&compiled, 0, vec![bench.source()], DEFAULT_FUEL, None).unwrap();
+        program::system(&compiled, 0, vec![program::PortSource::live(bench.source())], DEFAULT_FUEL, None).unwrap();
     let expression = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
 
     // The same arithmetic as the node graph it replaces.

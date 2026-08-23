@@ -1081,7 +1081,7 @@ impl Render for ConnectionPicker {
 
         let mut panel = div()
             .id("connection-picker-panel")
-            .key_context("ConnectionPicker")
+            .key_context("ConnectionPicker TextInput")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);

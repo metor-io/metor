@@ -21,11 +21,11 @@ use std::collections::BTreeMap;
 
 use metor_db::DB;
 use metor_expr::{CompSchema, Dtype, FrameSchema, Resolver, Ty};
-use metor_proto::types::PrimType;
+use metor_proto::types::{ComponentId, PrimType};
 
 /// The component tree as it stood when a compile began.
 pub struct DbResolver {
-    components: BTreeMap<String, Ty>,
+    components: BTreeMap<String, (ComponentId, Ty)>,
 }
 
 impl DbResolver {
@@ -36,7 +36,7 @@ impl DbResolver {
                 .filter(|(_, meta)| !meta.is_hidden())
                 .filter_map(|(id, meta)| {
                     let schema = &state.get_component(*id)?.schema;
-                    Some((meta.name.clone(), ty_of(schema.prim_type, &schema.dim)?))
+                    Some((meta.name.clone(), (*id, ty_of(schema.prim_type, &schema.dim)?)))
                 })
                 .collect()
         });
@@ -48,13 +48,25 @@ impl DbResolver {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.components.keys().map(String::as_str)
     }
+
+    /// The id of a component this resolver resolved.
+    ///
+    /// The id is carried, never re-derived. A component's id belongs to
+    /// whoever created it — a producer names its own channels, and
+    /// `ComponentId::new` masks a bit that `persist`'s hash does not — so
+    /// hashing a name a second time agrees with the real id for only about
+    /// half of all names. That is a bug that hides: it looks like the
+    /// component has not published.
+    pub fn id_of(&self, path: &str) -> Option<ComponentId> {
+        self.components.get(path).map(|(id, _)| *id)
+    }
 }
 
 impl Resolver for DbResolver {
     fn component(&self, path: &str) -> Option<CompSchema> {
         self.components
             .get(path)
-            .map(|ty| CompSchema { ty: ty.clone() })
+            .map(|(_, ty)| CompSchema { ty: ty.clone() })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {

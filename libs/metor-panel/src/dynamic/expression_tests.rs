@@ -194,7 +194,7 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
     let system = program::system(
         &compiled,
         0,
-        vec![db_source::from_db(&db, source_id).unwrap()],
+        vec![program::PortSource::live(db_source::from_db(&db, source_id).unwrap())],
         program::DEFAULT_FUEL,
         None,
     )
@@ -242,4 +242,63 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
         live.time_series.latest().is_some(),
         "an expression's component must accumulate the history a plot reads"
     );
+}
+
+/// The bug the id fix is for: a component's id belongs to whoever created it,
+/// so re-deriving it from the name is right only by luck.
+///
+/// `ComponentId::new` masks the top bit and `persist`'s hash does not, so the
+/// two agree for roughly half of all names — and `imu.omega` is in the half
+/// that does not. Re-hashing therefore looked up a component nobody had, and
+/// reported it as "not published yet" while it sat there publishing.
+#[test]
+fn a_components_id_is_carried_not_rederived() {
+    let name = "imu.omega";
+    assert_ne!(
+        ComponentId(component_id_for_name(name)),
+        ComponentId::new(name),
+        "this test is pointless if the two hashes agree for this name"
+    );
+
+    let (db, _temp) = db_with_ids(&[(name, ComponentId::new(name), PrimType::F64, &[3])]);
+    let resolver = DbResolver::snapshot(&db);
+
+    // The resolver types it, and hands back the id the component actually has.
+    assert!(resolver.component(name).is_some());
+    assert_eq!(resolver.id_of(name), Some(ComponentId::new(name)));
+    assert!(
+        db.with_state(|s| s.get_component(resolver.id_of(name).unwrap()).is_some()),
+        "the carried id must find the component"
+    );
+    assert!(
+        db.with_state(|s| s.get_component(ComponentId(component_id_for_name(name))).is_none()),
+        "and the re-derived one must not — which is the bug"
+    );
+}
+
+/// Register components under ids a producer chose, rather than ids derived
+/// from their names.
+fn db_with_ids(
+    components: &[(&str, ComponentId, PrimType, &[usize])],
+) -> (DB, tempfile::TempDir) {
+    let temp = tempfile::tempdir().unwrap();
+    let db = DB::create(temp.path().join("db")).unwrap();
+    for (name, id, prim, dim) in components {
+        db.with_state_mut(|state| {
+            state.insert_component(*id, ComponentSchema::new(*prim, dim), &db.path)
+        })
+        .unwrap();
+        db.with_state_mut(|state| {
+            state.set_component_metadata(
+                metor_proto_wkt::ComponentMetadata {
+                    component_id: *id,
+                    name: (*name).to_string(),
+                    metadata: Default::default(),
+                },
+                &db.path,
+            )
+        })
+        .unwrap();
+    }
+    (db, temp)
 }

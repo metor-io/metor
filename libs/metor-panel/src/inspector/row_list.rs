@@ -157,7 +157,7 @@ impl Render for RowList {
             // single-key bindings (e.g. NodeEditor's Delete keymap) while
             // a row is being edited — otherwise typing Backspace into a
             // text field would also delete the surrounding node.
-            .key_context("RowList")
+            .key_context("RowList TextInput")
             .flex()
             .flex_col()
             .py(px(1.0))

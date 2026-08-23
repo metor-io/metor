@@ -566,7 +566,7 @@ impl Inspector {
             .id("inspector-panel")
             // Names this subtree so a leader keybinding gated on `!Inspector`
             // is suppressed while the search field has focus.
-            .key_context("Inspector")
+            .key_context("Inspector TextInput")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);

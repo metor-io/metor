@@ -512,3 +512,46 @@ anyone repeating it: pushing all 2048 samples before draining loses the
 same fraction for *both* forms — a disruptor drops on full, and the
 first attempt saw exactly 512 of 2048 either way. That measures the ring,
 not the work. The feed goes in drainable chunks for this reason.
+
+### The run rule at startup, refined
+
+Two bugs found in use forced a refinement to the documented startup
+semantics, and it is worth stating plainly because it changes what an
+operator sees.
+
+**A port is seeded from what its component already published.** The run
+rule says an input that has never published skips the cycle, and that is
+still true — but "has never published" was being decided by a disruptor
+reader, which begins at the write head and cannot see anything committed
+before it existed. So a channel that had published and gone quiet looked
+identical to one that had never spoken, and an expression over it waited
+for a sample that might be minutes away. A plot of a slow channel looked
+broken rather than idle.
+
+The host now hands each port the last sample the component already holds
+(`program::latest_sample`, the same `time_series.latest()` read
+`views/binding.rs` does before entering its stream loop), and the system:
+
+- fills each **held** input's cell from its seed, so a cycle is skipped
+  only when that input has genuinely never published; and
+- fires **once** from the driving input's seed, so an expression shows
+  its current value immediately instead of at the next publish.
+
+The rule is therefore unchanged in substance — fire on the driving
+input, hold the latest of the rest, skip while anything is unknown — and
+what changed is that "latest" now includes history rather than only what
+arrived after the system was built.
+
+**A component's id is carried, never re-derived.** The lookups that
+turned a resolved path into a `ComponentId` re-hashed the name with
+`persist`'s FNV-1a. That is not the same function as `ComponentId::new`,
+which masks the top bit so the value fits in an `i64` — so the two agree
+for only about half of all names, and disagree for `imu.omega`,
+`sensor.temp`, `adcs.q_b_eci`, and most others. A real component was
+then looked up under an id nobody had, and reported as
+"`x` has not published yet" while it was publishing.
+
+`DbResolver` now carries the id it found alongside the type, and ports
+take it from there. Deriving is right in exactly one place — a
+`Produced` binding naming a component `persist` created moments earlier
+from that same name — and that case is now the only one that does it.

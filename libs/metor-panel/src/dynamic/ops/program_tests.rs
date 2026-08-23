@@ -111,11 +111,13 @@ async fn settle() {
 
 /// Build one system over db-backed ports, in the manifest's port order.
 fn wire(bench: &Bench, compiled: &Arc<Compiled>, index: usize) -> program::System {
-    let ports: Vec<Arc<dyn DynamicNode>> = compiled.manifest.systems[index]
+    let ports: Vec<program::PortSource> = compiled.manifest.systems[index]
         .inputs
         .iter()
         .map(|port| match &port.bindings[0] {
-            metor_expr::Binding::Component(path) => bench.source(path),
+            metor_expr::Binding::Component(path) => {
+                program::PortSource::live(bench.source(path))
+            }
             other => panic!("this helper wires components, not {other:?}"),
         })
         .collect();
@@ -314,7 +316,7 @@ async fn a_rebuild_carries_state_across_the_swap() {
     let rebuilt = program::system(
         &second,
         0,
-        vec![bench.source("wheels.rpm")],
+        vec![program::PortSource::live(bench.source("wheels.rpm"))],
         DEFAULT_FUEL,
         Some(&carried),
     )
@@ -335,4 +337,75 @@ async fn an_edit_only_changes_the_system_it_touched() {
     let port = vec![bench.source("wheels.rpm").id()];
     assert_eq!(before.system_hash(0, &port), after.system_hash(0, &port));
     assert_ne!(before.system_hash(1, &port), after.system_hash(1, &port));
+}
+
+/// A channel that has published and gone quiet must still show its value.
+///
+/// A disruptor reader begins at the write head, so without seeding, a system
+/// over a slow channel waits for a sample that may be minutes off and the plot
+/// of it looks broken rather than idle. The host hands the last committed
+/// sample in, and the system fires from it once.
+#[stellarator::test]
+async fn a_quiet_channel_still_yields_its_current_value() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let compiled = bench.compile("scaled = wheels.rpm * 2.0\n");
+
+    // Everything this channel will ever say, said before the system exists.
+    bench.push("wheels.rpm", 1, &[21.0]);
+    stellarator::sleep(Duration::from_millis(20)).await;
+
+    let id = bench.id("wheels.rpm");
+    let seed = program::latest_sample(&bench.db, id);
+    assert!(seed.is_some(), "the component must have history to seed from");
+
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource {
+            node: bench.source("wheels.rpm"),
+            seed,
+        }],
+        DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut out = watch(&field);
+
+    // Nothing more is ever pushed, and a value arrives anyway.
+    assert_eq!(take(&mut out, 1).await, vec![42.0]);
+}
+
+/// The same seeding, for an input the system merely holds: a system whose
+/// driving channel is live must not sit skipping cycles because a *second*
+/// channel published before it existed.
+#[stellarator::test]
+async fn a_held_input_is_seeded_from_what_it_already_published() {
+    let bench = Bench::new(&[
+        ("adcs.rate", PrimType::F64, &[]),
+        ("wheels.rpm", PrimType::F64, &[]),
+    ]);
+    let compiled = bench.compile(
+        "@system(\"adcs.rate\", \"wheels.rpm\")\ndef both(rate, rpm) -> f64:\n    return rate * 100.0 + rpm\n",
+    );
+
+    // The held input speaks once, before anything is watching it.
+    bench.push("wheels.rpm", 1, &[7.0]);
+    stellarator::sleep(Duration::from_millis(20)).await;
+
+    let ports: Vec<program::PortSource> = ["adcs.rate", "wheels.rpm"]
+        .iter()
+        .map(|name| program::PortSource {
+            node: bench.source(name),
+            seed: program::latest_sample(&bench.db, bench.id(name)),
+        })
+        .collect();
+    let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None).unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut out = watch(&field);
+
+    // Without the seed this cycle would be skipped as "rpm has never
+    // published" and nothing would ever come out.
+    bench.push("adcs.rate", 2, &[3.0]);
+    assert_eq!(take(&mut out, 1).await, vec![307.0]);
 }

@@ -144,7 +144,7 @@ impl ProgramPane {
         let worker = cx.global::<DynamicWorker>().handle().clone();
         let mut kept: Vec<Running> = Vec::new();
         for index in 0..compiled.manifest.systems.len() {
-            match self.reconcile(&compiled, index, &worker) {
+            match self.reconcile(&compiled, index, &resolver, &worker) {
                 Ok(system) => kept.push(system),
                 Err(why) => {
                     let span = compiled.manifest.systems[index].source;
@@ -166,6 +166,7 @@ impl ProgramPane {
         &mut self,
         compiled: &Arc<Compiled>,
         index: usize,
+        resolver: &DbResolver,
         worker: &crate::node_editor::worker::WorkerHandle,
     ) -> Result<Running, String> {
         let desc = &compiled.manifest.systems[index];
@@ -177,11 +178,11 @@ impl ProgramPane {
         // alone, so the hash below needs no node to exist yet.
         let mut sources = Vec::with_capacity(desc.inputs.len());
         for port in &desc.inputs {
-            sources.push(self.source_of(port, compiled)?);
+            sources.push(self.source_of(port, compiled, resolver)?);
         }
         let port_ids: Vec<NodeId> = sources
             .iter()
-            .map(|(id, _)| db_source::from_db_id(*id))
+            .map(|id| db_source::from_db_id(*id))
             .collect();
         let hash = compiled.system_hash(index, &port_ids);
 
@@ -206,8 +207,11 @@ impl ProgramPane {
             let names: Vec<String> = desc.publishes.clone();
             worker.call(move || -> Result<Built, BuildError> {
                 let mut ports = Vec::with_capacity(sources.len());
-                for (id, _) in &sources {
-                    ports.push(db_source::from_db(&db, *id)?);
+                for id in &sources {
+                    ports.push(program::PortSource {
+                        node: db_source::from_db(&db, *id)?,
+                        seed: program::latest_sample(&db, *id),
+                    });
                 }
                 let system = program::system(&compiled, index, ports, DEFAULT_FUEL, seed.as_ref())?;
                 let mut nodes = vec![system.node.clone()];
@@ -236,29 +240,37 @@ impl ProgramPane {
         })
     }
 
-    /// The component one input port reads, and what to call it if it is
-    /// missing.
+    /// The component one input port reads.
     ///
-    /// A `Produced` binding names another system in this module; it resolves
-    /// to the component that system publishes, which exists because systems
-    /// are built in declaration order and a binding may only name an earlier
-    /// one.
+    /// An external component's id is *carried* from the resolver that found
+    /// it, never re-derived: a producer names its own channels, so hashing
+    /// the name again agrees with the real id for only about half of all
+    /// names — and when it disagrees the component looks absent rather than
+    /// misaddressed.
+    ///
+    /// A `Produced` binding is the one case where deriving is right, because
+    /// `persist` created that component from the same name moments earlier.
+    /// Systems are built in declaration order and a binding may only name an
+    /// earlier one, so it exists by the time this runs.
     fn source_of(
         &self,
         port: &metor_expr::Port,
         compiled: &Arc<Compiled>,
-    ) -> Result<(ComponentId, String), String> {
-        let name = match &port.bindings[0] {
-            metor_expr::Binding::Component(path) => path.clone(),
+        resolver: &DbResolver,
+    ) -> Result<ComponentId, String> {
+        match &port.bindings[0] {
+            metor_expr::Binding::Component(path) => resolver
+                .id_of(path)
+                .ok_or_else(|| format!("`{path}` is not a known component")),
             metor_expr::Binding::Produced { system, field } => {
-                compiled.manifest.systems[*system].publishes[*field].clone()
+                let name = &compiled.manifest.systems[*system].publishes[*field];
+                let id = ComponentId(persist::component_id_for_name(name));
+                match self.db.with_state(|s| s.get_component(id).is_some()) {
+                    true => Ok(id),
+                    false => Err(format!("`{name}` has not published yet")),
+                }
             }
-        };
-        let id = ComponentId(persist::component_id_for_name(&name));
-        if self.db.with_state(|s| s.get_component(id).is_none()) {
-            return Err(format!("`{name}` has not published yet"));
         }
-        Ok((id, name))
     }
 
     /// Underline every span the last compile complained about.
@@ -314,7 +326,14 @@ impl Render for ProgramPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         div()
-            .key_context("ProgramPane")
+            // `TextInput` is what keeps single-key shortcuts — the leader
+            // above all — from being stolen out of the editor. Declared only
+            // while the editor is showing: on the canvas there is nothing
+            // typing into, so the shortcuts should work as they do anywhere.
+            .key_context(match self.graph {
+                true => "ProgramPane",
+                false => "ProgramPane TextInput",
+            })
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| this.on_key(event, cx)))
             .size_full()

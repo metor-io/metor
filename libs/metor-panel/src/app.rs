@@ -1177,31 +1177,26 @@ impl PanelApp {
                 // (`cmd-` would be the Win/Super key off-macOS).
                 cx.bind_keys([
                     KeyBinding::new("secondary-p", OpenPalette, None),
-                    // The leader opens the transient chord menu. Suppressed while
-                    // a text field (Inspector search, node-editor inline edit via
-                    // RowList) or the menu itself holds focus, so the key still
-                    // types normally there.
-                    KeyBinding::new(
-                        leader.as_str(),
-                        OpenLeader,
-                        Some("!Inspector && !RowList && !Transient"),
-                    ),
+                    // The leader opens the transient chord menu, and it is a
+                    // bare key — `space` by default — so anything typing into
+                    // it must say so. `TextInput` is that: every host owning
+                    // an editable field declares it beside its own name, and
+                    // one negation covers all of them, including ones that do
+                    // not exist yet. Naming the panes individually is what let
+                    // the program pane swallow its own spacebar.
+                    KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
                     KeyBinding::new("ctrl-tab", CycleTabForward, None),
                     KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
                     KeyBinding::new("secondary-l", ToggleCmdLock, None),
                     KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
-                    // Excluded when a `RowList` is focused so editing a node's
-                    // inline arg field (typing Backspace, hitting Delete) doesn't
-                    // also delete the surrounding node.
-                    KeyBinding::new(
-                        "delete",
-                        crate::node_editor::DeleteSelected,
-                        Some("NodeEditor && !RowList"),
-                    ),
+                    // Bare keys again, so they answer to the same rule:
+                    // editing a node's inline arg field must not also delete
+                    // the node around it.
+                    KeyBinding::new("delete", crate::node_editor::DeleteSelected, Some(DELETE_NODE)),
                     KeyBinding::new(
                         "backspace",
                         crate::node_editor::DeleteSelected,
-                        Some("NodeEditor && !RowList"),
+                        Some(DELETE_NODE),
                     ),
                 ]);
 
@@ -1288,6 +1283,23 @@ fn register_connection_commands(cx: &mut App) {
 /// specialized built-in panel kinds. Ordinary registered views are adapted
 /// into this registry immediately afterwards; Dashboard retains its dedicated
 /// deserializer because it is itself a host. The populated registry is a gpui
+/// The key context every host owning an editable field declares beside its own
+/// name, and the reason bare-key shortcuts can exist at all.
+///
+/// A predicate naming panes individually is wrong the moment someone adds a
+/// pane — which is exactly how the program pane came to swallow its own
+/// spacebar — so the rule is stated once, here, and every field opts in.
+pub const TEXT_INPUT: &str = "TextInput";
+
+/// Context predicate for a bare key that must not fire while something is
+/// being typed into. `Transient` is the chord menu itself, which must not
+/// re-trigger its own leader.
+pub const NOT_TYPING: &str = "!TextInput && !Transient";
+
+/// Deleting the selected node: only in a node editor, and never while an
+/// inline argument field has focus.
+pub const DELETE_NODE: &str = "NodeEditor && !TextInput";
+
 /// `Global` so palette callbacks can fetch it without threading.
 fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     use crate::tiles::ItemRegistry as PaneItemRegistry;
@@ -1379,3 +1391,73 @@ fn set_dock_icon() {
 
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
+
+#[cfg(test)]
+mod keybinding_tests {
+    use super::{DELETE_NODE, NOT_TYPING, TEXT_INPUT};
+    use gpui::{KeyBindingContextPredicate, KeyContext};
+
+    /// The focus path, root first — the order gpui evaluates a predicate over.
+    fn path(contexts: &[&str]) -> Vec<KeyContext> {
+        contexts
+            .iter()
+            .map(|c| KeyContext::try_from(*c).expect("a context parses"))
+            .collect()
+    }
+
+    fn fires(predicate: &str, contexts: &[&str]) -> bool {
+        KeyBindingContextPredicate::parse(predicate)
+            .expect("a predicate parses")
+            .depth_of(&path(contexts))
+            .is_some()
+    }
+
+    /// A host declares its own name *and* `TextInput` from one string, which
+    /// is what lets one negation cover every editable field.
+    #[test]
+    fn a_host_can_declare_its_name_and_text_input_together() {
+        let context = KeyContext::try_from("ProgramPane TextInput").unwrap();
+        assert!(context.contains("ProgramPane"));
+        assert!(context.contains(TEXT_INPUT));
+    }
+
+    /// The bug: the leader is a bare `space` by default, so it must not fire
+    /// anywhere a character is being typed — including panes that did not
+    /// exist when the predicate was written.
+    #[test]
+    fn the_leader_never_fires_while_something_is_being_typed_into() {
+        assert!(fires(NOT_TYPING, &["AppRoot"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "NodeEditor"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "ProgramPane"]));
+
+        for typing in [
+            &["AppRoot", "ProgramPane TextInput"][..],
+            &["AppRoot", "Inspector TextInput"][..],
+            &["AppRoot", "Inspector TextInput", "RowList TextInput"][..],
+            &["AppRoot", "ConnectionPicker TextInput"][..],
+            // A field nested under a pane that is not itself a text host: the
+            // negation looks at the whole path, not just the leaf.
+            &["AppRoot", "NodeEditor", "RowList TextInput"][..],
+        ] {
+            assert!(
+                !fires(NOT_TYPING, typing),
+                "the leader stole a keystroke from {typing:?}"
+            );
+        }
+
+        // The chord menu must not re-trigger its own leader.
+        assert!(!fires(NOT_TYPING, &["AppRoot", "Transient"]));
+    }
+
+    /// Backspace and Delete are bare keys too, and answer to the same rule.
+    #[test]
+    fn deleting_a_node_never_fires_from_inside_a_field() {
+        assert!(fires(DELETE_NODE, &["AppRoot", "NodeEditor"]));
+        assert!(!fires(
+            DELETE_NODE,
+            &["AppRoot", "NodeEditor", "RowList TextInput"]
+        ));
+        // Outside a node editor there is nothing to delete.
+        assert!(!fires(DELETE_NODE, &["AppRoot", "ProgramPane TextInput"]));
+    }
+}

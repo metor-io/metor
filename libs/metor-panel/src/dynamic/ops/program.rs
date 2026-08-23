@@ -162,14 +162,34 @@ pub struct System {
     pub state: StateCell,
 }
 
+/// One input port: where its samples come from, and what the host already has
+/// for it.
+pub struct PortSource {
+    pub node: Arc<dyn DynamicNode>,
+    /// The most recent sample already committed, if there is one.
+    ///
+    /// A disruptor reader begins at the write head and never sees what came
+    /// before it, so without this a system over a quiet channel waits for a
+    /// sample that may not arrive for minutes — and a plot of it looks broken
+    /// rather than idle.
+    pub seed: Option<(Timestamp, Vec<u8>)>,
+}
+
+impl PortSource {
+    /// A port with no history behind it.
+    pub fn live(node: Arc<dyn DynamicNode>) -> Self {
+        PortSource { node, seed: None }
+    }
+}
+
 /// Spawn the task that drives one system.
 ///
-/// `ports` supplies one node per input port, in the manifest's order; `seed`
+/// `ports` supplies one source per input port, in the manifest's order; `seed`
 /// carries state over from the instance this one replaces.
 pub fn system(
     compiled: &Arc<Compiled>,
     index: usize,
-    ports: Vec<Arc<dyn DynamicNode>>,
+    ports: Vec<PortSource>,
     fuel: u64,
     seed: Option<&Snapshot>,
 ) -> Result<System, BuildError> {
@@ -204,11 +224,28 @@ pub fn system(
 
     let mut layouts = Vec::with_capacity(ports.len());
     let mut readers = Vec::with_capacity(ports.len());
-    for (port, node) in desc.inputs.iter().zip(&ports) {
-        let schema = require_value(node)?;
-        layouts.push(PortLayout::new(port, &schema)?);
-        readers.push(Some(node.subscribe()));
+    let mut latest = Vec::with_capacity(ports.len());
+    for (port, source) in desc.inputs.iter().zip(&ports) {
+        let schema = require_value(&source.node)?;
+        let layout = PortLayout::new(port, &schema)?;
+        // Whatever the host already knows about this port becomes its first
+        // held value, so a system is not blind to everything published before
+        // it existed.
+        let mut held = Vec::new();
+        if let Some((_, value)) = &source.seed
+            && value.len() == layout.sample_bytes
+        {
+            layout.fill(value, &mut held);
+        }
+        latest.push(held);
+        layouts.push(layout);
+        readers.push(Some(source.node.subscribe()));
     }
+    // The driving port's own history is what the system fires from once at
+    // startup, so a quiet channel still shows its current value.
+    let opening = ports[driving].seed.clone().filter(|(_, value)| {
+        value.len() == layouts[driving].sample_bytes
+    });
     let wired = Ports {
         driving: readers[driving].take().expect("the driving port is wired once"),
         others: readers
@@ -216,24 +253,24 @@ pub fn system(
             .enumerate()
             .filter_map(|(i, reader)| Some((i, reader?)))
             .collect(),
-        latest: vec![Vec::new(); layouts.len()],
+        latest,
         layouts,
     };
 
-    let id = compiled.system_hash(index, &ports.iter().map(|p| p.id()).collect::<Vec<_>>());
+    let id = compiled.system_hash(index, &ports.iter().map(|p| p.node.id()).collect::<Vec<_>>());
     let frame_bytes = desc.output.bytes as usize;
     let health = Health::default();
     let node = NodeImpl::spawn(
         id,
         ValueType::Value(ComponentSchema::new(PrimType::U8, &[frame_bytes])),
-        ports[driving].parent_clock_id(),
+        ports[driving].node.parent_clock_id(),
         default_ring_bytes(frame_bytes),
         {
             let health = health.clone();
             let state = state.clone();
             move |output| async move {
                 let _ports = ports;
-                run(instance, wired, driving, output, health, state).await;
+                run(instance, wired, driving, opening, output, health, state).await;
             }
         },
     );
@@ -290,6 +327,18 @@ pub fn field(
             }
         },
     ))
+}
+
+/// The last sample a component already holds, for seeding a port.
+///
+/// This is the same read `views/binding.rs` does before entering its stream
+/// loop, and for the same reason: a fresh reader only sees what is committed
+/// from now on, so anything already published is invisible without it.
+pub fn latest_sample(db: &metor_db::DB, component: metor_proto::types::ComponentId) -> Option<(Timestamp, Vec<u8>)> {
+    db.with_state(|state| {
+        let latest = state.get_component(component)?.time_series.latest()?;
+        Some((latest.timestamp(), latest.data().to_vec()))
+    })
 }
 
 /// The component a field of the language publishes as.
@@ -386,11 +435,23 @@ async fn run(
     mut instance: Running,
     mut ports: Ports,
     driving: usize,
+    opening: Option<(Timestamp, Vec<u8>)>,
     output: Disruptor,
     health: Health,
     state: StateCell,
 ) {
     let mut sample = Vec::new();
+
+    // Fire once from what the driving input had already published, so an
+    // expression over a channel that is merely quiet shows its value straight
+    // away instead of waiting for a sample that may be minutes off.
+    if let Some((ts, value)) = &opening {
+        ports.layouts[driving].fill(value, &mut sample);
+        if evaluate(&mut instance, &ports, driving, &sample, *ts, &output, &state).is_err() {
+            return;
+        }
+    }
+
     let fault = 'live: loop {
         let Ports {
             driving: reader,
@@ -433,6 +494,39 @@ async fn run(
     };
     health.park(fault);
     parked(ports).await;
+}
+
+/// Write every port and evaluate once. `Err` means the instance is unusable
+/// and the task should end; a fault during the opening sample is treated the
+/// same way the live loop treats one.
+fn evaluate(
+    instance: &mut Running,
+    ports: &Ports,
+    driving: usize,
+    sample: &[u8],
+    ts: Timestamp,
+    output: &Disruptor,
+    state: &StateCell,
+) -> Result<(), ()> {
+    if ports
+        .others
+        .iter()
+        .any(|(i, _)| ports.latest[*i].is_empty())
+    {
+        return Ok(());
+    }
+    for (i, held) in ports.latest.iter().enumerate() {
+        let bytes = if i == driving { sample } else { held.as_slice() };
+        instance.write_port(i, bytes)?;
+    }
+    match instance.eval(ts) {
+        Ok(frame) => {
+            write_sample(output, ts, frame);
+            *state.0.lock().unwrap() = instance.read_state();
+            Ok(())
+        }
+        Err(_) => Ok(()),
+    }
 }
 
 /// After a fault the system stops computing but keeps reading, so nothing
