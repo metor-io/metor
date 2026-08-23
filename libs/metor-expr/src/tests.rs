@@ -12,6 +12,7 @@
 
 mod differential;
 mod m0;
+mod measure;
 mod robustness;
 mod scalar;
 mod semantics;

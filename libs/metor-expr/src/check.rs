@@ -63,8 +63,10 @@ use crate::ir::{Arith, BufId, Cmp, Desc, Expr, Func, Intrinsic, Num, Program, St
 use crate::{Dtype, FnSig, Manifest, Ty};
 
 /// How deep an expression may nest before the checker refuses it. Bounded so
-/// that a pathological input is a diagnostic rather than a blown stack.
-const MAX_DEPTH: u32 = 96;
+/// that a pathological input is a diagnostic rather than a blown stack, but
+/// generously: a left-associative chain of `n` terms nests `n` deep, and
+/// generated source reaches lengths hand-written source never would.
+const MAX_DEPTH: u32 = 512;
 
 /// The largest source this crate will look at. A panel expression is tens of
 /// bytes and a systems module is a few thousand, so the only thing this

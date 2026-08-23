@@ -293,10 +293,117 @@ the stack does.
   $k_add`. Every buffer is statically placed, so the descriptor can be baked at
   compile time. This is what makes M3's "no guest allocator" hold.
 
-### M0 — kernel catalog as landed
+### M4 — measurements
+
+Apple silicon, `--release` unless stated, `cargo test -p metor-expr --release
+measure -- --nocapture`. Every figure is reproducible from
+`src/tests/measure.rs`, which asserts the acceptance bars and prints the rest.
+
+**Compile latency.** Both bars cleared with an order of magnitude to spare.
+
+| | one-liner | 100-line module |
+|---|---|---|
+| release | **136 µs** (bar: < 1 ms) | 355 µs |
+| debug | **821 µs** (bar: < 20 ms) | 3.9 ms |
+
+Against the panel's 200 ms debounce a keystroke will not feel this even in a
+debug build. The figure includes the 64 MiB-stack thread `compile` spawns for
+the parse, so that hardening is already paid for here.
+
+**Module size**, all with zero imports.
+
+| module | bytes |
+|---|---|
+| prelude, as checked in | 21,445 |
+| compiled, no kernels reached | **5,009** |
+| compiled, `sin` + `exp` | 9,950 |
+| compiled, elementwise tensor kernels | 6,410 |
+| compiled, every kernel reachable | 16,176 |
+
+**Evaluation**, under fuel-metered wasmi.
+
+| expression | ns/eval | fuel/eval |
+|---|---|---|
+| `(x * 9.81 + y) / 2.0` | **32** | **5** |
+| `sin(x) * cos(x)` | 178 | 136 |
+
+**Kernel call versus open coding — the plan's open question, answered.** Both
+forms are expressible in the language, so both were compiled and measured.
+
+| operation | via kernel | open-coded |
+|---|---|---|
+| length-3 `sum(a + b)` | 790 ns / 752 fuel | **43 ns / 14 fuel** |
+| length-3 `dot` | 71 ns / 48 fuel | **42 ns / 14 fuel** |
+| length-8 `dot` | 133 ns / 98 fuel | **85 ns / 34 fuel** |
+| length-32 `dot` | 385 ns / 338 fuel | **183 ns / 130 fuel** |
+| length-128 `dot` | 1396 ns / 1298 fuel | **614 ns / 514 fuel** |
+
+The tax is not merely visible, it is decisive, and **open coding wins at every
+length measured** — there is no crossover in this range. Two separate effects:
+
+- A `call` plus the kernel's own prologue is ~34 fuel, which swamps a length-3
+  contraction that is 14 fuel open-coded.
+- The elementwise kernels are far worse than the contraction ones — 752 fuel to
+  add three elements — because `k_add` runs the *general* broadcast machinery
+  per call: two shape copies, two stride computations, and an odometer per
+  element. That generality costs ~230 fuel per element at length 3.
+
+So the plan's contingency applies, and Phase 1 should act on it in two
+independent ways:
+
+1. **Open-code small constant shapes in the compiler.** Shapes are static, so
+   the emitter already knows when a loop is three iterations. The measurement
+   says the threshold is high — everything up to at least 128 elements is
+   cheaper unrolled — but module size grows with the unroll, so the practical
+   rule is a fuel-versus-bytes knob rather than a single number.
+2. **Give the elementwise kernels a contiguous same-shape fast path.** Most
+   real call sites have identical operand shapes and need no broadcasting at
+   all; the odometer is being paid for a case that is rarely taken.
+
+Note the compiler is not obliged to choose one: kernels stay the fallback for
+shapes large enough that unrolling would bloat the module, and the checker
+already knows which case it is in.
+
+### M4 — one thing the sweep turned up
+
+Open-coding a 128-term dot product tripped `MAX_DEPTH`, which was 96: a
+left-associative chain of *n* terms nests *n* deep. Hand-written source never
+gets there, but generated source does — and the compiler open-coding small
+shapes for itself is exactly a generator. The limit is now 512, which is still
+bounded and still far below what the 64 MiB parse stack can carry.
+
+### Kernel catalog as landed
 
 `sin cos tan asin acos atan atan2 exp log pow sinh cosh tanh floor ceil round
 trunc fmod_floor` (libm, scalar `f64`); `k_add k_sub k_mul k_div k_pow k_atan2`
-(elementwise, broadcasting, via `EwDesc`); `k_neg k_dot k_sum` (flat, length in
-elements); `k_matmul` (row-major `(m,k)@(k,n)`); `expr_arena expr_arena_len`
-(the 16 KiB compiler-owned region).
+(elementwise, broadcasting, one pointer to an `EwDesc`); `k_neg k_dot k_sum`
+(flat, length in elements); `k_matmul` (row-major `(m,k)@(k,n)`).
+
+`sqrt`, `abs`, `min`, `max`, `floor`, `ceil`, `trunc`, and `round` are *not*
+reached from compiled code — wasm has instructions for all of them, so the
+emitter uses those and a module that only wants them reaches no kernel at all.
+The prelude keeps its own copies because they cost nothing once GC'd away.
+
+M0's `expr_arena` / `expr_arena_len` were removed in M3. Compiler-owned buffers
+now start at the linker's `__heap_base`, so the compiler owns the layout, the
+prelude reserves nothing, and there is no fixed ceiling on how much a program
+may place.
+
+### The other divergence M3 found: contractions are not fused
+
+nox's `dot` reaches faer, which fuses each multiply-add. Core wasm has **no
+scalar FMA instruction**, so no guest kernel can reproduce that rounding —
+measured as a one-ULP difference on `dot([0.01, -0.02, 0.005])`.
+
+`dot` in this language is therefore *defined* as a sequential non-fused sum,
+which is what the guest can actually compute, and `a_contraction_is_not_fused`
+pins the divergence in both directions so it cannot change unnoticed.
+
+This qualifies a claim in the parent design doc: "panel-side native nox and
+guest-side wasm nox are the same code, which is what makes identical results in
+both hosts a property of the build rather than a promise." For elementwise
+arithmetic that holds and is tested. For contractions it cannot, because the
+instruction sets differ. The property that matters operationally is untouched —
+panel and vehicle run *the same module* — but a Rust `nox::dot` of the same
+numbers can differ in the last place, and anything that compares a Python
+expression against a Rust implementation of the same formula needs to know it.
