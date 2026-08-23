@@ -15,6 +15,7 @@ mod m0;
 mod robustness;
 mod scalar;
 mod semantics;
+mod tensors;
 
 use wasmi::{Engine, Instance, Linker, Module, Store, Val};
 

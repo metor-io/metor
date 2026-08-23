@@ -28,6 +28,17 @@
 //!   `default-features = false` — which is how this workspace pins it —
 //!   routes its own `RealField` through `libm` for the same reason, so this
 //!   keeps one implementation across guest, oracle, and nox.
+//!
+//! ## The one place nox cannot be the oracle
+//!
+//! **Contractions.** nox's `dot` reaches faer, which fuses each multiply-add;
+//! core wasm has no scalar FMA instruction, so no guest kernel can reproduce
+//! that rounding. `dot` in this language is therefore defined as a sequential
+//! non-fused sum, and the oracle for it is that same definition. The property
+//! that actually matters is untouched — panel and vehicle run the *same
+//! module* — but a Rust `nox::dot` of the same numbers can differ in the last
+//! place, and `tensors::a_contraction_is_not_fused` pins exactly that so it
+//! stays a known fact rather than a later surprise.
 
 use nox::{Array, ArrayRepr, ReprMonad, Scalar, Tensor};
 

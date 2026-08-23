@@ -166,6 +166,24 @@ impl<'a> Template<'a> {
         self.exported_funcs.get(name).copied()
     }
 
+    /// First address in linear memory the linker left unclaimed.
+    ///
+    /// The guest has no allocator, so everything from here up belongs to the
+    /// compiler: argument buffers, return buffers, temporaries, and the
+    /// descriptors kernel call sites point at.
+    pub fn heap_base(&self) -> u32 {
+        let index = self
+            .exports
+            .iter()
+            .find(|(name, kind, _)| {
+                name == "__heap_base" && *kind == wasmparser::ExternalKind::Global
+            })
+            .map(|(_, _, index)| *index)
+            .expect("wasm-ld always exports __heap_base");
+        let init = &self.globals[index as usize].init_expr;
+        const_i32(init).expect("__heap_base is an i32 constant") as u32
+    }
+
     /// Number of functions the template defines.
     pub fn function_count(&self) -> u32 {
         self.func_types.len() as u32
@@ -314,6 +332,18 @@ impl Splice<'_> {
     /// Place initialized bytes at an absolute address in linear memory.
     pub fn data(&mut self, offset: u32, bytes: Vec<u8>) {
         self.data.push((offset, bytes));
+    }
+
+    /// Raise the memory minimum so `bytes` of linear memory exist.
+    pub fn reserve_memory(&mut self, bytes: u32) {
+        let pages = u64::from(bytes).div_ceil(64 * 1024);
+        let memory = &mut self.plan.template.memories[0];
+        memory.initial = memory.initial.max(pages);
+    }
+
+    /// First address the compiler may place a buffer at.
+    pub fn heap_base(&self) -> u32 {
+        self.plan.template.heap_base()
     }
 
     /// Emit the finished module.

@@ -116,7 +116,16 @@ pub extern "C" fn k_neg(a: u32, out: u32, n: u32) {
     }
 }
 
-/// Inner product of two length-`n` vectors.
+/// Inner product of two length-`n` vectors, accumulated in order and
+/// **without fusion**.
+///
+/// This is where the guest and native nox part company. nox's `dot` reaches
+/// faer, which fuses each multiply-add; core wasm has no scalar FMA
+/// instruction, so no kernel here can reproduce that rounding. The compiled
+/// language's `dot` is therefore *defined* as this sequential sum. Both hosts
+/// run the same module, so panel and vehicle still agree bit for bit — it is
+/// only a Rust `nox::dot` of the same numbers that can differ, in the last
+/// place.
 #[unsafe(no_mangle)]
 pub extern "C" fn k_dot(a: u32, b: u32, n: u32) -> f64 {
     let x = unsafe { core::slice::from_raw_parts(a as *const f64, n as usize) };
@@ -131,7 +140,8 @@ pub extern "C" fn k_dot(a: u32, b: u32, n: u32) -> f64 {
     acc
 }
 
-/// Row-major `(m, k) @ (k, n)` into `out`.
+/// Row-major `(m, k) @ (k, n)` into `out`, accumulated in order and without
+/// fusion, for the same reason as [`k_dot`].
 #[unsafe(no_mangle)]
 pub extern "C" fn k_matmul(a: u32, b: u32, out: u32, m: u32, k: u32, n: u32) {
     let (m, k, n) = (m as usize, k as usize, n as usize);

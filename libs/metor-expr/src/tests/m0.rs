@@ -16,7 +16,7 @@ fn prelude_is_closed_and_exports_its_kernels() {
     let template = Template::parse(PRELUDE).unwrap();
     for kernel in [
         "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow", "fmod_floor",
-        "k_add", "k_sub", "k_mul", "k_div", "k_neg", "k_dot", "k_matmul", "k_sum", "expr_arena",
+        "k_add", "k_sub", "k_mul", "k_div", "k_neg", "k_dot", "k_matmul", "k_sum",
     ] {
         assert!(template.export(kernel).is_some(), "missing kernel {kernel}");
     }
@@ -105,16 +105,10 @@ fn generated_function_drives_a_tensor_kernel() {
     assert_eq!(got, 11.0 * 1.0 + 22.0 * 2.0 + 33.0 * 3.0);
 }
 
-/// Read the arena base out of an untouched prelude instance.
+/// The first address the compiler may place a buffer at, straight from the
+/// linker.
 fn arena_base() -> u32 {
-    let (mut store, instance) = instantiate(PRELUDE, 100_000);
-    let func = instance.get_func(&store, "expr_arena").unwrap();
-    let mut out = [wasmi::Val::I32(0)];
-    func.call(&mut store, &[], &mut out).unwrap();
-    match &out[0] {
-        wasmi::Val::I32(v) => *v as u32,
-        other => panic!("expected i32, got {other:?}"),
-    }
+    Template::parse(PRELUDE).unwrap().heap_base()
 }
 
 /// The GC proof: asking for one kernel keeps far less than asking for all of
@@ -254,7 +248,7 @@ fn module_size_tracks_what_the_program_reaches() {
         vec![
             "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow",
             "fmod_floor", "k_add", "k_sub", "k_mul", "k_div", "k_neg", "k_dot", "k_matmul",
-            "k_sum", "expr_arena", "expr_arena_len",
+            "k_sum",
         ],
     ]
     .into_iter()

@@ -25,16 +25,42 @@
 //!   `while` conditions must *be* `bool`, and `True + 1` does not typecheck.
 //! - Mixed arithmetic promotes `i64` to `f64`. Narrowing is explicit, through
 //!   `int(x)`, and truncates toward zero.
+//! - Indices do not wrap around: `v[-1]` traps rather than reaching the end.
+//!
+//! ## Tensors are addresses, and every address is a constant
+//!
+//! Shapes are static, there is no allocator in the guest, and the plan asks
+//! for kernel call sites whose shape arguments are compile-time constants. All
+//! three fall out of one decision: **every tensor in a compiled program lives
+//! at an address the compiler picked.** A tensor-valued expression does not
+//! leave a value on the wasm stack; it writes into a buffer, and its "value"
+//! is that buffer's address, known while emitting.
+//!
+//! That is what lets an elementwise call site be `i32.const desc; call $k_add`,
+//! with `desc` a data segment holding both operand addresses and all three
+//! shapes.
+//!
+//! It also decides the calling convention. A function whose signature mentions
+//! a tensor takes no wasm parameters at all: its arguments live in static
+//! buffers the host writes through `<name>_arg_ptr(i)`, and its result in one
+//! the host reads through `<name>_ret_ptr()`. Internal callers use the very
+//! same buffers — copy in, call, copy out. Scalar-only functions keep passing
+//! by value, because nothing about them needs memory.
+//!
+//! Static buffers and recursion do not mix: a second activation would write
+//! over the first one's arguments. So a call cycle that passes through a
+//! tensor-using function is refused, with a span. Scalar recursion is
+//! untouched — it lives in wasm locals.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use num_traits::ToPrimitive;
 use rustpython_parser::ast::{self, Ranged};
 use rustpython_parser::{Parse, text_size::TextRange};
 
 use crate::diag::{Diagnostics, Span};
-use crate::ir::{Arith, Cmp, Expr, Func, Intrinsic, Num, Program, Stmt};
-use crate::{FnSig, Manifest, Ty};
+use crate::ir::{Arith, BufId, Cmp, Desc, Expr, Func, Intrinsic, Num, Program, Stmt};
+use crate::{Dtype, FnSig, Manifest, Ty};
 
 /// How deep an expression may nest before the checker refuses it. Bounded so
 /// that a pathological input is a diagnostic rather than a blown stack.
@@ -50,6 +76,10 @@ const MAX_SOURCE_BYTES: usize = 256 * 1024;
 /// thread somewhere between ten and fifty thousand levels. Bounding the source
 /// bounds the depth, and this leaves room for the worst case that bound allows.
 const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// The largest rank an annotation may declare. The kernels read four, and
+/// nothing in this phase writes more than two.
+const MAX_RANK: usize = 4;
 
 pub(crate) fn check(source: &str) -> Result<(Program, Manifest), Diagnostics> {
     if source.len() > MAX_SOURCE_BYTES {
@@ -145,26 +175,76 @@ fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
         sigs.push(FnSig { name, params, ret });
     }
 
+    let mut buffers: Vec<u32> = Vec::new();
+    let mut frames: Vec<FnFrame> = Vec::new();
+    for sig in &sigs {
+        let buffer_abi = sig.uses_buffers();
+        let mut arg_buffers = Vec::new();
+        let mut ret_buffer = None;
+        if buffer_abi {
+            for (_, ty) in &sig.params {
+                arg_buffers.push(alloc(&mut buffers, slot_bytes(ty)));
+            }
+            ret_buffer = Some(alloc(&mut buffers, slot_bytes(&sig.ret)));
+        }
+        frames.push(FnFrame {
+            buffer_abi,
+            arg_buffers,
+            ret_buffer,
+        });
+    }
+
     let mut funcs = Vec::new();
-    for (def, sig) in defs.iter().zip(&sigs) {
+    let mut edges: Vec<Vec<u32>> = Vec::new();
+    for ((def, sig), frame) in defs.iter().zip(&sigs).zip(&frames) {
         let before = diags.len();
+        let mut locals = Vec::new();
+        let mut names = HashMap::new();
+        let mut prologue = Vec::new();
+        for (i, (name, ty)) in sig.params.iter().enumerate() {
+            if matches!(ty, Ty::Tensor { .. }) {
+                names.insert(
+                    name.clone(),
+                    Binding::Tensor {
+                        buf: frame.arg_buffers[i],
+                        ty: ty.clone(),
+                    },
+                );
+                continue;
+            }
+            let slot = locals.len() as u32;
+            locals.push(ty.clone());
+            if frame.buffer_abi {
+                prologue.push((frame.arg_buffers[i], slot, ty.clone()));
+            }
+            names.insert(
+                name.clone(),
+                Binding::Scalar {
+                    slot,
+                    ty: ty.clone(),
+                },
+            );
+        }
+        let param_count = if frame.buffer_abi { 0 } else { locals.len() };
+
         let mut body = FnChecker {
             diags: &mut diags,
             sigs: &sigs,
             by_name: &by_name,
+            frames: &frames,
+            buffers: &mut buffers,
             ret: sig.ret.clone(),
-            locals: sig.params.iter().map(|(_, t)| t.clone()).collect(),
-            names: sig
-                .params
-                .iter()
-                .enumerate()
-                .map(|(i, (n, _))| (n.clone(), i as u32))
-                .collect(),
+            ret_buffer: frame.ret_buffer,
+            buffer_abi: frame.buffer_abi,
+            locals,
+            names,
             loop_depth: 0,
+            calls: Vec::new(),
         };
         let stmts = body.block(&def.body, 0);
         let complete = always_returns(&stmts);
         let locals = body.locals;
+        edges.push(body.calls);
         // Only worth saying when the body itself was understood; otherwise it
         // is noise stacked on the real complaint.
         if !complete && diags.len() == before {
@@ -172,16 +252,87 @@ fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
         }
         funcs.push(Func {
             name: sig.name.clone(),
-            param_count: sig.params.len(),
+            param_count,
             locals,
             body: stmts,
+            buffer_abi: frame.buffer_abi,
+            arg_buffers: frame.arg_buffers.clone(),
+            ret_buffer: frame.ret_buffer,
+            prologue,
         });
     }
 
+    for cycle in tensor_cycles(&edges, &frames) {
+        let name = &sigs[cycle as usize].name;
+        diags.push(
+            defs[cycle as usize].range,
+            format!("`{name}` is recursive and passes tensors, whose buffers are statically placed"),
+        );
+    }
+
     if diags.is_empty() {
-        Ok((Program { funcs }, Manifest { functions: sigs }))
+        let param_types = sigs
+            .iter()
+            .map(|sig| sig.params.iter().map(|(_, t)| t.clone()).collect())
+            .collect();
+        Ok((
+            Program {
+                funcs,
+                param_types,
+                buffers,
+            },
+            Manifest { functions: sigs },
+        ))
     } else {
         Err(diags.sorted())
+    }
+}
+
+struct FnFrame {
+    buffer_abi: bool,
+    arg_buffers: Vec<BufId>,
+    ret_buffer: Option<BufId>,
+}
+
+/// Functions that both take part in a call cycle and cross tensor buffers.
+fn tensor_cycles(edges: &[Vec<u32>], frames: &[FnFrame]) -> Vec<u32> {
+    let mut cyclic = Vec::new();
+    for start in 0..edges.len() as u32 {
+        if !frames[start as usize].buffer_abi {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let mut stack = vec![start];
+        while let Some(f) = stack.pop() {
+            for &next in &edges[f as usize] {
+                if next == start {
+                    cyclic.push(start);
+                    stack.clear();
+                    break;
+                }
+                if seen.insert(next) {
+                    stack.push(next);
+                }
+            }
+        }
+    }
+    cyclic
+}
+
+fn alloc(buffers: &mut Vec<u32>, bytes: u32) -> BufId {
+    buffers.push(bytes);
+    (buffers.len() - 1) as BufId
+}
+
+/// Bytes a value of this type occupies in a buffer.
+fn slot_bytes(ty: &Ty) -> u32 {
+    elems(ty) * 8
+}
+
+fn elems(ty: &Ty) -> u32 {
+    match ty {
+        Ty::Tensor { shape, .. } => shape.iter().product::<usize>() as u32,
+        _ => 1,
     }
 }
 
@@ -194,11 +345,12 @@ fn annotation(expr: &ast::Expr, diags: &mut Diagnostics) -> Ty {
             other => {
                 diags.push(
                     expr.range(),
-                    format!("unknown type `{other}`; expected f64, i64, or bool"),
+                    format!("unknown type `{other}`; expected f64, i64, bool, or Tensor[...]"),
                 );
                 Ty::F64
             }
         },
+        ast::Expr::Subscript(sub) => tensor_annotation(sub, diags),
         _ => {
             diags.push(expr.range(), "expected a type name");
             Ty::F64
@@ -206,20 +358,109 @@ fn annotation(expr: &ast::Expr, diags: &mut Diagnostics) -> Ty {
     }
 }
 
+/// `Tensor[f64, 3]` and `Tensor[f64, (3, 3)]`.
+fn tensor_annotation(sub: &ast::ExprSubscript, diags: &mut Diagnostics) -> Ty {
+    fn bad(sub: &ast::ExprSubscript, diags: &mut Diagnostics) -> Ty {
+        diags.push(
+            sub.range,
+            "expected Tensor[f64, N] or Tensor[f64, (N, M)] with positive constant dimensions",
+        );
+        Ty::F64
+    }
+    let ast::Expr::Name(head) = sub.value.as_ref() else {
+        return bad(sub, diags);
+    };
+    if head.id.as_str() != "Tensor" {
+        return bad(sub, diags);
+    }
+    let ast::Expr::Tuple(parts) = sub.slice.as_ref() else {
+        return bad(sub, diags);
+    };
+    if parts.elts.len() != 2 {
+        return bad(sub, diags);
+    }
+    let dtype = match &parts.elts[0] {
+        ast::Expr::Name(n) if matches!(n.id.as_str(), "f64" | "float") => Dtype::F64,
+        other => {
+            diags.push(other.range(), "only Tensor[f64, ...] exists in this phase");
+            return Ty::F64;
+        }
+    };
+    let dims: Vec<&ast::Expr> = match &parts.elts[1] {
+        ast::Expr::Tuple(dims) => dims.elts.iter().collect(),
+        single => vec![single],
+    };
+    if dims.is_empty() || dims.len() > MAX_RANK {
+        return bad(sub, diags);
+    }
+    let mut shape = Vec::with_capacity(dims.len());
+    for dim in dims {
+        let ast::Expr::Constant(c) = dim else {
+            return bad(sub, diags);
+        };
+        let ast::Constant::Int(n) = &c.value else {
+            return bad(sub, diags);
+        };
+        match n.to_usize() {
+            Some(n) if n > 0 => shape.push(n),
+            _ => return bad(sub, diags),
+        }
+    }
+    Ty::Tensor { dtype, shape }
+}
+
+/// nox's broadcast rule: shapes right-aligned, an extent of one stretches.
+fn broadcast(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+    let rank = a.len().max(b.len());
+    let mut out = Vec::with_capacity(rank);
+    for i in 0..rank {
+        out.push(match (axis(a, rank, i), axis(b, rank, i)) {
+            (x, y) if x == y => x,
+            (1, y) => y,
+            (x, 1) => x,
+            _ => return None,
+        });
+    }
+    Some(out)
+}
+
+fn axis(shape: &[usize], rank: usize, i: usize) -> usize {
+    let lead = rank - shape.len();
+    if i < lead { 1 } else { shape[i - lead] }
+}
+
+fn padded(shape: &[usize], rank: usize) -> Vec<u32> {
+    (0..rank).map(|i| axis(shape, rank, i) as u32).collect()
+}
+
+enum Binding {
+    Scalar { slot: u32, ty: Ty },
+    Tensor { buf: BufId, ty: Ty },
+}
+
 struct FnChecker<'a> {
     diags: &'a mut Diagnostics,
     sigs: &'a [FnSig],
     by_name: &'a HashMap<String, u32>,
+    frames: &'a [FnFrame],
+    buffers: &'a mut Vec<u32>,
     ret: Ty,
+    ret_buffer: Option<BufId>,
+    buffer_abi: bool,
     locals: Vec<Ty>,
-    names: HashMap<String, u32>,
+    names: HashMap<String, Binding>,
     loop_depth: u32,
+    calls: Vec<u32>,
 }
 
 impl FnChecker<'_> {
     fn temp(&mut self, ty: Ty) -> u32 {
         self.locals.push(ty);
         (self.locals.len() - 1) as u32
+    }
+
+    fn buffer(&mut self, ty: &Ty) -> BufId {
+        alloc(self.buffers, slot_bytes(ty))
     }
 
     fn block(&mut self, stmts: &[ast::Stmt], depth: u32) -> Vec<Stmt> {
@@ -241,8 +482,17 @@ impl FnChecker<'_> {
             ast::Stmt::Return(ret) => {
                 let value = ret.value.as_ref()?;
                 let (expr, ty) = self.expr(value, depth)?;
-                let expr = self.coerce(expr, ty, &self.ret.clone(), value.range())?;
-                Some(vec![Stmt::Return(expr)])
+                let want = self.ret.clone();
+                let expr = self.coerce(expr, ty, &want, value.range())?;
+                Some(vec![if self.buffer_abi {
+                    Stmt::ReturnBuffer {
+                        dest: self.ret_buffer.expect("a buffer-ABI function has one"),
+                        value: expr,
+                        ty: want,
+                    }
+                } else {
+                    Stmt::Return(expr)
+                }])
             }
             ast::Stmt::AnnAssign(ann) => {
                 let ast::Expr::Name(target) = ann.target.as_ref() else {
@@ -254,8 +504,7 @@ impl FnChecker<'_> {
                 let value = ann.value.as_ref()?;
                 let (expr, got) = self.expr(value, depth)?;
                 let expr = self.coerce(expr, got, &ty, value.range())?;
-                let slot = self.declare(target.id.as_str(), ty, ann.range);
-                Some(vec![Stmt::Assign { local: slot, value: expr }])
+                Some(vec![self.bind(target.id.as_str(), ty, expr)])
             }
             ast::Stmt::Assign(assign) => {
                 if assign.targets.len() != 1 {
@@ -263,22 +512,46 @@ impl FnChecker<'_> {
                         .push(assign.range, "chained assignment is not supported");
                     return None;
                 }
-                let ast::Expr::Name(target) = &assign.targets[0] else {
-                    self.diags
-                        .push(assign.targets[0].range(), "only plain names can be assigned");
-                    return None;
-                };
-                let (expr, got) = self.expr(&assign.value, depth)?;
-                let name = target.id.as_str();
-                match self.names.get(name).copied() {
-                    Some(slot) => {
-                        let want = self.locals[slot as usize].clone();
-                        let expr = self.coerce(expr, got, &want, assign.value.range())?;
-                        Some(vec![Stmt::Assign { local: slot, value: expr }])
+                match &assign.targets[0] {
+                    ast::Expr::Name(target) => {
+                        let (expr, got) = self.expr(&assign.value, depth)?;
+                        let name = target.id.as_str();
+                        match self.names.get(name) {
+                            Some(Binding::Scalar { slot, ty }) => {
+                                let (slot, want) = (*slot, ty.clone());
+                                let expr = self.coerce(expr, got, &want, assign.value.range())?;
+                                Some(vec![Stmt::Assign {
+                                    local: slot,
+                                    value: expr,
+                                }])
+                            }
+                            Some(Binding::Tensor { buf, ty }) => {
+                                let (buf, want) = (*buf, ty.clone());
+                                let expr = self.coerce(expr, got, &want, assign.value.range())?;
+                                Some(vec![Stmt::TensorAssign {
+                                    dest: buf,
+                                    value: expr,
+                                    bytes: slot_bytes(&want),
+                                }])
+                            }
+                            None => Some(vec![self.bind(name, got, expr)]),
+                        }
                     }
-                    None => {
-                        let slot = self.declare(name, got, assign.range);
-                        Some(vec![Stmt::Assign { local: slot, value: expr }])
+                    ast::Expr::Subscript(sub) => {
+                        let (value, got) = self.expr(&assign.value, depth)?;
+                        let value = self.coerce(value, got, &Ty::F64, assign.value.range())?;
+                        let (target, index, len) = self.index_of(sub, depth)?;
+                        Some(vec![Stmt::ElementAssign {
+                            target,
+                            index,
+                            value,
+                            len,
+                        }])
+                    }
+                    other => {
+                        self.diags
+                            .push(other.range(), "only names and elements can be assigned");
+                        None
                     }
                 }
             }
@@ -289,17 +562,34 @@ impl FnChecker<'_> {
                     return None;
                 };
                 let name = target.id.as_str();
-                let Some(slot) = self.names.get(name).copied() else {
-                    self.diags
-                        .push(aug.target.range(), format!("`{name}` is not defined"));
-                    return None;
+                let (lhs, dest) = match self.names.get(name) {
+                    Some(Binding::Scalar { slot, ty }) => {
+                        ((Expr::Local(*slot), ty.clone()), Err(*slot))
+                    }
+                    Some(Binding::Tensor { buf, ty }) => {
+                        ((Expr::Tensor(*buf), ty.clone()), Ok(*buf))
+                    }
+                    None => {
+                        self.diags
+                            .push(aug.target.range(), format!("`{name}` is not defined"));
+                        return None;
+                    }
                 };
-                let want = self.locals[slot as usize].clone();
-                let lhs = (Expr::Local(slot), want.clone());
+                let want = lhs.1.clone();
                 let rhs = self.expr(&aug.value, depth)?;
                 let (expr, got) = self.binop(aug.op, lhs, rhs, &aug.value, aug.range)?;
                 let expr = self.coerce(expr, got, &want, aug.range)?;
-                Some(vec![Stmt::Assign { local: slot, value: expr }])
+                Some(vec![match dest {
+                    Ok(buf) => Stmt::TensorAssign {
+                        dest: buf,
+                        value: expr,
+                        bytes: slot_bytes(&want),
+                    },
+                    Err(slot) => Stmt::Assign {
+                        local: slot,
+                        value: expr,
+                    },
+                }])
             }
             ast::Stmt::If(branch) => {
                 let cond = self.condition(&branch.test, depth)?;
@@ -318,6 +608,7 @@ impl FnChecker<'_> {
                 self.loop_depth -= 1;
                 Some(vec![Stmt::While { cond, body }])
             }
+            ast::Stmt::For(loop_) => self.for_range(loop_, depth),
             ast::Stmt::Break(b) => {
                 if self.loop_depth == 0 {
                     self.diags.push(b.range, "`break` outside a loop");
@@ -334,7 +625,15 @@ impl FnChecker<'_> {
             }
             ast::Stmt::Pass(_) => Some(Vec::new()),
             ast::Stmt::Expr(e) => {
-                let (expr, _) = self.expr(&e.value, depth)?;
+                let (expr, ty) = self.expr(&e.value, depth)?;
+                if matches!(ty, Ty::Tensor { .. }) {
+                    // The kernels already ran; the address is what is dropped.
+                    return Some(vec![Stmt::TensorAssign {
+                        dest: expr.buffer(),
+                        value: expr,
+                        bytes: 0,
+                    }]);
+                }
                 Some(vec![Stmt::Drop(expr)])
             }
             other => {
@@ -344,11 +643,125 @@ impl FnChecker<'_> {
         }
     }
 
-    fn declare(&mut self, name: &str, ty: Ty, range: TextRange) -> u32 {
-        let _ = range;
-        let slot = self.temp(ty);
-        self.names.insert(name.to_string(), slot);
-        slot
+    /// Introduce a name, in a wasm local or a buffer depending on its type.
+    fn bind(&mut self, name: &str, ty: Ty, value: Expr) -> Stmt {
+        if matches!(ty, Ty::Tensor { .. }) {
+            let buf = self.buffer(&ty);
+            let bytes = slot_bytes(&ty);
+            self.names
+                .insert(name.to_string(), Binding::Tensor { buf, ty });
+            Stmt::TensorAssign {
+                dest: buf,
+                value,
+                bytes,
+            }
+        } else {
+            let slot = self.temp(ty.clone());
+            self.names
+                .insert(name.to_string(), Binding::Scalar { slot, ty });
+            Stmt::Assign { local: slot, value }
+        }
+    }
+
+    /// `for i in range(...)`, the only iteration the subset has.
+    fn for_range(&mut self, loop_: &ast::StmtFor, depth: u32) -> Option<Vec<Stmt>> {
+        if !loop_.orelse.is_empty() {
+            self.diags
+                .push(loop_.range, "`for ... else` is not supported");
+        }
+        let ast::Expr::Name(target) = loop_.target.as_ref() else {
+            self.diags
+                .push(loop_.target.range(), "the loop variable must be a plain name");
+            return None;
+        };
+        let ast::Expr::Call(call) = loop_.iter.as_ref() else {
+            self.diags
+                .push(loop_.iter.range(), "`for` iterates `range(...)` only");
+            return None;
+        };
+        let is_range = matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range");
+        if !is_range || call.args.is_empty() || call.args.len() > 3 {
+            self.diags
+                .push(loop_.iter.range(), "`for` iterates `range(...)` only");
+            return None;
+        }
+        let mut bounds = Vec::new();
+        for arg in &call.args {
+            let (expr, ty) = self.expr(arg, depth)?;
+            bounds.push(self.coerce(expr, ty, &Ty::I64, arg.range())?);
+        }
+        let (start, stop, step) = match bounds.len() {
+            1 => (Expr::I64(0), bounds.remove(0), Expr::I64(1)),
+            2 => {
+                let stop = bounds.remove(1);
+                (bounds.remove(0), stop, Expr::I64(1))
+            }
+            _ => {
+                let step = bounds.remove(2);
+                let stop = bounds.remove(1);
+                (bounds.remove(0), stop, step)
+            }
+        };
+
+        let slot = self.temp(Ty::I64);
+        self.names.insert(
+            target.id.as_str().to_string(),
+            Binding::Scalar { slot, ty: Ty::I64 },
+        );
+        let limit = self.temp(Ty::I64);
+        let stride = self.temp(Ty::I64);
+
+        self.loop_depth += 1;
+        let mut body = self.block(&loop_.body, depth + 1);
+        self.loop_depth -= 1;
+        body.push(Stmt::Assign {
+            local: slot,
+            value: Expr::Arith {
+                op: Arith::Add,
+                ty: Num::I64,
+                lhs: Box::new(Expr::Local(slot)),
+                rhs: Box::new(Expr::Local(stride)),
+            },
+        });
+
+        // A negative step counts down, so the guard flips with it.
+        let cond = Expr::Select {
+            cond: Box::new(Expr::Cmp {
+                op: Cmp::Gt,
+                ty: Num::I64,
+                lhs: Box::new(Expr::Local(stride)),
+                rhs: Box::new(Expr::I64(0)),
+            }),
+            then: Box::new(Expr::Cmp {
+                op: Cmp::Lt,
+                ty: Num::I64,
+                lhs: Box::new(Expr::Local(slot)),
+                rhs: Box::new(Expr::Local(limit)),
+            }),
+            els: Box::new(Expr::Cmp {
+                op: Cmp::Gt,
+                ty: Num::I64,
+                lhs: Box::new(Expr::Local(slot)),
+                rhs: Box::new(Expr::Local(limit)),
+            }),
+            ty: Ty::Bool,
+        };
+
+        Some(vec![
+            Stmt::Assign {
+                local: slot,
+                value: start,
+            },
+            Stmt::Assign {
+                local: limit,
+                value: stop,
+            },
+            Stmt::Assign {
+                local: stride,
+                value: step,
+            },
+            Stmt::While { cond, body },
+        ])
     }
 
     fn condition(&mut self, expr: &ast::Expr, depth: u32) -> Option<Expr> {
@@ -412,10 +825,7 @@ impl FnChecker<'_> {
             _ => {
                 self.diags.push(
                     range,
-                    format!(
-                        "arithmetic needs numbers, found {} and {}",
-                        lhs.1, rhs.1
-                    ),
+                    format!("arithmetic needs numbers, found {} and {}", lhs.1, rhs.1),
                 );
                 None
             }
@@ -426,6 +836,63 @@ impl FnChecker<'_> {
         self.coerce(expr, ty, &Ty::F64, range)
     }
 
+    /// Put a scalar in a one-element buffer so it can broadcast.
+    fn splat(&mut self, expr: Expr, ty: Ty, range: TextRange) -> Option<(Expr, Vec<usize>)> {
+        match ty {
+            Ty::Tensor { shape, .. } => Some((expr, shape)),
+            other => {
+                let value = self.as_f64(expr, other, range)?;
+                let dest = self.buffer(&Ty::F64);
+                Some((
+                    Expr::Splat {
+                        dest,
+                        value: Box::new(value),
+                    },
+                    vec![1],
+                ))
+            }
+        }
+    }
+
+    fn elementwise(
+        &mut self,
+        kernel: &'static str,
+        lhs: (Expr, Ty),
+        rhs: (Expr, Ty),
+        range: TextRange,
+    ) -> Option<(Expr, Ty)> {
+        let (lhs_expr, lhs_shape) = self.splat(lhs.0, lhs.1, range)?;
+        let (rhs_expr, rhs_shape) = self.splat(rhs.0, rhs.1, range)?;
+        let Some(out_shape) = broadcast(&lhs_shape, &rhs_shape) else {
+            self.diags.push(
+                range,
+                format!("shapes {lhs_shape:?} and {rhs_shape:?} do not broadcast"),
+            );
+            return None;
+        };
+        let rank = out_shape.len();
+        let ty = Ty::Tensor {
+            dtype: Dtype::F64,
+            shape: out_shape.clone(),
+        };
+        let dest = self.buffer(&ty);
+        Some((
+            Expr::Elementwise {
+                kernel,
+                dest,
+                lhs: Box::new(lhs_expr),
+                rhs: Box::new(rhs_expr),
+                desc: Desc {
+                    rank: rank as u32,
+                    lhs: padded(&lhs_shape, rank),
+                    rhs: padded(&rhs_shape, rank),
+                    out: padded(&out_shape, rank),
+                },
+            },
+            ty,
+        ))
+    }
+
     fn binop(
         &mut self,
         op: ast::Operator,
@@ -434,6 +901,22 @@ impl FnChecker<'_> {
         rhs_ast: &ast::Expr,
         range: TextRange,
     ) -> Option<(Expr, Ty)> {
+        if matches!(lhs.1, Ty::Tensor { .. }) || matches!(rhs.1, Ty::Tensor { .. }) {
+            let kernel = match op {
+                ast::Operator::Add => "k_add",
+                ast::Operator::Sub => "k_sub",
+                ast::Operator::Mult => "k_mul",
+                ast::Operator::Div => "k_div",
+                ast::Operator::Pow => return self.tensor_pow(lhs, rhs, rhs_ast, range),
+                _ => {
+                    self.diags
+                        .push(range, "tensors support `+ - * / **` in this phase");
+                    return None;
+                }
+            };
+            return self.elementwise(kernel, lhs, rhs, range);
+        }
+
         let arith = match op {
             ast::Operator::Add => Arith::Add,
             ast::Operator::Sub => Arith::Sub,
@@ -512,11 +995,7 @@ impl FnChecker<'_> {
         rhs_ast: &ast::Expr,
         range: TextRange,
     ) -> Option<(Expr, Ty)> {
-        if let ast::Expr::Constant(c) = rhs_ast
-            && let ast::Constant::Int(n) = &c.value
-            && let Some(n) = n.to_u32()
-            && n <= 16
-        {
+        if let Some(n) = literal_exponent(rhs_ast) {
             let ty = match lhs.1 {
                 Ty::F64 => Num::F64,
                 Ty::I64 => Num::I64,
@@ -546,6 +1025,33 @@ impl FnChecker<'_> {
         ))
     }
 
+    /// The same rule as scalars, one kernel call per multiplication.
+    fn tensor_pow(
+        &mut self,
+        lhs: (Expr, Ty),
+        rhs: (Expr, Ty),
+        rhs_ast: &ast::Expr,
+        range: TextRange,
+    ) -> Option<(Expr, Ty)> {
+        let Some(n) = literal_exponent(rhs_ast) else {
+            return self.elementwise("k_pow", lhs, rhs, range);
+        };
+        if !matches!(lhs.1, Ty::Tensor { .. }) || n == 0 {
+            return self.elementwise("k_pow", lhs, rhs, range);
+        }
+        let base = Expr::Tensor(lhs.0.buffer());
+        let base_ty = lhs.1.clone();
+        let mut acc = lhs;
+        for _ in 1..n {
+            let next = match &base {
+                Expr::Tensor(id) => Expr::Tensor(*id),
+                _ => unreachable!("a tensor operand has a buffer"),
+            };
+            acc = self.elementwise("k_mul", acc, (next, base_ty.clone()), range)?;
+        }
+        Some(acc)
+    }
+
     fn expr(&mut self, expr: &ast::Expr, depth: u32) -> Option<(Expr, Ty)> {
         if depth > MAX_DEPTH {
             self.diags.push(expr.range(), "nested too deeply");
@@ -572,8 +1078,9 @@ impl FnChecker<'_> {
                     None
                 }
             },
-            ast::Expr::Name(name) => match self.names.get(name.id.as_str()).copied() {
-                Some(slot) => Some((Expr::Local(slot), self.locals[slot as usize].clone())),
+            ast::Expr::Name(name) => match self.names.get(name.id.as_str()) {
+                Some(Binding::Scalar { slot, ty }) => Some((Expr::Local(*slot), ty.clone())),
+                Some(Binding::Tensor { buf, ty }) => Some((Expr::Tensor(*buf), ty.clone())),
                 None => {
                     self.diags
                         .push(name.range, format!("`{}` is not defined", name.id.as_str()));
@@ -597,7 +1104,7 @@ impl FnChecker<'_> {
                         Some((Expr::Not(Box::new(operand)), Ty::Bool))
                     }
                     ast::UnaryOp::UAdd => match ty {
-                        Ty::F64 | Ty::I64 => Some((operand, ty)),
+                        Ty::F64 | Ty::I64 | Ty::Tensor { .. } => Some((operand, ty)),
                         other => {
                             self.diags
                                 .push(u.range, format!("unary `+` needs a number, found {other}"));
@@ -605,14 +1112,24 @@ impl FnChecker<'_> {
                         }
                     },
                     ast::UnaryOp::USub => {
+                        if matches!(ty, Ty::Tensor { .. }) {
+                            let dest = self.buffer(&ty);
+                            let count = elems(&ty);
+                            return Some((
+                                Expr::TensorNeg {
+                                    dest,
+                                    operand: Box::new(operand),
+                                    elems: count,
+                                },
+                                ty,
+                            ));
+                        }
                         let op = match ty {
                             Ty::F64 => Intrinsic::NegF64,
                             Ty::I64 => Intrinsic::NegI64,
                             other => {
-                                self.diags.push(
-                                    u.range,
-                                    format!("unary `-` needs a number, found {other}"),
-                                );
+                                self.diags
+                                    .push(u.range, format!("unary `-` needs a number, found {other}"));
                                 return None;
                             }
                         };
@@ -659,6 +1176,11 @@ impl FnChecker<'_> {
                 let cond = self.condition(&c.test, depth)?;
                 let (then, then_ty) = self.expr(&c.body, depth)?;
                 let (els, els_ty) = self.expr(&c.orelse, depth)?;
+                if matches!(then_ty, Ty::Tensor { .. }) || matches!(els_ty, Ty::Tensor { .. }) {
+                    self.diags
+                        .push(c.range, "a conditional expression cannot yield a tensor");
+                    return None;
+                }
                 let (then, els, ty) = if then_ty == els_ty {
                     (then, els, then_ty)
                 } else {
@@ -682,12 +1204,85 @@ impl FnChecker<'_> {
                     ty,
                 ))
             }
+            ast::Expr::Subscript(sub) => {
+                let (source, index, len) = self.index_of(sub, depth)?;
+                Some((
+                    Expr::Element {
+                        source: Box::new(source),
+                        index: Box::new(index),
+                        len,
+                    },
+                    Ty::F64,
+                ))
+            }
             ast::Expr::Call(call) => self.call(call, depth),
             other => {
                 self.diags.push(other.range(), expr_refusal(other));
                 None
             }
         }
+    }
+
+    /// `v[i]` and `m[i, j]`, flattened to one row-major offset.
+    fn index_of(&mut self, sub: &ast::ExprSubscript, depth: u32) -> Option<(Expr, Expr, u32)> {
+        let (source, ty) = self.expr(&sub.value, depth)?;
+        let Ty::Tensor { shape, .. } = ty else {
+            self.diags.push(sub.range, format!("{ty} cannot be indexed"));
+            return None;
+        };
+        let indices: Vec<&ast::Expr> = match sub.slice.as_ref() {
+            ast::Expr::Tuple(parts) => parts.elts.iter().collect(),
+            single => vec![single],
+        };
+        if indices.len() != shape.len() {
+            self.diags.push(
+                sub.range,
+                format!(
+                    "a rank-{} tensor needs {} indices, found {}",
+                    shape.len(),
+                    shape.len(),
+                    indices.len()
+                ),
+            );
+            return None;
+        }
+
+        let len: u32 = shape.iter().product::<usize>() as u32;
+        let mut offset: Option<Expr> = None;
+        for (which, index) in indices.iter().enumerate() {
+            let stride: i64 = shape[which + 1..].iter().product::<usize>() as i64;
+            let (lowered, index_ty) = self.expr(index, depth)?;
+            let lowered = self.coerce(lowered, index_ty, &Ty::I64, index.range())?;
+            if let Expr::I64(constant) = lowered
+                && !(0..shape[which] as i64).contains(&constant)
+            {
+                self.diags.push(
+                    index.range(),
+                    format!("index {constant} is outside 0..{} for this axis", shape[which]),
+                );
+                return None;
+            }
+            let term = if stride == 1 {
+                lowered
+            } else {
+                Expr::Arith {
+                    op: Arith::Mul,
+                    ty: Num::I64,
+                    lhs: Box::new(lowered),
+                    rhs: Box::new(Expr::I64(stride)),
+                }
+            };
+            offset = Some(match offset {
+                None => term,
+                Some(acc) => Expr::Arith {
+                    op: Arith::Add,
+                    ty: Num::I64,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(term),
+                },
+            });
+        }
+        Some((source, offset.expect("rank is at least one"), len))
     }
 
     /// Python's chained comparisons, which evaluate each operand once and
@@ -708,8 +1303,11 @@ impl FnChecker<'_> {
         // Every operand but the last is read twice, so each lands in a slot
         // before the chain that reads it.
         let mut slots = Vec::with_capacity(operands.len());
-        for (expr, ty) in &operands {
-            let _ = expr;
+        for (_, ty) in &operands {
+            if matches!(ty, Ty::Tensor { .. }) {
+                self.diags.push(c.range, "tensors do not compare");
+                return None;
+            }
             slots.push(self.temp(ty.clone()));
         }
 
@@ -730,14 +1328,10 @@ impl FnChecker<'_> {
         // that far, matching Python's short-circuit.
         let mut built = acc;
         for (i, (expr, _)) in operands.into_iter().enumerate().rev() {
-            built = if i < 2 {
-                Expr::Store {
-                    local: slots[i],
-                    value: Box::new(expr),
-                    then: Box::new(built),
-                }
-            } else {
-                bind_before(slots[i], expr, built, i)
+            built = Expr::Store {
+                local: slots[i],
+                value: Box::new(expr),
+                then: Box::new(built),
             };
         }
         Some((built, Ty::Bool))
@@ -763,11 +1357,14 @@ impl FnChecker<'_> {
                 return None;
             }
             ast::CmpOp::In | ast::CmpOp::NotIn => {
-                self.diags
-                    .push(range, "`in` is not supported in this phase");
+                self.diags.push(range, "`in` is not supported in this phase");
                 return None;
             }
         };
+        if matches!(lhs.1, Ty::Tensor { .. }) || matches!(rhs.1, Ty::Tensor { .. }) {
+            self.diags.push(range, "tensors do not compare");
+            return None;
+        }
         if lhs.1 == Ty::Bool && rhs.1 == Ty::Bool {
             return match cmp {
                 Cmp::Eq | Cmp::Ne => Some((
@@ -821,14 +1418,29 @@ impl FnChecker<'_> {
                 );
                 return None;
             }
+            self.calls.push(index);
             let wanted: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
             let ret = sig.ret.clone();
+            let buffer_abi = self.frames[index as usize].buffer_abi;
             let mut args = Vec::with_capacity(wanted.len());
             for (arg, want) in call.args.iter().zip(&wanted) {
                 let (lowered, got) = self.expr(arg, depth)?;
                 args.push(self.coerce(lowered, got, want, arg.range())?);
             }
-            return Some((Expr::Call { index, args }, ret));
+            return Some(if buffer_abi {
+                let dest = matches!(ret, Ty::Tensor { .. }).then(|| self.buffer(&ret));
+                (
+                    Expr::BufferCall {
+                        index,
+                        args,
+                        dest,
+                        ret: ret.clone(),
+                    },
+                    ret,
+                )
+            } else {
+                (Expr::Call { index, args }, ret)
+            });
         }
 
         self.builtin(name, call, depth)
@@ -846,6 +1458,48 @@ impl FnChecker<'_> {
                 false
             }
         };
+
+        match name {
+            "dot" => {
+                if !arity(2, self) {
+                    return None;
+                }
+                let lhs = self.expr(&call.args[0], depth)?;
+                let rhs = self.expr(&call.args[1], depth)?;
+                return self.dot(lhs, rhs, call.range);
+            }
+            "sum" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                let (source, ty) = self.expr(&call.args[0], depth)?;
+                if !matches!(ty, Ty::Tensor { .. }) {
+                    self.diags
+                        .push(call.range, format!("`sum` needs a tensor, found {ty}"));
+                    return None;
+                }
+                return Some((
+                    Expr::Sum {
+                        source: Box::new(source),
+                        elems: elems(&ty),
+                    },
+                    Ty::F64,
+                ));
+            }
+            "len" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                let (_, ty) = self.expr(&call.args[0], depth)?;
+                let Ty::Tensor { shape, .. } = &ty else {
+                    self.diags
+                        .push(call.range, format!("`len` needs a tensor, found {ty}"));
+                    return None;
+                };
+                return Some((Expr::I64(shape[0] as i64), Ty::I64));
+            }
+            _ => {}
+        }
 
         if let Some(kernel) = transcendental(name) {
             if !arity(1, self) {
@@ -986,16 +1640,78 @@ impl FnChecker<'_> {
             }
         }
     }
+
+    /// nox's contraction rules, for the ranks this phase has.
+    fn dot(&mut self, lhs: (Expr, Ty), rhs: (Expr, Ty), range: TextRange) -> Option<(Expr, Ty)> {
+        let (Ty::Tensor { shape: a, .. }, Ty::Tensor { shape: b, .. }) = (&lhs.1, &rhs.1) else {
+            self.diags.push(range, "`dot` needs two tensors");
+            return None;
+        };
+        let (a, b) = (a.clone(), b.clone());
+        match (a.as_slice(), b.as_slice()) {
+            ([n], [m]) if n == m => Some((
+                Expr::Dot {
+                    lhs: Box::new(lhs.0),
+                    rhs: Box::new(rhs.0),
+                    len: *n as u32,
+                },
+                Ty::F64,
+            )),
+            ([rows, cols], [k]) if cols == k => {
+                let (rows, cols) = (*rows, *cols);
+                let ty = Ty::Tensor {
+                    dtype: Dtype::F64,
+                    shape: vec![rows],
+                };
+                let dest = self.buffer(&ty);
+                Some((
+                    Expr::MatMul {
+                        dest,
+                        lhs: Box::new(lhs.0),
+                        rhs: Box::new(rhs.0),
+                        m: rows as u32,
+                        k: cols as u32,
+                        n: 1,
+                    },
+                    ty,
+                ))
+            }
+            ([rows, inner], [k, cols]) if inner == k => {
+                let (rows, inner, cols) = (*rows, *inner, *cols);
+                let ty = Ty::Tensor {
+                    dtype: Dtype::F64,
+                    shape: vec![rows, cols],
+                };
+                let dest = self.buffer(&ty);
+                Some((
+                    Expr::MatMul {
+                        dest,
+                        lhs: Box::new(lhs.0),
+                        rhs: Box::new(rhs.0),
+                        m: rows as u32,
+                        k: inner as u32,
+                        n: cols as u32,
+                    },
+                    ty,
+                ))
+            }
+            _ => {
+                self.diags
+                    .push(range, format!("shapes {a:?} and {b:?} do not contract"));
+                None
+            }
+        }
+    }
 }
 
-/// Wrap `body` so `expr` lands in `local` first, without disturbing the
-/// short-circuit structure the chain already has.
-fn bind_before(local: u32, expr: Expr, body: Expr, _position: usize) -> Expr {
-    Expr::Store {
-        local,
-        value: Box::new(expr),
-        then: Box::new(body),
-    }
+fn literal_exponent(expr: &ast::Expr) -> Option<u32> {
+    let ast::Expr::Constant(c) = expr else {
+        return None;
+    };
+    let ast::Constant::Int(n) = &c.value else {
+        return None;
+    };
+    n.to_u32().filter(|n| *n <= 16)
 }
 
 fn transcendental(name: &str) -> Option<&'static str> {
@@ -1017,10 +1733,8 @@ fn transcendental(name: &str) -> Option<&'static str> {
 
 fn always_returns(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        Stmt::Return(_) => true,
-        Stmt::If { then, els, .. } => {
-            !els.is_empty() && always_returns(then) && always_returns(els)
-        }
+        Stmt::Return(_) | Stmt::ReturnBuffer { .. } => true,
+        Stmt::If { then, els, .. } => !els.is_empty() && always_returns(then) && always_returns(els),
         _ => false,
     })
 }
@@ -1032,7 +1746,7 @@ fn refusal(stmt: &ast::Stmt) -> &'static str {
         }
         ast::Stmt::ClassDef(_) => "classes are not supported in this phase",
         ast::Stmt::Delete(_) => "`del` is not supported",
-        ast::Stmt::For(_) | ast::Stmt::AsyncFor(_) => "`for` is not supported in this phase",
+        ast::Stmt::AsyncFor(_) => "`async for` is not supported",
         ast::Stmt::With(_) | ast::Stmt::AsyncWith(_) => "`with` is not supported",
         ast::Stmt::Match(_) => "`match` is not supported",
         ast::Stmt::Raise(_) => "`raise` is not supported; a fault is a trap here",
@@ -1059,9 +1773,7 @@ fn expr_refusal(expr: &ast::Expr) -> &'static str {
         ast::Expr::Starred(_) => "argument unpacking is not supported",
         ast::Expr::NamedExpr(_) => "`:=` is not supported",
         ast::Expr::Attribute(_) => "attribute access arrives with frames, in Phase 1",
-        ast::Expr::Subscript(_) | ast::Expr::Slice(_) => {
-            "indexing arrives with tensors, in Phase 0's M3"
-        }
+        ast::Expr::Slice(_) => "slicing is not supported in this phase",
         ast::Expr::Tuple(_) => "tuples are not supported",
         _ => "this expression is not supported",
     }

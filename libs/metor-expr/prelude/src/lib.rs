@@ -29,34 +29,16 @@
 //! this module at all: the compiler emits native wasm opcodes for it, and only
 //! reaches in here for the functions wasm has no instruction for.
 //!
-//! ## The arena
+//! ## Where the compiler's buffers go
 //!
-//! [`expr_arena`] hands back the base of a fixed `static mut` block. Argument
-//! and return buffers for tensor-typed functions are carved out of it by the
-//! compiler at fixed offsets, which is what lets a generated `expr_arg_ptr`
-//! be a constant plus a call. Reserving it in the guest source rather than
-//! appending data segments keeps the linker's memory layout authoritative —
-//! nothing the compiler adds can land on the shadow stack.
+//! This crate reserves nothing for them. Everything above the linker's
+//! `__heap_base` is unclaimed — there is no allocator here to claim it — so
+//! the compiler lays argument, return, and temporary buffers out from that
+//! address, appends data segments for the ones with constant contents, and
+//! raises the memory minimum to cover the rest. The layout is the compiler's,
+//! and `__heap_base` is the linker's own statement of where it may begin.
 
 #![no_std]
-
-/// Bytes of linear memory the compiler may carve argument, return, and
-/// spill buffers out of.
-pub const ARENA_LEN: usize = 16 * 1024;
-
-static mut ARENA: [u8; ARENA_LEN] = [0; ARENA_LEN];
-
-/// Base address of the compiler-owned arena in linear memory.
-#[unsafe(no_mangle)]
-pub extern "C" fn expr_arena() -> u32 {
-    &raw const ARENA as u32
-}
-
-/// Bytes available at [`expr_arena`].
-#[unsafe(no_mangle)]
-pub extern "C" fn expr_arena_len() -> u32 {
-    ARENA_LEN as u32
-}
 
 macro_rules! unary {
     ($($name:ident),* $(,)?) => {

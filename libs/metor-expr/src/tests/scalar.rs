@@ -309,7 +309,6 @@ fn the_subset_refuses_what_it_does_not_implement() {
         ("def f() -> f64:\n    del x\n    return 1.0\n", "del"),
         ("def f() -> f64:\n    global g\n    return 1.0\n", "globals"),
         ("def f() -> f64:\n    yield 1.0\n", "yield"),
-        ("def f() -> f64:\n    for i in range(3):\n        pass\n    return 1.0\n", "for"),
         ("def f() -> f64:\n    def g() -> f64:\n        return 1.0\n    return 1.0\n", "nested"),
         ("def f(x) -> f64:\n    return 1.0\n", "annotated"),
         ("def f(x: f64):\n    return 1.0\n", "return type"),
@@ -321,7 +320,8 @@ fn the_subset_refuses_what_it_does_not_implement() {
         ("def f() -> f64:\n    return 1 @ 2\n", "`@`"),
         ("def f() -> f64:\n    return 1 & 2\n", "bitwise"),
         ("def f() -> f64:\n    return ~1\n", "`~`"),
-        ("def f() -> f64:\n    return x[0]\n", "indexing"),
+        ("def f(x: f64) -> f64:\n    return x[0]\n", "cannot be indexed"),
+        ("def f(v: Tensor[f64, 3]) -> f64:\n    return v[0:2]\n", "slicing"),
         ("def f() -> f64:\n    return a.b\n", "attribute"),
     ] {
         let diags = reject(source);

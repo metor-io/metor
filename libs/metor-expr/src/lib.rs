@@ -31,6 +31,17 @@
 //! wasm opcodes; the prelude is entered for transcendentals, for tensor
 //! kernels, and for nothing else.
 //!
+//! ## Tensors are addresses
+//!
+//! Every tensor in a compiled program lives at an address the compiler picked,
+//! above the linker's `__heap_base`. That is what makes kernel call sites
+//! constant — an elementwise operation is `i32.const desc; call $k_add`, where
+//! `desc` is a data segment holding both operand addresses and all three
+//! shapes — and it is why the guest needs no allocator. It also gives the
+//! host ABI its shape: a function whose signature mentions a tensor takes no
+//! wasm parameters, and is driven through `<name>_arg_ptr(i)`, `<name>()`,
+//! `<name>_ret_ptr()`. See [`FnSig::uses_buffers`].
+//!
 //! ## The pipeline
 //!
 //! [`compile`] is three passes and no more. `rustpython-parser` produces a
@@ -128,6 +139,23 @@ pub struct FnSig {
     pub name: String,
     pub params: Vec<(String, Ty)>,
     pub ret: Ty,
+}
+
+impl FnSig {
+    /// Whether this function crosses through static buffers rather than by
+    /// value.
+    ///
+    /// A tensor anywhere in the signature moves the whole signature into
+    /// memory: the host writes argument `i` at `<name>_arg_ptr(i)`, calls
+    /// `<name>()`, and reads the result at `<name>_ret_ptr()`. Scalar-only
+    /// functions keep taking and returning wasm values.
+    pub fn uses_buffers(&self) -> bool {
+        matches!(self.ret, Ty::Tensor { .. })
+            || self
+                .params
+                .iter()
+                .any(|(_, ty)| matches!(ty, Ty::Tensor { .. }))
+    }
 }
 
 /// What the host needs in order to call a compiled module.
