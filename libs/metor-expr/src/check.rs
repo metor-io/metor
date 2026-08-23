@@ -40,7 +40,47 @@ use crate::{FnSig, Manifest, Ty};
 /// that a pathological input is a diagnostic rather than a blown stack.
 const MAX_DEPTH: u32 = 96;
 
+/// The largest source this crate will look at. A panel expression is tens of
+/// bytes and a systems module is a few thousand, so the only thing this
+/// excludes is an input designed to be expensive.
+const MAX_SOURCE_BYTES: usize = 256 * 1024;
+
+/// Stack for the parse. `rustpython-parser` builds and drops its AST
+/// recursively, so nesting depth costs stack — measured to abort a 2 MiB
+/// thread somewhere between ten and fifty thousand levels. Bounding the source
+/// bounds the depth, and this leaves room for the worst case that bound allows.
+const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 pub(crate) fn check(source: &str) -> Result<(Program, Manifest), Diagnostics> {
+    if source.len() > MAX_SOURCE_BYTES {
+        let mut diags = Diagnostics::default();
+        let at = MAX_SOURCE_BYTES as u32;
+        diags.push(
+            Span::new(at, source.len() as u32),
+            format!("source is larger than the {MAX_SOURCE_BYTES} byte limit"),
+        );
+        return Err(diags);
+    }
+
+    // `rustpython-parser` is foreign code at this crate's edge, and `compile`
+    // owes its callers a diagnostic rather than an unwind for any input at
+    // all. Both concerns are met by running the parse somewhere with room and
+    // treating a panic as one more way the source can be bad.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(PARSE_STACK_BYTES)
+            .spawn_scoped(scope, || check_inner(source))
+            .expect("spawning the parse thread")
+            .join()
+            .unwrap_or_else(|_| {
+                let mut diags = Diagnostics::default();
+                diags.push(Span::new(0, 0), "the parser could not handle this source");
+                Err(diags)
+            })
+    })
+}
+
+fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
     let mut diags = Diagnostics::default();
 
     let module = match ast::Suite::parse(source, "<expr>") {

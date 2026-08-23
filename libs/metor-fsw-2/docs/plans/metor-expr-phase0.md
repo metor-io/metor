@@ -240,8 +240,10 @@ harness oracle **at fixed shapes**, which is where it is correct and well
 exercised; the oracle must not use `Dyn`. Nothing touches `src/noxpr/`, which
 is not even compiled today (`nox/src/lib.rs` declares no `mod noxpr`).
 
-The three `Dyn` bugs are left in place and unreported-on here beyond this note —
-they are nox's to fix, and this crate no longer depends on them.
+The three `Dyn` bugs — `dynamic.rs:61`'s sum-where-it-means-product, and the
+`dot` panic inside faer that follows from it — are **reported upstream for a
+separate fix** and deliberately left alone here. nox is not modified by this
+work, and this crate no longer depends on the path they affect.
 
 **One more thing the harness has to know.** Guest `libm::exp(1.0)` and host
 `f64::exp(1.0)` differ by 1 ULP (`2.7182818284590455` vs `2.718281828459045`).
