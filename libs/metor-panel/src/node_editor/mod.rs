@@ -16,6 +16,8 @@ pub mod coordinator;
 pub mod graph;
 pub mod inspector_rows;
 pub mod pane;
+pub mod projected_view;
+pub mod projection;
 pub mod registry;
 pub mod spec;
 pub mod validate;

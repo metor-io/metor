@@ -14,16 +14,32 @@ use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL, Health};
 use crate::dynamic::ops::{db_source, persist};
 use crate::dynamic::resolver::DbResolver;
 use crate::inspector::rows::TextField;
+use crate::node_editor::projected_view::{self, Placements};
+use crate::node_editor::projection::{self, Position, Projection};
 use crate::node_editor::worker::DynamicWorker;
 use crate::theme::theme;
 use crate::tiles::PaneItem;
 
-/// The pane's whole persisted state: the source is the artifact, and
-/// everything else is derived from it on load.
+/// The pane's whole persisted state.
+///
+/// The source is the artifact — everything the canvas shows is derived from it
+/// on load. Layout is the one thing that is not, because the source has no
+/// business knowing where a card sits, so positions ride alongside as a
+/// sidecar keyed by system name.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ProgramPaneConfig {
-    #[serde(default)]
     pub source: String,
+    pub graph: bool,
+    pub placements: Vec<Placement>,
+}
+
+/// Where one system's card sits, remembered across a reload.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Placement {
+    pub system: String,
+    pub x: f32,
+    pub y: f32,
 }
 
 /// One system as the pane knows it: what runs it, what it publishes, and
@@ -50,6 +66,13 @@ pub struct ProgramPane {
     /// Spans the last compile complained about, paired with their messages.
     diagnostics: Vec<(std::ops::Range<usize>, String)>,
     rebuild: Option<Task<()>>,
+    /// The program as a graph, re-derived on every successful compile. Read
+    /// only: proving the projection is this phase's job, editing through it is
+    /// the next one's.
+    projection: Projection,
+    placements: Placements,
+    /// Whether the pane is showing the canvas or the text it comes from.
+    graph: bool,
 }
 
 impl ProgramPane {
@@ -67,6 +90,13 @@ impl ProgramPane {
             running: Vec::new(),
             diagnostics: Vec::new(),
             rebuild: None,
+            projection: Projection::default(),
+            placements: cfg
+                .placements
+                .into_iter()
+                .map(|p| (p.system, Position { x: p.x, y: p.y }))
+                .collect(),
+            graph: cfg.graph,
         };
         this.schedule_rebuild(cx);
         this
@@ -126,6 +156,7 @@ impl ProgramPane {
         // Dropping what is left cancels the tasks of every system the edit
         // removed, and only those.
         self.running = kept;
+        self.projection = projection::project(&compiled.manifest, &self.placements);
         self.paint_diagnostics(cx);
         cx.notify();
     }
@@ -241,6 +272,22 @@ impl ProgramPane {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        // The canvas is a view of the text, so one key turns it over rather
+        // than the two being separate places to be.
+        let mods = &event.keystroke.modifiers;
+        let primary = if cfg!(target_os = "macos") {
+            mods.platform
+        } else {
+            mods.control
+        };
+        if primary && event.keystroke.key.as_str() == "g" {
+            self.graph = !self.graph;
+            cx.notify();
+            return;
+        }
+        if self.graph {
+            return;
+        }
         if self.editor.handle_key_down(event, cx) {
             self.editor.follow_cursor();
             self.schedule_rebuild(cx);
@@ -274,14 +321,18 @@ impl Render for ProgramPane {
             .flex()
             .flex_col()
             .bg(theme.bg_primary)
-            .child(
-                div()
+            .child(match self.graph {
+                true => div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(projected_view::render(&self.projection, (0.0, 0.0), cx)),
+                false => div()
                     .flex_1()
                     .p_2()
                     .overflow_hidden()
                     .text_size(px(12.0))
                     .child(self.editor.lines_element()),
-            )
+            })
             .child(status(self, cx))
     }
 }
@@ -349,6 +400,16 @@ impl PaneItem for ProgramPane {
     fn to_config(&self, _cx: &App) -> ProgramPaneConfig {
         ProgramPaneConfig {
             source: self.editor.text.clone(),
+            graph: self.graph,
+            placements: self
+                .placements
+                .iter()
+                .map(|(system, at)| Placement {
+                    system: system.clone(),
+                    x: at.x,
+                    y: at.y,
+                })
+                .collect(),
         }
     }
 }

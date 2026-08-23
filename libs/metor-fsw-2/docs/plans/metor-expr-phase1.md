@@ -343,3 +343,149 @@ Decisions the plan left open:
   grant stops evaluating, records why for the pane, and keeps draining
   its inputs — a reader that stops moving would make its *producer* drop
   samples, so parking silently would damage everything upstream.
+
+**The second risk, also resolved without its fallback.** The plan
+allowed an `$EDITOR` watch-and-reload workflow "if a real editor widget
+balloons". It did not: `TextField` gained multi-line editing *in place*
+— newline insert, line-wise movement holding the column, cross-line
+selection, a scroll follow that measures its own viewport in prepaint,
+and diagnostic underlines — in about 200 lines on top of what was
+already there for cursor movement, selection, and the clipboard. The
+pane is a real editor and the fallback is unused.
+
+One bug the tests caught, worth recording because it is the run rule's
+whole subtlety: the first implementation drained the non-driving inputs
+at the *top* of the loop, before awaiting the driving one. That makes an
+evaluation see the newest each input had published *as of the last time
+the system fired*, which is one cycle stale and silently wrong. Draining
+after the driving sample arrives is what the rule actually says, and
+`a_system_fires_on_its_driving_input_and_holds_the_rest` fails on the
+other order. The fix needed the driving reader to be a field of its own
+rather than an entry in a list, since only disjoint fields can be
+borrowed across an await.
+
+8 runtime tests; 324 panel tests green.
+
+### P5 — `=` fields
+
+`ExpressionRow` is pinned into `component_picker_rows`, so every
+consumer of that picker gained expression mode at once. It rests on two
+hooks the inspector already had: `consumes_search`, which keeps a row
+visible whatever the query, and `activate_with_search`, which hands the
+row the query as its input. A picker's search text *is* the expression —
+there is no second field to open and nothing to fuzzy-match against.
+
+`dynamic/expressions.rs` owns the lifetime rule. The registry holds
+`Weak` handles and never keeps an expression alive: a view holds the
+strong `Arc`, two views typing the same text reach the same content hash
+and share one running system, and the entry falls out once neither is
+left. No reference counts are kept by hand and nothing has to be told
+when a view goes away.
+
+`a_later_ambiguity_does_not_disturb_what_was_already_resolved` pins the
+plan's stability contract in both directions: a bare name records the
+path its suffix search found, and a second component with that suffix
+arriving later makes *fresh* authoring a diagnostic listing the
+candidates, while a saved binding keeps reading exactly what it read
+before. Nothing re-runs the suffix search, which is the point of
+recording the resolution rather than the text.
+
+**Monitor bindings work; plot series cannot, and the plan is why.**
+Monitor takes `impl ComponentStreamBuilder`, which `Arc<dyn DynamicNode>`
+already implements, so a view-owned expression feeds it with no db
+registration exactly as specified. The time-series plot does not read a
+stream: `line_plot.rs` calls `wait_for_component(&db, trace_id).await`
+and then reads `component.time_series`, the *history* store. A view-owned
+node has a ring and no history, so a trace bound to one waits forever and
+draws nothing.
+
+The two requirements — "no db registration" and "plot series as a first
+consumer" — are therefore incompatible as written, and the general shape
+is that **view-owned-and-unregistered only serves instantaneous
+readouts**: value strips, traffic lights, text. Even the monitor's own
+sparkline is a `LinePlot` and comes up blank for the same reason. This
+needs a decision rather than an improvisation, and the two candidates
+are:
+
+1. Register `=` outputs as *hidden* db components, content-hash named.
+   `hidden` already exists for exactly this ("derived series: queryable
+   by id, excluded from live streams and UI listings"), it gives
+   history, LoD, and alarms for free, and every existing view works
+   unchanged. Ephemerality becomes a *lifetime* question — drop the
+   component when no view references it — rather than a registration
+   one. This is also what the codebase already says: `Persist` exists
+   precisely so a node's output can be plotted.
+2. Give the plot an in-memory trace source. A new data path, much
+   larger, duplicating what the time series already does.
+
+(1) is the recommendation. Until it is settled, P5 ships the picker, the
+lifetime rule, the stability test, and the monitor consumer.
+
+### P6 — read-only projection
+
+`node_editor/projection.rs` is the projection *function* — `Manifest`
+plus remembered positions, to cards and edges — deliberately separate
+from anything that paints, because it is the part Phase 2 builds on.
+Edges are recovered from names, which is the design's claim made
+testable: `edges_are_recovered_from_names_and_lay_out_left_to_right`
+compiles three chained bindings and asserts the edges that nothing else
+recorded. `node_editor/projected_view.rs` paints it; the program pane
+hosts it behind a toggle, and cards are labelled read-only because they
+are.
+
+What Phase 2 needs to know about the data model:
+
+- **A card is identified by its system name, not by an index.** Names
+  are what edges are recovered from and what layout is keyed by, so a
+  rename is a real migration; an index would have hidden that.
+- **An edge is `(producer, producer field) → (consumer, consumer port)`,
+  and a multi-field frame read from one producer is one edge, not one
+  per field.** The canvas connects frames, so a rebinding gesture
+  rewrites one `bind` entry.
+- **Layout is a `name → position` sidecar** in `ProgramPaneConfig`, with
+  a deterministic column fallback keyed on depth from the raw
+  components. A program nobody has arranged still reads correctly; one
+  that has been arranged keeps it.
+- **Depths settle in one pass in declaration order**, because a binding
+  may only name an earlier declaration — which is also why the graph
+  cannot contain a cycle.
+
+### P6 — measurements
+
+Apple silicon, `--release`, from `dynamic/ops/program_measure.rs`.
+
+**Keystroke to updated plot.** The 200 ms debounce is the wait by
+design; what matters is that nothing *behind* it is felt.
+
+| stage | time |
+|---|---|
+| compile (`compile_module` + wasmi `Module::new`) | **0.26 ms** |
+| instantiate and wire the system and its field node | **0.01 ms** |
+| first sample through to the output | 2.10 ms |
+| total behind the debounce | **2.38 ms** |
+
+**Rebuild with state.** Snapshot the old instance, recompile, build the
+new one seeded from the snapshot: **0.28 ms**, and the low-pass continued
+from 50.0 to 62.5 rather than restarting at its default.
+
+**A three-system chain against three legacy nodes.** One Python system
+computing `(rpm * 9.81 + 3.0) * 0.5` against the three `affine` nodes it
+replaces, 2048 samples each, delivered end to end:
+
+| form | ns/sample |
+|---|---|
+| one Python system | 3555 |
+| three legacy nodes | 3383 |
+
+Within 5%, which is the finding. These figures are dominated by task
+scheduling rather than by arithmetic — M4 priced the same expression at
+32 ns and 5 fuel *per eval* — so what they establish is that the
+one-liner costs nothing for its convenience: it is delivered as fast as
+the three nodes, and the graph it replaces is three nodes and two edges
+smaller.
+
+One measurement artifact worth recording, because it would mislead
+anyone repeating it: pushing all 2048 samples before draining loses the
+same fraction for *both* forms — a disruptor drops on full, and the
+first attempt saw exactly 512 of 2048 either way. That measures the ring,
+not the work. The feed goes in drainable chunks for this reason.
