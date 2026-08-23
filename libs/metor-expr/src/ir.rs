@@ -60,8 +60,19 @@ pub(crate) struct Func {
 
 pub(crate) struct SystemAbi {
     /// One block per state field, addressed individually because snapshot and
-    /// restore work field by field.
+    /// restore work field by field, followed by the seed guard — which is a
+    /// state slot like any other, so a host that restores a snapshot marks the
+    /// instance seeded with the same byte copy it uses for everything else.
     pub state: Vec<BufId>,
+    /// What the first evaluation writes into the state slots, for the
+    /// defaults a fresh linear memory does not already supply.
+    pub seeds: Vec<Seed>,
+}
+
+pub(crate) struct Seed {
+    pub dest: BufId,
+    pub ty: Ty,
+    pub value: crate::Init,
 }
 
 /// Shapes for one elementwise call site, already right-aligned to a common
@@ -204,7 +215,10 @@ pub(crate) enum Expr {
     Tensor(BufId),
     /// A scalar living in a buffer rather than a local: a frame field, a state
     /// slot, or a projected port.
-    Load { buf: BufId, ty: Ty },
+    Load {
+        buf: BufId,
+        ty: Ty,
+    },
     /// Elementwise arithmetic writing into `dest`, broadcasting per `desc`.
     Elementwise {
         kernel: &'static str,

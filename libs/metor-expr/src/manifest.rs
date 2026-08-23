@@ -92,6 +92,18 @@ pub enum Init {
     Fill(f64),
 }
 
+impl Init {
+    /// Whether a fresh linear memory already holds this value, in which case
+    /// the seed needs no instructions.
+    pub fn is_zero(&self) -> bool {
+        match self {
+            Init::F64(v) | Init::Fill(v) => v.to_bits() == 0,
+            Init::I64(v) => *v == 0,
+            Init::Bool(v) => !*v,
+        }
+    }
+}
+
 /// One `@system`: its ports, its output, its state, and what makes it fire.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct System {

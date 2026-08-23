@@ -111,10 +111,9 @@ fn nox_values<const N: usize>(t: Tensor<f64, Const<N>, ArrayRepr>) -> Vec<f64> {
 
 #[test]
 fn a_tensor_signature_moves_the_whole_function_into_memory() {
-    let module = compile(
-        "def scale(v: Tensor[f64, 3], k: f64) -> Tensor[f64, 3]:\n    return v * k\n",
-    )
-    .unwrap();
+    let module =
+        compile("def scale(v: Tensor[f64, 3], k: f64) -> Tensor[f64, 3]:\n    return v * k\n")
+            .unwrap();
     let sig = &module.manifest.functions[0];
     assert!(sig.uses_buffers());
     assert_eq!(
@@ -179,9 +178,8 @@ fn a_scalar_broadcasts_against_a_tensor() {
     );
     let _ = got;
 
-    let wasm = build(
-        "def f(v: Tensor[f64, 3], k: f64) -> Tensor[f64, 3]:\n    return v * k + 1.0\n",
-    );
+    let wasm =
+        build("def f(v: Tensor[f64, 3], k: f64) -> Tensor[f64, 3]:\n    return v * k + 1.0\n");
     let mut driver = Driver::new(&wasm, "f");
     driver.write(0, &v);
     driver.write_scalar(1, 2.5);
@@ -206,11 +204,7 @@ fn rank_two_broadcasts_right_aligned() {
         &[&m, &row],
         9,
     );
-    let want: Vec<f64> = m
-        .iter()
-        .enumerate()
-        .map(|(i, x)| x + row[i % 3])
-        .collect();
+    let want: Vec<f64> = m.iter().enumerate().map(|(i, x)| x + row[i % 3]).collect();
     assert_eq!(bits(&got), bits(&want));
 
     for source in [
@@ -232,8 +226,14 @@ fn small_shapes_open_code_and_large_ones_call_kernels() {
     };
     let small = build(&source(3));
     let large = build(&source(200));
-    assert!(!reaches_kernels(&small), "a length-3 add must be open-coded");
-    assert!(reaches_kernels(&large), "a length-200 add must call kernels");
+    assert!(
+        !reaches_kernels(&small),
+        "a length-3 add must be open-coded"
+    );
+    assert!(
+        reaches_kernels(&large),
+        "a length-200 add must call kernels"
+    );
 
     for n in [3usize, 200] {
         let a: Vec<f64> = (0..n).map(|i| i as f64 * 0.25 - 1.0).collect();
@@ -276,9 +276,7 @@ fn negation_and_powers_agree_with_nox() {
 #[test]
 fn indexing_reads_constant_and_variable_positions() {
     let v = [10.0f64, 20.0, 30.0];
-    let wasm = build(
-        "def pick(v: Tensor[f64, 3], i: i64) -> f64:\n    return v[i]\n",
-    );
+    let wasm = build("def pick(v: Tensor[f64, 3], i: i64) -> f64:\n    return v[i]\n");
     for (i, want) in v.iter().enumerate() {
         let mut driver = Driver::new(&wasm, "pick");
         driver.write(0, &v);
@@ -347,7 +345,6 @@ fn for_range_drives_a_reduction() {
     driver.write(0, &v);
     driver.run().unwrap();
     assert_eq!(driver.read_scalar(), (1.5 + 2.25) + -3.0);
-
 }
 
 #[test]
@@ -371,8 +368,14 @@ fn range_variants_count_up_and_down() {
     );
     assert_eq!(super::run_i64(&wasm, "up", &[super::iv(5)]), 1 + 2 + 3 + 4);
     assert_eq!(super::run_i64(&wasm, "up", &[super::iv(0)]), 0);
-    assert_eq!(super::run_i64(&wasm, "span", &[super::iv(2), super::iv(6)]), 2 + 3 + 4 + 5);
-    assert_eq!(super::run_i64(&wasm, "down", &[super::iv(0), super::iv(4)]), 4 + 3 + 2 + 1);
+    assert_eq!(
+        super::run_i64(&wasm, "span", &[super::iv(2), super::iv(6)]),
+        2 + 3 + 4 + 5
+    );
+    assert_eq!(
+        super::run_i64(&wasm, "down", &[super::iv(0), super::iv(4)]),
+        4 + 3 + 2 + 1
+    );
 }
 
 #[test]
@@ -380,9 +383,8 @@ fn dot_and_sum_agree_with_nox() {
     let a = [1.5f64, -2.25, 3.75];
     let b = [0.5f64, 4.0, -1.25];
 
-    let wasm = build(
-        "def inner(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return dot(a, b)\n",
-    );
+    let wasm =
+        build("def inner(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return dot(a, b)\n");
     let mut driver = Driver::new(&wasm, "inner");
     driver.write(0, &a);
     driver.write(1, &b);
@@ -418,7 +420,8 @@ fn matrix_products_agree_with_nox() {
         &[&m, &v],
         2,
     );
-    let nm: Tensor<f64, (Const<2>, Const<3>), ArrayRepr> = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]].into();
+    let nm: Tensor<f64, (Const<2>, Const<3>), ArrayRepr> =
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]].into();
     let nv: Tensor<f64, Const<3>, ArrayRepr> = v.into();
     let want = nm.dot(&nv).into_inner().view().buf().to_vec();
     assert_eq!(bits(&got), bits(&want));
@@ -553,17 +556,36 @@ fn a_contraction_is_not_fused() {
         fused.to_bits(),
         "if nox stopped fusing, this note and the harness docs are stale"
     );
-    assert_eq!(fused.to_bits(), v[0].mul_add(v[0], v[1].mul_add(v[1], v[2] * v[2])).to_bits());
+    assert_eq!(
+        fused.to_bits(),
+        v[0].mul_add(v[0], v[1].mul_add(v[1], v[2] * v[2]))
+            .to_bits()
+    );
 }
 
 #[test]
 fn tensor_rejections_carry_spans() {
     for (source, needle) in [
-        ("def f(v: Tensor[f64, 0]) -> f64:\n    return v[0]\n", "positive constant"),
-        ("def f(v: Tensor[i64, 3]) -> f64:\n    return v[0]\n", "Tensor[f64"),
-        ("def f(v: Tensor[f64]) -> f64:\n    return v[0]\n", "Tensor[f64, N]"),
-        ("def f(x: f64) -> f64:\n    return x[0]\n", "cannot be indexed"),
-        ("def f(m: Tensor[f64, (2, 3)]) -> f64:\n    return m[0]\n", "needs 2 indices"),
+        (
+            "def f(v: Tensor[f64, 0]) -> f64:\n    return v[0]\n",
+            "positive constant",
+        ),
+        (
+            "def f(v: Tensor[i64, 3]) -> f64:\n    return v[0]\n",
+            "Tensor[f64",
+        ),
+        (
+            "def f(v: Tensor[f64]) -> f64:\n    return v[0]\n",
+            "Tensor[f64, N]",
+        ),
+        (
+            "def f(x: f64) -> f64:\n    return x[0]\n",
+            "cannot be indexed",
+        ),
+        (
+            "def f(m: Tensor[f64, (2, 3)]) -> f64:\n    return m[0]\n",
+            "needs 2 indices",
+        ),
         (
             "def f(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> bool:\n    return a == b\n",
             "do not compare",
@@ -576,7 +598,10 @@ fn tensor_rejections_carry_spans() {
             "def f(a: Tensor[f64, 3], b: Tensor[f64, 2]) -> f64:\n    return dot(a, b)\n",
             "do not contract",
         ),
-        ("def f(x: f64) -> f64:\n    return sum(x)\n", "needs a tensor"),
+        (
+            "def f(x: f64) -> f64:\n    return sum(x)\n",
+            "needs a tensor",
+        ),
     ] {
         let diags = reject(source);
         assert!(

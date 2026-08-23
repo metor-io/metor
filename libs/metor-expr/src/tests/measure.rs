@@ -43,7 +43,11 @@ fn median_micros(source: &str, runs: u32) -> f64 {
 /// Timings are only meaningful from a release build, so a debug run takes
 /// enough samples to report a number and no more.
 fn scaled(runs: u32) -> u32 {
-    if cfg!(debug_assertions) { runs / 100 } else { runs }
+    if cfg!(debug_assertions) {
+        runs / 100
+    } else {
+        runs
+    }
 }
 
 /// Cost per evaluation, and fuel per evaluation, driving a module the way a
@@ -82,7 +86,11 @@ fn compile_latency_is_inside_the_panel_budget() {
     println!("compile latency ({profile}): one-liner {one:.0} us, 100-line {many:.0} us");
 
     // The panel debounces at 200 ms; a keystroke must never feel this.
-    let budget = if cfg!(debug_assertions) { 20_000.0 } else { 1_000.0 };
+    let budget = if cfg!(debug_assertions) {
+        20_000.0
+    } else {
+        1_000.0
+    };
     assert!(
         one < budget,
         "a one-liner took {one:.0} us against a {budget:.0} us {profile} budget"
@@ -101,8 +109,24 @@ fn module_size_is_reported_three_ways() {
         let plan = Template::parse(PRELUDE)
             .unwrap()
             .plan(&[
-                "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow",
-                "fmod_floor", "k_add", "k_sub", "k_mul", "k_div", "k_neg", "k_dot", "k_matmul",
+                "sin",
+                "cos",
+                "tan",
+                "asin",
+                "acos",
+                "atan",
+                "atan2",
+                "exp",
+                "log",
+                "pow",
+                "fmod_floor",
+                "k_add",
+                "k_sub",
+                "k_mul",
+                "k_div",
+                "k_neg",
+                "k_dot",
+                "k_matmul",
                 "k_sum",
             ])
             .unwrap();

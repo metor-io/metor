@@ -27,15 +27,17 @@ use std::collections::HashMap;
 
 use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
-use crate::ir::{Arith, BufId, Cmp, Desc, Emit, Expr, Func, Intrinsic, Num, Place, Program, Stmt};
+use crate::ir::{
+    Arith, BufId, Cmp, Desc, Emit, Expr, Func, Intrinsic, Num, Place, Program, Seed, Stmt,
+};
 use crate::template::Template;
-use crate::{PRELUDE, Ty};
+use crate::{COMPILER_VERSION, Init, Manifest, PRELUDE, Ty};
 
 /// Bytes an elementwise descriptor occupies: three addresses, a rank, and
 /// three shapes of four axes.
 const DESC_BYTES: u32 = 16 * 4;
 
-pub(crate) fn emit(program: &Program) -> Vec<u8> {
+pub(crate) fn emit(program: &Program, manifest: &Manifest) -> Vec<u8> {
     let kernels = program.kernels();
     let plan = Template::parse(PRELUDE)
         .expect("the checked-in prelude parses")
@@ -75,8 +77,10 @@ pub(crate) fn emit(program: &Program) -> Vec<u8> {
             (Some(_), _) => splice.ty(vec![ValType::I64], vec![ValType::I32]),
             (None, true) => splice.ty(vec![], vec![ValType::I32]),
             (None, false) => {
-                let params: Vec<ValType> =
-                    func.locals[..func.param_count].iter().map(val_type).collect();
+                let params: Vec<ValType> = func.locals[..func.param_count]
+                    .iter()
+                    .map(val_type)
+                    .collect();
                 splice.ty(params, vec![val_type(&func.ret)])
             }
         })
@@ -85,8 +89,15 @@ pub(crate) fn emit(program: &Program) -> Vec<u8> {
     let mut descriptors: Vec<u8> = Vec::new();
     let mut indices = Vec::with_capacity(program.funcs.len());
     for (func, ty) in program.funcs.iter().zip(&types) {
-        let body =
-            Emitter::new(func, program, &kernel_index, base, &layout, &mut descriptors).finish(func);
+        let body = Emitter::new(
+            func,
+            program,
+            &kernel_index,
+            base,
+            &layout,
+            &mut descriptors,
+        )
+        .finish(func);
         indices.push(splice.function(*ty, body));
     }
 
@@ -121,8 +132,27 @@ pub(crate) fn emit(program: &Program) -> Vec<u8> {
     if !descriptors.is_empty() {
         splice.data(layout.descriptors, descriptors.clone());
     }
-    splice.reserve_memory(layout.descriptors + descriptors.len() as u32);
 
+    // Describe, then read: the manifest the host was handed and the one the
+    // module carries are the same bytes, so a module that outlives its
+    // compilation still says what it is.
+    let described = postcard::to_allocvec(manifest).expect("a manifest is postcard-encodable");
+    let at = layout.descriptors + descriptors.len() as u32;
+    let end = at + described.len() as u32;
+    splice.data(at, described.clone());
+    for (name, value) in [
+        ("expr_abi_version", COMPILER_VERSION as i32),
+        ("expr_describe", described.len() as i32),
+        ("expr_manifest_ptr", at as i32),
+    ] {
+        let mut body = Function::new([]);
+        body.instruction(&Instruction::I32Const(value));
+        body.instruction(&Instruction::End);
+        let index = splice.function(nullary, body);
+        splice.export(name, index);
+    }
+
+    splice.reserve_memory(end);
     splice.finish()
 }
 
@@ -208,6 +238,11 @@ impl<'a> Emitter<'a> {
             self.push(Instruction::I32Const(self.layout.at(*buf) as i32));
             self.push(load_of(ty));
             self.push(Instruction::LocalSet(*slot));
+        }
+        if let Some(abi) = &func.system
+            && let Some(guard) = abi.state.last()
+        {
+            self.seed(self.layout.at(*guard), &abi.seeds);
         }
         self.block(&func.body);
         if func.buffer_abi {
@@ -633,6 +668,51 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+    }
+
+    /// The first evaluation's one extra job: write the annotated defaults into
+    /// the state slots, once.
+    ///
+    /// The guard is why instantiation needs no host-side init walk, and it is
+    /// also what makes restore safe — a host that seeds a rebuilt instance
+    /// from a snapshot writes the guard along with the slots, and this never
+    /// runs.
+    fn seed(&mut self, guard: u32, seeds: &[Seed]) {
+        self.push(Instruction::I32Const(guard as i32));
+        self.push(Instruction::I32Load(mem_arg(2)));
+        self.push(Instruction::I32Eqz);
+        self.push(Instruction::If(BlockType::Empty));
+        self.depth += 1;
+        self.push(Instruction::I32Const(guard as i32));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Store(mem_arg(2)));
+        for seed in seeds {
+            let at = self.layout.at(seed.dest);
+            let (constant, store, stride) = match seed.value {
+                Init::F64(v) | Init::Fill(v) => (
+                    Instruction::F64Const(v.into()),
+                    Instruction::F64Store(mem_arg(3)),
+                    8,
+                ),
+                Init::I64(v) => (
+                    Instruction::I64Const(v),
+                    Instruction::I64Store(mem_arg(3)),
+                    8,
+                ),
+                Init::Bool(v) => (
+                    Instruction::I32Const(v as i32),
+                    Instruction::I32Store(mem_arg(2)),
+                    8,
+                ),
+            };
+            for i in 0..slot_bytes(&seed.ty) / stride {
+                self.push(Instruction::I32Const((at + i * stride) as i32));
+                self.push(constant.clone());
+                self.push(store.clone());
+            }
+        }
+        self.depth -= 1;
+        self.push(Instruction::End);
     }
 
     /// Evaluate a value and put it in a buffer — a tensor by copy, a scalar

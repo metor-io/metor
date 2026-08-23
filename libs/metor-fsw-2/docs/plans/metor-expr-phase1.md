@@ -222,3 +222,69 @@ Compile latency is unmoved (147 µs one-liner, 386 µs 100-line).
 `negation_and_powers_agree_with_nox` — at length 3 it no longer does —
 and `small_shapes_open_code_and_large_ones_call_kernels` pins the split
 in both directions plus the agreement across it.
+
+### P2 — the language layer
+
+`lang.rs` is the new front half: it reads classes and decorators and
+reduces all three tiers to one `SystemDecl`, so nothing downstream can
+tell which tier wrote a system. `resolve.rs` is the whole of the
+dependency on a host — `component` / `suffix` / `frame`, asked once.
+`manifest.rs` carries what a host needs to drive a module and is the
+type both `expr_describe` and the panel read.
+
+Decisions taken while implementing, none of them departures from the
+plan but all of them things the plan left open:
+
+- **A frame's name is the snake case of its class, for output frames as
+  well as ports.** Edges are recovered from names, so a system returning
+  `Imu` and a port typed `Imu` have to arrive at the same string from
+  the same class. `bind=` overrides the port's side only, which is
+  exactly what makes it a rebinding.
+- **A port reading an earlier anonymous binding gets its frame from the
+  checker, not the frontend.** `biggest = scaled[0] + scaled[1]` needs
+  `scaled`'s type, and `scaled`'s type is whatever its body computes —
+  which is not known until it has been checked. So `PortDecl::frame` is
+  optional and the checker fills it from the producer it has already
+  finished. Bindings may only reference *earlier* declarations, so the
+  producer is always available.
+- **Every field occupies eight bytes.** A frame is one block the host
+  addresses with `<system>_arg_ptr(i)`, with each field at a constant
+  offset; keeping every element eight-aligned means no host reasons
+  about packing and no `f64` load straddles. A `bool` uses the low four.
+- **`now()` is a builtin, not an IR node.** A system's wasm signature is
+  `(i64) -> i32`, so `now` is local 0 and `now()` reads it. Outside a
+  system it is a diagnostic.
+
+Three Phase 0 rejection tests changed message, all because module level
+now holds more than `def`: `import math`, a bare `class A`, and `a.b`
+in a body (which is now "`a` is not a frame here"). 83 tests green.
+
+### P3 — the ABI layer
+
+`expr_abi_version()` / `expr_describe()` / `expr_manifest_ptr()`, all
+`i32` — addresses are `i32` on wasm32 and a manifest is far short of
+2 GB, so an `i64` length would be ceremony. The manifest rides as a
+postcard data segment, and `the_embedded_manifest_equals_the_host_side_one`
+asserts the two are the same object for a plain module, a stateful
+system, and a bare expression.
+
+**One extension to the plan's guard mechanism, because the plan's
+version has a hole.** The plan says state seeds itself on first call
+behind a guard flag, and separately that restore happens before the
+first `eval` of a rebuilt instance. Those two cannot both hold: the
+first `eval` would seed its defaults straight over what restore just
+wrote. So the guard is addressable — it is slot `state.len()` of
+`<system>_state_ptr(i)`, one past the state fields. A host that restores
+a snapshot writes the guard with the same byte copy it uses for
+everything else, and the seed code never runs. `state::guards` names
+those slots; `a_changed_triple_resets_that_field_and_nothing_else` and
+`state_survives_a_rebuild_that_keeps_the_triple` pin both directions.
+
+Zero defaults emit no seed instructions at all, since a fresh linear
+memory already holds them — so the common `= 0.0` costs only the guard
+check (about 4 fuel per evaluation).
+
+`state.rs` holds the keying and the matching rule and touches no wasm
+instance: it hands back slot indices to pass to `<system>_state_ptr(i)`
+and byte counts, because both hosts already own an instance and read
+memory their own way. 89 tests green.

@@ -105,6 +105,7 @@ mod ir;
 mod lang;
 mod manifest;
 mod resolve;
+pub mod state;
 pub mod template;
 
 pub use diag::{Diagnostic, Diagnostics, Span};
@@ -112,6 +113,14 @@ pub use manifest::{
     Binding, COMPILER_VERSION, Field, FnSig, Frame, Init, Manifest, Port, StateField, System,
 };
 pub use resolve::{CompSchema, FrameSchema, Resolver, Unresolved};
+
+/// Decode the manifest a module carries behind `expr_manifest_ptr`.
+///
+/// A compiled module says what it is without the compiler that made it, which
+/// is what lets one be saved, uplinked, or handed to a different host.
+pub fn describe(bytes: &[u8]) -> Result<Manifest, postcard::Error> {
+    postcard::from_bytes(bytes)
+}
 
 /// The guest template generated functions are appended to.
 ///
@@ -197,7 +206,7 @@ pub fn compile_expr(source: &str, resolver: &dyn Resolver) -> Result<Program, Di
 
 fn emit((program, manifest): (ir::Program, Manifest)) -> Result<Program, Diagnostics> {
     Ok(Program {
-        wasm: codegen::emit(&program),
+        wasm: codegen::emit(&program, &manifest),
         manifest,
     })
 }

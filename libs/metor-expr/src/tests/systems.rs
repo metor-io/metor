@@ -18,10 +18,10 @@ use crate::{
 
 /// A host that knows a fixed set of components — what the panel's db vtables
 /// are, in miniature.
-struct Table(HashMap<String, Ty>);
+pub(super) struct Table(HashMap<String, Ty>);
 
 impl Table {
-    fn new(entries: &[(&str, Ty)]) -> Self {
+    pub(super) fn new(entries: &[(&str, Ty)]) -> Self {
         Table(
             entries
                 .iter()
@@ -196,7 +196,7 @@ class Rate(Frame):
     hot: bool
 ";
 
-fn imu_table() -> Table {
+pub(super) fn imu_table() -> Table {
     Table::new(&[
         ("imu.omega", vec3()),
         ("imu.accel", vec3()),
@@ -235,7 +235,9 @@ def watchdog(imu: Imu) -> Rate:
 /// and the manifest records what it resolved to rather than what was written.
 #[test]
 fn ports_bind_by_frame_name_and_the_manifest_records_the_paths() {
-    let source = format!("{IMU}\n@system\ndef w(imu: Imu) -> Rate:\n    return Rate(rate=imu.omega[0], hot=False)\n");
+    let source = format!(
+        "{IMU}\n@system\ndef w(imu: Imu) -> Rate:\n    return Rate(rate=imu.omega[0], hot=False)\n"
+    );
     let program = compile_module(&source, &imu_table()).unwrap();
     let system = program.manifest.system("w").unwrap();
     assert_eq!(
@@ -368,7 +370,10 @@ biggest = scaled[0] + scaled[1] + scaled[2]
             field: 0
         }
     );
-    assert_eq!(program.manifest.system("scaled").unwrap().publishes, ["scaled"]);
+    assert_eq!(
+        program.manifest.system("scaled").unwrap().publishes,
+        ["scaled"]
+    );
 
     let mut run = Run::new(program, "scaled");
     run.set("adcs.omega_b", "omega_b", &[1.0, 2.0, 3.0]);
@@ -409,7 +414,10 @@ fn a_bare_name_resolves_by_unique_suffix_and_is_recorded_resolved() {
     let diags = compile_expr("rpm * 2.0", &crowded).unwrap_err();
     let text = format!("{diags}");
     assert!(text.contains("ambiguous"), "{text}");
-    assert!(text.contains("motor.rpm") && text.contains("wheels.rpm"), "{text}");
+    assert!(
+        text.contains("motor.rpm") && text.contains("wheels.rpm"),
+        "{text}"
+    );
 }
 
 #[test]

@@ -60,8 +60,8 @@ use rustpython_parser::{Parse, text_size::TextRange};
 
 use crate::diag::{Diagnostics, Span};
 use crate::ir::{
-    Arith, BufId, Cmp, Desc, Emit, Expr, FieldWrite, Func, Intrinsic, Num, Place, Program, Stmt,
-    SystemAbi,
+    Arith, BufId, Cmp, Desc, Emit, Expr, FieldWrite, Func, Intrinsic, Num, Place, Program, Seed,
+    Stmt, SystemAbi,
 };
 use crate::lang::{self, SystemDecl};
 use crate::manifest::{self, Frame, Port};
@@ -315,7 +315,9 @@ fn check_inner(
         let name = &sigs[cycle as usize].name;
         diags.push(
             defs[cycle as usize].range,
-            format!("`{name}` is recursive and passes tensors, whose buffers are statically placed"),
+            format!(
+                "`{name}` is recursive and passes tensors, whose buffers are statically placed"
+            ),
         );
     }
 
@@ -425,18 +427,28 @@ fn system(
         });
     }
 
-    let mut state_buffers = Vec::with_capacity(decl.state.len());
+    let mut state_buffers = Vec::with_capacity(decl.state.len() + 1);
+    let mut seeds = Vec::new();
     for slot in &decl.state {
         let buf = alloc(buffers, slot_bytes(&slot.field.ty));
         state_buffers.push(buf);
+        if !slot.field.default.is_zero() {
+            seeds.push(Seed {
+                dest: buf,
+                ty: slot.field.ty.clone(),
+                value: slot.field.default.clone(),
+            });
+        }
         let cell = Cell {
             buf,
             ty: slot.field.ty.clone(),
         };
-        match names.entry(slot.param.clone()).or_insert_with(|| Binding::Record {
-            fields: Vec::new(),
-            writable: true,
-        }) {
+        match names
+            .entry(slot.param.clone())
+            .or_insert_with(|| Binding::Record {
+                fields: Vec::new(),
+                writable: true,
+            }) {
             Binding::Record { fields, .. } => fields.push((slot.field.name.clone(), cell)),
             _ => {
                 diags.push(decl.span, format!("`{}` is already a port", slot.param));
@@ -445,10 +457,19 @@ fn system(
         }
     }
 
+    // The seed guard sits one past the state fields, so it is reachable
+    // through the same accessor and restores like any other slot.
+    if !state_buffers.is_empty() {
+        state_buffers.push(alloc(buffers, 8));
+    }
+
     // A declared output frame is placed before the body runs, so a `return`
     // can write straight into its fields. A bare expression's frame cannot be
     // — its type is what the body turns out to compute.
-    let placed = decl.output.as_ref().map(|frame| place_frame(buffers, frame));
+    let placed = decl
+        .output
+        .as_ref()
+        .map(|frame| place_frame(buffers, frame));
 
     let mut body = FnChecker {
         diags,
@@ -482,7 +503,9 @@ fn system(
             let (block, _) = placed.expect("a statement body declares its output");
             (
                 checked,
-                decl.output.clone().expect("a statement body declares its output"),
+                decl.output
+                    .clone()
+                    .expect("a statement body declares its output"),
                 block,
             )
         }
@@ -524,7 +547,8 @@ fn system(
             ret_buffer: Some(ret_block),
             prologue: Vec::new(),
             system: Some(SystemAbi {
-                state: state_buffers.clone(),
+                state: state_buffers,
+                seeds,
             }),
         },
         manifest::System {
@@ -709,9 +733,18 @@ struct Cell {
 }
 
 enum Binding {
-    Scalar { slot: u32, ty: Ty },
-    Tensor { buf: BufId, ty: Ty },
-    Cell { cell: Cell, writable: bool },
+    Scalar {
+        slot: u32,
+        ty: Ty,
+    },
+    Tensor {
+        buf: BufId,
+        ty: Ty,
+    },
+    Cell {
+        cell: Cell,
+        writable: bool,
+    },
     /// A frame or state parameter, addressed field by field. Input frames are
     /// read-only; state is what a system is allowed to keep.
     Record {
@@ -848,8 +881,10 @@ impl FnChecker<'_> {
                                 Some(vec![self.write_cell(&cell, expr)])
                             }
                             Some(_) => {
-                                self.diags
-                                    .push(target.range, format!("`{name}` is an input; it cannot be assigned"));
+                                self.diags.push(
+                                    target.range,
+                                    format!("`{name}` is an input; it cannot be assigned"),
+                                );
                                 None
                             }
                             None => Some(vec![self.bind(name, got, expr)]),
@@ -907,8 +942,10 @@ impl FnChecker<'_> {
                         return Some(vec![self.write_cell(&cell, expr)]);
                     }
                     Some(_) => {
-                        self.diags
-                            .push(aug.target.range(), format!("`{name}` is an input; it cannot be assigned"));
+                        self.diags.push(
+                            aug.target.range(),
+                            format!("`{name}` is an input; it cannot be assigned"),
+                        );
                         return None;
                     }
                     None => {
@@ -994,8 +1031,10 @@ impl FnChecker<'_> {
                 Some((self.read_cell(&cell), cell.ty))
             }
             Some(Binding::Record { .. }) => {
-                self.diags
-                    .push(range, format!("`{name}` is a frame; name one of its fields"));
+                self.diags.push(
+                    range,
+                    format!("`{name}` is a frame; name one of its fields"),
+                );
                 None
             }
             None => {
@@ -1034,11 +1073,13 @@ impl FnChecker<'_> {
     /// The cell a dotted path names, refusing anything a body may not write.
     fn writable_cell(&mut self, target: &ast::Expr) -> Option<Cell> {
         let ast::Expr::Attribute(attr) = target else {
-            self.diags.push(target.range(), "only names and fields can be assigned");
+            self.diags
+                .push(target.range(), "only names and fields can be assigned");
             return None;
         };
         let Some(head) = lang::dotted(&attr.value) else {
-            self.diags.push(target.range(), "only names and fields can be assigned");
+            self.diags
+                .push(target.range(), "only names and fields can be assigned");
             return None;
         };
         match self.names.get(&head) {
@@ -1056,12 +1097,15 @@ impl FnChecker<'_> {
                 }
             },
             Some(_) => {
-                self.diags
-                    .push(target.range(), format!("`{head}` is an input; it cannot be assigned"));
+                self.diags.push(
+                    target.range(),
+                    format!("`{head}` is an input; it cannot be assigned"),
+                );
                 None
             }
             None => {
-                self.diags.push(target.range(), format!("`{head}` is not defined"));
+                self.diags
+                    .push(target.range(), format!("`{head}` is not defined"));
                 None
             }
         }
@@ -1164,8 +1208,10 @@ impl FnChecker<'_> {
                 .push(loop_.range, "`for ... else` is not supported");
         }
         let ast::Expr::Name(target) = loop_.target.as_ref() else {
-            self.diags
-                .push(loop_.target.range(), "the loop variable must be a plain name");
+            self.diags.push(
+                loop_.target.range(),
+                "the loop variable must be a plain name",
+            );
             return None;
         };
         let ast::Expr::Call(call) = loop_.iter.as_ref() else {
@@ -1644,8 +1690,10 @@ impl FnChecker<'_> {
                             Ty::F64 => Intrinsic::NegF64,
                             Ty::I64 => Intrinsic::NegI64,
                             other => {
-                                self.diags
-                                    .push(u.range, format!("unary `-` needs a number, found {other}"));
+                                self.diags.push(
+                                    u.range,
+                                    format!("unary `-` needs a number, found {other}"),
+                                );
                                 return None;
                             }
                         };
@@ -1743,7 +1791,8 @@ impl FnChecker<'_> {
     fn index_of(&mut self, sub: &ast::ExprSubscript, depth: u32) -> Option<(Expr, Expr, u32)> {
         let (source, ty) = self.expr(&sub.value, depth)?;
         let Ty::Tensor { shape, .. } = ty else {
-            self.diags.push(sub.range, format!("{ty} cannot be indexed"));
+            self.diags
+                .push(sub.range, format!("{ty} cannot be indexed"));
             return None;
         };
         let indices: Vec<&ast::Expr> = match sub.slice.as_ref() {
@@ -1774,7 +1823,10 @@ impl FnChecker<'_> {
             {
                 self.diags.push(
                     index.range(),
-                    format!("index {constant} is outside 0..{} for this axis", shape[which]),
+                    format!(
+                        "index {constant} is outside 0..{} for this axis",
+                        shape[which]
+                    ),
                 );
                 return None;
             }
@@ -1873,7 +1925,8 @@ impl FnChecker<'_> {
                 return None;
             }
             ast::CmpOp::In | ast::CmpOp::NotIn => {
-                self.diags.push(range, "`in` is not supported in this phase");
+                self.diags
+                    .push(range, "`in` is not supported in this phase");
                 return None;
             }
         };
@@ -2268,7 +2321,9 @@ fn transcendental(name: &str) -> Option<&'static str> {
 fn always_returns(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
         Stmt::Return(_) | Stmt::ReturnBuffer { .. } | Stmt::ReturnFrame(_) => true,
-        Stmt::If { then, els, .. } => !els.is_empty() && always_returns(then) && always_returns(els),
+        Stmt::If { then, els, .. } => {
+            !els.is_empty() && always_returns(then) && always_returns(els)
+        }
         _ => false,
     })
 }

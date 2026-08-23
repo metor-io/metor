@@ -10,6 +10,7 @@
 //! the same computation is also evaluated natively against nox in-process, and
 //! the two must agree bit for bit.
 
+mod abi;
 mod differential;
 mod m0;
 mod measure;
@@ -112,7 +113,11 @@ pub(super) fn build(source: &str) -> Vec<u8> {
         Ok(module) => module,
         Err(diags) => panic!("expected {source:?} to compile, got:\n{diags}"),
     };
-    assert_eq!(imports(&module.wasm), 0, "compiled modules must stay closed");
+    assert_eq!(
+        imports(&module.wasm),
+        0,
+        "compiled modules must stay closed"
+    );
     module.wasm
 }
 

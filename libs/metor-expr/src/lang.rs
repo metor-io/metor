@@ -150,7 +150,10 @@ pub(crate) fn collect<'a>(
     let mut seen = HashSet::new();
     for decl in &decls {
         if !seen.insert(decl.name.clone()) {
-            diags.push(decl.span, format!("`{}` is declared more than once", decl.name));
+            diags.push(
+                decl.span,
+                format!("`{}` is declared more than once", decl.name),
+            );
         }
     }
 
@@ -173,7 +176,10 @@ fn class_decl(class: &ast::StmtClassDef, diags: &mut Diagnostics) -> Option<Clas
     let kind = match class.bases.as_slice() {
         [ast::Expr::Name(base)] => base.id.as_str(),
         _ => {
-            diags.push(class.range, "a class derives from exactly one of Frame or State");
+            diags.push(
+                class.range,
+                "a class derives from exactly one of Frame or State",
+            );
             return None;
         }
     };
@@ -193,7 +199,10 @@ fn class_decl(class: &ast::StmtClassDef, diags: &mut Diagnostics) -> Option<Clas
     for stmt in &class.body {
         let ast::Stmt::AnnAssign(ann) = stmt else {
             if !matches!(stmt, ast::Stmt::Pass(_)) {
-                diags.push(stmt.range(), "a Frame or State class holds annotated fields");
+                diags.push(
+                    stmt.range(),
+                    "a Frame or State class holds annotated fields",
+                );
             }
             continue;
         };
@@ -227,7 +236,10 @@ fn class_decl(class: &ast::StmtClassDef, diags: &mut Diagnostics) -> Option<Clas
 
 fn default_of(value: &ast::Expr, ty: &Ty, diags: &mut Diagnostics) -> Option<Init> {
     let bad = |diags: &mut Diagnostics| {
-        diags.push(value.range(), format!("a {ty} default is a literal of that type"));
+        diags.push(
+            value.range(),
+            format!("a {ty} default is a literal of that type"),
+        );
         None
     };
     let (negate, inner) = match value {
@@ -289,7 +301,10 @@ fn signature(
             Some(ann) => match ann.as_ref() {
                 ast::Expr::Name(n) => Some(n.id.as_str().to_string()),
                 other => {
-                    diags.push(other.range(), "a system parameter names a Frame or State class");
+                    diags.push(
+                        other.range(),
+                        "a system parameter names a Frame or State class",
+                    );
                     return None;
                 }
             },
@@ -403,7 +418,9 @@ fn system_decl<'a>(
             let Some(class) = class else {
                 diags.push(
                     def.range,
-                    format!("`{param}` needs a Frame annotation, or a component path in @system(...)"),
+                    format!(
+                        "`{param}` needs a Frame annotation, or a component path in @system(...)"
+                    ),
                 );
                 return None;
             };
@@ -442,7 +459,13 @@ fn system_decl<'a>(
             return None;
         }
         for ((param, _), path) in sig.params.iter().zip(&decorator.paths) {
-            ports.push(projected_port(param.clone(), path, resolver, def.range.into(), diags)?);
+            ports.push(projected_port(
+                param.clone(),
+                path,
+                resolver,
+                def.range.into(),
+                diags,
+            )?);
         }
     }
 
@@ -492,12 +515,14 @@ fn bind_frame(
     diags: &mut Diagnostics,
 ) -> Option<Vec<Binding>> {
     if let Some(system) = produced.get(&frame.name) {
-        return Some((0..frame.fields.len())
-            .map(|field| Binding::Produced {
-                system: *system,
-                field,
-            })
-            .collect());
+        return Some(
+            (0..frame.fields.len())
+                .map(|field| Binding::Produced {
+                    system: *system,
+                    field,
+                })
+                .collect(),
+        );
     }
     if let Some(schema) = resolver.frame(&frame.name) {
         let want: Vec<(String, Ty)> = frame
@@ -521,7 +546,10 @@ fn bind_frame(
             Some(schema) => {
                 diags.push(
                     span,
-                    format!("`{path}` is {}, but the frame declares {}", schema.ty, field.ty),
+                    format!(
+                        "`{path}` is {}, but the frame declares {}",
+                        schema.ty, field.ty
+                    ),
                 );
                 return None;
             }
@@ -544,14 +572,18 @@ struct Decorator {
 
 fn decorator(def: &ast::StmtFunctionDef, diags: &mut Diagnostics) -> Option<Decorator> {
     if def.decorator_list.len() != 1 {
-        diags.push(def.range, "a function carries at most one @system decorator");
+        diags.push(
+            def.range,
+            "a function carries at most one @system decorator",
+        );
         return None;
     }
     let mut out = Decorator::default();
     match &def.decorator_list[0] {
         ast::Expr::Name(n) if n.id.as_str() == "system" => Some(out),
         ast::Expr::Call(call) => {
-            let named = matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "system");
+            let named =
+                matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "system");
             if !named {
                 diags.push(call.range, "the only decorator is @system");
                 return None;
@@ -560,7 +592,10 @@ fn decorator(def: &ast::StmtFunctionDef, diags: &mut Diagnostics) -> Option<Deco
                 match string_of(arg) {
                     Some(path) => out.paths.push(path),
                     None => {
-                        diags.push(arg.range(), "a positional @system argument is a component path");
+                        diags.push(
+                            arg.range(),
+                            "a positional @system argument is a component path",
+                        );
                         return None;
                     }
                 }
@@ -573,10 +608,9 @@ fn decorator(def: &ast::StmtFunctionDef, diags: &mut Diagnostics) -> Option<Deco
                             return None;
                         };
                         for (key, value) in dict.keys.iter().zip(&dict.values) {
-                            let (Some(key), Some(value)) = (
-                                key.as_ref().and_then(string_of),
-                                string_of(value),
-                            ) else {
+                            let (Some(key), Some(value)) =
+                                (key.as_ref().and_then(string_of), string_of(value))
+                            else {
                                 diags.push(keyword.range, "`bind` maps strings to strings");
                                 return None;
                             };
@@ -685,14 +719,14 @@ fn anonymous<'a>(
             false => match resolver.suffix(&key).as_slice() {
                 [only] => only.clone(),
                 [] => {
-                    diags.push(span, format!("`{key}` is not defined and names no component"));
+                    diags.push(
+                        span,
+                        format!("`{key}` is not defined and names no component"),
+                    );
                     return None;
                 }
                 many => {
-                    diags.push(
-                        span,
-                        format!("`{key}` is ambiguous: {}", many.join(", ")),
-                    );
+                    diags.push(span, format!("`{key}` is ambiguous: {}", many.join(", ")));
                     return None;
                 }
             },

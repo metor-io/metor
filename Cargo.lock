@@ -9420,6 +9420,7 @@ dependencies = [
  "libm",
  "nox",
  "num-traits",
+ "postcard",
  "rustpython-parser",
  "serde",
  "wasm-encoder",
