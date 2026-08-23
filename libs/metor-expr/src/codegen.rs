@@ -12,6 +12,13 @@
 //! into a data segment. That is what "compile-time-constant shapes" and "no
 //! guest allocator" both cash out to.
 //!
+//! Most tensor operations never make that call. Once every address and extent
+//! is a constant, so is the kernel's broadcast odometer, and running it here
+//! leaves straight-line loads and stores that cost a fifth of the fuel — a
+//! length-3 `sum(a + b)` went from 752 to 21. The checker decides per
+//! operation, by size ([`Emit`]); the kernels stay for shapes large enough
+//! that unrolling would cost more bytes than the fuel is worth.
+//!
 //! Nothing here re-checks anything. The IR arrived from a single validation
 //! gate, so a `Call` index is in range, an operand type is already unified, and
 //! a condition is already `bool`.
@@ -20,7 +27,7 @@ use std::collections::HashMap;
 
 use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
-use crate::ir::{Arith, BufId, Cmp, Desc, Expr, Func, Intrinsic, Num, Program, Stmt};
+use crate::ir::{Arith, BufId, Cmp, Desc, Emit, Expr, Func, Intrinsic, Num, Program, Stmt};
 use crate::template::Template;
 use crate::{Manifest, PRELUDE, Ty};
 
@@ -418,12 +425,29 @@ impl<'a> Emitter<'a> {
                 lhs,
                 rhs,
                 desc,
+                emit,
             } => {
                 self.expr(lhs);
                 self.expr(rhs);
-                let at = self.descriptor(lhs.buffer(), rhs.buffer(), *dest, desc);
-                self.push(Instruction::I32Const(at as i32));
-                self.push(Instruction::Call(self.kernels[kernel]));
+                match emit {
+                    Emit::Kernel => {
+                        let at = self.descriptor(lhs.buffer(), rhs.buffer(), *dest, desc);
+                        self.push(Instruction::I32Const(at as i32));
+                        self.push(Instruction::Call(self.kernels[kernel]));
+                    }
+                    Emit::Open => {
+                        let a = self.layout.at(lhs.buffer());
+                        let b = self.layout.at(rhs.buffer());
+                        let out = self.layout.at(*dest);
+                        for (i, (l, r)) in broadcast_pairs(desc).into_iter().enumerate() {
+                            self.push(Instruction::I32Const((out + i as u32 * 8) as i32));
+                            self.load(a + l * 8);
+                            self.load(b + r * 8);
+                            self.scalar_of(kernel);
+                            self.push(Instruction::F64Store(mem_arg(3)));
+                        }
+                    }
+                }
             }
             Expr::Splat { dest, value } => {
                 self.push(Instruction::I32Const(self.layout.at(*dest) as i32));
@@ -434,24 +458,59 @@ impl<'a> Emitter<'a> {
                 dest,
                 operand,
                 elems,
+                emit,
             } => {
                 self.expr(operand);
-                self.push(Instruction::I32Const(self.layout.at(operand.buffer()) as i32));
-                self.push(Instruction::I32Const(self.layout.at(*dest) as i32));
-                self.push(Instruction::I32Const(*elems as i32));
-                self.push(Instruction::Call(self.kernels["k_neg"]));
+                let source = self.layout.at(operand.buffer());
+                let out = self.layout.at(*dest);
+                match emit {
+                    Emit::Kernel => {
+                        self.push(Instruction::I32Const(source as i32));
+                        self.push(Instruction::I32Const(out as i32));
+                        self.push(Instruction::I32Const(*elems as i32));
+                        self.push(Instruction::Call(self.kernels["k_neg"]));
+                    }
+                    Emit::Open => {
+                        for i in 0..*elems {
+                            self.push(Instruction::I32Const((out + i * 8) as i32));
+                            self.load(source + i * 8);
+                            self.push(Instruction::F64Neg);
+                            self.push(Instruction::F64Store(mem_arg(3)));
+                        }
+                    }
+                }
             }
             Expr::Element { source, index, len } => {
                 self.element_address(source, index, *len);
                 self.push(Instruction::F64Load(mem_arg(3)));
             }
-            Expr::Dot { lhs, rhs, len } => {
+            Expr::Dot {
+                lhs,
+                rhs,
+                len,
+                emit,
+            } => {
                 self.expr(lhs);
                 self.expr(rhs);
-                self.push(Instruction::I32Const(self.layout.at(lhs.buffer()) as i32));
-                self.push(Instruction::I32Const(self.layout.at(rhs.buffer()) as i32));
-                self.push(Instruction::I32Const(*len as i32));
-                self.push(Instruction::Call(self.kernels["k_dot"]));
+                let a = self.layout.at(lhs.buffer());
+                let b = self.layout.at(rhs.buffer());
+                match emit {
+                    Emit::Kernel => {
+                        self.push(Instruction::I32Const(a as i32));
+                        self.push(Instruction::I32Const(b as i32));
+                        self.push(Instruction::I32Const(*len as i32));
+                        self.push(Instruction::Call(self.kernels["k_dot"]));
+                    }
+                    Emit::Open => {
+                        self.push(Instruction::F64Const(0.0.into()));
+                        for i in 0..*len {
+                            self.load(a + i * 8);
+                            self.load(b + i * 8);
+                            self.push(Instruction::F64Mul);
+                            self.push(Instruction::F64Add);
+                        }
+                    }
+                }
             }
             Expr::MatMul {
                 dest,
@@ -460,22 +519,63 @@ impl<'a> Emitter<'a> {
                 m,
                 k,
                 n,
+                emit,
             } => {
                 self.expr(lhs);
                 self.expr(rhs);
-                self.push(Instruction::I32Const(self.layout.at(lhs.buffer()) as i32));
-                self.push(Instruction::I32Const(self.layout.at(rhs.buffer()) as i32));
-                self.push(Instruction::I32Const(self.layout.at(*dest) as i32));
-                for extent in [m, k, n] {
-                    self.push(Instruction::I32Const(*extent as i32));
+                let a = self.layout.at(lhs.buffer());
+                let b = self.layout.at(rhs.buffer());
+                let out = self.layout.at(*dest);
+                match emit {
+                    Emit::Kernel => {
+                        self.push(Instruction::I32Const(a as i32));
+                        self.push(Instruction::I32Const(b as i32));
+                        self.push(Instruction::I32Const(out as i32));
+                        for extent in [m, k, n] {
+                            self.push(Instruction::I32Const(*extent as i32));
+                        }
+                        self.push(Instruction::Call(self.kernels["k_matmul"]));
+                    }
+                    Emit::Open => {
+                        for row in 0..*m {
+                            for col in 0..*n {
+                                self.push(Instruction::I32Const(
+                                    (out + (row * n + col) * 8) as i32,
+                                ));
+                                self.push(Instruction::F64Const(0.0.into()));
+                                for i in 0..*k {
+                                    self.load(a + (row * k + i) * 8);
+                                    self.load(b + (i * n + col) * 8);
+                                    self.push(Instruction::F64Mul);
+                                    self.push(Instruction::F64Add);
+                                }
+                                self.push(Instruction::F64Store(mem_arg(3)));
+                            }
+                        }
+                    }
                 }
-                self.push(Instruction::Call(self.kernels["k_matmul"]));
             }
-            Expr::Sum { source, elems } => {
+            Expr::Sum {
+                source,
+                elems,
+                emit,
+            } => {
                 self.expr(source);
-                self.push(Instruction::I32Const(self.layout.at(source.buffer()) as i32));
-                self.push(Instruction::I32Const(*elems as i32));
-                self.push(Instruction::Call(self.kernels["k_sum"]));
+                let at = self.layout.at(source.buffer());
+                match emit {
+                    Emit::Kernel => {
+                        self.push(Instruction::I32Const(at as i32));
+                        self.push(Instruction::I32Const(*elems as i32));
+                        self.push(Instruction::Call(self.kernels["k_sum"]));
+                    }
+                    Emit::Open => {
+                        self.push(Instruction::F64Const(0.0.into()));
+                        for i in 0..*elems {
+                            self.load(at + i * 8);
+                            self.push(Instruction::F64Add);
+                        }
+                    }
+                }
             }
             Expr::BufferCall {
                 index,
@@ -516,6 +616,27 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Push the `f64` at a constant address.
+    fn load(&mut self, at: u32) {
+        self.push(Instruction::I32Const(at as i32));
+        self.push(Instruction::F64Load(mem_arg(3)));
+    }
+
+    /// The scalar form of an elementwise kernel. `pow` and `atan2` have no
+    /// instruction, so open coding calls them once per element — which is what
+    /// the kernel was doing anyway, minus the odometer around it.
+    fn scalar_of(&mut self, kernel: &str) {
+        match kernel {
+            "k_add" => self.push(Instruction::F64Add),
+            "k_sub" => self.push(Instruction::F64Sub),
+            "k_mul" => self.push(Instruction::F64Mul),
+            "k_div" => self.push(Instruction::F64Div),
+            "k_pow" => self.push(Instruction::Call(self.kernels["pow"])),
+            "k_atan2" => self.push(Instruction::Call(self.kernels["atan2"])),
+            other => unreachable!("`{other}` is not an elementwise kernel"),
         }
     }
 
@@ -794,6 +915,42 @@ impl<'a> Emitter<'a> {
             }
         }
     }
+}
+
+/// Which element of each operand feeds each output element — `k_add`'s
+/// odometer, run here instead of at every call.
+///
+/// The shapes in a [`Desc`] are already right-aligned to a common rank, so an
+/// axis of extent one simply contributes stride zero, exactly as the kernel's
+/// `broadcast_strides` arranges.
+fn broadcast_pairs(desc: &Desc) -> Vec<(u32, u32)> {
+    let rank = desc.rank as usize;
+    let strides = |shape: &[u32]| {
+        let mut row = vec![0u32; rank];
+        let mut acc = 1;
+        for axis in (0..rank).rev() {
+            row[axis] = if shape[axis] == 1 { 0 } else { acc };
+            acc *= shape[axis];
+        }
+        row
+    };
+    let (lhs, rhs) = (strides(&desc.lhs), strides(&desc.rhs));
+
+    let mut index = vec![0u32; rank];
+    let mut pairs = Vec::with_capacity(desc.out.iter().product::<u32>() as usize);
+    for _ in 0..desc.out.iter().product::<u32>() {
+        pairs.push((0..rank).fold((0, 0), |(l, r), axis| {
+            (l + index[axis] * lhs[axis], r + index[axis] * rhs[axis])
+        }));
+        for axis in (0..rank).rev() {
+            index[axis] += 1;
+            if index[axis] < desc.out[axis] {
+                break;
+            }
+            index[axis] = 0;
+        }
+    }
+    pairs
 }
 
 fn val_type_of(ty: Num) -> ValType {

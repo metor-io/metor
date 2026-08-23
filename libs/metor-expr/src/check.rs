@@ -59,7 +59,7 @@ use rustpython_parser::ast::{self, Ranged};
 use rustpython_parser::{Parse, text_size::TextRange};
 
 use crate::diag::{Diagnostics, Span};
-use crate::ir::{Arith, BufId, Cmp, Desc, Expr, Func, Intrinsic, Num, Program, Stmt};
+use crate::ir::{Arith, BufId, Cmp, Desc, Emit, Expr, Func, Intrinsic, Num, Program, Stmt};
 use crate::{Dtype, FnSig, Manifest, Ty};
 
 /// How deep an expression may nest before the checker refuses it. Bounded so
@@ -82,6 +82,26 @@ const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// The largest rank an annotation may declare. The kernels read four, and
 /// nothing in this phase writes more than two.
 const MAX_RANK: usize = 4;
+
+/// How many scalar element operations a tensor operation may need before it
+/// goes through a prelude kernel instead of being open-coded.
+///
+/// The M4 sweep found no crossover: a length-128 `dot` was still 2.5× cheaper
+/// unrolled, because a `call` plus the kernel's prologue is ~34 fuel and the
+/// broadcasting kernels pay a general odometer per element on top. So this
+/// bound is not where kernels start winning on time — it is where the unrolled
+/// bytes stop being worth it, and 128 is the largest length the sweep priced.
+const OPEN_CODE_MAX_OPS: usize = 128;
+
+/// Straight-line code while the operation is small enough to be worth its
+/// bytes, a kernel call once it is not.
+fn emit_for(ops: usize) -> Emit {
+    if ops <= OPEN_CODE_MAX_OPS {
+        Emit::Open
+    } else {
+        Emit::Kernel
+    }
+}
 
 pub(crate) fn check(source: &str) -> Result<(Program, Manifest), Diagnostics> {
     if source.len() > MAX_SOURCE_BYTES {
@@ -890,6 +910,7 @@ impl FnChecker<'_> {
                     rhs: padded(&rhs_shape, rank),
                     out: padded(&out_shape, rank),
                 },
+                emit: emit_for(out_shape.iter().product()),
             },
             ty,
         ))
@@ -1122,6 +1143,7 @@ impl FnChecker<'_> {
                                     dest,
                                     operand: Box::new(operand),
                                     elems: count,
+                                    emit: emit_for(count as usize),
                                 },
                                 ty,
                             ));
@@ -1480,10 +1502,12 @@ impl FnChecker<'_> {
                         .push(call.range, format!("`sum` needs a tensor, found {ty}"));
                     return None;
                 }
+                let count = elems(&ty);
                 return Some((
                     Expr::Sum {
                         source: Box::new(source),
-                        elems: elems(&ty),
+                        elems: count,
+                        emit: emit_for(count as usize),
                     },
                     Ty::F64,
                 ));
@@ -1656,6 +1680,7 @@ impl FnChecker<'_> {
                     lhs: Box::new(lhs.0),
                     rhs: Box::new(rhs.0),
                     len: *n as u32,
+                    emit: emit_for(*n),
                 },
                 Ty::F64,
             )),
@@ -1674,6 +1699,7 @@ impl FnChecker<'_> {
                         m: rows as u32,
                         k: cols as u32,
                         n: 1,
+                        emit: emit_for(rows * cols),
                     },
                     ty,
                 ))
@@ -1693,6 +1719,7 @@ impl FnChecker<'_> {
                         m: rows as u32,
                         k: inner as u32,
                         n: cols as u32,
+                        emit: emit_for(rows * inner * cols),
                     },
                     ty,
                 ))

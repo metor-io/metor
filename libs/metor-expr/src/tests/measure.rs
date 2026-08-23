@@ -141,42 +141,51 @@ fn evaluation_cost_is_reported() {
     println!("sin*cos: {nanos:.0} ns/eval, {fuel} fuel/eval");
 }
 
-/// The plan's open question: does a length-3 vector op pay a visible tax for
-/// going through a kernel instead of being open-coded? Both forms are
-/// expressible in the language, so both are compiled and measured, and the
-/// answer decides whether small constant shapes should open-code.
+/// M4 asked whether a length-3 vector op pays a visible tax for going through
+/// a kernel; the answer was 752 fuel against 14, and P1 acted on it. What this
+/// measures now is whether writing the *natural* form — `sum(a + b)`, one
+/// kernel-shaped expression — costs anything against spelling the same
+/// arithmetic out by hand, which is the property open coding was for.
+///
+/// Above `OPEN_CODE_MAX_OPS` the natural form goes back to calling kernels, so
+/// the sweep runs past the threshold to price that side too.
 #[test]
-fn kernel_call_overhead_against_open_coding() {
+fn the_natural_form_costs_what_the_hand_written_one_does() {
     // Elementwise, summed to a scalar so both forms return the same thing
     // without either needing a tensor destination.
-    let kernel = build(
-        "def f(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return sum(a + b)\n",
-    );
-    let open = build(
+    let natural =
+        build("def f(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return sum(a + b)\n");
+    let by_hand = build(
         "def f(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n\
          \x20   return (a[0] + b[0]) + (a[1] + b[1]) + (a[2] + b[2])\n",
     );
-    let (kernel_ns, kernel_fuel) = per_eval(&kernel, "f", &[], 200_000);
-    let (open_ns, open_fuel) = per_eval(&open, "f", &[], 200_000);
+    let (natural_ns, natural_fuel) = per_eval(&natural, "f", &[], 200_000);
+    let (hand_ns, hand_fuel) = per_eval(&by_hand, "f", &[], 200_000);
     println!(
-        "length-3 add+sum: kernel {kernel_ns:.0} ns / {kernel_fuel} fuel, \
-         open-coded {open_ns:.0} ns / {open_fuel} fuel"
+        "length-3 add+sum: sum(a + b) {natural_ns:.0} ns / {natural_fuel} fuel, \
+         written out {hand_ns:.0} ns / {hand_fuel} fuel"
+    );
+    assert!(
+        natural_fuel < 4 * hand_fuel,
+        "sum(a + b) burned {natural_fuel} fuel against {hand_fuel} written out"
     );
 
-    for n in [3usize, 8, 32, 128] {
-        let kernel = build(&format!(
+    // 256 is past `OPEN_CODE_MAX_OPS` and still inside `MAX_DEPTH`, which a
+    // written-out chain of `n` terms consumes one level at a time.
+    for n in [3usize, 8, 32, 128, 256] {
+        let natural = build(&format!(
             "def f(a: Tensor[f64, {n}], b: Tensor[f64, {n}]) -> f64:\n    return dot(a, b)\n"
         ));
         let terms: Vec<String> = (0..n).map(|i| format!("a[{i}] * b[{i}]")).collect();
-        let open = build(&format!(
+        let by_hand = build(&format!(
             "def f(a: Tensor[f64, {n}], b: Tensor[f64, {n}]) -> f64:\n    return {}\n",
             terms.join(" + ")
         ));
-        let (kernel_ns, kernel_fuel) = per_eval(&kernel, "f", &[], 200_000);
-        let (open_ns, open_fuel) = per_eval(&open, "f", &[], 200_000);
+        let (natural_ns, natural_fuel) = per_eval(&natural, "f", &[], 200_000);
+        let (hand_ns, hand_fuel) = per_eval(&by_hand, "f", &[], 200_000);
         println!(
-            "length-{n} dot: kernel {kernel_ns:.0} ns / {kernel_fuel} fuel, \
-             open-coded {open_ns:.0} ns / {open_fuel} fuel"
+            "length-{n} dot: dot(a, b) {natural_ns:.0} ns / {natural_fuel} fuel, \
+             written out {hand_ns:.0} ns / {hand_fuel} fuel"
         );
     }
 }

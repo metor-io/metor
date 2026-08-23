@@ -222,8 +222,46 @@ fn rank_two_broadcasts_right_aligned() {
     }
 }
 
+/// P1: small constant shapes open-code and reach no kernel at all; large ones
+/// still call one. Both must compute the same thing, which is the point — the
+/// choice is a size trade, not a semantic one.
 #[test]
-fn negation_and_powers_run_through_kernels() {
+fn small_shapes_open_code_and_large_ones_call_kernels() {
+    let source = |n: usize| {
+        format!("def f(a: Tensor[f64, {n}], b: Tensor[f64, {n}]) -> f64:\n    return sum(a + b)\n")
+    };
+    let small = build(&source(3));
+    let large = build(&source(200));
+    assert!(!reaches_kernels(&small), "a length-3 add must be open-coded");
+    assert!(reaches_kernels(&large), "a length-200 add must call kernels");
+
+    for n in [3usize, 200] {
+        let a: Vec<f64> = (0..n).map(|i| i as f64 * 0.25 - 1.0).collect();
+        let b: Vec<f64> = (0..n).map(|i| 1.0 / (i as f64 + 3.0)).collect();
+        let got = evaluate(&source(n), "f", &[&a, &b], 1);
+        let want: f64 = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| x + y)
+            .fold(0.0, |acc, v| acc + v);
+        assert_eq!(got[0].to_bits(), want.to_bits(), "at length {n}");
+    }
+}
+
+/// Whether any prelude kernel survived the call-graph walk into this module.
+fn reaches_kernels(wasm: &[u8]) -> bool {
+    wasmparser::Parser::new(0)
+        .parse_all(wasm)
+        .filter_map(|p| match p.unwrap() {
+            wasmparser::Payload::ExportSection(r) => Some(r),
+            _ => None,
+        })
+        .flatten()
+        .any(|e| e.unwrap().name.starts_with("k_"))
+}
+
+#[test]
+fn negation_and_powers_agree_with_nox() {
     let v = [1.5f64, -2.0, 0.5];
     let got = evaluate(
         "def f(v: Tensor[f64, 3]) -> Tensor[f64, 3]:\n    return -(v ** 3)\n",

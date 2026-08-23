@@ -53,6 +53,19 @@ pub(crate) struct Desc {
     pub out: Vec<u32>,
 }
 
+/// How a tensor operation reaches the machine.
+///
+/// The checker picks, by size. A kernel call costs a `call` plus the kernel's
+/// prologue, and the elementwise kernels additionally run the general
+/// broadcast odometer per element — M4 measured that at ~230 fuel per element
+/// on a length-3 add. [`Emit::Open`] runs the odometer while emitting instead,
+/// leaving straight-line loads and stores behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Emit {
+    Open,
+    Kernel,
+}
+
 /// The type an arithmetic or comparison operator works in, after promotion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Num {
@@ -168,13 +181,14 @@ pub(crate) enum Expr {
     /// A tensor already sitting in a buffer. Evaluating it costs nothing —
     /// every tensor address in a compiled program is a compile-time constant.
     Tensor(BufId),
-    /// An elementwise kernel writing into `dest`, broadcasting per `desc`.
+    /// Elementwise arithmetic writing into `dest`, broadcasting per `desc`.
     Elementwise {
         kernel: &'static str,
         dest: BufId,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
         desc: Desc,
+        emit: Emit,
     },
     /// A scalar materialised into a one-element buffer so it can broadcast.
     Splat {
@@ -185,6 +199,7 @@ pub(crate) enum Expr {
         dest: BufId,
         operand: Box<Expr>,
         elems: u32,
+        emit: Emit,
     },
     /// One element of a tensor. A non-constant index is bounds-checked.
     Element {
@@ -197,6 +212,7 @@ pub(crate) enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
         len: u32,
+        emit: Emit,
     },
     /// Row-major matrix product into `dest`.
     MatMul {
@@ -206,10 +222,12 @@ pub(crate) enum Expr {
         m: u32,
         k: u32,
         n: u32,
+        emit: Emit,
     },
     Sum {
         source: Box<Expr>,
         elems: u32,
+        emit: Emit,
     },
     /// Call a buffer-ABI function: arguments are copied into the callee's own
     /// buffers, and the result is copied out of them into `dest`.
@@ -357,27 +375,48 @@ fn collect_expr(expr: &Expr, found: &mut Vec<&'static str>) {
             collect_expr(value, found);
             collect_expr(then, found);
         }
-        Expr::Elementwise { kernel, lhs, rhs, .. } => {
-            found.push(kernel);
+        Expr::Elementwise {
+            kernel,
+            lhs,
+            rhs,
+            emit,
+            ..
+        } => {
+            // Open coding still needs the transcendentals, one call per
+            // element; `+ - * /` become instructions and reach nothing.
+            match (emit, *kernel) {
+                (Emit::Kernel, _) => found.push(kernel),
+                (Emit::Open, "k_pow") => found.push("pow"),
+                (Emit::Open, "k_atan2") => found.push("atan2"),
+                (Emit::Open, _) => {}
+            }
             collect_expr(lhs, found);
             collect_expr(rhs, found);
         }
-        Expr::TensorNeg { operand, .. } => {
-            found.push("k_neg");
+        Expr::TensorNeg { operand, emit, .. } => {
+            if *emit == Emit::Kernel {
+                found.push("k_neg");
+            }
             collect_expr(operand, found);
         }
-        Expr::Dot { lhs, rhs, .. } => {
-            found.push("k_dot");
+        Expr::Dot { lhs, rhs, emit, .. } => {
+            if *emit == Emit::Kernel {
+                found.push("k_dot");
+            }
             collect_expr(lhs, found);
             collect_expr(rhs, found);
         }
-        Expr::MatMul { lhs, rhs, .. } => {
-            found.push("k_matmul");
+        Expr::MatMul { lhs, rhs, emit, .. } => {
+            if *emit == Emit::Kernel {
+                found.push("k_matmul");
+            }
             collect_expr(lhs, found);
             collect_expr(rhs, found);
         }
-        Expr::Sum { source, .. } => {
-            found.push("k_sum");
+        Expr::Sum { source, emit, .. } => {
+            if *emit == Emit::Kernel {
+                found.push("k_sum");
+            }
             collect_expr(source, found);
         }
         Expr::Splat { value, .. } => collect_expr(value, found),
