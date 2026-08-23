@@ -568,11 +568,13 @@ impl AppRoot {
         if let Some(store) = crate::alarms::try_global(cx) {
             let store = store.read(cx);
             let state = store.state();
-            let active = state.active_count();
-            if active == 0 {
+            // Pending, not active: a latched alarm still wants an operator, and a
+            // shelved one deliberately does not light the bar.
+            let pending = state.pending_count();
+            if pending == 0 {
                 bar = bar.child(Icon::Dot.svg_color(7.0, theme.control_active));
             } else {
-                if let Some(severity) = state.highest_active_severity() {
+                if let Some(severity) = state.highest_pending_severity() {
                     let idx = crate::alarms::severity_index(severity);
                     bar = bar.child(Icon::Dot.svg_color(7.0, theme.alarm_color(idx)));
                 }
@@ -593,7 +595,7 @@ impl AppRoot {
                     );
                 }
                 bar = bar.child(SharedString::from(format!(
-                    "{active} active, {} unacked",
+                    "{pending} pending, {} unacked",
                     state.unacked_count()
                 )));
             }

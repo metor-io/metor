@@ -270,8 +270,21 @@ alias (`src/app.rs`) and as a second `WidgetKind` registration for the same
 resolving.
 
 **Step 8 (alarm-sourced tiles) and the `source` / `AnnunciatorSource` config
-field are deferred to [14 — Alarm shelving + latching](./14-alarm-shelving-latching.md).**
-They depend on `AlarmState::point`/`defs_iter`, and the crate forbids config
-that nothing reads, so the shipped `AnnunciatorConfig` is `pattern`, `color`,
-`alarm_when`, `show_labels`, `show_values`, `latch`, `columns`. `alarm_when`
-is therefore always live rather than hidden behind an `Alarms` source.
+field landed 2026-08-22** alongside
+[14 — Alarm shelving + latching](./14-alarm-shelving-latching.md), which built
+the `AlarmState::point`/`defs_iter` queries they read.
+
+`AnnunciatorConfig.source` is `Components` (serde default, so every saved layout
+is unchanged) or `Alarms`. An alarm-sourced annunciator matches the glob against
+`AlarmDef::name`, builds no stream tasks at all — it `cx.observe`s the store and
+rebuilds its tiles from `AlarmState::point` each frame — takes state, severity
+and first-out ordering from that point, and acks through
+`AlarmStore::acknowledge` on click (with the header `Ack` chip always offered).
+The render-time rebind check compares `bound_source` too, so flipping the source
+in the inspector swaps the tile set that frame.
+
+One deviation: **`alarm_when` stays visible in the inspector when the source is
+`Alarms`**, where it means nothing. The registry has no conditional row
+visibility, and inventing it for one field is not worth the machinery; the field
+carries a doc comment saying the control system decides instead. Add the
+mechanism when a second field wants it.

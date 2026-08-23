@@ -15,10 +15,11 @@ use crate::views::time_series::{PlotStyle, TimeFormat};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, Annunciator, AttitudeConfig, AttitudeIndicator, ComponentBrowser, ComponentTable,
-    ComponentText, DataTable, Gauge, GaugeConfig, LevelFilter, LogView, Meter, MeterConfig,
-    SequenceControl, SequenceControlConfig, SequenceGrid, SequenceView, StateChip, StateChipConfig,
-    TimeSeriesPlot, TrafficLight, new_component_browser, new_component_table, new_data_table,
+    AlarmListMode, AlarmView, Annunciator, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
+    ComponentTable, ComponentText, DataTable, Gauge, GaugeConfig, LevelFilter, LogView, Meter,
+    MeterConfig, SequenceControl, SequenceControlConfig, SequenceGrid, SequenceView, StateChip,
+    StateChipConfig, TimeSeriesPlot, TrafficLight, new_component_browser, new_component_table,
+    new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -78,9 +79,13 @@ impl PaneItem for TextPanel {
 
 /// Persisted shape of an [`AlarmPanel`]. The panel shows global alarm state, so the
 /// only persisted bit is which tab it opens on.
+///
+/// `show_history` is the pre-shelving spelling, kept as the fallback when `mode` is
+/// absent so saved layouts restore unchanged.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AlarmPanelConfig {
+    pub mode: Option<AlarmListMode>,
     pub show_history: bool,
 }
 
@@ -98,7 +103,10 @@ impl AlarmPanel {
     pub fn from_config(cfg: AlarmPanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| {
             let mut view = AlarmView::new(cx);
-            view.set_history(cfg.show_history);
+            match cfg.mode {
+                Some(mode) => view.mode = mode,
+                None => view.set_history(cfg.show_history),
+            }
             view
         });
         Self { inner }
@@ -123,8 +131,10 @@ impl PaneItem for AlarmPanel {
     }
 
     fn to_config(&self, cx: &App) -> AlarmPanelConfig {
+        let view = self.inner.read(cx);
         AlarmPanelConfig {
-            show_history: self.inner.read(cx).is_history(),
+            mode: Some(view.mode),
+            show_history: view.is_history(),
         }
     }
 
@@ -1763,6 +1773,19 @@ mod tests {
         assert!(partial.states.is_empty());
         assert!(partial.unknown_label.is_empty());
 
+        let alarms = AlarmPanelConfig {
+            mode: Some(AlarmListMode::Shelved),
+            show_history: false,
+        };
+        let s = serde_json::to_string(&alarms).unwrap();
+        let back: AlarmPanelConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.mode, Some(AlarmListMode::Shelved));
+
+        // A layout saved before the mode was persisted restores through `show_history`.
+        let legacy: AlarmPanelConfig = serde_json::from_str(r#"{"show_history":true}"#).unwrap();
+        assert_eq!(legacy.mode, None);
+        assert!(legacy.show_history);
+
         let seq = SequenceControlConfig {
             channel: "mode".into(),
             compact: true,
@@ -1801,6 +1824,7 @@ mod tests {
         let annunciator = AnnunciatorPanelConfig {
             pattern: "*.healthy".into(),
             color: Some(Hsla::default()),
+            source: crate::views::AnnunciatorSource::Alarms,
             alarm_when: crate::views::AlarmWhen::Off,
             show_labels: true,
             show_values: true,
@@ -1811,6 +1835,7 @@ mod tests {
         let back: AnnunciatorPanelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.pattern, "*.healthy");
         assert_eq!(back.color, Some(Hsla::default()));
+        assert_eq!(back.source, crate::views::AnnunciatorSource::Alarms);
         assert_eq!(back.alarm_when, crate::views::AlarmWhen::Off);
         assert!(back.show_labels);
         assert!(back.show_values);
@@ -1828,6 +1853,7 @@ mod tests {
             serde_json::from_str(r#"{"pattern":"*.health"}"#).unwrap();
         assert_eq!(legacy.pattern, "*.health");
         assert_eq!(legacy.color, None);
+        assert_eq!(legacy.source, crate::views::AnnunciatorSource::Components);
         assert_eq!(legacy.alarm_when, crate::views::AlarmWhen::On);
         assert!(!legacy.show_labels);
         assert!(!legacy.show_values);

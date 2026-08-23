@@ -14,8 +14,9 @@ use metor_proto::types::Timestamp;
 /// `ClearedUnacked` is the ringback state that makes latching worth having: the
 /// condition went away on its own, and the tile stays lit until someone says
 /// they saw it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TileState {
+    #[default]
     Normal,
     AlarmUnacked,
     AlarmAcked,

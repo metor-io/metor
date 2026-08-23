@@ -249,13 +249,13 @@ pub(crate) fn channel_picker_rows(
         })
         .unwrap_or_default();
 
-    rows.push(Box::new(DefaultActionRow {
-        label: "Channel name...".into(),
-        callback: Arc::new(move |input, _window, cx| {
+    rows.push(Box::new(DefaultActionRow::new(
+        "Channel name...",
+        Arc::new(move |input, _window, cx| {
             if !input.is_empty() {
                 on_select(input.to_string(), cx);
             }
         }),
-    }));
+    )));
     rows
 }

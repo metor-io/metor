@@ -468,15 +468,15 @@ pub(crate) fn font_rows(cx: &App) -> Vec<Box<dyn InspectorRow>> {
 pub(crate) fn preset_save_rows(tiles: Entity<TileGroup>) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
     let tiles_for_name = tiles.clone();
-    rows.push(Box::new(DefaultActionRow {
-        label: SharedString::new_static("Type a name and press Enter"),
-        callback: Arc::new(move |name, _window, cx| {
+    rows.push(Box::new(DefaultActionRow::new(
+        SharedString::new_static("Type a name and press Enter"),
+        Arc::new(move |name, _window, cx| {
             let json = tiles_for_name.read(cx).to_json(cx);
             if let Err(e) = presets::save_preset(&name, &json) {
                 tracing::error!(%name, %e, "save preset failed");
             }
         }),
-    }));
+    )));
     rows.push(Box::new(CommandRow::new(
         SharedString::new_static("Save to file…"),
         Arc::new(move |_window, cx| {

@@ -215,9 +215,9 @@ pub fn build_add_node_rows(editor: Entity<NodeEditor>, cx: &App) -> Vec<Box<dyn 
 
 /// Single-row wizard: type a name, press Enter, get a `Persist` node.
 fn build_persist_wizard(editor: Entity<NodeEditor>) -> Vec<Box<dyn InspectorRow>> {
-    vec![Box::new(DefaultActionRow {
-        label: SharedString::new_static("Type a component name and press Enter"),
-        callback: Arc::new(move |name, _window, cx| {
+    vec![Box::new(DefaultActionRow::new(
+        SharedString::new_static("Type a component name and press Enter"),
+        Arc::new(move |name, _window, cx| {
             if name.trim().is_empty() {
                 return;
             }
@@ -225,7 +225,7 @@ fn build_persist_wizard(editor: Entity<NodeEditor>) -> Vec<Box<dyn InspectorRow>
                 ed.add_node_with_spec("Persist", NodeSpec::Persist { name: name.clone() }, cx);
             });
         }),
-    })]
+    ))]
 }
 
 /// Single-row wizard: pick an existing component from the DB.

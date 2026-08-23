@@ -11,11 +11,41 @@ use crate::theme::theme;
 /// entering a new component value, adding a filter pattern). The
 /// inspector forwards its current query string on activation, so the
 /// user types once instead of clicking through a second inline editor.
-/// When the search field is empty we fall back to [`RowAction::StartEdit`]
-/// so a bare Enter still opens the inline editor.
+///
+/// [`DefaultActionRow::new`] treats the input as required: an empty search
+/// falls back to [`RowAction::StartEdit`] so a bare Enter still opens the
+/// inline editor. [`DefaultActionRow::optional`] is for rows that mean
+/// something on their own (a shelf duration with an optional reason) — an
+/// empty search runs the callback with an empty string, so a click does what
+/// it says instead of opening an editor the user didn't ask for.
 pub struct DefaultActionRow {
-    pub label: SharedString,
-    pub callback: Arc<dyn Fn(String, &mut Window, &mut App)>,
+    label: SharedString,
+    callback: Arc<dyn Fn(String, &mut Window, &mut App)>,
+    require_input: bool,
+}
+
+impl DefaultActionRow {
+    pub fn new(
+        label: impl Into<SharedString>,
+        callback: Arc<dyn Fn(String, &mut Window, &mut App)>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            callback,
+            require_input: true,
+        }
+    }
+
+    pub fn optional(
+        label: impl Into<SharedString>,
+        callback: Arc<dyn Fn(String, &mut Window, &mut App)>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            callback,
+            require_input: false,
+        }
+    }
 }
 
 impl InspectorRow for DefaultActionRow {
@@ -34,7 +64,11 @@ impl InspectorRow for DefaultActionRow {
         render_label_row(row_ix, selected, self.label.clone(), None, color, cx)
     }
 
-    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
+    fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {
+        if !self.require_input {
+            (self.callback)(String::new(), window, cx);
+            return RowAction::Dismiss;
+        }
         let cb = self.callback.clone();
         RowAction::StartEdit {
             current_text: String::new(),

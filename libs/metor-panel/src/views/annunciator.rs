@@ -1,3 +1,4 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use gpui::{
 };
 use metor_db::DB;
 use metor_proto::types::{ComponentId, ElementValue, Timestamp};
-use metor_proto_wkt::Severity;
+use metor_proto_wkt::{OccurrenceId, Severity};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -36,11 +37,26 @@ pub enum AlarmWhen {
     Off,
 }
 
+/// What the glob matches, and therefore where a tile's state comes from.
+///
+/// `Components` derives the condition locally from a boolean the panel reads;
+/// `Alarms` matches [`AlarmDef::name`] and defers everything — colour, latch,
+/// acknowledgment — to the shared alarm store, so the tile agrees with the
+/// alarm panel, the titlebar, and every other console.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, facet::Facet)]
+#[repr(u8)]
+pub enum AnnunciatorSource {
+    #[default]
+    Components,
+    Alarms,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct AnnunciatorConfig {
     pub pattern: String,
     pub color: Option<Hsla>,
+    pub source: AnnunciatorSource,
     pub alarm_when: AlarmWhen,
     pub show_labels: bool,
     pub show_values: bool,
@@ -64,20 +80,27 @@ struct Tile {
     _task: gpui::Task<()>,
 }
 
-/// ISA-18.1 annunciator: one tile per component matching `pattern`.
+/// ISA-18.1 annunciator: one tile per component — or per declared alarm —
+/// matching `pattern`.
 ///
 /// `pattern` uses the same glob syntax as the component browser (`*`, `?`).
 /// The watcher task re-evaluates the regex every time a new component
 /// registers, so producers that come up after the annunciator is placed still
 /// appear without needing the user to retype.
 ///
-/// Latch state is per view and deliberately unpersisted: nothing outside this
-/// panel declared these conditions alarms, so restoring a latch from a layout
-/// file would assert a trip that may never have happened this session.
+/// Component-sourced latch state is per view and deliberately unpersisted:
+/// nothing outside this panel declared those conditions alarms, so restoring a
+/// latch from a layout file would assert a trip that may never have happened
+/// this session. Alarm-sourced tiles hold no local state at all — the store
+/// owns their latch, and the acks they publish are wire events.
 #[derive(facet::Facet)]
 pub struct Annunciator {
     pub pattern: SharedString,
     pub color: Hsla,
+    #[facet(inspect::variants = "Components,Alarms")]
+    pub source: AnnunciatorSource,
+    /// Which side of a component value is the alarm. Meaningless for
+    /// `Alarms`, where the control system decides.
     #[facet(inspect::variants = "On,Off")]
     pub alarm_when: AlarmWhen,
     pub show_labels: bool,
@@ -96,6 +119,10 @@ pub struct Annunciator {
     /// Polarity the tiles' latches were folded under, compared the same way.
     #[facet(skip)]
     bound_alarm_when: AlarmWhen,
+    /// Source the current tile set was built from, compared the same way so
+    /// flipping it in the inspector rebuilds the tiles that frame.
+    #[facet(skip)]
+    bound_source: AnnunciatorSource,
     #[facet(opaque)]
     regex: Option<Regex>,
     #[facet(opaque)]
@@ -122,10 +149,17 @@ impl Annunciator {
         let pattern = SharedString::from(cfg.pattern);
         let regex = compile_pattern(&pattern);
         let watcher = spawn_watcher(db.clone(), cx);
+        // Alarm-sourced tiles have no stream task of their own, and component-sourced
+        // ones still take their severity tint from the store.
+        if let Some(store) = crate::alarms::try_global(cx) {
+            cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        }
         Self {
             compiled_pattern: pattern.clone(),
             pattern,
             color: cfg.color.unwrap_or_else(|| theme(cx).control_active),
+            bound_source: cfg.source,
+            source: cfg.source,
             bound_alarm_when: cfg.alarm_when,
             alarm_when: cfg.alarm_when,
             show_labels: cfg.show_labels,
@@ -144,6 +178,7 @@ impl Annunciator {
         AnnunciatorConfig {
             pattern: self.pattern.to_string(),
             color: Some(self.color),
+            source: self.source,
             alarm_when: self.alarm_when,
             show_labels: self.show_labels,
             show_values: self.show_values,
@@ -181,6 +216,13 @@ impl Annunciator {
     /// Existing tiles keep their stream tasks so we don't drop in-flight
     /// values just because a sibling component registered.
     fn reconcile_tiles(&mut self, cx: &mut Context<Self>) {
+        // Alarm-sourced tiles are read straight from the store at render time,
+        // so there is nothing to keep a stream task for.
+        if self.source == AnnunciatorSource::Alarms {
+            self.tiles.clear();
+            cx.notify();
+            return;
+        }
         let matches: Vec<(ComponentId, String)> = match &self.regex {
             Some(re) => crate::inspector::trace_picker::list_components(&self.db)
                 .into_iter()
@@ -226,14 +268,72 @@ impl Annunciator {
         }
     }
 
-    /// The tile whose pending trip is oldest — the one that caused the rest.
-    fn first_out(&self) -> Option<ComponentId> {
+    /// Whether `name` is in this annunciator's set.
+    fn matches(&self, name: &str) -> bool {
+        self.regex.as_ref().is_some_and(|re| re.is_match(name))
+    }
+
+    /// Tiles for the components the glob matches, from their local latches.
+    fn component_visuals(&self, cx: &App) -> Vec<TileVisual> {
+        let latching = self.latch;
+        let toggles = !latching && self.alarm_when == AlarmWhen::On;
         self.tiles
             .iter()
-            .filter(|tile| tile.latch.state(self.latch) != TileState::Normal)
-            .filter_map(|tile| Some((tile.latch.since()?, tile.id)))
-            .min()
-            .map(|(_, id)| id)
+            .map(|tile| TileVisual {
+                key: tile.id.0,
+                name: tile.name.clone(),
+                label: self.show_labels.then(|| tile.label.clone()),
+                value: (self.show_values && !tile.is_bool).then(|| value_text(tile)),
+                click: match (latching, toggles && tile.is_bool) {
+                    (true, _) => Some(TileClick::AckLatch(tile.id)),
+                    (false, true) => Some(TileClick::Toggle(tile.id)),
+                    (false, false) => None,
+                },
+                state: tile.latch.state(latching),
+                since: tile.latch.since(),
+                reported: tile.latest_on.is_some(),
+                first_out: false,
+                severity: active_severity(ElementRef::new(tile.id, 0), cx),
+                hover: Some(tile.id),
+            })
+            .collect()
+    }
+
+    /// Tiles for the declared alarms the glob matches. The store owns their state, so
+    /// these are rebuilt from it each frame and hold nothing in between.
+    fn alarm_visuals(&self, cx: &App) -> Vec<TileVisual> {
+        let Some(store) = crate::alarms::try_global(cx) else {
+            return Vec::new();
+        };
+        let store = store.read(cx);
+        let state = store.state();
+        let mut visuals: Vec<TileVisual> = state
+            .defs_iter()
+            .filter(|def| self.matches(&def.name))
+            .map(|def| {
+                let point = state.point(&def.id);
+                TileVisual {
+                    key: tile_key(&def.id),
+                    name: SharedString::from(def.name.clone()),
+                    label: self
+                        .show_labels
+                        .then(|| strip_glob_literals(&self.pattern, &def.name)),
+                    value: self.show_values.then(|| match point.value {
+                        Some(value) => SharedString::from(format_number(value)),
+                        None => SharedString::new_static("—"),
+                    }),
+                    click: point.occurrence.map(TileClick::AckAlarm),
+                    state: point.state,
+                    since: point.since,
+                    reported: true,
+                    first_out: false,
+                    severity: point.severity,
+                    hover: def.target.as_ref().map(|target| target.component_id),
+                }
+            })
+            .collect();
+        visuals.sort_by(|a, b| a.name.cmp(&b.name));
+        visuals
     }
 
     fn ack(&mut self, id: ComponentId, cx: &mut Context<Self>) {
@@ -243,7 +343,26 @@ impl Annunciator {
         }
     }
 
+    /// Acknowledge every lit tile in *this* annunciator — never the global alarm set.
     fn ack_all(&mut self, cx: &mut Context<Self>) {
+        if self.source == AnnunciatorSource::Alarms {
+            let occurrences: Vec<OccurrenceId> = self
+                .alarm_visuals(cx)
+                .into_iter()
+                .filter(|visual| visual.state != TileState::Normal)
+                .filter_map(|visual| match visual.click {
+                    Some(TileClick::AckAlarm(occurrence)) => Some(occurrence),
+                    _ => None,
+                })
+                .collect();
+            if let Some(store) = crate::alarms::try_global(cx) {
+                let store = store.read(cx);
+                for occurrence in occurrences {
+                    store.acknowledge(occurrence);
+                }
+            }
+            return;
+        }
         for tile in &mut self.tiles {
             tile.latch.ack();
         }
@@ -282,29 +401,20 @@ impl Render for Annunciator {
         if self.compiled_pattern != self.pattern {
             self.recompile_and_reconcile(cx);
         }
+        if self.bound_source != self.source {
+            self.bound_source = self.source;
+            self.reconcile_tiles(cx);
+        }
         if self.bound_alarm_when != self.alarm_when {
             self.refold_polarity();
         }
         let theme = theme(cx);
-        let first_out = self.first_out();
-        let latching = self.latch;
-        let toggles = !latching && self.alarm_when == AlarmWhen::On;
 
-        let visuals: Vec<TileVisual> = self
-            .tiles
-            .iter()
-            .map(|tile| TileVisual {
-                id: tile.id,
-                name: tile.name.clone(),
-                label: self.show_labels.then(|| tile.label.clone()),
-                value: (self.show_values && !tile.is_bool).then(|| value_text(tile)),
-                clickable: latching || (toggles && tile.is_bool),
-                state: tile.latch.state(latching),
-                reported: tile.latest_on.is_some(),
-                first_out: first_out == Some(tile.id),
-                severity: active_severity(ElementRef::new(tile.id, 0), cx),
-            })
-            .collect();
+        let mut visuals = match self.source {
+            AnnunciatorSource::Components => self.component_visuals(cx),
+            AnnunciatorSource::Alarms => self.alarm_visuals(cx),
+        };
+        mark_first_out(&mut visuals);
 
         let fallback = self.color;
         let mut body = div()
@@ -317,7 +427,7 @@ impl Render for Annunciator {
             0 => {
                 let tiles: Vec<Stateful<Div>> = visuals
                     .iter()
-                    .map(|visual| render_tile(visual, fallback, latching, &theme, cx))
+                    .map(|visual| render_tile(visual, fallback, &theme, cx))
                     .collect();
                 body = body.child(
                     div()
@@ -332,14 +442,14 @@ impl Render for Annunciator {
                 for row in visuals.chunks(columns) {
                     let tiles: Vec<Stateful<Div>> = row
                         .iter()
-                        .map(|visual| render_tile(visual, fallback, latching, &theme, cx).flex_1())
+                        .map(|visual| render_tile(visual, fallback, &theme, cx).flex_1())
                         .collect();
                     body = body.child(div().flex().flex_row().gap(px(3.0)).children(tiles));
                 }
             }
         }
 
-        let ack_all = self.latch.then(|| {
+        let ack_all = (self.latch || self.source == AnnunciatorSource::Alarms).then(|| {
             div().flex().flex_row().justify_end().child(
                 div()
                     .id("annunciator-ack-all")
@@ -371,15 +481,55 @@ impl Render for Annunciator {
 /// One tile flattened to just what painting needs, so the element pass can
 /// take `&mut Context` without still borrowing the tile list.
 struct TileVisual {
-    id: ComponentId,
+    /// Stable per-tile element id: the component id, or a hash of the alarm id.
+    key: u64,
     name: SharedString,
     label: Option<SharedString>,
     value: Option<SharedString>,
-    clickable: bool,
+    click: Option<TileClick>,
     state: TileState,
+    /// When the pending trip began, for the first-out rule.
+    since: Option<Timestamp>,
     reported: bool,
     first_out: bool,
     severity: Option<Severity>,
+    /// Component the shift-hover plot preview should show, if any.
+    hover: Option<ComponentId>,
+}
+
+/// What a click on a tile does. The three differ in authority: a toggle writes a
+/// component, a latch ack is local to this view, and an alarm ack is a wire event.
+#[derive(Clone, Copy)]
+enum TileClick {
+    Toggle(ComponentId),
+    AckLatch(ComponentId),
+    AckAlarm(OccurrenceId),
+}
+
+/// Ring the oldest pending trip — the one that caused the rest.
+fn mark_first_out(visuals: &mut [TileVisual]) {
+    let Some(oldest) = visuals
+        .iter()
+        .filter(|visual| visual.state != TileState::Normal)
+        .filter_map(|visual| visual.since)
+        .min()
+    else {
+        return;
+    };
+    if let Some(visual) = visuals
+        .iter_mut()
+        .find(|visual| visual.state != TileState::Normal && visual.since == Some(oldest))
+    {
+        visual.first_out = true;
+    }
+}
+
+/// Element id for an alarm-sourced tile. Alarm ids are strings, and gpui wants an
+/// integer discriminator that stays the same across frames.
+fn tile_key(def_id: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    def_id.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Alpha of the acked fill when a tile has no declared alarm to take a
@@ -390,7 +540,6 @@ const FALLBACK_TINT_ALPHA: f32 = 0.10;
 fn render_tile(
     visual: &TileVisual,
     fallback: Hsla,
-    latching: bool,
     theme: &Theme,
     cx: &mut Context<Annunciator>,
 ) -> Stateful<Div> {
@@ -412,13 +561,12 @@ fn render_tile(
         TileState::ClearedUnacked => (theme.bg_secondary, accent, accent),
     };
 
-    let id = visual.id;
     let has_text = visual.label.is_some() || visual.value.is_some() || visual.first_out;
     let name = visual.name.clone();
     let control_active = theme.control_active;
 
     div()
-        .id(("annunciator-tile", id.0 as usize))
+        .id(("annunciator-tile", visual.key as usize))
         .rounded(px(3.0))
         .min_w(px(14.0))
         .min_h(px(14.0))
@@ -454,17 +602,24 @@ fn render_tile(
                 .clone()
                 .map(|value| div().text_size(px(10.0)).text_color(text).child(value)),
         )
-        .when(visual.clickable, |tile| {
+        .when_some(visual.click, |tile, click| {
             tile.cursor_pointer().on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _window, cx| match latching {
-                    true => this.ack(id, cx),
-                    false => this.toggle_tile(id, cx),
+                cx.listener(move |this, _, _window, cx| match click {
+                    TileClick::Toggle(id) => this.toggle_tile(id, cx),
+                    TileClick::AckLatch(id) => this.ack(id, cx),
+                    TileClick::AckAlarm(occurrence) => {
+                        if let Some(store) = crate::alarms::try_global(cx) {
+                            store.read(cx).acknowledge(occurrence);
+                        }
+                    }
                 }),
             )
         })
         .tooltip(move |_window, cx| TooltipText::build(name.clone(), cx))
-        .on_mouse_move(shift_hover_listener(id, SmallVec::new()))
+        .when_some(visual.hover, |tile, id| {
+            tile.on_mouse_move(shift_hover_listener(id, SmallVec::new()))
+        })
 }
 
 fn value_text(tile: &Tile) -> SharedString {
@@ -535,15 +690,15 @@ const VTABLE_DEBOUNCE: Duration = Duration::from_millis(50);
 pub fn glob_prompt_row(
     on_submit: Arc<dyn Fn(SharedString, &mut Window, &mut App)>,
 ) -> Box<dyn InspectorRow> {
-    Box::new(DefaultActionRow {
-        label: "Glob pattern (e.g. *.health)…".into(),
-        callback: Arc::new(move |input, window, cx| {
+    Box::new(DefaultActionRow::new(
+        "Glob pattern (e.g. *.health)…",
+        Arc::new(move |input, window, cx| {
             if input.is_empty() {
                 return;
             }
             on_submit(SharedString::from(input), window, cx);
         }),
-    })
+    ))
 }
 
 /// The config a freshly-added annunciator starts from.

@@ -810,9 +810,9 @@ pub fn dashboard_rows(
             let dashboard = dashboard.clone();
             Box::new(move |_cx| {
                 let dashboard = dashboard.clone();
-                vec![Box::new(DefaultActionRow {
-                    label: "Dashboard name...".into(),
-                    callback: Arc::new(move |input, _window, cx| {
+                vec![Box::new(DefaultActionRow::new(
+                    "Dashboard name...",
+                    Arc::new(move |input, _window, cx| {
                         if !input.is_empty() {
                             dashboard.update(cx, |this, cx| {
                                 this.title = SharedString::from(input);
@@ -820,7 +820,7 @@ pub fn dashboard_rows(
                             });
                         }
                     }),
-                }) as Box<dyn InspectorRow>]
+                )) as Box<dyn InspectorRow>]
             })
         },
     )));
@@ -1123,9 +1123,9 @@ fn annunciator_pattern_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn In
 }
 
 fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
-    vec![Box::new(DefaultActionRow {
-        label: "Image file path...".into(),
-        callback: Arc::new(move |input, _window, cx| {
+    vec![Box::new(DefaultActionRow::new(
+        "Image file path...",
+        Arc::new(move |input, _window, cx| {
             if !input.is_empty() {
                 let cfg = widgets::ImageWidgetConfig {
                     path: input.to_string(),
@@ -1137,7 +1137,7 @@ fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRo
                 });
             }
         }),
-    })]
+    ))]
 }
 
 /// A connector's palette label: its own label if it has one, else its shape
@@ -1225,13 +1225,13 @@ fn connector_rows(
             let dashboard = dashboard.clone();
             Box::new(move |_cx| {
                 let dashboard = dashboard.clone();
-                vec![Box::new(DefaultActionRow {
-                    label: "Connector label...".into(),
-                    callback: Arc::new(move |input, _window, cx| {
+                vec![Box::new(DefaultActionRow::new(
+                    "Connector label...",
+                    Arc::new(move |input, _window, cx| {
                         let text = input.to_string();
                         edit(&dashboard, id, cx, |c| c.style.label = text);
                     }),
-                }) as Box<dyn InspectorRow>]
+                )) as Box<dyn InspectorRow>]
             })
         },
     )));

@@ -322,9 +322,9 @@ pub fn edit_value_rows(db: Arc<DB>, request: EditRequest) -> Vec<Box<dyn Inspect
         .unwrap_or_else(|| SharedString::from(format!("[{}]", element_index)));
     let prompt = SharedString::from(format!("New value for {}.{}", component_name, label));
 
-    vec![Box::new(DefaultActionRow {
-        label: prompt,
-        callback: Arc::new(move |input, _window, cx| {
+    vec![Box::new(DefaultActionRow::new(
+        prompt,
+        Arc::new(move |input, _window, cx| {
             upsert_element_edit(
                 &db,
                 component_id,
@@ -335,7 +335,7 @@ pub fn edit_value_rows(db: Arc<DB>, request: EditRequest) -> Vec<Box<dyn Inspect
                 cx,
             );
         }),
-    })]
+    ))]
 }
 
 /// Stage a string-component edit by overwriting its `U8` buffer with UTF-8
