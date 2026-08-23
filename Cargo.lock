@@ -9419,6 +9419,7 @@ version = "0.14.2"
 dependencies = [
  "libm",
  "nox",
+ "num-traits",
  "rustpython-parser",
  "wasm-encoder",
  "wasmi",
