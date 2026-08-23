@@ -29,7 +29,7 @@ impl Bench {
         let temp = tempfile::tempdir().unwrap();
         let db = DB::create(temp.path().join("db")).unwrap();
         for (name, prim, dim) in components {
-            let id = ComponentId(ops::persist::component_id_for_name(name));
+            let id = ComponentId::new(name);
             db.with_state_mut(|state| {
                 state.insert_component(id, ComponentSchema::new(*prim, dim), &db.path)
             })
@@ -48,7 +48,7 @@ impl Bench {
     }
 
     fn id(&self, name: &str) -> ComponentId {
-        ComponentId(ops::persist::component_id_for_name(name))
+        ComponentId::new(name)
     }
 
     fn push(&self, name: &str, ts: i64, values: &[f64]) {

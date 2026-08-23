@@ -39,7 +39,7 @@ impl Bench {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let db = DB::create(temp.path().join("db")).unwrap();
-        let id = ComponentId(ops::persist::component_id_for_name(SOURCE));
+        let id = ComponentId::new(SOURCE);
         db.with_state_mut(|s| {
             s.insert_component(id, ComponentSchema::new(PrimType::F64, &[]), &db.path)
         })
@@ -59,7 +59,7 @@ impl Bench {
     }
 
     fn push(&self, ts: i64, value: f64) {
-        let id = ComponentId(ops::persist::component_id_for_name(SOURCE));
+        let id = ComponentId::new(SOURCE);
         self.db
             .with_state(|s| s.get_component(id).cloned())
             .unwrap()
@@ -68,7 +68,7 @@ impl Bench {
     }
 
     fn source(&self) -> Arc<dyn DynamicNode> {
-        let id = ComponentId(ops::persist::component_id_for_name(SOURCE));
+        let id = ComponentId::new(SOURCE);
         ops::db_source::from_db(&self.db, id).unwrap()
     }
 }

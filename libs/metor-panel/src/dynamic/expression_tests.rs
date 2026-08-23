@@ -11,14 +11,13 @@ use metor_expr::{Binding, Resolver, Ty};
 use metor_proto::types::{ComponentId, PrimType};
 
 use crate::dynamic::expressions;
-use crate::dynamic::ops::persist::component_id_for_name;
 use crate::dynamic::resolver::DbResolver;
 
 fn db_with(components: &[(&str, PrimType, &[usize])]) -> (DB, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let db = DB::create(temp.path().join("db")).unwrap();
     for (name, prim, dim) in components {
-        let id = ComponentId(component_id_for_name(name));
+        let id = ComponentId::new(name);
         db.with_state_mut(|state| {
             state.insert_component(id, ComponentSchema::new(*prim, dim), &db.path)
         })
@@ -93,7 +92,7 @@ fn a_later_ambiguity_does_not_disturb_what_was_already_resolved() {
     assert_eq!(recorded, "wheels.rpm");
 
     // A second component ending in `.rpm` arrives.
-    let id = ComponentId(component_id_for_name("motor.rpm"));
+    let id = ComponentId::new("motor.rpm");
     db.with_state_mut(|state| {
         state.insert_component(id, ComponentSchema::new(PrimType::F64, &[]), &db.path)
     })
@@ -184,12 +183,12 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
     let compiled =
         std::sync::Arc::new(program::Compiled::expression("wheels.rpm * 2.0", &resolver).unwrap());
 
-    let source_id = ComponentId(component_id_for_name("wheels.rpm"));
+    let source_id = ComponentId::new("wheels.rpm");
     let name = expressions::component_name(program::field_id(
         compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
         0,
     ));
-    let component = ComponentId(component_id_for_name(&name));
+    let component = ComponentId::new(&name);
 
     let system = program::system(
         &compiled,
@@ -244,35 +243,32 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
     );
 }
 
-/// The bug the id fix is for: a component's id belongs to whoever created it,
-/// so re-deriving it from the name is right only by luck.
+/// A component's id belongs to whoever created it, so it is carried from the
+/// resolver that found it rather than recomputed from the path.
 ///
-/// `ComponentId::new` masks the top bit and `persist`'s hash does not, so the
-/// two agree for roughly half of all names — and `imu.omega` is in the half
-/// that does not. Re-hashing therefore looked up a component nobody had, and
-/// reported it as "not published yet" while it sat there publishing.
+/// The db keeps a component's id and its name as independent facts — a peer
+/// announces both on the wire — so a producer is free to register `imu.omega`
+/// under any id it likes. Deriving one from the name is a guess, and a wrong
+/// guess looks like the component is absent rather than misaddressed.
 #[test]
 fn a_components_id_is_carried_not_rederived() {
     let name = "imu.omega";
-    assert_ne!(
-        ComponentId(component_id_for_name(name)),
-        ComponentId::new(name),
-        "this test is pointless if the two hashes agree for this name"
-    );
+    // An id that has nothing to do with the name, as a producer's may not.
+    let assigned = ComponentId(0x0123_4567_89ab_cdef);
+    assert_ne!(assigned, ComponentId::new(name));
 
-    let (db, _temp) = db_with_ids(&[(name, ComponentId::new(name), PrimType::F64, &[3])]);
+    let (db, _temp) = db_with_ids(&[(name, assigned, PrimType::F64, &[3])]);
     let resolver = DbResolver::snapshot(&db);
 
-    // The resolver types it, and hands back the id the component actually has.
-    assert!(resolver.component(name).is_some());
-    assert_eq!(resolver.id_of(name), Some(ComponentId::new(name)));
+    assert!(resolver.component(name).is_some(), "it must still type");
+    assert_eq!(resolver.id_of(name), Some(assigned));
     assert!(
-        db.with_state(|s| s.get_component(resolver.id_of(name).unwrap()).is_some()),
+        db.with_state(|s| s.get_component(assigned).is_some()),
         "the carried id must find the component"
     );
     assert!(
-        db.with_state(|s| s.get_component(ComponentId(component_id_for_name(name))).is_none()),
-        "and the re-derived one must not — which is the bug"
+        db.with_state(|s| s.get_component(ComponentId::new(name)).is_none()),
+        "and a name-derived one must not — which is what carrying avoids"
     );
 }
 
@@ -301,4 +297,40 @@ fn db_with_ids(
         .unwrap();
     }
     (db, temp)
+}
+
+/// The `=` path end to end, over a name whose two hashes disagree.
+///
+/// This is the bug the user hit: `imu.omega` is in the half of names where
+/// `persist`'s FNV-1a and `ComponentId::new` differ, so an expression naming
+/// it resolved fine and then failed to find the component, reporting it as not
+/// publishing. Resolution and lookup have to agree, and they only do when the
+/// id is carried rather than recomputed.
+#[test]
+fn an_expression_finds_the_components_it_names() {
+    for name in ["imu.omega", "sensor.temp", "adcs.q_b_eci", "wheels.rpm"] {
+        let (db, _temp) = db_with_ids(&[(name, ComponentId::new(name), PrimType::F64, &[])]);
+        let resolver = DbResolver::snapshot(&db);
+        let program = metor_expr::compile_expr(&format!("{name} * 2.0"), &resolver)
+            .unwrap_or_else(|d| panic!("`{name}` should compile, got:\n{d}"));
+
+        let ports = expressions::port_components(&program.manifest, &resolver)
+            .unwrap_or_else(|e| panic!("`{name}` should resolve to a component, got: {e}"));
+        assert_eq!(ports, vec![ComponentId::new(name)]);
+        assert!(
+            db.with_state(|s| s.get_component(ports[0]).is_some()),
+            "`{name}` must be found under the id the expression resolved to"
+        );
+    }
+}
+
+/// A name nothing publishes is still a clear diagnostic rather than a
+/// misaddressed lookup.
+#[test]
+fn an_unknown_component_says_so() {
+    let (db, _temp) = db_with_ids(&[("wheels.rpm", ComponentId::new("wheels.rpm"), PrimType::F64, &[])]);
+    let resolver = DbResolver::snapshot(&db);
+    // It cannot even compile, because the resolver never offered the name.
+    let diags = metor_expr::compile_expr("nothing.here * 2.0", &resolver).unwrap_err();
+    assert!(format!("{diags}").contains("no component"), "{diags}");
 }

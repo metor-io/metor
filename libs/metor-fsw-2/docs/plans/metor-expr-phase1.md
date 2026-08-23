@@ -542,16 +542,25 @@ input, hold the latest of the rest, skip while anything is unknown — and
 what changed is that "latest" now includes history rather than only what
 arrived after the system was built.
 
-**A component's id is carried, never re-derived.** The lookups that
-turned a resolved path into a `ComponentId` re-hashed the name with
-`persist`'s FNV-1a. That is not the same function as `ComponentId::new`,
-which masks the top bit so the value fits in an `i64` — so the two agree
-for only about half of all names, and disagree for `imu.omega`,
-`sensor.temp`, `adcs.q_b_eci`, and most others. A real component was
-then looked up under an id nobody had, and reported as
-"`x` has not published yet" while it was publishing.
+**There is one function that turns a name into a `ComponentId`.**
+`persist` had grown its own FNV-1a, hand-rolled for durability — a good
+reason — but `ComponentId::new` is *already* const FNV-1a and therefore
+already durable, and it additionally masks the high bit so the value
+fits an `i64`. So the private copy was a strictly worse duplicate, and
+its one difference was enough: the two agree for only about half of all
+names and disagree for `imu.omega`, `sensor.temp`, `adcs.q_b_eci` and
+most others. A live component was looked up under an id nobody had and
+reported as "`x` has not published yet" while it was publishing.
 
-`DbResolver` now carries the id it found alongside the type, and ports
-take it from there. Deriving is right in exactly one place — a
-`Produced` binding naming a component `persist` created moments earlier
-from that same name — and that case is now the only one that does it.
+`component_id_for_name` is deleted. Everything that derives an id from a
+name calls `ComponentId::new`.
+
+**And an id is carried, not derived, wherever one already exists.** The
+duplicate was what made the bug visible, but deriving was the deeper
+mistake: the db keeps a component's id and its name as independent facts
+— a peer announces both on the wire — so a producer may register
+`imu.omega` under any id it chooses. `DbResolver` now carries the id it
+found alongside the type, and ports take it from there. Deriving
+survives only where `persist` itself created the component from that
+same name moments earlier, which is the one case where the answer is
+known rather than guessed.

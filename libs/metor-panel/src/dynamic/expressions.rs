@@ -149,6 +149,32 @@ pub fn component_name(hash: NodeId) -> String {
     format!("expr.{:016x}", hash.0)
 }
 
+/// The component each port of a compiled expression reads.
+///
+/// Ids are taken from the resolver that found them, never re-derived from the
+/// path. A component's id belongs to whoever created it, and hashing the name
+/// a second time agrees with the real id for only about half of all names —
+/// which fails as "not publishing" for a component that is publishing
+/// perfectly well.
+pub(crate) fn port_components(
+    manifest: &metor_expr::Manifest,
+    resolver: &DbResolver,
+) -> Result<Vec<ComponentId>, ExprError> {
+    let mut sources = Vec::new();
+    for port in &manifest.systems[0].inputs {
+        let metor_expr::Binding::Component(path) = &port.bindings[0] else {
+            return Err(ExprError::Unbound(
+                "an expression reads components, not systems".into(),
+            ));
+        };
+        let id = resolver
+            .id_of(path)
+            .ok_or_else(|| ExprError::Unbound(format!("`{path}` is not a known component")))?;
+        sources.push(id);
+    }
+    Ok(sources)
+}
+
 /// Why an expression is not running.
 #[derive(Debug)]
 pub enum ExprError {
@@ -182,19 +208,7 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
     // Which components the ports read is decided here; the nodes that read
     // them are built on the worker thread. A source node's identity follows
     // from its component id alone, so the hash below needs nothing built.
-    let mut sources = Vec::new();
-    for port in &compiled.manifest.systems[0].inputs {
-        let metor_expr::Binding::Component(path) = &port.bindings[0] else {
-            return Err(ExprError::Unbound(
-                "an expression reads components, not systems".into(),
-            ));
-        };
-        let id = ComponentId(crate::dynamic::ops::persist::component_id_for_name(path));
-        if db.with_state(|s| s.get_component(id).is_none()) {
-            return Err(ExprError::Unbound(format!("`{path}` is not publishing")));
-        }
-        sources.push(id);
-    }
+    let sources = port_components(&compiled.manifest, &resolver)?;
 
     let port_ids: Vec<NodeId> = sources
         .iter()
@@ -202,7 +216,7 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
         .collect();
     let system_id = compiled.system_hash(0, &port_ids);
     let name = component_name(program::field_id(system_id, 0));
-    let component = ComponentId(crate::dynamic::ops::persist::component_id_for_name(&name));
+    let component = ComponentId::new(&name);
 
     // Two views typing the same expression against the same components reach
     // the same hash, and therefore share one running system rather than each
@@ -273,7 +287,7 @@ pub(crate) fn publish(
     use metor_proto_wkt::MetadataExt;
     let published = crate::dynamic::ops::persist::persist(db, name.to_string(), node)?;
     let mut metadata = metor_proto_wkt::ComponentMetadata {
-        component_id: ComponentId(crate::dynamic::ops::persist::component_id_for_name(name)),
+        component_id: ComponentId::new(name),
         name: label.to_string(),
         metadata: Default::default(),
     };

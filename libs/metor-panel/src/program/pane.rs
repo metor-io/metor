@@ -264,7 +264,7 @@ impl ProgramPane {
                 .ok_or_else(|| format!("`{path}` is not a known component")),
             metor_expr::Binding::Produced { system, field } => {
                 let name = &compiled.manifest.systems[*system].publishes[*field];
-                let id = ComponentId(persist::component_id_for_name(name));
+                let id = ComponentId::new(name);
                 match self.db.with_state(|s| s.get_component(id).is_some()) {
                     true => Ok(id),
                     false => Err(format!("`{name}` has not published yet")),

@@ -47,9 +47,12 @@ pub fn persist(
     let id = hash_id(op_tag::PERSIST, &[input.id()], |h| {
         name.hash(h);
     });
-    // ComponentId is name-derived (not node-id-derived) so the on-disk
-    // Component survives upstream edits.
-    let component_id = ComponentId(component_id_for_name(&name));
+    // Name-derived, not node-id-derived, so the on-disk Component survives
+    // upstream edits. `ComponentId::new` is the one function that turns a
+    // name into an id anywhere in this workspace: it is const FNV-1a, so it
+    // is as durable as a hand-rolled one, and it masks the high bit so the
+    // value still fits an `i64`.
+    let component_id = ComponentId::new(&name);
 
     // The existing on-disk schema (if any). Doubles as the "was this a new
     // insert?" signal: we only bump `vtable_gen` (which wakes view watchers)
@@ -115,20 +118,3 @@ pub fn persist(
     ))
 }
 
-/// Hash a component name into a stable `ComponentId` raw value.
-///
-/// Uses FNV-1a with pinned constants rather than [`hash_id`]'s
-/// `DefaultHasher` (SipHash): this id is written to disk as the durable
-/// identity of a persisted component, and `DefaultHasher`'s algorithm is
-/// unspecified across Rust releases, so a toolchain bump could orphan every
-/// persisted component. FNV-1a is fixed forever.
-pub fn component_id_for_name(name: &str) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for byte in name.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
