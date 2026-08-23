@@ -7,7 +7,9 @@ use metor_proto::types::ComponentId;
 
 use crate::inspector::rows::PreviewSpec;
 
-use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow, NavRow, RowAction, row_base};
+use crate::inspector::rows::{
+    BoolRow, CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction, row_base,
+};
 use crate::theme::theme;
 use crate::views::time_series::Trace;
 
@@ -46,21 +48,26 @@ pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
 }
 
 /// Rows listing every known component; selecting one invokes `on_select`.
+///
+/// The list is preceded by the expression row, so typing `=` turns the same
+/// search field into an expression field and `on_select` receives a computed
+/// channel exactly as it would a picked one. Every consumer of this picker
+/// gains that without knowing it happened.
 pub(crate) fn component_picker_rows(
     db: Arc<DB>,
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
 ) -> Vec<Box<dyn InspectorRow>> {
     let on_select = Arc::new(on_select);
-    list_components(&db)
-        .into_iter()
-        .map(|(id, name)| {
-            let on_select = on_select.clone();
-            Box::new(CommandRow::new(
-                SharedString::from(name.clone()),
-                Arc::new(move |_window, cx| on_select(id, name.clone(), cx)),
-            )) as Box<dyn InspectorRow>
-        })
-        .collect()
+    let mut rows: Vec<Box<dyn InspectorRow>> =
+        vec![Box::new(ExpressionRow::new(db.clone(), on_select.clone()))];
+    rows.extend(list_components(&db).into_iter().map(|(id, name)| {
+        let on_select = on_select.clone();
+        Box::new(CommandRow::new(
+            SharedString::from(name.clone()),
+            Arc::new(move |_window, cx| on_select(id, name.clone(), cx)),
+        )) as Box<dyn InspectorRow>
+    }));
+    rows
 }
 
 /// Element labels for `component_id`, derived from its schema dimension.

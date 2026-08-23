@@ -703,8 +703,25 @@ fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
             label: SharedString::new_static("?"),
         }));
     }
-    let id = metor_proto::types::ComponentId::new(&cfg.component);
-    let entity = cx.new(|cx| Monitor::new(db.clone(), id, cx));
+    // A `=` binding is an expression rather than a component name: it is
+    // compiled and started here, and the monitor holds a share of its
+    // lifetime. What was serialized is the text the operator typed.
+    let entity = if crate::dynamic::expressions::is_expression(&cfg.component) {
+        let Ok(expression) = crate::dynamic::expressions::resolve(&cfg.component, db, cx) else {
+            return as_live(cx.new(|_cx| PlaceholderWidget {
+                label: SharedString::from(cfg.component.clone()),
+            }));
+        };
+        let node = expression.node.clone();
+        let entity = cx.new(|cx| Monitor::new(db.clone(), node, cx));
+        entity.update(cx, |monitor, _cx| {
+            monitor.bind_expression(expression, cfg.component.clone());
+        });
+        entity
+    } else {
+        let id = metor_proto::types::ComponentId::new(&cfg.component);
+        cx.new(|cx| Monitor::new(db.clone(), id, cx))
+    };
     if cfg.unit.is_some() || cfg.show_sparkline.is_some() {
         entity.update(cx, |m, cx| {
             if let Some(unit) = cfg.unit {

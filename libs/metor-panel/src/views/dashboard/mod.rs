@@ -1038,12 +1038,35 @@ fn add_widget_rows(
     rows
 }
 
+/// The component list for a widget kind, preceded by the expression row so
+/// typing `=` binds the widget to a computed channel instead of a named one.
+///
+/// Both paths end in the same place: what the widget's config stores is a
+/// string, and a leading `=` is what tells the builder to compile it rather
+/// than look it up.
 fn component_picker_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
     kind: WidgetKind,
 ) -> Vec<Box<dyn InspectorRow>> {
-    crate::inspector::trace_picker::list_components(&db)
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    if kind == WidgetKind::monitor() {
+        let dashboard = dashboard.clone();
+        rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(
+            db.clone(),
+            Arc::new(move |_id, text, cx| {
+                let config = serde_json::to_string(&widgets::MonitorWidgetConfig {
+                    component: text,
+                    ..Default::default()
+                })
+                .expect("monitor config serializes");
+                dashboard.update(cx, |this, cx| {
+                    this.add_widget(WidgetKind::monitor(), config, cx);
+                });
+            }),
+        )));
+    }
+    rows.extend(crate::inspector::trace_picker::list_components(&db)
         .into_iter()
         .map(|(_id, name)| {
             let dashboard = dashboard.clone();
@@ -1079,8 +1102,8 @@ fn component_picker_rows(
                     });
                 }),
             )) as Box<dyn InspectorRow>
-        })
-        .collect()
+        }));
+    rows
 }
 
 /// Trace wizard for the scalar instruments: each picked element becomes its

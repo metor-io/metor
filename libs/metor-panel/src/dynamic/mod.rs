@@ -20,6 +20,8 @@ pub mod resolver;
 pub mod tensor;
 
 #[cfg(test)]
+mod expression_tests;
+#[cfg(test)]
 mod tests;
 
 pub use node::{

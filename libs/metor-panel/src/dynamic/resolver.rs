@@ -76,20 +76,23 @@ impl Resolver for DbResolver {
 
 /// A component's type in the language.
 ///
-/// Narrower element types widen: an `f32` channel reads as `f64` and an `i32`
-/// as `i64`, because the language has no narrower numbers and a frame field is
-/// eight bytes per element either way. The widening is the runtime's to
-/// perform when it fills the frame.
+/// Everything numeric reads as `f64`, whatever its element type on the wire.
+/// That is not a simplification imposed here — it is what the panel already
+/// does (`dynamic/tensor.rs` computes in `f64` and casts at write time) and
+/// what the runtime does when it fills a frame, so offering an `i32` counter
+/// as `i64` would be fidelity in name only. `bool` stays itself, because a
+/// flag read as a number is worse to write conditions against.
+///
+/// One rule, and it lets a single expression span a float sensor and an
+/// integer counter without saying so.
 fn ty_of(prim: PrimType, dim: &[usize]) -> Option<Ty> {
     match (prim, dim.is_empty()) {
-        (PrimType::F64 | PrimType::F32, true) => Some(Ty::F64),
-        (PrimType::I64 | PrimType::I32 | PrimType::I16 | PrimType::I8, true) => Some(Ty::I64),
-        (PrimType::U64 | PrimType::U32 | PrimType::U16 | PrimType::U8, true) => Some(Ty::I64),
         (PrimType::Bool, true) => Some(Ty::Bool),
-        (PrimType::F64 | PrimType::F32, false) => Some(Ty::Tensor {
+        (PrimType::Bool, false) => None,
+        (_, true) => Some(Ty::F64),
+        (_, false) => Some(Ty::Tensor {
             dtype: Dtype::F64,
             shape: dim.to_vec(),
         }),
-        _ => None,
     }
 }
