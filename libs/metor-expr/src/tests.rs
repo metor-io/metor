@@ -16,6 +16,7 @@ mod measure;
 mod robustness;
 mod scalar;
 mod semantics;
+mod systems;
 mod tensors;
 
 use wasmi::{Engine, Instance, Linker, Module, Store, Val};

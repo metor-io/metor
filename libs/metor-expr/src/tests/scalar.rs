@@ -299,9 +299,9 @@ fn the_subset_refuses_what_it_does_not_implement() {
         ("def f() -> f64:\n    return [1, 2]\n", "lists"),
         ("def f() -> f64:\n    return {1: 2}\n", "dicts"),
         ("def f() -> f64:\n    return \"hi\"\n", "literals"),
-        ("import math\ndef f() -> f64:\n    return 1.0\n", "def"),
+        ("import math\ndef f() -> f64:\n    return 1.0\n", "classes, functions, and bindings"),
         ("def f() -> f64:\n    import math\n    return 1.0\n", "imports"),
-        ("class A:\n    pass\n", "def"),
+        ("class A:\n    pass\n", "Frame or State"),
         ("def f() -> f64:\n    class A:\n        pass\n    return 1.0\n", "classes"),
         ("def f() -> f64:\n    g = lambda x: x\n    return 1.0\n", "lambdas"),
         ("def f() -> f64:\n    try:\n        pass\n    except:\n        pass\n    return 1.0\n", "try"),
@@ -322,7 +322,7 @@ fn the_subset_refuses_what_it_does_not_implement() {
         ("def f() -> f64:\n    return ~1\n", "`~`"),
         ("def f(x: f64) -> f64:\n    return x[0]\n", "cannot be indexed"),
         ("def f(v: Tensor[f64, 3]) -> f64:\n    return v[0:2]\n", "slicing"),
-        ("def f() -> f64:\n    return a.b\n", "attribute"),
+        ("def f() -> f64:\n    return a.b\n", "`a` is not a frame here"),
     ] {
         let diags = reject(source);
         let text = format!("{diags}");

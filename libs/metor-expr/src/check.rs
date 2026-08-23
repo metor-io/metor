@@ -59,8 +59,13 @@ use rustpython_parser::ast::{self, Ranged};
 use rustpython_parser::{Parse, text_size::TextRange};
 
 use crate::diag::{Diagnostics, Span};
-use crate::ir::{Arith, BufId, Cmp, Desc, Emit, Expr, Func, Intrinsic, Num, Program, Stmt};
-use crate::{Dtype, FnSig, Manifest, Ty};
+use crate::ir::{
+    Arith, BufId, Cmp, Desc, Emit, Expr, FieldWrite, Func, Intrinsic, Num, Place, Program, Stmt,
+    SystemAbi,
+};
+use crate::lang::{self, SystemDecl};
+use crate::manifest::{self, Frame, Port};
+use crate::{Dtype, FnSig, Manifest, Resolver, Ty};
 
 /// How deep an expression may nest before the checker refuses it. Bounded so
 /// that a pathological input is a diagnostic rather than a blown stack, but
@@ -103,7 +108,18 @@ fn emit_for(ops: usize) -> Emit {
     }
 }
 
-pub(crate) fn check(source: &str) -> Result<(Program, Manifest), Diagnostics> {
+/// Whether the source is a module of declarations or a single expression.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Entry {
+    Module,
+    Expression,
+}
+
+pub(crate) fn check(
+    source: &str,
+    resolver: &dyn Resolver,
+    entry: Entry,
+) -> Result<(Program, Manifest), Diagnostics> {
     if source.len() > MAX_SOURCE_BYTES {
         let mut diags = Diagnostics::default();
         let at = MAX_SOURCE_BYTES as u32;
@@ -121,7 +137,7 @@ pub(crate) fn check(source: &str) -> Result<(Program, Manifest), Diagnostics> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(PARSE_STACK_BYTES)
-            .spawn_scoped(scope, || check_inner(source))
+            .spawn_scoped(scope, || check_inner(source, resolver, entry))
             .expect("spawning the parse thread")
             .join()
             .unwrap_or_else(|_| {
@@ -132,7 +148,11 @@ pub(crate) fn check(source: &str) -> Result<(Program, Manifest), Diagnostics> {
     })
 }
 
-fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
+fn check_inner(
+    source: &str,
+    resolver: &dyn Resolver,
+    entry: Entry,
+) -> Result<(Program, Manifest), Diagnostics> {
     let mut diags = Diagnostics::default();
 
     let module = match ast::Suite::parse(source, "<expr>") {
@@ -144,23 +164,26 @@ fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
         }
     };
 
-    let mut defs = Vec::new();
-    for stmt in &module {
-        match stmt {
-            ast::Stmt::FunctionDef(def) => defs.push(def),
-            other => diags.push(
-                other.range(),
-                "only `def` is allowed at module level in this phase",
-            ),
-        }
-    }
+    let decls = match entry {
+        Entry::Module => lang::collect(&module, resolver, &mut diags),
+        Entry::Expression => match module.as_slice() {
+            [ast::Stmt::Expr(only)] => lang::Decls {
+                systems: lang::expression(&only.value, resolver, &mut diags)
+                    .into_iter()
+                    .collect(),
+                functions: Vec::new(),
+            },
+            _ => {
+                diags.push(Span::new(0, source.len() as u32), "expected one expression");
+                return Err(diags);
+            }
+        },
+    };
+    let defs = &decls.functions;
 
     let mut sigs: Vec<FnSig> = Vec::new();
     let mut by_name: HashMap<String, u32> = HashMap::new();
-    for def in &defs {
-        if !def.decorator_list.is_empty() {
-            diags.push(def.range, "decorators are not supported in this phase");
-        }
+    for def in defs {
         let name = def.name.as_str().to_string();
         let mut params = Vec::new();
         let args = &def.args;
@@ -197,7 +220,7 @@ fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
         sigs.push(FnSig { name, params, ret });
     }
 
-    let mut buffers: Vec<u32> = Vec::new();
+    let mut buffers: Vec<Place> = Vec::new();
     let mut frames: Vec<FnFrame> = Vec::new();
     for sig in &sigs {
         let buffer_abi = sig.uses_buffers();
@@ -258,6 +281,8 @@ fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
             ret: sig.ret.clone(),
             ret_buffer: frame.ret_buffer,
             buffer_abi: frame.buffer_abi,
+            output: None,
+            now: None,
             locals,
             names,
             loop_depth: 0,
@@ -276,11 +301,13 @@ fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
             name: sig.name.clone(),
             param_count,
             locals,
+            ret: sig.ret.clone(),
             body: stmts,
             buffer_abi: frame.buffer_abi,
             arg_buffers: frame.arg_buffers.clone(),
             ret_buffer: frame.ret_buffer,
             prologue,
+            system: None,
         });
     }
 
@@ -290,6 +317,29 @@ fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
             defs[cycle as usize].range,
             format!("`{name}` is recursive and passes tensors, whose buffers are statically placed"),
         );
+    }
+
+    let mut systems = Vec::new();
+    for decl in &decls.systems {
+        let before = diags.len();
+        match system(
+            decl,
+            &sigs,
+            &by_name,
+            &frames,
+            &systems,
+            &mut buffers,
+            &mut diags,
+        ) {
+            Some((func, desc)) => {
+                funcs.push(func);
+                systems.push(desc);
+            }
+            None if diags.len() == before => {
+                diags.push(decl.span, format!("`{}` could not be compiled", decl.name))
+            }
+            None => {}
+        }
     }
 
     if diags.is_empty() {
@@ -303,11 +353,201 @@ fn check_inner(source: &str) -> Result<(Program, Manifest), Diagnostics> {
                 param_types,
                 buffers,
             },
-            Manifest { functions: sigs },
+            Manifest {
+                compiler: crate::manifest::COMPILER_VERSION,
+                systems,
+                functions: sigs,
+            },
         ))
     } else {
         Err(diags.sorted())
     }
+}
+
+/// One `@system`, from ports and body to a buffer-ABI function plus the
+/// manifest entry that says how to drive it.
+fn system(
+    decl: &SystemDecl<'_>,
+    sigs: &[FnSig],
+    by_name: &HashMap<String, u32>,
+    frames: &[FnFrame],
+    done: &[manifest::System],
+    buffers: &mut Vec<Place>,
+    diags: &mut Diagnostics,
+) -> Option<(Func, manifest::System)> {
+    let mut names: HashMap<String, Binding> = HashMap::new();
+    let mut arg_buffers = Vec::with_capacity(decl.ports.len());
+    let mut ports = Vec::with_capacity(decl.ports.len());
+    for port in &decl.ports {
+        // A port reading an earlier anonymous binding takes that binding's
+        // output frame, which exists now that the producer has been checked.
+        let frame = match &port.frame {
+            Some(frame) => frame.clone(),
+            None => match &port.bindings[0] {
+                manifest::Binding::Produced { system, .. } => done[*system].output.clone(),
+                manifest::Binding::Component(path) => {
+                    diags.push(decl.span, format!("no component `{path}`"));
+                    return None;
+                }
+            },
+        };
+        let block = alloc(buffers, frame.bytes);
+        arg_buffers.push(block);
+        let fields: Vec<(String, Cell)> = frame
+            .fields
+            .iter()
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    Cell {
+                        buf: field(buffers, block, f.offset),
+                        ty: f.ty.clone(),
+                    },
+                )
+            })
+            .collect();
+        let binding = if port.projected {
+            Binding::Cell {
+                cell: fields[0].1.clone(),
+                writable: false,
+            }
+        } else {
+            Binding::Record {
+                fields,
+                writable: false,
+            }
+        };
+        names.insert(port.key.clone(), binding);
+        ports.push(Port {
+            param: port.key.clone(),
+            frame,
+            bindings: port.bindings.clone(),
+        });
+    }
+
+    let mut state_buffers = Vec::with_capacity(decl.state.len());
+    for slot in &decl.state {
+        let buf = alloc(buffers, slot_bytes(&slot.field.ty));
+        state_buffers.push(buf);
+        let cell = Cell {
+            buf,
+            ty: slot.field.ty.clone(),
+        };
+        match names.entry(slot.param.clone()).or_insert_with(|| Binding::Record {
+            fields: Vec::new(),
+            writable: true,
+        }) {
+            Binding::Record { fields, .. } => fields.push((slot.field.name.clone(), cell)),
+            _ => {
+                diags.push(decl.span, format!("`{}` is already a port", slot.param));
+                return None;
+            }
+        }
+    }
+
+    // A declared output frame is placed before the body runs, so a `return`
+    // can write straight into its fields. A bare expression's frame cannot be
+    // — its type is what the body turns out to compute.
+    let placed = decl.output.as_ref().map(|frame| place_frame(buffers, frame));
+
+    let mut body = FnChecker {
+        diags,
+        sigs,
+        by_name,
+        frames,
+        buffers,
+        ret: Ty::F64,
+        ret_buffer: None,
+        buffer_abi: true,
+        output: placed.as_ref().map(|(_, fields)| Output {
+            frame: decl.output.clone().expect("placed implies declared"),
+            fields: fields.clone(),
+            class: decl.output_class.clone(),
+            anonymous: decl.anonymous_output,
+        }),
+        now: Some(0),
+        locals: vec![Ty::I64],
+        names,
+        loop_depth: 0,
+        calls: Vec::new(),
+    };
+
+    let (stmts, output, ret_block) = match &decl.body {
+        lang::Body::Stmts(stmts) => {
+            let checked = body.block(stmts, 0);
+            if !always_returns(&checked) {
+                body.diags
+                    .push(decl.span, "not every path through this system returns");
+            }
+            let (block, _) = placed.expect("a statement body declares its output");
+            (
+                checked,
+                decl.output.clone().expect("a statement body declares its output"),
+                block,
+            )
+        }
+        lang::Body::Expr(expr) => {
+            let (value, ty) = body.expr(expr, 0)?;
+            let frame = lang::frame_of(&decl.name, [(decl.name.clone(), ty.clone())]);
+            let (block, fields) = place_frame(body.buffers, &frame);
+            (
+                vec![Stmt::ReturnFrame(vec![FieldWrite {
+                    dest: fields[0],
+                    value,
+                    ty,
+                }])],
+                frame,
+                block,
+            )
+        }
+    };
+    let locals = body.locals;
+
+    let publishes = output
+        .fields
+        .iter()
+        .map(|f| match decl.anonymous_output {
+            true => decl.name.clone(),
+            false => format!("{}.{}", decl.name, f.name),
+        })
+        .collect();
+
+    Some((
+        Func {
+            name: decl.name.clone(),
+            param_count: 1,
+            locals,
+            ret: Ty::I64,
+            body: stmts,
+            buffer_abi: true,
+            arg_buffers,
+            ret_buffer: Some(ret_block),
+            prologue: Vec::new(),
+            system: Some(SystemAbi {
+                state: state_buffers.clone(),
+            }),
+        },
+        manifest::System {
+            name: decl.name.clone(),
+            inputs: ports,
+            output,
+            publishes,
+            state: decl.state.iter().map(|s| s.field.clone()).collect(),
+            driving: decl.driving,
+            source: decl.span,
+        },
+    ))
+}
+
+/// Give a frame a block and every field a window into it.
+fn place_frame(buffers: &mut Vec<Place>, frame: &Frame) -> (BufId, Vec<BufId>) {
+    let block = alloc(buffers, frame.bytes);
+    let fields = frame
+        .fields
+        .iter()
+        .map(|f| field(buffers, block, f.offset))
+        .collect();
+    (block, fields)
 }
 
 struct FnFrame {
@@ -341,8 +581,13 @@ fn tensor_cycles(edges: &[Vec<u32>], frames: &[FnFrame]) -> Vec<u32> {
     cyclic
 }
 
-fn alloc(buffers: &mut Vec<u32>, bytes: u32) -> BufId {
-    buffers.push(bytes);
+fn alloc(buffers: &mut Vec<Place>, bytes: u32) -> BufId {
+    buffers.push(Place::Block(bytes));
+    (buffers.len() - 1) as BufId
+}
+
+fn field(buffers: &mut Vec<Place>, parent: BufId, offset: u32) -> BufId {
+    buffers.push(Place::Field { parent, offset });
     (buffers.len() - 1) as BufId
 }
 
@@ -358,7 +603,7 @@ fn elems(ty: &Ty) -> u32 {
     }
 }
 
-fn annotation(expr: &ast::Expr, diags: &mut Diagnostics) -> Ty {
+pub(crate) fn annotation(expr: &ast::Expr, diags: &mut Diagnostics) -> Ty {
     match expr {
         ast::Expr::Name(name) => match name.id.as_str() {
             "f64" | "float" => Ty::F64,
@@ -455,9 +700,34 @@ fn padded(shape: &[usize], rank: usize) -> Vec<u32> {
     (0..rank).map(|i| axis(shape, rank, i) as u32).collect()
 }
 
+/// A value the host owns a buffer for: a frame field, a state slot, or a
+/// projected port.
+#[derive(Clone)]
+struct Cell {
+    buf: BufId,
+    ty: Ty,
+}
+
 enum Binding {
     Scalar { slot: u32, ty: Ty },
     Tensor { buf: BufId, ty: Ty },
+    Cell { cell: Cell, writable: bool },
+    /// A frame or state parameter, addressed field by field. Input frames are
+    /// read-only; state is what a system is allowed to keep.
+    Record {
+        fields: Vec<(String, Cell)>,
+        writable: bool,
+    },
+}
+
+/// Where a system's `return` goes.
+struct Output {
+    frame: Frame,
+    fields: Vec<BufId>,
+    /// The class a `return Frame(...)` must name, absent for a one-field
+    /// output the body returns bare.
+    class: Option<String>,
+    anonymous: bool,
 }
 
 struct FnChecker<'a> {
@@ -465,10 +735,13 @@ struct FnChecker<'a> {
     sigs: &'a [FnSig],
     by_name: &'a HashMap<String, u32>,
     frames: &'a [FnFrame],
-    buffers: &'a mut Vec<u32>,
+    buffers: &'a mut Vec<Place>,
     ret: Ty,
     ret_buffer: Option<BufId>,
     buffer_abi: bool,
+    output: Option<Output>,
+    /// The slot `now()` reads, in a system.
+    now: Option<u32>,
     locals: Vec<Ty>,
     names: HashMap<String, Binding>,
     loop_depth: u32,
@@ -503,6 +776,9 @@ impl FnChecker<'_> {
         match stmt {
             ast::Stmt::Return(ret) => {
                 let value = ret.value.as_ref()?;
+                if self.output.is_some() {
+                    return Some(vec![self.return_frame(value, depth)?]);
+                }
                 let (expr, ty) = self.expr(value, depth)?;
                 let want = self.ret.clone();
                 let expr = self.coerce(expr, ty, &want, value.range())?;
@@ -535,6 +811,12 @@ impl FnChecker<'_> {
                     return None;
                 }
                 match &assign.targets[0] {
+                    ast::Expr::Attribute(_) => {
+                        let (value, got) = self.expr(&assign.value, depth)?;
+                        let cell = self.writable_cell(&assign.targets[0])?;
+                        let value = self.coerce(value, got, &cell.ty, assign.value.range())?;
+                        Some(vec![self.write_cell(&cell, value)])
+                    }
                     ast::Expr::Name(target) => {
                         let (expr, got) = self.expr(&assign.value, depth)?;
                         let name = target.id.as_str();
@@ -555,6 +837,20 @@ impl FnChecker<'_> {
                                     value: expr,
                                     bytes: slot_bytes(&want),
                                 }])
+                            }
+                            Some(Binding::Cell {
+                                cell,
+                                writable: true,
+                            }) => {
+                                let cell = cell.clone();
+                                let expr =
+                                    self.coerce(expr, got, &cell.ty, assign.value.range())?;
+                                Some(vec![self.write_cell(&cell, expr)])
+                            }
+                            Some(_) => {
+                                self.diags
+                                    .push(target.range, format!("`{name}` is an input; it cannot be assigned"));
+                                None
                             }
                             None => Some(vec![self.bind(name, got, expr)]),
                         }
@@ -578,6 +874,14 @@ impl FnChecker<'_> {
                 }
             }
             ast::Stmt::AugAssign(aug) => {
+                if matches!(aug.target.as_ref(), ast::Expr::Attribute(_)) {
+                    let cell = self.writable_cell(&aug.target)?;
+                    let lhs = (self.read_cell(&cell), cell.ty.clone());
+                    let rhs = self.expr(&aug.value, depth)?;
+                    let (expr, got) = self.binop(aug.op, lhs, rhs, &aug.value, aug.range)?;
+                    let expr = self.coerce(expr, got, &cell.ty, aug.range)?;
+                    return Some(vec![self.write_cell(&cell, expr)]);
+                }
                 let ast::Expr::Name(target) = aug.target.as_ref() else {
                     self.diags
                         .push(aug.target.range(), "only plain names can be assigned");
@@ -590,6 +894,22 @@ impl FnChecker<'_> {
                     }
                     Some(Binding::Tensor { buf, ty }) => {
                         ((Expr::Tensor(*buf), ty.clone()), Ok(*buf))
+                    }
+                    Some(Binding::Cell {
+                        cell,
+                        writable: true,
+                    }) => {
+                        let cell = cell.clone();
+                        let lhs = (self.read_cell(&cell), cell.ty.clone());
+                        let rhs = self.expr(&aug.value, depth)?;
+                        let (expr, got) = self.binop(aug.op, lhs, rhs, &aug.value, aug.range)?;
+                        let expr = self.coerce(expr, got, &cell.ty, aug.range)?;
+                        return Some(vec![self.write_cell(&cell, expr)]);
+                    }
+                    Some(_) => {
+                        self.diags
+                            .push(aug.target.range(), format!("`{name}` is an input; it cannot be assigned"));
+                        return None;
                     }
                     None => {
                         self.diags
@@ -663,6 +983,158 @@ impl FnChecker<'_> {
                 None
             }
         }
+    }
+
+    fn read(&mut self, name: &str, range: TextRange) -> Option<(Expr, Ty)> {
+        match self.names.get(name) {
+            Some(Binding::Scalar { slot, ty }) => Some((Expr::Local(*slot), ty.clone())),
+            Some(Binding::Tensor { buf, ty }) => Some((Expr::Tensor(*buf), ty.clone())),
+            Some(Binding::Cell { cell, .. }) => {
+                let cell = cell.clone();
+                Some((self.read_cell(&cell), cell.ty))
+            }
+            Some(Binding::Record { .. }) => {
+                self.diags
+                    .push(range, format!("`{name}` is a frame; name one of its fields"));
+                None
+            }
+            None => {
+                self.diags.push(range, format!("`{name}` is not defined"));
+                None
+            }
+        }
+    }
+
+    /// Read a value out of the buffer the host owns it in.
+    fn read_cell(&self, cell: &Cell) -> Expr {
+        match cell.ty {
+            Ty::Tensor { .. } => Expr::Tensor(cell.buf),
+            _ => Expr::Load {
+                buf: cell.buf,
+                ty: cell.ty.clone(),
+            },
+        }
+    }
+
+    fn write_cell(&self, cell: &Cell, value: Expr) -> Stmt {
+        match cell.ty {
+            Ty::Tensor { .. } => Stmt::TensorAssign {
+                dest: cell.buf,
+                value,
+                bytes: slot_bytes(&cell.ty),
+            },
+            _ => Stmt::Store {
+                dest: cell.buf,
+                value,
+                ty: cell.ty.clone(),
+            },
+        }
+    }
+
+    /// The cell a dotted path names, refusing anything a body may not write.
+    fn writable_cell(&mut self, target: &ast::Expr) -> Option<Cell> {
+        let ast::Expr::Attribute(attr) = target else {
+            self.diags.push(target.range(), "only names and fields can be assigned");
+            return None;
+        };
+        let Some(head) = lang::dotted(&attr.value) else {
+            self.diags.push(target.range(), "only names and fields can be assigned");
+            return None;
+        };
+        match self.names.get(&head) {
+            Some(Binding::Record {
+                fields,
+                writable: true,
+            }) => match fields.iter().find(|(name, _)| name == attr.attr.as_str()) {
+                Some((_, cell)) => Some(cell.clone()),
+                None => {
+                    self.diags.push(
+                        target.range(),
+                        format!("`{head}` has no field `{}`", attr.attr.as_str()),
+                    );
+                    None
+                }
+            },
+            Some(_) => {
+                self.diags
+                    .push(target.range(), format!("`{head}` is an input; it cannot be assigned"));
+                None
+            }
+            None => {
+                self.diags.push(target.range(), format!("`{head}` is not defined"));
+                None
+            }
+        }
+    }
+
+    /// A system's `return`: either the output frame constructed field by
+    /// field, or a bare value filling a one-field anonymous frame.
+    fn return_frame(&mut self, value: &ast::Expr, depth: u32) -> Option<Stmt> {
+        let output = self.output.as_ref().expect("only a system returns a frame");
+        let (frame, fields, class, anonymous) = (
+            output.frame.clone(),
+            output.fields.clone(),
+            output.class.clone(),
+            output.anonymous,
+        );
+
+        if anonymous {
+            let ty = frame.fields[0].ty.clone();
+            let (expr, got) = self.expr(value, depth)?;
+            let expr = self.coerce(expr, got, &ty, value.range())?;
+            return Some(Stmt::ReturnFrame(vec![FieldWrite {
+                dest: fields[0],
+                value: expr,
+                ty,
+            }]));
+        }
+
+        let class = class.expect("a declared output frame names its class");
+        let ast::Expr::Call(call) = value else {
+            self.diags
+                .push(value.range(), format!("a system returns `{class}(...)`"));
+            return None;
+        };
+        let named = matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == class);
+        if !named || !call.args.is_empty() {
+            self.diags.push(
+                value.range(),
+                format!("a system returns `{class}(...)` with one keyword per field"),
+            );
+            return None;
+        }
+
+        let mut writes = Vec::with_capacity(frame.fields.len());
+        for (field, dest) in frame.fields.iter().zip(&fields) {
+            let Some(keyword) = call
+                .keywords
+                .iter()
+                .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == field.name))
+            else {
+                self.diags
+                    .push(call.range, format!("`{}` is not given a value", field.name));
+                return None;
+            };
+            let (expr, got) = self.expr(&keyword.value, depth)?;
+            let expr = self.coerce(expr, got, &field.ty, keyword.value.range())?;
+            writes.push(FieldWrite {
+                dest: *dest,
+                value: expr,
+                ty: field.ty.clone(),
+            });
+        }
+        for keyword in &call.keywords {
+            let unknown = keyword
+                .arg
+                .as_ref()
+                .is_none_or(|a| frame.field(a.as_str()).is_none());
+            if unknown {
+                self.diags
+                    .push(keyword.range, format!("`{class}` has no such field"));
+                return None;
+            }
+        }
+        Some(Stmt::ReturnFrame(writes))
     }
 
     /// Introduce a name, in a wasm local or a buffer depending on its type.
@@ -1101,15 +1573,35 @@ impl FnChecker<'_> {
                     None
                 }
             },
-            ast::Expr::Name(name) => match self.names.get(name.id.as_str()) {
-                Some(Binding::Scalar { slot, ty }) => Some((Expr::Local(*slot), ty.clone())),
-                Some(Binding::Tensor { buf, ty }) => Some((Expr::Tensor(*buf), ty.clone())),
-                None => {
-                    self.diags
-                        .push(name.range, format!("`{}` is not defined", name.id.as_str()));
-                    None
+            ast::Expr::Name(name) => self.read(name.id.as_str(), name.range),
+            ast::Expr::Attribute(attr) => {
+                // A projected port's key is the whole dotted path the operator
+                // typed; a frame parameter's is just its head.
+                if let Some(path) = lang::dotted(expr)
+                    && self.names.contains_key(&path)
+                {
+                    return self.read(&path, attr.range);
                 }
-            },
+                let head = lang::dotted(&attr.value)?;
+                let Some(Binding::Record { fields, .. }) = self.names.get(&head) else {
+                    self.diags
+                        .push(attr.range, format!("`{head}` is not a frame here"));
+                    return None;
+                };
+                match fields.iter().find(|(name, _)| name == attr.attr.as_str()) {
+                    Some((_, cell)) => {
+                        let cell = cell.clone();
+                        Some((self.read_cell(&cell), cell.ty))
+                    }
+                    None => {
+                        self.diags.push(
+                            attr.range,
+                            format!("`{head}` has no field `{}`", attr.attr.as_str()),
+                        );
+                        None
+                    }
+                }
+            }
             ast::Expr::BinOp(b) => {
                 let lhs = self.expr(&b.left, depth)?;
                 let rhs = self.expr(&b.right, depth)?;
@@ -1512,6 +2004,19 @@ impl FnChecker<'_> {
                     Ty::F64,
                 ));
             }
+            "now" => {
+                if !arity(0, self) {
+                    return None;
+                }
+                return match self.now {
+                    Some(slot) => Some((Expr::Local(slot), Ty::I64)),
+                    None => {
+                        self.diags
+                            .push(call.range, "`now()` exists inside a system");
+                        None
+                    }
+                };
+            }
             "len" => {
                 if !arity(1, self) {
                     return None;
@@ -1762,7 +2267,7 @@ fn transcendental(name: &str) -> Option<&'static str> {
 
 fn always_returns(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        Stmt::Return(_) | Stmt::ReturnBuffer { .. } => true,
+        Stmt::Return(_) | Stmt::ReturnBuffer { .. } | Stmt::ReturnFrame(_) => true,
         Stmt::If { then, els, .. } => !els.is_empty() && always_returns(then) && always_returns(els),
         _ => false,
     })

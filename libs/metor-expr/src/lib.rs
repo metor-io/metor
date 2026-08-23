@@ -9,13 +9,35 @@
 //! rules out any pipeline with a toolchain in it. What is left is a compiler
 //! small enough to live in the flight binary: parse, check, encode.
 //!
-//! This crate is Phase 0 of that — the compiler spike, no frames and no
-//! decorators. What it establishes is the substrate the rest sits on.
-//!
 //! ```
 //! let module = metor_expr::compile("def f(x: f64) -> f64:\n    return x * 2.0\n").unwrap();
 //! assert_eq!(module.manifest.functions[0].name, "f");
 //! ```
+//!
+//! ## A frame is a class, a system is a decorated function
+//!
+//! The unit of the language is the one metor-fsw-2 already has. A `Frame`
+//! class is a named record of values sharing a timestamp; a `@system` is a
+//! function whose signature *is* its wiring surface — frame parameters are
+//! input ports, a `State` parameter is what it keeps, the return frame is what
+//! it publishes. There is no `persist`, because publishing is what returning
+//! means, and no `source`, because binding is what the signature means.
+//!
+//! Three tiers write the same construct, which is what makes promoting one to
+//! the next a copy-paste: `@system` over declared frames, `@system` over
+//! positional component paths, and a bare expression — `adcs.omega_b * 100` is
+//! already valid Python, so a one-liner in a panel field is a system that
+//! never needed a name. `lang` reduces all three to one shape
+//! before anything is checked.
+//!
+//! ## Names resolve here and stay resolved
+//!
+//! The compiler cannot know what `adcs.omega_b` is, so it asks a
+//! [`Resolver`] — the panel over its db vtables, the vehicle over its frame
+//! registry — and asks *once*. A bare name resolving by unique suffix is a
+//! fact about the component tree at authoring time; what the [`Manifest`]
+//! records is the full path it found, so a component added tomorrow cannot
+//! change what a saved expression reads.
 //!
 //! ## Nothing links at compile time
 //!
@@ -31,22 +53,27 @@
 //! wasm opcodes; the prelude is entered for transcendentals, for tensor
 //! kernels, and for nothing else.
 //!
-//! ## Tensors are addresses
+//! ## Tensors are addresses, and so are frames
 //!
 //! Every tensor in a compiled program lives at an address the compiler picked,
 //! above the linker's `__heap_base`. That is what makes kernel call sites
-//! constant — an elementwise operation is `i32.const desc; call $k_add`, where
-//! `desc` is a data segment holding both operand addresses and all three
-//! shapes — and it is why the guest needs no allocator. It also gives the
+//! constant, and it is why the guest needs no allocator. It also gives the
 //! host ABI its shape: a function whose signature mentions a tensor takes no
 //! wasm parameters, and is driven through `<name>_arg_ptr(i)`, `<name>()`,
 //! `<name>_ret_ptr()`. See [`FnSig::uses_buffers`].
 //!
+//! A frame is the same idea one level up: one block per port, addressed by
+//! `<system>_arg_ptr(i)`, with each field a constant offset the [`Manifest`]
+//! spells out. A system is therefore driven as
+//! `<system>_arg_ptr(i)` / `<system>_state_ptr(i)` / `<system>_eval(now)` /
+//! `<system>_ret_ptr()`, and nothing about that is discovered by convention.
+//!
 //! ## The pipeline
 //!
-//! [`compile`] is three passes and no more. `rustpython-parser` produces a
-//! Python AST; [`check`](mod@check) turns it into a typed IR, which is the
-//! only representation of a program this crate keeps; [`codegen`](mod@codegen)
+//! [`compile_module`] is four passes and no more. `rustpython-parser` produces
+//! a Python AST; `lang` reads its declarations and resolves every
+//! binding; `check` turns bodies into a typed IR, which is the
+//! only representation of a program this crate keeps; `codegen`
 //! emits. The checker is the *single* validation gate — codegen re-derives
 //! nothing and guards against nothing, because everything it could guard
 //! against was already refused with a span.
@@ -75,9 +102,16 @@ mod check;
 mod codegen;
 mod diag;
 mod ir;
+mod lang;
+mod manifest;
+mod resolve;
 pub mod template;
 
 pub use diag::{Diagnostic, Diagnostics, Span};
+pub use manifest::{
+    Binding, COMPILER_VERSION, Field, FnSig, Frame, Init, Manifest, Port, StateField, System,
+};
+pub use resolve::{CompSchema, FrameSchema, Resolver, Unresolved};
 
 /// The guest template generated functions are appended to.
 ///
@@ -86,8 +120,8 @@ pub use diag::{Diagnostic, Diagnostics, Span};
 pub const PRELUDE: &[u8] = include_bytes!("prelude.wasm");
 
 /// An element type. Only `f64` participates in tensors today; the rest of the
-/// vocabulary is here because the manifest is what Phase 1 serializes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// vocabulary is here because the manifest is what hosts serialize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Dtype {
     F64,
     I64,
@@ -95,7 +129,7 @@ pub enum Dtype {
 }
 
 /// A value's type in the subset.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Ty {
     F64,
     I64,
@@ -133,58 +167,39 @@ impl std::fmt::Display for Ty {
     }
 }
 
-/// One exported function: what to call it and what it takes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FnSig {
-    pub name: String,
-    pub params: Vec<(String, Ty)>,
-    pub ret: Ty,
-}
-
-impl FnSig {
-    /// Whether this function crosses through static buffers rather than by
-    /// value.
-    ///
-    /// A tensor anywhere in the signature moves the whole signature into
-    /// memory: the host writes argument `i` at `<name>_arg_ptr(i)`, calls
-    /// `<name>()`, and reads the result at `<name>_ret_ptr()`. Scalar-only
-    /// functions keep taking and returning wasm values.
-    pub fn uses_buffers(&self) -> bool {
-        matches!(self.ret, Ty::Tensor { .. })
-            || self
-                .params
-                .iter()
-                .any(|(_, ty)| matches!(ty, Ty::Tensor { .. }))
-    }
-}
-
-/// What the host needs in order to call a compiled module.
-///
-/// It stays host-side in this phase. Embedding it behind `expr_describe()`
-/// joins the ABI work in Phase 1, where the vocabulary aligns with the
-/// serialized `SystemDescriptor` forms.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Manifest {
-    pub functions: Vec<FnSig>,
-}
-
-/// A compiled program: a closed module, and the signatures to drive it by.
+/// A compiled program: a closed module, and the manifest to drive it by.
 #[derive(Clone, Debug)]
-pub struct Module {
+pub struct Program {
     /// A complete core module. No imports, ever.
     pub wasm: Vec<u8>,
     pub manifest: Manifest,
 }
 
-/// Compile a module of annotated `def`s.
+/// Compile a module of annotated `def`s, against a host that knows nothing.
 ///
 /// Never panics. Any input that is not a well-typed program in the subset —
 /// including a half-typed line, a truncated file, or arbitrary bytes — comes
 /// back as [`Diagnostics`] carrying spans.
-pub fn compile(source: &str) -> Result<Module, Diagnostics> {
-    let (program, manifest) = check::check(source)?;
-    let wasm = codegen::emit(&program, &manifest);
-    Ok(Module { wasm, manifest })
+pub fn compile(source: &str) -> Result<Program, Diagnostics> {
+    compile_module(source, &Unresolved)
+}
+
+/// Compile a module of frames, systems, bindings, and helper `def`s.
+pub fn compile_module(source: &str, resolver: &dyn Resolver) -> Result<Program, Diagnostics> {
+    emit(check::check(source, resolver, check::Entry::Module)?)
+}
+
+/// Compile one bare expression into the single anonymous system a `=` field
+/// runs, exported as `expr_eval`.
+pub fn compile_expr(source: &str, resolver: &dyn Resolver) -> Result<Program, Diagnostics> {
+    emit(check::check(source, resolver, check::Entry::Expression)?)
+}
+
+fn emit((program, manifest): (ir::Program, Manifest)) -> Result<Program, Diagnostics> {
+    Ok(Program {
+        wasm: codegen::emit(&program),
+        manifest,
+    })
 }
 
 #[cfg(test)]

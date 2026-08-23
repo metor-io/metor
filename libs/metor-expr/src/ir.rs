@@ -15,14 +15,25 @@ pub(crate) struct Program {
     /// Parameter types per function, so codegen knows how a buffer-ABI
     /// callee's arguments cross without consulting the manifest.
     pub param_types: Vec<Vec<Ty>>,
-    /// Every statically placed block of linear memory the program needs, in
-    /// bytes. Codegen turns these into addresses above `__heap_base`.
-    pub buffers: Vec<u32>,
+    /// Every statically placed piece of linear memory the program needs.
+    /// Codegen turns these into addresses above `__heap_base`.
+    pub buffers: Vec<Place>,
 }
 
-/// A statically placed block of linear memory: a tensor parameter, return
-/// value, named variable, or intermediate.
+/// A statically placed value: a tensor parameter, return value, named
+/// variable, intermediate, frame, frame field, or state slot.
 pub(crate) type BufId = u32;
+
+/// Where a statically placed value lives.
+///
+/// Frames need both halves. The host addresses a whole input frame through one
+/// pointer, so a frame is a [`Place::Block`]; the body addresses each field
+/// separately, so every field is a [`Place::Field`] into it. Nothing is
+/// relocated at run time — a field's address is its frame's plus a constant.
+pub(crate) enum Place {
+    Block(u32),
+    Field { parent: BufId, offset: u32 },
+}
 
 pub(crate) struct Func {
     pub name: String,
@@ -31,6 +42,7 @@ pub(crate) struct Func {
     /// `param_count` entries. A tensor parameter has no slot — it lives in a
     /// buffer — so this is empty for buffer-ABI functions.
     pub locals: Vec<Ty>,
+    pub ret: Ty,
     pub body: Vec<Stmt>,
     /// Set when the signature mentions a tensor. Such a function takes no
     /// wasm parameters: everything crosses through [`Func::arg_buffers`] and
@@ -41,6 +53,15 @@ pub(crate) struct Func {
     /// Scalar parameters of a buffer-ABI function, loaded out of their
     /// buffers into slots on entry.
     pub prologue: Vec<(BufId, u32, Ty)>,
+    /// Set for a `@system`, which is exported as `<name>_eval(now)` and adds
+    /// `<name>_state_ptr(i)` to the buffer ABI.
+    pub system: Option<SystemAbi>,
+}
+
+pub(crate) struct SystemAbi {
+    /// One block per state field, addressed individually because snapshot and
+    /// restore work field by field.
+    pub state: Vec<BufId>,
 }
 
 /// Shapes for one elementwise call site, already right-aligned to a common
@@ -181,6 +202,9 @@ pub(crate) enum Expr {
     /// A tensor already sitting in a buffer. Evaluating it costs nothing —
     /// every tensor address in a compiled program is a compile-time constant.
     Tensor(BufId),
+    /// A scalar living in a buffer rather than a local: a frame field, a state
+    /// slot, or a projected port.
+    Load { buf: BufId, ty: Ty },
     /// Elementwise arithmetic writing into `dest`, broadcasting per `desc`.
     Elementwise {
         kernel: &'static str,
@@ -293,6 +317,22 @@ pub(crate) enum Stmt {
         value: Expr,
         ty: Ty,
     },
+    /// Write a scalar into a buffer: a state slot, or one field of the output
+    /// frame.
+    Store {
+        dest: BufId,
+        value: Expr,
+        ty: Ty,
+    },
+    /// Fill every field of a system's output frame and report success.
+    /// Publishing is what returning means.
+    ReturnFrame(Vec<FieldWrite>),
+}
+
+pub(crate) struct FieldWrite {
+    pub dest: BufId,
+    pub value: Expr,
+    pub ty: Ty,
 }
 
 impl Program {
@@ -314,8 +354,13 @@ fn collect_stmts(stmts: &[Stmt], found: &mut Vec<&'static str>) {
             Stmt::Assign { value, .. } | Stmt::Return(value) | Stmt::Drop(value) => {
                 collect_expr(value, found)
             }
-            Stmt::TensorAssign { value, .. } | Stmt::ReturnBuffer { value, .. } => {
-                collect_expr(value, found)
+            Stmt::TensorAssign { value, .. }
+            | Stmt::ReturnBuffer { value, .. }
+            | Stmt::Store { value, .. } => collect_expr(value, found),
+            Stmt::ReturnFrame(fields) => {
+                for field in fields {
+                    collect_expr(&field.value, found);
+                }
             }
             Stmt::ElementAssign {
                 target,
@@ -429,6 +474,11 @@ fn collect_expr(expr: &Expr, found: &mut Vec<&'static str>) {
                 collect_expr(arg, found);
             }
         }
-        Expr::F64(_) | Expr::I64(_) | Expr::Bool(_) | Expr::Local(_) | Expr::Tensor(_) => {}
+        Expr::F64(_)
+        | Expr::I64(_)
+        | Expr::Bool(_)
+        | Expr::Local(_)
+        | Expr::Tensor(_)
+        | Expr::Load { .. } => {}
     }
 }

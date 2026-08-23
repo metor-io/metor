@@ -10,6 +10,7 @@ description = "Compiles a typed subset of Python to closed WebAssembly modules"
 [dependencies]
 num-traits = { version = "0.2", default-features = false }
 rustpython-parser = "0.4"
+serde = { version = "1.0", features = ["derive"] }
 wasm-encoder = { version = "0.256", features = ["wasmparser"] }
 wasmparser = "0.256"
 

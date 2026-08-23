@@ -27,15 +27,15 @@ use std::collections::HashMap;
 
 use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
-use crate::ir::{Arith, BufId, Cmp, Desc, Emit, Expr, Func, Intrinsic, Num, Program, Stmt};
+use crate::ir::{Arith, BufId, Cmp, Desc, Emit, Expr, Func, Intrinsic, Num, Place, Program, Stmt};
 use crate::template::Template;
-use crate::{Manifest, PRELUDE, Ty};
+use crate::{PRELUDE, Ty};
 
 /// Bytes an elementwise descriptor occupies: three addresses, a rank, and
 /// three shapes of four axes.
 const DESC_BYTES: u32 = 16 * 4;
 
-pub(crate) fn emit(program: &Program, manifest: &Manifest) -> Vec<u8> {
+pub(crate) fn emit(program: &Program) -> Vec<u8> {
     let kernels = program.kernels();
     let plan = Template::parse(PRELUDE)
         .expect("the checked-in prelude parses")
@@ -48,33 +48,36 @@ pub(crate) fn emit(program: &Program, manifest: &Manifest) -> Vec<u8> {
     let base = splice.next_function();
 
     // Buffers first, then the descriptors kernel call sites point at, all
-    // eight-aligned so an f64 load never straddles.
+    // eight-aligned so an f64 load never straddles. A field's parent is always
+    // placed before it, so one pass suffices.
     let mut cursor = (splice.heap_base() + 7) & !7;
-    let addresses: Vec<u32> = program
-        .buffers
-        .iter()
-        .map(|bytes| {
-            let at = cursor;
-            cursor += (bytes + 7) & !7;
-            at
-        })
-        .collect();
+    let mut addresses: Vec<u32> = Vec::with_capacity(program.buffers.len());
+    for place in &program.buffers {
+        addresses.push(match place {
+            Place::Block(bytes) => {
+                let at = cursor;
+                cursor += (bytes + 7) & !7;
+                at
+            }
+            Place::Field { parent, offset } => addresses[*parent as usize] + offset,
+        });
+    }
 
     let layout = Layout {
         addresses,
         descriptors: cursor,
     };
 
-    let types: Vec<u32> = manifest
-        .functions
+    let types: Vec<u32> = program
+        .funcs
         .iter()
-        .zip(&program.funcs)
-        .map(|(sig, func)| {
-            if func.buffer_abi {
-                splice.ty(vec![], vec![ValType::I32])
-            } else {
-                let params: Vec<ValType> = sig.params.iter().map(|(_, t)| val_type(t)).collect();
-                splice.ty(params, vec![val_type(&sig.ret)])
+        .map(|func| match (&func.system, func.buffer_abi) {
+            (Some(_), _) => splice.ty(vec![ValType::I64], vec![ValType::I32]),
+            (None, true) => splice.ty(vec![], vec![ValType::I32]),
+            (None, false) => {
+                let params: Vec<ValType> =
+                    func.locals[..func.param_count].iter().map(val_type).collect();
+                splice.ty(params, vec![val_type(&func.ret)])
             }
         })
         .collect();
@@ -82,32 +85,27 @@ pub(crate) fn emit(program: &Program, manifest: &Manifest) -> Vec<u8> {
     let mut descriptors: Vec<u8> = Vec::new();
     let mut indices = Vec::with_capacity(program.funcs.len());
     for (func, ty) in program.funcs.iter().zip(&types) {
-        let body = Emitter::new(func, program, &kernel_index, base, &layout, &mut descriptors)
-            .finish(func);
+        let body =
+            Emitter::new(func, program, &kernel_index, base, &layout, &mut descriptors).finish(func);
         indices.push(splice.function(*ty, body));
     }
 
     let accessor = splice.ty(vec![ValType::I32], vec![ValType::I32]);
     let nullary = splice.ty(vec![], vec![ValType::I32]);
     for (func, index) in program.funcs.iter().zip(&indices) {
-        splice.export(func.name.clone(), *index);
+        match &func.system {
+            Some(abi) => {
+                splice.export(format!("{}_eval", func.name), *index);
+                let table = address_table(&layout, &abi.state);
+                let state_ptr = splice.function(accessor, table);
+                splice.export(format!("{}_state_ptr", func.name), state_ptr);
+            }
+            None => splice.export(func.name.clone(), *index),
+        }
         if !func.buffer_abi {
             continue;
         }
-        // `<name>_arg_ptr(i)` is a jump table of constants: the shapes are
-        // static, so the addresses are too.
-        let mut table = Function::new([]);
-        for (i, buf) in func.arg_buffers.iter().enumerate() {
-            table.instruction(&Instruction::LocalGet(0));
-            table.instruction(&Instruction::I32Const(i as i32));
-            table.instruction(&Instruction::I32Eq);
-            table.instruction(&Instruction::If(BlockType::Empty));
-            table.instruction(&Instruction::I32Const(layout.at(*buf) as i32));
-            table.instruction(&Instruction::Return);
-            table.instruction(&Instruction::End);
-        }
-        table.instruction(&Instruction::I32Const(0));
-        table.instruction(&Instruction::End);
+        let table = address_table(&layout, &func.arg_buffers);
         let arg_ptr = splice.function(accessor, table);
         splice.export(format!("{}_arg_ptr", func.name), arg_ptr);
 
@@ -126,6 +124,25 @@ pub(crate) fn emit(program: &Program, manifest: &Manifest) -> Vec<u8> {
     splice.reserve_memory(layout.descriptors + descriptors.len() as u32);
 
     splice.finish()
+}
+
+/// `<name>_arg_ptr(i)` and `<name>_state_ptr(i)`: a jump table of constants,
+/// because every shape is static and so is every address. An index nothing
+/// claims answers zero.
+fn address_table(layout: &Layout, buffers: &[BufId]) -> Function {
+    let mut table = Function::new([]);
+    for (i, buf) in buffers.iter().enumerate() {
+        table.instruction(&Instruction::LocalGet(0));
+        table.instruction(&Instruction::I32Const(i as i32));
+        table.instruction(&Instruction::I32Eq);
+        table.instruction(&Instruction::If(BlockType::Empty));
+        table.instruction(&Instruction::I32Const(layout.at(*buf) as i32));
+        table.instruction(&Instruction::Return);
+        table.instruction(&Instruction::End);
+    }
+    table.instruction(&Instruction::I32Const(0));
+    table.instruction(&Instruction::End);
+    table
 }
 
 struct Layout {
@@ -304,19 +321,14 @@ impl<'a> Emitter<'a> {
                 self.push(Instruction::F64Store(mem_arg(3)));
             }
             Stmt::ReturnBuffer { dest, value, ty } => {
-                self.expr(value);
-                match ty {
-                    Ty::Tensor { .. } => {
-                        self.copy(self.layout.at(*dest), value.buffer(), slot_bytes(ty))
-                    }
-                    _ => {
-                        let slot = self.acquire(val_type(ty));
-                        self.push(Instruction::LocalSet(slot));
-                        self.push(Instruction::I32Const(self.layout.at(*dest) as i32));
-                        self.push(Instruction::LocalGet(slot));
-                        self.push(store_of(ty));
-                        self.release(val_type(ty), slot);
-                    }
+                self.write(*dest, value, ty);
+                self.push(Instruction::I32Const(0));
+                self.push(Instruction::Return);
+            }
+            Stmt::Store { dest, value, ty } => self.write(*dest, value, ty),
+            Stmt::ReturnFrame(fields) => {
+                for field in fields {
+                    self.write(field.dest, &field.value, &field.ty);
                 }
                 self.push(Instruction::I32Const(0));
                 self.push(Instruction::Return);
@@ -343,6 +355,10 @@ impl<'a> Emitter<'a> {
             Expr::I64(v) => self.push(Instruction::I64Const(*v)),
             Expr::Bool(v) => self.push(Instruction::I32Const(*v as i32)),
             Expr::Local(slot) => self.push(Instruction::LocalGet(*slot)),
+            Expr::Load { buf, ty } => {
+                self.push(Instruction::I32Const(self.layout.at(*buf) as i32));
+                self.push(load_of(ty));
+            }
             Expr::Store { local, value, then } => {
                 self.expr(value);
                 self.push(Instruction::LocalSet(*local));
@@ -615,6 +631,23 @@ impl<'a> Emitter<'a> {
                         self.push(load_of(ret));
                     }
                 }
+            }
+        }
+    }
+
+    /// Evaluate a value and put it in a buffer — a tensor by copy, a scalar
+    /// through a slot, since a store wants its address underneath its value.
+    fn write(&mut self, dest: BufId, value: &Expr, ty: &Ty) {
+        self.expr(value);
+        match ty {
+            Ty::Tensor { .. } => self.copy(self.layout.at(dest), value.buffer(), slot_bytes(ty)),
+            _ => {
+                let slot = self.acquire(val_type(ty));
+                self.push(Instruction::LocalSet(slot));
+                self.push(Instruction::I32Const(self.layout.at(dest) as i32));
+                self.push(Instruction::LocalGet(slot));
+                self.push(store_of(ty));
+                self.release(val_type(ty), slot);
             }
         }
     }

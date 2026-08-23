@@ -9421,6 +9421,7 @@ dependencies = [
  "nox",
  "num-traits",
  "rustpython-parser",
+ "serde",
  "wasm-encoder",
  "wasmi",
  "wasmparser 0.256.0",
