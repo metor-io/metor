@@ -35,6 +35,7 @@ members = [
     "libs/metor-fsw-2/core",
     "libs/metor-fsw-2/macros",
     "libs/metor-fsw-2/ring",
+    "libs/metor-expr",
     "libs/metor-fsw-2/tests/fixtures/dl-fixture",
     "libs/metor-fsw-2/tests/fixtures/seq-fixture",
     "libs/metor-fsw-2/tests/fixtures/seq-param-fixture",

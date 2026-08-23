@@ -1,0 +1,21 @@
+[package]
+name = "metor-expr"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+description = "Compiles a typed subset of Python to closed WebAssembly modules"
+
+[dependencies]
+rustpython-parser = "0.4"
+wasm-encoder = { version = "0.256", features = ["wasmparser"] }
+wasmparser = "0.256"
+
+[dev-dependencies]
+libm = "0.2"
+nox = { workspace = true }
+wasmi = { version = "1.1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true
