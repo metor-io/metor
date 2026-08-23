@@ -712,8 +712,12 @@ fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
                 label: SharedString::from(cfg.component.clone()),
             }));
         };
-        let node = expression.node.clone();
-        let entity = cx.new(|cx| Monitor::new(db.clone(), node, cx));
+        // Bind by component id, not by the node: an expression publishes into
+        // a real component, so the monitor reads its metadata, its element
+        // count, its seed and its sparkline through the ordinary path and
+        // never learns it was an expression at all.
+        let id = expression.component_id();
+        let entity = cx.new(|cx| Monitor::new(db.clone(), id, cx));
         entity.update(cx, |monitor, _cx| {
             monitor.bind_expression(expression, cfg.component.clone());
         });

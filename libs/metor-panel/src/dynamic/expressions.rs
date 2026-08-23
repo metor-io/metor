@@ -7,12 +7,27 @@
 //! publishes nothing. It exists while a view wants it and stops when the last
 //! one stops.
 //!
-//! That ownership rule is the whole of this module. The registry holds
-//! [`Weak`] handles, so it never keeps an expression alive: a view holds the
-//! strong `Arc`, two views typing the same text find the same node through its
-//! content hash and share it, and the entry falls out on its own once neither
-//! is left. No reference counts are kept by hand, and nothing has to be told
-//! when a view goes away.
+//! ## What owns a running expression
+//!
+//! The registry does, for the session. That is not the first answer — views
+//! held the strong references and the registry held [`Weak`] ones, so an
+//! expression stopped the moment nothing was showing it — but it is the only
+//! one consistent with the component being registered.
+//!
+//! The trouble with view ownership is that a view binds to a *component id*.
+//! Every consumer of the picker — a plot trace, a table column, a dashboard
+//! widget — takes an id and has nowhere to put a handle, so the handle died
+//! at the end of the call that made it. What the operator saw was an
+//! expression that published exactly one sample, from its seed, and then
+//! never again: the component was there, and nothing was writing to it.
+//!
+//! Since the component outlives the expression anyway (the db is
+//! insert-only), the nodes have to outlive it too, or the component is left
+//! stale and silently wrong. So an expression, once started, keeps its
+//! component current until the panel exits. Two views typing the same text
+//! still share one system — the content hash is what they meet on — and
+//! reclaiming what nothing references is the same startup sweep that reclaims
+//! the components, where nothing can be holding either.
 //!
 //! ## Ephemeral means hidden, not unregistered
 //!
@@ -42,7 +57,7 @@
 //! the compiled binding is the full path it meant at the time.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use gpui::{App, Global};
 use metor_db::DB;
@@ -69,23 +84,11 @@ pub fn body(text: &str) -> &str {
 
 /// Live `=` expressions, keyed by what they compute.
 ///
-/// Weak on purpose: see the module docs. Views own their expressions and this
-/// only lets them find each other.
+/// Strong on purpose: see the module docs. A view binds to a component id and
+/// has nowhere to keep a handle, so if this did not hold one nothing would.
 #[derive(Default)]
 pub struct Expressions {
-    live: HashMap<ComponentId, ExpressionRef>,
-}
-
-/// What the registry keeps: every part of a running expression, weakly.
-///
-/// All three have to come back together — a view that finds only the value
-/// node would hold the component alive while the system feeding it stopped —
-/// so an entry is live only while the whole chain is.
-struct ExpressionRef {
-    node: Weak<dyn DynamicNode>,
-    system: Weak<dyn DynamicNode>,
-    field: Weak<dyn DynamicNode>,
-    component: ComponentId,
+    live: HashMap<ComponentId, Expression>,
 }
 
 impl Global for Expressions {}
@@ -95,23 +98,31 @@ impl Expressions {
         cx.set_global(Expressions::default());
     }
 
-    /// The expression behind a component id, if a view still holds it.
+    /// The expression behind a component id, if this session started one.
     pub fn get(&self, id: ComponentId) -> Option<Expression> {
-        let entry = self.live.get(&id)?;
-        Some(Expression {
-            node: entry.node.upgrade()?,
-            component: entry.component,
-            _system: entry.system.upgrade()?,
-            _field: entry.field.upgrade()?,
-        })
+        self.live.get(&id).cloned()
     }
 
-    /// Whether a component id names an expression this session started.
+    /// Whether a component id names an expression this session is running.
     ///
-    /// A hidden component left behind by a previous session answers `false`:
+    /// A hidden component left behind by an earlier session answers `false`:
     /// it is a record with history, not something still computing.
     pub fn is_live(&self, id: ComponentId) -> bool {
-        self.live.get(&id).is_some_and(|e| e.node.strong_count() > 0)
+        self.live.contains_key(&id)
+    }
+
+    /// How many expressions are running, for a sweep to reason about.
+    pub fn len(&self) -> usize {
+        self.live.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+
+    /// Take ownership of a running expression, keyed by what it publishes.
+    pub fn insert(&mut self, expression: Expression) {
+        self.live.insert(expression.component, expression);
     }
 }
 
@@ -134,6 +145,25 @@ pub struct Expression {
 }
 
 impl Expression {
+    /// Assemble the parts of a running expression.
+    ///
+    /// `system` and `field` are held only for their drop — cancelling their
+    /// tasks is what stops an expression — so they are taken here rather than
+    /// exposed as fields nobody should read.
+    pub fn new(
+        node: Arc<dyn DynamicNode>,
+        component: ComponentId,
+        system: Arc<dyn DynamicNode>,
+        field: Arc<dyn DynamicNode>,
+    ) -> Self {
+        Expression {
+            node,
+            component,
+            _system: system,
+            _field: field,
+        }
+    }
+
     pub fn component_id(&self) -> ComponentId {
         self.component
     }
@@ -242,27 +272,16 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
             let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None)?;
             let field = program::field(&compiled, 0, 0, system.node.clone())?;
             let node = publish(&db, &name, field.clone(), &label)?;
-            Ok(Expression {
-                node,
-                component,
-                _system: system.node,
-                _field: field,
-            })
+            Ok(Expression::new(node, component, system.node, field))
         })
     };
     let built = built
         .ok_or_else(|| ExprError::Unbound("the node worker is gone".into()))?
         .map_err(|e| ExprError::Unbound(e.to_string()))?;
 
-    cx.global_mut::<Expressions>().live.insert(
-        component,
-        ExpressionRef {
-            node: Arc::downgrade(&built.node),
-            system: Arc::downgrade(&built._system),
-            field: Arc::downgrade(&built._field),
-            component,
-        },
-    );
+    // The registry keeps it running. Nothing else will: the caller is handed
+    // a component id, and an id cannot own anything.
+    cx.global_mut::<Expressions>().insert(built.clone());
     Ok(built)
 }
 

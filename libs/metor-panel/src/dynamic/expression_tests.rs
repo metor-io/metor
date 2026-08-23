@@ -334,3 +334,168 @@ fn an_unknown_component_says_so() {
     let diags = metor_expr::compile_expr("nothing.here * 2.0", &resolver).unwrap_err();
     assert!(format!("{diags}").contains("no component"), "{diags}");
 }
+
+/// The user's report, through the exact path `resolve` takes: seed from
+/// history, then follow the channel. One point and then silence is the
+/// symptom; this asserts the tail.
+#[stellarator::test]
+async fn a_published_expression_seeds_then_tails() {
+    use crate::dynamic::ops::{db_source, program};
+    use metor_proto::types::Timestamp;
+
+    let (db, _temp) = db_with_ids(&[(
+        "adcs.rate",
+        ComponentId::new("adcs.rate"),
+        PrimType::F64,
+        &[],
+    )]);
+    let source_id = ComponentId::new("adcs.rate");
+    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+
+    // History first, exactly as a channel that has been running.
+    source.push_buf(Timestamp(100), &10.0f64.to_le_bytes()).unwrap();
+    stellarator::sleep(std::time::Duration::from_millis(20)).await;
+
+    let resolver = DbResolver::snapshot(&db);
+    let compiled =
+        std::sync::Arc::new(program::Compiled::expression("adcs.rate + 1.0", &resolver).unwrap());
+    let name = expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    ));
+
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource {
+            node: db_source::from_db(&db, source_id).unwrap(),
+            seed: program::latest_sample(&db, source_id),
+        }],
+        program::DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let _published =
+        expressions::publish(&db, &name, field, "adcs.rate + 1.0").unwrap();
+
+    // Then the channel keeps publishing, as the user says it does.
+    for step in 1..=4 {
+        source
+            .push_buf(
+                Timestamp(100 + step),
+                &(10.0 + step as f64).to_le_bytes(),
+            )
+            .unwrap();
+    }
+
+    let component = db
+        .with_state(|s| s.get_component(ComponentId::new(&name)).cloned())
+        .expect("the expression's component");
+    for _ in 0..300 {
+        if component
+            .time_series
+            .latest()
+            .is_some_and(|l| l.timestamp() == Timestamp(104))
+        {
+            break;
+        }
+        stellarator::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let latest = component.time_series.latest().expect("history");
+    assert_eq!(
+        latest.timestamp(),
+        Timestamp(104),
+        "the expression stopped at {:?} instead of following its input",
+        latest.timestamp()
+    );
+    assert_eq!(f64::from_le_bytes(latest.data().try_into().unwrap()), 15.0);
+}
+
+/// The bug the user hit: a picker hands its caller a `ComponentId` and drops
+/// the handle, so if nothing else owns the expression its tasks are cancelled
+/// the moment the row returns.
+///
+/// What that looked like was an expression publishing exactly one sample —
+/// its seed, written while the nodes were briefly alive — and then never
+/// again, with the component sitting there and nothing writing to it. So the
+/// registry owns them, and dropping every caller-side handle changes nothing.
+#[stellarator::test]
+async fn an_expression_keeps_running_after_its_caller_drops_it() {
+    use crate::dynamic::ops::{db_source, program};
+    use metor_proto::types::Timestamp;
+
+    let (db, _temp) = db_with_ids(&[(
+        "adcs.rate",
+        ComponentId::new("adcs.rate"),
+        PrimType::F64,
+        &[],
+    )]);
+    let source_id = ComponentId::new("adcs.rate");
+    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+    source.push_buf(Timestamp(100), &10.0f64.to_le_bytes()).unwrap();
+    stellarator::sleep(std::time::Duration::from_millis(20)).await;
+
+    let resolver = DbResolver::snapshot(&db);
+    let compiled =
+        std::sync::Arc::new(program::Compiled::expression("adcs.rate + 1.0", &resolver).unwrap());
+    let name = expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    ));
+
+    // Build it, register it the way `resolve` does, then let every local
+    // handle go — which is exactly what the picker did.
+    let mut registry = expressions::Expressions::default();
+    {
+        let system = program::system(
+            &compiled,
+            0,
+            vec![program::PortSource {
+                node: db_source::from_db(&db, source_id).unwrap(),
+                seed: program::latest_sample(&db, source_id),
+            }],
+            program::DEFAULT_FUEL,
+            None,
+        )
+        .unwrap();
+        let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+        let published = expressions::publish(&db, &name, field.clone(), "adcs.rate + 1.0").unwrap();
+        registry.insert(expressions::Expression::new(
+            published,
+            ComponentId::new(&name),
+            system.node,
+            field,
+        ));
+    }
+    assert!(registry.is_live(ComponentId::new(&name)));
+
+    // The channel keeps publishing; so must the expression.
+    for step in 1..=4 {
+        source
+            .push_buf(Timestamp(100 + step), &(10.0 + step as f64).to_le_bytes())
+            .unwrap();
+    }
+
+    let component = db
+        .with_state(|s| s.get_component(ComponentId::new(&name)).cloned())
+        .expect("the expression's component");
+    for _ in 0..300 {
+        if component
+            .time_series
+            .latest()
+            .is_some_and(|l| l.timestamp() == Timestamp(104))
+        {
+            break;
+        }
+        stellarator::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let latest = component.time_series.latest().expect("history");
+    assert_eq!(
+        latest.timestamp(),
+        Timestamp(104),
+        "the expression stopped at {:?} — its tasks were dropped with the handle",
+        latest.timestamp()
+    );
+    assert_eq!(f64::from_le_bytes(latest.data().try_into().unwrap()), 15.0);
+}

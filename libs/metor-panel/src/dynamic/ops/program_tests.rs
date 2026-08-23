@@ -409,3 +409,142 @@ async fn a_held_input_is_seeded_from_what_it_already_published() {
     bench.push("adcs.rate", 2, &[3.0]);
     assert_eq!(take(&mut out, 1).await, vec![307.0]);
 }
+
+/// Seed *then* tail: the case the seeding work did not cover.
+///
+/// An expression over a channel that had already published must show its
+/// current value immediately AND keep following the channel afterwards. One
+/// point and then silence is the symptom this pins.
+#[stellarator::test]
+async fn a_seeded_system_keeps_following_its_input() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let compiled = bench.compile("scaled = wheels.rpm + 1.0\n");
+
+    // History, before anything is watching.
+    bench.push("wheels.rpm", 1, &[10.0]);
+    stellarator::sleep(Duration::from_millis(20)).await;
+
+    let id = bench.id("wheels.rpm");
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource {
+            node: bench.source("wheels.rpm"),
+            seed: program::latest_sample(&bench.db, id),
+        }],
+        DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut out = watch(&field);
+
+    // The seed, then a live tail.
+    for step in 2..=5 {
+        bench.push("wheels.rpm", step, &[f64::from(step as i32) * 10.0]);
+    }
+    assert_eq!(
+        take(&mut out, 5).await,
+        vec![11.0, 21.0, 31.0, 41.0, 51.0],
+        "the seed must be followed by every later sample"
+    );
+    assert_eq!(system.health.fault(), None);
+}
+
+/// The same, through the whole panel path: the expression's own hidden
+/// component must accumulate the seed and the tail, with advancing
+/// timestamps, because that is what a plot reads.
+#[stellarator::test]
+async fn a_seeded_expression_accumulates_history() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let compiled = bench.compile("scaled = wheels.rpm + 1.0\n");
+
+    bench.push("wheels.rpm", 1, &[10.0]);
+    stellarator::sleep(Duration::from_millis(20)).await;
+
+    let id = bench.id("wheels.rpm");
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource {
+            node: bench.source("wheels.rpm"),
+            seed: program::latest_sample(&bench.db, id),
+        }],
+        DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let published = ops::persist::persist(&bench.db, "scaled".to_string(), field).unwrap();
+    let mut out = watch(&published);
+
+    for step in 2..=5 {
+        bench.push("wheels.rpm", step, &[f64::from(step as i32) * 10.0]);
+    }
+    assert_eq!(take(&mut out, 5).await, vec![11.0, 21.0, 31.0, 41.0, 51.0]);
+
+    // What a plot actually reads: distinct, advancing entries.
+    let component = bench
+        .db
+        .with_state(|s| s.get_component(ComponentId::new("scaled")).cloned())
+        .expect("the expression's component");
+    let latest = component.time_series.latest().expect("history");
+    assert_eq!(
+        latest.timestamp(),
+        Timestamp(5),
+        "the newest entry must be the newest sample, not the seed"
+    );
+}
+
+/// A system feeding another system, tailing live.
+///
+/// The downstream system reads what the upstream *publishes*, so this is the
+/// whole chain — system, field, persist, back through `from_db` into the next
+/// system — and every link has to keep following rather than stopping after
+/// the first sample.
+#[stellarator::test]
+async fn a_chain_of_systems_keeps_following_its_input() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let compiled = bench.compile("doubled = wheels.rpm * 2.0\nplus = doubled + 1.0\n");
+    assert_eq!(compiled.manifest.systems.len(), 2);
+
+    // Upstream, published so the downstream port can read it.
+    let first = wire(&bench, &compiled, 0);
+    let first_field = program::field(&compiled, 0, 0, first.node.clone()).unwrap();
+    let upstream = ops::persist::persist(
+        &bench.db,
+        compiled.manifest.systems[0].publishes[0].clone(),
+        first_field,
+    )
+    .unwrap();
+
+    // Downstream, reading the component the upstream just created.
+    let upstream_id = ComponentId::new(&compiled.manifest.systems[0].publishes[0]);
+    let second = program::system(
+        &compiled,
+        1,
+        vec![program::PortSource {
+            node: ops::db_source::from_db(&bench.db, upstream_id).unwrap(),
+            seed: program::latest_sample(&bench.db, upstream_id),
+        }],
+        DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let second_field = program::field(&compiled, 1, 0, second.node.clone()).unwrap();
+
+    let mut out = watch(&second_field);
+    let mut mid = watch(&upstream);
+    for step in 1..=4 {
+        bench.push("wheels.rpm", step, &[f64::from(step as i32)]);
+    }
+
+    assert_eq!(take(&mut mid, 4).await, vec![2.0, 4.0, 6.0, 8.0]);
+    assert_eq!(
+        take(&mut out, 4).await,
+        vec![3.0, 5.0, 7.0, 9.0],
+        "the downstream system stopped following its producer"
+    );
+    assert_eq!(first.health.fault(), None);
+    assert_eq!(second.health.fault(), None);
+}

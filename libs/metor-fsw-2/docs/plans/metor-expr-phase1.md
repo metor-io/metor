@@ -375,12 +375,24 @@ visible whatever the query, and `activate_with_search`, which hands the
 row the query as its input. A picker's search text *is* the expression —
 there is no second field to open and nothing to fuzzy-match against.
 
-`dynamic/expressions.rs` owns the lifetime rule. The registry holds
-`Weak` handles and never keeps an expression alive: a view holds the
-strong `Arc`, two views typing the same text reach the same content hash
-and share one running system, and the entry falls out once neither is
-left. No reference counts are kept by hand and nothing has to be told
-when a view goes away.
+`dynamic/expressions.rs` owns the lifetime rule, and the first version of
+it was wrong in a way worth recording. The registry held `Weak` handles
+so that views would own their expressions — but a view binds to a
+*component id*, and every consumer of the picker (a plot trace, a table
+column, a dashboard widget) takes an id and has nowhere to put a handle.
+The handle therefore died at the end of the call that created it, the
+three tasks behind it were cancelled, and what the operator saw was an
+expression that published exactly one sample — its seed, written while
+the nodes were briefly alive — and then never again, with the component
+sitting there and nothing writing to it.
+
+Since the component outlives the expression anyway (the db is
+insert-only), the nodes must outlive it too, or the component is left
+stale and silently wrong. **The registry owns running expressions for
+the session.** Two views typing the same text still share one system —
+the content hash is what they meet on — and reclaiming what nothing
+references is the same startup sweep that reclaims the components, where
+nothing can be holding either.
 
 `a_later_ambiguity_does_not_disturb_what_was_already_resolved` pins the
 plan's stability contract in both directions: a bare name records the
