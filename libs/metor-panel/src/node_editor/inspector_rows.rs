@@ -296,6 +296,7 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
             crate::dynamic::BuildError::WrongArity { .. } => "wrong arity",
             crate::dynamic::BuildError::InvalidArg { .. } => "invalid arg",
             crate::dynamic::BuildError::ComponentNotFound(_) => "component not found",
+            crate::dynamic::BuildError::Expr(_) => "expression error",
             crate::dynamic::BuildError::DbError(_) => "db error",
         },
         None => "missing",

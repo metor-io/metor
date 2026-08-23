@@ -13,8 +13,10 @@
 //! reconciliation.
 
 mod node;
+pub mod expressions;
 pub mod ops;
 mod registry;
+pub mod resolver;
 pub mod tensor;
 
 #[cfg(test)]

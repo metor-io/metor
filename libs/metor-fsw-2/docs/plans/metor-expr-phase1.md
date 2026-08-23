@@ -288,3 +288,58 @@ check (about 4 fuel per evaluation).
 instance: it hands back slot indices to pass to `<system>_state_ptr(i)`
 and byte counts, because both hosts already own an instance and read
 memory their own way. 89 tests green.
+
+### P4 — panel runtime
+
+`dynamic/ops/program.rs` is the whole runtime: `Compiled` (a program plus
+the wasmi module it instantiates), `system` (one node per `@system`), and
+`field` (one node per output field). `dynamic/resolver.rs` answers the
+compiler's three questions from a snapshot of the db's component
+metadata.
+
+**The first risk, resolved without its fallback.** The plan expected
+`latest()` on a disruptor from a task that is not its subscriber to need
+"a small current-value cell per non-driving input, filled by a cheap
+subscriber loop". It does not, and the shape it takes instead is
+strictly smaller: a disruptor has no `latest()` at all, but it has
+`try_next()`, and `resample.rs` already uses it to keep the newest
+sample of a secondary input. So each system's own task holds one reader
+per port and drains the non-driving ones with `try_next` on the way past
+the await. **One task, one reader per port, no shared cells, no second
+loop** — the fallback's cost (an extra task and a lock per input) buys
+nothing the plain drain does not already give. A port whose cell is
+still empty skips the cycle, which is the run rule's `else return`.
+
+Decisions the plan left open:
+
+- **A snapshot resolver, not a live one.** Compilation happens off the
+  UI thread while the db keeps moving; a resolver holding the state lock
+  would put the two in each other's way for as long as a parse takes.
+  Snapshotting also makes resolution *reproducible* — every name in one
+  compile sees the same tree, so a component appearing mid-parse cannot
+  make two halves of an expression disagree.
+- **Everything numeric reads as `f64`.** A component's element type is
+  not the language's: `f32`, `i32`, and `u16` channels all widen on the
+  way into a frame, and only `bool` stays itself. This is the panel's
+  existing convention (`dynamic/tensor.rs` computes in `f64` and casts
+  at write time), and it means one expression can span a float sensor
+  and an integer counter without saying so.
+- **The system node carries frame *bytes*; fields hang off it.** A frame
+  is several fields of several types and no single `ComponentSchema`
+  describes it honestly, so the system's ring is `U8[frame.bytes]` and a
+  `field` node per output field re-reads it with the schema that field
+  really has. Publishing then needs no new machinery at all: a field
+  node is an ordinary value node, so `persist` registers it as
+  `<system>.<field>` exactly as it registers anything else.
+- **State is published, not fetched.** A rebuild cannot reach into a
+  spawned task, so rather than ask it, the task writes its state slots
+  into a cell the node owns after every evaluation — a few words, always
+  current. A rebuild reads that cell and hands it to the new instance.
+- **Compilation happens before the worker closure.** `WorkerHandle::run`
+  blocks the UI thread until the closure returns, so the closure does
+  nothing but instantiate; the wasmi module is built on the debounce
+  task, behind the 200 ms window.
+- **A fault parks, and keeps reading.** A system that traps or burns its
+  grant stops evaluating, records why for the pane, and keeps draining
+  its inputs — a reader that stops moving would make its *producer* drop
+  samples, so parking silently would damage everything upstream.

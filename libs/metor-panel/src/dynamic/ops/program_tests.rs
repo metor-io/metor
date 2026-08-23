@@ -1,0 +1,338 @@
+//! P4: compiled systems driven by real rings.
+//!
+//! Every test here feeds a system through db components — the same path the
+//! panel uses — and reads what it published back off its field nodes. What is
+//! being checked is the *runtime*: the run rule against rings that have no
+//! `latest()`, faults that park instead of cascading, and state that survives
+//! the swap a rebuild is.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use metor_db::{ComponentSchema, DB};
+use metor_expr::Ty;
+use metor_proto::types::{ComponentId, PrimType, Timestamp};
+
+use super::program::{self, Compiled, DEFAULT_FUEL};
+use crate::dynamic::node::{DynamicNode, DynamicNodeExt, NodeReader};
+use crate::dynamic::ops;
+use crate::dynamic::resolver::DbResolver;
+
+/// A db holding the components a test's expression names.
+struct Bench {
+    db: DB,
+    _temp: tempfile::TempDir,
+}
+
+impl Bench {
+    fn new(components: &[(&str, PrimType, &[usize])]) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DB::create(temp.path().join("db")).unwrap();
+        for (name, prim, dim) in components {
+            let id = ComponentId(ops::persist::component_id_for_name(name));
+            db.with_state_mut(|state| {
+                state.insert_component(id, ComponentSchema::new(*prim, dim), &db.path)
+            })
+            .unwrap();
+            let mut metadata = metor_proto_wkt::ComponentMetadata {
+                component_id: id,
+                name: (*name).to_string(),
+                metadata: Default::default(),
+            };
+            use metor_proto_wkt::MetadataExt;
+            metadata.set("source", "test");
+            db.with_state_mut(|state| state.set_component_metadata(metadata, &db.path))
+                .unwrap();
+        }
+        Bench { db, _temp: temp }
+    }
+
+    fn id(&self, name: &str) -> ComponentId {
+        ComponentId(ops::persist::component_id_for_name(name))
+    }
+
+    fn push(&self, name: &str, ts: i64, values: &[f64]) {
+        let component = self
+            .db
+            .with_state(|s| s.get_component(self.id(name)).cloned())
+            .unwrap();
+        let prim = component.schema.prim_type;
+        let mut bytes = Vec::new();
+        for v in values {
+            crate::dynamic::tensor::write_f64_as(&mut bytes, prim, *v);
+        }
+        component.push_buf(Timestamp(ts), &bytes).unwrap();
+    }
+
+    fn source(&self, name: &str) -> Arc<dyn DynamicNode> {
+        ops::db_source::from_db(&self.db, self.id(name)).unwrap()
+    }
+
+    fn compile(&self, source: &str) -> Arc<Compiled> {
+        let resolver = DbResolver::snapshot(&self.db);
+        match Compiled::module(source, &resolver) {
+            Ok(compiled) => Arc::new(compiled),
+            Err(diags) => panic!("expected {source:?} to compile, got:\n{diags}"),
+        }
+    }
+}
+
+/// Start watching a node.
+///
+/// Always before the samples are pushed: a disruptor reader begins at the
+/// current write position, so one made afterwards never sees what it missed.
+fn watch(node: &Arc<dyn DynamicNode>) -> NodeReader {
+    node.subscribe()
+}
+
+/// Read `count` scalars off a watched node, giving up rather than hanging.
+async fn take(reader: &mut NodeReader, count: usize) -> Vec<f64> {
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..300 {
+        while let Some(grant) = reader.try_next() {
+            for (_, value) in grant.samples() {
+                out.push(f64::from_le_bytes(value.try_into().unwrap()));
+            }
+        }
+        if out.len() >= count {
+            out.truncate(count);
+            return out;
+        }
+        settle().await;
+    }
+    panic!("expected {count} samples, saw {}: {out:?}", out.len());
+}
+
+/// Let the spawned tasks run. Nothing here is timing-dependent — this is only
+/// how a test yields to the nodes it is driving.
+async fn settle() {
+    stellarator::sleep(Duration::from_millis(5)).await;
+}
+
+/// Build one system over db-backed ports, in the manifest's port order.
+fn wire(bench: &Bench, compiled: &Arc<Compiled>, index: usize) -> program::System {
+    let ports: Vec<Arc<dyn DynamicNode>> = compiled.manifest.systems[index]
+        .inputs
+        .iter()
+        .map(|port| match &port.bindings[0] {
+            metor_expr::Binding::Component(path) => bench.source(path),
+            other => panic!("this helper wires components, not {other:?}"),
+        })
+        .collect();
+    program::system(compiled, index, ports, DEFAULT_FUEL, None).unwrap()
+}
+
+#[stellarator::test]
+async fn an_expression_publishes_what_it_computes() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let compiled = bench.compile("scaled = wheels.rpm * 2.0 + 1.0\n");
+    let system = wire(&bench, &compiled, 0);
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut out = watch(&field);
+
+    for step in 0..4 {
+        bench.push("wheels.rpm", step + 1, &[f64::from(step as i32)]);
+    }
+    assert_eq!(take(&mut out, 4).await, vec![1.0, 3.0, 5.0, 7.0]);
+    assert_eq!(system.health.fault(), None);
+}
+
+/// A component's own element type is not the language's. Everything numeric
+/// reads as `f64`, which is what lets one expression span an `f32` channel
+/// and an `i32` counter without saying so.
+#[stellarator::test]
+async fn narrower_components_widen_on_the_way_in() {
+    let bench = Bench::new(&[
+        ("sensor.temp", PrimType::F32, &[]),
+        ("counter.ticks", PrimType::I32, &[]),
+    ]);
+    let compiled = bench.compile("total = sensor.temp + counter.ticks\n");
+    let system = wire(&bench, &compiled, 0);
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut out = watch(&field);
+
+    bench.push("counter.ticks", 1, &[10.0]);
+    settle().await;
+    bench.push("sensor.temp", 2, &[0.5]);
+    assert_eq!(take(&mut out, 1).await, vec![10.5]);
+}
+
+/// The run rule: fire on the driving input, read the latest of the rest, and
+/// skip the cycle while anything else has never published.
+#[stellarator::test]
+async fn a_system_fires_on_its_driving_input_and_holds_the_rest() {
+    let bench = Bench::new(&[
+        ("adcs.rate", PrimType::F64, &[]),
+        ("wheels.rpm", PrimType::F64, &[]),
+    ]);
+    let compiled = bench.compile(
+        "@system(\"adcs.rate\", \"wheels.rpm\")\ndef both(rate, rpm) -> f64:\n    return rate * 100.0 + rpm\n",
+    );
+    let system = wire(&bench, &compiled, 0);
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut out = watch(&field);
+
+    // `wheels.rpm` has never published, so these are skipped rather than
+    // evaluated against a zero nobody wrote.
+    bench.push("adcs.rate", 1, &[1.0]);
+    bench.push("adcs.rate", 2, &[2.0]);
+    settle().await;
+
+    bench.push("wheels.rpm", 3, &[7.0]);
+    settle().await;
+    bench.push("adcs.rate", 4, &[3.0]);
+    bench.push("adcs.rate", 5, &[4.0]);
+    // Zero-order hold: one rpm sample serves both rate samples.
+    assert_eq!(take(&mut out, 2).await, vec![307.0, 407.0]);
+
+    bench.push("wheels.rpm", 6, &[9.0]);
+    settle().await;
+    bench.push("adcs.rate", 7, &[5.0]);
+    assert_eq!(take(&mut out, 1).await, vec![509.0]);
+}
+
+/// The output frame is several fields of several types, and each becomes an
+/// ordinary value node with the schema it really has.
+#[stellarator::test]
+async fn every_output_field_becomes_its_own_node() {
+    let bench = Bench::new(&[("imu.omega", PrimType::F64, &[3])]);
+    let compiled = bench.compile(
+        "class Omega(Frame):\n\
+         \x20   omega: Tensor[f64, 3]\n\
+         \n\
+         class Rate(Frame):\n\
+         \x20   magnitude: f64\n\
+         \x20   spinning: bool\n\
+         \n\
+         @system(bind={\"o\": \"imu\"})\n\
+         def rate(o: Omega) -> Rate:\n\
+         \x20   return Rate(magnitude=dot(o.omega, o.omega), spinning=o.omega[0] > 0.5)\n",
+    );
+    let system = &compiled.manifest.systems[0];
+    assert_eq!(system.publishes, vec!["rate.magnitude", "rate.spinning"]);
+    assert_eq!(system.output.fields[0].ty, Ty::F64);
+    assert_eq!(system.output.fields[1].ty, Ty::Bool);
+
+    let running = wire(&bench, &compiled, 0);
+    let magnitude = program::field(&compiled, 0, 0, running.node.clone()).unwrap();
+    let spinning = program::field(&compiled, 0, 1, running.node.clone()).unwrap();
+    assert_eq!(
+        spinning.value_type().schema().unwrap(),
+        &ComponentSchema::new(PrimType::Bool, &[])
+    );
+
+    let mut flags = watch(&spinning);
+    let mut out = watch(&magnitude);
+    bench.push("imu.omega", 1, &[1.0, 2.0, 3.0]);
+    assert_eq!(take(&mut out, 1).await, vec![14.0]);
+    let grant = flags.next().await;
+    assert_eq!(grant.sample_at(0).1, &[1u8]);
+}
+
+/// An output field is a value node like any other, so publishing it is the
+/// existing `persist` and nothing new.
+#[stellarator::test]
+async fn an_output_field_persists_as_a_real_component() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let compiled = bench.compile("doubled = wheels.rpm * 2.0\n");
+    let running = wire(&bench, &compiled, 0);
+    let field = program::field(&compiled, 0, 0, running.node.clone()).unwrap();
+    let name = compiled.manifest.systems[0].publishes[0].clone();
+    let published = ops::persist::persist(&bench.db, name.clone(), field).unwrap();
+    let mut out = watch(&published);
+
+    bench.push("wheels.rpm", 1, &[21.0]);
+    assert_eq!(take(&mut out, 1).await, vec![42.0]);
+    assert!(
+        bench
+            .db
+            .with_state(|s| s.get_component(bench.id(&name)).is_some())
+    );
+}
+
+/// A runaway loop burns its grant and the system parks — it does not stall the
+/// panel, and it does not take anything else down with it.
+#[stellarator::test]
+async fn a_runaway_body_parks_the_system() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let compiled = bench.compile(
+        "@system(\"wheels.rpm\")\ndef spin(rpm) -> f64:\n    x = rpm\n    while True:\n        x = x + 1.0\n    return x\n",
+    );
+    let system = wire(&bench, &compiled, 0);
+    bench.push("wheels.rpm", 1, &[1.0]);
+    for _ in 0..200 {
+        if system.health.fault().is_some() {
+            break;
+        }
+        settle().await;
+    }
+    let fault = system.health.fault().expect("a runaway body must park");
+    assert!(fault.contains("fuel"), "{fault}");
+
+    // Its inputs keep being read, so nothing upstream backs up behind it.
+    for step in 2..40 {
+        bench.push("wheels.rpm", step, &[1.0]);
+    }
+    settle().await;
+}
+
+/// The rebuild contract: an edit swaps one instance and the filter picks up
+/// where it left off, because state is keyed by what it means, not by which
+/// instance held it.
+#[stellarator::test]
+async fn a_rebuild_carries_state_across_the_swap() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let lowpass = |gain: &str| {
+        format!(
+            "class Lp(State):\n\
+             \x20   filtered: f64 = 0.0\n\
+             \n\
+             @system(\"wheels.rpm\")\n\
+             def lp(rpm, s: Lp) -> f64:\n\
+             \x20   s.filtered = {gain} * rpm + (1.0 - {gain}) * s.filtered\n\
+             \x20   return s.filtered\n"
+        )
+    };
+
+    let first = bench.compile(&lowpass("0.5"));
+    let running = wire(&bench, &first, 0);
+    let field = program::field(&first, 0, 0, running.node.clone()).unwrap();
+    let mut out = watch(&field);
+    bench.push("wheels.rpm", 1, &[100.0]);
+    assert_eq!(take(&mut out, 1).await, vec![50.0]);
+    let carried = running.state.snapshot();
+    assert_eq!(carried.entries.len(), 1);
+
+    // A gain edit changes the body, so this system rebuilds — and its memory
+    // of the last sample has to come with it.
+    let second = bench.compile(&lowpass("0.25"));
+    assert_ne!(
+        first.system_hash(0, &[]),
+        second.system_hash(0, &[]),
+        "an edited body must hash differently"
+    );
+    let rebuilt = program::system(
+        &second,
+        0,
+        vec![bench.source("wheels.rpm")],
+        DEFAULT_FUEL,
+        Some(&carried),
+    )
+    .unwrap();
+    let field = program::field(&second, 0, 0, rebuilt.node.clone()).unwrap();
+    let mut out = watch(&field);
+    bench.push("wheels.rpm", 2, &[100.0]);
+    assert_eq!(take(&mut out, 1).await, vec![0.25 * 100.0 + 0.75 * 50.0]);
+}
+
+/// An edit to one system leaves the others' identities alone, which is what
+/// makes "rebuild only what changed" a property rather than an intention.
+#[stellarator::test]
+async fn an_edit_only_changes_the_system_it_touched() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let before = bench.compile("a = wheels.rpm * 2.0\nb = wheels.rpm * 3.0\n");
+    let after = bench.compile("a = wheels.rpm * 2.0\nb = wheels.rpm * 4.0\n");
+    let port = vec![bench.source("wheels.rpm").id()];
+    assert_eq!(before.system_hash(0, &port), after.system_hash(0, &port));
+    assert_ne!(before.system_hash(1, &port), after.system_hash(1, &port));
+}

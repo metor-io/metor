@@ -1104,6 +1104,7 @@ impl PanelApp {
                 crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
                 crate::views::dashboard::WidgetRegistry::init(cx);
                 crate::dynamic::DynamicRegistry::init(cx);
+                crate::dynamic::expressions::Expressions::init(cx);
                 crate::node_editor::GraphCoordinator::init(cx);
                 crate::node_editor::DynamicWorker::init(cx);
                 crate::node_editor::inspector_rows::register_inspector_rows(cx);
@@ -1302,6 +1303,11 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         &mut reg,
         db.clone(),
         crate::node_editor::pane::NodeEditor::from_config,
+    );
+    register_panel::<crate::program::ProgramPane>(
+        &mut reg,
+        db.clone(),
+        crate::program::ProgramPane::from_config,
     );
     register_panel::<crate::views::system_graph::SystemGraphPanel>(
         &mut reg,

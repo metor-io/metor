@@ -32,10 +32,11 @@ use crate::dynamic::{BuildError, DynamicNode};
 pub type BuildClosure =
     Box<dyn FnOnce() -> Result<Arc<dyn DynamicNode>, BuildError> + Send + 'static>;
 
-struct BuildJob {
-    closure: BuildClosure,
-    reply: Sender<Result<Arc<dyn DynamicNode>, BuildError>>,
-}
+/// A unit of work for the worker thread. The reply channel is closed over
+/// rather than carried alongside, which is what lets one channel serve every
+/// return type — a node graph builds nodes, a program builds nodes and the
+/// cells that watch them, and the thread does not care which.
+type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// Cheap clonable handle to the worker. `rebuild_into` takes one of these
 /// instead of `&DynamicWorker` so the caller can clone it out of `cx`'s
@@ -43,7 +44,7 @@ struct BuildJob {
 /// mutably from the same `cx`.
 #[derive(Clone)]
 pub struct WorkerHandle {
-    tx: Sender<BuildJob>,
+    tx: Sender<Job>,
     /// Disposal channel for `Arc<dyn DynamicNode>` whose strong count is
     /// about to go to 1 (then 0) on a non-worker thread. Routing them here
     /// guarantees the actual drop — and the cancellation of the underlying
@@ -54,22 +55,27 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    /// Run `closure` on the worker thread; block until its result returns.
-    /// Used from gpui main during a debounced rebuild.
-    pub fn run(&self, closure: BuildClosure) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    /// Run `f` on the worker thread; block until it returns.
+    ///
+    /// `None` means the worker thread is gone, which is the only way this
+    /// fails. Everything a caller wants to say about *its own* failure travels
+    /// in `T`.
+    pub fn call<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
         let (reply_tx, reply_rx) = bounded(1);
-        if self
-            .tx
-            .send(BuildJob {
-                closure,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            // Worker thread is gone — degrade gracefully.
-            return Err(BuildError::ParentFailed);
+        let job: Job = Box::new(move || {
+            let _ = reply_tx.send(f());
+        });
+        if self.tx.send(job).is_err() {
+            return None;
         }
-        reply_rx.recv().unwrap_or(Err(BuildError::ParentFailed))
+        reply_rx.recv().ok()
+    }
+
+    /// Build one node on the worker thread. Used from gpui main during a
+    /// debounced rebuild.
+    pub fn run(&self, closure: BuildClosure) -> Result<Arc<dyn DynamicNode>, BuildError> {
+        // Worker thread gone — degrade gracefully.
+        self.call(closure).unwrap_or(Err(BuildError::ParentFailed))
     }
 
     /// Hand `arc` to the worker thread for disposal. Best-effort: if the
@@ -99,7 +105,7 @@ impl Default for DynamicWorker {
 
 impl DynamicWorker {
     pub fn new() -> Self {
-        let (tx, rx) = unbounded::<BuildJob>();
+        let (tx, rx) = unbounded::<Job>();
         let (dispose_tx, dispose_rx) = unbounded::<Arc<dyn DynamicNode>>();
         let thread = stellarator::struc_con::stellar(move || async move {
             run_worker(rx, dispose_rx).await;
@@ -125,12 +131,12 @@ impl DynamicWorker {
 /// rather than letting the gpui main thread drop the Arc directly — keeps
 /// `Sleep::drop` (and any other timer-touching destructor inside the
 /// spawned task) on the thread that owns the timer's spinlock.
-async fn run_worker(rx: Receiver<BuildJob>, dispose_rx: Receiver<Arc<dyn DynamicNode>>) {
+async fn run_worker(rx: Receiver<Job>, dispose_rx: Receiver<Arc<dyn DynamicNode>>) {
     loop {
+        // A job closes over its own reply channel; if the requester went
+        // away, the result is dropped silently.
         while let Ok(job) = rx.try_recv() {
-            let result = (job.closure)();
-            // If the requester went away, drop the result silently.
-            let _ = job.reply.send(result);
+            job();
         }
         // Drain the graveyard. `drop(arc)` here triggers the
         // `JoinHandleDropGuard` inside `NodeImpl`, which calls `cancel()`

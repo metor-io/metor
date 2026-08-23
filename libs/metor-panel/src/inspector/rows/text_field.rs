@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use gpui::{
     App, ClipboardItem, Hsla, IntoElement, KeyDownEvent, Pixels, SharedString, Styled, TextRun,
     canvas, fill, point, px, size,
@@ -57,6 +60,20 @@ pub struct TextField {
     placeholder: String,
     style: TextFieldStyle,
     align: TextAlign,
+    /// Newlines are text rather than a submit gesture, and the field paints
+    /// every line instead of scrolling one horizontally. What makes the
+    /// program pane an editor rather than a viewer.
+    multiline: bool,
+    /// Ranges to underline, and in what colour — how a compiler diagnostic
+    /// points at the thing it is complaining about.
+    pub marks: Vec<(std::ops::Range<usize>, Hsla)>,
+    /// First visible line, kept following the cursor.
+    scroll_line: usize,
+    /// Lines that fit, as the last paint measured them. Written from the
+    /// prepaint pass and read by [`follow_cursor`](Self::follow_cursor), so
+    /// scrolling follows the height the field actually has rather than one
+    /// the caller guessed.
+    rows: Arc<AtomicUsize>,
 }
 
 impl TextField {
@@ -68,7 +85,72 @@ impl TextField {
             placeholder: placeholder.into(),
             style: TextFieldStyle::from_theme(&theme(cx)),
             align: TextAlign::Left,
+            multiline: false,
+            marks: Vec::new(),
+            scroll_line: 0,
+            rows: Arc::new(AtomicUsize::new(1)),
         }
+    }
+
+    /// Turn the field into an editor: Enter inserts a newline, Up and Down
+    /// move by line, and paste keeps the newlines it was given.
+    pub fn multiline(mut self) -> Self {
+        self.multiline = true;
+        self
+    }
+
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        self.cursor = self.cursor.min(self.text.len());
+        self.mark = self.cursor;
+    }
+
+    /// Byte offset each line starts at, first included and last excluded —
+    /// the index every line-wise movement is computed against.
+    fn line_starts(&self) -> Vec<usize> {
+        let mut starts = vec![0];
+        starts.extend(
+            self.text
+                .bytes()
+                .enumerate()
+                .filter(|(_, b)| *b == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        starts
+    }
+
+    fn line_of(&self, offset: usize) -> usize {
+        self.line_starts()
+            .iter()
+            .rposition(|start| *start <= offset)
+            .unwrap_or(0)
+    }
+
+    fn line_bounds(&self, line: usize) -> std::ops::Range<usize> {
+        let starts = self.line_starts();
+        let start = starts.get(line).copied().unwrap_or(self.text.len());
+        let end = starts
+            .get(line + 1)
+            .map(|next| next - 1)
+            .unwrap_or(self.text.len());
+        start..end
+    }
+
+    /// Move the cursor `delta` lines, holding the column where the line is
+    /// long enough and clamping to its end where it is not.
+    fn move_line(&mut self, delta: isize, extend_selection: bool) {
+        let line = self.line_of(self.cursor);
+        let column = self.cursor - self.line_bounds(line).start;
+        let target = match delta < 0 {
+            true => line.saturating_sub(delta.unsigned_abs()),
+            false => (line + delta as usize).min(self.line_starts().len() - 1),
+        };
+        let bounds = self.line_bounds(target);
+        let mut at = (bounds.start + column).min(bounds.end);
+        while at > bounds.start && !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        self.move_cursor(at, extend_selection);
     }
 
     pub fn set_placeholder(&mut self, placeholder: impl Into<String>) {
@@ -148,7 +230,10 @@ impl TextField {
         if let Some(item) = cx.read_from_clipboard()
             && let Some(text) = item.text()
         {
-            let text = text.replace('\n', "");
+            let text = match self.multiline {
+                true => text,
+                false => text.replace('\n', ""),
+            };
             self.insert_text(&text);
         }
     }
@@ -202,6 +287,44 @@ impl TextField {
             mods.control
         };
 
+        // Line-wise movement replaces document-wise where there are lines to
+        // move through; the document ends stay on cmd-up and cmd-down.
+        if self.multiline {
+            match (primary, key) {
+                (_, "enter") if !mods.shift => {
+                    self.insert_text("\n");
+                    return true;
+                }
+                (false, "up") => {
+                    self.move_line(-1, mods.shift);
+                    return true;
+                }
+                (false, "down") => {
+                    self.move_line(1, mods.shift);
+                    return true;
+                }
+                (true, "up") => {
+                    self.move_to_start(mods.shift);
+                    return true;
+                }
+                (true, "down") => {
+                    self.move_to_end(mods.shift);
+                    return true;
+                }
+                (true, "left") => {
+                    let start = self.line_bounds(self.line_of(self.cursor)).start;
+                    self.move_cursor(start, mods.shift);
+                    return true;
+                }
+                (true, "right") => {
+                    let end = self.line_bounds(self.line_of(self.cursor)).end;
+                    self.move_cursor(end, mods.shift);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         if primary {
             match key {
                 "a" => {
@@ -247,11 +370,19 @@ impl TextField {
         if mods.control {
             match key {
                 "a" => {
-                    self.move_to_start(mods.shift);
+                    let at = match self.multiline {
+                        true => self.line_bounds(self.line_of(self.cursor)).start,
+                        false => 0,
+                    };
+                    self.move_cursor(at, mods.shift);
                     return true;
                 }
                 "e" => {
-                    self.move_to_end(mods.shift);
+                    let at = match self.multiline {
+                        true => self.line_bounds(self.line_of(self.cursor)).end,
+                        false => self.text.len(),
+                    };
+                    self.move_cursor(at, mods.shift);
                     return true;
                 }
                 "f" => {
@@ -272,10 +403,14 @@ impl TextField {
                     return true;
                 }
                 "k" => {
-                    if self.cursor < self.text.len() {
-                        let killed = self.text[self.cursor..].to_string();
+                    let end = match self.multiline {
+                        true => self.line_bounds(self.line_of(self.cursor)).end,
+                        false => self.text.len(),
+                    };
+                    if self.cursor < end {
+                        let killed = self.text[self.cursor..end].to_string();
                         cx.write_to_clipboard(ClipboardItem::new_string(killed));
-                        self.text.truncate(self.cursor);
+                        self.text.replace_range(self.cursor..end, "");
                         self.mark = self.cursor;
                     }
                     return true;
@@ -327,6 +462,150 @@ impl TextField {
                 false
             }
         }
+    }
+
+    /// Keep the cursor's line inside the window the last paint measured.
+    pub fn follow_cursor(&mut self) {
+        let line = self.line_of(self.cursor);
+        let rows = self.rows.load(Ordering::Relaxed).max(1);
+        if line < self.scroll_line {
+            self.scroll_line = line;
+        } else if line >= self.scroll_line + rows {
+            self.scroll_line = line + 1 - rows;
+        }
+    }
+
+    /// Paint every line, with the selection, the cursor, and any diagnostic
+    /// underlines placed against the same shaped runs.
+    ///
+    /// Each line is shaped on its own, so a column is an `x_for_index` into
+    /// that line rather than a measurement of the whole document — which is
+    /// what keeps a thousand-line module from being reshaped per frame.
+    pub fn lines_element(&self) -> impl IntoElement {
+        let text = self.text.clone();
+        let placeholder = self.placeholder.clone();
+        let cursor = self.cursor;
+        let mark = self.mark;
+        let scroll = self.scroll_line;
+        let marks = self.marks.clone();
+        let font_size = self.style.font_size;
+        let line_height = self.style.line_height;
+        let text_color = self.style.text_color;
+        let placeholder_color = self.style.placeholder_color;
+        let cursor_color = self.style.cursor_color;
+        let selection_color = self.style.selection_color;
+        let rows_seen = self.rows.clone();
+
+        canvas(
+            move |bounds, window, _cx| {
+                let font = window.text_style().font();
+                let showing_placeholder = text.is_empty();
+                let body = if showing_placeholder {
+                    placeholder.clone()
+                } else {
+                    text.clone()
+                };
+                let color = if showing_placeholder {
+                    placeholder_color
+                } else {
+                    text_color
+                };
+
+                let rows = (f32::from(bounds.size.height) / f32::from(line_height)).ceil() as usize;
+                rows_seen.store(rows.max(1), Ordering::Relaxed);
+                let mut shaped = Vec::with_capacity(rows);
+                let mut at = 0usize;
+                for (index, line) in body.split('\n').enumerate() {
+                    let start = at;
+                    at += line.len() + 1;
+                    if index < scroll || shaped.len() >= rows {
+                        continue;
+                    }
+                    let run = TextRun {
+                        len: line.len(),
+                        font: font.clone(),
+                        color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    shaped.push((
+                        start,
+                        line.len(),
+                        window.text_system().shape_line(
+                            SharedString::from(line.to_string()),
+                            font_size,
+                            &[run],
+                            None,
+                        ),
+                    ));
+                }
+                (bounds, shaped, showing_placeholder)
+            },
+            move |_, (bounds, shaped, showing_placeholder), window, cx| {
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    for (row, (start, len, line)) in shaped.iter().enumerate() {
+                        let y = bounds.origin.y + line_height * row as f32;
+                        let origin = point(bounds.origin.x, y);
+                        let x_at = |offset: usize| {
+                            line.x_for_index(offset.saturating_sub(*start).min(*len))
+                        };
+                        let overlaps = |range: &std::ops::Range<usize>| {
+                            range.start <= start + len && range.end >= *start
+                        };
+
+                        if !showing_placeholder && mark != cursor {
+                            let selection = mark.min(cursor)..mark.max(cursor);
+                            if overlaps(&selection) {
+                                // A selection running past this line's end
+                                // shows the newline it swallowed, so a
+                                // multi-line drag reads as one region.
+                                let to = match selection.end > start + len {
+                                    true => line.width + px(4.0),
+                                    false => x_at(selection.end),
+                                };
+                                let from = x_at(selection.start);
+                                window.paint_quad(fill(
+                                    gpui::Bounds::new(
+                                        point(origin.x + from, y),
+                                        size(to - from, line_height),
+                                    ),
+                                    selection_color,
+                                ));
+                            }
+                        }
+
+                        for (range, color) in &marks {
+                            if !overlaps(range) || range.start == range.end {
+                                continue;
+                            }
+                            let from = x_at(range.start);
+                            let to = x_at(range.end).max(from + px(2.0));
+                            window.paint_quad(fill(
+                                gpui::Bounds::new(
+                                    point(origin.x + from, y + line_height - px(2.0)),
+                                    size(to - from, px(1.5)),
+                                ),
+                                *color,
+                            ));
+                        }
+
+                        let _ = line.paint(origin, line_height, window, cx);
+
+                        if !showing_placeholder && (*start..=start + len).contains(&cursor) {
+                            window.paint_quad(fill(
+                                gpui::Bounds::new(
+                                    point(origin.x + x_at(cursor) - cursor_width() / 2.0, y),
+                                    size(cursor_width(), line_height),
+                                ),
+                                cursor_color,
+                            ));
+                        }
+                    }
+                });
+            },
+        )
+        .size_full()
     }
 
     pub fn element(&self) -> impl IntoElement {

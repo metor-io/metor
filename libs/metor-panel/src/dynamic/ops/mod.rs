@@ -8,4 +8,7 @@ pub mod db_source;
 pub mod derive;
 pub mod generators;
 pub mod persist;
+pub mod program;
+#[cfg(test)]
+mod program_tests;
 pub mod resample;

@@ -108,6 +108,8 @@ pub enum BuildError {
     ComponentNotFound(ComponentId),
     #[error("db error: {0}")]
     DbError(String),
+    #[error("{0}")]
+    Expr(String),
 }
 
 /// A live producer task whose output is a fan-out [`Disruptor`].
@@ -333,6 +335,8 @@ pub mod op_tag {
     pub const LINEAR: &[u8] = b"resample.linear";
     pub const PERSIST: &[u8] = b"persist";
     pub const FROM_DB: &[u8] = b"db_source";
+    pub const EXPR_SYSTEM: &[u8] = b"expr.system";
+    pub const EXPR_FIELD: &[u8] = b"expr.field";
 }
 
 /// Default ring capacity in bytes. Sized per-node from the value byte size

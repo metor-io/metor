@@ -9570,6 +9570,7 @@ dependencies = [
  "jiff",
  "mdns-sd",
  "metor-db",
+ "metor-expr",
  "metor-fsw-2",
  "metor-proto",
  "metor-proto-wkt",
@@ -9592,6 +9593,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "tracing-subscriber",
+ "wasmi",
  "wgpu 29.0.4",
  "zerocopy",
 ]

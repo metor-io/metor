@@ -29,6 +29,7 @@ pub mod inspector;
 pub mod logs;
 pub(crate) mod msg_ingest;
 pub mod node_editor;
+pub mod program;
 pub mod plot_events;
 pub mod presets;
 pub mod sequences;
