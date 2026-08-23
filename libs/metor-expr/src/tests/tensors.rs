@@ -625,3 +625,188 @@ fn tensor_modules_stay_closed_and_within_their_memory() {
     driver.run().unwrap();
     assert_eq!(driver.read(9), vec![8.0; 9]);
 }
+
+/// Right-aligned broadcast, computed the obvious way, as the reference every
+/// rank combination is checked against.
+fn broadcast_reference(a: &[f64], sa: &[usize], b: &[f64], sb: &[usize], out: &[usize]) -> Vec<f64> {
+    let rank = out.len();
+    let pad = |s: &[usize]| {
+        let mut v = vec![1usize; rank - s.len()];
+        v.extend_from_slice(s);
+        v
+    };
+    let (pa, pb) = (pad(sa), pad(sb));
+    let strides = |s: &[usize]| {
+        let mut r = vec![0usize; rank];
+        let mut acc = 1;
+        for i in (0..rank).rev() {
+            r[i] = if s[i] == 1 { 0 } else { acc };
+            acc *= s[i];
+        }
+        r
+    };
+    let (ta, tb) = (strides(&pa), strides(&pb));
+    let mut index = vec![0usize; rank];
+    let mut result = Vec::new();
+    for _ in 0..out.iter().product::<usize>() {
+        let (mut ia, mut ib) = (0, 0);
+        for axis in 0..rank {
+            ia += index[axis] * ta[axis];
+            ib += index[axis] * tb[axis];
+        }
+        result.push(a[ia] + b[ib]);
+        for axis in (0..rank).rev() {
+            index[axis] += 1;
+            if index[axis] < out[axis] {
+                break;
+            }
+            index[axis] = 0;
+        }
+    }
+    result
+}
+
+fn annotation_of(shape: &[usize]) -> String {
+    match shape {
+        [] => "f64".to_string(),
+        [n] => format!("Tensor[f64, {n}]"),
+        dims => format!(
+            "Tensor[f64, ({})]",
+            dims.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Every rank combination the type system can express, through *both* emit
+/// paths — the shapes below `OPEN_CODE_MAX_OPS` are open-coded and the ones
+/// above call the broadcasting kernel, and the two must agree with each other
+/// and with the rule.
+///
+/// The user-facing case is the first line: a channel carrying `[1, 2, 3]`,
+/// plus one, is `[2, 3, 4]`.
+#[test]
+fn broadcast_holds_across_every_rank_combination() {
+    let combinations: &[(&[usize], &[usize], &[usize])] = &[
+        // Scalar against a vector, both ways round: the one-liner's case.
+        (&[], &[3], &[3]),
+        (&[3], &[], &[3]),
+        (&[3], &[3], &[3]),
+        // Ranks that differ, right-aligned.
+        (&[3], &[2, 3], &[2, 3]),
+        (&[2, 3], &[3], &[2, 3]),
+        (&[], &[2, 3], &[2, 3]),
+        // An extent of one stretches.
+        (&[1, 3], &[2, 3], &[2, 3]),
+        (&[2, 1], &[2, 3], &[2, 3]),
+        (&[2, 3], &[2, 3], &[2, 3]),
+        // Rank three, padded on the left the same way.
+        (&[3, 3], &[2, 3, 3], &[2, 3, 3]),
+        (&[2, 3, 3], &[3], &[2, 3, 3]),
+        // Past the open-coding threshold, so the kernel answers instead.
+        (&[200], &[], &[200]),
+        (&[200], &[200], &[200]),
+        (&[2, 200], &[200], &[2, 200]),
+        (&[200], &[2, 200], &[2, 200]),
+        (&[], &[2, 200], &[2, 200]),
+    ];
+
+    for (sa, sb, out) in combinations {
+        let source = format!(
+            "def f(a: {}, b: {}) -> {}:\n    return a + b\n",
+            annotation_of(sa),
+            annotation_of(sb),
+            annotation_of(out),
+        );
+        let count: usize = out.iter().product();
+        let a: Vec<f64> = (0..sa.iter().product::<usize>().max(1))
+            .map(|i| i as f64 + 1.0)
+            .collect();
+        let b: Vec<f64> = (0..sb.iter().product::<usize>().max(1))
+            .map(|i| (i as f64 + 1.0) * 10.0)
+            .collect();
+
+        let got = evaluate(&source, "f", &[&a, &b], count);
+        let want = broadcast_reference(&a, sa, &b, sb, out);
+        assert_eq!(bits(&got), bits(&want), "{sa:?} + {sb:?} -> {out:?}");
+    }
+}
+
+/// The exact case from the field, end to end: `[1, 2, 3] + 1.0`.
+#[test]
+fn a_vector_plus_a_scalar_is_the_vector_shifted() {
+    let v = [1.0f64, 2.0, 3.0];
+    let got = evaluate(
+        "def f(v: Tensor[f64, 3]) -> Tensor[f64, 3]:\n    return v + 1.0\n",
+        "f",
+        &[&v],
+        3,
+    );
+    assert_eq!(got, vec![2.0, 3.0, 4.0]);
+
+    // The scalar on the left broadcasts the same way, and `nox` agrees.
+    let got = evaluate(
+        "def f(v: Tensor[f64, 3]) -> Tensor[f64, 3]:\n    return 1.0 + v\n",
+        "f",
+        &[&v],
+        3,
+    );
+    let want = nox_values(nox3(v) + nox3([1.0; 3]));
+    assert_eq!(bits(&got), bits(&want));
+}
+
+/// Every arithmetic operator broadcasts, not just `+`.
+#[test]
+fn the_whole_arithmetic_set_broadcasts() {
+    let v = [1.0f64, 2.0, 4.0];
+    for (op, want) in [
+        ("+", [3.0, 4.0, 6.0]),
+        ("-", [-1.0, 0.0, 2.0]),
+        ("*", [2.0, 4.0, 8.0]),
+        ("/", [0.5, 1.0, 2.0]),
+    ] {
+        let got = evaluate(
+            &format!("def f(v: Tensor[f64, 3]) -> Tensor[f64, 3]:\n    return v {op} 2.0\n"),
+            "f",
+            &[&v],
+            3,
+        );
+        assert_eq!(got, want.to_vec(), "`{op}` did not broadcast");
+    }
+
+    // Unary negation over a tensor is unaffected by any of this.
+    let got = evaluate(
+        "def f(v: Tensor[f64, 3]) -> Tensor[f64, 3]:\n    return -v\n",
+        "f",
+        &[&v],
+        3,
+    );
+    assert_eq!(got, vec![-1.0, -2.0, -4.0]);
+}
+
+/// Shapes that do not broadcast are refused with both of them named, at every
+/// rank — the rule is nox's, and so is what it rejects.
+#[test]
+fn shapes_that_do_not_broadcast_are_refused_with_spans() {
+    for (a, b) in [
+        (&[3usize][..], &[4usize][..]),
+        (&[2, 3][..], &[3, 2][..]),
+        (&[2, 3][..], &[4][..]),
+        (&[2, 3, 3][..], &[2, 2, 3][..]),
+    ] {
+        let source = format!(
+            "def f(a: {}, b: {}) -> f64:\n    return sum(a + b)\n",
+            annotation_of(a),
+            annotation_of(b),
+        );
+        let diags = reject(&source);
+        let text = format!("{diags}");
+        assert!(text.contains("broadcast"), "{a:?} vs {b:?}: {text}");
+        assert!(
+            text.contains(&format!("{a:?}")) && text.contains(&format!("{b:?}")),
+            "the diagnostic must name both shapes: {text}"
+        );
+    }
+}

@@ -576,3 +576,44 @@ found alongside the type, and ports take it from there. Deriving
 survives only where `persist` itself created the component from that
 same name moments earlier, which is the one case where the answer is
 known rather than guessed.
+
+### Broadcast, and where it was actually missing
+
+Reported as "broadcast semantics aren't applied in expressions": a channel
+carrying `[1, 2, 3]` plus `1.0` should be `[2, 3, 4]`.
+
+Reproducing first was the whole of the diagnosis. **The compiler was
+already right.** Every rank combination the type system can express
+typechecks *and* produces correct values, on both emit paths — the M3
+checker splats a scalar to a one-element operand and applies nox's
+right-aligned rule, and P1's open-coded emitter runs the same odometer
+the kernel does. `broadcast_holds_across_every_rank_combination` now pins
+that: scalar⊕tensor both ways, equal shapes, ranks that differ
+(`(3,)⊕(2,3)`, `(3,3)⊕(2,3,3)`), extents of one stretching
+(`(1,3)⊕(2,3)`, `(2,1)⊕(2,3)`), each below the open-coding threshold and
+again above it so the kernel answers. Refusals keep their spans and name
+both shapes.
+
+Writing that test found one thing — in the test, not the compiler.
+`(3,3) ⊕ (2,3,3)` was drafted as a refusal and is correctly *accepted*:
+right-aligned, `(3,3)` pads to `(1,3,3)`.
+
+The defect was downstream, in the picker. An expression committed a
+single trace at element zero:
+
+```rust
+let mut trace = Trace::new(component, 0, color);
+```
+
+So `=xyz + 1.0` over a rank-1 channel plotted one line showing `2.0`
+where three were expected — which reads exactly like the arithmetic never
+happened. An expression's output is plotted the way the channel it came
+from would be: one trace per element, labelled `<expression>.<element>`,
+colours cycling. `expression_elements` is the rule, separated from the
+colours so it can be checked without a window.
+
+The inferred output schema was already correct — a rank-1 input plus a
+scalar publishes a rank-1 component — and
+`a_scalar_broadcasts_over_a_vector_component` now asserts the shape at
+both the manifest and the component, because a rank-1 result published
+under a scalar schema would mislead every plot that read it.

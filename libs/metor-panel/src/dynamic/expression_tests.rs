@@ -499,3 +499,41 @@ async fn an_expression_keeps_running_after_its_caller_drops_it() {
     );
     assert_eq!(f64::from_le_bytes(latest.data().try_into().unwrap()), 15.0);
 }
+
+/// The defect behind "broadcast isn't applied": the compiler broadcasts fine,
+/// but the picker committed a single trace at element zero.
+///
+/// `=xyz + 1.0` over a rank-1 channel is a rank-1 result, and it plots the way
+/// that channel would — one trace per element. Collapsing it to element zero
+/// showed one number where three were expected, which reads exactly like the
+/// arithmetic never happened.
+#[test]
+fn an_expression_over_a_vector_plots_every_element() {
+    let (db, _temp) = db_with_ids(&[("xyz", ComponentId::new("xyz"), PrimType::F64, &[3])]);
+
+    // Stand in for the expression's own hidden component: rank-1, as
+    // `xyz + 1.0` would publish.
+    let out = ComponentId::new("expr.out");
+    db.with_state_mut(|s| {
+        s.insert_component(out, ComponentSchema::new(PrimType::F64, &[3]), &db.path)
+    })
+    .unwrap();
+
+    let plotted = crate::inspector::trace_picker::expression_elements(&db, out, "=xyz + 1.0");
+    assert_eq!(plotted.len(), 3, "a rank-1 expression plots each element");
+    assert_eq!(
+        plotted.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(plotted[0].1, "xyz + 1.0.x");
+    assert_eq!(plotted[2].1, "xyz + 1.0.z");
+
+    // A scalar expression is still exactly one trace, labelled by its text.
+    let scalar = ComponentId::new("expr.scalar");
+    db.with_state_mut(|s| {
+        s.insert_component(scalar, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+    })
+    .unwrap();
+    let plotted = crate::inspector::trace_picker::expression_elements(&db, scalar, "=xyz[0] + 1.0");
+    assert_eq!(plotted, vec![(0, "xyz[0] + 1.0".to_string())]);
+}

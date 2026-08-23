@@ -548,3 +548,50 @@ async fn a_chain_of_systems_keeps_following_its_input() {
     assert_eq!(first.health.fault(), None);
     assert_eq!(second.health.fault(), None);
 }
+
+
+/// The user's case, end to end: a rank-1 channel plus a scalar literal
+/// broadcasts, and the *shape* survives all the way to the output component.
+///
+/// The schema matters as much as the values — a rank-1 result published under
+/// a scalar schema would give every plot the wrong idea about what it is
+/// holding.
+#[stellarator::test]
+async fn a_scalar_broadcasts_over_a_vector_component() {
+    let bench = Bench::new(&[("xyz", PrimType::F64, &[3])]);
+    let compiled = bench.compile("out = xyz + 1.0\n");
+    assert_eq!(
+        compiled.manifest.systems[0].output.fields[0].ty,
+        Ty::Tensor {
+            dtype: metor_expr::Dtype::F64,
+            shape: vec![3],
+        },
+        "the inferred output must keep the broadcast shape"
+    );
+
+    let system = wire(&bench, &compiled, 0);
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    assert_eq!(
+        field.value_type().schema().unwrap(),
+        &ComponentSchema::new(PrimType::F64, &[3]),
+        "and so must the component it publishes as"
+    );
+
+    let published = ops::persist::persist(&bench.db, "out".to_string(), field).unwrap();
+    let mut reader = published.subscribe();
+    bench.push("xyz", 1, &[1.0, 2.0, 3.0]);
+
+    for _ in 0..300 {
+        if let Some(grant) = reader.try_next() {
+            let (_, value) = grant.sample_at(grant.sample_count() - 1);
+            let got: Vec<f64> = value
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            assert_eq!(got, vec![2.0, 3.0, 4.0]);
+            return;
+        }
+        stellarator::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("nothing published; fault = {:?}", system.health.fault());
+}

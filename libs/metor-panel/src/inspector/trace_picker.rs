@@ -227,25 +227,23 @@ fn component_list_rows(
 
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    // Typing `=` commits one computed trace on its own, rather than joining
-    // the multi-select: an expression is already exactly one channel, so
-    // there is nothing to check off.
+    // Typing `=` commits its traces on its own rather than joining the
+    // multi-select: an expression is one channel already, so there is nothing
+    // to check off — but a channel is not one *number*. An expression over a
+    // vector broadcasts to a vector, and it plots the way that component
+    // would: one trace per element.
     rows.push(Box::new(ExpressionRow::new(db.clone(), {
+        let db = db.clone();
         let on_continue = on_continue.clone();
         let color_basis = color_basis.clone();
         Arc::new(move |component, text, window, cx| {
-            let color = {
-                let theme = theme(cx);
-                theme.line_colors[(color_basis)(cx) % theme.line_colors.len()]
-            };
-            let mut trace = Trace::new(component, 0, color);
-            trace.label = SharedString::from(crate::dynamic::expressions::body(&text).to_string());
+            let traces = expression_traces(&db, component, &text, &color_basis, cx);
             match &on_continue {
                 ContinueAction::Dismiss(on_select) => {
-                    on_select(vec![trace], window, cx);
+                    on_select(traces, window, cx);
                     RowAction::Dismiss
                 }
-                ContinueAction::CascadeView(build) => RowAction::CascadeView(build(vec![trace], cx)),
+                ContinueAction::CascadeView(build) => RowAction::CascadeView(build(traces, cx)),
             }
         })
     })));
@@ -432,6 +430,58 @@ impl InspectorRow for DoneRow {
     fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
         RowAction::Pop
     }
+}
+
+/// One trace per element of an expression's output.
+///
+/// The output of `=omega_b * 100` is whatever the arithmetic produced — a
+/// vector in, a vector out — so it is plotted exactly as the component it was
+/// derived from would be, with each element on its own line. Collapsing it to
+/// element zero is what makes broadcasting look like it did not happen.
+pub(crate) fn expression_traces(
+    db: &DB,
+    component: ComponentId,
+    text: &str,
+    color_basis: &ColorBasis,
+    cx: &App,
+) -> Vec<Trace> {
+    let theme = theme(cx);
+    let base = (color_basis)(cx);
+    expression_elements(db, component, text)
+        .into_iter()
+        .map(|(index, label)| {
+            let color = theme.line_colors[(base + index) % theme.line_colors.len()];
+            let mut trace = Trace::new(component, index, color);
+            trace.label = SharedString::from(label);
+            trace
+        })
+        .collect()
+}
+
+/// Which elements of an expression's output get plotted, and what each is
+/// called. Separated from the colours so the rule can be checked without a
+/// window.
+pub(crate) fn expression_elements(
+    db: &DB,
+    component: ComponentId,
+    text: &str,
+) -> Vec<(usize, String)> {
+    let body = crate::dynamic::expressions::body(text);
+    let mut elements = element_names_for_component(db, component);
+    if elements.is_empty() {
+        elements.push(String::new());
+    }
+    elements
+        .into_iter()
+        .enumerate()
+        .map(|(index, element)| {
+            let label = match element.is_empty() {
+                true => body.to_string(),
+                false => format!("{body}.{element}"),
+            };
+            (index, label)
+        })
+        .collect()
 }
 
 fn build_traces(db: &DB, sel: &TraceSelection, color_basis: &ColorBasis, cx: &App) -> Vec<Trace> {
