@@ -48,9 +48,14 @@ __version__ = "0.4.0"
 # v7 added the `wasm` artifact kind and the coordinator's per-poll fuel and
 # guest-memory limits.
 # v8 moved eval-time validation to the one Rust gate (no shape change).
-# v9 added the captured Python program (`program`), the `"expr"` system type
-# it compiles, and the declaration-site `layout` on every system.
+# v9 added the captured Python program (`program`), the program-built wasm
+# artifact whose pack entries the `@system` declarations compile into, and
+# the declaration-site `layout` on every system.
 IR_VERSION = 9
+
+# Artifact id of the program-built wasm pack: the one artifact `to_ir`
+# synthesizes when the target file declares `@system` functions.
+PROGRAM_ARTIFACT = "program"
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -195,16 +200,20 @@ class Artifact:
     A prebuilt pack's module (``metor-fsw pack dev``, or an installed pack
     wheel) also carries ``prebuilt`` — the directory of per-triple libraries
     the host provisions from instead of running cargo — plus the generating
-    ABI version and, for a published pack, its distribution name/version."""
+    ABI version and, for a published pack, its distribution name/version.
+
+    ``kind`` is ``"cdylib"`` (the default, requiring ``crate``/``lib``) or
+    ``"wasm"`` — one arch-neutral module with no crate behind it."""
 
     id: str
-    crate: str
-    lib: str
+    crate: str | None = None
+    lib: str | None = None
     manifest_hash: str | None = None
     prebuilt: str | None = None
     abi_version: int | None = None
     dist: str | None = None
     dist_version: str | None = None
+    kind: str = "cdylib"
 
 
 class System(Spec):
@@ -257,8 +266,9 @@ class SystemHandle:
 #
 # A `@system`-decorated function written in the target file runs on the
 # vehicle: the decorator captures its source here, `Target.to_ir` assembles
-# every captured declaration into one program, and the host compiles it to
-# WASM at the init gate (`libs/metor-expr`). Under CPython the declarations
+# every captured declaration into one program, and the build driver compiles
+# it into an ordinary wasm pack artifact (`libs/metor-expr`) whose entries
+# the emitted system specs address by name. Under CPython the declarations
 # are defined and never called, so evaluation is harmless; the compiled
 # semantics live entirely on the Rust side. `Frame`/`State` subclasses with
 # annotated fields capture the same way — a field-less subclass is a
@@ -1293,23 +1303,29 @@ class Target:
             if existing["manifest_hash"] is None:
                 existing["manifest_hash"] = decl.manifest_hash
             return
-        dist = (
-            {"name": decl.dist, "version": decl.dist_version}
-            if decl.dist is not None and decl.dist_version is not None
-            else None
-        )
-        self._artifacts.append(
-            {
-                "id": decl.id,
-                "crate_name": decl.crate,
-                "lib": decl.lib,
-                "path": None,
-                "prebuilt_dir": decl.prebuilt,
-                "dist": dist,
-                "manifest_hash": decl.manifest_hash,
-                "src": _source_ref(),
-            }
-        )
+        if decl.kind == "cdylib" and (decl.crate is None or decl.lib is None):
+            raise ValueError(f"artifact `{decl.id}`: a cdylib names a crate and a lib stem")
+        entry = {
+            "id": decl.id,
+            "path": None,
+            "prebuilt_dir": decl.prebuilt,
+            "dist": (
+                {"name": decl.dist, "version": decl.dist_version}
+                if decl.dist is not None and decl.dist_version is not None
+                else None
+            ),
+            "manifest_hash": decl.manifest_hash,
+            "src": _source_ref(),
+        }
+        # Mirror serde's skips: `kind` is omitted for the default cdylib, and
+        # the crate/lib fields are omitted when empty (a wasm artifact).
+        if decl.kind != "cdylib":
+            entry["kind"] = decl.kind
+        if decl.crate is not None:
+            entry["crate_name"] = decl.crate
+        if decl.lib is not None:
+            entry["lib"] = decl.lib
+        self._artifacts.append(entry)
 
     # -- systems and slots --------------------------------------------------
 
@@ -1451,13 +1467,16 @@ class Target:
             return {"Simulated": {"dt_secs": float(self.sim_dt)}}
         return "Wall"
 
-    def _program_ir(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        """The assembled program blob and one ``"expr"`` system spec per
-        captured ``@system``, from the module-scoped capture list. Offsets are
-        byte offsets into the assembled source, what the compiler's spans are
-        mapped back through."""
+    def _program_ir(
+        self,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+        """The assembled program blob, the program-built wasm artifact, and one
+        ordinary system spec per captured ``@system`` — each addressing its
+        pack entry by name, exactly how a cdylib entry is addressed. Offsets
+        are byte offsets into the assembled source, what the compiler's spans
+        are mapped back through."""
         if not _program:
-            return None, []
+            return None, [], []
         decls: list[dict[str, Any]] = []
         parts: list[str] = []
         offset = 0
@@ -1474,8 +1493,8 @@ class Target:
         systems = [
             {
                 "name": entry["name"],
-                "ty": "expr",
-                "artifact": None,
+                "ty": entry["name"],
+                "artifact": PROGRAM_ARTIFACT,
                 "params": "None",
                 "process": False,
                 "src": entry["src"],
@@ -1486,11 +1505,24 @@ class Target:
             for entry in _program
             if entry["system"]
         ]
-        return {"source": "".join(parts), "decls": decls}, systems
+        artifacts: list[dict[str, Any]] = []
+        if systems:
+            artifacts.append(
+                {
+                    "id": PROGRAM_ARTIFACT,
+                    "kind": "wasm",
+                    "path": None,
+                    "prebuilt_dir": None,
+                    "dist": None,
+                    "manifest_hash": None,
+                    "src": None,
+                }
+            )
+        return {"source": "".join(parts), "decls": decls}, artifacts, systems
 
     def to_ir(self) -> dict[str, Any]:
         """The serialized ``Wiring`` this target describes."""
-        program, expr_systems = self._program_ir()
+        program, program_artifacts, program_systems = self._program_ir()
         return {
             "ir_version": IR_VERSION,
             "metor_config_version": __version__,
@@ -1502,9 +1534,9 @@ class Target:
                 "wasm_fuel_per_poll": self.wasm_fuel_per_poll,
                 "wasm_memory_limit_bytes": self.wasm_memory_limit_bytes,
             },
-            "artifacts": self._artifacts,
+            "artifacts": self._artifacts + program_artifacts,
             "states": self._states,
-            "systems": self._systems + expr_systems,
+            "systems": self._systems + program_systems,
             "slots": self._slots,
             "edges": self._edges,
             "scopes": self._scopes,

@@ -89,21 +89,27 @@ pub enum LoadErrorKind {
     UnknownType { ty: String },
 
     /// Two declarations of the wiring's Python program share a name. Decls
-    /// are addressed by name (an `expr` system references its function this
-    /// way), so a duplicate would silently shadow.
+    /// are addressed by name (a program-built pack entry references its
+    /// function this way), so a duplicate would silently shadow.
     #[error("program declaration `{name}` appears more than once")]
     DuplicateProgramDecl { name: String },
 
-    /// An `expr` system names no declaration of the wiring's program. The
-    /// program *is* an expr system's spec, so a spec without a matching
-    /// `@system` declaration is front-end drift, not a document mistake.
-    #[error("expr system `{name}`: the wiring's program declares no `{name}`")]
-    ExprUnknownDecl { name: String },
+    /// A system loading from the program artifact names an entry the wiring's
+    /// program never declares. The program *is* that artifact's source, so a
+    /// spec without a matching `@system` declaration is front-end drift, not
+    /// a document mistake.
+    #[error("Python system `{name}`: the wiring's program declares no `{name}`")]
+    ProgramUnknownDecl { name: String },
 
-    /// An `expr` system carries params. Its whole configuration is the
-    /// captured source; params here would be silently dropped.
-    #[error("expr system `{name}` carries params; a Python system's source is its whole spec")]
-    ExprParams { name: String },
+    /// A cdylib artifact without a crate name or lib stem: nothing could
+    /// build or locate it.
+    #[error("artifact `{id}` is a cdylib but names no crate or lib stem")]
+    ArtifactMissingCrate { id: String },
+
+    /// A program-built wasm artifact in a wiring that captured no program:
+    /// there is no source to compile it from.
+    #[error("artifact `{id}` compiles from the target program, but the wiring carries none")]
+    ProgramArtifactWithoutProgram { id: String },
 
     #[error("system `{name}` sets `process` without an `artifact`")]
     ProcessNeedsArtifact { name: String },

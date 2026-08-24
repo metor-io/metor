@@ -11,8 +11,8 @@
 //!
 use std::collections::HashSet;
 
-use super::model::{EXPR_TYPE, IR_VERSION};
-use super::model::{ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
+use super::model::IR_VERSION;
+use super::model::{ArtifactKind, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
 use super::resolve::slot_config_error;
 use super::{LoadError, LoadErrorKind};
 use crate::coordinator::validate_slot_spec;
@@ -31,6 +31,7 @@ pub(crate) fn validate(wiring: &Wiring) -> Result<(), LoadError> {
     for state in &wiring.states {
         check_state(state)?;
     }
+    check_artifact_fields(wiring)?;
     check_program(wiring)?;
     for spec in &wiring.systems {
         check_system(spec, wiring)?;
@@ -41,15 +42,32 @@ pub(crate) fn validate(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// Whether a spec is a compiled Python system: the reserved [`EXPR_TYPE`]
-/// with no artifact (a pack may still export an entry named `expr`).
-pub(crate) fn is_expr(spec: &SystemSpec) -> bool {
-    spec.artifact.is_none() && spec.ty.as_deref() == Some(EXPR_TYPE)
+/// Per-artifact field rules the kind implies: a cdylib is built (or located)
+/// through cargo, so it must name a crate and a lib stem; a program-built
+/// wasm artifact requires the captured program it compiles from.
+fn check_artifact_fields(wiring: &Wiring) -> Result<(), LoadError> {
+    for artifact in &wiring.artifacts {
+        if artifact.kind == ArtifactKind::Cdylib
+            && (artifact.crate_name.is_empty() || artifact.lib.is_empty())
+        {
+            return Err(LoadErrorKind::ArtifactMissingCrate {
+                id: artifact.id.clone(),
+            }
+            .bare());
+        }
+        if artifact.is_program() && wiring.program.is_none() {
+            return Err(LoadErrorKind::ProgramArtifactWithoutProgram {
+                id: artifact.id.clone(),
+            }
+            .bare());
+        }
+    }
+    Ok(())
 }
 
 /// The captured program's structural rules: declaration names are unique
-/// (an `expr` system addresses its declaration by name), and every `expr`
-/// system references one, carries no params, and attaches to nothing.
+/// (a program-built entry addresses its declaration by name), and every
+/// system loading from the program artifact references one.
 fn check_program(wiring: &Wiring) -> Result<(), LoadError> {
     if let Some(program) = &wiring.program {
         let mut seen = HashSet::new();
@@ -62,27 +80,27 @@ fn check_program(wiring: &Wiring) -> Result<(), LoadError> {
             }
         }
     }
-    for spec in wiring.systems.iter().filter(|s| is_expr(s)) {
+    let program_ids: HashSet<&str> = wiring
+        .artifacts
+        .iter()
+        .filter(|a| a.is_program())
+        .map(|a| a.id.as_str())
+        .collect();
+    for spec in &wiring.systems {
+        let Some(artifact) = spec.artifact.as_deref() else {
+            continue;
+        };
+        if !program_ids.contains(artifact) {
+            continue;
+        }
+        let entry = spec.ty.as_deref().unwrap_or(spec.name.as_str());
         let declared = wiring
             .program
             .as_ref()
-            .is_some_and(|p| p.decls.iter().any(|d| d.name == spec.name));
+            .is_some_and(|p| p.decls.iter().any(|d| d.name == entry));
         if !declared {
-            return Err(LoadErrorKind::ExprUnknownDecl {
-                name: spec.name.clone(),
-            }
-            .bare());
-        }
-        if !matches!(spec.params, ParamSource::None) {
-            return Err(LoadErrorKind::ExprParams {
-                name: spec.name.clone(),
-            }
-            .bare());
-        }
-        if let Some(attach) = &spec.attach {
-            return Err(LoadErrorKind::AttachOnNonSharedSystem {
-                system: spec.name.clone(),
-                attach: attach.clone(),
+            return Err(LoadErrorKind::ProgramUnknownDecl {
+                name: entry.to_string(),
             }
             .bare());
         }
@@ -276,11 +294,27 @@ fn artifact_exists(wiring: &Wiring, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{ProgramDecl, ProgramSpec};
+    use crate::ir::{Artifact, ProgramDecl, ProgramSpec};
     use crate::wiring::WiringBuilder;
 
-    fn expr_wiring() -> Wiring {
-        let mut wiring = WiringBuilder::new().system("f").ty(EXPR_TYPE).end().build();
+    fn program_wiring() -> Wiring {
+        let mut wiring = WiringBuilder::new()
+            .system("f")
+            .ty("f")
+            .from_artifact("program")
+            .end()
+            .build();
+        wiring.artifacts.push(Artifact {
+            id: "program".into(),
+            kind: ArtifactKind::Wasm,
+            crate_name: String::new(),
+            lib: String::new(),
+            path: None,
+            prebuilt_dir: None,
+            dist: None,
+            manifest_hash: None,
+            src: None,
+        });
         wiring.program = Some(ProgramSpec {
             source: "def f() -> f64:\n    return 1.0\n".into(),
             decls: vec![ProgramDecl {
@@ -293,32 +327,39 @@ mod tests {
     }
 
     #[test]
-    fn expr_system_must_reference_a_program_decl() {
-        assert!(validate(&expr_wiring()).is_ok());
+    fn program_system_must_reference_a_program_decl() {
+        assert!(validate(&program_wiring()).is_ok());
 
-        let mut wiring = expr_wiring();
-        wiring.program = None;
+        let mut wiring = program_wiring();
+        wiring.program.as_mut().unwrap().decls.clear();
         assert!(matches!(
             validate(&wiring).unwrap_err().kind,
-            LoadErrorKind::ExprUnknownDecl { name } if name == "f"
+            LoadErrorKind::ProgramUnknownDecl { name } if name == "f"
         ));
     }
 
     #[test]
-    fn expr_system_params_and_duplicate_decls_are_rejected() {
-        let mut wiring = expr_wiring();
-        wiring.systems[0].params = ParamSource::Value(serde_json::json!({ "a": 1 }));
+    fn program_artifact_and_decl_shape_are_checked() {
+        let mut wiring = program_wiring();
+        wiring.program = None;
         assert!(matches!(
             validate(&wiring).unwrap_err().kind,
-            LoadErrorKind::ExprParams { .. }
+            LoadErrorKind::ProgramArtifactWithoutProgram { .. }
         ));
 
-        let mut wiring = expr_wiring();
+        let mut wiring = program_wiring();
         let decl = wiring.program.as_ref().unwrap().decls[0].clone();
         wiring.program.as_mut().unwrap().decls.push(decl);
         assert!(matches!(
             validate(&wiring).unwrap_err().kind,
             LoadErrorKind::DuplicateProgramDecl { .. }
+        ));
+
+        let mut wiring = program_wiring();
+        wiring.artifacts[0].kind = ArtifactKind::Cdylib;
+        assert!(matches!(
+            validate(&wiring).unwrap_err().kind,
+            LoadErrorKind::ArtifactMissingCrate { .. }
         ));
     }
 }

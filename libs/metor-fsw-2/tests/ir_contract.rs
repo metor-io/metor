@@ -9,9 +9,9 @@
 //! consumes — deserialized and re-serialized to prove it is exactly what Rust
 //! accepts and emits.
 
-use metor_fsw_2::ir::{EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
+use metor_fsw_2::ir::{ArtifactKind, EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
 use metor_fsw_2::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EXPR_TYPE, EdgeSpec,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
     InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec,
     SystemSpec, Wiring,
 };
@@ -64,6 +64,19 @@ fn maximal() -> Wiring {
                 manifest_hash: Some("sha256:0".into()),
                 src: None,
             },
+            // The program-built wasm artifact: no crate, no lib stem, no
+            // prebuilt dir — compiled from `Wiring::program` at provision.
+            Artifact {
+                kind: ArtifactKind::Wasm,
+                id: "program".into(),
+                crate_name: String::new(),
+                lib: String::new(),
+                path: None,
+                prebuilt_dir: None,
+                dist: None,
+                manifest_hash: None,
+                src: None,
+            },
         ],
         states: Vec::new(),
         systems: vec![
@@ -102,8 +115,8 @@ fn maximal() -> Wiring {
             },
             SystemSpec {
                 name: "omega_norm".into(),
-                ty: Some(EXPR_TYPE.into()),
-                artifact: None,
+                ty: Some("omega_norm".into()),
+                artifact: Some("program".into()),
                 params: ParamSource::None,
                 process: false,
                 src: src(12),
@@ -244,11 +257,20 @@ fn representation_is_externally_tagged() {
     assert_eq!(v["systems"][0]["layout"], json!([40.0, 80.0]));
     assert_eq!(v["systems"][1]["layout"], Value::Null);
 
-    // The captured program: an `expr` system references its decl by name.
-    assert_eq!(v["systems"][3]["ty"], json!("expr"));
+    // The captured program: a Python system is an ordinary spec addressing
+    // the program artifact's pack entry of its declaration's name.
+    assert_eq!(v["systems"][3]["ty"], json!("omega_norm"));
+    assert_eq!(v["systems"][3]["artifact"], json!("program"));
     assert_eq!(v["systems"][3]["params"], json!("None"));
     assert_eq!(v["program"]["decls"][0]["name"], json!("omega_norm"));
     assert_eq!(v["program"]["decls"][0]["offset"], json!(0));
+
+    // Artifact kind renders snake_case and is omitted for the default cdylib;
+    // a program-built wasm artifact omits the crate/lib fields entirely.
+    assert_eq!(v["artifacts"][2]["kind"], json!("wasm"));
+    assert!(v["artifacts"][0].get("kind").is_none());
+    assert!(v["artifacts"][2].get("crate_name").is_none());
+    assert!(v["artifacts"][2].get("lib").is_none());
 
     // The v3 artifact fields: the arch-neutral lib stem, a prebuilt dir as a
     // plain path string, and dist provenance as a { name, version } object.

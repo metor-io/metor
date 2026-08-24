@@ -64,8 +64,9 @@ pub struct Wiring {
     /// collision-checked regardless. The Rust builder leaves it empty.
     #[serde(default)]
     pub scopes: Vec<ScopeSpec>,
-    /// The captured Python program the target's [`EXPR_TYPE`] systems compile
-    /// from, one per target. `None` when the target declares no Python system.
+    /// The captured Python program the target's program-built wasm
+    /// [`Artifact`] compiles from, one per target. `None` when the target
+    /// declares no Python system.
     #[serde(default)]
     pub program: Option<ProgramSpec>,
 }
@@ -134,16 +135,13 @@ pub const DOWNLINK_TYPE: &str = "Downlink";
 /// [`UplinkParams`](crate::UplinkParams).
 pub const UPLINK_TYPE: &str = "Uplink";
 
-/// Reserved `type=` of a compiled Python system: a `@system` function the
-/// recorder captured into [`Wiring::program`]. Carries no artifact and no
-/// params — the program *is* the spec — and is compiled and run by the host
-/// at the init gate rather than resolved in the registry.
-pub const EXPR_TYPE: &str = "expr";
-
 /// The captured Python program of one target: every `@system` function and
 /// `Frame`/`State` class the target file declared, assembled in definition
 /// order into a single compilation unit (bindings between systems only work
-/// inside one unit). Compiled once at the init gate by `metor-expr`.
+/// inside one unit). Compiled once by `metor-expr` at build/provision time
+/// into the target's program-built wasm [`Artifact`]; each `@system` is an
+/// ordinary [`SystemSpec`] addressing that artifact's pack entry of the same
+/// name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProgramSpec {
     /// The assembled module source.
@@ -157,8 +155,8 @@ pub struct ProgramSpec {
 /// back to a `target.py` line rather than a synthetic-module one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProgramDecl {
-    /// The declaration's name — a function or class name; an [`EXPR_TYPE`]
-    /// system's spec name references its declaration through this.
+    /// The declaration's name — a function or class name; a program-built
+    /// entry's spec references its declaration through this.
     pub name: String,
     /// Where the declaration was written.
     #[serde(default)]
@@ -263,12 +261,17 @@ pub struct Artifact {
     #[serde(default, skip_serializing_if = "ArtifactKind::is_cdylib")]
     pub kind: ArtifactKind,
     /// The cargo package name, used by the build driver as
-    /// `cargo build -p <crate_name>`.
+    /// `cargo build -p <crate_name>`. Empty (and omitted on the wire) for a
+    /// wasm artifact compiled from the target's [`Wiring::program`], which has
+    /// no crate behind it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub crate_name: String,
     /// The bare library stem (`foo` for `libfoo.so`/`libfoo.dylib`/`foo.dll`).
     /// The file name is derived per target triple at provision time
     /// ([`cdylib_file_name_for`](crate::wiring::cdylib_file_name_for)); the IR
-    /// stays arch-neutral.
+    /// stays arch-neutral. Empty for a program-built wasm artifact, whose one
+    /// arch-neutral file is named from its id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lib: String,
     /// The resolved artifact location, filled in by
     /// [`provision_artifacts`](crate::wiring::provision_artifacts). `None` until built or
@@ -298,6 +301,20 @@ pub struct Artifact {
     /// Where this artifact was declared.
     #[serde(default)]
     pub src: Option<SourceRef>,
+}
+
+impl Artifact {
+    /// Whether this artifact still needs compiling from the target's captured
+    /// Python program ([`Wiring::program`]): a wasm artifact with no crate,
+    /// no prebuilt directory, and no located path behind it. The build driver
+    /// compiles the program for it; every other wasm artifact arrives with a
+    /// path (builder-authored, or a bundle member) or a prebuilt dir.
+    pub fn is_program(&self) -> bool {
+        self.kind == ArtifactKind::Wasm
+            && self.crate_name.is_empty()
+            && self.prebuilt_dir.is_none()
+            && self.path.is_none()
+    }
 }
 
 /// The published distribution an [`Artifact`] was installed from, as the
@@ -368,7 +385,7 @@ pub struct SystemSpec {
     #[serde(default)]
     pub attach: Option<String>,
     /// Where this system's canvas card sits, from the declaration site: the
-    /// `@node(x=, y=)` decorator on an [`EXPR_TYPE`] system, the
+    /// `@node(x=, y=)` decorator on a `@system` function, the
     /// `Target.add(..., node=(x, y))` kwarg on a native one. `None` leaves
     /// placement to the canvas's auto-layout.
     #[serde(default)]

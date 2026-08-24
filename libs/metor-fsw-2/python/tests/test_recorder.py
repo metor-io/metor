@@ -218,11 +218,16 @@ class RecorderTest(unittest.TestCase):
             self.assertRegex(chunk, rf"(def|class) {decl['name']}\b")
         self.assertTrue(program["decls"][0]["src"]["file"].endswith("test_recorder.py"))
 
-        expr = [s for s in ir["systems"] if s["ty"] == "expr"]
-        self.assertEqual([s["name"] for s in expr], ["omega_norm", "smooth"])
-        self.assertEqual(expr[0]["layout"], [420.0, 180.0])
-        self.assertEqual(expr[1]["layout"], [10.0, 20.0])
-        self.assertEqual(expr[0]["params"], "None")
+        compiled = [s for s in ir["systems"] if s["artifact"] == "program"]
+        self.assertEqual([s["name"] for s in compiled], ["omega_norm", "smooth"])
+        # Each spec addresses its pack entry by the declaration's name.
+        self.assertEqual([s["ty"] for s in compiled], ["omega_norm", "smooth"])
+        self.assertEqual(compiled[0]["layout"], [420.0, 180.0])
+        self.assertEqual(compiled[1]["layout"], [10.0, 20.0])
+        self.assertEqual(compiled[0]["params"], "None")
+        program_artifacts = [a for a in ir["artifacts"] if a["id"] == "program"]
+        self.assertEqual([a["kind"] for a in program_artifacts], ["wasm"])
+        self.assertNotIn("crate_name", program_artifacts[0])
 
         # The handle's `.out` names the output port: the function itself for
         # the sugar form, the snake-cased Frame class for the canonical form.

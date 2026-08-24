@@ -32,6 +32,15 @@
       "dist": null,
       "manifest_hash": null,
       "src": null
+    },
+    {
+      "id": "program",
+      "kind": "wasm",
+      "path": null,
+      "prebuilt_dir": null,
+      "dist": null,
+      "manifest_hash": null,
+      "src": null
     }
   ],
   "states": [
@@ -138,8 +147,8 @@
     },
     {
       "name": "gyro_norm",
-      "ty": "expr",
-      "artifact": null,
+      "ty": "gyro_norm",
+      "artifact": "program",
       "params": "None",
       "process": false,
       "src": null,
