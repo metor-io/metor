@@ -394,6 +394,9 @@ impl<'a> Emitter<'a> {
                 self.push(Instruction::I32Const(self.layout.at(*buf) as i32));
                 self.push(load_of(ty));
             }
+            Expr::Address(buf) => {
+                self.push(Instruction::I32Const(self.layout.at(*buf) as i32))
+            }
             Expr::Store { local, value, then } => {
                 self.expr(value);
                 self.push(Instruction::LocalSet(*local));

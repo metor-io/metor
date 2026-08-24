@@ -53,6 +53,8 @@ pub(crate) struct SystemDecl<'a> {
     pub output_class: Option<String>,
     pub anonymous_output: bool,
     pub driving: Option<usize>,
+    /// Hertz, for a system that clocks itself instead of waiting on an input.
+    pub rate: Option<f64>,
     pub body: Body<'a>,
     pub span: Span,
 }
@@ -479,6 +481,7 @@ fn system_decl<'a>(
         output_class: sig.output_class,
         anonymous_output: sig.anonymous_output,
         driving,
+        rate: decorator.rate,
         body: Body::Stmts(&def.body),
         span: def.range.into(),
     })
@@ -568,6 +571,7 @@ struct Decorator {
     paths: Vec<String>,
     bind: HashMap<String, String>,
     on: Option<String>,
+    rate: Option<f64>,
 }
 
 fn decorator(def: &ast::StmtFunctionDef, diags: &mut Diagnostics) -> Option<Decorator> {
@@ -624,8 +628,15 @@ fn decorator(def: &ast::StmtFunctionDef, diags: &mut Diagnostics) -> Option<Deco
                             return None;
                         }
                     },
+                    Some("rate") => match number_of(&keyword.value) {
+                        Some(hz) if hz.is_finite() && hz > 0.0 => out.rate = Some(hz),
+                        _ => {
+                            diags.push(keyword.range, "`rate` is a positive number of hertz");
+                            return None;
+                        }
+                    },
                     _ => {
-                        diags.push(keyword.range, "@system takes `bind` and `on`");
+                        diags.push(keyword.range, "@system takes `bind`, `on`, and `rate`");
                         return None;
                     }
                 }
@@ -639,12 +650,27 @@ fn decorator(def: &ast::StmtFunctionDef, diags: &mut Diagnostics) -> Option<Deco
     }
 }
 
+/// Which port fires the system, or none when its own clock does.
+///
+/// The two are exclusive by construction: a system is either source-clocked or
+/// input-driven, and saying both is a question with no answer rather than a
+/// preference to resolve.
 fn driving_port(
     decorator: &Decorator,
     ports: &[PortDecl],
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<Option<usize>> {
+    if decorator.rate.is_some() {
+        if decorator.on.is_some() {
+            diags.push(
+                span,
+                "a system is either source-clocked (`rate`) or input-driven (`on`)",
+            );
+            return None;
+        }
+        return Some(None);
+    }
     match &decorator.on {
         None => Some((!ports.is_empty()).then_some(0)),
         Some(on) => match ports.iter().position(|p| p.key == *on) {
@@ -661,6 +687,17 @@ fn string_of(expr: &ast::Expr) -> Option<String> {
     match expr {
         ast::Expr::Constant(c) => match &c.value {
             ast::Constant::Str(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn number_of(expr: &ast::Expr) -> Option<f64> {
+    match expr {
+        ast::Expr::Constant(c) => match &c.value {
+            ast::Constant::Float(f) => Some(*f),
+            ast::Constant::Int(i) => num_traits::ToPrimitive::to_f64(i),
             _ => None,
         },
         _ => None,
@@ -743,6 +780,7 @@ fn anonymous<'a>(
         output_class: None,
         anonymous_output: true,
         driving,
+        rate: None,
         body: Body::Expr(expr),
         span: expr.range().into(),
     })

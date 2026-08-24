@@ -60,9 +60,9 @@ impl Resolver for Table {
 }
 
 /// Drive one system through the region ABI.
-struct Run {
-    store: Store<()>,
-    instance: Instance,
+pub(super) struct Run {
+    pub(super) store: Store<()>,
+    pub(super) instance: Instance,
     program: Program,
     system: usize,
 }
@@ -88,7 +88,7 @@ impl Run {
         &self.program.manifest.systems[self.system].name
     }
 
-    fn address(&mut self, accessor: &str, index: Option<i32>) -> u32 {
+    pub(super) fn address(&mut self, accessor: &str, index: Option<i32>) -> u32 {
         let accessor = format!("{}_{accessor}", self.name());
         let func = self
             .instance
@@ -105,7 +105,7 @@ impl Run {
 
     /// Fill one field of one input frame, addressed the way a host would:
     /// port pointer plus the manifest's offset.
-    fn set(&mut self, port: &str, field: &str, values: &[f64]) -> &mut Self {
+    pub(super) fn set(&mut self, port: &str, field: &str, values: &[f64]) -> &mut Self {
         let system = &self.program.manifest.systems[self.system];
         let index = system
             .inputs
@@ -124,7 +124,7 @@ impl Run {
         self
     }
 
-    fn eval(&mut self, now: i64) -> i32 {
+    pub(super) fn eval(&mut self, now: i64) -> i32 {
         let name = format!("{}_eval", self.name());
         let func = self.instance.get_func(&self.store, &name).unwrap();
         let mut out = [Val::I32(0)];
@@ -136,7 +136,7 @@ impl Run {
         }
     }
 
-    fn get(&mut self, field: &str) -> Vec<f64> {
+    pub(super) fn get(&mut self, field: &str) -> Vec<f64> {
         let output = &self.program.manifest.systems[self.system].output;
         let field = output
             .field(field)
@@ -158,24 +158,24 @@ impl Run {
             .collect()
     }
 
-    fn scalar(&mut self, field: &str) -> f64 {
+    pub(super) fn scalar(&mut self, field: &str) -> f64 {
         self.get(field)[0]
     }
 
     /// A `bool` field, which occupies the low four bytes of its eight.
-    fn flag(&mut self, field: &str) -> bool {
+    pub(super) fn flag(&mut self, field: &str) -> bool {
         self.get(field)[0].to_bits() as u32 != 0
     }
 }
 
-fn build(source: &str, table: &Table, system: &str) -> Run {
+pub(super) fn build(source: &str, table: &Table, system: &str) -> Run {
     match compile_module(source, table) {
         Ok(program) => Run::new(program, system),
         Err(diags) => panic!("expected {source:?} to compile, got:\n{diags}"),
     }
 }
 
-fn refuse(source: &str, table: &Table) -> String {
+pub(super) fn refuse(source: &str, table: &Table) -> String {
     match compile_module(source, table) {
         Ok(_) => panic!("expected {source:?} to be refused"),
         Err(diags) => format!("{diags}"),

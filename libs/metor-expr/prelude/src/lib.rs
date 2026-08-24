@@ -72,6 +72,25 @@ pub extern "C" fn fmod_floor(x: f64, y: f64) -> f64 {
     if r != 0.0 && (r < 0.0) != (y < 0.0) { r + y } else { r }
 }
 
+/// Advance a splitmix64 state word in place and return a uniform `f64` in
+/// `[0, 1)`.
+///
+/// The generator lives in the guest so that `random()` costs one call and no
+/// import, and its state lives in a state slot so that it survives an edit the
+/// way a filter's memory does. The host writes that slot at instantiation —
+/// zero is a legal splitmix64 seed but a shared one, and two systems drawing
+/// the same sequence would be a surprise.
+#[unsafe(no_mangle)]
+pub extern "C" fn rng_unit(state: *mut u64) -> f64 {
+    let s = unsafe { &mut *state };
+    *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
 #[cfg(feature = "tensor-kernels")]
 mod tensor;
 

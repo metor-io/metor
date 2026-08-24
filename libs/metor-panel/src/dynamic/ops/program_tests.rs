@@ -595,3 +595,64 @@ async fn a_scalar_broadcasts_over_a_vector_component() {
     }
     panic!("nothing published; fault = {:?}", system.health.fault());
 }
+
+/// Q2: a system with no inputs is fired by the clock it asked for, so a
+/// generator is a program rather than a node kind.
+#[stellarator::test]
+async fn a_source_system_clocks_itself() {
+    let bench = Bench::new(&[]);
+    let compiled = bench.compile("@system(rate=200.0)\ndef sig() -> f64:\n    return sine(1.0, 2.0)\n");
+    assert_eq!(compiled.manifest.systems[0].rate, Some(200.0));
+
+    let system = program::system(&compiled, 0, Vec::new(), DEFAULT_FUEL, None).unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut reader = watch(&field);
+    let seen = take(&mut reader, 4).await;
+    assert!(
+        seen.iter().all(|v| (-2.0..=2.0).contains(v)),
+        "a 2.0-amplitude sine stays inside its amplitude: {seen:?}"
+    );
+    assert!(
+        seen.windows(2).any(|w| w[0] != w[1]),
+        "a sine of the timestamp varies: {seen:?}"
+    );
+}
+
+/// The generator's state is seeded per instance, so two sources drawing at
+/// once do not draw the same numbers.
+#[stellarator::test]
+async fn two_random_sources_draw_different_sequences() {
+    let bench = Bench::new(&[]);
+    let compiled = bench.compile(
+        "@system(rate=200.0)\ndef a() -> f64:\n    return random()\n\
+         @system(rate=200.0)\ndef b() -> f64:\n    return random()\n",
+    );
+
+    let mut drawn = Vec::new();
+    let mut held = Vec::new();
+    for index in 0..2 {
+        let system = program::system(&compiled, index, Vec::new(), DEFAULT_FUEL, None).unwrap();
+        let field = program::field(&compiled, index, 0, system.node.clone()).unwrap();
+        let mut reader = watch(&field);
+        held.push(system);
+        drawn.push(take(&mut reader, 6).await);
+    }
+    assert!(
+        drawn[0].iter().all(|v| (0.0..1.0).contains(v)),
+        "random() is uniform in [0, 1): {:?}",
+        drawn[0]
+    );
+    assert_ne!(drawn[0], drawn[1], "two generators must not share a seed");
+}
+
+/// A system with no inputs and no rate has nothing to fire it, and says so
+/// rather than sitting silent.
+#[stellarator::test]
+async fn an_unclocked_system_with_no_inputs_is_refused() {
+    let bench = Bench::new(&[]);
+    let compiled = bench.compile("@system\ndef sig() -> f64:\n    return 1.0\n");
+    let Err(err) = program::system(&compiled, 0, Vec::new(), DEFAULT_FUEL, None) else {
+        panic!("nothing fires it, so it must not build");
+    };
+    assert!(format!("{err}").contains("rate="), "{err}");
+}

@@ -21,6 +21,13 @@
 //! skipped — the `else return` a Rust system writes, in the one place where
 //! the language cannot express it.
 //!
+//! A system declaring `@system(rate=)` has no driving input at all: it is a
+//! source, and what fires it is a [`clock::fixed_rate`] node built here and
+//! held for its lifetime. Everything else about it is unchanged — held inputs
+//! are still held, the run rule still skips a cycle whose inputs are unknown —
+//! so a source with inputs is the cyclic FSW shape and one without is a
+//! generator.
+//!
 //! ## A frame is one sample
 //!
 //! The system node's ring carries the output frame's *bytes*, not a value: a
@@ -53,7 +60,7 @@ use std::sync::{Arc, Mutex};
 
 use metor_db::ComponentSchema;
 use metor_db::disruptor::Disruptor;
-use metor_expr::state::Snapshot;
+use metor_expr::state::{RNG_FIELD, Snapshot};
 use metor_expr::{Diagnostics, Manifest, Resolver, Ty};
 use metor_proto::types::{PrimType, Timestamp};
 use wasmi::{Engine, Instance, Linker, Module, Store, TypedFunc};
@@ -210,17 +217,29 @@ pub fn system(
     if let Some(seed) = seed {
         instance.seed(seed);
     }
+    // A generator that has never run needs a seed nothing else can supply.
+    // Restoring one carries the sequence across an edit; otherwise the clock
+    // and the system's identity make a fresh one, so two systems drawing at
+    // once do not draw the same numbers.
+    let id = compiled.system_hash(index, &ports.iter().map(|p| p.node.id()).collect::<Vec<_>>());
+    if !seed.is_some_and(|s| s.entries.iter().any(|(key, _)| key.field == RNG_FIELD)) {
+        instance.seed_rng(id.0 ^ Timestamp::now().0 as u64);
+    }
     let state = StateCell::default();
     *state.0.lock().unwrap() = instance.read_state();
 
-    // Every reader subscribes now, not inside the task: a disruptor reader
-    // only ever sees what is committed after it is made.
+    // A source clocks itself; everything else waits on its driving input.
+    // Either way one reader supplies the timestamps the loop turns on.
+    let clock = match desc.rate {
+        Some(hz) => Some(super::clock::fixed_rate(hz)?),
+        None if ports.is_empty() => {
+            return Err(BuildError::Expr(
+                "a system with no inputs needs @system(rate=) to fire it".into(),
+            ));
+        }
+        None => None,
+    };
     let driving = desc.driving.unwrap_or(0);
-    if ports.is_empty() {
-        return Err(BuildError::Expr(
-            "a system with no inputs has nothing to fire it".into(),
-        ));
-    }
 
     let mut layouts = Vec::with_capacity(ports.len());
     let mut readers = Vec::with_capacity(ports.len());
@@ -242,12 +261,21 @@ pub fn system(
         readers.push(Some(source.node.subscribe()));
     }
     // The driving port's own history is what the system fires from once at
-    // startup, so a quiet channel still shows its current value.
-    let opening = ports[driving].seed.clone().filter(|(_, value)| {
-        value.len() == layouts[driving].sample_bytes
-    });
+    // startup, so a quiet channel still shows its current value. A source has
+    // no such history — its clock ticks immediately.
+    let opening = match &clock {
+        Some(_) => None,
+        None => ports[driving]
+            .seed
+            .clone()
+            .filter(|(_, value)| value.len() == layouts[driving].sample_bytes),
+    };
     let wired = Ports {
-        driving: readers[driving].take().expect("the driving port is wired once"),
+        driving: match &clock {
+            Some(clock) => clock.subscribe(),
+            None => readers[driving].take().expect("the driving port is wired once"),
+        },
+        driven_port: clock.is_none().then_some(driving),
         others: readers
             .into_iter()
             .enumerate()
@@ -257,20 +285,23 @@ pub fn system(
         layouts,
     };
 
-    let id = compiled.system_hash(index, &ports.iter().map(|p| p.node.id()).collect::<Vec<_>>());
     let frame_bytes = desc.output.bytes as usize;
     let health = Health::default();
     let node = NodeImpl::spawn(
         id,
         ValueType::Value(ComponentSchema::new(PrimType::U8, &[frame_bytes])),
-        ports[driving].node.parent_clock_id(),
+        match &clock {
+            Some(clock) => clock.parent_clock_id(),
+            None => ports[driving].node.parent_clock_id(),
+        },
         default_ring_bytes(frame_bytes),
         {
             let health = health.clone();
             let state = state.clone();
             move |output| async move {
                 let _ports = ports;
-                run(instance, wired, driving, opening, output, health, state).await;
+                let _clock = clock;
+                run(instance, wired, opening, output, health, state).await;
             }
         },
     );
@@ -423,6 +454,9 @@ impl PortLayout {
 /// disjoint fields can be.
 struct Ports {
     driving: NodeReader,
+    /// Which port the driving reader fills, or `None` when what fires the
+    /// system is a clock rather than an input.
+    driven_port: Option<usize>,
     /// Every other port's reader, with the index of the port it fills.
     others: Vec<(usize, NodeReader)>,
     layouts: Vec<PortLayout>,
@@ -434,7 +468,6 @@ struct Ports {
 async fn run(
     mut instance: Running,
     mut ports: Ports,
-    driving: usize,
     opening: Option<(Timestamp, Vec<u8>)>,
     output: Disruptor,
     health: Health,
@@ -446,8 +479,9 @@ async fn run(
     // expression over a channel that is merely quiet shows its value straight
     // away instead of waiting for a sample that may be minutes off.
     if let Some((ts, value)) = &opening {
+        let driving = ports.driven_port.expect("only an input port has a seed");
         ports.layouts[driving].fill(value, &mut sample);
-        if evaluate(&mut instance, &ports, driving, &sample, *ts, &output, &state).is_err() {
+        if evaluate(&mut instance, &ports, &sample, *ts, &output, &state).is_err() {
             return;
         }
     }
@@ -455,6 +489,7 @@ async fn run(
     let fault = 'live: loop {
         let Ports {
             driving: reader,
+            driven_port,
             others,
             layouts,
             latest,
@@ -470,15 +505,20 @@ async fn run(
 
         for at in 0..grant.sample_count() {
             let (ts, value) = grant.sample_at(at);
-            if value.len() != layouts[driving].sample_bytes {
-                continue;
+            if let Some(driving) = *driven_port {
+                if value.len() != layouts[driving].sample_bytes {
+                    continue;
+                }
+                layouts[driving].fill(value, &mut sample);
             }
-            layouts[driving].fill(value, &mut sample);
             if others.iter().any(|(i, _)| latest[*i].is_empty()) {
                 continue;
             }
             for (i, held) in latest.iter().enumerate() {
-                let bytes = if i == driving { &sample } else { held };
+                let bytes = match *driven_port == Some(i) {
+                    true => &sample,
+                    false => held,
+                };
                 if instance.write_port(i, bytes).is_err() {
                     return;
                 }
@@ -502,7 +542,6 @@ async fn run(
 fn evaluate(
     instance: &mut Running,
     ports: &Ports,
-    driving: usize,
     sample: &[u8],
     ts: Timestamp,
     output: &Disruptor,
@@ -516,7 +555,10 @@ fn evaluate(
         return Ok(());
     }
     for (i, held) in ports.latest.iter().enumerate() {
-        let bytes = if i == driving { sample } else { held.as_slice() };
+        let bytes = match ports.driven_port == Some(i) {
+            true => sample,
+            false => held.as_slice(),
+        };
         instance.write_port(i, bytes)?;
     }
     match instance.eval(ts) {
@@ -665,6 +707,20 @@ impl Running {
         }
         if let Some(guard) = self.guard {
             let _ = memory.write(&mut self.store, guard as usize, &1u32.to_le_bytes());
+        }
+    }
+
+    /// Write the generator's state word, leaving the seed guard alone.
+    ///
+    /// The guard may be left alone precisely because this field's declared
+    /// default is zero, so the guest emits no instruction to seed it and the
+    /// first evaluation cannot overwrite what was written here.
+    fn seed_rng(&mut self, entropy: u64) {
+        let memory = self.memory();
+        for (slot, at) in &self.state {
+            if slot.key.field == RNG_FIELD {
+                let _ = memory.write(&mut self.store, *at as usize, &entropy.to_le_bytes());
+            }
         }
     }
 

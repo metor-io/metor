@@ -114,8 +114,15 @@ pub struct System {
     pub publishes: Vec<String>,
     pub state: Vec<StateField>,
     /// Index into `inputs` of the port whose publication drives the system.
-    /// Absent when the system has no inputs at all.
+    /// Absent when the system is source-clocked, and when it has no inputs at
+    /// all.
     pub driving: Option<usize>,
+    /// Hertz, when the system clocks itself rather than waiting on an input.
+    ///
+    /// A source has nothing to fire it, so it says how often it wants to run
+    /// and the host supplies the timer. Mutually exclusive with `driving`: a
+    /// system is either source-clocked or input-driven, never both.
+    pub rate: Option<f64>,
     /// The source region this system was written in — the input to a
     /// per-system content hash, so an edit rebuilds only what changed.
     pub source: Span,

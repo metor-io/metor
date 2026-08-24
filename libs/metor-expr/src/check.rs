@@ -295,6 +295,7 @@ fn check_inner(
             buffer_abi: frame.buffer_abi,
             output: None,
             now: None,
+            rng: None,
             locals,
             names,
             loop_depth: 0,
@@ -469,12 +470,6 @@ fn system(
         }
     }
 
-    // The seed guard sits one past the state fields, so it is reachable
-    // through the same accessor and restores like any other slot.
-    if !state_buffers.is_empty() {
-        state_buffers.push(alloc(buffers, 8));
-    }
-
     // A declared output frame is placed before the body runs, so a `return`
     // can write straight into its fields. A bare expression's frame cannot be
     // — its type is what the body turns out to compute.
@@ -499,6 +494,7 @@ fn system(
             anonymous: decl.anonymous_output,
         }),
         now: Some(0),
+        rng: None,
         locals: vec![Ty::I64],
         names,
         loop_depth: 0,
@@ -538,6 +534,24 @@ fn system(
     };
     let locals = body.locals;
 
+    // `random()` keeps a word of state, and the body is what says whether it
+    // needs one — so its slot is allocated where it is first asked for and
+    // joins the declared fields here, before the guard closes the list.
+    let mut state = decl.state.iter().map(|s| s.field.clone()).collect::<Vec<_>>();
+    if let Some(rng) = body.rng {
+        state_buffers.push(rng);
+        state.push(manifest::StateField {
+            name: crate::state::RNG_FIELD.to_string(),
+            ty: Ty::I64,
+            default: crate::Init::I64(0),
+        });
+    }
+    // The seed guard sits one past the state fields, so it is reachable
+    // through the same accessor and restores like any other slot.
+    if !state_buffers.is_empty() {
+        state_buffers.push(alloc(buffers, 8));
+    }
+
     let publishes = output
         .fields
         .iter()
@@ -568,8 +582,9 @@ fn system(
             inputs: ports,
             output,
             publishes,
-            state: decl.state.iter().map(|s| s.field.clone()).collect(),
+            state,
             driving: decl.driving,
+            rate: decl.rate,
             source: decl.span,
         },
     ))
@@ -787,6 +802,9 @@ struct FnChecker<'a> {
     output: Option<Output>,
     /// The slot `now()` reads, in a system.
     now: Option<u32>,
+    /// The state word `random()` advances, allocated when it is first asked
+    /// for so that a system which never calls it carries no state.
+    rng: Option<BufId>,
     locals: Vec<Ty>,
     names: HashMap<String, Binding>,
     loop_depth: u32,
@@ -2077,6 +2095,46 @@ impl FnChecker<'_> {
                     }
                 };
             }
+            // The generators. A source system's body is where a test signal
+            // comes from now that `@system(rate=)` supplies the clock, so the
+            // legacy Waveform, Random, and Constant nodes are these calls.
+            "constant" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                return self.expr(&call.args[0], depth);
+            }
+            "sine" | "cosine" | "square" | "sawtooth" => {
+                if !arity(2, self) {
+                    return None;
+                }
+                return self.waveform(name, call, depth);
+            }
+            "random" => {
+                if !arity(0, self) {
+                    return None;
+                }
+                if self.now.is_none() {
+                    self.diags
+                        .push(call.range, "`random()` exists inside a system");
+                    return None;
+                }
+                let buf = match self.rng {
+                    Some(buf) => buf,
+                    None => {
+                        let buf = self.buffer(&Ty::I64);
+                        self.rng = Some(buf);
+                        buf
+                    }
+                };
+                return Some((
+                    Expr::Kernel {
+                        name: "rng_unit",
+                        args: vec![Expr::Address(buf)],
+                    },
+                    Ty::F64,
+                ));
+            }
             "len" => {
                 if !arity(1, self) {
                     return None;
@@ -2230,6 +2288,116 @@ impl FnChecker<'_> {
                 None
             }
         }
+    }
+
+    /// A periodic signal of the timestamp the system was handed.
+    ///
+    /// Phase is measured in whole cycles — `freq * t`, with `t` in seconds —
+    /// so `sawtooth` and `square` read the fractional part directly and the
+    /// two trigonometric shapes multiply by a turn. The kind is four names
+    /// rather than one function's argument because the subset has no strings
+    /// to spell a kind with, and four palette entries autocomplete better than
+    /// one that needs its first argument memorised.
+    fn waveform(
+        &mut self,
+        kind: &str,
+        call: &ast::ExprCall,
+        depth: u32,
+    ) -> Option<(Expr, Ty)> {
+        let Some(now) = self.now else {
+            self.diags
+                .push(call.range, format!("`{kind}` exists inside a system"));
+            return None;
+        };
+        let (freq, freq_ty) = self.expr(&call.args[0], depth)?;
+        let freq = self.as_f64(freq, freq_ty, call.args[0].range())?;
+        let (amp, amp_ty) = self.expr(&call.args[1], depth)?;
+        let amp = self.as_f64(amp, amp_ty, call.args[1].range())?;
+
+        let seconds = Expr::Arith {
+            op: Arith::Mul,
+            ty: Num::F64,
+            lhs: Box::new(Expr::Intrinsic {
+                op: Intrinsic::IntToFloat,
+                args: vec![Expr::Local(now)],
+            }),
+            rhs: Box::new(Expr::F64(1e-6)),
+        };
+        let cycles = Expr::Arith {
+            op: Arith::Mul,
+            ty: Num::F64,
+            lhs: Box::new(freq),
+            rhs: Box::new(seconds),
+        };
+
+        let shape = match kind {
+            "sine" | "cosine" => Expr::Kernel {
+                name: if kind == "sine" { "sin" } else { "cos" },
+                args: vec![Expr::Arith {
+                    op: Arith::Mul,
+                    ty: Num::F64,
+                    lhs: Box::new(cycles),
+                    rhs: Box::new(Expr::F64(std::f64::consts::TAU)),
+                }],
+            },
+            // The fraction of a cycle is read twice, so it lands in a slot
+            // first — `x - floor(x)` would otherwise recompute the phase.
+            _ => {
+                let slot = self.temp(Ty::F64);
+                let fraction = Expr::Arith {
+                    op: Arith::Sub,
+                    ty: Num::F64,
+                    lhs: Box::new(Expr::Local(slot)),
+                    rhs: Box::new(Expr::Intrinsic {
+                        op: Intrinsic::FloorF64,
+                        args: vec![Expr::Local(slot)],
+                    }),
+                };
+                let read = match kind {
+                    "sawtooth" => Expr::Arith {
+                        op: Arith::Sub,
+                        ty: Num::F64,
+                        lhs: Box::new(Expr::Arith {
+                            op: Arith::Mul,
+                            ty: Num::F64,
+                            lhs: Box::new(Expr::F64(2.0)),
+                            rhs: Box::new(Expr::Local(slot)),
+                        }),
+                        rhs: Box::new(Expr::F64(1.0)),
+                    },
+                    _ => Expr::Select {
+                        cond: Box::new(Expr::Cmp {
+                            op: Cmp::Le,
+                            ty: Num::F64,
+                            lhs: Box::new(Expr::Local(slot)),
+                            rhs: Box::new(Expr::F64(0.5)),
+                        }),
+                        then: Box::new(Expr::F64(1.0)),
+                        els: Box::new(Expr::F64(-1.0)),
+                        ty: Ty::F64,
+                    },
+                };
+                Expr::Store {
+                    local: slot,
+                    value: Box::new(cycles),
+                    then: Box::new(Expr::Store {
+                        local: slot,
+                        value: Box::new(fraction),
+                        then: Box::new(read),
+                    }),
+                }
+            }
+        };
+
+        Some((
+            Expr::Arith {
+                op: Arith::Mul,
+                ty: Num::F64,
+                lhs: Box::new(amp),
+                rhs: Box::new(shape),
+            },
+            Ty::F64,
+        ))
     }
 
     /// `@`, with Python's rank rules: rank-1 against rank-1 is the inner

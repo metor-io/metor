@@ -22,6 +22,15 @@
 
 use crate::{Manifest, Ty};
 
+/// The state field `random()` advances.
+///
+/// A declared field is a Python identifier, so none can collide with this one
+/// — which matters because it is real state: it is snapshotted and restored
+/// like any other field, so an edit does not restart the sequence. The host
+/// writes it at instantiation, since its declared default is zero and a shared
+/// seed would make two generators draw the same numbers.
+pub const RNG_FIELD: &str = "@rng";
+
 /// What makes two state fields the same field across a rebuild.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateKey {

@@ -228,6 +228,9 @@ pub(crate) enum Expr {
         buf: BufId,
         ty: Ty,
     },
+    /// A buffer's address, for the one kernel that reads *and writes* its
+    /// argument: `random()` advances the state word it returns from.
+    Address(BufId),
     /// Elementwise arithmetic writing into `dest`, broadcasting per `desc`.
     Elementwise {
         kernel: &'static str,
@@ -507,6 +510,7 @@ fn collect_expr(expr: &Expr, found: &mut Vec<&'static str>) {
         | Expr::Bool(_)
         | Expr::Local(_)
         | Expr::Tensor(_)
+        | Expr::Address(_)
         | Expr::Load { .. } => {}
     }
 }
