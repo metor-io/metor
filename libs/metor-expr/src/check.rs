@@ -351,11 +351,13 @@ fn check_inner(
                 let before = diags.len();
                 match system(
                     decl,
-                    &sigs,
-                    &by_name,
-                    &frames,
-                    &systems,
-                    &stages,
+                    Known {
+                        sigs: &sigs,
+                        by_name: &by_name,
+                        frames: &frames,
+                        systems: &systems,
+                        stages: &stages,
+                    },
                     &mut buffers,
                     &mut diags,
                 ) {
@@ -429,18 +431,31 @@ fn produced_ty(
     }
 }
 
+/// Everything a system may refer to that is not its own: the module's plain
+/// functions, and the declarations already finished ahead of it.
+struct Known<'a> {
+    sigs: &'a [FnSig],
+    by_name: &'a HashMap<String, u32>,
+    frames: &'a [FnFrame],
+    systems: &'a [manifest::System],
+    stages: &'a [manifest::Stage],
+}
+
 /// One `@system`, from ports and body to a buffer-ABI function plus the
 /// manifest entry that says how to drive it.
 fn system(
     decl: &SystemDecl<'_>,
-    sigs: &[FnSig],
-    by_name: &HashMap<String, u32>,
-    frames: &[FnFrame],
-    done: &[manifest::System],
-    stages: &[manifest::Stage],
+    known: Known<'_>,
     buffers: &mut Vec<Place>,
     diags: &mut Diagnostics,
 ) -> Option<(Func, manifest::System)> {
+    let Known {
+        sigs,
+        by_name,
+        frames,
+        systems: done,
+        stages,
+    } = known;
     let mut names: HashMap<String, Binding> = HashMap::new();
     let mut arg_buffers = Vec::with_capacity(decl.ports.len());
     let mut ports = Vec::with_capacity(decl.ports.len());
