@@ -277,3 +277,54 @@ fn every_gesture_round_trips_through_a_reparse() {
         assert_eq!(manifest.systems.len(), 2, "step {step}: nothing else moved");
     }
 }
+
+/// What a gesture costs, from the pointer release to a program the runtime
+/// can build. The 200 ms debounce dominates by design; this is what sits
+/// behind it.
+#[test]
+fn gesture_latency_is_reported() {
+    let source = "\
+@system(\"wheels.rpm\")
+def raw(rpm) -> f64:
+    return rpm * 2.0
+
+doubled = raw + 1.0
+slow = resample_zoh(doubled, 10.0)
+";
+    let manifest = compile(source);
+    let decl = decl_of(&manifest, "doubled");
+    let layout = manifest.systems[1].layout;
+
+    let bench = |label: &str, run: &dyn Fn() -> String| {
+        let rounds = 200;
+        let start = std::time::Instant::now();
+        let mut last = String::new();
+        for _ in 0..rounds {
+            last = run();
+        }
+        let edit = start.elapsed().as_secs_f64() / rounds as f64;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            let _ = metor_expr::compile_module(&last, &Table);
+        }
+        let reparse = start.elapsed().as_secs_f64() / rounds as f64;
+        println!(
+            "{label}: edit {:.1} µs, reparse {:.1} µs, total {:.1} µs",
+            edit * 1e6,
+            reparse * 1e6,
+            (edit + reparse) * 1e6
+        );
+    };
+
+    bench("drag", &|| layout.place(source, 120.0, 40.0));
+    bench("connect", &|| {
+        connect(&manifest, source, decl, 0, "wheels.torque").unwrap()
+    });
+    bench("rename", &|| {
+        rename(&manifest, source, decl_of(&manifest, "raw"), "scaled").unwrap()
+    });
+    bench("delete", &|| delete(&manifest, source, decl).unwrap());
+    bench("add", &|| {
+        insert(&manifest, source, "extra", "{name} = wheels.torque * 1.0").0
+    });
+}
