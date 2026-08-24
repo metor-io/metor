@@ -126,15 +126,17 @@ pub fn bind(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Bound, ExprError> 
 /// the component by content hash and then labels it with what was typed — so
 /// the sigil goes back on and the pair round-trips.
 ///
-/// `None` when the id is not a live expression, which is the caller's cue to
-/// keep the component name it already has.
-pub fn binding_text(db: &DB, id: ComponentId, cx: &App) -> Option<String> {
-    if !cx.global::<Expressions>().is_live(id) {
-        return None;
-    }
-    let label =
-        db.with_state(|state| state.get_component_metadata(id).map(|meta| meta.name.clone()))?;
-    Some(format!("{SIGIL}{label}"))
+/// `None` when the id is not an expression's component, which is the caller's
+/// cue to keep the component name it already has.
+pub fn binding_text(db: &DB, id: ComponentId) -> Option<String> {
+    use metor_proto_wkt::MetadataExt;
+    let text = db.with_state(|state| {
+        state
+            .get_component_metadata(id)
+            .and_then(|meta| meta.get("expression"))
+            .map(str::to_string)
+    })?;
+    Some(format!("{SIGIL}{text}"))
 }
 
 /// Live `=` expressions, keyed by what they compute.
@@ -367,6 +369,12 @@ pub(crate) fn publish(
     };
     metadata.set("source", "dynamic");
     metadata.set("hidden", "true");
+    // What the operator typed, recorded on the component itself. A view
+    // serializes text, so reloading one has to recover text — and asking the
+    // registry would only work while the session that made it is still
+    // running. This is a fact about the component, so it outlives the session
+    // exactly as the component does.
+    metadata.set("expression", label);
     if let Err(err) = db.with_state_mut(|s| s.set_component_metadata(metadata, &db.path)) {
         tracing::warn!(?err, "expression: could not hide its component");
     }

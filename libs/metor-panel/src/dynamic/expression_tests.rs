@@ -696,7 +696,7 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
 
         // And the round trip closes: what a view saves is text `bind` will
         // recognise again, not the hash-named component.
-        let text = expressions::binding_text(&db, published, cx).expect("a live expression");
+        let text = expressions::binding_text(&db, published).expect("an expression component");
         assert_eq!(text, saved);
         assert_eq!(
             expressions::bind(&text, &db, cx).unwrap().id,
@@ -809,4 +809,89 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
         .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
         .collect();
     assert_eq!(values, vec![2.0, 4.0, 6.0]);
+}
+
+/// Rebinding an already-placed view to an expression, and saving it.
+///
+/// The rebind picker sets a `ComponentId` field directly, so the live half
+/// works the moment the row hands one over. What did not work was the save:
+/// an instrument serializes its binding as a *name*, and an expression's
+/// component is named by a content hash and labelled with the text — so
+/// storing the label produced a config that rehydrated onto nothing, the same
+/// dead panel one layer along.
+#[gpui::test]
+fn rebinding_to_an_expression_survives_the_save(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::ops::{db_source, program};
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::views::MeterConfig;
+    use gpui::AppContext;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with_ids(&[("rpm", ComponentId::new("rpm"), PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let typed = "=rpm * 2.0";
+
+    let source_id = ComponentId::new("rpm");
+    let resolver = DbResolver::snapshot(&db);
+    let compiled = Arc::new(program::Compiled::expression("rpm * 2.0", &resolver).unwrap());
+    let published = ComponentId::new(&expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    )));
+
+    let saved = cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+
+        // Placed against an ordinary component, as it would be.
+        let meter = cx.new(|cx| {
+            crate::views::Meter::from_config(
+                &MeterConfig {
+                    component: "rpm".to_string(),
+                    ..Default::default()
+                },
+                db.clone(),
+                cx,
+            )
+        });
+
+        // Rebound to an expression, which is what the picker's row does: it
+        // hands over the component the expression publishes into.
+        let bound = expressions::bind(typed, &db, cx).expect("the expression compiles");
+        assert_eq!(bound.id, published);
+        meter.update(cx, |meter, _cx| meter.component_id = bound.id);
+
+        // Saved. The text is what has to come back, not the label.
+        meter.read(cx).to_config().component
+    });
+
+    assert_eq!(
+        saved, typed,
+        "a rebound expression must serialize as text `bind` will recognise"
+    );
+
+    // And reloading that config lands on the same component.
+    cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        let meter = cx.new(|cx| {
+            crate::views::Meter::from_config(
+                &MeterConfig {
+                    component: saved.clone(),
+                    ..Default::default()
+                },
+                db.clone(),
+                cx,
+            )
+        });
+        assert_eq!(
+            meter.read(cx).component_id,
+            published,
+            "the reloaded meter reads what the expression publishes"
+        );
+        assert!(
+            cx.global::<expressions::Expressions>().is_live(published),
+            "and reloading started it again"
+        );
+    });
 }

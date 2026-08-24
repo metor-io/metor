@@ -118,7 +118,9 @@ pub struct Meter {
 
 impl Meter {
     pub fn from_config(cfg: &MeterConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let component_id = crate::dynamic::expressions::bind(&cfg.component, &db, cx)
+            .map(|bound| bound.id)
+            .unwrap_or_else(|_| ComponentId::new(&cfg.component));
         let element = cfg.element;
         let at = ElementRef::new(component_id, element);
         let meta = component_meta(&db, component_id);
@@ -222,9 +224,14 @@ impl Meter {
             // Resolve the name for whatever is bound *now*, so a rebind is
             // what gets saved; the configured name is only the fallback for a
             // component nothing has registered.
-            component: binding::component_name(&self.db, self.component_id)
-                .unwrap_or_else(|| self.component.clone())
-                .to_string(),
+            // An expression's component is named by a content hash and
+            // labelled with the text that made it, so what round-trips is the
+            // text — a name would rehydrate onto nothing.
+            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
+                .or_else(|| {
+                    binding::component_name(&self.db, self.component_id).map(|n| n.to_string())
+                })
+                .unwrap_or_else(|| self.component.to_string()),
             element: self.element,
             label: Some(self.label.to_string()),
             min: self.min,

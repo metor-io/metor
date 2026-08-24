@@ -12,7 +12,7 @@ use gpui::{AnyEntity, App, AppContext, Entity, SharedString};
 use metor_db::DB;
 use metor_proto::types::{ComponentId, PacketId};
 
-use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction};
 use crate::plot_events::EventKindKey;
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{EventOverlay, LinePlot, Override};
@@ -36,25 +36,43 @@ pub(super) fn find_label_field<T: Facet<'static>>(value: &T) -> Option<SharedStr
     None
 }
 
+/// Rebind an already-placed view's `ComponentId` field.
+///
+/// The same picker the wizards offer, so rebinding accepts `=` exactly as
+/// placing did: what the row hands back is the component the expression
+/// publishes into, and the field takes a component id either way.
 pub(super) fn build_component_picker(
     db: &Arc<DB>,
     any_entity: AnyEntity,
     idx: usize,
     _cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let components = crate::inspector::trace_picker::list_components(db);
-    components
-        .into_iter()
-        .map(|(id, name)| {
-            let any_entity = any_entity.clone();
-            Box::new(CommandRow::new(
-                SharedString::from(name),
-                Arc::new(move |_w, cx| {
-                    crate::inspector::reflect::set_field::<ComponentId>(&any_entity, idx, id, cx);
-                }),
-            )) as Box<dyn InspectorRow>
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(db.clone(), {
+        let any_entity = any_entity.clone();
+        Arc::new(move |id, _text, _w, cx| {
+            crate::inspector::reflect::set_field::<ComponentId>(&any_entity, idx, id, cx);
+            RowAction::Dismiss
         })
-        .collect()
+    }))];
+    rows.extend(
+        crate::inspector::trace_picker::list_components(db)
+            .into_iter()
+            .map(|(id, name)| {
+                let any_entity = any_entity.clone();
+                Box::new(CommandRow::new(
+                    SharedString::from(name),
+                    Arc::new(move |_w, cx| {
+                        crate::inspector::reflect::set_field::<ComponentId>(
+                            &any_entity,
+                            idx,
+                            id,
+                            cx,
+                        );
+                    }),
+                )) as Box<dyn InspectorRow>
+            }),
+    );
+    rows
 }
 
 /// Name of the matching preset, or `None` when `value` is a custom range.
@@ -166,6 +184,19 @@ pub(super) fn build_option_row(
                     }),
                 )));
             } else {
+                let any_expr = any_entity.clone();
+                rows.push(Box::new(ExpressionRow::new(
+                    db.clone(),
+                    Arc::new(move |id, _text, _w, cx| {
+                        crate::inspector::reflect::set_field::<Option<ComponentId>>(
+                            &any_expr,
+                            field_idx,
+                            Some(id),
+                            cx,
+                        );
+                        RowAction::Dismiss
+                    }),
+                )));
                 for (id, name) in crate::inspector::trace_picker::list_components(&db) {
                     let any_entity = any_entity.clone();
                     rows.push(Box::new(CommandRow::new(
