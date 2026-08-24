@@ -1120,6 +1120,13 @@ fn gather(expr: &ast::Expr, out: &mut Vec<(String, Span)>) {
                 gather(element, out);
             }
         }
+        // A tensor literal's elements are ordinary expressions, so what they
+        // name are ordinary references.
+        ast::Expr::List(l) => {
+            for element in &l.elts {
+                gather(element, out);
+            }
+        }
         _ => {}
     }
 }

@@ -145,8 +145,41 @@ fn build_converted(source: &str, db: &DB) -> Result<Vec<Arc<dyn DynamicNode>>, S
     let mut held: Vec<Arc<dyn DynamicNode>> = Vec::new();
 
     for decl in compiled.manifest.declarations() {
-        let Decl::System(index) = decl else {
-            continue;
+        let index = match decl {
+            Decl::System(index) => index,
+            // A stage is host-wired: a clock at its declared rate, the
+            // resampler, and a component under its binding's name.
+            Decl::Stage(index) => {
+                let stage = &compiled.manifest.stages[index];
+                let id = match &stage.source {
+                    Binding::Component(path) => resolver
+                        .id_of(path)
+                        .ok_or_else(|| format!("`{path}` is not a component"))?,
+                    Binding::Produced { system, field } => {
+                        ComponentId::new(&compiled.manifest.systems[*system].publishes[*field])
+                    }
+                    Binding::Resampled { stage } => {
+                        ComponentId::new(&compiled.manifest.stages[*stage].name)
+                    }
+                };
+                let mode = match stage.kind {
+                    metor_expr::Resample::Zoh => crate::dynamic::ops::resample::ResampleMode::Zoh,
+                    metor_expr::Resample::Linear => {
+                        crate::dynamic::ops::resample::ResampleMode::Linear
+                    }
+                };
+                let input = db_source::from_db(db, id).map_err(|e| e.to_string())?;
+                let clock = crate::dynamic::ops::clock::fixed_rate(stage.rate)
+                    .map_err(|e| e.to_string())?;
+                let resampled = crate::dynamic::ops::resample::resample(input, clock.clone(), mode)
+                    .map_err(|e| e.to_string())?;
+                held.push(clock);
+                held.push(
+                    persist::persist(db, stage.name.clone(), resampled)
+                        .map_err(|e| e.to_string())?,
+                );
+                continue;
+            }
         };
         let desc = &compiled.manifest.systems[index];
         let mut ports = Vec::with_capacity(desc.inputs.len());
@@ -429,6 +462,27 @@ async fn generators_publish_the_same_component() {
     }
 }
 
+/// Resample was a clock plus a node; it is a stage the host wires from the
+/// manifest, and it publishes what it always did.
+#[stellarator::test]
+async fn resample_publishes_the_same_component() {
+    for (label, mode) in [
+        ("zoh", ResampleMode::Zoh),
+        ("linear", ResampleMode::Linear),
+    ] {
+        let graph = published(
+            from_component("wheels.rpm")
+                .node("clk", NodeSpec::FixedRate { hz: 25.0 })
+                .node("op", NodeSpec::Resample { mode }),
+        )
+        .edge("src", "op", 0)
+        .edge("clk", "op", 1)
+        .edge("op", "out", 0);
+        agree(&graph, SCALAR, "derived");
+        println!("resample {label}: identical");
+    }
+}
+
 /// A graph several nodes deep, which is where names rather than ids carry the
 /// edges.
 #[stellarator::test]
@@ -478,22 +532,118 @@ fn positions_become_annotations() {
     );
 }
 
-/// The two ops with no expression in the language say so, by name, instead of
-/// converting into something that merely looks right.
-#[test]
-fn what_cannot_convert_is_named() {
-    for (label, op, needle) in [
-        ("pack", NodeSpec::Pack, "no tensor literal"),
-        ("delta_t", NodeSpec::DeltaT, "state field"),
-    ] {
-        let graph = published(from_component("wheels.rpm").node("op", op))
-            .edge("src", "op", 0)
-            .edge("op", "out", 0);
-        let converted = convert_with(&graph.config(), &|_| Some("wheels.rpm".to_string()));
-        assert!(
-            converted.refused.iter().any(|why| why.contains(needle)),
-            "{label}: {:?}",
-            converted.refused
+/// `Pack` was N co-clocked values with a leading length-N axis, which is what
+/// a tensor literal writes — the language addition ratified 2026-08-23.
+#[stellarator::test]
+async fn pack_publishes_the_same_component() {
+    let graph = published(
+        from_component("wheels.rpm")
+            .node(
+                "a",
+                NodeSpec::Affine {
+                    op: AffineOp::Scale,
+                    k: k(2.0),
+                },
+            )
+            .node(
+                "b",
+                NodeSpec::Affine {
+                    op: AffineOp::Offset,
+                    k: k(1.0),
+                },
+            )
+            .node(
+                "c",
+                NodeSpec::Unary {
+                    op: UnaryOp::Neg,
+                },
+            )
+            .node("op", NodeSpec::Pack),
+    )
+    .edge("src", "a", 0)
+    .edge("src", "b", 0)
+    .edge("src", "c", 0)
+    .edge("a", "op", 0)
+    .edge("b", "op", 1)
+    .edge("c", "op", 2)
+    .edge("op", "out", 0);
+    agree(&graph, SCALAR, "derived");
+}
+
+/// `DeltaT` is the one conversion that declares state, because the interval
+/// between arrivals needs the previous timestamp.
+#[stellarator::test]
+async fn delta_t_publishes_the_same_component() {
+    let graph = published(from_component("wheels.rpm").node("op", NodeSpec::DeltaT))
+        .edge("src", "op", 0)
+        .edge("op", "out", 0);
+    agree(&graph, SCALAR, "derived");
+}
+
+/// And it computes the same intervals, in the same arithmetic: the legacy op
+/// subtracted timestamps as `i64` before scaling, so the converted system
+/// does too.
+///
+/// The one difference is the first sample, and it is the language's rather
+/// than the converter's: legacy published *nothing* until it had two
+/// timestamps to subtract, and a system publishes once per evaluation. The
+/// guard makes that first sample `0.0`, so the streams line up from the
+/// second onwards — which is every sample the legacy op ever emitted.
+#[stellarator::test]
+async fn delta_t_computes_the_same_intervals() {
+    let graph = published(from_component("wheels.rpm").node("op", NodeSpec::DeltaT))
+        .edge("src", "op", 0)
+        .edge("op", "out", 0);
+
+    let converted = convert_with(&graph.config(), &|_| Some("wheels.rpm".to_string()));
+    let bench = Bench::new(SCALAR);
+    let component = bench
+        .db
+        .with_state(|s| s.get_component(ComponentId::new("wheels.rpm")).cloned())
+        .unwrap();
+    let _held = build_converted(&converted.source, &bench.db).unwrap();
+
+    let published = bench
+        .db
+        .with_state(|s| s.get_component(ComponentId::new("derived")).cloned())
+        .unwrap();
+    let mut reader = crate::dynamic::NodeReader::from_disruptor(&published.wal, 8);
+
+    // A microsecond timeline the legacy op would have turned into
+    // 0.25 s and 0.5 s.
+    let stamps = [1_000_000i64, 1_250_000, 1_750_000];
+    for ts in stamps {
+        component
+            .push_buf(metor_proto::types::Timestamp(ts), &1.0f64.to_le_bytes())
+            .unwrap();
+    }
+
+    let mut seen = Vec::new();
+    for _ in 0..300 {
+        while let Some(grant) = reader.try_next() {
+            for (_, value) in grant.samples() {
+                seen.push(f64::from_le_bytes(value.try_into().unwrap()));
+            }
+        }
+        if seen.len() >= 3 {
+            break;
+        }
+        stellarator::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(
+        seen.len(),
+        3,
+        "one publication per evaluation: {seen:?}\n{}",
+        converted.source
+    );
+    assert_eq!(seen[0], 0.0, "the guard covers the sample legacy skipped");
+    // Exactly what the legacy op computed: an `i64` subtraction, then scaled.
+    for (at, want) in [(1usize, 250_000i64), (2, 500_000)] {
+        assert_eq!(
+            seen[at].to_bits(),
+            (want as f64 * 1e-6).to_bits(),
+            "interval {at} differs"
         );
     }
 }

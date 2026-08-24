@@ -315,18 +315,37 @@ impl<'a> Conversion<'a> {
                 binding(format!("{call}({}, {hz:?})", arg(0)))
             }
 
-            Pack => {
-                self.refused.push(format!(
-                    "`{name}` is a Pack: the subset has no tensor literal to build one with"
-                ));
-                None
-            }
+            // A Pack was N co-clocked values with a leading length-N axis,
+            // which is exactly what a tensor literal writes.
+            Pack => binding(format!("[{}]", read.join(", "))),
+
+            // The interval between arrivals needs the previous timestamp, so
+            // this is the one conversion that declares state. The subtraction
+            // stays in `i64` because that is where the legacy op did it, and
+            // the guard reproduces its first sample: it published nothing at
+            // all until it had two timestamps to subtract.
             DeltaT => {
-                self.refused.push(format!(
-                    "`{name}` is a DeltaT: the interval between arrivals needs a state field the \
-                     converter does not invent"
-                ));
-                None
+                let input = arg(0);
+                // `named` holds component paths too, so what decides this is
+                // whether the converter *declared* the input.
+                if self.taken.contains(&input) {
+                    self.refused.push(format!(
+                        "`{name}` reads `{input}`, which this program publishes rather than the \
+                         database; a DeltaT converts against a component"
+                    ));
+                }
+                let class = state_class(name);
+                self.lines
+                    .push(format!("class {class}(State):\n    prev: i64 = 0\n    seen: i64 = 0\n\n"));
+                Some(format!(
+                    "@system(\"{input}\")\n\
+                     def {name}({param}, state: {class}) -> f64:\n\
+                     \x20   dt = float(now() - state.prev) * 1e-06 if state.seen != 0 else 0.0\n\
+                     \x20   state.prev = now()\n\
+                     \x20   state.seen = 1\n\
+                     \x20   return dt\n",
+                    param = port_name(&input),
+                ))
             }
             FixedRate { .. } | ClockOf | FromDb { .. } | Persist { .. } => None,
         }
@@ -355,6 +374,23 @@ impl<'a> Conversion<'a> {
         self.taken.push(name.clone());
         name
     }
+}
+
+/// The class a `DeltaT` keeps its previous timestamp in.
+fn state_class(name: &str) -> String {
+    let mut chars = name.chars();
+    let head = chars.next().map(|c| c.to_ascii_uppercase());
+    format!(
+        "{}{}State",
+        head.unwrap_or('S'),
+        chars.as_str()
+    )
+}
+
+/// The parameter a path-bound port arrives as: the component's last segment,
+/// which is what the operator would have called it.
+fn port_name(path: &str) -> String {
+    sanitize(path.rsplit('.').next().unwrap_or(path))
 }
 
 /// A `Persist` name is a component id, which may contain dots and other things
