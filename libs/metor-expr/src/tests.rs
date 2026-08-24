@@ -12,6 +12,7 @@
 
 mod abi;
 mod differential;
+mod layout;
 mod m0;
 mod matmul;
 mod measure;

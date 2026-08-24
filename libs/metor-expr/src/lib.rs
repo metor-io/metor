@@ -110,8 +110,8 @@ pub mod template;
 
 pub use diag::{Diagnostic, Diagnostics, Span};
 pub use manifest::{
-    Binding, COMPILER_VERSION, Decl, Field, FnSig, Frame, Init, Manifest, Port, Resample, Stage,
-    StateField, System,
+    Binding, COMPILER_VERSION, Decl, Field, FnSig, Form, Frame, Init, Layout, Manifest, Port,
+    Resample, Stage, StateField, System,
 };
 pub use resolve::{CompSchema, FrameSchema, Resolver, Unresolved};
 

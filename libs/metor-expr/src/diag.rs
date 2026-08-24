@@ -9,7 +9,7 @@
 use rustpython_parser::text_size::TextRange;
 
 /// A byte range in the source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub start: u32,
     pub end: u32,

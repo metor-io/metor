@@ -96,6 +96,8 @@ pub struct Stage {
     pub rate: f64,
     /// What the output carries, which is what the input carried.
     pub ty: Ty,
+    /// Where this stage's card sits, per its own `# @node` comment.
+    pub layout: Layout,
     pub source_span: Span,
 }
 
@@ -139,6 +141,60 @@ impl Init {
     }
 }
 
+/// Where a declaration's card sits, according to its own source.
+///
+/// Layout rides the declaration rather than a sidecar, so the file is
+/// self-contained — share the `.py` and the diagram travels with it — and a
+/// rename cannot orphan a position, because the position is attached to the
+/// declaration rather than keyed by its name. The compiler parses it, carries
+/// it, and looks at nothing else about it.
+///
+/// [`Layout::span`] is what a drag rewrites. An empty span is where a
+/// declaration that has never been placed would gain its annotation, so
+/// placing one and moving one are the same edit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Layout {
+    pub position: Option<(f32, f32)>,
+    pub span: Span,
+    pub form: Form,
+}
+
+/// How a position is spelled at one declaration.
+///
+/// Python has no decorator syntax for an assignment, so a binding or a stage
+/// carries the same annotation as a trailing comment. Both are attached to the
+/// declaration and both are one region to replace, which is all the canvas
+/// needs them to have in common.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Form {
+    /// `@node(x=240, y=120)` on its own line above the declaration.
+    #[default]
+    Decorator,
+    /// `# @node(x=240, y=120)` at the end of the declaration's line.
+    Comment,
+}
+
+impl Layout {
+    /// The source with this declaration placed at `(x, y)`.
+    ///
+    /// The compiler owns the spelling so a host never has to know it; moving a
+    /// card and placing one for the first time are the same call, because an
+    /// unplaced declaration's span is the empty region its annotation belongs
+    /// in. Positions round to whole pixels — sub-pixel placement in a source
+    /// file is diff noise, not information.
+    pub fn place(&self, source: &str, x: f32, y: f32) -> String {
+        let annotation = match self.form {
+            Form::Decorator => format!("@node(x={}, y={})\n", x.round(), y.round()),
+            Form::Comment => format!("  # @node(x={}, y={})", x.round(), y.round()),
+        };
+        let mut out = String::with_capacity(source.len() + annotation.len());
+        out.push_str(&source[..self.span.start as usize]);
+        out.push_str(&annotation);
+        out.push_str(&source[self.span.end as usize..]);
+        out
+    }
+}
+
 /// One `@system`: its ports, its output, its state, and what makes it fire.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct System {
@@ -152,6 +208,8 @@ pub struct System {
     /// Absent when the system is source-clocked, and when it has no inputs at
     /// all.
     pub driving: Option<usize>,
+    /// Where this system's card sits, per its own `@node` decorator.
+    pub layout: Layout,
     /// Hertz, when the system clocks itself rather than waiting on an input.
     ///
     /// A source has nothing to fire it, so it says how often it wants to run

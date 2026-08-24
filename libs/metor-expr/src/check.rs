@@ -177,7 +177,7 @@ fn check_inner(
     };
 
     let decls = match entry {
-        Entry::Module => lang::collect(&module, resolver, &mut diags),
+        Entry::Module => lang::collect(&module, source, resolver, &mut diags),
         Entry::Expression => match module.as_slice() {
             [ast::Stmt::Expr(only)] => {
                 let systems: Vec<_> = lang::expression(&only.value, resolver, &mut diags)
@@ -387,6 +387,7 @@ fn check_inner(
                     source: decl.source.clone(),
                     rate: decl.rate,
                     ty,
+                    layout: decl.layout,
                     source_span: decl.span,
                 });
             }
@@ -658,6 +659,7 @@ fn system(
             state,
             driving: decl.driving,
             rate: decl.rate,
+            layout: decl.layout,
             source: decl.span,
         },
     ))

@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use rustpython_parser::ast::{self, Ranged};
 
 use crate::diag::{Diagnostics, Span};
-use crate::manifest::{Binding, Field, Frame, Init, Resample, StateField};
+use crate::manifest::{Binding, Field, Form, Frame, Init, Layout, Resample, StateField};
 use crate::{CompSchema, Resolver, Ty};
 
 /// The name a bare expression's system takes.
@@ -55,6 +55,8 @@ pub(crate) struct SystemDecl<'a> {
     pub driving: Option<usize>,
     /// Hertz, for a system that clocks itself instead of waiting on an input.
     pub rate: Option<f64>,
+    /// Where this declaration's card sits, and the region a drag rewrites.
+    pub layout: Layout,
     pub body: Body<'a>,
     pub span: Span,
 }
@@ -96,6 +98,7 @@ pub(crate) struct StageDecl {
     pub source: Binding,
     pub ty: Option<Ty>,
     pub rate: f64,
+    pub layout: Layout,
     pub span: Span,
 }
 
@@ -124,6 +127,7 @@ struct ClassDecl {
 
 pub(crate) fn collect<'a>(
     module: &'a [ast::Stmt],
+    source: &str,
     resolver: &dyn Resolver,
     diags: &mut Diagnostics,
 ) -> Decls<'a> {
@@ -165,7 +169,7 @@ pub(crate) fn collect<'a>(
     let mut order = Vec::new();
     for (def, sig) in systems.iter().zip(signatures) {
         let Some(sig) = sig else { continue };
-        if let Some(decl) = system_decl(def, sig, &classes, &produced, resolver, diags) {
+        if let Some(decl) = system_decl(def, sig, &classes, &produced, source, resolver, diags) {
             order.push(Item::System(decls.len()));
             decls.push(decl);
         }
@@ -174,14 +178,14 @@ pub(crate) fn collect<'a>(
     for assign in bindings {
         // A binding whose right-hand side is exactly a resample call is a
         // stage, not a system: it changes the clock, which is the host's job.
-        match stage_decl(assign, &decls, &stages, resolver, diags) {
+        match stage_decl(assign, &decls, &stages, source, resolver, diags) {
             Some(Some(stage)) => {
                 order.push(Item::Stage(stages.len()));
                 stages.push(stage);
             }
             Some(None) => {}
             None => {
-                if let Some(decl) = binding_decl(assign, &decls, &stages, resolver, diags) {
+                if let Some(decl) = binding_decl(assign, &decls, &stages, source, resolver, diags) {
                     order.push(Item::System(decls.len()));
                     decls.push(decl);
                 }
@@ -214,6 +218,7 @@ fn stage_decl(
     assign: &ast::StmtAssign,
     systems: &[SystemDecl<'_>],
     stages: &[StageDecl],
+    text: &str,
     resolver: &dyn Resolver,
     diags: &mut Diagnostics,
 ) -> Option<Option<StageDecl>> {
@@ -283,6 +288,7 @@ fn stage_decl(
         source,
         ty,
         rate,
+        layout: node_comment(text, assign.range.start().into()),
         span: assign.range.into(),
     }))
 }
@@ -554,10 +560,11 @@ fn system_decl<'a>(
     sig: Signature,
     classes: &HashMap<String, ClassDecl>,
     produced: &HashMap<String, usize>,
+    source: &str,
     resolver: &dyn Resolver,
     diags: &mut Diagnostics,
 ) -> Option<SystemDecl<'a>> {
-    let decorator = decorator(def, diags)?;
+    let decorator = decorator(def, source, diags)?;
 
     let mut ports = Vec::new();
     if decorator.paths.is_empty() {
@@ -627,6 +634,7 @@ fn system_decl<'a>(
         anonymous_output: sig.anonymous_output,
         driving,
         rate: decorator.rate,
+        layout: decorator.layout,
         body: Body::Stmts(&def.body),
         span: def.range.into(),
     })
@@ -717,18 +725,145 @@ struct Decorator {
     bind: HashMap<String, String>,
     on: Option<String>,
     rate: Option<f64>,
+    layout: Layout,
 }
 
-fn decorator(def: &ast::StmtFunctionDef, diags: &mut Diagnostics) -> Option<Decorator> {
-    if def.decorator_list.len() != 1 {
+/// `@node(x=, y=)` stacked on a declaration: presentation, parsed and carried.
+///
+/// The compiler's whole relationship with it is this function. It never
+/// affects what a system computes, and a system without one is laid out by
+/// whatever is drawing the graph.
+fn node_decorator(call: &ast::ExprCall, diags: &mut Diagnostics) -> Option<(f32, f32)> {
+    let (mut x, mut y) = (None, None);
+    for keyword in &call.keywords {
+        let value = number_of(&keyword.value).filter(|v| v.is_finite());
+        match (keyword.arg.as_ref().map(|a| a.as_str()), value) {
+            (Some("x"), Some(v)) => x = Some(v as f32),
+            (Some("y"), Some(v)) => y = Some(v as f32),
+            _ => {
+                diags.push(keyword.range, "@node takes finite x and y");
+                return None;
+            }
+        }
+    }
+    match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => {
+            diags.push(call.range, "@node takes both x and y");
+            None
+        }
+    }
+}
+
+/// The whole line an offset falls on, newline included.
+fn line_span(source: &str, at: u32) -> Span {
+    let at = (at as usize).min(source.len());
+    let start = source[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = source[at..].find('\n').map_or(source.len(), |i| at + i + 1);
+    Span::new(start as u32, end as u32)
+}
+
+/// An empty span at the start of the line an offset falls on.
+fn before_line(source: &str, at: u32) -> Span {
+    let start = line_span(source, at).start;
+    Span::new(start, start)
+}
+
+/// A `# @node(x=, y=)` trailing comment on the line an offset falls on, and
+/// the region a rewrite replaces — the comment itself, or the empty span at
+/// the end of the line where one would go.
+fn node_comment(source: &str, at: u32) -> Layout {
+    let line = line_span(source, at);
+    let text = &source[line.start as usize..line.end as usize];
+    let body = text.trim_end_matches(['\n', '\r']);
+    let Some(hash) = body.find('#') else {
+        let end = line.start + body.len() as u32;
+        return Layout {
+            position: None,
+            span: Span::new(end, end),
+            form: Form::Comment,
+        };
+    };
+    // The comment's own start is where the annotation begins, but the
+    // whitespace before it belongs to the annotation too, or a rewrite would
+    // double it.
+    let start = line.start + body[..hash].trim_end().len() as u32;
+    let span = Span::new(start, line.start + body.len() as u32);
+    Layout {
+        position: parse_node_comment(&body[hash..]),
+        span,
+        form: Form::Comment,
+    }
+}
+
+/// `# @node(x=240, y=120)`, read without a parser because a comment never
+/// reaches one.
+fn parse_node_comment(comment: &str) -> Option<(f32, f32)> {
+    let rest = comment.trim_start_matches('#').trim_start();
+    let inner = rest.strip_prefix("@node(")?.strip_suffix(')')?;
+    let (mut x, mut y) = (None, None);
+    for part in inner.split(',') {
+        let (key, value) = part.split_once('=')?;
+        let value: f32 = value.trim().parse().ok()?;
+        match key.trim() {
+            "x" => x = Some(value),
+            "y" => y = Some(value),
+            _ => return None,
+        }
+    }
+    Some((x?, y?))
+}
+
+fn decorator(
+    def: &ast::StmtFunctionDef,
+    source: &str,
+    diags: &mut Diagnostics,
+) -> Option<Decorator> {
+    let mut out = Decorator::default();
+    // A stacked `@node` is presentation and is taken out of the way first, so
+    // what is left is the one decorator that says what the function *is*.
+    let mut system = Vec::new();
+    for entry in &def.decorator_list {
+        let node = match entry {
+            ast::Expr::Call(call) => {
+                matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "node")
+                    .then_some(call)
+            }
+            _ => None,
+        };
+        match node {
+            Some(call) => {
+                out.layout = Layout {
+                    position: node_decorator(call, diags),
+                    span: line_span(source, call.range.start().into()),
+                    form: Form::Decorator,
+                };
+            }
+            None => system.push(entry),
+        }
+    }
+    // An unplaced declaration's annotation belongs above whatever decorators
+    // it already has, which is where the first one starts.
+    if out.layout.position.is_none() {
+        let at = def
+            .decorator_list
+            .first()
+            .map_or(def.range.start(), |d| d.range().start());
+        out.layout = Layout {
+            position: None,
+            span: before_line(source, at.into()),
+            form: Form::Decorator,
+        };
+    }
+
+    let [only] = system.as_slice() else {
         diags.push(
             def.range,
-            "a function carries at most one @system decorator",
+            "a function carries one @system decorator, and optionally @node",
         );
         return None;
-    }
-    let mut out = Decorator::default();
-    match &def.decorator_list[0] {
+    };
+    match only {
         ast::Expr::Name(n) if n.id.as_str() == "system" => Some(out),
         ast::Expr::Call(call) => {
             let named =
@@ -853,6 +988,7 @@ fn binding_decl<'a>(
     assign: &'a ast::StmtAssign,
     existing: &[SystemDecl<'_>],
     stages: &[StageDecl],
+    source: &str,
     resolver: &dyn Resolver,
     diags: &mut Diagnostics,
 ) -> Option<SystemDecl<'a>> {
@@ -860,14 +996,19 @@ fn binding_decl<'a>(
         diags.push(assign.range, "a top-level binding assigns one plain name");
         return None;
     };
-    anonymous(
+    let mut decl = anonymous(
         target.id.as_str().to_string(),
         &assign.value,
         existing,
         stages,
         resolver,
         diags,
-    )
+    )?;
+    // A binding is not a `def`, so Python has no decorator to hang a position
+    // on; the same annotation rides as a trailing comment instead.
+    decl.layout = node_comment(source, assign.range.start().into());
+    decl.span = assign.range.into();
+    Some(decl)
 }
 
 /// The shared shape behind a top-level binding and a bare `=` expression: free
@@ -925,6 +1066,7 @@ fn anonymous<'a>(
         anonymous_output: true,
         driving,
         rate: None,
+        layout: Layout::default(),
         body: Body::Expr(expr),
         span: expr.range().into(),
     })
