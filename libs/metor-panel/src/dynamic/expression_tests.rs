@@ -537,3 +537,107 @@ fn an_expression_over_a_vector_plots_every_element() {
     let plotted = crate::inspector::trace_picker::expression_elements(&db, scalar, "=xyz[0] + 1.0");
     assert_eq!(plotted, vec![(0, "xyz[0] + 1.0".to_string())]);
 }
+
+/// A list plot draws the interior of one sample, so an expression's element
+/// count is its trace length — the same rule the time-series picker follows,
+/// read the way this plot reads a channel.
+///
+/// Taking `len` as 1 would be this plot's version of collapsing to element
+/// zero: a single point where the arithmetic produced a vector.
+#[stellarator::test]
+async fn an_expression_fills_a_list_trace_element_by_element() {
+    use crate::dynamic::ops::{db_source, program};
+    use crate::views::list_plot::trace_picker::expression_len;
+    use metor_proto::types::Timestamp;
+
+    let (db, _temp) = db_with_ids(&[("xyz", ComponentId::new("xyz"), PrimType::F64, &[3])]);
+    let source_id = ComponentId::new("xyz");
+    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+
+    let text = "xyz * 2.0";
+    let resolver = DbResolver::snapshot(&db);
+    let compiled = std::sync::Arc::new(program::Compiled::expression(text, &resolver).unwrap());
+    let name = expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    ));
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource {
+            node: db_source::from_db(&db, source_id).unwrap(),
+            seed: program::latest_sample(&db, source_id),
+        }],
+        program::DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let _published = expressions::publish(&db, &name, field, text).unwrap();
+
+    let out = ComponentId::new(&name);
+    let component = db
+        .with_state(|s| s.get_component(out).cloned())
+        .expect("the expression's component");
+    assert_eq!(
+        component.schema.dim.as_slice(),
+        &[3],
+        "a rank-1 input times a scalar is rank-1 out"
+    );
+
+    // What the wizard binds: the hidden component, and every element of it.
+    assert_eq!(
+        expression_len(&db, out),
+        3,
+        "the trace is as long as the expression's output"
+    );
+
+    // The plot reads the whole vector out of the latest sample, so its bounds
+    // span every element rather than repeating the first.
+    source
+        .push_buf(Timestamp(100), &sample(&[1.0, 2.0, 3.0]))
+        .unwrap();
+    let bounds = wait_for_bounds(&component, 3, (2.0, 6.0)).await;
+    assert_eq!(bounds, (2.0, 6.0), "every element is doubled and plotted");
+
+    // And it follows the channel: a new sample replaces the whole vector,
+    // which is what a list plot is.
+    source
+        .push_buf(Timestamp(101), &sample(&[-4.0, 0.0, 10.0]))
+        .unwrap();
+    let bounds = wait_for_bounds(&component, 3, (-8.0, 20.0)).await;
+    assert_eq!(bounds, (-8.0, 20.0), "the trace follows its input");
+
+    // A scalar expression is still one point, not zero: `len` never falls to
+    // nothing, because a trace with no length draws nothing at all.
+    let scalar = ComponentId::new("expr.scalar");
+    db.with_state_mut(|s| {
+        s.insert_component(scalar, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+    })
+    .unwrap();
+    assert_eq!(expression_len(&db, scalar), 1);
+}
+
+/// Little-endian bytes for one rank-1 `f64` sample.
+fn sample(values: &[f64]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Wait for the expression's component to carry a sample whose bounds are
+/// `want`, then return them.
+async fn wait_for_bounds(
+    component: &metor_db::Component,
+    len: usize,
+    want: (f64, f64),
+) -> (f64, f64) {
+    use crate::views::time_series::expand_latest_sample_bounds;
+    let mut seen = None;
+    for _ in 0..300 {
+        seen = expand_latest_sample_bounds(component, len);
+        if seen == Some(want) {
+            break;
+        }
+        stellarator::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    seen.expect("the expression published a sample")
+}
