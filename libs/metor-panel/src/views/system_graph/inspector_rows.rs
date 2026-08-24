@@ -41,15 +41,33 @@ fn direction_label(direction: Direction) -> SharedString {
     })
 }
 
-/// Rows for the inspected panel: the flow direction and a re-layout command
-/// that clears manual node positions.
+/// Rows for the inspected tile: what the selected card is called, the flow
+/// direction, and the re-layout that forgets hand-placed native positions.
+///
+/// Renaming is here rather than on the card because a name is API — it is the
+/// card's title, its output frame, the prefix of every component it publishes,
+/// and the key its state is restored by — so it belongs where the rest of a
+/// declaration's identity is edited, with room to say so.
 fn build_panel_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let Ok(panel) = any.downcast::<GraphCanvas>() else {
         return Vec::new();
     };
     let direction = panel.read(cx).direction();
-    vec![
-        Box::new(HeaderRow::new("Graph")),
+    let selected = panel.read(cx).selected_declaration(cx).map(|(id, _)| id);
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(HeaderRow::new("Graph"))];
+    if let Some(name) = selected {
+        rows.push(Box::new(TextRow::new(
+            SharedString::new_static("Name"),
+            name,
+            Arc::new({
+                let panel = panel.clone();
+                move |value, _window, cx| {
+                    panel.update(cx, |p, cx| p.rename_selected(&value, cx));
+                }
+            }),
+        )));
+    }
+    rows.extend::<Vec<Box<dyn InspectorRow>>>(vec![
         Box::new(EnumRow {
             label: SharedString::new_static("Direction"),
             selected: direction_label(direction),
@@ -75,7 +93,8 @@ fn build_panel_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
                 panel.update(cx, |p, cx| p.relayout(cx));
             }),
         )),
-    ]
+    ]);
+    rows
 }
 
 fn text_row(label: &'static str, value: impl Into<SharedString>) -> Box<dyn InspectorRow> {

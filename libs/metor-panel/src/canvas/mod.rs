@@ -22,7 +22,9 @@
 //! source to rewrite, so their positions stay where they have always been — in
 //! this tile's own view state.
 
+pub mod edit;
 pub mod model;
+pub mod palette;
 pub mod run;
 
 use std::collections::BTreeSet;
@@ -89,6 +91,12 @@ pub struct GraphCanvas {
     node_drag: Option<NodeDrag>,
     /// Where a card is being dragged to, before the release that commits it.
     preview: Option<(SharedString, (f32, f32))>,
+    /// The producer a wire is being dragged from, until it lands on a port.
+    link: Option<SharedString>,
+    /// Where the pointer is, for painting that wire.
+    pointer: Point<Pixels>,
+    /// Whether the add-a-declaration list is showing.
+    palette: bool,
     pan_drag: Option<PanDrag>,
     canvas_origin: Option<Point<Pixels>>,
     /// Whether the text half is showing instead of the canvas.
@@ -123,6 +131,9 @@ impl GraphCanvas {
             selected_edge: None,
             node_drag: None,
             preview: None,
+            link: None,
+            pointer: point(px(0.0), px(0.0)),
+            palette: false,
             pan_drag: None,
             canvas_origin: None,
             text: cfg.program.text,
@@ -261,6 +272,80 @@ impl GraphCanvas {
         cx.notify();
     }
 
+    /// The declaration behind a card, when the card is one.
+    fn declaration(&self, id: &SharedString, cx: &App) -> Option<metor_expr::Decl> {
+        match self.model(cx).card(id)?.origin {
+            Origin::Python { decl, .. } => Some(decl),
+            Origin::Native { .. } => None,
+        }
+    }
+
+    /// The selected card, if it is one this tile may edit.
+    pub(crate) fn selected_declaration(&self, cx: &App) -> Option<(SharedString, metor_expr::Decl)> {
+        let id = self.selection.clone()?;
+        let decl = self.declaration(&id, cx)?;
+        Some((id, decl))
+    }
+
+    /// Take an edited source, if the edit produced one.
+    ///
+    /// Every gesture funnels through here, which is why there is exactly one
+    /// place that decides what happens after one: the text becomes the new
+    /// truth and everything else is re-derived from it.
+    fn apply(&mut self, edited: Option<String>, cx: &mut Context<Self>) {
+        let Some(source) = edited else { return };
+        self.editor.set_text(source);
+        self.schedule_rebuild(cx);
+        cx.notify();
+    }
+
+    /// Point one of a card's ports at a different producer.
+    fn connect(&mut self, to: &SharedString, port: usize, cx: &mut Context<Self>) {
+        let Some(from) = self.link.take() else { return };
+        let (Some(consumer), Some(manifest)) =
+            (self.declaration(to, cx), self.manifest.clone())
+        else {
+            return;
+        };
+        let edited = edit::connect(&manifest, &self.editor.text, consumer, port, &from);
+        self.apply(edited, cx);
+    }
+
+    pub(crate) fn rename_selected(&mut self, to: &str, cx: &mut Context<Self>) {
+        let (Some((_, decl)), Some(manifest)) =
+            (self.selected_declaration(cx), self.manifest.clone())
+        else {
+            return;
+        };
+        let edited = edit::rename(&manifest, &self.editor.text, decl, to);
+        if edited.is_some() {
+            self.selection = Some(SharedString::from(to.to_string()));
+        }
+        self.apply(edited, cx);
+    }
+
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        let (Some((_, decl)), Some(manifest)) =
+            (self.selected_declaration(cx), self.manifest.clone())
+        else {
+            return;
+        };
+        let edited = edit::delete(&manifest, &self.editor.text, decl);
+        self.selection = None;
+        self.apply(edited, cx);
+    }
+
+    /// Add a declaration from the palette, and select what it made.
+    fn add(&mut self, entry: &palette::Entry, cx: &mut Context<Self>) {
+        let Some(manifest) = self.manifest.clone() else {
+            return;
+        };
+        let (source, name) = edit::insert(&manifest, &self.editor.text, entry.stem, &entry.template);
+        self.palette = false;
+        self.selection = Some(SharedString::from(name));
+        self.apply(Some(source), cx);
+    }
+
     /// Forget every hand-placed native position. Python positions live in the
     /// source, so this deliberately leaves them alone — re-laying those out is
     /// an edit to the file, not a view reset.
@@ -302,6 +387,14 @@ impl GraphCanvas {
             return;
         }
         if !self.text {
+            match event.keystroke.key.as_str() {
+                "delete" | "backspace" => self.delete_selected(cx),
+                "escape" if self.palette => {
+                    self.palette = false;
+                    cx.notify();
+                }
+                _ => {}
+            }
             return;
         }
         if self.editor.handle_key_down(event, cx) {
@@ -395,6 +488,23 @@ impl GraphCanvas {
             })
             .collect();
 
+        // The wire being dragged, if one is: from the producer's outgoing
+        // side to wherever the pointer is. It is painted, never modelled —
+        // there is no half-made edge in the graph.
+        let in_flight = self.link.as_ref().and_then(|from| {
+            let card = model.card(from)?;
+            let source = match self.direction {
+                Direction::LeftRight => {
+                    (card.pos.0 + CARD_WIDTH, card.pos.1 + card.height / 2.0)
+                }
+                Direction::TopBottom => {
+                    (card.pos.0 + CARD_WIDTH / 2.0, card.pos.1 + card.height)
+                }
+            };
+            let route: RoutePoints = [local(source), self.pointer].into_iter().collect();
+            Some((route, theme.line_colors[0]))
+        });
+
         let theme_for_paint = theme.clone();
         let edges_for_paint = edges.clone();
         let canvas_layer = canvas(
@@ -409,6 +519,9 @@ impl GraphCanvas {
                 paint_grid(bounds, theme_for_paint.grid_color, window);
                 for (_e, route, color, dashed) in &edges_for_paint {
                     paint_route(bounds.origin, route, axis, *color, *dashed, window);
+                }
+                if let Some((route, color)) = &in_flight {
+                    paint_route(bounds.origin, route, axis, *color, true, window);
                 }
             },
         )
@@ -458,6 +571,12 @@ impl GraphCanvas {
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _w, cx| {
+                if let Some(origin) = this.canvas_origin {
+                    this.pointer = ev.position - origin;
+                    if this.link.is_some() {
+                        cx.notify();
+                    }
+                }
                 if let Some(pan) = &this.pan_drag {
                     let dx = f32::from(ev.position.x - pan.pointer_origin.x);
                     let dy = f32::from(ev.position.y - pan.pointer_origin.y);
@@ -480,6 +599,11 @@ impl GraphCanvas {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, ev: &gpui::MouseUpEvent, window, cx| {
+                    // A wire released on empty canvas simply does not land;
+                    // there is no half-made edge to leave behind.
+                    if this.link.take().is_some() {
+                        cx.notify();
+                    }
                     let Some(drag) = this.node_drag.take() else {
                         return;
                     };
@@ -509,7 +633,11 @@ impl GraphCanvas {
         for card in &model.cards {
             root = root.child(self.render_card(card, &theme, cx));
         }
-        root.child(self.render_toolbar(&model, &theme, cx))
+        root = root.child(self.render_toolbar(&model, &theme, cx));
+        if self.palette {
+            root = root.child(self.render_palette(&theme, cx));
+        }
+        root
     }
 
     fn render_card(
@@ -586,7 +714,7 @@ impl GraphCanvas {
             );
 
         element = match card.origin.is_python() {
-            true => element.child(sockets(card, theme)),
+            true => element.child(self.sockets(card, theme, cx)),
             false => element.child(
                 div()
                     .flex()
@@ -695,6 +823,18 @@ impl GraphCanvas {
                 ),
             )
             .child(
+                chip(SharedString::new_static("Add"))
+                    .text_color(theme.text_primary)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &gpui::MouseDownEvent, _w, cx| {
+                            this.palette = !this.palette;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
                 chip(SharedString::new_static("Text"))
                     .text_color(theme.text_primary)
                     .on_mouse_down(
@@ -756,45 +896,138 @@ impl GraphCanvas {
     }
 }
 
-/// A Python card's body: one row per socket, inputs then outputs, each naming
-/// what it carries.
-fn sockets(card: &Card, theme: &crate::theme::Theme) -> impl IntoElement {
-    let mut body = div().flex().flex_col().px_2().py_1();
-    for (socket, output) in card
-        .inputs
-        .iter()
-        .map(|s| (s, false))
-        .chain(card.outputs.iter().map(|s| (s, true)))
-    {
-        let dot = div().w(px(6.0)).h(px(6.0)).rounded_full().bg(match output {
-            true => theme.line_colors[2],
-            false => theme.text_tertiary,
-        });
-        let name = div()
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .text_ellipsis()
-            .text_size(px(10.0))
-            .text_color(theme.text_primary)
-            .child(SharedString::from(socket.name.clone()));
-        let detail = div()
-            .text_size(px(9.0))
-            .text_color(theme.text_tertiary)
-            .child(SharedString::from(socket.detail.clone()));
-        let row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1p5()
-            .h(px(SOCKET_ROW_HEIGHT));
-        body = body.child(match output {
-            true => row.child(name).child(detail).child(dot),
-            false => row.child(dot).child(name).child(detail),
-        });
+impl GraphCanvas {
+    /// A Python card's body: one row per socket, inputs then outputs, each
+    /// naming what it carries.
+    ///
+    /// The dots are the connect gesture. Pressing an output dot starts a wire
+    /// and releasing on an input dot lands it — which is one rewrite of the
+    /// consumer's binding, because an edge has no existence apart from the two
+    /// names at its ends.
+    fn sockets(
+        &self,
+        card: &Card,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut body = div().flex().flex_col().px_2().py_1();
+        let linking = self.link.is_some();
+        for (index, socket, output) in card
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s, false))
+            .chain(card.outputs.iter().enumerate().map(|(i, s)| (i, s, true)))
+        {
+            let mut dot = div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .rounded_full()
+                .border_1()
+                .border_color(theme.bg_elevated)
+                .bg(match (output, linking) {
+                    (true, _) => theme.line_colors[2],
+                    // While a wire is in flight every input is a target, and
+                    // saying so is the whole of the affordance.
+                    (false, true) => theme.line_colors[0],
+                    (false, false) => theme.text_tertiary,
+                });
+            let id = card.id.clone();
+            dot = match output {
+                true => dot.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev: &gpui::MouseDownEvent, _w, cx| {
+                        this.link = Some(id.clone());
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                ),
+                false => dot.on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev: &gpui::MouseUpEvent, _w, cx| {
+                        this.connect(&id, index, cx);
+                        cx.stop_propagation();
+                    }),
+                ),
+            };
+
+            let name = div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(10.0))
+                .text_color(theme.text_primary)
+                .child(SharedString::from(socket.name.clone()));
+            let detail = div()
+                .text_size(px(9.0))
+                .text_color(theme.text_tertiary)
+                .child(SharedString::from(socket.detail.clone()));
+            let row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .h(px(SOCKET_ROW_HEIGHT));
+            body = body.child(match output {
+                true => row.child(name).child(detail).child(dot),
+                false => row.child(dot).child(name).child(detail),
+            });
+        }
+        body
     }
-    body
+
+    /// The add-a-declaration list.
+    ///
+    /// Hugging the toolbar rather than filling the canvas, because it is a
+    /// short list of short labels and a modal would be a bigger gesture than
+    /// the one being made.
+    fn render_palette(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.selection.clone();
+        let entries = palette::entries(self.manifest.as_ref(), selected.as_ref().map(|s| s.as_ref()));
+        let mut list = div()
+            .absolute()
+            .left_2()
+            .top(px(36.0))
+            .flex()
+            .flex_col()
+            .w(px(220.0))
+            .rounded_md()
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_primary)
+            .overflow_hidden();
+        for entry in entries {
+            let label = SharedString::from(entry.label.clone());
+            let detail = SharedString::new_static(entry.detail);
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_0p5()
+                    .text_size(px(10.0))
+                    .hover(|s| s.bg(theme.bg_secondary))
+                    .child(div().text_color(theme.text_primary).child(label))
+                    .child(div().text_color(theme.text_tertiary).child(detail))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &gpui::MouseDownEvent, _w, cx| {
+                            this.add(&entry, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
+            );
+        }
+        list
+    }
 }
 
 /// The last dotted segment of a scope path, for the group card's header.
