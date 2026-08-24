@@ -4,6 +4,11 @@
 //! pick Y element → commit. A trace's color comes from the theme's
 //! categorical palette indexed by `color_basis` (the parent plot's
 //! existing trace count, or zero for fresh plots).
+//!
+//! Either axis will take a `=` expression, independently of the other, and an
+//! expression cascades into the same element page a picked component does —
+//! an XY axis is one scalar, and a rank-1 expression has to say which of its
+//! elements that is.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +16,8 @@ use gpui::{App, SharedString, Window};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::inspector::rows::{CommandRow, HeaderRow, InspectorRow, NavRow};
+use crate::dynamic::expressions;
+use crate::inspector::rows::{CommandRow, ExpressionRow, HeaderRow, InspectorRow, NavRow, RowAction};
 use crate::inspector::trace_picker::{ColorBasis, element_names_for_component, list_components};
 use crate::theme::theme;
 
@@ -44,8 +50,25 @@ fn x_component_rows(
     on_select: OnXyTraceSelected,
     draft: Arc<Mutex<XyDraft>>,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let header: Box<dyn InspectorRow> = Box::new(HeaderRow::new("Pick X axis component"));
+    let header: Box<dyn InspectorRow> =
+        Box::new(HeaderRow::new("Pick X axis component, or type = to compute one"));
     let mut rows: Vec<Box<dyn InspectorRow>> = vec![header];
+    rows.push(Box::new(ExpressionRow::new(db.clone(), {
+        let db = db.clone();
+        let color_basis = color_basis.clone();
+        let on_select = on_select.clone();
+        let draft = draft.clone();
+        Arc::new(move |component, text, _window, _cx| {
+            RowAction::Cascade(x_element_rows(
+                db.clone(),
+                color_basis.clone(),
+                on_select.clone(),
+                draft.clone(),
+                component,
+                expressions::body(&text).to_string(),
+            ))
+        })
+    })));
     for (id, name) in list_components(&db) {
         let db = db.clone();
         let color_basis = color_basis.clone();
@@ -126,8 +149,25 @@ fn y_component_rows(
     on_select: OnXyTraceSelected,
     draft: Arc<Mutex<XyDraft>>,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let header: Box<dyn InspectorRow> = Box::new(HeaderRow::new("Pick Y axis component"));
+    let header: Box<dyn InspectorRow> =
+        Box::new(HeaderRow::new("Pick Y axis component, or type = to compute one"));
     let mut rows: Vec<Box<dyn InspectorRow>> = vec![header];
+    rows.push(Box::new(ExpressionRow::new(db.clone(), {
+        let db = db.clone();
+        let color_basis = color_basis.clone();
+        let on_select = on_select.clone();
+        let draft = draft.clone();
+        Arc::new(move |component, text, _window, _cx| {
+            RowAction::Cascade(y_element_rows(
+                db.clone(),
+                color_basis.clone(),
+                on_select.clone(),
+                draft.clone(),
+                component,
+                expressions::body(&text).to_string(),
+            ))
+        })
+    })));
     for (id, name) in list_components(&db) {
         let db = db.clone();
         let color_basis = color_basis.clone();

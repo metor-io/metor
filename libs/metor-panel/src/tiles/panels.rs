@@ -1663,6 +1663,8 @@ mod tests {
                 visible: true,
                 label: "vx vs vy".into(),
                 stroke_width: 1.5,
+                x_expression: None,
+                y_expression: Some("=rpm * 2.0".into()),
             }],
             custom_title: Override::Custom("Phase".into()),
             x_min_override: Override::Custom(-1.0),

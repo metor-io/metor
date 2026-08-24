@@ -895,3 +895,79 @@ fn rebinding_to_an_expression_survives_the_save(cx: &mut gpui::TestAppContext) {
         );
     });
 }
+
+/// An expression on one axis of an XY plot, saved and reloaded.
+///
+/// The axes are independent, so this binds Y to an expression and leaves X on
+/// an ordinary component — which is also what makes the config interesting:
+/// only one of the two carries text, and the other must be untouched.
+#[gpui::test]
+fn an_xy_axis_binds_an_expression_independently(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::ops::{db_source, program};
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::views::xy_plot::{XyPlot, XyPlotPanelConfig, XyTraceConfig};
+    use gpui::AppContext;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with_ids(&[
+        ("rpm", ComponentId::new("rpm"), PrimType::F64, &[]),
+        ("torque", ComponentId::new("torque"), PrimType::F64, &[]),
+    ]);
+    let db = Arc::new(db);
+    let typed = "=torque * 2.0";
+
+    let source_id = ComponentId::new("torque");
+    let resolver = DbResolver::snapshot(&db);
+    let compiled = Arc::new(program::Compiled::expression("torque * 2.0", &resolver).unwrap());
+    let published = ComponentId::new(&expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    )));
+
+    let saved = cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+
+        // What the wizard commits once the expression row has cascaded
+        // through the element page: an ordinary component on X, the
+        // expression's component on Y.
+        let bound = expressions::bind(typed, &db, cx).expect("the expression compiles");
+        let config = XyPlotPanelConfig {
+            traces: vec![XyTraceConfig {
+                x_component_id: ComponentId::new("rpm"),
+                y_component_id: bound.id,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plot = cx.new(|cx| XyPlot::from_config(config, db.clone(), cx));
+        plot.read(cx).to_config(cx)
+    });
+
+    let trace = &saved.traces[0];
+    assert_eq!(
+        trace.y_expression.as_deref(),
+        Some(typed),
+        "the expression axis saves its text"
+    );
+    assert_eq!(
+        trace.x_expression, None,
+        "the ordinary axis is left alone"
+    );
+    assert_eq!(trace.x_component_id, ComponentId::new("rpm"));
+
+    // Reloading starts it again and binds what it publishes into.
+    cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        let plot = cx.new(|cx| XyPlot::from_config(saved, db.clone(), cx));
+        let line_plot = plot.read(cx).line_plot().read(cx);
+        let trace = line_plot.traces()[0].read(cx);
+        assert_eq!(trace.y_component_id, published);
+        assert_eq!(trace.x_component_id, ComponentId::new("rpm"));
+        assert!(
+            cx.global::<expressions::Expressions>().is_live(published),
+            "reloading an expression axis starts it"
+        );
+    });
+}
