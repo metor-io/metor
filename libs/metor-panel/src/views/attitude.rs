@@ -107,7 +107,9 @@ pub struct VectorMarker {
 
 impl VectorMarker {
     fn from_config(cfg: &VectorMarkerConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let component_id = crate::dynamic::expressions::bind(&cfg.component, &db, cx)
+            .map(|bound| bound.id)
+            .unwrap_or_else(|_| ComponentId::new(&cfg.component));
         let task = spawn_marker_stream(&db, component_id, cx);
         Self {
             component_id,
@@ -123,9 +125,13 @@ impl VectorMarker {
 
     fn to_config(&self) -> VectorMarkerConfig {
         VectorMarkerConfig {
-            component: binding::component_name(&self.db, self.component_id)
-                .unwrap_or_else(|| self.component.clone())
-                .to_string(),
+            // An expression's component is named by a content hash, so what
+            // round-trips is the text that made it.
+            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
+                .or_else(|| {
+                    binding::component_name(&self.db, self.component_id).map(|n| n.to_string())
+                })
+                .unwrap_or_else(|| self.component.to_string()),
             label: self.label.to_string(),
             color: self.color,
         }
