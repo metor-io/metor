@@ -663,8 +663,12 @@ fn build_text(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
             label: SharedString::new_static("?"),
         }));
     }
-    let id = metor_proto::types::ComponentId::new(&cfg.component);
-    as_live(cx.new(|cx| ComponentText::new(db.clone(), id, cx)))
+    let Ok(bound) = crate::dynamic::expressions::bind(&cfg.component, db, cx) else {
+        return as_live(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::from(cfg.component.clone()),
+        }));
+    };
+    as_live(cx.new(|cx| ComponentText::new(db.clone(), bound.id, cx)))
 }
 
 fn build_xy_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
@@ -703,29 +707,23 @@ fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
             label: SharedString::new_static("?"),
         }));
     }
-    // A `=` binding is an expression rather than a component name: it is
-    // compiled and started here, and the monitor holds a share of its
-    // lifetime. What was serialized is the text the operator typed.
-    let entity = if crate::dynamic::expressions::is_expression(&cfg.component) {
-        let Ok(expression) = crate::dynamic::expressions::resolve(&cfg.component, db, cx) else {
-            return as_live(cx.new(|_cx| PlaceholderWidget {
-                label: SharedString::from(cfg.component.clone()),
-            }));
-        };
-        // Bind by component id, not by the node: an expression publishes into
-        // a real component, so the monitor reads its metadata, its element
-        // count, its seed and its sparkline through the ordinary path and
-        // never learns it was an expression at all.
-        let id = expression.component_id();
-        let entity = cx.new(|cx| Monitor::new(db.clone(), id, cx));
-        entity.update(cx, |monitor, _cx| {
-            monitor.bind_expression(expression, cfg.component.clone());
-        });
-        entity
-    } else {
-        let id = metor_proto::types::ComponentId::new(&cfg.component);
-        cx.new(|cx| Monitor::new(db.clone(), id, cx))
+    // Bind by component id, not by the node: an expression publishes into a
+    // real component, so the monitor reads its metadata, its element count,
+    // its seed and its sparkline through the ordinary path and never learns it
+    // was an expression at all. The monitor additionally keeps the handle, so
+    // it can show the text the operator typed instead of a content hash.
+    let Ok(bound) = crate::dynamic::expressions::bind(&cfg.component, db, cx) else {
+        return as_live(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::from(cfg.component.clone()),
+        }));
     };
+    let entity = cx.new(|cx| Monitor::new(db.clone(), bound.id, cx));
+    if let Some(expression) = bound.expression {
+        let label = crate::dynamic::expressions::body(&cfg.component).to_string();
+        entity.update(cx, |monitor, _cx| {
+            monitor.bind_expression(expression, label);
+        });
+    }
     if cfg.unit.is_some() || cfg.show_sparkline.is_some() {
         entity.update(cx, |m, cx| {
             if let Some(unit) = cfg.unit {
@@ -752,8 +750,12 @@ fn build_traffic_light(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
             label: SharedString::new_static("?"),
         }));
     }
-    let id = metor_proto::types::ComponentId::new(&cfg.component);
-    let entity = cx.new(|cx| TrafficLight::new(db.clone(), id, cx));
+    let Ok(bound) = crate::dynamic::expressions::bind(&cfg.component, db, cx) else {
+        return as_live(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::from(cfg.component.clone()),
+        }));
+    };
+    let entity = cx.new(|cx| TrafficLight::new(db.clone(), bound.id, cx));
     if let Some(color) = cfg.color {
         entity.update(cx, |t, cx| t.set_color(color, cx));
     }

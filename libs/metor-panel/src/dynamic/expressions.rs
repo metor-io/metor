@@ -82,6 +82,61 @@ pub fn body(text: &str) -> &str {
     text.strip_prefix(SIGIL).unwrap_or(text).trim()
 }
 
+/// What a saved binding turned out to name.
+pub struct Bound {
+    /// The component to read. Every view binds to one of these, and none of
+    /// them has to learn what an expression is.
+    pub id: ComponentId,
+    /// The running expression, when the binding was one — for a view that
+    /// wants to show the text or keep a share of its lifetime.
+    pub expression: Option<Expression>,
+}
+
+/// Resolve a serialized binding, whichever kind it is.
+///
+/// This is the *one* rule for turning saved text into something to read: a
+/// plain name hashes to its component, as it always did, and an `=` binding is
+/// compiled and started so that what comes back is the hidden component it
+/// publishes into.
+///
+/// Every consumer needs it, and the reason is worth stating plainly. Hashing
+/// an expression's text as though it were a name yields an id nobody
+/// publishes, so the view binds to nothing and shows nothing — a panel that
+/// looks configured and is dead. `ComponentId::new("=a + b")` is not a
+/// component.
+pub fn bind(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Bound, ExprError> {
+    if !is_expression(text) {
+        return Ok(Bound {
+            id: ComponentId::new(text),
+            expression: None,
+        });
+    }
+    let expression = resolve(text, db, cx)?;
+    Ok(Bound {
+        id: expression.component_id(),
+        expression: Some(expression),
+    })
+}
+
+/// What to serialize for a binding that may be an expression.
+///
+/// The counterpart to [`bind`], and the reason a round trip closes: a view
+/// stores text, so an expression has to store text [`bind`] will recognise.
+/// Its component's metadata carries the operator's own words — `persist` names
+/// the component by content hash and then labels it with what was typed — so
+/// the sigil goes back on and the pair round-trips.
+///
+/// `None` when the id is not a live expression, which is the caller's cue to
+/// keep the component name it already has.
+pub fn binding_text(db: &DB, id: ComponentId, cx: &App) -> Option<String> {
+    if !cx.global::<Expressions>().is_live(id) {
+        return None;
+    }
+    let label =
+        db.with_state(|state| state.get_component_metadata(id).map(|meta| meta.name.clone()))?;
+    Some(format!("{SIGIL}{label}"))
+}
+
 /// Live `=` expressions, keyed by what they compute.
 ///
 /// Strong on purpose: see the module docs. A view binds to a component id and

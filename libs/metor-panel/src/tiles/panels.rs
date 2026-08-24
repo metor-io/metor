@@ -48,7 +48,9 @@ impl TextPanel {
     }
 
     pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let component_id = crate::dynamic::expressions::bind(&cfg.component, &db, cx)
+            .map(|bound| bound.id)
+            .unwrap_or_else(|_| ComponentId::new(&cfg.component));
         Self::new(db, component_id, cfg.component, cx)
     }
 }
@@ -342,7 +344,9 @@ impl TrafficLightPanel {
     }
 
     pub fn from_config(cfg: TrafficLightPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let component_id = crate::dynamic::expressions::bind(&cfg.component, &db, cx)
+            .map(|bound| bound.id)
+            .unwrap_or_else(|_| ComponentId::new(&cfg.component));
         let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
         if let Some(color) = cfg.color {
             inner.update(cx, |t, cx| t.set_color(color, cx));

@@ -1050,23 +1050,24 @@ fn component_picker_rows(
     kind: WidgetKind,
 ) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-    if kind == WidgetKind::monitor() {
+
+    // Every widget behind this picker resolves its binding through
+    // `expressions::bind`, so every one of them can be given an expression.
+    // The row used to be gated to the monitor because it was the only builder
+    // that could honour one.
+    rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(db.clone(), {
         let dashboard = dashboard.clone();
-        rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(
-            db.clone(),
-            Arc::new(move |_id, text, _window, cx| {
-                let config = serde_json::to_string(&widgets::MonitorWidgetConfig {
-                    component: text,
-                    ..Default::default()
-                })
-                .expect("monitor config serializes");
-                dashboard.update(cx, |this, cx| {
-                    this.add_widget(WidgetKind::monitor(), config, cx);
-                });
-                crate::inspector::rows::RowAction::Dismiss
-            }),
-        )));
-    }
+        let kind = kind.clone();
+        Arc::new(move |_id, text, _window, cx| {
+            let config = component_widget_config(&kind, text);
+            let kind = kind.clone();
+            dashboard.update(cx, |this, cx| {
+                this.add_widget(kind, config, cx);
+            });
+            crate::inspector::rows::RowAction::Dismiss
+        })
+    })));
+
     rows.extend(crate::inspector::trace_picker::list_components(&db)
         .into_iter()
         .map(|(_id, name)| {
@@ -1076,27 +1077,7 @@ fn component_picker_rows(
             Box::new(CommandRow::new(
                 SharedString::from(name),
                 Arc::new(move |_window, cx| {
-                    // Pick the kind-specific config struct so any future
-                    // divergence between the two doesn't silently lose the
-                    // user's component selection.
-                    let component = name_clone.clone();
-                    let config = if kind == WidgetKind::monitor() {
-                        let cfg = widgets::MonitorWidgetConfig {
-                            component,
-                            ..Default::default()
-                        };
-                        serde_json::to_string(&cfg)
-                    } else if kind == WidgetKind::traffic_light() {
-                        let cfg = widgets::TrafficLightWidgetConfig {
-                            component,
-                            color: None,
-                        };
-                        serde_json::to_string(&cfg)
-                    } else {
-                        let cfg = widgets::TextWidgetConfig { component };
-                        serde_json::to_string(&cfg)
-                    }
-                    .expect("component widget config serializes");
+                    let config = component_widget_config(&kind, name_clone.clone());
                     let kind = kind.clone();
                     dashboard.update(cx, |this, cx| {
                         this.add_widget(kind, config, cx);
@@ -1105,6 +1086,33 @@ fn component_picker_rows(
             )) as Box<dyn InspectorRow>
         }));
     rows
+}
+
+/// The config blob a component-bound widget of `kind` stores.
+///
+/// `component` is either a component's name or the text of an `=` expression;
+/// the builder resolves it either way, which is what lets the picked row and
+/// the expression row share one function. Picking the kind-specific struct
+/// keeps any future divergence between them from silently losing the
+/// selection.
+fn component_widget_config(kind: &WidgetKind, component: String) -> String {
+    if *kind == WidgetKind::monitor() {
+        let cfg = widgets::MonitorWidgetConfig {
+            component,
+            ..Default::default()
+        };
+        serde_json::to_string(&cfg)
+    } else if *kind == WidgetKind::traffic_light() {
+        let cfg = widgets::TrafficLightWidgetConfig {
+            component,
+            color: None,
+        };
+        serde_json::to_string(&cfg)
+    } else {
+        let cfg = widgets::TextWidgetConfig { component };
+        serde_json::to_string(&cfg)
+    }
+    .expect("component widget config serializes")
 }
 
 /// Trace wizard for the scalar instruments: each picked element becomes its

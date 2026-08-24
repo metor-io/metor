@@ -641,3 +641,172 @@ async fn wait_for_bounds(
     }
     seen.expect("the expression published a sample")
 }
+
+/// The dead-panel repro, turned green.
+///
+/// `ExpressionRow` hands a picker `(published_component_id, typed_text)`, and
+/// what a component-bound view serializes is text. So rehydration has to
+/// *resolve* that text — `ComponentId::new("=xyz * 2.0")` hashes a string
+/// nobody registered, and the view binds to a component that does not exist
+/// and never will. The panel looks configured and is dead.
+///
+/// Every one of these paths went through `ComponentId::new` on the raw text
+/// before; the assertion that catches a regression is the last one in each
+/// group — a view that did not resolve starts no expression, so the registry
+/// stays empty.
+#[gpui::test]
+fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::ops::{db_source, program};
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::views::{AttitudeConfig, ComponentTextConfig, TrafficLightConfig};
+    use gpui::AppContext;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with_ids(&[("xyz", ComponentId::new("xyz"), PrimType::F64, &[3])]);
+    let db = Arc::new(db);
+    let saved = "=xyz * 2.0";
+
+    // What the expression publishes into, derived the way the compiler does
+    // rather than from the code under test.
+    let source_id = ComponentId::new("xyz");
+    let resolver = DbResolver::snapshot(&db);
+    let compiled = Arc::new(program::Compiled::expression("xyz * 2.0", &resolver).unwrap());
+    let published = ComponentId::new(&expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    )));
+
+    // The bug, stated: what the old code bound to is not what the expression
+    // publishes into, and no amount of waiting would make it so.
+    assert_ne!(
+        ComponentId::new(saved),
+        published,
+        "hashing the text is what made the panel dead"
+    );
+
+    cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+
+        // `bind` is the one rule, and it lands on the published component.
+        let bound = expressions::bind(saved, &db, cx).expect("the expression compiles");
+        assert_eq!(bound.id, published);
+        assert!(bound.expression.is_some(), "an expression was started");
+
+        // And the round trip closes: what a view saves is text `bind` will
+        // recognise again, not the hash-named component.
+        let text = expressions::binding_text(&db, published, cx).expect("a live expression");
+        assert_eq!(text, saved);
+        assert_eq!(
+            expressions::bind(&text, &db, cx).unwrap().id,
+            published,
+            "saving and reloading is a fixed point"
+        );
+    });
+
+    // Each pane-side view, rehydrated from a config holding the text. A view
+    // that resolves starts the expression; one that hashed the text would
+    // leave the registry empty.
+    for (label, build) in [
+        (
+            "component text",
+            Box::new({
+                let db = db.clone();
+                move |cx: &mut gpui::App| {
+                    cx.new(|cx| {
+                        crate::tiles::panels::TextPanel::from_config(
+                            ComponentTextConfig {
+                                component: saved.to_string(),
+                            },
+                            db.clone(),
+                            cx,
+                        )
+                    })
+                    .into_any()
+                }
+            }) as Box<dyn Fn(&mut gpui::App) -> gpui::AnyEntity>,
+        ),
+        (
+            "traffic light",
+            Box::new({
+                let db = db.clone();
+                move |cx: &mut gpui::App| {
+                    cx.new(|cx| {
+                        crate::tiles::panels::TrafficLightPanel::from_config(
+                            TrafficLightConfig {
+                                component: saved.to_string(),
+                                color: None,
+                            },
+                            db.clone(),
+                            cx,
+                        )
+                    })
+                    .into_any()
+                }
+            }),
+        ),
+        (
+            "attitude",
+            Box::new({
+                let db = db.clone();
+                move |cx: &mut gpui::App| {
+                    cx.new(|cx| {
+                        crate::views::AttitudeIndicator::from_config(
+                            &AttitudeConfig {
+                                component: saved.to_string(),
+                                ..Default::default()
+                            },
+                            db.clone(),
+                            cx,
+                        )
+                    })
+                    .into_any()
+                }
+            }),
+        ),
+    ] {
+        cx.update(|cx| {
+            // A fresh registry per view, so each one is shown to start the
+            // expression itself rather than inheriting the last one's.
+            expressions::Expressions::init(cx);
+            let _view = build(cx);
+            assert!(
+                cx.global::<expressions::Expressions>().is_live(published),
+                "{label} did not resolve its binding"
+            );
+        });
+    }
+
+    // And the component it bound to is the one receiving data.
+    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+    source
+        .push_buf(
+            metor_proto::types::Timestamp(1),
+            &[1.0f64, 2.0, 3.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+
+    let component = db
+        .with_state(|s| s.get_component(published).cloned())
+        .expect("the expression's component exists");
+    for _ in 0..400 {
+        if component.time_series.latest().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let latest = component
+        .time_series
+        .latest()
+        .expect("the bound component receives data");
+    let values: Vec<f64> = latest
+        .data()
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(values, vec![2.0, 4.0, 6.0]);
+}

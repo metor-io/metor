@@ -201,7 +201,9 @@ pub struct AttitudeIndicator {
 
 impl AttitudeIndicator {
     pub fn from_config(cfg: &AttitudeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let component_id = crate::dynamic::expressions::bind(&cfg.component, &db, cx)
+            .map(|bound| bound.id)
+            .unwrap_or_else(|_| ComponentId::new(&cfg.component));
         let meta = component_meta(&db, component_id);
         let offset = cfg.element_offset;
 
