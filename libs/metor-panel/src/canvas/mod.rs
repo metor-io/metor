@@ -23,6 +23,7 @@
 //! this tile's own view state.
 
 pub mod edit;
+pub mod migrate;
 pub mod model;
 pub mod palette;
 pub mod run;
