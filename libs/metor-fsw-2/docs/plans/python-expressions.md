@@ -447,8 +447,10 @@ FSW — owns ports and rings; the guest is pure compute plus state:
   directly (the existing `ComponentStreamBuilder` bridge) and skips
   component registration — ephemeral by default, shared by content hash
   when two views type the same expression.
-- **FSW:** a built-in native `ExprSystem` (the `AlarmSystem` precedent —
-  standard path, no carve-outs) adapts real wired ports to the same ABI.
+- **FSW:** host-internal init plumbing (revised 2026-08-24 — no
+  registered `ExprSystem` type) adapts real wired ports to the same ABI:
+  each `@system` becomes its own cyclic node with hand-built descriptors,
+  sharing one wasmi instance per program.
 
 Every instance runs under wasmi with fuel, in the panel exactly as in
 FSW — a `while True:` burns its grant and surfaces as a diagnostic on the
@@ -519,10 +521,14 @@ and deleted with the old format.
 This is where the frame-based surface pays off hardest: a Python `@system`
 is not "promotable to" an FSW system — it already *is* one, in the same
 shape the Rust macro produces. Ports from the signature, `latest()` reads,
-state struct, one publish per execute. Registration:
+state struct, one publish per execute. Registration (revised 2026-08-24:
+the decorator itself, written directly in the target file — no module
+path, no wrapper system):
 
 ```python
-target.systems(Path("systems/derived.py"))          # every @system in the module
+@system("imu.omega_b")
+def omega_norm(omega_b):
+    return (omega_b @ omega_b) ** 0.5
 ```
 
 The Wiring IR carries the source; the host compiles at init, inside the
@@ -533,15 +539,15 @@ enough to live in the flight binary. Frame classes declared in Python
 generate real frame vtables (name, fields, shapes, component ids), so a
 Python system's output is first-class telemetry; a signature can equally
 name frames the Rust side already defines, checked one-to-one against the
-existing vtable at init. Replacing a system at runtime is a parameter
-update on `ExprSystem`: send source, recompile, swap at a cycle boundary,
-restore matching state slots — the same edit-with-state mechanism the
-panel uses, and the uplink story in one move.
+existing vtable at init. Replacing a system at runtime is deferred
+(2026-08-24): the `ExprSystem` parameter surface that would have carried
+uplinked source is gone with the wrapper, a config change is a rebuild —
+the normal FSW flow — and the panel remains the live-iteration surface.
 
 The promotion path — prototype live against telemetry in the panel with
-path-bound sugar, then tighten to declared frames and hand the same file
-to `target.systems(...)` — is the payoff the whole design aims at, and the
-sugar-to-canonical desugaring is what makes it a mechanical step.
+path-bound sugar, then tighten to declared frames and paste the same
+function into `target.py` — is the payoff the whole design aims at, and
+the sugar-to-canonical desugaring is what makes it a mechanical step.
 
 ## Staging
 
@@ -571,9 +577,15 @@ sugar-to-canonical desugaring is what makes it a mechanical step.
   the prelude (generators, `window`/`fft`, `resample`), preset migration
   converter, then delete `NodeSpec` and the node editor. This is the
   Enso-lesson phase; it gets its own plan.
-- **Phase 3 — FSW.** `ExprSystem`, `target.systems(...)`, IR threading,
-  init-gate compile, vtable checks against Rust-defined frames,
-  parameter-driven replacement with state restore.
+- **Phase 3 — FSW.** (Revised 2026-08-24: no `ExprSystem`, no
+  `target.systems(Path)` — the decorator is the registration surface.)
+  `@system` functions written directly in `target.py`, captured at
+  config-eval time and threaded through the IR as source; init-gate
+  compile; vtable checks against Rust-defined frames; real rings and
+  first-class telemetry per system. Runtime source replacement is
+  deferred with the parameter surface that would have carried it — a
+  config change is a rebuild, and the panel stays the live-iteration
+  surface. Plan: `metor-expr-phase3.md`.
 - **Phase 4 (deferred, decision point) — sequences.** Python `async def` /
   generator syntax compiled to a poll-driven state machine speaking the
   full pack ABI, so uplinkable *sequences* can be written in Python.
