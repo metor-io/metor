@@ -62,6 +62,41 @@ pub enum Binding {
     Component(String),
     /// A field of another system's output frame, in this same program.
     Produced { system: usize, field: usize },
+    /// The output of a [`Stage`] in this same program.
+    Resampled { stage: usize },
+}
+
+/// How a [`Stage`] fills a tick the input did not land on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Resample {
+    /// Hold the most recent sample.
+    Zoh,
+    /// Interpolate between the samples that bracket the tick.
+    Linear,
+}
+
+/// A clock-changing stage: a top-level binding whose right-hand side is
+/// exactly a resample call.
+///
+/// This is the one construct in the language that is *not* compiled, and the
+/// exception is deliberate. Resampling changes which clock a value ticks on,
+/// so it is scheduling rather than arithmetic — putting it in a body would put
+/// a timer inside the sandbox, which is the one thing the sandbox is for not
+/// having. So the checker recognises the shape at the top level, refuses the
+/// call anywhere else, and the host wires its own resampler.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stage {
+    /// The binding's name, which is also what the stage publishes under.
+    pub name: String,
+    pub kind: Resample,
+    /// What is being resampled: a component, a system's output field, or an
+    /// earlier stage.
+    pub source: Binding,
+    /// Hertz of the clock the output ticks on.
+    pub rate: f64,
+    /// What the output carries, which is what the input carried.
+    pub ty: Ty,
+    pub source_span: Span,
 }
 
 /// One input frame of a system, and what fills it.
@@ -158,12 +193,44 @@ impl FnSig {
 pub struct Manifest {
     pub compiler: u32,
     pub systems: Vec<System>,
+    /// Host-wired resamplers, in declaration order among themselves.
+    pub stages: Vec<Stage>,
     /// Plain `def`s, exported by name and called directly.
     pub functions: Vec<FnSig>,
+}
+
+/// One top-level declaration, by which list it lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decl {
+    System(usize),
+    Stage(usize),
 }
 
 impl Manifest {
     pub fn system(&self, name: &str) -> Option<&System> {
         self.systems.iter().find(|s| s.name == name)
+    }
+
+    /// Every declaration in the order the source wrote it.
+    ///
+    /// A host must build in this order, because a binding may name an earlier
+    /// declaration and only an earlier one. Order is recovered from the spans
+    /// rather than stored: top-level declarations do not overlap, so where
+    /// each one starts *is* the order it was written in.
+    pub fn declarations(&self) -> Vec<Decl> {
+        let mut all: Vec<(u32, Decl)> = self
+            .systems
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.source.start, Decl::System(i)))
+            .chain(
+                self.stages
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.source_span.start, Decl::Stage(i))),
+            )
+            .collect();
+        all.sort_by_key(|(at, _)| *at);
+        all.into_iter().map(|(_, decl)| decl).collect()
     }
 }

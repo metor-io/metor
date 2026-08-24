@@ -337,6 +337,7 @@ pub mod op_tag {
     pub const FROM_DB: &[u8] = b"db_source";
     pub const EXPR_SYSTEM: &[u8] = b"expr.system";
     pub const EXPR_FIELD: &[u8] = b"expr.field";
+    pub const EXPR_STAGE: &[u8] = b"expr.stage";
 }
 
 /// Default ring capacity in bytes. Sized per-node from the value byte size

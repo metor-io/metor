@@ -193,3 +193,97 @@ fn the_generators_need_a_system_around_them() {
         assert!(text.contains("inside a system"), "{source}: {text}");
     }
 }
+
+/// Q4: a resample is a top-level binding and nothing else — the one construct
+/// the compiler recognises and deliberately does not compile.
+#[test]
+fn a_resample_binding_becomes_a_host_stage() {
+    let program = compile_module(
+        "slow = resample_zoh(wheels.rpm, 10.0)\nsmooth = resample_linear(adcs.omega_b, 5.0)\n",
+        &imu_table(),
+    )
+    .unwrap();
+    assert!(program.manifest.systems.is_empty(), "a stage is not compiled");
+    assert_eq!(program.manifest.stages.len(), 2);
+
+    let zoh = &program.manifest.stages[0];
+    assert_eq!(zoh.name, "slow");
+    assert_eq!(zoh.kind, crate::Resample::Zoh);
+    assert_eq!(zoh.rate, 10.0);
+    assert_eq!(zoh.source, crate::Binding::Component("wheels.rpm".into()));
+    assert_eq!(zoh.ty, Ty::F64);
+
+    let linear = &program.manifest.stages[1];
+    assert_eq!(linear.kind, crate::Resample::Linear);
+    assert_eq!(
+        linear.ty,
+        Ty::Tensor {
+            dtype: crate::Dtype::F64,
+            shape: vec![3]
+        },
+        "a stage carries what its input carried"
+    );
+}
+
+/// A stage is an ordinary producer: what reads it is an edge, not a lookup.
+#[test]
+fn a_stage_feeds_what_comes_after_it() {
+    let program = compile_module(
+        "slow = resample_zoh(wheels.rpm, 10.0)\nscaled = slow * 2.0\nslower = resample_zoh(slow, 1.0)\n",
+        &imu_table(),
+    )
+    .unwrap();
+    let scaled = program.manifest.system("scaled").unwrap();
+    assert_eq!(scaled.inputs[0].bindings, vec![crate::Binding::Resampled { stage: 0 }]);
+    assert_eq!(scaled.inputs[0].frame.fields[0].ty, Ty::F64);
+    assert_eq!(
+        program.manifest.stages[1].source,
+        crate::Binding::Resampled { stage: 0 }
+    );
+
+    // A host builds in declaration order, and the spans are what say it.
+    assert_eq!(
+        program.manifest.declarations(),
+        vec![
+            crate::Decl::Stage(0),
+            crate::Decl::System(0),
+            crate::Decl::Stage(1)
+        ]
+    );
+}
+
+/// A system's output can be resampled, which is why stages and systems are
+/// checked in one pass rather than two.
+#[test]
+fn a_stage_can_read_a_system() {
+    let program = compile_module(
+        "fast = wheels.rpm * 2.0\nslow = resample_linear(fast, 4.0)\n",
+        &imu_table(),
+    )
+    .unwrap();
+    assert_eq!(
+        program.manifest.stages[0].source,
+        crate::Binding::Produced { system: 0, field: 0 }
+    );
+    assert_eq!(program.manifest.stages[0].ty, Ty::F64);
+}
+
+#[test]
+fn a_resample_anywhere_else_says_where_it_belongs() {
+    for source in [
+        "scaled = resample_zoh(wheels.rpm, 10.0) * 2.0\n",
+        "@system(\"wheels.rpm\")\ndef f(rpm) -> f64:\n    return resample_linear(rpm, 10.0)\n",
+    ] {
+        let text = refuse(source, &imu_table());
+        assert!(text.contains("top-level binding of its own"), "{source}: {text}");
+    }
+
+    for (source, needle) in [
+        ("slow = resample_zoh(wheels.rpm)\n", "a source and a rate"),
+        ("slow = resample_zoh(wheels.rpm, 0.0)\n", "positive number of hertz"),
+        ("slow = resample_zoh(nothing.here, 10.0)\n", "no component"),
+    ] {
+        let text = refuse(source, &imu_table());
+        assert!(text.contains(needle), "{source}: {text}");
+    }
+}

@@ -294,9 +294,18 @@ Across parameters, the run rule is the FSW one, not a new one:
   The waveform kind is four names rather than one function's string
   argument because the subset has no strings.
 
-The panel's explicit `Resample{Zoh,Linear}` ops survive only as prelude
-functions for when interpolation actually matters. What remains static and
-checked: dtype and shape inference over bodies, reusing the panel's
+The panel's explicit `Resample{Zoh,Linear}` ops survive for when
+interpolation actually matters — but *not* as prelude functions, and this
+is the language's one deliberate exception. Resampling changes which clock
+a value ticks on, so it is scheduling rather than arithmetic, and a guest
+that could reschedule itself would need a timer inside the sandbox — the
+one thing the sandbox exists to not have. So a **top-level binding whose
+right-hand side is exactly a resample call** (`slow =
+resample_zoh(fast, 10.0)`) is recognised as a host-wired stage: it is not
+compiled at all, it publishes under its binding name like any other
+declaration, and what reads it is an ordinary edge. The call is refused
+anywhere else, with a diagnostic that says where it belongs. What remains
+static and checked: dtype and shape inference over bodies, reusing the panel's
 broadcast rules (`dynamic/tensor.rs`), so the checker accepts
 exactly what the runtime does. Windowed prelude functions with static
 bounds (`window(x, 256)`, `fft`, `delta`, `lowpass`) are stateful

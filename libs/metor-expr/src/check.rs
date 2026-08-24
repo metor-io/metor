@@ -179,12 +179,17 @@ fn check_inner(
     let decls = match entry {
         Entry::Module => lang::collect(&module, resolver, &mut diags),
         Entry::Expression => match module.as_slice() {
-            [ast::Stmt::Expr(only)] => lang::Decls {
-                systems: lang::expression(&only.value, resolver, &mut diags)
+            [ast::Stmt::Expr(only)] => {
+                let systems: Vec<_> = lang::expression(&only.value, resolver, &mut diags)
                     .into_iter()
-                    .collect(),
-                functions: Vec::new(),
-            },
+                    .collect();
+                lang::Decls {
+                    order: systems.iter().enumerate().map(|(i, _)| lang::Item::System(i)).collect(),
+                    systems,
+                    stages: Vec::new(),
+                    functions: Vec::new(),
+                }
+            }
             _ => {
                 diags.push(Span::new(0, source.len() as u32), "expected one expression");
                 return Err(diags);
@@ -334,26 +339,55 @@ fn check_inner(
         );
     }
 
-    let mut systems = Vec::new();
-    for decl in &decls.systems {
-        let before = diags.len();
-        match system(
-            decl,
-            &sigs,
-            &by_name,
-            &frames,
-            &systems,
-            &mut buffers,
-            &mut diags,
-        ) {
-            Some((func, desc)) => {
-                funcs.push(func);
-                systems.push(desc);
+    // Declaration order, because a binding may name what came before it and
+    // a stage's output type can be a system's — which is only known once that
+    // system's body has been checked.
+    let mut systems: Vec<manifest::System> = Vec::new();
+    let mut stages: Vec<manifest::Stage> = Vec::new();
+    for item in &decls.order {
+        match *item {
+            lang::Item::System(at) => {
+                let decl = &decls.systems[at];
+                let before = diags.len();
+                match system(
+                    decl,
+                    &sigs,
+                    &by_name,
+                    &frames,
+                    &systems,
+                    &stages,
+                    &mut buffers,
+                    &mut diags,
+                ) {
+                    Some((func, desc)) => {
+                        funcs.push(func);
+                        systems.push(desc);
+                    }
+                    None if diags.len() == before => {
+                        diags.push(decl.span, format!("`{}` could not be compiled", decl.name))
+                    }
+                    None => {}
+                }
             }
-            None if diags.len() == before => {
-                diags.push(decl.span, format!("`{}` could not be compiled", decl.name))
+            lang::Item::Stage(at) => {
+                let decl = &decls.stages[at];
+                let Some(ty) = decl
+                    .ty
+                    .clone()
+                    .or_else(|| produced_ty(&decl.source, &systems, &stages))
+                else {
+                    diags.push(decl.span, format!("`{}` reads nothing", decl.name));
+                    continue;
+                };
+                stages.push(manifest::Stage {
+                    name: decl.name.clone(),
+                    kind: decl.kind,
+                    source: decl.source.clone(),
+                    rate: decl.rate,
+                    ty,
+                    source_span: decl.span,
+                });
             }
-            None => {}
         }
     }
 
@@ -371,11 +405,27 @@ fn check_inner(
             Manifest {
                 compiler: crate::manifest::COMPILER_VERSION,
                 systems,
+                stages,
                 functions: sigs,
             },
         ))
     } else {
         Err(diags.sorted())
+    }
+}
+
+/// What an in-program binding carries, once its producer has been checked.
+fn produced_ty(
+    binding: &manifest::Binding,
+    systems: &[manifest::System],
+    stages: &[manifest::Stage],
+) -> Option<Ty> {
+    match binding {
+        manifest::Binding::Component(_) => None,
+        manifest::Binding::Produced { system, field } => {
+            Some(systems.get(*system)?.output.fields.get(*field)?.ty.clone())
+        }
+        manifest::Binding::Resampled { stage } => Some(stages.get(*stage)?.ty.clone()),
     }
 }
 
@@ -387,6 +437,7 @@ fn system(
     by_name: &HashMap<String, u32>,
     frames: &[FnFrame],
     done: &[manifest::System],
+    stages: &[manifest::Stage],
     buffers: &mut Vec<Place>,
     diags: &mut Diagnostics,
 ) -> Option<(Func, manifest::System)> {
@@ -400,6 +451,10 @@ fn system(
             Some(frame) => frame.clone(),
             None => match &port.bindings[0] {
                 manifest::Binding::Produced { system, .. } => done[*system].output.clone(),
+                manifest::Binding::Resampled { stage } => lang::frame_of(
+                    &port.key,
+                    [(port.key.clone(), stages[*stage].ty.clone())],
+                ),
                 manifest::Binding::Component(path) => {
                     diags.push(decl.span, format!("no component `{path}`"));
                     return None;
@@ -2141,6 +2196,20 @@ impl FnChecker<'_> {
                     },
                     Ty::F64,
                 ));
+            }
+            // Resampling changes which clock a value ticks on, so it is
+            // scheduling rather than arithmetic and the host owns it. The
+            // shape is recognised at the top level; here it can only be a
+            // mistake, and saying where it belongs is the whole diagnostic.
+            "resample_zoh" | "resample_linear" => {
+                self.diags.push(
+                    call.range,
+                    format!(
+                        "`{name}` changes the clock, so it is a top-level binding of its own: \
+                         `slow = {name}(fast, 10.0)`"
+                    ),
+                );
+                return None;
             }
             "window" => {
                 if !arity(2, self) {

@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use rustpython_parser::ast::{self, Ranged};
 
 use crate::diag::{Diagnostics, Span};
-use crate::manifest::{Binding, Field, Frame, Init, StateField};
+use crate::manifest::{Binding, Field, Frame, Init, Resample, StateField};
 use crate::{CompSchema, Resolver, Ty};
 
 /// The name a bare expression's system takes.
@@ -85,9 +85,34 @@ pub(crate) enum Body<'a> {
     Expr(&'a ast::Expr),
 }
 
+/// A clock-changing stage, as written: `slow = resample_zoh(fast, 10.0)`.
+///
+/// The output type is absent when the source is a declaration whose type the
+/// body decides — the checker fills it from the producer it has already
+/// finished, exactly as it does for a port.
+pub(crate) struct StageDecl {
+    pub name: String,
+    pub kind: Resample,
+    pub source: Binding,
+    pub ty: Option<Ty>,
+    pub rate: f64,
+    pub span: Span,
+}
+
+/// One top-level declaration, in the order it was written.
+#[derive(Clone, Copy)]
+pub(crate) enum Item {
+    System(usize),
+    Stage(usize),
+}
+
 /// Everything a module declares, before bodies are looked at.
 pub(crate) struct Decls<'a> {
     pub systems: Vec<SystemDecl<'a>>,
+    pub stages: Vec<StageDecl>,
+    /// Declaration order across both lists, which is the order a binding may
+    /// name what came before it in.
+    pub order: Vec<Item>,
     pub functions: Vec<&'a ast::StmtFunctionDef>,
 }
 
@@ -137,31 +162,151 @@ pub(crate) fn collect<'a>(
         .collect();
 
     let mut decls = Vec::new();
+    let mut order = Vec::new();
     for (def, sig) in systems.iter().zip(signatures) {
         let Some(sig) = sig else { continue };
         if let Some(decl) = system_decl(def, sig, &classes, &produced, resolver, diags) {
+            order.push(Item::System(decls.len()));
             decls.push(decl);
         }
     }
+    let mut stages: Vec<StageDecl> = Vec::new();
     for assign in bindings {
-        if let Some(decl) = binding_decl(assign, &decls, resolver, diags) {
-            decls.push(decl);
+        // A binding whose right-hand side is exactly a resample call is a
+        // stage, not a system: it changes the clock, which is the host's job.
+        match stage_decl(assign, &decls, &stages, resolver, diags) {
+            Some(Some(stage)) => {
+                order.push(Item::Stage(stages.len()));
+                stages.push(stage);
+            }
+            Some(None) => {}
+            None => {
+                if let Some(decl) = binding_decl(assign, &decls, &stages, resolver, diags) {
+                    order.push(Item::System(decls.len()));
+                    decls.push(decl);
+                }
+            }
         }
     }
 
     let mut seen = HashSet::new();
-    for decl in &decls {
-        if !seen.insert(decl.name.clone()) {
-            diags.push(
-                decl.span,
-                format!("`{}` is declared more than once", decl.name),
-            );
+    for (name, span) in decls
+        .iter()
+        .map(|d| (&d.name, d.span))
+        .chain(stages.iter().map(|s| (&s.name, s.span)))
+    {
+        if !seen.insert(name.clone()) {
+            diags.push(span, format!("`{name}` is declared more than once"));
         }
     }
 
     Decls {
         systems: decls,
+        stages,
+        order,
         functions,
+    }
+}
+
+/// `name = resample_zoh(source, rate)`, or `None` when the assignment is not
+/// that shape at all. `Some(None)` means it was, and was malformed.
+fn stage_decl(
+    assign: &ast::StmtAssign,
+    systems: &[SystemDecl<'_>],
+    stages: &[StageDecl],
+    resolver: &dyn Resolver,
+    diags: &mut Diagnostics,
+) -> Option<Option<StageDecl>> {
+    let ast::Expr::Call(call) = assign.value.as_ref() else {
+        return None;
+    };
+    let ast::Expr::Name(callee) = call.func.as_ref() else {
+        return None;
+    };
+    let kind = match callee.id.as_str() {
+        "resample_zoh" => Resample::Zoh,
+        "resample_linear" => Resample::Linear,
+        _ => return None,
+    };
+
+    let [ast::Expr::Name(target)] = assign.targets.as_slice() else {
+        diags.push(
+            assign.range,
+            "a resample is a top-level binding to one plain name",
+        );
+        return Some(None);
+    };
+    if call.args.len() != 2 || !call.keywords.is_empty() {
+        diags.push(
+            call.range,
+            format!("`{}` takes a source and a rate in hertz", callee.id),
+        );
+        return Some(None);
+    }
+    let Some(rate) = number_of(&call.args[1]).filter(|hz| hz.is_finite() && *hz > 0.0) else {
+        diags.push(
+            call.args[1].range(),
+            "a resample rate is a positive number of hertz",
+        );
+        return Some(None);
+    };
+    let Some(key) = dotted(&call.args[0]) else {
+        diags.push(call.args[0].range(), "a resample reads one channel");
+        return Some(None);
+    };
+
+    let span: Span = call.args[0].range().into();
+    let (source, ty) = if let Some(stage) = stages.iter().position(|s| s.name == key) {
+        (Binding::Resampled { stage }, stages[stage].ty.clone())
+    } else if let Some(system) = systems.iter().position(|s| s.name == key) {
+        (
+            Binding::Produced { system, field: 0 },
+            systems[system]
+                .output
+                .as_ref()
+                .map(|frame| frame.fields[0].ty.clone()),
+        )
+    } else {
+        let Some(path) = resolve_path(&key, resolver, span, diags) else {
+            return Some(None);
+        };
+        let Some(CompSchema { ty }) = resolver.component(&path) else {
+            diags.push(span, format!("no component `{path}`"));
+            return Some(None);
+        };
+        (Binding::Component(path), Some(ty))
+    };
+
+    Some(Some(StageDecl {
+        name: target.id.as_str().to_string(),
+        kind,
+        source,
+        ty,
+        rate,
+        span: assign.range.into(),
+    }))
+}
+
+/// A dotted path as written, or the one a bare name's unique suffix finds.
+fn resolve_path(
+    key: &str,
+    resolver: &dyn Resolver,
+    span: Span,
+    diags: &mut Diagnostics,
+) -> Option<String> {
+    if key.contains('.') {
+        return Some(key.to_string());
+    }
+    match resolver.suffix(key).as_slice() {
+        [only] => Some(only.clone()),
+        [] => {
+            diags.push(span, format!("`{key}` is not defined and names no component"));
+            None
+        }
+        many => {
+            diags.push(span, format!("`{key}` is ambiguous: {}", many.join(", ")));
+            None
+        }
     }
 }
 
@@ -171,7 +316,7 @@ pub(crate) fn expression<'a>(
     resolver: &dyn Resolver,
     diags: &mut Diagnostics,
 ) -> Option<SystemDecl<'a>> {
-    anonymous(ANONYMOUS.to_string(), expr, &[], resolver, diags)
+    anonymous(ANONYMOUS.to_string(), expr, &[], &[], resolver, diags)
 }
 
 fn class_decl(class: &ast::StmtClassDef, diags: &mut Diagnostics) -> Option<ClassDecl> {
@@ -707,6 +852,7 @@ fn number_of(expr: &ast::Expr) -> Option<f64> {
 fn binding_decl<'a>(
     assign: &'a ast::StmtAssign,
     existing: &[SystemDecl<'_>],
+    stages: &[StageDecl],
     resolver: &dyn Resolver,
     diags: &mut Diagnostics,
 ) -> Option<SystemDecl<'a>> {
@@ -718,6 +864,7 @@ fn binding_decl<'a>(
         target.id.as_str().to_string(),
         &assign.value,
         existing,
+        stages,
         resolver,
         diags,
     )
@@ -729,6 +876,7 @@ fn anonymous<'a>(
     name: String,
     expr: &'a ast::Expr,
     existing: &[SystemDecl<'_>],
+    stages: &[StageDecl],
     resolver: &dyn Resolver,
     diags: &mut Diagnostics,
 ) -> Option<SystemDecl<'a>> {
@@ -741,7 +889,7 @@ fn anonymous<'a>(
             continue;
         }
         // An earlier binding in the same module is a frame edge, not a
-        // component lookup.
+        // component lookup, and so is an earlier stage.
         if let Some(system) = existing.iter().position(|s| s.name == key) {
             ports.push(PortDecl {
                 key,
@@ -751,23 +899,19 @@ fn anonymous<'a>(
             });
             continue;
         }
-        let path = match key.contains('.') {
-            true => key.clone(),
-            false => match resolver.suffix(&key).as_slice() {
-                [only] => only.clone(),
-                [] => {
-                    diags.push(
-                        span,
-                        format!("`{key}` is not defined and names no component"),
-                    );
-                    return None;
-                }
-                many => {
-                    diags.push(span, format!("`{key}` is ambiguous: {}", many.join(", ")));
-                    return None;
-                }
-            },
-        };
+        if let Some(stage) = stages.iter().position(|s| s.name == key) {
+            ports.push(PortDecl {
+                key: key.clone(),
+                frame: stages[stage]
+                    .ty
+                    .clone()
+                    .map(|ty| frame_of(&key, [(key.clone(), ty)])),
+                bindings: vec![Binding::Resampled { stage }],
+                projected: true,
+            });
+            continue;
+        }
+        let path = resolve_path(&key, resolver, span, diags)?;
         ports.push(projected_port(key, &path, resolver, span, diags)?);
     }
 

@@ -11,7 +11,7 @@ use metor_expr::state::Snapshot;
 
 use crate::dynamic::{BuildError, DynamicNode, NodeId};
 use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL, Health};
-use crate::dynamic::ops::{db_source, persist};
+use crate::dynamic::ops::{self, db_source, persist};
 use crate::dynamic::resolver::DbResolver;
 use crate::inspector::rows::TextField;
 use crate::node_editor::projected_view::{self, Placements};
@@ -143,14 +143,24 @@ impl ProgramPane {
 
         let worker = cx.global::<DynamicWorker>().handle().clone();
         let mut kept: Vec<Running> = Vec::new();
-        for index in 0..compiled.manifest.systems.len() {
-            match self.reconcile(&compiled, index, &resolver, &worker) {
-                Ok(system) => kept.push(system),
-                Err(why) => {
-                    let span = compiled.manifest.systems[index].source;
-                    self.diagnostics
-                        .push((span.start as usize..span.end as usize, why));
-                }
+        // Declaration order, because a declaration may read an earlier one and
+        // what it reads has to exist by then.
+        for decl in compiled.manifest.declarations() {
+            let (span, built) = match decl {
+                metor_expr::Decl::System(index) => (
+                    compiled.manifest.systems[index].source,
+                    self.reconcile(&compiled, index, &resolver, &worker),
+                ),
+                metor_expr::Decl::Stage(index) => (
+                    compiled.manifest.stages[index].source_span,
+                    self.reconcile_stage(&compiled, index, &resolver, &worker),
+                ),
+            };
+            match built {
+                Ok(running) => kept.push(running),
+                Err(why) => self
+                    .diagnostics
+                    .push((span.start as usize..span.end as usize, why)),
             }
         }
         // Dropping what is left cancels the tasks of every system the edit
@@ -240,6 +250,62 @@ impl ProgramPane {
         })
     }
 
+    /// Keep or build one resample stage.
+    ///
+    /// A stage is not compiled and has no state to carry, so reconciling one
+    /// is only the question of whether anything about it changed: what it
+    /// reads, how it fills a tick, and how fast it ticks.
+    fn reconcile_stage(
+        &mut self,
+        compiled: &Arc<Compiled>,
+        index: usize,
+        resolver: &DbResolver,
+        worker: &crate::node_editor::worker::WorkerHandle,
+    ) -> Result<Running, String> {
+        let stage = &compiled.manifest.stages[index];
+        let source = self.component_of(&stage.source, compiled, resolver)?;
+        let hash = crate::dynamic::hash_id(
+            crate::dynamic::op_tag::EXPR_STAGE,
+            &[db_source::from_db_id(source)],
+            |h| {
+                use std::hash::Hash;
+                stage.name.hash(h);
+                (stage.kind == metor_expr::Resample::Linear).hash(h);
+                stage.rate.to_bits().hash(h);
+            },
+        );
+        if let Some(at) = self.running.iter().position(|r| r.hash == hash) {
+            return Ok(self.running.remove(at));
+        }
+
+        let mode = match stage.kind {
+            metor_expr::Resample::Zoh => ops::resample::ResampleMode::Zoh,
+            metor_expr::Resample::Linear => ops::resample::ResampleMode::Linear,
+        };
+        let (name, rate) = (stage.name.clone(), stage.rate);
+        let nodes = {
+            let db = self.db.clone();
+            worker.call(move || -> Result<Vec<Arc<dyn DynamicNode>>, BuildError> {
+                let input = db_source::from_db(&db, source)?;
+                let clock = ops::clock::fixed_rate(rate)?;
+                let resampled = ops::resample::resample(input, clock.clone(), mode)?;
+                Ok(vec![clock, persist::persist(&db, name, resampled)?])
+            })
+        };
+        let nodes = nodes
+            .ok_or_else(|| "the node worker is gone".to_string())?
+            .map_err(|e| e.to_string())?;
+
+        Ok(Running {
+            name: stage.name.clone(),
+            _nodes: nodes,
+            publishes: vec![stage.name.clone()],
+            health: Health::default(),
+            state: program::StateCell::default(),
+            hash,
+        })
+    }
+
     /// The component one input port reads.
     ///
     /// An external component's id is *carried* from the resolver that found
@@ -258,18 +324,31 @@ impl ProgramPane {
         compiled: &Arc<Compiled>,
         resolver: &DbResolver,
     ) -> Result<ComponentId, String> {
-        match &port.bindings[0] {
-            metor_expr::Binding::Component(path) => resolver
-                .id_of(path)
-                .ok_or_else(|| format!("`{path}` is not a known component")),
-            metor_expr::Binding::Produced { system, field } => {
-                let name = &compiled.manifest.systems[*system].publishes[*field];
-                let id = ComponentId::new(name);
-                match self.db.with_state(|s| s.get_component(id).is_some()) {
-                    true => Ok(id),
-                    false => Err(format!("`{name}` has not published yet")),
-                }
+        self.component_of(&port.bindings[0], compiled, resolver)
+    }
+
+    /// The component behind one binding, whatever produced it.
+    fn component_of(
+        &self,
+        binding: &metor_expr::Binding,
+        compiled: &Arc<Compiled>,
+        resolver: &DbResolver,
+    ) -> Result<ComponentId, String> {
+        let produced = match binding {
+            metor_expr::Binding::Component(path) => {
+                return resolver
+                    .id_of(path)
+                    .ok_or_else(|| format!("`{path}` is not a known component"));
             }
+            metor_expr::Binding::Produced { system, field } => {
+                &compiled.manifest.systems[*system].publishes[*field]
+            }
+            metor_expr::Binding::Resampled { stage } => &compiled.manifest.stages[*stage].name,
+        };
+        let id = ComponentId::new(produced);
+        match self.db.with_state(|s| s.get_component(id).is_some()) {
+            true => Ok(id),
+            false => Err(format!("`{produced}` has not published yet")),
         }
     }
 
