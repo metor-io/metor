@@ -11,9 +11,17 @@ description = "Compiles a typed subset of Python to closed WebAssembly modules"
 num-traits = { version = "0.2", default-features = false }
 rustpython-parser = "0.4"
 postcard = { version = "1.1", features = ["alloc"] }
+postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 wasm-encoder = { version = "0.256", features = ["wasmparser"] }
 wasmparser = "0.256"
+
+# The pack backend: a compiled Python module is an ordinary wasm pack, so the
+# manifest it bakes is the host's own `PackManifest` with real vtables built
+# from the compiled frame layouts.
+metor-fsw-2-core = { path = "../metor-fsw-2/core" }
+metor-proto = { path = "../metor-proto", features = ["std"] }
+metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
 [dev-dependencies]
 libm = "0.2"

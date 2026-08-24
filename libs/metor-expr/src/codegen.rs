@@ -38,7 +38,21 @@ use crate::{COMPILER_VERSION, Init, Manifest, PRELUDE, Ty};
 const DESC_BYTES: u32 = 16 * 4;
 
 pub(crate) fn emit(program: &Program, manifest: &Manifest) -> Vec<u8> {
-    let kernels = program.kernels();
+    emit_with(program, manifest, None)
+}
+
+/// [`emit`], optionally appending the pack ABI: the prelude's pack helpers
+/// join the GC roots and [`pack_abi`](crate::pack_abi) generates the
+/// `fsw_pack_*` entry points after the expr exports.
+pub(crate) fn emit_with(
+    program: &Program,
+    manifest: &Manifest,
+    pack: Option<&crate::pack::PackPlan>,
+) -> Vec<u8> {
+    let mut kernels = program.kernels();
+    if pack.is_some() {
+        kernels.extend_from_slice(crate::pack_abi::PACK_HELPERS);
+    }
     let plan = Template::parse(PRELUDE)
         .expect("the checked-in prelude parses")
         .plan(&kernels)
@@ -152,6 +166,10 @@ pub(crate) fn emit(program: &Program, manifest: &Manifest) -> Vec<u8> {
         splice.export(name, index);
     }
 
+    let end = match pack {
+        Some(plan) => crate::pack_abi::emit(&mut splice, program, &layout, &indices, plan, end),
+        None => end,
+    };
     splice.reserve_memory(end);
     splice.finish()
 }
@@ -175,13 +193,13 @@ fn address_table(layout: &Layout, buffers: &[BufId]) -> Function {
     table
 }
 
-struct Layout {
+pub(crate) struct Layout {
     addresses: Vec<u32>,
     descriptors: u32,
 }
 
 impl Layout {
-    fn at(&self, buf: BufId) -> u32 {
+    pub(crate) fn at(&self, buf: BufId) -> u32 {
         self.addresses[buf as usize]
     }
 }
@@ -394,9 +412,7 @@ impl<'a> Emitter<'a> {
                 self.push(Instruction::I32Const(self.layout.at(*buf) as i32));
                 self.push(load_of(ty));
             }
-            Expr::Address(buf) => {
-                self.push(Instruction::I32Const(self.layout.at(*buf) as i32))
-            }
+            Expr::Address(buf) => self.push(Instruction::I32Const(self.layout.at(*buf) as i32)),
             Expr::Store { local, value, then } => {
                 self.expr(value);
                 self.push(Instruction::LocalSet(*local));
@@ -566,11 +582,7 @@ impl<'a> Emitter<'a> {
                 // Leading dimensions were walked while checking, so a batch is
                 // three more constants rather than a loop.
                 for batch in batches {
-                    let (a, b, out) = (
-                        a + batch.lhs * 8,
-                        b + batch.rhs * 8,
-                        out + batch.out * 8,
-                    );
+                    let (a, b, out) = (a + batch.lhs * 8, b + batch.rhs * 8, out + batch.out * 8);
                     match emit {
                         Emit::Kernel => {
                             self.push(Instruction::I32Const(a as i32));

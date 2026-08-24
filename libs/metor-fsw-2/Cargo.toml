@@ -55,6 +55,11 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 
 libloading = { version = "0.8" }
 
+# The Python-system compiler: `provision_artifacts` compiles a target's
+# captured program into its wasm pack artifact at build time. Nothing on the
+# run loop touches it.
+metor-expr = { path = "../metor-expr" }
+
 # The wasm occupant backing: a pure-Rust interpreter with fuel metering, so a
 # guest poll is bounded rather than able to stall the cycle (docs/plans/wasm-occupant.md).
 wasmi = { version = "1.1", default-features = false, features = ["std"] }

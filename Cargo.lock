@@ -9418,9 +9418,13 @@ name = "metor-expr"
 version = "0.14.2"
 dependencies = [
  "libm",
+ "metor-fsw-2-core",
+ "metor-proto",
+ "metor-proto-wkt",
  "nox",
  "num-traits",
  "postcard",
+ "postcard-schema",
  "rustfft",
  "rustpython-parser",
  "serde",
@@ -9443,6 +9447,7 @@ dependencies = [
  "mdns-sd",
  "memmap2",
  "metor-component",
+ "metor-expr",
  "metor-fsw-2-core",
  "metor-fsw-2-macros",
  "metor-fsw-ring",

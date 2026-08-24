@@ -714,3 +714,155 @@ fn resolve_rejects_an_unknown_wasm_entry() {
         "the diagnostic names the missing entry, got: {rendered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Compiled Python packs: the pack backend meets the wasm host it was built
+// for. The compiler-side facts (manifest shape, determinism, gate rules) are
+// pinned in metor-expr's own suite; here the artifact walks the real
+// open → create → ring → bind → execute sequence and the run rule shows in
+// what lands on the rings.
+// ---------------------------------------------------------------------------
+
+/// The build-time resolver a provision pass would derive, reduced to one
+/// producer: instance `imu`, port `sensors`, a 3-vector at offset 8 behind
+/// the record timestamp.
+struct ImuResolver;
+
+const GYRO_PATH: &str = "imu.sensors.gyro_b";
+
+fn gyro_source() -> metor_expr::ComponentSource {
+    use metor_proto::types::{ComponentId, PrimType};
+    metor_expr::ComponentSource {
+        instance: "imu".into(),
+        port_name: "sensors".into(),
+        frame_id: ComponentId::new("sensors"),
+        max_size: 32,
+        component_id: ComponentId::new("sensors.gyro_b"),
+        component_name: "sensors.gyro_b".into(),
+        prim: PrimType::F64,
+        shape: vec![3],
+        offset: 8,
+    }
+}
+
+impl metor_expr::Resolver for ImuResolver {
+    fn component(&self, path: &str) -> Option<metor_expr::CompSchema> {
+        (path == GYRO_PATH).then(|| metor_expr::CompSchema {
+            ty: metor_expr::Ty::Tensor {
+                dtype: metor_expr::Dtype::F64,
+                shape: vec![3],
+            },
+        })
+    }
+
+    fn suffix(&self, name: &str) -> Vec<String> {
+        GYRO_PATH
+            .ends_with(&format!(".{name}"))
+            .then(|| GYRO_PATH.to_string())
+            .into_iter()
+            .collect()
+    }
+
+    fn frame(&self, _name: &str) -> Option<metor_expr::FrameSchema> {
+        None
+    }
+}
+
+impl metor_expr::PackResolver for ImuResolver {
+    fn component_source(&self, path: &str) -> Option<metor_expr::ComponentSource> {
+        (path == GYRO_PATH).then(gyro_source)
+    }
+}
+
+fn python_pack() -> metor_expr::PackProgram {
+    let source = "@system(\"imu.sensors.gyro_b\")\n\
+                  def gyro_norm(gyro_b) -> f64:\n    return (gyro_b @ gyro_b) ** 0.5\n";
+    metor_expr::compile_pack(source, &ImuResolver, 120.0).expect("the fixture program compiles")
+}
+
+/// The whole pack lifecycle over a compiled Python system, with the run rule
+/// observed on real rings: a never-published input skips, a fresh driving
+/// record fires and publishes `[now][value]`, a quiet cycle publishes
+/// nothing.
+#[test]
+fn a_compiled_python_system_runs_through_the_pack_host() {
+    let program = python_pack();
+    let mut pack =
+        WasmPack::open(&program.wasm, AMPLE_FUEL).expect("a compiled pack opens under the host");
+
+    // The host's decoded view is the compiler's baked bytes.
+    let decoded: metor_fsw_2_core::abi::PackManifest =
+        postcard::from_bytes(&program.pack_manifest).expect("baked manifest decodes");
+    assert_eq!(pack.manifest().systems.len(), decoded.systems.len());
+    assert_eq!(pack.manifest().systems[0].descriptor.name, "gyro_norm");
+
+    let state = pack.create(0, 0, &[]).expect("create entry 0 wired");
+    let in_cfg = Config {
+        capacity: capacity_for(32, 8),
+        max_readers: 2,
+    };
+    let out_cfg = Config {
+        capacity: capacity_for(16, 8),
+        max_readers: 2,
+    };
+    let input = pack.add_ring(in_cfg, ROLE_INPUT).expect("input ring");
+    let output = pack.add_ring(out_cfg, ROLE_OUTPUT).expect("output ring");
+    pack.bind_init(state, &[input], &[output], "gyro_norm")
+        .expect("bind");
+    pack.pin_memory();
+
+    let base = pack.memory_base();
+    // SAFETY: both regions were just formatted inside pinned guest memory,
+    // which outlives the handles below.
+    let in_ring = unsafe { RingBuffer::attach_raw(base.add(input.offset as usize), input.len) }
+        .expect("host attaches the guest input ring");
+    let mut writer = in_ring.writer(NoWake).expect("host writer");
+    // SAFETY: as above.
+    let out_ring = unsafe { RingBuffer::attach_raw(base.add(output.offset as usize), output.len) }
+        .expect("host attaches the guest output ring");
+    let mut view = out_ring.view(NoWake).expect("host view");
+
+    // Never-published driving input: the cycle is skipped, not an error.
+    assert_eq!(pack.execute(state, 1).unwrap(), FswStatus::Running);
+    assert!(
+        view.try_latest().expect("output ring intact").is_none(),
+        "a skipped cycle publishes nothing"
+    );
+
+    // One driving record: [ts][1, 2, 3].
+    let mut record = Vec::new();
+    record.extend_from_slice(&41i64.to_le_bytes());
+    for v in [1.0f64, 2.0, 3.0] {
+        record.extend_from_slice(&v.to_le_bytes());
+    }
+    writer.try_write(&record).expect("input record");
+    assert_eq!(pack.execute(state, 42).unwrap(), FswStatus::Running);
+    {
+        let grant = view
+            .try_latest()
+            .expect("output ring intact")
+            .expect("a fresh driving record fires the system");
+        assert_eq!(grant.len(), 16, "[timestamp][f64 norm]");
+        let ts = i64::from_le_bytes(grant[0..8].try_into().unwrap());
+        let norm = f64::from_le_bytes(grant[8..16].try_into().unwrap());
+        assert_eq!(ts, 42, "records are stamped with execute's own now");
+        assert_eq!(norm, 14.0f64.sqrt());
+    }
+
+    // No new input: execute keeps running but publishes nothing new.
+    let committed = out_ring.committed();
+    assert_eq!(pack.execute(state, 43).unwrap(), FswStatus::Running);
+    assert_eq!(
+        out_ring.committed(),
+        committed,
+        "a quiet driving ring skips the cycle"
+    );
+
+    // A second concurrent create of the same entry would alias the static
+    // buffers; the guest refuses it like a failed native create.
+    assert!(matches!(pack.create(0, 0, &[]), Err(WasmError::Create(0))));
+
+    pack.shutdown(state).expect("shutdown");
+    pack.destroy(state).expect("destroy");
+    pack.close().expect("close");
+}

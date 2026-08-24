@@ -16,6 +16,7 @@ mod layout;
 mod m0;
 mod matmul;
 mod measure;
+mod pack;
 mod robustness;
 mod scalar;
 mod semantics;

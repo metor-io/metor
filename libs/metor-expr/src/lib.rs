@@ -104,6 +104,8 @@ mod diag;
 mod ir;
 mod lang;
 mod manifest;
+mod pack;
+mod pack_abi;
 mod resolve;
 pub mod state;
 pub mod template;
@@ -113,6 +115,7 @@ pub use manifest::{
     Binding, COMPILER_VERSION, Decl, Field, FnSig, Form, Frame, Init, Layout, Manifest, Port,
     Resample, Stage, StateField, System,
 };
+pub use pack::{ComponentSource, PackProgram, PackResolver, compile_pack};
 pub use resolve::{CompSchema, FrameSchema, Resolver, Unresolved};
 
 /// Decode the manifest a module carries behind `expr_manifest_ptr`.

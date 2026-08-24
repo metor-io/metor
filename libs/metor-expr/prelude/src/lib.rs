@@ -10,11 +10,13 @@
 //!
 //! Two rules shape everything here.
 //!
-//! - **No imports, no allocator.** The module must stay closed, so the panic
-//!   handler traps rather than reporting, and every kernel writes through
-//!   caller-supplied pointers into linear memory. Shapes arrive as arguments
-//!   because the compiler knows them statically; the guest never sizes
-//!   anything at run time.
+//! - **No imports, and no allocation on the evaluation path.** The module
+//!   must stay closed, so a panic traps rather than reporting (wasm32 with
+//!   `panic = "abort"` aborts; nothing unwinds), and every kernel writes
+//!   through caller-supplied pointers into linear memory. Shapes arrive as
+//!   arguments because the compiler knows them statically. The [`pack`]
+//!   module's ring handles do allocate — once, at bind time, before the host
+//!   pins guest memory — and nothing allocates per evaluation.
 //! - **The tensor layer is `nox_array`, not `nox`.** The M0 spike measured
 //!   nox's `Dyn` path and rejected it: `Array<T, Dyn>` is `Vec`-backed, so
 //!   every operation would allocate; `RealField: faer::ComplexField` drags
@@ -32,13 +34,12 @@
 //! ## Where the compiler's buffers go
 //!
 //! This crate reserves nothing for them. Everything above the linker's
-//! `__heap_base` is unclaimed — there is no allocator here to claim it — so
-//! the compiler lays argument, return, and temporary buffers out from that
-//! address, appends data segments for the ones with constant contents, and
-//! raises the memory minimum to cover the rest. The layout is the compiler's,
-//! and `__heap_base` is the linker's own statement of where it may begin.
-
-#![no_std]
+//! `__heap_base` is unclaimed at link time, so the compiler lays argument,
+//! return, and temporary buffers out from that address, appends data segments
+//! for the ones with constant contents, and raises the memory minimum to
+//! cover the rest. The allocator (dlmalloc, serving [`pack`]'s bind-time
+//! handles and `fsw_pack_alloc`) grows fresh pages via `memory.grow`, so it
+//! can never hand out bytes the compiler placed below the raised minimum.
 
 macro_rules! unary {
     ($($name:ident),* $(,)?) => {
@@ -51,7 +52,9 @@ macro_rules! unary {
     };
 }
 
-unary!(sin, cos, tan, asin, acos, atan, exp, log, sinh, cosh, tanh, floor, ceil, round, trunc);
+unary!(
+    sin, cos, tan, asin, acos, atan, exp, log, sinh, cosh, tanh, floor, ceil, round, trunc
+);
 
 /// Two-argument arctangent, quadrant-aware.
 #[unsafe(no_mangle)]
@@ -69,7 +72,11 @@ pub extern "C" fn pow(x: f64, y: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn fmod_floor(x: f64, y: f64) -> f64 {
     let r = libm::fmod(x, y);
-    if r != 0.0 && (r < 0.0) != (y < 0.0) { r + y } else { r }
+    if r != 0.0 && (r < 0.0) != (y < 0.0) {
+        r + y
+    } else {
+        r
+    }
 }
 
 /// Advance a splitmix64 state word in place and return a uniform `f64` in
@@ -94,8 +101,4 @@ pub extern "C" fn rng_unit(state: *mut u64) -> f64 {
 #[cfg(feature = "tensor-kernels")]
 mod tensor;
 
-#[cfg(target_arch = "wasm32")]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
+mod pack;
