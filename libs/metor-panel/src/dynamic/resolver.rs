@@ -5,7 +5,7 @@
 //! components taken before compiling, not a live view of it.
 //!
 //! Snapshotting rather than borrowing is the point. Compilation runs on the
-//! [`DynamicWorker`](crate::node_editor::worker) thread while the UI thread
+//! [`DynamicWorker`](crate::dynamic::worker) thread while the UI thread
 //! keeps touching the db, and a resolver that held the state lock would put
 //! the two in each other's way for as long as a parse takes. A snapshot also
 //! makes the resolution *reproducible*: every name in one compile resolves

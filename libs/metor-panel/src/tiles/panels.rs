@@ -1463,18 +1463,6 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
-    rows.push(Box::new(CommandRow::new("Node Editor", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let editor = cx.new(|cx| crate::node_editor::pane::NodeEditor::new(db.clone(), cx));
-                pane.add_item(Box::new(editor), cx);
-            });
-        })
-    })));
-
     rows.push(Box::new(CommandRow::new("Graph", {
         let db = db.clone();
         let pane = pane.clone();

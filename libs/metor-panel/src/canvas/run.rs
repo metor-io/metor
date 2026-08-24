@@ -25,7 +25,7 @@ use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL, Health};
 use crate::dynamic::ops::{self, db_source, persist};
 use crate::dynamic::resolver::DbResolver;
 use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, op_tag};
-use crate::node_editor::worker::WorkerHandle;
+use crate::dynamic::worker::WorkerHandle;
 
 /// One declaration, running.
 pub struct Running {

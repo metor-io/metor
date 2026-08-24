@@ -23,6 +23,7 @@
 //! this tile's own view state.
 
 pub mod edit;
+pub mod legacy;
 pub mod migrate;
 pub mod model;
 pub mod palette;
@@ -45,7 +46,7 @@ use crate::dynamic::resolver::DbResolver;
 use crate::graph_canvas::{RoutePoints, hit_test_edges, paint_grid, paint_route};
 use crate::graph_layout::Direction;
 use crate::inspector::rows::TextField;
-use crate::node_editor::worker::DynamicWorker;
+use crate::dynamic::worker::DynamicWorker;
 use crate::theme::theme;
 use crate::tiles::PaneItem;
 use crate::views::system_graph::config::{SystemGraphConfig, Viewport};

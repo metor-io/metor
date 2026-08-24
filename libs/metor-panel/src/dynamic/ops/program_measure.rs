@@ -26,7 +26,6 @@ use super::program::{self, Compiled, DEFAULT_FUEL};
 use crate::dynamic::node::{DynamicNode, DynamicNodeExt, NodeReader};
 use crate::dynamic::ops;
 use crate::dynamic::resolver::DbResolver;
-use crate::dynamic::tensor::TypedScalar;
 
 const SOURCE: &str = "wheels.rpm";
 
@@ -205,27 +204,14 @@ async fn a_three_system_chain_against_three_legacy_nodes() {
         program::system(&compiled, 0, vec![program::PortSource::live(bench.source())], DEFAULT_FUEL, None).unwrap();
     let expression = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
 
-    // The same arithmetic as the node graph it replaces.
-    let scale = ops::derive::affine(
-        bench.source(),
-        ops::derive::AffineOp::Scale,
-        TypedScalar::F64(9.81),
-    )
-    .unwrap();
-    let offset =
-        ops::derive::affine(scale, ops::derive::AffineOp::Offset, TypedScalar::F64(3.0)).unwrap();
-    let legacy =
-        ops::derive::affine(offset, ops::derive::AffineOp::Scale, TypedScalar::F64(0.5)).unwrap();
-
+    // Phase 1 priced this against the three `affine` nodes it replaces and
+    // found them within 5% — both dominated by task scheduling rather than by
+    // arithmetic. Those nodes are gone, so what is left to watch is that the
+    // one system has not drifted from the figure that comparison recorded.
     let (expression_ns, seen) = drain_cost(&bench, &expression, 1).await;
     assert_eq!(seen, SAMPLES, "the system dropped samples");
-    let (legacy_ns, seen) = drain_cost(&bench, &legacy, SAMPLES as i64 + 1).await;
-    assert_eq!(seen, SAMPLES, "the legacy chain dropped samples");
 
-    println!(
-        "three-step chain, {SAMPLES} samples: one Python system {expression_ns:.0} ns/sample, \
-         three legacy nodes {legacy_ns:.0} ns/sample"
-    );
+    println!("three-step chain, {SAMPLES} samples: one Python system {expression_ns:.0} ns/sample");
 }
 
 const SAMPLES: usize = 2048;

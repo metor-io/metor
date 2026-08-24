@@ -1,5 +1,10 @@
 //! Clock-typed nodes. A clock emits `Timestamp`s only — value bytes are zero
-//! length. Generators consume a clock and emit one value per tick.
+//! length.
+//!
+//! One clock is left, and it is the one a source system asks for: a
+//! `@system(rate=)` declares how often it wants to run and the host answers
+//! with a fixed-rate tick. A resample stage uses the same thing for its target
+//! clock.
 
 use std::hash::Hash;
 use std::sync::Arc;
@@ -8,7 +13,7 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 
 use crate::dynamic::node::{
-    BuildError, DynamicNode, DynamicNodeExt, NodeImpl, ValueType, default_ring_bytes, hash_id,
+    BuildError, DynamicNode, NodeImpl, ValueType, default_ring_bytes, hash_id,
     op_tag, write_sample,
 };
 
@@ -46,27 +51,4 @@ pub fn fixed_rate(hz: f64) -> Result<Arc<dyn DynamicNode>, BuildError> {
         },
     );
     Ok(node)
-}
-
-/// Treat another node's per-sample timestamps as a clock. Useful for binding
-/// a generator to whatever rate an upstream component is ticking at.
-pub fn clock_of(source: Arc<dyn DynamicNode>) -> Arc<dyn DynamicNode> {
-    let id = hash_id(op_tag::CLOCK_OF, &[source.id()], |_| {});
-    let mut reader = source.subscribe();
-    NodeImpl::spawn(
-        id,
-        ValueType::Clock,
-        Some(id),
-        default_ring_bytes(0),
-        move |output| async move {
-            // hold `source` alive for the lifetime of the task
-            let _source = source;
-            loop {
-                let grant = reader.next().await;
-                for (ts, _) in grant.samples() {
-                    write_sample(&output, ts, &[]);
-                }
-            }
-        },
-    )
 }

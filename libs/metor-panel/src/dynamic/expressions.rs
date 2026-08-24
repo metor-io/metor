@@ -67,7 +67,7 @@ use metor_proto::types::ComponentId;
 use crate::dynamic::{BuildError, DynamicNode, NodeId};
 use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL};
 use crate::dynamic::resolver::DbResolver;
-use crate::node_editor::worker::DynamicWorker;
+use crate::dynamic::worker::DynamicWorker;
 
 /// The prefix that turns a picker's search field into an expression field.
 pub const SIGIL: char = '=';

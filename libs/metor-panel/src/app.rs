@@ -1103,11 +1103,8 @@ impl PanelApp {
                 ItemRegistry::init(cx);
                 crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
                 crate::views::dashboard::WidgetRegistry::init(cx);
-                crate::dynamic::DynamicRegistry::init(cx);
                 crate::dynamic::expressions::Expressions::init(cx);
-                crate::node_editor::GraphCoordinator::init(cx);
-                crate::node_editor::DynamicWorker::init(cx);
-                crate::node_editor::inspector_rows::register_inspector_rows(cx);
+                crate::dynamic::worker::DynamicWorker::init(cx);
                 crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::logs::LogStore::init(db.clone(), cx);
@@ -1189,15 +1186,6 @@ impl PanelApp {
                     KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
                     KeyBinding::new("secondary-l", ToggleCmdLock, None),
                     KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
-                    // Bare keys again, so they answer to the same rule:
-                    // editing a node's inline arg field must not also delete
-                    // the node around it.
-                    KeyBinding::new("delete", crate::node_editor::DeleteSelected, Some(DELETE_NODE)),
-                    KeyBinding::new(
-                        "backspace",
-                        crate::node_editor::DeleteSelected,
-                        Some(DELETE_NODE),
-                    ),
                 ]);
 
                 let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
@@ -1297,9 +1285,6 @@ pub const TEXT_INPUT: &str = "TextInput";
 pub const NOT_TYPING: &str = "!TextInput && !Transient";
 
 /// Deleting the selected node: only in a node editor, and never while an
-/// inline argument field has focus.
-pub const DELETE_NODE: &str = "NodeEditor && !TextInput";
-
 /// `Global` so palette callbacks can fetch it without threading.
 fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     use crate::tiles::ItemRegistry as PaneItemRegistry;
@@ -1311,11 +1296,6 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
     register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
-    register_panel::<crate::node_editor::pane::NodeEditor>(
-        &mut reg,
-        db.clone(),
-        crate::node_editor::pane::NodeEditor::from_config,
-    );
     register_panel::<crate::canvas::GraphCanvas>(
         &mut reg,
         db.clone(),
@@ -1344,6 +1324,28 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
             ..Default::default()
         };
         let db = db_program.clone();
+        let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
+        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
+    });
+
+    // A layout that still names the node editor opens on the graph tile with
+    // its graph converted to a program — one declaration per node, positions
+    // carried across. It opens on the *text*, because a conversion is
+    // something to read before it is something to keep, and anything the
+    // converter could not express rides at the top as a comment.
+    let db_nodes = db.clone();
+    reg.register_erased("node_editor", move |state, cx| {
+        let saved: crate::canvas::legacy::NodeEditorConfig =
+            serde_json::from_str(state).unwrap_or_default();
+        let db = db_nodes.clone();
+        let converted = crate::canvas::migrate::convert(&saved, &db);
+        let cfg = crate::canvas::GraphCanvasConfig {
+            program: crate::canvas::ProgramState {
+                source: converted.annotated(),
+                text: true,
+            },
+            ..Default::default()
+        };
         let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
         Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
     });
@@ -1415,7 +1417,7 @@ fn set_dock_icon() {}
 
 #[cfg(test)]
 mod keybinding_tests {
-    use super::{DELETE_NODE, NOT_TYPING, TEXT_INPUT};
+    use super::{NOT_TYPING, TEXT_INPUT};
     use gpui::{KeyBindingContextPredicate, KeyContext};
 
     /// The focus path, root first — the order gpui evaluates a predicate over.
@@ -1470,15 +1472,13 @@ mod keybinding_tests {
         assert!(!fires(NOT_TYPING, &["AppRoot", "Transient"]));
     }
 
-    /// Backspace and Delete are bare keys too, and answer to the same rule.
+    /// Deleting a card is the graph tile's own key rather than an action, and
+    /// it answers to the same rule: the canvas declares `TextInput` only while
+    /// its editor is showing, so a keystroke meant for the text never reaches
+    /// the graph.
     #[test]
-    fn deleting_a_node_never_fires_from_inside_a_field() {
-        assert!(fires(DELETE_NODE, &["AppRoot", "NodeEditor"]));
-        assert!(!fires(
-            DELETE_NODE,
-            &["AppRoot", "NodeEditor", "RowList TextInput"]
-        ));
-        // Outside a node editor there is nothing to delete.
-        assert!(!fires(DELETE_NODE, &["AppRoot", "GraphCanvas TextInput"]));
+    fn deleting_a_card_never_fires_from_inside_a_field() {
+        assert!(fires(NOT_TYPING, &["AppRoot", "GraphCanvas"]));
+        assert!(!fires(NOT_TYPING, &["AppRoot", "GraphCanvas TextInput"]));
     }
 }

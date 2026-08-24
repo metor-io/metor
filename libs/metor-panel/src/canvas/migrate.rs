@@ -45,21 +45,40 @@ use std::collections::HashMap;
 use metor_db::DB;
 use metor_proto::types::{ComponentId, PrimType};
 
-use crate::dynamic::ops::compose::BinaryOp;
-use crate::dynamic::ops::derive::{AffineOp, ThresholdOp, UnaryOp};
-use crate::dynamic::ops::generators::Waveform;
+use crate::canvas::legacy::{
+    AffineOp, BinaryOp, NodeEditorConfig, NodeSpec, SerializedNode, ThresholdOp, UnaryOp, Waveform,
+};
 use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
-use crate::node_editor::config::{NodeEditorConfig, SerializedNode};
-use crate::node_editor::spec::NodeSpec;
 
 /// What a conversion produced.
 pub struct Converted {
     /// The program, ready to compile.
     pub source: String,
-    /// One line per node that could not be expressed, for the prompt to show
-    /// before anything is applied.
+    /// One line per node that could not be expressed.
     pub refused: Vec<String>,
+}
+
+impl Converted {
+    /// The program with anything the converter could not express written at
+    /// the top as comments.
+    ///
+    /// A conversion is something to read before it is something to keep, and a
+    /// comment is the review surface that needs no new machinery: it is
+    /// visible, it compiles to nothing, and it stays until the operator has
+    /// dealt with it.
+    pub fn annotated(&self) -> String {
+        if self.refused.is_empty() {
+            return self.source.clone();
+        }
+        let mut out = String::from("# Converted from a node graph. Not carried across:\n");
+        for why in &self.refused {
+            out.push_str(&format!("#   {why}\n"));
+        }
+        out.push('\n');
+        out.push_str(&self.source);
+        out
+    }
 }
 
 /// Convert a saved graph, resolving component ids through the db the way the
