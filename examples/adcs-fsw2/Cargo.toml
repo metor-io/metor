@@ -33,3 +33,5 @@ serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.13"
 # The eclipse/momentum/sequences tests patch the evaluated target's params value trees.
 serde_json = "1.0"
+# The Python-system oracle test mirrors the compiled output frame host-side.
+zerocopy = { version = "0.8.2", features = ["derive"] }

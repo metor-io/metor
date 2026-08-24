@@ -72,11 +72,9 @@ fn build_static(phase: f64) -> Option<Coordinator> {
         panic!("plant carries a params value tree");
     };
     params.insert("init_orbit_phase".into(), phase.into());
-    for spec in &mut wiring.systems {
-        // Static rlib systems, in-process (test binaries can't host a process worker).
-        spec.artifact = None;
-        spec.process = false;
-    }
+    // Static rlib systems, in-process (test binaries can't host a process worker);
+    // the compiled Python system keeps its wasm artifact.
+    common::link_statically(&mut wiring);
     for slot in &mut wiring.slots {
         slot.initial = None;
     }

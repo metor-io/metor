@@ -140,7 +140,7 @@ fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorR
     };
 
     if let Some(sys) = wiring.systems.iter().find(|s| s.name == id.as_str()) {
-        return system_rows(sys);
+        return system_rows(sys, wiring);
     }
     if let Some(slot) = wiring.slots.iter().find(|s| s.name == id.as_str()) {
         return slot_rows(slot);
@@ -148,7 +148,7 @@ fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorR
     scope_or_coordinator_rows(&id, wiring)
 }
 
-fn system_rows(sys: &metor_fsw_2::ir::SystemSpec) -> Vec<Box<dyn InspectorRow>> {
+fn system_rows(sys: &metor_fsw_2::ir::SystemSpec, wiring: &Wiring) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
     rows.push(Box::new(HeaderRow::new("System")));
     rows.push(text_row("Name", sys.name.clone()));
@@ -167,7 +167,37 @@ fn system_rows(sys: &metor_fsw_2::ir::SystemSpec) -> Vec<Box<dyn InspectorRow>> 
     if let Some(src) = src_summary(&sys.src) {
         rows.push(text_row("Source", src));
     }
+    if let Some(source) = program_source(sys, wiring) {
+        // A vehicle Python system: its declaration, verbatim. Read-only like
+        // every row here — the source of truth is `target.py`, and edits go
+        // through it.
+        rows.push(Box::new(HeaderRow::new("Python")));
+        rows.push(text_row("Declaration", source));
+    }
     rows
+}
+
+/// The captured `@system` declaration behind a program-built spec: the slice
+/// of [`Wiring::program`]'s assembled source from the declaration's offset to
+/// the next declaration's (or the end).
+fn program_source(sys: &metor_fsw_2::ir::SystemSpec, wiring: &Wiring) -> Option<String> {
+    let program_artifact = wiring
+        .artifacts
+        .iter()
+        .any(|a| sys.artifact.as_deref() == Some(a.id.as_str()) && a.is_program());
+    if !program_artifact {
+        return None;
+    }
+    let program = wiring.program.as_ref()?;
+    let entry = sys.ty.as_deref().unwrap_or(&sys.name);
+    let at = program.decls.iter().position(|d| d.name == entry)?;
+    let start = program.decls[at].offset as usize;
+    let end = program
+        .decls
+        .get(at + 1)
+        .map(|d| d.offset as usize)
+        .unwrap_or(program.source.len());
+    Some(program.source.get(start..end)?.trim_end().to_string())
 }
 
 fn slot_rows(slot: &metor_fsw_2::ir::SlotSpec) -> Vec<Box<dyn InspectorRow>> {

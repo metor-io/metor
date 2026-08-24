@@ -14,8 +14,9 @@
 use metor_fsw_2::ir::ArtifactKind;
 use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
-    Artifact, ClockSpec, Frame, Input, ParamSource, ProgramDecl, ProgramSpec, StopReason,
-    SystemSpec, Wiring, WiringBuilder,
+    AllowedOccupantSpec, Artifact, ClockSpec, Frame, InitialOccupantSpec, Input, ParamSource,
+    ProgramDecl, ProgramSpec, SlotInitState, SlotSpec, StopReason, SystemSpec, Wiring,
+    WiringBuilder,
     wiring::{BuildOptions, Registry, provision_artifacts, resolve},
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -225,4 +226,71 @@ struct SteadyOut {
     #[metor_fsw(timestamp)]
     timestamp: Timestamp,
     steady: f64,
+}
+
+/// The same artifact shape mounts as a slot occupant through the existing
+/// runtime-slot machinery: the occupant loads at startup, gets the mount
+/// tail appended (which the guest simply never opens), and publishes through
+/// the slot's rings.
+#[test]
+fn a_python_entry_mounts_as_a_slot_occupant() {
+    const SRC: &str = "@system(rate=60.0)\ndef beat() -> f64:\n    return 4.25\n";
+    let mut wiring = python_wiring("pyslot_program", SRC, &["beat"], 120.0);
+    // The entry occupies a slot instead of a wired position.
+    wiring
+        .systems
+        .retain(|s| s.artifact.as_deref() != Some("pyslot_program"));
+    wiring.slots.push(SlotSpec {
+        name: "mode".into(),
+        inputs: Vec::new(),
+        outputs: vec!["beat".into()],
+        allow: vec![AllowedOccupantSpec {
+            occupant: "beat".into(),
+            artifact: Some("pyslot_program".into()),
+            params: ParamSource::None,
+            src: None,
+        }],
+        initial: Some(InitialOccupantSpec {
+            occupant: "beat".into(),
+            state: SlotInitState::Running,
+        }),
+        process: false,
+        src: None,
+        scope: None,
+    });
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("compiles");
+
+    let mut coord = resolve(&wiring, &Registry::with_builtins())
+        .unwrap_or_else(|e| panic!("a Python slot occupant resolves: {e}"));
+    let mut beat_view: Input<BeatOnly> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("mode.beat"))
+            .expect("the slot output is registered")
+            .expect("a reader slot is available"),
+    );
+    let coord = stellarator::run(|| async move {
+        coord.run_for(8).await;
+        coord
+    });
+    assert!(coord.stopped().is_empty(), "{:?}", coord.stopped());
+
+    let mut beats = Vec::new();
+    beat_view
+        .drain(|record| beats.push(record.get().beat))
+        .expect("slot ring intact");
+    assert_eq!(
+        beats,
+        [4.25, 4.25, 4.25, 4.25],
+        "rate=60 against 120 Hz fires every 2nd cycle through the slot"
+    );
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "beat")]
+struct BeatOnly {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    beat: f64,
 }

@@ -47,6 +47,7 @@ from metor_config import (
     Uplink,
     VectorMarker,
     band,
+    f64,
     node,
     system,
 )
@@ -176,7 +177,7 @@ def build_target() -> Target:
 
     @system("block.plant.sensors.gyro_b")
     @node(x=420, y=180)
-    def gyro_norm(gyro_b):
+    def gyro_norm(gyro_b) -> f64:
         return (gyro_b @ gyro_b) ** 0.5
 
     return m

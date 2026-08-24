@@ -729,37 +729,48 @@ fn resolve_rejects_an_unknown_wasm_entry() {
 struct ImuResolver;
 
 const GYRO_PATH: &str = "imu.sensors.gyro_b";
+const TEMP_PATH: &str = "imu.sensors.temp";
 
-fn gyro_source() -> metor_expr::ComponentSource {
+fn imu_source(path: &str) -> Option<metor_expr::ComponentSource> {
     use metor_proto::types::{ComponentId, PrimType};
-    metor_expr::ComponentSource {
+    let (name, prim, shape, offset): (_, _, &[usize], _) = match path {
+        GYRO_PATH => ("sensors.gyro_b", PrimType::F64, &[3], 8),
+        // A narrower element type, so the differential also exercises the
+        // guest's f32 → slot conversion.
+        TEMP_PATH => ("sensors.temp", PrimType::F32, &[], 32),
+        _ => return None,
+    };
+    Some(metor_expr::ComponentSource {
         instance: "imu".into(),
         port_name: "sensors".into(),
         frame_id: ComponentId::new("sensors"),
-        max_size: 32,
-        component_id: ComponentId::new("sensors.gyro_b"),
-        component_name: "sensors.gyro_b".into(),
-        prim: PrimType::F64,
-        shape: vec![3],
-        offset: 8,
-    }
+        max_size: 36,
+        component_id: ComponentId::new(name),
+        component_name: name.into(),
+        prim,
+        shape: shape.to_vec(),
+        offset,
+    })
 }
 
 impl metor_expr::Resolver for ImuResolver {
     fn component(&self, path: &str) -> Option<metor_expr::CompSchema> {
-        (path == GYRO_PATH).then(|| metor_expr::CompSchema {
-            ty: metor_expr::Ty::Tensor {
+        let source = imu_source(path)?;
+        let ty = match source.shape.as_slice() {
+            [] => metor_expr::Ty::F64,
+            shape => metor_expr::Ty::Tensor {
                 dtype: metor_expr::Dtype::F64,
-                shape: vec![3],
+                shape: shape.to_vec(),
             },
-        })
+        };
+        Some(metor_expr::CompSchema { ty })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {
-        GYRO_PATH
-            .ends_with(&format!(".{name}"))
-            .then(|| GYRO_PATH.to_string())
+        [GYRO_PATH, TEMP_PATH]
             .into_iter()
+            .filter(|p| p.ends_with(&format!(".{name}")))
+            .map(str::to_string)
             .collect()
     }
 
@@ -770,7 +781,7 @@ impl metor_expr::Resolver for ImuResolver {
 
 impl metor_expr::PackResolver for ImuResolver {
     fn component_source(&self, path: &str) -> Option<metor_expr::ComponentSource> {
-        (path == GYRO_PATH).then(gyro_source)
+        imu_source(path)
     }
 }
 
@@ -865,4 +876,103 @@ fn a_compiled_python_system_runs_through_the_pack_host() {
     pack.shutdown(state).expect("shutdown");
     pack.destroy(state).expect("destroy");
     pack.close().expect("close");
+}
+
+/// The bit-parity differential (plan WP5): one module, two hosts. The panel
+/// drives the expr export family — write the argument frames, call
+/// `<system>_eval`, read `<system>_ret_ptr` — while the vehicle feeds
+/// producer records through the pack ABI's rings; the output frame bytes
+/// must be identical to the bit. A multi-field frame both ways (a tensor
+/// beside a scalar, an `f32` source component), since the panel's own use
+/// never exercises more than one field.
+#[test]
+fn the_expr_and_pack_hosts_produce_identical_frames() {
+    let source = "\
+class Est(Frame):
+    norm: f64
+    doubled: Tensor[f64, 3]
+
+@system(\"imu.sensors.gyro_b\", \"imu.sensors.temp\")
+def est(gyro_b, temp) -> Est:
+    return Est(norm=(gyro_b @ gyro_b) ** 0.5 + temp, doubled=gyro_b * 2.0)
+";
+    let program = metor_expr::compile_pack(source, &ImuResolver, 120.0).expect("compiles");
+    const FRAME_BYTES: usize = 8 + 24; // norm, then doubled
+
+    // --- the vehicle host: records in, records out --------------------------
+    let mut pack = WasmPack::open(&program.wasm, AMPLE_FUEL).expect("opens");
+    let state = pack.create(0, 0, &[]).expect("create");
+    let cfg = Config {
+        capacity: capacity_for(64, 8),
+        max_readers: 2,
+    };
+    let input = pack.add_ring(cfg, ROLE_INPUT).expect("input ring");
+    let output = pack.add_ring(cfg, ROLE_OUTPUT).expect("output ring");
+    pack.bind_init(state, &[input], &[output], "est").expect("bind");
+    pack.pin_memory();
+    let base = pack.memory_base();
+    // SAFETY: both regions sit inside pinned guest memory for the test's life.
+    let in_ring = unsafe { RingBuffer::attach_raw(base.add(input.offset as usize), input.len) }
+        .expect("attach input");
+    let mut writer = in_ring.writer(NoWake).expect("writer");
+    let out_ring = unsafe { RingBuffer::attach_raw(base.add(output.offset as usize), output.len) }
+        .expect("attach output");
+    let mut view = out_ring.view(NoWake).expect("view");
+
+    // --- the panel host: argument frames in, the return frame out -----------
+    let engine = wasmi::Engine::default();
+    let module = wasmi::Module::new(&engine, &program.wasm[..]).expect("validates");
+    let mut store = wasmi::Store::new(&engine, ());
+    let instance = wasmi::Linker::new(&engine)
+        .instantiate_and_start(&mut store, &module)
+        .expect("instantiates");
+    let memory = instance.get_memory(&store, "memory").expect("memory");
+    let accessor = |store: &mut wasmi::Store<()>, name: &str, arg: i32| -> usize {
+        let f: wasmi::TypedFunc<i32, i32> = instance.get_typed_func(&*store, name).expect(name);
+        f.call(store, arg).expect(name) as usize
+    };
+    let gyro_at = accessor(&mut store, "est_arg_ptr", 0);
+    let temp_at = accessor(&mut store, "est_arg_ptr", 1);
+    let ret: wasmi::TypedFunc<(), i32> = instance.get_typed_func(&store, "est_ret_ptr").unwrap();
+    let ret_at = ret.call(&mut store, ()).expect("ret_ptr") as usize;
+    let eval: wasmi::TypedFunc<i64, i32> = instance.get_typed_func(&store, "est_eval").unwrap();
+
+    for (cycle, (gyro, temp)) in [
+        ([0.1f64, -2.5, 3.75], 20.5f32),
+        ([1.0, 2.0, 3.0], -4.25),
+        ([-0.001, 0.0, 12.5], 0.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = cycle as i64 + 1;
+        // Vehicle: one producer record, [ts][gyro f64 ×3][temp f32].
+        let mut record = Vec::new();
+        record.extend_from_slice(&now.to_le_bytes());
+        for v in gyro {
+            record.extend_from_slice(&v.to_le_bytes());
+        }
+        record.extend_from_slice(&temp.to_le_bytes());
+        writer.try_write(&record).expect("input record");
+        assert_eq!(pack.execute(state, now as u64).unwrap(), FswStatus::Running);
+        let grant = view.try_latest().expect("intact").expect("published");
+        assert_eq!(grant.len(), 8 + FRAME_BYTES);
+        let vehicle = grant[8..].to_vec();
+        drop(grant);
+
+        // Panel: the same values through the argument frames.
+        let mut gyro_bytes = Vec::new();
+        for v in gyro {
+            gyro_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        memory.write(&mut store, gyro_at, &gyro_bytes).unwrap();
+        memory
+            .write(&mut store, temp_at, &f64::from(temp).to_le_bytes())
+            .unwrap();
+        eval.call(&mut store, now).expect("eval");
+        let mut panel = vec![0u8; FRAME_BYTES];
+        memory.read(&store, ret_at, &mut panel).unwrap();
+
+        assert_eq!(vehicle, panel, "cycle {cycle}: the two hosts diverged");
+    }
 }

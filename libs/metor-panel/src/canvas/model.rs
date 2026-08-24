@@ -142,7 +142,14 @@ pub fn build(
     if let Some(wiring) = wiring {
         let graph = layout::layout(wiring, collapsed, direction);
         for node in &graph.nodes {
-            let pos = overrides.get(&node.id).copied().unwrap_or(node.pos);
+            // A hand-drag wins, then the declaration-site position the IR
+            // carries (`@node(x=, y=)` / `Target.add(node=)`), then the
+            // engine's auto-layout.
+            let pos = overrides
+                .get(&node.id)
+                .copied()
+                .or_else(|| ir_position(wiring, node.kind, node.source_index))
+                .unwrap_or(node.pos);
             let height = card_size(node.kind).1;
             native_bottom = native_bottom.max(pos.1 + height);
             model.cards.push(Card {
@@ -377,6 +384,14 @@ fn describe(port: &metor_expr::Port) -> String {
     match &port.bindings[0] {
         Binding::Component(path) => path.clone(),
         Binding::Produced { .. } | Binding::Resampled { .. } => port.frame.name.clone(),
+    }
+}
+
+/// The declaration-site canvas position a wiring spec carries, if any.
+fn ir_position(wiring: &Wiring, kind: GraphNodeKind, index: Option<usize>) -> Option<(f32, f32)> {
+    match (kind, index) {
+        (GraphNodeKind::System, Some(i)) => wiring.systems[i].layout,
+        _ => None,
     }
 }
 

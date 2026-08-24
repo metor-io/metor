@@ -84,10 +84,15 @@ fn python_target_packages_and_runs() {
         "python provenance rides along"
     );
     for artifact in &wiring.artifacts {
-        let cdylib = metor_fsw_2::wiring::cdylib_file_name(&artifact.lib);
+        let member = match artifact.kind {
+            metor_fsw_2::ir::ArtifactKind::Wasm => format!("{}.wasm", artifact.id),
+            metor_fsw_2::ir::ArtifactKind::Cdylib => {
+                metor_fsw_2::wiring::cdylib_file_name(&artifact.lib)
+            }
+        };
         assert!(
-            dir.join(&cdylib).exists(),
-            "cdylib `{cdylib}` copied into the bundle"
+            dir.join(&member).exists(),
+            "artifact `{member}` copied into the bundle"
         );
     }
 

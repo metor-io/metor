@@ -31,6 +31,9 @@ from metor_config import (
     VSplit,
     VectorMarker,
     band,
+    f64,
+    node,
+    system,
 )
 from adcs_pack import Ctrl, Nav, Plant
 from adcs_seqs import commissioning, safe_mode
@@ -66,6 +69,15 @@ plant = m.add(
 )
 nav = m.add("nav", Nav(meas_sigma=0.02))
 ctrl = m.add("ctrl", Ctrl(q_weight=5.0, r_weight=8.0, k_desat=0.0005, k_detumble=0.00005))
+
+# A Python system, compiled at build time into an ordinary wasm pack entry
+# and run by the vehicle like any other cyclic system: the measured body-rate
+# magnitude, published as `cube_sat.gyro_norm.gyro_norm`.
+@system("plant.sensors.gyro_b")
+@node(x=980, y=40)
+def gyro_norm(gyro_b) -> f64:
+    return (gyro_b @ gyro_b) ** 0.5
+
 
 alarms = m.add(
     "alarms",

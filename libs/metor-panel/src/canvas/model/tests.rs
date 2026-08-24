@@ -166,3 +166,77 @@ fn an_unknown_component_is_not_an_edge() {
     assert!(model.edges.is_empty());
     assert_eq!(model.card("scaled").unwrap().inputs[0].detail, "wheels.rpm");
 }
+
+/// A native card sits where the IR's declaration-site layout says, unless a
+/// hand-drag overrides it; without either, the auto-layout decides.
+#[test]
+fn ir_layout_places_a_native_card_and_overrides_still_win() {
+    use metor_fsw_2::ir::{
+        ClockSpec, CoordinatorSpec, IR_VERSION, ParamSource, SystemSpec, Wiring,
+    };
+    let wiring = Wiring {
+        ir_version: IR_VERSION,
+        coordinator: CoordinatorSpec {
+            cycle_rate: 100.0,
+            default_depth: None,
+            clock: ClockSpec::Wall,
+            namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
+        },
+        artifacts: Vec::new(),
+        states: Vec::new(),
+        systems: vec![
+            SystemSpec {
+                name: "placed".into(),
+                ty: Some("Demo".into()),
+                artifact: None,
+                params: ParamSource::None,
+                process: false,
+                src: None,
+                scope: None,
+                attach: None,
+                layout: Some((420.0, 180.0)),
+            },
+            SystemSpec {
+                name: "auto".into(),
+                ty: Some("Demo".into()),
+                artifact: None,
+                params: ParamSource::None,
+                process: false,
+                src: None,
+                scope: None,
+                attach: None,
+                layout: None,
+            },
+        ],
+        slots: Vec::new(),
+        edges: Vec::new(),
+        scopes: Vec::new(),
+        program: None,
+    };
+    let model = build(
+        None,
+        Some(&wiring),
+        &BTreeSet::new(),
+        Direction::LeftRight,
+        &Overrides::new(),
+    );
+    assert_eq!(model.card("placed").unwrap().pos, (420.0, 180.0));
+    assert_ne!(model.card("auto").unwrap().pos, (420.0, 180.0));
+
+    let mut overrides = Overrides::new();
+    overrides.insert("placed".into(), (10.0, 20.0));
+    let model = build(
+        None,
+        Some(&wiring),
+        &BTreeSet::new(),
+        Direction::LeftRight,
+        &overrides,
+    );
+    assert_eq!(
+        model.card("placed").unwrap().pos,
+        (10.0, 20.0),
+        "a hand-drag beats the declaration-site position"
+    );
+}

@@ -193,7 +193,7 @@ fn maximal() -> Wiring {
             },
         ],
         program: Some(ProgramSpec {
-            source: "@system(\"block.plant.sensors.gyro_b\")\ndef omega_norm(gyro_b):\n    \
+            source: "@system(\"block.plant.sensors.gyro_b\")\ndef omega_norm(gyro_b) -> f64:\n    \
                      return (gyro_b @ gyro_b) ** 0.5\n\n"
                 .into(),
             decls: vec![ProgramDecl {

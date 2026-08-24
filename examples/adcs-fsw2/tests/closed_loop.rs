@@ -72,13 +72,10 @@ struct Measure {
 fn build_static() -> Coordinator {
     let mut wiring = eval_python_target(&target_py()).expect("evaluate target.py");
     provision_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
-    for spec in &mut wiring.systems {
-        // plant/nav/ctrl: link statically via the Registry rather than dlopen. Process
-        // isolation needs an artifact to spawn, so it drops with it — in-proc static systems
-        // are the parity reference.
-        spec.artifact = None;
-        spec.process = false;
-    }
+    // plant/nav/ctrl: link statically via the Registry rather than dlopen (in-proc static
+    // systems are the parity reference); the compiled Python system keeps its wasm artifact
+    // in both runs, like the slot's sequence cdylibs.
+    common::link_statically(&mut wiring);
     let mut registry = Registry::with_builtins();
     registry.register_pack(adcs_systems::pack());
     resolve(&wiring, &registry).expect("resolve the target with static systems")

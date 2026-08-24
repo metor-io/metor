@@ -252,7 +252,7 @@
     }
   ],
   "program": {
-    "source": "@system(\"block.plant.sensors.gyro_b\")\n@node(x=420, y=180)\ndef gyro_norm(gyro_b):\n    return (gyro_b @ gyro_b) ** 0.5\n\n",
+    "source": "@system(\"block.plant.sensors.gyro_b\")\n@node(x=420, y=180)\ndef gyro_norm(gyro_b) -> f64:\n    return (gyro_b @ gyro_b) ** 0.5\n\n",
     "decls": [
       {
         "name": "gyro_norm",
