@@ -641,6 +641,57 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            Expr::Window {
+                state,
+                value,
+                elems,
+                len,
+            } => {
+                // Shift the ring down by one sample and write the new one at
+                // the end, so the newest is last. Both addresses are
+                // constants, so the shift is one `memory.copy`.
+                let at = self.layout.at(*state);
+                let stride = elems * 8;
+                self.push(Instruction::I32Const(at as i32));
+                self.push(Instruction::I32Const((at + stride) as i32));
+                self.push(Instruction::I32Const(((len - 1) * stride) as i32));
+                self.push(Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+                let last = at + (len - 1) * stride;
+                self.expr(value);
+                match *elems {
+                    1 => {
+                        let slot = self.acquire(ValType::F64);
+                        self.push(Instruction::LocalSet(slot));
+                        self.push(Instruction::I32Const(last as i32));
+                        self.push(Instruction::LocalGet(slot));
+                        self.push(Instruction::F64Store(mem_arg(3)));
+                        self.release(ValType::F64, slot);
+                    }
+                    _ => self.copy(last, value.buffer(), stride),
+                }
+            }
+            Expr::Fft {
+                dest,
+                source,
+                scratch,
+                len,
+                groups,
+            } => {
+                self.expr(source);
+                for at in [
+                    self.layout.at(source.buffer()),
+                    self.layout.at(*dest),
+                    self.layout.at(*scratch),
+                ] {
+                    self.push(Instruction::I32Const(at as i32));
+                }
+                self.push(Instruction::I32Const(*len as i32));
+                self.push(Instruction::I32Const(*groups as i32));
+                self.push(Instruction::Call(self.kernels["k_fft"]));
+            }
             Expr::BufferCall {
                 index,
                 args,

@@ -159,6 +159,63 @@ pub extern "C" fn k_matmul(a: u32, b: u32, out: u32, m: u32, k: u32, n: u32) {
     }
 }
 
+/// One-sided magnitude spectrum of `groups` real signals of length `n`,
+/// written as `n / 2 + 1` magnitudes each.
+///
+/// Iterative radix-2 Cooley–Tukey: bit-reverse the input into `scratch` as
+/// interleaved (re, im), then log2(n) stages of butterflies with twiddles from
+/// libm. `n` is a power of two — the checker refuses anything else — and the
+/// compiler supplies `scratch`, `2 * n` doubles wide, because the guest has no
+/// allocator to size one at run time.
+///
+/// The layout is the compatibility contract: this is what the panel's Fft node
+/// published, so a plot reading `|X[k]|` for `k` in `0..=n/2` reads the new
+/// output unchanged.
+#[unsafe(no_mangle)]
+pub extern "C" fn k_fft(src: u32, out: u32, scratch: u32, n: u32, groups: u32) {
+    let (n, groups) = (n as usize, groups as usize);
+    let half = n / 2 + 1;
+    let input = unsafe { core::slice::from_raw_parts(src as *const f64, groups * n) };
+    let output = unsafe { core::slice::from_raw_parts_mut(out as *mut f64, groups * half) };
+    let work = unsafe { core::slice::from_raw_parts_mut(scratch as *mut f64, 2 * n) };
+
+    let bits = n.trailing_zeros();
+    for group in 0..groups {
+        let signal = &input[group * n..][..n];
+        for (i, x) in signal.iter().enumerate() {
+            let j = (i as u32).reverse_bits() >> (32 - bits);
+            work[2 * j as usize] = *x;
+            work[2 * j as usize + 1] = 0.0;
+        }
+
+        let mut span = 2;
+        while span <= n {
+            let step = -2.0 * core::f64::consts::PI / span as f64;
+            for block in (0..n).step_by(span) {
+                for k in 0..span / 2 {
+                    let angle = step * k as f64;
+                    let (wr, wi) = (libm::cos(angle), libm::sin(angle));
+                    let (a, b) = (2 * (block + k), 2 * (block + k + span / 2));
+                    let (br, bi) = (work[b], work[b + 1]);
+                    let (tr, ti) = (wr * br - wi * bi, wr * bi + wi * br);
+                    let (ar, ai) = (work[a], work[a + 1]);
+                    work[a] = ar + tr;
+                    work[a + 1] = ai + ti;
+                    work[b] = ar - tr;
+                    work[b + 1] = ai - ti;
+                }
+            }
+            span *= 2;
+        }
+
+        let bin = &mut output[group * half..][..half];
+        for (k, slot) in bin.iter_mut().enumerate() {
+            let (re, im) = (work[2 * k], work[2 * k + 1]);
+            *slot = libm::sqrt(re * re + im * im);
+        }
+    }
+}
+
 /// Sum of `n` elements — the reduction `dot` cannot express.
 #[unsafe(no_mangle)]
 pub extern "C" fn k_sum(a: u32, n: u32) -> f64 {

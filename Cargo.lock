@@ -9421,6 +9421,7 @@ dependencies = [
  "nox",
  "num-traits",
  "postcard",
+ "rustfft",
  "rustpython-parser",
  "serde",
  "wasm-encoder",

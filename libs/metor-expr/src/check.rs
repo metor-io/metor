@@ -295,7 +295,7 @@ fn check_inner(
             buffer_abi: frame.buffer_abi,
             output: None,
             now: None,
-            rng: None,
+            synthetic: Vec::new(),
             locals,
             names,
             loop_depth: 0,
@@ -494,7 +494,7 @@ fn system(
             anonymous: decl.anonymous_output,
         }),
         now: Some(0),
-        rng: None,
+        synthetic: Vec::new(),
         locals: vec![Ty::I64],
         names,
         loop_depth: 0,
@@ -534,17 +534,20 @@ fn system(
     };
     let locals = body.locals;
 
-    // `random()` keeps a word of state, and the body is what says whether it
-    // needs one — so its slot is allocated where it is first asked for and
-    // joins the declared fields here, before the guard closes the list.
+    // `random()` keeps a word and `window` keeps a ring, and the body is what
+    // says whether either is needed — so their slots are allocated where they
+    // are first asked for and join the declared fields here, before the guard
+    // closes the list. Both start at zero, which is why neither costs a seed
+    // instruction: a fresh linear memory already holds it, and a window
+    // preloaded with zeros is what the panel's Window node published.
     let mut state = decl.state.iter().map(|s| s.field.clone()).collect::<Vec<_>>();
-    if let Some(rng) = body.rng {
-        state_buffers.push(rng);
-        state.push(manifest::StateField {
-            name: crate::state::RNG_FIELD.to_string(),
-            ty: Ty::I64,
-            default: crate::Init::I64(0),
-        });
+    for (name, ty, buf) in body.synthetic {
+        state_buffers.push(buf);
+        let default = match ty {
+            Ty::I64 => crate::Init::I64(0),
+            _ => crate::Init::Fill(0.0),
+        };
+        state.push(manifest::StateField { name, ty, default });
     }
     // The seed guard sits one past the state fields, so it is reachable
     // through the same accessor and restores like any other slot.
@@ -802,9 +805,11 @@ struct FnChecker<'a> {
     output: Option<Output>,
     /// The slot `now()` reads, in a system.
     now: Option<u32>,
-    /// The state word `random()` advances, allocated when it is first asked
-    /// for so that a system which never calls it carries no state.
-    rng: Option<BufId>,
+    /// State the body asked for that no `State` class declared: the word
+    /// `random()` advances, and one ring per `window` call site. Each is
+    /// allocated where it is first needed, so a system that asks for neither
+    /// carries no state at all.
+    synthetic: Vec<(String, Ty, BufId)>,
     locals: Vec<Ty>,
     names: HashMap<String, Binding>,
     loop_depth: u32,
@@ -2119,13 +2124,15 @@ impl FnChecker<'_> {
                         .push(call.range, "`random()` exists inside a system");
                     return None;
                 }
-                let buf = match self.rng {
-                    Some(buf) => buf,
-                    None => {
-                        let buf = self.buffer(&Ty::I64);
-                        self.rng = Some(buf);
-                        buf
-                    }
+                // One word for the whole system: every call site advances the
+                // same sequence, which is what makes it one generator.
+                let buf = match self
+                    .synthetic
+                    .iter()
+                    .find(|(name, _, _)| name == crate::state::RNG_FIELD)
+                {
+                    Some((_, _, buf)) => *buf,
+                    None => self.keep(crate::state::RNG_FIELD.to_string(), Ty::I64),
                 };
                 return Some((
                     Expr::Kernel {
@@ -2134,6 +2141,18 @@ impl FnChecker<'_> {
                     },
                     Ty::F64,
                 ));
+            }
+            "window" => {
+                if !arity(2, self) {
+                    return None;
+                }
+                return self.window(call, depth);
+            }
+            "fft" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                return self.fft(call, depth);
             }
             "len" => {
                 if !arity(1, self) {
@@ -2288,6 +2307,112 @@ impl FnChecker<'_> {
                 None
             }
         }
+    }
+
+    /// Claim a state slot the body asked for but no `State` class declared.
+    fn keep(&mut self, name: String, ty: Ty) -> BufId {
+        let buf = self.buffer(&ty);
+        self.synthetic.push((name, ty, buf));
+        buf
+    }
+
+    /// `window(x, N)`: the last `N` samples of `x`, newest last.
+    ///
+    /// The ring is a state slot and the result *is* that slot — the sample
+    /// pushes in and the whole ring reads out, which is the layout the panel's
+    /// Window node published and therefore what every saved plot expects. A
+    /// tensor sample keeps its shape, so the result is one rank deeper.
+    fn window(&mut self, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
+        if self.now.is_none() {
+            self.diags
+                .push(call.range, "`window` exists inside a system");
+            return None;
+        }
+        let Some(len) = literal_count(&call.args[1]) else {
+            self.diags.push(
+                call.args[1].range(),
+                "a window's length is a positive integer literal",
+            );
+            return None;
+        };
+        let (value, ty) = self.expr(&call.args[0], depth)?;
+        let (value, sample) = match ty {
+            Ty::Tensor { .. } => (value, ty.clone()),
+            other => (self.as_f64(value, other, call.args[0].range())?, Ty::F64),
+        };
+
+        let mut shape = vec![len];
+        if let Ty::Tensor { shape: dims, .. } = &sample {
+            shape.extend(dims.iter().copied());
+        }
+        if shape.len() > MAX_RANK {
+            self.diags.push(
+                call.range,
+                format!("a window of {sample} would exceed rank {MAX_RANK}"),
+            );
+            return None;
+        }
+        let ty = Ty::Tensor {
+            dtype: Dtype::F64,
+            shape,
+        };
+        let index = self.synthetic.len();
+        let state = self.keep(format!("@window{index}"), ty.clone());
+        Some((
+            Expr::Window {
+                state,
+                value: Box::new(value),
+                elems: elems(&sample),
+                len: len as u32,
+            },
+            ty,
+        ))
+    }
+
+    /// `fft(x)`: one-sided magnitudes along the last axis.
+    ///
+    /// Radix-2 wants a power of two and there is no padding rule worth
+    /// guessing at, so anything else is a diagnostic naming the length. The
+    /// output replaces the last axis with `N / 2 + 1`, which is what the
+    /// panel's Fft node published.
+    fn fft(&mut self, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
+        let (source, ty) = self.expr(&call.args[0], depth)?;
+        let Ty::Tensor { shape, .. } = &ty else {
+            self.diags
+                .push(call.range, format!("`fft` needs a tensor, found {ty}"));
+            return None;
+        };
+        let len = *shape.last().expect("a tensor has at least one axis");
+        if len < 2 || !len.is_power_of_two() {
+            self.diags.push(
+                call.range,
+                format!("`fft` needs a power-of-two last axis, found {len}"),
+            );
+            return None;
+        }
+        let groups = shape[..shape.len() - 1].iter().product::<usize>();
+
+        let mut out = shape.clone();
+        *out.last_mut().expect("a tensor has at least one axis") = len / 2 + 1;
+        let ty = Ty::Tensor {
+            dtype: Dtype::F64,
+            shape: out,
+        };
+        let dest = self.buffer(&ty);
+        let scratch = self.buffer(&Ty::Tensor {
+            dtype: Dtype::F64,
+            shape: vec![2 * len],
+        });
+        Some((
+            Expr::Fft {
+                dest,
+                source: Box::new(source),
+                scratch,
+                len: len as u32,
+                groups: groups as u32,
+            },
+            ty,
+        ))
     }
 
     /// A periodic signal of the timestamp the system was handed.
@@ -2536,6 +2661,17 @@ fn batches(
         }
     }
     all
+}
+
+/// A positive integer literal, for the lengths that have to be static.
+fn literal_count(expr: &ast::Expr) -> Option<usize> {
+    let ast::Expr::Constant(c) = expr else {
+        return None;
+    };
+    let ast::Constant::Int(n) = &c.value else {
+        return None;
+    };
+    n.to_usize().filter(|n| *n > 0)
 }
 
 fn literal_exponent(expr: &ast::Expr) -> Option<u32> {

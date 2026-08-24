@@ -19,6 +19,7 @@ mod robustness;
 mod scalar;
 mod semantics;
 mod sources;
+mod spectra;
 mod systems;
 mod tensors;
 

@@ -17,6 +17,7 @@ wasmparser = "0.256"
 
 [dev-dependencies]
 libm = "0.2"
+rustfft = "6"
 nox = { workspace = true }
 wasmi = { version = "1.1", default-features = false, features = ["std"] }
 

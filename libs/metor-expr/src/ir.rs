@@ -284,6 +284,30 @@ pub(crate) enum Expr {
         elems: u32,
         emit: Emit,
     },
+    /// Push a sample into a state-slot ring and yield the whole ring.
+    ///
+    /// The ring *is* the result — the buffer this evaluates to is the state
+    /// slot itself, shifted one sample left with the new one written at the
+    /// end, so the newest sample is last exactly as the panel's Window node
+    /// published it.
+    Window {
+        state: BufId,
+        value: Box<Expr>,
+        /// Elements in one sample.
+        elems: u32,
+        /// Samples the ring holds.
+        len: u32,
+    },
+    /// One-sided magnitude spectrum along the last axis, through `k_fft`.
+    Fft {
+        dest: BufId,
+        source: Box<Expr>,
+        /// Scratch the kernel needs, `2 * len` doubles, since the guest has no
+        /// allocator to size one at run time.
+        scratch: BufId,
+        len: u32,
+        groups: u32,
+    },
     /// Call a buffer-ABI function: arguments are copied into the callee's own
     /// buffers, and the result is copied out of them into `dest`.
     BufferCall {
@@ -303,7 +327,9 @@ impl Expr {
             | Expr::Elementwise { dest: id, .. }
             | Expr::Splat { dest: id, .. }
             | Expr::TensorNeg { dest: id, .. }
-            | Expr::MatMul { dest: id, .. } => *id,
+            | Expr::MatMul { dest: id, .. }
+            | Expr::Fft { dest: id, .. }
+            | Expr::Window { state: id, .. } => *id,
             Expr::BufferCall { dest: Some(id), .. } => *id,
             _ => unreachable!("only tensor-valued expressions have a buffer"),
         }
@@ -493,6 +519,11 @@ fn collect_expr(expr: &Expr, found: &mut Vec<&'static str>) {
             if *emit == Emit::Kernel {
                 found.push("k_sum");
             }
+            collect_expr(source, found);
+        }
+        Expr::Window { value, .. } => collect_expr(value, found),
+        Expr::Fft { source, .. } => {
+            found.push("k_fft");
             collect_expr(source, found);
         }
         Expr::Splat { value, .. } => collect_expr(value, found),
