@@ -810,3 +810,123 @@ fn shapes_that_do_not_broadcast_are_refused_with_spans() {
         );
     }
 }
+
+/// A list literal is a tensor constructor, ratified 2026-08-23. It types as a
+/// tensor the moment it is read — its length is its shape and there is
+/// nothing to append to — which is why admitting it does not admit lists.
+#[test]
+fn a_literal_constructs_a_tensor_and_agrees_with_nox() {
+    let got = evaluate(
+        "def f(x: f64, y: f64) -> Tensor[f64, 3]:\n    return [x, y, x + y]\n",
+        "f",
+        &[],
+        3,
+    );
+    let _ = got;
+
+    let wasm = build("def f(x: f64, y: f64) -> Tensor[f64, 3]:\n    return [x, y, x + y]\n");
+    let mut driver = Driver::new(&wasm, "f");
+    driver.write(0, &[1.5]);
+    driver.write(1, &[-2.25]);
+    driver.run().unwrap();
+    assert_eq!(driver.read(3), vec![1.5, -2.25, 1.5 + -2.25]);
+
+    // Constructed and then used, against nox elementwise.
+    let v = [1.5f64, -2.25, 3.75];
+    let got = evaluate(
+        "def f(v: Tensor[f64, 3]) -> Tensor[f64, 3]:\n    return v * [2.0, 0.5, -1.0] + [1.0, 1.0, 1.0]\n",
+        "f",
+        &[&v],
+        3,
+    );
+    let scale = nox3([2.0, 0.5, -1.0]);
+    let one = nox3([1.0, 1.0, 1.0]);
+    assert_eq!(bits(&got), bits(&nox_values(nox3(v) * scale + one)));
+}
+
+/// Mixed integers promote to `f64`, because a tensor is `f64` in this phase
+/// and the unification is what decides what to refuse rather than what to be.
+#[test]
+fn literal_elements_unify_to_one_numeric_type() {
+    let got = evaluate(
+        "def f() -> Tensor[f64, 4]:\n    return [1, 2.5, 3, 4.75]\n",
+        "f",
+        &[],
+        4,
+    );
+    assert_eq!(got, vec![1.0, 2.5, 3.0, 4.75]);
+}
+
+/// Rank two, row-major, through both emit paths — and the second one is past
+/// the open-coding threshold so the broadcasting kernel answers instead.
+#[test]
+fn a_nested_literal_is_rank_two_on_both_emit_paths() {
+    let m = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let got = evaluate(
+        "def f(m: Tensor[f64, (2, 3)]) -> Tensor[f64, (2, 3)]:\n\
+         \x20   return m + [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]\n",
+        "f",
+        &[&m],
+        6,
+    );
+    assert_eq!(got, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+
+    // A literal contracts like any other tensor.
+    let got = evaluate(
+        "def f(v: Tensor[f64, 3]) -> f64:\n    return v @ [1.0, 10.0, 100.0]\n",
+        "f",
+        &[&[2.0, 3.0, 4.0]],
+        1,
+    );
+    assert_eq!(got[0], 2.0 + 30.0 + 400.0);
+
+    // Above `OPEN_CODE_MAX_OPS` the kernel path carries the same literal.
+    let elements: Vec<String> = (0..200).map(|i| format!("{}.0", i)).collect();
+    let source = format!(
+        "def f(v: Tensor[f64, 200]) -> Tensor[f64, 200]:\n    return v + [{}]\n",
+        elements.join(", ")
+    );
+    let v: Vec<f64> = (0..200).map(|i| i as f64 * 0.5).collect();
+    let got = evaluate(&source, "f", &[&v], 200);
+    let want: Vec<f64> = v.iter().enumerate().map(|(i, x)| x + i as f64).collect();
+    assert_eq!(bits(&got), bits(&want));
+    assert!(reaches_kernels(&build(&source)), "a length-200 add calls a kernel");
+}
+
+/// What a literal is not: a value type. Every refusal names what went wrong
+/// rather than refusing the syntax wholesale.
+#[test]
+fn malformed_literals_are_diagnostics() {
+    for (source, needle) in [
+        (
+            "def f() -> Tensor[f64, 1]:\n    return []\n",
+            "at least one element",
+        ),
+        (
+            "def f() -> Tensor[f64, (2, 2)]:\n    return [[1.0, 2.0], [3.0]]\n",
+            "this row has 1 elements but the first has 2",
+        ),
+        (
+            "def f() -> Tensor[f64, 2]:\n    return [1.0, [2.0]]\n",
+            "all rows or all elements",
+        ),
+        (
+            "def f() -> Tensor[f64, 2]:\n    return [True, False]\n",
+            "holds numbers, found bool",
+        ),
+        (
+            "def f(v: Tensor[f64, 3]) -> Tensor[f64, 3]:\n    return [v, v]\n",
+            "holds numbers, found Tensor[f64, 3]",
+        ),
+        (
+            "def f() -> Tensor[f64, 2]:\n    return [[[1.0]], [[2.0]]]\n",
+            "two deep, not three",
+        ),
+    ] {
+        let diags = reject(source);
+        assert!(
+            format!("{diags}").contains(needle),
+            "expected {source:?} to mention {needle:?}, got:\n{diags}"
+        );
+    }
+}

@@ -296,7 +296,17 @@ fn a_hundred_line_module_compiles_and_runs() {
 #[test]
 fn the_subset_refuses_what_it_does_not_implement() {
     for (source, needle) in [
-        ("def f() -> f64:\n    return [1, 2]\n", "lists"),
+        // A list *literal* is a tensor constructor, so what is refused here
+        // is the type error, not the syntax. The list type itself stays gone:
+        // there is nothing to append to and no way to name one.
+        (
+            "def f() -> f64:\n    return [1, 2]\n",
+            "expected f64, found Tensor[f64, 2]",
+        ),
+        (
+            "def f() -> Tensor[f64, 3]:\n    return [x for x in range(3)]\n",
+            "list comprehensions",
+        ),
         ("def f() -> f64:\n    return {1: 2}\n", "dicts"),
         ("def f() -> f64:\n    return \"hi\"\n", "literals"),
         ("import math\ndef f() -> f64:\n    return 1.0\n", "classes, functions, and bindings"),

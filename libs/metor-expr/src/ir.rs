@@ -245,6 +245,15 @@ pub(crate) enum Expr {
         dest: BufId,
         value: Box<Expr>,
     },
+    /// `[a, b, c]`: element expressions written into consecutive slots.
+    ///
+    /// Rank two is the same node with its elements already in row-major
+    /// order, because a literal's shape is static and a tensor is contiguous —
+    /// there is nothing left for the emitter to arrange.
+    TensorLit {
+        dest: BufId,
+        elements: Vec<Expr>,
+    },
     TensorNeg {
         dest: BufId,
         operand: Box<Expr>,
@@ -326,6 +335,7 @@ impl Expr {
             Expr::Tensor(id)
             | Expr::Elementwise { dest: id, .. }
             | Expr::Splat { dest: id, .. }
+            | Expr::TensorLit { dest: id, .. }
             | Expr::TensorNeg { dest: id, .. }
             | Expr::MatMul { dest: id, .. }
             | Expr::Fft { dest: id, .. }
@@ -527,6 +537,11 @@ fn collect_expr(expr: &Expr, found: &mut Vec<&'static str>) {
             collect_expr(source, found);
         }
         Expr::Splat { value, .. } => collect_expr(value, found),
+        Expr::TensorLit { elements, .. } => {
+            for element in elements {
+                collect_expr(element, found);
+            }
+        }
         Expr::Element { source, index, .. } => {
             collect_expr(source, found);
             collect_expr(index, found);

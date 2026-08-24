@@ -480,34 +480,16 @@ impl<'a> Emitter<'a> {
                 rhs,
                 desc,
                 emit,
-            } => {
-                self.expr(lhs);
-                self.expr(rhs);
-                match emit {
-                    Emit::Kernel => {
-                        let at = self.descriptor(lhs.buffer(), rhs.buffer(), *dest, desc);
-                        self.push(Instruction::I32Const(at as i32));
-                        self.push(Instruction::Call(self.kernels[kernel]));
-                    }
-                    Emit::Open => {
-                        let a = self.layout.at(lhs.buffer());
-                        let b = self.layout.at(rhs.buffer());
-                        let out = self.layout.at(*dest);
-                        for (i, (l, r)) in broadcast_pairs(desc).into_iter().enumerate() {
-                            self.push(Instruction::I32Const((out + i as u32 * 8) as i32));
-                            self.load(a + l * 8);
-                            self.load(b + r * 8);
-                            self.scalar_of(kernel);
-                            self.push(Instruction::F64Store(mem_arg(3)));
-                        }
-                    }
-                }
-            }
+            } => self.elementwise(kernel, *dest, lhs, rhs, desc, *emit),
             Expr::Splat { dest, value } => {
                 self.push(Instruction::I32Const(self.layout.at(*dest) as i32));
                 self.expr(value);
                 self.push(Instruction::F64Store(mem_arg(3)));
             }
+            // A literal's shape is static and a tensor is contiguous, so this
+            // is one store per element at a constant address — the same shape
+            // as a splat, repeated.
+            Expr::TensorLit { dest, elements } => self.tensor_lit(*dest, elements),
             Expr::TensorNeg {
                 dest,
                 operand,
@@ -792,6 +774,56 @@ impl<'a> Emitter<'a> {
                 self.push(Instruction::LocalGet(slot));
                 self.push(store_of(ty));
                 self.release(val_type(ty), slot);
+            }
+        }
+    }
+
+    /// A literal's shape is static and a tensor is contiguous, so this is one
+    /// store per element at a constant address — a splat, repeated.
+    fn tensor_lit(&mut self, dest: BufId, elements: &[Expr]) {
+        let at = self.layout.at(dest);
+        for (i, element) in elements.iter().enumerate() {
+            self.push(Instruction::I32Const((at + i as u32 * 8) as i32));
+            self.expr(element);
+            self.push(Instruction::F64Store(mem_arg(3)));
+        }
+    }
+
+    /// Elementwise arithmetic, by whichever path the checker chose.
+    ///
+    /// This is a method rather than a match arm for a reason that only shows
+    /// up in a debug build: every arm's locals are live for the whole of
+    /// [`Emitter::expr`], and a deeply nested expression pays for all of them
+    /// at every level. The arms that carry the most — this one and the
+    /// literal above — are what a two-hundred-term chain could not afford.
+    fn elementwise(
+        &mut self,
+        kernel: &'static str,
+        dest: BufId,
+        lhs: &Expr,
+        rhs: &Expr,
+        desc: &Desc,
+        emit: Emit,
+    ) {
+        self.expr(lhs);
+        self.expr(rhs);
+        match emit {
+            Emit::Kernel => {
+                let at = self.descriptor(lhs.buffer(), rhs.buffer(), dest, desc);
+                self.push(Instruction::I32Const(at as i32));
+                self.push(Instruction::Call(self.kernels[kernel]));
+            }
+            Emit::Open => {
+                let a = self.layout.at(lhs.buffer());
+                let b = self.layout.at(rhs.buffer());
+                let out = self.layout.at(dest);
+                for (i, (l, r)) in broadcast_pairs(desc).into_iter().enumerate() {
+                    self.push(Instruction::I32Const((out + i as u32 * 8) as i32));
+                    self.load(a + l * 8);
+                    self.load(b + r * 8);
+                    self.scalar_of(kernel);
+                    self.push(Instruction::F64Store(mem_arg(3)));
+                }
             }
         }
     }

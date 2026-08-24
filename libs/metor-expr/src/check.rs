@@ -11,6 +11,12 @@
 //! with a span, because a language that can be checked completely is worth
 //! more here than a language that can express everything.
 //!
+//! `[a, b, c]` is the one thing that looks like a container and is not. It is
+//! a fixed-size tensor *constructor*: it types as a `Tensor` the moment it is
+//! read, its length is its shape, and there is no list value anywhere for it
+//! to be — nothing to append to, and no way to name one. See
+//! [`FnChecker::tensor_literal`].
+//!
 //! ## Where this differs from CPython, on purpose
 //!
 //! The numerics are a tensor library's, not an interpreter's:
@@ -1885,6 +1891,7 @@ impl FnChecker<'_> {
                 ))
             }
             ast::Expr::Call(call) => self.call(call, depth),
+            ast::Expr::List(list) => self.tensor_literal(list, depth),
             other => {
                 self.diags.push(other.range(), expr_refusal(other));
                 None
@@ -2395,6 +2402,96 @@ impl FnChecker<'_> {
         }
     }
 
+    /// `[a, b, c]` and `[[a, b], [c, d]]`: a tensor, written out.
+    ///
+    /// A literal is a *constructor*, not a value of some list type. It types
+    /// as a tensor the moment it is read, its length is its shape, and there
+    /// is nothing to append to — which is why admitting this does not admit
+    /// lists. Elements are scalars unified to one numeric type, and since
+    /// tensors are `f64` in this phase that unification always lands on `f64`;
+    /// what it decides is what to *refuse*, which is `bool` and anything that
+    /// is itself a tensor.
+    fn tensor_literal(&mut self, list: &ast::ExprList, depth: u32) -> Option<(Expr, Ty)> {
+        if list.elts.is_empty() {
+            self.diags
+                .push(list.range, "a tensor literal needs at least one element");
+            return None;
+        }
+
+        let rows: Vec<&ast::Expr> = list.elts.iter().collect();
+        let nested = rows
+            .iter()
+            .filter(|e| matches!(e, ast::Expr::List(_)))
+            .count();
+        if nested != 0 && nested != rows.len() {
+            self.diags.push(
+                list.range,
+                "a tensor literal is all rows or all elements, not a mixture",
+            );
+            return None;
+        }
+
+        let (shape, flat) = match nested {
+            0 => (vec![rows.len()], rows),
+            _ => {
+                let mut flat = Vec::new();
+                let mut cols = None;
+                for row in &rows {
+                    let ast::Expr::List(row) = row else {
+                        unreachable!("every element was checked to be a row");
+                    };
+                    let width = *cols.get_or_insert(row.elts.len());
+                    if row.elts.len() != width {
+                        self.diags.push(
+                            row.range,
+                            format!(
+                                "this row has {} elements but the first has {width}",
+                                row.elts.len()
+                            ),
+                        );
+                        return None;
+                    }
+                    if row.elts.iter().any(|e| matches!(e, ast::Expr::List(_))) {
+                        self.diags
+                            .push(row.range, "a tensor literal goes two deep, not three");
+                        return None;
+                    }
+                    flat.extend(row.elts.iter());
+                }
+                if cols == Some(0) {
+                    self.diags
+                        .push(list.range, "a tensor literal needs at least one element");
+                    return None;
+                }
+                (vec![rows.len(), cols.expect("there is at least one row")], flat)
+            }
+        };
+
+        let mut elements = Vec::with_capacity(flat.len());
+        for element in flat {
+            let (value, ty) = self.expr(element, depth)?;
+            match ty {
+                Ty::F64 | Ty::I64 => {
+                    elements.push(self.as_f64(value, ty, element.range())?);
+                }
+                other => {
+                    self.diags.push(
+                        element.range(),
+                        format!("a tensor literal holds numbers, found {other}"),
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let ty = Ty::Tensor {
+            dtype: Dtype::F64,
+            shape,
+        };
+        let dest = self.buffer(&ty);
+        Some((Expr::TensorLit { dest, elements }, ty))
+    }
+
     /// Claim a state slot the body asked for but no `State` class declared.
     fn keep(&mut self, name: String, ty: Ty) -> BufId {
         let buf = self.buffer(&ty);
@@ -2822,7 +2919,7 @@ fn expr_refusal(expr: &ast::Expr) -> &'static str {
         ast::Expr::Lambda(_) => "lambdas and closures are not supported",
         ast::Expr::Dict(_) | ast::Expr::DictComp(_) => "dicts are not supported",
         ast::Expr::Set(_) | ast::Expr::SetComp(_) => "sets are not supported",
-        ast::Expr::List(_) | ast::Expr::ListComp(_) => "lists are not supported",
+        ast::Expr::ListComp(_) => "list comprehensions are not supported",
         ast::Expr::GeneratorExp(_) => "generators are not supported",
         ast::Expr::Await(_) | ast::Expr::Yield(_) | ast::Expr::YieldFrom(_) => {
             "`await` and `yield` are not supported"

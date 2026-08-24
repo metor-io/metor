@@ -95,6 +95,17 @@ differential harness checks each against native nox.
    sets, classes, closures, imports, `try`, `with`, generators, `del`,
    globals mutation. The subset is small on purpose.
 
+   **Amended 2026-08-23 (user), during Phase 2's Q6.** A `[a, b, c]`
+   *literal* is a fixed-size tensor constructor, not a list: elements are
+   scalar expressions unified to one numeric type, the length is the
+   static shape, and nesting one level builds rank two with ragged rows
+   refused by span. The list *type* stays refused exactly as this rule
+   says — there is no list value, no variable of list type, and nothing
+   to append to, because a literal types as a `Tensor` the moment it is
+   read. Comprehensions remain refused. The amendment exists because
+   `Pack` had no other spelling, and a converter that cannot express a
+   legacy op is a migration that silently drops one.
+
 ## Milestones
 
 Each milestone ends green (`cargo test -p metor-expr`) and is committed

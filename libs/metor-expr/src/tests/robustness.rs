@@ -33,7 +33,50 @@ const CORPUS: &[&str] = &[
      \x20   return total\n",
     "def a(x: f64) -> f64:\n    return b(x) + 1.0\ndef b(x: f64) -> f64:\n    return x * 2.0\n",
     "def chained(a: i64, b: i64, c: i64) -> bool:\n    return a < b < c\n",
+    "def gains() -> Tensor[f64, 3]:\n    return [0.5, 1.0, -2.0]\n",
+    "def rows() -> Tensor[f64, (2, 2)]:\n    return [[1.0, 2.0], [3.0, 4.0]]\n",
 ];
+
+/// Literals nested and dented past what any parser should like. A bracket is
+/// the easiest thing in the language to leave half-typed, so the shapes that
+/// only a keystroke produces are worth naming rather than leaving to the
+/// prefix sweep.
+#[test]
+fn malformed_literals_are_survivable() {
+    let bodies = [
+        "[",
+        "[]",
+        "[,]",
+        "[1.0,",
+        "[1.0,,2.0]",
+        "[[",
+        "[[]]",
+        "[[1.0], [2.0",
+        "[[1.0], [2.0, 3.0]]",
+        "[1.0, [2.0]]",
+        "[[[[[[[[1.0]]]]]]]]",
+        "[1.0] + [2.0, 3.0]",
+        "[x for x in range(3)]",
+        "[True]",
+        "[[1.0, 2.0]][0]",
+    ];
+    for body in bodies {
+        for ret in ["f64", "Tensor[f64, 3]", "Tensor[f64, (2, 2)]"] {
+            survives(&format!("def f() -> {ret}:\n    return {body}\n"));
+        }
+    }
+
+    // And one that is only brackets, at every depth up to something no
+    // hand-written source reaches.
+    for depth in 0..64 {
+        let source = format!(
+            "def f() -> f64:\n    return {}1.0{}\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        survives(&source);
+    }
+}
 
 /// Whatever comes back, its spans must point inside the source.
 fn survives(source: &str) {
