@@ -21,7 +21,7 @@ use metor_fsw_2_core::{Binder, BoundInput, BoundPort};
 use metor_fsw_2_core::{FanIn, PortConn, PortId, SystemDescriptor};
 
 use super::init::{
-    AsyncPlumbing, ConsEdges, DlReg, Node, ProcReg, RingAlloc, SystemBind, owned_writer,
+    AsyncPlumbing, ConsEdges, DlReg, Node, ProcReg, RingAlloc, SystemBind, WasmReg, owned_writer,
 };
 use super::slot::{
     self, AllowedOccupant, OccupantBacking, SlotReg, SlotRunner, SlotStatus, slot_writer,
@@ -114,6 +114,15 @@ pub(super) fn bind_systems(
             SystemBind::Proc(proc_reg) => cyclic.push(bind_proc(
                 id, proc_reg, &desc, name, cons_edges, alloc, proc_ctx,
             )?),
+            SystemBind::Wasm(reg) => cyclic.push(Box::new(bind_wasm(
+                id,
+                reg,
+                &desc,
+                &name,
+                cons_edges,
+                &alloc.output_rings,
+                proc_ctx,
+            )?)),
             SystemBind::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
                 id, slot_reg, &desc, cons_edges, alloc, proc_ctx,
             )?)),
@@ -349,6 +358,59 @@ fn bind_proc(
         detail: "process systems need a cross-process futex (Linux or macOS 14.4+); \
                  unsupported on this target"
             .into(),
+    })
+}
+
+/// The wired wasm arm: gather the same per-port regions as the dl arm, in
+/// the identical positional order, and bind a
+/// [`WasmCyclic`](crate::wasm::WasmCyclic) over them — its own interpreter
+/// instance, `Mount::Wired`, the descriptor's own delivery lists, no tail.
+fn bind_wasm(
+    id: usize,
+    reg: WasmReg,
+    desc: &SystemDescriptor,
+    name: &str,
+    cons_edges: &ConsEdges,
+    output_rings: &[Vec<RingBuffer>],
+    ctx: &ProcBindCtx,
+) -> Result<crate::wasm::WasmCyclic, WireError> {
+    use metor_fsw_2_core::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+    let outputs: Vec<FswRing> = (0..desc.outputs.len())
+        .map(|out_idx| {
+            let (base, len) = output_rings[id][out_idx].region();
+            FswRing {
+                base,
+                len,
+                role: ROLE_OUTPUT,
+            }
+        })
+        .collect();
+    let inputs: Vec<FswRing> = (0..desc.inputs.len())
+        .map(|in_idx| {
+            let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
+            let (base, len) = output_rings[prod_id][out_idx].region();
+            FswRing {
+                base,
+                len,
+                role: ROLE_INPUT,
+            }
+        })
+        .collect();
+    crate::wasm::WasmCyclic::bind(
+        &reg.bytes,
+        reg.index,
+        &reg.params,
+        Arc::from(desc.name.as_str()),
+        name,
+        &inputs,
+        &outputs,
+        super::slot::WASM_SETUP_FUEL,
+        ctx.wasm_fuel_per_poll,
+        ctx.wasm_memory_limit_bytes,
+    )
+    .map_err(|e| WireError::WasmBind {
+        system: name.to_string(),
+        detail: e.to_string(),
     })
 }
 

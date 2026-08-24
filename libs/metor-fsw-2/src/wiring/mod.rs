@@ -46,6 +46,7 @@ mod bundle;
 mod error;
 mod pack_dist;
 mod pack_module;
+mod program;
 mod py;
 mod registry;
 mod resolve;

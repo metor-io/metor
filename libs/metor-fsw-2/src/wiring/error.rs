@@ -208,6 +208,13 @@ pub enum LoadErrorKind {
     #[error("{0}")]
     WasmOccupant(Box<str>),
 
+    /// A wired wasm system could not be read, described, matched to an
+    /// entry, or its synthesized edges did not line up with its descriptor.
+    /// One boxed message, for the same size reason as
+    /// [`WasmOccupant`](Self::WasmOccupant).
+    #[error("{0}")]
+    WasmSystem(Box<str>),
+
     /// A static system was given typed builder params. The static path has no
     /// postcard decoder; its registered factory deserializes params from a
     /// value tree, so the postcard bytes would be silently dropped and the

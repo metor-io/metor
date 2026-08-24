@@ -1,0 +1,228 @@
+//! End-to-end test of Python systems on the vehicle: a captured `@system`
+//! program provisions into an ordinary wasm pack artifact
+//! ([`provision_artifacts`]'s program arm compiles it — no fixture crate, no
+//! nested cargo), resolves through the wired wasm arm with its edges
+//! synthesized from the baked expr manifest, and runs in the cyclic loop
+//! with its output as real telemetry.
+//!
+//! The second test is the fault path: a runaway system burns its fuel grant,
+//! latches stopped, surfaces through the coordinator's health vocabulary —
+//! and the vehicle keeps cycling.
+
+#![cfg(not(miri))]
+
+use metor_fsw_2::ir::ArtifactKind;
+use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
+use metor_fsw_2::{
+    Artifact, ClockSpec, Frame, Input, ParamSource, ProgramDecl, ProgramSpec, StopReason,
+    SystemSpec, Wiring, WiringBuilder,
+    wiring::{BuildOptions, Registry, provision_artifacts, resolve},
+};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+// Host-side mirrors of the compiled frames, for reading the telemetry rings:
+// an 8-byte timestamp then eight-byte slots, exactly the layout the compiler
+// documents.
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "beat")]
+struct BeatOut {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    v: f64,
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "double")]
+struct DoubleOut {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    double: f64,
+}
+
+/// Assemble the wiring the recorder would emit: the captured program, one
+/// program-built wasm artifact, and one ordinary system spec per `@system`
+/// addressing its entry by name.
+fn python_wiring(artifact_id: &str, source: &str, decls: &[&str], cycle_rate: f64) -> Wiring {
+    let mut wiring = WiringBuilder::new()
+        .coordinator(
+            cycle_rate,
+            ClockSpec::Simulated {
+                dt_secs: 1.0 / cycle_rate,
+            },
+        )
+        .build();
+    wiring.artifacts.push(Artifact {
+        id: artifact_id.into(),
+        kind: ArtifactKind::Wasm,
+        crate_name: String::new(),
+        lib: String::new(),
+        path: None,
+        prebuilt_dir: None,
+        dist: None,
+        manifest_hash: None,
+        src: None,
+    });
+    wiring.program = Some(ProgramSpec {
+        source: source.into(),
+        decls: decls
+            .iter()
+            .map(|name| ProgramDecl {
+                name: name.to_string(),
+                src: None,
+                offset: source
+                    .find(&format!("def {name}"))
+                    .or_else(|| source.find(&format!("class {name}")))
+                    .expect("declaration present") as u32,
+            })
+            .collect(),
+    });
+    for decl in decls {
+        if source.contains(&format!("def {decl}")) {
+            wiring.systems.push(SystemSpec {
+                name: decl.to_string(),
+                ty: Some(decl.to_string()),
+                artifact: Some(artifact_id.to_string()),
+                params: ParamSource::None,
+                process: false,
+                src: None,
+                scope: None,
+                attach: None,
+                layout: None,
+            });
+        }
+    }
+    wiring
+}
+
+/// A rate-clocked source feeding an input-driven consumer over a synthesized
+/// `Produced` edge: eval → provision (compile) → resolve → cycles →
+/// telemetered values.
+#[test]
+fn a_python_program_provisions_resolves_and_runs() {
+    const SRC: &str = "\
+class Beat(Frame):
+    v: f64
+
+@system(rate=30.0)
+def beat() -> Beat:
+    return Beat(v=2.5)
+
+@system
+def double(beat: Beat) -> f64:
+    return beat.v * 2.0
+";
+    let mut wiring = python_wiring("pyint_program", SRC, &["Beat", "beat", "double"], 120.0);
+    provision_artifacts(&mut wiring, &BuildOptions::default())
+        .expect("the program arm compiles the artifact without cargo");
+    let path = wiring.artifacts[0].path.clone().expect("path filled");
+    assert!(path.exists(), "compiled module written");
+    let mut sidecar = path.clone().into_os_string();
+    sidecar.push(".manifest");
+    assert!(
+        std::path::PathBuf::from(sidecar).exists(),
+        "the .manifest sidecar rides next to the module"
+    );
+
+    let mut coord = resolve(&wiring, &Registry::with_builtins())
+        .unwrap_or_else(|e| panic!("a Python-only target resolves: {e}"));
+    let mut beat_view: Input<BeatOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("beat.beat"))
+            .expect("the source's output is registered for telemetry")
+            .expect("a reader slot is available"),
+    );
+    let mut double_view: Input<DoubleOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("double.double"))
+            .expect("the consumer's output is registered for telemetry")
+            .expect("a reader slot is available"),
+    );
+
+    // 8 cycles at 120 Hz with rate=30: the source fires on cycles 1 and 5.
+    let coord = stellarator::run(|| async move {
+        coord.run_for(8).await;
+        coord
+    });
+    assert!(coord.stopped().is_empty(), "nothing hard-stopped");
+
+    let mut beats = Vec::new();
+    beat_view
+        .drain(|record| beats.push((record.get().timestamp, record.get().v)))
+        .expect("source ring intact");
+    assert_eq!(
+        beats.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        [2.5, 2.5],
+        "rate=30 against 120 Hz fires every 4th cycle"
+    );
+
+    let mut doubles = Vec::new();
+    double_view
+        .drain(|record| doubles.push(record.get().double))
+        .expect("consumer ring intact");
+    assert_eq!(
+        doubles,
+        [5.0, 5.0],
+        "the consumer fires exactly when its driving input moved, same cycle"
+    );
+}
+
+/// A runaway Python system exhausts its fuel grant: it stops, the
+/// coordinator reports it in its health vocabulary, and the rest of the
+/// target keeps cycling.
+#[test]
+fn a_runaway_python_system_degrades_and_the_loop_survives() {
+    const SRC: &str = "\
+@system(rate=120.0)
+def steady() -> f64:
+    return 1.0
+
+@system(rate=120.0)
+def runaway() -> f64:
+    i = 0
+    while i < 100000000:
+        i = i + 1
+    return float(i)
+";
+    let mut wiring = python_wiring("pyfault_program", SRC, &["steady", "runaway"], 120.0);
+    // A grant far below what the loop needs, and plenty for everything else.
+    wiring.coordinator.wasm_fuel_per_poll = Some(200_000);
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("compiles");
+
+    let mut coord = resolve(&wiring, &Registry::with_builtins()).expect("resolves");
+    let mut steady_view: Input<SteadyOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("steady.steady"))
+            .expect("registered")
+            .expect("slot free"),
+    );
+    let coord = stellarator::run(|| async move {
+        coord.run_for(6).await;
+        coord
+    });
+
+    let stopped = coord.stopped();
+    assert_eq!(stopped.len(), 1, "only the runaway stopped: {stopped:?}");
+    assert_eq!(&*stopped[0].name, "runaway");
+    assert_eq!(stopped[0].reason, StopReason::Panicked);
+
+    let mut healthy = 0;
+    steady_view
+        .drain(|_| healthy += 1)
+        .expect("healthy ring intact");
+    assert_eq!(healthy, 6, "the loop kept cycling the healthy system");
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "steady")]
+struct SteadyOut {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    steady: f64,
+}

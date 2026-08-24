@@ -19,7 +19,7 @@ use metor_fsw_2_core::Delivery;
 use metor_fsw_2_core::abi::{FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT};
 use metor_proto::types::Timestamp;
 
-use super::{GuestRing, RingBridge, WasmError, WasmPack};
+use super::{RingBridge, WasmError, WasmPack};
 
 /// One bound wasm occupant: its module, its instance, and the pump joining it
 /// to the slot's rings.
@@ -145,8 +145,8 @@ impl WasmSlot {
 
         // One guest region per host region, sized from the host's, so the two
         // sides of a leg always agree on what a record can be.
-        let guest_inputs = Self::mirror_rings(&mut pack, host_inputs, ROLE_INPUT)?;
-        let guest_outputs = Self::mirror_rings(&mut pack, host_outputs, ROLE_OUTPUT)?;
+        let guest_inputs = super::mirror_rings(&mut pack, host_inputs, ROLE_INPUT)?;
+        let guest_outputs = super::mirror_rings(&mut pack, host_outputs, ROLE_OUTPUT)?;
         pack.bind_init(state, &guest_inputs, &guest_outputs, instance)?;
 
         // Nothing may grow the guest's memory after this point; every bridge
@@ -184,22 +184,6 @@ impl WasmSlot {
             boundary_corruptions: 0,
             dead: false,
         })
-    }
-
-    /// Give the guest a region matching each host region's geometry.
-    fn mirror_rings(
-        pack: &mut WasmPack,
-        host: &[FswRing],
-        role: u8,
-    ) -> Result<Vec<GuestRing>, WasmError> {
-        host.iter()
-            .map(|r| {
-                // SAFETY: a coordinator-owned region, live for the runner's life.
-                let cfg =
-                    unsafe { metor_fsw_ring::config_of(r.base, r.len) }.map_err(WasmError::Ring)?;
-                pack.add_ring(cfg, role)
-            })
-            .collect()
     }
 
     /// Extend a per-declared-port delivery list to cover the mount tail, which

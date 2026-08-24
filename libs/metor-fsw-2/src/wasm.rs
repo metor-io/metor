@@ -243,6 +243,10 @@ struct Exports {
     alloc: TypedFunc<i32, i32>,
     ring_init: RingInitFn,
     set_now: TypedFunc<i64, ()>,
+    /// The expr-manifest pair a compiled Python pack also exports; absent on
+    /// an ordinary Rust-authored pack.
+    expr_describe: Option<TypedFunc<(), i32>>,
+    expr_manifest_ptr: Option<TypedFunc<(), i32>>,
 }
 
 /// A loaded wasm pack: the instantiated module plus its opened pack pointer
@@ -333,6 +337,8 @@ impl WasmPack {
             alloc: typed(&instance, &store, "fsw_pack_alloc")?,
             ring_init: typed(&instance, &store, "fsw_pack_ring_init")?,
             set_now: typed(&instance, &store, "fsw_pack_set_now")?,
+            expr_describe: typed(&instance, &store, "expr_describe").ok(),
+            expr_manifest_ptr: typed(&instance, &store, "expr_manifest_ptr").ok(),
         };
 
         let mut this = Self {
@@ -414,6 +420,20 @@ impl WasmPack {
     /// `.so` path decodes.
     pub fn manifest(&self) -> &PackManifest {
         &self.manifest
+    }
+
+    /// The expr manifest a compiled Python pack bakes beside its pack one,
+    /// for the resolver's edge synthesis. `None` for a module without the
+    /// expr export family (an ordinary Rust-authored pack).
+    pub(crate) fn expr_manifest_bytes(&mut self) -> Result<Option<Vec<u8>>, WasmError> {
+        let (Some(describe), Some(manifest_ptr)) =
+            (self.exports.expr_describe, self.exports.expr_manifest_ptr)
+        else {
+            return Ok(None);
+        };
+        let len = self.call(|_| describe, ())? as usize;
+        let at = self.call(|_| manifest_ptr, ())?;
+        Ok(Some(self.read(at as u32, len)?))
     }
 
     /// Describe, then copy the bytes out of guest memory and decode them.
@@ -643,10 +663,29 @@ where
         .map_err(|_| WasmError::MissingExport(name))
 }
 
+/// Give the guest one ring region matching each host region's geometry, so
+/// the two sides of a bridge leg always agree on what a record can be.
+pub(crate) fn mirror_rings(
+    pack: &mut WasmPack,
+    host: &[metor_fsw_2_core::abi::FswRing],
+    role: u8,
+) -> Result<Vec<GuestRing>, WasmError> {
+    host.iter()
+        .map(|r| {
+            // SAFETY: a coordinator-owned region, live for the runner's life.
+            let cfg =
+                unsafe { metor_fsw_ring::config_of(r.base, r.len) }.map_err(WasmError::Ring)?;
+            pack.add_ring(cfg, role)
+        })
+        .collect()
+}
+
 mod bridge;
 mod slot;
+mod wired;
 pub use bridge::RingBridge;
 pub use slot::WasmSlot;
+pub(crate) use wired::WasmCyclic;
 
 #[cfg(test)]
 mod tests;

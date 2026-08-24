@@ -174,6 +174,22 @@ pub enum BuildError {
         /// The cdylib file name that was searched for.
         cdylib: String,
     },
+    /// The target's captured Python program did not compile. `detail`
+    /// carries the diagnostics, each mapped to its `target.py` line.
+    #[error("compiling artifact `{artifact}` from the target program failed:\n{detail}")]
+    ProgramCompile {
+        /// The program artifact's id.
+        artifact: String,
+        /// The rendered diagnostics.
+        detail: String,
+    },
+    /// A wasm artifact with no path, no prebuilt dir, and no program behind
+    /// it: nothing can produce its module.
+    #[error("wasm artifact `{artifact}` has no path and nothing to build it from")]
+    WasmSourceless {
+        /// The artifact id.
+        artifact: String,
+    },
     /// A prebuilt artifact needs a target triple to select by, and neither a
     /// `--target` nor the host triple could be determined.
     #[error(
@@ -194,9 +210,27 @@ pub enum BuildError {
 pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), BuildError> {
     let cross = opts.manifest_sidecar && is_cross(&opts.extra_args);
     let target = requested_target(&opts.extra_args).map(str::to_string);
-    for artifact in &mut wiring.artifacts {
+    // Program artifacts compile last, against the other artifacts' built
+    // manifests — the build-time resolver reads their sidecars.
+    let mut programs: Vec<usize> = Vec::new();
+    for (at, artifact) in wiring.artifacts.iter_mut().enumerate() {
         if let Some(dir) = artifact.prebuilt_dir.clone() {
             artifact.path = Some(select_prebuilt(artifact, &dir, target.as_deref())?);
+            continue;
+        }
+        // The kind dispatch also guards the dl arm: a wasm module must never
+        // reach `cargo build` (or, later, a dlopen) by silent fallthrough.
+        if artifact.kind == crate::ir::ArtifactKind::Wasm {
+            match (artifact.path.is_some(), artifact.is_program()) {
+                // Located or builder-authored: one arch-neutral file, as-is.
+                (true, _) => {}
+                (false, true) => programs.push(at),
+                (false, false) => {
+                    return Err(BuildError::WasmSourceless {
+                        artifact: artifact.id.clone(),
+                    });
+                }
+            }
             continue;
         }
         let cdylib = match &target {
@@ -213,7 +247,48 @@ pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(
         }
         artifact.path = Some(path);
     }
+    for at in programs {
+        let out_dir = wasm_out_dir(wiring, opts.release);
+        let path = super::program::provision_program(wiring, at, &out_dir)?;
+        wiring.artifacts[at].path = Some(path);
+    }
     Ok(())
+}
+
+/// Where a program-compiled module lands: next to the crate-built cdylibs
+/// when the target has any (one directory holds every produced artifact),
+/// else the workspace `target/<profile>` dir, found like [`locate_built`]
+/// and created on demand.
+fn wasm_out_dir(wiring: &Wiring, release: bool) -> PathBuf {
+    if let Some(dir) = wiring
+        .artifacts
+        .iter()
+        .filter(|a| a.prebuilt_dir.is_none() && a.kind == crate::ir::ArtifactKind::Cdylib)
+        .filter_map(|a| a.path.as_deref().and_then(Path::parent))
+        .next()
+    {
+        return dir.to_path_buf();
+    }
+    let profile = if release { "release" } else { "debug" };
+    target_root().join(profile)
+}
+
+/// The workspace `target/` dir: `CARGO_TARGET_DIR`, else the nearest
+/// existing `target/` walking up from the working directory, else a fresh
+/// `./target`.
+fn target_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        return PathBuf::from(dir);
+    }
+    let mut dir = std::env::current_dir().ok();
+    while let Some(d) = dir {
+        let target = d.join("target");
+        if target.exists() {
+            return target;
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    PathBuf::from("target")
 }
 
 /// Select a prebuilt artifact's library for `target` (or the host): the
@@ -378,11 +453,21 @@ pub fn locate_artifacts(
             artifact.path = Some(select_prebuilt(artifact, &dir, None)?);
             continue;
         }
-        let cdylib = super::cdylib_file_name(&artifact.lib);
+        // A previously compiled program module is located like a built
+        // cdylib; `--no-build` never compiles, by the same contract.
+        let file = match artifact.kind {
+            crate::ir::ArtifactKind::Wasm => {
+                if artifact.path.is_some() {
+                    continue;
+                }
+                format!("{}.wasm", artifact.id)
+            }
+            crate::ir::ArtifactKind::Cdylib => super::cdylib_file_name(&artifact.lib),
+        };
         let path =
-            locate_built(target_dir, &cdylib, release).ok_or_else(|| BuildError::NotBuilt {
+            locate_built(target_dir, &file, release).ok_or_else(|| BuildError::NotBuilt {
                 crate_name: artifact.crate_name.clone(),
-                cdylib: cdylib.clone(),
+                cdylib: file.clone(),
             })?;
         artifact.path = Some(path);
     }
@@ -619,7 +704,7 @@ fn fresh_sidecar(sidecar: &Path, so: &Path) -> Option<Vec<u8>> {
 
 /// Write via a temp file + rename, so concurrent builders sharing one target
 /// dir (parallel test binaries, say) never expose a torn sidecar.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".tmp{}", std::process::id()));
     let tmp = PathBuf::from(tmp);

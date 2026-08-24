@@ -149,4 +149,8 @@ pub enum WireError {
     /// the worker's own failure code when it reported one.
     #[error("process system '{system}': {detail}")]
     ProcSpawn { system: String, detail: String },
+    /// A wired wasm system could not be instantiated, created, or bound.
+    /// `system` is the instance name; `detail` carries the guest-side cause.
+    #[error("wasm system '{system}': {detail}")]
+    WasmBind { system: String, detail: String },
 }

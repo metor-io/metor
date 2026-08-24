@@ -182,6 +182,17 @@ pub(crate) struct ProcReg {
     pub(crate) system: String,
 }
 
+/// A registered wired wasm system: the module bytes (shared across every
+/// entry the artifact serves), the entry to instantiate, and its postcard
+/// params. At [`build`](InitGraph::build) it becomes a
+/// [`WasmCyclic`](crate::wasm::WasmCyclic) with its own interpreter instance.
+pub(crate) struct WasmReg {
+    pub(crate) bytes: Arc<Vec<u8>>,
+    /// Manifest position of the entry, resolved by name at resolve time.
+    pub(crate) index: u32,
+    pub(crate) params: Vec<u8>,
+}
+
 pub(crate) enum SystemBind {
     /// The coordinator itself, system #0: a marker registration whose bind arm
     /// wraps the allocated rings into the coordinator's own fields (it is never
@@ -197,6 +208,9 @@ pub(crate) enum SystemBind {
     /// A cross-process cyclic system, spawned as a worker and bound to a
     /// [`ProcSlot`](crate::proc) at [`build`](InitGraph::build).
     Proc(ProcReg),
+    /// A wired wasm pack entry, bound to a
+    /// [`WasmCyclic`](crate::wasm::WasmCyclic) at [`build`](InitGraph::build).
+    Wasm(WasmReg),
     /// A runtime-swappable slot, bound to a [`SlotRunner`](super::slot::SlotRunner) at [`build`](InitGraph::build).
     Slot(SlotReg),
 }
@@ -424,6 +438,19 @@ impl InitGraph {
                 params,
             }),
         )
+    }
+
+    /// Register a wired wasm pack entry under an explicit instance name.
+    pub(crate) fn add_wasm_cyclic(
+        &mut self,
+        name: impl Into<String>,
+        mut descriptor: SystemDescriptor,
+        reg: WasmReg,
+    ) -> SystemHandle {
+        // Cyclic-only, pinned here like the dl path: the registered kind is
+        // never trusted from decoded wire bytes.
+        descriptor.kind = SystemKind::Cyclic;
+        self.push_system(descriptor, name.into(), SystemBind::Wasm(reg))
     }
 
     /// Register a cross-process cyclic system under an explicit instance name.
