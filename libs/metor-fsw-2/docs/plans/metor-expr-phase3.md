@@ -334,3 +334,150 @@ directed by the user**; the panel keeps the expr export family
 - `wasm32` targets in `pack_dist` wheels (deferred in
   `wasm-occupant.md`; unchanged).
 - Editing vehicle Python systems from the canvas.
+
+## Results
+
+Landed in four gates on `sphw/reduce-code`:
+`a8d284c6` (WP1 IR rework), `9c5ff954` (WP2 pack backend),
+`ca3ae231` (WP3 provision + WP4 wired arm), `01910109` (WP5 example,
+panel, differentials).
+
+### What landed
+
+**WP1.** The `"expr"` type is gone. The recorder emits one
+`Artifact { kind: wasm, id: "program" }` and one ordinary
+`SystemSpec { name, ty: <decl name>, artifact: "program" }` per
+`@system`; `Artifact::crate_name`/`lib` are serde-defaulted (omitted
+when empty) with a validate-time check that a cdylib still names both.
+`Artifact::is_program()` — wasm, no crate, no prebuilt dir, no path —
+is the provision-side discriminator. Program-decl validation keeps
+unique names and the decl-reference check; attach/params rules ride
+the generic artifact-system checks now that the specs are ordinary.
+IR stayed v9, goldens amended in both suites; the golden program
+gained the `-> f64` the build gate compiles.
+
+**WP2.** `metor_expr::compile_pack(source, &dyn PackResolver,
+cycle_rate)` emits one module speaking both ABIs. The pack manifest is
+the host's own type — metor-expr now depends on `metor-fsw-2-core`,
+`metor-proto`, `metor-proto-wkt` — with real vtables from the frame
+layouts and **carried** ids/offsets from the new
+`PackResolver::component_source` answers; `Binding::Produced` sources
+are minted by the same `output_port` convention that bakes them.
+Bindings group into one input `PortDesc` per distinct producing port
+in first-appearance order; outputs are the Table port plus the
+health/log tail every native entry carries; params schema is unit,
+`reloadable: true`. The generated guest half (`pack_abi`) is
+straight-line wasm over constants — create (double-create refused:
+one instance per entry, since the expr backend has one set of static
+buffers), bind (positional `FswRing` walk; a slot mount's tail is
+simply never opened), execute (the run rule), destroy (ring handles
+closed for a clean re-create). The run rule fires an input-driven
+entry when its driving ring's committed position moved, refreshes the
+latest of the rest, skips otherwise, and skips while any input has
+never published; records shorter than a group's fill coverage are
+ignored as non-samples (the one boundary validation). A distinct-port
+count above 63 is refused at compile (the seen mask is one word).
+
+**WP3.** `provision_artifacts` dispatches on `ArtifactKind` (also
+fixing the silent wasm→cargo/dlopen fallthrough); the program arm
+(`wiring::program`) builds a `BuildResolver` from the *other*
+artifacts' decoded manifests (cdylib sidecar, else in-process
+describe; wasm through the interpreter; slot occupant contracts
+included), compiles, and writes `<id>.wasm` + `.manifest` next to the
+built cdylibs (else the workspace `target/<profile>`). Diagnostics
+render `target.py:line:col` through the per-declaration offsets.
+`locate_artifacts` finds a previously compiled module under
+`--no-build`; bundles carry the arch-neutral `<id>.wasm` on both the
+write and load sides.
+
+**WP4.** `SystemBind::Wasm`/`WasmReg` + `WasmCyclic`: one interpreter
+instance per entry (chosen over one-per-artifact for ownership
+simplicity — a `WasmPack` is single-owner and the slot path already
+opens per-occupant; the cost is one ~1 MiB guest memory per entry),
+`Mount::Wired`, no tail, the descriptor's own delivery lists,
+`WASM_SETUP_FUEL` for bind and the per-poll budget after. Faults
+degrade per D8: `SlotState::Stopped` → the coordinator's existing
+`system_stopped` health + log fold; the bridge keeps pumping inputs
+after death; drops count as `wasm_boundary_dropped`. Edge synthesis
+walks the baked expr manifest's bindings in the compiler's own
+grouping order and cross-checks name-for-name against the descriptor,
+so artifact/wiring drift fails loudly. `@rng` seeds ride the params
+channel as fresh host entropy per boot. The slot paths share the
+describe step (`WasmCache`); occupant search no longer dlopens wasm
+modules.
+
+**WP5.** `examples/adcs-fsw2/target.py` gained `gyro_norm` off
+`plant.sensors.gyro_b`; its test matches telemetry against the nox
+oracle timestamp-paired (tolerance 1e-12 — the oracle path is nox
+`norm()` where the guest computes `pow(x, 0.5)` via libm, so bitwise
+identity is not the claim there; the two-host differential is). The
+bit-parity differential drives one module through both export
+families — multi-field frame, tensor beside scalar, `f32` source
+component — and the output frames are bit-identical. The slot smoke
+test mounts the same artifact shape as a running occupant. The panel
+canvas prefers IR layout (override > `@node`/`node=` > auto) and the
+inspector shows a program-built system's captured declaration
+verbatim, read-only.
+
+### Measurements
+
+- **Artifact size**: the example's compiled `program.wasm` (one real
+  system off the IMU) is **19,324 bytes** vs the 307,788-byte
+  core-based seq fixture — ~16× smaller. The four test programs land
+  at 18.8–20.3 KB.
+- **Prelude**: 38,503 bytes checked in (was 21,525; +17 KB for the
+  linked ring crate and std's allocator). Expr-only modules carry some
+  of that as always-live data/element segments: a no-kernel module is
+  now 8,602 B (was 5,198 pre-std). Nothing on the panel's evaluation
+  path changed; the 131 pre-existing metor-expr tests pass unchanged.
+- **The ring-linking decision**: the real `metor-fsw-ring`
+  (`default-features = false`) linked into the prelude, as planned —
+  no second implementation of the SeqCst registration handshake. The
+  prelude became `std` for it (ring handles are `Arc`-backed);
+  `panic = "abort"` keeps the no-unwind property, and allocation
+  happens only at bind, before the host pins guest memory.
+  `fsw_pack_alloc` is `alloc_zeroed` over the same dlmalloc, which
+  grows fresh pages via `memory.grow` and so can never hand out bytes
+  below the compiler's raised minimum.
+- Determinism: compile-twice is pinned byte-equal;
+  `entry_identity`-gated slot reload rides the existing wasm-occupant
+  test; provision in one process and resolve in another (the example
+  and bundle tests) agree through the sidecar bytes.
+
+### Divergences from the plan text
+
+- **D3's rate tick is a countdown, not a now-crossing.** `rate=` fires
+  every `cycle_rate / rate` executes — the exact integer the
+  divisibility gate proves — rather than comparing `now` against
+  accumulated ticks, because timestamps are integer microseconds and
+  a rounded period (e.g. 30 Hz → 33,333 µs) would drift one cycle
+  every few seconds. The decision D3 makes (run rule in the guest,
+  host driver fully generic) is unchanged.
+- **The compiler is linked into `metor-fsw-2`** (provisioning calls
+  `metor_expr::compile_pack`), and since the crate is one binary
+  surface, a flight binary links it too. It cannot *run* on the
+  vehicle path — nothing past provision calls it — but "never links
+  rustpython-parser" is not literally achieved without a crate split
+  the plan did not order. Flagged for a future carve if binary size
+  matters.
+- **Statically registered systems' outputs are not bindable from
+  Python at build time**: they have no manifest to read (the registry
+  would have to construct them to describe them). A binding naming one
+  is a compile diagnostic, not a misbind. Artifact-backed systems and
+  slot contracts cover the example and every current use.
+
+### Residuals
+
+- `examples/adcs-fsw2/tests/momentum.rs` fails on this machine with
+  `TcpServer … Address already in use` at its second in-process
+  resolve — **verified pre-existing** by running it unchanged at the
+  base commit `7414d5fc` in a clean worktree (same failure). Not
+  touched beyond the shared static-linking helper.
+- The inspector shows a Python declaration as a plain read-only text
+  row; a syntax-highlighted, scrollable source view is a panel polish
+  item.
+- No cross-restart byte-hash pin exists for compiled modules (no
+  checked-in hash); the sidecar hash plus the in-process compile-twice
+  pin are the current guards.
+- Guest state carryover across occupant swaps, sequences, and live
+  source uplink remain out of scope as planned.
