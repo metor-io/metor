@@ -198,7 +198,7 @@ fn the_natural_form_costs_what_the_hand_written_one_does() {
     // written-out chain of `n` terms consumes one level at a time.
     for n in [3usize, 8, 32, 128, 256] {
         let natural = build(&format!(
-            "def f(a: Tensor[f64, {n}], b: Tensor[f64, {n}]) -> f64:\n    return dot(a, b)\n"
+            "def f(a: Tensor[f64, {n}], b: Tensor[f64, {n}]) -> f64:\n    return a @ b\n"
         ));
         let terms: Vec<String> = (0..n).map(|i| format!("a[{i}] * b[{i}]")).collect();
         let by_hand = build(&format!(
@@ -208,7 +208,7 @@ fn the_natural_form_costs_what_the_hand_written_one_does() {
         let (natural_ns, natural_fuel) = per_eval(&natural, "f", &[], 200_000);
         let (hand_ns, hand_fuel) = per_eval(&by_hand, "f", &[], 200_000);
         println!(
-            "length-{n} dot: dot(a, b) {natural_ns:.0} ns / {natural_fuel} fuel, \
+            "length-{n} dot: a @ b {natural_ns:.0} ns / {natural_fuel} fuel, \
              written out {hand_ns:.0} ns / {hand_fuel} fuel"
         );
     }

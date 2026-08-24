@@ -570,6 +570,7 @@ impl<'a> Emitter<'a> {
                 m,
                 k,
                 n,
+                batches,
                 emit,
             } => {
                 self.expr(lhs);
@@ -577,30 +578,39 @@ impl<'a> Emitter<'a> {
                 let a = self.layout.at(lhs.buffer());
                 let b = self.layout.at(rhs.buffer());
                 let out = self.layout.at(*dest);
-                match emit {
-                    Emit::Kernel => {
-                        self.push(Instruction::I32Const(a as i32));
-                        self.push(Instruction::I32Const(b as i32));
-                        self.push(Instruction::I32Const(out as i32));
-                        for extent in [m, k, n] {
-                            self.push(Instruction::I32Const(*extent as i32));
+                // Leading dimensions were walked while checking, so a batch is
+                // three more constants rather than a loop.
+                for batch in batches {
+                    let (a, b, out) = (
+                        a + batch.lhs * 8,
+                        b + batch.rhs * 8,
+                        out + batch.out * 8,
+                    );
+                    match emit {
+                        Emit::Kernel => {
+                            self.push(Instruction::I32Const(a as i32));
+                            self.push(Instruction::I32Const(b as i32));
+                            self.push(Instruction::I32Const(out as i32));
+                            for extent in [m, k, n] {
+                                self.push(Instruction::I32Const(*extent as i32));
+                            }
+                            self.push(Instruction::Call(self.kernels["k_matmul"]));
                         }
-                        self.push(Instruction::Call(self.kernels["k_matmul"]));
-                    }
-                    Emit::Open => {
-                        for row in 0..*m {
-                            for col in 0..*n {
-                                self.push(Instruction::I32Const(
-                                    (out + (row * n + col) * 8) as i32,
-                                ));
-                                self.push(Instruction::F64Const(0.0.into()));
-                                for i in 0..*k {
-                                    self.load(a + (row * k + i) * 8);
-                                    self.load(b + (i * n + col) * 8);
-                                    self.push(Instruction::F64Mul);
-                                    self.push(Instruction::F64Add);
+                        Emit::Open => {
+                            for row in 0..*m {
+                                for col in 0..*n {
+                                    self.push(Instruction::I32Const(
+                                        (out + (row * n + col) * 8) as i32,
+                                    ));
+                                    self.push(Instruction::F64Const(0.0.into()));
+                                    for i in 0..*k {
+                                        self.load(a + (row * k + i) * 8);
+                                        self.load(b + (i * n + col) * 8);
+                                        self.push(Instruction::F64Mul);
+                                        self.push(Instruction::F64Add);
+                                    }
+                                    self.push(Instruction::F64Store(mem_arg(3)));
                                 }
-                                self.push(Instruction::F64Store(mem_arg(3)));
                             }
                         }
                     }

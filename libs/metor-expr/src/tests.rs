@@ -13,6 +13,7 @@
 mod abi;
 mod differential;
 mod m0;
+mod matmul;
 mod measure;
 mod robustness;
 mod scalar;

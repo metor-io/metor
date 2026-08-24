@@ -12,14 +12,14 @@ use super::{build, instantiate, reject};
 use crate::{Dtype, Ty, compile};
 
 /// Drive a buffer-ABI function: arguments in, call, result out.
-struct Driver {
+pub(super) struct Driver {
     store: Store<()>,
     instance: Instance,
     name: String,
 }
 
 impl Driver {
-    fn new(wasm: &[u8], name: &str) -> Self {
+    pub(super) fn new(wasm: &[u8], name: &str) -> Self {
         let (store, instance) = instantiate(wasm, 100_000_000);
         Driver {
             store,
@@ -42,7 +42,7 @@ impl Driver {
         }
     }
 
-    fn write(&mut self, arg: usize, values: &[f64]) {
+    pub(super) fn write(&mut self, arg: usize, values: &[f64]) {
         let at = self.address(&format!("{}_arg_ptr", self.name), Some(arg as i32));
         let memory = self.instance.get_memory(&self.store, "memory").unwrap();
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -63,13 +63,13 @@ impl Driver {
             .unwrap();
     }
 
-    fn run(&mut self) -> Result<(), wasmi::Error> {
+    pub(super) fn run(&mut self) -> Result<(), wasmi::Error> {
         let func = self.instance.get_func(&self.store, &self.name).unwrap();
         let mut out = [Val::I32(0)];
         func.call(&mut self.store, &[], &mut out)
     }
 
-    fn read(&mut self, count: usize) -> Vec<f64> {
+    pub(super) fn read(&mut self, count: usize) -> Vec<f64> {
         let at = self.address(&format!("{}_ret_ptr", self.name), None);
         let memory = self.instance.get_memory(&self.store, "memory").unwrap();
         let mut bytes = vec![0u8; count * 8];
@@ -87,7 +87,7 @@ impl Driver {
 
 /// Compile, feed the tensor arguments in order, run, and read `count`
 /// elements back.
-fn evaluate(source: &str, name: &str, args: &[&[f64]], count: usize) -> Vec<f64> {
+pub(super) fn evaluate(source: &str, name: &str, args: &[&[f64]], count: usize) -> Vec<f64> {
     let wasm = build(source);
     let mut driver = Driver::new(&wasm, name);
     for (i, values) in args.iter().enumerate() {
@@ -97,7 +97,7 @@ fn evaluate(source: &str, name: &str, args: &[&[f64]], count: usize) -> Vec<f64>
     driver.read(count)
 }
 
-fn bits(values: &[f64]) -> Vec<u64> {
+pub(super) fn bits(values: &[f64]) -> Vec<u64> {
     values.iter().map(|v| v.to_bits()).collect()
 }
 
@@ -249,7 +249,7 @@ fn small_shapes_open_code_and_large_ones_call_kernels() {
 }
 
 /// Whether any prelude kernel survived the call-graph walk into this module.
-fn reaches_kernels(wasm: &[u8]) -> bool {
+pub(super) fn reaches_kernels(wasm: &[u8]) -> bool {
     wasmparser::Parser::new(0)
         .parse_all(wasm)
         .filter_map(|p| match p.unwrap() {
@@ -379,12 +379,12 @@ fn range_variants_count_up_and_down() {
 }
 
 #[test]
-fn dot_and_sum_agree_with_nox() {
+fn the_inner_product_and_sum_agree_with_nox() {
     let a = [1.5f64, -2.25, 3.75];
     let b = [0.5f64, 4.0, -1.25];
 
     let wasm =
-        build("def inner(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return dot(a, b)\n");
+        build("def inner(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return a @ b\n");
     let mut driver = Driver::new(&wasm, "inner");
     driver.write(0, &a);
     driver.write(1, &b);
@@ -415,7 +415,7 @@ fn matrix_products_agree_with_nox() {
     let v = [1.0f64, 0.5, -2.0];
     let got = evaluate(
         "def mv(m: Tensor[f64, (2, 3)], v: Tensor[f64, 3]) -> Tensor[f64, 2]:\n\
-         \x20   return dot(m, v)\n",
+         \x20   return m @ v\n",
         "mv",
         &[&m, &v],
         2,
@@ -430,7 +430,7 @@ fn matrix_products_agree_with_nox() {
     let b = [5.0f64, 6.0, 7.0, 8.0];
     let got = evaluate(
         "def mm(a: Tensor[f64, (2, 2)], b: Tensor[f64, (2, 2)]) -> Tensor[f64, (2, 2)]:\n\
-         \x20   return dot(a, b)\n",
+         \x20   return a @ b\n",
         "mm",
         &[&a, &b],
         4,
@@ -458,7 +458,7 @@ fn tensors_cross_between_functions_through_the_same_buffers() {
     // A scalar result of a buffer-ABI callee comes back through its buffer.
     let wasm = build(
         "def norm(v: Tensor[f64, 3]) -> f64:\n\
-         \x20   return sqrt(dot(v, v))\n\
+         \x20   return sqrt(v @ v)\n\
          def twice_norm(v: Tensor[f64, 3]) -> f64:\n\
          \x20   return norm(v) + norm(v)\n",
     );
@@ -508,7 +508,7 @@ fn a_realistic_tensor_program_agrees_with_nox() {
     let gain = [0.5f64, 0.5, 0.5];
     let wasm = build(
         "def rate(omega_b: Tensor[f64, 3]) -> f64:\n\
-         \x20   return sqrt(dot(omega_b, omega_b))\n\
+         \x20   return sqrt(omega_b @ omega_b)\n\
          def control(omega_b: Tensor[f64, 3], k: Tensor[f64, 3]) -> Tensor[f64, 3]:\n\
          \x20   return -(k * omega_b) * rate(omega_b)\n",
     );
@@ -536,13 +536,13 @@ fn sequential_dot(a: &[f64], b: &[f64]) -> f64 {
     acc
 }
 
-/// `dot` is a sequential sum, not a fused one — nox's reaches faer's FMA and
-/// core wasm has no FMA instruction to answer with. Pinned so the divergence
-/// stays a known fact.
+/// A contraction is a sequential sum, not a fused one — nox's `dot` reaches
+/// faer's FMA and core wasm has no FMA instruction to answer with. Pinned so
+/// the divergence stays a known fact.
 #[test]
 fn a_contraction_is_not_fused() {
     let v = [0.01f64, -0.02, 0.005];
-    let wasm = build("def n2(v: Tensor[f64, 3]) -> f64:\n    return dot(v, v)\n");
+    let wasm = build("def n2(v: Tensor[f64, 3]) -> f64:\n    return v @ v\n");
     let mut driver = Driver::new(&wasm, "n2");
     driver.write(0, &v);
     driver.run().unwrap();
@@ -595,7 +595,7 @@ fn tensor_rejections_carry_spans() {
             "tensors support",
         ),
         (
-            "def f(a: Tensor[f64, 3], b: Tensor[f64, 2]) -> f64:\n    return dot(a, b)\n",
+            "def f(a: Tensor[f64, 3], b: Tensor[f64, 2]) -> f64:\n    return a @ b\n",
             "do not contract",
         ),
         (
@@ -615,7 +615,7 @@ fn tensor_rejections_carry_spans() {
 fn tensor_modules_stay_closed_and_within_their_memory() {
     let module = compile(
         "def f(a: Tensor[f64, (3, 3)], b: Tensor[f64, (3, 3)]) -> Tensor[f64, (3, 3)]:\n\
-         \x20   return dot(a, b) + a * b\n",
+         \x20   return a @ b + a * b\n",
     )
     .unwrap();
     assert_eq!(super::imports(&module.wasm), 0);
@@ -666,7 +666,7 @@ fn broadcast_reference(a: &[f64], sa: &[usize], b: &[f64], sb: &[usize], out: &[
     result
 }
 
-fn annotation_of(shape: &[usize]) -> String {
+pub(super) fn annotation_of(shape: &[usize]) -> String {
     match shape {
         [] => "f64".to_string(),
         [n] => format!("Tensor[f64, {n}]"),

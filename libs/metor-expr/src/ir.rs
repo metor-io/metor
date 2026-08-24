@@ -75,6 +75,15 @@ pub(crate) struct Seed {
     pub value: crate::Init,
 }
 
+/// One matrix product of a batched `@`, as element offsets into the three
+/// operands. A rank-2 `@` is the single batch `(0, 0, 0)`.
+#[derive(Clone, Copy)]
+pub(crate) struct Batch {
+    pub lhs: u32,
+    pub rhs: u32,
+    pub out: u32,
+}
+
 /// Shapes for one elementwise call site, already right-aligned to a common
 /// rank with leading `1`s, which is the form the kernel reads.
 #[derive(Clone)]
@@ -252,7 +261,11 @@ pub(crate) enum Expr {
         len: u32,
         emit: Emit,
     },
-    /// Row-major matrix product into `dest`.
+    /// Row-major `(m, k) @ (k, n)` into `dest`, once per entry of `batches`.
+    ///
+    /// Leading dimensions broadcast, so the checker walks their odometer and
+    /// leaves one [`Batch`] per product — the addresses are constants, and a
+    /// batch is a stride the emitter no longer has to compute.
     MatMul {
         dest: BufId,
         lhs: Box<Expr>,
@@ -260,6 +273,7 @@ pub(crate) enum Expr {
         m: u32,
         k: u32,
         n: u32,
+        batches: Vec<Batch>,
         emit: Emit,
     },
     Sum {

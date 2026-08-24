@@ -208,7 +208,7 @@ async fn every_output_field_becomes_its_own_node() {
          \n\
          @system(bind={\"o\": \"imu\"})\n\
          def rate(o: Omega) -> Rate:\n\
-         \x20   return Rate(magnitude=dot(o.omega, o.omega), spinning=o.omega[0] > 0.5)\n",
+         \x20   return Rate(magnitude=o.omega @ o.omega, spinning=o.omega[0] > 0.5)\n",
     );
     let system = &compiled.manifest.systems[0];
     assert_eq!(system.publishes, vec!["rate.magnitude", "rate.spinning"]);

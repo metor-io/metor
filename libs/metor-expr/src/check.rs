@@ -27,6 +27,17 @@
 //!   `int(x)`, and truncates toward zero.
 //! - Indices do not wrap around: `v[-1]` traps rather than reaching the end.
 //!
+//! ## `@` is the only contraction
+//!
+//! Python spells the tensor product `@`, and its rank rules are numpy's:
+//! rank-1 against rank-1 is the inner product, rank-2 is matrix
+//! multiplication, and above that the leading dimensions broadcast while the
+//! last two contract. Phase 1's `dot(a, b)` is gone rather than kept as an
+//! alias — numpy's `dot` and `@` agree only up to rank 2 and diverge above it,
+//! so a second spelling would either be a rank-limited carve-out or a quiet
+//! lie about which contraction ran. The old spelling is a diagnostic naming
+//! the new one, which is a keystroke in an expression field.
+//!
 //! ## Tensors are addresses, and every address is a constant
 //!
 //! Shapes are static, there is no allocator in the guest, and the plan asks
@@ -60,8 +71,8 @@ use rustpython_parser::{Parse, text_size::TextRange};
 
 use crate::diag::{Diagnostics, Span};
 use crate::ir::{
-    Arith, BufId, Cmp, Desc, Emit, Expr, FieldWrite, Func, Intrinsic, Num, Place, Program, Seed,
-    Stmt, SystemAbi,
+    Arith, Batch, BufId, Cmp, Desc, Emit, Expr, FieldWrite, Func, Intrinsic, Num, Place, Program,
+    Seed, Stmt, SystemAbi,
 };
 use crate::lang::{self, SystemDecl};
 use crate::manifest::{self, Frame, Port};
@@ -84,8 +95,9 @@ const MAX_SOURCE_BYTES: usize = 256 * 1024;
 /// bounds the depth, and this leaves room for the worst case that bound allows.
 const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-/// The largest rank an annotation may declare. The kernels read four, and
-/// nothing in this phase writes more than two.
+/// The largest rank an annotation may declare, and what the elementwise
+/// kernels' descriptors carry. A batched `@` contracts the last two axes and
+/// broadcasts the rest, so four is two matrices' worth of batching.
 const MAX_RANK: usize = 4;
 
 /// How many scalar element operations a tensor operation may need before it
@@ -1449,6 +1461,7 @@ impl FnChecker<'_> {
                 ast::Operator::Mult => "k_mul",
                 ast::Operator::Div => "k_div",
                 ast::Operator::Pow => return self.tensor_pow(lhs, rhs, rhs_ast, range),
+                ast::Operator::MatMult => return self.matmul(lhs, rhs, range),
                 _ => {
                     self.diags
                         .push(range, "tensors support `+ - * / **` in this phase");
@@ -1498,10 +1511,7 @@ impl FnChecker<'_> {
                 ));
             }
             ast::Operator::Pow => return self.pow(lhs, rhs, rhs_ast, range),
-            ast::Operator::MatMult => {
-                self.diags.push(range, "`@` is not supported in this phase");
-                return None;
-            }
+            ast::Operator::MatMult => return self.matmul(lhs, rhs, range),
             ast::Operator::LShift
             | ast::Operator::RShift
             | ast::Operator::BitOr
@@ -2030,12 +2040,9 @@ impl FnChecker<'_> {
 
         match name {
             "dot" => {
-                if !arity(2, self) {
-                    return None;
-                }
-                let lhs = self.expr(&call.args[0], depth)?;
-                let rhs = self.expr(&call.args[1], depth)?;
-                return self.dot(lhs, rhs, call.range);
+                self.diags
+                    .push(call.range, "`dot(a, b)` is written `a @ b`");
+                return None;
             }
             "sum" => {
                 if !arity(1, self) {
@@ -2225,15 +2232,35 @@ impl FnChecker<'_> {
         }
     }
 
-    /// nox's contraction rules, for the ranks this phase has.
-    fn dot(&mut self, lhs: (Expr, Ty), rhs: (Expr, Ty), range: TextRange) -> Option<(Expr, Ty)> {
+    /// `@`, with Python's rank rules: rank-1 against rank-1 is the inner
+    /// product, rank-2 is matrix multiplication, and above that the leading
+    /// dimensions broadcast while the last two contract.
+    ///
+    /// A rank-1 operand is promoted for the duration — prepended on the left,
+    /// appended on the right — and the axis that promotion invented is dropped
+    /// from the result, which is what makes `m @ v` a vector rather than a
+    /// one-column matrix.
+    fn matmul(&mut self, lhs: (Expr, Ty), rhs: (Expr, Ty), range: TextRange) -> Option<(Expr, Ty)> {
         let (Ty::Tensor { shape: a, .. }, Ty::Tensor { shape: b, .. }) = (&lhs.1, &rhs.1) else {
-            self.diags.push(range, "`dot` needs two tensors");
+            self.diags.push(
+                range,
+                format!("`@` contracts two tensors, found {} and {}", lhs.1, rhs.1),
+            );
             return None;
         };
         let (a, b) = (a.clone(), b.clone());
-        match (a.as_slice(), b.as_slice()) {
-            ([n], [m]) if n == m => Some((
+
+        let refuse = |this: &mut Self, why: &str| {
+            this.diags
+                .push(range, format!("shapes {a:?} and {b:?} {why}"));
+            None::<(Expr, Ty)>
+        };
+
+        if let ([n], [m]) = (a.as_slice(), b.as_slice()) {
+            if n != m {
+                return refuse(self, "do not contract under `@`");
+            }
+            return Some((
                 Expr::Dot {
                     lhs: Box::new(lhs.0),
                     rhs: Box::new(rhs.0),
@@ -2241,54 +2268,106 @@ impl FnChecker<'_> {
                     emit: emit_for(*n),
                 },
                 Ty::F64,
-            )),
-            ([rows, cols], [k]) if cols == k => {
-                let (rows, cols) = (*rows, *cols);
-                let ty = Ty::Tensor {
-                    dtype: Dtype::F64,
-                    shape: vec![rows],
-                };
-                let dest = self.buffer(&ty);
-                Some((
-                    Expr::MatMul {
-                        dest,
-                        lhs: Box::new(lhs.0),
-                        rhs: Box::new(rhs.0),
-                        m: rows as u32,
-                        k: cols as u32,
-                        n: 1,
-                        emit: emit_for(rows * cols),
-                    },
-                    ty,
-                ))
+            ));
+        }
+
+        let (row_vector, column_vector) = (a.len() == 1, b.len() == 1);
+        let left = match row_vector {
+            true => vec![1, a[0]],
+            false => a.clone(),
+        };
+        let right = match column_vector {
+            true => vec![b[0], 1],
+            false => b.clone(),
+        };
+        let (m, k) = (left[left.len() - 2], left[left.len() - 1]);
+        let (inner, n) = (right[right.len() - 2], right[right.len() - 1]);
+        if k != inner {
+            return refuse(self, "do not contract under `@`");
+        }
+
+        let (lead_lhs, lead_rhs) = (&left[..left.len() - 2], &right[..right.len() - 2]);
+        let Some(lead) = broadcast(lead_lhs, lead_rhs) else {
+            return refuse(self, "have leading dimensions that do not broadcast");
+        };
+
+        let batches = batches(lead_lhs, lead_rhs, &lead, m * k, inner * n, m * n);
+
+        // The promoted axis leaves with the promotion that invented it.
+        let mut shape = lead;
+        if !row_vector {
+            shape.push(m);
+        }
+        if !column_vector {
+            shape.push(n);
+        }
+        let ty = Ty::Tensor {
+            dtype: Dtype::F64,
+            shape,
+        };
+        let dest = self.buffer(&ty);
+        Some((
+            Expr::MatMul {
+                dest,
+                lhs: Box::new(lhs.0),
+                rhs: Box::new(rhs.0),
+                m: m as u32,
+                k: k as u32,
+                n: n as u32,
+                emit: emit_for(batches.len() * m * k * n),
+                batches,
+            },
+            ty,
+        ))
+    }
+}
+
+/// One matrix product per element of the broadcast leading shape, as element
+/// offsets into each operand.
+fn batches(
+    lhs: &[usize],
+    rhs: &[usize],
+    out: &[usize],
+    lhs_matrix: usize,
+    rhs_matrix: usize,
+    out_matrix: usize,
+) -> Vec<Batch> {
+    let rank = out.len();
+    let strides = |shape: &[usize]| {
+        let mut row = vec![0usize; rank];
+        let mut acc = 1;
+        for axis in (0..rank).rev() {
+            let extent = self::axis(shape, rank, axis);
+            row[axis] = if extent == 1 { 0 } else { acc };
+            acc *= extent;
+        }
+        row
+    };
+    let (lhs_stride, rhs_stride) = (strides(lhs), strides(rhs));
+
+    let mut index = vec![0usize; rank];
+    let mut all = Vec::with_capacity(out.iter().product::<usize>().max(1));
+    for at in 0..out.iter().product::<usize>().max(1) {
+        let (l, r) = (0..rank).fold((0, 0), |(l, r), axis| {
+            (
+                l + index[axis] * lhs_stride[axis],
+                r + index[axis] * rhs_stride[axis],
+            )
+        });
+        all.push(Batch {
+            lhs: (l * lhs_matrix) as u32,
+            rhs: (r * rhs_matrix) as u32,
+            out: (at * out_matrix) as u32,
+        });
+        for axis in (0..rank).rev() {
+            index[axis] += 1;
+            if index[axis] < out[axis] {
+                break;
             }
-            ([rows, inner], [k, cols]) if inner == k => {
-                let (rows, inner, cols) = (*rows, *inner, *cols);
-                let ty = Ty::Tensor {
-                    dtype: Dtype::F64,
-                    shape: vec![rows, cols],
-                };
-                let dest = self.buffer(&ty);
-                Some((
-                    Expr::MatMul {
-                        dest,
-                        lhs: Box::new(lhs.0),
-                        rhs: Box::new(rhs.0),
-                        m: rows as u32,
-                        k: inner as u32,
-                        n: cols as u32,
-                        emit: emit_for(rows * inner * cols),
-                    },
-                    ty,
-                ))
-            }
-            _ => {
-                self.diags
-                    .push(range, format!("shapes {a:?} and {b:?} do not contract"));
-                None
-            }
+            index[axis] = 0;
         }
     }
+    all
 }
 
 fn literal_exponent(expr: &ast::Expr) -> Option<u32> {

@@ -272,7 +272,7 @@ fn path_bound_parameters_take_their_types_from_the_host() {
     let source = "\
 @system(\"adcs.omega_b\", \"wheels.rpm\")
 def rate(omega_b, rpm) -> f64:
-    return sqrt(dot(omega_b, omega_b)) + rpm
+    return sqrt(omega_b @ omega_b) + rpm
 ";
     let mut run = build(source, &imu_table(), "rate");
     let omega = [1.0f64, 2.0, 3.0];
@@ -475,7 +475,7 @@ fn a_system_agrees_with_nox_field_by_field() {
 @system
 def watchdog(imu: Imu) -> Rate:
     scaled = imu.omega * 2.0 - imu.accel
-    return Rate(rate=dot(scaled, scaled), hot=scaled[0] < 0.0)
+    return Rate(rate=scaled @ scaled, hot=scaled[0] < 0.0)
 "
     );
     let mut run = build(&source, &imu_table(), "watchdog");
