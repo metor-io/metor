@@ -1,309 +1,336 @@
 # metor-expr Phase 3 — Python systems in the target file
 
-2026-08-24. Parent design: `python-expressions.md` (revision 4). Prior
-phases: `metor-expr-phase0.md` (compiler), `metor-expr-phase1.md`
-(panel runtime + `=` fields), `metor-expr-phase2.md` (unified canvas,
-node editor deleted).
+2026-08-24, **revision 2** (pack-ABI unification — user direction: "why
+can they not fit in the same spot as normal WASM? Ideally these are
+very similar to slots and sequences"). Parent design:
+`python-expressions.md` (revision 4). Prior phases:
+`metor-expr-phase0.md` (compiler), `metor-expr-phase1.md` (panel
+runtime + `=` fields), `metor-expr-phase2.md` (unified canvas, node
+editor deleted).
 
 ## Goal
 
 A `@system`-decorated function written **directly in `target.py`** runs
-on the vehicle as a first-class cyclic system: ports from the signature,
-output as real telemetry, wired to native systems by ordinary edges,
-compiled to WASM at the init gate, executed under wasmi with fuel.
+on the vehicle as a first-class cyclic system: ports from the
+signature, output as real telemetry, wired to native systems by
+ordinary edges, executed under wasmi with fuel — **as an ordinary wasm
+pack artifact through the existing wasm machinery**, not through an
+expression-shaped sibling of it.
 
-## The pivot: no `ExprSystem`
+## The two pivots
 
-Revision 4 staged Phase 3 as "`ExprSystem`, `target.systems(Path)`" — a
-named built-in wrapper system plus path-based module registration. Both
-are gone (user decision, 2026-08-24). The registration surface is the
-decorator itself:
+**No `ExprSystem`** (user, 2026-08-24): the decorator is the
+registration surface. `@system` functions live in `target.py`, captured
+at config-eval time; no wrapper type, no `target.systems(Path)`.
 
-```python
-from metor_config import Target, system, node
+**No expr-shaped carve-out on the vehicle** (user, 2026-08-24):
+revision 1 planned a parallel expr-ABI host (a second wasm driver, a
+`ty: "expr"` special case in resolve, a bespoke runner). Instead, the
+compiler emits modules that **speak the pack ABI**, so a Python program
+compiles to a pack artifact exposing N systems — exactly the shape a
+Rust pack cdylib has — and flows through `WasmPack`/`WasmSlot`/
+`RingBridge` like any other wasm. Python becomes *a pack whose build
+step is metor-expr instead of cargo*. What revision 1's carve-out
+would have duplicated, this pre-pays instead: the pack-ABI guest layer
+is exactly what Phase 4 sequences need.
 
-target = Target(cycle_rate=100.0)
-imu = target.add("imu", adcs_pack.Imu())
+Status note: revision 1's gate A landed as `cd67aabe` (recorder
+capture, IR v9); its host-side draft (`src/wiring/expr.rs`,
+`src/coordinator/expr.rs`) was stopped **untracked and unwired** — no
+`mod` declaration, `resolve_exprs` never called. Gate A's capture
+machinery survives this revision; its IR emission shape is reworked in
+place (v9 is branch-local, no v10). The draft files are mined for
+their vtable-construction code and deleted.
 
-@system("imu.omega_b")
-@node(x=420, y=180)
-def omega_norm(omega_b):
-    return (omega_b @ omega_b) ** 0.5
-```
+## What the unification buys
 
-No `ExprSystem` type in the registry, no separate module file, no
-`Path` indirection. The target file *is* the program. Consequences:
+- **One wasm host on the vehicle.** `WasmSlot`'s open/bind/pump/execute
+  machinery drives Python systems; no expr-ABI sibling to maintain.
+- **The compiler stays off the vehicle.** Compilation happens at
+  build/provision time — the same seam that builds path-source cdylibs
+  — so the flight binary never links rustpython-parser or
+  wasm-encoder. The binary-size risk from revision 1 disappears; "no
+  toolchain on the target" becomes literal.
+- **Slots work today.** A Python system mounted in a slot is an
+  ordinary wasm occupant: `Load`/`Start`/`Stop`/`Reset` occupant
+  swapping already exists and is tested for wasm (fresh-bytes reload
+  gated by `entry_identity`). Revision 1's deferred hot-swap question
+  partially dissolves into standard machinery.
+- **Sequences converge.** A wasm sequence path already exists and is
+  tested (`seq-fixture` runs a `task` entry to `Done` under the
+  bridge). Phase 4 compiles Python coroutines into the same artifact
+  shape this phase establishes.
+- **Provisioning, hashing, bundling come free-ish.** The `.so` and
+  `.wasm` paths share `PackManifest` bytes exactly; a build step that
+  emits the `.manifest` sidecar inherits `check_manifest_hashes` and
+  the sidecar tooling unchanged.
 
-- The decorator is the capture point: it records the function's source
-  at config-eval time; `Target.to_ir()` assembles the captured
-  declarations into one module per target and threads it through the IR.
-- There is no user-visible wrapper to parameterize, so **live source
-  replacement loses its vehicle** (`ExprSystem` params were the uplink
-  path). Phase 3 recompiles at init; the panel stays the live-iteration
-  surface. Runtime swap returns as its own arc if wanted (see Open
-  Questions).
-- The host machinery still exists, but as internal init plumbing (a
-  bind arm and a runner struct), not a registered `type=`. Standard
-  path: the runner follows the existing dynamic-port precedents
-  (`SlotRunner` drives a foreign descriptor as a `CyclicSlot`;
-  `UplinkSystem` mints ports from config via `instance_descriptor`),
-  it does not invent a parallel one.
+## Survey facts this plan builds on (2026-08-24)
 
-The promotion path survives intact and gets shorter: prototype in the
-panel canvas, then paste the same function into `target.py` — the
-decorator spelling, frame classes, and semantics are identical because
-the vehicle compiles the same source with the same compiler.
-
-## What already exists (survey 2026-08-24)
-
-- **wasmi 1.1 is already a host dependency** (`metor-fsw-2/Cargo.toml`)
-  with a proven sandbox: `src/wasm.rs` has the fuel-per-call, memory
-  ResourceLimiter (64 MiB default), and trap policy, plumbed from
-  `CoordinatorSpec.wasm_fuel_per_poll` / `wasm_memory_limit_bytes`. It
-  is pack-ABI-shaped (guest rings, `RingBridge`); Phase 3 writes a much
-  smaller expr-ABI host reusing the same policy. The panel's
-  `dynamic/ops/program.rs` (`Compiled`/`Running`) is the reference
-  implementation of the expr-ABI hosting sequence.
-- **`metor-expr` is host-ready**: `compile_module(src, &dyn Resolver)`,
-  `Manifest::declarations()` build order, `pub mod state` (snapshot /
-  restore keyed `(system, field, ty)`, `@rng` host-seeded), `Layout`
-  with the `@node` rewrite machinery. `Resolver::frame()` returning
-  `Some` is the explicitly reserved FSW hook (panel returns `None`).
-  Note the manifest has **four** fields — `{compiler, systems, stages,
-  functions}` — and `declarations()` interleaves systems and stages; a
-  host that ignores stages silently drops resamples.
-- **Dynamic Table ports are constructible**: `PortDesc` fields are all
-  `pub`; `PortSchema::Table` builds from `metor_proto::vtable::builder`.
-  `announce()` derives prefixed component ids from the metadata list, so
-  metadata is load-bearing.
-- **No source capture exists in the recorder** — nearest precedent is
-  `_source_ref()`'s frame-walk provenance. `inspect.getsource` is new
-  ground.
-- **`metor_config.Frame` already exists** as the base of pack-generated
-  frame classes (typed fields, `InPort[F]`/`OutPort[F]` markers). This
-  is a unification opportunity, not a collision: an expr signature that
-  annotates a parameter with a pack-generated frame class *is* the
-  `bind=`-to-host-frame case, checked one-to-one at compile.
-- **`metor-fsw-2` does not depend on `metor-expr` today.** Adding it
-  pulls rustpython-parser + wasm-encoder + the checked-in
-  `prelude.wasm` into the flight binary — priced in Phase 0 (parser +
-  encoder, 136 µs compiles, no toolchain on target).
+- **The pack ABI guest contract is satisfiable by a minimal guest.**
+  Required exports (all resolved once in `WasmPack::open`):
+  `fsw_abi_version` (= 11, checked first), `fsw_pack_open/close`,
+  `describe`/`manifest_ptr` (postcard `PackManifest` — can be a baked
+  data segment), `create(pack, index, mount, params)` (entry by
+  manifest position), `bind_init`, `execute(state, now) -> FswStatus`,
+  `shutdown`, `destroy`, `alloc` (host allocates params, ring regions,
+  `FswRing` arrays, name — all sizes statically known, so a bump
+  pointer over a compile-time-sized arena suffices; align 8),
+  `ring_init` (guest formats the ring header), `set_now`. `free` is
+  exported by the macro but never called by the host. **Zero imports**
+  — the linker is empty, any import fails instantiation.
+- **Rings are guest-allocated and guest-formatted** (the allocator and
+  arch-tag lessons are already encoded in the design). The guest must
+  speak the real ring format — magic/version/control/reader slots,
+  8-byte aligned records, Release-committed positions, the SeqCst
+  registration fence. `metor-fsw-ring` is already
+  `default-features = false`-capable for wasm: **link the real crate
+  into the prelude rather than reimplementing a safety-critical
+  format** (fall back to a minimal hand impl only if it drags in
+  weight the prelude can't carry; it creates/attaches on raw regions,
+  no allocator needed).
+- **Multiple systems per artifact already works** end to end
+  (manifest `Vec<PackEntryDesc>`, create-by-index, name→index lookup
+  in `resolve_wasm_occupant`; the seq-fixture ships three entries).
+- **The host pumps**: `RingBridge` forwards host↔guest per cycle —
+  `Log` legs drain the backlog, `Snapshot` legs forward `try_latest()`
+  only when `committed` moved. Memory is pinned after bind
+  (`ResourceLimiter` denies growth; `check_memory_stable` before every
+  pump). Fuel is granted **per call**; setup fuel and poll fuel are
+  separate budgets. Marshalling measured at 7 ns against a 2,873 ns
+  cycle.
+- **Wired wasm systems don't exist yet — and nothing structurally
+  prevents them.** `resolve_with` sends any `(Some(artifact), false)`
+  spec to `resolve_dl` with **no kind check** (a wasm artifact would
+  be `dlopen`'d — silent fallthrough to guard). The wired arm is
+  ~120–180 mechanical lines: `SystemBind::Wasm` + `WasmReg` (path,
+  entry name, identity, params — mirroring `ProcReg`), a bind arm
+  that is `WasmSlot::bind_opened` with `Mount::Wired` (0), no mount
+  tail, no delivery padding, and a thin `CyclicSlot`. Fuel/memory
+  plumbing already reaches binds via `ProcBindCtx`.
+- **Provisioning has the seam but not the arm**: `provision_artifacts`
+  never inspects `artifact.kind`; `ArtifactKind::Wasm` exists in the
+  IR (since v7) but the recorder never emits it and bundling's member
+  naming assumes cdylibs. The recorder's `Artifact` also has no way to
+  name a single arch-neutral file.
+- **`entry_identity` is postcard of (descriptor, params_schema,
+  reloadable)** — byte-fragile by design. Codegen must be
+  deterministic to the metadata level or every reload is rejected.
+- **No state carryover exists in the pack path** (`#[fsw(snapshot)]`
+  is a delivery marker, not persistence; occupant swaps destroy the
+  instance). metor-expr's `state` module is the right shape for a
+  future pack-ABI addition; not this phase.
+- **Guest panics are invisible on wasm32** (abort, not unwind; no
+  imports ⇒ no message). The generated guest must have no panicking
+  paths; validate ring configs before formatting rather than trusting
+  `catch_unwind`.
 
 ## Design decisions
 
-**D1 — Capture unit: one synthetic module per target.** Each `@system`
-records `{source (dedented, decorators included), file, firstlineno}`
-via a module-scoped registry the decorator appends to; user-defined
-`Frame`/`State` subclasses capture the same way through
-`__init_subclass__` (pack-generated frames are marked and skipped —
-they are *host* frames, resolved not compiled). `to_ir()` assembles
-captured classes + functions in definition order into one module
-string. Rationale: `Binding::Produced` (one system reading another's
-output) and `Manifest::declarations()` ordering only work inside one
-compilation unit, and the panel's program pane has the same unit.
-Diagnostics must map back: the IR carries per-declaration
-`SourceRef`s and the synthetic module's per-decl offsets so an
-init-gate error prints `target.py:LINE`, never a synthetic-module
-line.
+**D1 — Capture: unchanged from revision 1 (landed).** `@system` /
+`@node` decorators and `Frame`/`State` `__init_subclass__` capture
+source with file/line provenance in the recorder; `to_ir()` assembles
+one synthetic module per target in definition order;
+`Wiring.program` carries `{source, decls}` — now as **build input and
+provenance/canvas display**, not as an init-gate compile input.
+Decorated forms only on the vehicle (bare expressions and top-level
+bindings would evaluate under CPython; they stay panel-only). Stages
+(`resample_*`) rejected: markers not exported, a manifest containing
+stages fails the build (user decision, unchanged).
 
-**D2 — Tiers on the vehicle: decorated forms only.** `@system` defs
-(both sugar and canonical frame form) and `Frame`/`State` classes
-execute harmlessly under CPython (defined, never called) and are
-capturable. Bare expressions and top-level `name = expr` bindings would
-actually *evaluate* under CPython and fail — they remain panel-only
-tiers, which matches the promotion gradient (`=` field → module binding
-→ `@system` def; the def is the flight form).
+**D2 — The compiler emits pack-ABI modules.** metor-expr's template/
+prelude layer grows the pack entry points as thin adapters over the
+existing static-buffer machinery: baked postcard `PackManifest` data
+segment (one `PackEntryDesc` per `@system`: full `SystemDescriptor`
+with real vtables built from `Frame` layouts — 8-byte slots,
+f64-aligned, bool low 4; metadata list is load-bearing for announce;
+`params_schema` empty/unit; `reloadable: true`), `fsw_abi_version` =
+11, bump-arena `alloc`, `ring_init`/ring I/O via linked
+`metor-fsw-ring`, `create` by entry index, `execute` dispatching to
+the per-system eval. **The `expr_*` export family stays** — one module,
+two hosts: the panel keeps its fine-grained per-sample surface
+(`_arg_ptr`/`_eval`/`_state_ptr`), the vehicle speaks pack. Forcing
+the panel onto per-cycle pump semantics would regress its streaming
+model for no gain; the two families share every body and buffer. The
+mined vtable-construction code from the untracked draft seeds the
+manifest baking. **Codegen determinism is a contract** (entry_identity):
+pinned test — compile twice, byte-identical module.
 
-**D3 — IR shape: uniform `SystemSpec` + one program blob.** Each
-captured system emits an ordinary `SystemSpec` (`ty: "expr"`, no
-artifact) so name/scope/edge validation, namespacing, and the broadcast
-manifest treat Python systems like any other; a new `Wiring.program:
-Option<ProgramSpec>` carries `{source, decls: [{name, src: SourceRef,
-offset}]}` once. `IR_VERSION` 8 → 9 in **both** `ir.rs` and
-`metor_config/__init__.py` (also fix the stale v2–v6 comment block),
-golden fixture `tests/golden/target.json` updated for **both** the Rust
-`ir_contract.rs` and Python `test_golden.py` suites. Broadcasting the
-source in `WiringManifest` is deliberate: the panel canvas can show
-vehicle Python systems with their real source (read-only in this
-phase). Size is KBs against a manifest ring that already special-cases
-its size.
+**D3 — Run rule lives in the guest.** Pack `execute` runs every cycle;
+the guest decides. Driving input: fire when the driving ring's
+committed position moved since last execute, read latest from the
+rest, skip (return Ok, publish nothing) otherwise; never-published
+driving input skips. `rate=`: fire when `now` crosses the next tick
+(guest-side, from the `execute(now)` argument); the gate still
+validates rate-divides-cycle_rate (hard error, user decision Q3).
+This keeps the host driver completely generic — it cannot tell a
+Python pack from a Rust one.
 
-**D4 — Compile at the init gate, in the resolve systems pass.**
-`resolve_with` gains an `"expr"` arm: build an `FswResolver` over the
-already-resolved graph (component paths → `Ty` from `PortDesc`
-vtable metadata; `frame(name)` → `FrameSchema` from host frame
-definitions — the reserved hook; **ids are carried from the registry,
-never re-derived** — `ComponentId::new` masks a bit, re-hashing
-"works" for half of all names), call `compile_module`, and construct
-one `Node` per manifest system with a hand-built `SystemDescriptor`.
-This must complete inside the pass because `instance_descriptor` runs
-at node construction, before `build()`. A bad program fails
-construction with a `target.py`-line-numbered diagnostic — the design
-doc's init-gate promise.
+**D4 — Compile at build/provision time.** `provision_artifacts` gains
+`ArtifactKind` dispatch (also fixing the silent dl fallthrough for any
+misdeclared artifact): the wasm-from-program arm runs
+`metor_expr::compile_module` against a resolver built from the other
+artifacts' decoded pack manifests (paths → `Ty` from `PortDesc`
+vtable metadata, **ids carried, never re-derived** —
+`ComponentId::new` masks the FNV top bit; `frame()` answered from
+host frame definitions — the reserved hook), writes the `.wasm` next
+to the built cdylibs, sets `artifact.path`, and emits the
+`.manifest` sidecar so `check_manifest_hashes` covers it unchanged.
+Diagnostics map to `target.py` lines via `ProgramSpec` offsets — the
+line-numbered-failure promise moves from init gate to build gate,
+which is strictly earlier. Bundling's member naming gets a wasm arm.
+`--no-build` (`locate_artifacts`) treats the compiled `.wasm` like a
+located cdylib.
 
-**D5 — One instance, N cyclic nodes.** The compiled module instantiates
-once (one `Store`, fuel set per eval from `wasm_fuel_per_poll`, memory
-limit from config, `@rng` seeded at instantiation); each system is its
-own cyclic `Node` sharing the instance through the runner. Rationale:
-the cyclic loop is single-threaded, buffers are per-system static
-addresses, and N instances would cost N linear memories for nothing.
-Each system being its own node keeps step order, edge validation
-(`StaleFrameEdge`), health, and telemetry uniform.
+**D5 — IR: uniform artifact + entries, no `"expr"` type.** The
+recorder emits one `Artifact { kind: Wasm }` for the program (recorder
+`Artifact` gains `kind` and drops the cdylib-only field requirements
+for wasm; the stale "v7 added the wasm artifact kind" comment finally
+becomes true) and one ordinary `SystemSpec { name, ty: <entry name>,
+artifact }` per `@system` — exactly how cdylib pack entries are
+addressed. Gate A's `EXPR_TYPE`/artifact-less validation carve-outs
+are removed; program-decl validation (unique names, every system
+references a decl) stays. IR stays at v9, goldens amended in place.
+`SystemSpec.layout` (D11 of revision 1) is unchanged: `@node(x=,y=)`
+for Python systems, `Target.add(node=)` for native ones, canvas
+prefers IR layout, local overrides still win.
 
-**D6 — Ports are real rings, even Python→Python.** Every binding
-becomes an edge: `Binding::Component(path)` → an edge from the
-producing port (consumer `PortDesc` is the single-component subset —
-Table compatibility is component-subset by design);
-`Binding::Produced{system, field}` → an edge between the two Python
-systems' rings. Inputs are `Snapshot × One` (latest-wins is the run
-rule; `Snapshot × Many` is a hard error anyway). The output port is one
-Table port per system: frame name from the manifest, vtable +
-metadata built from `Frame{fields}` (8-byte slots, f64-aligned, bool in
-the low 4 — the Phase 1 layout), components named `{system}.{field}`
-and prefixed by instance/namespace exactly like native ports. This is
-what makes a Python system's output first-class telemetry with zero new
-announce machinery.
+**D6 — Resolve: the wired wasm arm.** `resolve_with` dispatches on
+`ArtifactKind`: the wasm arm opens the artifact (setup fuel), finds
+the entry by name, registers `SystemBind::Wasm`/`WasmReg`, and the
+bind pass instantiates via the `Mount::Wired` variant of the slot's
+bind sequence with a thin `CyclicSlot`. This is a **general
+capability** — any wasm pack becomes mountable as a plain wired
+system, Rust-authored ones included; Python is just its first
+producer. Kind guard added to the dl arm. `resolve_wasm_occupant`
+refactors to share the describe step. One wasmi instance per artifact
+is the natural outcome (entries share a module instance the way slot
+occupants each get one; prefer one instance per artifact serving all
+its entries if the bind sequence allows, else one per entry — decide
+by measurement, both are correct).
 
-**D7 — Run rule on the coordinator clock.** `on=`/default: fire when
-the driving input has a fresh sample this cycle (drain non-driving
-inputs, hold latest), skip the cycle otherwise; a port that has never
-published skips — identical to the panel. `rate=`: the coordinator has
-one global `cycle_rate` and no per-system division, so the runner
-decimates with a step counter; **validate at the gate that `rate`
-divides `cycle_rate`** (error, not silent rounding). A system with no
-inputs requires `rate=` (same diagnostic as the panel).
+**D7 — Edges.** Explicit `target.connect(handle.out, ...)` edges ride
+the IR as today (Gate A's handles). Path bindings
+(`Binding::Component`) and Python→Python bindings
+(`Binding::Produced`) are synthesized into edges at resolve by
+reading the expr manifest baked in the artifact (`expr_manifest_ptr`
+— already exported): input port descriptors are in the pack manifest
+(the compiler built them from resolved types), so synthesis is only
+"find the producing (instance, port) for each bound path and connect".
+Ordering: Python systems register after native systems, before the
+deferred receive-all block; feeding an earlier native system needs
+`delayed=True` (`StaleFrameEdge` already says so).
 
-**D8 — Faults degrade, never kill.** A non-zero eval return or a trap
-(fuel exhaustion included — `while True:` burns its grant) marks the
-system's `SystemHealth` degraded with the fault code and a `LogEvent`,
-skips the publish, and keeps draining inputs so upstream never backs
-up — the panel's park behavior, expressed in FSW health vocabulary.
-The vehicle never stalls on a bad expression.
+**D8 — Faults degrade, never kill.** The wired runner maps
+trap/fuel-exhaustion/pump failure to degraded `SystemHealth` + a
+`LogEvent`, keeps pumping inputs (drops counted like
+`wasm_boundary_dropped`), never re-enters a dead instance — the slot
+path's `dead` latch, surfaced in system-health vocabulary. The
+vehicle never stalls on a bad expression.
 
-**D9 — Ordering.** Python systems are pushed after the native systems
-pass, before the deferred receive-all block (receive-all must be last;
-being before it keeps downlink telemetry same-cycle fresh). They can
-therefore read any native output same-cycle; feeding a native system
-declared earlier requires `delayed=True` on the edge, and the existing
-`StaleFrameEdge` diagnostic already says so.
+**D9 — `@rng` seeding.** No imports means no guest entropy. The seed
+rides the params channel: resolve injects a host-entropy seed into
+the entry's params at vehicle init (fresh per boot), and the
+generated `create` stores it into the `@rng` state slot — the same
+observable behavior the panel host produces by writing the slot
+directly.
 
-**D10 — Cross-wiring surface.** The decorator returns a handle usable
-where a `SystemHandle` is: `omega_norm.out` in
-`target.connect(omega_norm.out, nav.some_input)` — legal when the
-output frame is (or binds one-to-one to) a host-defined frame, checked
-by the same Table compatibility rule. Path-bound sugar outputs (an
-anonymous frame) connect only component-subset-wise, which the rule
-also already handles.
-
-**D11 — Layout lands in the IR, for both sources.** `SystemSpec` gains
-`layout: Option<(f32, f32)>` (same IR bump as D3). Python systems get
-it from `@node(x=, y=)`; native systems get a placement kwarg on
-`Target.add(..., node=(x, y))` — "position lives at the declaration
-site" finally covers both. The panel canvas prefers IR layout over
-auto-layout; the per-view manual override map still wins locally (the
-Phase 2 decision), and re-layout still clears overrides only.
+**D10 — Slots: free, state carryover deferred.** A Python system named
+in a slot's `allow` set works through the existing occupant machinery
+today (including fresh-bytes reload gated by `entry_identity` —
+another reason D2's determinism contract matters). State carryover
+across swaps doesn't exist for any pack and is out of scope; when it
+comes, metor-expr's `state` module (`StateKey` triples, seed guards)
+is the shape a pack-ABI `state_ptr` addition should take. Live
+source-uplink remains deferred: there is no file-transfer path in the
+crate today, and the compiler lives ground-side where the panel
+already runs it.
 
 ## Work packages
 
-**WP1 — Recorder: capture + IR.** `metor_config`: export `system`,
-`node`, `State`, and the annotation vocabulary (`Tensor`, dtypes) —
-`Frame` unifies with the existing pack-frame base (D1); decorator
-captures source + provenance; handle object for `target.connect`
-(D10); `Target.add(node=)` (D11); `to_ir()` assembles the module and
-emits `SystemSpec`s + `ProgramSpec` (D3). IR_VERSION 9 both sides,
-both golden suites, recorder version bump, stale comment fixed.
-Stubgen/type-stub updates so `target.py` type-checks.
+**WP1 — IR rework (revises Gate A in place).** Recorder: `Artifact`
+gains `kind`, wasm artifacts drop crate/lib requirements, program
+emits `Artifact{kind: Wasm}` + per-system `SystemSpec{ty, artifact}`
+(D5); remove `EXPR_TYPE` carve-outs, keep program-decl validation;
+goldens amended both suites, still v9. Delete the untracked expr host
+drafts after mining their vtable construction.
 
-**WP2 — Rust IR + validate.** `ir.rs`: `ProgramSpec`, `SystemSpec.
-layout`, version bump; `validate.rs`: `ty == "expr"` systems must
-reference a program decl, program decls must be unique, rate-divides-
-cycle_rate check (D7 — needs the coordinator spec, so it may live in
-resolve; put it wherever the diagnostic is best), `check_system`
-relaxed for artifact-less expr systems.
+**WP2 — metor-expr pack backend (the heart).** Prelude links stripped
+`metor-fsw-ring`; pack-ABI exports as adapters over static buffers
+(D2); baked `PackManifest`; guest-side run rule + rate ticks (D3);
+no panicking paths; determinism pin (compile twice, byte-equal);
+expr-ABI exports and all 131 existing tests untouched. Verify the
+seq-fixture-style host tests can open/bind/execute a compiled Python
+module via `WasmPack` directly.
 
-**WP3 — Init-gate compile.** `metor-fsw-2` ← `metor-expr` dependency.
-`FswResolver` (D4) over the resolved graph: `component()` from
-announce-shaped metadata with carried ids, `suffix()` for authoring-
-time names, `frame()` from host frames — the Phase 1 reserved hook
-comes alive. Compile in the resolve systems pass; map diagnostics to
-`target.py` lines via `ProgramSpec` offsets; fail construction cleanly.
+**WP3 — Build-time compile.** Provision arm with `ArtifactKind`
+dispatch + dl-arm kind guard (D4); build-time resolver from decoded
+pack manifests; `.manifest` sidecar; bundle member-naming wasm arm;
+`target.py`-line diagnostics; `--no-build` path.
 
-**WP4 — The runner.** Expr-ABI host (small sibling of `wasm.rs`, same
-fuel/limit/trap policy): instantiate once per program (D5), per-system
-cyclic slots with hand-built `SystemDescriptor`s (D6), raw ring
-writers/views (the `SlotRunner` precedent), the run rule + decimator
-(D7), fault policy (D8), `@rng` seeding, state slots initialized from
-manifest defaults. Bind arm mirroring `bind_slot`. Ordering per D9.
-Stages: per Open Question Q1's answer.
+**WP4 — The wired wasm arm.** `SystemBind::Wasm`/`WasmReg`, resolve
+dispatch, `Mount::Wired` bind (no tail, no padding, descriptor's own
+delivery list), thin `CyclicSlot`, fault policy (D8), `@rng` param
+seeding (D9), edge synthesis from the expr manifest (D7), ordering
+(D7). Pinned test on port order through the bridge.
 
-**WP5 — Edges from bindings + handles.** Resolve `Binding::Component`
-and `Binding::Produced` to real edges with subset `PortDesc`s (D6);
-`target.connect` edges from decorator handles type-check through the
-existing compatibility rule (D10).
+**WP5 — Panel + example + differentials.** Canvas renders vehicle
+Python systems read-only with source from `ProgramSpec`, position
+from IR layout. `examples/adcs-fsw2/target.py` gains a real Python
+system off the IMU. Integration test: eval target → provision
+(compile) → init → run cycles → telemetered values vs the nox oracle.
+**Bit-parity differential**: same module, same input samples, panel
+host (expr ABI) vs vehicle host (pack ABI) produce bit-identical
+output frames — now also proving the two export families agree. Fault
+path: fuel-exhausting system degrades health, vehicle keeps cycling.
+Slot smoke test: the same artifact mounted as a slot occupant loads
+and steps through the existing runner. Measure artifact size
+(prelude + ring vs the 307 KB core-based fixture) and record it.
 
-**WP6 — Panel: vehicle Python systems on the canvas.** The canvas
-already renders manifest systems; teach it that an `"expr"` system
-carries source in `ProgramSpec` — show it read-only (open the card,
-see the function), position from IR layout (D11). No editing of
-vehicle systems in this phase.
-
-**WP7 — Example + differential.** `examples/adcs-fsw2/target.py` gains
-a real Python system (e.g. `omega_norm` off the IMU). Integration
-test: eval target → init → run N cycles → assert the output component
-telemeters with correct schema and values against the nox oracle.
-**Bit-parity test**: the same module, same input samples, evaluated by
-the panel host and the FSW runner produce bit-identical output frames
-(the design doc's promise at line 627). Fault-path test: a
-fuel-exhausting system degrades health and the vehicle keeps cycling.
-
-Gates: WP1+WP2 land together (IR contract). WP3+WP4+WP5 are the core
-and land together behind the integration test. WP6 and WP7's
-differential can trail. Commit at each gate.
+Gates: WP1 alone (IR contract, small). WP2 alone (compiler-side,
+self-contained, its own tests). WP3+WP4 together behind the
+integration test. WP5 last. Commit at each gate.
 
 ## Decided questions (user, 2026-08-24)
 
-**Q1 — Resample stages: rejected this phase.** `resample_zoh`/
-`resample_linear` are top-level bindings — under CPython they'd need
-exported marker functions to be capturable at all. Not exported; a
-program whose manifest contains stages fails the gate with "resample
-is panel-only for now". Add the host resampler when a vehicle use case
-shows up.
-
-**Q2 — Runtime source replacement: deferred.** With `ExprSystem` gone
-there is no parameter surface to send new source through; a config
-change is a rebuild + restart, the normal FSW config flow. The panel
-remains the sub-second iteration surface. Revisit as its own arc (it
-wants a cycle-boundary swap protocol and a port-topology-change story,
-which is re-init territory anyway).
-
-**Q3 — `rate=` that doesn't divide `cycle_rate`: hard error** (D7).
+**Q1 — Resample stages: rejected this phase** (build-gate diagnostic,
+markers not exported). **Q2 — Runtime source replacement: deferred**
+(no transport exists; slots give occupant-swap without it; compiler
+stays ground-side). **Q3 — `rate=` must divide `cycle_rate`: hard
+error.** **Q4 (rev 2) — pack-ABI unification over an expr-ABI host:
+directed by the user**; the panel keeps the expr export family
+(decision D2).
 
 ## Risks
 
-- **The multi-field frame path has never run.** The panel's port layout
-  hard-errors on ≠1-field frames ("a multi-field frame is a Phase 3
-  shape") — on the vehicle every host frame is multi-field. The
-  canonical-form path (declared frames, `bind=`) gets its first real
-  exercise; the vtable-vs-manifest one-to-one check is new code. The
-  differential test in WP7 is the guard.
-- **Descriptor/binding order is a silent-misbind trap** (minted ports
-  must trail statics on the `UplinkSystem` path; positional bind is in
-  declaration order). The runner uses raw rings precisely to keep this
-  explicit; a pinned test asserts port order round-trips through the
-  descriptor.
-- **Flight-binary weight**: rustpython-parser + wasm-encoder + prelude.
-  Phase 0 priced compile speed, not binary size — measure the delta in
-  WP3 and record it in Results; if it's ugly, feature-gating is the
-  escape hatch (default-on, since the whole point is no toolchain on
-  the target).
-- **Id re-derivation footgun** (`ComponentId::new` masks a bit) now has
-  a second host. `FswResolver` carries ids from the registry — stated
-  in D4, tested in WP7.
+- **The guest ring implementation is the safety-critical center.**
+  Linking real `metor-fsw-ring` avoids a second implementation of
+  SeqCst fencing; if it can't be carried into the prelude, the
+  hand-written fallback is small but must be reviewed as
+  concurrency-critical code. Either way the WP2 host-side tests
+  exercise real pump traffic, not mocks.
+- **Determinism is now load-bearing twice** (entry_identity reloads,
+  manifest hashing). The compile-twice pin plus a
+  hash-stability test across a process restart guard it.
+- **The multi-field frame path gets its first real exercise** (the
+  panel hard-errors on ≠1-field frames; on the vehicle every host
+  frame is multi-field). The WP5 differential is the guard.
+- **Baked-manifest drift**: the pack manifest is compiler-emitted
+  bytes while the type it must decode to lives in
+  `metor-fsw-2-core`. A round-trip test (compile → `WasmPack::
+  read_manifest` decodes → descriptor equals the expr manifest's
+  view) pins the contract; ABI version equality (11) is the tripwire
+  for divergence.
+- **Fuel-exhaustion detection is a string match** in the host
+  (`is_out_of_fuel`); inherited, not worsened — noted so nobody
+  "fixes" a fault-path test around it.
 
 ## Out of scope
 
-- Sequences (Phase 4, deferred decision point).
-- Editing vehicle Python systems from the canvas / uplink swap (Q2).
-- Per-system rates that don't divide the coordinator clock.
-- Reclaiming the panel's hidden `expr.<hash>` components (existing
-  deferred item, unrelated).
+- Sequences (Phase 4 — now with its substrate pre-paid).
+- State carryover across occupant swaps (future pack-ABI addition,
+  shaped like `metor_expr::state`).
+- Live source uplink / file transfer to the vehicle.
+- `wasm32` targets in `pack_dist` wheels (deferred in
+  `wasm-occupant.md`; unchanged).
+- Editing vehicle Python systems from the canvas.

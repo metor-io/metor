@@ -447,10 +447,12 @@ FSW — owns ports and rings; the guest is pure compute plus state:
   directly (the existing `ComponentStreamBuilder` bridge) and skips
   component registration — ephemeral by default, shared by content hash
   when two views type the same expression.
-- **FSW:** host-internal init plumbing (revised 2026-08-24 — no
-  registered `ExprSystem` type) adapts real wired ports to the same ABI:
-  each `@system` becomes its own cyclic node with hand-built descriptors,
-  sharing one wasmi instance per program.
+- **FSW:** (revised again 2026-08-24 — no expr-shaped host either) the
+  compiler emits modules that speak the **pack ABI**, so a Python
+  program is an ordinary wasm pack artifact exposing N systems, driven
+  by the same `WasmPack`/`RingBridge` machinery as any other wasm —
+  slots and sequences included. The `expr_*` exports remain alongside
+  for the panel's per-sample hosting; one module, two entry families.
 
 Every instance runs under wasmi with fuel, in the panel exactly as in
 FSW — a `while True:` burns its grant and surfaces as a diagnostic on the
@@ -531,11 +533,13 @@ def omega_norm(omega_b):
     return (omega_b @ omega_b) ** 0.5
 ```
 
-The Wiring IR carries the source; the host compiles at init, inside the
-existing validate gate, so a bad program fails construction with a
-line-numbered error rather than a runtime fault. No per-triple matrix, no
-toolchain on the target — the compiler is a parser and an encoder, cheap
-enough to live in the flight binary. Frame classes declared in Python
+The Wiring IR carries the source; the build driver compiles it into an
+ordinary wasm **pack artifact** at provision time (revised 2026-08-24 —
+the same seam that builds path-source cdylibs), so a bad program fails
+the build with a line-numbered error rather than a runtime fault, and
+the flight binary never links the compiler at all. No per-triple
+matrix, no toolchain on the target — the vehicle only ever loads wasm
+artifacts through its one existing path. Frame classes declared in Python
 generate real frame vtables (name, fields, shapes, component ids), so a
 Python system's output is first-class telemetry; a signature can equally
 name frames the Rust side already defines, checked one-to-one against the
