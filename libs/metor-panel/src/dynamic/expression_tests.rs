@@ -971,3 +971,164 @@ fn an_xy_axis_binds_an_expression_independently(cx: &mut gpui::TestAppContext) {
         );
     });
 }
+
+/// Compile an expression over `source` and report the component it will
+/// publish into, without starting it.
+fn expression_target(db: &std::sync::Arc<DB>, body: &str, source: ComponentId) -> ComponentId {
+    use crate::dynamic::ops::{db_source, program};
+    let resolver = DbResolver::snapshot(db);
+    let compiled = std::sync::Arc::new(program::Compiled::expression(body, &resolver).unwrap());
+    ComponentId::new(&expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source)]),
+        0,
+    )))
+}
+
+/// Push one `f64` and wait for the expression's component to carry a sample
+/// stamped `at`, returning its value.
+///
+/// The wait is a plain sleep rather than an async one: the expression's nodes
+/// run on the stellarator worker thread, which the gpui test executor knows
+/// nothing about and cannot be driven to park on.
+fn feed_and_await(
+    db: &std::sync::Arc<DB>,
+    source: ComponentId,
+    published: ComponentId,
+    at: i64,
+    value: f64,
+) -> f64 {
+    use metor_proto::types::Timestamp;
+    let component = db.with_state(|s| s.get_component(source).cloned()).unwrap();
+    component
+        .push_buf(Timestamp(at), &value.to_le_bytes())
+        .unwrap();
+    let out = db.with_state(|s| s.get_component(published).cloned()).unwrap();
+    for _ in 0..400 {
+        if let Some(latest) = out.time_series.latest()
+            && latest.timestamp() == Timestamp(at)
+        {
+            return f64::from_le_bytes(latest.data().try_into().unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the expression never published at {at}");
+}
+
+/// A time-series trace bound to an expression, saved and reloaded.
+///
+/// The trace stores a component id, and an expression's component keeps its
+/// history but not its computation across a restart — so an id alone comes
+/// back as a frozen line with nothing writing to it. The last assertion is the
+/// one that matters: after reloading, *new* data has to arrive, not just the
+/// history that was already there.
+#[gpui::test]
+fn a_time_series_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::views::time_series::{PlotPanelConfig, TimeSeriesPlot, TraceConfig};
+    use gpui::AppContext;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with_ids(&[("rpm", ComponentId::new("rpm"), PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let source = ComponentId::new("rpm");
+    let typed = "=rpm * 2.0";
+    let published = expression_target(&db, "rpm * 2.0", source);
+
+    let saved = cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+
+        let bound = expressions::bind(typed, &db, cx).expect("the expression compiles");
+        assert_eq!(bound.id, published);
+        let config = PlotPanelConfig {
+            traces: vec![TraceConfig {
+                component_id: bound.id,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plot = cx.new(|cx| TimeSeriesPlot::from_config(config, db.clone(), cx));
+        plot.read(cx).to_config(cx)
+    });
+    assert_eq!(
+        saved.traces[0].expression.as_deref(),
+        Some(typed),
+        "a trace over an expression saves the text that made it"
+    );
+
+    // History accumulates while that session is running.
+    assert_eq!(feed_and_await(&db, source, published, 100, 5.0), 10.0);
+
+    // A new session: the old expression's handles go, and with them its
+    // tasks. The component survives, holding what it already computed.
+    cx.update(expressions::Expressions::init);
+
+    let reloaded = cx.update(|cx| {
+        let plot = cx.new(|cx| TimeSeriesPlot::from_config(saved, db.clone(), cx));
+        let line_plot = plot.read(cx).line_plot().read(cx);
+        let id = line_plot.traces()[0].read(cx).component_id;
+        assert!(
+            cx.global::<expressions::Expressions>().is_live(published),
+            "reloading has to start the expression again"
+        );
+        id
+    });
+    assert_eq!(reloaded, published, "and bind onto what it publishes into");
+
+    // The point of all of it: the reloaded trace follows new data.
+    assert_eq!(feed_and_await(&db, source, published, 200, 7.0), 14.0);
+}
+
+/// The same for a list plot, whose trace additionally carries a length.
+#[gpui::test]
+fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::views::list_plot::{ListPlot, ListPlotPanelConfig, ListTraceConfig};
+    use gpui::AppContext;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with_ids(&[("rpm", ComponentId::new("rpm"), PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let source = ComponentId::new("rpm");
+    let typed = "=rpm * 3.0";
+    let published = expression_target(&db, "rpm * 3.0", source);
+
+    let saved = cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+
+        let bound = expressions::bind(typed, &db, cx).expect("the expression compiles");
+        let config = ListPlotPanelConfig {
+            traces: vec![ListTraceConfig {
+                component_id: bound.id,
+                len: crate::views::list_plot::trace_picker::expression_len(&db, bound.id),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plot = cx.new(|cx| ListPlot::from_config(config, db.clone(), cx));
+        plot.read(cx).to_config(cx)
+    });
+    assert_eq!(saved.traces[0].expression.as_deref(), Some(typed));
+    assert_eq!(saved.traces[0].len, 1, "a scalar expression is one point");
+
+    assert_eq!(feed_and_await(&db, source, published, 100, 2.0), 6.0);
+
+    cx.update(expressions::Expressions::init);
+
+    let reloaded = cx.update(|cx| {
+        let plot = cx.new(|cx| ListPlot::from_config(saved, db.clone(), cx));
+        let line_plot = plot.read(cx).line_plot().read(cx);
+        let id = line_plot.traces()[0].read(cx).component_id;
+        assert!(
+            cx.global::<expressions::Expressions>().is_live(published),
+            "reloading has to start the expression again"
+        );
+        id
+    });
+    assert_eq!(reloaded, published);
+
+    assert_eq!(feed_and_await(&db, source, published, 200, 4.0), 12.0);
+}

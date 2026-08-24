@@ -1565,6 +1565,7 @@ mod tests {
                 label: "vx".into(),
                 stroke_width: 2.0,
                 axis_index: 1,
+                expression: Some("=rpm * 2.0".into()),
             }],
             custom_title: Override::Custom("My View".into()),
             axes: vec![
