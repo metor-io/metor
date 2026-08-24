@@ -4,8 +4,9 @@
 //! [`SelectedGraphNode`] proxy; the inspector's registry maps that type to
 //! [`build_rows`], which re-derives the node's detail from the live wiring
 //! store. Those rows are read-only — the tile shows topology, it never edits
-//! it. The panel itself (reached from tab right-click and the palette) gets
-//! its view settings: flow direction and re-layout.
+//! it. The tile itself (reached from tab right-click and the palette) gets
+//! its view settings: flow direction, and the re-layout that forgets every
+//! hand-placed native position.
 
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use crate::graph_layout::Direction;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{CommandRow, EnumRow, HeaderRow, InspectorRow, TextRow};
 
-use super::SystemGraphPanel;
+use crate::canvas::GraphCanvas;
 
 /// Entity placed into the inspector when a graph node is selected. Carries
 /// only the node id; [`build_rows`] looks the details up in the live store so
@@ -30,7 +31,7 @@ pub fn register_inspector_rows(cx: &mut App) {
     cx.global_mut::<InspectorRegistry>()
         .register_type_builder::<SelectedGraphNode>(Arc::new(build_rows));
     cx.global_mut::<InspectorRegistry>()
-        .register_type_builder::<SystemGraphPanel>(Arc::new(build_panel_rows));
+        .register_type_builder::<GraphCanvas>(Arc::new(build_panel_rows));
 }
 
 fn direction_label(direction: Direction) -> SharedString {
@@ -43,12 +44,12 @@ fn direction_label(direction: Direction) -> SharedString {
 /// Rows for the inspected panel: the flow direction and a re-layout command
 /// that clears manual node positions.
 fn build_panel_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
-    let Ok(panel) = any.downcast::<SystemGraphPanel>() else {
+    let Ok(panel) = any.downcast::<GraphCanvas>() else {
         return Vec::new();
     };
     let direction = panel.read(cx).direction();
     vec![
-        Box::new(HeaderRow::new("System Graph")),
+        Box::new(HeaderRow::new("Graph")),
         Box::new(EnumRow {
             label: SharedString::new_static("Direction"),
             selected: direction_label(direction),

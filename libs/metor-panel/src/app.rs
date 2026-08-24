@@ -1316,16 +1316,37 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         db.clone(),
         crate::node_editor::pane::NodeEditor::from_config,
     );
-    register_panel::<crate::program::ProgramPane>(
+    register_panel::<crate::canvas::GraphCanvas>(
         &mut reg,
         db.clone(),
-        crate::program::ProgramPane::from_config,
+        crate::canvas::GraphCanvas::from_config,
     );
-    register_panel::<crate::views::system_graph::SystemGraphPanel>(
-        &mut reg,
-        db.clone(),
-        crate::views::system_graph::SystemGraphPanel::from_config,
-    );
+
+    // The graph tile is the system graph with a second source added, so it
+    // keeps that key and every layout naming it opens unchanged. A layout that
+    // names the program pane opens on the same tile, showing the text it was
+    // saved on — the two were views of one artifact even before they were one
+    // tile.
+    let db_program = db.clone();
+    reg.register_erased("program", move |state, cx| {
+        #[derive(Default, serde::Deserialize)]
+        #[serde(default)]
+        struct Saved {
+            source: String,
+            graph: bool,
+        }
+        let saved: Saved = serde_json::from_str(state).unwrap_or_default();
+        let cfg = crate::canvas::GraphCanvasConfig {
+            program: crate::canvas::ProgramState {
+                source: saved.source,
+                text: !saved.graph,
+            },
+            ..Default::default()
+        };
+        let db = db_program.clone();
+        let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
+        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
+    });
 
     // Layouts written before the annunciator rename still name it
     // `traffic_light_grid`; the alias rehydrates them and they re-save under
@@ -1416,8 +1437,8 @@ mod keybinding_tests {
     /// is what lets one negation cover every editable field.
     #[test]
     fn a_host_can_declare_its_name_and_text_input_together() {
-        let context = KeyContext::try_from("ProgramPane TextInput").unwrap();
-        assert!(context.contains("ProgramPane"));
+        let context = KeyContext::try_from("GraphCanvas TextInput").unwrap();
+        assert!(context.contains("GraphCanvas"));
         assert!(context.contains(TEXT_INPUT));
     }
 
@@ -1428,10 +1449,10 @@ mod keybinding_tests {
     fn the_leader_never_fires_while_something_is_being_typed_into() {
         assert!(fires(NOT_TYPING, &["AppRoot"]));
         assert!(fires(NOT_TYPING, &["AppRoot", "NodeEditor"]));
-        assert!(fires(NOT_TYPING, &["AppRoot", "ProgramPane"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "GraphCanvas"]));
 
         for typing in [
-            &["AppRoot", "ProgramPane TextInput"][..],
+            &["AppRoot", "GraphCanvas TextInput"][..],
             &["AppRoot", "Inspector TextInput"][..],
             &["AppRoot", "Inspector TextInput", "RowList TextInput"][..],
             &["AppRoot", "ConnectionPicker TextInput"][..],
@@ -1458,6 +1479,6 @@ mod keybinding_tests {
             &["AppRoot", "NodeEditor", "RowList TextInput"]
         ));
         // Outside a node editor there is nothing to delete.
-        assert!(!fires(DELETE_NODE, &["AppRoot", "ProgramPane TextInput"]));
+        assert!(!fires(DELETE_NODE, &["AppRoot", "GraphCanvas TextInput"]));
     }
 }

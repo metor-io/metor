@@ -1475,27 +1475,14 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
-    rows.push(Box::new(CommandRow::new("Program", {
+    rows.push(Box::new(CommandRow::new("Graph", {
         let db = db.clone();
         let pane = pane.clone();
         Arc::new(move |_window, cx| {
             let db = db.clone();
             pane.update(cx, |pane, cx| {
-                let item = cx.new(|cx| crate::program::ProgramPane::new(db.clone(), cx));
-                pane.add_item(Box::new(item), cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("System Graph", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> = Box::new(
-                    cx.new(|cx| crate::views::system_graph::SystemGraphPanel::new(db, cx)),
-                );
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| crate::canvas::GraphCanvas::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })
