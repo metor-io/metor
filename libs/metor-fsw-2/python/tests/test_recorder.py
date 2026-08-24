@@ -12,20 +12,27 @@ from metor_config import (
     Alarms,
     Artifact,
     Component,
+    Frame,
+    State,
     Target,
+    Tensor,
     System,
     Downlink,
     TcpServer,
     Uplink,
     band,
+    f64,
+    node,
     static_system,
+    system,
 )
 
 
 class RecorderTest(unittest.TestCase):
     def setUp(self):
-        # The exactly-one-Target tracker is module-global; isolate each test.
+        # The capture trackers are module-global; isolate each test.
         mc._targets.clear()
+        mc._program.clear()
 
     def test_coordinator_clock_and_knobs(self):
         wall = Target(cycle_rate=100.0).to_ir()["coordinator"]
@@ -176,6 +183,68 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(uplink.attach, "link")
         self.assertEqual(Downlink(link).attach, "link")
         self.assertEqual(TcpServer(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
+
+    def test_system_capture_assembles_the_program(self):
+        m = Target(cycle_rate=100.0)
+
+        class RateEstimate(Frame):
+            omega: Tensor[f64, 3]
+
+        class Lpf(State):
+            y: f64 = 0.0
+
+        @system("imu.omega_b")
+        @node(x=420, y=180)
+        def omega_norm(omega_b):
+            return (omega_b @ omega_b) ** 0.5
+
+        # `@node` above `@system` places the same way.
+        @node(x=10, y=20)
+        @system
+        def smooth(est: RateEstimate, s: Lpf) -> RateEstimate:
+            return RateEstimate(omega=est.omega)
+
+        ir = m.to_ir()
+        program = ir["program"]
+        self.assertEqual(
+            [d["name"] for d in program["decls"]],
+            ["RateEstimate", "Lpf", "omega_norm", "smooth"],
+        )
+        # Offsets index the assembled source at each declaration's first byte
+        # (a decorated function's chunk starts at its decorators).
+        ends = [d["offset"] for d in program["decls"][1:]] + [len(program["source"])]
+        for decl, end in zip(program["decls"], ends):
+            chunk = program["source"][decl["offset"]:end]
+            self.assertRegex(chunk, rf"(def|class) {decl['name']}\b")
+        self.assertTrue(program["decls"][0]["src"]["file"].endswith("test_recorder.py"))
+
+        expr = [s for s in ir["systems"] if s["ty"] == "expr"]
+        self.assertEqual([s["name"] for s in expr], ["omega_norm", "smooth"])
+        self.assertEqual(expr[0]["layout"], [420.0, 180.0])
+        self.assertEqual(expr[1]["layout"], [10.0, 20.0])
+        self.assertEqual(expr[0]["params"], "None")
+
+        # The handle's `.out` names the output port: the function itself for
+        # the sugar form, the snake-cased Frame class for the canonical form.
+        self.assertEqual((omega_norm.out.instance, omega_norm.out.port),
+                         ("omega_norm", "omega_norm"))
+        self.assertEqual(smooth.out.port, "rate_estimate")
+
+    def test_pack_frame_markers_are_not_captured(self):
+        Target(cycle_rate=100.0)
+
+        class Sensors(Frame):
+            """Frame marker (checker-only)."""
+
+        self.assertEqual(mc._program, [])
+
+    def test_native_node_kwarg_records_layout(self):
+        m = Target(cycle_rate=100.0)
+        m.add("a", static_system("A"), node=(40, 80))
+        m.add("b", static_system("B"))
+        systems = m.to_ir()["systems"]
+        self.assertEqual(systems[0]["layout"], [40.0, 80.0])
+        self.assertIsNone(systems[1]["layout"])
 
     def test_non_json_param_names_the_key(self):
         m = Target(cycle_rate=100.0)

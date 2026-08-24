@@ -47,6 +47,8 @@ from metor_config import (
     Uplink,
     VectorMarker,
     band,
+    node,
+    system,
 )
 
 GOLDEN = os.path.join(
@@ -151,6 +153,7 @@ def build_target() -> Target:
                 hysteresis=0.005,
             )
         ]),
+        node=(40, 80),
     )
     link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
     uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand"]))
@@ -170,6 +173,12 @@ def build_target() -> Target:
     m.connect(mode.mode_cmd, plant.torque_cmd, delayed=True)
     m.route(uplink, mode, msg="SequenceCommand")
     m.route(m.coordinator, mode, msg="SequenceCommand")
+
+    @system("block.plant.sensors.gyro_b")
+    @node(x=420, y=180)
+    def gyro_norm(gyro_b):
+        return (gyro_b @ gyro_b) ** 0.5
+
     return m
 
 
@@ -192,6 +201,7 @@ def normalize(v):
 class GoldenTest(unittest.TestCase):
     def setUp(self):
         mc._targets.clear()
+        mc._program.clear()
 
     def test_emits_the_golden_fixture(self):
         with open(GOLDEN, encoding="utf-8") as f:

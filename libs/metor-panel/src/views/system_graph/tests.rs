@@ -26,6 +26,7 @@ fn base_wiring() -> Wiring {
         slots: Vec::new(),
         edges: Vec::new(),
         scopes: Vec::new(),
+        program: None,
     }
 }
 
@@ -39,6 +40,7 @@ fn system(name: &str, scope: Option<usize>) -> SystemSpec {
         src: None,
         scope,
         attach: None,
+        layout: None,
     }
 }
 

@@ -88,6 +88,23 @@ pub enum LoadErrorKind {
     #[error("unknown system type `{ty}` (not in the registry)")]
     UnknownType { ty: String },
 
+    /// Two declarations of the wiring's Python program share a name. Decls
+    /// are addressed by name (an `expr` system references its function this
+    /// way), so a duplicate would silently shadow.
+    #[error("program declaration `{name}` appears more than once")]
+    DuplicateProgramDecl { name: String },
+
+    /// An `expr` system names no declaration of the wiring's program. The
+    /// program *is* an expr system's spec, so a spec without a matching
+    /// `@system` declaration is front-end drift, not a document mistake.
+    #[error("expr system `{name}`: the wiring's program declares no `{name}`")]
+    ExprUnknownDecl { name: String },
+
+    /// An `expr` system carries params. Its whole configuration is the
+    /// captured source; params here would be silently dropped.
+    #[error("expr system `{name}` carries params; a Python system's source is its whole spec")]
+    ExprParams { name: String },
+
     #[error("system `{name}` sets `process` without an `artifact`")]
     ProcessNeedsArtifact { name: String },
 

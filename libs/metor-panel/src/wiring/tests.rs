@@ -28,10 +28,12 @@ fn wiring_with_system(name: &str) -> Wiring {
             src: None,
             scope: None,
             attach: None,
+            layout: None,
         }],
         slots: Vec::new(),
         edges: Vec::new(),
         scopes: Vec::new(),
+        program: None,
     }
 }
 

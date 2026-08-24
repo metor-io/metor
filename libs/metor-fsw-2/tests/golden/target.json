@@ -1,9 +1,13 @@
 {
-  "ir_version": 8,
+  "ir_version": 9,
   "coordinator": {
     "cycle_rate": 120.0,
     "default_depth": null,
-    "clock": { "Simulated": { "dt_secs": 0.5 } },
+    "clock": {
+      "Simulated": {
+        "dt_secs": 0.5
+      }
+    },
     "namespace": null,
     "wasm_fuel_per_poll": null,
     "wasm_memory_limit_bytes": null
@@ -34,7 +38,11 @@
     {
       "name": "link",
       "ty": "TcpServer",
-      "params": { "Value": { "addr": "127.0.0.1:2240" } },
+      "params": {
+        "Value": {
+          "addr": "127.0.0.1:2240"
+        }
+      },
       "src": null
     }
   ],
@@ -49,13 +57,18 @@
           "init_rate": 0.15,
           "seed": 42,
           "disarmed": false,
-          "cp_offset_b": [0.02, 0.0, 0.0]
+          "cp_offset_b": [
+            0.02,
+            0.0,
+            0.0
+          ]
         }
       },
       "process": true,
       "src": null,
       "scope": 0,
-      "attach": null
+      "attach": null,
+      "layout": null
     },
     {
       "name": "block.nav",
@@ -65,7 +78,8 @@
       "process": false,
       "src": null,
       "scope": 0,
-      "attach": null
+      "attach": null,
+      "layout": null
     },
     {
       "name": "alarms",
@@ -78,9 +92,18 @@
               "id": "ADCS_RATE_HIGH",
               "name": "Body Rate High",
               "description": "Measured body-Y rate exceeds the detumbled envelope",
-              "target": { "component": "block.plant.sensors.gyro_b", "element": 1 },
-              "warning": { "above": 0.05, "below": -0.05 },
-              "critical": { "above": 0.15, "below": -0.15 },
+              "target": {
+                "component": "block.plant.sensors.gyro_b",
+                "element": 1
+              },
+              "warning": {
+                "above": 0.05,
+                "below": -0.05
+              },
+              "critical": {
+                "above": 0.15,
+                "below": -0.15
+              },
               "debounce": 2,
               "hysteresis": 0.005
             }
@@ -90,29 +113,63 @@
       "process": false,
       "src": null,
       "scope": null,
-      "attach": null
+      "attach": null,
+      "layout": [
+        40.0,
+        80.0
+      ]
     },
     {
       "name": "uplink",
       "ty": "Uplink",
       "artifact": null,
-      "params": { "Value": { "msgs": ["SequenceCommand"] } },
+      "params": {
+        "Value": {
+          "msgs": [
+            "SequenceCommand"
+          ]
+        }
+      },
       "process": false,
       "src": null,
       "scope": null,
-      "attach": "link"
+      "attach": "link",
+      "layout": null
+    },
+    {
+      "name": "gyro_norm",
+      "ty": "expr",
+      "artifact": null,
+      "params": "None",
+      "process": false,
+      "src": null,
+      "scope": null,
+      "attach": null,
+      "layout": [
+        420.0,
+        180.0
+      ]
     }
   ],
   "slots": [
     {
       "name": "mode",
-      "inputs": ["attitude_estimate", "gps"],
-      "outputs": ["mode_cmd"],
+      "inputs": [
+        "attitude_estimate",
+        "gps"
+      ],
+      "outputs": [
+        "mode_cmd"
+      ],
       "allow": [
         {
           "occupant": "commissioning",
           "artifact": "seqs",
-          "params": { "Value": { "rate_detumble_enter": 1.0 } },
+          "params": {
+            "Value": {
+              "rate_detumble_enter": 1.0
+            }
+          },
           "src": null
         },
         {
@@ -122,7 +179,10 @@
           "src": null
         }
       ],
-      "initial": { "occupant": "commissioning", "state": "Running" },
+      "initial": {
+        "occupant": "commissioning",
+        "state": "Running"
+      },
       "process": false,
       "src": null,
       "scope": null
@@ -175,5 +235,21 @@
       "src": null
     }
   ],
-  "scopes": [{ "path": "block", "parent": null, "src": null }]
+  "scopes": [
+    {
+      "path": "block",
+      "parent": null,
+      "src": null
+    }
+  ],
+  "program": {
+    "source": "@system(\"block.plant.sensors.gyro_b\")\n@node(x=420, y=180)\ndef gyro_norm(gyro_b):\n    return (gyro_b @ gyro_b) ** 0.5\n\n",
+    "decls": [
+      {
+        "name": "gyro_norm",
+        "src": null,
+        "offset": 0
+      }
+    ]
+  }
 }

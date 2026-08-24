@@ -11,8 +11,9 @@
 
 use metor_fsw_2::ir::{EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
 use metor_fsw_2::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EXPR_TYPE, EdgeSpec,
+    InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec,
+    SystemSpec, Wiring,
 };
 use serde_json::{Value, json};
 
@@ -75,6 +76,7 @@ fn maximal() -> Wiring {
                 src: src(5),
                 scope: Some(0),
                 attach: None,
+                layout: Some((40.0, 80.0)),
             },
             SystemSpec {
                 name: "postcard_sys".into(),
@@ -85,6 +87,7 @@ fn maximal() -> Wiring {
                 src: None,
                 scope: Some(1),
                 attach: None,
+                layout: None,
             },
             SystemSpec {
                 name: "bare".into(),
@@ -95,6 +98,18 @@ fn maximal() -> Wiring {
                 src: None,
                 scope: None,
                 attach: Some("link".into()),
+                layout: None,
+            },
+            SystemSpec {
+                name: "omega_norm".into(),
+                ty: Some(EXPR_TYPE.into()),
+                artifact: None,
+                params: ParamSource::None,
+                process: false,
+                src: src(12),
+                scope: None,
+                attach: None,
+                layout: Some((420.0, 180.0)),
             },
         ],
         slots: vec![SlotSpec {
@@ -164,6 +179,16 @@ fn maximal() -> Wiring {
                 src: None,
             },
         ],
+        program: Some(ProgramSpec {
+            source: "@system(\"block.plant.sensors.gyro_b\")\ndef omega_norm(gyro_b):\n    \
+                     return (gyro_b @ gyro_b) ** 0.5\n\n"
+                .into(),
+            decls: vec![ProgramDecl {
+                name: "omega_norm".into(),
+                src: src(12),
+                offset: 0,
+            }],
+        }),
     }
 }
 
@@ -214,6 +239,16 @@ fn representation_is_externally_tagged() {
     // Absent optionals render as null, not omitted.
     assert_eq!(v["systems"][2]["ty"], Value::Null);
     assert_eq!(v["systems"][2]["scope"], Value::Null);
+
+    // Layout renders as a two-element array, absent as null.
+    assert_eq!(v["systems"][0]["layout"], json!([40.0, 80.0]));
+    assert_eq!(v["systems"][1]["layout"], Value::Null);
+
+    // The captured program: an `expr` system references its decl by name.
+    assert_eq!(v["systems"][3]["ty"], json!("expr"));
+    assert_eq!(v["systems"][3]["params"], json!("None"));
+    assert_eq!(v["program"]["decls"][0]["name"], json!("omega_norm"));
+    assert_eq!(v["program"]["decls"][0]["offset"], json!(0));
 
     // The v3 artifact fields: the arch-neutral lib stem, a prebuilt dir as a
     // plain path string, and dist provenance as a { name, version } object.

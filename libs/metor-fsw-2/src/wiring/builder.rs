@@ -69,6 +69,7 @@ impl WiringBuilder {
                 slots: Vec::new(),
                 edges: Vec::new(),
                 scopes: Vec::new(),
+                program: None,
             },
         }
     }
@@ -154,6 +155,7 @@ impl WiringBuilder {
                 src: None,
                 scope: None,
                 attach: None,
+                layout: None,
             },
         }
     }

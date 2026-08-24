@@ -21,14 +21,16 @@ place in the IR scope tree.
 from __future__ import annotations
 
 import atexit
+import inspect
 import json
 import os
 import sys
+import textwrap
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Generic, Iterator, TypeVar, cast
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # The IR model version this recorder emits; must match `ir::IR_VERSION`.
 # v2 dropped the KDL front-end's `ParamSource::Kdl` variant (phase 4).
@@ -43,7 +45,12 @@ __version__ = "0.3.0"
 # their constructor), replacing the host's compiled-in by-type association.
 # v6 removed the redundant empty initial-occupant state; an absent `initial`
 # now exclusively represents an empty slot.
-IR_VERSION = 8
+# v7 added the `wasm` artifact kind and the coordinator's per-poll fuel and
+# guest-memory limits.
+# v8 moved eval-time validation to the one Rust gate (no shape change).
+# v9 added the captured Python program (`program`), the `"expr"` system type
+# it compiles, and the declaration-site `layout` on every system.
+IR_VERSION = 9
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -144,7 +151,17 @@ H = TypeVar("H", bound="Spec")
 
 
 class Frame:
-    """Base of a generated per-frame marker class (checker-only)."""
+    """Base of a per-frame marker class.
+
+    A generated pack module's markers are field-less (checker-only) and name
+    host frames. A subclass with annotated fields is a compiled frame: its
+    source is captured into the target program (see :func:`system`)."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "__annotations__" in cls.__dict__:
+            _frames.add(cls.__name__)
+            _capture(cls)
 
 
 class Msg:
@@ -233,6 +250,135 @@ class SystemHandle:
         if name.startswith("_"):
             raise AttributeError(name)
         return PortRef(self.name, name)
+
+
+# ---------------------------------------------------------------------------
+# Python systems
+#
+# A `@system`-decorated function written in the target file runs on the
+# vehicle: the decorator captures its source here, `Target.to_ir` assembles
+# every captured declaration into one program, and the host compiles it to
+# WASM at the init gate (`libs/metor-expr`). Under CPython the declarations
+# are defined and never called, so evaluation is harmless; the compiled
+# semantics live entirely on the Rust side. `Frame`/`State` subclasses with
+# annotated fields capture the same way — a field-less subclass is a
+# generated pack marker naming a *host* frame, resolved at compile rather
+# than compiled.
+# ---------------------------------------------------------------------------
+
+# Every captured declaration in definition order. Module-scoped like
+# `_targets`: classes and decorators execute before (or without) a Target.
+_program: list[dict[str, Any]] = []
+
+# The captured Frame class names, for naming a system's output port.
+_frames: set[str] = set()
+
+
+def _capture(obj: Any) -> dict[str, Any]:
+    """Record a declaration's source and provenance for the target program."""
+    lines, line = inspect.getsourcelines(obj)
+    file = inspect.getsourcefile(obj)
+    if file is not None:
+        try:
+            file = os.path.relpath(file)
+        except ValueError:
+            pass
+    entry: dict[str, Any] = {
+        "name": obj.__name__,
+        "source": textwrap.dedent("".join(lines)),
+        "src": {"file": file, "line": line, "col": 1},
+        "layout": None,
+        "system": False,
+    }
+    _program.append(entry)
+    return entry
+
+
+class Tensor:
+    """The tensor annotation (``Tensor[f64, 3]``), evaluated only so class
+    bodies run: the compiler reads the annotation from source, not from this
+    object."""
+
+    def __class_getitem__(cls, item: Any) -> Any:
+        return cls
+
+
+# The scalar annotation vocabulary. Aliases so annotations evaluate under
+# CPython; the compiler reads the spelling from source.
+f64 = float
+i64 = int
+
+
+class ExprHandle(SystemHandle):
+    """The instance a ``@system`` function registers as. ``.out`` names its
+    one output port; any other attribute is a :class:`PortRef` like any
+    handle's."""
+
+    def __init__(self, name: str, entry: dict[str, Any], out: str):
+        super().__init__(name)
+        self._entry = entry
+        self._out = out
+
+    @property
+    def out(self) -> Any:
+        return PortRef(self.name, self._out)
+
+
+def _snake(name: str) -> str:
+    """``RateEstimate`` to ``rate_estimate`` — the compiler's frame naming."""
+    out = ""
+    for i, c in enumerate(name):
+        if c.isupper() and i > 0:
+            out += "_"
+        out += c.lower()
+    return out
+
+
+def _output_frame(func: Any) -> str:
+    """The output port's frame name: the snake case of a declared Frame class
+    named by the return annotation, else the function's own name (the
+    anonymous one-field frame of the sugar form)."""
+    ret = func.__annotations__.get("return")
+    name = ret if isinstance(ret, str) else getattr(ret, "__name__", None)
+    if isinstance(name, str) and name in _frames:
+        return _snake(name)
+    return func.__name__
+
+
+def _system(func: Any) -> ExprHandle:
+    entry = _capture(func)
+    entry["system"] = True
+    placed = getattr(func, "_metor_node", None)
+    if placed is not None:
+        entry["layout"] = placed
+    return ExprHandle(func.__name__, entry, _output_frame(func))
+
+
+def system(*args: Any, **kwargs: Any) -> Any:
+    """Register a Python system to run on the vehicle.
+
+    Bare (``@system``) over Frame-annotated parameters, or parameterized
+    (``@system("imu.omega_b")``, ``bind=``, ``on=``, ``rate=``) — the
+    arguments configure the *compiled* system and are read from source by the
+    host, so they are accepted and ignored here. Returns the instance handle:
+    ``handle.out`` is the output port for :meth:`Target.connect`."""
+    if len(args) == 1 and not kwargs and inspect.isfunction(args[0]):
+        return _system(args[0])
+    return _system
+
+
+def node(x: float, y: float) -> Any:
+    """Pin a declaration's canvas card at ``(x, y)``. Stacks with ``@system``
+    in either order; the position rides the IR as the system's layout."""
+
+    def place(obj: Any) -> Any:
+        if isinstance(obj, ExprHandle):
+            obj._entry["layout"] = [float(x), float(y)]
+        else:
+            obj._metor_node = [float(x), float(y)]
+        return obj
+
+    return place
 
 
 # ---------------------------------------------------------------------------
@@ -613,11 +759,20 @@ class Gauge:
 @dataclass(frozen=True)
 class State:
     """One row of a :class:`StateChip` table: the code, what it means, and
-    optionally the colour it shows in."""
+    optionally the colour it shows in.
+
+    Also the base of a compiled system's state record: a subclass with
+    annotated, defaulted fields is captured into the target program exactly
+    like a :class:`Frame` subclass (see :func:`system`)."""
 
     value: float
     label: str
     color: str | None = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "__annotations__" in cls.__dict__:
+            _capture(cls)
 
     def _json(self) -> dict[str, Any]:
         return _drop_none(
@@ -1174,13 +1329,21 @@ class Target:
         )
         return StateHandle(name)
 
-    def add(self, name: str, spec: H, process: bool = False) -> H:
+    def add(
+        self,
+        name: str,
+        spec: H,
+        process: bool = False,
+        node: tuple[float, float] | None = None,
+    ) -> H:
         """Register ``spec`` under ``name`` (scope-prefixed) and return its handle.
 
         The return is typed as the spec's own class so a generated entry's port
         attributes (``plant.sensors``) are checkable; at runtime it is a
         :class:`SystemHandle` whose attribute access yields :class:`PortRef`s.
-        A generated :class:`System` also auto-registers its artifact."""
+        A generated :class:`System` also auto-registers its artifact. ``node``
+        pins the system's canvas card, the :func:`node` decorator's twin for a
+        native system."""
         full, scope = self._scoped(name)
         self._register_spec_artifact(spec)
         self._systems.append(
@@ -1193,6 +1356,7 @@ class Target:
                 "src": _source_ref(),
                 "scope": scope,
                 "attach": spec.attach,
+                "layout": [float(node[0]), float(node[1])] if node else None,
             }
         )
         return cast(H, SystemHandle(full))
@@ -1287,8 +1451,46 @@ class Target:
             return {"Simulated": {"dt_secs": float(self.sim_dt)}}
         return "Wall"
 
+    def _program_ir(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """The assembled program blob and one ``"expr"`` system spec per
+        captured ``@system``, from the module-scoped capture list. Offsets are
+        byte offsets into the assembled source, what the compiler's spans are
+        mapped back through."""
+        if not _program:
+            return None, []
+        decls: list[dict[str, Any]] = []
+        parts: list[str] = []
+        offset = 0
+        for entry in _program:
+            text = entry["source"]
+            if not text.endswith("\n"):
+                text += "\n"
+            text += "\n"
+            decls.append(
+                {"name": entry["name"], "src": entry["src"], "offset": offset}
+            )
+            parts.append(text)
+            offset += len(text.encode())
+        systems = [
+            {
+                "name": entry["name"],
+                "ty": "expr",
+                "artifact": None,
+                "params": "None",
+                "process": False,
+                "src": entry["src"],
+                "scope": None,
+                "attach": None,
+                "layout": entry["layout"],
+            }
+            for entry in _program
+            if entry["system"]
+        ]
+        return {"source": "".join(parts), "decls": decls}, systems
+
     def to_ir(self) -> dict[str, Any]:
         """The serialized ``Wiring`` this target describes."""
+        program, expr_systems = self._program_ir()
         return {
             "ir_version": IR_VERSION,
             "metor_config_version": __version__,
@@ -1302,10 +1504,11 @@ class Target:
             },
             "artifacts": self._artifacts,
             "states": self._states,
-            "systems": self._systems,
+            "systems": self._systems + expr_systems,
             "slots": self._slots,
             "edges": self._edges,
             "scopes": self._scopes,
+            "program": program,
         }
 
 

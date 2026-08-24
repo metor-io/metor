@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 8;
+pub const IR_VERSION: u32 = 9;
 
 /// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
@@ -64,6 +64,10 @@ pub struct Wiring {
     /// collision-checked regardless. The Rust builder leaves it empty.
     #[serde(default)]
     pub scopes: Vec<ScopeSpec>,
+    /// The captured Python program the target's [`EXPR_TYPE`] systems compile
+    /// from, one per target. `None` when the target declares no Python system.
+    #[serde(default)]
+    pub program: Option<ProgramSpec>,
 }
 
 impl Wiring {
@@ -129,6 +133,47 @@ pub const DOWNLINK_TYPE: &str = "Downlink";
 /// [`TCP_SERVER_TYPE`] state, configured by
 /// [`UplinkParams`](crate::UplinkParams).
 pub const UPLINK_TYPE: &str = "Uplink";
+
+/// Reserved `type=` of a compiled Python system: a `@system` function the
+/// recorder captured into [`Wiring::program`]. Carries no artifact and no
+/// params — the program *is* the spec — and is compiled and run by the host
+/// at the init gate rather than resolved in the registry.
+pub const EXPR_TYPE: &str = "expr";
+
+/// The captured Python program of one target: every `@system` function and
+/// `Frame`/`State` class the target file declared, assembled in definition
+/// order into a single compilation unit (bindings between systems only work
+/// inside one unit). Compiled once at the init gate by `metor-expr`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProgramSpec {
+    /// The assembled module source.
+    pub source: String,
+    /// One entry per captured declaration, in assembly order.
+    pub decls: Vec<ProgramDecl>,
+}
+
+/// One captured declaration of a [`ProgramSpec`]: where it sits in the
+/// assembled source and where it was written, so a compile diagnostic maps
+/// back to a `target.py` line rather than a synthetic-module one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProgramDecl {
+    /// The declaration's name — a function or class name; an [`EXPR_TYPE`]
+    /// system's spec name references its declaration through this.
+    pub name: String,
+    /// Where the declaration was written.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
+    /// Byte offset of the declaration in [`ProgramSpec::source`].
+    pub offset: u32,
+}
+
+impl ProgramSpec {
+    /// The declaration a compiler span at byte `offset` falls in: the last
+    /// one starting at or before it.
+    pub fn decl_at(&self, offset: u32) -> Option<&ProgramDecl> {
+        self.decls.iter().rev().find(|d| d.offset <= offset)
+    }
+}
 
 /// Coordinator-wide configuration, the serializable mirror of
 /// [`CoordinatorConfig`](crate::CoordinatorConfig).
@@ -322,6 +367,12 @@ pub struct SystemSpec {
     /// rejected too.
     #[serde(default)]
     pub attach: Option<String>,
+    /// Where this system's canvas card sits, from the declaration site: the
+    /// `@node(x=, y=)` decorator on an [`EXPR_TYPE`] system, the
+    /// `Target.add(..., node=(x, y))` kwarg on a native one. `None` leaves
+    /// placement to the canvas's auto-layout.
+    #[serde(default)]
+    pub layout: Option<(f32, f32)>,
 }
 
 impl StateSpec {
@@ -379,6 +430,7 @@ impl SystemSpec {
             src: None,
             scope: None,
             attach: Some("link".to_string()),
+            layout: None,
         }
     }
 }
