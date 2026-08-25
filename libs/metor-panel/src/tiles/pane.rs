@@ -380,7 +380,18 @@ impl Pane {
                 item: item_handle,
                 ix,
             },
-            |dragged, _, _, cx| {
+            |dragged, _, window, cx| {
+                // Mirror the drag app-side so a mouse-up outside the window
+                // (which gpui otherwise swallows) can tear the tab out.
+                super::drag::set_active_tab_drag(
+                    super::drag::ActiveTabDrag {
+                        pane: dragged.pane.clone(),
+                        item: dragged.item.clone_handle(),
+                        ix: dragged.ix,
+                        source_window: window.window_handle(),
+                    },
+                    cx,
+                );
                 cx.new(|_| DraggedTab {
                     pane: dragged.pane.clone(),
                     item: dragged.item.clone_handle(),

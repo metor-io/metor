@@ -1,6 +1,7 @@
 use super::SplitPath;
 use gpui::{
-    Bounds, Context, Empty, Entity, IntoElement, Pixels, Point, Render, Window, div, prelude::*, px,
+    AnyWindowHandle, App, Bounds, Context, Empty, Entity, Global, IntoElement, Pixels, Point,
+    Render, Window, div, prelude::*, px,
 };
 
 use super::item::PaneItemHandle;
@@ -15,6 +16,32 @@ pub struct DraggedTab {
     pub pane: Entity<Pane>,
     pub item: Box<dyn PaneItemHandle>,
     pub ix: usize,
+}
+
+/// The tab drag in flight, mirrored app-side because gpui's own payload
+/// (`App::active_drag`) is crate-private and a mouse-up outside every drop
+/// target discards it without telling anyone. The ghost constructor sets
+/// this at drag start; the window root takes it on mouse-up — outside the
+/// window to tear the tab out, inside merely to clear it.
+pub struct ActiveTabDrag {
+    pub pane: Entity<Pane>,
+    pub item: Box<dyn PaneItemHandle>,
+    pub ix: usize,
+    pub source_window: AnyWindowHandle,
+}
+
+impl Global for ActiveTabDrag {}
+
+pub(crate) fn set_active_tab_drag(drag: ActiveTabDrag, cx: &mut App) {
+    cx.set_global(drag);
+}
+
+/// Take the in-flight tab drag, if any. Callers still gate on
+/// `cx.has_active_drag()` — a leftover mirror from a drag that ended
+/// without a mouse-up reaching us must not tear anything out.
+pub(crate) fn take_active_tab_drag(cx: &mut App) -> Option<ActiveTabDrag> {
+    cx.has_global::<ActiveTabDrag>()
+        .then(|| cx.remove_global::<ActiveTabDrag>())
 }
 
 impl Render for DraggedTab {

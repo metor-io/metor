@@ -22,8 +22,9 @@ use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupE
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use crate::views::time_series::time_range::GlobalTimeRange;
 use gpui::{
-    App, Application, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Pixels,
-    Point, Render, SharedString, Window, actions, div, prelude::*, px,
+    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
+    MouseUpEvent, Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px,
+    size,
 };
 use metor_db::{DB, Server};
 use stellarator::{net::TcpListener, struc_con::stellar};
@@ -390,6 +391,74 @@ impl AppRoot {
         cx.notify();
     }
 
+    /// A left-button release outside this window's viewport while a tab drag
+    /// is live: tear the tab out into its own window at the drop point.
+    ///
+    /// Registered as `on_mouse_up_out`, which also fires for a release over
+    /// occluded chrome (the titlebar, an overlay) — the viewport test is what
+    /// separates "dropped on nothing in this window" (a no-op, as before)
+    /// from "dropped on the desktop".
+    fn handle_tab_drag_out(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !cx.has_active_drag() {
+            return;
+        }
+        let Some(drag) = crate::tiles::take_active_tab_drag(cx) else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        let inside = event.position.x >= px(0.)
+            && event.position.y >= px(0.)
+            && event.position.x <= viewport.width
+            && event.position.y <= viewport.height;
+        if inside {
+            return;
+        }
+        // Screen-space drop point, nudged so the cursor lands on the new
+        // window's tab strip rather than its top-left corner.
+        let origin = window.bounds().origin + event.position - point(px(60.0), px(20.0));
+        let outer = drag.pane.read(cx).current_outer_size();
+        let window_size = size(
+            px(outer.width.max(400.0)),
+            px(outer.height.max(300.0) + TITLEBAR_HEIGHT),
+        );
+        let db = self.db.clone();
+        // Deferred: opening and closing windows mid-dispatch re-enters the
+        // platform layer.
+        cx.defer(move |cx: &mut App| {
+            drag.pane.update(cx, |pane, cx| pane.remove_item(drag.ix, cx));
+            let pane = cx.new(|cx| crate::tiles::Pane::new(vec![drag.item], cx));
+            let tiles = cx.new(|cx| TileGroup::from_pane(pane, cx));
+            crate::workspace::open_panel_window(
+                db,
+                Some(Bounds {
+                    origin,
+                    size: window_size,
+                }),
+                Some(tiles),
+                false,
+                cx,
+            );
+            // Tearing out a window's only tab reads as moving the window:
+            // close the emptied source unless the picker is holding it open.
+            if let Some(source) = drag.source_window.downcast::<AppRoot>() {
+                let _ = source.update(cx, |root, window, cx| {
+                    let picker_up = root
+                        .connection_picker
+                        .as_ref()
+                        .is_some_and(|p| !p.read(cx).dismissed);
+                    if !root.tiles.read(cx).has_items(cx) && !picker_up {
+                        window.remove_window();
+                    }
+                });
+            }
+        });
+    }
+
     fn handle_tile_event(
         &mut self,
         _tiles: Entity<TileGroup>,
@@ -500,6 +569,17 @@ impl Render for AppRoot {
                     }
                 },
             ))
+            // An in-window mouse-up ends any tab drag through the normal
+            // drop handlers; clear the mirror so it can't go stale. Fires
+            // exactly when `on_mouse_up_out` below doesn't (hover is the
+            // gate for both, in opposite directions).
+            .capture_any_mouse_up(|_, _, cx| {
+                crate::tiles::take_active_tab_drag(cx);
+            })
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(Self::handle_tab_drag_out),
+            )
             .font_family(font_family)
             .flex()
             .flex_col()
