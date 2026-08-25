@@ -11,7 +11,6 @@ use gpui::{AnyEntity, App, Entity, Global, PathPromptOptions, SharedString, Wind
 use metor_db::DB;
 
 use crate::config::FontConfig;
-use crate::inspector::OpenInspectorCallback;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, HeaderRow, InspectorRow, NavRow};
 use crate::presets;
 use crate::tiles::TileGroup;
@@ -189,25 +188,24 @@ fn item_to_row(item: InspectionItem, db: Arc<DB>, tag: SharedString) -> Box<dyn 
 
 /// Register the built-in Panel, Widget, and Command providers.
 ///
-/// Call once after [`ItemRegistry::init`]. `on_open_inspector` is forwarded
-/// to the "New Panel → Time Series Plot" flow so the trace wizard can open
-/// immediately after the plot is created.
-pub fn register_builtin_providers(
-    db: Arc<DB>,
-    tiles: Entity<TileGroup>,
-    on_open_inspector: OpenInspectorCallback,
-    cx: &mut App,
-) {
-    register_panel_provider(tiles.clone(), cx);
-    register_pane_settings_provider(tiles.clone(), cx);
-    register_widget_provider(tiles.clone(), cx);
-    register_preset_provider(tiles.clone(), cx);
-    register_command_provider(db, tiles, on_open_inspector, cx);
+/// Call once at boot, after [`ItemRegistry::init`]. Providers resolve the
+/// active window's tile tree on every evaluation — the palette always opens
+/// inside the window it describes, so its snapshot follows the window it
+/// was opened in rather than capturing any one tree.
+pub fn register_builtin_providers(db: Arc<DB>, cx: &mut App) {
+    register_panel_provider(cx);
+    register_pane_settings_provider(cx);
+    register_widget_provider(cx);
+    register_preset_provider(cx);
+    register_command_provider(db, cx);
 }
 
 /// Reachable even when the tab bar is hidden.
-fn register_pane_settings_provider(tiles: Entity<TileGroup>, cx: &mut App) {
+fn register_pane_settings_provider(cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
+        let Some(tiles) = crate::workspace::active_tiles(cx) else {
+            return Vec::new();
+        };
         let panes = tiles.read(cx).panes().to_vec();
         panes
             .iter()
@@ -228,8 +226,11 @@ fn register_pane_settings_provider(tiles: Entity<TileGroup>, cx: &mut App) {
     ItemRegistry::register(cx, Category::Custom("Pane".into()), provider);
 }
 
-fn register_panel_provider(tiles: Entity<TileGroup>, cx: &mut App) {
+fn register_panel_provider(cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
+        let Some(tiles) = crate::workspace::active_tiles(cx) else {
+            return Vec::new();
+        };
         let panes = tiles.read(cx).panes().to_vec();
         let multi_pane = panes.len() > 1;
         let mut items = Vec::new();
@@ -254,8 +255,11 @@ fn register_panel_provider(tiles: Entity<TileGroup>, cx: &mut App) {
     ItemRegistry::register(cx, Category::Panel, provider);
 }
 
-fn register_widget_provider(tiles: Entity<TileGroup>, cx: &mut App) {
+fn register_widget_provider(cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
+        let Some(tiles) = crate::workspace::active_tiles(cx) else {
+            return Vec::new();
+        };
         let panes = tiles.read(cx).panes().to_vec();
         let mut items = Vec::new();
         for pane in panes.iter() {
@@ -280,18 +284,15 @@ fn register_widget_provider(tiles: Entity<TileGroup>, cx: &mut App) {
     ItemRegistry::register(cx, Category::Widget, provider);
 }
 
-fn register_command_provider(
-    db: Arc<DB>,
-    tiles: Entity<TileGroup>,
-    on_open_inspector: OpenInspectorCallback,
-    cx: &mut App,
-) {
+fn register_command_provider(db: Arc<DB>, cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
         let mut items: Vec<InspectionItem> = Vec::new();
+        let tiles = crate::workspace::active_tiles(cx);
+        let on_open_inspector = crate::inspector::open_inspector(cx);
 
         // New Panel targets the current pane so palette-created panels land in
         // the tile the user last interacted with (falling back to the first).
-        if let Some(pane) = tiles.read(cx).active_pane(cx) {
+        if let Some(pane) = tiles.and_then(|tiles| tiles.read(cx).active_pane(cx)) {
             let new_db = db.clone();
             let new_open = on_open_inspector.clone();
             items.push(InspectionItem::SubMenu {
@@ -301,12 +302,25 @@ fn register_command_provider(
                     crate::tiles::panels::new_panel_rows(
                         new_db.clone(),
                         pane.clone(),
-                        Some(new_open.clone()),
+                        new_open.clone(),
                         _cx,
                     )
                 }),
             });
         }
+
+        let window_db = db.clone();
+        items.push(InspectionItem::Command {
+            label: SharedString::new_static("New Window"),
+            callback: Arc::new(move |_window, cx| {
+                let db = window_db.clone();
+                // Deferred: opening a window mid-dispatch re-enters the
+                // platform layer.
+                cx.defer(move |cx| {
+                    crate::workspace::open_panel_window(db, None, None, false, cx);
+                });
+            }),
+        });
 
         let update_db = db.clone();
         items.push(InspectionItem::SubMenu {
@@ -340,9 +354,8 @@ fn register_command_provider(
         });
 
         let pending_count = crate::inspector::edits::pending_edits(cx).edits.len();
-        if pending_count > 0 {
+        if let Some(review_open) = on_open_inspector.filter(|_| pending_count > 0) {
             let review_db = db.clone();
-            let review_open = on_open_inspector.clone();
             items.push(InspectionItem::Command {
                 label: SharedString::from(format!("Review Edits ({})", pending_count)),
                 callback: Arc::new(move |window, cx| {
@@ -401,8 +414,11 @@ fn read_and_load(path: &Path, tiles: &Entity<TileGroup>, cx: &mut App) {
 /// **Load preset**. Each opens a submenu listing the built-in directory
 /// items alongside a `Save to file…` / `Load from file…` row, so the OS
 /// file dialog is reachable without a separate top-level command.
-fn register_preset_provider(tiles: Entity<TileGroup>, cx: &mut App) {
-    let provider: ItemProvider = Arc::new(move |_cx: &App| {
+fn register_preset_provider(cx: &mut App) {
+    let provider: ItemProvider = Arc::new(move |cx: &App| {
+        let Some(tiles) = crate::workspace::active_tiles(cx) else {
+            return Vec::new();
+        };
         let mut items: Vec<InspectionItem> = Vec::new();
 
         // Save preset

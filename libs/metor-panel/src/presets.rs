@@ -169,7 +169,7 @@ fn apply_shipped_preset(store: Entity<TargetPresetStore>, cx: &mut App) {
     let Some(connections) = crate::connections::try_global(cx) else {
         return;
     };
-    let tiles = {
+    {
         let conns = connections.read(cx);
         let active = conns.active();
         if active.is_empty() {
@@ -181,14 +181,13 @@ fn apply_shipped_preset(store: Entity<TargetPresetStore>, cx: &mut App) {
         {
             return;
         }
-        let Some(tiles) = conns.tiles() else {
-            return;
-        };
-        tiles
-    };
-    if tiles.read(cx).has_items(cx) {
+    }
+    if crate::workspace::any_window_has_items(cx) {
         return;
     }
+    let Some(tiles) = crate::workspace::active_tiles(cx) else {
+        return;
+    };
     let Some(layout) = store.read(cx).presets.first().map(|p| p.layout.clone()) else {
         return;
     };

@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task, WeakEntity};
+use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use metor_db::DB;
 use metor_db::remote::Hydrator;
 use stellarator::util::CancelToken;
@@ -383,9 +383,6 @@ pub struct ConnectionsStore {
     /// The LoD companion task is DB-wide and never stopped, so it spawns at
     /// most once — on the first local-authority connection.
     lod_spawned: bool,
-    /// The window's tile tree, handed over by the app root; the autosave
-    /// tick snapshots it while anything is connected.
-    tiles: Option<WeakEntity<crate::tiles::TileGroup>>,
     /// Last layout JSON written to disk; skips rewrites while idle. Pane and
     /// item mutations don't notify the tile group, so autosave poll-compares
     /// instead of observing.
@@ -479,20 +476,10 @@ impl ConnectionsStore {
             active: Vec::new(),
             db,
             lod_spawned: false,
-            tiles: None,
             last_saved_layout: None,
             registry_rx,
             _poll: poll,
         }
-    }
-
-    /// Hand over the window's tile tree for layout autosave and restore.
-    pub fn set_tiles(&mut self, tiles: WeakEntity<crate::tiles::TileGroup>) {
-        self.tiles = Some(tiles);
-    }
-
-    pub fn tiles(&self) -> Option<Entity<crate::tiles::TileGroup>> {
-        self.tiles.as_ref().and_then(|w| w.upgrade())
     }
 
     /// Snapshot the layout to every active connection's file when it moved
@@ -502,7 +489,7 @@ impl ConnectionsStore {
         if self.active.is_empty() {
             return;
         }
-        let Some(tiles) = self.tiles() else {
+        let Some(tiles) = crate::workspace::active_tiles(cx) else {
             return;
         };
         let json = tiles.read(cx).to_json(cx);

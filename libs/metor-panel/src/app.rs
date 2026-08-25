@@ -22,9 +22,8 @@ use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupE
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use crate::views::time_series::time_range::GlobalTimeRange;
 use gpui::{
-    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
-    Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, point, prelude::*, px, size,
+    App, Application, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Pixels,
+    Point, Render, SharedString, Window, actions, div, prelude::*, px,
 };
 use metor_db::{DB, Server};
 use stellarator::{net::TcpListener, struc_con::stellar};
@@ -50,9 +49,13 @@ const TITLEBAR_HEIGHT: f32 = 36.0;
 /// events, pending-edit flushes). They're queued into `pending_*` fields and
 /// drained inside `render` so entity creation always happens on the render
 /// thread with access to [`Window`] for focus transfer.
-struct AppRoot {
+pub(crate) struct AppRoot {
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
+    /// This window's own instances of the consumer-supplied overlays. Built
+    /// per window from [`OverlayBuilders`] — two windows never share one
+    /// view entity, since element state and hitboxes are per-window.
+    overlays: Vec<gpui::AnyView>,
     inspector: Option<Entity<Inspector>>,
     /// Anchored, non-focused plot preview shown while the user holds shift
     /// over a component name. Tracked separately from `inspector` so the
@@ -89,17 +92,14 @@ struct HoverPreview {
 }
 
 impl AppRoot {
-    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let tiles = cx.new(|cx| TileGroup::new(vec![], cx));
+    pub(crate) fn new(
+        db: Arc<DB>,
+        tiles: Option<Entity<TileGroup>>,
+        show_picker_if_disconnected: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let tiles = tiles.unwrap_or_else(|| cx.new(|cx| TileGroup::new(vec![], cx)));
         cx.subscribe(&tiles, Self::handle_tile_event).detach();
-        let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
-        cx.set_global(OpenInspectorGlobal(on_open_inspector.clone()));
-        crate::inspector::palette::register_builtin_providers(
-            db.clone(),
-            tiles.clone(),
-            on_open_inspector,
-            cx,
-        );
         // Repaint the status bar when alarms change.
         if let Some(store) = crate::alarms::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
@@ -110,14 +110,19 @@ impl AppRoot {
         let mut pending_connection_picker = None;
         if let Some(store) = crate::connections::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
-            store.update(cx, |store, _| store.set_tiles(tiles.downgrade()));
-            if store.read(cx).active().is_empty() {
+            if show_picker_if_disconnected && store.read(cx).active().is_empty() {
                 pending_connection_picker = Some(true);
             }
         }
+        let overlay_builders = cx
+            .try_global::<OverlayBuilders>()
+            .map(|b| b.0.clone())
+            .unwrap_or_default();
+        let overlays = overlay_builders.iter().map(|build| build(cx)).collect();
         Self {
             db,
             tiles,
+            overlays,
             inspector: None,
             hover_preview: None,
             pending_inspector_request: None,
@@ -149,13 +154,8 @@ impl AppRoot {
         cx.notify();
     }
 
-    fn make_on_open_inspector(root: Entity<AppRoot>) -> crate::inspector::OpenInspectorCallback {
-        Arc::new(move |request, _window, cx| {
-            root.update(cx, |this, cx| {
-                this.pending_inspector_open = Some(request);
-                cx.notify();
-            });
-        })
+    pub(crate) fn tiles(&self) -> &Entity<TileGroup> {
+        &self.tiles
     }
 
     fn toggle_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -527,24 +527,22 @@ impl Render for AppRoot {
         }
 
         // Consumer-supplied overlays, mounted last so they draw over everything.
-        // Each is an opaque view the consumer built at startup (e.g. a modal that
-        // renders nothing until its own state says otherwise).
-        if let Some(overlays) = cx.try_global::<OverlayViews>() {
-            for view in &overlays.0 {
-                root = root.child(view.clone());
-            }
+        // Each is an opaque view this window built for itself at construction
+        // (e.g. a modal that renders nothing until its own state says otherwise).
+        for view in &self.overlays {
+            root = root.child(view.clone());
         }
 
         crate::window_controls::client_side_decorations(root, window, cx)
     }
 }
 
-/// Consumer-supplied root overlays, installed via [`PanelApp::overlay`] and read
-/// by [`AppRoot::render`]. Held in a global because overlays are built before the
-/// window (and thus `AppRoot`) exists.
-struct OverlayViews(Vec<gpui::AnyView>);
+/// Consumer-supplied overlay constructors, installed via [`PanelApp::overlay`].
+/// Held in a global as constructors rather than views so every window builds
+/// its own instances in [`AppRoot::new`].
+struct OverlayBuilders(Vec<std::rc::Rc<dyn Fn(&mut App) -> gpui::AnyView>>);
 
-impl gpui::Global for OverlayViews {}
+impl gpui::Global for OverlayBuilders {}
 
 impl AppRoot {
     /// Active-alarm summary shown on the left of the title bar; clicking opens the alarm
@@ -895,7 +893,7 @@ pub struct PanelApp {
     default_options: OptionSpec,
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
-    overlays: Vec<Box<dyn FnOnce(&mut App) -> gpui::AnyView>>,
+    overlays: Vec<std::rc::Rc<dyn Fn(&mut App) -> gpui::AnyView>>,
     views: Vec<(
         crate::views::dashboard::WidgetKind,
         crate::views::dashboard::WidgetSpec,
@@ -972,18 +970,19 @@ impl PanelApp {
         self
     }
 
-    /// Mount a consumer-built view over the window root. `build` runs at startup
-    /// (with `&mut App`, after the built-in registries exist) and returns any
-    /// [`Render`] entity as an [`AnyView`](gpui::AnyView); it is drawn above the
-    /// tile tree and inspector every frame. The consumer owns the view's state
-    /// and updates — a modal that renders nothing until shown, say. Call more
-    /// than once to stack overlays in insertion order.
+    /// Mount a consumer-built view over the window root. `build` runs once per
+    /// window (with `&mut App`, after the built-in registries exist) and
+    /// returns any [`Render`] entity as an [`AnyView`](gpui::AnyView); it is
+    /// drawn above the tile tree and inspector every frame. The consumer owns
+    /// the view's state and updates — a modal that renders nothing until
+    /// shown, say. Call more than once to stack overlays in insertion order.
     pub fn overlay<V, F>(mut self, build: F) -> Self
     where
         V: Render,
-        F: FnOnce(&mut App) -> Entity<V> + 'static,
+        F: Fn(&mut App) -> Entity<V> + 'static,
     {
-        self.overlays.push(Box::new(move |cx| build(cx).into()));
+        self.overlays
+            .push(std::rc::Rc::new(move |cx| build(cx).into()));
         self
     }
 
@@ -1052,11 +1051,13 @@ impl PanelApp {
         self
     }
 
-    /// Boot the gpui application and block until the last window closes.
+    /// Boot the gpui application and block until it quits.
     ///
     /// Registers the theme, fonts, icons, edit queue, palette providers,
     /// inspector registry, and widget registry, drains any consumer-supplied
-    /// command providers and init hooks, then opens the root window.
+    /// command providers and init hooks, then opens the first window. The
+    /// app outlives its last window: closing them all leaves the process in
+    /// the dock, and a reopen (dock click) spawns a fresh window.
     pub fn run(self) {
         let PanelApp {
             db,
@@ -1083,9 +1084,17 @@ impl PanelApp {
             });
         }
 
-        Application::new()
-            .with_assets(crate::icons::IconAssets)
-            .run(move |cx: &mut App| {
+        let app = Application::new().with_assets(crate::icons::IconAssets);
+        // A dock-click (macOS "reopen") with every window closed brings the
+        // app back with a fresh window; the process deliberately outlives its
+        // last window so the stores and connections keep running.
+        let reopen_db = db.clone();
+        app.on_reopen(move |cx| {
+            if crate::workspace::panel_windows(cx).is_empty() {
+                crate::workspace::open_panel_window(reopen_db.clone(), None, None, true, cx);
+            }
+        });
+        app.run(move |cx: &mut App| {
                 crate::theme::register_fonts(cx);
                 let cfg = crate::config::load();
                 // Capture the leader before `cfg` moves into the font global; it
@@ -1155,6 +1164,20 @@ impl PanelApp {
                 }
                 register_connection_commands(cx);
 
+                // Inspector requests route to the window they were made in:
+                // the callback resolves the root of whatever `Window` the
+                // caller passed, so one installation serves every window.
+                cx.set_global(OpenInspectorGlobal(Arc::new(|request, window, cx| {
+                    let Some(root) = window.root::<AppRoot>().flatten() else {
+                        return;
+                    };
+                    root.update(cx, |this, cx| {
+                        this.pending_inspector_open = Some(request);
+                        cx.notify();
+                    });
+                })));
+                crate::inspector::palette::register_builtin_providers(db.clone(), cx);
+
                 // Consumer extensions: register custom palette providers, run
                 // init hooks, then build overlays. All happen after the built-in
                 // registries exist so they can call into any of them; overlays
@@ -1165,9 +1188,7 @@ impl PanelApp {
                 for hook in init_hooks {
                     hook(cx);
                 }
-                let built: Vec<gpui::AnyView> =
-                    overlays.into_iter().map(|build| build(cx)).collect();
-                cx.set_global(OverlayViews(built));
+                cx.set_global(OverlayBuilders(overlays));
 
                 set_dock_icon();
                 // `secondary-` resolves to cmd on macOS and ctrl elsewhere
@@ -1188,29 +1209,7 @@ impl PanelApp {
                     KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
                 ]);
 
-                let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
-                let db = db.clone();
-                cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        // `appears_transparent` hides the native titlebar on
-                        // macOS (leaving the traffic lights) and on Windows
-                        // (leaving nothing — the app draws its own controls).
-                        titlebar: Some(TitlebarOptions {
-                            appears_transparent: true,
-                            traffic_light_position: Some(point(px(12.0), px(8.0))),
-                            ..Default::default()
-                        }),
-                        // Linux-only: request client-side decorations; the
-                        // window root wraps itself in resize borders and a
-                        // shadow via `window_controls::client_side_decorations`.
-                        window_decorations: Some(gpui::WindowDecorations::Client),
-                        app_id: Some("metor-panel".into()),
-                        ..Default::default()
-                    },
-                    move |_window, cx| cx.new(|cx| AppRoot::new(db, cx)),
-                )
-                .unwrap();
+                crate::workspace::open_panel_window(db.clone(), None, None, true, cx);
             });
     }
 }
