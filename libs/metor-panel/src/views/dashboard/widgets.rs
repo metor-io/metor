@@ -81,6 +81,17 @@ pub struct WidgetLive {
     pub state: gpui::AnyEntity,
 }
 
+struct ExpressionView<T: Render + 'static> {
+    inner: Entity<T>,
+    _expression: crate::dynamic::expressions::Expression,
+}
+
+impl<T: Render + 'static> Render for ExpressionView<T> {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.inner.clone()
+    }
+}
+
 impl WidgetSpec {
     /// Define a view kind in one place: construction, display naming, and
     /// live persistence. Register it through [`WidgetRegistry::register`]
@@ -643,6 +654,23 @@ fn as_live<T: Render + 'static>(e: Entity<T>) -> WidgetLive {
     }
 }
 
+fn expression_live<T: Render + 'static>(
+    entity: Entity<T>,
+    expression: crate::dynamic::expressions::Expression,
+    cx: &mut App,
+) -> WidgetLive {
+    let any = entity.clone().into_any();
+    let view = cx.new(|_| ExpressionView {
+        inner: entity,
+        _expression: expression,
+    });
+    WidgetLive {
+        view: AnyView::from(view),
+        inspect: any.clone(),
+        state: any,
+    }
+}
+
 fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     // Only LinePlot has Facet adapters, so expose it — not the outer
     // TimeSeriesPlot — as the inspectable entity.
@@ -668,7 +696,11 @@ fn build_text(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
             label: SharedString::from(cfg.component.clone()),
         }));
     };
-    as_live(cx.new(|cx| ComponentText::new(db.clone(), bound.id, cx)))
+    let entity = cx.new(|cx| ComponentText::new(db.clone(), bound.id, cx));
+    match bound.expression {
+        Some(expression) => expression_live(entity, expression, cx),
+        None => as_live(entity),
+    }
 }
 
 fn build_xy_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
@@ -759,7 +791,10 @@ fn build_traffic_light(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     if let Some(color) = cfg.color {
         entity.update(cx, |t, cx| t.set_color(color, cx));
     }
-    as_live(entity)
+    match bound.expression {
+        Some(expression) => expression_live(entity, expression, cx),
+        None => as_live(entity),
+    }
 }
 
 fn build_meter(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {

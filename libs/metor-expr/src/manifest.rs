@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 /// The compiler revision a manifest was produced by. Hosts refuse a manifest
 /// they do not recognise rather than guessing at a layout.
-pub const COMPILER_VERSION: u32 = 1;
+pub const COMPILER_VERSION: u32 = 2;
 
 /// One field of a frame or state record.
 ///
@@ -216,6 +216,8 @@ pub struct System {
     /// and the host supplies the timer. Mutually exclusive with `driving`: a
     /// system is either source-clocked or input-driven, never both.
     pub rate: Option<f64>,
+    /// Plain functions called by this system, including indirect calls.
+    pub dependencies: Vec<usize>,
     /// The source region this system was written in — the input to a
     /// per-system content hash, so an edit rebuilds only what changed.
     pub source: Span,
@@ -227,6 +229,8 @@ pub struct FnSig {
     pub name: String,
     pub params: Vec<(String, Ty)>,
     pub ret: Ty,
+    /// The function declaration's source region.
+    pub source: Span,
 }
 
 impl FnSig {

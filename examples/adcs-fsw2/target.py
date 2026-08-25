@@ -387,7 +387,7 @@ m.connect(ctrl.mtq_cmd, plant.mtq_cmd, delayed=True)
 
 downlink = m.add("downlink", Downlink(link))
 
-m.route(uplink, mode, msg="SequenceCommand")  #
+m.route(uplink, mode, msg="SequenceCommand")
 m.route(m.coordinator, mode, msg="SequenceCommand")
 m.route(uplink, alarms, msg="AlarmAck")
 m.route(uplink, m.coordinator, msg="ReloadSequences")

@@ -1,4 +1,4 @@
-//! M3: tensors, through static buffers, against native nox.
+//! Tensor semantics checked against native nox.
 //!
 //! A tensor-using function is driven the way the hosts will drive it — write
 //! the arguments at `<name>_arg_ptr(i)`, call `<name>()`, read the result at
@@ -216,9 +216,7 @@ fn rank_two_broadcasts_right_aligned() {
     }
 }
 
-/// P1: small constant shapes open-code and reach no kernel at all; large ones
-/// still call one. Both must compute the same thing, which is the point — the
-/// choice is a size trade, not a semantic one.
+/// Inline and kernel emission must produce the same values.
 #[test]
 fn small_shapes_open_code_and_large_ones_call_kernels() {
     let source = |n: usize| {
@@ -316,6 +314,19 @@ fn an_out_of_range_index_traps_rather_than_reading_past_the_end() {
 }
 
 #[test]
+fn each_dynamic_tensor_axis_is_checked_separately() {
+    let wasm =
+        build("def pick(m: Tensor[f64, (2, 3)], i: i64, j: i64) -> f64:\n    return m[i, j]\n");
+    for (i, j) in [(0, 3), (1, -1), (2, -3)] {
+        let mut driver = Driver::new(&wasm, "pick");
+        driver.write(0, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        driver.write_int(1, i);
+        driver.write_int(2, j);
+        assert!(driver.run().is_err(), "index ({i}, {j}) must trap");
+    }
+}
+
+#[test]
 fn element_assignment_builds_a_result() {
     let v = [1.0f64, 2.0, 3.0];
     let got = evaluate(
@@ -383,8 +394,7 @@ fn the_inner_product_and_sum_agree_with_nox() {
     let a = [1.5f64, -2.25, 3.75];
     let b = [0.5f64, 4.0, -1.25];
 
-    let wasm =
-        build("def inner(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return a @ b\n");
+    let wasm = build("def inner(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return a @ b\n");
     let mut driver = Driver::new(&wasm, "inner");
     driver.write(0, &a);
     driver.write(1, &b);
@@ -628,7 +638,13 @@ fn tensor_modules_stay_closed_and_within_their_memory() {
 
 /// Right-aligned broadcast, computed the obvious way, as the reference every
 /// rank combination is checked against.
-fn broadcast_reference(a: &[f64], sa: &[usize], b: &[f64], sb: &[usize], out: &[usize]) -> Vec<f64> {
+fn broadcast_reference(
+    a: &[f64],
+    sa: &[usize],
+    b: &[f64],
+    sb: &[usize],
+    out: &[usize],
+) -> Vec<f64> {
     let rank = out.len();
     let pad = |s: &[usize]| {
         let mut v = vec![1usize; rank - s.len()];
@@ -811,9 +827,7 @@ fn shapes_that_do_not_broadcast_are_refused_with_spans() {
     }
 }
 
-/// A list literal is a tensor constructor, ratified 2026-08-23. It types as a
-/// tensor the moment it is read — its length is its shape and there is
-/// nothing to append to — which is why admitting it does not admit lists.
+/// A list literal constructs a fixed-shape tensor.
 #[test]
 fn a_literal_constructs_a_tensor_and_agrees_with_nox() {
     let got = evaluate(
@@ -890,7 +904,10 @@ fn a_nested_literal_is_rank_two_on_both_emit_paths() {
     let got = evaluate(&source, "f", &[&v], 200);
     let want: Vec<f64> = v.iter().enumerate().map(|(i, x)| x + i as f64).collect();
     assert_eq!(bits(&got), bits(&want));
-    assert!(reaches_kernels(&build(&source)), "a length-200 add calls a kernel");
+    assert!(
+        reaches_kernels(&build(&source)),
+        "a length-200 add calls a kernel"
+    );
 }
 
 /// What a literal is not: a value type. Every refusal names what went wrong

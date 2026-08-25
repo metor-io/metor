@@ -1,10 +1,4 @@
-//! P5: the `=` tier, and the stability contract underneath it.
-//!
-//! The contract the plan singles out is the one an operator would never think
-//! to check: a bare name resolves by unique suffix *at authoring time*, so a
-//! component added tomorrow must not change what a saved binding reads. These
-//! tests pin that in both directions — what the compiler records, and what a
-//! saved binding does once the tree it was written against has moved on.
+//! Expression binding and identity tests.
 
 use metor_db::{ComponentSchema, DB};
 use metor_expr::{Binding, Resolver, Ty};
@@ -74,13 +68,7 @@ fn a_bare_name_is_recorded_as_the_path_it_resolved_to() {
     );
 }
 
-/// The stability contract, backwards — the case the plan names. A second
-/// `*.rpm` appearing later makes the bare name ambiguous for *new* authoring,
-/// and must leave a saved layout alone.
-///
-/// It does, because a saved layout is read back through the recorded path.
-/// Nothing re-runs the suffix search, which is the whole point of recording
-/// the resolution rather than the text.
+/// A saved resolved path is unaffected by later suffix ambiguity.
 #[test]
 fn a_later_ambiguity_does_not_disturb_what_was_already_resolved() {
     let (db, _temp) = db_with(&[("wheels.rpm", PrimType::F64, &[])]);
@@ -115,11 +103,14 @@ fn a_later_ambiguity_does_not_disturb_what_was_already_resolved() {
         .expect_err("the bare name is ambiguous now");
     let text = format!("{diags}");
     assert!(text.contains("ambiguous"), "{text}");
-    assert!(text.contains("motor.rpm") && text.contains("wheels.rpm"), "{text}");
+    assert!(
+        text.contains("motor.rpm") && text.contains("wheels.rpm"),
+        "{text}"
+    );
 
     // ...while the saved binding still reads exactly what it always read.
-    let reloaded = metor_expr::compile_expr(recorded, &crowded)
-        .expect("the recorded path is never ambiguous");
+    let reloaded =
+        metor_expr::compile_expr(recorded, &crowded).expect("the recorded path is never ambiguous");
     assert_eq!(
         reloaded.manifest.systems[0].inputs[0].bindings[0],
         Binding::Component("wheels.rpm".into())
@@ -132,7 +123,10 @@ fn a_later_ambiguity_does_not_disturb_what_was_already_resolved() {
 fn the_sigil_is_what_separates_a_binding_from_an_expression() {
     assert!(expressions::is_expression("=adcs.omega_b * 100.0"));
     assert!(!expressions::is_expression("adcs.omega_b"));
-    assert_eq!(expressions::body("=adcs.omega_b * 100.0"), "adcs.omega_b * 100.0");
+    assert_eq!(
+        expressions::body("=adcs.omega_b * 100.0"),
+        "adcs.omega_b * 100.0"
+    );
     assert_eq!(expressions::body("= rpm * 2.0 "), "rpm * 2.0");
     // An unprefixed expression is still readable, so a caller may hand either.
     assert_eq!(expressions::body("rpm * 2.0"), "rpm * 2.0");
@@ -193,7 +187,9 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
     let system = program::system(
         &compiled,
         0,
-        vec![program::PortSource::live(db_source::from_db(&db, source_id).unwrap())],
+        vec![program::PortSource::live(
+            db_source::from_db(&db, source_id).unwrap(),
+        )],
         program::DEFAULT_FUEL,
         None,
     )
@@ -213,7 +209,10 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
         let meta = s.get_component_metadata(component).expect("metadata");
         assert_eq!(meta.name, "wheels.rpm * 2.0");
         assert!(meta.is_hidden(), "an expression must not appear in pickers");
-        assert_eq!(meta.metadata.get("source").map(String::as_str), Some("dynamic"));
+        assert_eq!(
+            meta.metadata.get("source").map(String::as_str),
+            Some("dynamic")
+        );
     });
 
     // ...and it is absent from every picker and browser, which is what makes
@@ -225,7 +224,9 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
     );
 
     // Finally, what a plot actually reads: history accumulating behind the id.
-    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+    let source = db
+        .with_state(|s| s.get_component(source_id).cloned())
+        .unwrap();
     for step in 1..=4 {
         source
             .push_buf(Timestamp(step), &f64::from(step as i32).to_le_bytes())
@@ -274,9 +275,7 @@ fn a_components_id_is_carried_not_rederived() {
 
 /// Register components under ids a producer chose, rather than ids derived
 /// from their names.
-fn db_with_ids(
-    components: &[(&str, ComponentId, PrimType, &[usize])],
-) -> (DB, tempfile::TempDir) {
+fn db_with_ids(components: &[(&str, ComponentId, PrimType, &[usize])]) -> (DB, tempfile::TempDir) {
     let temp = tempfile::tempdir().unwrap();
     let db = DB::create(temp.path().join("db")).unwrap();
     for (name, id, prim, dim) in components {
@@ -299,13 +298,7 @@ fn db_with_ids(
     (db, temp)
 }
 
-/// The `=` path end to end, over a name whose two hashes disagree.
-///
-/// This is the bug the user hit: `imu.omega` is in the half of names where
-/// `persist`'s FNV-1a and `ComponentId::new` differ, so an expression naming
-/// it resolved fine and then failed to find the component, reporting it as not
-/// publishing. Resolution and lookup have to agree, and they only do when the
-/// id is carried rather than recomputed.
+/// Expression ports retain the component id supplied by the resolver.
 #[test]
 fn an_expression_finds_the_components_it_names() {
     for name in ["imu.omega", "sensor.temp", "adcs.q_b_eci", "wheels.rpm"] {
@@ -328,7 +321,12 @@ fn an_expression_finds_the_components_it_names() {
 /// misaddressed lookup.
 #[test]
 fn an_unknown_component_says_so() {
-    let (db, _temp) = db_with_ids(&[("wheels.rpm", ComponentId::new("wheels.rpm"), PrimType::F64, &[])]);
+    let (db, _temp) = db_with_ids(&[(
+        "wheels.rpm",
+        ComponentId::new("wheels.rpm"),
+        PrimType::F64,
+        &[],
+    )]);
     let resolver = DbResolver::snapshot(&db);
     // It cannot even compile, because the resolver never offered the name.
     let diags = metor_expr::compile_expr("nothing.here * 2.0", &resolver).unwrap_err();
@@ -350,10 +348,14 @@ async fn a_published_expression_seeds_then_tails() {
         &[],
     )]);
     let source_id = ComponentId::new("adcs.rate");
-    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+    let source = db
+        .with_state(|s| s.get_component(source_id).cloned())
+        .unwrap();
 
     // History first, exactly as a channel that has been running.
-    source.push_buf(Timestamp(100), &10.0f64.to_le_bytes()).unwrap();
+    source
+        .push_buf(Timestamp(100), &10.0f64.to_le_bytes())
+        .unwrap();
     stellarator::sleep(std::time::Duration::from_millis(20)).await;
 
     let resolver = DbResolver::snapshot(&db);
@@ -376,16 +378,12 @@ async fn a_published_expression_seeds_then_tails() {
     )
     .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
-    let _published =
-        expressions::publish(&db, &name, field, "adcs.rate + 1.0").unwrap();
+    let _published = expressions::publish(&db, &name, field, "adcs.rate + 1.0").unwrap();
 
     // Then the channel keeps publishing, as the user says it does.
     for step in 1..=4 {
         source
-            .push_buf(
-                Timestamp(100 + step),
-                &(10.0 + step as f64).to_le_bytes(),
-            )
+            .push_buf(Timestamp(100 + step), &(10.0 + step as f64).to_le_bytes())
             .unwrap();
     }
 
@@ -412,16 +410,8 @@ async fn a_published_expression_seeds_then_tails() {
     assert_eq!(f64::from_le_bytes(latest.data().try_into().unwrap()), 15.0);
 }
 
-/// The bug the user hit: a picker hands its caller a `ComponentId` and drops
-/// the handle, so if nothing else owns the expression its tasks are cancelled
-/// the moment the row returns.
-///
-/// What that looked like was an expression publishing exactly one sample —
-/// its seed, written while the nodes were briefly alive — and then never
-/// again, with the component sitting there and nothing writing to it. So the
-/// registry owns them, and dropping every caller-side handle changes nothing.
 #[stellarator::test]
-async fn an_expression_keeps_running_after_its_caller_drops_it() {
+async fn the_registry_does_not_keep_an_unused_expression_alive() {
     use crate::dynamic::ops::{db_source, program};
     use metor_proto::types::Timestamp;
 
@@ -432,8 +422,12 @@ async fn an_expression_keeps_running_after_its_caller_drops_it() {
         &[],
     )]);
     let source_id = ComponentId::new("adcs.rate");
-    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
-    source.push_buf(Timestamp(100), &10.0f64.to_le_bytes()).unwrap();
+    let source = db
+        .with_state(|s| s.get_component(source_id).cloned())
+        .unwrap();
+    source
+        .push_buf(Timestamp(100), &10.0f64.to_le_bytes())
+        .unwrap();
     stellarator::sleep(std::time::Duration::from_millis(20)).await;
 
     let resolver = DbResolver::snapshot(&db);
@@ -444,10 +438,8 @@ async fn an_expression_keeps_running_after_its_caller_drops_it() {
         0,
     ));
 
-    // Build it, register it the way `resolve` does, then let every local
-    // handle go — which is exactly what the picker did.
     let mut registry = expressions::Expressions::default();
-    {
+    let expression = {
         let system = program::system(
             &compiled,
             0,
@@ -461,52 +453,15 @@ async fn an_expression_keeps_running_after_its_caller_drops_it() {
         .unwrap();
         let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
         let published = expressions::publish(&db, &name, field.clone(), "adcs.rate + 1.0").unwrap();
-        registry.insert(expressions::Expression::new(
-            published,
-            ComponentId::new(&name),
-            system.node,
-            field,
-        ));
-    }
+        expressions::Expression::new(published, ComponentId::new(&name), system.node, field)
+    };
+    registry.insert(expression.clone());
     assert!(registry.is_live(ComponentId::new(&name)));
-
-    // The channel keeps publishing; so must the expression.
-    for step in 1..=4 {
-        source
-            .push_buf(Timestamp(100 + step), &(10.0 + step as f64).to_le_bytes())
-            .unwrap();
-    }
-
-    let component = db
-        .with_state(|s| s.get_component(ComponentId::new(&name)).cloned())
-        .expect("the expression's component");
-    for _ in 0..300 {
-        if component
-            .time_series
-            .latest()
-            .is_some_and(|l| l.timestamp() == Timestamp(104))
-        {
-            break;
-        }
-        stellarator::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    let latest = component.time_series.latest().expect("history");
-    assert_eq!(
-        latest.timestamp(),
-        Timestamp(104),
-        "the expression stopped at {:?} — its tasks were dropped with the handle",
-        latest.timestamp()
-    );
-    assert_eq!(f64::from_le_bytes(latest.data().try_into().unwrap()), 15.0);
+    drop(expression);
+    assert!(!registry.is_live(ComponentId::new(&name)));
 }
 
-/// The defect behind "broadcast isn't applied": the compiler broadcasts fine,
-/// but the picker committed a single trace at element zero.
-///
-/// `=xyz + 1.0` over a rank-1 channel is a rank-1 result, and it plots the way
-/// that channel would — one trace per element. Collapsing it to element zero
-/// showed one number where three were expected, which reads exactly like the
-/// arithmetic never happened.
+/// A vector expression creates one trace per element.
 #[test]
 fn an_expression_over_a_vector_plots_every_element() {
     let (db, _temp) = db_with_ids(&[("xyz", ComponentId::new("xyz"), PrimType::F64, &[3])]);
@@ -552,7 +507,9 @@ async fn an_expression_fills_a_list_trace_element_by_element() {
 
     let (db, _temp) = db_with_ids(&[("xyz", ComponentId::new("xyz"), PrimType::F64, &[3])]);
     let source_id = ComponentId::new("xyz");
-    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+    let source = db
+        .with_state(|s| s.get_component(source_id).cloned())
+        .unwrap();
 
     let text = "xyz * 2.0";
     let resolver = DbResolver::snapshot(&db);
@@ -676,8 +633,7 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
         0,
     )));
 
-    // The bug, stated: what the old code bound to is not what the expression
-    // publishes into, and no amount of waiting would make it so.
+    // The binding must use the expression's published component.
     assert_ne!(
         ComponentId::new(saved),
         published,
@@ -708,6 +664,7 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
     // Each pane-side view, rehydrated from a config holding the text. A view
     // that resolves starts the expression; one that hashed the text would
     // leave the registry empty.
+    let mut views = Vec::new();
     for (label, build) in [
         (
             "component text",
@@ -766,20 +723,24 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
             }),
         ),
     ] {
-        cx.update(|cx| {
+        let view = cx.update(|cx| {
             // A fresh registry per view, so each one is shown to start the
             // expression itself rather than inheriting the last one's.
             expressions::Expressions::init(cx);
-            let _view = build(cx);
+            let view = build(cx);
             assert!(
                 cx.global::<expressions::Expressions>().is_live(published),
                 "{label} did not resolve its binding"
             );
+            view
         });
+        views.push(view);
     }
 
     // And the component it bound to is the one receiving data.
-    let source = db.with_state(|s| s.get_component(source_id).cloned()).unwrap();
+    let source = db
+        .with_state(|s| s.get_component(source_id).cloned())
+        .unwrap();
     source
         .push_buf(
             metor_proto::types::Timestamp(1),
@@ -951,10 +912,7 @@ fn an_xy_axis_binds_an_expression_independently(cx: &mut gpui::TestAppContext) {
         Some(typed),
         "the expression axis saves its text"
     );
-    assert_eq!(
-        trace.x_expression, None,
-        "the ordinary axis is left alone"
-    );
+    assert_eq!(trace.x_expression, None, "the ordinary axis is left alone");
     assert_eq!(trace.x_component_id, ComponentId::new("rpm"));
 
     // Reloading starts it again and binds what it publishes into.
@@ -1002,7 +960,9 @@ fn feed_and_await(
     component
         .push_buf(Timestamp(at), &value.to_le_bytes())
         .unwrap();
-    let out = db.with_state(|s| s.get_component(published).cloned()).unwrap();
+    let out = db
+        .with_state(|s| s.get_component(published).cloned())
+        .unwrap();
     for _ in 0..400 {
         if let Some(latest) = out.time_series.latest()
             && latest.timestamp() == Timestamp(at)
@@ -1034,7 +994,7 @@ fn a_time_series_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::
     let typed = "=rpm * 2.0";
     let published = expression_target(&db, "rpm * 2.0", source);
 
-    let saved = cx.update(|cx| {
+    let (saved, plot) = cx.update(|cx| {
         crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
@@ -1049,7 +1009,7 @@ fn a_time_series_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::
             ..Default::default()
         };
         let plot = cx.new(|cx| TimeSeriesPlot::from_config(config, db.clone(), cx));
-        plot.read(cx).to_config(cx)
+        (plot.read(cx).to_config(cx), plot)
     });
     assert_eq!(
         saved.traces[0].expression.as_deref(),
@@ -1062,9 +1022,10 @@ fn a_time_series_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::
 
     // A new session: the old expression's handles go, and with them its
     // tasks. The component survives, holding what it already computed.
+    drop(plot);
     cx.update(expressions::Expressions::init);
 
-    let reloaded = cx.update(|cx| {
+    let (reloaded, _plot) = cx.update(|cx| {
         let plot = cx.new(|cx| TimeSeriesPlot::from_config(saved, db.clone(), cx));
         let line_plot = plot.read(cx).line_plot().read(cx);
         let id = line_plot.traces()[0].read(cx).component_id;
@@ -1072,7 +1033,7 @@ fn a_time_series_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::
             cx.global::<expressions::Expressions>().is_live(published),
             "reloading has to start the expression again"
         );
-        id
+        (id, plot)
     });
     assert_eq!(reloaded, published, "and bind onto what it publishes into");
 
@@ -1094,7 +1055,7 @@ fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestApp
     let typed = "=rpm * 3.0";
     let published = expression_target(&db, "rpm * 3.0", source);
 
-    let saved = cx.update(|cx| {
+    let (saved, plot) = cx.update(|cx| {
         crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
         expressions::Expressions::init(cx);
         DynamicWorker::init(cx);
@@ -1109,16 +1070,17 @@ fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestApp
             ..Default::default()
         };
         let plot = cx.new(|cx| ListPlot::from_config(config, db.clone(), cx));
-        plot.read(cx).to_config(cx)
+        (plot.read(cx).to_config(cx), plot)
     });
     assert_eq!(saved.traces[0].expression.as_deref(), Some(typed));
     assert_eq!(saved.traces[0].len, 1, "a scalar expression is one point");
 
     assert_eq!(feed_and_await(&db, source, published, 100, 2.0), 6.0);
 
+    drop(plot);
     cx.update(expressions::Expressions::init);
 
-    let reloaded = cx.update(|cx| {
+    let (reloaded, _plot) = cx.update(|cx| {
         let plot = cx.new(|cx| ListPlot::from_config(saved, db.clone(), cx));
         let line_plot = plot.read(cx).line_plot().read(cx);
         let id = line_plot.traces()[0].read(cx).component_id;
@@ -1126,7 +1088,7 @@ fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestApp
             cx.global::<expressions::Expressions>().is_live(published),
             "reloading has to start the expression again"
         );
-        id
+        (id, plot)
     });
     assert_eq!(reloaded, published);
 

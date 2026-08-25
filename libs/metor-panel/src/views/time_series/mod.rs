@@ -1138,6 +1138,7 @@ struct CursorDrag {
 /// `TimeSeriesPlot` only owns drag state and chrome.
 pub struct TimeSeriesPlot {
     line_plot: Entity<LinePlot>,
+    _expressions: Vec<crate::dynamic::expressions::Expression>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotView>,
     drag_zone: AxisZone,
@@ -1235,6 +1236,7 @@ impl TimeSeriesPlot {
         }
         Self {
             line_plot,
+            _expressions: Vec::new(),
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,

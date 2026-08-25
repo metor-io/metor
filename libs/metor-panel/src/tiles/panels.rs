@@ -31,6 +31,7 @@ pub use crate::views::ComponentTextConfig as TextPanelConfig;
 pub struct TextPanel {
     inner: Entity<ComponentText>,
     label: SharedString,
+    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl TextPanel {
@@ -44,14 +45,19 @@ impl TextPanel {
         Self {
             inner,
             label: label.into(),
+            _expression: None,
         }
     }
 
     pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = crate::dynamic::expressions::bind(&cfg.component, &db, cx)
+        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
+        let component_id = bound
+            .as_ref()
             .map(|bound| bound.id)
-            .unwrap_or_else(|_| ComponentId::new(&cfg.component));
-        Self::new(db, component_id, cfg.component, cx)
+            .unwrap_or_else(|| ComponentId::new(&cfg.component));
+        let mut panel = Self::new(db, component_id, cfg.component, cx);
+        panel._expression = bound.and_then(|bound| bound.expression);
+        panel
     }
 }
 
@@ -327,6 +333,7 @@ pub use crate::views::TrafficLightConfig as TrafficLightPanelConfig;
 pub struct TrafficLightPanel {
     inner: Entity<TrafficLight>,
     label: SharedString,
+    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl TrafficLightPanel {
@@ -340,13 +347,16 @@ impl TrafficLightPanel {
         Self {
             inner,
             label: label.into(),
+            _expression: None,
         }
     }
 
     pub fn from_config(cfg: TrafficLightPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = crate::dynamic::expressions::bind(&cfg.component, &db, cx)
+        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
+        let component_id = bound
+            .as_ref()
             .map(|bound| bound.id)
-            .unwrap_or_else(|_| ComponentId::new(&cfg.component));
+            .unwrap_or_else(|| ComponentId::new(&cfg.component));
         let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
         if let Some(color) = cfg.color {
             inner.update(cx, |t, cx| t.set_color(color, cx));
@@ -354,6 +364,7 @@ impl TrafficLightPanel {
         Self {
             inner,
             label: cfg.component.into(),
+            _expression: bound.and_then(|bound| bound.expression),
         }
     }
 }

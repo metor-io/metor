@@ -532,6 +532,18 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            Expr::CheckedIndex { value, len } => {
+                let checked = self.acquire(ValType::I64);
+                self.expr(value);
+                self.push(Instruction::LocalTee(checked));
+                self.push(Instruction::I64Const(*len as i64));
+                self.push(Instruction::I64GeU);
+                self.push(Instruction::If(BlockType::Empty));
+                self.push(Instruction::Unreachable);
+                self.push(Instruction::End);
+                self.push(Instruction::LocalGet(checked));
+                self.release(ValType::I64, checked);
+            }
             Expr::Element { source, index, len } => {
                 self.element_address(source, index, *len);
                 self.push(Instruction::F64Load(mem_arg(3)));
@@ -956,8 +968,7 @@ impl<'a> Emitter<'a> {
         self.push(op);
     }
 
-    /// `a // b` with Python's sign rule: `i64.div_s` truncates, so subtract one
-    /// when the remainder is non-zero and the operands disagree in sign.
+    /// Emit wrapping floor division with Python's sign rule.
     fn floor_div_i64(&mut self, lhs: &Expr, rhs: &Expr) {
         let (a, b, r) = (
             self.acquire(ValType::I64),
@@ -970,6 +981,16 @@ impl<'a> Emitter<'a> {
         self.push(Instruction::LocalSet(b));
 
         self.push(Instruction::LocalGet(a));
+        self.push(Instruction::I64Const(i64::MIN));
+        self.push(Instruction::I64Eq);
+        self.push(Instruction::LocalGet(b));
+        self.push(Instruction::I64Const(-1));
+        self.push(Instruction::I64Eq);
+        self.push(Instruction::I32And);
+        self.push(Instruction::If(BlockType::Result(ValType::I64)));
+        self.push(Instruction::I64Const(i64::MIN));
+        self.push(Instruction::Else);
+        self.push(Instruction::LocalGet(a));
         self.push(Instruction::LocalGet(b));
         self.push(Instruction::I64DivS);
 
@@ -980,6 +1001,7 @@ impl<'a> Emitter<'a> {
         self.signs_differ(b, r);
         self.push(Instruction::I64ExtendI32U);
         self.push(Instruction::I64Sub);
+        self.push(Instruction::End);
 
         self.release(ValType::I64, a);
         self.release(ValType::I64, b);

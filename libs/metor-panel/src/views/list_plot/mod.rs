@@ -69,6 +69,7 @@ impl ListTrace {
 /// and pan/zoom input.
 pub struct ListPlot {
     line_plot: Entity<ListLinePlot>,
+    _expressions: Vec<crate::dynamic::expressions::Expression>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
@@ -85,6 +86,7 @@ impl ListPlot {
         cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
         Self {
             line_plot,
+            _expressions: Vec::new(),
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,

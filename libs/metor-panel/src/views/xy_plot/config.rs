@@ -106,24 +106,36 @@ impl XyPlot {
         // An axis written as an expression is compiled and started before the
         // trace is built, so what it binds is the component now publishing
         // rather than the one that did last session.
+        let mut expressions = Vec::new();
         let traces = config
             .traces
             .into_iter()
             .map(|mut trace| {
-                for (text, id) in [
-                    (&trace.x_expression, &mut trace.x_component_id),
-                    (&trace.y_expression, &mut trace.y_component_id),
+                let x = trace
+                    .x_expression
+                    .clone()
+                    .or_else(|| expressions::binding_text(&db, trace.x_component_id));
+                let y = trace
+                    .y_expression
+                    .clone()
+                    .or_else(|| expressions::binding_text(&db, trace.y_component_id));
+                for (text, id, saved) in [
+                    (x, &mut trace.x_component_id, &mut trace.x_expression),
+                    (y, &mut trace.y_component_id, &mut trace.y_expression),
                 ] {
-                    if let Some(text) = text
-                        && let Ok(bound) = expressions::bind(text, &db, cx)
-                    {
-                        *id = bound.id;
-                    }
+                    let Some(text) = text else { continue };
+                    let Ok(bound) = expressions::bind(&text, &db, cx) else {
+                        continue;
+                    };
+                    *id = bound.id;
+                    *saved = Some(text);
+                    expressions.extend(bound.expression);
                 }
                 XyTrace::from(trace)
             })
             .collect();
-        let plot = Self::new(db, traces, cx);
+        let mut plot = Self::new(db, traces, cx);
+        plot._expressions = expressions;
         plot.line_plot.update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             line_plot.x_min_override = config.x_min_override;

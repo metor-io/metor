@@ -94,13 +94,7 @@ pub(crate) struct Desc {
     pub out: Vec<u32>,
 }
 
-/// How a tensor operation reaches the machine.
-///
-/// The checker picks, by size. A kernel call costs a `call` plus the kernel's
-/// prologue, and the elementwise kernels additionally run the general
-/// broadcast odometer per element — M4 measured that at ~230 fuel per element
-/// on a length-3 add. [`Emit::Open`] runs the odometer while emitting instead,
-/// leaving straight-line loads and stores behind.
+/// Selects inline or kernel emission for a tensor operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Emit {
     Open,
@@ -259,6 +253,11 @@ pub(crate) enum Expr {
         operand: Box<Expr>,
         elems: u32,
         emit: Emit,
+    },
+    /// A dynamic tensor index checked against one axis.
+    CheckedIndex {
+        value: Box<Expr>,
+        len: u32,
     },
     /// One element of a tensor. A non-constant index is bounds-checked.
     Element {
@@ -542,6 +541,7 @@ fn collect_expr(expr: &Expr, found: &mut Vec<&'static str>) {
                 collect_expr(element, found);
             }
         }
+        Expr::CheckedIndex { value, .. } => collect_expr(value, found),
         Expr::Element { source, index, .. } => {
             collect_expr(source, found);
             collect_expr(index, found);

@@ -32,14 +32,12 @@ pub struct ExpressionRow {
     /// What the last commit made of the query, if there has been one.
     status: Option<String>,
 }
-
 /// What a picker does with a committed expression.
 ///
 /// It receives the hidden component the expression publishes into and the text
 /// that produced it, and decides what happens next — most callers dismiss,
 /// while a multi-select wizard hands back a trace and closes itself.
-pub type OnExpression =
-    Arc<dyn Fn(ComponentId, String, &mut Window, &mut App) -> RowAction>;
+pub type OnExpression = Arc<dyn Fn(ComponentId, String, &mut Window, &mut App) -> RowAction>;
 
 impl ExpressionRow {
     pub fn new(db: Arc<DB>, on_select: OnExpression) -> Self {
@@ -121,4 +119,3 @@ impl InspectorRow for ExpressionRow {
         }
     }
 }
-

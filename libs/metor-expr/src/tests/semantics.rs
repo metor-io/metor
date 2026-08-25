@@ -1,4 +1,4 @@
-//! M2: the ground rules, one test each, checked against nox.
+//! Scalar semantics checked against nox.
 //!
 //! These are the decisions the phase ratifies. Each is pinned here so that
 //! changing one is a deliberate act with a failing test attached, and each
@@ -35,9 +35,7 @@ fn ints_are_i64_and_wrap() {
 /// included.
 #[test]
 fn division_always_yields_f64() {
-    agrees("7.0 / 2.0", || {
-        nox_value(nox_scalar(7.0) / nox_scalar(2.0))
-    });
+    agrees("7.0 / 2.0", || nox_value(nox_scalar(7.0) / nox_scalar(2.0)));
     assert_eq!(eval_f64("7 / 2"), 3.5);
     assert_eq!(eval_f64("4 / 2"), 2.0);
 
@@ -60,7 +58,11 @@ fn floor_division_and_modulo_follow_the_divisor() {
             py_floordiv(a, b),
             "{a} // {b}"
         );
-        assert_eq!(run_i64(&rem, "f", &[iv(a), iv(b)]), py_rem(a, b), "{a} % {b}");
+        assert_eq!(
+            run_i64(&rem, "f", &[iv(a), iv(b)]),
+            py_rem(a, b),
+            "{a} % {b}"
+        );
     }
 
     assert_eq!(eval_i64("-7 // 2"), -4);
@@ -90,6 +92,11 @@ fn floor_division_and_modulo_follow_the_divisor() {
     );
 }
 
+#[test]
+fn integer_floor_division_wraps_the_minimum_overflow() {
+    assert_eq!(eval_i64("(-9223372036854775807 - 1) // -1"), i64::MIN);
+}
+
 /// Rule 4 — integer division and modulo by zero trap. Float division by zero
 /// is IEEE-754, which has an answer, so it gets one.
 #[test]
@@ -101,7 +108,10 @@ fn integer_division_by_zero_traps_and_float_division_does_not() {
 
     let float = build("def f(a: f64, b: f64) -> f64:\n    return a / b\n");
     assert_eq!(run_f64(&float, "f", &[fv(1.0), fv(0.0)]), f64::INFINITY);
-    assert_eq!(run_f64(&float, "f", &[fv(-1.0), fv(0.0)]), f64::NEG_INFINITY);
+    assert_eq!(
+        run_f64(&float, "f", &[fv(-1.0), fv(0.0)]),
+        f64::NEG_INFINITY
+    );
     assert!(run_f64(&float, "f", &[fv(0.0), fv(0.0)]).is_nan());
 }
 
@@ -159,9 +169,7 @@ fn bool_is_not_an_int() {
 /// and truncates toward zero.
 #[test]
 fn promotion_is_implicit_and_narrowing_is_not() {
-    agrees("1 + 2.0", || {
-        nox_value(nox_scalar(1.0) + nox_scalar(2.0))
-    });
+    agrees("1 + 2.0", || nox_value(nox_scalar(1.0) + nox_scalar(2.0)));
     assert_eq!(eval_f64("2 * 1.5"), 3.0);
     assert_eq!(eval_f64("float(3)"), 3.0);
 

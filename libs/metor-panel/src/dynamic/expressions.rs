@@ -1,73 +1,17 @@
-//! View-owned expressions: the `=` tier, running.
-//!
-//! A component picker with a leading `=` is the spreadsheet convention, and
-//! what it produces is a system like any other — the difference is only who
-//! owns it. A program pane's systems are owned by the pane and publish real
-//! components; an `=` expression is owned by *the view that typed it* and
-//! publishes nothing. It exists while a view wants it and stops when the last
-//! one stops.
-//!
-//! ## What owns a running expression
-//!
-//! The registry does, for the session. That is not the first answer — views
-//! held the strong references and the registry held [`Weak`] ones, so an
-//! expression stopped the moment nothing was showing it — but it is the only
-//! one consistent with the component being registered.
-//!
-//! The trouble with view ownership is that a view binds to a *component id*.
-//! Every consumer of the picker — a plot trace, a table column, a dashboard
-//! widget — takes an id and has nowhere to put a handle, so the handle died
-//! at the end of the call that made it. What the operator saw was an
-//! expression that published exactly one sample, from its seed, and then
-//! never again: the component was there, and nothing was writing to it.
-//!
-//! Since the component outlives the expression anyway (the db is
-//! insert-only), the nodes have to outlive it too, or the component is left
-//! stale and silently wrong. So an expression, once started, keeps its
-//! component current until the panel exits. Two views typing the same text
-//! still share one system — the content hash is what they meet on — and
-//! reclaiming what nothing references is the same startup sweep that reclaims
-//! the components, where nothing can be holding either.
-//!
-//! ## Ephemeral means hidden, not unregistered
-//!
-//! An expression's output *is* registered as a db component — named by its
-//! content hash and marked `hidden`, which is the flag the db already has for
-//! "queryable by id, absent from pickers and browsers". Registration is what
-//! buys history, and history is what every view that draws a line needs: a
-//! plot reads `component.time_series`, not a stream, so a trace bound to a
-//! bare ring would wait forever and draw nothing.
-//!
-//! Hiddenness, not absence, is therefore what makes an expression ephemeral.
-//! It never appears anywhere an operator picks from; it simply exists where
-//! views can read it, exactly as a `Persist`ed node does.
-//!
-//! **The component outlives the expression, deliberately.** The db is
-//! insert-only — there is no `remove_component` — so when the last view drops
-//! an expression its task stops and its ring goes quiet, while the component
-//! record stays behind holding whatever history it accumulated. That is the
-//! conservative direction to be wrong in: a stale hidden component is
-//! invisible and costs a directory, whereas removing one out from under a
-//! view still reading it would not be recoverable. Reclaiming them is a sweep
-//! at startup, when nothing can hold a reference.
-//!
-//! What a view serializes is the text the operator typed, prefixed with `=`.
-//! The node is derived from it on load — which is also why the resolution
-//! recorded in the manifest matters: the text is what the operator wrote, and
-//! the compiled binding is the full path it meant at the time.
+//! View-owned `=` expressions shared through a weak registry.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use gpui::{App, Global};
 use metor_db::DB;
 use metor_expr::Diagnostics;
 use metor_proto::types::ComponentId;
 
-use crate::dynamic::{BuildError, DynamicNode, NodeId};
 use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL};
 use crate::dynamic::resolver::DbResolver;
 use crate::dynamic::worker::DynamicWorker;
+use crate::dynamic::{BuildError, DynamicNode, NodeId};
 
 /// The prefix that turns a picker's search field into an expression field.
 pub const SIGIL: char = '=';
@@ -139,13 +83,14 @@ pub fn binding_text(db: &DB, id: ComponentId) -> Option<String> {
     Some(format!("{SIGIL}{text}"))
 }
 
-/// Live `=` expressions, keyed by what they compute.
-///
-/// Strong on purpose: see the module docs. A view binds to a component id and
-/// has nowhere to keep a handle, so if this did not hold one nothing would.
+pub fn running(id: ComponentId, cx: &App) -> Option<Expression> {
+    cx.try_global::<Expressions>()?.get(id)
+}
+
+/// Live `=` expressions, keyed without extending their lifetime.
 #[derive(Default)]
 pub struct Expressions {
-    live: HashMap<ComponentId, Expression>,
+    live: HashMap<ComponentId, Weak<ExpressionInner>>,
 }
 
 impl Global for Expressions {}
@@ -157,7 +102,7 @@ impl Expressions {
 
     /// The expression behind a component id, if this session started one.
     pub fn get(&self, id: ComponentId) -> Option<Expression> {
-        self.live.get(&id).cloned()
+        self.live.get(&id)?.upgrade().map(Expression)
     }
 
     /// Whether a component id names an expression this session is running.
@@ -165,21 +110,27 @@ impl Expressions {
     /// A hidden component left behind by an earlier session answers `false`:
     /// it is a record with history, not something still computing.
     pub fn is_live(&self, id: ComponentId) -> bool {
-        self.live.contains_key(&id)
+        self.live.get(&id).and_then(Weak::upgrade).is_some()
     }
 
     /// How many expressions are running, for a sweep to reason about.
     pub fn len(&self) -> usize {
-        self.live.len()
+        self.live
+            .values()
+            .filter(|entry| entry.strong_count() > 0)
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.live.is_empty()
+        self.len() == 0
     }
 
     /// Take ownership of a running expression, keyed by what it publishes.
     pub fn insert(&mut self, expression: Expression) {
-        self.live.insert(expression.component, expression);
+        self.live
+            .retain(|_, expression| expression.strong_count() > 0);
+        self.live
+            .insert(expression.component_id(), Arc::downgrade(&expression.0));
     }
 }
 
@@ -188,10 +139,10 @@ impl Expressions {
 /// Dropping this is what stops the expression computing — assuming no other
 /// view is showing the same one.
 #[derive(Clone)]
-pub struct Expression {
-    /// The node writing into the component, which is also what a view can
-    /// bind to directly when it wants the live stream rather than history.
-    pub node: Arc<dyn DynamicNode>,
+pub struct Expression(Arc<ExpressionInner>);
+
+struct ExpressionInner {
+    _node: Arc<dyn DynamicNode>,
     /// The hidden component this expression publishes into. Views bind to
     /// this and take the ordinary path — history, LoD, alarms and all.
     pub component: ComponentId,
@@ -213,16 +164,16 @@ impl Expression {
         system: Arc<dyn DynamicNode>,
         field: Arc<dyn DynamicNode>,
     ) -> Self {
-        Expression {
-            node,
+        Expression(Arc::new(ExpressionInner {
+            _node: node,
             component,
             _system: system,
             _field: field,
-        }
+        }))
     }
 
     pub fn component_id(&self) -> ComponentId {
-        self.component
+        self.0.component
     }
 }
 

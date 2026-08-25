@@ -53,7 +53,7 @@ plots, geospatial, annotations, export, staleness indication, table alarm colori
    (Grafana, MoTeC damper/throttle histograms, scope measurement statistics). Needs a
    `Histogram` node op (window + bins) plus a view; MoTeC's linked-recompute (histogram
    follows plot zoom) and gating (only when condition holds) are the distinctive
-   interactions. 
+   interactions.
 
 5. **Spectrogram / waterfall.** (Skip for now) Time × frequency × magnitude-as-color, scrolling
    (DEWESoft, IADS flutter analysis, Yamcs Intensity Graph). The `Window→FFT→Magnitude`

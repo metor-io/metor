@@ -1,73 +1,4 @@
-//! Python AST in, typed IR out — the compiler's single validation gate.
-//!
-//! Everything downstream trusts what leaves this module. Codegen does not
-//! re-derive a type, re-check an arity, or guard against a name it cannot
-//! resolve; if the checker returned a [`Program`], the program is well typed
-//! and every index in it is in range.
-//!
-//! The subset is small deliberately, and the rejections are as much a part of
-//! the design as the acceptances. Strings, containers, classes, closures,
-//! imports, `try`, `with`, generators, and global mutation are all refused
-//! with a span, because a language that can be checked completely is worth
-//! more here than a language that can express everything.
-//!
-//! `[a, b, c]` is the one thing that looks like a container and is not. It is
-//! a fixed-size tensor *constructor*: it types as a `Tensor` the moment it is
-//! read, its length is its shape, and there is no list value anywhere for it
-//! to be — nothing to append to, and no way to name one. See
-//! [`FnChecker::tensor_literal`].
-//!
-//! ## Where this differs from CPython, on purpose
-//!
-//! The numerics are a tensor library's, not an interpreter's:
-//!
-//! - Ints are `i64` and **wrap**. There are no bignums.
-//! - `/` is always true division and always yields `f64`, `int / int` included.
-//! - `//` and `%` floor, so the sign follows the divisor — but wasm's `rem` is
-//!   truncating, so the emitter carries the correction.
-//! - Integer division or modulo by zero **traps**. A trap is a contained
-//!   diagnostic; manufacturing a value would not be.
-//! - `bool` is not an int in disguise. Comparisons yield `bool`, `if` and
-//!   `while` conditions must *be* `bool`, and `True + 1` does not typecheck.
-//! - Mixed arithmetic promotes `i64` to `f64`. Narrowing is explicit, through
-//!   `int(x)`, and truncates toward zero.
-//! - Indices do not wrap around: `v[-1]` traps rather than reaching the end.
-//!
-//! ## `@` is the only contraction
-//!
-//! Python spells the tensor product `@`, and its rank rules are numpy's:
-//! rank-1 against rank-1 is the inner product, rank-2 is matrix
-//! multiplication, and above that the leading dimensions broadcast while the
-//! last two contract. Phase 1's `dot(a, b)` is gone rather than kept as an
-//! alias — numpy's `dot` and `@` agree only up to rank 2 and diverge above it,
-//! so a second spelling would either be a rank-limited carve-out or a quiet
-//! lie about which contraction ran. The old spelling is a diagnostic naming
-//! the new one, which is a keystroke in an expression field.
-//!
-//! ## Tensors are addresses, and every address is a constant
-//!
-//! Shapes are static, there is no allocator in the guest, and the plan asks
-//! for kernel call sites whose shape arguments are compile-time constants. All
-//! three fall out of one decision: **every tensor in a compiled program lives
-//! at an address the compiler picked.** A tensor-valued expression does not
-//! leave a value on the wasm stack; it writes into a buffer, and its "value"
-//! is that buffer's address, known while emitting.
-//!
-//! That is what lets an elementwise call site be `i32.const desc; call $k_add`,
-//! with `desc` a data segment holding both operand addresses and all three
-//! shapes.
-//!
-//! It also decides the calling convention. A function whose signature mentions
-//! a tensor takes no wasm parameters at all: its arguments live in static
-//! buffers the host writes through `<name>_arg_ptr(i)`, and its result in one
-//! the host reads through `<name>_ret_ptr()`. Internal callers use the very
-//! same buffers — copy in, call, copy out. Scalar-only functions keep passing
-//! by value, because nothing about them needs memory.
-//!
-//! Static buffers and recursion do not mix: a second activation would write
-//! over the first one's arguments. So a call cycle that passes through a
-//! tensor-using function is refused, with a span. Scalar recursion is
-//! untouched — it lives in wasm locals.
+//! Type-check Python expressions into trusted IR.
 
 use std::collections::{HashMap, HashSet};
 
@@ -84,40 +15,22 @@ use crate::lang::{self, SystemDecl};
 use crate::manifest::{self, Frame, Port};
 use crate::{Dtype, FnSig, Manifest, Resolver, Ty};
 
-/// How deep an expression may nest before the checker refuses it. Bounded so
-/// that a pathological input is a diagnostic rather than a blown stack, but
-/// generously: a left-associative chain of `n` terms nests `n` deep, and
-/// generated source reaches lengths hand-written source never would.
+/// Maximum expression depth accepted by the checker.
 const MAX_DEPTH: u32 = 512;
 
-/// The largest source this crate will look at. A panel expression is tens of
-/// bytes and a systems module is a few thousand, so the only thing this
-/// excludes is an input designed to be expensive.
+/// Maximum source size accepted by the checker.
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 
-/// Stack for the parse. `rustpython-parser` builds and drops its AST
-/// recursively, so nesting depth costs stack — measured to abort a 2 MiB
-/// thread somewhere between ten and fifty thousand levels. Bounding the source
-/// bounds the depth, and this leaves room for the worst case that bound allows.
+/// Stack reserved for recursive parser work.
 const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-/// The largest rank an annotation may declare, and what the elementwise
-/// kernels' descriptors carry. A batched `@` contracts the last two axes and
-/// broadcasts the rest, so four is two matrices' worth of batching.
+/// Maximum tensor rank supported by kernel descriptors.
 const MAX_RANK: usize = 4;
 
-/// How many scalar element operations a tensor operation may need before it
-/// goes through a prelude kernel instead of being open-coded.
-///
-/// The M4 sweep found no crossover: a length-128 `dot` was still 2.5× cheaper
-/// unrolled, because a `call` plus the kernel's prologue is ~34 fuel and the
-/// broadcasting kernels pay a general odometer per element on top. So this
-/// bound is not where kernels start winning on time — it is where the unrolled
-/// bytes stop being worth it, and 128 is the largest length the sweep priced.
+/// Maximum scalar work emitted inline before calling a kernel.
 const OPEN_CODE_MAX_OPS: usize = 128;
 
-/// Straight-line code while the operation is small enough to be worth its
-/// bytes, a kernel call once it is not.
+/// Choose inline code for small operations and a kernel otherwise.
 fn emit_for(ops: usize) -> Emit {
     if ops <= OPEN_CODE_MAX_OPS {
         Emit::Open
@@ -148,10 +61,7 @@ pub(crate) fn check(
         return Err(diags);
     }
 
-    // `rustpython-parser` is foreign code at this crate's edge, and `compile`
-    // owes its callers a diagnostic rather than an unwind for any input at
-    // all. Both concerns are met by running the parse somewhere with room and
-    // treating a panic as one more way the source can be bad.
+    // Isolate parser stack use and convert parser panics into diagnostics.
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(PARSE_STACK_BYTES)
@@ -190,7 +100,11 @@ fn check_inner(
                     .into_iter()
                     .collect();
                 lang::Decls {
-                    order: systems.iter().enumerate().map(|(i, _)| lang::Item::System(i)).collect(),
+                    order: systems
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| lang::Item::System(i))
+                        .collect(),
                     systems,
                     stages: Vec::new(),
                     functions: Vec::new(),
@@ -240,7 +154,12 @@ fn check_inner(
         if by_name.insert(name.clone(), sigs.len() as u32).is_some() {
             diags.push(def.range, format!("`{name}` is defined more than once"));
         }
-        sigs.push(FnSig { name, params, ret });
+        sigs.push(FnSig {
+            name,
+            params,
+            ret,
+            source: def.range.into(),
+        });
     }
 
     let mut buffers: Vec<Place> = Vec::new();
@@ -361,6 +280,7 @@ fn check_inner(
                         sigs: &sigs,
                         by_name: &by_name,
                         frames: &frames,
+                        edges: &edges,
                         systems: &systems,
                         stages: &stages,
                     },
@@ -444,6 +364,7 @@ struct Known<'a> {
     sigs: &'a [FnSig],
     by_name: &'a HashMap<String, u32>,
     frames: &'a [FnFrame],
+    edges: &'a [Vec<u32>],
     systems: &'a [manifest::System],
     stages: &'a [manifest::Stage],
 }
@@ -460,6 +381,7 @@ fn system(
         sigs,
         by_name,
         frames,
+        edges,
         systems: done,
         stages,
     } = known;
@@ -473,10 +395,9 @@ fn system(
             Some(frame) => frame.clone(),
             None => match &port.bindings[0] {
                 manifest::Binding::Produced { system, .. } => done[*system].output.clone(),
-                manifest::Binding::Resampled { stage } => lang::frame_of(
-                    &port.key,
-                    [(port.key.clone(), stages[*stage].ty.clone())],
-                ),
+                manifest::Binding::Resampled { stage } => {
+                    lang::frame_of(&port.key, [(port.key.clone(), stages[*stage].ty.clone())])
+                }
                 manifest::Binding::Component(path) => {
                     diags.push(decl.span, format!("no component `{path}`"));
                     return None;
@@ -609,6 +530,7 @@ fn system(
             )
         }
     };
+    let dependencies = function_dependencies(&body.calls, edges);
     let locals = body.locals;
 
     // `random()` keeps a word and `window` keeps a ring, and the body is what
@@ -617,7 +539,11 @@ fn system(
     // closes the list. Both start at zero, which is why neither costs a seed
     // instruction: a fresh linear memory already holds it, and a window
     // preloaded with zeros is what the panel's Window node published.
-    let mut state = decl.state.iter().map(|s| s.field.clone()).collect::<Vec<_>>();
+    let mut state = decl
+        .state
+        .iter()
+        .map(|s| s.field.clone())
+        .collect::<Vec<_>>();
     for (name, ty, buf) in body.synthetic {
         state_buffers.push(buf);
         let default = match ty {
@@ -665,10 +591,24 @@ fn system(
             state,
             driving: decl.driving,
             rate: decl.rate,
+            dependencies,
             layout: decl.layout,
             source: decl.span,
         },
     ))
+}
+
+fn function_dependencies(calls: &[u32], edges: &[Vec<u32>]) -> Vec<usize> {
+    let mut found = HashSet::new();
+    let mut pending = calls.to_vec();
+    while let Some(index) = pending.pop() {
+        if found.insert(index) {
+            pending.extend_from_slice(&edges[index as usize]);
+        }
+    }
+    let mut dependencies: Vec<_> = found.into_iter().map(|index| index as usize).collect();
+    dependencies.sort_unstable();
+    dependencies
 }
 
 /// Give a frame a block and every field a window into it.
@@ -1930,18 +1870,25 @@ impl FnChecker<'_> {
             let stride: i64 = shape[which + 1..].iter().product::<usize>() as i64;
             let (lowered, index_ty) = self.expr(index, depth)?;
             let lowered = self.coerce(lowered, index_ty, &Ty::I64, index.range())?;
-            if let Expr::I64(constant) = lowered
-                && !(0..shape[which] as i64).contains(&constant)
-            {
-                self.diags.push(
-                    index.range(),
-                    format!(
-                        "index {constant} is outside 0..{} for this axis",
-                        shape[which]
-                    ),
-                );
-                return None;
-            }
+            let lowered = match lowered {
+                Expr::I64(constant) => {
+                    if !(0..shape[which] as i64).contains(&constant) {
+                        self.diags.push(
+                            index.range(),
+                            format!(
+                                "index {constant} is outside 0..{} for this axis",
+                                shape[which]
+                            ),
+                        );
+                        return None;
+                    }
+                    Expr::I64(constant)
+                }
+                value => Expr::CheckedIndex {
+                    value: Box::new(value),
+                    len: shape[which] as u32,
+                },
+            };
             let term = if stride == 1 {
                 lowered
             } else {
@@ -2463,7 +2410,10 @@ impl FnChecker<'_> {
                         .push(list.range, "a tensor literal needs at least one element");
                     return None;
                 }
-                (vec![rows.len(), cols.expect("there is at least one row")], flat)
+                (
+                    vec![rows.len(), cols.expect("there is at least one row")],
+                    flat,
+                )
             }
         };
 
@@ -2606,12 +2556,7 @@ impl FnChecker<'_> {
     /// rather than one function's argument because the subset has no strings
     /// to spell a kind with, and four palette entries autocomplete better than
     /// one that needs its first argument memorised.
-    fn waveform(
-        &mut self,
-        kind: &str,
-        call: &ast::ExprCall,
-        depth: u32,
-    ) -> Option<(Expr, Ty)> {
+    fn waveform(&mut self, kind: &str, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
         let Some(now) = self.now else {
             self.diags
                 .push(call.range, format!("`{kind}` exists inside a system"));
@@ -2927,7 +2872,7 @@ fn expr_refusal(expr: &ast::Expr) -> &'static str {
         ast::Expr::JoinedStr(_) | ast::Expr::FormattedValue(_) => "strings are not supported",
         ast::Expr::Starred(_) => "argument unpacking is not supported",
         ast::Expr::NamedExpr(_) => "`:=` is not supported",
-        ast::Expr::Attribute(_) => "attribute access arrives with frames, in Phase 1",
+        ast::Expr::Attribute(_) => "attribute access is only supported for frame fields",
         ast::Expr::Slice(_) => "slicing is not supported in this phase",
         ast::Expr::Tuple(_) => "tuples are not supported",
         _ => "this expression is not supported",

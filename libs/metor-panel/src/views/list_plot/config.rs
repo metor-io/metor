@@ -93,19 +93,27 @@ impl ListPlot {
         // A trace written as an expression is compiled and started before it
         // is built, so what it binds is the component now publishing rather
         // than the one that did last session.
+        let mut expressions = Vec::new();
         let traces = config
             .traces
             .into_iter()
             .map(|mut trace| {
-                if let Some(text) = &trace.expression
-                    && let Ok(bound) = crate::dynamic::expressions::bind(text, &db, cx)
+                let expression = trace
+                    .expression
+                    .clone()
+                    .or_else(|| crate::dynamic::expressions::binding_text(&db, trace.component_id));
+                if let Some(text) = expression
+                    && let Ok(bound) = crate::dynamic::expressions::bind(&text, &db, cx)
                 {
                     trace.component_id = bound.id;
+                    trace.expression = Some(text);
+                    expressions.extend(bound.expression);
                 }
                 ListTrace::from(trace)
             })
             .collect();
-        let plot = Self::new(db, traces, cx);
+        let mut plot = Self::new(db, traces, cx);
+        plot._expressions = expressions;
         plot.line_plot.update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             line_plot.x_min_override = config.x_min_override;

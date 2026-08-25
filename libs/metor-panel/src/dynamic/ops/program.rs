@@ -1,60 +1,4 @@
-//! Compiled Python systems, running as streaming nodes.
-//!
-//! A `@system` is a function over frames, and the panel already has everything
-//! a frame needs except the frame: rings that carry `[Timestamp][value]`,
-//! content-hashed nodes that dedup, and a worker thread that owns their tasks.
-//! So a compiled system becomes one node like any other — what is new is only
-//! what happens between reading the inputs and writing the output.
-//!
-//! ## The run rule, against real rings
-//!
-//! The design says a system fires when its **driving** input publishes and
-//! reads the **latest** of everything else. A disruptor has no `latest()`: it
-//! is a fan-out stream, and a reader that is not drained makes its *producer*
-//! drop samples. So the latest of a non-driving input is kept where it can be
-//! kept cheaply — in the system's own task, refreshed by draining that input's
-//! reader with `try_next` on the way past. One task, one reader per port, no
-//! shared cells and no second loop. `resample` already reads its inputs this
-//! way; this is the same shape with N of them.
-//!
-//! An input that has never published leaves its cell empty, and the cycle is
-//! skipped — the `else return` a Rust system writes, in the one place where
-//! the language cannot express it.
-//!
-//! A system declaring `@system(rate=)` has no driving input at all: it is a
-//! source, and what fires it is a [`clock::fixed_rate`] node built here and
-//! held for its lifetime. Everything else about it is unchanged — held inputs
-//! are still held, the run rule still skips a cycle whose inputs are unknown —
-//! so a source with inputs is the cyclic FSW shape and one without is a
-//! generator.
-//!
-//! ## A frame is one sample
-//!
-//! The system node's ring carries the output frame's *bytes*, not a value: a
-//! frame is several fields of several types and no single `ComponentSchema`
-//! describes it honestly. [`field`] nodes hang off it, one per output field,
-//! each with the schema that field really has. That is also what makes
-//! publishing work — a field node is an ordinary value node, so `persist`
-//! registers it as `<system>.<field>` with no new machinery.
-//!
-//! ## Faults park, they do not cascade
-//!
-//! Every evaluation runs under a fuel grant. A `while True:` burns its grant
-//! and a bad index traps; either way the system stops evaluating, records what
-//! happened for the pane to show, and keeps draining its inputs so nothing
-//! upstream backs up behind it. The module is not torn down and no other
-//! system notices. An edit is what clears a fault, because an edit is what can
-//! fix one.
-//!
-//! ## State outlives the instance
-//!
-//! Editing must not reset the world, so state has to survive a rebuild — but
-//! the instance holding it lives inside a spawned task, where a rebuild cannot
-//! reach. Rather than ask the task for it, the task publishes it: after every
-//! evaluation the state slots are copied into a cell the node owns, which is
-//! at most a few words and makes the snapshot always current. A rebuild reads
-//! that cell, hands it to the new system, and `metor_expr::state` decides
-//! field by field what still matches.
+//! Run compiled systems as streaming nodes.
 
 use std::sync::{Arc, Mutex};
 
@@ -71,10 +15,7 @@ use crate::dynamic::node::{
 };
 use crate::dynamic::tensor::read_f64_at;
 
-/// Fuel one evaluation may burn. The M4 sweep put a realistic expression in
-/// the tens of units and a hundred-term contraction near a thousand, so this
-/// is roughly four orders of margin — generous enough that no honest program
-/// meets it, tight enough that a runaway loop is a diagnostic within a frame.
+/// Fuel available to one evaluation.
 pub const DEFAULT_FUEL: u64 = 1_000_000;
 
 /// A program compiled once, ready to instantiate per system.
@@ -104,8 +45,8 @@ impl Compiled {
         config.compilation_mode(wasmi::CompilationMode::Eager);
         config.consume_fuel(true);
         let engine = Engine::new(&config);
-        let module = Module::new(&engine, &program.wasm[..])
-            .expect("a module this crate emitted validates");
+        let module =
+            Module::new(&engine, &program.wasm[..]).expect("a module this crate emitted validates");
         Ok(Compiled {
             source: source.into(),
             manifest: program.manifest,
@@ -119,17 +60,44 @@ impl Compiled {
     /// module leaves this untouched, which is what lets the rest keep running.
     pub fn system_hash(&self, index: usize, ports: &[NodeId]) -> NodeId {
         let system = &self.manifest.systems[index];
-        let region = self
-            .source
-            .get(system.source.start as usize..system.source.end as usize)
-            .unwrap_or(&self.source);
         hash_id(op_tag::EXPR_SYSTEM, ports, |h| {
             use std::hash::Hash;
-            region.hash(h);
-            postcard::to_allocvec(system)
+            self.hash_declaration(system.source, system.layout.span, h);
+            for &dependency in &system.dependencies {
+                let function = &self.manifest.functions[dependency];
+                self.hash_declaration(function.source, Default::default(), h);
+            }
+            let mut descriptor = system.clone();
+            descriptor.source = Default::default();
+            descriptor.layout = Default::default();
+            descriptor.dependencies.clear();
+            postcard::to_allocvec(&descriptor)
                 .expect("a system descriptor encodes")
                 .hash(h);
         })
+    }
+
+    fn hash_declaration(
+        &self,
+        source: metor_expr::Span,
+        ignored: metor_expr::Span,
+        h: &mut impl std::hash::Hasher,
+    ) {
+        use std::hash::Hash;
+        let start = source.start as usize;
+        let end = source.end as usize;
+        let ignored_start = ignored.start as usize;
+        let ignored_end = ignored.end as usize;
+        let Some(region) = self.source.get(start..end) else {
+            self.source.hash(h);
+            return;
+        };
+        if start <= ignored_start && ignored_start <= ignored_end && ignored_end <= end {
+            self.source[start..ignored_start].hash(h);
+            self.source[ignored_end..end].hash(h);
+        } else {
+            region.hash(h);
+        }
     }
 }
 
@@ -221,7 +189,10 @@ pub fn system(
     // Restoring one carries the sequence across an edit; otherwise the clock
     // and the system's identity make a fresh one, so two systems drawing at
     // once do not draw the same numbers.
-    let id = compiled.system_hash(index, &ports.iter().map(|p| p.node.id()).collect::<Vec<_>>());
+    let id = compiled.system_hash(
+        index,
+        &ports.iter().map(|p| p.node.id()).collect::<Vec<_>>(),
+    );
     if !seed.is_some_and(|s| s.entries.iter().any(|(key, _)| key.field == RNG_FIELD)) {
         instance.seed_rng(id.0 ^ Timestamp::now().0 as u64);
     }
@@ -273,7 +244,9 @@ pub fn system(
     let wired = Ports {
         driving: match &clock {
             Some(clock) => clock.subscribe(),
-            None => readers[driving].take().expect("the driving port is wired once"),
+            None => readers[driving]
+                .take()
+                .expect("the driving port is wired once"),
         },
         driven_port: clock.is_none().then_some(driving),
         others: readers
@@ -365,7 +338,10 @@ pub fn field(
 /// This is the same read `views/binding.rs` does before entering its stream
 /// loop, and for the same reason: a fresh reader only sees what is committed
 /// from now on, so anything already published is invisible without it.
-pub fn latest_sample(db: &metor_db::DB, component: metor_proto::types::ComponentId) -> Option<(Timestamp, Vec<u8>)> {
+pub fn latest_sample(
+    db: &metor_db::DB,
+    component: metor_proto::types::ComponentId,
+) -> Option<(Timestamp, Vec<u8>)> {
     db.with_state(|state| {
         let latest = state.get_component(component)?.time_series.latest()?;
         Some((latest.timestamp(), latest.data().to_vec()))
@@ -412,7 +388,7 @@ struct PortLayout {
 impl PortLayout {
     fn new(port: &metor_expr::Port, schema: &ComponentSchema) -> Result<Self, BuildError> {
         // A port the panel builds is a projection of one component, so it has
-        // exactly one field; a multi-field frame is a Phase 3 shape.
+        // Component ports project exactly one field.
         let [field] = port.frame.fields.as_slice() else {
             return Err(BuildError::Expr(format!(
                 "`{}` binds a frame of {} fields; the panel binds one component per port",
@@ -475,14 +451,13 @@ async fn run(
 ) {
     let mut sample = Vec::new();
 
-    // Fire once from what the driving input had already published, so an
-    // expression over a channel that is merely quiet shows its value straight
-    // away instead of waiting for a sample that may be minutes off.
+    // Evaluate the newest saved driving sample before waiting for live input.
     if let Some((ts, value)) = &opening {
         let driving = ports.driven_port.expect("only an input port has a seed");
         ports.layouts[driving].fill(value, &mut sample);
-        if evaluate(&mut instance, &ports, &sample, *ts, &output, &state).is_err() {
-            return;
+        if let Err(why) = evaluate(&mut instance, &ports, &sample, *ts, &output, &state) {
+            health.park(why);
+            parked(ports).await;
         }
     }
 
@@ -519,8 +494,8 @@ async fn run(
                     true => &sample,
                     false => held,
                 };
-                if instance.write_port(i, bytes).is_err() {
-                    return;
+                if let Err(why) = instance.write_port(i, bytes) {
+                    break 'live why;
                 }
             }
             match instance.eval(ts) {
@@ -536,9 +511,7 @@ async fn run(
     parked(ports).await;
 }
 
-/// Write every port and evaluate once. `Err` means the instance is unusable
-/// and the task should end; a fault during the opening sample is treated the
-/// same way the live loop treats one.
+/// Write every port and evaluate once.
 fn evaluate(
     instance: &mut Running,
     ports: &Ports,
@@ -546,7 +519,7 @@ fn evaluate(
     ts: Timestamp,
     output: &Disruptor,
     state: &StateCell,
-) -> Result<(), ()> {
+) -> Result<(), String> {
     if ports
         .others
         .iter()
@@ -561,14 +534,10 @@ fn evaluate(
         };
         instance.write_port(i, bytes)?;
     }
-    match instance.eval(ts) {
-        Ok(frame) => {
-            write_sample(output, ts, frame);
-            *state.0.lock().unwrap() = instance.read_state();
-            Ok(())
-        }
-        Err(_) => Ok(()),
-    }
+    let frame = instance.eval(ts)?;
+    write_sample(output, ts, frame);
+    *state.0.lock().unwrap() = instance.read_state();
+    Ok(())
 }
 
 /// After a fault the system stops computing but keeps reading, so nothing
@@ -621,9 +590,8 @@ impl Running {
 
         let desc = &compiled.manifest.systems[index];
         let accessor = |store: &mut Store<()>, name: &str, arg: i32| -> Result<u32, BuildError> {
-            let func: TypedFunc<i32, i32> = instance
-                .get_typed_func(&*store, name)
-                .map_err(expr_error)?;
+            let func: TypedFunc<i32, i32> =
+                instance.get_typed_func(&*store, name).map_err(expr_error)?;
             func.call(store, arg).map(|v| v as u32).map_err(expr_error)
         };
 
@@ -685,10 +653,12 @@ impl Running {
             .expect("a compiled module exports its memory")
     }
 
-    fn write_port(&mut self, port: usize, bytes: &[u8]) -> Result<(), ()> {
+    fn write_port(&mut self, port: usize, bytes: &[u8]) -> Result<(), String> {
         let at = self.args[port] as usize;
         let memory = self.memory();
-        memory.write(&mut self.store, at, bytes).map_err(|_| ())
+        memory
+            .write(&mut self.store, at, bytes)
+            .map_err(|err| format!("could not write input frame: {err}"))
     }
 
     /// Seed the state slots from a snapshot and mark the instance seeded, so

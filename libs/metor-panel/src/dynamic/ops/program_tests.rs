@@ -1,10 +1,4 @@
-//! P4: compiled systems driven by real rings.
-//!
-//! Every test here feeds a system through db components — the same path the
-//! panel uses — and reads what it published back off its field nodes. What is
-//! being checked is the *runtime*: the run rule against rings that have no
-//! `latest()`, faults that park instead of cascading, and state that survives
-//! the swap a rebuild is.
+//! Runtime tests for compiled streaming systems.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,9 +109,7 @@ fn wire(bench: &Bench, compiled: &Arc<Compiled>, index: usize) -> program::Syste
         .inputs
         .iter()
         .map(|port| match &port.bindings[0] {
-            metor_expr::Binding::Component(path) => {
-                program::PortSource::live(bench.source(path))
-            }
+            metor_expr::Binding::Component(path) => program::PortSource::live(bench.source(path)),
             other => panic!("this helper wires components, not {other:?}"),
         })
         .collect();
@@ -339,6 +331,27 @@ async fn an_edit_only_changes_the_system_it_touched() {
     assert_ne!(before.system_hash(1, &port), after.system_hash(1, &port));
 }
 
+#[stellarator::test]
+async fn editing_a_helper_changes_each_dependent_system() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let before =
+        bench.compile("def gain(x: f64) -> f64:\n    return x * 2.0\n\nout = gain(wheels.rpm)\n");
+    let after =
+        bench.compile("def gain(x: f64) -> f64:\n    return x * 3.0\n\nout = gain(wheels.rpm)\n");
+    let port = vec![bench.source("wheels.rpm").id()];
+    assert_ne!(before.system_hash(0, &port), after.system_hash(0, &port));
+}
+
+#[stellarator::test]
+async fn source_positions_and_canvas_layout_do_not_change_system_identity() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let before = bench.compile("# short\nout = wheels.rpm * 2.0  # @node(x=1, y=2)\n");
+    let after = bench
+        .compile("# a longer unrelated comment\nout = wheels.rpm * 2.0  # @node(x=30, y=40)\n");
+    let port = vec![bench.source("wheels.rpm").id()];
+    assert_eq!(before.system_hash(0, &port), after.system_hash(0, &port));
+}
+
 /// A channel that has published and gone quiet must still show its value.
 ///
 /// A disruptor reader begins at the write head, so without seeding, a system
@@ -356,7 +369,10 @@ async fn a_quiet_channel_still_yields_its_current_value() {
 
     let id = bench.id("wheels.rpm");
     let seed = program::latest_sample(&bench.db, id);
-    assert!(seed.is_some(), "the component must have history to seed from");
+    assert!(
+        seed.is_some(),
+        "the component must have history to seed from"
+    );
 
     let system = program::system(
         &compiled,
@@ -374,6 +390,33 @@ async fn a_quiet_channel_still_yields_its_current_value() {
 
     // Nothing more is ever pushed, and a value arrives anyway.
     assert_eq!(take(&mut out, 1).await, vec![42.0]);
+}
+
+#[stellarator::test]
+async fn a_fault_in_the_opening_sample_parks_the_system() {
+    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
+    let compiled = bench.compile("out = [1.0, 2.0][int(wheels.rpm)]\n");
+    bench.push("wheels.rpm", 1, &[2.0]);
+    settle().await;
+    let id = bench.id("wheels.rpm");
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource {
+            node: bench.source("wheels.rpm"),
+            seed: program::latest_sample(&bench.db, id),
+        }],
+        DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    for _ in 0..200 {
+        if system.health.fault().is_some() {
+            break;
+        }
+        settle().await;
+    }
+    assert!(system.health.fault().is_some());
 }
 
 /// The same seeding, for an input the system merely holds: a system whose
@@ -549,7 +592,6 @@ async fn a_chain_of_systems_keeps_following_its_input() {
     assert_eq!(second.health.fault(), None);
 }
 
-
 /// The user's case, end to end: a rank-1 channel plus a scalar literal
 /// broadcasts, and the *shape* survives all the way to the output component.
 ///
@@ -596,12 +638,12 @@ async fn a_scalar_broadcasts_over_a_vector_component() {
     panic!("nothing published; fault = {:?}", system.health.fault());
 }
 
-/// Q2: a system with no inputs is fired by the clock it asked for, so a
-/// generator is a program rather than a node kind.
+/// A source system is driven by its declared clock.
 #[stellarator::test]
 async fn a_source_system_clocks_itself() {
     let bench = Bench::new(&[]);
-    let compiled = bench.compile("@system(rate=200.0)\ndef sig() -> f64:\n    return sine(1.0, 2.0)\n");
+    let compiled =
+        bench.compile("@system(rate=200.0)\ndef sig() -> f64:\n    return sine(1.0, 2.0)\n");
     assert_eq!(compiled.manifest.systems[0].rate, Some(200.0));
 
     let system = program::system(&compiled, 0, Vec::new(), DEFAULT_FUEL, None).unwrap();
@@ -657,9 +699,7 @@ async fn an_unclocked_system_with_no_inputs_is_refused() {
     assert!(format!("{err}").contains("rate="), "{err}");
 }
 
-/// Q4: a resample binding is wired by the host, not compiled — so what the
-/// manifest hands over is a source, a mode, and a rate, and the existing
-/// resampler answers all three.
+/// The host wires a resample stage as an ordinary input ring.
 #[stellarator::test]
 async fn a_resample_stage_is_wired_from_the_manifest() {
     let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);

@@ -195,19 +195,27 @@ impl TimeSeriesPlot {
         // is built, so what it binds is the component now publishing rather
         // than the one that did last session — which would come back as
         // history with nothing writing into it.
+        let mut expressions = Vec::new();
         let traces = config
             .traces
             .into_iter()
             .map(|mut trace| {
-                if let Some(text) = &trace.expression
-                    && let Ok(bound) = crate::dynamic::expressions::bind(text, &db, cx)
+                let expression = trace
+                    .expression
+                    .clone()
+                    .or_else(|| crate::dynamic::expressions::binding_text(&db, trace.component_id));
+                if let Some(text) = expression
+                    && let Ok(bound) = crate::dynamic::expressions::bind(&text, &db, cx)
                 {
                     trace.component_id = bound.id;
+                    trace.expression = Some(text);
+                    expressions.extend(bound.expression);
                 }
                 Trace::from(trace)
             })
             .collect();
         let mut plot = Self::new(db, traces, cx);
+        plot._expressions = expressions;
         plot.line_plot.update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             if let Ok(range) = config.x_range.parse() {
@@ -275,8 +283,10 @@ impl TimeSeriesPlot {
                 .map(|trace| {
                     let trace = trace.read(cx);
                     let mut config = TraceConfig::from(trace);
-                    config.expression =
-                        crate::dynamic::expressions::binding_text(line_plot.db(), trace.component_id);
+                    config.expression = crate::dynamic::expressions::binding_text(
+                        line_plot.db(),
+                        trace.component_id,
+                    );
                     config
                 })
                 .collect(),
