@@ -125,6 +125,12 @@ def build_target() -> Target:
     m = Target(cycle_rate=120.0, sim_dt=0.5)
     adcs = Artifact(id="adcs", crate="adcs-systems", lib="adcs_systems")
     seqs = Artifact(id="seqs", crate="adcs-sequences", lib="adcs_sequences")
+
+    @system("block.plant.sensors.gyro_b")
+    @node(x=420, y=180)
+    def gyro_norm(gyro_b) -> f64:
+        return (gyro_b @ gyro_b) ** 0.5
+
     with m.scope("block"):
         plant = m.add(
             "plant",
@@ -140,6 +146,9 @@ def build_target() -> Target:
             process=True,
         )
         nav = m.add("nav", System("Nav", adcs))
+        # A Python system added like any native one: scoped, renamed, and
+        # interleaved into the step order at this position.
+        m.add("gyro_norm", gyro_norm)
     m.add(
         "alarms",
         Alarms(alarms=[
@@ -174,12 +183,6 @@ def build_target() -> Target:
     m.connect(mode.mode_cmd, plant.torque_cmd, delayed=True)
     m.route(uplink, mode, msg="SequenceCommand")
     m.route(m.coordinator, mode, msg="SequenceCommand")
-
-    @system("block.plant.sensors.gyro_b")
-    @node(x=420, y=180)
-    def gyro_norm(gyro_b) -> f64:
-        return (gyro_b @ gyro_b) ** 0.5
-
     return m
 
 

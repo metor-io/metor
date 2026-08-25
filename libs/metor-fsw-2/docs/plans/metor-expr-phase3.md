@@ -481,3 +481,32 @@ verbatim, read-only.
   pin are the current guards.
 - Guest state carryover across occupant swaps, sequences, and live
   source uplink remain out of scope as planned.
+
+### Revision 2.1 — explicit add (2026-08-24)
+
+Python systems now register through `target.add(name, handle)`, exactly
+like native pack systems — decoration captures the declaration but no
+longer registers an instance. Rationale (user decision): defining or
+importing a `@system` must not mean flying it (the target file stays a
+manifest); the spec is emitted at the add call's position in the system
+list, so cyclic step order is user-controlled and interleaves with
+native systems instead of being pinned invisibly to the tail; the add
+participates in `with target.scope(...)` like any other, so the
+instance name (the spec's `name`, scope-prefixed and free to differ
+from the declaration `ty` addresses) is the add's own; and a
+one-declaration/one-instance handle is the surface a future
+multi-instance binding extends — adding the same handle twice is an
+error saying so. The program blob carries every captured `Frame`/
+`State` class plus only the *added* systems, in definition order
+(compile order is source order; step order is add order; the two are
+independent), and the program artifact is emitted only when at least
+one system was added. A captured-but-never-added `@system` is staged
+code: legal, but `to_ir` warns on stderr with the function and its
+file:line so "why isn't my system running" answers itself.
+`process=True` is rejected for a Python system at record time, matching
+the resolve-side wasm rule. On the Rust side, edge synthesis moved
+after the systems/slots/deferred passes and `Produced` bindings map
+declaration → registered instance, so list position and renames are
+free; a compiled consumer listed ahead of its producer fails with the
+same stale-edge build error a native pair gets. Goldens exercise a
+scoped, renamed, interleaved add (`block.gyro_norm`); IR stays v9.

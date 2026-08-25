@@ -28,7 +28,7 @@ import sys
 import textwrap
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Generic, Iterator, TypeVar, cast
+from typing import Any, Generic, Iterator, TypeVar, overload
 
 __version__ = "0.4.0"
 
@@ -54,7 +54,7 @@ __version__ = "0.4.0"
 IR_VERSION = 9
 
 # Artifact id of the program-built wasm pack: the one artifact `to_ir`
-# synthesizes when the target file declares `@system` functions.
+# synthesizes when the target added `@system` functions.
 PROGRAM_ARTIFACT = "program"
 
 # Reserved instance name of the coordinator (command plane).
@@ -265,15 +265,18 @@ class SystemHandle:
 # Python systems
 #
 # A `@system`-decorated function written in the target file runs on the
-# vehicle: the decorator captures its source here, `Target.to_ir` assembles
-# every captured declaration into one program, and the build driver compiles
-# it into an ordinary wasm pack artifact (`libs/metor-expr`) whose entries
-# the emitted system specs address by name. Under CPython the declarations
-# are defined and never called, so evaluation is harmless; the compiled
-# semantics live entirely on the Rust side. `Frame`/`State` subclasses with
-# annotated fields capture the same way — a field-less subclass is a
-# generated pack marker naming a *host* frame, resolved at compile rather
-# than compiled.
+# vehicle: the decorator captures its source here (a declaration, like a
+# native pack entry), `Target.add` registers an instance of it — at the call
+# position, so cyclic step order and scope prefixing work exactly as they do
+# for native systems — and `Target.to_ir` assembles the added declarations
+# into one program the build driver compiles into an ordinary wasm pack
+# artifact (`libs/metor-expr`) whose entries the emitted system specs address
+# by name. Under CPython the declarations are defined and never called, so
+# evaluation is harmless; the compiled semantics live entirely on the Rust
+# side. `Frame`/`State` subclasses with annotated fields capture the same way
+# and always ride the program (declarations take no `add`) — a field-less
+# subclass is a generated pack marker naming a *host* frame, resolved at
+# compile rather than compiled.
 # ---------------------------------------------------------------------------
 
 # Every captured declaration in definition order. Module-scoped like
@@ -320,9 +323,11 @@ i64 = int
 
 
 class ExprHandle(SystemHandle):
-    """The instance a ``@system`` function registers as. ``.out`` names its
-    one output port; any other attribute is a :class:`PortRef` like any
-    handle's."""
+    """A captured ``@system`` declaration, and — once :meth:`Target.add`
+    registers it — the instance's handle. ``.out`` names its one output port;
+    any other attribute is a :class:`PortRef` like any handle's. Until the
+    add, ``name`` is the declaration's own (ports resolve only after
+    registration, like a native spec's)."""
 
     def __init__(self, name: str, entry: dict[str, Any], out: str):
         super().__init__(name)
@@ -358,6 +363,8 @@ def _output_frame(func: Any) -> str:
 def _system(func: Any) -> ExprHandle:
     entry = _capture(func)
     entry["system"] = True
+    # The instance name the handle was added under; `None` until then.
+    entry["added"] = None
     placed = getattr(func, "_metor_node", None)
     if placed is not None:
         entry["layout"] = placed
@@ -365,12 +372,14 @@ def _system(func: Any) -> ExprHandle:
 
 
 def system(*args: Any, **kwargs: Any) -> Any:
-    """Register a Python system to run on the vehicle.
+    """Declare a Python system that can run on the vehicle.
 
     Bare (``@system``) over Frame-annotated parameters, or parameterized
     (``@system("imu.omega_b")``, ``bind=``, ``on=``, ``rate=``) — the
     arguments configure the *compiled* system and are read from source by the
-    host, so they are accepted and ignored here. Returns the instance handle:
+    host, so they are accepted and ignored here. Decoration only captures the
+    declaration; :meth:`Target.add` registers an instance, exactly like a
+    native pack entry. Returns the handle ``add`` takes: after registration
     ``handle.out`` is the output port for :meth:`Target.connect`."""
     if len(args) == 1 and not kwargs and inspect.isfunction(args[0]):
         return _system(args[0])
@@ -1345,13 +1354,31 @@ class Target:
         )
         return StateHandle(name)
 
+    @overload
+    def add(
+        self,
+        name: str,
+        spec: ExprHandle,
+        process: bool = False,
+        node: tuple[float, float] | None = None,
+    ) -> ExprHandle: ...
+
+    @overload
     def add(
         self,
         name: str,
         spec: H,
         process: bool = False,
         node: tuple[float, float] | None = None,
-    ) -> H:
+    ) -> H: ...
+
+    def add(
+        self,
+        name: str,
+        spec: Any,
+        process: bool = False,
+        node: tuple[float, float] | None = None,
+    ) -> Any:
         """Register ``spec`` under ``name`` (scope-prefixed) and return its handle.
 
         The return is typed as the spec's own class so a generated entry's port
@@ -1359,8 +1386,11 @@ class Target:
         :class:`SystemHandle` whose attribute access yields :class:`PortRef`s.
         A generated :class:`System` also auto-registers its artifact. ``node``
         pins the system's canvas card, the :func:`node` decorator's twin for a
-        native system."""
+        native system. A ``@system`` handle registers here too, at this call's
+        step position, and comes back renamed to the instance."""
         full, scope = self._scoped(name)
+        if isinstance(spec, ExprHandle):
+            return self._add_expr(full, scope, spec, process, node)
         self._register_spec_artifact(spec)
         self._systems.append(
             {
@@ -1375,7 +1405,45 @@ class Target:
                 "layout": [float(node[0]), float(node[1])] if node else None,
             }
         )
-        return cast(H, SystemHandle(full))
+        return SystemHandle(full)
+
+    def _add_expr(
+        self,
+        full: str,
+        scope: int | None,
+        handle: ExprHandle,
+        process: bool,
+        node: tuple[float, float] | None,
+    ) -> ExprHandle:
+        """The ``@system`` arm of :meth:`add`: an ordinary spec addressing the
+        declaration's pack entry, at this call's position in the system list."""
+        entry = handle._entry
+        if process:
+            raise ValueError(
+                f"system `{full}`: `process=True` is redundant for a Python "
+                "system (the interpreter already isolates it)"
+            )
+        if entry["added"] is not None:
+            raise ValueError(
+                f"`{entry['name']}` is already added as `{entry['added']}`; "
+                "multi-instance binding of one function is future work"
+            )
+        entry["added"] = full
+        handle.name = full
+        self._systems.append(
+            {
+                "name": full,
+                "ty": entry["name"],
+                "artifact": PROGRAM_ARTIFACT,
+                "params": "None",
+                "process": False,
+                "src": _source_ref(),
+                "scope": scope,
+                "attach": None,
+                "layout": [float(node[0]), float(node[1])] if node else entry["layout"],
+            }
+        )
+        return handle
 
     def slot(
         self,
@@ -1469,18 +1537,32 @@ class Target:
 
     def _program_ir(
         self,
-    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
-        """The assembled program blob, the program-built wasm artifact, and one
-        ordinary system spec per captured ``@system`` — each addressing its
-        pack entry by name, exactly how a cdylib entry is addressed. Offsets
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """The assembled program blob and the program-built wasm artifact its
+        added ``@system`` specs address. The blob carries every captured
+        ``Frame``/``State`` class plus the *added* system declarations, in
+        definition order — compile order is source order; step order is add
+        order; the two are independent. A ``@system`` never added is staged
+        code: legal, but warned about, and left out of the program. Offsets
         are byte offsets into the assembled source, what the compiler's spans
         are mapped back through."""
-        if not _program:
-            return None, [], []
+        for entry in _program:
+            if entry["system"] and entry["added"] is None:
+                src = entry["src"]
+                at = f"{src['file']}:{src['line']}" if src["file"] else f"line {src['line']}"
+                print(
+                    f"warning: @system `{entry['name']}` ({at}) was never added and "
+                    f'will not run; register it with target.add("{entry["name"]}", '
+                    f"{entry['name']})",
+                    file=sys.stderr,
+                )
+        included = [e for e in _program if not e["system"] or e["added"] is not None]
+        if not any(e["system"] for e in included):
+            return None, []
         decls: list[dict[str, Any]] = []
         parts: list[str] = []
         offset = 0
-        for entry in _program:
+        for entry in included:
             text = entry["source"]
             if not text.endswith("\n"):
                 text += "\n"
@@ -1490,39 +1572,20 @@ class Target:
             )
             parts.append(text)
             offset += len(text.encode())
-        systems = [
-            {
-                "name": entry["name"],
-                "ty": entry["name"],
-                "artifact": PROGRAM_ARTIFACT,
-                "params": "None",
-                "process": False,
-                "src": entry["src"],
-                "scope": None,
-                "attach": None,
-                "layout": entry["layout"],
-            }
-            for entry in _program
-            if entry["system"]
-        ]
-        artifacts: list[dict[str, Any]] = []
-        if systems:
-            artifacts.append(
-                {
-                    "id": PROGRAM_ARTIFACT,
-                    "kind": "wasm",
-                    "path": None,
-                    "prebuilt_dir": None,
-                    "dist": None,
-                    "manifest_hash": None,
-                    "src": None,
-                }
-            )
-        return {"source": "".join(parts), "decls": decls}, artifacts, systems
+        artifact = {
+            "id": PROGRAM_ARTIFACT,
+            "kind": "wasm",
+            "path": None,
+            "prebuilt_dir": None,
+            "dist": None,
+            "manifest_hash": None,
+            "src": None,
+        }
+        return {"source": "".join(parts), "decls": decls}, [artifact]
 
     def to_ir(self) -> dict[str, Any]:
         """The serialized ``Wiring`` this target describes."""
-        program, program_artifacts, program_systems = self._program_ir()
+        program, program_artifacts = self._program_ir()
         return {
             "ir_version": IR_VERSION,
             "metor_config_version": __version__,
@@ -1536,7 +1599,7 @@ class Target:
             },
             "artifacts": self._artifacts + program_artifacts,
             "states": self._states,
-            "systems": self._systems + program_systems,
+            "systems": self._systems,
             "slots": self._slots,
             "edges": self._edges,
             "scopes": self._scopes,

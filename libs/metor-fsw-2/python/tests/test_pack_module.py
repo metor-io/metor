@@ -58,7 +58,9 @@ class TypedCoreTest(unittest.TestCase):
 
 class RecordTest(unittest.TestCase):
     def setUp(self):
+        # The capture trackers are module-global; isolate each test.
         mc._targets.clear()
+        mc._program.clear()
 
     def test_add_auto_registers_artifact_and_records_system(self):
         m = Target(cycle_rate=100.0)

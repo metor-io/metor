@@ -72,12 +72,15 @@ ctrl = m.add("ctrl", Ctrl(q_weight=5.0, r_weight=8.0, k_desat=0.0005, k_detumble
 
 # A Python system, compiled at build time into an ordinary wasm pack entry
 # and run by the vehicle like any other cyclic system: the measured body-rate
-# magnitude, published as `cube_sat.gyro_norm.gyro_norm`.
+# magnitude, published as `cube_sat.gyro_norm.gyro_norm`. The decorator only
+# declares it; the `add` registers it, at this position in the step order.
 @system("plant.sensors.gyro_b")
 @node(x=980, y=40)
 def gyro_norm(gyro_b) -> f64:
     return (gyro_b @ gyro_b) ** 0.5
 
+
+m.add("gyro_norm", gyro_norm)
 
 alarms = m.add(
     "alarms",

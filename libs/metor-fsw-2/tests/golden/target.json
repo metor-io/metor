@@ -91,6 +91,20 @@
       "layout": null
     },
     {
+      "name": "block.gyro_norm",
+      "ty": "gyro_norm",
+      "artifact": "program",
+      "params": "None",
+      "process": false,
+      "src": null,
+      "scope": 0,
+      "attach": null,
+      "layout": [
+        420.0,
+        180.0
+      ]
+    },
+    {
       "name": "alarms",
       "ty": "Alarms",
       "artifact": null,
@@ -144,20 +158,6 @@
       "scope": null,
       "attach": "link",
       "layout": null
-    },
-    {
-      "name": "gyro_norm",
-      "ty": "gyro_norm",
-      "artifact": "program",
-      "params": "None",
-      "process": false,
-      "src": null,
-      "scope": null,
-      "attach": null,
-      "layout": [
-        420.0,
-        180.0
-      ]
     }
   ],
   "slots": [

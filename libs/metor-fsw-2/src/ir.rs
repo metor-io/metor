@@ -66,7 +66,7 @@ pub struct Wiring {
     pub scopes: Vec<ScopeSpec>,
     /// The captured Python program the target's program-built wasm
     /// [`Artifact`] compiles from, one per target. `None` when the target
-    /// declares no Python system.
+    /// added no Python system.
     #[serde(default)]
     pub program: Option<ProgramSpec>,
 }
@@ -135,13 +135,15 @@ pub const DOWNLINK_TYPE: &str = "Downlink";
 /// [`UplinkParams`](crate::UplinkParams).
 pub const UPLINK_TYPE: &str = "Uplink";
 
-/// The captured Python program of one target: every `@system` function and
-/// `Frame`/`State` class the target file declared, assembled in definition
-/// order into a single compilation unit (bindings between systems only work
-/// inside one unit). Compiled once by `metor-expr` at build/provision time
-/// into the target's program-built wasm [`Artifact`]; each `@system` is an
-/// ordinary [`SystemSpec`] addressing that artifact's pack entry of the same
-/// name.
+/// The captured Python program of one target: every `Frame`/`State` class
+/// the target file declared plus each `@system` function the target *added*,
+/// assembled in definition order into a single compilation unit (bindings
+/// between systems only work inside one unit; step order is the added specs'
+/// list order, independent of this). Compiled once by `metor-expr` at
+/// build/provision time into the target's program-built wasm [`Artifact`];
+/// each added `@system` is an ordinary [`SystemSpec`] addressing that
+/// artifact's pack entry through `ty`, under the instance name the add
+/// chose.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProgramSpec {
     /// The assembled module source.

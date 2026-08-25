@@ -168,6 +168,7 @@ pub fn resolve_with(
     let mut deferred: Vec<&SystemSpec> = Vec::new();
     let mut packs = PackCache::default();
     let mut wasm = WasmCache::default();
+    let mut pending: Vec<PendingSynth> = Vec::new();
     for spec in &wiring.systems {
         // The artifact's kind picks the loader; the dl and proc arms must
         // never see a wasm module (dlopen on one would fail obscurely).
@@ -179,7 +180,7 @@ pub fn resolve_with(
         });
         let (handle, desc) = match (&spec.artifact, spec.process) {
             (Some(artifact_id), false) if wasm_backed => {
-                resolve_wasm(spec, artifact_id, wiring, &mut wasm, &instances, &mut graph)?
+                resolve_wasm(spec, artifact_id, wiring, &mut wasm, &mut pending, &mut graph)?
             }
             (Some(_), true) if wasm_backed => {
                 return Err(LoadErrorKind::WasmSystem(
@@ -223,6 +224,22 @@ pub fn resolve_with(
     for spec in deferred {
         let (handle, desc) = resolve_static(spec, registry, &state_tokens, &mut graph)?;
         instances.insert(spec.name.clone(), Instance { handle, desc });
+    }
+
+    // --- Synthesized edges: the bindings a compiled Python entry bakes are
+    //     wired only now, over the finished instance map, so a spec's list
+    //     position never decides whether its producer is visible. Staleness
+    //     stays uniform with explicit edges: a compiled system listed ahead
+    //     of a producer it reads fails at build like any native pair.
+    let added: HashMap<(&str, &str), &str> = pending
+        .iter()
+        .map(|p| ((p.artifact.as_str(), p.entry.as_str()), p.instance.as_str()))
+        .collect();
+    for p in &pending {
+        let module = &wasm.modules[&p.artifact];
+        let manifest = module.expr.as_ref().expect("pending implies a compiled module");
+        let system = manifest.system(&p.entry).expect("pending keys a manifest entry");
+        synth_edges(system, manifest, &instances, &added, p, &mut graph)?;
     }
 
     // Every declared state must have gained an attachment by now (attach
@@ -528,17 +545,30 @@ fn wasm_entry<'e>(
     }
 }
 
+/// One compiled Python instance awaiting edge synthesis, recorded during the
+/// systems pass and wired after every instance is registered.
+struct PendingSynth {
+    artifact: String,
+    /// The pack entry (declaration) name — the manifest's key.
+    entry: String,
+    /// The instance name of this registration, the spec's own (possibly
+    /// scope-prefixed, and free to differ from the entry name).
+    instance: String,
+    handle: SystemHandle,
+}
+
 /// Resolve a wired wasm system (plan D6): describe the artifact once per
 /// resolve, select the entry, encode its params — a compiled Python entry
 /// with an `@rng` slot takes a host-entropy seed on the params channel
-/// instead (plan D9) — register it, and synthesize the edges its compiled
-/// bindings imply (plan D7).
+/// instead (plan D9) — and register it. The edges its compiled bindings
+/// imply (plan D7) are queued on `pending` and synthesized after the systems
+/// pass.
 fn resolve_wasm(
     spec: &SystemSpec,
     artifact_id: &str,
     wiring: &Wiring,
     wasm: &mut WasmCache,
-    instances: &HashMap<String, Instance>,
+    pending: &mut Vec<PendingSynth>,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     let max_memory = graph.config.wasm_memory_limit_bytes;
@@ -588,10 +618,13 @@ fn resolve_wasm(
             params,
         },
     );
-    if let (Some(manifest), Some(system)) = (&module.expr, compiled) {
-        synth_edges(
-            system, manifest, instances, handle, &desc, graph, &spec.name,
-        )?;
+    if compiled.is_some() {
+        pending.push(PendingSynth {
+            artifact: artifact_id.to_string(),
+            entry: desc.name.to_string(),
+            instance: spec.name.clone(),
+            handle,
+        });
     }
     Ok((handle, desc))
 }
@@ -600,15 +633,19 @@ fn resolve_wasm(
 /// distinct producing port, in the same first-appearance order the compiler
 /// grouped the descriptor's inputs by. The two walks share their key — the
 /// binding list — so a mismatch is artifact/wiring drift and fails loudly.
+/// A `Produced` binding names a *declaration*; `added` maps it to the
+/// instance the declaration was registered under.
 fn synth_edges(
     system: &metor_expr::System,
     manifest: &metor_expr::Manifest,
     instances: &HashMap<String, Instance>,
-    consumer: SystemHandle,
-    desc: &SystemDescriptor,
+    added: &HashMap<(&str, &str), &str>,
+    p: &PendingSynth,
     graph: &mut InitGraph,
-    owner: &str,
 ) -> Result<(), LoadError> {
+    let owner = p.instance.as_str();
+    let consumer = p.handle;
+    let desc = &instances[&p.instance].desc;
     let drift = |detail: String| {
         LoadErrorKind::WasmSystem(format!("Python system `{owner}`: {detail}").into_boxed_str())
             .bare()
@@ -618,9 +655,17 @@ fn synth_edges(
         for binding in &port.bindings {
             let key = match binding {
                 metor_expr::Binding::Component(path) => locate_producer(instances, path, owner)?,
-                metor_expr::Binding::Produced { system: p, .. } => {
-                    let producer = &manifest.systems[*p];
-                    (producer.name.clone(), producer.output.name.clone())
+                metor_expr::Binding::Produced { system: s, .. } => {
+                    let producer = &manifest.systems[*s];
+                    let instance = added
+                        .get(&(p.artifact.as_str(), producer.name.as_str()))
+                        .ok_or_else(|| {
+                            drift(format!(
+                                "bound declaration `{}` is not registered as a system",
+                                producer.name
+                            ))
+                        })?;
+                    (instance.to_string(), producer.output.name.clone())
                 }
                 metor_expr::Binding::Resampled { .. } => {
                     return Err(drift(

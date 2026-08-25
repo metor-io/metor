@@ -1,5 +1,7 @@
 """Recorder surface, scopes, provenance, and the record-time error cases."""
 
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -184,7 +186,7 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(Downlink(link).attach, "link")
         self.assertEqual(TcpServer(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
 
-    def test_system_capture_assembles_the_program(self):
+    def test_added_systems_assemble_the_program(self):
         m = Target(cycle_rate=100.0)
 
         class RateEstimate(Frame):
@@ -204,6 +206,11 @@ class RecorderTest(unittest.TestCase):
         def smooth(est: RateEstimate, s: Lpf) -> RateEstimate:
             return RateEstimate(omega=est.omega)
 
+        # Step order is add order (`smooth` first); the program still
+        # assembles in definition order, which is what compilation needs.
+        m.add("smooth", smooth)
+        m.add("omega_norm", omega_norm)
+
         ir = m.to_ir()
         program = ir["program"]
         self.assertEqual(
@@ -219,12 +226,13 @@ class RecorderTest(unittest.TestCase):
         self.assertTrue(program["decls"][0]["src"]["file"].endswith("test_recorder.py"))
 
         compiled = [s for s in ir["systems"] if s["artifact"] == "program"]
-        self.assertEqual([s["name"] for s in compiled], ["omega_norm", "smooth"])
+        self.assertEqual([s["name"] for s in compiled], ["smooth", "omega_norm"])
         # Each spec addresses its pack entry by the declaration's name.
-        self.assertEqual([s["ty"] for s in compiled], ["omega_norm", "smooth"])
-        self.assertEqual(compiled[0]["layout"], [420.0, 180.0])
-        self.assertEqual(compiled[1]["layout"], [10.0, 20.0])
+        self.assertEqual([s["ty"] for s in compiled], ["smooth", "omega_norm"])
+        self.assertEqual(compiled[0]["layout"], [10.0, 20.0])
+        self.assertEqual(compiled[1]["layout"], [420.0, 180.0])
         self.assertEqual(compiled[0]["params"], "None")
+        self.assertTrue(compiled[0]["src"]["file"].endswith("test_recorder.py"))
         program_artifacts = [a for a in ir["artifacts"] if a["id"] == "program"]
         self.assertEqual([a["kind"] for a in program_artifacts], ["wasm"])
         self.assertNotIn("crate_name", program_artifacts[0])
@@ -234,6 +242,85 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual((omega_norm.out.instance, omega_norm.out.port),
                          ("omega_norm", "omega_norm"))
         self.assertEqual(smooth.out.port, "rate_estimate")
+
+    def test_added_python_system_scopes_renames_and_interleaves(self):
+        m = Target(cycle_rate=100.0)
+
+        @system("imu.omega_b")
+        def omega_norm(omega_b):
+            return (omega_b @ omega_b) ** 0.5
+
+        m.add("a", static_system("A"))
+        with m.scope("adcs"):
+            handle = m.add("rate_mag", omega_norm, node=(1, 2))
+        m.add("b", static_system("B"))
+
+        ir = m.to_ir()
+        # The spec sits at the add call's position, between the native adds.
+        self.assertEqual([s["name"] for s in ir["systems"]], ["a", "adcs.rate_mag", "b"])
+        spec = ir["systems"][1]
+        self.assertEqual(spec["ty"], "omega_norm")
+        self.assertEqual(spec["scope"], 0)
+        self.assertEqual(spec["layout"], [1.0, 2.0])
+        # `add` returns the handle itself, renamed to the instance.
+        self.assertIs(handle, omega_norm)
+        self.assertEqual(
+            (handle.out.instance, handle.out.port), ("adcs.rate_mag", "omega_norm")
+        )
+
+    def test_unadded_system_warns_and_stays_out_of_the_program(self):
+        m = Target(cycle_rate=100.0)
+
+        @system("imu.omega_b")
+        def omega_norm(omega_b):
+            return (omega_b @ omega_b) ** 0.5
+
+        @system("imu.omega_b")
+        def staged(omega_b):
+            return omega_b * 2.0
+
+        m.add("omega_norm", omega_norm)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ir = m.to_ir()
+        self.assertIn("@system `staged`", err.getvalue())
+        self.assertIn("test_recorder.py", err.getvalue())
+        self.assertNotIn("omega_norm`", err.getvalue())
+        self.assertEqual([d["name"] for d in ir["program"]["decls"]], ["omega_norm"])
+        self.assertEqual([s["name"] for s in ir["systems"]], ["omega_norm"])
+
+    def test_no_added_system_emits_no_program(self):
+        m = Target(cycle_rate=100.0)
+
+        @system
+        def staged() -> f64:
+            return 1.0
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            ir = m.to_ir()
+        self.assertIsNone(ir["program"])
+        self.assertEqual([a["id"] for a in ir["artifacts"]], [])
+
+    def test_adding_one_handle_twice_is_an_error(self):
+        m = Target(cycle_rate=100.0)
+
+        @system
+        def beat() -> f64:
+            return 1.0
+
+        m.add("one", beat)
+        with self.assertRaisesRegex(ValueError, "multi-instance"):
+            m.add("two", beat)
+
+    def test_process_is_rejected_for_python_systems(self):
+        m = Target(cycle_rate=100.0)
+
+        @system
+        def beat() -> f64:
+            return 1.0
+
+        with self.assertRaisesRegex(ValueError, "process"):
+            m.add("beat", beat, process=True)
 
     def test_pack_frame_markers_are_not_captured(self):
         Target(cycle_rate=100.0)

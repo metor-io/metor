@@ -113,14 +113,17 @@ fn maximal() -> Wiring {
                 attach: Some("link".into()),
                 layout: None,
             },
+            // A registered `@system`: an ordinary spec, free to sit anywhere
+            // in the list, carry a scope, and name its instance apart from
+            // the declaration its `ty` addresses.
             SystemSpec {
-                name: "omega_norm".into(),
+                name: "block.rate_mag".into(),
                 ty: Some("omega_norm".into()),
                 artifact: Some("program".into()),
                 params: ParamSource::None,
                 process: false,
                 src: src(12),
-                scope: None,
+                scope: Some(0),
                 attach: None,
                 layout: Some((420.0, 180.0)),
             },
@@ -258,8 +261,11 @@ fn representation_is_externally_tagged() {
     assert_eq!(v["systems"][1]["layout"], Value::Null);
 
     // The captured program: a Python system is an ordinary spec addressing
-    // the program artifact's pack entry of its declaration's name.
+    // the program artifact's pack entry by `ty`, its instance name and scope
+    // the registering `add`'s own.
+    assert_eq!(v["systems"][3]["name"], json!("block.rate_mag"));
     assert_eq!(v["systems"][3]["ty"], json!("omega_norm"));
+    assert_eq!(v["systems"][3]["scope"], json!(0));
     assert_eq!(v["systems"][3]["artifact"], json!("program"));
     assert_eq!(v["systems"][3]["params"], json!("None"));
     assert_eq!(v["program"]["decls"][0]["name"], json!("omega_norm"));

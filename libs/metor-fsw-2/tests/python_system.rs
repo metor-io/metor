@@ -172,6 +172,68 @@ def double(beat: Beat) -> f64:
     );
 }
 
+/// Instance names belong to the registering `add`, not the declaration: a
+/// scope-prefixed rename still resolves (the synthesized `Produced` edge
+/// maps declaration to instance), and listing the consumer ahead of its
+/// producer is the same stale-edge build error a native pair gets — step
+/// order is the list order the adds chose.
+#[test]
+fn renamed_instances_wire_and_misordered_ones_fail_stale() {
+    const SRC: &str = "\
+class Beat(Frame):
+    v: f64
+
+@system(rate=30.0)
+def beat() -> Beat:
+    return Beat(v=2.5)
+
+@system
+def double(beat: Beat) -> f64:
+    return beat.v * 2.0
+";
+    let rename = |wiring: &mut Wiring| {
+        for spec in &mut wiring.systems {
+            spec.name = format!("adcs.{}", spec.name);
+        }
+    };
+
+    let mut wiring = python_wiring("pyname_program", SRC, &["Beat", "beat", "double"], 120.0);
+    rename(&mut wiring);
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("compiles");
+    let mut coord =
+        resolve(&wiring, &Registry::with_builtins()).expect("renamed instances resolve");
+    let mut doubles: Input<DoubleOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.double.double"))
+            .expect("telemetry announces under the instance name")
+            .expect("a reader slot is available"),
+    );
+    let coord = stellarator::run(|| async move {
+        coord.run_for(8).await;
+        coord
+    });
+    assert!(coord.stopped().is_empty(), "{:?}", coord.stopped());
+    let mut values = Vec::new();
+    doubles
+        .drain(|record| values.push(record.get().double))
+        .expect("ring intact");
+    assert_eq!(values, [5.0, 5.0], "the Produced edge found its instance");
+
+    // Same program, consumer listed first: stale, exactly like native specs.
+    let mut wiring = python_wiring("pyorder_program", SRC, &["Beat", "beat", "double"], 120.0);
+    rename(&mut wiring);
+    wiring.systems.reverse();
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("compiles");
+    let err = resolve(&wiring, &Registry::with_builtins())
+        .err()
+        .expect("a consumer stepping before its producer is rejected");
+    assert!(
+        err.to_string().contains("registered before"),
+        "the stale-edge diagnostic names the order: {err}"
+    );
+}
+
 /// A runaway Python system exhausts its fuel grant: it stops, the
 /// coordinator reports it in its health vocabulary, and the rest of the
 /// target keeps cycling.

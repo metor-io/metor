@@ -523,14 +523,19 @@ and deleted with the old format.
 This is where the frame-based surface pays off hardest: a Python `@system`
 is not "promotable to" an FSW system — it already *is* one, in the same
 shape the Rust macro produces. Ports from the signature, `latest()` reads,
-state struct, one publish per execute. Registration (revised 2026-08-24:
-the decorator itself, written directly in the target file — no module
-path, no wrapper system):
+state struct, one publish per execute. Written directly in the target file —
+no module path, no wrapper system — the decorator *declares* it, and
+`target.add` registers the instance exactly like a native pack entry
+(revised 2026-08-24 twice: decorator-as-registration first, then explicit
+`add` so the target file stays a manifest, step order and scope follow the
+add call, and one function can someday bind several instances):
 
 ```python
 @system("imu.omega_b")
 def omega_norm(omega_b):
     return (omega_b @ omega_b) ** 0.5
+
+target.add("omega_norm", omega_norm)
 ```
 
 The Wiring IR carries the source; the build driver compiles it into an
