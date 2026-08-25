@@ -10,12 +10,35 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext as _, Bounds, Entity, Pixels, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, point, px, size,
+    WindowHandle, WindowId, WindowOptions, point, px, size,
 };
 use metor_db::DB;
 
 use crate::app::AppRoot;
-use crate::tiles::TileGroup;
+use crate::tiles::{LoadError, TileGroup, TileLayout};
+
+/// Version of the multi-window layout document. Independent of the
+/// per-window [`TileLayout`] version, which each window's tree still
+/// carries and checks.
+pub(crate) const WORKSPACE_LAYOUT_VERSION: u32 = 1;
+
+/// The document written to per-target layout files: one tile tree per open
+/// window plus its screen bounds. Named presets and target-shipped presets
+/// deliberately stay single-window [`TileLayout`] documents — a preset
+/// describes an arrangement, not the user's monitor setup.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkspaceLayout {
+    pub version: u32,
+    pub windows: Vec<WindowLayout>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct WindowLayout {
+    /// Screen-space `(x, y, width, height)` in gpui pixels; `None` centers.
+    #[serde(default)]
+    pub bounds: Option<(f32, f32, f32, f32)>,
+    pub layout: TileLayout,
+}
 
 /// Every open panel window, ordered by window id so iteration (layout
 /// serialization, "first window" fallbacks) is deterministic in a session.
@@ -89,10 +112,153 @@ pub(crate) fn open_panel_window(
             app_id: Some("metor-panel".into()),
             ..Default::default()
         },
-        move |_window, cx| cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx)),
+        move |window, cx| {
+            // Snapshot the layout while the closing window still counts:
+            // this is the only hook that runs before gpui drops it, and it
+            // is what lets closing the last window behave like quitting.
+            window.on_window_should_close(cx, |window, cx| {
+                crate::connections::flush_layout_including(window, cx);
+                true
+            });
+            cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx))
+        },
     )
     .inspect_err(|err| tracing::error!(%err, "open panel window failed"))
     .ok()
+}
+
+/// Serialize every open panel window into a [`WorkspaceLayout`] JSON
+/// document, or `None` when no panel window is open — the caller keeps its
+/// previous snapshot rather than persisting emptiness.
+///
+/// `extra` carries a window that can't be reached through its handle: the
+/// one currently dispatching its own close, whose slot gpui has taken.
+/// Build it with [`window_layout`].
+pub(crate) fn serialize_workspace(
+    extra: Option<(WindowId, WindowLayout)>,
+    cx: &mut App,
+) -> Option<String> {
+    let mut windows: Vec<(WindowId, WindowLayout)> = panel_windows(cx)
+        .into_iter()
+        .filter_map(|handle| {
+            let layout = handle
+                .update(cx, |root, window, cx| WindowLayout {
+                    bounds: Some(bounds_tuple(window.bounds())),
+                    layout: root.tiles().read(cx).serialize(cx),
+                })
+                .ok()?;
+            Some((handle.window_id(), layout))
+        })
+        .collect();
+    if let Some((id, layout)) = extra
+        && !windows.iter().any(|(existing, _)| *existing == id)
+    {
+        windows.push((id, layout));
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    windows.sort_by_key(|(id, _)| *id);
+    let workspace = WorkspaceLayout {
+        version: WORKSPACE_LAYOUT_VERSION,
+        windows: windows.into_iter().map(|(_, layout)| layout).collect(),
+    };
+    Some(serde_json::to_string(&workspace).expect("workspace layout always serializes"))
+}
+
+/// Snapshot one window from in-hand references, for close-time hooks that
+/// run while the window is mid-dispatch and unreachable through its handle.
+pub(crate) fn window_layout(window: &Window, cx: &App) -> Option<(WindowId, WindowLayout)> {
+    let tiles = tiles_for(window, cx)?;
+    Some((
+        window.window_handle().window_id(),
+        WindowLayout {
+            bounds: Some(bounds_tuple(window.bounds())),
+            layout: tiles.read(cx).serialize(cx),
+        },
+    ))
+}
+
+/// Parse a layout file: the multi-window document, or — for files written
+/// before multi-window — a bare single-tree [`TileLayout`], wrapped as one
+/// centered window. Per-window tree versions are checked on restore.
+pub(crate) fn parse_workspace(json: &str) -> Result<WorkspaceLayout, LoadError> {
+    if let Ok(workspace) = serde_json::from_str::<WorkspaceLayout>(json) {
+        if workspace.version != WORKSPACE_LAYOUT_VERSION {
+            return Err(LoadError::UnsupportedVersion(workspace.version));
+        }
+        return Ok(workspace);
+    }
+    let layout: TileLayout = serde_json::from_str(json)?;
+    Ok(WorkspaceLayout {
+        version: WORKSPACE_LAYOUT_VERSION,
+        windows: vec![WindowLayout {
+            bounds: None,
+            layout,
+        }],
+    })
+}
+
+/// Restore a workspace document: the first window's tree replaces
+/// `window`'s tiles in place (keeping the live bounds the user is looking
+/// at), and every further window opens at its saved bounds. Returns whether
+/// the first tree loaded.
+pub(crate) fn restore_workspace(
+    json: &str,
+    window: &mut Window,
+    cx: &mut App,
+    db: Arc<DB>,
+) -> bool {
+    let workspace = match parse_workspace(json) {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            tracing::error!(%err, "failed to load workspace layout");
+            return false;
+        }
+    };
+    let mut windows = workspace.windows.into_iter();
+    let Some(first) = windows.next() else {
+        return false;
+    };
+    let Some(tiles) = tiles_for(window, cx) else {
+        return false;
+    };
+    let loaded = tiles.update(cx, |tiles, cx| {
+        tiles
+            .replace_from_layout(first.layout, cx)
+            .inspect_err(|err| tracing::error!(%err, "failed to load layout"))
+            .is_ok()
+    });
+    for saved in windows {
+        let db = db.clone();
+        // Deferred: the caller is mid-dispatch inside `window`.
+        cx.defer(move |cx| {
+            if saved.layout.version != crate::tiles::SUPPORTED_LAYOUT_VERSION {
+                tracing::error!(
+                    version = saved.layout.version,
+                    "skipping saved window with unsupported layout version"
+                );
+                return;
+            }
+            let registry = cx.global::<crate::tiles::ItemRegistry>().clone();
+            let tiles = cx.new(|cx| TileGroup::deserialize(saved.layout, &registry, cx));
+            let bounds = saved.bounds.map(|(x, y, w, h)| Bounds {
+                origin: point(px(x), px(y)),
+                size: size(px(w), px(h)),
+            });
+            open_panel_window(db, bounds, Some(tiles), false, cx);
+        });
+    }
+    loaded
+}
+
+fn bounds_tuple(bounds: Bounds<Pixels>) -> (f32, f32, f32, f32) {
+    (
+        bounds.origin.x.into(),
+        bounds.origin.y.into(),
+        bounds.size.width.into(),
+        bounds.size.height.into(),
+    )
 }
 
 fn display_bounds(cx: &App) -> Vec<Bounds<Pixels>> {
@@ -109,6 +275,7 @@ fn bounds_visible(bounds: &Bounds<Pixels>, displays: &[Bounds<Pixels>]) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiles::serial::{TileNode, TilePane};
     use gpui::{point, px, size};
 
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
@@ -116,6 +283,63 @@ mod tests {
             origin: point(px(x), px(y)),
             size: size(px(w), px(h)),
         }
+    }
+
+    fn minimal_layout(version: u32) -> TileLayout {
+        TileLayout {
+            version,
+            global_time_range: String::new(),
+            root: TileNode::Pane(TilePane {
+                active_index: 0,
+                tab_orientation: Default::default(),
+                hide_tab_bar: false,
+                locked_size: None,
+                items: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn workspace_documents_round_trip() {
+        let json = serde_json::to_string(&WorkspaceLayout {
+            version: WORKSPACE_LAYOUT_VERSION,
+            windows: vec![WindowLayout {
+                bounds: Some((10.0, 20.0, 800.0, 600.0)),
+                layout: minimal_layout(crate::tiles::SUPPORTED_LAYOUT_VERSION),
+            }],
+        })
+        .unwrap();
+        let parsed = parse_workspace(&json).unwrap();
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(parsed.windows[0].bounds, Some((10.0, 20.0, 800.0, 600.0)));
+    }
+
+    /// A layout file written before multi-window is a bare tile tree; it
+    /// loads as one centered window with its own version intact.
+    #[test]
+    fn a_bare_single_tree_layout_wraps_as_one_window() {
+        let json =
+            serde_json::to_string(&minimal_layout(crate::tiles::SUPPORTED_LAYOUT_VERSION)).unwrap();
+        let parsed = parse_workspace(&json).unwrap();
+        assert_eq!(parsed.windows.len(), 1);
+        assert!(parsed.windows[0].bounds.is_none());
+        assert_eq!(
+            parsed.windows[0].layout.version,
+            crate::tiles::SUPPORTED_LAYOUT_VERSION
+        );
+    }
+
+    #[test]
+    fn an_unsupported_workspace_version_is_refused() {
+        let json = serde_json::to_string(&WorkspaceLayout {
+            version: 999,
+            windows: vec![],
+        })
+        .unwrap();
+        assert!(matches!(
+            parse_workspace(&json),
+            Err(LoadError::UnsupportedVersion(999))
+        ));
     }
 
     #[test]

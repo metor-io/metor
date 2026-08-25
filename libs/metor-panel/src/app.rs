@@ -1289,6 +1289,17 @@ impl PanelApp {
                     KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
                 ]);
 
+                // A non-last close: re-snapshot the survivors right away, so
+                // a quit inside the next autosave interval can't resurrect
+                // the closed window. After the last close this is a no-op,
+                // leaving the should-close snapshot that included it.
+                cx.on_window_closed(|cx| {
+                    if !crate::workspace::panel_windows(cx).is_empty() {
+                        crate::connections::flush_layout_now(cx);
+                    }
+                })
+                .detach();
+
                 crate::workspace::open_panel_window(db.clone(), None, None, true, cx);
             });
     }

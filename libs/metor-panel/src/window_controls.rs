@@ -94,8 +94,11 @@ pub(crate) fn window_controls(theme: &Theme, window: &Window) -> impl IntoElemen
         .child(
             caption_button("window-close", Icon::Close, WindowControlArea::Close, theme)
                 .hover(|s| s.bg(theme.error_accent))
-                .on_mouse_up(MouseButton::Left, |_, window, _| {
+                .on_mouse_up(MouseButton::Left, |_, window, cx| {
                     if !cfg!(target_os = "windows") {
+                        // `remove_window` skips the should-close hook, so
+                        // this close flushes the layout itself.
+                        crate::connections::flush_layout_including(window, cx);
                         window.remove_window();
                     }
                 }),

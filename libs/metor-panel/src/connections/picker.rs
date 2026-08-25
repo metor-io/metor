@@ -256,8 +256,8 @@ impl ConnectionPicker {
     }
 
     fn load_layout(&mut self, layout: String, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tiles) = crate::workspace::tiles_for(window, cx) {
-            crate::presets::load_into_tiles(&layout, &tiles, cx);
+        let db = self.store.read(cx).db().clone();
+        if crate::workspace::restore_workspace(&layout, window, cx, db) {
             self.store
                 .update(cx, |store, _| store.note_loaded_layout(layout));
         }
