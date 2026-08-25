@@ -1334,21 +1334,45 @@ fn register_connection_commands(cx: &mut App) {
                     }),
                 });
             }
-            let configurable: Vec<ConnectionTarget> = store
+            // Every configurable target would otherwise add its own top-level
+            // "{name} · options" row, swamping the palette when discovery
+            // registers one target per deployment. Nest them under a single
+            // submenu whose children are rebuilt on entry, so the target list
+            // stays live without flooding the root page.
+            let has_configurable = store
                 .read(cx)
                 .state()
                 .targets()
                 .iter()
-                .filter(|t| !store.read(cx).state().spec_for(t).is_empty())
-                .cloned()
-                .collect();
-            for target in configurable {
+                .any(|t| !store.read(cx).state().spec_for(t).is_empty());
+            if has_configurable {
                 let store = store.clone();
                 items.push(InspectionItem::SubMenu {
-                    label: SharedString::from(format!("{} \u{00b7} options", target.name)),
-                    summary: target.detail.clone(),
+                    label: SharedString::new_static("Connection options\u{2026}"),
+                    summary: SharedString::new_static(""),
                     build: Arc::new(move |cx| {
-                        crate::connections::options::option_rows(store.clone(), target.clone(), cx)
+                        store
+                            .read(cx)
+                            .state()
+                            .targets()
+                            .iter()
+                            .filter(|t| !store.read(cx).state().spec_for(t).is_empty())
+                            .cloned()
+                            .map(|target| {
+                                let store = store.clone();
+                                Box::new(crate::inspector::rows::NavRow::new(
+                                    target.name.clone(),
+                                    target.detail.clone(),
+                                    Box::new(move |cx| {
+                                        crate::connections::options::option_rows(
+                                            store.clone(),
+                                            target.clone(),
+                                            cx,
+                                        )
+                                    }),
+                                )) as Box<dyn InspectorRow>
+                            })
+                            .collect()
                     }),
                 });
             }
