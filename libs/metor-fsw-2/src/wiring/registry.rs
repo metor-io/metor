@@ -17,11 +17,14 @@
 
 use std::collections::HashMap;
 
-use crate::binder::BindPorts;
+use crate::async_system::AsyncSystem;
 use crate::coordinator::init::{self, Node};
-use crate::descriptor::SystemDescriptor;
-use crate::message::MsgTable;
-use crate::system::{AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput};
+use metor_fsw_2_core::BindPorts;
+use metor_fsw_2_core::MsgTable;
+use metor_fsw_2_core::SystemDescriptor;
+use metor_fsw_2_core::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput};
+
+use metor_fsw_2_core::params::{NoParams, ParamErrorKind, decode_value_params};
 
 use super::error::{LoadError, LoadErrorKind};
 
@@ -44,32 +47,17 @@ pub(crate) struct LoadCtx<'a> {
     /// [`SystemSpec::attach`](super::SystemSpec) during the states pass.
     /// `None` for an ordinary system; a shared-state entry's factory requires
     /// it.
-    pub attach: Option<&'a crate::pack::AttachTarget>,
+    pub attach: Option<&'a metor_fsw_2_core::AttachTarget>,
 }
 
 /// The params surface a static-path factory decodes, the typed twin of the dl
 /// path's [`ParamSource`](super::ParamSource) reduction.
 pub(crate) enum StaticParams<'a> {
-    /// A params value tree. `src` is the best-available diagnostic snippet
-    /// (a value tree carries no spans of its own), anchored by the spec's
-    /// [`SourceRef`](super::SourceRef) when it has one.
-    Value {
-        value: &'a serde_json::Value,
-        src: &'a str,
-    },
+    /// A params value tree.
+    Value(&'a serde_json::Value),
     /// No params. Decodes as an all-defaults value, so a required field is
     /// reported as the same missing param an empty params object raises.
     None,
-}
-
-impl StaticParams<'_> {
-    /// The diagnostic source text, for errors outside the params surface.
-    fn diag_src(&self, name: &str) -> String {
-        match self {
-            StaticParams::Value { src, .. } => (*src).to_string(),
-            StaticParams::None => format!("system \"{name}\""),
-        }
-    }
 }
 
 /// A registered factory: decode `ctx.params`, construct the system, run its
@@ -155,7 +143,7 @@ where
                 msg: name,
                 available: available.join(", "),
             }
-            .whole(ctx.params.diag_src(ctx.name)),
+            .bare(),
         })?;
     Ok(system.into_node(ctx.name.to_string()))
 }
@@ -168,96 +156,16 @@ fn decode_static_params<P: serde::de::DeserializeOwned>(
     name: &str,
 ) -> Result<P, LoadError> {
     match params {
-        StaticParams::Value { value, src } => decode_value_params(value, name, src),
+        StaticParams::Value(value) => decode_value_params(value, name, "").map_err(LoadError::from),
         StaticParams::None => P::deserialize(NoParams).map_err(|e| {
-            LoadErrorKind::ValueParams {
+            ParamErrorKind::ValueParams {
                 system: name.to_string(),
                 reason: e.to_string(),
             }
             .at(format!("system \"{name}\""), (0, name.len() + 9).into())
+            .into()
         }),
     }
-}
-
-/// A serde deserializer for a params surface that carries no fields: it yields
-/// the unit value for `()` and an empty map for a struct (so `#[serde(default)]`
-/// fields fill in and a required field is a clean missing-field error). A
-/// `serde_json::Value` alone cannot serve both, since `()` needs `Null` and a
-/// defaulted struct needs `{}`.
-pub(crate) struct NoParams;
-
-impl<'de> serde::Deserializer<'de> for NoParams {
-    type Error = serde::de::value::Error;
-
-    fn deserialize_any<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
-        // Default to an empty map, so a struct with defaulted fields decodes.
-        v.visit_map(serde::de::value::MapDeserializer::new(std::iter::empty::<(
-            &str,
-            &str,
-        )>()))
-    }
-
-    fn deserialize_unit<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
-        v.visit_unit()
-    }
-
-    fn deserialize_unit_struct<V: serde::de::Visitor<'de>>(
-        self,
-        _name: &'static str,
-        v: V,
-    ) -> Result<V::Value, Self::Error> {
-        v.visit_unit()
-    }
-
-    fn deserialize_option<V: serde::de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {
-        v.visit_none()
-    }
-
-    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
-        self,
-        _name: &'static str,
-        v: V,
-    ) -> Result<V::Value, Self::Error> {
-        v.visit_newtype_struct(self)
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf seq tuple tuple_struct map struct enum identifier ignored_any
-    }
-}
-
-/// Deserialize a typed `Params` from a value tree.
-///
-/// Unlike the dl path's schema conformance, this is plain serde, so
-/// `#[serde(default)]` field attributes are honored. `serde_ignored` supplies
-/// the typo guard serde_json's deserializer lacks: a key no field consumed is
-/// an [`UnknownParam`](LoadErrorKind::UnknownParam), and any other decode failure
-/// is a [`ValueParams`](LoadErrorKind::ValueParams) carrying serde's own message.
-pub(crate) fn decode_value_params<P: serde::de::DeserializeOwned>(
-    value: &serde_json::Value,
-    system: &str,
-    src: &str,
-) -> Result<P, LoadError> {
-    let mut unknown: Option<String> = None;
-    let params = serde_ignored::deserialize(value, |path: serde_ignored::Path<'_>| {
-        unknown.get_or_insert_with(|| path.to_string());
-    })
-    .map_err(|e| {
-        LoadErrorKind::ValueParams {
-            system: system.to_string(),
-            reason: e.to_string(),
-        }
-        .whole(src)
-    })?;
-    if let Some(property) = unknown {
-        return Err(LoadErrorKind::UnknownParam {
-            property,
-            system: system.to_string(),
-        }
-        .whole(src));
-    }
-    Ok(params)
 }
 
 /// One registered type: its factory plus the static descriptor, available
@@ -301,7 +209,7 @@ pub struct Registry {
     pub(super) msgs: MsgTable,
     /// Pack-declared shared states, keyed by their declaration name — the
     /// `type=` a [`StateSpec`](super::StateSpec) constructs through.
-    pub(super) states: HashMap<&'static str, std::cell::RefCell<crate::pack::StateEntry>>,
+    pub(super) states: HashMap<&'static str, std::cell::RefCell<metor_fsw_2_core::StateEntry>>,
 }
 
 impl Registry {
@@ -317,11 +225,11 @@ impl Registry {
     /// so a target's `msgs` list can name any of them out of the box. An
     /// app-built registry starts here and adds its own systems.
     pub fn with_builtins() -> Self {
+        use crate::telemetry::{LinkParams, LinkState, TelemetrySystem, UplinkSystem};
         use metor_proto_wkt::{
             AlarmAck, AlarmCleared, AlarmDef, AlarmDefs, AlarmRaised, ReloadSequences,
             SequenceChannelEvent, SequenceCommand, SequenceRegistry,
         };
-        use crate::telemetry::{LinkParams, LinkState, TelemetrySystem, UplinkSystem};
 
         let mut r = Self::new();
         r.register::<crate::AlarmSystem, _>("Alarms");
@@ -411,17 +319,13 @@ impl Registry {
                 // entry's schema, so its declared defaults fill in — the pack
                 // twin of the static `NoParams` decode.
                 let empty = serde_json::Value::Object(serde_json::Map::new());
-                let synthesized_src;
-                let (value, src) = match &ctx.params {
-                    StaticParams::Value { value, src } => (*value, *src),
-                    StaticParams::None => {
-                        synthesized_src = ctx.params.diag_src(ctx.name);
-                        (&empty, synthesized_src.as_str())
-                    }
+                let value = match &ctx.params {
+                    StaticParams::Value(value) => *value,
+                    StaticParams::None => &empty,
                 };
-                let params = crate::pack::EntryParams::Value {
+                let params = metor_fsw_2_core::EntryParams::Value {
                     value,
-                    src,
+                    src: "",
                     name: ctx.name,
                     msgs: ctx.msgs,
                     attach: ctx.attach,
@@ -429,31 +333,31 @@ impl Registry {
                 // The create phase runs here (a bad config fails at registration);
                 // the returned node rides the ordinary cyclic bind path.
                 init::pending_node(ctx.name.to_string(), &mut entry, params).map_err(|e| match e {
-                    // The params decode already carries its span; unwrap it.
-                    crate::pack::MakeError::Params(e) => *e,
+                    // Preserve the params-specific error kind.
+                    metor_fsw_2_core::MakeError::Params(e) => (*e).into(),
                     // A by-name attach that named a wrong-typed state: refine
                     // the generic create error into the attach diagnostic.
-                    crate::pack::MakeError::AttachTypeMismatch { system, state } => {
+                    metor_fsw_2_core::MakeError::AttachTypeMismatch { system, state } => {
                         LoadErrorKind::AttachTypeMismatch {
                             system: system.to_string(),
                             attach: state.to_string(),
                         }
-                        .whole(ctx.params.diag_src(ctx.name))
+                        .bare()
                     }
                     // Reached only when a shared entry's create runs without a
                     // resolved attach; the resolver's pre-check normally
-                    // pre-empts it with the spanned `MissingAttach`.
-                    crate::pack::MakeError::MissingAttach { system } => {
+                    // pre-empts it with `MissingAttach`.
+                    metor_fsw_2_core::MakeError::MissingAttach { system } => {
                         LoadErrorKind::MissingAttach {
                             system: system.to_string(),
                         }
-                        .whole(ctx.params.diag_src(ctx.name))
+                        .bare()
                     }
                     other => LoadErrorKind::PackCreate {
                         system: ctx.name.to_string(),
                         message: other.to_string(),
                     }
-                    .whole(ctx.params.diag_src(ctx.name)),
+                    .bare(),
                 })
             });
             self.factories.insert(

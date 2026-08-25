@@ -1,7 +1,7 @@
 //! A two-entry pack compiled as a shared library and driven over the C ABI.
 //!
 //! This crate builds as a `cdylib` whose only export surface is the
-//! [`export_pack!`](metor_fsw_2::export_pack) invocation at the bottom. A
+//! [`export_pack!`](metor_fsw_2_core::export_pack) invocation at the bottom. A
 //! host process `dlopen`s the produced library, reads the pack manifest from
 //! `fsw_pack_describe`, constructs an entry through `fsw_pack_create` from
 //! postcard-encoded params, and steps it cycle by cycle.
@@ -21,17 +21,14 @@
 //! The host declares byte-identical twins of the frame types, and the layout
 //! check in the wiring step verifies that the two sides agree.
 
-use metor_fsw_2::metor_proto::types::Timestamp;
-use metor_fsw_2::{
-    BuildSystem, CyclicSystem, Input, MsgOut, NamedMsg, Out, Output, Pack, System, SystemInput,
-    SystemOutput,
-};
+use metor_fsw_2_core::metor_proto::types::Timestamp;
+use metor_fsw_2_core::{HealthPort, Input, MsgOut, NamedMsg, Output, Pack, system};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Input frame the host writes each cycle.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "tick_in")]
 pub struct TickIn {
@@ -41,7 +38,7 @@ pub struct TickIn {
 }
 
 /// Output frame [`DlCounter`] publishes each cycle.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "tick_out")]
 pub struct TickOut {
@@ -68,7 +65,9 @@ impl NamedMsg for TickEvent {
 ///
 /// The mix of an integer and a float keeps parameter round-trip checks honest
 /// beyond a single-value encoding.
-#[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
+#[derive(
+    Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq, metor_fsw_2_core::ParamsDocs,
+)]
 pub struct CounterParams {
     pub start: u64,
     pub scale: f64,
@@ -83,61 +82,46 @@ pub struct DlCounter {
     scale: f64,
 }
 
-#[derive(SystemInput)]
-pub struct DlCounterIn {
-    tick: Input<TickIn>,
-}
-
-#[derive(SystemOutput)]
-pub struct DlCounterOut {
-    out: Output<TickOut>,
-    events: MsgOut<TickEvent>,
-}
-
-impl System for DlCounter {
-    type Input = DlCounterIn;
-    type Output = Out<DlCounterOut>;
-    const NAME: &'static str = "dl_counter";
-}
-
-impl CyclicSystem for DlCounter {
-    fn execute(&mut self, now: Timestamp, input: &mut DlCounterIn, output: &mut Out<DlCounterOut>) {
-        let value = match input.tick.latest() {
-            Ok(Some(t)) => t.get().value,
-            Ok(None) => {
-                output.health().error("no_tick");
-                return;
-            }
-            Err(_) => {
-                output.health().error("tick_corrupt");
-                return;
-            }
-        };
-        let count = self.start + (value as f64 * self.scale).round() as u64;
-        // Exercises the pack-side tracing pipeline: the export shim installed
-        // a per-dylib subscriber, so this lands on the instance's log port.
-        tracing::info!(count, "tick counted");
-        let _ = output.out.write(&TickOut {
-            timestamp: now,
-            count,
-        });
-        let _ = output.events.emit(&TickEvent { count });
-    }
-}
-
-impl BuildSystem for DlCounter {
-    type Params = CounterParams;
-    fn new(params: Self::Params) -> Self {
-        DlCounter {
-            start: params.start,
-            scale: params.scale,
+fn count(
+    state: &mut DlCounter,
+    now: Timestamp,
+    tick: &mut Input<TickIn>,
+    out: &mut Output<TickOut>,
+    events: &mut MsgOut<TickEvent>,
+    health: &mut HealthPort,
+) {
+    let value = match tick.latest() {
+        Ok(Some(t)) => t.get().value,
+        Ok(None) => {
+            health.error("no_tick");
+            return;
         }
+        Err(_) => {
+            health.error("tick_corrupt");
+            return;
+        }
+    };
+    let count = state.start + (value as f64 * state.scale).round() as u64;
+    // Exercises the pack-side tracing pipeline: the export shim installed
+    // a per-dylib subscriber, so this lands on the instance's log port.
+    tracing::info!(count, "tick counted");
+    let _ = out.write(&TickOut {
+        timestamp: now,
+        count,
+    });
+    let _ = events.emit(&TickEvent { count });
+}
+
+fn new_counter(params: CounterParams) -> DlCounter {
+    DlCounter {
+        start: params.start,
+        scale: params.scale,
     }
 }
 
 /// Output frame [`DlEcho`] publishes each cycle, named apart from `tick_out`
 /// so the pack's two entries have distinct output components.
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[derive(metor_fsw_2_core::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "echo_out")]
 pub struct EchoOut {
@@ -146,49 +130,21 @@ pub struct EchoOut {
     pub value: u64,
 }
 
-/// The pack's second entry: paramless, republishing each tick verbatim.
-pub struct DlEcho;
-
-#[derive(SystemInput)]
-pub struct DlEchoIn {
-    tick: Input<TickIn>,
-}
-
-#[derive(SystemOutput)]
-pub struct DlEchoOut {
-    out: Output<EchoOut>,
-}
-
-impl System for DlEcho {
-    type Input = DlEchoIn;
-    type Output = Out<DlEchoOut>;
-    const NAME: &'static str = "dl_echo";
-}
-
-impl CyclicSystem for DlEcho {
-    fn execute(&mut self, now: Timestamp, input: &mut DlEchoIn, output: &mut Out<DlEchoOut>) {
-        if let Ok(Some(t)) = input.tick.latest() {
-            let _ = output.out.write(&EchoOut {
-                timestamp: now,
-                value: t.get().value,
-            });
-        }
-    }
-}
-
-impl BuildSystem for DlEcho {
-    type Params = ();
-    fn new(_params: ()) -> Self {
-        DlEcho
+fn echo(_: &mut (), now: Timestamp, tick: &mut Input<TickIn>, out: &mut Output<EchoOut>) {
+    if let Ok(Some(t)) = tick.latest() {
+        let _ = out.write(&EchoOut {
+            timestamp: now,
+            value: t.get().value,
+        });
     }
 }
 
 /// The crate's pack, referenced by `export_pack!` below.
 pub fn pack() -> Pack {
     Pack::new()
-        .system_type::<DlCounter>("DlCounter")
-        .system_type::<DlEcho>("DlEcho")
+        .system("DlCounter", system(count).init(new_counter))
+        .system("DlEcho", system(echo))
 }
 
 // Exports the `fsw_*` C symbols the host resolves after `dlopen`.
-metor_fsw_2::export_pack!(pack);
+metor_fsw_2_core::export_pack!(pack);

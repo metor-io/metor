@@ -222,12 +222,23 @@ const FREE_SLOT: u64 = u64::MAX;
 /// `high_water_mark` value meaning no wrap gap is pending.
 const HWM_NONE: u64 = u64::MAX;
 
-/// A tag identifying the architecture that wrote a region. The byte pattern
-/// of this native `u64` differs across endianness and the low word carries
-/// the pointer width, so comparing tags on attach rejects a region written by
-/// an incompatible target.
+/// A tag identifying the architecture that wrote a region: the byte pattern of
+/// this native `u64` differs across endianness, so comparing tags on attach
+/// rejects a region written by an incompatible target.
+///
+/// Pointer width is deliberately *not* encoded. Nothing in the region format
+/// is `usize`-shaped — every header, control, and reader-slot field is an
+/// explicit width — and the one place pointer width genuinely matters, a
+/// capacity too large for the attaching target's `usize`, is already caught
+/// as [`AttachError::BadGeometry`], which is both narrower and more accurate
+/// than refusing the region outright.
+///
+/// Encoding it would therefore reject a compatible region for no reason, and
+/// the case is not hypothetical: a wasm guest's `usize` is four bytes where
+/// its 64-bit host's is eight, and the two share ring regions in the guest's
+/// linear memory (`metor_fsw_2::wasm`).
 const fn arch_tag() -> u64 {
-    ((0x0102_0304u32 as u64) << 32) | (core::mem::size_of::<usize>() as u64)
+    (0x0102_0304u32 as u64) << 32
 }
 
 /// The tag stamped on writer and reader claims: the claiming process's id,
@@ -236,9 +247,19 @@ const fn arch_tag() -> u64 {
 /// alias two claimants across a pid wrap-around, so reclaim promptly after
 /// reaping a dead peer, before spawning replacements.
 #[inline]
-#[cfg(not(kani))]
+#[cfg(all(not(kani), not(target_arch = "wasm32")))]
 fn owner_tag() -> u64 {
     std::process::id() as u64
+}
+
+/// Wasm has no process id — `std::process::id` is unsupported there and
+/// panics — and a guest is not a process anyway: its regions live and die with
+/// the instance, so there is no peer to outlive them and nothing to reclaim.
+/// A fixed non-zero tag keeps the "never `0`" invariant.
+#[inline]
+#[cfg(all(not(kani), target_arch = "wasm32"))]
+fn owner_tag() -> u64 {
+    1
 }
 
 /// Kani has no process to ask, and the harnesses never depend on the tag's
@@ -374,12 +395,7 @@ pub enum ReadError {
 
 impl core::fmt::Display for ReadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ReadError::Corrupt => write!(
-                f,
-                "ring region violates a structural invariant (possible external corruption)"
-            ),
-        }
+        f.write_str("ring region violates a structural invariant (possible external corruption)")
     }
 }
 
@@ -391,10 +407,7 @@ pub struct FullReaderTable;
 
 impl core::fmt::Display for FullReaderTable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "the ring's reader table is full; no free slot for another view"
-        )
+        f.write_str("the ring's reader table is full; no free slot for another view")
     }
 }
 
@@ -407,10 +420,7 @@ pub struct WriterClaimed;
 
 impl core::fmt::Display for WriterClaimed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "a writer already exists for this ring (or a crashed process leaked its claim)"
-        )
+        f.write_str("a writer already exists for this ring (or a crashed process leaked its claim)")
     }
 }
 
@@ -439,22 +449,20 @@ pub enum AttachError {
 impl core::fmt::Display for AttachError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            AttachError::BadMagic => write!(f, "region header has the wrong magic"),
+            AttachError::BadMagic => f.write_str("region header has the wrong magic"),
             AttachError::BadVersion => {
-                write!(f, "region was written by an incompatible ring version")
+                f.write_str("region was written by an incompatible ring version")
             }
-            AttachError::ArchMismatch => write!(
-                f,
-                "region was written by a different pointer width or endianness"
-            ),
-            AttachError::TooSmall => write!(f, "region is shorter than the fixed header"),
-            AttachError::Misaligned => write!(f, "region base pointer is not 8-byte aligned"),
+            AttachError::ArchMismatch => {
+                f.write_str("region was written by a different pointer width or endianness")
+            }
+            AttachError::TooSmall => f.write_str("region is shorter than the fixed header"),
+            AttachError::Misaligned => f.write_str("region base pointer is not 8-byte aligned"),
             AttachError::BadGeometry => {
-                write!(f, "region header fields are internally inconsistent")
+                f.write_str("region header fields are internally inconsistent")
             }
-            AttachError::RegionTruncated => write!(
-                f,
-                "region header's total_size exceeds the backing region (truncated file?)"
+            AttachError::RegionTruncated => f.write_str(
+                "region header's total_size exceeds the backing region (truncated file?)",
             ),
         }
     }
@@ -495,6 +503,7 @@ enum BackingOwner {
     /// ever makes would be through a dead tag. Miri reports it as the first
     /// write in `init_region`.
     Heap { words: *mut [Word] },
+    #[cfg(feature = "mmap")]
     Mmap { _map: memmap2::MmapMut },
     Raw,
 }
@@ -535,6 +544,7 @@ impl Backing {
     }
 
     /// An mmap-backed region. The mapping is unmapped when the backing drops.
+    #[cfg(feature = "mmap")]
     fn mmap(map: memmap2::MmapMut) -> Self {
         let (base, len) = (map.as_ptr() as *mut u8, map.len());
         Self {
@@ -613,21 +623,25 @@ impl WakeSink for NoWake {
 /// A shared wait queue that wakes tasks within one process. The writer and
 /// its views share clones of a single `Notifier`, so a commit wakes the
 /// awaiting readers.
+#[cfg(feature = "notify")]
 #[derive(Clone)]
 pub struct Notifier(Arc<stellarator::sync::WaitQueue>);
 
+#[cfg(feature = "notify")]
 impl Default for Notifier {
     fn default() -> Self {
         Self(Arc::new(stellarator::sync::WaitQueue::new()))
     }
 }
 
+#[cfg(feature = "notify")]
 impl WakeSource for Notifier {
     fn notify(&self) {
         self.0.wake_all();
     }
 }
 
+#[cfg(feature = "notify")]
 impl WakeSink for Notifier {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F) {
         let _ = self.0.wait_for(ready).await;
@@ -721,14 +735,10 @@ impl Inner {
         // so either the scan observes a new reader's claim or that reader's
         // registration recheck observes the store.
         fence(SeqCst);
-        let mut slowest: Option<u64> = None;
-        for slot in 0..self.max_readers {
-            let v = self.slot_cursor(slot).load(Acquire);
-            if v != FREE_SLOT {
-                slowest = Some(slowest.map_or(v, |s| s.min(v)));
-            }
-        }
-        slowest
+        (0..self.max_readers)
+            .map(|slot| self.slot_cursor(slot).load(Acquire))
+            .filter(|&cursor| cursor != FREE_SLOT)
+            .min()
     }
 
     /// Compute the wrap for a record of `rec` bytes written at absolute
@@ -824,8 +834,44 @@ impl RingBuffer {
         }
     }
 
+    /// Format a ring into a region the caller owns, then attach to it.
+    ///
+    /// The counterpart to [`create_in_memory`](Self::create_in_memory) for a
+    /// host that must place the region somewhere specific rather than on its
+    /// own heap — a wasm host puts rings inside the guest's linear memory so
+    /// the guest can attach to them by offset, since a guest cannot follow a
+    /// pointer into the host.
+    ///
+    /// `len` must be at least [`region_len`] for `cfg`, and `base` must be
+    /// 8-aligned; both are checked. The region is left formatted, so a later
+    /// [`attach_raw`](Self::attach_raw) over the same bytes reads the same
+    /// geometry back.
+    ///
+    /// # Safety
+    /// `base..base + len` is a live, exclusively-owned region that outlives
+    /// every [`Writer`] and [`View`] produced here, and nothing else is
+    /// reading it while this formats it.
+    pub unsafe fn create_raw(base: *mut u8, len: usize, cfg: Config) -> Result<Self, AttachError> {
+        if !(base as usize).is_multiple_of(8) {
+            return Err(AttachError::Misaligned);
+        }
+        let (reader_table_offset, data_offset, total) = layout(&cfg);
+        if len < total {
+            return Err(AttachError::TooSmall);
+        }
+        // SAFETY: caller asserts a live region of at least `len` bytes, and
+        // `total <= len` was just checked.
+        let backing = unsafe { Backing::raw(base, total) };
+        // SAFETY: same region, exclusively owned by the caller, and nothing
+        // else observes it until this returns.
+        unsafe { init_region(&backing, &cfg, reader_table_offset, data_offset, total) };
+        // SAFETY: the region was just formatted, so its header is valid.
+        unsafe { Self::attach_raw(base, total) }
+    }
+
     /// Create a new mmap-backed region at `path`, truncating any existing
     /// file.
+    #[cfg(feature = "mmap")]
     pub fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
         let (reader_table_offset, data_offset, total) = layout(&cfg);
         let file = std::fs::OpenOptions::new()
@@ -859,6 +905,7 @@ impl RingBuffer {
     /// compatible build and is not being concurrently torn down. The
     /// magic/version/arch handshake guards against accidental misuse but not
     /// deliberate corruption.
+    #[cfg(feature = "mmap")]
     pub unsafe fn attach_mmap(path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -1054,6 +1101,33 @@ impl RingBuffer {
             .filter(|&s| self.inner.slot_cursor(s).load(Relaxed) != FREE_SLOT)
             .count()
     }
+}
+
+/// The [`Config`] an existing region was formatted with, read back out of its
+/// header.
+///
+/// For a caller that must build a *second* ring matching a first — a wasm host
+/// giving its guest a region mirroring the coordinator's, so the two sides of
+/// a copy always agree on what a record can be.
+///
+/// # Safety
+/// `base..base + len` is a live, header-valid ring region.
+pub unsafe fn config_of(base: *mut u8, len: usize) -> Result<Config, AttachError> {
+    // SAFETY: caller asserts a live, header-valid region; `attach_raw`
+    // validates before forming any reference into it.
+    let ring = unsafe { RingBuffer::attach_raw(base, len) }?;
+    Ok(Config {
+        capacity: ring.inner.capacity as usize,
+        max_readers: ring.inner.max_readers as usize,
+    })
+}
+
+/// The number of bytes a ring with `cfg` occupies, for a caller that has to
+/// allocate the region itself before [`RingBuffer::create_raw`] formats it.
+///
+/// Panics on the same invalid configs [`RingBuffer::create_in_memory`] does.
+pub fn region_len(cfg: &Config) -> usize {
+    layout(cfg).2
 }
 
 /// Compute `(reader_table_offset, data_offset, total_size)` and validate the

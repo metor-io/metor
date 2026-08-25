@@ -8,9 +8,9 @@ mod safe_mode;
 
 /// This crate's pack: both sequence occupants, under the names the target's slot
 /// `allow`/`initial` lines select.
-pub fn pack() -> metor_fsw_2::Pack {
-    metor_fsw_2::Pack::new()
+pub fn pack() -> metor_fsw_2_core::Pack {
+    metor_fsw_2_core::Pack::new()
         .task("commissioning", commissioning::commissioning)
         .task("safe_mode", safe_mode::safe)
 }
-metor_fsw_2::export_pack!(pack);
+metor_fsw_2_core::export_pack!(pack);

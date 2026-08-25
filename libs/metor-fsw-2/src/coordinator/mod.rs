@@ -6,15 +6,14 @@
 //! arrives already wired, from the wiring front-end
 //! ([`resolve`](crate::wiring::resolve)) via [`init::InitGraph::build`].
 //! [`Coordinator::run_for`] drives the lifecycle: spawn the async systems, init
-//! everything behind a barrier, step the cyclic systems once per cycle, run the
-//! async copy-in mirror, update health or status when their state changes, and
-//! tear the graph down.
+//! everything behind a barrier, step cyclic systems and async boundaries in
+//! registration order, update health or status, and tear the graph down.
 //!
 //! Cyclic systems step in registration order, once per cycle; the build-time
 //! passes ([`init`]) reject any wiring whose dataflow disagrees with that
 //! order, so the loop here never has to reason about staleness. Async systems
-//! run on their own tasks, off the cycle clock, and observe their snapshot
-//! inputs through the post-step copy-in mirror.
+//! run on their own tasks, off the cycle clock, while private rings meet the
+//! graph at deterministic import/export boundaries.
 
 use core::mem::offset_of;
 use std::sync::Arc;
@@ -24,7 +23,7 @@ use std::sync::atomic::{
 };
 use std::time::{Duration, Instant};
 
-use metor_fsw_ring::{NoWake, Notifier, RingBuffer, View, Writer};
+use metor_fsw_ring::{NoWake, Notifier, RingBuffer};
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto_wkt::{ReloadSequences, SequenceCommand, SequenceRegistry, WiringManifest};
 use stellarator::JoinHandle;
@@ -32,27 +31,26 @@ use stellarator::sync::WaitQueue;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::DEFAULT_DEPTH;
-use crate::descriptor::{Hz, PortId};
 use crate::FrameStr;
-use crate::dynamic::FrameList;
-use crate::health::{HealthPort, LogLevel};
-use crate::message::{MsgIn, MsgOut};
-use crate::port::Output;
+use crate::async_system::{AsyncContext, AsyncSystem};
+use crate::io_bridge::IoBridge;
 use crate::proc::session::SessionDir;
-use crate::registry::Registry;
-use crate::system::{AsyncContext, AsyncSystem};
+use metor_fsw_2_core::FrameList;
+use metor_fsw_2_core::Output;
+use metor_fsw_2_core::Registry;
+use metor_fsw_2_core::health::{HealthPort, LogLevel};
+use metor_fsw_2_core::{CyclicSlot, NAME_CAP, SlotState, StoppedSystem, WorkerStatus};
+use metor_fsw_2_core::{Hz, PortId};
+use metor_fsw_2_core::{MsgIn, MsgOut};
 
 mod bind;
 mod error;
 pub(crate) mod init;
 pub(crate) mod slot;
-mod status;
 
 pub use error::WireError;
 pub(crate) use slot::validate_slot_spec;
 pub use slot::{AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError, SlotStatus};
-pub(crate) use status::CyclicSlot;
-pub use status::{NAME_CAP, SlotState, StopReason, StoppedSystem, WorkerRunState, WorkerStatus};
 
 /// The default [`CoordinatorConfig::reader_slack`].
 const READER_SLACK: usize = 4;
@@ -115,6 +113,12 @@ pub struct CoordinatorConfig {
     /// How long a dead worker's slot waits before respawning, so a
     /// crash-looping artifact cannot busy-spin the spawn path. Default 500 ms.
     pub proc_restart_backoff: Duration,
+    /// Fuel granted to one wasm occupant poll. Default 100,000,000.
+    pub wasm_fuel_per_poll: u64,
+    /// Maximum linear memory one wasm occupant may allocate while loading and
+    /// binding. Memory is frozen at its bound size before execution.
+    /// Default 64 MiB.
+    pub wasm_memory_limit_bytes: usize,
 }
 
 impl Default for CoordinatorConfig {
@@ -127,6 +131,8 @@ impl Default for CoordinatorConfig {
             proc_step_timeout: Duration::from_millis(100),
             proc_max_restarts: 3,
             proc_restart_backoff: Duration::from_millis(500),
+            wasm_fuel_per_poll: crate::coordinator::slot::DEFAULT_FUEL_PER_CALL,
+            wasm_memory_limit_bytes: crate::wasm::DEFAULT_MAX_MEMORY_BYTES,
         }
     }
 }
@@ -212,9 +218,8 @@ enum BufferRole {
     /// A system's declared output buffer, the coordinator's own #0 outputs
     /// included.
     Output { system: usize, port: usize },
-    /// A dedicated input-side ring: an async copy-in buffer, or a
-    /// host-connected input's ring.
-    Private { system: usize, input: usize },
+    /// A private async input/output ring, or a host-connected input's ring.
+    Private { system: usize, port: usize },
 }
 
 /// One owned ring plus its identity. `ring` is the canonical handle whose sole
@@ -240,20 +245,51 @@ pub(crate) struct RingTable {
 // Async plumbing
 // ---------------------------------------------------------------------------
 
-/// One mirroring job that copies the newest upstream record into an async
-/// system's private buffer, at most once per new upstream commit. It exists
-/// only for snapshot inputs; the record is borrowed in place off the upstream
-/// ring and written through, with no intermediate buffer.
-pub(crate) struct CopyIn {
-    upstream: View<NoWake>,
-    /// The private ring's sole writer. The matched data `Notifier` wakes the
-    /// parked async `recv`; a full private ring (the consumer is behind) drops
-    /// this cycle's mirror rather than suspending the cycle loop.
-    writer: Writer<Notifier>,
-    /// The upstream ring's `committed` at the last mirror, so an unchanged
-    /// upstream is skipped instead of re-waking the consumer with the same
-    /// pinned record every cycle. `u64::MAX` means nothing mirrored yet.
-    last_committed: u64,
+/// The deterministic graph boundary of one free-running async task.
+pub(crate) struct AsyncBoundary {
+    name: Arc<str>,
+    io: IoBridge<Notifier, NoWake>,
+    corruptions: u64,
+}
+
+impl AsyncBoundary {
+    pub(crate) fn new(name: impl Into<Arc<str>>, io: IoBridge<Notifier, NoWake>) -> Self {
+        Self {
+            name: name.into(),
+            io,
+            corruptions: 0,
+        }
+    }
+}
+
+impl CyclicSlot for AsyncBoundary {
+    fn init(&mut self) {}
+
+    fn step(&mut self, _now: Timestamp) {
+        // Waking an input only schedules the local task. The coordinator does
+        // not yield here, so export still observes work from before this
+        // boundary, never work caused by the just-imported records.
+        self.corruptions += u64::from(self.io.import().is_err());
+        self.corruptions += u64::from(self.io.export().is_err());
+    }
+
+    fn shutdown(&mut self) {}
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn state(&self) -> &SlotState {
+        &SlotState::Running
+    }
+
+    fn drain_boundary_drops(&mut self) -> u64 {
+        self.io.drain_dropped()
+    }
+
+    fn drain_boundary_corruptions(&mut self) -> u64 {
+        std::mem::take(&mut self.corruptions)
+    }
 }
 
 /// Per-task signals the coordinator hands a spawned async system: a stop flag,
@@ -372,21 +408,6 @@ fn simulated_now(epoch: Timestamp, dt: Duration, k: u64) -> Timestamp {
     }
 }
 
-/// Whether the freshly scanned stopped set differs from the previously
-/// published one. Both slices come from the same in-order scan of the cyclic
-/// slots, so an element-wise `(name, reason)` compare is an exact membership
-/// compare, with no set structure and no allocation. A length-only check is
-/// not enough: stops are not monotonic (a slot recovers via `Load`/`Reset`),
-/// so slot A can recover the same cycle slot B stops, changing the membership
-/// while the count stays put.
-fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
-    cur.len() != prev.len()
-        || cur
-            .iter()
-            .zip(prev)
-            .any(|(a, b)| a.name != b.name || a.reason != b.reason)
-}
-
 // ---------------------------------------------------------------------------
 // Coordinator
 // ---------------------------------------------------------------------------
@@ -419,26 +440,12 @@ struct CoordChannels {
 }
 
 impl CoordChannels {
-    /// Emit the boot [`SequenceRegistry`] on the coordinator's message channel:
-    /// the slots and their allowed occupants.
-    fn emit_sequence_registry(&mut self) {
+    /// Emit the registry and manifest at boot or after a reload request.
+    fn emit_registry_and_manifest(&mut self) {
         let _ = self.seq_registry_out.emit(&self.seq_registry);
-    }
-
-    /// Emit the full target IR on the `wiring` channel — the live/historical
-    /// topology the panel graph tile consumes. A no-op when no front-end set a
-    /// manifest.
-    fn emit_wiring_manifest(&mut self) {
         if let (Some(out), Some(manifest)) = (&mut self.wiring_out, &self.wiring_manifest) {
             let _ = out.emit(manifest);
         }
-    }
-
-    /// Emit the boot registry and manifest at the head of the one permitted
-    /// run, so a tap claimed after `build()` observes them first.
-    fn emit_boot(&mut self) {
-        self.emit_sequence_registry();
-        self.emit_wiring_manifest();
     }
 
     /// Drain the cycle's reload requests; on any request re-emit the registry
@@ -448,8 +455,7 @@ impl CoordChannels {
         let mut reload = false;
         self.reload_in.drain(|ReloadSequences {}| reload = true)?;
         if reload {
-            self.emit_sequence_registry();
-            self.emit_wiring_manifest();
+            self.emit_registry_and_manifest();
         }
         Ok(())
     }
@@ -460,14 +466,13 @@ impl CoordChannels {
     }
 }
 
-/// The wired, ready flight-software graph. Drives cyclic systems once per
-/// cycle, runs the async copy-in step, spawns and tears down async systems,
-/// and emits coordinator-level health plus a status frame.
+/// The wired, ready flight-software graph. Drives cyclic systems and async
+/// boundaries once per cycle, owns async task lifecycle, and emits
+/// coordinator-level health plus a status frame.
 pub struct Coordinator {
     config: CoordinatorConfig,
     cyclic: Vec<Box<dyn CyclicSlot>>,
     pending_async: Vec<PendingAsync>,
-    copy_ins: Vec<CopyIn>,
     coord_health: HealthPort,
     status_out: Output<CoordinatorStatus>,
     stopped: Vec<StoppedSystem>,
@@ -599,7 +604,7 @@ impl Coordinator {
             "target starting"
         );
         let tasks = self.start().await;
-        self.channels.emit_boot();
+        self.channels.emit_registry_and_manifest();
         // The Wall pacing budget. Only computed under a `Wall` clock, since
         // `cycle_rate` is documented ignored under `Simulated` and an unusable
         // rate must not panic there; under `Wall` the rate was validated at
@@ -624,7 +629,7 @@ impl Coordinator {
             // Publish to the ambient FSW clock before anything steps, so
             // out-of-port stamps (tracing events, async health) land on the
             // cycle timeline.
-            crate::clock::set_now(now);
+            metor_fsw_2_core::set_now(now);
             // A reload request re-emits the registry and manifest for consumers
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.
@@ -637,7 +642,6 @@ impl Coordinator {
             for slot in &mut self.cyclic {
                 slot.step(now);
             }
-            self.run_copy_ins();
             self.update_status(now);
             self.drain_forwarded_logs(now);
             match self.config.clock {
@@ -705,54 +709,51 @@ impl Coordinator {
         tasks
     }
 
-    /// Mirror the newest upstream record into each async system's private
-    /// buffer, waking the async `recv`. Snapshot semantics: older unread
-    /// upstream records are consumed on the way (freed for the producer) and
-    /// only the newest is mirrored, at most once per new upstream commit. A
-    /// full private ring (the consumer is behind) skips this cycle's mirror;
-    /// the next cycle retries with whatever is newest then.
-    fn run_copy_ins(&mut self) {
-        for c in &mut self.copy_ins {
-            // Skip untouched upstreams: `committed` moves iff a record landed
-            // on this ring, so this also keeps the pinned newest record from
-            // being re-mirrored (and the consumer re-woken) every cycle.
-            let committed = c.upstream.committed();
-            if committed == c.last_committed {
-                continue;
-            }
-            c.last_committed = committed;
-            // Corrupt (unreachable from in-crate behavior) reads as "nothing new".
-            if let Ok(Some(grant)) = c.upstream.try_latest() {
-                let _ = c.writer.try_write(&grant);
-            }
-        }
-    }
-
     /// Scan the slots; when the stopped set changes, refresh the status frame
     /// and log the change to coordinator health. The scan fills a retained
     /// scratch and swaps it with `stopped` on a change, so nothing allocates
     /// per cycle.
     fn update_status(&mut self, now: Timestamp) {
-        // Host-side worker trouble (a step missing its ack deadline, a
-        // restart beginning) lands on coordinator health: the worker owns its
-        // system's health ring, so the host cannot report through it. At most
-        // one of each per slot per cycle.
-        let mut worker_event = false;
+        // Boundary and worker failures land on coordinator health because the
+        // host cannot report them through the system-owned health port.
+        let mut coord_event = false;
         for slot in &mut self.cyclic {
+            let boundary_drops = slot.drain_boundary_drops();
+            if boundary_drops > 0 {
+                self.coord_health.error(slot.boundary_drop_health_key());
+                self.coord_health.log(LogLevel::Warn, slot.name());
+                tracing::warn!(
+                    system = slot.name(),
+                    dropped = boundary_drops,
+                    "async boundary dropped records"
+                );
+                coord_event = true;
+            }
+            let boundary_corruptions = slot.drain_boundary_corruptions();
+            if boundary_corruptions > 0 {
+                self.coord_health.error("boundary_corrupt");
+                self.coord_health.log(LogLevel::Error, slot.name());
+                tracing::error!(
+                    system = slot.name(),
+                    corruptions = boundary_corruptions,
+                    "isolated boundary read corrupt"
+                );
+                coord_event = true;
+            }
             if slot.drain_timeouts() > 0 {
                 self.coord_health.error("proc_step_timeout");
                 self.coord_health.log(LogLevel::Warn, slot.name());
                 tracing::warn!(system = slot.name(), "worker step missed its deadline");
-                worker_event = true;
+                coord_event = true;
             }
             if slot.drain_restarts() > 0 {
                 self.coord_health.error("proc_restart");
                 self.coord_health.log(LogLevel::Warn, slot.name());
                 tracing::warn!(system = slot.name(), "worker restarting");
-                worker_event = true;
+                coord_event = true;
             }
         }
-        if worker_event {
+        if coord_event {
             self.coord_health.end_cycle(now, 0);
         }
         self.stopped_scratch.clear();
@@ -770,7 +771,7 @@ impl Coordinator {
                 self.workers_scratch.push(status);
             }
         }
-        let stopped_changed = stopped_set_changed(&self.stopped_scratch, &self.stopped);
+        let stopped_changed = self.stopped_scratch != self.stopped;
         // Worker changes (a pid after a restart, a run-state transition) also
         // re-publish, so the wire always names the current process.
         let workers_changed = self.workers_scratch != self.workers;
@@ -842,7 +843,7 @@ impl Coordinator {
     /// once per cycle (after the slots step) and once more at shutdown;
     /// events fired before the first cycle (build, init) flush here too.
     fn drain_forwarded_logs(&mut self, now: Timestamp) {
-        let dropped = crate::logfwd::drain(|ev| self.coord_health.emit_event(&ev));
+        let dropped = metor_fsw_2_core::logfwd::drain(|ev| self.coord_health.emit_event(&ev));
         if dropped > 0 {
             for _ in 0..dropped {
                 self.coord_health.error("log_dropped");
@@ -899,12 +900,3 @@ impl Coordinator {
         self.drain_forwarded_logs(Timestamp::now());
     }
 }
-
-#[cfg(test)]
-mod tests;
-
-// Scripted-uplink command dispatch, driven through the builder with a
-// test-double transport the Wiring front end cannot express (WP3). Gated off
-// miri, since two of the tests cross a real shared-object boundary.
-#[cfg(all(test, not(miri)))]
-mod uplink_tests;

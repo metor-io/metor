@@ -102,12 +102,19 @@ pub struct VectorMarker {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _expression: Option<crate::dynamic::expressions::Expression>,
+    #[facet(opaque)]
     _task: gpui::Task<()>,
 }
 
 impl VectorMarker {
     fn from_config(cfg: &VectorMarkerConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
+        let component_id = bound
+            .as_ref()
+            .map(|bound| bound.id)
+            .unwrap_or_else(|| ComponentId::new(&cfg.component));
+        let expression = bound.and_then(|bound| bound.expression);
         let task = spawn_marker_stream(&db, component_id, cx);
         Self {
             component_id,
@@ -117,15 +124,20 @@ impl VectorMarker {
             bound: Some(component_id),
             value: None,
             db,
+            _expression: expression,
             _task: task,
         }
     }
 
     fn to_config(&self) -> VectorMarkerConfig {
         VectorMarkerConfig {
-            component: binding::component_name(&self.db, self.component_id)
-                .unwrap_or_else(|| self.component.clone())
-                .to_string(),
+            // An expression's component is named by a content hash, so what
+            // round-trips is the text that made it.
+            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
+                .or_else(|| {
+                    binding::component_name(&self.db, self.component_id).map(|n| n.to_string())
+                })
+                .unwrap_or_else(|| self.component.to_string()),
             label: self.label.to_string(),
             color: self.color,
         }
@@ -139,6 +151,7 @@ impl VectorMarker {
             return;
         }
         self.bound = Some(self.component_id);
+        self._expression = crate::dynamic::expressions::running(self.component_id, cx);
         self.component = component_meta(&self.db, self.component_id).name;
         self.value = None;
         self._task = spawn_marker_stream(&self.db, self.component_id, cx);
@@ -156,6 +169,7 @@ impl VectorMarker {
             bound: Some(ComponentId(0)),
             value: None,
             db,
+            _expression: None,
             _task: gpui::Task::ready(()),
         }
     }
@@ -194,6 +208,8 @@ pub struct AttitudeIndicator {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _expression: Option<crate::dynamic::expressions::Expression>,
+    #[facet(opaque)]
     _task: gpui::Task<()>,
     #[facet(opaque)]
     _resolver_task: gpui::Task<()>,
@@ -201,7 +217,12 @@ pub struct AttitudeIndicator {
 
 impl AttitudeIndicator {
     pub fn from_config(cfg: &AttitudeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
+        let component_id = bound
+            .as_ref()
+            .map(|bound| bound.id)
+            .unwrap_or_else(|| ComponentId::new(&cfg.component));
+        let expression = bound.and_then(|bound| bound.expression);
         let meta = component_meta(&db, component_id);
         let offset = cfg.element_offset;
 
@@ -240,6 +261,7 @@ impl AttitudeIndicator {
             bound: Some(ElementRef::new(component_id, offset)),
             quat: None,
             db,
+            _expression: expression,
             _task: task,
             _resolver_task: resolver_task,
         }
@@ -256,6 +278,7 @@ impl AttitudeIndicator {
         if !binding::rebound(want, &mut self.bound) {
             return;
         }
+        self._expression = crate::dynamic::expressions::running(want.component, cx);
         let offset = want.element;
         let meta = component_meta(&self.db, want.component);
         self.label = meta.name.clone();
@@ -271,9 +294,12 @@ impl AttitudeIndicator {
 
     pub fn to_config(&self, cx: &gpui::App) -> AttitudeConfig {
         AttitudeConfig {
-            component: binding::component_name(&self.db, self.component_id)
-                .unwrap_or_else(|| self.component.clone())
-                .to_string(),
+            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
+                .or_else(|| {
+                    binding::component_name(&self.db, self.component_id)
+                        .map(|name| name.to_string())
+                })
+                .unwrap_or_else(|| self.component.to_string()),
             element_offset: self.element_offset,
             label: Some(self.label.to_string()),
             vectors: self

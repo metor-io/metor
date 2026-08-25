@@ -204,26 +204,6 @@ pub(crate) fn paint_route(
     }
 }
 
-/// Paint a plain two-point wire — the drag-draft and fallback shape.
-pub(crate) fn paint_bezier(
-    canvas_origin: Point<Pixels>,
-    source: Point<Pixels>,
-    target: Point<Pixels>,
-    color: Hsla,
-    dashed: bool,
-    window: &mut Window,
-) {
-    let route: RoutePoints = SmallVec::from_slice(&[source, target]);
-    paint_route(
-        canvas_origin,
-        &route,
-        Axis::Horizontal,
-        color,
-        dashed,
-        window,
-    );
-}
-
 /// Find the first edge whose route passes within `HIT_RADIUS` pixels of
 /// `pointer` (pointer is in canvas-local coordinates). Each edge gets a cheap
 /// bounding-box precheck, then its curve — the same one [`paint_route`]

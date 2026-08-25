@@ -1,7 +1,7 @@
 //! `#[derive(ParamsDocs)]`: capture a `Params` struct's field doc comments.
 //!
 //! Each documented field contributes a `(name, doc)` pair to a
-//! [`ParamsDocEntry`](metor_fsw_2::ParamsDocEntry) submitted into the
+//! [`ParamsDocEntry`](metor_fsw_2_core::ParamsDocEntry) submitted into the
 //! crate-local `inventory` collection, keyed by the struct name (which is its
 //! postcard-schema name). The pack's own `.so` reads these back when it builds
 //! its manifest, so pack module generation can render the units and prose. Docs
@@ -81,6 +81,10 @@ fn doc_text(attrs: &[syn::Attribute]) -> Option<String> {
             lines.push(s.value().trim().to_string());
         }
     }
-    let joined = lines.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+    let joined = lines
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     (!joined.is_empty()).then_some(joined)
 }

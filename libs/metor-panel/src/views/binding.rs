@@ -26,6 +26,7 @@ use std::sync::Arc;
 use gpui::{App, Context, Hsla, SharedString};
 use metor_db::DB;
 use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType};
+use metor_proto_wkt::Severity;
 use smallvec::SmallVec;
 
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
@@ -142,7 +143,7 @@ pub(crate) fn component_name(db: &DB, component: ComponentId) -> Option<SharedSt
 /// then repaints; there is no hook to run a side effect. So a view whose
 /// binding is editable compares the two at the top of its `render` and
 /// respawns when they disagree — the same shape
-/// [`TrafficLightGrid`](super::TrafficLightGrid) uses to recompile its glob.
+/// [`Annunciator`](super::Annunciator) uses to recompile its glob.
 pub(crate) fn rebound(want: ElementRef, bound: &mut Option<ElementRef>) -> bool {
     if *bound == Some(want) {
         return false;
@@ -279,8 +280,12 @@ where
     )
 }
 
-/// Spawn a task that drains a stream and forwards the boolean
-/// [`any_on`] to `apply` on the parent entity.
+/// Spawn a task that drains a stream and forwards the boolean [`any_on`],
+/// paired with the sample's leading element as a number, to `apply`.
+///
+/// On/off views want the bit; an annunciator tile that shows a readout wants
+/// the number behind it. Both come out of the same decode so a component is
+/// never parsed twice for one sample.
 ///
 /// The task exits when the entity is dropped (the `update` returns `Err`).
 pub(crate) fn spawn_on_stream<E, F>(
@@ -291,16 +296,21 @@ pub(crate) fn spawn_on_stream<E, F>(
 ) -> gpui::Task<()>
 where
     E: 'static,
-    F: Fn(&mut E, bool, &mut Context<E>) + Send + 'static,
+    F: Fn(&mut E, bool, Option<f64>, &mut Context<E>) + Send + 'static,
 {
     spawn_seeded_stream(
         db,
         source,
         cx,
-        |_, _| ((), |view: ComponentView<'_>| Some(any_on(view.iter()))),
+        |_, _| {
+            ((), |view: ComponentView<'_>| {
+                let leading = view.iter().next().map(|value| value.as_f64());
+                Some((any_on(view.iter()), leading))
+            })
+        },
         move |view, update, cx| {
-            if let StreamUpdate::Value(on) = update {
-                apply(view, on, cx);
+            if let StreamUpdate::Value((on, value)) = update {
+                apply(view, on, value, cx);
             }
         },
     )
@@ -346,13 +356,17 @@ pub(crate) fn limit_marks(at: ElementRef, cx: &App) -> SmallVec<[(f64, Hsla); 4]
         .collect()
 }
 
-/// Wash color for an instrument whose element currently has an active alarm.
-pub(crate) fn alarm_tint(at: ElementRef, cx: &App) -> Option<Hsla> {
-    let store = crate::alarms::try_global(cx)?;
-    let severity = store
+/// Severity of the worst alarm currently raised against `at`, if any.
+pub(crate) fn active_severity(at: ElementRef, cx: &App) -> Option<Severity> {
+    crate::alarms::try_global(cx)?
         .read(cx)
         .state()
-        .active_severity_for(at.component, at.element)?;
+        .active_severity_for(at.component, at.element)
+}
+
+/// Wash color for an instrument whose element currently has an active alarm.
+pub(crate) fn alarm_tint(at: ElementRef, cx: &App) -> Option<Hsla> {
+    let severity = active_severity(at, cx)?;
     Some(crate::theme::theme(cx).alarm_tint(crate::alarms::severity_index(severity)))
 }
 

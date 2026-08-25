@@ -1,7 +1,8 @@
 # metor-fsw-2 ergonomics report
 
 Written while bringing `adcs-fsw2` to feature parity with the older `examples/cube-sat`
-target. The parity port — full plant physics (reaction wheels, orbit/gravity, sensor
+target (since deleted along with metor-fsw-1 — the `cube-sat` paths cited below are
+historical, read them out of git history). The parity port — full plant physics (reaction wheels, orbit/gravity, sensor
 suite), pointing modes wired through the `mode` slot into the controller, nav reference
 modeling, live uplink — landed cleanly and entirely example-side. This report records the
 friction that surfaced and what would make the framework more ergonomic for the next target.
@@ -147,14 +148,14 @@ field-poking trick.
 Sharing one `ReactionWheel` struct as both the plant's internal state and its telemetry (a
 `[ReactionWheel; 3]` field on the `wheels` frame) hit two framework gaps:
 
-- **The component sub-derives target `::metor_fsw`, not `::metor_fsw-2`.** A nested component
-  type (one that is *not* a top-level `Frame`) must derive `AsVTable`/`Metadatatize`/
-  `Componentize`/`Decomponentize` standalone, and those derives expand to `::metor_fsw` paths
-  (`metor_fsw_crate_name()` hard-`expect`s `metor-fsw` in `Cargo.toml`). `#[derive(Frame)]`
-  bundles them with `::metor_fsw-2` paths, but there is no fsw2-flavored *standalone* derive —
-  so a schema crate that otherwise depends only on `metor-fsw-2` must add a `metor-fsw`
-  dependency purely to derive a nested component. **Recommendation:** a fsw2 `#[derive(Component)]`
-  (or re-exported fsw2-pathed sub-derives) so a nested group needs no fsw1 dependency.
+- **The standalone component derives live in another crate.** A nested component type (one
+  that is *not* a top-level `Frame`) must derive `AsVTable`/`Metadatatize`/`Componentize`/
+  `Decomponentize` standalone, and those derives expand to `::metor_component` paths.
+  `#[derive(Frame)]` bundles equivalent expansions behind `::metor_fsw_2` paths, but there is
+  no fsw2-flavored *standalone* derive — so a schema crate that otherwise depends only on
+  `metor-fsw-2` must also depend on `metor-component` purely to derive a nested component.
+  **Recommendation:** a fsw2 `#[derive(Component)]` (or fsw2-pathed re-exports of the
+  standalone sub-derives) so a nested group needs only the framework dependency.
 - **`Componentize`/`Decomponentize` had no array impl.** `AsVTable`/`Metadatatize` already
   implement `[T; N]` (indexing `field.i.*`), but the columnar `com_de` traits did not, so a
   `[Struct; N]` frame field would not compile even though the VTable side supports it. Added the

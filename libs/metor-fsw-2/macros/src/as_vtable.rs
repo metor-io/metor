@@ -58,34 +58,35 @@ pub fn as_vtable_impl(
     });
     // The timestamp field feeds the source above and is filtered out
     // of the component fields, as are `skip`ped fields.
-    let vtable_items = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
-        let ty = &field.ty;
-        let name = field.component_name();
-        let name = if let Some(parent) = parent {
-            format!("{parent}.{name}")
-        } else {
-            name
-        };
-        let ident = &field.ident;
-        quote! {
-            .chain(<#ty as #crate_name::AsVTable>::vtable_fields(path.chain(#name))
-                .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
-            )
-        }
-    });
+    let vtable_items = fields
+        .iter()
+        .filter(|f| !f.timestamp && !f.skipped())
+        .map(|field| {
+            let ty = &field.ty;
+            let name = field.qualified_component_name(parent.as_deref());
+            let ident = &field.ident;
+            quote! {
+                .chain(<#ty as #crate_name::AsVTable>::vtable_fields(path.chain(#name))
+                    .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
+                )
+            }
+        });
     // `element_fields` names members relative to a plain string prefix
     // instead of a component path, so a dynamic container can stamp
     // out copies under names chosen at runtime.
-    let element_items = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
-        let ty = &field.ty;
-        let name = field.component_name();
-        let ident = &field.ident;
-        quote! {
-            .chain(<#ty as #crate_name::AsVTable>::element_fields(child(#name))
-                .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
-            )
-        }
-    });
+    let element_items = fields
+        .iter()
+        .filter(|f| !f.timestamp && !f.skipped())
+        .map(|field| {
+            let ty = &field.ty;
+            let name = field.component_name();
+            let ident = &field.ident;
+            quote! {
+                .chain(<#ty as #crate_name::AsVTable>::element_fields(child(#name))
+                    .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
+                )
+            }
+        });
     quote! {
         impl #crate_name::AsVTable for #ident #generics #where_clause {
             fn vtable_fields(path: impl #crate_name::path::ComponentPath) -> impl Iterator<Item = #impeller::vtable::builder::FieldBuilder> {

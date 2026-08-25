@@ -10,8 +10,8 @@
 //! `_att`/`_gps` ports. The commanded `ModeCmd` output is the contract's sole user output.
 
 use adcs_contracts::{AttitudeEstimate, Gps, ModeCmd};
-use metor_fsw_2::sequence::{now, progress};
-use metor_fsw_2::{Input, Outcome, Output};
+use metor_fsw_2_core::sequence::{now, progress};
+use metor_fsw_2_core::{Input, Outcome, Output};
 
 /// Command safe and complete. `_att`/`_gps` are the contract inputs the slot shares with
 /// `commissioning` (unused here); `mode` is the commanded-mode output.

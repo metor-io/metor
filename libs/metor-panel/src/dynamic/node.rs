@@ -108,6 +108,8 @@ pub enum BuildError {
     ComponentNotFound(ComponentId),
     #[error("db error: {0}")]
     DbError(String),
+    #[error("{0}")]
+    Expr(String),
 }
 
 /// A live producer task whose output is a fan-out [`Disruptor`].
@@ -298,41 +300,19 @@ impl DynamicNode for NodeImpl {
     }
 }
 
-/// Tag bytes mixed into the hash to disambiguate ops at the same arity. Each
-/// op picks a distinct constant; collisions just produce a different (still
-/// stable) NodeId, but using distinct tags keeps debug logs readable.
+/// Tag bytes mixed into the hash to disambiguate constructors at the same
+/// arity. Each picks a distinct constant; a collision would only produce a
+/// different (still stable) `NodeId`, but distinct tags keep debug logs
+/// readable.
 pub mod op_tag {
     pub const FIXED_RATE_CLOCK: &[u8] = b"clock.fixed_rate";
-    pub const CLOCK_OF: &[u8] = b"clock.of";
-    pub const WAVEFORM: &[u8] = b"gen.waveform";
-    pub const RANDOM: &[u8] = b"gen.random";
-    pub const CONSTANT: &[u8] = b"gen.constant";
-    pub const SCALE: &[u8] = b"derive.scale";
-    pub const OFFSET: &[u8] = b"derive.offset";
-    pub const ABS: &[u8] = b"derive.abs";
-    pub const NEG: &[u8] = b"derive.neg";
-    pub const LOG: &[u8] = b"derive.log";
-    pub const SQRT: &[u8] = b"derive.sqrt";
-    pub const EXP: &[u8] = b"derive.exp";
-    pub const FLOOR: &[u8] = b"derive.floor";
-    pub const WINDOW: &[u8] = b"derive.window";
-    pub const FFT: &[u8] = b"derive.fft";
-    pub const ADD: &[u8] = b"compose.add";
-    pub const SUB: &[u8] = b"compose.sub";
-    pub const MUL: &[u8] = b"compose.mul";
-    pub const DIV: &[u8] = b"compose.div";
-    pub const MEAN: &[u8] = b"compose.mean";
-    pub const PACK: &[u8] = b"compose.pack";
-    pub const DOT: &[u8] = b"compose.dot";
-    pub const MAGNITUDE: &[u8] = b"derive.magnitude";
-    pub const INDEX: &[u8] = b"derive.index";
-    pub const THRESHOLD: &[u8] = b"derive.threshold";
-    pub const DELTA: &[u8] = b"derive.delta";
-    pub const DELTA_T: &[u8] = b"derive.delta_t";
     pub const ZOH: &[u8] = b"resample.zoh";
     pub const LINEAR: &[u8] = b"resample.linear";
     pub const PERSIST: &[u8] = b"persist";
     pub const FROM_DB: &[u8] = b"db_source";
+    pub const EXPR_SYSTEM: &[u8] = b"expr.system";
+    pub const EXPR_FIELD: &[u8] = b"expr.field";
+    pub const EXPR_STAGE: &[u8] = b"expr.stage";
 }
 
 /// Default ring capacity in bytes. Sized per-node from the value byte size

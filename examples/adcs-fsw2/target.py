@@ -31,6 +31,9 @@ from metor_config import (
     VSplit,
     VectorMarker,
     band,
+    f64,
+    node,
+    system,
 )
 from adcs_pack import Ctrl, Nav, Plant
 from adcs_seqs import commissioning, safe_mode
@@ -67,6 +70,18 @@ plant = m.add(
 nav = m.add("nav", Nav(meas_sigma=0.02))
 ctrl = m.add("ctrl", Ctrl(q_weight=5.0, r_weight=8.0, k_desat=0.0005, k_detumble=0.00005))
 
+# A Python system, compiled at build time into an ordinary wasm pack entry
+# and run by the vehicle like any other cyclic system: the measured body-rate
+# magnitude, published as `cube_sat.gyro_norm.gyro_norm`. The decorator only
+# declares it; the `add` registers it, at this position in the step order.
+@system("plant.sensors.gyro_b")
+@node(x=980, y=40)
+def gyro_norm(gyro_b) -> f64:
+    return (gyro_b @ gyro_b) ** 0.5
+
+
+m.add("gyro_norm", gyro_norm)
+
 alarms = m.add(
     "alarms",
     Alarms(alarms=[
@@ -95,19 +110,6 @@ alarms = m.add(
     ]),
 )
 
-# --- the operator dashboard -------------------------------------------------
-#
-# Laid out on an explicit grid: every widget is placed from a column/row
-# constant rather than a literal, so the gutters between them stay uniform and
-# nothing can silently overlap. GUTTER also sets the width of the lanes the
-# schematic connectors run through — a line squeezed against a widget edge
-# reads as a rendering fault rather than as a connection.
-#
-# Instrument scales come from the contract constants, so the panel and the
-# plant agree on what "full" means: RW_MOMENTUM_MAX = 0.04 N·m·s per wheel and
-# MTQ_MAX_DIPOLE = 0.2 A·m² per axis. Warn/critical ticks are *not* set here —
-# the meters and gauges read them from the ADCS_RATE_HIGH and RW_MOMENTUM_HIGH
-# definitions above, so a limit is stated once and shown everywhere.
 RW_MOMENTUM_MAX = 0.04
 MTQ_MAX_DIPOLE = 0.2
 RATE_FULL_SCALE = 0.2  # rad/s, comfortably past the critical rate band
@@ -200,7 +202,7 @@ wheel_meters = [
     Place(
         Meter(
             f"plant.wheels.wheels.{w}.ang_momentum",
-            element=0,
+            element=w,
             label=f"wheel {w}",
             unit="N·m·s",
             min=-RW_MOMENTUM_MAX,
@@ -385,7 +387,7 @@ m.connect(ctrl.mtq_cmd, plant.mtq_cmd, delayed=True)
 
 downlink = m.add("downlink", Downlink(link))
 
-m.route(uplink, mode, msg="SequenceCommand")  #
+m.route(uplink, mode, msg="SequenceCommand")
 m.route(m.coordinator, mode, msg="SequenceCommand")
 m.route(uplink, alarms, msg="AlarmAck")
 m.route(uplink, m.coordinator, msg="ReloadSequences")

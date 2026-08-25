@@ -21,25 +21,24 @@ pub fn componentize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> TokenSt
     // recurse through their own `sink_columns`; a `FrameList`/`FrameMap` slot
     // holds no in-struct value, so its call is a no-op. The timestamp field
     // supplies the frame's time and is never emitted as a component.
-    let sink_calls = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
-        let ident = field.ident.as_ref().expect("only named fields allowed");
-        if field.is_nested() {
-            quote! { self.#ident.sink_columns(output); }
-        } else {
-            let component_id = field.component_name();
-            let component_id = match parent {
-                Some(parent) => format!("{parent}.{component_id}"),
-                None => component_id,
-            };
-            quote! {
-                let _ = output.apply_value(
-                    #impeller::types::ComponentId::new(#component_id),
-                    self.#ident.as_component_view(),
-                    None,
-                );
+    let sink_calls = fields
+        .iter()
+        .filter(|f| !f.timestamp && !f.skipped())
+        .map(|field| {
+            let ident = field.ident.as_ref().expect("only named fields allowed");
+            if field.is_nested() {
+                quote! { self.#ident.sink_columns(output); }
+            } else {
+                let component_id = field.qualified_component_name(parent.as_deref());
+                quote! {
+                    let _ = output.apply_value(
+                        #impeller::types::ComponentId::new(#component_id),
+                        self.#ident.as_component_view(),
+                        None,
+                    );
+                }
             }
-        }
-    });
+        });
 
     // MAX_SIZE covers the fixed region (`size_of::<Self>()` already counts
     // each 8-byte dynamic slot), every dynamic field's trailer budget, and an

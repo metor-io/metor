@@ -77,14 +77,13 @@ let wiring = WiringBuilder::new()
     .build();
 ```
 
-The builder checks local mistakes as calls finish. It panics on faults such as
-a repeated name or an unknown artifact. Serialized IR gets the same checks at
-resolve time and returns a `LoadError`.
+The builder records IR without a second semantic implementation. The resolver
+checks Rust-built and serialized IR alike and returns a `LoadError`.
 
 ## The wiring IR
 
 Both examples produce `Wiring`, a plain data value that serde can read and
-write. The current IR version is 6. A host rejects another version during
+write. The current IR version is 8. A host rejects another version during
 resolve.
 
 The top-level fields are:

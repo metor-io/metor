@@ -34,3 +34,29 @@ pub fn ensure_stubs() -> bool {
         true
     })
 }
+
+/// Re-link a resolved target's dl systems statically: null every cdylib
+/// system's `artifact` (the [`Registry`] factory takes over) and drop
+/// process isolation, which needs an artifact to spawn. A wasm-backed
+/// system — the target's compiled Python — has no static twin and keeps its
+/// artifact.
+#[allow(dead_code)] // each test binary compiles its own copy of this module
+pub fn link_statically(wiring: &mut metor_fsw_2::Wiring) {
+    let wasm_backed: std::collections::HashSet<String> = wiring
+        .artifacts
+        .iter()
+        .filter(|a| a.kind == metor_fsw_2::ir::ArtifactKind::Wasm)
+        .map(|a| a.id.clone())
+        .collect();
+    for spec in &mut wiring.systems {
+        if spec
+            .artifact
+            .as_deref()
+            .is_some_and(|id| wasm_backed.contains(id))
+        {
+            continue;
+        }
+        spec.artifact = None;
+        spec.process = false;
+    }
+}

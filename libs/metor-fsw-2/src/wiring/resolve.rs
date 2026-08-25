@@ -17,28 +17,28 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-
-use miette::SourceSpan;
 
 use metor_proto::types::ComponentId;
 
-use crate::coordinator::init::{InitGraph, Node, SystemBind};
+use crate::coordinator::init::{InitGraph, Node, SystemBind, WasmReg};
 use crate::coordinator::slot::{SlotReg, plan_slot};
 use crate::coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, OccupantBacking,
     PortRef, SlotConfigError, SystemHandle,
 };
-use crate::descriptor::{PortId, SystemDescriptor};
 use crate::dl::DlSystem;
+use metor_fsw_2_core::{PortId, SystemDescriptor};
 
 use super::error::{LoadError, LoadErrorKind};
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, ParamSource,
-    SlotInitState, SlotSpec, SourceRef, StateSpec, SystemSpec, Wiring,
+    SlotInitState, SlotSpec, StateSpec, SystemSpec, Wiring,
 };
 use super::registry::{LoadCtx, Registry, StaticParams};
 use super::{encode_value_params, pack_module, validate};
+use crate::ir::ArtifactKind;
 
 /// One resolved instance after the systems pass.
 struct Instance {
@@ -98,9 +98,8 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 /// is instantiated through the [`Registry`] factory; a dl system is opened
 /// from its built [`Artifact::path`] and registered as a loaded cyclic node.
 ///
-/// A `Wiring` carries no source text (a builder-origin one never had any), so
-/// resolve-time [`LoadError`]s hold a best-effort snippet rather than original
-/// document spans. The error variants are the same either way.
+/// Wiring faults are structured [`LoadError`] variants. Parameter decoding has
+/// its own field-aware error variants.
 pub fn resolve_with(
     wiring: &Wiring,
     registry: &Registry,
@@ -143,7 +142,7 @@ pub fn resolve_with(
     //     an attached entry's create finds its instance in place. Each
     //     construction yields the token a by-name attach downcasts, keyed by
     //     the state's declaration name for the systems pass.
-    let mut state_tokens: HashMap<&str, crate::pack::AttachTarget> = HashMap::new();
+    let mut state_tokens: HashMap<&str, metor_fsw_2_core::AttachTarget> = HashMap::new();
     for spec in &wiring.states {
         let target = resolve_state(spec, registry)?;
         state_tokens.insert(spec.name.as_str(), target);
@@ -168,8 +167,32 @@ pub fn resolve_with(
     // static branch defers; dl systems never carry capabilities.
     let mut deferred: Vec<&SystemSpec> = Vec::new();
     let mut packs = PackCache::default();
+    let mut wasm = WasmCache::default();
+    let mut pending: Vec<PendingSynth> = Vec::new();
     for spec in &wiring.systems {
+        // The artifact's kind picks the loader; the dl and proc arms must
+        // never see a wasm module (dlopen on one would fail obscurely).
+        let wasm_backed = spec.artifact.as_deref().is_some_and(|id| {
+            wiring
+                .artifacts
+                .iter()
+                .any(|a| a.id == id && a.kind == ArtifactKind::Wasm)
+        });
         let (handle, desc) = match (&spec.artifact, spec.process) {
+            (Some(artifact_id), false) if wasm_backed => {
+                resolve_wasm(spec, artifact_id, wiring, &mut wasm, &mut pending, &mut graph)?
+            }
+            (Some(_), true) if wasm_backed => {
+                return Err(LoadErrorKind::WasmSystem(
+                    format!(
+                        "system `{}`: `process=#true` is redundant for a wasm system \
+                         (the interpreter already isolates it)",
+                        spec.name
+                    )
+                    .into_boxed_str(),
+                )
+                .bare());
+            }
             (Some(artifact_id), true) => resolve_proc(spec, artifact_id, wiring, &mut graph)?,
             (Some(artifact_id), false) => {
                 resolve_dl(spec, artifact_id, wiring, &mut packs, &mut graph)?
@@ -192,7 +215,7 @@ pub fn resolve_with(
     // --- Slots pass: a slot `connect`s by name like a system, so it joins
     //     `instances` before the edges pass.
     for slot in &wiring.slots {
-        let (handle, desc) = resolve_slot(slot, wiring, &mut packs, &mut graph)?;
+        let (handle, desc) = resolve_slot(slot, wiring, &mut packs, &mut wasm, &mut graph)?;
         instances.insert(slot.name.clone(), Instance { handle, desc });
     }
 
@@ -201,6 +224,22 @@ pub fn resolve_with(
     for spec in deferred {
         let (handle, desc) = resolve_static(spec, registry, &state_tokens, &mut graph)?;
         instances.insert(spec.name.clone(), Instance { handle, desc });
+    }
+
+    // --- Synthesized edges: the bindings a compiled Python entry bakes are
+    //     wired only now, over the finished instance map, so a spec's list
+    //     position never decides whether its producer is visible. Staleness
+    //     stays uniform with explicit edges: a compiled system listed ahead
+    //     of a producer it reads fails at build like any native pair.
+    let added: HashMap<(&str, &str), &str> = pending
+        .iter()
+        .map(|p| ((p.artifact.as_str(), p.entry.as_str()), p.instance.as_str()))
+        .collect();
+    for p in &pending {
+        let module = &wasm.modules[&p.artifact];
+        let manifest = module.expr.as_ref().expect("pending implies a compiled module");
+        let system = manifest.system(&p.entry).expect("pending keys a manifest entry");
+        synth_edges(system, manifest, &instances, &added, p, &mut graph)?;
     }
 
     // Every declared state must have gained an attachment by now (attach
@@ -217,28 +256,18 @@ pub fn resolve_with(
                 name: spec.name.clone(),
                 ty: spec.ty.clone(),
             }
-            .whole(state_src(spec)));
+            .bare());
         }
     }
 
     // --- Edges pass ------------------------------------------------------
     for edge in &wiring.edges {
-        let arrow = if edge.delayed { "~>" } else { "->" };
-        let src = format!(
-            "connect \"{}\" {arrow} \"{}\" out=\"{}\" in=\"{}\"{}",
-            edge.from,
-            edge.to,
-            edge.out,
-            edge.in_,
-            src_anchor(edge.src.as_ref())
-        );
-        let span: SourceSpan = (0, src.len()).into();
         let (producer, consumer) = match edge.kind {
             EdgeKind::Frame => (
-                resolve_endpoint(&instances, &src, &edge.from, &edge.out, Dir::Out, span)?,
-                resolve_endpoint(&instances, &src, &edge.to, &edge.in_, Dir::In, span)?,
+                resolve_endpoint(&instances, &edge.from, &edge.out, Dir::Out)?,
+                resolve_endpoint(&instances, &edge.to, &edge.in_, Dir::In)?,
             ),
-            EdgeKind::Msg => resolve_msg_edge(&instances, &src, edge, span)?,
+            EdgeKind::Msg => resolve_msg_edge(&instances, edge)?,
         };
         // One `connect` entry point for every edge; its behavior is inferred
         // from the connected ports' descriptors, and `EdgeKind` only picked
@@ -252,23 +281,20 @@ pub fn resolve_with(
         }
     }
 
-    // A `Wiring` is format-independent, so a build-time `WireError` uses its own
-    // rendered message as the diagnostic snippet, not original document spans.
-    graph.build().map_err(|err| {
-        let src = err.to_string();
-        LoadErrorKind::Wire { source: err }.whole(src)
-    })
+    graph
+        .build()
+        .map_err(|source| LoadErrorKind::Wire { source }.bare())
 }
 
 /// Construct one pack-shared state through its registered
 /// [`StateEntry`](crate::StateEntry): decode the spec's params off the value
 /// surface and run the state's init fn. Construction failure (a listener
-/// bind) is a spanned load error, not a runtime one. Returns the
-/// [`AttachTarget`](crate::pack::AttachTarget) a by-name attach downcasts.
+/// bind) is a load error, not a runtime one. Returns the
+/// [`AttachTarget`](metor_fsw_2_core::AttachTarget) a by-name attach downcasts.
 fn resolve_state(
     spec: &StateSpec,
     registry: &Registry,
-) -> Result<crate::pack::AttachTarget, LoadError> {
+) -> Result<metor_fsw_2_core::AttachTarget, LoadError> {
     let Some(entry) = registry.states.get(spec.ty.as_str()) else {
         let mut available: Vec<&str> = registry.states.keys().copied().collect();
         available.sort_unstable();
@@ -277,9 +303,8 @@ fn resolve_state(
             ty: spec.ty.clone(),
             available: available.join(", "),
         }
-        .whole(state_src(spec)));
+        .bare());
     };
-    let snippet = state_src(spec);
     // A paramless spec conforms an empty object against the state's schema,
     // the same all-defaults decode a paramless pack entry gets.
     let empty = serde_json::Value::Object(serde_json::Map::new());
@@ -290,37 +315,27 @@ fn resolve_state(
         ParamSource::Value(value) => value,
         ParamSource::None => &empty,
     };
-    let params = crate::pack::EntryParams::Value {
+    let params = metor_fsw_2_core::EntryParams::Value {
         value,
-        src: &snippet,
+        src: "",
         name: &spec.name,
         msgs: &registry.msgs,
         attach: None,
     };
     entry.borrow_mut().create(params).map_err(|e| match e {
-        crate::pack::MakeError::Params(e) => *e,
+        metor_fsw_2_core::MakeError::Params(e) => (*e).into(),
         other => LoadErrorKind::StateInit {
             name: spec.name.clone(),
             ty: spec.ty.clone(),
             message: other.to_string(),
         }
-        .whole(snippet.clone()),
+        .bare(),
     })?;
     let entry = entry.borrow();
-    Ok(crate::pack::AttachTarget {
+    Ok(metor_fsw_2_core::AttachTarget {
         ty: entry.name(),
         token: entry.token.clone(),
     })
-}
-
-/// A best-effort source snippet for a state spec's errors.
-pub(super) fn state_src(spec: &StateSpec) -> String {
-    format!(
-        "state \"{}\" type=\"{}\"{}",
-        spec.name,
-        spec.ty,
-        src_anchor(spec.src.as_ref())
-    )
 }
 
 /// Instantiate a static system through the [`Registry`] factory.
@@ -331,7 +346,7 @@ pub(super) fn state_src(spec: &StateSpec) -> String {
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
-    state_tokens: &HashMap<&str, crate::pack::AttachTarget>,
+    state_tokens: &HashMap<&str, metor_fsw_2_core::AttachTarget>,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
     // `type=` and non-postcard params are guaranteed for a static system by
@@ -343,7 +358,7 @@ fn resolve_static(
     let factory = registry
         .factories
         .get(ty)
-        .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.whole(system_src(spec)))?;
+        .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.bare())?;
 
     // Attach/shared consistency: a shared-state entry needs an `attach`, and a
     // plain entry must not carry one. `validate` already proved a present
@@ -358,30 +373,23 @@ fn resolve_static(
             return Err(LoadErrorKind::MissingAttach {
                 system: spec.name.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         (false, Some(attach)) => {
             return Err(LoadErrorKind::AttachOnNonSharedSystem {
                 system: spec.name.clone(),
                 attach: attach.to_string(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         (false, None) => None,
     };
 
-    let snippet;
     let params = match &spec.params {
         ParamSource::Postcard(_) => {
             unreachable!("validate() rejects postcard params on a static system")
         }
-        ParamSource::Value(value) => {
-            snippet = system_src(spec);
-            StaticParams::Value {
-                value,
-                src: &snippet,
-            }
-        }
+        ParamSource::Value(value) => StaticParams::Value(value),
         ParamSource::None => StaticParams::None,
     };
     let node = (factory.factory)(&mut LoadCtx {
@@ -411,11 +419,9 @@ impl PackCache {
         wiring: &Wiring,
         artifact_id: &str,
         owner: &str,
-        src: &str,
-        span: SourceSpan,
     ) -> Result<&crate::dl::DlPack, LoadError> {
         if !self.packs.contains_key(artifact_id) {
-            let artifact = find_built_artifact(wiring, artifact_id, owner, src, span)?;
+            let artifact = find_built_artifact(wiring, artifact_id, owner)?;
             let path = artifact
                 .path
                 .as_ref()
@@ -426,12 +432,338 @@ impl PackCache {
                     artifact: artifact_id.to_string(),
                     source: Box::new(source),
                 }
-                .at(src, span)
+                .bare()
             })?;
             self.packs.insert(artifact_id.to_string(), pack);
         }
         Ok(&self.packs[artifact_id])
     }
+}
+
+/// The per-resolve cache of described wasm artifacts, the [`PackCache`] twin:
+/// bytes read once, the pack manifest decoded through a short-lived describe
+/// instance, and — for a compiled Python pack — the expr manifest read
+/// alongside, since edge synthesis and `@rng` seeding both key off it.
+#[derive(Default)]
+struct WasmCache {
+    modules: HashMap<String, WasmModule>,
+}
+
+/// One described wasm artifact.
+struct WasmModule {
+    bytes: Arc<Vec<u8>>,
+    entries: Vec<metor_fsw_2_core::abi::PackEntryDesc>,
+    /// The expr manifest a compiled Python pack also bakes; `None` for an
+    /// ordinary Rust-authored pack.
+    expr: Option<metor_expr::Manifest>,
+}
+
+impl WasmCache {
+    /// The described module for `artifact_id`, reading and describing it on
+    /// first use.
+    fn open(
+        &mut self,
+        wiring: &Wiring,
+        artifact_id: &str,
+        owner: &str,
+        max_memory: usize,
+    ) -> Result<&WasmModule, LoadError> {
+        if !self.modules.contains_key(artifact_id) {
+            let bad = |detail: String| {
+                LoadErrorKind::WasmSystem(
+                    format!("`{owner}`: wasm artifact `{artifact_id}`: {detail}").into_boxed_str(),
+                )
+                .bare()
+            };
+            let artifact = find_built_artifact(wiring, artifact_id, owner)?;
+            let path = artifact
+                .path
+                .as_ref()
+                .expect("checked by find_built_artifact");
+            let bytes =
+                std::fs::read(path).map_err(|e| bad(format!("reading {}: {e}", path.display())))?;
+            let mut pack = crate::wasm::WasmPack::open_with_memory_limit(
+                &bytes,
+                crate::coordinator::slot::WASM_SETUP_FUEL,
+                max_memory,
+            )
+            .map_err(|e| bad(e.to_string()))?;
+            let entries = pack.manifest().systems.clone();
+            let expr = match pack.expr_manifest_bytes().map_err(|e| bad(e.to_string()))? {
+                Some(manifest) => Some(
+                    metor_expr::describe(&manifest)
+                        .map_err(|e| bad(format!("expr manifest: {e}")))?,
+                ),
+                None => None,
+            };
+            self.modules.insert(
+                artifact_id.to_string(),
+                WasmModule {
+                    bytes: Arc::new(bytes),
+                    entries,
+                    expr,
+                },
+            );
+        }
+        Ok(&self.modules[artifact_id])
+    }
+}
+
+/// Select a wasm entry by name (or the sole export when the spec named
+/// none), the wasm shape of [`resolve_occupant`]'s select step.
+fn wasm_entry<'e>(
+    entries: &'e [metor_fsw_2_core::abi::PackEntryDesc],
+    ty: Option<&str>,
+    bad: &dyn Fn(String) -> LoadError,
+) -> Result<(u32, &'e metor_fsw_2_core::abi::PackEntryDesc), LoadError> {
+    let available = || {
+        entries
+            .iter()
+            .map(|e| e.descriptor.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match ty {
+        Some(name) => entries
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.descriptor.name == name)
+            .map(|(i, e)| (i as u32, e))
+            .ok_or_else(|| {
+                bad(format!(
+                    "module exports no `{name}` entry (available: {})",
+                    available()
+                ))
+            }),
+        None => match entries {
+            [only] => Ok((0, only)),
+            _ => Err(bad(format!(
+                "`type=` is required (module exports: {})",
+                available()
+            ))),
+        },
+    }
+}
+
+/// One compiled Python instance awaiting edge synthesis, recorded during the
+/// systems pass and wired after every instance is registered.
+struct PendingSynth {
+    artifact: String,
+    /// The pack entry (declaration) name — the manifest's key.
+    entry: String,
+    /// The instance name of this registration, the spec's own (possibly
+    /// scope-prefixed, and free to differ from the entry name).
+    instance: String,
+    handle: SystemHandle,
+}
+
+/// Resolve a wired wasm system (plan D6): describe the artifact once per
+/// resolve, select the entry, encode its params — a compiled Python entry
+/// with an `@rng` slot takes a host-entropy seed on the params channel
+/// instead (plan D9) — and register it. The edges its compiled bindings
+/// imply (plan D7) are queued on `pending` and synthesized after the systems
+/// pass.
+fn resolve_wasm(
+    spec: &SystemSpec,
+    artifact_id: &str,
+    wiring: &Wiring,
+    wasm: &mut WasmCache,
+    pending: &mut Vec<PendingSynth>,
+    graph: &mut InitGraph,
+) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
+    let max_memory = graph.config.wasm_memory_limit_bytes;
+    let module = wasm.open(wiring, artifact_id, &spec.name, max_memory)?;
+    let bad = |detail: String| {
+        LoadErrorKind::WasmSystem(
+            format!(
+                "system `{}` (artifact `{artifact_id}`): {detail}",
+                spec.name
+            )
+            .into_boxed_str(),
+        )
+        .bare()
+    };
+    let (index, entry) = wasm_entry(&module.entries, spec.ty.as_deref(), &bad)?;
+    let compiled = module
+        .expr
+        .as_ref()
+        .and_then(|m| m.system(&entry.descriptor.name));
+    let params = match compiled {
+        Some(system)
+            if system
+                .state
+                .iter()
+                .any(|s| s.name == metor_expr::state::RNG_FIELD) =>
+        {
+            // Fresh per boot and distinct per instance; the guest's `create`
+            // stores it into the `@rng` slot before the seed guard runs.
+            let entropy =
+                metor_proto::types::Timestamp::now().0 as u64 ^ ComponentId::new(&spec.name).0;
+            entropy.to_le_bytes().to_vec()
+        }
+        _ => encode_occupant_params(
+            &spec.params,
+            &entry.params_schema,
+            entry.params_default.as_deref(),
+            &spec.name,
+        )?,
+    };
+    let desc = entry.descriptor.clone();
+    let handle = graph.add_wasm_cyclic(
+        &spec.name,
+        desc.clone(),
+        WasmReg {
+            bytes: module.bytes.clone(),
+            index,
+            params,
+        },
+    );
+    if compiled.is_some() {
+        pending.push(PendingSynth {
+            artifact: artifact_id.to_string(),
+            entry: desc.name.to_string(),
+            instance: spec.name.clone(),
+            handle,
+        });
+    }
+    Ok((handle, desc))
+}
+
+/// Wire the edges a compiled entry's bindings imply (plan D7): one edge per
+/// distinct producing port, in the same first-appearance order the compiler
+/// grouped the descriptor's inputs by. The two walks share their key — the
+/// binding list — so a mismatch is artifact/wiring drift and fails loudly.
+/// A `Produced` binding names a *declaration*; `added` maps it to the
+/// instance the declaration was registered under.
+fn synth_edges(
+    system: &metor_expr::System,
+    manifest: &metor_expr::Manifest,
+    instances: &HashMap<String, Instance>,
+    added: &HashMap<(&str, &str), &str>,
+    p: &PendingSynth,
+    graph: &mut InitGraph,
+) -> Result<(), LoadError> {
+    let owner = p.instance.as_str();
+    let consumer = p.handle;
+    let desc = &instances[&p.instance].desc;
+    let drift = |detail: String| {
+        LoadErrorKind::WasmSystem(format!("Python system `{owner}`: {detail}").into_boxed_str())
+            .bare()
+    };
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for port in &system.inputs {
+        for binding in &port.bindings {
+            let key = match binding {
+                metor_expr::Binding::Component(path) => locate_producer(instances, path, owner)?,
+                metor_expr::Binding::Produced { system: s, .. } => {
+                    let producer = &manifest.systems[*s];
+                    let instance = added
+                        .get(&(p.artifact.as_str(), producer.name.as_str()))
+                        .ok_or_else(|| {
+                            drift(format!(
+                                "bound declaration `{}` is not registered as a system",
+                                producer.name
+                            ))
+                        })?;
+                    (instance.to_string(), producer.output.name.clone())
+                }
+                metor_expr::Binding::Resampled { .. } => {
+                    return Err(drift(
+                        "artifact carries a resample stage the build gate rejects".into(),
+                    ));
+                }
+            };
+            if seen.contains(&key) {
+                continue;
+            }
+            let Some(input) = desc.inputs.get(seen.len()) else {
+                return Err(drift(format!(
+                    "bindings imply more input ports than the descriptor's {}",
+                    desc.inputs.len()
+                )));
+            };
+            if input.name != key.1 {
+                return Err(drift(format!(
+                    "descriptor input `{}` does not match bound producer port `{}.{}`",
+                    input.name, key.0, key.1
+                )));
+            }
+            let producer = instances.get(&key.0).ok_or_else(|| {
+                LoadErrorKind::UnknownInstance {
+                    name: key.0.clone(),
+                }
+                .bare()
+            })?;
+            let out = producer
+                .desc
+                .outputs
+                .iter()
+                .find(|p| p.name == key.1)
+                .ok_or_else(|| LoadErrorKind::UnknownFrame {
+                    instance: key.0.clone(),
+                    frame: key.1.clone(),
+                })
+                .map_err(LoadErrorKind::bare)?;
+            graph.connect(
+                PortRef {
+                    system: producer.handle,
+                    port: out.id(),
+                },
+                PortRef {
+                    system: consumer,
+                    port: input.id(),
+                },
+            );
+            seen.push(key);
+        }
+    }
+    if seen.len() != desc.inputs.len() {
+        return Err(drift(format!(
+            "bindings imply {} input ports, the descriptor declares {}",
+            seen.len(),
+            desc.inputs.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The producing `(instance, port)` behind a bound component path: the
+/// longest registered instance name prefixing the path, then the output port
+/// whose name heads the remainder.
+fn locate_producer(
+    instances: &HashMap<String, Instance>,
+    path: &str,
+    owner: &str,
+) -> Result<(String, String), LoadError> {
+    let bad = |detail: String| {
+        LoadErrorKind::WasmSystem(
+            format!("Python system `{owner}`: bound component `{path}` {detail}").into_boxed_str(),
+        )
+        .bare()
+    };
+    let mut best: Option<&str> = None;
+    for name in instances.keys() {
+        if path.starts_with(name.as_str())
+            && path.as_bytes().get(name.len()) == Some(&b'.')
+            && best.is_none_or(|b| name.len() > b.len())
+        {
+            best = Some(name);
+        }
+    }
+    let instance = best.ok_or_else(|| bad("names no registered instance".into()))?;
+    let rest = &path[instance.len() + 1..];
+    let port = instances[instance]
+        .desc
+        .outputs
+        .iter()
+        .find(|p| {
+            rest == p.name
+                || rest
+                    .strip_prefix(p.name.as_str())
+                    .is_some_and(|r| r.starts_with('.'))
+        })
+        .ok_or_else(|| bad(format!("names no output port of `{instance}`")))?;
+    Ok((instance.to_string(), port.name.clone()))
 }
 
 /// The two ways an artifact self-describes at resolve: a pack opened in
@@ -444,7 +776,7 @@ pub(super) enum EntrySource<'a> {
     },
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Described {
-        entries: &'a [crate::abi::PackEntryDesc],
+        entries: &'a [metor_fsw_2_core::abi::PackEntryDesc],
         artifact: &'a str,
     },
 }
@@ -529,8 +861,6 @@ pub(super) fn resolve_occupant(
     params: &ParamSource,
     owner: &str,
     require_reloadable: bool,
-    src: &str,
-    span: SourceSpan,
 ) -> Result<(OccupantEntry, Vec<u8>), LoadError> {
     let name = match entry {
         Some(name) => name,
@@ -540,7 +870,7 @@ pub(super) fn resolve_occupant(
                 artifact: source.artifact().to_string(),
                 available: source.entry_names().join(", "),
             }
-            .at(src, span)
+            .bare()
         })?,
     };
     let pack_system = |source: crate::dl::DlError| {
@@ -548,14 +878,14 @@ pub(super) fn resolve_occupant(
             system: owner.to_string(),
             source: Box::new(source),
         }
-        .at(src, span)
+        .bare()
     };
     let not_reloadable = || {
         LoadErrorKind::OccupantNotReloadable {
             slot: owner.to_string(),
             occupant: name.to_string(),
         }
-        .at(src, span)
+        .bare()
     };
     match source {
         EntrySource::Opened { pack, .. } => {
@@ -625,22 +955,13 @@ fn resolve_dl(
     packs: &mut PackCache,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    let src = system_src(spec);
-    let span: SourceSpan = (0, src.len()).into();
-    let pack = packs.open(wiring, artifact_id, &spec.name, &src, span)?;
+    let pack = packs.open(wiring, artifact_id, &spec.name)?;
     let source = EntrySource::Opened {
         pack,
         artifact: artifact_id,
     };
-    let (entry, params) = resolve_occupant(
-        &source,
-        spec.ty.as_deref(),
-        &spec.params,
-        &spec.name,
-        false,
-        &src,
-        span,
-    )?;
+    let (entry, params) =
+        resolve_occupant(&source, spec.ty.as_deref(), &spec.params, &spec.name, false)?;
     let loaded = entry.opened();
     let desc = loaded.descriptor().clone();
     let handle = graph.add_dl_cyclic(&spec.name, loaded, params);
@@ -653,8 +974,6 @@ fn find_built_artifact<'w>(
     wiring: &'w Wiring,
     artifact_id: &str,
     owner: &str,
-    src: &str,
-    span: SourceSpan,
 ) -> Result<&'w Artifact, LoadError> {
     let artifact = wiring
         .artifacts
@@ -665,13 +984,13 @@ fn find_built_artifact<'w>(
                 system: owner.to_string(),
                 artifact: artifact_id.to_string(),
             }
-            .at(src, span)
+            .bare()
         })?;
     if artifact.path.is_none() {
         return Err(LoadErrorKind::ArtifactNotBuilt {
             artifact: artifact_id.to_string(),
         }
-        .at(src, span));
+        .bare());
     }
     Ok(artifact)
 }
@@ -689,9 +1008,7 @@ fn resolve_proc(
     wiring: &Wiring,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    let src = system_src(spec);
-    let span: SourceSpan = (0, src.len()).into();
-    let artifact = find_built_artifact(wiring, artifact_id, &spec.name, &src, span)?;
+    let artifact = find_built_artifact(wiring, artifact_id, &spec.name)?;
     let path = artifact
         .path
         .as_ref()
@@ -702,25 +1019,18 @@ fn resolve_proc(
             artifact: artifact_id.to_string(),
             detail,
         }
-        .at(src.clone(), span)
+        .bare()
     };
     let bytes = crate::proc::host::describe_via_worker(None, path)
         .map_err(|e| proc_describe(e.to_string()))?;
-    let entries: Vec<crate::abi::PackEntryDesc> =
+    let entries: Vec<metor_fsw_2_core::abi::PackEntryDesc> =
         crate::dl::decode_pack_manifest(&bytes).map_err(|e| proc_describe(e.to_string()))?;
     let source = EntrySource::Described {
         entries: &entries,
         artifact: artifact_id,
     };
-    let (entry, params) = resolve_occupant(
-        &source,
-        spec.ty.as_deref(),
-        &spec.params,
-        &spec.name,
-        false,
-        &src,
-        span,
-    )?;
+    let (entry, params) =
+        resolve_occupant(&source, spec.ty.as_deref(), &spec.params, &spec.name, false)?;
     let desc = entry.described();
     let entry_name = desc.name.to_string();
     let handle = graph.add_proc_cyclic(&spec.name, desc.clone(), path.clone(), entry_name, params);
@@ -738,7 +1048,7 @@ fn resolve_proc(
     Err(LoadErrorKind::ProcessUnsupported {
         name: spec.name.clone(),
     }
-    .whole(system_src(spec)))
+    .bare())
 }
 
 /// Enforce generated-stub freshness: for each artifact whose stub module
@@ -754,17 +1064,13 @@ fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
         let Some(path) = artifact.path.as_deref() else {
             continue;
         };
-        // The live manifest is the sidecar the build driver wrote (no dlopen);
-        // absent that, describe the built object in process — resolve dlopens
-        // it momentarily anyway.
-        let bytes = match crate::dl::manifest_sidecar_bytes(path) {
-            Some(bytes) => bytes,
-            None => match crate::dl::describe_raw(path) {
-                Ok(bytes) => bytes,
-                // A describe failure is not a staleness verdict; let the
-                // dlopen path surface the real load error.
-                Err(_) => continue,
-            },
+        // Prefer the build driver's sidecar (no dlopen); otherwise describe in
+        // process. A describe failure is not a staleness verdict, so let the
+        // later dlopen path surface it.
+        let Some(bytes) =
+            crate::dl::manifest_sidecar_bytes(path).or_else(|| crate::dl::describe_raw(path).ok())
+        else {
+            continue;
         };
         if pack_module::manifest_hash(&bytes) != recorded {
             return Err(LoadErrorKind::StaleStubs {
@@ -776,57 +1082,35 @@ fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// The ` @ file:line:col` suffix locating a spec in its source document, or
-/// nothing for a spec with no recorded [`SourceRef`] (the Rust builder).
-pub(super) fn src_anchor(src: Option<&SourceRef>) -> String {
-    match src {
-        Some(SourceRef {
-            file: Some(file),
-            line,
-            col,
-        }) => format!("  @ {file}:{line}:{col}"),
-        Some(SourceRef {
-            file: None,
-            line,
-            col,
-        }) => format!("  @ {line}:{col}"),
-        None => String::new(),
-    }
-}
-
-/// A best-effort source snippet for a system's resolve-time errors (a
-/// [`Wiring`] carries no original document text, only [`SourceRef`] anchors).
-pub(super) fn system_src(spec: &SystemSpec) -> String {
-    let anchor = src_anchor(spec.src.as_ref());
-    match &spec.ty {
-        Some(ty) => format!("system \"{}\" type=\"{}\"{anchor}", spec.name, ty),
-        None => format!("system \"{}\"{anchor}", spec.name),
-    }
-}
-
-/// A best-effort source snippet for a slot's resolve-time errors.
-pub(super) fn slot_src(slot: &SlotSpec) -> String {
-    format!("slot \"{}\"{}", slot.name, src_anchor(slot.src.as_ref()))
-}
-
 /// The artifact whose pack exports `occ.occupant`: the `artifact=` the allow
 /// line named, or (absent one) the unique artifact exporting an entry of
 /// that name. No match or more than one is a clean error either way.
 fn occupant_artifact(
     wiring: &Wiring,
     packs: &mut PackCache,
+    wasm: &mut WasmCache,
     occ: &AllowedOccupantSpec,
     slot: &str,
-    src: &str,
-    span: SourceSpan,
+    max_memory: usize,
 ) -> Result<String, LoadError> {
     if let Some(artifact) = &occ.artifact {
         return Ok(artifact.clone());
     }
     let mut matches: Vec<String> = Vec::new();
     for artifact in &wiring.artifacts {
-        let pack = packs.open(wiring, &artifact.id, slot, src, span)?;
-        if pack.system_names().any(|n| n == occ.occupant) {
+        // A wasm artifact is described through the interpreter, never dlopened.
+        let exports = if artifact.kind == ArtifactKind::Wasm {
+            wasm.open(wiring, &artifact.id, slot, max_memory)?
+                .entries
+                .iter()
+                .any(|e| e.descriptor.name == occ.occupant)
+        } else {
+            packs
+                .open(wiring, &artifact.id, slot)?
+                .system_names()
+                .any(|n| n == occ.occupant)
+        };
+        if exports {
             matches.push(artifact.id.clone());
         }
     }
@@ -837,43 +1121,35 @@ fn occupant_artifact(
             occupant: occ.occupant.clone(),
             matches,
         }
-        .at(src, span)),
+        .bare()),
     }
 }
 
 /// Map a [`SlotConfigError`] — from the shared pure-spec validation or from
-/// [`plan_slot`](crate::coordinator::slot::plan_slot) — onto this front-end's spanned slot
-/// diagnostics.
-pub(super) fn slot_config_error(
-    err: SlotConfigError,
-    slot: &SlotSpec,
-    src: &str,
-    span: SourceSpan,
-) -> LoadError {
+/// [`plan_slot`](crate::coordinator::slot::plan_slot) — onto the resolver's
+/// public error variants.
+pub(super) fn slot_config_error(err: SlotConfigError, slot: &SlotSpec) -> LoadError {
     let name = slot.name.clone();
-    let src = src.to_string();
     match err {
-        SlotConfigError::Empty => LoadErrorKind::EmptySlot { slot: name }.at(src, span),
+        SlotConfigError::Empty => LoadErrorKind::EmptySlot { slot: name }.bare(),
         SlotConfigError::UnknownInitial { occupant, allowed } => {
             LoadErrorKind::UnknownInitialOccupant {
                 slot: name,
                 occupant,
                 allowed,
             }
-            .at(src, span)
+            .bare()
         }
         // A mount-reserved port and a declared capability are
         // occupant-contract defects too: the occupant cannot honor the
         // slot's contract as declared.
         SlotConfigError::OccupantMismatch { occupant, .. }
         | SlotConfigError::ReservedPort { occupant, .. }
-        | SlotConfigError::CapabilityOccupant { occupant } => {
-            LoadErrorKind::SlotOccupantMismatch {
-                slot: name,
-                occupant,
-            }
-            .at(src, span)
+        | SlotConfigError::CapabilityOccupant { occupant } => LoadErrorKind::SlotOccupantMismatch {
+            slot: name,
+            occupant,
         }
+        .bare(),
         SlotConfigError::MixedBacking => {
             unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
         }
@@ -885,39 +1161,89 @@ pub(super) fn slot_config_error(
 /// [`describe_occupants`]), and the descriptor returned for the edges pass is
 /// the one [`plan_slot`](crate::coordinator::slot::plan_slot) derives, not a
 /// raw occupant descriptor.
+/// Describe one wasm occupant: open the module under the interpreter, find the
+/// named entry in its manifest, and encode its params.
+///
+/// The module is opened only to be *described* — the returned backing carries
+/// its path, and the slot loads a fresh instance per `Load`.
+fn resolve_wasm_occupant(
+    art: &crate::ir::Artifact,
+    module: &WasmModule,
+    occ: &crate::ir::AllowedOccupantSpec,
+    slot: &str,
+) -> Result<AllowedOccupant, LoadError> {
+    let bad = |detail: String| {
+        LoadErrorKind::WasmOccupant(
+            format!(
+                "slot `{slot}`: wasm occupant `{}` from artifact `{}`: {detail}",
+                occ.occupant, art.id
+            )
+            .into_boxed_str(),
+        )
+        .bare()
+    };
+    let path = art
+        .path
+        .as_ref()
+        .ok_or_else(|| bad("wasm artifact has no path".into()))?;
+    let (_, e) = wasm_entry(&module.entries, Some(&occ.occupant), &bad)?;
+    let params = match &occ.params {
+        ParamSource::None => e.params_default.clone().unwrap_or_default(),
+        ParamSource::Postcard(bytes) => bytes.clone(),
+        ParamSource::Value(value) => metor_fsw_2_core::params::encode_value_params(
+            value,
+            &e.params_schema,
+            &occ.occupant,
+            e.params_default.as_deref(),
+        )
+        .map_err(|err| bad(err.to_string()))?,
+    };
+    Ok(AllowedOccupant {
+        name: occ.occupant.clone(),
+        params,
+        descriptor: e.descriptor.clone(),
+        backing: OccupantBacking::Wasm {
+            path: path.clone(),
+            entry_identity: crate::wasm::entry_identity(e),
+        },
+    })
+}
+
 fn resolve_slot(
     slot: &SlotSpec,
     wiring: &Wiring,
     packs: &mut PackCache,
+    wasm: &mut WasmCache,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    let src = slot_src(slot);
-    let span: SourceSpan = (0, src.len()).into();
-
     // The pure-spec checks (non-empty allow set, `initial` inside it) ran in
     // `validate` before any artifact was opened. Open and param-encode each
     // allowed occupant; a process slot takes the describe-worker path instead,
     // and the backing decides the slot's mode in `plan_slot`.
     let allowed: Vec<AllowedOccupant> = if slot.process {
-        describe_occupants(slot, wiring, &src, span)?
+        describe_occupants(slot, wiring)?
     } else {
+        let max_memory = graph.config.wasm_memory_limit_bytes;
         let mut allowed = Vec::with_capacity(slot.allow.len());
         for occ in &slot.allow {
-            let artifact_id = occupant_artifact(wiring, packs, occ, &slot.name, &src, span)?;
-            let pack = packs.open(wiring, &artifact_id, &slot.name, &src, span)?;
+            let artifact_id = occupant_artifact(wiring, packs, wasm, occ, &slot.name, max_memory)?;
+            // A wasm artifact is read as bytes and described through the
+            // interpreter, not `dlopen`ed: its manifest comes from the module
+            // itself, so nothing about it enters this process's address space.
+            if let Some(art) = wiring.artifacts.iter().find(|a| a.id == artifact_id)
+                && art.kind == crate::ir::ArtifactKind::Wasm
+            {
+                let module = wasm.open(wiring, &artifact_id, &slot.name, max_memory)?;
+                allowed.push(resolve_wasm_occupant(art, module, occ, &slot.name)?);
+                continue;
+            }
+            let pack = packs.open(wiring, &artifact_id, &slot.name)?;
             let source = EntrySource::Opened {
                 pack,
                 artifact: &artifact_id,
             };
-            let (entry, params) = resolve_occupant(
-                &source,
-                Some(&occ.occupant),
-                &occ.params,
-                &slot.name,
-                true,
-                &src,
-                span,
-            )?;
+            let (entry, params) =
+                resolve_occupant(&source, Some(&occ.occupant), &occ.params, &slot.name, true)?;
             allowed.push(AllowedOccupant::dl(
                 occ.occupant.clone(),
                 entry.opened(),
@@ -927,21 +1253,15 @@ fn resolve_slot(
         allowed
     };
 
-    let initial = slot.initial.as_ref().map(|i| match i.state {
-        SlotInitState::Loaded => InitialOccupant {
-            occupant: i.occupant.clone(),
-            start: false,
-        },
-        SlotInitState::Running => InitialOccupant {
-            occupant: i.occupant.clone(),
-            start: true,
-        },
+    let initial = slot.initial.as_ref().map(|i| InitialOccupant {
+        occupant: i.occupant.clone(),
+        start: i.state == SlotInitState::Running,
     });
 
     // `plan_slot` is the one place the registered contract is derived and the
     // descriptor-level checks run, so this front-end cannot drift from it.
     let (registered, ports, process) =
-        plan_slot(&slot.name, &allowed).map_err(|e| slot_config_error(e, slot, &src, span))?;
+        plan_slot(&slot.name, &allowed).map_err(|e| slot_config_error(e, slot))?;
     let desc = registered.clone();
     let handle = graph.push_node(Node {
         name: slot.name.clone(),
@@ -959,33 +1279,23 @@ fn resolve_slot(
     // sequence channels) is not part of the user contract; the edge outputs
     // do include the implicit status and log tail, which a declaration may
     // name but need not.
-    use crate::descriptor::PortConn;
-    for frame in &slot.inputs {
-        if !desc
-            .inputs
-            .iter()
-            .any(|p| p.conn == PortConn::Edge && &p.name == frame)
-        {
-            return Err(LoadErrorKind::SlotContractMismatch {
-                slot: slot.name.clone(),
-                dir: "input",
-                frame: frame.clone(),
+    use metor_fsw_2_core::PortConn;
+    for (dir, frames, ports) in [
+        ("input", &slot.inputs, &desc.inputs),
+        ("output", &slot.outputs, &desc.outputs),
+    ] {
+        for frame in frames {
+            if !ports
+                .iter()
+                .any(|p| p.conn == PortConn::Edge && &p.name == frame)
+            {
+                return Err(LoadErrorKind::SlotContractMismatch {
+                    slot: slot.name.clone(),
+                    dir,
+                    frame: frame.clone(),
+                }
+                .bare());
             }
-            .at(src.clone(), span));
-        }
-    }
-    for frame in &slot.outputs {
-        if !desc
-            .outputs
-            .iter()
-            .any(|p| p.conn == PortConn::Edge && &p.name == frame)
-        {
-            return Err(LoadErrorKind::SlotContractMismatch {
-                slot: slot.name.clone(),
-                dir: "output",
-                frame: frame.clone(),
-            }
-            .at(src.clone(), span));
         }
     }
 
@@ -998,27 +1308,20 @@ fn resolve_slot(
 /// [`OccupantBacking::Artifact`], which is what makes [`plan_slot`] register
 /// the slot process-mode.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn describe_occupants(
-    slot: &SlotSpec,
-    wiring: &Wiring,
-    src: &str,
-    span: SourceSpan,
-) -> Result<Vec<AllowedOccupant>, LoadError> {
+fn describe_occupants(slot: &SlotSpec, wiring: &Wiring) -> Result<Vec<AllowedOccupant>, LoadError> {
     // Manifests by artifact id, so a slot allowing several entries of one
     // pack runs one describe worker for it, not one per occupant.
-    let mut manifests: HashMap<String, Vec<crate::abi::PackEntryDesc>> = HashMap::new();
+    let mut manifests: HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>> = HashMap::new();
     fn describe(
-        manifests: &mut HashMap<String, Vec<crate::abi::PackEntryDesc>>,
+        manifests: &mut HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>>,
         wiring: &Wiring,
         slot: &SlotSpec,
         artifact_id: &str,
-        src: &str,
-        span: SourceSpan,
     ) -> Result<(), LoadError> {
         if manifests.contains_key(artifact_id) {
             return Ok(());
         }
-        let artifact = find_built_artifact(wiring, artifact_id, &slot.name, src, span)?;
+        let artifact = find_built_artifact(wiring, artifact_id, &slot.name)?;
         let path = artifact
             .path
             .as_ref()
@@ -1029,7 +1332,7 @@ fn describe_occupants(
                 artifact: artifact_id.to_string(),
                 detail,
             }
-            .at(src, span)
+            .bare()
         };
         let bytes = crate::proc::host::describe_via_worker(None, path)
             .map_err(|e| proc_describe(e.to_string()))?;
@@ -1048,7 +1351,7 @@ fn describe_occupants(
             Some(id) => id.clone(),
             None => {
                 for artifact in &wiring.artifacts {
-                    describe(&mut manifests, wiring, slot, &artifact.id, src, span)?;
+                    describe(&mut manifests, wiring, slot, &artifact.id)?;
                 }
                 let matches: Vec<String> = manifests
                     .iter()
@@ -1065,26 +1368,19 @@ fn describe_occupants(
                             occupant: occ.occupant.clone(),
                             matches,
                         }
-                        .at(src, span));
+                        .bare());
                     }
                 }
             }
         };
-        describe(&mut manifests, wiring, slot, &artifact_id, src, span)?;
+        describe(&mut manifests, wiring, slot, &artifact_id)?;
         let source = EntrySource::Described {
             entries: &manifests[&artifact_id],
             artifact: &artifact_id,
         };
-        let (entry, params) = resolve_occupant(
-            &source,
-            Some(&occ.occupant),
-            &occ.params,
-            &slot.name,
-            true,
-            src,
-            span,
-        )?;
-        let artifact = find_built_artifact(wiring, &artifact_id, &slot.name, src, span)?;
+        let (entry, params) =
+            resolve_occupant(&source, Some(&occ.occupant), &occ.params, &slot.name, true)?;
+        let artifact = find_built_artifact(wiring, &artifact_id, &slot.name)?;
         let path = artifact
             .path
             .as_ref()
@@ -1105,13 +1401,11 @@ fn describe_occupants(
 fn describe_occupants(
     slot: &SlotSpec,
     _wiring: &Wiring,
-    src: &str,
-    span: SourceSpan,
 ) -> Result<Vec<AllowedOccupant>, LoadError> {
     Err(LoadErrorKind::ProcessUnsupported {
         name: slot.name.clone(),
     }
-    .at(src, span))
+    .bare())
 }
 
 /// Convert the serializable [`CoordinatorSpec`] into the runtime
@@ -1123,6 +1417,20 @@ fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadE
     };
     if let Some(depth) = spec.default_depth {
         config.default_depth = depth;
+    }
+    if let Some(fuel) = spec.wasm_fuel_per_poll {
+        if fuel == 0 {
+            return Err(LoadErrorKind::InvalidWasmFuel.bare());
+        }
+        config.wasm_fuel_per_poll = fuel;
+    }
+    if let Some(bytes) = spec.wasm_memory_limit_bytes {
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| LoadErrorKind::InvalidWasmMemory { bytes }.bare())?;
+        if bytes == 0 {
+            return Err(LoadErrorKind::InvalidWasmMemory { bytes: 0 }.bare());
+        }
+        config.wasm_memory_limit_bytes = bytes;
     }
     config.clock = match spec.clock {
         ClockSpec::Wall => ClockMode::Wall,
@@ -1148,28 +1456,26 @@ fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadE
 /// [`UnknownMsg`](LoadErrorKind::UnknownMsg).
 fn resolve_msg_edge(
     instances: &HashMap<String, Instance>,
-    src: &str,
     edge: &EdgeSpec,
-    span: SourceSpan,
 ) -> Result<(PortRef, PortRef), LoadError> {
     let inst = |name: &str| {
         instances.get(name).ok_or_else(|| {
             LoadErrorKind::UnknownInstance {
                 name: name.to_string(),
             }
-            .at(src, span)
+            .bare()
         })
     };
     let prod = inst(&edge.from)?;
     let cons = inst(&edge.to)?;
 
-    let by_name = |ports: &[crate::descriptor::PortDesc], token: &str| {
+    let by_name = |ports: &[metor_fsw_2_core::PortDesc], token: &str| {
         ports
             .iter()
             .find(|p| matches!(p.id(), PortId::Packet(_)) && p.name == token)
             .map(|p| p.id())
     };
-    let by_id = |ports: &[crate::descriptor::PortDesc], id: PortId| {
+    let by_id = |ports: &[metor_fsw_2_core::PortDesc], id: PortId| {
         ports.iter().find(|p| p.id() == id).map(|p| p.id())
     };
     let unknown = |instance: &str, msg: &str| {
@@ -1177,7 +1483,7 @@ fn resolve_msg_edge(
             instance: instance.to_string(),
             msg: msg.to_string(),
         }
-        .at(src, span)
+        .bare()
     };
 
     let p_named = by_name(&prod.desc.outputs, &edge.out);
@@ -1210,17 +1516,15 @@ fn resolve_msg_edge(
 /// name against the instance descriptor's port list so a typo is a load error.
 fn resolve_endpoint(
     instances: &HashMap<String, Instance>,
-    src: &str,
     name: &str,
     port_name: &str,
     dir: Dir,
-    span: SourceSpan,
 ) -> Result<PortRef, LoadError> {
     let inst = instances.get(name).ok_or_else(|| {
         LoadErrorKind::UnknownInstance {
             name: name.to_string(),
         }
-        .at(src, span)
+        .bare()
     })?;
     let ports = match dir {
         Dir::Out => &inst.desc.outputs,
@@ -1232,7 +1536,7 @@ fn resolve_endpoint(
             instance: name.to_string(),
             frame: port_name.to_string(),
         }
-        .at(src, span));
+        .bare());
     }
     Ok(PortRef {
         system: inst.handle,

@@ -5,7 +5,7 @@
 //! (each a [`Node`]: its type-erased [`SystemBind`], its descriptor, its
 //! instance name), the edges between their ports, and the run-scoped overrides.
 //! [`build`](InitGraph::build) runs the passes in order — validation, edge resolution, fan-out
-//! counting, ring allocation, registry freeze, copy-in planning, bind — each
+//! counting, ring allocation, registry freeze, async-boundary planning, bind — each
 //! handing its product to the next, and assembles the `Coordinator` literal.
 //!
 //! # Ordering invariants
@@ -34,16 +34,16 @@
 //! ([`WireError::FeedbackCycle`]). One-cycle-late sampling is therefore always
 //! a declared decision, never an accident of registration order. Log edges
 //! carry decoupled event/command streams with no same-cycle dependency and are
-//! exempt from both rules, as are edges touching an async endpoint.
+//! exempt from both rules. Async boundaries participate in registration order
+//! exactly like cyclic systems.
 //!
-//! # Async systems and copy-ins
+//! # Async system boundaries
 //!
 //! An async system runs on its own task, off the cycle clock, so it cannot be
-//! step-gated. Each of its edge-connected snapshot inputs is decoupled through
-//! a private ring: after the cyclic step loop, the coordinator mirrors the
-//! newest upstream record into the private ring, whose data notifier wakes the
-//! task's parked `recv`. Log inputs need no copy-in; they read the producers'
-//! rings directly and are poll-drained.
+//! step-gated. Its inputs and outputs are decoupled through private rings. At
+//! the system's registration position the coordinator imports graph inputs,
+//! then exports work produced before that boundary. The local cooperative task
+//! cannot run between those operations, so graph visibility is deterministic.
 //!
 //! # Reader budgets
 //!
@@ -72,23 +72,26 @@ use metor_proto_wkt::{
     ReloadSequences, SequenceChannelSpec, SequenceCommand, SequenceRegistry, WiringManifest,
 };
 
-use crate::binder::{AnySource, BindPorts, Binder};
-use crate::descriptor::{
+use crate::async_system::AsyncSystem;
+use crate::io_bridge::{IoBridge, RingPump};
+use crate::proc::session::SessionDir;
+use metor_fsw_2_core::capacity_for;
+use metor_fsw_2_core::{AnySource, BindPorts, Binder, BoundInput, BoundPort};
+use metor_fsw_2_core::{CyclicRunner, CyclicSystem, HealthOutput};
+use metor_fsw_2_core::{
     Delivery, FanIn, PortConn, PortDesc, PortSchema, SystemDescriptor, SystemKind, compatible,
 };
-use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
-use crate::port::capacity_for;
-use crate::proc::session::SessionDir;
-use crate::registry::{Registry, RegistryEntry};
-use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, HealthOutput};
+use metor_fsw_2_core::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
+use metor_fsw_2_core::{Registry, RegistryEntry};
 
 use super::bind::{ProcBindCtx, bind_systems};
 use super::slot::SlotReg;
 use super::{
-    AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, ClockMode, CoordChannels, Coordinator,
-    CoordinatorConfig, CoordinatorStatus, CopyIn, CyclicSlot, NAME_CAP, PortRef, RingEntry,
-    RingTable, SlotState, SystemHandle, WireError,
+    AsyncBoundary, AsyncLauncher, AsyncSlot, BoundSystems, BufferRole, ClockMode, CoordChannels,
+    Coordinator, CoordinatorConfig, CoordinatorStatus, PortRef, RingEntry, RingTable, SystemHandle,
+    WireError,
 };
+use metor_fsw_2_core::{CyclicSlot, NAME_CAP, SlotState};
 
 // ---------------------------------------------------------------------------
 // Registration (type erasure of the boxed systems)
@@ -141,19 +144,19 @@ where
 }
 
 /// A pack entry as a cyclic registration: the bind-phase
-/// [`Pending`](crate::pack::Pending) plus the entry's static display name, so a
+/// [`Pending`](metor_fsw_2_core::Pending) plus the entry's static display name, so a
 /// pack entry rides the ordinary cyclic path with no dedicated `SystemBind`
 /// variant.
 struct PendingDriver {
-    pending: crate::pack::Pending,
+    pending: metor_fsw_2_core::Pending,
     entry_name: &'static str,
 }
 
 impl CyclicRegistration for PendingDriver {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
         let mut src = AnySource::Host(binder);
-        let driver = (self.pending)(&mut src, crate::pack::Mount::Wired);
-        Box::new(crate::pack::DriverSlot {
+        let driver = (self.pending)(&mut src, metor_fsw_2_core::Mount::Wired);
+        Box::new(metor_fsw_2_core::DriverSlot {
             driver,
             name: self.entry_name,
             state: SlotState::Running,
@@ -179,6 +182,17 @@ pub(crate) struct ProcReg {
     pub(crate) system: String,
 }
 
+/// A registered wired wasm system: the module bytes (shared across every
+/// entry the artifact serves), the entry to instantiate, and its postcard
+/// params. At [`build`](InitGraph::build) it becomes a
+/// [`WasmCyclic`](crate::wasm::WasmCyclic) with its own interpreter instance.
+pub(crate) struct WasmReg {
+    pub(crate) bytes: Arc<Vec<u8>>,
+    /// Manifest position of the entry, resolved by name at resolve time.
+    pub(crate) index: u32,
+    pub(crate) params: Vec<u8>,
+}
+
 pub(crate) enum SystemBind {
     /// The coordinator itself, system #0: a marker registration whose bind arm
     /// wraps the allocated rings into the coordinator's own fields (it is never
@@ -194,6 +208,9 @@ pub(crate) enum SystemBind {
     /// A cross-process cyclic system, spawned as a worker and bound to a
     /// [`ProcSlot`](crate::proc) at [`build`](InitGraph::build).
     Proc(ProcReg),
+    /// A wired wasm pack entry, bound to a
+    /// [`WasmCyclic`](crate::wasm::WasmCyclic) at [`build`](InitGraph::build).
+    Wasm(WasmReg),
     /// A runtime-swappable slot, bound to a [`SlotRunner`](super::slot::SlotRunner) at [`build`](InitGraph::build).
     Slot(SlotReg),
 }
@@ -243,9 +260,9 @@ where
 /// runs at [`build`](InitGraph::build) along the ordinary cyclic path (via [`PendingDriver`]).
 pub(crate) fn pending_node(
     name: String,
-    entry: &mut crate::pack::PackEntry,
-    params: crate::pack::EntryParams<'_>,
-) -> Result<Node, crate::pack::MakeError> {
+    entry: &mut metor_fsw_2_core::PackEntry,
+    params: metor_fsw_2_core::EntryParams<'_>,
+) -> Result<Node, metor_fsw_2_core::MakeError> {
     let created = entry.create(params)?;
     let desc = created
         .instance_desc
@@ -423,6 +440,19 @@ impl InitGraph {
         )
     }
 
+    /// Register a wired wasm pack entry under an explicit instance name.
+    pub(crate) fn add_wasm_cyclic(
+        &mut self,
+        name: impl Into<String>,
+        mut descriptor: SystemDescriptor,
+        reg: WasmReg,
+    ) -> SystemHandle {
+        // Cyclic-only, pinned here like the dl path: the registered kind is
+        // never trusted from decoded wire bytes.
+        descriptor.kind = SystemKind::Cyclic;
+        self.push_system(descriptor, name.into(), SystemBind::Wasm(reg))
+    }
+
     /// Register a cross-process cyclic system under an explicit instance name.
     pub(crate) fn add_proc_cyclic(
         &mut self,
@@ -491,14 +521,13 @@ impl InitGraph {
 
     /// Receive-all (telemetry) systems must register last. The downlink's
     /// end-of-cycle snapshot only observes systems stepping before it, so a
-    /// cyclic system registered after it would telemeter one cycle stale.
-    /// Enforced, not silently reordered: reordering registrations would change
-    /// the step order the stale-edge diagnostics validate. Async systems are
-    /// exempt (they run off their own task, not the registration-ordered loop).
+    /// participant registered after it would telemeter one cycle stale.
+    /// Enforced, not silently reordered: async boundaries export at their
+    /// registration position just like cyclic systems publish at theirs.
     fn validate_receive_all_last(&self) -> Result<(), WireError> {
         let mut first_receive_all: Option<usize> = None;
         for (s, sys) in self.systems.iter().enumerate() {
-            if sys.desc.kind != SystemKind::Cyclic {
+            if !matches!(sys.desc.kind, SystemKind::Cyclic | SystemKind::Async) {
                 continue;
             }
             let has_receive_all = sys
@@ -649,12 +678,12 @@ impl InitGraph {
         }
 
         // --- Registration order must agree with the dataflow ------------------
-        // A backward non-delayed snapshot edge between cyclic systems would
+        // A backward non-delayed snapshot edge between scheduled systems would
         // read last cycle's value forever: silent staleness that must be
         // declared with `connect_delayed`. Checked after cycle detection so an
-        // unbroken loop reports the clearer `FeedbackCycle`. Log edges and
-        // async endpoints are exempt (no step-order semantics); self-edges
-        // never reach here (rejected above as a one-member cycle).
+        // unbroken loop reports the clearer `FeedbackCycle`. Log edges remain
+        // order-independent; self-edges never reach here (rejected above as a
+        // one-member cycle).
         for (p, c, delayed) in &self.edges {
             if *delayed {
                 continue;
@@ -669,8 +698,8 @@ impl InitGraph {
             if in_delivery != Some(Delivery::Snapshot) {
                 continue;
             }
-            let both_cyclic = prod.kind == SystemKind::Cyclic && cons.kind == SystemKind::Cyclic;
-            if both_cyclic && c.system.id < p.system.id {
+            let scheduled = |kind| matches!(kind, SystemKind::Cyclic | SystemKind::Async);
+            if scheduled(prod.kind) && scheduled(cons.kind) && c.system.id < p.system.id {
                 return Err(WireError::StaleFrameEdge {
                     producer: prod.name.clone(),
                     consumer: cons.name.clone(),
@@ -831,32 +860,21 @@ impl InitGraph {
                 } else {
                     alloc_ring(port.delivery, port.max_size, depth, readers)
                 };
-                match &port.schema {
-                    PortSchema::Table { .. } => {
-                        alloc
-                            .reg_entries
-                            .push(registry_entry(&instance, port, ring.clone()));
-                        alloc.table.rings.push(RingEntry {
-                            ring: ring.clone(),
-                            frame_id: port
-                                .id()
-                                .component()
-                                .expect("table port keys on a ComponentId"),
-                            role,
-                            instance: Some(instance),
-                        });
-                    }
-                    PortSchema::Postcard { .. } => {
-                        let entry = registry_entry(&instance, port, ring.clone());
-                        alloc.table.rings.push(RingEntry {
-                            ring: ring.clone(),
-                            frame_id: entry.key,
-                            role,
-                            instance: Some(instance),
-                        });
-                        alloc.reg_entries.push(entry);
-                    }
-                }
+                let entry = registry_entry(&instance, port, ring.clone());
+                let frame_id = match &port.schema {
+                    PortSchema::Table { .. } => port
+                        .id()
+                        .component()
+                        .expect("table port keys on a ComponentId"),
+                    PortSchema::Postcard { .. } => entry.key,
+                };
+                alloc.table.rings.push(RingEntry {
+                    ring: ring.clone(),
+                    frame_id,
+                    role,
+                    instance: Some(instance),
+                });
+                alloc.reg_entries.push(entry);
                 row.push(ring);
             }
             alloc.output_rings.push(row);
@@ -898,7 +916,7 @@ impl InitGraph {
                         .expect("v1 host-connected inputs are table ports"),
                     role: BufferRole::Private {
                         system: sid,
-                        input: in_idx,
+                        port: in_idx,
                     },
                     instance: Some(instance.clone()),
                 });
@@ -926,56 +944,102 @@ impl InitGraph {
         SequenceRegistry { channels }
     }
 
-    /// Private copy-in buffers for async snapshot inputs, each with the matched
-    /// data `Notifier` the async `recv` parks on (see the module docs); log
-    /// inputs read the producers' rings directly, with no copy-in.
-    fn plan_copy_ins(&self, cons_edges: &ConsEdges, alloc: &mut RingAlloc) -> AsyncPlumbing {
+    /// Build one isolated, bidirectional ring boundary per async system.
+    fn plan_async_io(&self, cons_edges: &ConsEdges, alloc: &mut RingAlloc) -> AsyncPlumbing {
         let depth = self.config.default_depth;
-        let slack = self.config.reader_slack;
         let mut plumbing = AsyncPlumbing {
-            private_inputs: HashMap::new(),
-            copy_ins: Vec::new(),
+            plans: HashMap::new(),
         };
         for (sid, sys) in self.systems.iter().enumerate() {
             if sys.desc.kind != SystemKind::Async {
                 continue;
             }
+
+            let mut imports = Vec::new();
+            let mut bound_inputs = Vec::with_capacity(sys.desc.inputs.len());
             for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
-                // Only edge-connected snapshot inputs are copy-in decoupled; a
-                // Host/SelfTap input is fed by its runner, not a producer edge.
-                if port.delivery == Delivery::Log || port.conn != PortConn::Edge {
-                    continue;
+                assert_eq!(
+                    port.conn,
+                    PortConn::Edge,
+                    "async systems expose only edge-connected typed inputs"
+                );
+                let producers = cons_edges
+                    .get(&(sid, in_idx))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let mut ports = Vec::with_capacity(producers.len());
+                for &(prod_id, out_idx) in producers {
+                    let private = alloc_ring(port.delivery, port.max_size, depth, 1);
+                    let data = Notifier::default();
+                    let writer = private
+                        .writer(data.clone())
+                        .expect("async private input has one boundary writer");
+                    let upstream = alloc.output_rings[prod_id][out_idx]
+                        .view(NoWake)
+                        .expect("producer reader slot reserved at sizing time");
+                    imports.push(RingPump::new(upstream, writer, port.delivery));
+                    ports.push(BoundPort::matched(private.clone(), Box::new(data.clone())));
+                    alloc.table.rings.push(RingEntry {
+                        ring: private,
+                        frame_id: port
+                            .id()
+                            .component()
+                            .unwrap_or_else(|| ComponentId::new(&port.name)),
+                        role: BufferRole::Private {
+                            system: sid,
+                            port: in_idx,
+                        },
+                        instance: Some(self.qualify(&sys.name)),
+                    });
                 }
-                let (prod_id, out_idx) = cons_edges[&(sid, in_idx)][0];
-                let private = alloc_ring(port.delivery, port.max_size, depth, 1 + slack);
-                let data = Notifier::default();
-                let writer = private
-                    .writer(data.clone())
-                    .expect("private copy-in ring has exactly one writer");
-                let upstream = alloc.output_rings[prod_id][out_idx]
-                    .view(NoWake)
-                    .expect("producer reader slot reserved at sizing time");
-                plumbing.copy_ins.push(CopyIn {
-                    upstream,
-                    writer,
-                    last_committed: u64::MAX,
+                bound_inputs.push(match port.fan_in {
+                    FanIn::One => BoundInput::One(
+                        ports
+                            .pop()
+                            .expect("edge validation connected this async input"),
+                    ),
+                    FanIn::Many => BoundInput::Many(ports),
                 });
-                plumbing
-                    .private_inputs
-                    .insert((sid, in_idx), (private.clone(), data.clone()));
+            }
+
+            let mut exports = Vec::with_capacity(sys.desc.outputs.len());
+            let mut bound_outputs = Vec::with_capacity(sys.desc.outputs.len());
+            for (out_idx, port) in sys.desc.outputs.iter().enumerate() {
+                let private = alloc_ring(port.delivery, port.max_size, depth, 1);
+                let source = private
+                    .view(NoWake)
+                    .expect("async private output has one boundary reader");
+                let public = alloc.output_rings[sid][out_idx]
+                    .writer(NoWake)
+                    .expect("async boundary owns the public output writer");
+                exports.push(RingPump::new(source, public, port.delivery));
+                bound_outputs.push(BoundPort::new(private.clone()));
                 alloc.table.rings.push(RingEntry {
                     ring: private,
                     frame_id: port
                         .id()
                         .component()
-                        .expect("copy-in inputs are table ports"),
+                        .unwrap_or_else(|| ComponentId::new(&port.name)),
                     role: BufferRole::Private {
                         system: sid,
-                        input: in_idx,
+                        port: out_idx,
                     },
                     instance: Some(self.qualify(&sys.name)),
                 });
             }
+
+            let boundary = AsyncBoundary::new(
+                Arc::<str>::from(sys.name.as_str()),
+                IoBridge::new(imports, exports),
+            );
+            plumbing.plans.insert(
+                sid,
+                AsyncIoPlan {
+                    inputs: bound_inputs,
+                    outputs: bound_outputs,
+                    boundary,
+                },
+            );
         }
         plumbing
     }
@@ -985,7 +1049,7 @@ impl InitGraph {
     ///
     /// One orchestrator over named passes, each handing its product to the
     /// next: validation, edge resolution, fan-out counting, ring allocation,
-    /// registry freeze, copy-in planning, bind.
+    /// registry freeze, async-boundary planning, bind.
     pub(crate) fn build(self) -> Result<Coordinator, WireError> {
         let init_span = tracing::info_span!("init");
         let _init_span = init_span.enter();
@@ -1002,7 +1066,7 @@ impl InitGraph {
         tracing::debug!(rings = alloc.reg_entries.len(), "rings allocated");
         let seq_registry = self.seq_registry_payload();
         let registry = freeze_registry(std::mem::take(&mut alloc.reg_entries))?;
-        let mut plumbing = self.plan_copy_ins(&cons_edges, &mut alloc);
+        let mut plumbing = self.plan_async_io(&cons_edges, &mut alloc);
         let InitGraph {
             config,
             systems,
@@ -1015,6 +1079,8 @@ impl InitGraph {
             worker_exe,
             max_restarts: config.proc_max_restarts,
             restart_backoff: config.proc_restart_backoff,
+            wasm_fuel_per_poll: config.wasm_fuel_per_poll,
+            wasm_memory_limit_bytes: config.wasm_memory_limit_bytes,
         };
         let BoundSystems {
             cyclic,
@@ -1038,7 +1104,6 @@ impl InitGraph {
             config,
             cyclic,
             pending_async,
-            copy_ins: plumbing.copy_ins,
             coord_health: coord.health,
             status_out: coord.status_out,
             stopped: Vec::new(),
@@ -1066,7 +1131,7 @@ impl InitGraph {
 
 /// The one connection map, `(consumer, input-index)` to the producer endpoints
 /// explicitly wired into it. Product of [`InitGraph::solve_edges`]; consumed by
-/// fan-out counting, copy-in planning, and the bind pass.
+/// fan-out counting, async-boundary planning, and the bind pass.
 pub(crate) type ConsEdges = HashMap<(usize, usize), Vec<(usize, usize)>>;
 
 /// The ring-allocation pass product: the canonical owning [`RingTable`], one
@@ -1090,11 +1155,16 @@ pub(crate) struct RingAlloc {
     pub(crate) host_input_paths: HashMap<(usize, usize), PathBuf>,
 }
 
-/// The copy-in planning product: each async snapshot input's private ring plus
-/// matched data notifier and the copy-in jobs.
+/// One async system's private typed ports and its graph-visible cycle boundary.
+pub(crate) struct AsyncIoPlan {
+    pub(crate) inputs: Vec<BoundInput>,
+    pub(crate) outputs: Vec<BoundPort>,
+    pub(crate) boundary: AsyncBoundary,
+}
+
+/// Async I/O plans keyed by the system's registration position.
 pub(crate) struct AsyncPlumbing {
-    pub(crate) private_inputs: HashMap<(usize, usize), (RingBuffer, Notifier)>,
-    pub(crate) copy_ins: Vec<CopyIn>,
+    pub(crate) plans: HashMap<usize, AsyncIoPlan>,
 }
 
 /// Freeze the one registry every consumer's bind pulls. Frames and channels
@@ -1236,10 +1306,10 @@ const COORDINATOR_INSTANCE: &str = "coordinator";
 /// Build a [`RegistryEntry`] for one buffer: the instance-qualified key over a
 /// clone of the port's descriptor and a clone of the ring as the read source.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer) -> RegistryEntry {
-    RegistryEntry {
-        key: ComponentId::new(&format!("{instance}.{}", port.name)),
-        instance: Arc::from(instance),
-        desc: port.clone(),
+    RegistryEntry::new(
+        ComponentId::new(&format!("{instance}.{}", port.name)),
+        Arc::from(instance),
+        port.clone(),
         ring,
-    }
+    )
 }

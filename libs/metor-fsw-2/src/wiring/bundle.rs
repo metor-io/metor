@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::abi::FSW_ABI_VERSION;
+use metor_fsw_2_core::abi::FSW_ABI_VERSION;
 
 use super::model::Wiring;
 
@@ -334,7 +334,7 @@ fn bundle_members(
             .ok_or_else(|| BundleError::NotBuilt {
                 artifact: artifact.id.clone(),
             })?;
-        let cdylib = member_cdylib_name(opts.target.as_deref(), &artifact.lib);
+        let cdylib = member_artifact_name(opts.target.as_deref(), artifact);
         let so_bytes = fs::read(src).map_err(io_at(src))?;
         packs.push(PackProvenance {
             artifact_id: artifact.id.clone(),
@@ -387,14 +387,18 @@ fn bundle_members(
     Ok(members)
 }
 
-/// The member file name of an artifact's shared object: derived from the
-/// bundle's recorded target triple, or the host's convention when the bundle
-/// records none (in which case the load-time triple check is skipped too, so
-/// writer and reader agree by the same fallback).
-fn member_cdylib_name(target: Option<&str>, lib: &str) -> String {
-    match target {
-        Some(triple) => super::cdylib_file_name_for(triple, lib),
-        None => super::cdylib_file_name(lib),
+/// The member file name of an artifact's loadable: a cdylib's is derived
+/// from the bundle's recorded target triple (or the host's convention when
+/// the bundle records none — the load-time triple check is skipped by the
+/// same fallback, so writer and reader agree); a wasm module is one
+/// arch-neutral `<id>.wasm` regardless of triple.
+fn member_artifact_name(target: Option<&str>, artifact: &super::model::Artifact) -> String {
+    match artifact.kind {
+        crate::ir::ArtifactKind::Wasm => format!("{}.wasm", artifact.id),
+        crate::ir::ArtifactKind::Cdylib => match target {
+            Some(triple) => super::cdylib_file_name_for(triple, &artifact.lib),
+            None => super::cdylib_file_name(&artifact.lib),
+        },
     }
 }
 
@@ -512,7 +516,7 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
         })?;
 
     for artifact in &mut wiring.artifacts {
-        let cdylib = member_cdylib_name(meta.target.as_deref(), &artifact.lib);
+        let cdylib = member_artifact_name(meta.target.as_deref(), artifact);
         validate_member_name(&cdylib)?;
         let so = dir.join(&cdylib);
         if !so.exists() {

@@ -27,7 +27,7 @@ use crate::wiring::{ClockSpec, Wiring};
 /// full default format. The default filter passes `cargo`/`build` at `INFO`,
 /// which `RUST_LOG` overrides for debugging. Runtime events at `INFO` and up
 /// are additionally forwarded onto the downlink as `LogEvent`s
-/// ([`crate::logfwd`]); the build/cargo UI streams stay terminal-only.
+/// ([`metor_fsw_2_core::logfwd`]); the build/cargo UI streams stay terminal-only.
 pub(super) fn init_tracing() {
     let indicatif_layer = IndicatifLayer::new().with_progress_style(
         ProgressStyle::with_template("{span_child_prefix}{spinner} {msg} {elapsed}")
@@ -68,7 +68,7 @@ pub(super) fn init_tracing() {
                 .with_filter(events)
                 .with_filter(filter_fn(move |meta| !ui(meta))),
         )
-        .with(crate::logfwd::forward_layer().with_filter(forward))
+        .with(metor_fsw_2_core::logfwd::forward_layer().with_filter(forward))
         .init();
 }
 

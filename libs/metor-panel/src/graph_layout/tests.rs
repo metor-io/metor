@@ -142,23 +142,6 @@ fn anchors_fan_out_in_heading_order() {
 }
 
 /// Offset pins are honored verbatim rather than fanned.
-#[test]
-fn offset_pins_bypass_fanning() {
-    let nodes = vec![node(168.0, 100.0), node(168.0, 100.0)];
-    let edges = vec![LayoutEdge {
-        from: 0,
-        to: 1,
-        from_pin: PinAnchor::Offset(50.0),
-        to_pin: PinAnchor::Offset(36.0),
-        ranked: true,
-    }];
-    let out = lr(&nodes, &edges);
-    assert_eq!(out.routes[0].source.1, out.positions[0].1 + 50.0);
-    assert_eq!(out.routes[0].target.1, out.positions[1].1 + 36.0);
-    assert_eq!(out.routes[0].source.0, out.positions[0].0 + 168.0);
-    assert_eq!(out.routes[0].target.0, out.positions[1].0);
-}
-
 fn unranked(from: usize, to: usize) -> LayoutEdge {
     LayoutEdge {
         ranked: false,

@@ -9,16 +9,11 @@
 //! (unknown types, manifest freshness, occupant/entry resolution, a built
 //! artifact path) stays in resolve, next to what it needs.
 //!
-//! The per-item helpers are `pub(crate)` so the builder can call the same
-//! logic at insert time and panic on violation: a builder-produced `Wiring`
-//! always passes [`validate`], so the panic can never fire on a wiring that
-//! reached resolve through the builder.
-
-use miette::SourceSpan;
+use std::collections::HashSet;
 
 use super::model::IR_VERSION;
-use super::model::{Artifact, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
-use super::resolve::{slot_config_error, slot_src, src_anchor, state_src, system_src};
+use super::model::{ArtifactKind, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
+use super::resolve::slot_config_error;
 use super::{LoadError, LoadErrorKind};
 use crate::coordinator::validate_slot_spec;
 
@@ -36,11 +31,79 @@ pub(crate) fn validate(wiring: &Wiring) -> Result<(), LoadError> {
     for state in &wiring.states {
         check_state(state)?;
     }
+    check_artifact_fields(wiring)?;
+    check_program(wiring)?;
     for spec in &wiring.systems {
         check_system(spec, wiring)?;
     }
     for slot in &wiring.slots {
         check_slot(slot, wiring)?;
+    }
+    Ok(())
+}
+
+/// Per-artifact field rules the kind implies: a cdylib is built (or located)
+/// through cargo, so it must name a crate and a lib stem; a program-built
+/// wasm artifact requires the captured program it compiles from.
+fn check_artifact_fields(wiring: &Wiring) -> Result<(), LoadError> {
+    for artifact in &wiring.artifacts {
+        if artifact.kind == ArtifactKind::Cdylib
+            && (artifact.crate_name.is_empty() || artifact.lib.is_empty())
+        {
+            return Err(LoadErrorKind::ArtifactMissingCrate {
+                id: artifact.id.clone(),
+            }
+            .bare());
+        }
+        if artifact.is_program() && wiring.program.is_none() {
+            return Err(LoadErrorKind::ProgramArtifactWithoutProgram {
+                id: artifact.id.clone(),
+            }
+            .bare());
+        }
+    }
+    Ok(())
+}
+
+/// The captured program's structural rules: declaration names are unique
+/// (a program-built entry addresses its declaration by name), and every
+/// system loading from the program artifact references one.
+fn check_program(wiring: &Wiring) -> Result<(), LoadError> {
+    if let Some(program) = &wiring.program {
+        let mut seen = HashSet::new();
+        for decl in &program.decls {
+            if !seen.insert(&decl.name) {
+                return Err(LoadErrorKind::DuplicateProgramDecl {
+                    name: decl.name.clone(),
+                }
+                .bare());
+            }
+        }
+    }
+    let program_ids: HashSet<&str> = wiring
+        .artifacts
+        .iter()
+        .filter(|a| a.is_program())
+        .map(|a| a.id.as_str())
+        .collect();
+    for spec in &wiring.systems {
+        let Some(artifact) = spec.artifact.as_deref() else {
+            continue;
+        };
+        if !program_ids.contains(artifact) {
+            continue;
+        }
+        let entry = spec.ty.as_deref().unwrap_or(spec.name.as_str());
+        let declared = wiring
+            .program
+            .as_ref()
+            .is_some_and(|p| p.decls.iter().any(|d| d.name == entry));
+        if !declared {
+            return Err(LoadErrorKind::ProgramUnknownDecl {
+                name: entry.to_string(),
+            }
+            .bare());
+        }
     }
     Ok(())
 }
@@ -80,27 +143,18 @@ fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
 }
 
 /// Instance names — systems and slots in one flat namespace, plus the reserved
-/// coordinator — must be unique. This is the whole-wiring twin of
-/// [`check_instance_available`], which the builder runs per insert.
+/// coordinator — must be unique.
 fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
-    let mut seen: Vec<&str> = vec![RESERVED_INSTANCE];
-    for spec in &wiring.systems {
-        if seen.contains(&spec.name.as_str()) {
-            return Err(LoadErrorKind::DuplicateInstance {
-                name: spec.name.clone(),
-            }
-            .whole(system_src(spec)));
+    let mut seen = HashSet::from([RESERVED_INSTANCE]);
+    for name in wiring
+        .systems
+        .iter()
+        .map(|spec| &spec.name)
+        .chain(wiring.slots.iter().map(|slot| &slot.name))
+    {
+        if !seen.insert(name) {
+            return Err(LoadErrorKind::DuplicateInstance { name: name.clone() }.bare());
         }
-        seen.push(&spec.name);
-    }
-    for slot in &wiring.slots {
-        if seen.contains(&slot.name.as_str()) {
-            return Err(LoadErrorKind::DuplicateInstance {
-                name: slot.name.clone(),
-            }
-            .whole(slot_src(slot)));
-        }
-        seen.push(&slot.name);
     }
     Ok(())
 }
@@ -108,15 +162,14 @@ fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
 /// Artifact ids must be unique: a system's `artifact=` and a slot's `allow`
 /// address a pack by id, so a duplicate would silently shadow.
 fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen = HashSet::new();
     for artifact in &wiring.artifacts {
-        if seen.contains(&artifact.id.as_str()) {
+        if !seen.insert(&artifact.id) {
             return Err(LoadErrorKind::DuplicateArtifact {
                 id: artifact.id.clone(),
             }
-            .whole(artifact_src(artifact)));
+            .bare());
         }
-        seen.push(&artifact.id);
     }
     Ok(())
 }
@@ -125,24 +178,22 @@ fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
 /// instance (the pack declared one cell), so a second spec of either kind
 /// could only shadow or double-construct.
 fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
-    let mut names: Vec<&str> = Vec::new();
-    let mut types: Vec<&str> = Vec::new();
+    let mut names = HashSet::new();
+    let mut types = HashSet::new();
     for state in &wiring.states {
-        if names.contains(&state.name.as_str()) || types.contains(&state.ty.as_str()) {
+        if !names.insert(&state.name) || !types.insert(&state.ty) {
             return Err(LoadErrorKind::DuplicateState {
                 name: state.name.clone(),
             }
-            .whole(state_src(state)));
+            .bare());
         }
-        names.push(&state.name);
-        types.push(&state.ty);
     }
     Ok(())
 }
 
 /// One state spec's structural rules: states construct on the static value
 /// path only, so typed postcard params cannot reach one.
-pub(crate) fn check_state(state: &StateSpec) -> Result<(), LoadError> {
+fn check_state(state: &StateSpec) -> Result<(), LoadError> {
     if matches!(state.params, ParamSource::Postcard(_)) {
         return Err(LoadErrorKind::StateInit {
             name: state.name.clone(),
@@ -150,7 +201,7 @@ pub(crate) fn check_state(state: &StateSpec) -> Result<(), LoadError> {
             message: "typed postcard params cannot construct a state (states decode value trees)"
                 .into(),
         }
-        .whole(state_src(state)));
+        .bare());
     }
     Ok(())
 }
@@ -158,7 +209,7 @@ pub(crate) fn check_state(state: &StateSpec) -> Result<(), LoadError> {
 /// One system spec's structural rules: a named artifact must exist, a
 /// `process` system must name one, and a static system must carry a `type` and
 /// no [`ParamSource::Postcard`] (the static path has no postcard decoder).
-pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
+fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
     // An `attach` must name a declared state, and only a static system can hold
     // one — a loaded/process pack cannot own shared state (the pack ABI forbids
     // it). The static shared-vs-plain check needs the registry and lives in
@@ -169,14 +220,14 @@ pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), Loa
                 system: spec.name.clone(),
                 attach: attach.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         if spec.artifact.is_some() {
             return Err(LoadErrorKind::AttachOnNonSharedSystem {
                 system: spec.name.clone(),
                 attach: attach.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
     }
     match (&spec.artifact, spec.process) {
@@ -186,28 +237,28 @@ pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), Loa
                     system: spec.name.clone(),
                     artifact: artifact.clone(),
                 }
-                .whole(system_src(spec)));
+                .bare());
             }
         }
         (None, true) => {
             return Err(LoadErrorKind::ProcessNeedsArtifact {
                 name: spec.name.clone(),
             }
-            .whole(system_src(spec)));
+            .bare());
         }
         (None, false) => {
             let Some(ty) = spec.ty.as_deref() else {
                 return Err(LoadErrorKind::MissingType {
                     name: spec.name.clone(),
                 }
-                .whole(system_src(spec)));
+                .bare());
             };
             if matches!(spec.params, ParamSource::Postcard(_)) {
                 return Err(LoadErrorKind::StaticPostcardParams {
                     system: spec.name.clone(),
                     ty: ty.to_string(),
                 }
-                .whole(system_src(spec)));
+                .bare());
             }
         }
     }
@@ -217,10 +268,10 @@ pub(crate) fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), Loa
 /// One slot spec's structural rules: a non-empty allow set with the `initial`
 /// name inside it ([`validate_slot_spec`]), and every `allow` that names an
 /// artifact references a declared one.
-pub(crate) fn check_slot(slot: &SlotSpec, wiring: &Wiring) -> Result<(), LoadError> {
-    check_slot_spec(slot)?;
-    let src = slot_src(slot);
-    let span: SourceSpan = (0, src.len()).into();
+fn check_slot(slot: &SlotSpec, wiring: &Wiring) -> Result<(), LoadError> {
+    let names: Vec<&str> = slot.allow.iter().map(|a| a.occupant.as_str()).collect();
+    validate_slot_spec(&names, slot.initial.as_ref().map(|i| i.occupant.as_str()))
+        .map_err(|e| slot_config_error(e, slot))?;
     for occ in &slot.allow {
         if let Some(artifact) = &occ.artifact
             && !artifact_exists(wiring, artifact)
@@ -229,65 +280,10 @@ pub(crate) fn check_slot(slot: &SlotSpec, wiring: &Wiring) -> Result<(), LoadErr
                 system: slot.name.clone(),
                 artifact: artifact.clone(),
             }
-            .at(src.clone(), span));
+            .bare());
         }
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Per-item helpers the builder calls at insert time.
-// ---------------------------------------------------------------------------
-
-/// A new instance `name` must not collide with an existing system, slot, or
-/// the reserved coordinator. Spanless: the builder formats it into a panic.
-pub(crate) fn check_instance_available(wiring: &Wiring, name: &str) -> Result<(), LoadError> {
-    if name == RESERVED_INSTANCE
-        || wiring.systems.iter().any(|s| s.name == name)
-        || wiring.slots.iter().any(|s| s.name == name)
-    {
-        return Err(LoadErrorKind::DuplicateInstance {
-            name: name.to_string(),
-        }
-        .bare());
-    }
-    Ok(())
-}
-
-/// A new artifact `id` must not duplicate a declared one.
-pub(crate) fn check_artifact_id_available(wiring: &Wiring, id: &str) -> Result<(), LoadError> {
-    if artifact_exists(wiring, id) {
-        return Err(LoadErrorKind::DuplicateArtifact { id: id.to_string() }.bare());
-    }
-    Ok(())
-}
-
-/// An `artifact=`/`allow_from` reference must name a declared artifact. `owner`
-/// is the referencing system or slot, for the message.
-pub(crate) fn check_artifact_declared(
-    wiring: &Wiring,
-    owner: &str,
-    id: &str,
-) -> Result<(), LoadError> {
-    if !artifact_exists(wiring, id) {
-        return Err(LoadErrorKind::UnknownArtifact {
-            system: owner.to_string(),
-            artifact: id.to_string(),
-        }
-        .bare());
-    }
-    Ok(())
-}
-
-/// The pure-spec half of slot validation ([`validate_slot_spec`]): a non-empty
-/// allow set with the `initial` name inside it. Shared by [`check_slot`] and
-/// the builder's `slot(..).end()`.
-pub(crate) fn check_slot_spec(slot: &SlotSpec) -> Result<(), LoadError> {
-    let src = slot_src(slot);
-    let span: SourceSpan = (0, src.len()).into();
-    let names: Vec<&str> = slot.allow.iter().map(|a| a.occupant.as_str()).collect();
-    validate_slot_spec(&names, slot.initial.as_ref().map(|i| i.occupant.as_str()))
-        .map_err(|e| slot_config_error(e, slot, &src, span))
 }
 
 /// Whether `id` names a declared artifact.
@@ -295,11 +291,75 @@ fn artifact_exists(wiring: &Wiring, id: &str) -> bool {
     wiring.artifacts.iter().any(|a| a.id == id)
 }
 
-/// A best-effort source snippet for an artifact's structural errors.
-fn artifact_src(artifact: &Artifact) -> String {
-    format!(
-        "artifact \"{}\"{}",
-        artifact.id,
-        src_anchor(artifact.src.as_ref())
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Artifact, ProgramDecl, ProgramSpec};
+    use crate::wiring::WiringBuilder;
+
+    fn program_wiring() -> Wiring {
+        let mut wiring = WiringBuilder::new()
+            .system("f")
+            .ty("f")
+            .from_artifact("program")
+            .end()
+            .build();
+        wiring.artifacts.push(Artifact {
+            id: "program".into(),
+            kind: ArtifactKind::Wasm,
+            crate_name: String::new(),
+            lib: String::new(),
+            path: None,
+            prebuilt_dir: None,
+            dist: None,
+            manifest_hash: None,
+            src: None,
+        });
+        wiring.program = Some(ProgramSpec {
+            source: "def f() -> f64:\n    return 1.0\n".into(),
+            decls: vec![ProgramDecl {
+                name: "f".into(),
+                src: None,
+                offset: 0,
+            }],
+        });
+        wiring
+    }
+
+    #[test]
+    fn program_system_must_reference_a_program_decl() {
+        assert!(validate(&program_wiring()).is_ok());
+
+        let mut wiring = program_wiring();
+        wiring.program.as_mut().unwrap().decls.clear();
+        assert!(matches!(
+            validate(&wiring).unwrap_err().kind,
+            LoadErrorKind::ProgramUnknownDecl { name } if name == "f"
+        ));
+    }
+
+    #[test]
+    fn program_artifact_and_decl_shape_are_checked() {
+        let mut wiring = program_wiring();
+        wiring.program = None;
+        assert!(matches!(
+            validate(&wiring).unwrap_err().kind,
+            LoadErrorKind::ProgramArtifactWithoutProgram { .. }
+        ));
+
+        let mut wiring = program_wiring();
+        let decl = wiring.program.as_ref().unwrap().decls[0].clone();
+        wiring.program.as_mut().unwrap().decls.push(decl);
+        assert!(matches!(
+            validate(&wiring).unwrap_err().kind,
+            LoadErrorKind::DuplicateProgramDecl { .. }
+        ));
+
+        let mut wiring = program_wiring();
+        wiring.artifacts[0].kind = ArtifactKind::Cdylib;
+        assert!(matches!(
+            validate(&wiring).unwrap_err().kind,
+            LoadErrorKind::ArtifactMissingCrate { .. }
+        ));
+    }
 }

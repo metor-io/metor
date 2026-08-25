@@ -146,22 +146,26 @@ The ring never overwrites unread data. A full ring makes `try_write` return `Wou
 
 Each input edge claims one reader slot. Each `AllOutputs` grant adds one slot to every output ring. The coordinator also adds spare slots for host readers that claim views through `Registry`.
 
-## Async snapshot inputs
+## Async boundaries
 
-A free-running `AsyncSystem` does not read a cyclic producer's snapshot ring at an unknown point in the cycle. Build gives the async input a private ring.
+A free-running `AsyncSystem` never attaches directly to graph rings. Build
+gives every input and output a private ring and leaves an import/export
+boundary at the system's registration position.
 
-After all cyclic systems step, the coordinator checks each source. If the source has a new commit, it copies only the newest record into the private ring and wakes the async reader.
+For a snapshot input, import copies only the newest record when the source has
+a new commit. For a log input, it drains every pending record in order. Export
+applies the same delivery rule from private outputs to public graph rings.
 
 ```text
-cyclic steps
-    -> newest source record
-    -> async private ring
-    -> Input::recv wakes
+public inputs -> import -> private async inputs
+                              local task runs between cycles
+public outputs <- export <- private async outputs
 ```
 
-If the private ring is full, the coordinator skips that copy. On the next cycle it tries again with the newest source record.
-
-Message inputs do not use this copy step. They drain their producer rings directly.
+The boundary calls import and then export without yielding. Import may wake the
+task but cannot run it inline, so that export contains only work completed
+before the boundary. If a destination private or public ring is full, copying
+drops the record and reports coordinator health rather than blocking the cycle.
 
 ## Registry and telemetry
 

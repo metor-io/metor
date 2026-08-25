@@ -1,8 +1,8 @@
 //! The [`WireError`] graph-defect vocabulary, reported before any byte flows.
 
-use crate::descriptor::{Hz, PortId};
+use metor_fsw_2_core::{Hz, PortId};
 
-use super::NAME_CAP;
+use metor_fsw_2_core::NAME_CAP;
 
 /// A defect in the declared graph, reported during graph build before any
 /// byte flows.
@@ -72,15 +72,14 @@ pub enum WireError {
         "{system} input {port:?} is host-connected: its counterpart is held by the system's runner, not an edge — remove the edge"
     )]
     HostPort { system: String, port: PortId },
-    /// A non-delayed snapshot edge points backward in registration order
-    /// between two cyclic systems. The step loop runs in registration order,
-    /// so the consumer would execute before its producer every cycle and
+    /// A non-delayed snapshot edge points backward between two scheduled
+    /// cycle positions. The loop runs in registration order, so the consumer
+    /// boundary would run before its producer every cycle and
     /// permanently read the previous cycle's value, exactly the staleness
     /// `connect_delayed` exists to make explicit. Fix by registering the
     /// producer before the consumer, or
     /// declare the one-cycle delay with `connect_delayed`. Log edges are
-    /// exempt, as are edges touching an async endpoint (async systems run off
-    /// the copy-in step or their own task, not the registration-ordered loop).
+    /// exempt; async import/export boundaries participate in the order.
     #[error(
         "{consumer} is registered before {producer} but consumes its {port:?} output: it would step first every cycle and permanently read the previous cycle's value — register {producer} before {consumer}, or declare the one-cycle delay with connect_delayed"
     )]
@@ -129,16 +128,16 @@ pub enum WireError {
         max = NAME_CAP
     )]
     SlotNameTooLong { name: String, len: usize },
-    /// A cyclic system without a receive-all port was registered after one
+    /// A cycle participant without a receive-all port was registered after one
     /// with it (the telemetry downlink). The downlink's end-of-cycle snapshot
     /// only observes systems that step before it, so a later registration
     /// would telemeter one cycle stale. Enforced rather than silently
     /// reordered, because reordering would change the step order the
     /// stale-edge diagnostics validate. Fix by registering `system` before the
-    /// receive-all system. Async systems are exempt (they are not in the step
-    /// order). Both fields are instance names.
+    /// receive-all system. Async boundaries are included because they export
+    /// at their registered positions. Both fields are instance names.
     #[error(
-        "cyclic system '{system}' is registered after the receive-all system '{receive_all}' (the telemetry downlink), whose end-of-cycle snapshot would miss it; register '{system}' before the telemetry downlink"
+        "system '{system}' is registered after the receive-all system '{receive_all}' (the telemetry downlink), whose end-of-cycle snapshot would miss it; register '{system}' before the telemetry downlink"
     )]
     ReceiveAllNotLast { system: String, receive_all: String },
     /// The run's shared-memory session (the mmap ring files process systems
@@ -150,4 +149,8 @@ pub enum WireError {
     /// the worker's own failure code when it reported one.
     #[error("process system '{system}': {detail}")]
     ProcSpawn { system: String, detail: String },
+    /// A wired wasm system could not be instantiated, created, or bound.
+    /// `system` is the instance name; `detail` carries the guest-side cause.
+    #[error("wasm system '{system}': {detail}")]
+    WasmBind { system: String, detail: String },
 }

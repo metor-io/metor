@@ -89,7 +89,9 @@ plant then writes the next state
 
 Each feedback loop must contain a delayed edge. The run-time ring path stays the same. The delayed mark tells validation that the old value is intended.
 
-Message log edges do not form same-cycle data needs, so they do not take part in this check. Edges with an async endpoint are also outside the cyclic order check.
+Message log edges do not form same-cycle data needs, so they do not take part
+in this check. Async import/export boundaries do: their registration position
+defines when inputs are sampled and outputs become visible.
 
 ## Ring allocation
 
@@ -106,15 +108,16 @@ Each ring has a fixed reader count. Build includes:
 
 A later registry view claim fails if no reader slot remains.
 
-## Async copy-in
+## Async boundaries
 
-A free-running async system receives each snapshot input through a private ring. Build creates a matched wake endpoint for that ring.
+A free-running async system binds only private rings. Its graph position holds
+a boundary that imports all inputs and then exports outputs completed before
+that point. Snapshot ports copy the newest changed record; log ports drain all
+pending records. No copy waits for space.
 
-After cyclic systems step, the coordinator checks the source ring. It copies the newest record only when the source has a new commit.
-
-If the private ring is full, the coordinator skips the copy. It never waits inside the cycle. A later cycle tries the latest source record.
-
-Message inputs do not need a private ring. The async task drains their producer rings.
+The task is local and cooperative, so an import wake cannot run it before the
+immediately following export. Input sampled on cycle N can therefore first
+produce graph-visible output on cycle N+1.
 
 ## Start
 
@@ -139,8 +142,7 @@ Each cycle does this work:
 choose one timestamp
 publish it as FSW time
 handle registry reload requests
-step cyclic slots in order
-copy new snapshots to async inputs
+step cyclic slots and async import/export boundaries in order
 update coordinator status if state changed
 drain host tracing logs
 sleep for wall-clock pace, or yield in simulated mode

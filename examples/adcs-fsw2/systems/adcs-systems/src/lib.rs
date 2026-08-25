@@ -4,10 +4,8 @@
 //! pack()` every loading mode shares (static registry, dlopen, process worker), and the
 //! target's `system` nodes selecting entries by `type=`.
 //!
-//! The pack deliberately mixes both authoring styles: `plant` and `nav` are fn-authored
-//! (a plain state struct, an `init` fn, an `execute` fn whose signature is the port set),
-//! while `ctrl` stays `#[system]` struct-authored and rides in via `system_type` — the
-//! example suite keeps both styles exercised end to end.
+//! All three entries are function-authored: a state struct, an init function,
+//! and an execute function whose signature declares the port set.
 
 pub mod ctrl;
 pub mod nav;
@@ -17,7 +15,7 @@ pub use ctrl::CtrlSystem;
 pub use nav::sun_from_css;
 pub use plant::{DisturbanceTorques, WheelDynamics, css_readings, disturbance_torques, propagate};
 
-use metor_fsw_2::{Pack, system};
+use metor_fsw_2_core::{Pack, system};
 
 use crate::{nav::NavState, plant::PlantState};
 
@@ -27,18 +25,19 @@ pub fn pack() -> Pack {
     Pack::new()
         .system("Plant", system(plant::execute).init(PlantState::new))
         .system("Nav", system(NavState::execute).init(NavState::new))
-        // Deliberately struct-authored (`#[system]`), so the pack exercises both styles.
-        .system_type::<CtrlSystem>("Ctrl")
+        .system(
+            "Ctrl",
+            system(CtrlSystem::execute)
+                .init(CtrlSystem::new)
+                .defaults(adcs_contracts::CtrlParams::default()),
+        )
 }
-metor_fsw_2::export_pack!(pack, feature = "export");
+metor_fsw_2_core::export_pack!(pack, feature = "export");
 
 #[cfg(test)]
 mod tests {
-    /// `Ctrl` is `#[system]`-authored with `CtrlParams: Default`, so the pack
-    /// declares its defaults blob and a target node may spell only overrides
-    /// (target.kdl still spells the gains in full, exercising the other
-    /// form). The fn-authored entries declare no defaults, which is why the
-    /// plant node spells its whole environment.
+    /// `Ctrl` explicitly declares defaults, so a target node may spell only
+    /// overrides. The other entries declare none.
     #[test]
     fn ctrl_entry_declares_default_params() {
         let mut pack = super::pack();

@@ -1,8 +1,12 @@
+use std::time::Duration;
+
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
-    AlarmAck, AlarmCleared, AlarmDef, AlarmLimit, AlarmRaised, AlarmTarget, LimitKind, Severity,
+    AlarmAck, AlarmCleared, AlarmDef, AlarmLimit, AlarmRaised, AlarmShelved, AlarmTarget,
+    AlarmUnshelved, LimitKind, Severity,
 };
 
+use super::latch::TileState;
 use super::{AlarmEventKind, AlarmState};
 use crate::msg_ingest::{IngestSource, apply_backfill};
 
@@ -39,11 +43,13 @@ fn def_with_target(element_index: Option<u64>) -> AlarmDef {
     }
 }
 
+/// A clear nobody acknowledged latches: the occurrence leaves the live set but stays
+/// pending, so a transient alarm is still there to be dismissed.
 #[test]
-fn raise_then_clear_removes_active() {
+fn an_unacked_clear_latches() {
     let mut state = AlarmState::default();
     state.apply_raised(ts(1), raised(1, Severity::Warning));
-    assert_eq!(state.active_count(), 1);
+    assert_eq!(state.active_sorted().len(), 1);
     assert_eq!(state.unacked_count(), 1);
 
     state.apply_cleared(
@@ -53,8 +59,197 @@ fn raise_then_clear_removes_active() {
             occurrence: 1,
         },
     );
-    assert_eq!(state.active_count(), 0);
+    assert!(state.active_sorted().is_empty());
+    assert_eq!(state.unacked_count(), 1);
+
+    let pending = state.pending_sorted();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].state, TileState::ClearedUnacked);
+    assert_eq!(pending[0].cleared_at, Some(ts(2)));
+    assert_eq!(state.point(&"A".into()).state, TileState::ClearedUnacked);
+}
+
+/// Acking the latch is the only thing that retires it.
+#[test]
+fn an_ack_retires_a_latch() {
+    let mut state = AlarmState::default();
+    state.apply_raised(ts(1), raised(1, Severity::Warning));
+    state.apply_cleared(
+        ts(2),
+        AlarmCleared {
+            def_id: "A".into(),
+            occurrence: 1,
+        },
+    );
+    state.apply_ack(
+        ts(3),
+        AlarmAck {
+            def_id: "A".into(),
+            occurrence: 1,
+            operator: "op".into(),
+            note: None,
+        },
+    );
+    assert_eq!(state.pending_count(), 0);
+    assert_eq!(state.point(&"A".into()).state, TileState::Normal);
+}
+
+/// An occurrence the operator already dismissed leaves nothing behind when it clears.
+#[test]
+fn a_clear_after_an_ack_drops_the_occurrence() {
+    let mut state = AlarmState::default();
+    state.apply_raised(ts(1), raised(1, Severity::Warning));
+    state.apply_ack(
+        ts(2),
+        AlarmAck {
+            def_id: "A".into(),
+            occurrence: 1,
+            operator: "op".into(),
+            note: None,
+        },
+    );
+    state.apply_cleared(
+        ts(3),
+        AlarmCleared {
+            def_id: "A".into(),
+            occurrence: 1,
+        },
+    );
+    assert_eq!(state.pending_count(), 0);
+}
+
+/// A chattering point replaces its own latch instead of growing the pending list.
+#[test]
+fn a_second_occurrence_replaces_the_latch() {
+    let mut state = AlarmState::default();
+    for occurrence in [1, 2] {
+        state.apply_raised(
+            ts(occurrence as i64 * 2),
+            raised(occurrence, Severity::Warning),
+        );
+        state.apply_cleared(
+            ts(occurrence as i64 * 2 + 1),
+            AlarmCleared {
+                def_id: "A".into(),
+                occurrence,
+            },
+        );
+    }
+    let pending = state.pending_sorted();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].alarm.occurrence, 2);
+}
+
+/// The control system reuses the occurrence id when an alarm escalates, so an ack of
+/// the milder band must not carry over to the worse one.
+#[test]
+fn an_escalation_clears_the_ack() {
+    let mut state = AlarmState::default();
+    state.apply_raised(ts(1), raised(1, Severity::Warning));
+    state.apply_ack(
+        ts(2),
+        AlarmAck {
+            def_id: "A".into(),
+            occurrence: 1,
+            operator: "op".into(),
+            note: None,
+        },
+    );
     assert_eq!(state.unacked_count(), 0);
+
+    state.apply_raised(ts(3), raised(1, Severity::Critical));
+    assert!(!state.is_acked(1));
+    assert_eq!(state.unacked_count(), 1);
+}
+
+/// A shelf hides the point from the pending list and the counts, and stops doing so the
+/// moment it expires — evaluated at query time, with no removal task involved.
+#[test]
+fn a_shelf_expires_at_query_time() {
+    let mut state = AlarmState::default();
+    state.apply_raised(ts(1), raised(1, Severity::Warning));
+    state.apply_shelved(
+        ts(2),
+        AlarmShelved {
+            def_id: "A".into(),
+            until: Timestamp::now() + Duration::from_secs(60),
+            reason: Some("chattering".into()),
+            operator: "op".into(),
+        },
+    );
+    assert_eq!(state.pending_count(), 0);
+    assert_eq!(state.counts_by_severity(), [0, 0, 0]);
+    assert_eq!(state.shelves_sorted().len(), 1);
+    assert_eq!(state.point(&"A".into()).state, TileState::Normal);
+    // The occurrence is only hidden, never dropped.
+    assert_eq!(state.active_sorted().len(), 1);
+
+    state.apply_shelved(
+        ts(3),
+        AlarmShelved {
+            def_id: "A".into(),
+            until: Timestamp::now() - Duration::from_secs(1),
+            reason: None,
+            operator: "op".into(),
+        },
+    );
+    assert_eq!(state.pending_count(), 1);
+    assert!(state.shelves_sorted().is_empty());
+}
+
+/// Shelving must never mask an escalation: a raise above the severity the shelf was
+/// taken at removes it.
+#[test]
+fn an_escalation_defeats_a_shelf() {
+    let mut state = AlarmState::default();
+    state.apply_raised(ts(1), raised(1, Severity::Warning));
+    state.apply_shelved(
+        ts(2),
+        AlarmShelved {
+            def_id: "A".into(),
+            until: Timestamp::now() + Duration::from_secs(600),
+            reason: None,
+            operator: "op".into(),
+        },
+    );
+    assert_eq!(state.pending_count(), 0);
+
+    state.apply_raised(ts(3), raised(2, Severity::Critical));
+    assert!(state.shelves_sorted().is_empty());
+    assert_eq!(state.highest_pending_severity(), Some(Severity::Critical));
+    assert!(
+        state
+            .history()
+            .iter()
+            .any(|event| event.kind == AlarmEventKind::Unshelved)
+    );
+}
+
+/// An unshelve ends the suppression early and lands in history as the audit trail.
+#[test]
+fn an_unshelve_restores_the_point() {
+    let mut state = AlarmState::default();
+    state.apply_raised(ts(1), raised(1, Severity::Warning));
+    state.apply_shelved(
+        ts(2),
+        AlarmShelved {
+            def_id: "A".into(),
+            until: Timestamp::now() + Duration::from_secs(600),
+            reason: None,
+            operator: "op".into(),
+        },
+    );
+    state.apply_unshelved(
+        ts(3),
+        AlarmUnshelved {
+            def_id: "A".into(),
+            operator: "op".into(),
+        },
+    );
+    assert_eq!(state.pending_count(), 1);
+    let kinds: Vec<AlarmEventKind> = state.history().iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&AlarmEventKind::Shelved));
+    assert!(kinds.contains(&AlarmEventKind::Unshelved));
 }
 
 #[test]
@@ -72,7 +267,7 @@ fn ack_marks_acked_only_while_active() {
     );
     assert!(state.is_acked(1));
     assert_eq!(state.unacked_count(), 0);
-    assert_eq!(state.active_count(), 1);
+    assert_eq!(state.active_sorted().len(), 1);
 
     // Clearing the occurrence also drops its ack so a re-raise starts unacked.
     state.apply_cleared(
@@ -137,11 +332,11 @@ fn active_sorted_orders_by_severity_then_recency() {
 }
 
 #[test]
-fn highest_active_severity_and_counts() {
+fn highest_pending_severity_and_counts() {
     let mut state = AlarmState::default();
     state.apply_raised(ts(1), raised(1, Severity::Warning));
     state.apply_raised(ts(2), raised(2, Severity::Critical));
-    assert_eq!(state.highest_active_severity(), Some(Severity::Critical));
+    assert_eq!(state.highest_pending_severity(), Some(Severity::Critical));
     // [info, warning, critical]
     assert_eq!(state.counts_by_severity(), [0, 1, 1]);
 }
@@ -250,8 +445,7 @@ fn backfill_folds_cross_log_clear_after_its_raise() {
     ];
     apply_backfill(&mut state, &mut sources, entries);
 
-    assert_eq!(state.active_count(), 0);
-    assert_eq!(state.unacked_count(), 0);
+    assert!(state.active_sorted().is_empty());
 }
 
 /// When a raise and its clear share one timestamp, the source declaration index breaks
@@ -275,5 +469,5 @@ fn backfill_breaks_equal_timestamp_ties_by_source_index() {
     ];
     apply_backfill(&mut state, &mut sources, entries);
 
-    assert_eq!(state.active_count(), 0);
+    assert!(state.active_sorted().is_empty());
 }

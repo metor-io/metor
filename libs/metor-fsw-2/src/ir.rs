@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 6;
+pub const IR_VERSION: u32 = 9;
 
 /// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
@@ -64,6 +64,11 @@ pub struct Wiring {
     /// collision-checked regardless. The Rust builder leaves it empty.
     #[serde(default)]
     pub scopes: Vec<ScopeSpec>,
+    /// The captured Python program the target's program-built wasm
+    /// [`Artifact`] compiles from, one per target. `None` when the target
+    /// added no Python system.
+    #[serde(default)]
+    pub program: Option<ProgramSpec>,
 }
 
 impl Wiring {
@@ -130,6 +135,46 @@ pub const DOWNLINK_TYPE: &str = "Downlink";
 /// [`UplinkParams`](crate::UplinkParams).
 pub const UPLINK_TYPE: &str = "Uplink";
 
+/// The captured Python program of one target: every `Frame`/`State` class
+/// the target file declared plus each `@system` function the target *added*,
+/// assembled in definition order into a single compilation unit (bindings
+/// between systems only work inside one unit; step order is the added specs'
+/// list order, independent of this). Compiled once by `metor-expr` at
+/// build/provision time into the target's program-built wasm [`Artifact`];
+/// each added `@system` is an ordinary [`SystemSpec`] addressing that
+/// artifact's pack entry through `ty`, under the instance name the add
+/// chose.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProgramSpec {
+    /// The assembled module source.
+    pub source: String,
+    /// One entry per captured declaration, in assembly order.
+    pub decls: Vec<ProgramDecl>,
+}
+
+/// One captured declaration of a [`ProgramSpec`]: where it sits in the
+/// assembled source and where it was written, so a compile diagnostic maps
+/// back to a `target.py` line rather than a synthetic-module one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProgramDecl {
+    /// The declaration's name — a function or class name; a program-built
+    /// entry's spec references its declaration through this.
+    pub name: String,
+    /// Where the declaration was written.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
+    /// Byte offset of the declaration in [`ProgramSpec::source`].
+    pub offset: u32,
+}
+
+impl ProgramSpec {
+    /// The declaration a compiler span at byte `offset` falls in: the last
+    /// one starting at or before it.
+    pub fn decl_at(&self, offset: u32) -> Option<&ProgramDecl> {
+        self.decls.iter().rev().find(|d| d.offset <= offset)
+    }
+}
+
 /// Coordinator-wide configuration, the serializable mirror of
 /// [`CoordinatorConfig`](crate::CoordinatorConfig).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -152,6 +197,13 @@ pub struct CoordinatorSpec {
     /// regardless; the prefix rides only the registry/announce seam.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Fuel granted to one wasm occupant poll. `None` selects the framework
+    /// default of 100,000,000.
+    #[serde(default)]
+    pub wasm_fuel_per_poll: Option<u64>,
+    /// Maximum guest linear memory during load and bind. `None` selects 64 MiB.
+    #[serde(default)]
+    pub wasm_memory_limit_bytes: Option<u64>,
 }
 
 /// Which clock drives the run loop, the serializable mirror of
@@ -168,6 +220,29 @@ pub enum ClockSpec {
     },
 }
 
+/// What a loadable artifact actually is.
+///
+/// The distinction is not cosmetic: a cdylib is per-triple and needs a
+/// matching toolchain to produce, which is what makes uplinking one expensive;
+/// a wasm module is one arch-neutral file that runs anywhere the interpreter
+/// does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    /// A native shared object, loaded with `dlopen` into this process.
+    #[default]
+    Cdylib,
+    /// A WebAssembly module, run under an interpreter and bounded by fuel.
+    Wasm,
+}
+
+impl ArtifactKind {
+    /// Whether this is the default native cdylib, for skipping it on the wire.
+    pub fn is_cdylib(&self) -> bool {
+        matches!(self, ArtifactKind::Cdylib)
+    }
+}
+
 /// A loadable pack shared object and the crate it comes from.
 ///
 /// Each cdylib exports one **pack** — any number of system types — through
@@ -179,13 +254,26 @@ pub enum ClockSpec {
 pub struct Artifact {
     /// The id that [`SystemSpec::artifact`] references.
     pub id: String,
+    /// What kind of loadable this is.
+    ///
+    /// Defaults to a native cdylib and is omitted when it is one, so the wire
+    /// format is purely additive: an IR written before this field existed still
+    /// reads, and one written now is byte-identical unless a wasm artifact is
+    /// actually present.
+    #[serde(default, skip_serializing_if = "ArtifactKind::is_cdylib")]
+    pub kind: ArtifactKind,
     /// The cargo package name, used by the build driver as
-    /// `cargo build -p <crate_name>`.
+    /// `cargo build -p <crate_name>`. Empty (and omitted on the wire) for a
+    /// wasm artifact compiled from the target's [`Wiring::program`], which has
+    /// no crate behind it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub crate_name: String,
     /// The bare library stem (`foo` for `libfoo.so`/`libfoo.dylib`/`foo.dll`).
     /// The file name is derived per target triple at provision time
     /// ([`cdylib_file_name_for`](crate::wiring::cdylib_file_name_for)); the IR
-    /// stays arch-neutral.
+    /// stays arch-neutral. Empty for a program-built wasm artifact, whose one
+    /// arch-neutral file is named from its id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lib: String,
     /// The resolved artifact location, filled in by
     /// [`provision_artifacts`](crate::wiring::provision_artifacts). `None` until built or
@@ -215,6 +303,20 @@ pub struct Artifact {
     /// Where this artifact was declared.
     #[serde(default)]
     pub src: Option<SourceRef>,
+}
+
+impl Artifact {
+    /// Whether this artifact still needs compiling from the target's captured
+    /// Python program ([`Wiring::program`]): a wasm artifact with no crate,
+    /// no prebuilt directory, and no located path behind it. The build driver
+    /// compiles the program for it; every other wasm artifact arrives with a
+    /// path (builder-authored, or a bundle member) or a prebuilt dir.
+    pub fn is_program(&self) -> bool {
+        self.kind == ArtifactKind::Wasm
+            && self.crate_name.is_empty()
+            && self.prebuilt_dir.is_none()
+            && self.path.is_none()
+    }
 }
 
 /// The published distribution an [`Artifact`] was installed from, as the
@@ -284,6 +386,12 @@ pub struct SystemSpec {
     /// rejected too.
     #[serde(default)]
     pub attach: Option<String>,
+    /// Where this system's canvas card sits, from the declaration site: the
+    /// `@node(x=, y=)` decorator on a `@system` function, the
+    /// `Target.add(..., node=(x, y))` kwarg on a native one. `None` leaves
+    /// placement to the canvas's auto-layout.
+    #[serde(default)]
+    pub layout: Option<(f32, f32)>,
 }
 
 impl StateSpec {
@@ -341,6 +449,7 @@ impl SystemSpec {
             src: None,
             scope: None,
             attach: Some("link".to_string()),
+            layout: None,
         }
     }
 }

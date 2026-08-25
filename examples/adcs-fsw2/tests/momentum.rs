@@ -95,11 +95,9 @@ fn build_static(k_desat: f64) -> Option<Coordinator> {
         eprintln!("skipping: provision_artifacts failed: {e}");
         return None;
     }
-    for spec in &mut wiring.systems {
-        // Static rlib systems, in-process (test binaries can't host a process worker).
-        spec.artifact = None;
-        spec.process = false;
-    }
+    // Static rlib systems, in-process (test binaries can't host a process worker);
+    // the compiled Python system keeps its wasm artifact.
+    common::link_statically(&mut wiring);
     let mut registry = Registry::with_builtins();
     registry.register_pack(adcs_systems::pack());
     Some(resolve(&wiring, &registry).expect("resolve the patched target"))

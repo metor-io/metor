@@ -88,28 +88,11 @@
 //! process workers, telemetry, alarms, and runtime slots.
 
 mod alarm;
-mod binder;
+mod async_system;
 mod coordinator;
-mod descriptor;
-mod dynamic;
-mod frame;
-mod handler;
-mod message;
-mod pack;
-mod port;
+mod io_bridge;
 mod preset;
-mod registry;
-mod shared;
-mod system;
 mod telemetry;
-mod text;
-mod writer;
-
-mod clock;
-pub mod health;
-pub mod logfwd;
-
-pub mod sequence;
 
 // The pure-data target IR; the `wiring` module re-exports these types
 // alongside its resolver.
@@ -117,101 +100,45 @@ pub mod ir;
 
 pub mod wiring;
 
-pub mod abi;
 pub mod dl;
-mod params_docs;
+pub mod wasm;
 
 // Cross-process systems need a shared futex (Linux, macOS 14.4+); on other
 // targets the module reduces to a no-op `worker_entry` and `build()` rejects
 // process registrations. See docs/process-systems.md for the platform floor.
 pub mod proc;
 
-pub use dynamic::{FrameList, FrameMap};
-pub use frame::Frame;
-pub use text::FrameStr;
-pub use writer::{DynamicWriteError, FrameWriter, KeyError, ListWriter, MapWriter};
+pub mod cli;
 
-pub use metor_fsw_ring::{ReadError, WriteError};
+// The authoring surface, whole. A target crate depends on this crate and sees
+// one framework; a pack, sequence, or contract crate depends on
+// `metor-fsw-2-core` alone and sees the half that compiles for wasm.
+pub use metor_fsw_2_core::*;
 
-pub use binder::{AnySource, BindPorts, Binder, BoundInput, BoundPort, RingSource};
-// `system` the fn (value namespace) coexists with `system` the attribute
-// macro (macro namespace) at the root: `system(nav_execute)` and
-// `#[metor_fsw_2::system]` resolve independently.
+pub use async_system::{AsyncContext, AsyncSystem};
 pub use coordinator::{
-    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, NAME_CAP,
-    OccupantBacking, SlotConfigError, SlotState, SlotStatus, StopReason, StoppedSystem, WireError,
-    WorkerRunState, WorkerStatus,
+    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, OccupantBacking,
+    SlotConfigError, SlotStatus, WireError,
 };
-pub use handler::{
-    AsyncSystemFn, BindCx, CycleCx, DeclSink, ExecParam, ExecParamSet, ExecuteFn, InitFn,
-    IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
-};
-pub use pack::{
-    Created, Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus,
-};
-pub use registry::{AllOutputs, Registry, RegistryEntry};
-pub use shared::{Shared, SharedLifecycle};
 pub use telemetry::{
     DownlinkParams, LinkParams, LinkState, LinkStats, TelemetrySystem, UplinkParams, UplinkSystem,
-};
-
-pub use descriptor::{
-    Capability, Declarations, Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema,
-    SystemDescriptor, SystemKind,
-};
-pub use health::{HealthPort, LogEvent, LogLevel, MAX_ERR_KINDS, MAX_LINES, SystemHealth};
-pub use port::{
-    DEFAULT_DEPTH, FrameRef, FrameWriteError, Input, Output, buffer_capacity, capacity_for,
 };
 
 pub use alarm::{AlarmIn, AlarmOut, AlarmSpec, AlarmSystem, AlarmsParams, BandSpec, TargetSpec};
 
 pub use preset::{PresetOut, PresetSpec, PresetSystem, PresetsParams};
 
-pub use message::{
-    CommandOut, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, MsgTable, NamedMsg, split_record,
-};
-pub use system::{
-    AsyncContext, AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicRunner, CyclicSystem,
-    HealthOutput, Out, System, SystemInput, SystemOutput,
-};
-#[doc(hidden)]
-pub use system::{NoParamsDefault, ParamsDefaultProbe};
-
-#[doc(hidden)]
-pub use params_docs::ParamsDocEntry;
-
-// Re-exported so `#[derive(inventory-based ParamsDocs)]` can name the crate.
-#[doc(hidden)]
-pub use inventory;
-
-pub use metor_fsw_ring as ring;
-
-pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
-pub use metor_fsw_2_macros::{Frame, ParamsDocs, SystemInput, SystemOutput};
-
-pub use metor_fsw_2_macros::system;
-
-pub use metor_proto::types::Timestamp;
-
-pub use sequence::{Outcome, SequenceStatus, SlotControlIn};
-
-pub use metor_fsw::path;
-pub use {metor_proto, metor_proto_wkt, zerocopy};
-
 pub use dl::{DlError, DlPack, DlSystem};
 
 pub use ir::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, DistRef, EdgeSpec,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, StateSpec, SystemSpec,
-    TCP_SERVER_TYPE, UPLINK_TYPE, Wiring,
+    InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec, StateSpec,
+    SystemSpec, TCP_SERVER_TYPE, UPLINK_TYPE, Wiring,
 };
 
 pub use wiring::{BuildError, BuildOptions, BundleError, PackageOptions, WiringBuilder};
 
-pub mod cli;
-
-// Frame acceptance tests span frame/dynamic/writer, so they live at the
-// crate root rather than under any single module.
+// Fn-authored systems and pack entries end to end, through a live
+// coordinator — hence here rather than beside the handler in the core crate.
 #[cfg(test)]
 mod tests;

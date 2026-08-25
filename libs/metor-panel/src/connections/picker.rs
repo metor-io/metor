@@ -248,11 +248,7 @@ impl ConnectionPicker {
             self.dismiss(window, cx);
             return;
         };
-        let Some(tiles) = self.store.read(cx).tiles() else {
-            self.dismiss(window, cx);
-            return;
-        };
-        if tiles.read(cx).has_items(cx) {
+        if crate::workspace::any_window_has_items(cx) {
             self.phase = Phase::LayoutChoice { layout, choice: 0 };
         } else {
             self.load_layout(layout, window, cx);
@@ -260,8 +256,8 @@ impl ConnectionPicker {
     }
 
     fn load_layout(&mut self, layout: String, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tiles) = self.store.read(cx).tiles() {
-            crate::presets::load_into_tiles(&layout, &tiles, cx);
+        let db = self.store.read(cx).db().clone();
+        if crate::workspace::restore_workspace(&layout, window, cx, db) {
             self.store
                 .update(cx, |store, _| store.note_loaded_layout(layout));
         }
@@ -1081,7 +1077,7 @@ impl Render for ConnectionPicker {
 
         let mut panel = div()
             .id("connection-picker-panel")
-            .key_context("ConnectionPicker")
+            .key_context("ConnectionPicker TextInput")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key_down(event, window, cx);

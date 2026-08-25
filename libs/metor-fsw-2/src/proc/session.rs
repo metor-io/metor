@@ -27,7 +27,7 @@ impl SessionDir {
     /// Create a fresh, uniquely named session directory under `root` (or the
     /// default root).
     pub(crate) fn create(root: Option<&Path>) -> std::io::Result<Self> {
-        let root = root.map(Path::to_path_buf).unwrap_or_else(default_root);
+        let root = root.map_or_else(default_root, Path::to_path_buf);
         let dir = tempfile::Builder::new()
             .prefix("metor-fsw-")
             .tempdir_in(root)?;

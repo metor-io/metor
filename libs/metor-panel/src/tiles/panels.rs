@@ -15,10 +15,11 @@ use crate::views::time_series::{PlotStyle, TimeFormat};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, AttitudeConfig, AttitudeIndicator, ComponentBrowser, ComponentTable, ComponentText,
-    DataTable, Gauge, GaugeConfig, LevelFilter, LogView, Meter, MeterConfig, SequenceControl,
-    SequenceControlConfig, SequenceGrid, SequenceView, StateChip, StateChipConfig, TimeSeriesPlot,
-    TrafficLight, TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
+    AlarmListMode, AlarmView, Annunciator, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
+    ComponentTable, ComponentText, DataTable, Gauge, GaugeConfig, LevelFilter, LogView, Meter,
+    MeterConfig, SequenceControl, SequenceControlConfig, SequenceGrid, SequenceView, StateChip,
+    StateChipConfig, TimeSeriesPlot, TrafficLight, new_component_browser, new_component_table,
+    new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -30,6 +31,7 @@ pub use crate::views::ComponentTextConfig as TextPanelConfig;
 pub struct TextPanel {
     inner: Entity<ComponentText>,
     label: SharedString,
+    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl TextPanel {
@@ -43,12 +45,19 @@ impl TextPanel {
         Self {
             inner,
             label: label.into(),
+            _expression: None,
         }
     }
 
     pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
-        Self::new(db, component_id, cfg.component, cx)
+        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
+        let component_id = bound
+            .as_ref()
+            .map(|bound| bound.id)
+            .unwrap_or_else(|| ComponentId::new(&cfg.component));
+        let mut panel = Self::new(db, component_id, cfg.component, cx);
+        panel._expression = bound.and_then(|bound| bound.expression);
+        panel
     }
 }
 
@@ -78,9 +87,13 @@ impl PaneItem for TextPanel {
 
 /// Persisted shape of an [`AlarmPanel`]. The panel shows global alarm state, so the
 /// only persisted bit is which tab it opens on.
+///
+/// `show_history` is the pre-shelving spelling, kept as the fallback when `mode` is
+/// absent so saved layouts restore unchanged.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AlarmPanelConfig {
+    pub mode: Option<AlarmListMode>,
     pub show_history: bool,
 }
 
@@ -98,7 +111,10 @@ impl AlarmPanel {
     pub fn from_config(cfg: AlarmPanelConfig, _db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| {
             let mut view = AlarmView::new(cx);
-            view.set_history(cfg.show_history);
+            match cfg.mode {
+                Some(mode) => view.mode = mode,
+                None => view.set_history(cfg.show_history),
+            }
             view
         });
         Self { inner }
@@ -123,8 +139,10 @@ impl PaneItem for AlarmPanel {
     }
 
     fn to_config(&self, cx: &App) -> AlarmPanelConfig {
+        let view = self.inner.read(cx);
         AlarmPanelConfig {
-            show_history: self.inner.read(cx).is_history(),
+            mode: Some(view.mode),
+            show_history: view.is_history(),
         }
     }
 
@@ -315,6 +333,7 @@ pub use crate::views::TrafficLightConfig as TrafficLightPanelConfig;
 pub struct TrafficLightPanel {
     inner: Entity<TrafficLight>,
     label: SharedString,
+    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl TrafficLightPanel {
@@ -328,11 +347,16 @@ impl TrafficLightPanel {
         Self {
             inner,
             label: label.into(),
+            _expression: None,
         }
     }
 
     pub fn from_config(cfg: TrafficLightPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
+        let component_id = bound
+            .as_ref()
+            .map(|bound| bound.id)
+            .unwrap_or_else(|| ComponentId::new(&cfg.component));
         let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
         if let Some(color) = cfg.color {
             inner.update(cx, |t, cx| t.set_color(color, cx));
@@ -340,6 +364,7 @@ impl TrafficLightPanel {
         Self {
             inner,
             label: cfg.component.into(),
+            _expression: bound.and_then(|bound| bound.expression),
         }
     }
 }
@@ -576,64 +601,52 @@ impl PaneItem for SequenceControlPanel {
     }
 }
 
-pub use crate::views::TrafficLightGridConfig as TrafficLightGridPanelConfig;
+pub use crate::views::AnnunciatorConfig as AnnunciatorPanelConfig;
 
-/// Pane item rendering every component matching a glob pattern as a grid of
-/// traffic-light tiles.
-pub struct TrafficLightGridPanel {
-    inner: Entity<TrafficLightGrid>,
+/// Pane item rendering every component matching a glob pattern as an
+/// annunciator tile.
+pub struct AnnunciatorPanel {
+    inner: Entity<Annunciator>,
     label: SharedString,
 }
 
-impl TrafficLightGridPanel {
+impl AnnunciatorPanel {
     pub fn new(db: Arc<DB>, pattern: SharedString, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| TrafficLightGrid::new(db, pattern, cx));
+        let inner = cx.new(|cx| Annunciator::new(db, pattern, cx));
         Self {
             inner,
-            label: "Traffic Lights".into(),
+            label: "Annunciator".into(),
         }
     }
 
-    pub fn from_config(
-        cfg: TrafficLightGridPanelConfig,
-        db: Arc<DB>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let pattern = SharedString::from(cfg.pattern);
-        let inner = cx.new(|cx| TrafficLightGrid::new(db, pattern, cx));
-        if let Some(color) = cfg.color {
-            inner.update(cx, |g, cx| g.set_color(color, cx));
-        }
+    pub fn from_config(cfg: AnnunciatorPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| Annunciator::from_config(cfg, db, cx));
         Self {
             inner,
-            label: "Traffic Lights".into(),
+            label: "Annunciator".into(),
         }
     }
 }
 
-impl Render for TrafficLightGridPanel {
+impl Render for AnnunciatorPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full().child(self.inner.clone())
     }
 }
 
-impl PaneItem for TrafficLightGridPanel {
-    type Config = TrafficLightGridPanelConfig;
+impl PaneItem for AnnunciatorPanel {
+    type Config = AnnunciatorPanelConfig;
 
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
 
     fn serialization_key() -> &'static str {
-        "traffic_light_grid"
+        "annunciator"
     }
 
-    fn to_config(&self, cx: &App) -> TrafficLightGridPanelConfig {
-        let inner = self.inner.read(cx);
-        TrafficLightGridPanelConfig {
-            pattern: inner.pattern().to_string(),
-            color: Some(inner.color()),
-        }
+    fn to_config(&self, cx: &App) -> AnnunciatorPanelConfig {
+        self.inner.read(cx).to_config()
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1264,11 +1277,11 @@ pub(crate) fn new_panel_rows(
     )));
 
     rows.push(Box::new(NavRow::new(
-        "Traffic Light Grid",
+        "Annunciator",
         SharedString::new_static(""),
         {
             let pane = pane.clone();
-            Box::new(move |_cx| traffic_light_grid_pattern_rows(pane.clone()))
+            Box::new(move |_cx| annunciator_pattern_rows(pane.clone()))
         },
     )));
 
@@ -1465,27 +1478,14 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
-    rows.push(Box::new(CommandRow::new("Node Editor", {
+    rows.push(Box::new(CommandRow::new("Graph", {
         let db = db.clone();
         let pane = pane.clone();
         Arc::new(move |_window, cx| {
             let db = db.clone();
             pane.update(cx, |pane, cx| {
-                let editor = cx.new(|cx| crate::node_editor::pane::NodeEditor::new(db.clone(), cx));
-                pane.add_item(Box::new(editor), cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("System Graph", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> = Box::new(
-                    cx.new(|cx| crate::views::system_graph::SystemGraphPanel::new(db, cx)),
-                );
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| crate::canvas::GraphCanvas::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })
@@ -1504,19 +1504,15 @@ pub(crate) fn new_panel_rows(
     rows
 }
 
-/// Single-question wizard for "New Panel → Traffic Light Grid": prompts
-/// for a glob pattern, then constructs a [`TrafficLightGridPanel`] seeded
-/// with that pattern.
-fn traffic_light_grid_pattern_rows(pane: Entity<Pane>) -> Vec<Box<dyn InspectorRow>> {
-    vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
+/// Single-question wizard for "New Panel → Annunciator": prompts for a glob
+/// pattern, then constructs an [`AnnunciatorPanel`] seeded with that pattern.
+fn annunciator_pattern_rows(pane: Entity<Pane>) -> Vec<Box<dyn InspectorRow>> {
+    vec![crate::views::annunciator::glob_prompt_row(Arc::new(
         move |pattern, _window, cx| {
             add_registered_panel(
                 &pane,
-                "traffic_light_grid",
-                &TrafficLightGridPanelConfig {
-                    pattern: pattern.to_string(),
-                    color: None,
-                },
+                "annunciator",
+                &crate::views::annunciator::seeded_config(&pattern),
                 cx,
             );
         },
@@ -1580,6 +1576,7 @@ mod tests {
                 label: "vx".into(),
                 stroke_width: 2.0,
                 axis_index: 1,
+                expression: Some("=rpm * 2.0".into()),
             }],
             custom_title: Override::Custom("My View".into()),
             axes: vec![
@@ -1678,6 +1675,8 @@ mod tests {
                 visible: true,
                 label: "vx vs vy".into(),
                 stroke_width: 1.5,
+                x_expression: None,
+                y_expression: Some("=rpm * 2.0".into()),
             }],
             custom_title: Override::Custom("Phase".into()),
             x_min_override: Override::Custom(-1.0),
@@ -1779,6 +1778,19 @@ mod tests {
         assert!(partial.states.is_empty());
         assert!(partial.unknown_label.is_empty());
 
+        let alarms = AlarmPanelConfig {
+            mode: Some(AlarmListMode::Shelved),
+            show_history: false,
+        };
+        let s = serde_json::to_string(&alarms).unwrap();
+        let back: AlarmPanelConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.mode, Some(AlarmListMode::Shelved));
+
+        // A layout saved before the mode was persisted restores through `show_history`.
+        let legacy: AlarmPanelConfig = serde_json::from_str(r#"{"show_history":true}"#).unwrap();
+        assert_eq!(legacy.mode, None);
+        assert!(legacy.show_history);
+
         let seq = SequenceControlConfig {
             channel: "mode".into(),
             compact: true,
@@ -1813,5 +1825,44 @@ mod tests {
         assert_eq!(partial.element_offset, 0);
         assert!(partial.vectors.is_empty());
         assert!(!partial.hide_readout);
+
+        let annunciator = AnnunciatorPanelConfig {
+            pattern: "*.healthy".into(),
+            color: Some(Hsla::default()),
+            source: crate::views::AnnunciatorSource::Alarms,
+            alarm_when: crate::views::AlarmWhen::Off,
+            show_labels: true,
+            show_values: true,
+            latch: true,
+            columns: 4,
+        };
+        let s = serde_json::to_string(&annunciator).unwrap();
+        let back: AnnunciatorPanelConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.pattern, "*.healthy");
+        assert_eq!(back.color, Some(Hsla::default()));
+        assert_eq!(back.source, crate::views::AnnunciatorSource::Alarms);
+        assert_eq!(back.alarm_when, crate::views::AlarmWhen::Off);
+        assert!(back.show_labels);
+        assert!(back.show_values);
+        assert!(back.latch);
+        assert_eq!(back.columns, 4);
+    }
+
+    /// A grid saved before the annunciator rename carries only the two
+    /// original fields; every field added since must default to what that
+    /// layout used to render, `alarm_when: On` included so an old grid keeps
+    /// lighting on truthy.
+    #[test]
+    fn a_pre_rename_grid_blob_keeps_its_old_behaviour() {
+        let legacy: AnnunciatorPanelConfig =
+            serde_json::from_str(r#"{"pattern":"*.health"}"#).unwrap();
+        assert_eq!(legacy.pattern, "*.health");
+        assert_eq!(legacy.color, None);
+        assert_eq!(legacy.source, crate::views::AnnunciatorSource::Components);
+        assert_eq!(legacy.alarm_when, crate::views::AlarmWhen::On);
+        assert!(!legacy.show_labels);
+        assert!(!legacy.show_values);
+        assert!(!legacy.latch);
+        assert_eq!(legacy.columns, 0);
     }
 }

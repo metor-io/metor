@@ -113,6 +113,8 @@ pub struct Gauge {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _expression: Option<crate::dynamic::expressions::Expression>,
+    #[facet(opaque)]
     _task: gpui::Task<()>,
     #[facet(opaque)]
     _resolver_task: gpui::Task<()>,
@@ -120,7 +122,12 @@ pub struct Gauge {
 
 impl Gauge {
     pub fn from_config(cfg: &GaugeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = ComponentId::new(&cfg.component);
+        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
+        let component_id = bound
+            .as_ref()
+            .map(|bound| bound.id)
+            .unwrap_or_else(|| ComponentId::new(&cfg.component));
+        let expression = bound.and_then(|bound| bound.expression);
         let element = cfg.element;
         let meta = component_meta(&db, component_id);
 
@@ -170,6 +177,7 @@ impl Gauge {
             bound: Some(ElementRef::new(component_id, element)),
             value: None,
             db,
+            _expression: expression,
             _task: task,
             _resolver_task: resolver_task,
         }
@@ -188,6 +196,7 @@ impl Gauge {
         if !binding::rebound(want, &mut self.bound) {
             return;
         }
+        self._expression = crate::dynamic::expressions::running(want.component, cx);
         let element = want.element;
         let meta = component_meta(&self.db, want.component);
         self.label = super::meter::default_label(&meta.element_names, element, &meta.name);
@@ -220,9 +229,14 @@ impl Gauge {
         GaugeConfig {
             // Resolve the name for whatever is bound *now*, so a rebind is
             // what gets saved.
-            component: binding::component_name(&self.db, self.component_id)
-                .unwrap_or_else(|| self.component.clone())
-                .to_string(),
+            // An expression's component is named by a content hash and
+            // labelled with the text that made it, so what round-trips is the
+            // text — a name would rehydrate onto nothing.
+            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
+                .or_else(|| {
+                    binding::component_name(&self.db, self.component_id).map(|n| n.to_string())
+                })
+                .unwrap_or_else(|| self.component.to_string()),
             element: self.element,
             label: Some(self.label.to_string()),
             min: self.min,

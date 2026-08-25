@@ -9,10 +9,11 @@
 //! consumes — deserialized and re-serialized to prove it is exactly what Rust
 //! accepts and emits.
 
-use metor_fsw_2::ir::{EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
+use metor_fsw_2::ir::{ArtifactKind, EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
 use metor_fsw_2::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
+    InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec,
+    SystemSpec, Wiring,
 };
 use serde_json::{Value, json};
 
@@ -34,9 +35,12 @@ fn maximal() -> Wiring {
             default_depth: Some(8),
             clock: ClockSpec::Simulated { dt_secs: 0.5 },
             namespace: None,
+            wasm_fuel_per_poll: Some(50_000_000),
+            wasm_memory_limit_bytes: Some(32 * 1024 * 1024),
         },
         artifacts: vec![
             Artifact {
+                kind: Default::default(),
                 id: "adcs".into(),
                 crate_name: "adcs-systems".into(),
                 lib: "adcs_systems".into(),
@@ -47,6 +51,7 @@ fn maximal() -> Wiring {
                 src: src(3),
             },
             Artifact {
+                kind: Default::default(),
                 id: "gnc".into(),
                 crate_name: "gnc-systems".into(),
                 lib: "gnc_systems".into(),
@@ -57,6 +62,19 @@ fn maximal() -> Wiring {
                     version: "1.2.0".into(),
                 }),
                 manifest_hash: Some("sha256:0".into()),
+                src: None,
+            },
+            // The program-built wasm artifact: no crate, no lib stem, no
+            // prebuilt dir — compiled from `Wiring::program` at provision.
+            Artifact {
+                kind: ArtifactKind::Wasm,
+                id: "program".into(),
+                crate_name: String::new(),
+                lib: String::new(),
+                path: None,
+                prebuilt_dir: None,
+                dist: None,
+                manifest_hash: None,
                 src: None,
             },
         ],
@@ -71,6 +89,7 @@ fn maximal() -> Wiring {
                 src: src(5),
                 scope: Some(0),
                 attach: None,
+                layout: Some((40.0, 80.0)),
             },
             SystemSpec {
                 name: "postcard_sys".into(),
@@ -81,6 +100,7 @@ fn maximal() -> Wiring {
                 src: None,
                 scope: Some(1),
                 attach: None,
+                layout: None,
             },
             SystemSpec {
                 name: "bare".into(),
@@ -91,6 +111,21 @@ fn maximal() -> Wiring {
                 src: None,
                 scope: None,
                 attach: Some("link".into()),
+                layout: None,
+            },
+            // A registered `@system`: an ordinary spec, free to sit anywhere
+            // in the list, carry a scope, and name its instance apart from
+            // the declaration its `ty` addresses.
+            SystemSpec {
+                name: "block.rate_mag".into(),
+                ty: Some("omega_norm".into()),
+                artifact: Some("program".into()),
+                params: ParamSource::None,
+                process: false,
+                src: src(12),
+                scope: Some(0),
+                attach: None,
+                layout: Some((420.0, 180.0)),
             },
         ],
         slots: vec![SlotSpec {
@@ -160,6 +195,16 @@ fn maximal() -> Wiring {
                 src: None,
             },
         ],
+        program: Some(ProgramSpec {
+            source: "@system(\"block.plant.sensors.gyro_b\")\ndef omega_norm(gyro_b) -> f64:\n    \
+                     return (gyro_b @ gyro_b) ** 0.5\n\n"
+                .into(),
+            decls: vec![ProgramDecl {
+                name: "omega_norm".into(),
+                src: src(12),
+                offset: 0,
+            }],
+        }),
     }
 }
 
@@ -183,6 +228,11 @@ fn representation_is_externally_tagged() {
         v["coordinator"]["clock"],
         json!({ "Simulated": { "dt_secs": 0.5 } })
     );
+    assert_eq!(v["coordinator"]["wasm_fuel_per_poll"], json!(50_000_000));
+    assert_eq!(
+        v["coordinator"]["wasm_memory_limit_bytes"],
+        json!(32 * 1024 * 1024)
+    );
     assert_eq!(
         v["systems"][0]["params"],
         json!({ "Value": { "init_angle": 0.5, "seed": 42 } })
@@ -205,6 +255,28 @@ fn representation_is_externally_tagged() {
     // Absent optionals render as null, not omitted.
     assert_eq!(v["systems"][2]["ty"], Value::Null);
     assert_eq!(v["systems"][2]["scope"], Value::Null);
+
+    // Layout renders as a two-element array, absent as null.
+    assert_eq!(v["systems"][0]["layout"], json!([40.0, 80.0]));
+    assert_eq!(v["systems"][1]["layout"], Value::Null);
+
+    // The captured program: a Python system is an ordinary spec addressing
+    // the program artifact's pack entry by `ty`, its instance name and scope
+    // the registering `add`'s own.
+    assert_eq!(v["systems"][3]["name"], json!("block.rate_mag"));
+    assert_eq!(v["systems"][3]["ty"], json!("omega_norm"));
+    assert_eq!(v["systems"][3]["scope"], json!(0));
+    assert_eq!(v["systems"][3]["artifact"], json!("program"));
+    assert_eq!(v["systems"][3]["params"], json!("None"));
+    assert_eq!(v["program"]["decls"][0]["name"], json!("omega_norm"));
+    assert_eq!(v["program"]["decls"][0]["offset"], json!(0));
+
+    // Artifact kind renders snake_case and is omitted for the default cdylib;
+    // a program-built wasm artifact omits the crate/lib fields entirely.
+    assert_eq!(v["artifacts"][2]["kind"], json!("wasm"));
+    assert!(v["artifacts"][0].get("kind").is_none());
+    assert!(v["artifacts"][2].get("crate_name").is_none());
+    assert!(v["artifacts"][2].get("lib").is_none());
 
     // The v3 artifact fields: the arch-neutral lib stem, a prebuilt dir as a
     // plain path string, and dist provenance as a { name, version } object.
@@ -242,7 +314,7 @@ fn golden_fixture_round_trips() {
 /// (line numbers track the emitting source) and each artifact's `path` and
 /// `prebuilt_dir` (both machine-located). The `lib` stem is arch-neutral and
 /// stays in the comparison.
-pub fn normalize(mut v: Value) -> Value {
+fn normalize(mut v: Value) -> Value {
     strip_key(&mut v, "src");
     if let Some(artifacts) = v.get_mut("artifacts").and_then(Value::as_array_mut) {
         for a in artifacts {

@@ -16,6 +16,7 @@ use drag::ResizeDrag;
 use serial::{TileItem, TileNode, TilePane, TileSplit};
 
 pub use drag::SplitDirection;
+pub(crate) use drag::take_active_tab_drag;
 pub use item::{PaneItem, PaneItemHandle};
 pub use pane::{Pane, PaneEvent, PlotComponentAction, PreviewPlotAction, TabOrientation};
 pub use serial::{ItemRegistry, TileLayout};
@@ -59,7 +60,7 @@ const RESIZE_HANDLE_SIZE: f32 = 1.0;
 ///   either fall back to their config defaults.
 /// - 5: drop all legacy-layout fallbacks; plot bounds live only on `axes` and
 ///   dashboard allocation counters are derived from item ids.
-const SUPPORTED_LAYOUT_VERSION: u32 = serial::TILE_LAYOUT_VERSION;
+pub(crate) const SUPPORTED_LAYOUT_VERSION: u32 = serial::TILE_LAYOUT_VERSION;
 
 /// Failure modes when loading a layout from JSON.
 #[derive(Debug)]
@@ -599,18 +600,29 @@ impl TileGroup {
     }
 
     /// Parse `json` and swap the layout in place.
-    ///
-    /// Pulls the panel-item registry from gpui globals so callers don't have
-    /// to thread it. The clone keeps the global borrow short so the rest of
-    /// the deserialization can take `&mut Context<Self>` freely.
     pub fn replace_from_json(
         &mut self,
         json: &str,
         cx: &mut Context<Self>,
     ) -> Result<(), LoadError> {
+        self.replace_from_layout(serde_json::from_str(json)?, cx)
+    }
+
+    /// Swap the layout in place from an already-parsed document.
+    ///
+    /// Pulls the panel-item registry from gpui globals so callers don't have
+    /// to thread it. The clone keeps the global borrow short so the rest of
+    /// the deserialization can take `&mut Context<Self>` freely.
+    pub fn replace_from_layout(
+        &mut self,
+        layout: TileLayout,
+        cx: &mut Context<Self>,
+    ) -> Result<(), LoadError> {
+        if layout.version != SUPPORTED_LAYOUT_VERSION {
+            return Err(LoadError::UnsupportedVersion(layout.version));
+        }
         let registry = cx.global::<ItemRegistry>().clone();
-        let new_self = Self::from_json(json, &registry, cx)?;
-        *self = new_self;
+        *self = Self::deserialize(layout, &registry, cx);
         cx.notify();
         Ok(())
     }

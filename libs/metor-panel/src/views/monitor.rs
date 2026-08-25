@@ -23,6 +23,10 @@ use crate::theme::theme;
 pub struct Monitor {
     #[facet(skip)]
     name: SharedString,
+    /// Held for its drop when this monitor is bound to a `=` expression: the
+    /// expression runs while a view wants it, and this is that view.
+    #[facet(opaque)]
+    _expression: Option<crate::dynamic::expressions::Expression>,
     pub unit: SharedString,
     pub show_sparkline: bool,
     #[facet(opaque)]
@@ -40,6 +44,17 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    /// Bind this monitor to a running `=` expression, taking a share of its
+    /// lifetime and showing the text the operator typed as its name.
+    pub fn bind_expression(
+        &mut self,
+        expression: crate::dynamic::expressions::Expression,
+        label: impl Into<SharedString>,
+    ) {
+        self.name = label.into();
+        self._expression = Some(expression);
+    }
+
     pub fn new(
         db: Arc<DB>,
         source: impl ComponentStreamBuilder + Send + 'static,
@@ -116,6 +131,7 @@ impl Monitor {
             show_sparkline: true,
             db,
             component_id,
+            _expression: None,
             sparkline,
             strip,
             click,

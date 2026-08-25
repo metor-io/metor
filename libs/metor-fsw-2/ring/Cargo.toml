@@ -11,9 +11,21 @@ authors = ["sascha@metor.io"]
 [lints]
 workspace = true
 
+# Both default-on. A host wants them; a guest built for `wasm32-unknown-unknown`
+# takes `default-features = false`, since `memmap2` has no mapping to offer
+# there and `stellarator` reaches syscalls the target does not have. Neither
+# feature touches the region format or the reader protocol, so a ring created
+# with one set is readable with the other.
+[features]
+default = ["mmap", "notify"]
+# File-backed regions: `RingBuffer::create_mmap` / `attach_mmap`.
+mmap = ["dep:memmap2"]
+# `Notifier`, the in-process wake endpoint. `NoWake` needs nothing.
+notify = ["dep:stellarator"]
+
 [dependencies]
-memmap2 = "0.9"
-stellarator = { path = "../../stellarator" }
+memmap2 = { version = "0.9", optional = true }
+stellarator = { path = "../../stellarator", optional = true }
 zerocopy = { version = "0.8.2", features = ["derive"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

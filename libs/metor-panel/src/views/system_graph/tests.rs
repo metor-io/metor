@@ -17,6 +17,8 @@ fn base_wiring() -> Wiring {
             default_depth: None,
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         },
         artifacts: Vec::new(),
         states: Vec::new(),
@@ -24,6 +26,7 @@ fn base_wiring() -> Wiring {
         slots: Vec::new(),
         edges: Vec::new(),
         scopes: Vec::new(),
+        program: None,
     }
 }
 
@@ -37,6 +40,7 @@ fn system(name: &str, scope: Option<usize>) -> SystemSpec {
         src: None,
         scope,
         attach: None,
+        layout: None,
     }
 }
 

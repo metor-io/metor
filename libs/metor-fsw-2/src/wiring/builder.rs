@@ -18,17 +18,13 @@
 //!     .build();
 //! ```
 //!
-//! The builder wraps a [`Wiring`] and stamps its structure as it goes: a
-//! declared name that collides, an `artifact=` that names nothing, a slot with
-//! no allowed occupant — each is a mistake in the target definition, caught
-//! at the offending call with a panic (the shared checks in
-//! [`validate`](super::validate) format the message). A `WiringBuilder`-built
-//! `Wiring` therefore always passes [`validate`](super::validate::validate);
-//! the serde-ingested Python IR is validated instead at resolve.
+//! The builder is deliberately a thin recorder. The resolver applies
+//! [`validate`](super::validate::validate) to Rust-built and Python-built IR
+//! alike, so semantic rules have one implementation and one error surface.
 //!
 //! [`system`](WiringBuilder::system) builds a [`SystemSpec`] directly. The same
-//! builder covers static and artifact-backed systems; the shared validator
-//! rejects invalid combinations when [`SystemSpecBuilder::end`] is called.
+//! builder covers static and artifact-backed systems; the resolver rejects
+//! invalid combinations before loading or binding anything.
 
 use std::net::SocketAddr;
 
@@ -38,7 +34,6 @@ use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, StateSpec, SystemSpec, Wiring,
 };
-use super::validate;
 
 /// Wraps the [`Wiring`] under construction, exposing a fluent surface over its
 /// coordinator, artifacts, systems, slots, and edges. Systems and slots are
@@ -65,6 +60,8 @@ impl WiringBuilder {
                     default_depth: None,
                     clock: ClockSpec::Wall,
                     namespace: None,
+                    wasm_fuel_per_poll: None,
+                    wasm_memory_limit_bytes: None,
                 },
                 artifacts: Vec::new(),
                 states: Vec::new(),
@@ -72,6 +69,7 @@ impl WiringBuilder {
                 slots: Vec::new(),
                 edges: Vec::new(),
                 scopes: Vec::new(),
+                program: None,
             },
         }
     }
@@ -79,12 +77,8 @@ impl WiringBuilder {
     /// Sets the cycle rate and clock, leaving `default_depth` untouched. Use
     /// [`coordinator_spec`](Self::coordinator_spec) to set everything at once.
     pub fn coordinator(mut self, cycle_rate: f64, clock: ClockSpec) -> Self {
-        self.wiring.coordinator = CoordinatorSpec {
-            cycle_rate,
-            default_depth: self.wiring.coordinator.default_depth,
-            clock,
-            namespace: self.wiring.coordinator.namespace.clone(),
-        };
+        self.wiring.coordinator.cycle_rate = cycle_rate;
+        self.wiring.coordinator.clock = clock;
         self
     }
 
@@ -104,17 +98,39 @@ impl WiringBuilder {
     /// the build driver ([`provision_artifacts`](super::provision_artifacts)) fills it
     /// in.
     ///
-    /// Panics on a duplicate `id`.
+    /// Declare a WebAssembly artifact at `path`.
+    ///
+    /// Unlike [`artifact`](Self::artifact) there is no crate or library stem
+    /// to build per triple: a `.wasm` is one arch-neutral file, which is the
+    /// property that makes it cheap to uplink.
+    pub fn wasm_artifact(
+        mut self,
+        id: impl Into<String>,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.wiring.artifacts.push(Artifact {
+            id: id.into(),
+            kind: crate::ir::ArtifactKind::Wasm,
+            crate_name: String::new(),
+            lib: String::new(),
+            path: Some(path.into()),
+            prebuilt_dir: None,
+            dist: None,
+            manifest_hash: None,
+            src: None,
+        });
+        self
+    }
+
     pub fn artifact(
         mut self,
         id: impl Into<String>,
         crate_name: impl Into<String>,
         lib_stem: impl AsRef<str>,
     ) -> Self {
-        let id = id.into();
-        validate::check_artifact_id_available(&self.wiring, &id).unwrap_or_else(|e| panic!("{e}"));
         self.wiring.artifacts.push(Artifact {
-            id,
+            id: id.into(),
+            kind: crate::ir::ArtifactKind::Cdylib,
             crate_name: crate_name.into(),
             lib: lib_stem.as_ref().to_string(),
             path: None,
@@ -139,6 +155,7 @@ impl WiringBuilder {
                 src: None,
                 scope: None,
                 attach: None,
+                layout: None,
             },
         }
     }
@@ -296,11 +313,8 @@ impl WiringBuilder {
     }
 
     /// Pushes a fully built [`SlotSpec`], for slots assembled outside the
-    /// fluent chain. Panics on a name collision; the spec's own occupant set
-    /// is trusted (unlike [`SlotSpecBuilder::end`], which checks it).
+    /// fluent chain.
     pub fn add_slot_spec(mut self, spec: SlotSpec) -> Self {
-        validate::check_instance_available(&self.wiring, &spec.name)
-            .unwrap_or_else(|e| panic!("{e}"));
         self.wiring.slots.push(spec);
         self
     }
@@ -310,11 +324,8 @@ impl WiringBuilder {
         self.wiring
     }
 
-    /// Push a well-formed system spec, checking only its name (the built-in
-    /// link specs are valid by construction).
+    /// Push a built-in system spec.
     fn push_system(&mut self, spec: SystemSpec) {
-        validate::check_instance_available(&self.wiring, &spec.name)
-            .unwrap_or_else(|e| panic!("{e}"));
         self.wiring.systems.push(spec);
     }
 }
@@ -341,10 +352,7 @@ impl SlotSpecBuilder {
     /// Allows the named pack entry from a specific artifact. Panics if
     /// `artifact` names no declared artifact.
     pub fn allow_from(self, occupant: impl Into<String>, artifact: impl Into<String>) -> Self {
-        let artifact = artifact.into();
-        validate::check_artifact_declared(&self.parent.wiring, &self.spec.name, &artifact)
-            .unwrap_or_else(|e| panic!("{e}"));
-        self.push_allowed(occupant.into(), Some(artifact), ParamSource::None)
+        self.push_allowed(occupant.into(), Some(artifact.into()), ParamSource::None)
     }
 
     /// Allows the named occupant with postcard-encoded typed default params.
@@ -392,12 +400,7 @@ impl SlotSpecBuilder {
     }
 
     /// Pushes this slot onto the [`Wiring`] and returns the parent builder.
-    /// Panics on a name collision, an empty allow set, or an `initial` outside
-    /// the allow set.
     pub fn end(mut self) -> WiringBuilder {
-        validate::check_instance_available(&self.parent.wiring, &self.spec.name)
-            .unwrap_or_else(|e| panic!("{e}"));
-        validate::check_slot_spec(&self.spec).unwrap_or_else(|e| panic!("{e}"));
         self.parent.wiring.slots.push(self.spec);
         self.parent
     }
@@ -439,10 +442,7 @@ impl SystemSpecBuilder {
 
     /// Loads this system from the named [`Artifact`].
     pub fn from_artifact(mut self, artifact_id: impl Into<String>) -> Self {
-        let artifact = artifact_id.into();
-        validate::check_artifact_declared(&self.parent.wiring, &self.spec.name, &artifact)
-            .unwrap_or_else(|e| panic!("{e}"));
-        self.spec.artifact = Some(artifact);
+        self.spec.artifact = Some(artifact_id.into());
         self
     }
 
@@ -468,13 +468,9 @@ impl SystemSpecBuilder {
         self
     }
 
-    /// Validates and adds the system, returning the parent builder.
-    pub fn end(self) -> WiringBuilder {
-        let mut parent = self.parent;
-        validate::check_instance_available(&parent.wiring, &self.spec.name)
-            .unwrap_or_else(|e| panic!("{e}"));
-        validate::check_system(&self.spec, &parent.wiring).unwrap_or_else(|e| panic!("{e}"));
-        parent.wiring.systems.push(self.spec);
-        parent
+    /// Adds the system and returns the parent builder.
+    pub fn end(mut self) -> WiringBuilder {
+        self.parent.wiring.systems.push(self.spec);
+        self.parent
     }
 }

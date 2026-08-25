@@ -20,19 +20,17 @@ pub fn metadatatize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> TokenSt
     let where_clause = &generics.where_clause;
     let impeller_wkt = quote! { #crate_name::metor_proto_wkt };
 
-    let metadata_items = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {
-        let ty = &field.ty;
+    let metadata_items = fields
+        .iter()
+        .filter(|f| !f.timestamp && !f.skipped())
+        .map(|field| {
+            let ty = &field.ty;
 
-        let name = field.component_name();
-        let name = if let Some(parent) = parent {
-            format!("{parent}.{name}")
-        } else {
-            name
-        };
-        quote! {
-            .chain(<#ty>::metadata(prefix.clone().chain(#name)))
-        }
-    });
+            let name = field.qualified_component_name(parent.as_deref());
+            quote! {
+                .chain(<#ty>::metadata(prefix.clone().chain(#name)))
+            }
+        });
     // No group entry at an empty root prefix, since the empty name
     // would collide across roots.
     let group_emit = match group {

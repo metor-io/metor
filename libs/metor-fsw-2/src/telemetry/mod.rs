@@ -52,18 +52,17 @@ use metor_proto::vtable::VTable;
 use metor_proto_wkt::{ComponentMetadata, MsgMetadata, SetMsgMetadata};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::binder::{BindPorts, RingSource};
-use crate::descriptor::{Declarations, Delivery, PortDesc, SystemDescriptor};
-use crate::health::HealthPort;
-use crate::message::{MsgFanOut, NamedMsg, split_record};
-use crate::registry::{AllOutputs, RegistryEntry};
-use crate::shared::Shared;
-use crate::system::{
+use metor_fsw_2_core::Shared;
+use metor_fsw_2_core::health::{HealthPort, LogLevel};
+use metor_fsw_2_core::{AllOutputs, RegistryEntry};
+use metor_fsw_2_core::{BindPorts, RingSource};
+use metor_fsw_2_core::{
     BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput, Out, System, SystemOutput,
 };
+use metor_fsw_2_core::{Declarations, Delivery, PortDesc, SystemDescriptor};
+use metor_fsw_2_core::{MsgFanOut, NamedMsg, split_record};
 
 /// Which registry entries the downlink taps.
-#[derive(Clone, Debug)]
 enum TelemetryMode {
     /// Tap every entry: every system's user frames and their implicit
     /// `health`/`log`, plus the coordinator-owned `health`/`log`/`status`.
@@ -111,28 +110,22 @@ pub struct DownlinkParams {
     pub frames: Option<Vec<String>>,
 }
 
-impl DownlinkParams {
-    /// Project the two optional subset lists onto a [`TelemetryMode`].
-    fn mode(&self) -> TelemetryMode {
-        match (&self.instances, &self.frames) {
-            (None, None) => TelemetryMode::All,
-            (instances, frames) => TelemetryMode::Subset {
-                instances: instances.clone().unwrap_or_default(),
-                frames: frames.clone().unwrap_or_default(),
-            },
-        }
-    }
-}
-
 impl BuildSystem for TelemetrySystem {
     type Params = DownlinkParams;
 
     /// Construct detached: the builtin link pack's ctor attaches the shared
     /// server ([`attach`](TelemetrySystem::attach)) right after.
     fn new(params: DownlinkParams) -> Self {
+        let mode = match (params.instances, params.frames) {
+            (None, None) => TelemetryMode::All,
+            (instances, frames) => TelemetryMode::Subset {
+                instances: instances.unwrap_or_default(),
+                frames: frames.unwrap_or_default(),
+            },
+        };
         Self {
             link: None,
-            mode: params.mode(),
+            mode,
             taps: Vec::new(),
             batch: Vec::new(),
             retain_scratch: Vec::new(),
@@ -164,9 +157,10 @@ impl BuildSystem for UplinkSystem {
 
     /// Construct detached, like the downlink's.
     fn new(params: UplinkParams) -> Self {
-        let mut system = Self::new();
-        system.unresolved = params.msgs.unwrap_or_default();
-        system
+        Self {
+            unresolved: params.msgs.unwrap_or_default(),
+            ..Self::new()
+        }
     }
 
     fn configure(&mut self, ctx: &BuildCtx) -> Result<(), ConfigureError> {
@@ -232,7 +226,7 @@ impl HealthOutput for UplinkOut {
 impl BindPorts for UplinkOut {
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let health = crate::Output::bind(src);
-        let log = crate::message::MsgOut::bind(src);
+        let log = metor_fsw_2_core::MsgOut::bind(src);
         let fan = MsgFanOut::bind(src);
         let mut health = HealthPort::new(health, log);
         health.set_instance(src.instance_name());
@@ -263,8 +257,6 @@ pub struct UplinkSystem {
     /// [`configure`](BuildSystem::configure); [`with_msg`](Self::with_msg)
     /// resolves statically instead.
     unresolved: Vec<String>,
-    /// The one-time first-cycle config checks ran.
-    checked: bool,
 }
 
 impl Default for UplinkSystem {
@@ -282,7 +274,6 @@ impl UplinkSystem {
             link: None,
             msgs: Vec::new(),
             unresolved: Vec::new(),
-            checked: false,
         }
     }
 
@@ -313,6 +304,18 @@ impl System for UplinkSystem {
     /// last by its `ReceiveAll` capability); a late registration is a
     /// config defect reported here rather than silently unadvertised.
     fn init(&mut self, output: &mut UplinkOut) {
+        let (fan, health) = output.split();
+        if self.msgs.is_empty() {
+            health.log(
+                LogLevel::Warn,
+                "uplink has no msgs configured; it will relay nothing",
+            );
+        } else if fan.len() != self.msgs.len() {
+            // One writer per configured msg is the bind contract; a mismatch
+            // means the registered descriptor and this instance diverged.
+            health.error("uplink_bind_mismatch");
+        }
+
         let link = self
             .link
             .as_ref()
@@ -322,7 +325,7 @@ impl System for UplinkSystem {
             let health = output.health();
             health.error("uplink_announced_late");
             health.log(
-                crate::health::LogLevel::Warn,
+                LogLevel::Warn,
                 "uplink registered after the downlink; its command set is not advertised to clients",
             );
         }
@@ -349,35 +352,21 @@ impl CyclicSystem for UplinkSystem {
     /// drains fully so a bad sender cannot wedge it.
     fn execute(&mut self, _now: Timestamp, _input: &mut (), output: &mut UplinkOut) {
         let (fan, health) = output.split();
-        if !self.checked {
-            if self.msgs.is_empty() {
-                health.log(
-                    crate::health::LogLevel::Warn,
-                    "uplink has no msgs configured; it will relay nothing",
-                );
-            } else if fan.len() != self.msgs.len() {
-                // One writer per configured msg is the bind contract; a
-                // mismatch means the registered descriptor and this instance
-                // diverged.
-                health.error("uplink_bind_mismatch");
-            }
-            self.checked = true;
-        }
         let link = self
             .link
             .as_ref()
             .expect("uplink attached to a TcpServer state (the builtin link pack's ctor)");
         let msgs = &self.msgs;
-        link.get().drain_inbound(|id, payload| {
-            match msgs.iter().position(|&(_, mid)| mid == id) {
+        link.get().drain_inbound(
+            |id, payload| match msgs.iter().position(|&(_, mid)| mid == id) {
                 Some(idx) => {
                     if fan.write_raw(idx, id, payload).is_err() {
                         health.error("uplink_dropped");
                     }
                 }
                 None => health.error("uplink_unroutable"),
-            }
-        });
+            },
+        );
     }
 }
 
@@ -399,7 +388,7 @@ pub(crate) enum Announce {
 /// pulls the host registry rather than consuming a ring.
 #[derive(crate::SystemOutput)]
 pub struct TelemetryPorts {
-    status: crate::port::Output<LinkStatus>,
+    status: metor_fsw_2_core::Output<LinkStatus>,
     all: AllOutputs,
 }
 
@@ -551,13 +540,12 @@ impl System for TelemetrySystem {
                     Wire::Msg
                 }
             };
-            let retain_slot = (entry.delivery() == Delivery::Snapshot
-                && matches!(wire, Wire::Msg))
-            .then(|| {
-                let slot = n_retained;
-                n_retained += 1;
-                slot
-            });
+            let retain_slot = (entry.delivery() == Delivery::Snapshot && matches!(wire, Wire::Msg))
+                .then(|| {
+                    let slot = n_retained;
+                    n_retained += 1;
+                    slot
+                });
             taps.push(Tap {
                 view,
                 delivery: entry.delivery(),
@@ -571,7 +559,7 @@ impl System for TelemetrySystem {
             let health = output.health();
             health.error("telemetry_reader_slot");
             health.log(
-                crate::health::LogLevel::Warn,
+                LogLevel::Warn,
                 &format!("no reader slot left on `{key}` — raise CoordinatorConfig::reader_slack"),
             );
         }
@@ -580,19 +568,19 @@ impl System for TelemetrySystem {
             .link
             .as_ref()
             .expect("downlink attached to a TcpServer state (the builtin link pack's ctor)");
-        link.get().set_retained_slots(n_retained);
         if link.get().set_announces(&announces).is_err() {
             // A second downlink on one server would corrupt the replay every
             // connection decodes against.
             let health = output.health();
             health.error("link_announce_conflict");
             health.log(
-                crate::health::LogLevel::Warn,
+                LogLevel::Warn,
                 "another downlink already announced on this link; this instance streams nothing",
             );
             self.link = None;
             return;
         }
+        link.get().set_retained_slots(n_retained);
         self.taps = taps;
     }
 }
@@ -630,7 +618,7 @@ impl CyclicSystem for TelemetrySystem {
         let Some(link_token) = &self.link else {
             return;
         };
-        let link = link_token.get();
+        let mut link = link_token.get();
 
         // Fold the server's counters into this cycle's health and the gauge.
         let stats = link.take_stats();
@@ -662,7 +650,7 @@ impl CyclicSystem for TelemetrySystem {
         // still drain below — records are consumed and DISCARDED — because an
         // undrained tap view stalls its producer's ring and freezes every
         // consumer of that output, not just telemetry.
-        self.batch.clear();
+        link.prepare_batch(&mut self.batch);
         let mut batch = (connections != 0).then_some(&mut self.batch);
         for tap in &mut self.taps {
             match tap.delivery {
@@ -683,10 +671,10 @@ impl CyclicSystem for TelemetrySystem {
                             Some(slot) => {
                                 self.retain_scratch.clear();
                                 append_record(&mut self.retain_scratch, &tap.wire, &grant);
-                                link.retain(slot, &self.retain_scratch);
                                 if let Some(batch) = &mut batch {
                                     batch.extend_from_slice(&self.retain_scratch);
                                 }
+                                link.retain(slot, &mut self.retain_scratch);
                             }
                             None => {
                                 if let Some(batch) = &mut batch {
@@ -702,7 +690,7 @@ impl CyclicSystem for TelemetrySystem {
                 Delivery::Log => {
                     let wire = &tap.wire;
                     let batch = &mut batch;
-                    let result = crate::port::drain_view(&mut tap.view, |rec| {
+                    let result = metor_fsw_2_core::drain_view(&mut tap.view, |rec| {
                         if let Some(batch) = batch.as_mut() {
                             append_record(batch, wire, rec);
                         }
@@ -716,10 +704,8 @@ impl CyclicSystem for TelemetrySystem {
         if let Some(batch) = batch
             && !batch.is_empty()
         {
-            link.broadcast(batch);
+            link.broadcast_buffer(batch);
         }
+        link.flush();
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -300,9 +300,9 @@ impl ComponentBrowserDelegate {
                 SharedString::new_static(""),
                 Box::new(move |_cx| {
                     let browser = browser.clone();
-                    vec![Box::new(DefaultActionRow {
-                        label: SharedString::new_static("label = pattern (e.g. *.health)"),
-                        callback: Arc::new(move |input, _window, cx| {
+                    vec![Box::new(DefaultActionRow::new(
+                        SharedString::new_static("label = pattern (e.g. *.health)"),
+                        Arc::new(move |input, _window, cx| {
                             let trimmed = input.trim();
                             if trimmed.is_empty() {
                                 return;
@@ -323,7 +323,7 @@ impl ComponentBrowserDelegate {
                                 });
                             }
                         }),
-                    }) as Box<dyn InspectorRow>]
+                    )) as Box<dyn InspectorRow>]
                 }),
             )));
         }

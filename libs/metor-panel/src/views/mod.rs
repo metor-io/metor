@@ -1,4 +1,5 @@
 pub mod alarm_panel;
+pub mod annunciator;
 pub mod attitude;
 pub(crate) mod binding;
 pub mod column_browser;
@@ -27,12 +28,12 @@ pub mod table;
 pub mod time_series;
 pub mod tooltip;
 pub mod traffic_light;
-pub mod traffic_light_grid;
 pub mod value_strip;
 pub mod viewer_3d;
 pub mod xy_plot;
 
-pub use alarm_panel::AlarmView;
+pub use alarm_panel::{AlarmListMode, AlarmView};
+pub use annunciator::{AlarmWhen, Annunciator, AnnunciatorConfig, AnnunciatorSource};
 pub use attitude::{AttitudeConfig, AttitudeIndicator, VectorMarker, VectorMarkerConfig};
 pub use column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 pub use component_browser::{BrowserEvent, ComponentBrowser, new_component_browser};
@@ -59,7 +60,6 @@ pub use time_series::{
 };
 pub use tooltip::TooltipText;
 pub use traffic_light::{TrafficLight, TrafficLightConfig};
-pub use traffic_light_grid::{TrafficLightGrid, TrafficLightGridConfig};
 pub use value_strip::{
     ComponentValueStrip, StripBehavior, StripCell, StripClick, StripPreset, StripStyle,
 };

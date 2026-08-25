@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use metor_fsw_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
-use crate::abi::FswStatus;
-use crate::coordinator::{CyclicSlot, SlotState, StopReason, WorkerRunState, WorkerStatus};
+use metor_fsw_2_core::abi::FswStatus;
+use metor_fsw_2_core::{CyclicSlot, SlotState, StopReason, WorkerRunState, WorkerStatus};
 
 use super::ctl::{CtlHost, StepOutcome, WorkerState};
 use super::session::SessionDir;
@@ -66,7 +66,7 @@ pub(crate) fn resolve_worker_exe(overridden: Option<&Path>) -> Result<PathBuf, P
 }
 
 /// Run a describe-mode worker over `artifact` and return the raw postcard
-/// [`PackManifest`](crate::abi::PackManifest) bytes it wrote — the host-side
+/// [`PackManifest`](metor_fsw_2_core::abi::PackManifest) bytes it wrote — the host-side
 /// twin of `fsw_pack_describe`, with the dlopen quarantined in a short-lived
 /// child. Decode the bytes with
 /// [`decode_pack_manifest`](crate::dl) and register via the wiring resolver's
@@ -368,7 +368,7 @@ impl ProcSlot {
     pub(crate) fn spawn(spec: SpawnSpec) -> Result<Self, String> {
         let exe = resolve_worker_exe(spec.worker_exe.as_deref()).map_err(|e| e.to_string())?;
         let manifest = WorkerManifest::Run {
-            abi_version: crate::abi::FSW_ABI_VERSION,
+            abi_version: metor_fsw_2_core::abi::FSW_ABI_VERSION,
             mode: RunMode::Cyclic,
             instance: spec.instance,
             system: spec.system,

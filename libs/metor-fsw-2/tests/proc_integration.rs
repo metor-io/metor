@@ -28,15 +28,15 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod common;
-use common::locate_fixture;
+use common::{drain_msgs, locate_fixture};
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
+use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use metor_fsw_2::{
     BuildSystem, CyclicSystem, Frame, Input, MsgIn, Out, Output, SequenceStatus, SlotStatus,
-    StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState, split_record,
+    StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -240,6 +240,8 @@ fn lockstep_end_to_end(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Simulated { dt_secs: 0.005 },
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         })
         .artifact(
             "counter",
@@ -402,6 +404,8 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         })
         .artifact(
             "counter",
@@ -509,6 +513,8 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
             default_depth: Some(8),
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         })
         .artifact(
             "counter",
@@ -655,23 +661,6 @@ fn seq_load(ch: &str, occupant: &str) -> SequenceCommand {
     )
 }
 
-/// Drain a message ring, decoding every record as one `Msg` type.
-fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
-    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake>,
-) -> Vec<M> {
-    let mut out = Vec::new();
-    let mut buf = Vec::new();
-    while view
-        .try_read_into(&mut buf)
-        .expect("no lap on the message tap")
-    {
-        let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
-        assert_eq!(id, M::ID, "every record on this channel carries M::ID");
-        out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
-    }
-    out
-}
-
 /// Await phase `want` on the slot's status stream, appending every newly
 /// published phase to `phases` with consecutive repeats deduplicated (the
 /// frame is republished each cycle). Gives up at `deadline` and answers
@@ -736,6 +725,8 @@ fn slow_sim_coordinator() -> metor_fsw_2::CoordinatorSpec {
         default_depth: Some(8),
         clock: metor_fsw_2::ClockSpec::Simulated { dt_secs: 1e-9 },
         namespace: None,
+        wasm_fuel_per_poll: None,
+        wasm_memory_limit_bytes: None,
     }
 }
 

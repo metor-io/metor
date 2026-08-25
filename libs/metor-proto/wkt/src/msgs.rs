@@ -576,7 +576,19 @@ pub type AlarmId = String;
 pub type OccurrenceId = u64;
 
 /// Alarm severity, ordered low → high so consumers can compute the highest active level.
-#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize,
+    Deserialize,
+    postcard_schema::Schema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Info,
@@ -661,6 +673,27 @@ pub struct AlarmAck {
     pub occurrence: OccurrenceId,
     pub operator: String,
     pub note: Option<String>,
+}
+
+/// Operator suppression of an alarm definition until `until`, published by the panel.
+///
+/// Shelving is an operator-console function (ISA-18.2): the control system keeps
+/// evaluating and reporting the alarm, and never subscribes to this message — it exists
+/// so every connected console agrees on which points are shelved and for how long.
+/// `until` is wall-clock, produced and compared by the consoles.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+pub struct AlarmShelved {
+    pub def_id: AlarmId,
+    pub until: Timestamp,
+    pub reason: Option<String>,
+    pub operator: String,
+}
+
+/// Operator cancellation of a live [`AlarmShelved`], published by the panel.
+#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone)]
+pub struct AlarmUnshelved {
+    pub def_id: AlarmId,
+    pub operator: String,
 }
 
 /// Human-readable, unique channel (slot instance) name, e.g. `"adcs"` — the stable
@@ -834,7 +867,19 @@ pub struct PresetDefs {
 
 /// Log severity, ordered low → high so consumers can filter by minimum level.
 /// Mirrors the `tracing` level set.
-#[derive(Serialize, Deserialize, postcard_schema::Schema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize,
+    Deserialize,
+    postcard_schema::Schema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     Trace,
@@ -1187,6 +1232,22 @@ mod alarm_tests {
             note: Some("looking into it".into()),
         };
         assert_eq!(ack.operator, roundtrip(&ack).operator);
+
+        let shelved = AlarmShelved {
+            def_id: "BATT_OVERTEMP".into(),
+            until: Timestamp(1_700_000_000_000_000),
+            reason: Some("sensor swap".into()),
+            operator: "sphw".into(),
+        };
+        let shelved2 = roundtrip(&shelved);
+        assert_eq!(shelved.until, shelved2.until);
+        assert_eq!(shelved.reason, shelved2.reason);
+
+        let unshelved = AlarmUnshelved {
+            def_id: "BATT_OVERTEMP".into(),
+            operator: "sphw".into(),
+        };
+        assert_eq!(unshelved.def_id, roundtrip(&unshelved).def_id);
     }
 
     #[test]
@@ -1196,6 +1257,8 @@ mod alarm_tests {
             AlarmRaised::ID,
             AlarmCleared::ID,
             AlarmAck::ID,
+            AlarmShelved::ID,
+            AlarmUnshelved::ID,
         ];
         for (i, a) in ids.iter().enumerate() {
             for b in &ids[i + 1..] {
@@ -1405,7 +1468,16 @@ mod alarm_id_tests {
         assert_eq!(AlarmRaised::ID, [217, 65]);
         assert_eq!(AlarmCleared::ID, [91, 221]);
         assert_eq!(AlarmAck::ID, [253, 188]);
-        for id in [AlarmDef::ID, AlarmRaised::ID, AlarmCleared::ID, AlarmAck::ID] {
+        assert_eq!(AlarmShelved::ID, [83, 33]);
+        assert_eq!(AlarmUnshelved::ID, [200, 230]);
+        for id in [
+            AlarmDef::ID,
+            AlarmRaised::ID,
+            AlarmCleared::ID,
+            AlarmAck::ID,
+            AlarmShelved::ID,
+            AlarmUnshelved::ID,
+        ] {
             assert!(!NODE_PROTOCOL_MESSAGES.contains(&id));
         }
     }
@@ -1456,6 +1528,8 @@ mod wiring_manifest_tests {
             AlarmRaised::ID,
             AlarmCleared::ID,
             AlarmAck::ID,
+            AlarmShelved::ID,
+            AlarmUnshelved::ID,
         ] {
             assert_ne!(id, WiringManifest::ID);
         }
@@ -1506,6 +1580,8 @@ mod log_event_tests {
             AlarmRaised::ID,
             AlarmCleared::ID,
             AlarmAck::ID,
+            AlarmShelved::ID,
+            AlarmUnshelved::ID,
         ] {
             assert_ne!(id, LogEvent::ID);
         }

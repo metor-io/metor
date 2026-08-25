@@ -12,7 +12,7 @@ name = "metor-fsw"
 version = "0.14.2"
 description = "Build, package, and run metor-fsw targets"
 requires-python = ">=3.10"
-dependencies = ["metor-fsw-abi==10"]
+dependencies = ["metor-fsw-abi==11"]
 
 [project.scripts]
 metor-fsw = "metor_fsw:main"

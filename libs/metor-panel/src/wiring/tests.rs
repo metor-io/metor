@@ -14,6 +14,8 @@ fn wiring_with_system(name: &str) -> Wiring {
             default_depth: None,
             clock: ClockSpec::Wall,
             namespace: None,
+            wasm_fuel_per_poll: None,
+            wasm_memory_limit_bytes: None,
         },
         artifacts: Vec::new(),
         states: Vec::new(),
@@ -26,10 +28,12 @@ fn wiring_with_system(name: &str) -> Wiring {
             src: None,
             scope: None,
             attach: None,
+            layout: None,
         }],
         slots: Vec::new(),
         edges: Vec::new(),
         scopes: Vec::new(),
+        program: None,
     }
 }
 

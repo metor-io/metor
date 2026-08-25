@@ -12,23 +12,22 @@ use metor_proto_wkt::{
 };
 
 use crate::Frame;
-use crate::binder::{Binder, BoundInput, BoundPort};
-use crate::descriptor::{FanIn, PortConn, PortId, SystemDescriptor};
-use crate::health::{HealthPort, LogEvent, SystemHealth};
-use crate::message::MsgIn;
-use crate::port::Input;
-use crate::registry::Registry;
-use crate::sequence::{SequenceStatus, SlotControlIn};
+use metor_fsw_2_core::Input;
+use metor_fsw_2_core::MsgIn;
+use metor_fsw_2_core::Registry;
+use metor_fsw_2_core::health::{HealthPort, LogEvent, SystemHealth};
+use metor_fsw_2_core::sequence::{SequenceStatus, SlotControlIn};
+use metor_fsw_2_core::{Binder, BoundInput, BoundPort};
+use metor_fsw_2_core::{FanIn, PortConn, PortId, SystemDescriptor};
 
 use super::init::{
-    AsyncPlumbing, ConsEdges, DlReg, Node, ProcReg, RingAlloc, SystemBind, owned_writer,
+    AsyncPlumbing, ConsEdges, DlReg, Node, ProcReg, RingAlloc, SystemBind, WasmReg, owned_writer,
 };
 use super::slot::{
     self, AllowedOccupant, OccupantBacking, SlotReg, SlotRunner, SlotStatus, slot_writer,
 };
-use super::{
-    BoundSystems, CoordinatorPorts, CoordinatorStatus, CyclicSlot, PendingAsync, WireError,
-};
+use super::{BoundSystems, CoordinatorPorts, CoordinatorStatus, PendingAsync, WireError};
+use metor_fsw_2_core::CyclicSlot;
 
 /// What the proc bind arm needs beyond the shared alloc products: the step
 /// deadline and the worker-executable override, both builder-scoped.
@@ -37,18 +36,20 @@ pub(super) struct ProcBindCtx {
     pub(super) worker_exe: Option<PathBuf>,
     pub(super) max_restarts: u32,
     pub(super) restart_backoff: Duration,
+    pub(super) wasm_fuel_per_poll: u64,
+    pub(super) wasm_memory_limit_bytes: usize,
 }
 
 /// Build the typed `BoundPort`s a static (host-side) registration binds over:
 /// the system's own output buffers, and its inputs in `descriptors()` order. A
-/// `One` input views its producer's output (or its private copy-in buffer); a
-/// `Many` input is a multi-view over every wired producer ring.
+/// `One` input views its producer's output; a `Many` input is a multi-view over
+/// every wired producer ring. Async registrations use their prebuilt private
+/// I/O plan instead of this direct path.
 fn bind_static_io(
     id: usize,
     desc: &SystemDescriptor,
     cons_edges: &ConsEdges,
     alloc: &RingAlloc,
-    plumbing: &AsyncPlumbing,
 ) -> (Vec<BoundPort>, Vec<BoundInput>) {
     let outs: Vec<BoundPort> = (0..desc.outputs.len())
         .map(|out_idx| BoundPort::new(alloc.output_rings[id][out_idx].clone()))
@@ -57,11 +58,7 @@ fn bind_static_io(
         .map(|in_idx| match desc.inputs[in_idx].fan_in {
             FanIn::One => {
                 let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
-                let port = match plumbing.private_inputs.get(&(id, in_idx)) {
-                    Some((ring, data)) => BoundPort::matched(ring.clone(), Box::new(data.clone())),
-                    None => BoundPort::new(alloc.output_rings[prod_id][out_idx].clone()),
-                };
-                BoundInput::One(port)
+                BoundInput::One(BoundPort::new(alloc.output_rings[prod_id][out_idx].clone()))
             }
             FanIn::Many => {
                 let ports = cons_edges
@@ -117,6 +114,15 @@ pub(super) fn bind_systems(
             SystemBind::Proc(proc_reg) => cyclic.push(bind_proc(
                 id, proc_reg, &desc, name, cons_edges, alloc, proc_ctx,
             )?),
+            SystemBind::Wasm(reg) => cyclic.push(Box::new(bind_wasm(
+                id,
+                reg,
+                &desc,
+                &name,
+                cons_edges,
+                &alloc.output_rings,
+                proc_ctx,
+            )?)),
             SystemBind::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
                 id, slot_reg, &desc, cons_edges, alloc, proc_ctx,
             )?)),
@@ -124,17 +130,26 @@ pub(super) fn bind_systems(
             // (`bind_static_io`) and walk them with a `Binder`. A pack entry
             // rides this arm too (via `PendingDriver`).
             SystemBind::Cyclic(r) => {
-                let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
+                let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc);
                 let mut binder = Binder::new(&outs, &ins, registry.clone(), &name);
                 cyclic.push(r.bind(&mut binder));
             }
             SystemBind::Async(r) => {
-                let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc, plumbing);
+                let plan = plumbing
+                    .plans
+                    .remove(&id)
+                    .expect("every async registration has one I/O plan");
+                let super::init::AsyncIoPlan {
+                    inputs: ins,
+                    outputs: outs,
+                    boundary,
+                } = plan;
                 let launcher = {
                     let mut binder = Binder::new(&outs, &ins, registry.clone(), &name);
                     r.bind(&mut binder)
                 };
                 pending_async.push(PendingAsync { name, launcher });
+                cyclic.push(Box::new(boundary));
             }
         }
     }
@@ -229,7 +244,7 @@ fn bind_dl(
     cons_edges: &ConsEdges,
     output_rings: &[Vec<RingBuffer>],
 ) -> crate::dl::DlSlot {
-    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+    use metor_fsw_2_core::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
     let outputs: Vec<FswRing> = (0..desc.outputs.len())
         .map(|out_idx| {
             let (base, len) = output_rings[id][out_idx].region();
@@ -346,6 +361,59 @@ fn bind_proc(
     })
 }
 
+/// The wired wasm arm: gather the same per-port regions as the dl arm, in
+/// the identical positional order, and bind a
+/// [`WasmCyclic`](crate::wasm::WasmCyclic) over them — its own interpreter
+/// instance, `Mount::Wired`, the descriptor's own delivery lists, no tail.
+fn bind_wasm(
+    id: usize,
+    reg: WasmReg,
+    desc: &SystemDescriptor,
+    name: &str,
+    cons_edges: &ConsEdges,
+    output_rings: &[Vec<RingBuffer>],
+    ctx: &ProcBindCtx,
+) -> Result<crate::wasm::WasmCyclic, WireError> {
+    use metor_fsw_2_core::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+    let outputs: Vec<FswRing> = (0..desc.outputs.len())
+        .map(|out_idx| {
+            let (base, len) = output_rings[id][out_idx].region();
+            FswRing {
+                base,
+                len,
+                role: ROLE_OUTPUT,
+            }
+        })
+        .collect();
+    let inputs: Vec<FswRing> = (0..desc.inputs.len())
+        .map(|in_idx| {
+            let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
+            let (base, len) = output_rings[prod_id][out_idx].region();
+            FswRing {
+                base,
+                len,
+                role: ROLE_INPUT,
+            }
+        })
+        .collect();
+    crate::wasm::WasmCyclic::bind(
+        &reg.bytes,
+        reg.index,
+        &reg.params,
+        Arc::from(desc.name.as_str()),
+        name,
+        &inputs,
+        &outputs,
+        super::slot::WASM_SETUP_FUEL,
+        ctx.wasm_fuel_per_poll,
+        ctx.wasm_memory_limit_bytes,
+    )
+    .map_err(|e| WireError::WasmBind {
+        system: name.to_string(),
+        detail: e.to_string(),
+    })
+}
+
 /// A runtime slot: gather the same per-port regions as the dl arm, but locate
 /// the runner's tail ports by their declared shape and hand the runner the
 /// control/status writers. No occupant is created here; only `init`/`Load`
@@ -360,7 +428,7 @@ fn bind_slot(
     alloc: &RingAlloc,
     proc_ctx: &ProcBindCtx,
 ) -> Result<SlotRunner, WireError> {
-    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+    use metor_fsw_2_core::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
     let SlotReg {
         allowed,
         initial,
@@ -416,7 +484,7 @@ fn bind_slot(
 
     // --- The runner's tail ports, read straight off the port plan --------------
     // Host cancel writer over the SlotControlIn input's dedicated ring.
-    let control_in_idx = ports.control_in_idx();
+    let control_in_idx = n_occ_inputs - 1;
     debug_assert_eq!(
         desc.inputs[control_in_idx].conn,
         PortConn::Host,
@@ -425,7 +493,7 @@ fn bind_slot(
     let control = slot_writer::<SlotControlIn>(&alloc.host_input_rings[&(id, control_in_idx)]);
     // The slot's command fan-in: one view per producer explicitly edged into
     // the declared `commands` input (zero edges is a legal, command-less slot).
-    let cmd_in_idx = ports.commands_in_idx();
+    let cmd_in_idx = n_occ_inputs;
     debug_assert_eq!(
         desc.inputs[cmd_in_idx].id(),
         PortId::Packet(SequenceCommand::ID),
@@ -448,7 +516,7 @@ fn bind_slot(
     );
     // The declared self-tap over the occupant's own SequenceStatus output (+1
     // fan-out counted at sizing): Progress plus outcome.
-    let seq_out_idx = ports.seq_status_out_idx();
+    let seq_out_idx = n_occ_outputs - 1;
     debug_assert_eq!(
         desc.outputs[seq_out_idx].id(),
         PortId::Component(SequenceStatus::FRAME_ID),
@@ -461,8 +529,8 @@ fn bind_slot(
     );
     // Host writers over the runner's output tail: SlotStatus plus the
     // "sequences" events channel (real output indices, no side allocation).
-    let status_out = slot_writer::<SlotStatus>(&output_rings[id][ports.status_out_idx()]);
-    let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][ports.events_out_idx()]);
+    let status_out = slot_writer::<SlotStatus>(&output_rings[id][n_occ_outputs]);
+    let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][n_occ_outputs + 1]);
 
     Ok(SlotRunner::new(
         Arc::from(desc.name.as_str()),
@@ -476,6 +544,8 @@ fn bind_slot(
         seq_status,
         commands,
         proc,
+        proc_ctx.wasm_fuel_per_poll,
+        proc_ctx.wasm_memory_limit_bytes,
     ))
 }
 
@@ -542,7 +612,7 @@ fn slot_proc_parts(
                 unreachable!("add_slot pins a process slot's occupants to artifact backings");
             };
             let manifest = WorkerManifest::Run {
-                abi_version: crate::abi::FSW_ABI_VERSION,
+                abi_version: metor_fsw_2_core::abi::FSW_ABI_VERSION,
                 mode: RunMode::Sequence,
                 // The worker-side identity is the slot's, whoever occupies it,
                 // matching the in-process `make_slot(.., self.name)`.

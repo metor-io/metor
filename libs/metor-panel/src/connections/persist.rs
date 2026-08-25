@@ -7,9 +7,11 @@
 //!   recents stay connectable across restarts through the installed
 //!   address resolver; discovery-only recents carry display fields alone,
 //!   reappearing as connectable once their source re-produces the target.
-//! - `layouts/<sanitized-id>.json` — one tile-layout document per target,
-//!   in the same format as named presets so the preset load path applies
-//!   unchanged.
+//! - `layouts/<sanitized-id>.json` — one workspace document per target: a
+//!   tile layout per open window plus its screen bounds
+//!   ([`crate::workspace::WorkspaceLayout`]). Files written before
+//!   multi-window hold a bare single-tree layout; the loader wraps them as
+//!   one window. Named presets deliberately stay single-tree.
 
 use std::path::PathBuf;
 use std::{fs, io};

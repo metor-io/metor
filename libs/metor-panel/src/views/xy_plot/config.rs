@@ -8,6 +8,7 @@ use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
 use super::{XyPlot, XyTrace};
+use crate::dynamic::expressions;
 use crate::views::time_series::{Override, PlotStyle};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -34,6 +35,17 @@ pub struct XyTraceConfig {
     pub visible: bool,
     pub label: String,
     pub stroke_width: f32,
+    /// The text an axis was written as, when it was an expression.
+    ///
+    /// The component id beside it is where that expression published *last*
+    /// session; this is what starts it again, because an expression's
+    /// component keeps its history but not its computation across a restart.
+    /// Absent for an ordinary component, so layouts saved before this existed
+    /// deserialize unchanged and layouts that never use one stay unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_expression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y_expression: Option<String>,
 }
 
 impl Default for XyTraceConfig {
@@ -48,6 +60,8 @@ impl Default for XyTraceConfig {
             visible: true,
             label: String::new(),
             stroke_width: 1.5,
+            x_expression: None,
+            y_expression: None,
         }
     }
 }
@@ -64,6 +78,9 @@ impl From<&XyTrace> for XyTraceConfig {
             visible: trace.visible,
             label: trace.label.to_string(),
             stroke_width: trace.stroke_width,
+            // Filled by `to_config`, which has the database to ask.
+            x_expression: None,
+            y_expression: None,
         }
     }
 }
@@ -86,8 +103,39 @@ impl From<XyTraceConfig> for XyTrace {
 
 impl XyPlot {
     pub fn from_config(config: XyPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let traces = config.traces.into_iter().map(XyTrace::from).collect();
-        let plot = Self::new(db, traces, cx);
+        // An axis written as an expression is compiled and started before the
+        // trace is built, so what it binds is the component now publishing
+        // rather than the one that did last session.
+        let mut expressions = Vec::new();
+        let traces = config
+            .traces
+            .into_iter()
+            .map(|mut trace| {
+                let x = trace
+                    .x_expression
+                    .clone()
+                    .or_else(|| expressions::binding_text(&db, trace.x_component_id));
+                let y = trace
+                    .y_expression
+                    .clone()
+                    .or_else(|| expressions::binding_text(&db, trace.y_component_id));
+                for (text, id, saved) in [
+                    (x, &mut trace.x_component_id, &mut trace.x_expression),
+                    (y, &mut trace.y_component_id, &mut trace.y_expression),
+                ] {
+                    let Some(text) = text else { continue };
+                    let Ok(bound) = expressions::bind(&text, &db, cx) else {
+                        continue;
+                    };
+                    *id = bound.id;
+                    *saved = Some(text);
+                    expressions.extend(bound.expression);
+                }
+                XyTrace::from(trace)
+            })
+            .collect();
+        let mut plot = Self::new(db, traces, cx);
+        plot._expressions = expressions;
         plot.line_plot.update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             line_plot.x_min_override = config.x_min_override;
@@ -106,7 +154,17 @@ impl XyPlot {
             traces: line_plot
                 .traces()
                 .iter()
-                .map(|trace| XyTraceConfig::from(trace.read(cx)))
+                .map(|trace| {
+                    let trace = trace.read(cx);
+                    let mut config = XyTraceConfig::from(trace);
+                    // An axis bound to an expression saves the text that made
+                    // it; the id alone would come back as history with nothing
+                    // computing into it.
+                    let db = line_plot.db();
+                    config.x_expression = expressions::binding_text(db, trace.x_component_id);
+                    config.y_expression = expressions::binding_text(db, trace.y_component_id);
+                    config
+                })
                 .collect(),
             custom_title: line_plot
                 .custom_title

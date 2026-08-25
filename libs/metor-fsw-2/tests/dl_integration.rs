@@ -132,6 +132,8 @@ fn dl_coordinator() -> CoordinatorSpec {
         default_depth: Some(8),
         clock: ClockSpec::Simulated { dt_secs: 0.005 },
         namespace: None,
+        wasm_fuel_per_poll: None,
+        wasm_memory_limit_bytes: None,
     }
 }
 
@@ -279,8 +281,7 @@ fn dlopen_cyclic_system_end_to_end() {
     });
 
     // 5. The loaded system produced correct output: count = start + value.
-    let mut last_out_ts = Timestamp(0);
-    {
+    let last_out_ts = {
         let out = out_view
             .latest()
             .expect("tick_out ring readable")
@@ -290,8 +291,8 @@ fn dlopen_cyclic_system_end_to_end() {
             1000 + CYCLES as u64,
             "start + latest value"
         );
-        last_out_ts = out.get().timestamp;
-    }
+        out.get().timestamp
+    };
 
     // 5a. The second instance of the same entry ran independently, with its
     //     own params.

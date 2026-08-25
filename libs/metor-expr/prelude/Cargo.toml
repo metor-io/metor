@@ -1,0 +1,38 @@
+[package]
+name = "metor-expr-prelude"
+license = "MIT OR Apache-2.0"
+version = "0.14.2"
+edition = "2024"
+publish = false
+description = "The guest-side kernel library metor-expr splices generated functions into"
+
+# A guest crate that links for `wasm32-unknown-unknown` and for nothing
+# else, which is why it sits outside the root workspace rather than inside
+# its `members` list. It is `std` (wasm32 std aborts on panic under the
+# profile below) because the pack module links the real ring crate, whose
+# handles are `Arc`-backed.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["tensor-kernels"]
+# Off only for the size measurement the M0 spike records: it isolates what the
+# tensor layer costs the guest over bare libm.
+tensor-kernels = ["dep:nox-array"]
+
+[dependencies]
+libm = "0.2"
+nox-array = { path = "../../nox/array", optional = true }
+# The real ring format, not a reimplementation: `default-features = false`
+# drops mmap and the wake endpoint, leaving create/attach over raw regions.
+metor-fsw-ring = { path = "../../metor-fsw-2/ring", default-features = false }
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"

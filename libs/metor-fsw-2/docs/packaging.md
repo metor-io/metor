@@ -155,7 +155,7 @@ target.bundle/
 The `.metor` form contains the same members in an uncompressed tar archive.
 The archive uses a fixed member order and clears variable tar metadata.
 
-`wiring.json` holds wiring IR v4 with build paths removed. It is the target
+`wiring.json` holds wiring IR v8 with build paths removed. It is the target
 definition that the host will resolve and run.
 
 `target.py` records provenance. Bundle load never evaluates it. A CI check

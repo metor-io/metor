@@ -91,6 +91,11 @@ Use a cyclic system when the work belongs at one fixed point in each cycle.
 
 A struct async system implements `System` and `AsyncSystem`. The coordinator spawns `run` once. The task sets its own pace.
 
+`AsyncSystem` and its `AsyncContext` live in the host crate, not in
+`metor-fsw-2-core`: the task is owned by the coordinator's runtime, so it is
+registered statically and a pack cannot export one. Every other form works from
+core alone.
+
 ```rust
 impl AsyncSystem for LinkReader {
     async fn run(
@@ -111,7 +116,12 @@ impl AsyncSystem for LinkReader {
 
 The task may wait on input or a timer. It should use `AsyncContext::until_cancelled` around long waits so shutdown can stop it.
 
-Snapshot inputs use private copy-in rings. Message inputs read producer rings without that copy.
+Every async input and output uses a private ring. At the system's registered
+cycle position, the coordinator imports its inputs and then exports work the
+task produced before that boundary. The local task cannot run between those
+operations, so newly imported data can first affect graph-visible output on the
+next cycle. Registration order and `connect_delayed` therefore have the same
+visibility meaning at async boundaries as at cyclic systems.
 
 The coordinator does not call `HealthPort::end_cycle` for this form. The system must choose when to publish health and flush queued logs. It must also choose how to report output publish drops.
 

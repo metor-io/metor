@@ -15,15 +15,16 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, BrowserPanel, DataTablePanel, LogPanel, PlotPanel, SequenceGridPanel, SequencePanel,
+    AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, DataTablePanel, LogPanel,
+    PlotPanel, SequenceGridPanel, SequencePanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use crate::views::time_series::time_range::GlobalTimeRange;
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
-    Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, point, prelude::*, px, size,
+    MouseUpEvent, Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px,
+    size,
 };
 use metor_db::{DB, Server};
 use stellarator::{net::TcpListener, struc_con::stellar};
@@ -49,9 +50,13 @@ const TITLEBAR_HEIGHT: f32 = 36.0;
 /// events, pending-edit flushes). They're queued into `pending_*` fields and
 /// drained inside `render` so entity creation always happens on the render
 /// thread with access to [`Window`] for focus transfer.
-struct AppRoot {
+pub(crate) struct AppRoot {
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
+    /// This window's own instances of the consumer-supplied overlays. Built
+    /// per window from [`OverlayBuilders`] — two windows never share one
+    /// view entity, since element state and hitboxes are per-window.
+    overlays: Vec<gpui::AnyView>,
     inspector: Option<Entity<Inspector>>,
     /// Anchored, non-focused plot preview shown while the user holds shift
     /// over a component name. Tracked separately from `inspector` so the
@@ -88,17 +93,14 @@ struct HoverPreview {
 }
 
 impl AppRoot {
-    fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let tiles = cx.new(|cx| TileGroup::new(vec![], cx));
+    pub(crate) fn new(
+        db: Arc<DB>,
+        tiles: Option<Entity<TileGroup>>,
+        show_picker_if_disconnected: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let tiles = tiles.unwrap_or_else(|| cx.new(|cx| TileGroup::new(vec![], cx)));
         cx.subscribe(&tiles, Self::handle_tile_event).detach();
-        let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
-        cx.set_global(OpenInspectorGlobal(on_open_inspector.clone()));
-        crate::inspector::palette::register_builtin_providers(
-            db.clone(),
-            tiles.clone(),
-            on_open_inspector,
-            cx,
-        );
         // Repaint the status bar when alarms change.
         if let Some(store) = crate::alarms::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
@@ -109,14 +111,19 @@ impl AppRoot {
         let mut pending_connection_picker = None;
         if let Some(store) = crate::connections::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
-            store.update(cx, |store, _| store.set_tiles(tiles.downgrade()));
-            if store.read(cx).active().is_empty() {
+            if show_picker_if_disconnected && store.read(cx).active().is_empty() {
                 pending_connection_picker = Some(true);
             }
         }
+        let overlay_builders = cx
+            .try_global::<OverlayBuilders>()
+            .map(|b| b.0.clone())
+            .unwrap_or_default();
+        let overlays = overlay_builders.iter().map(|build| build(cx)).collect();
         Self {
             db,
             tiles,
+            overlays,
             inspector: None,
             hover_preview: None,
             pending_inspector_request: None,
@@ -148,13 +155,8 @@ impl AppRoot {
         cx.notify();
     }
 
-    fn make_on_open_inspector(root: Entity<AppRoot>) -> crate::inspector::OpenInspectorCallback {
-        Arc::new(move |request, _window, cx| {
-            root.update(cx, |this, cx| {
-                this.pending_inspector_open = Some(request);
-                cx.notify();
-            });
-        })
+    pub(crate) fn tiles(&self) -> &Entity<TileGroup> {
+        &self.tiles
     }
 
     fn toggle_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -389,6 +391,74 @@ impl AppRoot {
         cx.notify();
     }
 
+    /// A left-button release outside this window's viewport while a tab drag
+    /// is live: tear the tab out into its own window at the drop point.
+    ///
+    /// Registered as `on_mouse_up_out`, which also fires for a release over
+    /// occluded chrome (the titlebar, an overlay) — the viewport test is what
+    /// separates "dropped on nothing in this window" (a no-op, as before)
+    /// from "dropped on the desktop".
+    fn handle_tab_drag_out(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !cx.has_active_drag() {
+            return;
+        }
+        let Some(drag) = crate::tiles::take_active_tab_drag(cx) else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        let inside = event.position.x >= px(0.)
+            && event.position.y >= px(0.)
+            && event.position.x <= viewport.width
+            && event.position.y <= viewport.height;
+        if inside {
+            return;
+        }
+        // Screen-space drop point, nudged so the cursor lands on the new
+        // window's tab strip rather than its top-left corner.
+        let origin = window.bounds().origin + event.position - point(px(60.0), px(20.0));
+        let outer = drag.pane.read(cx).current_outer_size();
+        let window_size = size(
+            px(outer.width.max(400.0)),
+            px(outer.height.max(300.0) + TITLEBAR_HEIGHT),
+        );
+        let db = self.db.clone();
+        // Deferred: opening and closing windows mid-dispatch re-enters the
+        // platform layer.
+        cx.defer(move |cx: &mut App| {
+            drag.pane.update(cx, |pane, cx| pane.remove_item(drag.ix, cx));
+            let pane = cx.new(|cx| crate::tiles::Pane::new(vec![drag.item], cx));
+            let tiles = cx.new(|cx| TileGroup::from_pane(pane, cx));
+            crate::workspace::open_panel_window(
+                db,
+                Some(Bounds {
+                    origin,
+                    size: window_size,
+                }),
+                Some(tiles),
+                false,
+                cx,
+            );
+            // Tearing out a window's only tab reads as moving the window:
+            // close the emptied source unless the picker is holding it open.
+            if let Some(source) = drag.source_window.downcast::<AppRoot>() {
+                let _ = source.update(cx, |root, window, cx| {
+                    let picker_up = root
+                        .connection_picker
+                        .as_ref()
+                        .is_some_and(|p| !p.read(cx).dismissed);
+                    if !root.tiles.read(cx).has_items(cx) && !picker_up {
+                        window.remove_window();
+                    }
+                });
+            }
+        });
+    }
+
     fn handle_tile_event(
         &mut self,
         _tiles: Entity<TileGroup>,
@@ -499,6 +569,17 @@ impl Render for AppRoot {
                     }
                 },
             ))
+            // An in-window mouse-up ends any tab drag through the normal
+            // drop handlers; clear the mirror so it can't go stale. Fires
+            // exactly when `on_mouse_up_out` below doesn't (hover is the
+            // gate for both, in opposite directions).
+            .capture_any_mouse_up(|_, _, cx| {
+                crate::tiles::take_active_tab_drag(cx);
+            })
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(Self::handle_tab_drag_out),
+            )
             .font_family(font_family)
             .flex()
             .flex_col()
@@ -526,24 +607,22 @@ impl Render for AppRoot {
         }
 
         // Consumer-supplied overlays, mounted last so they draw over everything.
-        // Each is an opaque view the consumer built at startup (e.g. a modal that
-        // renders nothing until its own state says otherwise).
-        if let Some(overlays) = cx.try_global::<OverlayViews>() {
-            for view in &overlays.0 {
-                root = root.child(view.clone());
-            }
+        // Each is an opaque view this window built for itself at construction
+        // (e.g. a modal that renders nothing until its own state says otherwise).
+        for view in &self.overlays {
+            root = root.child(view.clone());
         }
 
         crate::window_controls::client_side_decorations(root, window, cx)
     }
 }
 
-/// Consumer-supplied root overlays, installed via [`PanelApp::overlay`] and read
-/// by [`AppRoot::render`]. Held in a global because overlays are built before the
-/// window (and thus `AppRoot`) exists.
-struct OverlayViews(Vec<gpui::AnyView>);
+/// Consumer-supplied overlay constructors, installed via [`PanelApp::overlay`].
+/// Held in a global as constructors rather than views so every window builds
+/// its own instances in [`AppRoot::new`].
+struct OverlayBuilders(Vec<std::rc::Rc<dyn Fn(&mut App) -> gpui::AnyView>>);
 
-impl gpui::Global for OverlayViews {}
+impl gpui::Global for OverlayBuilders {}
 
 impl AppRoot {
     /// Active-alarm summary shown on the left of the title bar; clicking opens the alarm
@@ -567,11 +646,13 @@ impl AppRoot {
         if let Some(store) = crate::alarms::try_global(cx) {
             let store = store.read(cx);
             let state = store.state();
-            let active = state.active_count();
-            if active == 0 {
+            // Pending, not active: a latched alarm still wants an operator, and a
+            // shelved one deliberately does not light the bar.
+            let pending = state.pending_count();
+            if pending == 0 {
                 bar = bar.child(Icon::Dot.svg_color(7.0, theme.control_active));
             } else {
-                if let Some(severity) = state.highest_active_severity() {
+                if let Some(severity) = state.highest_pending_severity() {
                     let idx = crate::alarms::severity_index(severity);
                     bar = bar.child(Icon::Dot.svg_color(7.0, theme.alarm_color(idx)));
                 }
@@ -592,7 +673,7 @@ impl AppRoot {
                     );
                 }
                 bar = bar.child(SharedString::from(format!(
-                    "{active} active, {} unacked",
+                    "{pending} pending, {} unacked",
                     state.unacked_count()
                 )));
             }
@@ -892,7 +973,7 @@ pub struct PanelApp {
     default_options: OptionSpec,
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
-    overlays: Vec<Box<dyn FnOnce(&mut App) -> gpui::AnyView>>,
+    overlays: Vec<std::rc::Rc<dyn Fn(&mut App) -> gpui::AnyView>>,
     views: Vec<(
         crate::views::dashboard::WidgetKind,
         crate::views::dashboard::WidgetSpec,
@@ -969,18 +1050,19 @@ impl PanelApp {
         self
     }
 
-    /// Mount a consumer-built view over the window root. `build` runs at startup
-    /// (with `&mut App`, after the built-in registries exist) and returns any
-    /// [`Render`] entity as an [`AnyView`](gpui::AnyView); it is drawn above the
-    /// tile tree and inspector every frame. The consumer owns the view's state
-    /// and updates — a modal that renders nothing until shown, say. Call more
-    /// than once to stack overlays in insertion order.
+    /// Mount a consumer-built view over the window root. `build` runs once per
+    /// window (with `&mut App`, after the built-in registries exist) and
+    /// returns any [`Render`] entity as an [`AnyView`](gpui::AnyView); it is
+    /// drawn above the tile tree and inspector every frame. The consumer owns
+    /// the view's state and updates — a modal that renders nothing until
+    /// shown, say. Call more than once to stack overlays in insertion order.
     pub fn overlay<V, F>(mut self, build: F) -> Self
     where
         V: Render,
-        F: FnOnce(&mut App) -> Entity<V> + 'static,
+        F: Fn(&mut App) -> Entity<V> + 'static,
     {
-        self.overlays.push(Box::new(move |cx| build(cx).into()));
+        self.overlays
+            .push(std::rc::Rc::new(move |cx| build(cx).into()));
         self
     }
 
@@ -1049,11 +1131,13 @@ impl PanelApp {
         self
     }
 
-    /// Boot the gpui application and block until the last window closes.
+    /// Boot the gpui application and block until it quits.
     ///
     /// Registers the theme, fonts, icons, edit queue, palette providers,
     /// inspector registry, and widget registry, drains any consumer-supplied
-    /// command providers and init hooks, then opens the root window.
+    /// command providers and init hooks, then opens the first window. The
+    /// app outlives its last window: closing them all leaves the process in
+    /// the dock, and a reopen (dock click) spawns a fresh window.
     pub fn run(self) {
         let PanelApp {
             db,
@@ -1080,9 +1164,17 @@ impl PanelApp {
             });
         }
 
-        Application::new()
-            .with_assets(crate::icons::IconAssets)
-            .run(move |cx: &mut App| {
+        let app = Application::new().with_assets(crate::icons::IconAssets);
+        // A dock-click (macOS "reopen") with every window closed brings the
+        // app back with a fresh window; the process deliberately outlives its
+        // last window so the stores and connections keep running.
+        let reopen_db = db.clone();
+        app.on_reopen(move |cx| {
+            if crate::workspace::panel_windows(cx).is_empty() {
+                crate::workspace::open_panel_window(reopen_db.clone(), None, None, true, cx);
+            }
+        });
+        app.run(move |cx: &mut App| {
                 crate::theme::register_fonts(cx);
                 let cfg = crate::config::load();
                 // Capture the leader before `cfg` moves into the font global; it
@@ -1100,10 +1192,8 @@ impl PanelApp {
                 ItemRegistry::init(cx);
                 crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
                 crate::views::dashboard::WidgetRegistry::init(cx);
-                crate::dynamic::DynamicRegistry::init(cx);
-                crate::node_editor::GraphCoordinator::init(cx);
-                crate::node_editor::DynamicWorker::init(cx);
-                crate::node_editor::inspector_rows::register_inspector_rows(cx);
+                crate::dynamic::expressions::Expressions::init(cx);
+                crate::dynamic::worker::DynamicWorker::init(cx);
                 crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::logs::LogStore::init(db.clone(), cx);
@@ -1154,6 +1244,20 @@ impl PanelApp {
                 }
                 register_connection_commands(cx);
 
+                // Inspector requests route to the window they were made in:
+                // the callback resolves the root of whatever `Window` the
+                // caller passed, so one installation serves every window.
+                cx.set_global(OpenInspectorGlobal(Arc::new(|request, window, cx| {
+                    let Some(root) = window.root::<AppRoot>().flatten() else {
+                        return;
+                    };
+                    root.update(cx, |this, cx| {
+                        this.pending_inspector_open = Some(request);
+                        cx.notify();
+                    });
+                })));
+                crate::inspector::palette::register_builtin_providers(db.clone(), cx);
+
                 // Consumer extensions: register custom palette providers, run
                 // init hooks, then build overlays. All happen after the built-in
                 // registries exist so they can call into any of them; overlays
@@ -1164,66 +1268,39 @@ impl PanelApp {
                 for hook in init_hooks {
                     hook(cx);
                 }
-                let built: Vec<gpui::AnyView> =
-                    overlays.into_iter().map(|build| build(cx)).collect();
-                cx.set_global(OverlayViews(built));
+                cx.set_global(OverlayBuilders(overlays));
 
                 set_dock_icon();
                 // `secondary-` resolves to cmd on macOS and ctrl elsewhere
                 // (`cmd-` would be the Win/Super key off-macOS).
                 cx.bind_keys([
                     KeyBinding::new("secondary-p", OpenPalette, None),
-                    // The leader opens the transient chord menu. Suppressed while
-                    // a text field (Inspector search, node-editor inline edit via
-                    // RowList) or the menu itself holds focus, so the key still
-                    // types normally there.
-                    KeyBinding::new(
-                        leader.as_str(),
-                        OpenLeader,
-                        Some("!Inspector && !RowList && !Transient"),
-                    ),
+                    // The leader opens the transient chord menu, and it is a
+                    // bare key — `space` by default — so anything typing into
+                    // it must say so. `TextInput` is that: every host owning
+                    // an editable field declares it beside its own name, and
+                    // one negation covers all of them, including ones that do
+                    // not exist yet. Naming the panes individually is what let
+                    // the program pane swallow its own spacebar.
+                    KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
                     KeyBinding::new("ctrl-tab", CycleTabForward, None),
                     KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
                     KeyBinding::new("secondary-l", ToggleCmdLock, None),
                     KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
-                    // Excluded when a `RowList` is focused so editing a node's
-                    // inline arg field (typing Backspace, hitting Delete) doesn't
-                    // also delete the surrounding node.
-                    KeyBinding::new(
-                        "delete",
-                        crate::node_editor::DeleteSelected,
-                        Some("NodeEditor && !RowList"),
-                    ),
-                    KeyBinding::new(
-                        "backspace",
-                        crate::node_editor::DeleteSelected,
-                        Some("NodeEditor && !RowList"),
-                    ),
                 ]);
 
-                let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
-                let db = db.clone();
-                cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        // `appears_transparent` hides the native titlebar on
-                        // macOS (leaving the traffic lights) and on Windows
-                        // (leaving nothing — the app draws its own controls).
-                        titlebar: Some(TitlebarOptions {
-                            appears_transparent: true,
-                            traffic_light_position: Some(point(px(12.0), px(8.0))),
-                            ..Default::default()
-                        }),
-                        // Linux-only: request client-side decorations; the
-                        // window root wraps itself in resize borders and a
-                        // shadow via `window_controls::client_side_decorations`.
-                        window_decorations: Some(gpui::WindowDecorations::Client),
-                        app_id: Some("metor-panel".into()),
-                        ..Default::default()
-                    },
-                    move |_window, cx| cx.new(|cx| AppRoot::new(db, cx)),
-                )
-                .unwrap();
+                // A non-last close: re-snapshot the survivors right away, so
+                // a quit inside the next autosave interval can't resurrect
+                // the closed window. After the last close this is a no-op,
+                // leaving the should-close snapshot that included it.
+                cx.on_window_closed(|cx| {
+                    if !crate::workspace::panel_windows(cx).is_empty() {
+                        crate::connections::flush_layout_now(cx);
+                    }
+                })
+                .detach();
+
+                crate::workspace::open_panel_window(db.clone(), None, None, true, cx);
             });
     }
 }
@@ -1284,6 +1361,20 @@ fn register_connection_commands(cx: &mut App) {
 /// specialized built-in panel kinds. Ordinary registered views are adapted
 /// into this registry immediately afterwards; Dashboard retains its dedicated
 /// deserializer because it is itself a host. The populated registry is a gpui
+/// The key context every host owning an editable field declares beside its own
+/// name, and the reason bare-key shortcuts can exist at all.
+///
+/// A predicate naming panes individually is wrong the moment someone adds a
+/// pane — which is exactly how the program pane came to swallow its own
+/// spacebar — so the rule is stated once, here, and every field opts in.
+pub const TEXT_INPUT: &str = "TextInput";
+
+/// Context predicate for a bare key that must not fire while something is
+/// being typed into. `Transient` is the chord menu itself, which must not
+/// re-trigger its own leader.
+pub const NOT_TYPING: &str = "!TextInput && !Transient";
+
+/// Deleting the selected node: only in a node editor, and never while an
 /// `Global` so palette callbacks can fetch it without threading.
 fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     use crate::tiles::ItemRegistry as PaneItemRegistry;
@@ -1295,16 +1386,70 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
     register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
-    register_panel::<crate::node_editor::pane::NodeEditor>(
+    register_panel::<crate::canvas::GraphCanvas>(
         &mut reg,
         db.clone(),
-        crate::node_editor::pane::NodeEditor::from_config,
+        crate::canvas::GraphCanvas::from_config,
     );
-    register_panel::<crate::views::system_graph::SystemGraphPanel>(
-        &mut reg,
-        db.clone(),
-        crate::views::system_graph::SystemGraphPanel::from_config,
-    );
+
+    // The graph tile is the system graph with a second source added, so it
+    // keeps that key and every layout naming it opens unchanged. A layout that
+    // names the program pane opens on the same tile, showing the text it was
+    // saved on — the two were views of one artifact even before they were one
+    // tile.
+    let db_program = db.clone();
+    reg.register_erased("program", move |state, cx| {
+        #[derive(Default, serde::Deserialize)]
+        #[serde(default)]
+        struct Saved {
+            source: String,
+            graph: bool,
+        }
+        let saved: Saved = serde_json::from_str(state).unwrap_or_default();
+        let cfg = crate::canvas::GraphCanvasConfig {
+            program: crate::canvas::ProgramState {
+                source: saved.source,
+                text: !saved.graph,
+            },
+            ..Default::default()
+        };
+        let db = db_program.clone();
+        let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
+        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
+    });
+
+    // A layout that still names the node editor opens on the graph tile with
+    // its graph converted to a program — one declaration per node, positions
+    // carried across. It opens on the *text*, because a conversion is
+    // something to read before it is something to keep, and anything the
+    // converter could not express rides at the top as a comment.
+    let db_nodes = db.clone();
+    reg.register_erased("node_editor", move |state, cx| {
+        let saved: crate::canvas::legacy::NodeEditorConfig =
+            serde_json::from_str(state).unwrap_or_default();
+        let db = db_nodes.clone();
+        let converted = crate::canvas::migrate::convert(&saved, &db);
+        let cfg = crate::canvas::GraphCanvasConfig {
+            program: crate::canvas::ProgramState {
+                source: converted.annotated(),
+                text: true,
+            },
+            ..Default::default()
+        };
+        let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
+        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
+    });
+
+    // Layouts written before the annunciator rename still name it
+    // `traffic_light_grid`; the alias rehydrates them and they re-save under
+    // the new key.
+    let db_annunciator = db.clone();
+    reg.register_erased("traffic_light_grid", move |state, cx| {
+        let cfg: AnnunciatorPanelConfig = serde_json::from_str(state).unwrap_or_default();
+        let db = db_annunciator.clone();
+        let entity = cx.new(|cx| AnnunciatorPanel::from_config(cfg, db, cx));
+        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
+    });
 
     // Dashboard's deserializer returns a fully-constructed entity rather
     // than a `Self`, so it doesn't fit the generic helper.
@@ -1359,3 +1504,71 @@ fn set_dock_icon() {
 
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon() {}
+
+#[cfg(test)]
+mod keybinding_tests {
+    use super::{NOT_TYPING, TEXT_INPUT};
+    use gpui::{KeyBindingContextPredicate, KeyContext};
+
+    /// The focus path, root first — the order gpui evaluates a predicate over.
+    fn path(contexts: &[&str]) -> Vec<KeyContext> {
+        contexts
+            .iter()
+            .map(|c| KeyContext::try_from(*c).expect("a context parses"))
+            .collect()
+    }
+
+    fn fires(predicate: &str, contexts: &[&str]) -> bool {
+        KeyBindingContextPredicate::parse(predicate)
+            .expect("a predicate parses")
+            .depth_of(&path(contexts))
+            .is_some()
+    }
+
+    /// A host declares its own name *and* `TextInput` from one string, which
+    /// is what lets one negation cover every editable field.
+    #[test]
+    fn a_host_can_declare_its_name_and_text_input_together() {
+        let context = KeyContext::try_from("GraphCanvas TextInput").unwrap();
+        assert!(context.contains("GraphCanvas"));
+        assert!(context.contains(TEXT_INPUT));
+    }
+
+    /// The bug: the leader is a bare `space` by default, so it must not fire
+    /// anywhere a character is being typed — including panes that did not
+    /// exist when the predicate was written.
+    #[test]
+    fn the_leader_never_fires_while_something_is_being_typed_into() {
+        assert!(fires(NOT_TYPING, &["AppRoot"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "NodeEditor"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "GraphCanvas"]));
+
+        for typing in [
+            &["AppRoot", "GraphCanvas TextInput"][..],
+            &["AppRoot", "Inspector TextInput"][..],
+            &["AppRoot", "Inspector TextInput", "RowList TextInput"][..],
+            &["AppRoot", "ConnectionPicker TextInput"][..],
+            // A field nested under a pane that is not itself a text host: the
+            // negation looks at the whole path, not just the leaf.
+            &["AppRoot", "NodeEditor", "RowList TextInput"][..],
+        ] {
+            assert!(
+                !fires(NOT_TYPING, typing),
+                "the leader stole a keystroke from {typing:?}"
+            );
+        }
+
+        // The chord menu must not re-trigger its own leader.
+        assert!(!fires(NOT_TYPING, &["AppRoot", "Transient"]));
+    }
+
+    /// Deleting a card is the graph tile's own key rather than an action, and
+    /// it answers to the same rule: the canvas declares `TextInput` only while
+    /// its editor is showing, so a keystroke meant for the text never reaches
+    /// the graph.
+    #[test]
+    fn deleting_a_card_never_fires_from_inside_a_field() {
+        assert!(fires(NOT_TYPING, &["AppRoot", "GraphCanvas"]));
+        assert!(!fires(NOT_TYPING, &["AppRoot", "GraphCanvas TextInput"]));
+    }
+}

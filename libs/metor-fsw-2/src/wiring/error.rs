@@ -1,6 +1,7 @@
 //! Errors raised while loading and resolving a wiring document.
 
-use miette::{Diagnostic, LabeledSpan, SourceCode, SourceSpan};
+use metor_fsw_2_core::params::{ParamError, ParamErrorKind};
+use miette::Diagnostic;
 use thiserror::Error;
 
 use crate::coordinator::WireError;
@@ -10,17 +11,9 @@ use crate::dl::DlError;
 /// graph, from missing params through graph-level [`WireError`]s and
 /// shared-library loading failures ([`DlError`]).
 ///
-/// The [`kind`](LoadError::kind) carries the failure's payload and display
-/// string; the [`anchor`](LoadError::anchor) — when it has one — the source
-/// snippet and offending span, so rendering the error as a [`miette`] report
-/// points at the target line responsible. A few kinds are spanless (version
-/// skew, front-end metadata bugs) and carry no anchor.
-///
-/// [`SourceRef`]: super::SourceRef
 #[derive(Debug)]
 pub struct LoadError {
     pub kind: LoadErrorKind,
-    pub anchor: Option<Anchor>,
 }
 
 impl std::fmt::Display for LoadError {
@@ -35,205 +28,24 @@ impl std::error::Error for LoadError {
     }
 }
 
-/// The source snippet a spanned [`LoadError`] renders and the span of the
-/// offending node within it. The span is a real field, not derived from the
-/// snippet: params errors anchor at a value's own document span.
-#[derive(Debug)]
-pub struct Anchor {
-    pub src: String,
-    pub span: SourceSpan,
-}
+impl Diagnostic for LoadError {}
 
-impl Diagnostic for LoadError {
-    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        Some(Box::new(self.kind.code()))
-    }
-
-    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.kind
-            .help()
-            .map(|h| Box::new(h) as Box<dyn std::fmt::Display>)
-    }
-
-    fn source_code(&self) -> Option<&dyn SourceCode> {
-        self.anchor.as_ref().map(|a| &a.src as &dyn SourceCode)
-    }
-
-    fn labels(&self) -> Option<Box<dyn Iterator<Item = LabeledSpan> + '_>> {
-        let anchor = self.anchor.as_ref()?;
-        let label = self.kind.label()?;
-        Some(Box::new(std::iter::once(LabeledSpan::new_with_span(
-            Some(label),
-            anchor.span,
-        ))))
+impl From<ParamError> for LoadError {
+    fn from(e: ParamError) -> Self {
+        LoadError {
+            kind: LoadErrorKind::Params(e.kind),
+        }
     }
 }
 
 impl LoadErrorKind {
-    /// Anchor this kind to a source snippet and the span of the offending node.
-    pub fn at(self, src: impl Into<String>, span: SourceSpan) -> LoadError {
-        LoadError {
-            kind: self,
-            anchor: Some(Anchor {
-                src: src.into(),
-                span,
-            }),
-        }
-    }
-
-    /// Anchor this kind to a snippet whose whole extent is the label span, the
-    /// common case for resolve-time snippets that carry no interior spans.
-    pub fn whole(self, src: impl Into<String>) -> LoadError {
-        let src = src.into();
-        let span = (0, src.len()).into();
-        self.at(src, span)
-    }
-
-    /// A spanless [`LoadError`]: version skew or a front-end metadata bug, with
-    /// no document text to point at.
+    /// Wrap this error kind for the resolver's public error surface.
     pub fn bare(self) -> LoadError {
-        LoadError {
-            kind: self,
-            anchor: None,
-        }
-    }
-
-    /// This kind's stable diagnostic code.
-    fn code(&self) -> &'static str {
-        use LoadErrorKind::*;
-        match self {
-            IrVersionMismatch { .. } => "fsw_wiring::ir_version_mismatch",
-            InvalidSimulatedStep { .. } => "fsw_wiring::invalid_simulated_step",
-            BadScopeRef { .. } => "fsw_wiring::bad_scope_ref",
-            MissingType { .. } => "fsw_wiring::missing_type",
-            DuplicateArtifact { .. } => "fsw_wiring::duplicate_artifact",
-            UnknownType { .. } => "fsw_wiring::unknown_type",
-            ProcessNeedsArtifact { .. } => "fsw_wiring::process_needs_artifact",
-            ProcessUnsupported { .. } => "fsw_wiring::process_unsupported",
-            ProcDescribe { .. } => "fsw_wiring::proc_describe",
-            DuplicateInstance { .. } => "fsw_wiring::duplicate_instance",
-            MissingParam { .. } => "fsw_wiring::missing_param",
-            InvalidParam { .. } => "fsw_wiring::invalid_param",
-            UnknownParam { .. } => "fsw_wiring::unknown_param",
-            UnknownInstance { .. } => "fsw_wiring::unknown_instance",
-            UnknownFrame { .. } => "fsw_wiring::unknown_frame",
-            UnknownMsg { .. } => "fsw_wiring::unknown_msg",
-            UnknownMsgName { .. } => "fsw_wiring::unknown_msg_name",
-            Wire { .. } => "fsw_wiring::wire",
-            UnknownArtifact { .. } => "fsw_wiring::unknown_artifact",
-            StaleStubs { .. } => "fsw_wiring::stale_stubs",
-            ArtifactNotBuilt { .. } => "fsw_wiring::artifact_not_built",
-            DlOpen { .. } => "fsw_wiring::dl_open",
-            DlParamEncode { .. } => "fsw_wiring::dl_param_encode",
-            ValueParams { .. } => "fsw_wiring::value_params",
-            StaticPostcardParams { .. } => "fsw_wiring::static_postcard_params",
-            PackCreate { .. } => "fsw_wiring::pack_create",
-            UnknownStateType { .. } => "fsw_wiring::unknown_state_type",
-            DuplicateState { .. } => "fsw_wiring::duplicate_state",
-            StateInit { .. } => "fsw_wiring::state_init",
-            StateUnused { .. } => "fsw_wiring::state_unused",
-            AttachUnknownState { .. } => "fsw_wiring::attach_unknown_state",
-            AttachOnNonSharedSystem { .. } => "fsw_wiring::attach_on_non_shared_system",
-            MissingAttach { .. } => "fsw_wiring::missing_attach",
-            AttachTypeMismatch { .. } => "fsw_wiring::attach_type_mismatch",
-            PackSystem { .. } => "fsw_wiring::pack_system",
-            PackTypeRequired { .. } => "fsw_wiring::pack_type_required",
-            OccupantAmbiguous { .. } => "fsw_wiring::occupant_ambiguous",
-            OccupantNotReloadable { .. } => "fsw_wiring::occupant_not_reloadable",
-            EmptySlot { .. } => "fsw_wiring::empty_slot",
-            SlotContractMismatch { .. } => "fsw_wiring::slot_contract_mismatch",
-            UnknownInitialOccupant { .. } => "fsw_wiring::unknown_initial_occupant",
-            SlotOccupantMismatch { .. } => "fsw_wiring::slot_occupant_mismatch",
-        }
-    }
-
-    /// This kind's `help` line, for the kinds that carry one.
-    fn help(&self) -> Option<&'static str> {
-        use LoadErrorKind::*;
-        Some(match self {
-            ProcessNeedsArtifact { .. } => {
-                "a process system runs in a worker that loads its cdylib, so only \
-                 artifact-backed systems can cross; a static-registry type cannot"
-            }
-            ProcessUnsupported { .. } => {
-                "process systems need a cross-process futex: Linux or macOS 14.4+"
-            }
-            ProcDescribe { .. } => {
-                "the worker dlopens the artifact and reports its descriptor; its captured \
-                 stderr is in the message above"
-            }
-            UnknownMsgName { .. } => {
-                "register the message type via `Registry::register_msg::<M>()`"
-            }
-            _ => return None,
-        })
-    }
-
-    /// The label pointing at the offending span, for the spanned kinds.
-    fn label(&self) -> Option<String> {
-        use LoadErrorKind::*;
-        Some(match self {
-            MissingType { .. } => "set a registered `type`".into(),
-            UnknownType { .. } => "register this type before loading".into(),
-            ProcessNeedsArtifact { .. } => "set an `artifact` or drop `process`".into(),
-            ProcessUnsupported { .. } => "this instance cannot run cross-process here".into(),
-            ProcDescribe { .. } => "describing this artifact failed".into(),
-            DuplicateInstance { .. } => "instance names must be unique".into(),
-            DuplicateArtifact { .. } => "artifact ids must be unique".into(),
-            MissingParam { .. } => "this node is missing the param".into(),
-            InvalidParam { .. } => "invalid value here".into(),
-            UnknownParam { .. } => "no params field is named this".into(),
-            UnknownInstance { .. } => "no `system` declares this instance".into(),
-            UnknownFrame { .. } => "misspelled or wrong-direction frame".into(),
-            UnknownMsg { .. } => "misspelled or wrong-direction message type".into(),
-            UnknownMsgName { .. } => "not a registered NamedMsg token".into(),
-            Wire { .. } => "introduced here".into(),
-            UnknownArtifact { artifact, .. } => {
-                format!("declare an `artifact \"{artifact}\" ...` node, or fix the `artifact=` ref")
-            }
-            ArtifactNotBuilt { .. } => {
-                "`provision_artifacts` must set this artifact's `path` before `resolve`".into()
-            }
-            DlOpen { .. } => "this dl system failed to load".into(),
-            DlParamEncode { .. } => {
-                "these params could not be encoded against the `Params` schema".into()
-            }
-            ValueParams { .. } => "these params".into(),
-            StaticPostcardParams { .. } => {
-                "typed `params(...)` cannot reach a static system".into()
-            }
-            PackCreate { .. } => "this system".into(),
-            UnknownStateType { .. } => "no registered pack declares this state type".into(),
-            DuplicateState { .. } => "state names must be unique".into(),
-            StateInit { .. } => "this state's construction failed".into(),
-            StateUnused { .. } => "declared here, attached nowhere".into(),
-            AttachUnknownState { .. } => "no `state` declares this name".into(),
-            AttachOnNonSharedSystem { .. } => "this system type declares no shared state".into(),
-            MissingAttach { .. } => "a shared-state system needs an `attach` state".into(),
-            AttachTypeMismatch { .. } => "this state's type is not the system's shared type".into(),
-            PackSystem { .. } => "this instance".into(),
-            PackTypeRequired { .. } => "add `type=\"…\"`".into(),
-            OccupantAmbiguous { .. } => "this slot".into(),
-            OccupantNotReloadable { .. } => "this slot".into(),
-            EmptySlot { .. } => "add an `allow occupant=\"...\"` child".into(),
-            SlotContractMismatch { dir, .. } => format!("no occupant {dir} port is named this"),
-            UnknownInitialOccupant { allowed, .. } => {
-                format!("no `allow occupant=` names this (allowed: {allowed})")
-            }
-            SlotOccupantMismatch { .. } => {
-                "this occupant's ports differ from the first allowed occupant's".into()
-            }
-            IrVersionMismatch { .. }
-            | InvalidSimulatedStep { .. }
-            | BadScopeRef { .. }
-            | StaleStubs { .. } => return None,
-        })
+        LoadError { kind: self }
     }
 }
 
-/// The payload and display string behind a [`LoadError`], one variant per
-/// failure. The rendered snippet and span live on the [`LoadError`]'s
-/// [`anchor`](LoadError::anchor), not here.
+/// The payload and display string behind a [`LoadError`].
 #[derive(Error, Debug)]
 pub enum LoadErrorKind {
     /// A [`Wiring`](super::Wiring) stamped with a different
@@ -276,6 +88,29 @@ pub enum LoadErrorKind {
     #[error("unknown system type `{ty}` (not in the registry)")]
     UnknownType { ty: String },
 
+    /// Two declarations of the wiring's Python program share a name. Decls
+    /// are addressed by name (a program-built pack entry references its
+    /// function this way), so a duplicate would silently shadow.
+    #[error("program declaration `{name}` appears more than once")]
+    DuplicateProgramDecl { name: String },
+
+    /// A system loading from the program artifact names an entry the wiring's
+    /// program never declares. The program *is* that artifact's source, so a
+    /// spec without a matching `@system` declaration is front-end drift, not
+    /// a document mistake.
+    #[error("Python system `{name}`: the wiring's program declares no `{name}`")]
+    ProgramUnknownDecl { name: String },
+
+    /// A cdylib artifact without a crate name or lib stem: nothing could
+    /// build or locate it.
+    #[error("artifact `{id}` is a cdylib but names no crate or lib stem")]
+    ArtifactMissingCrate { id: String },
+
+    /// A program-built wasm artifact in a wiring that captured no program:
+    /// there is no source to compile it from.
+    #[error("artifact `{id}` compiles from the target program, but the wiring carries none")]
+    ProgramArtifactWithoutProgram { id: String },
+
     #[error("system `{name}` sets `process` without an `artifact`")]
     ProcessNeedsArtifact { name: String },
 
@@ -283,6 +118,12 @@ pub enum LoadErrorKind {
     /// support. `name` is the instance name of either.
     #[error("`{name}` sets `process=#true`, unsupported on this target")]
     ProcessUnsupported { name: String },
+
+    #[error("wasm_fuel_per_poll must be greater than zero")]
+    InvalidWasmFuel,
+
+    #[error("wasm_memory_limit_bytes must be nonzero and fit this host (got {bytes})")]
+    InvalidWasmMemory { bytes: u64 },
 
     /// A resolve-time describe worker failed. `system` names the owning
     /// `system` or `slot` instance; for a slot, `artifact` is the allowed
@@ -297,25 +138,12 @@ pub enum LoadErrorKind {
     #[error("duplicate instance name `{name}`")]
     DuplicateInstance { name: String },
 
-    /// A required params field has no matching property or child on the node.
-    #[error("missing required param `{property}` for system `{system}`")]
-    MissingParam { property: String, system: String },
-
-    /// A params value that does not decode as the field's type, or a malformed
-    /// params surface such as a stray positional argument or a repeated
-    /// property.
-    #[error("invalid value for `{property}` on system `{system}`: expected {expected}")]
-    InvalidParam {
-        property: String,
-        system: String,
-        expected: String,
-    },
-
-    /// A property or child with no matching params field, usually a typo or a
-    /// stale config. Both the typed deserializer and the dynamic schema
-    /// validation raise this same variant.
-    #[error("unknown param `{property}` for system `{system}`")]
-    UnknownParam { property: String, system: String },
+    /// A params surface that did not decode or encode as the system's typed
+    /// `Params`. The codec is `metor-fsw-2-core`'s, since a pack entry decodes
+    /// its own params with no host in the loop; its diagnostic code and label
+    /// come straight off the kind.
+    #[error(transparent)]
+    Params(ParamErrorKind),
 
     #[error("unknown instance `{name}` referenced in a `connect`")]
     UnknownInstance { name: String },
@@ -371,17 +199,21 @@ pub enum LoadErrorKind {
         source: Box<DlError>,
     },
 
-    /// The dl system's params could not be encoded against its `Params`
-    /// schema, either because the schema has an unsupported shape or because
-    /// the dynamic encoder rejected a value.
-    #[error("dl system `{system}` params could not be schema-encoded: {reason}")]
-    DlParamEncode { system: String, reason: String },
+    /// A wasm occupant could not be read, described, or matched to an entry.
+    ///
+    /// Carries one boxed message rather than the slot, occupant, artifact and
+    /// cause as separate fields: four `String`s would make this the largest
+    /// variant and bloat every `LoadError`, the same `result_large_err` reason
+    /// [`DlOpen`](Self::DlOpen) boxes its source.
+    #[error("{0}")]
+    WasmOccupant(Box<str>),
 
-    /// A static system's value-tree params did not deserialize as its typed
-    /// `Params`. The reason is serde's own message; a value tree carries no
-    /// document spans, so the label covers the whole diagnostic snippet.
-    #[error("system `{system}` value params did not deserialize: {reason}")]
-    ValueParams { system: String, reason: String },
+    /// A wired wasm system could not be read, described, matched to an
+    /// entry, or its synthesized edges did not line up with its descriptor.
+    /// One boxed message, for the same size reason as
+    /// [`WasmOccupant`](Self::WasmOccupant).
+    #[error("{0}")]
+    WasmSystem(Box<str>),
 
     /// A static system was given typed builder params. The static path has no
     /// postcard decoder; its registered factory deserializes params from a
@@ -397,7 +229,7 @@ pub enum LoadErrorKind {
 
     /// A pack entry's create phase failed for a non-params reason (a
     /// moved-in state instantiated twice, a configure failure); a params
-    /// failure surfaces as its own spanned error instead.
+    /// failure surfaces as its own parameter error instead.
     #[error("system `{system}` failed to create: {message}")]
     PackCreate { system: String, message: String },
 

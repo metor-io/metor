@@ -264,7 +264,10 @@ struct AlarmEventSource;
 fn alarm_color(ev: &AlarmEvent, theme: &Theme) -> Hsla {
     match ev.kind {
         AlarmEventKind::Raised => theme.alarm_color(ev.severity.map_or(0, severity_index)),
-        AlarmEventKind::Cleared | AlarmEventKind::Acked => theme.text_secondary,
+        AlarmEventKind::Cleared
+        | AlarmEventKind::Acked
+        | AlarmEventKind::Shelved
+        | AlarmEventKind::Unshelved => theme.text_secondary,
     }
 }
 
@@ -273,6 +276,8 @@ fn alarm_short(ev: &AlarmEvent) -> SharedString {
         AlarmEventKind::Raised => ev.def_id.clone().into(),
         AlarmEventKind::Cleared => format!("{} clr", ev.def_id).into(),
         AlarmEventKind::Acked => format!("{} ack", ev.def_id).into(),
+        AlarmEventKind::Shelved => format!("{} shlv", ev.def_id).into(),
+        AlarmEventKind::Unshelved => format!("{} unshlv", ev.def_id).into(),
     }
 }
 
@@ -281,6 +286,8 @@ fn alarm_label(ev: &AlarmEvent) -> SharedString {
         AlarmEventKind::Raised => "Raised",
         AlarmEventKind::Cleared => "Cleared",
         AlarmEventKind::Acked => "Acked",
+        AlarmEventKind::Shelved => "Shelved",
+        AlarmEventKind::Unshelved => "Unshelved",
     };
     if ev.detail.is_empty() {
         format!("{kind} {}", ev.def_id).into()

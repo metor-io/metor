@@ -21,14 +21,16 @@ place in the IR scope tree.
 from __future__ import annotations
 
 import atexit
+import inspect
 import json
 import os
 import sys
+import textwrap
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Generic, Iterator, TypeVar, cast
+from typing import Any, Generic, Iterator, TypeVar, overload
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # The IR model version this recorder emits; must match `ir::IR_VERSION`.
 # v2 dropped the KDL front-end's `ParamSource::Kdl` variant (phase 4).
@@ -43,7 +45,17 @@ __version__ = "0.3.0"
 # their constructor), replacing the host's compiled-in by-type association.
 # v6 removed the redundant empty initial-occupant state; an absent `initial`
 # now exclusively represents an empty slot.
-IR_VERSION = 6
+# v7 added the `wasm` artifact kind and the coordinator's per-poll fuel and
+# guest-memory limits.
+# v8 moved eval-time validation to the one Rust gate (no shape change).
+# v9 added the captured Python program (`program`), the program-built wasm
+# artifact whose pack entries the `@system` declarations compile into, and
+# the declaration-site `layout` on every system.
+IR_VERSION = 9
+
+# Artifact id of the program-built wasm pack: the one artifact `to_ir`
+# synthesizes when the target added `@system` functions.
+PROGRAM_ARTIFACT = "program"
 
 # Reserved instance name of the coordinator (command plane).
 COORDINATOR = "coordinator"
@@ -78,36 +90,8 @@ def _source_ref() -> dict[str, Any]:
     return {"file": path, "line": frame.f_lineno, "col": 1}
 
 
-def _validate_namespace(namespace: str | None) -> str | None:
-    """A target namespace is a bare dotted path (``"sat1"``, ``"fleet.sat1"``):
-    non-empty, no leading/trailing dot, and every segment non-empty. It prefixes
-    every component name the target registers, so a malformed one would corrupt
-    every :class:`ComponentId`; reject it here rather than emit it."""
-    if namespace is None:
-        return None
-    if not isinstance(namespace, str):
-        raise TypeError(f"namespace must be a str, not {type(namespace).__name__}")
-    if not namespace or namespace.startswith(".") or namespace.endswith("."):
-        raise ValueError(f"namespace {namespace!r} must be a non-empty dotted path")
-    if any(seg == "" for seg in namespace.split(".")):
-        raise ValueError(f"namespace {namespace!r} has an empty segment")
-    return namespace
-
-
-def _json_scalar(value: Any, key: str) -> Any:
-    """Coerce a params value to something serde's JSON codec accepts, naming
-    the offending key when it cannot."""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_json_scalar(v, key) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _json_scalar(v, f"{key}.{k}") for k, v in value.items()}
-    raise TypeError(f"param {key!r} is not JSON-representable: {type(value).__name__}")
-
-
 def _params(kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {k: _json_scalar(v, k) for k, v in kwargs.items()}
+    return json.loads(json.dumps(kwargs))
 
 
 def _handle_name(handle: Any) -> str:
@@ -172,7 +156,17 @@ H = TypeVar("H", bound="Spec")
 
 
 class Frame:
-    """Base of a generated per-frame marker class (checker-only)."""
+    """Base of a per-frame marker class.
+
+    A generated pack module's markers are field-less (checker-only) and name
+    host frames. A subclass with annotated fields is a compiled frame: its
+    source is captured into the target program (see :func:`system`)."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "__annotations__" in cls.__dict__:
+            _frames.add(cls.__name__)
+            _capture(cls)
 
 
 class Msg:
@@ -206,16 +200,20 @@ class Artifact:
     A prebuilt pack's module (``metor-fsw pack dev``, or an installed pack
     wheel) also carries ``prebuilt`` — the directory of per-triple libraries
     the host provisions from instead of running cargo — plus the generating
-    ABI version and, for a published pack, its distribution name/version."""
+    ABI version and, for a published pack, its distribution name/version.
+
+    ``kind`` is ``"cdylib"`` (the default, requiring ``crate``/``lib``) or
+    ``"wasm"`` — one arch-neutral module with no crate behind it."""
 
     id: str
-    crate: str
-    lib: str
+    crate: str | None = None
+    lib: str | None = None
     manifest_hash: str | None = None
     prebuilt: str | None = None
     abi_version: int | None = None
     dist: str | None = None
     dist_version: str | None = None
+    kind: str = "cdylib"
 
 
 class System(Spec):
@@ -261,6 +259,145 @@ class SystemHandle:
         if name.startswith("_"):
             raise AttributeError(name)
         return PortRef(self.name, name)
+
+
+# ---------------------------------------------------------------------------
+# Python systems
+#
+# A `@system`-decorated function written in the target file runs on the
+# vehicle: the decorator captures its source here (a declaration, like a
+# native pack entry), `Target.add` registers an instance of it — at the call
+# position, so cyclic step order and scope prefixing work exactly as they do
+# for native systems — and `Target.to_ir` assembles the added declarations
+# into one program the build driver compiles into an ordinary wasm pack
+# artifact (`libs/metor-expr`) whose entries the emitted system specs address
+# by name. Under CPython the declarations are defined and never called, so
+# evaluation is harmless; the compiled semantics live entirely on the Rust
+# side. `Frame`/`State` subclasses with annotated fields capture the same way
+# and always ride the program (declarations take no `add`) — a field-less
+# subclass is a generated pack marker naming a *host* frame, resolved at
+# compile rather than compiled.
+# ---------------------------------------------------------------------------
+
+# Every captured declaration in definition order. Module-scoped like
+# `_targets`: classes and decorators execute before (or without) a Target.
+_program: list[dict[str, Any]] = []
+
+# The captured Frame class names, for naming a system's output port.
+_frames: set[str] = set()
+
+
+def _capture(obj: Any) -> dict[str, Any]:
+    """Record a declaration's source and provenance for the target program."""
+    lines, line = inspect.getsourcelines(obj)
+    file = inspect.getsourcefile(obj)
+    if file is not None:
+        try:
+            file = os.path.relpath(file)
+        except ValueError:
+            pass
+    entry: dict[str, Any] = {
+        "name": obj.__name__,
+        "source": textwrap.dedent("".join(lines)),
+        "src": {"file": file, "line": line, "col": 1},
+        "layout": None,
+        "system": False,
+    }
+    _program.append(entry)
+    return entry
+
+
+class Tensor:
+    """The tensor annotation (``Tensor[f64, 3]``), evaluated only so class
+    bodies run: the compiler reads the annotation from source, not from this
+    object."""
+
+    def __class_getitem__(cls, item: Any) -> Any:
+        return cls
+
+
+# The scalar annotation vocabulary. Aliases so annotations evaluate under
+# CPython; the compiler reads the spelling from source.
+f64 = float
+i64 = int
+
+
+class ExprHandle(SystemHandle):
+    """A captured ``@system`` declaration, and — once :meth:`Target.add`
+    registers it — the instance's handle. ``.out`` names its one output port;
+    any other attribute is a :class:`PortRef` like any handle's. Until the
+    add, ``name`` is the declaration's own (ports resolve only after
+    registration, like a native spec's)."""
+
+    def __init__(self, name: str, entry: dict[str, Any], out: str):
+        super().__init__(name)
+        self._entry = entry
+        self._out = out
+
+    @property
+    def out(self) -> Any:
+        return PortRef(self.name, self._out)
+
+
+def _snake(name: str) -> str:
+    """``RateEstimate`` to ``rate_estimate`` — the compiler's frame naming."""
+    out = ""
+    for i, c in enumerate(name):
+        if c.isupper() and i > 0:
+            out += "_"
+        out += c.lower()
+    return out
+
+
+def _output_frame(func: Any) -> str:
+    """The output port's frame name: the snake case of a declared Frame class
+    named by the return annotation, else the function's own name (the
+    anonymous one-field frame of the sugar form)."""
+    ret = func.__annotations__.get("return")
+    name = ret if isinstance(ret, str) else getattr(ret, "__name__", None)
+    if isinstance(name, str) and name in _frames:
+        return _snake(name)
+    return func.__name__
+
+
+def _system(func: Any) -> ExprHandle:
+    entry = _capture(func)
+    entry["system"] = True
+    # The instance name the handle was added under; `None` until then.
+    entry["added"] = None
+    placed = getattr(func, "_metor_node", None)
+    if placed is not None:
+        entry["layout"] = placed
+    return ExprHandle(func.__name__, entry, _output_frame(func))
+
+
+def system(*args: Any, **kwargs: Any) -> Any:
+    """Declare a Python system that can run on the vehicle.
+
+    Bare (``@system``) over Frame-annotated parameters, or parameterized
+    (``@system("imu.omega_b")``, ``bind=``, ``on=``, ``rate=``) — the
+    arguments configure the *compiled* system and are read from source by the
+    host, so they are accepted and ignored here. Decoration only captures the
+    declaration; :meth:`Target.add` registers an instance, exactly like a
+    native pack entry. Returns the handle ``add`` takes: after registration
+    ``handle.out`` is the output port for :meth:`Target.connect`."""
+    if len(args) == 1 and not kwargs and inspect.isfunction(args[0]):
+        return _system(args[0])
+    return _system
+
+
+def node(x: float, y: float) -> Any:
+    """Pin a declaration's canvas card at ``(x, y)``. Stacks with ``@system``
+    in either order; the position rides the IR as the system's layout."""
+
+    def place(obj: Any) -> Any:
+        if isinstance(obj, ExprHandle):
+            obj._entry["layout"] = [float(x), float(y)]
+        else:
+            obj._metor_node = [float(x), float(y)]
+        return obj
+
+    return place
 
 
 # ---------------------------------------------------------------------------
@@ -348,10 +485,6 @@ def TcpServer(addr: str, name: str | None = None) -> Spec:  # noqa: N802
 
 def _attached(spec: Spec, state: StateHandle) -> Spec:
     """Attach ``spec`` to the pack-shared ``state`` and return it."""
-    if not isinstance(state, StateHandle):
-        raise TypeError(
-            f"expected a state handle from m.state(...), not {type(state).__name__}"
-        )
     spec.attach = state.name
     return spec
 
@@ -645,11 +778,20 @@ class Gauge:
 @dataclass(frozen=True)
 class State:
     """One row of a :class:`StateChip` table: the code, what it means, and
-    optionally the colour it shows in."""
+    optionally the colour it shows in.
+
+    Also the base of a compiled system's state record: a subclass with
+    annotated, defaulted fields is captured into the target program exactly
+    like a :class:`Frame` subclass (see :func:`system`)."""
 
     value: float
     label: str
     color: str | None = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "__annotations__" in cls.__dict__:
+            _capture(cls)
 
     def _json(self) -> dict[str, Any]:
         return _drop_none(
@@ -924,10 +1066,8 @@ class Dashboard:
 
         return {
             "title": self.title,
-            "next_id": len(entries) + 1,
             "widgets": entries,
             "connectors": lines,
-            "next_connector_id": len(lines) + 1,
         }
 
     def _connector(
@@ -1099,7 +1239,9 @@ class Target:
     prefix (``"sat1"``) stamped onto every component name this target registers
     and announces, so several targets sharing one db keep disjoint id spaces;
     ``None`` leaves names and ids identical to an un-namespaced target. These
-    are the only knobs ``CoordinatorSpec`` carries.
+    ``wasm_fuel_per_poll`` bounds one guest poll and
+    ``wasm_memory_limit_bytes`` bounds guest memory during load and bind;
+    omitted values select 100,000,000 fuel and 64 MiB.
     """
 
     def __init__(
@@ -1108,11 +1250,15 @@ class Target:
         sim_dt: float | None = None,
         default_depth: int | None = None,
         namespace: str | None = None,
+        wasm_fuel_per_poll: int | None = None,
+        wasm_memory_limit_bytes: int | None = None,
     ):
         self.cycle_rate = float(cycle_rate)
         self.sim_dt = sim_dt
         self.default_depth = default_depth
-        self.namespace = _validate_namespace(namespace)
+        self.namespace = namespace
+        self.wasm_fuel_per_poll = wasm_fuel_per_poll
+        self.wasm_memory_limit_bytes = wasm_memory_limit_bytes
         self.coordinator = SystemHandle(COORDINATOR)
         self._artifacts: list[dict[str, Any]] = []
         self._states: list[dict[str, Any]] = []
@@ -1121,7 +1267,6 @@ class Target:
         self._edges: list[dict[str, Any]] = []
         self._scopes: list[dict[str, Any]] = []
         self._scope_stack: list[int] = []
-        self._names: set[str] = set()
         _targets.append(self)
 
     # -- scopes -------------------------------------------------------------
@@ -1147,11 +1292,6 @@ class Target:
         index = self._scope_stack[-1]
         return f"{self._scopes[index]['path']}.{name}", index
 
-    def _claim(self, name: str) -> None:
-        if name in self._names:
-            raise ValueError(f"duplicate instance name {name!r}")
-        self._names.add(name)
-
     def _register_spec_artifact(self, spec: Spec) -> None:
         """Auto-register a generated :class:`System`'s declaring artifact."""
         decl = getattr(spec, "artifact_decl", None)
@@ -1166,44 +1306,35 @@ class Target:
         than the evaluating host expects is refused here, naming the pack —
         the record-time tier of the three-layer ABI gate
         (see ``docs/packaging.md``)."""
-        expected = os.environ.get("METOR_EXPECTED_ABI")
-        if (
-            expected is not None
-            and decl.abi_version is not None
-            and decl.abi_version != int(expected)
-        ):
-            raise ValueError(
-                f"pack {decl.dist or decl.id!r} was built for FSW ABI "
-                f"{decl.abi_version}, but this metor-fsw expects ABI {expected}; "
-                "rebuild the pack or match the metor-fsw version"
-            )
         for existing in self._artifacts:
             if existing["id"] != decl.id:
                 continue
-            if existing["crate_name"] != decl.crate or existing["lib"] != decl.lib:
-                raise ValueError(
-                    f"artifact {decl.id!r} is declared twice with different crate/lib"
-                )
             if existing["manifest_hash"] is None:
                 existing["manifest_hash"] = decl.manifest_hash
             return
-        dist = (
-            {"name": decl.dist, "version": decl.dist_version}
-            if decl.dist is not None and decl.dist_version is not None
-            else None
-        )
-        self._artifacts.append(
-            {
-                "id": decl.id,
-                "crate_name": decl.crate,
-                "lib": decl.lib,
-                "path": None,
-                "prebuilt_dir": decl.prebuilt,
-                "dist": dist,
-                "manifest_hash": decl.manifest_hash,
-                "src": _source_ref(),
-            }
-        )
+        if decl.kind == "cdylib" and (decl.crate is None or decl.lib is None):
+            raise ValueError(f"artifact `{decl.id}`: a cdylib names a crate and a lib stem")
+        entry = {
+            "id": decl.id,
+            "path": None,
+            "prebuilt_dir": decl.prebuilt,
+            "dist": (
+                {"name": decl.dist, "version": decl.dist_version}
+                if decl.dist is not None and decl.dist_version is not None
+                else None
+            ),
+            "manifest_hash": decl.manifest_hash,
+            "src": _source_ref(),
+        }
+        # Mirror serde's skips: `kind` is omitted for the default cdylib, and
+        # the crate/lib fields are omitted when empty (a wasm artifact).
+        if decl.kind != "cdylib":
+            entry["kind"] = decl.kind
+        if decl.crate is not None:
+            entry["crate_name"] = decl.crate
+        if decl.lib is not None:
+            entry["lib"] = decl.lib
+        self._artifacts.append(entry)
 
     # -- systems and slots --------------------------------------------------
 
@@ -1213,8 +1344,6 @@ class Target:
         system, from its own params. States live in their own namespace and
         take no edges. The returned handle is passed to a shared-state
         system's constructor (``Downlink(link)``) to attach it."""
-        if any(s["name"] == name or s["ty"] == spec.ty for s in self._states):
-            raise ValueError(f"state {name!r} (type {spec.ty!r}) is already declared")
         self._states.append(
             {
                 "name": name,
@@ -1225,15 +1354,43 @@ class Target:
         )
         return StateHandle(name)
 
-    def add(self, name: str, spec: H, process: bool = False) -> H:
+    @overload
+    def add(
+        self,
+        name: str,
+        spec: ExprHandle,
+        process: bool = False,
+        node: tuple[float, float] | None = None,
+    ) -> ExprHandle: ...
+
+    @overload
+    def add(
+        self,
+        name: str,
+        spec: H,
+        process: bool = False,
+        node: tuple[float, float] | None = None,
+    ) -> H: ...
+
+    def add(
+        self,
+        name: str,
+        spec: Any,
+        process: bool = False,
+        node: tuple[float, float] | None = None,
+    ) -> Any:
         """Register ``spec`` under ``name`` (scope-prefixed) and return its handle.
 
         The return is typed as the spec's own class so a generated entry's port
         attributes (``plant.sensors``) are checkable; at runtime it is a
         :class:`SystemHandle` whose attribute access yields :class:`PortRef`s.
-        A generated :class:`System` also auto-registers its artifact."""
+        A generated :class:`System` also auto-registers its artifact. ``node``
+        pins the system's canvas card, the :func:`node` decorator's twin for a
+        native system. A ``@system`` handle registers here too, at this call's
+        step position, and comes back renamed to the instance."""
         full, scope = self._scoped(name)
-        self._claim(full)
+        if isinstance(spec, ExprHandle):
+            return self._add_expr(full, scope, spec, process, node)
         self._register_spec_artifact(spec)
         self._systems.append(
             {
@@ -1245,9 +1402,48 @@ class Target:
                 "src": _source_ref(),
                 "scope": scope,
                 "attach": spec.attach,
+                "layout": [float(node[0]), float(node[1])] if node else None,
             }
         )
-        return cast(H, SystemHandle(full))
+        return SystemHandle(full)
+
+    def _add_expr(
+        self,
+        full: str,
+        scope: int | None,
+        handle: ExprHandle,
+        process: bool,
+        node: tuple[float, float] | None,
+    ) -> ExprHandle:
+        """The ``@system`` arm of :meth:`add`: an ordinary spec addressing the
+        declaration's pack entry, at this call's position in the system list."""
+        entry = handle._entry
+        if process:
+            raise ValueError(
+                f"system `{full}`: `process=True` is redundant for a Python "
+                "system (the interpreter already isolates it)"
+            )
+        if entry["added"] is not None:
+            raise ValueError(
+                f"`{entry['name']}` is already added as `{entry['added']}`; "
+                "multi-instance binding of one function is future work"
+            )
+        entry["added"] = full
+        handle.name = full
+        self._systems.append(
+            {
+                "name": full,
+                "ty": entry["name"],
+                "artifact": PROGRAM_ARTIFACT,
+                "params": "None",
+                "process": False,
+                "src": _source_ref(),
+                "scope": scope,
+                "attach": None,
+                "layout": [float(node[0]), float(node[1])] if node else entry["layout"],
+            }
+        )
+        return handle
 
     def slot(
         self,
@@ -1262,7 +1458,6 @@ class Target:
         """Register a runtime-loadable slot. ``allow`` occupants use the same
         call convention as system specs; ``initial`` names one of them."""
         full, scope = self._scoped(name)
-        self._claim(full)
         for occupant in allow:
             self._register_spec_artifact(occupant)
         occupants = [
@@ -1276,11 +1471,7 @@ class Target:
         ]
         initial_spec = None
         if initial is not None:
-            if initial not in {o["occupant"] for o in occupants}:
-                raise ValueError(f"initial occupant {initial!r} is not in the allow set")
-            state = _INIT_STATES.get(initial_state)
-            if state is None:
-                raise ValueError(f"unknown initial_state {initial_state!r}")
+            state = _INIT_STATES.get(initial_state, initial_state.capitalize())
             initial_spec = {"occupant": initial, "state": state}
         self._slots.append(
             {
@@ -1344,8 +1535,57 @@ class Target:
             return {"Simulated": {"dt_secs": float(self.sim_dt)}}
         return "Wall"
 
+    def _program_ir(
+        self,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """The assembled program blob and the program-built wasm artifact its
+        added ``@system`` specs address. The blob carries every captured
+        ``Frame``/``State`` class plus the *added* system declarations, in
+        definition order — compile order is source order; step order is add
+        order; the two are independent. A ``@system`` never added is staged
+        code: legal, but warned about, and left out of the program. Offsets
+        are byte offsets into the assembled source, what the compiler's spans
+        are mapped back through."""
+        for entry in _program:
+            if entry["system"] and entry["added"] is None:
+                src = entry["src"]
+                at = f"{src['file']}:{src['line']}" if src["file"] else f"line {src['line']}"
+                print(
+                    f"warning: @system `{entry['name']}` ({at}) was never added and "
+                    f'will not run; register it with target.add("{entry["name"]}", '
+                    f"{entry['name']})",
+                    file=sys.stderr,
+                )
+        included = [e for e in _program if not e["system"] or e["added"] is not None]
+        if not any(e["system"] for e in included):
+            return None, []
+        decls: list[dict[str, Any]] = []
+        parts: list[str] = []
+        offset = 0
+        for entry in included:
+            text = entry["source"]
+            if not text.endswith("\n"):
+                text += "\n"
+            text += "\n"
+            decls.append(
+                {"name": entry["name"], "src": entry["src"], "offset": offset}
+            )
+            parts.append(text)
+            offset += len(text.encode())
+        artifact = {
+            "id": PROGRAM_ARTIFACT,
+            "kind": "wasm",
+            "path": None,
+            "prebuilt_dir": None,
+            "dist": None,
+            "manifest_hash": None,
+            "src": None,
+        }
+        return {"source": "".join(parts), "decls": decls}, [artifact]
+
     def to_ir(self) -> dict[str, Any]:
         """The serialized ``Wiring`` this target describes."""
+        program, program_artifacts = self._program_ir()
         return {
             "ir_version": IR_VERSION,
             "metor_config_version": __version__,
@@ -1354,13 +1594,16 @@ class Target:
                 "default_depth": self.default_depth,
                 "clock": self._clock(),
                 "namespace": self.namespace,
+                "wasm_fuel_per_poll": self.wasm_fuel_per_poll,
+                "wasm_memory_limit_bytes": self.wasm_memory_limit_bytes,
             },
-            "artifacts": self._artifacts,
+            "artifacts": self._artifacts + program_artifacts,
             "states": self._states,
             "systems": self._systems,
             "slots": self._slots,
             "edges": self._edges,
             "scopes": self._scopes,
+            "program": program,
         }
 
 

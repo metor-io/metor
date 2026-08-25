@@ -4,8 +4,9 @@
 //! [`SelectedGraphNode`] proxy; the inspector's registry maps that type to
 //! [`build_rows`], which re-derives the node's detail from the live wiring
 //! store. Those rows are read-only — the tile shows topology, it never edits
-//! it. The panel itself (reached from tab right-click and the palette) gets
-//! its view settings: flow direction and re-layout.
+//! it. The tile itself (reached from tab right-click and the palette) gets
+//! its view settings: flow direction, and the re-layout that forgets every
+//! hand-placed native position.
 
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use crate::graph_layout::Direction;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{CommandRow, EnumRow, HeaderRow, InspectorRow, TextRow};
 
-use super::SystemGraphPanel;
+use crate::canvas::GraphCanvas;
 
 /// Entity placed into the inspector when a graph node is selected. Carries
 /// only the node id; [`build_rows`] looks the details up in the live store so
@@ -30,7 +31,7 @@ pub fn register_inspector_rows(cx: &mut App) {
     cx.global_mut::<InspectorRegistry>()
         .register_type_builder::<SelectedGraphNode>(Arc::new(build_rows));
     cx.global_mut::<InspectorRegistry>()
-        .register_type_builder::<SystemGraphPanel>(Arc::new(build_panel_rows));
+        .register_type_builder::<GraphCanvas>(Arc::new(build_panel_rows));
 }
 
 fn direction_label(direction: Direction) -> SharedString {
@@ -40,15 +41,33 @@ fn direction_label(direction: Direction) -> SharedString {
     })
 }
 
-/// Rows for the inspected panel: the flow direction and a re-layout command
-/// that clears manual node positions.
+/// Rows for the inspected tile: what the selected card is called, the flow
+/// direction, and the re-layout that forgets hand-placed native positions.
+///
+/// Renaming is here rather than on the card because a name is API — it is the
+/// card's title, its output frame, the prefix of every component it publishes,
+/// and the key its state is restored by — so it belongs where the rest of a
+/// declaration's identity is edited, with room to say so.
 fn build_panel_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
-    let Ok(panel) = any.downcast::<SystemGraphPanel>() else {
+    let Ok(panel) = any.downcast::<GraphCanvas>() else {
         return Vec::new();
     };
     let direction = panel.read(cx).direction();
-    vec![
-        Box::new(HeaderRow::new("System Graph")),
+    let selected = panel.read(cx).selected_declaration(cx).map(|(id, _)| id);
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(HeaderRow::new("Graph"))];
+    if let Some(name) = selected {
+        rows.push(Box::new(TextRow::new(
+            SharedString::new_static("Name"),
+            name,
+            Arc::new({
+                let panel = panel.clone();
+                move |value, _window, cx| {
+                    panel.update(cx, |p, cx| p.rename_selected(&value, cx));
+                }
+            }),
+        )));
+    }
+    rows.extend::<Vec<Box<dyn InspectorRow>>>(vec![
         Box::new(EnumRow {
             label: SharedString::new_static("Direction"),
             selected: direction_label(direction),
@@ -74,7 +93,8 @@ fn build_panel_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
                 panel.update(cx, |p, cx| p.relayout(cx));
             }),
         )),
-    ]
+    ]);
+    rows
 }
 
 fn text_row(label: &'static str, value: impl Into<SharedString>) -> Box<dyn InspectorRow> {
@@ -120,7 +140,7 @@ fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorR
     };
 
     if let Some(sys) = wiring.systems.iter().find(|s| s.name == id.as_str()) {
-        return system_rows(sys);
+        return system_rows(sys, wiring);
     }
     if let Some(slot) = wiring.slots.iter().find(|s| s.name == id.as_str()) {
         return slot_rows(slot);
@@ -128,7 +148,7 @@ fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorR
     scope_or_coordinator_rows(&id, wiring)
 }
 
-fn system_rows(sys: &metor_fsw_2::ir::SystemSpec) -> Vec<Box<dyn InspectorRow>> {
+fn system_rows(sys: &metor_fsw_2::ir::SystemSpec, wiring: &Wiring) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
     rows.push(Box::new(HeaderRow::new("System")));
     rows.push(text_row("Name", sys.name.clone()));
@@ -147,7 +167,37 @@ fn system_rows(sys: &metor_fsw_2::ir::SystemSpec) -> Vec<Box<dyn InspectorRow>> 
     if let Some(src) = src_summary(&sys.src) {
         rows.push(text_row("Source", src));
     }
+    if let Some(source) = program_source(sys, wiring) {
+        // A vehicle Python system: its declaration, verbatim. Read-only like
+        // every row here — the source of truth is `target.py`, and edits go
+        // through it.
+        rows.push(Box::new(HeaderRow::new("Python")));
+        rows.push(text_row("Declaration", source));
+    }
     rows
+}
+
+/// The captured `@system` declaration behind a program-built spec: the slice
+/// of [`Wiring::program`]'s assembled source from the declaration's offset to
+/// the next declaration's (or the end).
+fn program_source(sys: &metor_fsw_2::ir::SystemSpec, wiring: &Wiring) -> Option<String> {
+    let program_artifact = wiring
+        .artifacts
+        .iter()
+        .any(|a| sys.artifact.as_deref() == Some(a.id.as_str()) && a.is_program());
+    if !program_artifact {
+        return None;
+    }
+    let program = wiring.program.as_ref()?;
+    let entry = sys.ty.as_deref().unwrap_or(&sys.name);
+    let at = program.decls.iter().position(|d| d.name == entry)?;
+    let start = program.decls[at].offset as usize;
+    let end = program
+        .decls
+        .get(at + 1)
+        .map(|d| d.offset as usize)
+        .unwrap_or(program.source.len());
+    Some(program.source.get(start..end)?.trim_end().to_string())
 }
 
 fn slot_rows(slot: &metor_fsw_2::ir::SlotSpec) -> Vec<Box<dyn InspectorRow>> {

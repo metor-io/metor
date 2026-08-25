@@ -18,8 +18,8 @@ use metor_proto::types::Timestamp;
 use metor_proto_wkt::{Preset, PresetDefs, TILE_LAYOUT_VERSION, TileLayout};
 use serde::Deserialize;
 
-use crate::message::MsgOut;
-use crate::system::{BuildSystem, CyclicSystem, Out, System};
+use metor_fsw_2_core::MsgOut;
+use metor_fsw_2_core::{BuildSystem, CyclicSystem, Out, System};
 
 /// The presets one [`PresetSystem`] instance broadcasts, one [`PresetSpec`]
 /// per repeated `preset` entry. An empty instance is legal and publishes an
@@ -57,7 +57,9 @@ impl BuildSystem for PresetSystem {
     type Params = PresetsParams;
 
     fn new(params: PresetsParams) -> Self {
-        Self { presets: Some(params.preset) }
+        Self {
+            presets: Some(params.preset),
+        }
     }
 }
 
@@ -74,13 +76,12 @@ impl CyclicSystem for PresetSystem {
         };
         let presets = presets
             .into_iter()
-            .map(|spec| {
-                let mut layout = spec.layout;
+            .map(|PresetSpec { name, mut layout }| {
                 if layout.version == 0 {
                     layout.version = TILE_LAYOUT_VERSION;
                 }
                 Preset {
-                    name: spec.name,
+                    name,
                     layout: serde_json::to_string(&layout).expect("tile layout always serializes"),
                 }
             })

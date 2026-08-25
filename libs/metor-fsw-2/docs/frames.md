@@ -14,7 +14,7 @@ storage without a second data model.
 Derive `Frame` and the four zerocopy traits. Mark one field as the timestamp.
 
 ```rust
-use metor_fsw_2::{Frame, Timestamp};
+use metor_fsw_2_core::{Frame, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -63,7 +63,7 @@ if let Some(frame) = input.latest()? {
 `FrameList<T, MAX>` stores up to `MAX` values by index. `FrameMap<V, MAX, MAX_KEY>` stores up to `MAX` values by string key.
 
 ```rust
-use metor_fsw_2::{FrameList, FrameMap};
+use metor_fsw_2_core::{FrameList, FrameMap};
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]

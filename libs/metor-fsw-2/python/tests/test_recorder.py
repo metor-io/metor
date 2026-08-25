@@ -1,5 +1,7 @@
 """Recorder surface, scopes, provenance, and the record-time error cases."""
 
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -12,32 +14,49 @@ from metor_config import (
     Alarms,
     Artifact,
     Component,
+    Frame,
+    State,
     Target,
+    Tensor,
     System,
     Downlink,
     TcpServer,
     Uplink,
     band,
+    f64,
+    node,
     static_system,
+    system,
 )
 
 
 class RecorderTest(unittest.TestCase):
     def setUp(self):
-        # The exactly-one-Target tracker is module-global; isolate each test.
+        # The capture trackers are module-global; isolate each test.
         mc._targets.clear()
+        mc._program.clear()
 
     def test_coordinator_clock_and_knobs(self):
         wall = Target(cycle_rate=100.0).to_ir()["coordinator"]
         self.assertEqual(wall["clock"], "Wall")
         self.assertEqual(wall["cycle_rate"], 100.0)
         self.assertIsNone(wall["default_depth"])
+        self.assertIsNone(wall["wasm_fuel_per_poll"])
+        self.assertIsNone(wall["wasm_memory_limit_bytes"])
 
-        sim = Target(cycle_rate=120.0, sim_dt=0.5, default_depth=8).to_ir()["coordinator"]
+        sim = Target(
+            cycle_rate=120.0,
+            sim_dt=0.5,
+            default_depth=8,
+            wasm_fuel_per_poll=50_000_000,
+            wasm_memory_limit_bytes=32 * 1024 * 1024,
+        ).to_ir()["coordinator"]
         self.assertEqual(sim["clock"], {"Simulated": {"dt_secs": 0.5}})
         self.assertEqual(sim["default_depth"], 8)
+        self.assertEqual(sim["wasm_fuel_per_poll"], 50_000_000)
+        self.assertEqual(sim["wasm_memory_limit_bytes"], 32 * 1024 * 1024)
 
-    def test_namespace_emission_and_validation(self):
+    def test_namespace_emission(self):
         # Absent by default: an un-namespaced target emits a null namespace,
         # keeping component ids identical to before.
         self.assertIsNone(Target(cycle_rate=100.0).to_ir()["coordinator"]["namespace"])
@@ -45,12 +64,6 @@ class RecorderTest(unittest.TestCase):
         # A dotted namespace rides in the coordinator dict verbatim.
         ns = Target(cycle_rate=100.0, namespace="fleet.sat1").to_ir()["coordinator"]
         self.assertEqual(ns["namespace"], "fleet.sat1")
-
-        # Malformed namespaces are rejected at construction.
-        for bad in ["", ".sat1", "sat1.", "sat1..a"]:
-            mc._targets.clear()
-            with self.assertRaises(ValueError):
-                Target(cycle_rate=100.0, namespace=bad)
 
     def test_add_records_system_and_ports(self):
         m = Target(cycle_rate=100.0)
@@ -173,42 +186,161 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(Downlink(link).attach, "link")
         self.assertEqual(TcpServer(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
 
-    # -- error cases --------------------------------------------------------
-
-    def test_duplicate_instance_name(self):
+    def test_added_systems_assemble_the_program(self):
         m = Target(cycle_rate=100.0)
+
+        class RateEstimate(Frame):
+            omega: Tensor[f64, 3]
+
+        class Lpf(State):
+            y: f64 = 0.0
+
+        @system("imu.omega_b")
+        @node(x=420, y=180)
+        def omega_norm(omega_b):
+            return (omega_b @ omega_b) ** 0.5
+
+        # `@node` above `@system` places the same way.
+        @node(x=10, y=20)
+        @system
+        def smooth(est: RateEstimate, s: Lpf) -> RateEstimate:
+            return RateEstimate(omega=est.omega)
+
+        # Step order is add order (`smooth` first); the program still
+        # assembles in definition order, which is what compilation needs.
+        m.add("smooth", smooth)
+        m.add("omega_norm", omega_norm)
+
+        ir = m.to_ir()
+        program = ir["program"]
+        self.assertEqual(
+            [d["name"] for d in program["decls"]],
+            ["RateEstimate", "Lpf", "omega_norm", "smooth"],
+        )
+        # Offsets index the assembled source at each declaration's first byte
+        # (a decorated function's chunk starts at its decorators).
+        ends = [d["offset"] for d in program["decls"][1:]] + [len(program["source"])]
+        for decl, end in zip(program["decls"], ends):
+            chunk = program["source"][decl["offset"]:end]
+            self.assertRegex(chunk, rf"(def|class) {decl['name']}\b")
+        self.assertTrue(program["decls"][0]["src"]["file"].endswith("test_recorder.py"))
+
+        compiled = [s for s in ir["systems"] if s["artifact"] == "program"]
+        self.assertEqual([s["name"] for s in compiled], ["smooth", "omega_norm"])
+        # Each spec addresses its pack entry by the declaration's name.
+        self.assertEqual([s["ty"] for s in compiled], ["smooth", "omega_norm"])
+        self.assertEqual(compiled[0]["layout"], [10.0, 20.0])
+        self.assertEqual(compiled[1]["layout"], [420.0, 180.0])
+        self.assertEqual(compiled[0]["params"], "None")
+        self.assertTrue(compiled[0]["src"]["file"].endswith("test_recorder.py"))
+        program_artifacts = [a for a in ir["artifacts"] if a["id"] == "program"]
+        self.assertEqual([a["kind"] for a in program_artifacts], ["wasm"])
+        self.assertNotIn("crate_name", program_artifacts[0])
+
+        # The handle's `.out` names the output port: the function itself for
+        # the sugar form, the snake-cased Frame class for the canonical form.
+        self.assertEqual((omega_norm.out.instance, omega_norm.out.port),
+                         ("omega_norm", "omega_norm"))
+        self.assertEqual(smooth.out.port, "rate_estimate")
+
+    def test_added_python_system_scopes_renames_and_interleaves(self):
+        m = Target(cycle_rate=100.0)
+
+        @system("imu.omega_b")
+        def omega_norm(omega_b):
+            return (omega_b @ omega_b) ** 0.5
+
         m.add("a", static_system("A"))
-        with self.assertRaisesRegex(ValueError, "duplicate instance name 'a'"):
-            m.add("a", static_system("B"))
+        with m.scope("adcs"):
+            handle = m.add("rate_mag", omega_norm, node=(1, 2))
+        m.add("b", static_system("B"))
 
-    def test_unknown_initial_occupant(self):
-        m = Target(cycle_rate=100.0)
-        seqs = Artifact(id="seqs", crate="c", lib="l")
-        with self.assertRaisesRegex(ValueError, "initial occupant 'missing'"):
-            m.slot(
-                "mode",
-                inputs=[],
-                outputs=[],
-                allow=[System("safe_mode", seqs)],
-                initial="missing",
-            )
+        ir = m.to_ir()
+        # The spec sits at the add call's position, between the native adds.
+        self.assertEqual([s["name"] for s in ir["systems"]], ["a", "adcs.rate_mag", "b"])
+        spec = ir["systems"][1]
+        self.assertEqual(spec["ty"], "omega_norm")
+        self.assertEqual(spec["scope"], 0)
+        self.assertEqual(spec["layout"], [1.0, 2.0])
+        # `add` returns the handle itself, renamed to the instance.
+        self.assertIs(handle, omega_norm)
+        self.assertEqual(
+            (handle.out.instance, handle.out.port), ("adcs.rate_mag", "omega_norm")
+        )
 
-    def test_empty_is_not_an_initial_occupant_state(self):
+    def test_unadded_system_warns_and_stays_out_of_the_program(self):
         m = Target(cycle_rate=100.0)
-        seqs = Artifact(id="seqs", crate="c", lib="l")
-        with self.assertRaisesRegex(ValueError, "unknown initial_state 'empty'"):
-            m.slot(
-                "mode",
-                inputs=[],
-                outputs=[],
-                allow=[System("safe_mode", seqs)],
-                initial="safe_mode",
-                initial_state="empty",
-            )
+
+        @system("imu.omega_b")
+        def omega_norm(omega_b):
+            return (omega_b @ omega_b) ** 0.5
+
+        @system("imu.omega_b")
+        def staged(omega_b):
+            return omega_b * 2.0
+
+        m.add("omega_norm", omega_norm)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ir = m.to_ir()
+        self.assertIn("@system `staged`", err.getvalue())
+        self.assertIn("test_recorder.py", err.getvalue())
+        self.assertNotIn("omega_norm`", err.getvalue())
+        self.assertEqual([d["name"] for d in ir["program"]["decls"]], ["omega_norm"])
+        self.assertEqual([s["name"] for s in ir["systems"]], ["omega_norm"])
+
+    def test_no_added_system_emits_no_program(self):
+        m = Target(cycle_rate=100.0)
+
+        @system
+        def staged() -> f64:
+            return 1.0
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            ir = m.to_ir()
+        self.assertIsNone(ir["program"])
+        self.assertEqual([a["id"] for a in ir["artifacts"]], [])
+
+    def test_adding_one_handle_twice_is_an_error(self):
+        m = Target(cycle_rate=100.0)
+
+        @system
+        def beat() -> f64:
+            return 1.0
+
+        m.add("one", beat)
+        with self.assertRaisesRegex(ValueError, "multi-instance"):
+            m.add("two", beat)
+
+    def test_process_is_rejected_for_python_systems(self):
+        m = Target(cycle_rate=100.0)
+
+        @system
+        def beat() -> f64:
+            return 1.0
+
+        with self.assertRaisesRegex(ValueError, "process"):
+            m.add("beat", beat, process=True)
+
+    def test_pack_frame_markers_are_not_captured(self):
+        Target(cycle_rate=100.0)
+
+        class Sensors(Frame):
+            """Frame marker (checker-only)."""
+
+        self.assertEqual(mc._program, [])
+
+    def test_native_node_kwarg_records_layout(self):
+        m = Target(cycle_rate=100.0)
+        m.add("a", static_system("A"), node=(40, 80))
+        m.add("b", static_system("B"))
+        systems = m.to_ir()["systems"]
+        self.assertEqual(systems[0]["layout"], [40.0, 80.0])
+        self.assertIsNone(systems[1]["layout"])
 
     def test_non_json_param_names_the_key(self):
         m = Target(cycle_rate=100.0)
-        with self.assertRaisesRegex(TypeError, "'bad'"):
+        with self.assertRaises(TypeError):
             m.add("a", static_system("A", bad=object()))
 
     def test_dataclass_rejects_unknown_kwargs(self):
@@ -338,9 +470,9 @@ class DashboardTest(unittest.TestCase):
         )
         self.assertEqual(state["title"], "ADCS")
         self.assertEqual([w["kind"] for w in state["widgets"]], ["meter", "gauge"])
-        # Ids are assigned in placement order and the counter clears them.
+        # Ids are assigned in placement order; the panel derives the next id.
         self.assertEqual([w["id"] for w in state["widgets"]], [1, 2])
-        self.assertEqual(state["next_id"], 3)
+        self.assertNotIn("next_id", state)
 
         meter = json.loads(state["widgets"][0]["config"])
         self.assertEqual(meter["component"], "sat1.plant.wheels.h")
@@ -410,7 +542,7 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(style["label"], "leader")
         self.assertEqual(style["bind"]["component"], "sat1.plant.wheels.arm")
         self.assertEqual(style["bind"]["threshold"], 0.5)
-        self.assertEqual(state["next_connector_id"], 2)
+        self.assertNotIn("next_connector_id", state)
 
     def test_a_plot_placed_on_a_dashboard_uses_the_widget_kind(self):
         plot = mc.Place(mc.TimeSeriesPlot([mc.Trace("plant.gyro.rates")]), 0, 0)

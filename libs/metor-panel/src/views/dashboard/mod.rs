@@ -91,6 +91,11 @@ impl WidgetKind {
     pub fn traffic_light() -> Self {
         Self(SharedString::new_static("traffic_light"))
     }
+    pub fn annunciator() -> Self {
+        Self(SharedString::new_static("annunciator"))
+    }
+    /// The annunciator's pre-rename on-disk id, kept so saved dashboards and
+    /// target-shipped presets keep resolving.
     pub fn traffic_light_grid() -> Self {
         Self(SharedString::new_static("traffic_light_grid"))
     }
@@ -805,9 +810,9 @@ pub fn dashboard_rows(
             let dashboard = dashboard.clone();
             Box::new(move |_cx| {
                 let dashboard = dashboard.clone();
-                vec![Box::new(DefaultActionRow {
-                    label: "Dashboard name...".into(),
-                    callback: Arc::new(move |input, _window, cx| {
+                vec![Box::new(DefaultActionRow::new(
+                    "Dashboard name...",
+                    Arc::new(move |input, _window, cx| {
                         if !input.is_empty() {
                             dashboard.update(cx, |this, cx| {
                                 this.title = SharedString::from(input);
@@ -815,7 +820,7 @@ pub fn dashboard_rows(
                             });
                         }
                     }),
-                }) as Box<dyn InspectorRow>]
+                )) as Box<dyn InspectorRow>]
             })
         },
     )));
@@ -901,11 +906,11 @@ fn add_widget_rows(
         },
     )));
     rows.push(Box::new(NavRow::new(
-        "Traffic Light Grid",
+        "Annunciator",
         SharedString::new_static(""),
         {
             let dashboard = dashboard.clone();
-            Box::new(move |_cx| traffic_light_grid_pattern_rows(dashboard.clone()))
+            Box::new(move |_cx| annunciator_pattern_rows(dashboard.clone()))
         },
     )));
     rows.push(Box::new(NavRow::new(
@@ -1033,12 +1038,37 @@ fn add_widget_rows(
     rows
 }
 
+/// The component list for a widget kind, preceded by the expression row so
+/// typing `=` binds the widget to a computed channel instead of a named one.
+///
+/// Both paths end in the same place: what the widget's config stores is a
+/// string, and a leading `=` is what tells the builder to compile it rather
+/// than look it up.
 fn component_picker_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
     kind: WidgetKind,
 ) -> Vec<Box<dyn InspectorRow>> {
-    crate::inspector::trace_picker::list_components(&db)
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+
+    // Every widget behind this picker resolves its binding through
+    // `expressions::bind`, so every one of them can be given an expression.
+    // The row used to be gated to the monitor because it was the only builder
+    // that could honour one.
+    rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(db.clone(), {
+        let dashboard = dashboard.clone();
+        let kind = kind.clone();
+        Arc::new(move |_id, text, _window, cx| {
+            let config = component_widget_config(&kind, text);
+            let kind = kind.clone();
+            dashboard.update(cx, |this, cx| {
+                this.add_widget(kind, config, cx);
+            });
+            crate::inspector::rows::RowAction::Dismiss
+        })
+    })));
+
+    rows.extend(crate::inspector::trace_picker::list_components(&db)
         .into_iter()
         .map(|(_id, name)| {
             let dashboard = dashboard.clone();
@@ -1047,35 +1077,42 @@ fn component_picker_rows(
             Box::new(CommandRow::new(
                 SharedString::from(name),
                 Arc::new(move |_window, cx| {
-                    // Pick the kind-specific config struct so any future
-                    // divergence between the two doesn't silently lose the
-                    // user's component selection.
-                    let component = name_clone.clone();
-                    let config = if kind == WidgetKind::monitor() {
-                        let cfg = widgets::MonitorWidgetConfig {
-                            component,
-                            ..Default::default()
-                        };
-                        serde_json::to_string(&cfg)
-                    } else if kind == WidgetKind::traffic_light() {
-                        let cfg = widgets::TrafficLightWidgetConfig {
-                            component,
-                            color: None,
-                        };
-                        serde_json::to_string(&cfg)
-                    } else {
-                        let cfg = widgets::TextWidgetConfig { component };
-                        serde_json::to_string(&cfg)
-                    }
-                    .expect("component widget config serializes");
+                    let config = component_widget_config(&kind, name_clone.clone());
                     let kind = kind.clone();
                     dashboard.update(cx, |this, cx| {
                         this.add_widget(kind, config, cx);
                     });
                 }),
             )) as Box<dyn InspectorRow>
-        })
-        .collect()
+        }));
+    rows
+}
+
+/// The config blob a component-bound widget of `kind` stores.
+///
+/// `component` is either a component's name or the text of an `=` expression;
+/// the builder resolves it either way, which is what lets the picked row and
+/// the expression row share one function. Picking the kind-specific struct
+/// keeps any future divergence between them from silently losing the
+/// selection.
+fn component_widget_config(kind: &WidgetKind, component: String) -> String {
+    if *kind == WidgetKind::monitor() {
+        let cfg = widgets::MonitorWidgetConfig {
+            component,
+            ..Default::default()
+        };
+        serde_json::to_string(&cfg)
+    } else if *kind == WidgetKind::traffic_light() {
+        let cfg = widgets::TrafficLightWidgetConfig {
+            component,
+            color: None,
+        };
+        serde_json::to_string(&cfg)
+    } else {
+        let cfg = widgets::TextWidgetConfig { component };
+        serde_json::to_string(&cfg)
+    }
+    .expect("component widget config serializes")
 }
 
 /// Trace wizard for the scalar instruments: each picked element becomes its
@@ -1102,31 +1139,25 @@ fn instrument_widget_rows(
     )
 }
 
-/// Single-question wizard for "+ widget → Traffic Light Grid": prompts for
-/// a glob pattern, then adds a `traffic_light_grid` widget with that
-/// pattern. Mirrors [`image_path_rows`].
-fn traffic_light_grid_pattern_rows(
-    dashboard: Entity<DashboardPanel>,
-) -> Vec<Box<dyn InspectorRow>> {
-    vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
+/// Single-question wizard for "+ widget → Annunciator": prompts for a glob
+/// pattern, then adds an `annunciator` widget with that pattern. Mirrors
+/// [`image_path_rows`].
+fn annunciator_pattern_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
+    vec![crate::views::annunciator::glob_prompt_row(Arc::new(
         move |input, _window, cx| {
-            let cfg = widgets::TrafficLightGridWidgetConfig {
-                pattern: input.to_string(),
-                color: None,
-            };
-            let config =
-                serde_json::to_string(&cfg).expect("traffic light grid widget config serializes");
+            let cfg = crate::views::annunciator::seeded_config(&input);
+            let config = serde_json::to_string(&cfg).expect("annunciator widget config serializes");
             dashboard.update(cx, |this, cx| {
-                this.add_widget(WidgetKind::traffic_light_grid(), config, cx);
+                this.add_widget(WidgetKind::annunciator(), config, cx);
             });
         },
     ))]
 }
 
 fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
-    vec![Box::new(DefaultActionRow {
-        label: "Image file path...".into(),
-        callback: Arc::new(move |input, _window, cx| {
+    vec![Box::new(DefaultActionRow::new(
+        "Image file path...",
+        Arc::new(move |input, _window, cx| {
             if !input.is_empty() {
                 let cfg = widgets::ImageWidgetConfig {
                     path: input.to_string(),
@@ -1138,7 +1169,7 @@ fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRo
                 });
             }
         }),
-    })]
+    ))]
 }
 
 /// A connector's palette label: its own label if it has one, else its shape
@@ -1226,13 +1257,13 @@ fn connector_rows(
             let dashboard = dashboard.clone();
             Box::new(move |_cx| {
                 let dashboard = dashboard.clone();
-                vec![Box::new(DefaultActionRow {
-                    label: "Connector label...".into(),
-                    callback: Arc::new(move |input, _window, cx| {
+                vec![Box::new(DefaultActionRow::new(
+                    "Connector label...",
+                    Arc::new(move |input, _window, cx| {
                         let text = input.to_string();
                         edit(&dashboard, id, cx, |c| c.style.label = text);
                     }),
-                }) as Box<dyn InspectorRow>]
+                )) as Box<dyn InspectorRow>]
             })
         },
     )));

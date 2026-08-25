@@ -5,9 +5,9 @@ members = [
     "libs/nox",
     "libs/nox-frames",
     #"apps/metor",
-    "libs/metor-fsw",
-    "libs/metor-fsw/macros",
-    "libs/metor-fsw/adcs",
+    "libs/metor-component",
+    "libs/metor-component/macros",
+    "libs/metor-adcs",
     "libs/wmm",
     "libs/metor-proto",
     "libs/metor-proto/stellar",
@@ -30,8 +30,20 @@ members = [
     "fsw/gstreamer",
     "libs/db/eql",
     "libs/metor-proto/kdl",
-    "examples/cube-sat"
-, "libs/metor-panel", "libs/metor-fsw-2/ring", "libs/metor-fsw-2", "libs/metor-fsw-2/macros", "examples/adcs-fsw2", "examples/adcs-fsw2/contracts", "examples/adcs-fsw2/systems/adcs-systems", "examples/adcs-fsw2/systems/adcs-sequences", "libs/metor-fsw-2/tests/fixtures/dl-fixture", "libs/metor-fsw-2/tests/fixtures/seq-fixture", "libs/metor-fsw-2/tests/fixtures/seq-param-fixture"]
+    "libs/metor-panel",
+    "libs/metor-fsw-2",
+    "libs/metor-fsw-2/core",
+    "libs/metor-fsw-2/macros",
+    "libs/metor-fsw-2/ring",
+    "libs/metor-expr",
+    "libs/metor-fsw-2/tests/fixtures/dl-fixture",
+    "libs/metor-fsw-2/tests/fixtures/seq-fixture",
+    "libs/metor-fsw-2/tests/fixtures/seq-param-fixture",
+    "examples/adcs-fsw2",
+    "examples/adcs-fsw2/contracts",
+    "examples/adcs-fsw2/systems/adcs-systems",
+    "examples/adcs-fsw2/systems/adcs-sequences",
+]
 exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve", "apps/metor"]
 
 # Shared lint pins. Opt-in per crate via `[lints] workspace = true` — the fsw-2
@@ -76,10 +88,9 @@ lto = "thin"
 
 [workspace.dependencies]
 dirs = "5"
-metor-fsw-macros.path = "libs/metor-fsw/macros"
-metor-fsw.path = "libs/metor-fsw"
-metor-fsw.default-features = false
-metor-fsw-adcs.path = "libs/metor-fsw/adcs"
+metor-component-macros.path = "libs/metor-component/macros"
+metor-component.path = "libs/metor-component"
+metor-adcs.path = "libs/metor-adcs"
 nox.path = "libs/nox"
 nox.default-features = false
 nox-frames.path = "libs/nox-frames"

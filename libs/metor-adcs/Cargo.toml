@@ -1,0 +1,17 @@
+[package]
+name = "metor-adcs"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+edition = "2024"
+description = "Attitude determination and control algorithms: MEKF, UKF, TRIAD, magnetometer calibration, and the Yang LQR controller."
+repository = "https://github.com/metor-sys/metor"
+
+[dependencies]
+nox.workspace = true
+nox.default-features = false
+metor-component.workspace = true
+zerocopy.version = "0.8"
+zerocopy.features = ["derive"]
+
+[dev-dependencies]
+approx = "0.5"

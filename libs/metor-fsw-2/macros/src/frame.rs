@@ -70,8 +70,8 @@ pub fn frame(input: TokenStream) -> TokenStream {
         group: raw.group,
     };
 
-    // The sub-derives emit `::metor_fsw_2::…` re-export paths, so a crate that
-    // depends only on metor_fsw_2 can use the derive without depending on the
+    // The sub-derives emit `::metor_fsw_2_core::…` re-export paths, so a crate that
+    // depends only on metor_fsw_2_core can use the derive without depending on the
     // protocol crate directly.
     let fsw2 = crate::metor_fsw_2_crate_name();
     let impeller = quote! { #fsw2::metor_proto };

@@ -16,6 +16,7 @@ use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod alarms;
 pub mod app;
+pub mod canvas;
 pub mod config;
 pub mod connections;
 pub mod dynamic;
@@ -28,7 +29,6 @@ pub mod inspect;
 pub mod inspector;
 pub mod logs;
 pub(crate) mod msg_ingest;
-pub mod node_editor;
 pub mod plot_events;
 pub mod presets;
 pub mod sequences;
@@ -38,6 +38,7 @@ pub mod transient;
 pub mod views;
 pub(crate) mod window_controls;
 pub mod wiring;
+pub(crate) mod workspace;
 
 pub use app::PanelApp;
 pub use connections::{

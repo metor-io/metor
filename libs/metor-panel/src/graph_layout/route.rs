@@ -158,26 +158,18 @@ pub(super) fn routes(
             .last()
             .map(|w| w.1)
             .unwrap_or(geo.cross[e.from]);
-        match e.from_pin {
-            PinAnchor::Auto => fans.entry((e.from, Side::Out)).or_default().push(Endpoint {
-                edge: ei,
-                is_source: true,
-                heading: heading_out,
-            }),
-            PinAnchor::Offset(off) => {
-                routes[ei].source = anchor(e.from, Side::Out, off.clamp(0.0, sizes[e.from].1));
-            }
-        }
-        match e.to_pin {
-            PinAnchor::Auto => fans.entry((e.to, target_side)).or_default().push(Endpoint {
-                edge: ei,
-                is_source: false,
-                heading: heading_in,
-            }),
-            PinAnchor::Offset(off) => {
-                routes[ei].target = anchor(e.to, target_side, off.clamp(0.0, sizes[e.to].1));
-            }
-        }
+        let PinAnchor::Auto = e.from_pin;
+        fans.entry((e.from, Side::Out)).or_default().push(Endpoint {
+            edge: ei,
+            is_source: true,
+            heading: heading_out,
+        });
+        let PinAnchor::Auto = e.to_pin;
+        fans.entry((e.to, target_side)).or_default().push(Endpoint {
+            edge: ei,
+            is_source: false,
+            heading: heading_in,
+        });
     }
 
     for ((node, side), mut endpoints) in fans {

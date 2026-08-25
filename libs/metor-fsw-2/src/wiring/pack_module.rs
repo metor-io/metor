@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 
 use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
 
-use crate::abi::{PackEntryDesc, PackManifest};
-use crate::descriptor::{Delivery, FanIn, PortDesc, PortSchema};
+use metor_fsw_2_core::abi::{PackEntryDesc, PackManifest};
+use metor_fsw_2_core::{Delivery, FanIn, PortDesc, PortSchema};
 
 // ---------------------------------------------------------------------------
 // Codegen
@@ -57,8 +57,11 @@ pub(super) fn render_module(
     out.push_str(&header(id, crate_name));
     out.push_str("from __future__ import annotations\n\n");
     out.push_str("from pathlib import Path\n\n");
-    out.push_str(&cg.imports());
-    out.push('\n');
+    out.push_str(
+        "from dataclasses import dataclass\n\
+         from typing import Literal, Sequence\n\n\
+         from metor_config import Artifact, Frame, InPort, Msg, OutPort, System\n\n",
+    );
     out.push_str(&format!(
         "ARTIFACT = Artifact(\n    id=\"{id}\",\n    crate=\"{crate_name}\",\n    lib=\"{lib}\",\n    manifest_hash=\"{hash}\",\n",
     ));
@@ -90,12 +93,7 @@ pub(super) fn render_module(
 /// Shared with the resolve-time staleness check.
 pub(super) fn manifest_hash(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(7 + digest.len() * 2);
-    hex.push_str("sha256:");
-    for b in digest {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    hex
+    format!("sha256:{digest:x}")
 }
 
 /// The generated-file header: a provenance line and the regenerate/verify
@@ -127,56 +125,9 @@ struct Codegen {
     dataclasses: Vec<String>,
     /// Nested dataclass names already emitted.
     dataclass_names: HashSet<String>,
-    used_sequence: bool,
-    used_literal: bool,
-    used_msg: bool,
-    used_inport: bool,
-    used_outport: bool,
-    used_system: bool,
 }
 
 impl Codegen {
-    /// The `from typing`/`from metor_config` import block, naming only the
-    /// symbols the module actually uses.
-    fn imports(&self) -> String {
-        let mut typing: Vec<&str> = Vec::new();
-        if self.used_literal {
-            typing.push("Literal");
-        }
-        if self.used_sequence {
-            typing.push("Sequence");
-        }
-        let mut core: Vec<&str> = vec!["Artifact"];
-        if !self.frames.is_empty() {
-            core.push("Frame");
-        }
-        if self.used_inport {
-            core.push("InPort");
-        }
-        if self.used_msg {
-            core.push("Msg");
-        }
-        if self.used_outport {
-            core.push("OutPort");
-        }
-        if self.used_system {
-            core.push("System");
-        }
-        core.sort_unstable();
-        let mut out = String::new();
-        if !self.dataclasses.is_empty() {
-            out.push_str("from dataclasses import dataclass\n");
-        }
-        if !typing.is_empty() {
-            out.push_str(&format!("from typing import {}\n", typing.join(", ")));
-        }
-        if !self.dataclasses.is_empty() || !typing.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&format!("from metor_config import {}\n", core.join(", ")));
-        out
-    }
-
     /// Render one manifest entry: a `System` subclass for a CapWords name, a
     /// module-level occupant callable for a snake_case (sequence task) name.
     fn entry(&mut self, entry: &PackEntryDesc) -> String {
@@ -197,7 +148,6 @@ impl Codegen {
     /// A `System` subclass: a typed keyword-only `__init__` plus class-level
     /// port annotations (checker-only; runtime access returns handles).
     fn render_class(&mut self, entry: &PackEntryDesc, params: &[Param]) -> String {
-        self.used_system = true;
         let desc = &entry.descriptor;
         let name = &desc.name;
         let mut out = format!("class {name}(System):\n");
@@ -224,7 +174,6 @@ impl Codegen {
     /// A sequence occupant: a module-level function with the same typed kwargs,
     /// returning an occupant spec bound to this artifact.
     fn render_occupant(&mut self, entry: &PackEntryDesc, params: &[Param]) -> String {
-        self.used_system = true;
         let name = &entry.descriptor.name;
         let sig = occupant_signature(name, params);
         let doc = docstring(
@@ -238,7 +187,7 @@ impl Codegen {
     }
 
     /// The class-level `port: OutPort[Frame]  # …` annotation block.
-    fn port_annotations(&mut self, desc: &crate::descriptor::SystemDescriptor) -> String {
+    fn port_annotations(&mut self, desc: &metor_fsw_2_core::SystemDescriptor) -> String {
         let mut out = String::new();
         for port in &desc.inputs {
             out.push_str(&self.port_line(port, true));
@@ -251,13 +200,7 @@ impl Codegen {
 
     fn port_line(&mut self, port: &PortDesc, input: bool) -> String {
         let marker = self.marker_name(port);
-        let wrapper = if input {
-            self.used_inport = true;
-            "InPort"
-        } else {
-            self.used_outport = true;
-            "OutPort"
-        };
+        let wrapper = if input { "InPort" } else { "OutPort" };
         let mut notes: Vec<String> = Vec::new();
         notes.push(if input {
             "input".into()
@@ -310,10 +253,7 @@ impl Codegen {
                 self.frame_by_id.push((id, name.clone()));
                 name
             }
-            PortSchema::Postcard { .. } => {
-                self.used_msg = true;
-                "Msg".to_string()
-            }
+            PortSchema::Postcard { .. } => "Msg".to_string(),
         }
     }
 
@@ -382,10 +322,7 @@ impl Codegen {
             T::Char | T::String => "str".into(),
             T::ByteArray => "bytes".into(),
             T::Option(inner) => format!("{} | None", self.py_type(inner)),
-            T::Seq(inner) => {
-                self.used_sequence = true;
-                format!("Sequence[{}]", self.py_type(inner))
-            }
+            T::Seq(inner) => format!("Sequence[{}]", self.py_type(inner)),
             T::Tuple(items) | T::TupleStruct(items) => {
                 if items.is_empty() {
                     "tuple[()]".into()
@@ -408,11 +345,10 @@ impl Codegen {
     /// Register (once) a frozen kw_only dataclass for a nested struct and
     /// return its name.
     fn nested_struct(&mut self, nt: &OwnedNamedType) -> String {
-        let name = pascal_case(&type_ident(&nt.name));
-        if self.dataclass_names.contains(&name) {
+        let name = pascal_case(type_ident(&nt.name));
+        if !self.dataclass_names.insert(name.clone()) {
             return name;
         }
-        self.dataclass_names.insert(name.clone());
         let OwnedDataModelType::Struct(fields) = &nt.ty else {
             return name;
         };
@@ -440,20 +376,18 @@ impl Codegen {
     ) -> String {
         use postcard_schema::schema::owned::OwnedDataModelVariant as V;
         if variants.iter().all(|v| matches!(v.ty, V::UnitVariant)) {
-            self.used_literal = true;
             let names: Vec<String> = variants.iter().map(|v| format!("\"{}\"", v.name)).collect();
             return format!("Literal[{}]", names.join(", "));
         }
         // Enum with data: one frozen dataclass per variant, unioned.
-        let prefix = pascal_case(&type_ident(&nt.name));
+        let prefix = pascal_case(type_ident(&nt.name));
         let mut union: Vec<String> = Vec::new();
         for v in variants {
             let vname = format!("{prefix}{}", pascal_case(&v.name));
             union.push(vname.clone());
-            if self.dataclass_names.contains(&vname) {
+            if !self.dataclass_names.insert(vname.clone()) {
                 continue;
             }
-            self.dataclass_names.insert(vname.clone());
             let mut lines = String::new();
             match &v.ty {
                 V::UnitVariant => {}
@@ -721,9 +655,9 @@ fn py_str(s: &str) -> String {
 
 /// The trailing identifier of a (possibly path- or generic-qualified) Rust type
 /// name, e.g. `foo::Bar<T>` → `Bar`.
-fn type_ident(name: &str) -> String {
+fn type_ident(name: &str) -> &str {
     let name = name.split('<').next().unwrap_or(name);
-    name.rsplit("::").next().unwrap_or(name).trim().to_string()
+    name.rsplit("::").next().unwrap_or(name).trim()
 }
 
 /// Convert a snake_case or lowercase name to PascalCase for a class name.
@@ -746,8 +680,8 @@ fn pascal_case(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::PackManifest;
-    use crate::descriptor::SystemKind;
+    use metor_fsw_2_core::SystemKind;
+    use metor_fsw_2_core::abi::PackManifest;
     use metor_proto::types::ComponentId;
     use metor_proto::vtable::VTable;
     use metor_proto_wkt::ComponentMetadata;
@@ -847,7 +781,7 @@ mod tests {
         params_docs: Vec<(String, String)>,
     ) -> PackEntryDesc {
         PackEntryDesc {
-            descriptor: crate::descriptor::SystemDescriptor {
+            descriptor: metor_fsw_2_core::SystemDescriptor {
                 name: name.to_string(),
                 kind: SystemKind::Cyclic,
                 inputs,
@@ -903,7 +837,7 @@ mod tests {
             "demo-systems",
             "demo_systems",
             &bytes,
-            crate::abi::FSW_ABI_VERSION,
+            metor_fsw_2_core::abi::FSW_ABI_VERSION,
             "demo-pack",
             "1.2.0",
         )
@@ -913,7 +847,7 @@ mod tests {
             "demo-systems",
             "demo_systems",
             &bytes,
-            crate::abi::FSW_ABI_VERSION,
+            metor_fsw_2_core::abi::FSW_ABI_VERSION,
             "demo-pack",
             "1.2.0",
         )
@@ -950,7 +884,7 @@ mod tests {
             "demo-systems",
             "demo_systems",
             &bytes,
-            crate::abi::FSW_ABI_VERSION,
+            metor_fsw_2_core::abi::FSW_ABI_VERSION,
             "demo-pack",
             "1.2.0",
         )
@@ -959,7 +893,10 @@ mod tests {
         assert!(a.contains("@generated by `metor-fsw pack dev`"));
         assert!(a.contains("from pathlib import Path"));
         assert!(a.contains("prebuilt=str(Path(__file__).resolve().parent / \"_libs\"),"));
-        assert!(a.contains(&format!("abi_version={},", crate::abi::FSW_ABI_VERSION)));
+        assert!(a.contains(&format!(
+            "abi_version={},",
+            metor_fsw_2_core::abi::FSW_ABI_VERSION
+        )));
         assert!(a.contains("dist=\"demo-pack\","));
         assert!(a.contains("dist_version=\"1.2.0\","));
     }
@@ -974,7 +911,7 @@ mod tests {
             "demo-systems",
             "demo_systems",
             &demo_manifest(),
-            crate::abi::FSW_ABI_VERSION,
+            metor_fsw_2_core::abi::FSW_ABI_VERSION,
             "demo-pack",
             "1.2.0",
         )
@@ -1029,7 +966,7 @@ mod fixture_dump {
             "demo-systems",
             "demo_systems",
             &demo_manifest(),
-            crate::abi::FSW_ABI_VERSION,
+            metor_fsw_2_core::abi::FSW_ABI_VERSION,
             "demo-pack",
             "1.2.0",
         )

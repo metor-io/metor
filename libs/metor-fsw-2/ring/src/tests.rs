@@ -1095,3 +1095,55 @@ async fn no_wake_resolves_immediately() {
         .await;
     assert!(polled, "NoWake must poll its readiness predicate");
 }
+
+/// `create_raw` formats a ring into memory the caller owns, and the result is
+/// a normal ring: a record written through it reads back through a fresh
+/// `attach_raw` over the same bytes. This is the path a wasm host uses to put
+/// a region inside guest linear memory.
+#[test]
+fn create_raw_formats_a_caller_owned_region() {
+    let cfg = Config {
+        capacity: 1024,
+        max_readers: 4,
+    };
+    let len = region_len(&cfg);
+    // Over-allocate so the "region may be larger than the ring" case is live.
+    let mut region = vec![0u8; len + 64];
+    let base = region.as_mut_ptr();
+
+    // SAFETY: `region` outlives every handle below and nothing else reads it.
+    let ring = unsafe { RingBuffer::create_raw(base, region.len(), cfg) }.expect("formats");
+    let mut writer = ring.writer(NoWake).expect("sole writer");
+
+    // A second attach over the same bytes is what the guest does after the
+    // host formats the region: it reads the geometry back out of the header
+    // and registers its own reader slot. Register before writing, since a
+    // slot joins at the live edge rather than replaying a backlog.
+    // SAFETY: same live region, still owned by `region`.
+    let attached = unsafe { RingBuffer::attach_raw(base, len) }.expect("attaches");
+    let mut view = attached.view(NoWake).expect("reader slot");
+
+    writer.try_write(&[1u8; 16]).expect("record fits");
+    assert_eq!(&view.try_latest().unwrap().expect("the record")[..], &[1u8; 16]);
+}
+
+/// The two rejections `create_raw` owns: a base the ring cannot attach to, and
+/// a region too small for the configured geometry.
+#[test]
+fn create_raw_rejects_bad_regions() {
+    let cfg = Config {
+        capacity: 1024,
+        max_readers: 4,
+    };
+    let len = region_len(&cfg);
+    let mut region = vec![0u8; len + 16];
+    let base = region.as_mut_ptr();
+
+    // SAFETY: a live region; the call fails before formatting anything.
+    let misaligned = unsafe { RingBuffer::create_raw(base.wrapping_add(1), len, cfg) };
+    assert!(matches!(misaligned, Err(AttachError::Misaligned)));
+
+    // SAFETY: same, one byte short of the computed layout.
+    let small = unsafe { RingBuffer::create_raw(base, len - 1, cfg) };
+    assert!(matches!(small, Err(AttachError::TooSmall)));
+}

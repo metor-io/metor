@@ -9,10 +9,8 @@
 //!
 //! Errors keep their native surface: a Python-level failure prints CPython's
 //! own traceback (the target file is just a script, so `pdb` and IDE debuggers
-//! work), and the host's [`LoadError`] anchors resolve-time failures via the
-//! `src` fields the recorder fills.
+//! work). The recorder's `src` fields remain IR provenance for tooling.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -98,10 +96,6 @@ pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
         .arg(path)
         .env("PYTHONPATH", prepend_pythonpath(&roots))
         .env("METOR_IR_OUT", ir_file.path())
-        .env(
-            "METOR_EXPECTED_ABI",
-            crate::abi::FSW_ABI_VERSION.to_string(),
-        )
         .status()
         .map_err(|e| miette!("failed to run `{}`: {e}", python.display()))?;
 
@@ -244,8 +238,7 @@ fn materialize_recorder() -> miette::Result<tempfile::TempDir> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).into_diagnostic()?;
         }
-        let mut f = std::fs::File::create(&target).into_diagnostic()?;
-        f.write_all(contents.as_bytes()).into_diagnostic()?;
+        std::fs::write(&target, contents).into_diagnostic()?;
     }
     Ok(dir)
 }

@@ -51,14 +51,15 @@ impl Direction {
 }
 
 /// Where an edge endpoint attaches to its node.
+///
+/// One variant, for now. The node editor pinned endpoints to its sockets by
+/// offset and took its pin geometry with it; the wiring graph has no sockets
+/// to pin to, so every endpoint is fanned.
 #[derive(Clone, Copy, Debug)]
 pub enum PinAnchor {
     /// The engine fans endpoints out along the node's side, ordered so that
     /// locally-crossing pairs untwist at the boundary.
     Auto,
-    /// Fixed offset along the node's cross axis from its top (left in
-    /// [`Direction::TopBottom`]) edge — the caller owns pin geometry.
-    Offset(f32),
 }
 
 /// One node to lay out; the engine only needs its footprint.
@@ -143,7 +144,7 @@ pub fn compute(input: &LayoutInput) -> LayoutOutput {
     let transposed = input.options.direction == Direction::TopBottom;
 
     // Normalized (left→right) sizes; a transposed layout swaps them back at
-    // the end, which also makes `PinAnchor::Offset` measure along whichever
+    // the end, which also makes a pin offset measure along whichever
     // axis is "down the node's side" for the chosen direction.
     let sizes: Vec<(f32, f32)> = input
         .nodes

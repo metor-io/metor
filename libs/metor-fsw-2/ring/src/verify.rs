@@ -540,8 +540,7 @@ fn corrupt_data_never_ub() {
     }
 
     match v.try_read() {
-        Err(ReadError::Corrupt) => {}
-        Ok(None) => {}
+        Err(ReadError::Corrupt) | Ok(None) => {}
         Ok(Some(g)) => {
             // A served record fits in the region with room for its header.
             assert!(g.len() <= CAP - 8);

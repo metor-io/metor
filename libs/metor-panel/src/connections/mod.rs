@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task, WeakEntity};
+use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task, Window};
 use metor_db::DB;
 use metor_db::remote::Hydrator;
 use stellarator::util::CancelToken;
@@ -383,9 +383,6 @@ pub struct ConnectionsStore {
     /// The LoD companion task is DB-wide and never stopped, so it spawns at
     /// most once — on the first local-authority connection.
     lod_spawned: bool,
-    /// The window's tile tree, handed over by the app root; the autosave
-    /// tick snapshots it while anything is connected.
-    tiles: Option<WeakEntity<crate::tiles::TileGroup>>,
     /// Last layout JSON written to disk; skips rewrites while idle. Pane and
     /// item mutations don't notify the tile group, so autosave poll-compares
     /// instead of observing.
@@ -402,6 +399,26 @@ pub fn try_global(cx: &App) -> Option<Entity<ConnectionsStore>> {
     cx.try_global::<GlobalConnections>().map(|g| g.0.clone())
 }
 
+/// Flush the layout through the global store, for hooks holding only
+/// `&mut App` (a non-last window just closed; the survivors re-snapshot).
+pub(crate) fn flush_layout_now(cx: &mut App) {
+    let Some(store) = try_global(cx) else {
+        return;
+    };
+    store.update(cx, |store, cx| store.flush_layout(None, cx));
+}
+
+/// Flush including `window`, which is mid-close and unreachable through its
+/// handle — gpui takes a window's slot for the duration of its dispatch.
+/// This is how closing the last window still lands in the saved layout.
+pub(crate) fn flush_layout_including(window: &Window, cx: &mut App) {
+    let Some(store) = try_global(cx) else {
+        return;
+    };
+    let extra = crate::workspace::window_layout(window, cx);
+    store.update(cx, |store, cx| store.flush_layout(extra, cx));
+}
+
 impl ConnectionsStore {
     /// Install the store and hand back the producer side of the registry.
     pub fn init(db: Arc<DB>, cx: &mut App) -> RegistryHandle {
@@ -409,7 +426,7 @@ impl ConnectionsStore {
         let entity = cx.new(|cx| ConnectionsStore::new(db, rx, cx));
         cx.set_global(GlobalConnections(entity.clone()));
         cx.on_app_quit(move |cx| {
-            entity.update(cx, |store, cx| store.flush_layout(cx));
+            entity.update(cx, |store, cx| store.flush_layout(None, cx));
             async {}
         })
         .detach();
@@ -461,7 +478,7 @@ impl ConnectionsStore {
                         }
                     }
                     if autosave {
-                        store.flush_layout(cx);
+                        store.flush_layout(None, cx);
                     }
                     if changed {
                         cx.notify();
@@ -479,33 +496,30 @@ impl ConnectionsStore {
             active: Vec::new(),
             db,
             lod_spawned: false,
-            tiles: None,
             last_saved_layout: None,
             registry_rx,
             _poll: poll,
         }
     }
 
-    /// Hand over the window's tile tree for layout autosave and restore.
-    pub fn set_tiles(&mut self, tiles: WeakEntity<crate::tiles::TileGroup>) {
-        self.tiles = Some(tiles);
-    }
-
-    pub fn tiles(&self) -> Option<Entity<crate::tiles::TileGroup>> {
-        self.tiles.as_ref().and_then(|w| w.upgrade())
-    }
-
-    /// Snapshot the layout to every active connection's file when it moved
-    /// since the last write. The layout is "what the user ran while
-    /// connected to X" — on reconnect to any X it is offered back.
-    fn flush_layout(&mut self, cx: &mut Context<Self>) {
+    /// Snapshot every window's layout to every active connection's file when
+    /// it moved since the last write. The layout is "what the user ran while
+    /// connected to X" — on reconnect to any X it is offered back. `extra`
+    /// rides along for a window that is mid-close (see
+    /// [`crate::workspace::window_layout`]).
+    fn flush_layout(
+        &mut self,
+        extra: Option<(gpui::WindowId, crate::workspace::WindowLayout)>,
+        cx: &mut Context<Self>,
+    ) {
         if self.active.is_empty() {
             return;
         }
-        let Some(tiles) = self.tiles() else {
+        let Some(json) = crate::workspace::serialize_workspace(extra, cx) else {
+            // No panel window open: keep the snapshot taken while one was,
+            // rather than wiping every saved layout with emptiness.
             return;
         };
-        let json = tiles.read(cx).to_json(cx);
         if self.last_saved_layout.as_deref() == Some(json.as_str()) {
             return;
         }
@@ -518,9 +532,15 @@ impl ConnectionsStore {
     }
 
     /// Note a layout the picker just loaded, so the next autosave tick
-    /// doesn't immediately rewrite every file with it.
+    /// doesn't immediately rewrite every file with it. A restore that
+    /// changed formatting (a wrapped pre-multi-window file, say) still
+    /// rewrites once — harmless.
     pub(crate) fn note_loaded_layout(&mut self, json: String) {
         self.last_saved_layout = Some(json);
+    }
+
+    pub(crate) fn db(&self) -> &Arc<DB> {
+        &self.db
     }
 
     pub fn set_resolver(&mut self, resolver: AddressResolver) {
@@ -638,7 +658,7 @@ impl ConnectionsStore {
         let Some(index) = self.active.iter().position(|c| &c.target.id == id) else {
             return;
         };
-        self.flush_layout(cx);
+        self.flush_layout(None, cx);
         let conn = self.active.remove(index);
         conn.cancel.cancel();
         conn.status.set(ConnectionStatus::Disconnected);

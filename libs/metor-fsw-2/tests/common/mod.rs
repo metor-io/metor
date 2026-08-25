@@ -3,6 +3,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use metor_fsw_2::metor_proto::types::Msg;
+use metor_fsw_2::ring::{NoWake, View};
+use metor_fsw_2::split_record;
+
 /// The platform file name of a `cdylib` with library stem `stem`.
 pub fn fixture_lib_name(stem: &str) -> String {
     if cfg!(target_os = "macos") {
@@ -47,4 +51,22 @@ pub fn locate_fixture(package: &str, stem: &str) -> Option<PathBuf> {
     }
     eprintln!("skipping: built the fixture but could not locate {want} in cargo output");
     None
+}
+
+/// Drain a message ring, checking and decoding every record as `M`.
+// Each integration target compiles this module independently; the dl-only
+// target uses the fixture helpers but has no raw message tap.
+#[allow(dead_code)]
+pub fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(view: &mut View<NoWake>) -> Vec<M> {
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    while view
+        .try_read_into(&mut buf)
+        .expect("no lap on the message tap")
+    {
+        let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
+        assert_eq!(id, M::ID, "every record on this channel carries M::ID");
+        out.push(postcard::from_bytes(payload).expect("postcard round-trip"));
+    }
+    out
 }

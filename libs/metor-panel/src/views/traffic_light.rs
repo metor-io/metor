@@ -58,7 +58,7 @@ impl TrafficLight {
         let default_color = theme(cx).control_active;
 
         let meta = component_meta(&db, component_id);
-        let task = spawn_on_stream(db.clone(), source, cx, |this, on, cx| {
+        let task = spawn_on_stream(db.clone(), source, cx, |this, on, _value, cx| {
             this.latest_on = Some(on);
             cx.notify();
         });

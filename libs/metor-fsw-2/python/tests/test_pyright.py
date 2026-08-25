@@ -31,8 +31,17 @@ class PyrightTest(unittest.TestCase):
         if cmd is None:
             self.skipTest("pyright not available on PATH")
         result = subprocess.run(
-            [*cmd, "--outputjson", "metor_config", os.path.join("tests", "data", "demo.py")],
+            [
+                *cmd,
+                "--outputjson",
+                os.path.join("metor-config", "metor_config"),
+                os.path.join("tests", "data", "demo.py"),
+            ],
             cwd=os.path.abspath(PYTHON_DIR),
+            env={
+                **os.environ,
+                "PYTHONPATH": os.path.abspath(os.path.join(PYTHON_DIR, "metor-config")),
+            },
             capture_output=True,
             text=True,
         )
