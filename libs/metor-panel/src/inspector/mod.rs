@@ -108,6 +108,11 @@ pub struct Inspector {
     parent_focus: Option<FocusHandle>,
     pub dismissed: bool,
     search: TextField,
+    /// What a provider row made of the current query, when one did. Shown in
+    /// place of the page's fuzzy-filtered rows and re-asked on every query
+    /// change; owned here because the page's own rows stay untouched behind
+    /// it. See [`InspectorRow::query_rows`].
+    query_rows: Option<Vec<Box<dyn InspectorRow>>>,
     selected_index: usize,
     editing: Option<EditState>,
     panel_bounds: Option<Bounds<Pixels>>,
@@ -168,6 +173,7 @@ impl Inspector {
             parent_focus: None,
             dismissed: false,
             search: TextField::new("Search...", cx),
+            query_rows: None,
             selected_index: 0,
             editing: None,
             panel_bounds: None,
@@ -218,6 +224,7 @@ impl Inspector {
             label: incoming_label,
         });
         self.search.clear();
+        self.query_rows = None;
         self.selected_index = self.first_selectable_index();
         cx.notify();
     }
@@ -229,6 +236,7 @@ impl Inspector {
                 current.label = None;
             }
             self.search.clear();
+            self.query_rows = None;
             self.selected_index = self.first_selectable_index();
             cx.notify();
             true
@@ -237,11 +245,37 @@ impl Inspector {
         }
     }
 
+    /// The rows the panel currently shows: a provider's take on the query
+    /// when there is one, the page's own rows otherwise.
     fn current_rows(&self) -> Option<&[Box<dyn InspectorRow>]> {
+        if let Some(rows) = &self.query_rows {
+            return Some(rows.as_slice());
+        }
         match &self.current_page().kind {
             InspectorPageKind::Rows(rows) => Some(rows.as_slice()),
             InspectorPageKind::View { .. } => None,
         }
+    }
+
+    /// Ask the current page's provider row, if any, to reinterpret the query.
+    ///
+    /// Called after every query change. The first row that answers wins; an
+    /// empty query always falls back to the page's own rows so a picker opens
+    /// looking exactly as it always has.
+    fn refresh_query_rows(&mut self, cx: &mut App) {
+        self.query_rows = None;
+        if self.search.text.is_empty() {
+            return;
+        }
+        let query = self.search.text.clone();
+        let cursor = self.search.cursor;
+        let computed = match &self.current_page().kind {
+            InspectorPageKind::Rows(rows) => rows
+                .iter()
+                .find_map(|row| row.query_rows(&query, cursor, cx)),
+            InspectorPageKind::View { .. } => None,
+        };
+        self.query_rows = computed;
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -249,7 +283,10 @@ impl Inspector {
             return Vec::new();
         };
         let filter = &self.search.text;
-        if filter.is_empty() {
+        // A provider's rows are already the answer to the query — fuzzy
+        // re-filtering them against expression text would drop candidates
+        // whose labels don't happen to resemble the whole expression.
+        if filter.is_empty() || self.query_rows.is_some() {
             return (0..rows.len()).collect();
         }
 
@@ -312,13 +349,38 @@ impl Inspector {
             .unwrap_or(0)
     }
 
+    fn current_rows_mut(&mut self) -> Option<&mut [Box<dyn InspectorRow>]> {
+        if self.query_rows.is_some() {
+            return self.query_rows.as_deref_mut();
+        }
+        match &mut self.pages.last_mut()?.kind {
+            InspectorPageKind::Rows(rows) => Some(rows),
+            InspectorPageKind::View { .. } => None,
+        }
+    }
+
     fn activate_row(&mut self, row_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let search = self.search.text.clone();
-        let page = self.pages.last_mut().expect("page stack empty");
-        let InspectorPageKind::Rows(rows) = &mut page.kind else {
+        let Some(rows) = self.current_rows_mut() else {
             return;
         };
-        let action = rows[row_idx].activate_with_search(&search, window, cx);
+        let Some(row) = rows.get_mut(row_idx) else {
+            return;
+        };
+        let action = row.activate_with_search(&search, window, cx);
+        self.handle_action(action, row_idx, window, cx);
+    }
+
+    /// Tab on the selected row: insert instead of commit.
+    fn insert_row(&mut self, row_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let search = self.search.text.clone();
+        let Some(rows) = self.current_rows_mut() else {
+            return;
+        };
+        let Some(row) = rows.get_mut(row_idx) else {
+            return;
+        };
+        let action = row.insert(&search, window, cx);
         self.handle_action(action, row_idx, window, cx);
     }
 
@@ -360,6 +422,14 @@ impl Inspector {
             }
             RowAction::Dismiss => {
                 self.dismiss(window);
+            }
+            RowAction::ReplaceQuery { text, cursor } => {
+                self.search.text = text;
+                self.search.cursor = cursor.min(self.search.text.len());
+                self.search.mark = self.search.cursor;
+                self.refresh_query_rows(cx);
+                self.selected_index = self.first_selectable_index();
+                cx.notify();
             }
             RowAction::StartEdit {
                 current_text,
@@ -497,10 +567,21 @@ impl Inspector {
                 cx.notify();
                 return;
             }
+            "tab" => {
+                let filtered = self.filtered_indices();
+                if let Some(&row_idx) = filtered.get(self.selected_index)
+                    && !self.is_header_at(&filtered, self.selected_index)
+                {
+                    self.insert_row(row_idx, window, cx);
+                }
+                cx.notify();
+                return;
+            }
             _ => {}
         }
 
         if self.search.handle_key_down(event, cx) {
+            self.refresh_query_rows(cx);
             self.selected_index = self.first_selectable_index();
         }
     }
@@ -628,7 +709,7 @@ impl Inspector {
                                 .as_ref()
                                 .is_some_and(|e| e.row_index == row_idx);
 
-                            let InspectorPageKind::Rows(rows) = &this.current_page().kind else {
+                            let Some(rows) = this.current_rows() else {
                                 unreachable!("render_rows_panel is only entered on Rows pages");
                             };
 

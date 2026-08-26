@@ -98,8 +98,12 @@ impl RowList {
                     );
                 }
             }
-            // Embedded RowList has no page stack and no overlay to dismiss.
-            RowAction::Pop | RowAction::Dismiss | RowAction::CascadeView { .. } => {}
+            // Embedded RowList has no page stack, no overlay to dismiss, and
+            // no search field to rewrite.
+            RowAction::Pop
+            | RowAction::Dismiss
+            | RowAction::CascadeView { .. }
+            | RowAction::ReplaceQuery { .. } => {}
         }
     }
 

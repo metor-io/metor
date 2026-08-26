@@ -81,6 +81,35 @@ pub trait InspectorRow: 'static {
         false
     }
 
+    /// Reinterpret the whole query, replacing the page's list.
+    ///
+    /// A completion provider lives on its page as an ordinary row — the same
+    /// way [`ExpressionRow`] already rides along in every picker — and this is
+    /// how it takes over: given the query and the search field's cursor, it
+    /// returns the rows to show *instead of* the fuzzy-filtered page. `None`
+    /// leaves the page to the default filter, so a page without a provider
+    /// behaves exactly as before.
+    ///
+    /// The first row on a page that answers wins; the inspector re-asks on
+    /// every query change and owns the returned rows until the next one.
+    fn query_rows(
+        &self,
+        _query: &str,
+        _cursor: usize,
+        _cx: &mut App,
+    ) -> Option<Vec<Box<dyn InspectorRow>>> {
+        None
+    }
+
+    /// Respond to Tab: insert rather than commit.
+    ///
+    /// Completion rows override this to push their candidate into the search
+    /// field ([`RowAction::ReplaceQuery`]) without triggering the commit that
+    /// Enter means. Rows with nothing to insert leave the default no-op.
+    fn insert(&mut self, _search: &str, _window: &mut Window, _cx: &mut App) -> RowAction {
+        RowAction::Handled
+    }
+
     /// Non-interactive section headers return `true` so the inspector skips
     /// them during arrow-key selection and drops them from filtered results
     /// (an empty header is more confusing than none).
@@ -121,6 +150,10 @@ pub enum RowAction {
     /// row list. Used for transient previews (impromptu plots) that benefit
     /// from the inspector's overlay chrome and page stack.
     CascadeView(PreviewSpec),
+    /// Rewrite the search field — how an accepted completion lands in the
+    /// query without committing anything. `cursor` is a byte offset into
+    /// `text`.
+    ReplaceQuery { text: String, cursor: usize },
 }
 
 /// Small pill used for category and tag annotations next to a row label.
