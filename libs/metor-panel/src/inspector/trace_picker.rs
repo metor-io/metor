@@ -58,13 +58,19 @@ pub(crate) fn component_picker_rows(
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
 ) -> Vec<Box<dyn InspectorRow>> {
     let on_select = Arc::new(on_select);
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(db.clone(), {
+    let commit: crate::inspector::rows::OnExpression = {
         let on_select = on_select.clone();
         Arc::new(move |id, text, _window, cx| {
             on_select(id, text, cx);
             RowAction::Dismiss
         })
-    }))];
+    };
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(
+        db.clone(),
+        commit.clone(),
+        ExpressionRow::commit_component_row(commit),
+        None,
+    ))];
     rows.extend(list_components(&db).into_iter().map(|(id, name)| {
         let on_select = on_select.clone();
         Box::new(CommandRow::new(
@@ -227,12 +233,12 @@ fn component_list_rows(
 
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    // Typing `=` commits its traces on its own rather than joining the
+    // An expression commits its traces on its own rather than joining the
     // multi-select: an expression is one channel already, so there is nothing
     // to check off — but a channel is not one *number*. An expression over a
     // vector broadcasts to a vector, and it plots the way that component
     // would: one trace per element.
-    rows.push(Box::new(ExpressionRow::new(db.clone(), {
+    let commit_expression: crate::inspector::rows::OnExpression = {
         let db = db.clone();
         let on_continue = on_continue.clone();
         let color_basis = color_basis.clone();
@@ -246,7 +252,44 @@ fn component_list_rows(
                 ContinueAction::CascadeView(build) => RowAction::CascadeView(build(traces, cx)),
             }
         })
-    })));
+    };
+    // A matched component keeps the wizard's own spelling — the element-page
+    // NavRow — and the Continue row rides below the candidates, so a query
+    // never takes the multi-select away.
+    let nav_row: crate::inspector::rows::ComponentRowBuilder = {
+        let db = db.clone();
+        let selection = selection.clone();
+        Arc::new(move |id, item, _cx| {
+            let elem_count = element_names_for_component(&db, id).len().max(1);
+            Some(wizard_component_row(
+                &db,
+                &selection,
+                id,
+                item.label.clone(),
+                elem_count,
+            ))
+        })
+    };
+    let continue_row: crate::inspector::rows::TailRowBuilder = {
+        let selection = selection.clone();
+        let db = db.clone();
+        let color_basis = color_basis.clone();
+        let on_continue = on_continue.clone();
+        Arc::new(move || {
+            Box::new(ContinueRow {
+                selection: selection.clone(),
+                db: db.clone(),
+                color_basis: color_basis.clone(),
+                on_continue: on_continue.clone(),
+            })
+        })
+    };
+    rows.push(Box::new(ExpressionRow::new(
+        db.clone(),
+        commit_expression,
+        nav_row,
+        Some(continue_row),
+    )));
 
     rows.push(Box::new(ContinueRow {
         selection: selection.clone(),
@@ -256,36 +299,54 @@ fn component_list_rows(
     }));
 
     for (comp_id, comp_name, elem_count) in components {
-        let sel_for_summary = selection.clone();
-        let sel_for_cascade = selection.clone();
-        let db_for_cascade = db.clone();
-        let name_for_cascade = comp_name.clone();
-
-        rows.push(Box::new(NavRow::with_dynamic_summary(
-            SharedString::from(comp_name),
-            Box::new(move |_cx| {
-                let n = sel_for_summary.lock().unwrap().count_for(comp_id);
-                if n == 0 {
-                    SharedString::new_static("")
-                } else if n == elem_count {
-                    SharedString::new_static("all")
-                } else {
-                    SharedString::from(format!("{n} selected"))
-                }
-            }),
-            Box::new(move |_cx| {
-                element_page_rows(
-                    db_for_cascade.clone(),
-                    comp_id,
-                    name_for_cascade.clone(),
-                    elem_count,
-                    sel_for_cascade.clone(),
-                )
-            }),
-        )));
+        rows.push(wizard_component_row(
+            &db,
+            &selection,
+            comp_id,
+            comp_name,
+            elem_count,
+        ));
     }
 
     rows
+}
+
+/// One component's line in the wizard: its selection summary, cascading into
+/// the element checkboxes. Shared by the unfiltered list and the completion
+/// provider so a query changes what is offered, never what a row does.
+fn wizard_component_row(
+    db: &Arc<DB>,
+    selection: &Arc<Mutex<TraceSelection>>,
+    comp_id: ComponentId,
+    comp_name: String,
+    elem_count: usize,
+) -> Box<dyn InspectorRow> {
+    let sel_for_summary = selection.clone();
+    let sel_for_cascade = selection.clone();
+    let db_for_cascade = db.clone();
+    let name_for_cascade = comp_name.clone();
+    Box::new(NavRow::with_dynamic_summary(
+        SharedString::from(comp_name),
+        Box::new(move |_cx| {
+            let n = sel_for_summary.lock().unwrap().count_for(comp_id);
+            if n == 0 {
+                SharedString::new_static("")
+            } else if n == elem_count {
+                SharedString::new_static("all")
+            } else {
+                SharedString::from(format!("{n} selected"))
+            }
+        }),
+        Box::new(move |_cx| {
+            element_page_rows(
+                db_for_cascade.clone(),
+                comp_id,
+                name_for_cascade.clone(),
+                elem_count,
+                sel_for_cascade.clone(),
+            )
+        }),
+    ))
 }
 
 fn element_page_rows(

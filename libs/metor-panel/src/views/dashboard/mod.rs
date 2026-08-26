@@ -1055,7 +1055,7 @@ fn component_picker_rows(
     // `expressions::bind`, so every one of them can be given an expression.
     // The row used to be gated to the monitor because it was the only builder
     // that could honour one.
-    rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(db.clone(), {
+    let commit: crate::inspector::rows::OnExpression = {
         let dashboard = dashboard.clone();
         let kind = kind.clone();
         Arc::new(move |_id, text, _window, cx| {
@@ -1066,7 +1066,13 @@ fn component_picker_rows(
             });
             crate::inspector::rows::RowAction::Dismiss
         })
-    })));
+    };
+    rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(
+        db.clone(),
+        commit.clone(),
+        crate::inspector::rows::ExpressionRow::commit_component_row(commit),
+        None,
+    )));
 
     rows.extend(crate::inspector::trace_picker::list_components(&db)
         .into_iter()

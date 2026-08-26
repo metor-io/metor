@@ -43,12 +43,6 @@ impl DbResolver {
         DbResolver { components }
     }
 
-    /// Every component the language can address, for the picker's expression
-    /// mode to offer as completions.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.components.keys().map(String::as_str)
-    }
-
     /// The id of a component this resolver resolved.
     ///
     /// The id is carried, never re-derived. A component's id belongs to
@@ -83,6 +77,11 @@ impl Resolver for DbResolver {
     /// `bind=` target can name a frame the host already defines.
     fn frame(&self, _name: &str) -> Option<FrameSchema> {
         None
+    }
+
+    /// Every component the language can address, for completion to offer.
+    fn paths(&self) -> Vec<String> {
+        self.components.keys().cloned().collect()
     }
 }
 

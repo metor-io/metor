@@ -47,13 +47,19 @@ pub(super) fn build_component_picker(
     idx: usize,
     _cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(db.clone(), {
+    let commit: crate::inspector::rows::OnExpression = {
         let any_entity = any_entity.clone();
         Arc::new(move |id, _text, _w, cx| {
             crate::inspector::reflect::set_field::<ComponentId>(&any_entity, idx, id, cx);
             RowAction::Dismiss
         })
-    }))];
+    };
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(
+        db.clone(),
+        commit.clone(),
+        ExpressionRow::commit_component_row(commit),
+        None,
+    ))];
     rows.extend(
         crate::inspector::trace_picker::list_components(db)
             .into_iter()
@@ -185,8 +191,7 @@ pub(super) fn build_option_row(
                 )));
             } else {
                 let any_expr = any_entity.clone();
-                rows.push(Box::new(ExpressionRow::new(
-                    db.clone(),
+                let commit: crate::inspector::rows::OnExpression =
                     Arc::new(move |id, _text, _w, cx| {
                         crate::inspector::reflect::set_field::<Option<ComponentId>>(
                             &any_expr,
@@ -195,7 +200,12 @@ pub(super) fn build_option_row(
                             cx,
                         );
                         RowAction::Dismiss
-                    }),
+                    });
+                rows.push(Box::new(ExpressionRow::new(
+                    db.clone(),
+                    commit.clone(),
+                    ExpressionRow::commit_component_row(commit),
+                    None,
                 )));
                 for (id, name) in crate::inspector::trace_picker::list_components(&db) {
                     let any_entity = any_entity.clone();

@@ -37,11 +37,11 @@ pub fn select_list_trace_wizard_rows(
 ) -> Vec<Box<dyn InspectorRow>> {
     let candidates = list_vector_components(&db);
     let mut rows: Vec<Box<dyn InspectorRow>> =
-        vec![Box::new(HeaderRow::new("Pick a vector component, or type = to compute one"))];
+        vec![Box::new(HeaderRow::new("Pick a vector component, or type an expression"))];
 
     // Pinned above the list, and before the empty-state note: a db with no
     // vector component of its own can still have one computed from it.
-    rows.push(Box::new(ExpressionRow::new(db.clone(), {
+    let commit: crate::inspector::rows::OnExpression = {
         let db = db.clone();
         let color_basis = color_basis.clone();
         let on_select = on_select.clone();
@@ -50,7 +50,40 @@ pub fn select_list_trace_wizard_rows(
             on_select(trace, window, cx);
             RowAction::Dismiss
         })
-    })));
+    };
+    // Only vectors fit a list plot, so the completion provider's component
+    // candidates are declined unless their schema says vector — the same
+    // rule `list_vector_components` applies to the unfiltered list.
+    let vector_row: crate::inspector::rows::ComponentRowBuilder = {
+        let db = db.clone();
+        let color_basis = color_basis.clone();
+        let on_select = on_select.clone();
+        Arc::new(move |id, _item, _cx| {
+            let (_, name, len) = list_vector_components(&db)
+                .into_iter()
+                .find(|(vid, _, _)| *vid == id)?;
+            let on_select = on_select.clone();
+            let color_basis = color_basis.clone();
+            let label = SharedString::from(format!("{} [{}]", name, len));
+            Some(Box::new(CommandRow::new(
+                label,
+                Arc::new(move |window, cx| {
+                    let theme = theme(cx);
+                    let basis = (color_basis)(cx);
+                    let color = theme.line_colors[basis % theme.line_colors.len()];
+                    let mut trace = ListTrace::new(id, len, color);
+                    trace.label = SharedString::from(name.clone());
+                    (on_select)(trace, window, cx);
+                }),
+            )) as Box<dyn InspectorRow>)
+        })
+    };
+    rows.push(Box::new(ExpressionRow::new(
+        db.clone(),
+        commit,
+        vector_row,
+        None,
+    )));
 
     if candidates.is_empty() {
         rows.push(Box::new(HeaderRow::new(

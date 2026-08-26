@@ -51,9 +51,9 @@ fn x_component_rows(
     draft: Arc<Mutex<XyDraft>>,
 ) -> Vec<Box<dyn InspectorRow>> {
     let header: Box<dyn InspectorRow> =
-        Box::new(HeaderRow::new("Pick X axis component, or type = to compute one"));
+        Box::new(HeaderRow::new("Pick X axis component, or type an expression"));
     let mut rows: Vec<Box<dyn InspectorRow>> = vec![header];
-    rows.push(Box::new(ExpressionRow::new(db.clone(), {
+    let commit: crate::inspector::rows::OnExpression = {
         let db = db.clone();
         let color_basis = color_basis.clone();
         let on_select = on_select.clone();
@@ -68,7 +68,35 @@ fn x_component_rows(
                 expressions::body(&text).to_string(),
             ))
         })
-    })));
+    };
+    let nav: crate::inspector::rows::ComponentRowBuilder = {
+        let db = db.clone();
+        let color_basis = color_basis.clone();
+        let on_select = on_select.clone();
+        let draft = draft.clone();
+        Arc::new(move |id, item, _cx| {
+            let db = db.clone();
+            let color_basis = color_basis.clone();
+            let on_select = on_select.clone();
+            let draft = draft.clone();
+            let name = item.label.clone();
+            Some(Box::new(NavRow::new(
+                SharedString::from(name.clone()),
+                SharedString::new_static(""),
+                Box::new(move |_cx| {
+                    x_element_rows(
+                        db.clone(),
+                        color_basis.clone(),
+                        on_select.clone(),
+                        draft.clone(),
+                        id,
+                        name.clone(),
+                    )
+                }),
+            )) as Box<dyn InspectorRow>)
+        })
+    };
+    rows.push(Box::new(ExpressionRow::new(db.clone(), commit, nav, None)));
     for (id, name) in list_components(&db) {
         let db = db.clone();
         let color_basis = color_basis.clone();
@@ -150,9 +178,9 @@ fn y_component_rows(
     draft: Arc<Mutex<XyDraft>>,
 ) -> Vec<Box<dyn InspectorRow>> {
     let header: Box<dyn InspectorRow> =
-        Box::new(HeaderRow::new("Pick Y axis component, or type = to compute one"));
+        Box::new(HeaderRow::new("Pick Y axis component, or type an expression"));
     let mut rows: Vec<Box<dyn InspectorRow>> = vec![header];
-    rows.push(Box::new(ExpressionRow::new(db.clone(), {
+    let commit: crate::inspector::rows::OnExpression = {
         let db = db.clone();
         let color_basis = color_basis.clone();
         let on_select = on_select.clone();
@@ -167,7 +195,35 @@ fn y_component_rows(
                 expressions::body(&text).to_string(),
             ))
         })
-    })));
+    };
+    let nav: crate::inspector::rows::ComponentRowBuilder = {
+        let db = db.clone();
+        let color_basis = color_basis.clone();
+        let on_select = on_select.clone();
+        let draft = draft.clone();
+        Arc::new(move |id, item, _cx| {
+            let db = db.clone();
+            let color_basis = color_basis.clone();
+            let on_select = on_select.clone();
+            let draft = draft.clone();
+            let name = item.label.clone();
+            Some(Box::new(NavRow::new(
+                SharedString::from(name.clone()),
+                SharedString::new_static(""),
+                Box::new(move |_cx| {
+                    y_element_rows(
+                        db.clone(),
+                        color_basis.clone(),
+                        on_select.clone(),
+                        draft.clone(),
+                        id,
+                        name.clone(),
+                    )
+                }),
+            )) as Box<dyn InspectorRow>)
+        })
+    };
+    rows.push(Box::new(ExpressionRow::new(db.clone(), commit, nav, None)));
     for (id, name) in list_components(&db) {
         let db = db.clone();
         let color_basis = color_basis.clone();

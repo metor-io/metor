@@ -14,6 +14,7 @@ use gpui::{
     UniformListScrollHandle, Window, anchored, canvas, deferred, div, prelude::*, px, uniform_list,
 };
 
+pub mod completion;
 pub mod drag_paint;
 pub mod edits;
 pub mod palette;
