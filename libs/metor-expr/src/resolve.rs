@@ -40,6 +40,13 @@ pub trait Resolver: Sync {
     /// A frame the host defines, for checking a `bind=` target field by
     /// field.
     fn frame(&self, name: &str) -> Option<FrameSchema>;
+
+    /// Every path [`component`](Self::component) would answer for, so a
+    /// completion can offer what the compiler would accept. Compilation never
+    /// calls this; a host that cannot enumerate simply offers nothing.
+    fn paths(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A host that knows nothing, for compiling a module of plain `def`s.

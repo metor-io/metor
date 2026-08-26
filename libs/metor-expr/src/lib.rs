@@ -98,8 +98,10 @@
 //! dependencies beyond `zerocopy` — and writes its loops out by hand. See the
 //! plan's Results section for the numbers behind that.
 
+pub mod builtins;
 mod check;
 mod codegen;
+pub mod complete;
 mod diag;
 mod ir;
 mod lang;

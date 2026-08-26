@@ -11,6 +11,7 @@
 //! the two must agree bit for bit.
 
 mod abi;
+mod completion;
 mod differential;
 mod layout;
 mod m0;
