@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use gpui::{
-    App, ClipboardItem, Hsla, IntoElement, KeyDownEvent, Pixels, SharedString, Styled, TextRun,
-    canvas, fill, point, px, size,
+    App, ClipboardItem, Hsla, IntoElement, KeyDownEvent, Pixels, Point, SharedString, Styled,
+    TextRun, canvas, fill, point, px, size,
 };
 
 use crate::theme::{Theme, theme};
@@ -74,6 +74,10 @@ pub struct TextField {
     /// scrolling follows the height the field actually has rather than one
     /// the caller guessed.
     rows: Arc<AtomicUsize>,
+    /// Where the caret's baseline landed, in window coordinates, as the last
+    /// paint placed it — the anchor a completion popup hangs from. Packed
+    /// f32 bits so the paint closure can write it without a lock.
+    caret_px: Arc<AtomicU64>,
 }
 
 impl TextField {
@@ -89,7 +93,18 @@ impl TextField {
             marks: Vec::new(),
             scroll_line: 0,
             rows: Arc::new(AtomicUsize::new(1)),
+            caret_px: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Where the caret sat below its line at the last paint, in window
+    /// coordinates — the anchor for a popup that follows typing. A frame
+    /// stale at worst, which is invisible under a keystroke.
+    pub fn caret_position(&self) -> Point<Pixels> {
+        let packed = self.caret_px.load(Ordering::Relaxed);
+        let x = f32::from_bits((packed >> 32) as u32);
+        let y = f32::from_bits(packed as u32);
+        point(px(x), px(y))
     }
 
     /// Turn the field into an editor: Enter inserts a newline, Up and Down
@@ -495,6 +510,7 @@ impl TextField {
         let cursor_color = self.style.cursor_color;
         let selection_color = self.style.selection_color;
         let rows_seen = self.rows.clone();
+        let caret_seen = self.caret_px.clone();
 
         canvas(
             move |bounds, window, _cx| {
@@ -593,9 +609,13 @@ impl TextField {
                         let _ = line.paint(origin, line_height, window, cx);
 
                         if !showing_placeholder && (*start..=start + len).contains(&cursor) {
+                            let caret_x = origin.x + x_at(cursor);
+                            let packed = ((f32::from(caret_x).to_bits() as u64) << 32)
+                                | f32::from(y + line_height).to_bits() as u64;
+                            caret_seen.store(packed, Ordering::Relaxed);
                             window.paint_quad(fill(
                                 gpui::Bounds::new(
-                                    point(origin.x + x_at(cursor) - cursor_width() / 2.0, y),
+                                    point(caret_x - cursor_width() / 2.0, y),
                                     size(cursor_width(), line_height),
                                 ),
                                 cursor_color,

@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use gpui::{
     App, Axis, Bounds, Context, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    Pixels, Point, Render, SharedString, Task, Window, canvas, div, point, prelude::*, px,
+    Pixels, Point, Render, SharedString, Task, Window, anchored, canvas, deferred, div, point,
+    prelude::*, px,
 };
 use metor_db::DB;
 use metor_expr::Manifest;
@@ -103,6 +104,15 @@ pub struct GraphCanvas {
     canvas_origin: Option<Point<Pixels>>,
     /// Whether the text half is showing instead of the canvas.
     text: bool,
+    /// The completion menu, while one is up over the editor.
+    completion: Option<CompletionMenu>,
+}
+
+/// What the editor's completion popup shows: the ranked candidates for the
+/// caret, and which one Enter would take.
+struct CompletionMenu {
+    completions: metor_expr::complete::Completions,
+    selected: usize,
 }
 
 impl GraphCanvas {
@@ -139,6 +149,7 @@ impl GraphCanvas {
             pan_drag: None,
             canvas_origin: None,
             text: cfg.program.text,
+            completion: None,
         };
         this.schedule_rebuild(cx);
         this
@@ -385,6 +396,7 @@ impl GraphCanvas {
         };
         if primary && event.keystroke.key.as_str() == "g" {
             self.text = !self.text;
+            self.completion = None;
             cx.notify();
             return;
         }
@@ -399,11 +411,90 @@ impl GraphCanvas {
             }
             return;
         }
+
+        let key = event.keystroke.key.as_str();
+        // While the menu is up, the navigation keys are its keys; everything
+        // else falls through to the editor and re-queries.
+        if let Some(menu) = &mut self.completion {
+            match key {
+                "escape" => {
+                    self.completion = None;
+                    cx.notify();
+                    return;
+                }
+                "up" => {
+                    menu.selected = menu.selected.saturating_sub(1);
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    menu.selected = (menu.selected + 1).min(menu.completions.items.len() - 1);
+                    cx.notify();
+                    return;
+                }
+                "enter" | "return" | "tab" if !mods.shift => {
+                    self.accept_completion(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if mods.control && key == "space" {
+            self.refresh_completion(true);
+            cx.notify();
+            return;
+        }
         if self.editor.handle_key_down(event, cx) {
             self.editor.follow_cursor();
             self.schedule_rebuild(cx);
+            self.refresh_completion(false);
             cx.notify();
         }
+    }
+
+    /// Recompute what the caret could take, opening or closing the menu.
+    ///
+    /// The menu opens itself only while a prefix is being typed; an empty
+    /// position offers everything, but only when asked (ctrl-space), so the
+    /// popup never chases the caret through plain navigation.
+    fn refresh_completion(&mut self, explicit: bool) {
+        let resolver = crate::inspector::completion::resolver(&self.db);
+        let mut completions = metor_expr::complete::complete(
+            &self.editor.text,
+            self.editor.cursor as u32,
+            metor_expr::complete::Scope::Module,
+            resolver.as_ref(),
+            self.manifest.as_ref(),
+        );
+        crate::inspector::completion::rank(&mut completions);
+        let open = (explicit || !completions.prefix.is_empty()) && !completions.items.is_empty();
+        self.completion = open.then_some(CompletionMenu {
+            completions,
+            selected: 0,
+        });
+    }
+
+    /// Splice the selected candidate over its replace range and recompile.
+    fn accept_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.completion.take() else {
+            return;
+        };
+        let Some(item) = menu.completions.items.get(menu.selected) else {
+            return;
+        };
+        let (start, end) = (
+            menu.completions.replace.start as usize,
+            menu.completions.replace.end as usize,
+        );
+        let mut text = self.editor.text.clone();
+        text.replace_range(start..end, &item.insert);
+        self.editor.set_text(text);
+        let caret = start + item.caret.map(|c| c as usize).unwrap_or(item.insert.len());
+        self.editor.cursor = caret;
+        self.editor.mark = caret;
+        self.editor.follow_cursor();
+        self.schedule_rebuild(cx);
+        cx.notify();
     }
 }
 
@@ -417,13 +508,18 @@ impl Render for GraphCanvas {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let body = match self.text {
-            true => div()
-                .flex_1()
-                .p_2()
-                .overflow_hidden()
-                .text_size(px(12.0))
-                .child(self.editor.lines_element())
-                .into_any_element(),
+            true => {
+                let mut editor = div()
+                    .flex_1()
+                    .p_2()
+                    .overflow_hidden()
+                    .text_size(px(12.0))
+                    .child(self.editor.lines_element());
+                if let Some(popup) = self.render_completion(cx) {
+                    editor = editor.child(popup);
+                }
+                editor.into_any_element()
+            }
             false => self.render_canvas(cx).into_any_element(),
         };
         div()
@@ -447,6 +543,60 @@ impl Render for GraphCanvas {
 }
 
 impl GraphCanvas {
+    /// The completion popup, hung from the caret's last painted position.
+    ///
+    /// A short window onto the ranked list: the top candidates are already
+    /// the answer, and a taller panel would only cover the code being
+    /// written. Clicking a row accepts it exactly as Enter does.
+    fn render_completion(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        const VISIBLE: usize = 8;
+        let menu = self.completion.as_ref()?;
+        let theme = theme(cx);
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .py(px(2.0))
+            .w(px(320.0))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_primary)
+            .rounded(px(4.0))
+            .shadow_sm();
+        // Keep the selection on screen: slide the window, not the caret.
+        let first = menu.selected.saturating_sub(VISIBLE - 1);
+        for (ix, item) in menu.completions.items.iter().enumerate().skip(first).take(VISIBLE) {
+            let selected = ix == menu.selected;
+            let row = div()
+                .id(("completion-row", ix))
+                .px(px(8.0))
+                .py(px(2.0))
+                .when(selected, |d| d.bg(theme.selection_bg))
+                .hover(|d| d.bg(theme.selection_bg))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _window, cx| {
+                        if let Some(menu) = &mut this.completion {
+                            menu.selected = ix;
+                        }
+                        this.accept_completion(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(crate::inspector::completion::candidate_content(item, cx));
+            list = list.child(row);
+        }
+        Some(
+            deferred(
+                anchored()
+                    .position(self.editor.caret_position())
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(list),
+            )
+            .with_priority(1),
+        )
+    }
+
     fn render_canvas(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let model = self.model(cx);

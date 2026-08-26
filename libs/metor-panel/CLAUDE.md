@@ -16,7 +16,7 @@ Run from the workspace root (`/Users/sphw/code/metor/metor`) — this is a membe
 - Build (dev): `cargo build -p metor-panel`
 - Build (release): `cargo build -p metor-panel --release`
 - Test the crate: `cargo test -p metor-panel`
-- Run a single test: `cargo test -p metor-panel <test_name>` (e.g. `cargo test -p metor-panel node_editor::tests::`)
+- Run a single test: `cargo test -p metor-panel <test_name>` (e.g. `cargo test -p metor-panel canvas::migrate::tests::`)
 - Lint: `cargo clippy -p metor-panel`
 
 The workspace pins `rustc 1.94.0` (`rust-toolchain.toml`). The `facet` family of crates is patched to a fork (`metor-io/facet`, branch `sphw/facet-gpui`) — see the workspace `[patch.crates-io]` block. Don't bump those past the pinned 0.44.x versions without coordinating the patch chain.
@@ -32,13 +32,15 @@ The central abstraction is `ComponentStream` (`src/lib.rs`), an async iterator t
 
 ### Dynamic nodes (`src/dynamic/`)
 
-User-defined components are computed lazily as a graph of producer tasks. Each `DynamicNode` writes `[Timestamp][value]` samples into its own `Disruptor`. Identity is a content hash of `(op, args, parents)`, so the same expression always yields the same `NodeId` — this is what powers reconciliation in the node editor.
+User-defined components are computed lazily as a graph of producer tasks. Each `DynamicNode` writes `[Timestamp][value]` samples into its own `Disruptor`. Identity is a content hash, so the same program always yields the same `NodeId` — this is what powers reconciliation in the canvas.
 
-Construction goes through one of the `ops/` modules (`clock`, `generators`, `derive` for single-input, `compose` for multi-input, `resample`, `db_source`, `persist`). Dropping the last `Arc<dyn DynamicNode>` cancels the task. Subscribers either iterate every sample (`NodeReader`, used by downstream derivations) or pull only the latest (`WalComponentStream::from_disruptor`, used by views).
+There are no hand-written ops anymore: user computation is metor-expr source, compiled to wasm and run by `ops/program.rs`. The remaining `ops/` modules are infrastructure (`clock`, `db_source`, `resample`, `persist`). Dropping the last `Arc<dyn DynamicNode>` cancels the task. Subscribers either iterate every sample (`NodeReader`, used by downstream derivations) or pull only the latest (`WalComponentStream::from_disruptor`, used by views).
 
-### Node editor (`src/node_editor/`)
+`expressions.rs` is the `=` one-liner tier: `bind`/`binding_text` turn saved picker text into a component either way, and a compiled expression publishes into a hidden hash-named component every view reads ordinarily. `resolver.rs` (`DbResolver`) answers the compiler's and the completion engine's name questions from a snapshot of the component tree.
 
-Phase 2 of the dynamic system: the visual graph editor. Owns the serializable `NodeSpec` (per-node op + args), `NodeGraph` (data model), `GraphCoordinator` (multi-editor alive-set aggregator), `OpDescriptor` registry (palette/canvas/validator metadata), and `validate` (connection validation + edge coloring). The `worker` rebuilds dynamic nodes when the spec changes.
+### Canvas (`src/canvas/`)
+
+The program tile: one metor-expr module shown as text or as cards (Cmd-G toggles). The source is the single truth — every canvas gesture is a text rewrite (`edit.rs`), debounce-compiled (`mod.rs::rebuild`), reconciled against running systems (`run.rs`), and drawn from the manifest (`model.rs`). The text editor has caret-anchored completion backed by `metor_expr::complete` (`mod.rs::render_completion`). `legacy.rs`/`migrate.rs` read old node-editor layouts into programs.
 
 ### Tiles (`src/tiles/`)
 
@@ -52,6 +54,7 @@ A unified row-list overlay that serves as both command palette (centered) and ri
 - Field rendering is driven by **facet attributes** (`#[facet(inspect::label = "…")]`, `inspect::range(min=…,max=…)`, and `inspect::variants = "…"`). The grammar is defined in `src/inspect.rs` via `facet::define_attr_grammar!`. The grammar lives outside the derive crate because the macro needs to resolve `Attr` at the call site.
 - `registry/` chooses a row builder based on the facet type + attributes.
 - Inspector requests cross pane boundaries via the `InspectEntity` gpui action and a global `OpenInspectorCallback`.
+- A page's provider row can reinterpret the query (`InspectorRow::query_rows`): the component pickers' `ExpressionRow` swaps in completion candidates from `metor_expr::complete` (ranked in `completion.rs`), which is how every picker searches components and builds `=`-free expressions with one field.
 
 ### Views (`src/views/`)
 
