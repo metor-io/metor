@@ -8,8 +8,11 @@ publish = false
 description = "Compiles a typed subset of Python to closed WebAssembly modules"
 
 [dependencies]
-num-traits = { version = "0.2", default-features = false }
-rustpython-parser = "0.4"
+# Pinned exactly: ruff's parser crates release weekly as 0.0.x with no
+# stability promise, and 0.0.5+ raises MSRV past the workspace's 1.94 pin.
+ruff_python_parser = "=0.0.4"
+ruff_python_ast = "=0.0.4"
+ruff_text_size = "=0.0.4"
 postcard = { version = "1.1", features = ["alloc"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 serde = { version = "1.0", features = ["derive"] }

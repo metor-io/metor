@@ -2,9 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use num_traits::ToPrimitive;
-use rustpython_parser::ast::{self, Ranged};
-use rustpython_parser::{Parse, text_size::TextRange};
+use ruff_python_ast as ast;
+use ruff_text_size::{Ranged, TextRange};
 
 use crate::diag::{Diagnostics, Span};
 use crate::ir::{
@@ -83,14 +82,17 @@ fn check_inner(
 ) -> Result<(Program, Manifest), Diagnostics> {
     let mut diags = Diagnostics::default();
 
-    let module = match ast::Suite::parse(source, "<expr>") {
-        Ok(module) => module,
-        Err(err) => {
-            let at = u32::from(err.offset).min(source.len() as u32);
-            diags.push(Span::new(at, at), format!("{}", err.error));
-            return Err(diags);
+    let parsed = ruff_python_parser::parse_unchecked_source(source, ast::PySourceType::Python);
+    if !parsed.has_valid_syntax() {
+        // The parser recovered a tree anyway, but checking it would report
+        // ghosts of the recovery alongside the real mistake. Every syntax
+        // error is reported — recovery is what lets there be more than one.
+        for err in parsed.errors() {
+            diags.push(err.location, format!("{}", err.error));
         }
-    };
+        return Err(diags);
+    }
+    let module = parsed.into_syntax().body;
 
     let decls = match entry {
         Entry::Module => lang::collect(&module, source, resolver, &mut diags),
@@ -123,7 +125,7 @@ fn check_inner(
     for def in defs {
         let name = def.name.as_str().to_string();
         let mut params = Vec::new();
-        let args = &def.args;
+        let args = &def.parameters;
         if !args.posonlyargs.is_empty()
             || !args.kwonlyargs.is_empty()
             || args.vararg.is_some()
@@ -133,16 +135,16 @@ fn check_inner(
         }
         for arg in &args.args {
             if arg.default.is_some() {
-                diags.push(arg.def.range, "default arguments are not supported");
+                diags.push(arg.parameter.range, "default arguments are not supported");
             }
-            let ty = match &arg.def.annotation {
+            let ty = match &arg.parameter.annotation {
                 Some(ann) => annotation(ann, &mut diags),
                 None => {
-                    diags.push(arg.def.range, "parameters must be annotated");
+                    diags.push(arg.parameter.range, "parameters must be annotated");
                     Ty::F64
                 }
             };
-            params.push((arg.def.arg.as_str().to_string(), ty));
+            params.push((arg.parameter.name.as_str().to_string(), ty));
         }
         let ret = match &def.returns {
             Some(ann) => annotation(ann, &mut diags),
@@ -734,13 +736,13 @@ fn tensor_annotation(sub: &ast::ExprSubscript, diags: &mut Diagnostics) -> Ty {
     }
     let mut shape = Vec::with_capacity(dims.len());
     for dim in dims {
-        let ast::Expr::Constant(c) = dim else {
+        let ast::Expr::NumberLiteral(c) = dim else {
             return bad(sub, diags);
         };
-        let ast::Constant::Int(n) = &c.value else {
+        let ast::Number::Int(n) = &c.value else {
             return bad(sub, diags);
         };
-        match n.to_usize() {
+        match n.as_usize() {
             Some(n) if n > 0 => shape.push(n),
             _ => return bad(sub, diags),
         }
@@ -1026,7 +1028,7 @@ impl FnChecker<'_> {
             ast::Stmt::If(branch) => {
                 let cond = self.condition(&branch.test, depth)?;
                 let then = self.block(&branch.body, depth + 1);
-                let els = self.block(&branch.orelse, depth + 1);
+                let els = self.otherwise(&branch.elif_else_clauses, depth + 1);
                 Some(vec![Stmt::If { cond, then, els }])
             }
             ast::Stmt::While(loop_) => {
@@ -1040,7 +1042,7 @@ impl FnChecker<'_> {
                 self.loop_depth -= 1;
                 Some(vec![Stmt::While { cond, body }])
             }
-            ast::Stmt::For(loop_) => self.for_range(loop_, depth),
+            ast::Stmt::For(loop_) if !loop_.is_async => self.for_range(loop_, depth),
             ast::Stmt::Break(b) => {
                 if self.loop_depth == 0 {
                     self.diags.push(b.range, "`break` outside a loop");
@@ -1073,6 +1075,27 @@ impl FnChecker<'_> {
                 None
             }
         }
+    }
+
+    /// The `elif`/`else` tail of an `if`, nested back into the chain of
+    /// two-armed branches the IR is written in.
+    fn otherwise(&mut self, clauses: &[ast::ElifElseClause], depth: u32) -> Vec<Stmt> {
+        let Some((clause, rest)) = clauses.split_first() else {
+            return Vec::new();
+        };
+        let Some(test) = &clause.test else {
+            return self.block(&clause.body, depth);
+        };
+        if depth > MAX_DEPTH {
+            self.diags.push(clause.range, "nested too deeply");
+            return Vec::new();
+        }
+        let Some(cond) = self.condition(test, depth) else {
+            return Vec::new();
+        };
+        let then = self.block(&clause.body, depth + 1);
+        let els = self.otherwise(rest, depth + 1);
+        vec![Stmt::If { cond, then, els }]
     }
 
     fn read(&mut self, name: &str, range: TextRange) -> Option<(Expr, Ty)> {
@@ -1193,7 +1216,7 @@ impl FnChecker<'_> {
             return None;
         };
         let named = matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == class);
-        if !named || !call.args.is_empty() {
+        if !named || !call.arguments.args.is_empty() {
             self.diags.push(
                 value.range(),
                 format!("a system returns `{class}(...)` with one keyword per field"),
@@ -1204,6 +1227,7 @@ impl FnChecker<'_> {
         let mut writes = Vec::with_capacity(frame.fields.len());
         for (field, dest) in frame.fields.iter().zip(&fields) {
             let Some(keyword) = call
+                .arguments
                 .keywords
                 .iter()
                 .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == field.name))
@@ -1220,7 +1244,7 @@ impl FnChecker<'_> {
                 ty: field.ty.clone(),
             });
         }
-        for keyword in &call.keywords {
+        for keyword in &call.arguments.keywords {
             let unknown = keyword
                 .arg
                 .as_ref()
@@ -1273,13 +1297,13 @@ impl FnChecker<'_> {
             return None;
         };
         let is_range = matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range");
-        if !is_range || call.args.is_empty() || call.args.len() > 3 {
+        if !is_range || call.arguments.args.is_empty() || call.arguments.args.len() > 3 {
             self.diags
                 .push(loop_.iter.range(), "`for` iterates `range(...)` only");
             return None;
         }
         let mut bounds = Vec::new();
-        for arg in &call.args {
+        for arg in &call.arguments.args {
             let (expr, ty) = self.expr(arg, depth)?;
             bounds.push(self.coerce(expr, ty, &Ty::I64, arg.range())?);
         }
@@ -1651,10 +1675,9 @@ impl FnChecker<'_> {
         }
         let depth = depth + 1;
         match expr {
-            ast::Expr::Constant(c) => match &c.value {
-                ast::Constant::Float(f) => Some((Expr::F64(*f), Ty::F64)),
-                ast::Constant::Bool(b) => Some((Expr::Bool(*b), Ty::Bool)),
-                ast::Constant::Int(i) => match i.to_i64() {
+            ast::Expr::NumberLiteral(c) => match &c.value {
+                ast::Number::Float(f) => Some((Expr::F64(*f), Ty::F64)),
+                ast::Number::Int(i) => match i.as_i64() {
                     Some(v) => Some((Expr::I64(v), Ty::I64)),
                     None => {
                         self.diags.push(
@@ -1664,12 +1687,21 @@ impl FnChecker<'_> {
                         None
                     }
                 },
-                _ => {
+                ast::Number::Complex { .. } => {
                     self.diags
                         .push(c.range, "only numeric and bool literals are supported");
                     None
                 }
             },
+            ast::Expr::BooleanLiteral(b) => Some((Expr::Bool(b.value), Ty::Bool)),
+            ast::Expr::StringLiteral(_)
+            | ast::Expr::BytesLiteral(_)
+            | ast::Expr::NoneLiteral(_)
+            | ast::Expr::EllipsisLiteral(_) => {
+                self.diags
+                    .push(expr.range(), "only numeric and bool literals are supported");
+                None
+            }
             ast::Expr::Name(name) => self.read(name.id.as_str(), name.range),
             ast::Expr::Attribute(attr) => {
                 // A projected port's key is the whole dotted path the operator
@@ -1787,7 +1819,7 @@ impl FnChecker<'_> {
                 Some((acc, Ty::Bool))
             }
             ast::Expr::Compare(c) => self.compare(c, depth),
-            ast::Expr::IfExp(c) => {
+            ast::Expr::If(c) => {
                 let cond = self.condition(&c.test, depth)?;
                 let (then, then_ty) = self.expr(&c.body, depth)?;
                 let (els, els_ty) = self.expr(&c.orelse, depth)?;
@@ -2023,7 +2055,7 @@ impl FnChecker<'_> {
     }
 
     fn call(&mut self, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
-        if !call.keywords.is_empty() {
+        if !call.arguments.keywords.is_empty() {
             self.diags
                 .push(call.range, "keyword arguments are not supported");
             return None;
@@ -2037,9 +2069,9 @@ impl FnChecker<'_> {
 
         if let Some(index) = self.by_name.get(name).copied() {
             let sig = &self.sigs[index as usize];
-            if sig.params.len() != call.args.len() {
+            if sig.params.len() != call.arguments.args.len() {
                 let want = sig.params.len();
-                let got = call.args.len();
+                let got = call.arguments.args.len();
                 self.diags.push(
                     call.range,
                     format!("`{name}` takes {want} arguments, found {got}"),
@@ -2051,7 +2083,7 @@ impl FnChecker<'_> {
             let ret = sig.ret.clone();
             let buffer_abi = self.frames[index as usize].buffer_abi;
             let mut args = Vec::with_capacity(wanted.len());
-            for (arg, want) in call.args.iter().zip(&wanted) {
+            for (arg, want) in call.arguments.args.iter().zip(&wanted) {
                 let (lowered, got) = self.expr(arg, depth)?;
                 args.push(self.coerce(lowered, got, want, arg.range())?);
             }
@@ -2076,12 +2108,15 @@ impl FnChecker<'_> {
 
     fn builtin(&mut self, name: &str, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
         let arity = |n: usize, this: &mut Self| -> bool {
-            if call.args.len() == n {
+            if call.arguments.args.len() == n {
                 true
             } else {
                 this.diags.push(
                     call.range,
-                    format!("`{name}` takes {n} arguments, found {}", call.args.len()),
+                    format!(
+                        "`{name}` takes {n} arguments, found {}",
+                        call.arguments.args.len()
+                    ),
                 );
                 false
             }
@@ -2097,7 +2132,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (source, ty) = self.expr(&call.args[0], depth)?;
+                let (source, ty) = self.expr(&call.arguments.args[0], depth)?;
                 if !matches!(ty, Ty::Tensor { .. }) {
                     self.diags
                         .push(call.range, format!("`sum` needs a tensor, found {ty}"));
@@ -2133,7 +2168,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                return self.expr(&call.args[0], depth);
+                return self.expr(&call.arguments.args[0], depth);
             }
             "sine" | "cosine" | "square" | "sawtooth" => {
                 if !arity(2, self) {
@@ -2198,7 +2233,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (_, ty) = self.expr(&call.args[0], depth)?;
+                let (_, ty) = self.expr(&call.arguments.args[0], depth)?;
                 let Ty::Tensor { shape, .. } = &ty else {
                     self.diags
                         .push(call.range, format!("`len` needs a tensor, found {ty}"));
@@ -2213,8 +2248,8 @@ impl FnChecker<'_> {
             if !arity(1, self) {
                 return None;
             }
-            let (arg, ty) = self.expr(&call.args[0], depth)?;
-            let arg = self.as_f64(arg, ty, call.args[0].range())?;
+            let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+            let arg = self.as_f64(arg, ty, call.arguments.args[0].range())?;
             return Some((
                 Expr::Kernel {
                     name: kernel,
@@ -2236,8 +2271,8 @@ impl FnChecker<'_> {
             if !arity(1, self) {
                 return None;
             }
-            let (arg, ty) = self.expr(&call.args[0], depth)?;
-            let arg = self.as_f64(arg, ty, call.args[0].range())?;
+            let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+            let arg = self.as_f64(arg, ty, call.arguments.args[0].range())?;
             return Some((
                 Expr::Intrinsic {
                     op,
@@ -2252,10 +2287,10 @@ impl FnChecker<'_> {
                 if !arity(2, self) {
                     return None;
                 }
-                let (a, at) = self.expr(&call.args[0], depth)?;
-                let a = self.as_f64(a, at, call.args[0].range())?;
-                let (b, bt) = self.expr(&call.args[1], depth)?;
-                let b = self.as_f64(b, bt, call.args[1].range())?;
+                let (a, at) = self.expr(&call.arguments.args[0], depth)?;
+                let a = self.as_f64(a, at, call.arguments.args[0].range())?;
+                let (b, bt) = self.expr(&call.arguments.args[1], depth)?;
+                let b = self.as_f64(b, bt, call.arguments.args[1].range())?;
                 let kernel = if name == "atan2" { "atan2" } else { "pow" };
                 Some((
                     Expr::Kernel {
@@ -2269,7 +2304,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (arg, ty) = self.expr(&call.args[0], depth)?;
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
                 let op = match ty {
                     Ty::F64 => Intrinsic::AbsF64,
                     Ty::I64 => Intrinsic::AbsI64,
@@ -2291,8 +2326,8 @@ impl FnChecker<'_> {
                 if !arity(2, self) {
                     return None;
                 }
-                let a = self.expr(&call.args[0], depth)?;
-                let b = self.expr(&call.args[1], depth)?;
+                let a = self.expr(&call.arguments.args[0], depth)?;
+                let b = self.expr(&call.arguments.args[1], depth)?;
                 let (l, r, num) = self.unify(a, b, call.range)?;
                 let op = match (name, num) {
                     ("min", Num::F64) => Intrinsic::MinF64,
@@ -2316,7 +2351,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (arg, ty) = self.expr(&call.args[0], depth)?;
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
                 match ty {
                     Ty::I64 => Some((arg, Ty::I64)),
                     Ty::F64 => Some((
@@ -2337,8 +2372,8 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (arg, ty) = self.expr(&call.args[0], depth)?;
-                let arg = self.as_f64(arg, ty, call.args[0].range())?;
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+                let arg = self.as_f64(arg, ty, call.arguments.args[0].range())?;
                 Some((arg, Ty::F64))
             }
             other => {
@@ -2461,17 +2496,20 @@ impl FnChecker<'_> {
                 .push(call.range, "`window` exists inside a system");
             return None;
         }
-        let Some(len) = literal_count(&call.args[1]) else {
+        let Some(len) = literal_count(&call.arguments.args[1]) else {
             self.diags.push(
-                call.args[1].range(),
+                call.arguments.args[1].range(),
                 "a window's length is a positive integer literal",
             );
             return None;
         };
-        let (value, ty) = self.expr(&call.args[0], depth)?;
+        let (value, ty) = self.expr(&call.arguments.args[0], depth)?;
         let (value, sample) = match ty {
             Ty::Tensor { .. } => (value, ty.clone()),
-            other => (self.as_f64(value, other, call.args[0].range())?, Ty::F64),
+            other => (
+                self.as_f64(value, other, call.arguments.args[0].range())?,
+                Ty::F64,
+            ),
         };
 
         let mut shape = vec![len];
@@ -2509,7 +2547,7 @@ impl FnChecker<'_> {
     /// output replaces the last axis with `N / 2 + 1`, which is what the
     /// panel's Fft node published.
     fn fft(&mut self, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
-        let (source, ty) = self.expr(&call.args[0], depth)?;
+        let (source, ty) = self.expr(&call.arguments.args[0], depth)?;
         let Ty::Tensor { shape, .. } = &ty else {
             self.diags
                 .push(call.range, format!("`fft` needs a tensor, found {ty}"));
@@ -2562,10 +2600,10 @@ impl FnChecker<'_> {
                 .push(call.range, format!("`{kind}` exists inside a system"));
             return None;
         };
-        let (freq, freq_ty) = self.expr(&call.args[0], depth)?;
-        let freq = self.as_f64(freq, freq_ty, call.args[0].range())?;
-        let (amp, amp_ty) = self.expr(&call.args[1], depth)?;
-        let amp = self.as_f64(amp, amp_ty, call.args[1].range())?;
+        let (freq, freq_ty) = self.expr(&call.arguments.args[0], depth)?;
+        let freq = self.as_f64(freq, freq_ty, call.arguments.args[0].range())?;
+        let (amp, amp_ty) = self.expr(&call.arguments.args[1], depth)?;
+        let amp = self.as_f64(amp, amp_ty, call.arguments.args[1].range())?;
 
         let seconds = Expr::Arith {
             op: Arith::Mul,
@@ -2793,23 +2831,23 @@ fn batches(
 
 /// A positive integer literal, for the lengths that have to be static.
 fn literal_count(expr: &ast::Expr) -> Option<usize> {
-    let ast::Expr::Constant(c) = expr else {
+    let ast::Expr::NumberLiteral(c) = expr else {
         return None;
     };
-    let ast::Constant::Int(n) = &c.value else {
+    let ast::Number::Int(n) = &c.value else {
         return None;
     };
-    n.to_usize().filter(|n| *n > 0)
+    n.as_usize().filter(|n| *n > 0)
 }
 
 fn literal_exponent(expr: &ast::Expr) -> Option<u32> {
-    let ast::Expr::Constant(c) = expr else {
+    let ast::Expr::NumberLiteral(c) = expr else {
         return None;
     };
-    let ast::Constant::Int(n) = &c.value else {
+    let ast::Number::Int(n) = &c.value else {
         return None;
     };
-    n.to_u32().filter(|n| *n <= 16)
+    n.as_u32().filter(|n| *n <= 16)
 }
 
 fn transcendental(name: &str) -> Option<&'static str> {
@@ -2841,16 +2879,14 @@ fn always_returns(stmts: &[Stmt]) -> bool {
 
 fn refusal(stmt: &ast::Stmt) -> &'static str {
     match stmt {
-        ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => {
-            "nested functions and closures are not supported"
-        }
+        ast::Stmt::FunctionDef(_) => "nested functions and closures are not supported",
         ast::Stmt::ClassDef(_) => "classes are not supported in this phase",
         ast::Stmt::Delete(_) => "`del` is not supported",
-        ast::Stmt::AsyncFor(_) => "`async for` is not supported",
-        ast::Stmt::With(_) | ast::Stmt::AsyncWith(_) => "`with` is not supported",
+        ast::Stmt::For(_) => "`async for` is not supported",
+        ast::Stmt::With(_) => "`with` is not supported",
         ast::Stmt::Match(_) => "`match` is not supported",
         ast::Stmt::Raise(_) => "`raise` is not supported; a fault is a trap here",
-        ast::Stmt::Try(_) | ast::Stmt::TryStar(_) => "`try` is not supported",
+        ast::Stmt::Try(_) => "`try` is not supported",
         ast::Stmt::Assert(_) => "`assert` is not supported",
         ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => "imports are not supported",
         ast::Stmt::Global(_) | ast::Stmt::Nonlocal(_) => "globals cannot be mutated",
@@ -2865,13 +2901,13 @@ fn expr_refusal(expr: &ast::Expr) -> &'static str {
         ast::Expr::Dict(_) | ast::Expr::DictComp(_) => "dicts are not supported",
         ast::Expr::Set(_) | ast::Expr::SetComp(_) => "sets are not supported",
         ast::Expr::ListComp(_) => "list comprehensions are not supported",
-        ast::Expr::GeneratorExp(_) => "generators are not supported",
+        ast::Expr::Generator(_) => "generators are not supported",
         ast::Expr::Await(_) | ast::Expr::Yield(_) | ast::Expr::YieldFrom(_) => {
             "`await` and `yield` are not supported"
         }
-        ast::Expr::JoinedStr(_) | ast::Expr::FormattedValue(_) => "strings are not supported",
+        ast::Expr::FString(_) => "strings are not supported",
         ast::Expr::Starred(_) => "argument unpacking is not supported",
-        ast::Expr::NamedExpr(_) => "`:=` is not supported",
+        ast::Expr::Named(_) => "`:=` is not supported",
         ast::Expr::Attribute(_) => "attribute access is only supported for frame fields",
         ast::Expr::Slice(_) => "slicing is not supported in this phase",
         ast::Expr::Tuple(_) => "tuples are not supported",

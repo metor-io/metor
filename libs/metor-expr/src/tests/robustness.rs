@@ -217,14 +217,15 @@ fn deeply_nested_sources_are_diagnostics() {
         assert!(compile(source).is_err(), "deep nesting must be refused");
     }
 
-    // Parentheses group without nesting the AST, so this is merely long.
+    // Parentheses group without nesting the AST, but they do nest the parser,
+    // which refuses them before a tree ever reaches the checker.
     let parens = format!(
         "def f() -> f64:\n    return {}1.0{}\n",
         "(".repeat(60_000),
         ")".repeat(60_000)
     );
     survives(&parens);
-    assert!(compile(&parens).is_ok());
+    assert!(compile(&parens).is_err(), "deep nesting must be refused");
 }
 
 /// Past the size cap the answer is a diagnostic, immediately.

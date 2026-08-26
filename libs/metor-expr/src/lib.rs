@@ -70,7 +70,7 @@
 //!
 //! ## The pipeline
 //!
-//! [`compile_module`] is four passes and no more. `rustpython-parser` produces
+//! [`compile_module`] is four passes and no more. `ruff_python_parser` produces
 //! a Python AST; `lang` reads its declarations and resolves every
 //! binding; `check` turns bodies into a typed IR, which is the
 //! only representation of a program this crate keeps; `codegen`
