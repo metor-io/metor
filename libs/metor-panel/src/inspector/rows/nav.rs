@@ -76,12 +76,23 @@ impl InspectorRow for NavRow {
         &self,
         row_ix: usize,
         selected: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let theme = theme(cx);
 
         let summary = (self.summary)(cx);
+        // What the right side takes is what the label cannot have: the
+        // summary up to its cap, the tag, and the chevron.
+        let budget = super::label_budget(cx).map(|width| {
+            let summary_w = super::measure(&summary, px(12.0), window).min(px(260.0));
+            let tag_w = self
+                .tag
+                .as_ref()
+                .map(|tag| super::measure(tag, px(10.0), window) + px(18.0))
+                .unwrap_or_default();
+            width - summary_w - tag_w - px(26.0)
+        });
         let mut right = div().flex().flex_row().items_center().gap(px(6.0));
         if let Some(tag) = &self.tag {
             right = right.child(super::tag_pill(tag.clone(), cx));
@@ -101,12 +112,13 @@ impl InspectorRow for NavRow {
             .child(Icon::ChevronRight.svg(8.0));
 
         row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
-                    .child(self.label.clone()),
-            )
+            .child(super::path_label(
+                &self.label,
+                theme.text_primary,
+                budget,
+                window,
+                cx,
+            ))
             .child(right)
             .into_any_element()
     }

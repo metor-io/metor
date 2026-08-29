@@ -127,7 +127,10 @@ pub fn convert_with(
     order.sort_by(|a, b| a.flow_id.cmp(&b.flow_id));
     for node in &order {
         if let NodeSpec::Persist { name } = &node.spec {
-            let Some(parent) = state.parents.get(node.flow_id.as_str()).and_then(|p| p.first())
+            let Some(parent) = state
+                .parents
+                .get(node.flow_id.as_str())
+                .and_then(|p| p.first())
             else {
                 state
                     .refused
@@ -140,8 +143,10 @@ pub fn convert_with(
     // Anything not reachable from a `Persist` is still a node the operator
     // drew, so it converts too — as an unpublished intermediate.
     for node in &order {
-        if !matches!(node.spec, NodeSpec::Persist { .. } | NodeSpec::FromDb { .. })
-            && !state.is_clock(node.flow_id.as_str())
+        if !matches!(
+            node.spec,
+            NodeSpec::Persist { .. } | NodeSpec::FromDb { .. }
+        ) && !state.is_clock(node.flow_id.as_str())
         {
             state.declare(node.flow_id.as_str(), None);
         }
@@ -200,8 +205,9 @@ impl<'a> Conversion<'a> {
         // path its consumers name directly.
         if let NodeSpec::FromDb { component_id } = &node.spec {
             let path = (self.resolve)(ComponentId(*component_id)).or_else(|| {
-                self.refused
-                    .push(format!("component {component_id:#x} is not in this database"));
+                self.refused.push(format!(
+                    "component {component_id:#x} is not in this database"
+                ));
                 None
             })?;
             self.named.insert(flow.to_string(), path.clone());
@@ -218,14 +224,21 @@ impl<'a> Conversion<'a> {
         }
 
         let name = self.fresh(want.unwrap_or_else(|| stem(&node.spec).to_string()));
-        let rate = inputs.iter().find(|i| self.is_clock(i)).and_then(|c| self.rate_of(c));
+        let rate = inputs
+            .iter()
+            .find(|i| self.is_clock(i))
+            .and_then(|c| self.rate_of(c));
         let body = self.expression(node, &read, rate, &name)?;
 
         // The position rides the declaration, in whichever form that
         // declaration can carry.
         let placed = match body.starts_with('@') {
             true => format!("@node(x={}, y={})\n{body}", node.x.round(), node.y.round()),
-            false => format!("{body}  # @node(x={}, y={})\n", node.x.round(), node.y.round()),
+            false => format!(
+                "{body}  # @node(x={}, y={})\n",
+                node.x.round(),
+                node.y.round()
+            ),
         };
         self.lines.push(placed);
         self.named.insert(flow.to_string(), name.clone());
@@ -354,8 +367,9 @@ impl<'a> Conversion<'a> {
                     ));
                 }
                 let class = state_class(name);
-                self.lines
-                    .push(format!("class {class}(State):\n    prev: i64 = 0\n    seen: i64 = 0\n\n"));
+                self.lines.push(format!(
+                    "class {class}(State):\n    prev: i64 = 0\n    seen: i64 = 0\n\n"
+                ));
                 Some(format!(
                     "@system(\"{input}\")\n\
                      def {name}({param}, state: {class}) -> f64:\n\
@@ -399,11 +413,7 @@ impl<'a> Conversion<'a> {
 fn state_class(name: &str) -> String {
     let mut chars = name.chars();
     let head = chars.next().map(|c| c.to_ascii_uppercase());
-    format!(
-        "{}{}State",
-        head.unwrap_or('S'),
-        chars.as_str()
-    )
+    format!("{}{}State", head.unwrap_or('S'), chars.as_str())
 }
 
 /// The parameter a path-bound port arrives as: the component's last segment,
@@ -419,7 +429,11 @@ fn sanitize(name: &str) -> String {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect();
-    if !out.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') {
+    if !out
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+    {
         out.insert(0, '_');
     }
     out

@@ -30,6 +30,14 @@ use rows::text_field::TextAlign;
 use rows::{InspectorRow, PreviewSpec, RowAction, TextField, tag_pill};
 
 const ROW_HEIGHT: f32 = 28.0;
+/// Horizontal padding inside a row, both sides together.
+const ROW_PADDING: Pixels = px(24.0);
+/// What a row needs beyond its label: padding, and room for a chevron or a
+/// short summary.
+const ROW_CHROME: Pixels = px(72.0);
+const ANCHORED_MIN_WIDTH: Pixels = px(280.0);
+const ANCHORED_MAX_WIDTH: Pixels = px(480.0);
+const CENTERED_WIDTH: Pixels = px(500.0);
 
 /// gpui action that asks the root view to inspect `entity` anchored at
 /// `position`. Dispatched from deep in the view tree so inspection can reach
@@ -635,7 +643,7 @@ impl Inspector {
 
     fn render_panel(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = theme(cx);
@@ -672,7 +680,7 @@ impl Inspector {
             .child(bounds_tracker);
 
         match &self.current_page().kind {
-            InspectorPageKind::Rows(_) => self.render_rows_panel(frame, cx),
+            InspectorPageKind::Rows(_) => self.render_rows_panel(frame, window, cx),
             InspectorPageKind::View { view, size } => {
                 let view = view.clone();
                 let size = *size;
@@ -684,10 +692,32 @@ impl Inspector {
     fn render_rows_panel(
         &mut self,
         frame: gpui::Stateful<gpui::Div>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = theme(cx);
         let indices = self.filtered_indices();
+
+        // An anchored panel is sized to what it lists, within reason: a
+        // component's path is often longer than a fixed menu, and cutting
+        // it off hides exactly the part that names it. Rows are told the
+        // room that leaves so what still does not fit elides from the front.
+        let width = match self.mode {
+            InspectorMode::Anchored(_) => {
+                let rows = self.current_rows().unwrap_or_default();
+                let widest = indices
+                    .iter()
+                    .take(200)
+                    .map(|&i| rows::measure(rows[i].label(), rows::LABEL_SIZE, window))
+                    .fold(px(0.0), Pixels::max);
+                Some((widest + ROW_CHROME).clamp(ANCHORED_MIN_WIDTH, ANCHORED_MAX_WIDTH))
+            }
+            InspectorMode::Centered => Some(CENTERED_WIDTH),
+            InspectorMode::Inline => None,
+        };
+        cx.set_global(rows::LabelFit {
+            row_width: width.map(|w| w - ROW_PADDING),
+        });
 
         let items_element: AnyElement = if indices.is_empty() {
             div()
@@ -768,12 +798,11 @@ impl Inspector {
             .into_any_element()
         };
 
-        let frame = match self.mode {
-            InspectorMode::Anchored(_) => frame.w(px(280.0)),
-            InspectorMode::Centered => frame.w(px(500.0)),
+        let frame = match (self.mode, width) {
+            (InspectorMode::Anchored(_) | InspectorMode::Centered, Some(width)) => frame.w(width),
             // The host's column owns the width; a border and rounding would
             // draw a panel inside a panel, so inline drops both.
-            InspectorMode::Inline => frame.w_full().border_0().rounded(px(0.0)),
+            _ => frame.w_full().border_0().rounded(px(0.0)),
         };
 
         frame

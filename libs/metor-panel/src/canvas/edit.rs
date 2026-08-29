@@ -73,8 +73,7 @@ pub fn rename(manifest: &Manifest, source: &str, decl: Decl, to: &str) -> Option
     if to == from || !is_identifier(to) {
         return None;
     }
-    if manifest.systems.iter().any(|s| s.name == to)
-        || manifest.stages.iter().any(|s| s.name == to)
+    if manifest.systems.iter().any(|s| s.name == to) || manifest.stages.iter().any(|s| s.name == to)
     {
         return None;
     }
@@ -247,7 +246,10 @@ fn fresh(manifest: &Manifest, stem: &str) -> String {
     if !taken(stem) {
         return stem.to_string();
     }
-    (2..).map(|n| format!("{stem}{n}")).find(|n| !taken(n)).expect("some suffix is free")
+    (2..)
+        .map(|n| format!("{stem}{n}"))
+        .find(|n| !taken(n))
+        .expect("some suffix is free")
 }
 
 fn is_identifier(name: &str) -> bool {
@@ -263,9 +265,7 @@ fn line_start(source: &str, at: u32) -> u32 {
 
 fn line_end(source: &str, at: u32) -> u32 {
     let at = (at as usize).min(source.len());
-    source[at..]
-        .find('\n')
-        .map_or(source.len(), |i| at + i + 1) as u32
+    source[at..].find('\n').map_or(source.len(), |i| at + i + 1) as u32
 }
 
 #[cfg(test)]

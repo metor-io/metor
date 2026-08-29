@@ -60,7 +60,11 @@ fn every_declaration_is_a_card_and_every_binding_is_an_edge() {
         "scaled = wheels.rpm * 2.0\nslow = resample_zoh(scaled, 10.0)\nfinal = slow + 1.0\n",
     );
     assert_eq!(
-        model.cards.iter().map(|c| c.id.as_ref()).collect::<Vec<_>>(),
+        model
+            .cards
+            .iter()
+            .map(|c| c.id.as_ref())
+            .collect::<Vec<_>>(),
         vec!["scaled", "slow", "final"]
     );
     assert!(model.cards.iter().all(|c| c.origin.is_python()));

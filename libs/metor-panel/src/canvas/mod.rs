@@ -44,10 +44,10 @@ use metor_fsw_2::ir::{EdgeKind, Wiring};
 
 use crate::dynamic::ops::program::Compiled;
 use crate::dynamic::resolver::DbResolver;
+use crate::dynamic::worker::DynamicWorker;
 use crate::graph_canvas::{RoutePoints, hit_test_edges, paint_grid, paint_route};
 use crate::graph_layout::Direction;
 use crate::inspector::rows::TextField;
-use crate::dynamic::worker::DynamicWorker;
 use crate::theme::theme;
 use crate::tiles::PaneItem;
 use crate::views::system_graph::config::{SystemGraphConfig, Viewport};
@@ -220,7 +220,12 @@ impl GraphCanvas {
             Err(diags) => {
                 self.diagnostics = diags
                     .iter()
-                    .map(|d| (d.span.start as usize..d.span.end as usize, d.message.clone()))
+                    .map(|d| {
+                        (
+                            d.span.start as usize..d.span.end as usize,
+                            d.message.clone(),
+                        )
+                    })
                     .collect();
                 self.paint_diagnostics(cx);
                 cx.notify();
@@ -294,7 +299,10 @@ impl GraphCanvas {
     }
 
     /// The selected card, if it is one this tile may edit.
-    pub(crate) fn selected_declaration(&self, cx: &App) -> Option<(SharedString, metor_expr::Decl)> {
+    pub(crate) fn selected_declaration(
+        &self,
+        cx: &App,
+    ) -> Option<(SharedString, metor_expr::Decl)> {
         let id = self.selection.clone()?;
         let decl = self.declaration(&id, cx)?;
         Some((id, decl))
@@ -315,8 +323,7 @@ impl GraphCanvas {
     /// Point one of a card's ports at a different producer.
     fn connect(&mut self, to: &SharedString, port: usize, cx: &mut Context<Self>) {
         let Some(from) = self.link.take() else { return };
-        let (Some(consumer), Some(manifest)) =
-            (self.declaration(to, cx), self.manifest.clone())
+        let (Some(consumer), Some(manifest)) = (self.declaration(to, cx), self.manifest.clone())
         else {
             return;
         };
@@ -353,7 +360,8 @@ impl GraphCanvas {
         let Some(manifest) = self.manifest.clone() else {
             return;
         };
-        let (source, name) = edit::insert(&manifest, &self.editor.text, entry.stem, &entry.template);
+        let (source, name) =
+            edit::insert(&manifest, &self.editor.text, entry.stem, &entry.template);
         self.palette = false;
         self.selection = Some(SharedString::from(name));
         self.apply(Some(source), cx);
@@ -505,7 +513,7 @@ impl Focusable for GraphCanvas {
 }
 
 impl Render for GraphCanvas {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let body = match self.text {
             true => {
@@ -515,7 +523,7 @@ impl Render for GraphCanvas {
                     .overflow_hidden()
                     .text_size(px(12.0))
                     .child(self.editor.lines_element());
-                if let Some(popup) = self.render_completion(cx) {
+                if let Some(popup) = self.render_completion(window, cx) {
                     editor = editor.child(popup);
                 }
                 editor.into_any_element()
@@ -548,7 +556,11 @@ impl GraphCanvas {
     /// A short window onto the ranked list: the top candidates are already
     /// the answer, and a taller panel would only cover the code being
     /// written. Clicking a row accepts it exactly as Enter does.
-    fn render_completion(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_completion(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         const VISIBLE: usize = 8;
         let menu = self.completion.as_ref()?;
         let theme = theme(cx);
@@ -564,7 +576,14 @@ impl GraphCanvas {
             .shadow_sm();
         // Keep the selection on screen: slide the window, not the caret.
         let first = menu.selected.saturating_sub(VISIBLE - 1);
-        for (ix, item) in menu.completions.items.iter().enumerate().skip(first).take(VISIBLE) {
+        for (ix, item) in menu
+            .completions
+            .items
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(VISIBLE)
+        {
             let selected = ix == menu.selected;
             let row = div()
                 .id(("completion-row", ix))
@@ -583,7 +602,9 @@ impl GraphCanvas {
                         cx.stop_propagation();
                     }),
                 )
-                .child(crate::inspector::completion::candidate_content(item, cx));
+                .child(crate::inspector::completion::candidate_content(
+                    item, None, window, cx,
+                ));
             list = list.child(row);
         }
         Some(
@@ -646,12 +667,8 @@ impl GraphCanvas {
         let in_flight = self.link.as_ref().and_then(|from| {
             let card = model.card(from)?;
             let source = match self.direction {
-                Direction::LeftRight => {
-                    (card.pos.0 + CARD_WIDTH, card.pos.1 + card.height / 2.0)
-                }
-                Direction::TopBottom => {
-                    (card.pos.0 + CARD_WIDTH / 2.0, card.pos.1 + card.height)
-                }
+                Direction::LeftRight => (card.pos.0 + CARD_WIDTH, card.pos.1 + card.height / 2.0),
+                Direction::TopBottom => (card.pos.0 + CARD_WIDTH / 2.0, card.pos.1 + card.height),
             };
             let route: RoutePoints = [local(source), self.pointer].into_iter().collect();
             Some((route, theme.line_colors[0]))
@@ -1141,7 +1158,10 @@ impl GraphCanvas {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let selected = self.selection.clone();
-        let entries = palette::entries(self.manifest.as_ref(), selected.as_ref().map(|s| s.as_ref()));
+        let entries = palette::entries(
+            self.manifest.as_ref(),
+            selected.as_ref().map(|s| s.as_ref()),
+        );
         let mut list = div()
             .absolute()
             .left_2()

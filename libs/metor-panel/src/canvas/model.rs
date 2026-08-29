@@ -62,10 +62,7 @@ pub enum Origin {
     },
     /// A declaration in this tile's source. Editable, and its position lives
     /// in the text.
-    Python {
-        decl: Decl,
-        layout: SourceLayout,
-    },
+    Python { decl: Decl, layout: SourceLayout },
 }
 
 impl Origin {
@@ -169,8 +166,8 @@ pub fn build(
             // The engine's waypoints hold only while both endpoints sit where
             // it put them; a dragged endpoint falls back to a straight wire so
             // the line tracks the card under the pointer.
-            let dragged = overrides.contains_key(&edge.from_node)
-                || overrides.contains_key(&edge.to_node);
+            let dragged =
+                overrides.contains_key(&edge.from_node) || overrides.contains_key(&edge.to_node);
             model.edges.push(Edge {
                 from: edge.from_node.clone(),
                 from_port: edge.from_port.clone(),
@@ -277,7 +274,7 @@ fn python_cards(manifest: &Manifest, native_bottom: f32, model: &mut Model) {
             },
             pos: layout.position.unwrap_or(fallback),
             height: HEADER_HEIGHT + rowcount as f32 * SOCKET_ROW_HEIGHT + 8.0,
-            });
+        });
     }
 
     python_edges(manifest, &declarations, first, model);
@@ -311,7 +308,9 @@ fn python_edges(manifest: &Manifest, declarations: &[Decl], first: usize, model:
                     };
                     (
                         from,
-                        SharedString::from(manifest.systems[*system].output.fields[*field].name.clone()),
+                        SharedString::from(
+                            manifest.systems[*system].output.fields[*field].name.clone(),
+                        ),
                     )
                 }
                 Binding::Resampled { stage } => {

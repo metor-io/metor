@@ -60,7 +60,7 @@ impl InspectorRow for CommandRow {
         &self,
         row_ix: usize,
         selected: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let color = theme(cx).text_primary;
@@ -70,6 +70,7 @@ impl InspectorRow for CommandRow {
             self.label.clone(),
             self.tag.clone(),
             color,
+            window,
             cx,
         )
     }

@@ -155,7 +155,8 @@ fn build_converted(source: &str, db: &DB) -> Result<Vec<Arc<dyn DynamicNode>>, S
                     .map_err(|e| e.to_string())?;
                 held.push(clock);
                 held.push(
-                    persist::persist(db, stage.name.clone(), resampled).map_err(|e| e.to_string())?,
+                    persist::persist(db, stage.name.clone(), resampled)
+                        .map_err(|e| e.to_string())?,
                 );
                 continue;
             }
@@ -199,7 +200,10 @@ fn publishes(graph: &Graph, components: &[(&str, PrimType, &[usize])], want: (Pr
     let bench = Bench::new(components);
     let _held = match build_converted(&converted.source, &bench.db) {
         Ok(nodes) => nodes,
-        Err(why) => panic!("converted program did not build: {why}\n{}", converted.source),
+        Err(why) => panic!(
+            "converted program did not build: {why}\n{}",
+            converted.source
+        ),
     };
     let got = bench
         .published("derived")
@@ -242,7 +246,9 @@ fn k(v: f64) -> TypedScalar {
 
 /// One source, one op, one `Persist` — the shape almost every saved graph has.
 fn one_op(graph: Graph) -> Graph {
-    published_as(graph).edge("src", "op", 0).edge("op", "out", 0)
+    published_as(graph)
+        .edge("src", "op", 0)
+        .edge("op", "out", 0)
 }
 
 #[stellarator::test]

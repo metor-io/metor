@@ -71,8 +71,14 @@ fn decl_of(manifest: &Manifest, name: &str) -> Decl {
 fn connecting_an_edge_rewrites_one_binding() {
     let source = "scaled = wheels.rpm * 2.0\n";
     let manifest = compile(source);
-    let edited = connect(&manifest, source, decl_of(&manifest, "scaled"), 0, "wheels.torque")
-        .expect("the port is rebindable");
+    let edited = connect(
+        &manifest,
+        source,
+        decl_of(&manifest, "scaled"),
+        0,
+        "wheels.torque",
+    )
+    .expect("the port is rebindable");
 
     let after = recompiled(&edited);
     assert_eq!(
@@ -95,7 +101,13 @@ fn an_edge_between_declarations_is_rebindable() {
 
     let after = recompiled(&edited);
     let c = after.system("c").unwrap();
-    assert_eq!(c.inputs[0].bindings[0], Binding::Produced { system: 1, field: 0 });
+    assert_eq!(
+        c.inputs[0].bindings[0],
+        Binding::Produced {
+            system: 1,
+            field: 0
+        }
+    );
     assert_eq!(after.systems[1].name, "b");
 }
 
@@ -110,7 +122,14 @@ fn a_bare_name_is_rebound_where_it_is_written() {
         Binding::Component("wheels.rpm".into()),
         "the manifest records what the suffix search found"
     );
-    let edited = connect(&manifest, source, decl_of(&manifest, "scaled"), 0, "wheels.torque").unwrap();
+    let edited = connect(
+        &manifest,
+        source,
+        decl_of(&manifest, "scaled"),
+        0,
+        "wheels.torque",
+    )
+    .unwrap();
     assert_eq!(edited, "scaled = wheels.torque * 2.0\n");
 }
 
@@ -133,12 +152,18 @@ slow = resample_zoh(doubled, 10.0)
     assert_eq!(after.system("scaled").unwrap().publishes, vec!["scaled"]);
     assert_eq!(
         after.system("doubled").unwrap().inputs[0].bindings[0],
-        Binding::Produced { system: 0, field: 0 },
+        Binding::Produced {
+            system: 0,
+            field: 0
+        },
         "the consumer still reads it"
     );
     assert_eq!(
         after.stages[0].source,
-        Binding::Produced { system: 1, field: 0 },
+        Binding::Produced {
+            system: 1,
+            field: 0
+        },
         "and so does the stage downstream of that"
     );
 }
@@ -198,7 +223,10 @@ fn a_rename_that_would_not_compile_is_refused() {
     assert!(rename(&manifest, source, a, "b").is_none(), "name is taken");
     assert!(rename(&manifest, source, a, "2fast").is_none());
     assert!(rename(&manifest, source, a, "").is_none());
-    assert!(rename(&manifest, source, a, "a").is_none(), "already named that");
+    assert!(
+        rename(&manifest, source, a, "a").is_none(),
+        "already named that"
+    );
 }
 
 /// Deleting takes the declaration and its annotation, and leaves what read it
@@ -250,7 +278,10 @@ fn adding_from_the_palette_inserts_a_declaration() {
         "@system(rate=10.0)\ndef {name}() -> f64:\n    return sine(1.0, 1.0)\n",
     );
     assert_eq!(name, "signal");
-    assert_eq!(recompiled(&edited).system("signal").unwrap().rate, Some(10.0));
+    assert_eq!(
+        recompiled(&edited).system("signal").unwrap().rate,
+        Some(10.0)
+    );
 }
 
 /// The property the whole design rests on, stated once: a gesture's output is

@@ -75,18 +75,30 @@ fn every_transform_entry_inserts_something_already_wired() {
             .system(&name)
             .map(|s| {
                 s.inputs.iter().any(|p| {
-                    p.bindings[0] == metor_expr::Binding::Produced { system: 0, field: 0 }
+                    p.bindings[0]
+                        == metor_expr::Binding::Produced {
+                            system: 0,
+                            field: 0,
+                        }
                 })
             })
             .or_else(|| {
-                after
-                    .stages
-                    .iter()
-                    .find(|s| s.name == name)
-                    .map(|s| s.source == metor_expr::Binding::Produced { system: 0, field: 0 })
+                after.stages.iter().find(|s| s.name == name).map(|s| {
+                    s.source
+                        == metor_expr::Binding::Produced {
+                            system: 0,
+                            field: 0,
+                        }
+                })
             })
-            .unwrap_or_else(|| panic!("`{}` inserted nothing named {name}:\n{source}", entry.label));
-        assert!(reads_signal, "`{}` must read the selection:\n{source}", entry.label);
+            .unwrap_or_else(|| {
+                panic!("`{}` inserted nothing named {name}:\n{source}", entry.label)
+            });
+        assert!(
+            reads_signal,
+            "`{}` must read the selection:\n{source}",
+            entry.label
+        );
     }
 }
 
@@ -111,6 +123,9 @@ signal = wheels.rpm * 1.0
     let after = compile(&source);
     assert_eq!(
         after.system(&name).unwrap().inputs[0].bindings[0],
-        metor_expr::Binding::Produced { system: 0, field: 0 }
+        metor_expr::Binding::Produced {
+            system: 0,
+            field: 0
+        }
     );
 }

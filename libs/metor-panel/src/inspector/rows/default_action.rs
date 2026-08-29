@@ -57,11 +57,19 @@ impl InspectorRow for DefaultActionRow {
         &self,
         row_ix: usize,
         selected: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let color = theme(cx).text_tertiary;
-        render_label_row(row_ix, selected, self.label.clone(), None, color, cx)
+        render_label_row(
+            row_ix,
+            selected,
+            self.label.clone(),
+            None,
+            color,
+            window,
+            cx,
+        )
     }
 
     fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {

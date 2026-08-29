@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use gpui::{App, SharedString, div, prelude::*, px};
+use gpui::{App, Pixels, SharedString, Window, div, prelude::*, px};
 use metor_db::DB;
 use metor_expr::complete::{CompletionItem, CompletionKind, Completions};
 
@@ -120,8 +120,16 @@ fn tier(kind: CompletionKind) -> u8 {
 /// A candidate's line: kind glyph, label, and the type dimmed at the far
 /// side. The picker wraps this in `row_base`; the canvas popup stacks it in
 /// its own panel — one spelling of a candidate either way.
-pub(crate) fn candidate_content(item: &CompletionItem, cx: &App) -> gpui::Div {
+pub(crate) fn candidate_content(
+    item: &CompletionItem,
+    budget: Option<Pixels>,
+    window: &Window,
+    cx: &App,
+) -> gpui::Div {
     let theme = theme(cx);
+    // The glyph and the detail take their share before the label elides.
+    let budget = budget
+        .map(|b| b - crate::inspector::rows::measure(&item.detail, px(11.0), window) - px(36.0));
     let glyph = match item.kind {
         CompletionKind::Component => "◆",
         CompletionKind::Field | CompletionKind::Local => "▪",
@@ -141,15 +149,13 @@ pub(crate) fn candidate_content(item: &CompletionItem, cx: &App) -> gpui::Div {
                 .text_color(theme.text_tertiary)
                 .child(SharedString::new_static(glyph)),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_size(px(12.0))
-                .text_color(theme.text_primary)
-                .child(SharedString::from(item.label.clone())),
-        )
+        .child(crate::inspector::rows::path_label(
+            &item.label,
+            theme.text_primary,
+            budget,
+            window,
+            cx,
+        ))
         .child(
             div()
                 .text_size(px(11.0))

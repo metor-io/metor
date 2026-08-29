@@ -5,7 +5,7 @@
 //! only sees [`InspectorRow`] trait objects and a [`RowAction`] reply when
 //! a row is activated, so adding a new widget doesn't touch shared code.
 use gpui::{
-    AnyElement, AnyView, App, Hsla, Pixels, SharedString, Size, Window, div, prelude::*, px,
+    AnyElement, AnyView, App, Global, Hsla, Pixels, SharedString, Size, Window, div, prelude::*, px,
 };
 
 use crate::theme::theme;
@@ -188,21 +188,124 @@ pub fn render_label_row(
     label: SharedString,
     tag: Option<SharedString>,
     color: Hsla,
+    window: &mut Window,
     cx: &App,
 ) -> AnyElement {
-    let mut row = row_base(row_ix, selected, cx).child(
-        div()
-            .flex_1()
-            .min_w_0()
-            .truncate()
-            .text_size(px(12.0))
-            .text_color(color)
-            .child(label),
-    );
+    let mut budget = label_budget(cx);
+    if let (Some(budget), Some(tag)) = (budget.as_mut(), &tag) {
+        *budget -= measure(tag, px(10.0), window) + px(24.0);
+    }
+    let mut row =
+        row_base(row_ix, selected, cx).child(path_label(&label, color, budget, window, cx));
     if let Some(tag) = tag {
         row = row.child(tag_pill(tag, cx));
     }
     row.into_any_element()
+}
+
+/// The room a row's label has, set by the inspector for the panel it is
+/// rendering. Rows read it to elide a dotted path from the front instead of
+/// letting the layout cut off its tail — the end of a path is the part that
+/// tells two components apart.
+pub struct LabelFit {
+    /// Width inside the row's padding, when the panel knows it.
+    pub row_width: Option<Pixels>,
+}
+
+impl Global for LabelFit {}
+
+/// The label width a row may use before eliding, if the panel said.
+pub fn label_budget(cx: &App) -> Option<Pixels> {
+    cx.try_global::<LabelFit>()?.row_width
+}
+
+/// The label font: what every row's text is set in.
+pub const LABEL_SIZE: Pixels = px(12.0);
+
+/// Width of `text` at `size` in the window's font.
+pub fn measure(text: &str, size: Pixels, window: &Window) -> Pixels {
+    let run = gpui::TextRun {
+        len: text.len(),
+        font: window.text_style().font(),
+        color: Hsla::transparent_black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(SharedString::from(text.to_string()), size, &[run], None)
+        .width
+}
+
+/// A dotted path as a label: the leaf in `color`, the namespaces before it
+/// dimmed, and — when `budget` is too narrow for the whole — leading
+/// namespaces dropped behind an ellipsis so the leaf survives.
+///
+/// Text without a dot is just the leaf.
+pub fn path_label(
+    text: &str,
+    color: Hsla,
+    budget: Option<Pixels>,
+    window: &Window,
+    cx: &App,
+) -> gpui::Div {
+    let theme = theme(cx);
+    let (prefix, leaf) = elide_front(text, budget, |s| measure(s, LABEL_SIZE, window));
+    let mut label = div()
+        .flex()
+        .flex_row()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(LABEL_SIZE);
+    if !prefix.is_empty() {
+        label = label.child(
+            div()
+                .flex_none()
+                .text_color(theme.text_tertiary)
+                .child(SharedString::from(prefix)),
+        );
+    }
+    label.child(
+        div()
+            .min_w_0()
+            .truncate()
+            .text_color(color)
+            .child(SharedString::from(leaf)),
+    )
+}
+
+/// Split `text` into the namespaces to dim and the leaf to keep, dropping
+/// namespaces from the front until `width` of the whole fits `budget`.
+fn elide_front(
+    text: &str,
+    budget: Option<Pixels>,
+    width: impl Fn(&str) -> Pixels,
+) -> (String, String) {
+    let Some(dot) = text.rfind('.') else {
+        return (String::new(), text.to_string());
+    };
+    let leaf = &text[dot + 1..];
+    let namespaces: Vec<&str> = text[..dot].split('.').collect();
+    let Some(budget) = budget else {
+        return (format!("{}.", namespaces.join(".")), leaf.to_string());
+    };
+    for skip in 0..namespaces.len() {
+        let mut prefix = String::new();
+        if skip > 0 {
+            prefix.push('…');
+        }
+        for ns in &namespaces[skip..] {
+            prefix.push_str(ns);
+            prefix.push('.');
+        }
+        if width(&format!("{prefix}{leaf}")) <= budget {
+            return (prefix, leaf.to_string());
+        }
+    }
+    (String::from("…"), leaf.to_string())
 }
 
 /// Row-chrome the concrete widgets wrap: background, hover, spacing, and id.
@@ -241,4 +344,42 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
                 .bg(pill_bg)
                 .group_hover("inspector-row", |s| s.bg(theme.selection_bg)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One unit per character stands in for the text system.
+    fn by_chars(s: &str) -> Pixels {
+        px(s.chars().count() as f32)
+    }
+
+    #[test]
+    fn a_path_keeps_its_leaf_and_sheds_namespaces_from_the_front() {
+        let text = "cube_sat.plant.body.omega_b";
+        assert_eq!(
+            elide_front(text, None, by_chars),
+            ("cube_sat.plant.body.".into(), "omega_b".into())
+        );
+        assert_eq!(
+            elide_front(text, Some(px(100.0)), by_chars),
+            ("cube_sat.plant.body.".into(), "omega_b".into())
+        );
+        assert_eq!(
+            elide_front(text, Some(px(20.0)), by_chars),
+            ("…plant.body.".into(), "omega_b".into()),
+            "the first namespace goes first"
+        );
+        assert_eq!(
+            elide_front(text, Some(px(9.0)), by_chars),
+            ("…".into(), "omega_b".into()),
+            "the leaf is never given up"
+        );
+        assert_eq!(
+            elide_front("Add Model", Some(px(3.0)), by_chars),
+            (String::new(), "Add Model".into()),
+            "no dots, no prefix"
+        );
+    }
 }

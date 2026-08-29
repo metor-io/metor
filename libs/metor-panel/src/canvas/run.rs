@@ -24,8 +24,8 @@ use metor_proto::types::ComponentId;
 use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL, Health};
 use crate::dynamic::ops::{self, db_source, persist};
 use crate::dynamic::resolver::DbResolver;
-use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, op_tag};
 use crate::dynamic::worker::WorkerHandle;
+use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, op_tag};
 
 /// One declaration, running.
 pub struct Running {
@@ -106,7 +106,10 @@ impl Systems {
         for port in &desc.inputs {
             sources.push(component_of(&port.bindings[0], compiled, db, resolver)?);
         }
-        let port_ids: Vec<NodeId> = sources.iter().map(|id| db_source::from_db_id(*id)).collect();
+        let port_ids: Vec<NodeId> = sources
+            .iter()
+            .map(|id| db_source::from_db_id(*id))
+            .collect();
         let hash = compiled.system_hash(index, &port_ids);
         if let Some(at) = self.running.iter().position(|r| r.hash == hash) {
             return Ok(self.running.remove(at));
@@ -240,7 +243,9 @@ fn component_of(
                 .id_of(path)
                 .ok_or_else(|| format!("`{path}` is not a known component"));
         }
-        Binding::Produced { system, field } => &compiled.manifest.systems[*system].publishes[*field],
+        Binding::Produced { system, field } => {
+            &compiled.manifest.systems[*system].publishes[*field]
+        }
         Binding::Resampled { stage } => &compiled.manifest.stages[*stage].name,
     };
     let id = ComponentId::new(produced);
@@ -252,5 +257,10 @@ fn component_of(
 
 /// Whether anything in this manifest is worth showing as running.
 pub fn publishes(manifest: &Manifest) -> usize {
-    manifest.systems.iter().map(|s| s.publishes.len()).sum::<usize>() + manifest.stages.len()
+    manifest
+        .systems
+        .iter()
+        .map(|s| s.publishes.len())
+        .sum::<usize>()
+        + manifest.stages.len()
 }

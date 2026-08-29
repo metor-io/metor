@@ -248,11 +248,14 @@ impl InspectorRow for CandidateRow {
         &self,
         row_ix: usize,
         selected: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
+        let budget = super::label_budget(cx);
         row_base(row_ix, selected, cx)
-            .child(completion::candidate_content(&self.item, cx))
+            .child(completion::candidate_content(
+                &self.item, budget, window, cx,
+            ))
             .into_any_element()
     }
 

@@ -34,9 +34,7 @@ fn sources() -> Vec<Entry> {
     let wave = |label: &str, call: &str| Entry {
         label: label.to_string(),
         detail: "source · 100 Hz",
-        template: format!(
-            "@system(rate=100.0)\ndef {{name}}() -> f64:\n    return {call}\n"
-        ),
+        template: format!("@system(rate=100.0)\ndef {{name}}() -> f64:\n    return {call}\n"),
         stem: "signal",
     };
     vec![
