@@ -740,3 +740,37 @@ async fn a_resample_stage_is_wired_from_the_manifest() {
         metor_expr::Binding::Resampled { stage: 0 }
     );
 }
+
+/// Two seeded vector inputs contracted with `@`: the product must follow
+/// both channels after the opening sample, not stop at one.
+#[stellarator::test]
+async fn a_dot_of_two_seeded_inputs_keeps_following_both() {
+    let bench = Bench::new(&[
+        ("imu.a", PrimType::F64, &[3]),
+        ("imu.b", PrimType::F64, &[3]),
+    ]);
+    let compiled = bench.compile("d = imu.a @ imu.b\n");
+
+    bench.push("imu.a", 1, &[1.0, 0.0, 0.0]);
+    bench.push("imu.b", 1, &[2.0, 0.0, 0.0]);
+    stellarator::sleep(Duration::from_millis(20)).await;
+
+    let ports: Vec<program::PortSource> = ["imu.a", "imu.b"]
+        .iter()
+        .map(|name| program::PortSource {
+            node: bench.source(name),
+            seed: program::latest_sample(&bench.db, bench.id(name)),
+        })
+        .collect();
+    let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None).unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut out = watch(&field);
+
+    for step in 2..=5 {
+        let v = f64::from(step as i32);
+        bench.push("imu.a", step, &[v, 0.0, 0.0]);
+        bench.push("imu.b", step, &[2.0, 0.0, 0.0]);
+    }
+    assert_eq!(take(&mut out, 5).await, vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+    assert_eq!(system.health.fault(), None);
+}

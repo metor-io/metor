@@ -143,6 +143,7 @@ impl From<TraceConfig> for Trace {
             stroke_width: config.stroke_width,
             axis_index: config.axis_index,
             line_plot: None,
+            expression: None,
         }
     }
 }
@@ -195,7 +196,6 @@ impl TimeSeriesPlot {
         // is built, so what it binds is the component now publishing rather
         // than the one that did last session — which would come back as
         // history with nothing writing into it.
-        let mut expressions = Vec::new();
         let traces = config
             .traces
             .into_iter()
@@ -209,13 +209,14 @@ impl TimeSeriesPlot {
                 {
                     trace.component_id = bound.id;
                     trace.expression = Some(text);
-                    expressions.extend(bound.expression);
+                    let mut built = Trace::from(trace);
+                    built.expression = bound.expression;
+                    return built;
                 }
                 Trace::from(trace)
             })
             .collect();
         let mut plot = Self::new(db, traces, cx);
-        plot._expressions = expressions;
         plot.line_plot.update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             if let Ok(range) = config.x_range.parse() {

@@ -1102,6 +1102,11 @@ pub struct Trace {
     /// `MeasurementCursor`'s plot handle). `None` until reconcile runs.
     #[facet(opaque)]
     pub line_plot: Option<gpui::WeakEntity<LinePlot>>,
+    /// The `=` expression this trace plots, when it is one. The trace holds
+    /// the share that keeps it computing: removing the trace is what stops
+    /// it, and nothing else has to remember to.
+    #[facet(opaque)]
+    pub expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl Trace {
@@ -1116,6 +1121,7 @@ impl Trace {
             stroke_width: 1.5,
             axis_index: 0,
             line_plot: None,
+            expression: None,
         }
     }
 }
@@ -1138,7 +1144,6 @@ struct CursorDrag {
 /// `TimeSeriesPlot` only owns drag state and chrome.
 pub struct TimeSeriesPlot {
     line_plot: Entity<LinePlot>,
-    _expressions: Vec<crate::dynamic::expressions::Expression>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotView>,
     drag_zone: AxisZone,
@@ -1214,6 +1219,7 @@ pub fn traces_for_component(
                 stroke_width: 1.5,
                 axis_index: 0,
                 line_plot: None,
+                expression: None,
             }
         })
         .collect()
@@ -1236,7 +1242,6 @@ impl TimeSeriesPlot {
         }
         Self {
             line_plot,
-            _expressions: Vec::new(),
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,

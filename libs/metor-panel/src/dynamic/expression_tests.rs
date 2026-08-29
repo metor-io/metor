@@ -1094,3 +1094,122 @@ fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestApp
 
     assert_eq!(feed_and_await(&db, source, published, 200, 4.0), 12.0);
 }
+
+/// The user's report, verbatim in shape: a vector component contracted with
+/// itself, parenthesised, through `resolve`'s exact path.
+#[stellarator::test]
+async fn a_self_dot_seeds_then_tails() {
+    use crate::dynamic::ops::{db_source, program};
+    use metor_proto::types::Timestamp;
+
+    let path = "cube_sat.plant.body.omega_b";
+    let (db, _temp) = db_with_ids(&[(path, ComponentId::new(path), PrimType::F64, &[3])]);
+    let source_id = ComponentId::new(path);
+    let source = db
+        .with_state(|s| s.get_component(source_id).cloned())
+        .unwrap();
+
+    source
+        .push_buf(Timestamp(100), &sample(&[1.0, 0.0, 0.0]))
+        .unwrap();
+    stellarator::sleep(std::time::Duration::from_millis(20)).await;
+
+    let text = format!("({path} @ {path})");
+    let resolver = DbResolver::snapshot(&db);
+    let compiled = std::sync::Arc::new(program::Compiled::expression(&text, &resolver).unwrap());
+    let inputs = &compiled.manifest.systems[0].inputs;
+    assert_eq!(
+        inputs.len(),
+        1,
+        "{:?}",
+        inputs.iter().map(|p| &p.bindings).collect::<Vec<_>>()
+    );
+    let name = expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    ));
+
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource {
+            node: db_source::from_db(&db, source_id).unwrap(),
+            seed: program::latest_sample(&db, source_id),
+        }],
+        program::DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let _published = expressions::publish(&db, &name, field, &text).unwrap();
+
+    for step in 1..=4 {
+        let v = 1.0 + step as f64;
+        source
+            .push_buf(Timestamp(100 + step), &sample(&[v, 0.0, 0.0]))
+            .unwrap();
+    }
+
+    let component = db
+        .with_state(|s| s.get_component(ComponentId::new(&name)).cloned())
+        .expect("the expression's component");
+    for _ in 0..300 {
+        if component
+            .time_series
+            .latest()
+            .is_some_and(|l| l.timestamp() == Timestamp(104))
+        {
+            break;
+        }
+        stellarator::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let latest = component.time_series.latest().expect("history");
+    assert_eq!(
+        latest.timestamp(),
+        Timestamp(104),
+        "fault: {:?}; the expression stopped at {:?}",
+        system.health.fault(),
+        latest.timestamp()
+    );
+    assert_eq!(f64::from_le_bytes(latest.data().try_into().unwrap()), 25.0);
+}
+
+/// The user's report: `(omega_b @ omega_b)` typed into an existing plot showed
+/// one sample and stopped. The picker resolves the expression and hands the
+/// plot bare traces; once its own handle drops, nothing keeps the system
+/// computing. The traces must carry the share.
+#[gpui::test]
+fn a_trace_added_from_the_picker_keeps_its_expression_alive(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::inspector::trace_picker::expression_traces;
+    use std::sync::Arc;
+
+    let path = "cube_sat.plant.body.omega_b";
+    let (db, _temp) = db_with_ids(&[(path, ComponentId::new(path), PrimType::F64, &[3])]);
+    let db = Arc::new(db);
+    let text = format!("=({path} @ {path})");
+
+    cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+
+        // What `ComputeRow::activate` does: resolve, hand out the id, drop.
+        let traces = {
+            let expression = expressions::resolve(&text, &db, cx).expect("compiles and starts");
+            let id = expression.component_id();
+            let basis: crate::inspector::trace_picker::ColorBasis = Arc::new(|_: &gpui::App| 0);
+            expression_traces(&db, id, &text, &basis, cx)
+        };
+        let id = traces[0].component_id;
+        assert!(
+            expressions::running(id, cx).is_some(),
+            "the trace's share must outlive the picker's"
+        );
+        drop(traces);
+        assert!(
+            expressions::running(id, cx).is_none(),
+            "and removing the trace is what stops the expression"
+        );
+    });
+}

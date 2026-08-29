@@ -49,6 +49,10 @@ pub struct ListTrace {
     pub label: SharedString,
     #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
+    /// The `=` expression this trace plots, when it is one; the trace's
+    /// share is what keeps it computing.
+    #[facet(opaque)]
+    pub expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl ListTrace {
@@ -61,6 +65,7 @@ impl ListTrace {
             visible: true,
             label: SharedString::new_static(""),
             stroke_width: 1.5,
+            expression: None,
         }
     }
 }
@@ -69,7 +74,6 @@ impl ListTrace {
 /// and pan/zoom input.
 pub struct ListPlot {
     line_plot: Entity<ListLinePlot>,
-    _expressions: Vec<crate::dynamic::expressions::Expression>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
@@ -86,7 +90,6 @@ impl ListPlot {
         cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
         Self {
             line_plot,
-            _expressions: Vec::new(),
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,

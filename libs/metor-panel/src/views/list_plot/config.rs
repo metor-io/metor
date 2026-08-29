@@ -84,6 +84,7 @@ impl From<ListTraceConfig> for ListTrace {
             visible: config.visible,
             label: config.label.into(),
             stroke_width: config.stroke_width,
+            expression: None,
         }
     }
 }
@@ -93,7 +94,6 @@ impl ListPlot {
         // A trace written as an expression is compiled and started before it
         // is built, so what it binds is the component now publishing rather
         // than the one that did last session.
-        let mut expressions = Vec::new();
         let traces = config
             .traces
             .into_iter()
@@ -107,13 +107,14 @@ impl ListPlot {
                 {
                     trace.component_id = bound.id;
                     trace.expression = Some(text);
-                    expressions.extend(bound.expression);
+                    let mut built = ListTrace::from(trace);
+                    built.expression = bound.expression;
+                    return built;
                 }
                 ListTrace::from(trace)
             })
             .collect();
-        let mut plot = Self::new(db, traces, cx);
-        plot._expressions = expressions;
+        let plot = Self::new(db, traces, cx);
         plot.line_plot.update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             line_plot.x_min_override = config.x_min_override;

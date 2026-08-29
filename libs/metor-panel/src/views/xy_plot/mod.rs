@@ -59,6 +59,10 @@ pub struct XyTrace {
     pub label: SharedString,
     #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
+    /// The `=` expressions behind either axis; the trace's share is what
+    /// keeps them computing.
+    #[facet(opaque)]
+    pub expressions: Vec<crate::dynamic::expressions::Expression>,
 }
 
 impl XyTrace {
@@ -79,6 +83,7 @@ impl XyTrace {
             visible: true,
             label: SharedString::new_static(""),
             stroke_width: 1.5,
+            expressions: Vec::new(),
         }
     }
 }
@@ -90,7 +95,6 @@ impl XyTrace {
 /// [`XyLinePlot`]; this entity owns drag state and chrome only.
 pub struct XyPlot {
     line_plot: Entity<XyLinePlot>,
-    _expressions: Vec<crate::dynamic::expressions::Expression>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
@@ -107,7 +111,6 @@ impl XyPlot {
         cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
         Self {
             line_plot,
-            _expressions: Vec::new(),
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,

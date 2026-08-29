@@ -514,6 +514,7 @@ pub(crate) fn expression_traces(
             let color = theme.line_colors[(base + index) % theme.line_colors.len()];
             let mut trace = Trace::new(component, index, color);
             trace.label = SharedString::from(label);
+            trace.expression = crate::dynamic::expressions::running(component, cx);
             trace
         })
         .collect()

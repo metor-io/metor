@@ -341,5 +341,9 @@ fn build_trace(
         color,
     );
     t.label = SharedString::from(label);
+    t.expressions = [x_component_id, y_component_id]
+        .into_iter()
+        .filter_map(|id| expressions::running(id, cx))
+        .collect();
     Some(t)
 }

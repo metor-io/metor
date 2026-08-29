@@ -97,6 +97,7 @@ impl From<XyTraceConfig> for XyTrace {
             visible: config.visible,
             label: config.label.into(),
             stroke_width: config.stroke_width,
+            expressions: Vec::new(),
         }
     }
 }
@@ -106,11 +107,11 @@ impl XyPlot {
         // An axis written as an expression is compiled and started before the
         // trace is built, so what it binds is the component now publishing
         // rather than the one that did last session.
-        let mut expressions = Vec::new();
         let traces = config
             .traces
             .into_iter()
             .map(|mut trace| {
+                let mut expressions = Vec::new();
                 let x = trace
                     .x_expression
                     .clone()
@@ -131,11 +132,12 @@ impl XyPlot {
                     *saved = Some(text);
                     expressions.extend(bound.expression);
                 }
-                XyTrace::from(trace)
+                let mut built = XyTrace::from(trace);
+                built.expressions = expressions;
+                built
             })
             .collect();
-        let mut plot = Self::new(db, traces, cx);
-        plot._expressions = expressions;
+        let plot = Self::new(db, traces, cx);
         plot.line_plot.update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             line_plot.x_min_override = config.x_min_override;
