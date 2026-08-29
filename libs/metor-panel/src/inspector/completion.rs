@@ -47,25 +47,47 @@ pub(crate) fn resolver(db: &DB) -> Arc<DbResolver> {
 /// keeps everything in tier order.
 pub(crate) fn rank(completions: &mut Completions) {
     use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
-    use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-    let items = &mut completions.items;
-    if completions.prefix.is_empty() {
-        items.sort_by(|a, b| tier(a.kind).cmp(&tier(b.kind)));
-        return;
-    }
-
-    let mut config = Config::DEFAULT;
-    config.prefer_prefix = true;
-    let mut matcher = Matcher::new(config);
     // The prefix is matched literally: fzf's query operators are for search
     // boxes, and `^` or `!` typed here is expression text, not syntax.
+    let unfiltered = completions.prefix.is_empty();
     let pattern = Pattern::new(
         &completions.prefix,
         CaseMatching::Ignore,
         Normalization::Smart,
         AtomKind::Fuzzy,
     );
+    rank_by(completions, true, pattern, unfiltered);
+}
+
+/// Order candidates for a *search* query — the picker's plain-name mode,
+/// where the field is a filter rather than an expression. Matching follows
+/// the inspector's own rules (`Pattern::parse`, default config), so a spaced
+/// query narrows by every word exactly as the fuzzy filter always has.
+pub(crate) fn rank_search(completions: &mut Completions, query: &str) {
+    use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+
+    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    rank_by(completions, false, pattern, query.trim().is_empty());
+}
+
+fn rank_by(
+    completions: &mut Completions,
+    prefer_prefix: bool,
+    pattern: nucleo_matcher::pattern::Pattern,
+    unfiltered: bool,
+) {
+    use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+    let items = &mut completions.items;
+    if unfiltered {
+        items.sort_by(|a, b| tier(a.kind).cmp(&tier(b.kind)));
+        return;
+    }
+
+    let mut config = Config::DEFAULT;
+    config.prefer_prefix = prefer_prefix;
+    let mut matcher = Matcher::new(config);
 
     let mut buf = Vec::new();
     let mut scored: Vec<(CompletionItem, u32)> = std::mem::take(items)
@@ -180,6 +202,21 @@ mod tests {
         rank(&mut c);
         assert_eq!(c.items[0].label, "adcs.omega_b");
         assert_eq!(c.items.len(), 2);
+    }
+
+    #[test]
+    fn search_splits_words_like_the_inspector() {
+        let mut c = Completions {
+            replace: Span { start: 0, end: 1 },
+            prefix: "b".to_string(),
+            items: vec![
+                item("adcs.omega_b", CompletionKind::Component),
+                item("power.bus_v", CompletionKind::Component),
+            ],
+        };
+        rank_search(&mut c, "omega b");
+        let labels: Vec<&str> = c.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["adcs.omega_b"], "each word narrows");
     }
 
     #[test]

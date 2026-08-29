@@ -110,6 +110,14 @@ impl InspectorRow for ExpressionRow {
         RowAction::Handled
     }
 
+    /// A hint is not a choice: keeping it out of the arrow-key path leaves
+    /// the default selection on a row Enter can actually take — the wizard's
+    /// Continue after popping back from an element page, a component in a
+    /// single-pick list.
+    fn is_header(&self) -> bool {
+        true
+    }
+
     fn query_rows(
         &self,
         query: &str,
@@ -135,12 +143,18 @@ impl InspectorRow for ExpressionRow {
             None,
         );
 
-        // A query that is nothing but one dotted chain is a search; anything
-        // more — or the sigil — is an expression being built.
-        let searching = !sigil && body.trim() == comps.prefix;
+        // A query made only of name characters and spaces is a search —
+        // spaces are how fuzzy queries narrow, not how expressions start.
+        // Any operator, or the sigil, means an expression is being built.
+        let searching = !sigil
+            && !body.trim().is_empty()
+            && body
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | ' '));
         let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
         let mut ids: std::collections::HashMap<String, ComponentId> = Default::default();
+        let mut compute = None;
         if searching {
             // The engine offers only what the language can read (f64-shaped
             // components); a search must keep offering everything, so the
@@ -162,16 +176,18 @@ impl InspectorRow for ExpressionRow {
                     caret: None,
                 });
             }
+            completion::rank_search(&mut comps, body.trim());
         } else {
-            rows.push(Box::new(ComputeRow::new(
-                self.db.clone(),
-                query.to_string(),
-                self.on_select.clone(),
-                cx,
-            )));
+            let row = ComputeRow::new(self.db.clone(), query.to_string(), self.on_select.clone());
+            // A compiling expression is the answer, so committing it is the
+            // default Enter; one that does not compile yet is only feedback,
+            // and the candidates — the way forward — take the selection.
+            match row.complaint.is_none() {
+                true => rows.push(Box::new(row)),
+                false => compute = Some(row),
+            }
+            completion::rank(&mut comps);
         }
-
-        completion::rank(&mut comps);
 
         let replace_start = off + comps.replace.start as usize;
         let replace_end = off + comps.replace.end as usize;
@@ -197,6 +213,9 @@ impl InspectorRow for ExpressionRow {
             }));
         }
 
+        if let Some(row) = compute {
+            rows.push(Box::new(row));
+        }
         if let Some(tail) = &self.tail {
             rows.push(tail());
         }
@@ -277,7 +296,7 @@ struct ComputeRow {
 }
 
 impl ComputeRow {
-    fn new(db: Arc<DB>, query: String, on_select: OnExpression, _cx: &App) -> Self {
+    fn new(db: Arc<DB>, query: String, on_select: OnExpression) -> Self {
         let resolver = completion::resolver(&db);
         let body = expressions::body(&query);
         let complaint = match body.is_empty() {
