@@ -197,7 +197,10 @@ impl InspectorRow for ExpressionRow {
                     continue;
                 };
                 if let Some(row) = (self.component_row)(*id, item, cx) {
-                    rows.push(row);
+                    rows.push(Box::new(Completing {
+                        row,
+                        text: item.insert.clone(),
+                    }));
                 }
                 continue;
             }
@@ -205,8 +208,7 @@ impl InspectorRow for ExpressionRow {
             text.push_str(&query[..replace_start]);
             text.push_str(&item.insert);
             text.push_str(&query[replace_end..]);
-            let caret =
-                replace_start + item.caret.map(|c| c as usize).unwrap_or(item.insert.len());
+            let caret = replace_start + item.caret.map(|c| c as usize).unwrap_or(item.insert.len());
             rows.push(Box::new(CandidateRow {
                 item: item.clone(),
                 action: CandidateAction::Insert { text, caret },
@@ -279,6 +281,61 @@ impl InspectorRow for CandidateRow {
     }
 }
 
+/// A page's own component row, with Tab added.
+///
+/// The page spells a matched component however it likes — a commit line, a
+/// drill-in to its elements — and Enter keeps that meaning. Tab is the
+/// provider's: it puts the component's name into the field, so a search can
+/// become the start of an expression without retyping the name.
+struct Completing {
+    row: Box<dyn InspectorRow>,
+    text: String,
+}
+
+impl InspectorRow for Completing {
+    fn label(&self) -> &str {
+        self.row.label()
+    }
+
+    fn render_row(
+        &self,
+        row_ix: usize,
+        selected: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        self.row.render_row(row_ix, selected, window, cx)
+    }
+
+    fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {
+        self.row.activate(window, cx)
+    }
+
+    fn activate_with_search(
+        &mut self,
+        search: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RowAction {
+        self.row.activate_with_search(search, window, cx)
+    }
+
+    fn consumes_search(&self) -> bool {
+        self.row.consumes_search()
+    }
+
+    fn is_header(&self) -> bool {
+        self.row.is_header()
+    }
+
+    fn insert(&mut self, _search: &str, _window: &mut Window, _cx: &mut App) -> RowAction {
+        RowAction::ReplaceQuery {
+            cursor: self.text.len(),
+            text: self.text.clone(),
+        }
+    }
+}
+
 /// The pinned commit line of an expression query.
 ///
 /// Checked — not started — on every keystroke: `compile_expr` is the real
@@ -299,15 +356,16 @@ impl ComputeRow {
     fn new(db: Arc<DB>, query: String, on_select: OnExpression) -> Self {
         let resolver = completion::resolver(&db);
         let body = expressions::body(&query);
-        let complaint = match body.is_empty() {
-            true => Some("an empty expression".to_string()),
-            false => metor_expr::compile_expr(body, resolver.as_ref())
-                .err()
-                .map(|diags| match diags.iter().next() {
-                    Some(first) => first.message.clone(),
-                    None => "this expression could not be compiled".to_string(),
-                }),
-        };
+        let complaint =
+            match body.is_empty() {
+                true => Some("an empty expression".to_string()),
+                false => metor_expr::compile_expr(body, resolver.as_ref())
+                    .err()
+                    .map(|diags| match diags.iter().next() {
+                        Some(first) => first.message.clone(),
+                        None => "this expression could not be compiled".to_string(),
+                    }),
+            };
         Self {
             db,
             query,
@@ -382,5 +440,69 @@ impl InspectorRow for ComputeRow {
                 RowAction::Handled
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inspector::rows::NavRow;
+    use metor_db::ComponentSchema;
+    use metor_proto::types::PrimType;
+
+    fn db_with(names: &[&str]) -> (Arc<DB>, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DB::create(temp.path().join("db")).unwrap();
+        for name in names {
+            let id = ComponentId::new(name);
+            db.with_state_mut(|s| {
+                s.insert_component(id, ComponentSchema::new(PrimType::F64, &[3]), &db.path)
+            })
+            .unwrap();
+            let mut metadata = metor_proto_wkt::ComponentMetadata {
+                component_id: id,
+                name: name.to_string(),
+                metadata: Default::default(),
+            };
+            use metor_proto_wkt::MetadataExt;
+            metadata.set("source", "test");
+            db.with_state_mut(|s| s.set_component_metadata(metadata, &db.path))
+                .unwrap();
+        }
+        (Arc::new(db), temp)
+    }
+
+    /// The wizard spells a matched component as a drill-in row. Enter keeps
+    /// drilling; Tab must still put the name into the field, which is how a
+    /// search becomes the first operand of an expression.
+    #[gpui::test]
+    fn tab_on_a_pages_own_component_row_inserts_its_name(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = db_with(&["cube_sat.plant.body.omega_b"]);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            let drill: ComponentRowBuilder = Arc::new(|_id, item, _cx| {
+                Some(Box::new(NavRow::new(
+                    SharedString::from(item.label.clone()),
+                    SharedString::new_static(""),
+                    Box::new(|_cx| Vec::new()),
+                )) as Box<dyn InspectorRow>)
+            });
+            let provider =
+                ExpressionRow::new(db, Arc::new(|_, _, _, _| RowAction::Dismiss), drill, None);
+            let mut rows = provider
+                .query_rows("omega", 5, cx)
+                .expect("a query takes the page");
+            let row = rows
+                .iter_mut()
+                .find(|r| r.label() == "cube_sat.plant.body.omega_b")
+                .expect("matched");
+            let action = row.insert("omega", window, cx);
+            let RowAction::ReplaceQuery { text, cursor } = action else {
+                panic!("Tab must rewrite the query");
+            };
+            assert_eq!(text, "cube_sat.plant.body.omega_b");
+            assert_eq!(cursor, text.len());
+        });
     }
 }
