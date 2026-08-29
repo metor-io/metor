@@ -85,6 +85,7 @@ impl From<ListTraceConfig> for ListTrace {
             label: config.label.into(),
             stroke_width: config.stroke_width,
             expression: None,
+            line_plot: None,
         }
     }
 }

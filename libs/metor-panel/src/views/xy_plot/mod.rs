@@ -59,10 +59,16 @@ pub struct XyTrace {
     pub label: SharedString,
     #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
-    /// The `=` expressions behind either axis; the trace's share is what
-    /// keeps them computing.
+    /// The `=` expression behind each axis, when it is one; the trace's
+    /// share is what keeps it computing.
     #[facet(opaque)]
-    pub expressions: Vec<crate::dynamic::expressions::Expression>,
+    pub x_expression: Option<crate::dynamic::expressions::Expression>,
+    #[facet(opaque)]
+    pub y_expression: Option<crate::dynamic::expressions::Expression>,
+    /// Back-reference to the owning plot, set by [`XyLinePlot::reconcile`],
+    /// so the trace's inspector can ask the plot to follow a new source.
+    #[facet(opaque)]
+    pub line_plot: Option<gpui::WeakEntity<XyLinePlot>>,
 }
 
 impl XyTrace {
@@ -83,7 +89,9 @@ impl XyTrace {
             visible: true,
             label: SharedString::new_static(""),
             stroke_width: 1.5,
-            expressions: Vec::new(),
+            x_expression: None,
+            y_expression: None,
+            line_plot: None,
         }
     }
 }

@@ -97,7 +97,9 @@ impl From<XyTraceConfig> for XyTrace {
             visible: config.visible,
             label: config.label.into(),
             stroke_width: config.stroke_width,
-            expressions: Vec::new(),
+            x_expression: None,
+            y_expression: None,
+            line_plot: None,
         }
     }
 }
@@ -111,7 +113,7 @@ impl XyPlot {
             .traces
             .into_iter()
             .map(|mut trace| {
-                let mut expressions = Vec::new();
+                let (mut x_live, mut y_live) = (None, None);
                 let x = trace
                     .x_expression
                     .clone()
@@ -120,9 +122,19 @@ impl XyPlot {
                     .y_expression
                     .clone()
                     .or_else(|| expressions::binding_text(&db, trace.y_component_id));
-                for (text, id, saved) in [
-                    (x, &mut trace.x_component_id, &mut trace.x_expression),
-                    (y, &mut trace.y_component_id, &mut trace.y_expression),
+                for (text, id, saved, live) in [
+                    (
+                        x,
+                        &mut trace.x_component_id,
+                        &mut trace.x_expression,
+                        &mut x_live,
+                    ),
+                    (
+                        y,
+                        &mut trace.y_component_id,
+                        &mut trace.y_expression,
+                        &mut y_live,
+                    ),
                 ] {
                     let Some(text) = text else { continue };
                     let Ok(bound) = expressions::bind(&text, &db, cx) else {
@@ -130,10 +142,11 @@ impl XyPlot {
                     };
                     *id = bound.id;
                     *saved = Some(text);
-                    expressions.extend(bound.expression);
+                    *live = bound.expression;
                 }
                 let mut built = XyTrace::from(trace);
-                built.expressions = expressions;
+                built.x_expression = x_live;
+                built.y_expression = y_live;
                 built
             })
             .collect();

@@ -53,6 +53,10 @@ pub struct ListTrace {
     /// share is what keeps it computing.
     #[facet(opaque)]
     pub expression: Option<crate::dynamic::expressions::Expression>,
+    /// Back-reference to the owning plot, set by [`ListLinePlot::reconcile`],
+    /// so the trace's inspector can ask the plot to follow a new source.
+    #[facet(opaque)]
+    pub line_plot: Option<gpui::WeakEntity<ListLinePlot>>,
 }
 
 impl ListTrace {
@@ -66,6 +70,7 @@ impl ListTrace {
             label: SharedString::new_static(""),
             stroke_width: 1.5,
             expression: None,
+            line_plot: None,
         }
     }
 }

@@ -14,11 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{App, SharedString, Window};
 use metor_db::DB;
-use metor_proto::types::ComponentId;
 
-use crate::dynamic::expressions;
-use crate::inspector::rows::{CommandRow, ExpressionRow, HeaderRow, InspectorRow, NavRow, RowAction};
-use crate::inspector::trace_picker::{ColorBasis, element_names_for_component, list_components};
+use crate::inspector::rows::{InspectorRow, RowAction};
+use crate::inspector::trace_picker::{Channel, ColorBasis, OnChannel, channel_picker_rows};
 use crate::theme::theme;
 
 use super::XyTrace;
@@ -26,324 +24,49 @@ use super::XyTrace;
 /// Invoked with the [`XyTrace`] the user built through the wizard.
 pub type OnXyTraceSelected = Arc<dyn Fn(XyTrace, &mut Window, &mut App)>;
 
-/// Draft state carried across the wizard pages. The Y component+element
-/// reach `build_trace` directly through closure capture from the Y-axis
-/// pages, so only the X selection needs to round-trip through here.
+/// The X pick, carried from its page to the Y page's commit.
 #[derive(Default)]
 struct XyDraft {
-    x: Option<(ComponentId, usize)>,
+    x: Option<Channel>,
 }
 
-/// Build the wizard's first page: a list of components for the X axis.
+/// Build the wizard's first page: the X axis channel.
 pub fn select_xy_trace_wizard_rows(
     db: Arc<DB>,
     color_basis: ColorBasis,
     on_select: OnXyTraceSelected,
 ) -> Vec<Box<dyn InspectorRow>> {
     let draft = Arc::new(Mutex::new(XyDraft::default()));
-    x_component_rows(db, color_basis, on_select, draft)
+    let db_for_y = db.clone();
+    let on_x: OnChannel = Arc::new(move |x, _window, _cx| {
+        draft.lock().unwrap().x = Some(x);
+        let draft = draft.clone();
+        let color_basis = color_basis.clone();
+        let on_select = on_select.clone();
+        let on_y: OnChannel = Arc::new(move |y, window, cx| {
+            let Some(x) = draft.lock().unwrap().x.take() else {
+                return RowAction::Pop;
+            };
+            let theme = theme(cx);
+            let base = (color_basis)(cx);
+            let color = theme.line_colors[base % theme.line_colors.len()];
+            on_select(xy_trace(x, y, color), window, cx);
+            RowAction::Dismiss
+        });
+        RowAction::Cascade(channel_picker_rows(
+            db_for_y.clone(),
+            "Pick Y axis component, or type an expression",
+            on_y,
+        ))
+    });
+    channel_picker_rows(db, "Pick X axis component, or type an expression", on_x)
 }
 
-fn x_component_rows(
-    db: Arc<DB>,
-    color_basis: ColorBasis,
-    on_select: OnXyTraceSelected,
-    draft: Arc<Mutex<XyDraft>>,
-) -> Vec<Box<dyn InspectorRow>> {
-    let header: Box<dyn InspectorRow> =
-        Box::new(HeaderRow::new("Pick X axis component, or type an expression"));
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![header];
-    let commit: crate::inspector::rows::OnExpression = {
-        let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
-        let draft = draft.clone();
-        Arc::new(move |component, text, _window, _cx| {
-            RowAction::Cascade(x_element_rows(
-                db.clone(),
-                color_basis.clone(),
-                on_select.clone(),
-                draft.clone(),
-                component,
-                expressions::body(&text).to_string(),
-            ))
-        })
-    };
-    let nav: crate::inspector::rows::ComponentRowBuilder = {
-        let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
-        let draft = draft.clone();
-        Arc::new(move |id, item, _cx| {
-            let db = db.clone();
-            let color_basis = color_basis.clone();
-            let on_select = on_select.clone();
-            let draft = draft.clone();
-            let name = item.label.clone();
-            Some(Box::new(NavRow::new(
-                SharedString::from(name.clone()),
-                SharedString::new_static(""),
-                Box::new(move |_cx| {
-                    x_element_rows(
-                        db.clone(),
-                        color_basis.clone(),
-                        on_select.clone(),
-                        draft.clone(),
-                        id,
-                        name.clone(),
-                    )
-                }),
-            )) as Box<dyn InspectorRow>)
-        })
-    };
-    rows.push(Box::new(ExpressionRow::new(db.clone(), commit, nav, None)));
-    for (id, name) in list_components(&db) {
-        let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
-        let draft = draft.clone();
-        let label = SharedString::from(name.clone());
-        rows.push(Box::new(NavRow::new(
-            label,
-            SharedString::new_static(""),
-            Box::new(move |_cx| {
-                x_element_rows(
-                    db.clone(),
-                    color_basis.clone(),
-                    on_select.clone(),
-                    draft.clone(),
-                    id,
-                    name.clone(),
-                )
-            }),
-        )));
-    }
-    rows
-}
-
-fn x_element_rows(
-    db: Arc<DB>,
-    color_basis: ColorBasis,
-    on_select: OnXyTraceSelected,
-    draft: Arc<Mutex<XyDraft>>,
-    component_id: ComponentId,
-    component_name: String,
-) -> Vec<Box<dyn InspectorRow>> {
-    let elem_names = element_names_for_component(&db, component_id);
-    let elem_names = if elem_names.is_empty() {
-        vec!["value".to_string()]
-    } else {
-        elem_names
-    };
-    let header: Box<dyn InspectorRow> = Box::new(HeaderRow::new(format!(
-        "Pick X element ({})",
-        component_name
-    )));
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![header];
-    for (idx, elem_name) in elem_names.into_iter().enumerate() {
-        let display = if elem_name.is_empty() {
-            format!("[{}]", idx)
-        } else {
-            elem_name
-        };
-        let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
-        let draft = draft.clone();
-        let label = SharedString::from(format!("{}.{}", component_name, display));
-        rows.push(Box::new(NavRow::new(
-            label,
-            SharedString::new_static(""),
-            Box::new(move |_cx| {
-                {
-                    let mut d = draft.lock().unwrap();
-                    d.x = Some((component_id, idx));
-                }
-                y_component_rows(
-                    db.clone(),
-                    color_basis.clone(),
-                    on_select.clone(),
-                    draft.clone(),
-                )
-            }),
-        )));
-    }
-    rows
-}
-
-fn y_component_rows(
-    db: Arc<DB>,
-    color_basis: ColorBasis,
-    on_select: OnXyTraceSelected,
-    draft: Arc<Mutex<XyDraft>>,
-) -> Vec<Box<dyn InspectorRow>> {
-    let header: Box<dyn InspectorRow> =
-        Box::new(HeaderRow::new("Pick Y axis component, or type an expression"));
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![header];
-    let commit: crate::inspector::rows::OnExpression = {
-        let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
-        let draft = draft.clone();
-        Arc::new(move |component, text, _window, _cx| {
-            RowAction::Cascade(y_element_rows(
-                db.clone(),
-                color_basis.clone(),
-                on_select.clone(),
-                draft.clone(),
-                component,
-                expressions::body(&text).to_string(),
-            ))
-        })
-    };
-    let nav: crate::inspector::rows::ComponentRowBuilder = {
-        let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
-        let draft = draft.clone();
-        Arc::new(move |id, item, _cx| {
-            let db = db.clone();
-            let color_basis = color_basis.clone();
-            let on_select = on_select.clone();
-            let draft = draft.clone();
-            let name = item.label.clone();
-            Some(Box::new(NavRow::new(
-                SharedString::from(name.clone()),
-                SharedString::new_static(""),
-                Box::new(move |_cx| {
-                    y_element_rows(
-                        db.clone(),
-                        color_basis.clone(),
-                        on_select.clone(),
-                        draft.clone(),
-                        id,
-                        name.clone(),
-                    )
-                }),
-            )) as Box<dyn InspectorRow>)
-        })
-    };
-    rows.push(Box::new(ExpressionRow::new(db.clone(), commit, nav, None)));
-    for (id, name) in list_components(&db) {
-        let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
-        let draft = draft.clone();
-        let label = SharedString::from(name.clone());
-        rows.push(Box::new(NavRow::new(
-            label,
-            SharedString::new_static(""),
-            Box::new(move |_cx| {
-                y_element_rows(
-                    db.clone(),
-                    color_basis.clone(),
-                    on_select.clone(),
-                    draft.clone(),
-                    id,
-                    name.clone(),
-                )
-            }),
-        )));
-    }
-    rows
-}
-
-fn y_element_rows(
-    db: Arc<DB>,
-    color_basis: ColorBasis,
-    on_select: OnXyTraceSelected,
-    draft: Arc<Mutex<XyDraft>>,
-    component_id: ComponentId,
-    component_name: String,
-) -> Vec<Box<dyn InspectorRow>> {
-    let elem_names = element_names_for_component(&db, component_id);
-    let elem_names = if elem_names.is_empty() {
-        vec!["value".to_string()]
-    } else {
-        elem_names
-    };
-    let header: Box<dyn InspectorRow> = Box::new(HeaderRow::new(format!(
-        "Pick Y element ({})",
-        component_name
-    )));
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![header];
-    for (idx, elem_name) in elem_names.into_iter().enumerate() {
-        let display = if elem_name.is_empty() {
-            format!("[{}]", idx)
-        } else {
-            elem_name
-        };
-        let db = db.clone();
-        let color_basis = color_basis.clone();
-        let on_select = on_select.clone();
-        let draft = draft.clone();
-        let component_name = component_name.clone();
-        let label = SharedString::from(format!("{}.{}", component_name, display));
-        rows.push(Box::new(CommandRow::new(
-            label,
-            Arc::new(move |window, cx| {
-                let trace = build_trace(
-                    &db,
-                    &draft,
-                    component_id,
-                    idx,
-                    component_name.clone(),
-                    display.clone(),
-                    &color_basis,
-                    cx,
-                );
-                if let Some(trace) = trace {
-                    (on_select)(trace, window, cx);
-                }
-            }),
-        )));
-    }
-    rows
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_trace(
-    db: &DB,
-    draft: &Arc<Mutex<XyDraft>>,
-    y_component_id: ComponentId,
-    y_element_index: usize,
-    y_component_name: String,
-    y_element_display: String,
-    color_basis: &ColorBasis,
-    cx: &App,
-) -> Option<XyTrace> {
-    let theme = theme(cx);
-    let base = (color_basis)(cx);
-    let color = theme.line_colors[base % theme.line_colors.len()];
-
-    let (x_component_id, x_element_index) = draft.lock().unwrap().x?;
-    let x_component_name = list_components(db)
-        .into_iter()
-        .find(|(id, _)| *id == x_component_id)
-        .map(|(_, n)| n)
-        .unwrap_or_default();
-    let x_elem_names = element_names_for_component(db, x_component_id);
-    let x_elem_display = x_elem_names
-        .get(x_element_index)
-        .cloned()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("[{}]", x_element_index));
-
-    let label = format!(
-        "{}.{} vs {}.{}",
-        x_component_name, x_elem_display, y_component_name, y_element_display
-    );
-    let mut t = XyTrace::new(
-        x_component_id,
-        x_element_index,
-        y_component_id,
-        y_element_index,
-        color,
-    );
-    t.label = SharedString::from(label);
-    t.expressions = [x_component_id, y_component_id]
-        .into_iter()
-        .filter_map(|id| expressions::running(id, cx))
-        .collect();
-    Some(t)
+/// One XY trace over two picked channels, labelled `x vs y`.
+pub(crate) fn xy_trace(x: Channel, y: Channel, color: gpui::Hsla) -> XyTrace {
+    let mut t = XyTrace::new(x.component, x.element, y.component, y.element, color);
+    t.label = SharedString::from(format!("{} vs {}", x.label, y.label));
+    t.x_expression = x.expression;
+    t.y_expression = y.expression;
+    t
 }

@@ -131,6 +131,16 @@ impl XyLinePlot {
         cx.notify();
     }
 
+    /// Forget what `trace` was tracking, so the next reconcile follows the
+    /// component it names now — the inspector's rebind, after the tracker
+    /// latched its component at start.
+    pub fn rebind_trace(&mut self, trace: &Entity<XyTrace>, cx: &mut Context<Self>) {
+        let id = trace.entity_id();
+        self.tracking.remove(&id);
+        self.tasks.remove(&id);
+        cx.notify();
+    }
+
     pub fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
         if self.view_override.map(|b| b.bits()) != view.map(|b| b.bits()) {
             self.view_override = view;
@@ -143,6 +153,24 @@ impl XyLinePlot {
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        // Point each trace back at this plot so its inspector page can reach
+        // the plot to rebind. Mutating without notifying cannot re-enter
+        // reconcile: the plot does not observe its traces.
+        let self_weak = cx.entity().downgrade();
+        let self_id = cx.entity().entity_id();
+        for trace in &self.traces {
+            trace.update(cx, |t, _| {
+                let linked = t
+                    .line_plot
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .map(|e| e.entity_id());
+                if linked != Some(self_id) {
+                    t.line_plot = Some(self_weak.clone());
+                }
+            });
+        }
+
         let db = self.db.clone();
         reconcile_trackers(
             &self.traces,

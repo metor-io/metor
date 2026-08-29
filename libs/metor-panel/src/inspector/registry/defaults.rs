@@ -12,8 +12,9 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::inspector::rows::{
-    BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
+    BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, RowAction, ScalarRow, TextRow,
 };
+use crate::inspector::trace_picker::{OnChannel, channel_picker_rows};
 use crate::views::list_plot::{ListLinePlot, ListTrace};
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{EventOverlay, LinePlot, Override, Trace, YAxis};
@@ -21,6 +22,51 @@ use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
 use super::{AddBehavior, InspectorRegistry, builders};
+
+/// A "Source" row: the trace's current channel as its summary, the
+/// single-pick channel page underneath.
+fn source_row(
+    label: &'static str,
+    summary: SharedString,
+    db: &Arc<DB>,
+    on_pick: OnChannel,
+) -> Box<dyn InspectorRow> {
+    let db = db.clone();
+    Box::new(NavRow::new(
+        SharedString::new_static(label),
+        summary,
+        Box::new(move |_cx| {
+            channel_picker_rows(
+                db.clone(),
+                "Pick a component, or type an expression",
+                on_pick.clone(),
+            )
+        }),
+    ))
+}
+
+/// How a trace's channel reads in a summary: an expression's text, or
+/// `component.element` the way the trace was labelled when it was picked.
+fn channel_summary(db: &DB, component: ComponentId, element: usize) -> SharedString {
+    if let Some(text) = crate::dynamic::expressions::binding_text(db, component) {
+        let body = crate::dynamic::expressions::body(&text).to_string();
+        let names = crate::inspector::trace_picker::element_names_for_component(db, component);
+        return SharedString::from(match names.get(element) {
+            Some(name) if names.len() > 1 => format!("{body}.{name}"),
+            _ => body,
+        });
+    }
+    let name = crate::inspector::trace_picker::list_components(db)
+        .into_iter()
+        .find(|(id, _)| *id == component)
+        .map(|(_, name)| name)
+        .unwrap_or_else(|| format!("{component:?}"));
+    let names = crate::inspector::trace_picker::element_names_for_component(db, component);
+    SharedString::from(match names.get(element) {
+        Some(elem) if names.len() > 1 => format!("{name}.{elem}"),
+        _ => name,
+    })
+}
 
 impl InspectorRegistry {
     pub(super) fn register_defaults(&mut self, db: Arc<DB>) {
@@ -91,6 +137,8 @@ impl InspectorRegistry {
         self.register_pane_builder();
         self.register_component_browser_builder();
         self.register_trace_builder(db.clone());
+        self.register_xy_trace_builder();
+        self.register_list_trace_builder();
         self.register_entity_list::<XyLinePlot, XyTrace>(
             db.clone(),
             |lp| &lp.traces,
@@ -363,14 +411,44 @@ impl InspectorRegistry {
         }));
     }
 
-    /// Trace inspector: the default facet rows plus an axis picker. The
-    /// picker reads the owning plot's `axes` (via the trace's back-ref) and
-    /// writes `axis_index`; it's hidden when the plot has a single axis.
+    /// Trace inspector: the default facet rows, a source picker, and an axis
+    /// picker. The source picker rebinds the trace in place and asks the
+    /// owning plot (via the trace's back-ref) to follow the new channel; the
+    /// axis picker reads the plot's `axes` and writes `axis_index`, and is
+    /// hidden when the plot has a single axis.
     fn register_trace_builder(&mut self, _db: Arc<DB>) {
         self.register_type_builder::<Trace>(Arc::new(|any_entity, db, cx| {
             let trace: Entity<Trace> = any_entity.clone().downcast().expect("Trace type mismatch");
             let mut rows =
                 crate::inspector::reflect::default_rows_for_any_entity(&any_entity, db, cx);
+
+            let (component, element) = {
+                let t = trace.read(cx);
+                (t.component_id, t.element_index)
+            };
+            let source = {
+                let trace = trace.clone();
+                let on_pick: OnChannel = Arc::new(move |channel, _window, cx| {
+                    trace.update(cx, |t, cx| {
+                        t.component_id = channel.component;
+                        t.element_index = channel.element;
+                        t.label = SharedString::from(channel.label);
+                        t.expression = channel.expression;
+                        cx.notify();
+                    });
+                    if let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) {
+                        lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
+                    }
+                    RowAction::Pop
+                });
+                source_row(
+                    "Source",
+                    channel_summary(db, component, element),
+                    db,
+                    on_pick,
+                )
+            };
+            rows.push(source);
 
             let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) else {
                 return rows;
@@ -426,6 +504,118 @@ impl InspectorRegistry {
                             )) as Box<dyn InspectorRow>
                         })
                         .collect()
+                }),
+            )));
+            rows
+        }));
+    }
+
+    /// XY trace inspector: the default facet rows plus a source picker per
+    /// axis, each rebinding its own end of the trace.
+    fn register_xy_trace_builder(&mut self) {
+        self.register_type_builder::<XyTrace>(Arc::new(|any_entity, db, cx| {
+            let trace: Entity<XyTrace> = any_entity
+                .clone()
+                .downcast()
+                .expect("XyTrace type mismatch");
+            let mut rows =
+                crate::inspector::reflect::default_rows_for_any_entity(&any_entity, db, cx);
+            let (x, y) = {
+                let t = trace.read(cx);
+                (
+                    (t.x_component_id, t.x_element_index),
+                    (t.y_component_id, t.y_element_index),
+                )
+            };
+            for (label, (component, element), is_x) in
+                [("X source", x, true), ("Y source", y, false)]
+            {
+                let trace = trace.clone();
+                let db_for_pick = db.clone();
+                let on_pick: OnChannel = Arc::new(move |channel, _window, cx| {
+                    trace.update(cx, |t, cx| {
+                        let (component, element) = match is_x {
+                            true => (&mut t.x_component_id, &mut t.x_element_index),
+                            false => (&mut t.y_component_id, &mut t.y_element_index),
+                        };
+                        *component = channel.component;
+                        *element = channel.element;
+                        let other = match is_x {
+                            true => {
+                                channel_summary(&db_for_pick, t.y_component_id, t.y_element_index)
+                            }
+                            false => {
+                                channel_summary(&db_for_pick, t.x_component_id, t.x_element_index)
+                            }
+                        };
+                        t.label = SharedString::from(match is_x {
+                            true => format!("{} vs {other}", channel.label),
+                            false => format!("{other} vs {}", channel.label),
+                        });
+                        match is_x {
+                            true => t.x_expression = channel.expression,
+                            false => t.y_expression = channel.expression,
+                        }
+                        cx.notify();
+                    });
+                    if let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) {
+                        lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
+                    }
+                    RowAction::Pop
+                });
+                rows.push(source_row(
+                    label,
+                    channel_summary(db, component, element),
+                    db,
+                    on_pick,
+                ));
+            }
+            rows
+        }));
+    }
+
+    /// List trace inspector: the default facet rows plus a source picker,
+    /// offering the same vector-only page the add wizard does.
+    fn register_list_trace_builder(&mut self) {
+        self.register_type_builder::<ListTrace>(Arc::new(|any_entity, db, cx| {
+            let trace: Entity<ListTrace> = any_entity
+                .clone()
+                .downcast()
+                .expect("ListTrace type mismatch");
+            let mut rows =
+                crate::inspector::reflect::default_rows_for_any_entity(&any_entity, db, cx);
+            let component = trace.read(cx).component_id;
+            let summary = channel_summary(db, component, 0);
+            let db_for_children = db.clone();
+            rows.push(Box::new(NavRow::new(
+                SharedString::new_static("Source"),
+                SharedString::from(
+                    crate::dynamic::expressions::binding_text(db, component)
+                        .map(|text| crate::dynamic::expressions::body(&text).to_string())
+                        .unwrap_or_else(|| summary.to_string()),
+                ),
+                Box::new(move |_cx| {
+                    let trace = trace.clone();
+                    let on_select: crate::views::list_plot::trace_picker::OnListTraceSelected =
+                        Arc::new(move |picked, _window, cx| {
+                            trace.update(cx, |t, cx| {
+                                t.component_id = picked.component_id;
+                                t.len = picked.len;
+                                t.label = picked.label;
+                                t.expression = picked.expression;
+                                cx.notify();
+                            });
+                            if let Some(lp) =
+                                trace.read(cx).line_plot.clone().and_then(|w| w.upgrade())
+                            {
+                                lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
+                            }
+                        });
+                    crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
+                        db_for_children.clone(),
+                        Arc::new(|_cx| 0),
+                        on_select,
+                    )
                 }),
             )));
             rows

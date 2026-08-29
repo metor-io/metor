@@ -194,6 +194,17 @@ impl LinePlot {
         cx.notify();
     }
 
+    /// Forget what `trace` was tracking, so the next reconcile follows the
+    /// component it names now. The inspector calls this after rewriting a
+    /// trace's source; the tracker latched its component when it started
+    /// and would otherwise keep reading the old one.
+    pub fn rebind_trace(&mut self, trace: &Entity<Trace>, cx: &mut Context<Self>) {
+        let id = trace.entity_id();
+        self.tracking.remove(&id);
+        self.tasks.remove(&id);
+        cx.notify();
+    }
+
     /// Pin the view to `view`, or clear the override with `None`.
     ///
     /// Called by pan/zoom handlers. Uses a bit-pattern compare to dodge
@@ -952,4 +963,63 @@ fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> Share
         .collect();
 
     SharedString::from(parts.join(", "))
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    use super::*;
+    use metor_db::ComponentSchema;
+    use metor_proto::types::PrimType;
+
+    /// Rewriting a trace's source is only half of a rebind: the plot's
+    /// tracker latched the old component when it started, so the plot has
+    /// to be told to follow the new one.
+    #[gpui::test]
+    fn a_rebound_trace_is_tracked_on_its_new_component(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        for name in ["adcs.rate", "wheels.rpm"] {
+            db.with_state_mut(|s| {
+                s.insert_component(
+                    ComponentId::new(name),
+                    ComponentSchema::new(PrimType::F64, &[]),
+                    &db.path,
+                )
+            })
+            .unwrap();
+        }
+        let plot = cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.new(|cx| {
+                let mut lp = LinePlot::new(db.clone(), cx);
+                let trace = Trace::new(
+                    ComponentId::new("adcs.rate"),
+                    0,
+                    crate::theme::DARK.line_colors[0],
+                );
+                lp.bind_traces(vec![trace], cx);
+                lp
+            })
+        });
+        cx.run_until_parked();
+        let trace = cx.update(|cx| plot.read(cx).traces()[0].clone());
+        let tracked = cx.update(|cx| {
+            plot.read(cx)
+                .component_for_trace(&trace, cx)
+                .map(|c| c.component_id)
+        });
+        assert_eq!(tracked, Some(ComponentId::new("adcs.rate")));
+
+        cx.update(|cx| {
+            trace.update(cx, |t, _| t.component_id = ComponentId::new("wheels.rpm"));
+            plot.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
+        });
+        cx.run_until_parked();
+        let tracked = cx.update(|cx| {
+            plot.read(cx)
+                .component_for_trace(&trace, cx)
+                .map(|c| c.component_id)
+        });
+        assert_eq!(tracked, Some(ComponentId::new("wheels.rpm")));
+    }
 }
