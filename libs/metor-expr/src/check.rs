@@ -2347,6 +2347,207 @@ impl FnChecker<'_> {
                     ty,
                 ))
             }
+            // Conveniences spelled out of what the language already has, so
+            // the prelude stays as it is and a `mean` costs what `sum` does.
+            "mean" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                let (source, ty) = self.expr(&call.arguments.args[0], depth)?;
+                if !matches!(ty, Ty::Tensor { .. }) {
+                    self.diags
+                        .push(call.range, format!("`mean` needs a tensor, found {ty}"));
+                    return None;
+                }
+                let count = elems(&ty);
+                Some((
+                    Expr::Arith {
+                        op: Arith::Div,
+                        ty: Num::F64,
+                        lhs: Box::new(Expr::Sum {
+                            source: Box::new(source),
+                            elems: count,
+                            emit: emit_for(count as usize),
+                        }),
+                        rhs: Box::new(Expr::F64(count as f64)),
+                    },
+                    Ty::F64,
+                ))
+            }
+            "clamp" => {
+                if !arity(3, self) {
+                    return None;
+                }
+                let x = self.expr(&call.arguments.args[0], depth)?;
+                let lo = self.expr(&call.arguments.args[1], depth)?;
+                let hi = self.expr(&call.arguments.args[2], depth)?;
+                let (x, lo, num) = self.unify(x, lo, call.range)?;
+                let ty = match num {
+                    Num::F64 => Ty::F64,
+                    Num::I64 => Ty::I64,
+                };
+                let floor = Expr::Intrinsic {
+                    op: match num {
+                        Num::F64 => Intrinsic::MaxF64,
+                        Num::I64 => Intrinsic::MaxI64,
+                    },
+                    args: vec![x, lo],
+                };
+                let (floor, hi, num) = self.unify((floor, ty), hi, call.range)?;
+                let ty = match num {
+                    Num::F64 => Ty::F64,
+                    Num::I64 => Ty::I64,
+                };
+                Some((
+                    Expr::Intrinsic {
+                        op: match num {
+                            Num::F64 => Intrinsic::MinF64,
+                            Num::I64 => Intrinsic::MinI64,
+                        },
+                        args: vec![floor, hi],
+                    },
+                    ty,
+                ))
+            }
+            "sign" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+                let num = match ty {
+                    Ty::F64 => Num::F64,
+                    Ty::I64 => Num::I64,
+                    other => {
+                        self.diags
+                            .push(call.range, format!("`sign` needs a number, found {other}"));
+                        return None;
+                    }
+                };
+                let lit = |v: i64| match num {
+                    Num::F64 => Expr::F64(v as f64),
+                    Num::I64 => Expr::I64(v),
+                };
+                let slot = self.temp(ty.clone());
+                let cmp = |op| Expr::Cmp {
+                    op,
+                    ty: num,
+                    lhs: Box::new(Expr::Local(slot)),
+                    rhs: Box::new(lit(0)),
+                };
+                Some((
+                    Expr::Store {
+                        local: slot,
+                        value: Box::new(arg),
+                        then: Box::new(Expr::Select {
+                            cond: Box::new(cmp(Cmp::Gt)),
+                            then: Box::new(lit(1)),
+                            els: Box::new(Expr::Select {
+                                cond: Box::new(cmp(Cmp::Lt)),
+                                then: Box::new(lit(-1)),
+                                els: Box::new(lit(0)),
+                                ty: ty.clone(),
+                            }),
+                            ty: ty.clone(),
+                        }),
+                    },
+                    ty,
+                ))
+            }
+            "hypot" => {
+                if !arity(2, self) {
+                    return None;
+                }
+                let (a, at) = self.expr(&call.arguments.args[0], depth)?;
+                let a = self.as_f64(a, at, call.arguments.args[0].range())?;
+                let (b, bt) = self.expr(&call.arguments.args[1], depth)?;
+                let b = self.as_f64(b, bt, call.arguments.args[1].range())?;
+                let (x, y) = (self.temp(Ty::F64), self.temp(Ty::F64));
+                let square = |slot| Expr::Arith {
+                    op: Arith::Mul,
+                    ty: Num::F64,
+                    lhs: Box::new(Expr::Local(slot)),
+                    rhs: Box::new(Expr::Local(slot)),
+                };
+                Some((
+                    Expr::Store {
+                        local: x,
+                        value: Box::new(a),
+                        then: Box::new(Expr::Store {
+                            local: y,
+                            value: Box::new(b),
+                            then: Box::new(Expr::Intrinsic {
+                                op: Intrinsic::SqrtF64,
+                                args: vec![Expr::Arith {
+                                    op: Arith::Add,
+                                    ty: Num::F64,
+                                    lhs: Box::new(square(x)),
+                                    rhs: Box::new(square(y)),
+                                }],
+                            }),
+                        }),
+                    },
+                    Ty::F64,
+                ))
+            }
+            "lerp" => {
+                if !arity(3, self) {
+                    return None;
+                }
+                let mut args = Vec::with_capacity(3);
+                for arg in &call.arguments.args {
+                    let (e, ty) = self.expr(arg, depth)?;
+                    args.push(self.as_f64(e, ty, arg.range())?);
+                }
+                let t = args.pop()?;
+                let b = args.pop()?;
+                let a = args.pop()?;
+                let slot = self.temp(Ty::F64);
+                Some((
+                    Expr::Store {
+                        local: slot,
+                        value: Box::new(a),
+                        then: Box::new(Expr::Arith {
+                            op: Arith::Add,
+                            ty: Num::F64,
+                            lhs: Box::new(Expr::Local(slot)),
+                            rhs: Box::new(Expr::Arith {
+                                op: Arith::Mul,
+                                ty: Num::F64,
+                                lhs: Box::new(Expr::Arith {
+                                    op: Arith::Sub,
+                                    ty: Num::F64,
+                                    lhs: Box::new(b),
+                                    rhs: Box::new(Expr::Local(slot)),
+                                }),
+                                rhs: Box::new(t),
+                            }),
+                        }),
+                    },
+                    Ty::F64,
+                ))
+            }
+            "log2" | "log10" | "degrees" | "radians" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+                let arg = self.as_f64(arg, ty, call.arguments.args[0].range())?;
+                let (lhs, scale) = match name {
+                    "log2" => (kernel_log(arg), 1.0 / std::f64::consts::LN_2),
+                    "log10" => (kernel_log(arg), 1.0 / std::f64::consts::LN_10),
+                    "degrees" => (arg, 180.0 / std::f64::consts::PI),
+                    _ => (arg, std::f64::consts::PI / 180.0),
+                };
+                Some((
+                    Expr::Arith {
+                        op: Arith::Mul,
+                        ty: Num::F64,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(Expr::F64(scale)),
+                    },
+                    Ty::F64,
+                ))
+            }
             "int" => {
                 if !arity(1, self) {
                     return None;
@@ -2848,6 +3049,13 @@ fn literal_exponent(expr: &ast::Expr) -> Option<u32> {
         return None;
     };
     n.as_u32().filter(|n| *n <= 16)
+}
+
+fn kernel_log(arg: Expr) -> Expr {
+    Expr::Kernel {
+        name: "log",
+        args: vec![arg],
+    }
 }
 
 fn transcendental(name: &str) -> Option<&'static str> {

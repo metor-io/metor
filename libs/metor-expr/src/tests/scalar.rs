@@ -252,6 +252,30 @@ fn the_builtin_set_computes_what_it_says() {
     assert_eq!(eval_f64("tanh(0.5)"), libm::tanh(0.5));
 }
 
+#[test]
+fn the_composed_builtins_compute_what_they_say() {
+    assert_eq!(eval_f64("clamp(5.0, 0.0, 1.0)"), 1.0);
+    assert_eq!(eval_f64("clamp(-5.0, 0.0, 1.0)"), 0.0);
+    assert_eq!(eval_f64("clamp(0.5, 0.0, 1.0)"), 0.5);
+    assert_eq!(eval_i64("clamp(7, 1, 3)"), 3);
+    assert_eq!(eval_f64("clamp(7, 1.0, 3)"), 3.0);
+    assert_eq!(eval_f64("sign(-2.5)"), -1.0);
+    assert_eq!(eval_f64("sign(0.0)"), 0.0);
+    assert_eq!(eval_f64("sign(2.5)"), 1.0);
+    assert_eq!(eval_i64("sign(-7)"), -1);
+    assert_eq!(eval_i64("sign(0)"), 0);
+    assert_eq!(eval_i64("sign(7)"), 1);
+    assert_eq!(eval_f64("hypot(3.0, 4.0)"), 5.0);
+    assert_eq!(eval_f64("hypot(3, 4)"), 5.0);
+    assert_eq!(eval_f64("lerp(10.0, 20.0, 0.25)"), 12.5);
+    assert_eq!(eval_f64("lerp(10.0, 20.0, 0.0)"), 10.0);
+    assert_eq!(eval_f64("lerp(10.0, 20.0, 1.0)"), 20.0);
+    assert!((eval_f64("log2(8.0)") - 3.0).abs() < 1e-12);
+    assert!((eval_f64("log10(1000.0)") - 3.0).abs() < 1e-12);
+    assert!((eval_f64("degrees(3.0)") - 3.0f64.to_degrees()).abs() < 1e-12);
+    assert!((eval_f64("radians(180.0)") - 180.0f64.to_radians()).abs() < 1e-12);
+}
+
 /// `round` is `f64.nearest`, which is round-half-to-even — the same rule
 /// Python's `round` uses.
 #[test]
