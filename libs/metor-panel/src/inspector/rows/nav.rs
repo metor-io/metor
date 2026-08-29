@@ -20,6 +20,9 @@ pub struct NavRow {
     summary: Box<dyn Fn(&App) -> SharedString>,
     pub build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
     tag: Option<SharedString>,
+    /// Text the child page opens with in its search field, when the page
+    /// edits something that already has one.
+    query: Option<String>,
 }
 
 impl NavRow {
@@ -34,6 +37,7 @@ impl NavRow {
             summary: Box::new(move |_| summary.clone()),
             build_children,
             tag: None,
+            query: None,
         }
     }
 
@@ -47,11 +51,18 @@ impl NavRow {
             summary,
             build_children,
             tag: None,
+            query: None,
         }
     }
 
     pub fn with_tag(mut self, tag: impl Into<SharedString>) -> Self {
         self.tag = Some(tag.into());
+        self
+    }
+
+    /// Open the child page with `query` already in its search field.
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
         self
     }
 }
@@ -101,6 +112,35 @@ impl InspectorRow for NavRow {
     }
 
     fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
-        RowAction::Cascade((self.build_children)(cx))
+        let rows = (self.build_children)(cx);
+        match &self.query {
+            Some(query) => RowAction::CascadeWith {
+                rows,
+                query: query.clone(),
+            },
+            None => RowAction::Cascade(rows),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row that edits an existing binding opens its page on that binding.
+    #[gpui::test]
+    fn a_query_rides_along_into_the_child_page(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let mut plain = NavRow::new("Source", "", Box::new(|_cx| Vec::new()));
+            assert!(matches!(plain.activate(window, cx), RowAction::Cascade(_)));
+
+            let mut seeded = NavRow::new("Source", "", Box::new(|_cx| Vec::new()))
+                .with_query("=adcs.omega_b @ adcs.omega_b");
+            let RowAction::CascadeWith { query, .. } = seeded.activate(window, cx) else {
+                panic!("a seeded row opens its page on the query");
+            };
+            assert_eq!(query, "=adcs.omega_b @ adcs.omega_b");
+        });
     }
 }

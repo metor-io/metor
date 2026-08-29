@@ -137,6 +137,13 @@ pub enum RowAction {
     Handled,
     /// Drill into a sub-page with the provided rows.
     Cascade(Vec<Box<dyn InspectorRow>>),
+    /// Drill into a sub-page with its search field already holding `query`
+    /// — how a page that edits an existing binding opens on that binding
+    /// rather than on a blank field.
+    CascadeWith {
+        rows: Vec<Box<dyn InspectorRow>>,
+        query: String,
+    },
     /// Pop the current page off the stack, returning to the parent.
     Pop,
     /// Close the inspector.

@@ -29,20 +29,37 @@ fn source_row(
     label: &'static str,
     summary: SharedString,
     db: &Arc<DB>,
+    component: ComponentId,
     on_pick: OnChannel,
 ) -> Box<dyn InspectorRow> {
+    let query = binding_query(db, component);
     let db = db.clone();
-    Box::new(NavRow::new(
-        SharedString::new_static(label),
-        summary,
-        Box::new(move |_cx| {
-            channel_picker_rows(
-                db.clone(),
-                "Pick a component, or type an expression",
-                on_pick.clone(),
-            )
-        }),
-    ))
+    Box::new(
+        NavRow::new(
+            SharedString::new_static(label),
+            summary,
+            Box::new(move |_cx| {
+                channel_picker_rows(
+                    db.clone(),
+                    "Pick a component, or type an expression",
+                    on_pick.clone(),
+                )
+            }),
+        )
+        .with_query(query),
+    )
+}
+
+/// What to put in the picker's field to edit a binding: the expression with
+/// its sigil, so the field opens in expression mode, or the component's name.
+fn binding_query(db: &DB, component: ComponentId) -> String {
+    crate::dynamic::expressions::binding_text(db, component).unwrap_or_else(|| {
+        crate::inspector::trace_picker::list_components(db)
+            .into_iter()
+            .find(|(id, _)| *id == component)
+            .map(|(_, name)| name)
+            .unwrap_or_default()
+    })
 }
 
 /// How a trace's channel reads in a summary: an expression's text, or
@@ -445,6 +462,7 @@ impl InspectorRegistry {
                     "Source",
                     channel_summary(db, component, element),
                     db,
+                    component,
                     on_pick,
                 )
             };
@@ -567,6 +585,7 @@ impl InspectorRegistry {
                     label,
                     channel_summary(db, component, element),
                     db,
+                    component,
                     on_pick,
                 ));
             }
@@ -587,37 +606,37 @@ impl InspectorRegistry {
             let component = trace.read(cx).component_id;
             let summary = channel_summary(db, component, 0);
             let db_for_children = db.clone();
-            rows.push(Box::new(NavRow::new(
-                SharedString::new_static("Source"),
-                SharedString::from(
-                    crate::dynamic::expressions::binding_text(db, component)
-                        .map(|text| crate::dynamic::expressions::body(&text).to_string())
-                        .unwrap_or_else(|| summary.to_string()),
-                ),
-                Box::new(move |_cx| {
-                    let trace = trace.clone();
-                    let on_select: crate::views::list_plot::trace_picker::OnListTraceSelected =
-                        Arc::new(move |picked, _window, cx| {
-                            trace.update(cx, |t, cx| {
-                                t.component_id = picked.component_id;
-                                t.len = picked.len;
-                                t.label = picked.label;
-                                t.expression = picked.expression;
-                                cx.notify();
+            let query = binding_query(db, component);
+            rows.push(Box::new(
+                NavRow::new(
+                    SharedString::new_static("Source"),
+                    summary,
+                    Box::new(move |_cx| {
+                        let trace = trace.clone();
+                        let on_select: crate::views::list_plot::trace_picker::OnListTraceSelected =
+                            Arc::new(move |picked, _window, cx| {
+                                trace.update(cx, |t, cx| {
+                                    t.component_id = picked.component_id;
+                                    t.len = picked.len;
+                                    t.label = picked.label;
+                                    t.expression = picked.expression;
+                                    cx.notify();
+                                });
+                                if let Some(lp) =
+                                    trace.read(cx).line_plot.clone().and_then(|w| w.upgrade())
+                                {
+                                    lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
+                                }
                             });
-                            if let Some(lp) =
-                                trace.read(cx).line_plot.clone().and_then(|w| w.upgrade())
-                            {
-                                lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
-                            }
-                        });
-                    crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
-                        db_for_children.clone(),
-                        Arc::new(|_cx| 0),
-                        on_select,
-                    )
-                }),
-            )));
+                        crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
+                            db_for_children.clone(),
+                            Arc::new(|_cx| 0),
+                            on_select,
+                        )
+                    }),
+                )
+                .with_query(query),
+            ));
             rows
         }));
     }

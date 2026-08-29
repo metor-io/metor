@@ -403,6 +403,17 @@ impl Inspector {
                     .map(|r| SharedString::from(r.label().to_string()));
                 self.push_page(outgoing, None, InspectorPageKind::Rows(child_rows), cx);
             }
+            RowAction::CascadeWith { rows, query } => {
+                let outgoing = self
+                    .current_rows()
+                    .and_then(|rows| rows.get(row_idx))
+                    .map(|r| SharedString::from(r.label().to_string()));
+                self.push_page(outgoing, None, InspectorPageKind::Rows(rows), cx);
+                self.search.set_text(query);
+                self.refresh_query_rows(cx);
+                self.selected_index = self.first_selectable_index();
+                cx.notify();
+            }
             RowAction::CascadeView(spec) => {
                 let outgoing = self
                     .current_rows()
