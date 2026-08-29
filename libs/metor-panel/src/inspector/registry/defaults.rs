@@ -7,14 +7,13 @@
 
 use std::sync::Arc;
 
-use gpui::{Entity, Hsla, SharedString};
+use gpui::{AppContext as _, Entity, Hsla, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::inspector::rows::{
-    BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, RowAction, ScalarRow, TextRow,
+    BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
 };
-use crate::inspector::trace_picker::{OnChannel, channel_picker_rows};
 use crate::views::list_plot::{ListLinePlot, ListTrace};
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{EventOverlay, LinePlot, Override, Trace, YAxis};
@@ -23,31 +22,15 @@ use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
 use super::{AddBehavior, InspectorRegistry, builders};
 
-/// A "Source" row: the trace's current channel as its summary, the
-/// single-pick channel page underneath.
+/// A "Source" row: the trace's current channel as its summary, and beneath
+/// it the same wizard the palette adds a trace with, opened on that channel
+/// so it can be edited rather than retyped.
 fn source_row(
-    label: &'static str,
     summary: SharedString,
-    db: &Arc<DB>,
-    component: ComponentId,
-    on_pick: OnChannel,
+    query: String,
+    wizard: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
 ) -> Box<dyn InspectorRow> {
-    let query = binding_query(db, component);
-    let db = db.clone();
-    Box::new(
-        NavRow::new(
-            SharedString::new_static(label),
-            summary,
-            Box::new(move |_cx| {
-                channel_picker_rows(
-                    db.clone(),
-                    "Pick a component, or type an expression",
-                    on_pick.clone(),
-                )
-            }),
-        )
-        .with_query(query),
-    )
+    Box::new(NavRow::new(SharedString::new_static("Source"), summary, wizard).with_query(query))
 }
 
 /// What to put in the picker's field to edit a binding: the expression with
@@ -60,6 +43,51 @@ fn binding_query(db: &DB, component: ComponentId) -> String {
             .map(|(_, name)| name)
             .unwrap_or_default()
     })
+}
+
+/// What the add wizard produced, in place of the trace being edited.
+///
+/// The first new trace inherits how the old one was drawn — colour, style,
+/// width, axis, visibility — so editing a source does not restyle it; an
+/// expression over a vector yields one trace per element, and the rest
+/// follow it in the plot's list with the palette colours the wizard chose.
+fn replace_trace(trace: &Entity<Trace>, picked: Vec<Trace>, cx: &mut gpui::App) {
+    let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) else {
+        return;
+    };
+    lp.update(cx, |lp, cx| {
+        let Some(at) = lp
+            .traces
+            .iter()
+            .position(|t| t.entity_id() == trace.entity_id())
+        else {
+            return;
+        };
+        let old = trace.read(cx);
+        let (color, style, stroke_width, axis_index, visible) = (
+            old.color,
+            old.style,
+            old.stroke_width,
+            old.axis_index,
+            old.visible,
+        );
+        let replacements: Vec<Entity<Trace>> = picked
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut t)| {
+                if i == 0 {
+                    t.color = color;
+                    t.style = style;
+                    t.stroke_width = stroke_width;
+                }
+                t.axis_index = axis_index;
+                t.visible = visible;
+                cx.new(|_| t)
+            })
+            .collect();
+        lp.traces.splice(at..at + 1, replacements);
+        cx.notify();
+    });
 }
 
 /// How a trace's channel reads in a summary: an expression's text, or
@@ -444,26 +472,32 @@ impl InspectorRegistry {
                 (t.component_id, t.element_index)
             };
             let source = {
+                let db = db.clone();
                 let trace = trace.clone();
-                let on_pick: OnChannel = Arc::new(move |channel, _window, cx| {
-                    trace.update(cx, |t, cx| {
-                        t.component_id = channel.component;
-                        t.element_index = channel.element;
-                        t.label = SharedString::from(channel.label);
-                        t.expression = channel.expression;
-                        cx.notify();
-                    });
-                    if let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) {
-                        lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
-                    }
-                    RowAction::Pop
-                });
+                let query = binding_query(&db, component);
                 source_row(
-                    "Source",
-                    channel_summary(db, component, element),
-                    db,
-                    component,
-                    on_pick,
+                    channel_summary(&db, component, element),
+                    query,
+                    Box::new(move |_cx| {
+                        let trace = trace.clone();
+                        let color_basis: crate::inspector::trace_picker::ColorBasis = {
+                            let trace = trace.clone();
+                            Arc::new(move |cx| {
+                                trace
+                                    .read(cx)
+                                    .line_plot
+                                    .clone()
+                                    .and_then(|w| w.upgrade())
+                                    .map(|lp| lp.read(cx).traces().len())
+                                    .unwrap_or(0)
+                            })
+                        };
+                        crate::inspector::trace_picker::select_traces_wizard_rows(
+                            db.clone(),
+                            color_basis,
+                            Arc::new(move |picked, _window, cx| replace_trace(&trace, picked, cx)),
+                        )
+                    }),
                 )
             };
             rows.push(source);
@@ -545,50 +579,41 @@ impl InspectorRegistry {
                     (t.y_component_id, t.y_element_index),
                 )
             };
-            for (label, (component, element), is_x) in
-                [("X source", x, true), ("Y source", y, false)]
-            {
-                let trace = trace.clone();
-                let db_for_pick = db.clone();
-                let on_pick: OnChannel = Arc::new(move |channel, _window, cx| {
-                    trace.update(cx, |t, cx| {
-                        let (component, element) = match is_x {
-                            true => (&mut t.x_component_id, &mut t.x_element_index),
-                            false => (&mut t.y_component_id, &mut t.y_element_index),
-                        };
-                        *component = channel.component;
-                        *element = channel.element;
-                        let other = match is_x {
-                            true => {
-                                channel_summary(&db_for_pick, t.y_component_id, t.y_element_index)
+            let summary = SharedString::from(format!(
+                "{} vs {}",
+                channel_summary(db, x.0, x.1),
+                channel_summary(db, y.0, y.1)
+            ));
+            let query = binding_query(db, x.0);
+            let db = db.clone();
+            rows.push(source_row(
+                summary,
+                query,
+                Box::new(move |_cx| {
+                    let trace = trace.clone();
+                    crate::views::xy_plot::trace_picker::select_xy_trace_wizard_rows(
+                        db.clone(),
+                        Arc::new(|_cx| 0),
+                        Arc::new(move |picked, _window, cx| {
+                            trace.update(cx, |t, cx| {
+                                t.x_component_id = picked.x_component_id;
+                                t.x_element_index = picked.x_element_index;
+                                t.y_component_id = picked.y_component_id;
+                                t.y_element_index = picked.y_element_index;
+                                t.label = picked.label;
+                                t.x_expression = picked.x_expression;
+                                t.y_expression = picked.y_expression;
+                                cx.notify();
+                            });
+                            if let Some(lp) =
+                                trace.read(cx).line_plot.clone().and_then(|w| w.upgrade())
+                            {
+                                lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
                             }
-                            false => {
-                                channel_summary(&db_for_pick, t.x_component_id, t.x_element_index)
-                            }
-                        };
-                        t.label = SharedString::from(match is_x {
-                            true => format!("{} vs {other}", channel.label),
-                            false => format!("{other} vs {}", channel.label),
-                        });
-                        match is_x {
-                            true => t.x_expression = channel.expression,
-                            false => t.y_expression = channel.expression,
-                        }
-                        cx.notify();
-                    });
-                    if let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) {
-                        lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
-                    }
-                    RowAction::Pop
-                });
-                rows.push(source_row(
-                    label,
-                    channel_summary(db, component, element),
-                    db,
-                    component,
-                    on_pick,
-                ));
-            }
+                        }),
+                    )
+                }),
+            ));
             rows
         }));
     }
@@ -607,35 +632,32 @@ impl InspectorRegistry {
             let summary = channel_summary(db, component, 0);
             let db_for_children = db.clone();
             let query = binding_query(db, component);
-            rows.push(Box::new(
-                NavRow::new(
-                    SharedString::new_static("Source"),
-                    summary,
-                    Box::new(move |_cx| {
-                        let trace = trace.clone();
-                        let on_select: crate::views::list_plot::trace_picker::OnListTraceSelected =
-                            Arc::new(move |picked, _window, cx| {
-                                trace.update(cx, |t, cx| {
-                                    t.component_id = picked.component_id;
-                                    t.len = picked.len;
-                                    t.label = picked.label;
-                                    t.expression = picked.expression;
-                                    cx.notify();
-                                });
-                                if let Some(lp) =
-                                    trace.read(cx).line_plot.clone().and_then(|w| w.upgrade())
-                                {
-                                    lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
-                                }
+            rows.push(source_row(
+                summary,
+                query,
+                Box::new(move |_cx| {
+                    let trace = trace.clone();
+                    let on_select: crate::views::list_plot::trace_picker::OnListTraceSelected =
+                        Arc::new(move |picked, _window, cx| {
+                            trace.update(cx, |t, cx| {
+                                t.component_id = picked.component_id;
+                                t.len = picked.len;
+                                t.label = picked.label;
+                                t.expression = picked.expression;
+                                cx.notify();
                             });
-                        crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
-                            db_for_children.clone(),
-                            Arc::new(|_cx| 0),
-                            on_select,
-                        )
-                    }),
-                )
-                .with_query(query),
+                            if let Some(lp) =
+                                trace.read(cx).line_plot.clone().and_then(|w| w.upgrade())
+                            {
+                                lp.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
+                            }
+                        });
+                    crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
+                        db_for_children.clone(),
+                        Arc::new(|_cx| 0),
+                        on_select,
+                    )
+                }),
             ));
             rows
         }));
@@ -783,5 +805,77 @@ impl InspectorRegistry {
                 crate::views::dashboard::dashboard_rows(entity, db.clone(), cx)
             },
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metor_db::ComponentSchema;
+    use metor_proto::types::PrimType;
+
+    /// Editing a source runs the add wizard, and what it yields stands in
+    /// for the trace: the first keeps how the old one was drawn, the rest
+    /// follow it in the list.
+    #[gpui::test]
+    fn the_wizards_traces_replace_the_edited_one_in_place(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        for name in ["a", "b", "c"] {
+            db.with_state_mut(|s| {
+                s.insert_component(
+                    ComponentId::new(name),
+                    ComponentSchema::new(PrimType::F64, &[]),
+                    &db.path,
+                )
+            })
+            .unwrap();
+        }
+        let palette = crate::theme::DARK.line_colors;
+        let plot = cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.new(|cx| {
+                let mut lp = LinePlot::new(db.clone(), cx);
+                let mut edited = Trace::new(ComponentId::new("a"), 0, palette[3]);
+                edited.stroke_width = 4.0;
+                let after = Trace::new(ComponentId::new("c"), 0, palette[1]);
+                lp.bind_traces(vec![edited, after], cx);
+                lp
+            })
+        });
+        cx.run_until_parked();
+        let edited = cx.update(|cx| plot.read(cx).traces()[0].clone());
+
+        cx.update(|cx| {
+            let picked = vec![
+                Trace::new(ComponentId::new("b"), 0, palette[0]),
+                Trace::new(ComponentId::new("b"), 1, palette[1]),
+            ];
+            replace_trace(&edited, picked, cx);
+        });
+        cx.update(|cx| {
+            let lp = plot.read(cx);
+            let ids: Vec<(ComponentId, usize)> = lp
+                .traces()
+                .iter()
+                .map(|t| (t.read(cx).component_id, t.read(cx).element_index))
+                .collect();
+            assert_eq!(
+                ids,
+                vec![
+                    (ComponentId::new("b"), 0),
+                    (ComponentId::new("b"), 1),
+                    (ComponentId::new("c"), 0),
+                ]
+            );
+            let first = lp.traces()[0].read(cx);
+            assert_eq!(first.color, palette[3], "the edited trace keeps its colour");
+            assert_eq!(first.stroke_width, 4.0);
+            assert_eq!(
+                lp.traces()[1].read(cx).color,
+                palette[1],
+                "extras keep the wizard's"
+            );
+        });
     }
 }
