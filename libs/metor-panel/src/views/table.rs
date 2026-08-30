@@ -323,7 +323,7 @@ impl<D: TableDelegate> Render for Table<D> {
             .size_full()
             .absolute();
 
-            let mut col_div = div().relative().overflow_hidden();
+            let mut col_div = div().relative().h_full().overflow_hidden();
             if ix < last_col {
                 col_div = col_div.border_r_1().border_color(theme.border_primary);
             }
@@ -400,7 +400,7 @@ impl<D: TableDelegate> Render for Table<D> {
                                 // collapses below its column width and
                                 // the strip's flex_wrap breaks element
                                 // boxes onto a new line.
-                                cell_div = cell_div.w(this.col_states[col_ix].width);
+                                cell_div = cell_div.w(this.col_states[col_ix].width).h(row_height);
                                 cell_div.style().flex_shrink = Some(0.0);
                             }
 

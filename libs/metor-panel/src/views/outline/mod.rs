@@ -881,7 +881,10 @@ impl OutlineDelegate {
         let cells = pivot.fields.iter().zip(&pivot.cells).map(|(field, &n)| {
             div()
                 .w(px(pivot_cell_width(n)))
+                .h_full()
                 .flex_shrink_0()
+                .border_r_1()
+                .border_color(theme.border_primary)
                 .px(px(PIVOT_CELL_PAD / 2.0))
                 .overflow_hidden()
                 .text_ellipsis()
@@ -911,7 +914,10 @@ impl OutlineDelegate {
         for (field_ix, (field, &n)) in pivot.fields.iter().zip(&pivot.cells).enumerate() {
             let cell = div()
                 .w(px(pivot_cell_width(n)))
+                .h_full()
                 .flex_shrink_0()
+                .border_r_1()
+                .border_color(theme.border_primary)
                 .px(px(PIVOT_CELL_PAD / 2.0))
                 .flex()
                 .items_center();
@@ -1047,7 +1053,6 @@ fn pivot_scroller(row_ix: usize, scroll: ScrollHandle) -> gpui::Stateful<gpui::D
         .flex_row()
         .items_center()
         .h_full()
-        .px(px(4.0))
         .overflow_x_scroll()
         .track_scroll(&scroll);
     scroller.style().restrict_scroll_to_axis = Some(true);
