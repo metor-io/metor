@@ -91,13 +91,13 @@ impl ComponentOutline {
         }
     }
 
-    pub fn sparklines(&self, cx: &App) -> bool {
-        self.table.read(cx).delegate().sparklines
+    pub fn columns(&self, cx: &App) -> OutlineColumns {
+        self.table.read(cx).delegate().columns
     }
 
-    pub fn set_sparklines(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub fn set_columns(&mut self, columns: OutlineColumns, cx: &mut Context<Self>) {
         self.table.update(cx, |table, cx| {
-            table.delegate_mut().set_sparklines(on, cx);
+            table.delegate_mut().set_columns(columns, cx);
         });
         cx.notify();
     }
@@ -286,16 +286,32 @@ impl Render for ComponentOutline {
     }
 }
 
-/// The inspector's sparkline toggle for an outline pane.
-pub fn sparklines_row(outline: Entity<ComponentOutline>) -> BoolRow {
-    let read = outline.clone();
-    BoolRow::dynamic(
-        "Sparklines",
-        Arc::new(move |cx| read.read(cx).sparklines(cx)),
-        Arc::new(move |on, _window, cx| {
-            outline.update(cx, |outline, cx| outline.set_sparklines(on, cx));
-        }),
-    )
+/// The inspector's column toggles for an outline pane, one per optional
+/// column.
+pub fn column_rows(outline: Entity<ComponentOutline>) -> Vec<BoolRow> {
+    let toggles: [(&str, fn(&mut OutlineColumns) -> &mut bool); 3] = [
+        ("Unit column", |c| &mut c.unit),
+        ("Type column", |c| &mut c.ty),
+        ("Sparklines", |c| &mut c.sparkline),
+    ];
+    toggles
+        .into_iter()
+        .map(|(label, field)| {
+            let read = outline.clone();
+            let write = outline.clone();
+            BoolRow::dynamic(
+                label,
+                Arc::new(move |cx| *field(&mut read.read(cx).columns(cx))),
+                Arc::new(move |on, _window, cx| {
+                    write.update(cx, |outline, cx| {
+                        let mut columns = outline.columns(cx);
+                        *field(&mut columns) = on;
+                        outline.set_columns(columns, cx);
+                    });
+                }),
+            )
+        })
+        .collect()
 }
 
 /// The inspector's filter-bar toggle for an outline pane.
@@ -317,6 +333,7 @@ pub fn filter_bar_row(outline: Entity<ComponentOutline>) -> BoolRow {
 /// Column order. Value comes last so it can absorb the remaining width —
 /// wide tensors need it most — and the sparkline column slots in before it
 /// only while enabled.
+#[derive(Clone, Copy)]
 enum Col {
     Name,
     Unit,
@@ -325,15 +342,39 @@ enum Col {
     Value,
 }
 
-impl Col {
-    fn at(col_ix: usize, sparklines: bool) -> Self {
-        match (col_ix, sparklines) {
-            (0, _) => Col::Name,
-            (1, _) => Col::Unit,
-            (2, _) => Col::Type,
-            (3, true) => Col::Sparkline,
-            _ => Col::Value,
+/// Which optional columns the outline shows. Name and Value always do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct OutlineColumns {
+    pub unit: bool,
+    pub ty: bool,
+    pub sparkline: bool,
+}
+
+impl Default for OutlineColumns {
+    fn default() -> Self {
+        Self {
+            unit: true,
+            ty: true,
+            sparkline: false,
         }
+    }
+}
+
+impl OutlineColumns {
+    fn order(self) -> SmallVec<[Col; 5]> {
+        let mut cols: SmallVec<[Col; 5]> = SmallVec::new();
+        cols.push(Col::Name);
+        if self.unit {
+            cols.push(Col::Unit);
+        }
+        if self.ty {
+            cols.push(Col::Type);
+        }
+        if self.sparkline {
+            cols.push(Col::Sparkline);
+        }
+        cols.push(Col::Value);
+        cols
     }
 }
 
@@ -358,7 +399,7 @@ pub struct OutlineDelegate {
     /// A type label shown alone.
     focus: Option<SharedString>,
     rows: Vec<OutlineRow>,
-    sparklines: bool,
+    columns: OutlineColumns,
     strips: VisibleEntityCache<ComponentValueStrip>,
     sparks: VisibleEntityCache<LinePlot>,
     _watcher: gpui::Task<()>,
@@ -377,7 +418,7 @@ impl OutlineDelegate {
             types: Vec::new(),
             focus: None,
             rows: Vec::new(),
-            sparklines: false,
+            columns: OutlineColumns::default(),
             strips: VisibleEntityCache::new(CACHE_CAP),
             sparks: VisibleEntityCache::new(CACHE_CAP),
             _watcher: watcher,
@@ -600,9 +641,9 @@ impl OutlineDelegate {
         self.reflatten(cx);
     }
 
-    fn set_sparklines(&mut self, on: bool, cx: &mut Context<Table<Self>>) {
-        self.sparklines = on;
-        if !on {
+    fn set_columns(&mut self, columns: OutlineColumns, cx: &mut Context<Table<Self>>) {
+        self.columns = columns;
+        if !columns.sparkline {
             self.sparks = VisibleEntityCache::new(CACHE_CAP);
         }
         cx.notify();
@@ -913,16 +954,17 @@ impl OutlineDelegate {
 
 impl TableDelegate for OutlineDelegate {
     fn columns(&self) -> Vec<Column> {
-        let mut cols = vec![
-            Column::new("Name", 280.0).min_width(140.0),
-            Column::new("Unit", 64.0),
-            Column::new("Type", 88.0),
-        ];
-        if self.sparklines {
-            cols.push(Column::new("Sparkline", 200.0).min_width(120.0));
-        }
-        cols.push(Column::new("Value", 320.0).flex().resizable(false));
-        cols
+        self.columns
+            .order()
+            .into_iter()
+            .map(|col| match col {
+                Col::Name => Column::new("Name", 280.0).min_width(140.0),
+                Col::Unit => Column::new("Unit", 64.0),
+                Col::Type => Column::new("Type", 88.0),
+                Col::Sparkline => Column::new("Sparkline", 200.0).min_width(120.0),
+                Col::Value => Column::new("Value", 320.0).flex().resizable(false),
+            })
+            .collect()
     }
 
     fn rows_count(&self) -> usize {
@@ -930,7 +972,7 @@ impl TableDelegate for OutlineDelegate {
     }
 
     fn row_height(&self) -> Pixels {
-        if self.sparklines {
+        if self.columns.sparkline {
             px(SPARKLINE_ROW_HEIGHT)
         } else {
             px(ROW_HEIGHT)
@@ -952,7 +994,10 @@ impl TableDelegate for OutlineDelegate {
         let Some(row) = self.rows.get(row_ix).cloned() else {
             return div().into_any_element();
         };
-        match Col::at(col_ix, self.sparklines) {
+        let Some(col) = self.columns.order().get(col_ix).copied() else {
+            return div().into_any_element();
+        };
+        match col {
             Col::Name => self.render_name(row_ix, &row, cx),
             Col::Value => self.render_value(row_ix, &row, cx),
             Col::Unit | Col::Type | Col::Sparkline

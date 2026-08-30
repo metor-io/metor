@@ -17,9 +17,9 @@ use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
     AlarmListMode, AlarmView, Annunciator, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
     ComponentOutline, ComponentTable, ComponentText, DataTable, Gauge, GaugeConfig, LevelFilter,
-    LogView, Meter, MeterConfig, SequenceControl, SequenceControlConfig, SequenceGrid,
-    SequenceView, StateChip, StateChipConfig, TimeSeriesPlot, TrafficLight, new_component_browser,
-    new_component_table, new_data_table,
+    LogView, Meter, MeterConfig, OutlineColumns, SequenceControl, SequenceControlConfig,
+    SequenceGrid, SequenceView, StateChip, StateChipConfig, TimeSeriesPlot, TrafficLight,
+    new_component_browser, new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -766,16 +766,41 @@ impl PaneItem for DataTablePanel {
 
 /// Persisted shape of an [`OutlinePanel`]: the filter bar, the sparkline
 /// column, and which branches the user folded or opened.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct OutlinePanelConfig {
     pub filter: String,
     pub filter_bar: bool,
     pub sparklines: bool,
+    #[serde(default = "shown")]
+    pub unit: bool,
+    #[serde(default = "shown")]
+    pub type_column: bool,
     pub toggled: Vec<String>,
     pub pivoted: Vec<String>,
     pub types: Vec<FrameTypeConfig>,
     pub focus: Option<String>,
+}
+
+/// Columns are on unless a saved layout turned them off.
+fn shown() -> bool {
+    true
+}
+
+impl Default for OutlinePanelConfig {
+    fn default() -> Self {
+        Self {
+            filter: String::new(),
+            filter_bar: false,
+            sparklines: false,
+            unit: true,
+            type_column: true,
+            toggled: Vec::new(),
+            pivoted: Vec::new(),
+            types: Vec::new(),
+            focus: None,
+        }
+    }
 }
 
 /// A frame type the outline collected: a label and the leaf paths that
@@ -807,7 +832,14 @@ impl OutlinePanel {
         panel.inner.update(cx, |outline, cx| {
             outline.set_filter_visible(cfg.filter_bar, cx);
             outline.set_filter_text(&cfg.filter, cx);
-            outline.set_sparklines(cfg.sparklines, cx);
+            outline.set_columns(
+                OutlineColumns {
+                    unit: cfg.unit,
+                    ty: cfg.type_column,
+                    sparkline: cfg.sparklines,
+                },
+                cx,
+            );
             outline.set_toggled_paths(cfg.toggled, cx);
             outline.set_pivoted_paths(cfg.pivoted, cx);
             outline.set_types(
@@ -842,7 +874,9 @@ impl PaneItem for OutlinePanel {
         OutlinePanelConfig {
             filter: inner.filter_text(cx),
             filter_bar: inner.filter_visible(),
-            sparklines: inner.sparklines(cx),
+            sparklines: inner.columns(cx).sparkline,
+            unit: inner.columns(cx).unit,
+            type_column: inner.columns(cx).ty,
             toggled: inner.toggled_paths(cx),
             pivoted: inner.pivoted_paths(cx),
             types: inner

@@ -817,10 +817,12 @@ impl InspectorRegistry {
             let outline: Entity<ComponentOutline> = any_entity
                 .downcast()
                 .expect("ComponentOutline type mismatch");
-            vec![
-                Box::new(outline::sparklines_row(outline.clone())),
-                Box::new(outline::filter_bar_row(outline)),
-            ]
+            let mut rows: Vec<Box<dyn InspectorRow>> = outline::column_rows(outline.clone())
+                .into_iter()
+                .map(|row| Box::new(row) as Box<dyn InspectorRow>)
+                .collect();
+            rows.push(Box::new(outline::filter_bar_row(outline)));
+            rows
         }));
     }
 

@@ -51,7 +51,7 @@ pub use list_plot::{ListLinePlot, ListPlot, ListPlotPanelConfig, ListTrace, List
 pub use log_panel::{LevelFilter, LogView};
 pub use meter::{Meter, MeterConfig, Orientation};
 pub use monitor::Monitor;
-pub use outline::ComponentOutline;
+pub use outline::{ComponentOutline, OutlineColumns};
 pub use scrollbar::Scrollbar;
 pub use sequence_control::{SequenceControl, SequenceControlConfig};
 pub use sequence_grid::SequenceGrid;
