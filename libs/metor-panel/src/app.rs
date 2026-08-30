@@ -1194,6 +1194,7 @@ impl PanelApp {
                 crate::views::dashboard::WidgetRegistry::init(cx);
                 crate::dynamic::expressions::Expressions::init(cx);
                 crate::dynamic::worker::DynamicWorker::init(cx);
+                crate::backfill::Backfiller::init(db.clone(), cx);
                 crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
                 crate::alarms::AlarmStore::init(db.clone(), cx);
                 crate::logs::LogStore::init(db.clone(), cx);

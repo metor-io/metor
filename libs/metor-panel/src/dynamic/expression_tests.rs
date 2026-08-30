@@ -453,7 +453,13 @@ async fn the_registry_does_not_keep_an_unused_expression_alive() {
         .unwrap();
         let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
         let published = expressions::publish(&db, &name, field.clone(), "adcs.rate + 1.0").unwrap();
-        expressions::Expression::new(published, ComponentId::new(&name), system.node, field)
+        let plan = crate::dynamic::ops::replay::ReplayPlan {
+            compiled: compiled.clone(),
+            system: 0,
+            ports: vec![source.clone()],
+            outputs: vec![(0, ComponentId::new(&name))],
+        };
+        expressions::Expression::new(published, system.node, field, plan)
     };
     registry.insert(expression.clone());
     assert!(registry.is_live(ComponentId::new(&name)));
@@ -1212,4 +1218,104 @@ fn a_trace_added_from_the_picker_keeps_its_expression_alive(cx: &mut gpui::TestA
             "and removing the trace is what stops the expression"
         );
     });
+}
+
+/// The history an expression's inputs already hold is computed on request
+/// and lands behind what the live system publishes.
+///
+/// Binding starts the expression, which seeds itself with the input's newest
+/// sample — that is the live head. Everything older is uncovered until a
+/// backfill computes it, and afterwards the component reads as one series:
+/// the computed history, the seed, and whatever arrives next.
+#[gpui::test]
+fn an_expression_backfills_the_history_its_inputs_already_have(cx: &mut gpui::TestAppContext) {
+    use crate::backfill;
+    use crate::dynamic::worker::DynamicWorker;
+    use metor_db::manifest::RangeVec;
+    use metor_proto::types::Timestamp;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with_ids(&[("rpm", ComponentId::new("rpm"), PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let source = ComponentId::new("rpm");
+    // History already on disk, as a target that ran before this session
+    // leaves it. (The test thread runs no persist task, so the WAL is not
+    // the way to put it there.)
+    let input = db.with_state(|s| s.get_component(source).cloned()).unwrap();
+    let recorded: Vec<(Timestamp, [u8; 8])> = (1..=50i64)
+        .map(|ts| (Timestamp(ts), (ts as f64).to_le_bytes()))
+        .collect();
+    input
+        .time_series
+        .install_samples(
+            8,
+            recorded.iter().map(|(ts, bytes)| (*ts, bytes.as_slice())),
+            metor_db::manifest::SpanSource::LocalIngest,
+        )
+        .unwrap();
+
+    let published = expression_target(&db, "rpm * 2.0", source);
+    // Held as a view would hold it: dropping the binding stops the expression.
+    let (bound, plan) = cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+        let bound = expressions::bind("=rpm * 2.0", &db, cx).expect("the expression compiles");
+        assert_eq!(bound.id, published);
+        let plan =
+            expressions::replay_plan(published, &db, cx).expect("a running expression has a plan");
+        (bound, plan)
+    });
+    let output = db.with_state(|s| s.get_component(published).cloned()).unwrap();
+    // The seed evaluation is the live head; nothing may be written at it.
+    wait_for_latest(&output, 50);
+    assert_eq!(backfill::ceiling(&output, &plan), Some(Timestamp(50)));
+
+    let filled = backfill::fill(&db, published, Timestamp(1)..Timestamp(51), &plan).unwrap();
+    assert_eq!(filled, 49, "everything before the seed, and only that");
+
+    let mut left = RangeVec::new();
+    backfill::wanted(&output, &plan, Timestamp(1)..Timestamp(51), &mut left);
+    assert!(left.is_empty(), "nothing is left to compute: {left:?}");
+
+    let mut nodes: Vec<_> = output.time_series.iter_node_slices().collect();
+    nodes.reverse();
+    let history: Vec<(i64, f64)> = nodes
+        .iter()
+        .flat_map(|node| {
+            node.iter_values(&output.schema)
+                .map(|(ts, view)| (ts.0, view.to_f64()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let expected: Vec<(i64, f64)> = (1..=50).map(|ts| (ts, ts as f64 * 2.0)).collect();
+    assert_eq!(history, expected, "computed history, then the seed, as one series");
+
+    // The live tail still lands after the install.
+    assert_eq!(feed_and_await(&db, source, published, 60, 7.0), 14.0);
+
+    // A later session has no running expression; the component's own record
+    // of what it computes is enough to compute more of it.
+    drop(bound);
+    cx.update(expressions::Expressions::init);
+    let reloaded = cx.update(|cx| expressions::replay_plan(published, &db, cx));
+    let reloaded = reloaded.expect("the recorded text recompiles to this component");
+    assert_eq!(reloaded.outputs, vec![(0, published)]);
+    assert_eq!(reloaded.ports[0].component_id, source);
+}
+
+/// Wait for the persist task to land `component`'s sample at `at`.
+fn wait_for_latest(component: &metor_db::Component, at: i64) {
+    use metor_proto::types::Timestamp;
+    for _ in 0..400 {
+        if component
+            .time_series
+            .latest()
+            .is_some_and(|latest| latest.timestamp() >= Timestamp(at))
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the component never persisted its sample at {at}");
 }

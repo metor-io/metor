@@ -9,6 +9,7 @@ use metor_expr::Diagnostics;
 use metor_proto::types::ComponentId;
 
 use crate::dynamic::ops::program::{self, Compiled, DEFAULT_FUEL};
+use crate::dynamic::ops::replay::ReplayPlan;
 use crate::dynamic::resolver::DbResolver;
 use crate::dynamic::worker::DynamicWorker;
 use crate::dynamic::{BuildError, DynamicNode, NodeId};
@@ -150,6 +151,8 @@ struct ExpressionInner {
     /// node between them.
     _system: Arc<dyn DynamicNode>,
     _field: Arc<dyn DynamicNode>,
+    /// The same wiring, for computing the history the live system never saw.
+    plan: ReplayPlan,
 }
 
 impl Expression {
@@ -160,20 +163,25 @@ impl Expression {
     /// exposed as fields nobody should read.
     pub fn new(
         node: Arc<dyn DynamicNode>,
-        component: ComponentId,
         system: Arc<dyn DynamicNode>,
         field: Arc<dyn DynamicNode>,
+        plan: ReplayPlan,
     ) -> Self {
         Expression(Arc::new(ExpressionInner {
             _node: node,
-            component,
+            component: plan.outputs[0].1,
             _system: system,
             _field: field,
+            plan,
         }))
     }
 
     pub fn component_id(&self) -> ComponentId {
         self.0.component
+    }
+
+    pub fn replay_plan(&self) -> ReplayPlan {
+        self.0.plan.clone()
     }
 }
 
@@ -234,11 +242,17 @@ impl std::fmt::Display for ExprError {
     }
 }
 
-/// Compile an expression and start it, or hand back the one already running
-/// it.
-///
-/// `text` is what the operator typed, with or without its `=`.
-pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, ExprError> {
+/// What compiling an expression's text against the component tree decided:
+/// the program, the components its ports read, and the component it
+/// publishes into. Starting it and replaying it both begin here.
+struct Resolved {
+    compiled: Arc<Compiled>,
+    sources: Vec<ComponentId>,
+    name: String,
+    component: ComponentId,
+}
+
+fn resolve_text(text: &str, db: &DB) -> Result<Resolved, ExprError> {
     let resolver = DbResolver::snapshot(db);
     let compiled =
         Arc::new(Compiled::expression(body(text), &resolver).map_err(ExprError::Compile)?);
@@ -247,27 +261,59 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
     // them are built on the worker thread. A source node's identity follows
     // from its component id alone, so the hash below needs nothing built.
     let sources = port_components(&compiled.manifest, &resolver)?;
-
     let port_ids: Vec<NodeId> = sources
         .iter()
         .map(|id| crate::dynamic::ops::db_source::from_db_id(*id))
         .collect();
     let system_id = compiled.system_hash(0, &port_ids);
     let name = component_name(program::field_id(system_id, 0));
-    let component = ComponentId::new(&name);
+    Ok(Resolved {
+        compiled,
+        sources,
+        component: ComponentId::new(&name),
+        name,
+    })
+}
+
+impl Resolved {
+    /// The replay wiring, once every port's component is known to the db.
+    fn plan(&self, db: &DB) -> Result<ReplayPlan, ExprError> {
+        let ports = db.with_state(|state| {
+            self.sources
+                .iter()
+                .map(|id| state.get_component(*id).cloned())
+                .collect::<Option<Vec<_>>>()
+        });
+        Ok(ReplayPlan {
+            compiled: self.compiled.clone(),
+            system: 0,
+            ports: ports.ok_or_else(|| ExprError::Unbound("a port's component is gone".into()))?,
+            outputs: vec![(0, self.component)],
+        })
+    }
+}
+
+/// Compile an expression and start it, or hand back the one already running
+/// it.
+///
+/// `text` is what the operator typed, with or without its `=`.
+pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, ExprError> {
+    let resolved = resolve_text(text, db)?;
 
     // Two views typing the same expression against the same components reach
     // the same hash, and therefore share one running system rather than each
     // starting a copy of it.
-    if let Some(running) = cx.global::<Expressions>().get(component) {
+    if let Some(running) = cx.global::<Expressions>().get(resolved.component) {
         return Ok(running);
     }
+    let plan = resolved.plan(db)?;
 
     let worker = cx.global::<DynamicWorker>().handle().clone();
     let built = {
-        let compiled = compiled.clone();
+        let compiled = resolved.compiled.clone();
         let db = db.clone();
-        let name = name.clone();
+        let name = resolved.name.clone();
+        let sources = resolved.sources;
         let label = body(text).to_string();
         worker.call(move || -> Result<Expression, BuildError> {
             let mut ports = Vec::with_capacity(sources.len());
@@ -280,7 +326,7 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
             let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None)?;
             let field = program::field(&compiled, 0, 0, system.node.clone())?;
             let node = publish(&db, &name, field.clone(), &label)?;
-            Ok(Expression::new(node, component, system.node, field))
+            Ok(Expression::new(node, system.node, field, plan))
         })
     };
     let built = built
@@ -291,6 +337,30 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
     // a component id, and an id cannot own anything.
     cx.global_mut::<Expressions>().insert(built.clone());
     Ok(built)
+}
+
+/// How to compute history for an expression's component, running or not.
+///
+/// A running expression carries its wiring. One that only exists as a
+/// component — left by an earlier session, or bound by id from the picker —
+/// is recompiled from the text recorded on it, and only counts if that text
+/// against today's component tree still names this component: the same words
+/// over a changed tree are a different computation, and its history must not
+/// be written under this id.
+pub fn replay_plan(id: ComponentId, db: &DB, cx: &App) -> Option<ReplayPlan> {
+    if let Some(running) = running(id, cx) {
+        return Some(running.replay_plan());
+    }
+    replay_plan_from_metadata(id, db)
+}
+
+/// [`replay_plan`] without the registry: the recompile-from-metadata path.
+pub fn replay_plan_from_metadata(id: ComponentId, db: &DB) -> Option<ReplayPlan> {
+    let text = binding_text(db, id)?;
+    let resolved = resolve_text(&text, db).ok()?;
+    (resolved.component == id)
+        .then(|| resolved.plan(db).ok())
+        .flatten()
 }
 
 /// Register an expression's output as the hidden component views read it
@@ -320,6 +390,9 @@ pub(crate) fn publish(
     };
     metadata.set("source", "dynamic");
     metadata.set("hidden", "true");
+    // Hidden components are otherwise passed over by the LoD engine; an
+    // expression's history is plotted like any other and wants the levels.
+    metadata.set(metor_db::lod::LOD_OPT_IN_KEY, "true");
     // What the operator typed, recorded on the component itself. A view
     // serializes text, so reloading one has to recover text — and asking the
     // registry would only work while the session that made it is still

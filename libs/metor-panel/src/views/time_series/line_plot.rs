@@ -52,6 +52,10 @@ struct TraceTracking {
     lod_y_bounds: Option<(f64, f64)>,
     lod_node_bounds: NodeBoundsCache,
     lod_cache_key: Option<ComponentId>,
+    /// How to compute the history this component lacks, when it is an
+    /// expression's. Its ports also size the window while the component
+    /// itself is still empty.
+    plan: Option<crate::dynamic::ops::replay::ReplayPlan>,
 }
 
 impl TraceTracking {
@@ -68,6 +72,7 @@ impl TraceTracking {
             lod_y_bounds: None,
             lod_node_bounds: NodeBoundsCache::default(),
             lod_cache_key: None,
+            plan: None,
         }
     }
 
@@ -303,7 +308,9 @@ impl LinePlot {
         let span = (max_x - min_x).max(1.0);
         let visible = Timestamp(min_x as i64)..Timestamp(max_x as i64);
         let hydrator = crate::hydration::hydrator(cx);
+        let backfiller = crate::backfill::backfiller(cx);
         let mut gaps = metor_db::manifest::GapVec::new();
+        let mut uncovered = metor_db::manifest::RangeVec::new();
         for trace in &self.traces {
             let cfg = trace.read(cx);
             if !cfg.visible {
@@ -324,6 +331,13 @@ impl LinePlot {
             };
             gaps.clear();
             series.coverage(visible.clone(), &mut gaps);
+            let mut band = |range: &std::ops::Range<Timestamp>| {
+                let start = ((range.start.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
+                let end = ((range.end.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
+                if end > start {
+                    bands.push((start, end - start));
+                }
+            };
             for gap in &gaps {
                 if hydrate
                     && gap.state == metor_db::manifest::SpanState::RemoteOnly
@@ -331,10 +345,19 @@ impl LinePlot {
                 {
                     hydrator.request(hydrate_id, gap.range.clone());
                 }
-                let start = ((gap.range.start.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
-                let end = ((gap.range.end.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
-                if end > start {
-                    bands.push((start, end - start));
+                band(&gap.range);
+            }
+            // What an expression has never computed is a gap of the other
+            // kind: nothing to fetch, something to compute. Always against
+            // the raw series — a LoD level is derived from it afterwards.
+            if let Some(plan) = &tracking.plan {
+                uncovered.clear();
+                crate::backfill::wanted(component, plan, visible.clone(), &mut uncovered);
+                for range in &uncovered {
+                    if let Some(backfiller) = &backfiller {
+                        backfiller.request(cfg.component_id, range.clone(), plan.clone());
+                    }
+                    band(range);
                 }
             }
         }
@@ -444,24 +467,35 @@ impl LinePlot {
             let Some(comp) = &tracking.component else {
                 continue;
             };
-            if let Some(s) = comp.time_series.start_timestamp() {
-                start = start.min(s.0 as f64);
-                any_time = true;
-            }
-            if let Some(l) = comp.time_series.latest() {
-                end = end.max(l.timestamp().0 as f64);
-                any_time = true;
-            }
-            // Remote-only history has no resident nodes; the manifest is
-            // what lets a full-range view span the whole archive.
-            let manifest = comp.time_series.manifest();
-            if let Some(span) = manifest.spans.first() {
-                start = start.min(span.seal.start_ts.0 as f64);
-                any_time = true;
-            }
-            if let Some(span) = manifest.spans.last() {
-                end = end.max(span.cover_end.0 as f64);
-                any_time = true;
+            let mut extend = |comp: &Component| {
+                if let Some(s) = comp.time_series.start_timestamp() {
+                    start = start.min(s.0 as f64);
+                    any_time = true;
+                }
+                if let Some(l) = comp.time_series.latest() {
+                    end = end.max(l.timestamp().0 as f64);
+                    any_time = true;
+                }
+                // Remote-only history has no resident nodes; the manifest is
+                // what lets a full-range view span the whole archive.
+                let manifest = comp.time_series.manifest();
+                if let Some(span) = manifest.spans.first() {
+                    start = start.min(span.seal.start_ts.0 as f64);
+                    any_time = true;
+                }
+                if let Some(span) = manifest.spans.last() {
+                    end = end.max(span.cover_end.0 as f64);
+                    any_time = true;
+                }
+            };
+            extend(comp);
+            // An expression's component holds only what has been computed;
+            // what *could* be is bounded by its inputs, and that is the
+            // window a backfill fills.
+            if let Some(plan) = &tracking.plan {
+                for port in &plan.ports {
+                    extend(port);
+                }
             }
             let ai = cfg.axis_index.min(axis_count - 1);
             if let Some((lo, hi)) = tracking.y_bounds {
@@ -653,8 +687,10 @@ impl LinePlot {
             };
             let component = wait_for_component(&db, trace_id).await;
             let installed = this.update(cx, |lp, cx| {
+                let plan = crate::dynamic::expressions::replay_plan(trace_id, &db, cx);
                 if let Some(tracking) = lp.tracking.get_mut(&id) {
                     tracking.component = Some(component.clone());
+                    tracking.plan = plan;
                     cx.notify();
                     true
                 } else {

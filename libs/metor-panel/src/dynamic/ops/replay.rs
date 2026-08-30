@@ -204,9 +204,7 @@ pub fn ticks(hz: f64, range: Range<Timestamp>) -> impl Iterator<Item = Timestamp
     } else {
         first
     };
-    (first..range.end.0)
-        .step_by(period as usize)
-        .map(Timestamp)
+    (first..range.end.0).step_by(period as usize).map(Timestamp)
 }
 
 /// The last sample a component holds from strictly before `ts`.
@@ -247,9 +245,9 @@ impl Cursor {
             })
             .collect();
         nodes.reverse();
-        let at = nodes
-            .last()
-            .map_or(0, |node| node.timestamps().partition_point(|t| t.0 < range.start.0));
+        let at = nodes.last().map_or(0, |node| {
+            node.timestamps().partition_point(|t| t.0 < range.start.0)
+        });
         Cursor {
             nodes,
             at,

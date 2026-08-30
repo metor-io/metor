@@ -149,7 +149,10 @@ async fn a_replay_seeds_held_ports_from_before_the_gap() {
     // evaluation at 5 must see.
     let (replayed, stats) = run(&plan, 5..6);
     assert_eq!(replayed, vec![(5, 309.0)]);
-    assert_eq!(stats.read, 1, "history before the range is a seed, not a read");
+    assert_eq!(
+        stats.read, 1,
+        "history before the range is a seed, not a read"
+    );
 }
 
 #[stellarator::test]
@@ -244,8 +247,13 @@ async fn a_faulting_body_ends_the_replay_with_an_error() {
     let plan = bench.plan(
         "@system(\"wheels.rpm\")\ndef spin(rpm) -> f64:\n    x = rpm\n    while True:\n        x = x + 1.0\n    return x\n",
     );
-    let err = replay(&plan, Timestamp(0)..Timestamp(10), DEFAULT_FUEL, &mut |_, _| true)
-        .expect_err("a runaway body must fault");
+    let err = replay(
+        &plan,
+        Timestamp(0)..Timestamp(10),
+        DEFAULT_FUEL,
+        &mut |_, _| true,
+    )
+    .expect_err("a runaway body must fault");
     assert!(format!("{err}").contains("fuel"), "{err}");
 }
 
