@@ -25,8 +25,23 @@ use crate::{Error, Executor, Reactor};
 pub struct PollingReactor {
     poller: Arc<Poller>,
     states: Slab<OpState>,
-    fds: HashMap<RawFd, SmallVec<[CompletionId; 4]>>,
+    /// The live ops waiting on each registered fd, with the interest each
+    /// one asked for. The fd is registered with the poller for the *union*
+    /// of these interests: `polling`'s `modify` replaces an fd's interest
+    /// set wholesale, so registering only the newest op's interest would
+    /// silently disarm every other op on the fd (a parked write on a split
+    /// socket would never wake once the read half re-registered).
+    fds: HashMap<RawFd, SmallVec<[(CompletionId, polling::Event); 4]>>,
     events: polling::Events,
+}
+
+#[cfg(not(target_os = "windows"))]
+fn borrow_source(fd: RawFd) -> std::os::fd::BorrowedFd<'static> {
+    unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+}
+#[cfg(target_os = "windows")]
+fn borrow_source(fd: RawFd) -> std::os::windows::io::BorrowedSocket<'static> {
+    unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(fd as _) }
 }
 
 pub enum OpState {
@@ -45,10 +60,10 @@ impl Reactor for PollingReactor {
             self.poller.wait(&mut self.events, Some(Duration::ZERO))?;
         }
         for event in self.events.iter() {
-            let Some(ids) = self.fds.get(&(event.key as RawFd)) else {
+            let Some(ops) = self.fds.get(&(event.key as RawFd)) else {
                 continue;
             };
-            for id in ids.iter() {
+            for (id, _) in ops.iter() {
                 let Some(state) = self.states.get_mut(id.0) else {
                     continue;
                 };
@@ -107,19 +122,49 @@ impl PollingReactor {
     fn submit_op_reactor(&mut self, op_code: &impl OpCode, id: CompletionId) -> Result<(), Error> {
         if let Some(event) = op_code.event() {
             let fd = event.key as RawFd;
-            #[cfg(not(target_os = "windows"))]
-            let source = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-            #[cfg(target_os = "windows")]
-            let source = unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(fd as _) };
-            if let Some(states) = self.fds.get_mut(&fd) {
-                self.poller.modify(source, event)?;
-                states.push(id);
+            let source = borrow_source(fd);
+            if let Some(ops) = self.fds.get_mut(&fd) {
+                // A pending op re-submits after every `Poll::Pending`;
+                // update its slot rather than growing the list.
+                match ops.iter_mut().find(|(i, _)| i.0 == id.0) {
+                    Some((_, interest)) => *interest = event,
+                    None => ops.push((id, event)),
+                }
+                let union = ops
+                    .iter()
+                    .fold(polling::Event::none(event.key), |acc, (_, e)| {
+                        polling::Event::new(
+                            acc.key,
+                            acc.readable || e.readable,
+                            acc.writable || e.writable,
+                        )
+                    });
+                self.poller.modify(source, union)?;
             } else {
                 unsafe { self.poller.add(&source, event)? };
-                self.fds.insert(fd, smallvec::smallvec![id]);
+                self.fds.insert(fd, smallvec::smallvec![(id, event)]);
             }
         }
         Ok(())
+    }
+
+    /// Forget a finished (or dropped) op: drop its interest from the fd's
+    /// union and unregister the fd once nothing waits on it, so a later op
+    /// on a reused fd number starts from a clean `add`.
+    fn release_op(&mut self, event: Option<polling::Event>, id: CompletionId) {
+        let _ = self.states.try_remove(id.0);
+        let Some(event) = event else { return };
+        let fd = event.key as RawFd;
+        let Some(ops) = self.fds.get_mut(&fd) else {
+            return;
+        };
+        ops.retain(|(i, _)| i.0 != id.0);
+        if ops.is_empty() {
+            self.fds.remove(&fd);
+            // The op borrowed the fd, so it is still open here; a failed
+            // delete just means the registration is already gone.
+            let _ = self.poller.delete(borrow_source(fd));
+        }
     }
 
     pub fn poll_completion<O: OpCode>(
@@ -152,7 +197,7 @@ impl PollingReactor {
                 Poll::Pending
             }
             Poll::Ready(res) => {
-                let _ = self.states.try_remove(completion.id.0);
+                self.release_op(completion.op_code.event(), *completion.id);
                 Poll::Ready(res)
             }
         }
@@ -205,8 +250,9 @@ impl<O: OpCode> Future for Completion<O> {
 #[pinned_drop]
 impl<O: OpCode> PinnedDrop for Completion<O> {
     fn drop(self: Pin<&mut Self>) {
-        // TODO
-        //Executor::with_reactor(|r| todo!())
+        // Tolerant of executor teardown: cancelled tasks may drop their
+        // completions while the executor itself is going away.
+        Executor::try_with_reactor(|r| r.release_op(self.op_code.event(), self.id));
     }
 }
 

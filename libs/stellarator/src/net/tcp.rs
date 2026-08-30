@@ -107,6 +107,7 @@ impl TcpListener {
 mod tests {
     use super::*;
     use crate::{rent, test};
+    use std::time::Duration;
 
     #[test]
     async fn test_echo_server() {
@@ -125,5 +126,50 @@ mod tests {
         let n = rent!(stream.read(buf).await, buf).unwrap();
         assert_eq!(&buf[..n], b"foo");
         handle.await.unwrap();
+    }
+
+    /// A write parked on a full socket must still complete after a read on
+    /// the same (split) socket registers its own interest: the reactor has
+    /// to keep both filters armed, not let the later registration replace
+    /// the earlier one.
+    #[test]
+    async fn blocked_write_survives_concurrent_read_registration() {
+        use crate::io::{AsyncWrite, SplitExt};
+        use std::io::Read as _;
+
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut peer = std::net::TcpStream::connect(addr).unwrap();
+        let stream = listener.accept().await.unwrap();
+        let (rx, tx) = stream.split();
+
+        // Far more than the socket buffers hold, so the write parks.
+        const LEN: usize = 16 << 20;
+        let write = crate::spawn(async move { tx.write_all(vec![0xABu8; LEN]).await.0 });
+        crate::sleep(Duration::from_millis(50)).await;
+        // Now a read registers on the same fd while the write is parked.
+        let read = crate::spawn(async move { rx.read(vec![0u8; 16]).await });
+        crate::sleep(Duration::from_millis(50)).await;
+
+        let drain = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 << 10];
+            let mut total = 0;
+            while total < LEN {
+                match peer.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+            }
+            (peer, total)
+        });
+
+        let timeout = async {
+            crate::sleep(Duration::from_secs(5)).await;
+            panic!("write never completed: writable interest was lost");
+        };
+        futures_lite::future::race(async { write.await.unwrap().unwrap() }, timeout).await;
+        let (_peer, total) = drain.join().unwrap();
+        assert_eq!(total, LEN);
+        drop(read);
     }
 }
