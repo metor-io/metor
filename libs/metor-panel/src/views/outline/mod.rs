@@ -27,7 +27,8 @@ pub(crate) mod model;
 
 use super::column_browser::ToggleFilterBar;
 use super::component_browser::component_tree::{ComponentNode, build_tree};
-use super::component_browser::{right_click_plot, strip_cell_count};
+use super::component_browser::{strip_cell_count, strip_menu};
+use super::copy::{copy_name_row, copy_rows};
 use super::filter_bar::{FilterBar, FilterBarEvent};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
@@ -40,6 +41,7 @@ use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::theme;
+use crate::tiles::PlotComponentAction;
 use model::{
     Disclosure, FrameType, Layout, OutlineRow, Pivot, RowKind, alike, common_suffix,
     component_count, flatten, signature, type_key,
@@ -535,8 +537,9 @@ impl OutlineDelegate {
         self.pivot_scrolls.entry(path.clone()).or_default().clone()
     }
 
-    /// Right-click on a branch: pivot it, or open and fold its subtree.
-    fn open_branch_menu(
+    /// Right-click on a row: a branch pivots or folds its subtree, a
+    /// component plots or copies, a pivot instance copies its path.
+    fn open_row_menu(
         &mut self,
         row: &OutlineRow,
         position: gpui::Point<Pixels>,
@@ -583,7 +586,8 @@ impl OutlineDelegate {
             return;
         }
         let pivoted = row.is_pivoted();
-        let can_pivot = row.node.children.values().any(|c| !c.children.is_empty());
+        let is_branch = row.is_branch() && !matches!(row.kind, RowKind::PivotInstance { .. });
+        let can_pivot = is_branch && row.node.children.values().any(|c| !c.children.is_empty());
         if can_pivot {
             let label = if pivoted { "Unpivot" } else { "Pivot" };
             let target = row.clone();
@@ -598,7 +602,7 @@ impl OutlineDelegate {
             )));
         }
         // Any branch with components has a shape worth collecting.
-        if row.component_count > usize::from(row.node.component_id.is_some()) {
+        if is_branch && row.component_count > usize::from(row.node.component_id.is_some()) {
             let exemplar = row.node.clone();
             let table = table.clone();
             rows.push(Box::new(CommandRow::new(
@@ -610,21 +614,48 @@ impl OutlineDelegate {
                 }),
             )));
         }
-        for (label, expanded) in [("Expand all", true), ("Collapse all", false)] {
-            let target = row.clone();
-            let table = table.clone();
-            rows.push(Box::new(CommandRow::new(
-                label,
-                Arc::new(move |_window, cx| {
-                    table.update(cx, |table, cx| {
-                        let delegate = table.delegate_mut();
-                        delegate
-                            .disclosure
-                            .set_subtree(&target.node, target.depth, expanded);
-                        delegate.reflatten(cx);
-                    });
-                }),
-            )));
+        if is_branch {
+            for (label, expanded) in [("Expand all", true), ("Collapse all", false)] {
+                let target = row.clone();
+                let table = table.clone();
+                rows.push(Box::new(CommandRow::new(
+                    label,
+                    Arc::new(move |_window, cx| {
+                        table.update(cx, |table, cx| {
+                            let delegate = table.delegate_mut();
+                            delegate
+                                .disclosure
+                                .set_subtree(&target.node, target.depth, expanded);
+                            delegate.reflatten(cx);
+                        });
+                    }),
+                )));
+            }
+        }
+        match (row.node.component_id, &row.kind) {
+            (Some(id), _) => {
+                let count = element_count(&self.db, id);
+                rows.push(Box::new(CommandRow::new(
+                    "Plot component",
+                    Arc::new(move |window, cx| {
+                        let indices: SmallVec<[usize; 4]> = (0..count).collect();
+                        window.dispatch_action(
+                            Box::new(PlotComponentAction {
+                                component_id: id,
+                                indices,
+                            }),
+                            cx,
+                        );
+                    }),
+                )));
+                rows.extend(copy_rows(
+                    self.db.clone(),
+                    id,
+                    row.node.full_name.clone(),
+                    None,
+                ));
+            }
+            (None, _) => rows.push(copy_name_row(row.node.full_name.clone())),
         }
         open(
             InspectorRequest {
@@ -780,26 +811,23 @@ impl OutlineDelegate {
         }
 
         if is_branch {
-            let menu_row = row.clone();
-            cell = cell
-                .cursor_pointer()
-                .on_click(cx.listener(move |table, event: &ClickEvent, _, cx| {
+            cell = cell.cursor_pointer().on_click(cx.listener(
+                move |table, event: &ClickEvent, _, cx| {
                     let subtree = event.modifiers().alt;
                     table.delegate_mut().toggle_row(row_ix, subtree, cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |table, event: &MouseDownEvent, window, cx| {
-                        table.delegate_mut().open_branch_menu(
-                            &menu_row,
-                            event.position,
-                            window,
-                            cx,
-                        );
-                        cx.stop_propagation();
-                    }),
-                );
+                },
+            ));
         }
+        let menu_row = row.clone();
+        cell = cell.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |table, event: &MouseDownEvent, window, cx| {
+                table
+                    .delegate_mut()
+                    .open_row_menu(&menu_row, event.position, window, cx);
+                cx.stop_propagation();
+            }),
+        );
         if let Some(id) = row.node.component_id {
             cell = cell.on_mouse_move(shift_hover_listener(id, SmallVec::new()));
         }
@@ -843,7 +871,7 @@ impl OutlineDelegate {
         let strip = self.strip(id, cx);
         let click = edit_click(db.clone(), id, row.node.full_name.clone());
         let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
-        behavior.on_element_right_click = Some(right_click_plot(db.clone(), id));
+        behavior.on_element_right_click = Some(strip_menu(db.clone(), id));
         strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
 
         // The strip wraps its element boxes; inside a fixed-height row a
@@ -935,7 +963,7 @@ impl OutlineDelegate {
             let name = SharedString::from(format!("{}.{}", instance.node.full_name, field));
             let click = edit_click(db.clone(), id, name);
             let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
-            behavior.on_element_right_click = Some(right_click_plot(db.clone(), id));
+            behavior.on_element_right_click = Some(strip_menu(db.clone(), id));
             strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
             // Hold the strip to one line: the cell is sized for it, and
             // an element that still doesn't fit should clip, not wrap.

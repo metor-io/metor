@@ -14,6 +14,7 @@ use smallvec::{SmallVec, smallvec};
 pub mod component_tree;
 
 use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
+use super::copy::{copy_name_row, copy_rows};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::time_series::Override;
@@ -376,10 +377,11 @@ impl ComponentBrowserDelegate {
                 && node.children.is_empty()
             {
                 let db = self.db.clone();
+                let db_for_plot = db.clone();
                 rows.push(Box::new(CommandRow::new(
                     SharedString::new_static("Plot component"),
                     Arc::new(move |window, cx| {
-                        let count = element_count(&db, component_id);
+                        let count = element_count(&db_for_plot, component_id);
                         let indices: SmallVec<[usize; 4]> = (0..count).collect();
                         window.dispatch_action(
                             Box::new(PlotComponentAction {
@@ -390,6 +392,7 @@ impl ComponentBrowserDelegate {
                         );
                     }),
                 )));
+                rows.extend(copy_rows(db, component_id, node.full_name.clone(), None));
             } else {
                 let reroot_column = column_ix;
                 let browser_reroot = browser.clone();
@@ -404,6 +407,12 @@ impl ComponentBrowserDelegate {
                         }
                     }),
                 )));
+                match node.component_id {
+                    Some(id) => {
+                        rows.extend(copy_rows(self.db.clone(), id, node.full_name.clone(), None))
+                    }
+                    None => rows.push(copy_name_row(node.full_name.clone())),
+                }
             }
         }
 
@@ -537,15 +546,15 @@ impl ComponentBrowser {
     }
 }
 
-/// Build the right-click callback for a strip cell: opens an anchored
-/// inspector with a single "Plot this element" command.
-pub(crate) fn right_click_plot(db: Arc<DB>, component_id: ComponentId) -> StripClick {
+/// The right-click menu of a strip cell: plot the element, or copy it or
+/// the component's name.
+pub(crate) fn strip_menu(db: Arc<DB>, component_id: ComponentId) -> StripClick {
     Arc::new(move |element_index, position, window, cx| {
-        let _ = &db;
         let Some(open) = open_inspector(cx) else {
             return;
         };
-        let rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
+        let name = component_name(&db, component_id);
+        let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
             SharedString::from(format!("Plot element [{}]", element_index)),
             Arc::new(move |window, cx| {
                 window.dispatch_action(
@@ -557,6 +566,12 @@ pub(crate) fn right_click_plot(db: Arc<DB>, component_id: ComponentId) -> StripC
                 );
             }),
         ))];
+        rows.extend(copy_rows(
+            db.clone(),
+            component_id,
+            name,
+            Some(element_index),
+        ));
         open(
             InspectorRequest {
                 rows,
@@ -565,6 +580,16 @@ pub(crate) fn right_click_plot(db: Arc<DB>, component_id: ComponentId) -> StripC
             window,
             cx,
         );
+    })
+}
+
+/// A component's registered name, or empty until it registers.
+fn component_name(db: &DB, component_id: ComponentId) -> SharedString {
+    db.with_state(|state| {
+        state
+            .get_component_metadata(component_id)
+            .map(|m| SharedString::from(m.name.clone()))
+            .unwrap_or_default()
     })
 }
 
@@ -809,7 +834,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
                         // Refresh the pending-edit snapshot each frame; click
                         // callbacks are cheap Arc captures (`db.clone()` + id).
                         let click = edit_click(db.clone(), id, full_name.clone());
-                        let right_click = right_click_plot(db.clone(), id);
+                        let right_click = strip_menu(db.clone(), id);
                         let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
                         behavior.on_element_right_click = Some(right_click);
                         strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
@@ -1102,6 +1127,44 @@ struct PreviewRow {
     db: Arc<DB>,
 }
 
+/// The right-click menu of a detail row's name: plot every element, or
+/// copy the value or the name.
+fn open_detail_menu(
+    db: &Arc<DB>,
+    component_id: ComponentId,
+    name: &SharedString,
+    position: gpui::Point<gpui::Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(open) = open_inspector(cx) else {
+        return;
+    };
+    let count = element_count(db, component_id);
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
+        "Plot component",
+        Arc::new(move |window, cx| {
+            let indices: SmallVec<[usize; 4]> = (0..count).collect();
+            window.dispatch_action(
+                Box::new(PlotComponentAction {
+                    component_id,
+                    indices,
+                }),
+                cx,
+            );
+        }),
+    ))];
+    rows.extend(copy_rows(db.clone(), component_id, name.clone(), None));
+    open(
+        InspectorRequest {
+            rows,
+            mode: InspectorMode::Anchored(position),
+        },
+        window,
+        cx,
+    );
+}
+
 fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
     let db = row.db.clone();
     let component_id = row.component_id;
@@ -1180,6 +1243,21 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
                             component_id,
                             SmallVec::new(),
                         ))
+                        .on_mouse_down(MouseButton::Right, {
+                            let db = row.db.clone();
+                            let name = row.full_name.clone();
+                            move |event: &gpui::MouseDownEvent, window, cx| {
+                                open_detail_menu(
+                                    &db,
+                                    component_id,
+                                    &name,
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }
+                        })
                         .child(row.full_name.clone()),
                 )
                 .child(plot_icon),

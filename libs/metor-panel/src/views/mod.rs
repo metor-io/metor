@@ -5,6 +5,7 @@ pub(crate) mod binding;
 pub mod column_browser;
 pub mod component_browser;
 pub mod component_text;
+pub(crate) mod copy;
 pub mod dashboard;
 pub mod filter_bar;
 pub mod format;
