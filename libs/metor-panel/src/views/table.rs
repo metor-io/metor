@@ -1,8 +1,9 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, IntoElement, Pixels, Render,
-    ScrollHandle, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, ElementId, Empty, IntoElement, Pixels,
+    Render, ScrollHandle, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
+    uniform_list,
 };
 
 use super::Scrollbar;
@@ -239,17 +240,22 @@ impl<D: TableDelegate> Table<D> {
         cell
     }
 
+    /// The grab zone along a column's right edge. Every cell in the column
+    /// carries one, not just the header, so the divider is draggable down
+    /// the whole table; `id` keeps each instance distinct.
     fn render_resize_handle(
         &self,
+        id: impl Into<ElementId>,
         col_ix: usize,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
-            .id(("resize-handle", col_ix))
+            .id(id)
+            .absolute()
+            .right_0()
+            .top_0()
+            .bottom_0()
             .w(px(RESIZE_HANDLE_WIDTH))
-            .h_full()
-            .ml(px(-RESIZE_HANDLE_WIDTH / 2.0))
             .cursor_col_resize()
             .on_drag(ResizeDrag(col_ix), |drag, _, _, cx| {
                 cx.new(|_| drag.clone())
@@ -288,10 +294,12 @@ impl<D: TableDelegate> Render for Table<D> {
             .items_center()
             .w_full()
             .h(px(HEADER_HEIGHT))
+            .bg(theme.bg_secondary)
             .border_b_1()
             .border_color(theme.border_primary);
 
         let view = cx.entity().clone();
+        let last_col = columns.len().saturating_sub(1);
         for (ix, col) in columns.iter().enumerate() {
             let width = self.col_states[ix].width;
             let is_flex = col.flex;
@@ -316,6 +324,9 @@ impl<D: TableDelegate> Render for Table<D> {
             .absolute();
 
             let mut col_div = div().relative().overflow_hidden();
+            if ix < last_col {
+                col_div = col_div.border_r_1().border_color(theme.border_primary);
+            }
             if is_flex {
                 col_div = col_div.flex_1();
             } else {
@@ -327,15 +338,7 @@ impl<D: TableDelegate> Render for Table<D> {
             col_div = col_div.child(bounds_canvas).child(cell);
 
             if is_resizable && !is_flex {
-                let handle = self.render_resize_handle(ix, window, cx);
-                col_div = col_div.child(
-                    div()
-                        .absolute()
-                        .right(px(-RESIZE_HANDLE_WIDTH / 2.0))
-                        .top_0()
-                        .bottom_0()
-                        .child(handle),
-                );
+                col_div = col_div.child(self.render_resize_handle(("resize-handle", ix), ix, cx));
             }
 
             header = header.child(col_div);
@@ -343,6 +346,7 @@ impl<D: TableDelegate> Render for Table<D> {
 
         let col_count = columns.len();
         let col_flex: Vec<bool> = columns.iter().map(|c| c.flex).collect();
+        let col_resizable: Vec<bool> = columns.iter().map(|c| c.resizable).collect();
         let any_flex = col_flex.iter().any(|f| *f);
 
         let total_width: f32 = self
@@ -385,7 +389,10 @@ impl<D: TableDelegate> Render for Table<D> {
                         for col_ix in 0..col_count {
                             let cell = this.delegate.render_cell(row_ix, col_ix, window, cx);
 
-                            let mut cell_div = div().overflow_hidden();
+                            let mut cell_div = div().relative().overflow_hidden();
+                            if col_ix + 1 < col_count {
+                                cell_div = cell_div.border_r_1().border_color(border_color);
+                            }
                             if col_flex[col_ix] {
                                 cell_div = cell_div.flex_1().h(row_height);
                             } else {
@@ -397,7 +404,15 @@ impl<D: TableDelegate> Render for Table<D> {
                                 cell_div.style().flex_shrink = Some(0.0);
                             }
 
-                            row = row.child(cell_div.child(cell));
+                            cell_div = cell_div.child(cell);
+                            if col_resizable[col_ix] && !col_flex[col_ix] {
+                                cell_div = cell_div.child(this.render_resize_handle(
+                                    ("cell-resize", row_ix * col_count + col_ix),
+                                    col_ix,
+                                    cx,
+                                ));
+                            }
+                            row = row.child(cell_div);
                         }
 
                         items.push(row.into_any_element());
