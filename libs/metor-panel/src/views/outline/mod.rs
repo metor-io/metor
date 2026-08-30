@@ -713,15 +713,20 @@ impl OutlineDelegate {
             .child(slot)
             .child(
                 div()
+                    .flex_shrink_0()
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
                     .child(label),
             );
+        // The name keeps its width; a tight column truncates the count.
         if let RowKind::PivotBranch(pivot) = &row.kind {
             cell = cell.child(
                 div()
                     .ml(px(4.0))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
                     .whitespace_nowrap()
                     .text_size(px(11.0))
                     .text_color(theme.text_tertiary)
