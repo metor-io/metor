@@ -149,7 +149,7 @@ impl Render for FilterBar {
             .text_color(theme.text_tertiary)
             .cursor_text()
             .child(Icon::Search.svg_color(11.0, theme.text_tertiary))
-            .child(div().flex_1().h_full().child(self.field.element()))
+            .child(div().flex_1().min_w_0().child(self.field.element()))
             .children(
                 self.status
                     .clone()
