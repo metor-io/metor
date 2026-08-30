@@ -610,7 +610,11 @@ pub(crate) struct Running {
 }
 
 impl Running {
-    pub(crate) fn new(compiled: &Arc<Compiled>, index: usize, fuel: u64) -> Result<Self, BuildError> {
+    pub(crate) fn new(
+        compiled: &Arc<Compiled>,
+        index: usize,
+        fuel: u64,
+    ) -> Result<Self, BuildError> {
         let mut store = Store::new(&compiled.engine, ());
         store.set_fuel(fuel).map_err(expr_error)?;
         let instance = Linker::new(&compiled.engine)

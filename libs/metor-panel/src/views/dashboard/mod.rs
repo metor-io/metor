@@ -1074,23 +1074,25 @@ fn component_picker_rows(
         None,
     )));
 
-    rows.extend(crate::inspector::trace_picker::list_components(&db)
-        .into_iter()
-        .map(|(_id, name)| {
-            let dashboard = dashboard.clone();
-            let name_clone = name.clone();
-            let kind = kind.clone();
-            Box::new(CommandRow::new(
-                SharedString::from(name),
-                Arc::new(move |_window, cx| {
-                    let config = component_widget_config(&kind, name_clone.clone());
-                    let kind = kind.clone();
-                    dashboard.update(cx, |this, cx| {
-                        this.add_widget(kind, config, cx);
-                    });
-                }),
-            )) as Box<dyn InspectorRow>
-        }));
+    rows.extend(
+        crate::inspector::trace_picker::list_components(&db)
+            .into_iter()
+            .map(|(_id, name)| {
+                let dashboard = dashboard.clone();
+                let name_clone = name.clone();
+                let kind = kind.clone();
+                Box::new(CommandRow::new(
+                    SharedString::from(name),
+                    Arc::new(move |_window, cx| {
+                        let config = component_widget_config(&kind, name_clone.clone());
+                        let kind = kind.clone();
+                        dashboard.update(cx, |this, cx| {
+                            this.add_widget(kind, config, cx);
+                        });
+                    }),
+                )) as Box<dyn InspectorRow>
+            }),
+    );
     rows
 }
 

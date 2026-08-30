@@ -702,10 +702,14 @@ impl PaneItem for TablePanel {
     }
 }
 
-/// Persisted shape of a [`DataTablePanel`]. No per-instance configuration today.
+/// Persisted shape of a [`DataTablePanel`]: the filter bar's query and
+/// whether the bar is showing.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
-pub struct DataTablePanelConfig {}
+pub struct DataTablePanelConfig {
+    pub filter: String,
+    pub filter_bar: bool,
+}
 
 /// Pane item rendering one row per component, grouped by namespace, with
 /// live values per element. Wraps the same [`DataTable`] view used outside
@@ -724,8 +728,13 @@ impl DataTablePanel {
         }
     }
 
-    pub fn from_config(_cfg: DataTablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::new(db, cx)
+    pub fn from_config(cfg: DataTablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let panel = Self::new(db, cx);
+        panel.inner.update(cx, |table, cx| {
+            table.set_filter_visible(cfg.filter_bar, cx);
+            table.set_filter_text(&cfg.filter, cx);
+        });
+        panel
     }
 }
 
@@ -746,8 +755,12 @@ impl PaneItem for DataTablePanel {
         "data_table"
     }
 
-    fn to_config(&self, _cx: &App) -> DataTablePanelConfig {
-        DataTablePanelConfig {}
+    fn to_config(&self, cx: &App) -> DataTablePanelConfig {
+        let inner = self.inner.read(cx);
+        DataTablePanelConfig {
+            filter: inner.filter_text(cx),
+            filter_bar: inner.filter_visible(),
+        }
     }
 }
 
@@ -762,6 +775,8 @@ impl PaneItem for DataTablePanel {
 pub struct BrowserPanelConfig {
     pub custom_title: Override<String>,
     pub root_override: Vec<String>,
+    pub filter: String,
+    pub filter_bar: bool,
 }
 
 /// Pane item with a Finder-style browser over the component namespace tree.
@@ -794,6 +809,8 @@ impl BrowserPanel {
                 delegate.set_pending_root_path(Some(segments.clone()));
                 delegate.set_root_path(&segments, cx);
             }
+            browser.set_filter_visible(cfg.filter_bar, cx);
+            browser.set_filter_text(&cfg.filter, cx);
         });
         panel
     }
@@ -825,6 +842,8 @@ impl PaneItem for BrowserPanel {
                 .root_override()
                 .map(|segs| segs.iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default(),
+            filter: inner.filter_text(cx),
+            filter_bar: inner.filter_visible(),
         }
     }
 

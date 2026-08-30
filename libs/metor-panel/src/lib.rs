@@ -32,6 +32,7 @@ pub mod logs;
 pub(crate) mod msg_ingest;
 pub mod plot_events;
 pub mod presets;
+pub mod query;
 pub mod sequences;
 pub mod theme;
 pub mod tiles;

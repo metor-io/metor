@@ -20,6 +20,7 @@ use super::{ConnectionStatus, ConnectionTarget, ConnectionsStore, PickerEntry, T
 use crate::icons::Icon;
 use crate::inspector::rows::text_field::TextField;
 use crate::inspector::{Inspector, InspectorMode};
+use crate::query::fuzzy_scores;
 use crate::theme::{Theme, theme};
 
 const DIALOG_WIDTH: f32 = 640.0;
@@ -123,10 +124,7 @@ impl ConnectionPicker {
         if !query.is_empty() {
             let scored = fuzzy_scores(
                 &query,
-                entries
-                    .iter()
-                    .map(|e| format!("{} {}", e.name, e.detail))
-                    .collect(),
+                entries.iter().map(|e| format!("{} {}", e.name, e.detail)),
             );
             entries = entries
                 .into_iter()
@@ -1118,24 +1116,4 @@ impl Render for ConnectionPicker {
 
         deferred(centered).with_priority(1).into_any_element()
     }
-}
-
-/// Nucleo fuzzy scores for `query` against each haystack; `None` filters
-/// the row out. Mirrors the inspector's matcher setup so both surfaces
-/// feel identical to type into.
-fn fuzzy_scores(query: &str, haystacks: Vec<String>) -> Vec<Option<u32>> {
-    use nucleo_matcher::{
-        Matcher,
-        pattern::{CaseMatching, Normalization, Pattern},
-    };
-    let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
-    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-    let mut buf = Vec::new();
-    haystacks
-        .iter()
-        .map(|haystack| {
-            let haystack = nucleo_matcher::Utf32Str::new(haystack, &mut buf);
-            pattern.score(haystack, &mut matcher)
-        })
-        .collect()
 }

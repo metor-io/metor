@@ -1266,7 +1266,9 @@ fn an_expression_backfills_the_history_its_inputs_already_have(cx: &mut gpui::Te
             expressions::replay_plan(published, &db, cx).expect("a running expression has a plan");
         (bound, plan)
     });
-    let output = db.with_state(|s| s.get_component(published).cloned()).unwrap();
+    let output = db
+        .with_state(|s| s.get_component(published).cloned())
+        .unwrap();
     // The seed evaluation is the live head; nothing may be written at it.
     wait_for_latest(&output, 50);
     assert_eq!(backfill::ceiling(&output, &plan), Some(Timestamp(50)));
@@ -1289,7 +1291,10 @@ fn an_expression_backfills_the_history_its_inputs_already_have(cx: &mut gpui::Te
         })
         .collect();
     let expected: Vec<(i64, f64)> = (1..=50).map(|ts| (ts, ts as f64 * 2.0)).collect();
-    assert_eq!(history, expected, "computed history, then the seed, as one series");
+    assert_eq!(
+        history, expected,
+        "computed history, then the seed, as one series"
+    );
 
     // The live tail still lands after the install.
     assert_eq!(feed_and_await(&db, source, published, 60, 7.0), 14.0);

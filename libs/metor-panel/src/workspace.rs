@@ -378,9 +378,15 @@ mod tests {
     #[test]
     fn bounds_on_a_live_display_are_visible() {
         let displays = [bounds(0.0, 0.0, 1920.0, 1080.0)];
-        assert!(bounds_visible(&bounds(100.0, 100.0, 800.0, 600.0), &displays));
+        assert!(bounds_visible(
+            &bounds(100.0, 100.0, 800.0, 600.0),
+            &displays
+        ));
         // Partially off-screen still counts — the user can drag it back.
-        assert!(bounds_visible(&bounds(1800.0, 900.0, 800.0, 600.0), &displays));
+        assert!(bounds_visible(
+            &bounds(1800.0, 900.0, 800.0, 600.0),
+            &displays
+        ));
     }
 
     #[test]

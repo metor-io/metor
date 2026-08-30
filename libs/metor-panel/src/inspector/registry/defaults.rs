@@ -14,6 +14,7 @@ use metor_proto::types::ComponentId;
 use crate::inspector::rows::{
     BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
 };
+use crate::views::column_browser::filter_bar_row;
 use crate::views::list_plot::{ListLinePlot, ListTrace};
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{EventOverlay, LinePlot, Override, Trace, YAxis};
@@ -181,6 +182,7 @@ impl InspectorRegistry {
         self.register_dashboard_builder(db.clone());
         self.register_pane_builder();
         self.register_component_browser_builder();
+        self.register_data_table_builder();
         self.register_trace_builder(db.clone());
         self.register_xy_trace_builder();
         self.register_list_trace_builder();
@@ -760,7 +762,8 @@ impl InspectorRegistry {
             let label = SharedString::new_static("Title");
             let nav_browser = browser.clone();
             let label_for_nav = label.clone();
-            vec![Box::new(NavRow::new(
+            let filter_row = filter_bar_row(browser.clone());
+            let title_row = NavRow::new(
                 label.clone(),
                 summary,
                 Box::new(move |cx| {
@@ -793,7 +796,16 @@ impl InspectorRegistry {
                         )) as Box<dyn InspectorRow>,
                     ]
                 }),
-            ))]
+            );
+            vec![Box::new(title_row), Box::new(filter_row)]
+        }));
+    }
+
+    fn register_data_table_builder(&mut self) {
+        use crate::views::DataTable;
+        self.register_type_builder::<DataTable>(Arc::new(|any_entity, _db, _cx| {
+            let table: Entity<DataTable> = any_entity.downcast().expect("DataTable type mismatch");
+            vec![Box::new(filter_bar_row(table))]
         }));
     }
 

@@ -36,8 +36,9 @@ pub fn select_list_trace_wizard_rows(
     on_select: OnListTraceSelected,
 ) -> Vec<Box<dyn InspectorRow>> {
     let candidates = list_vector_components(&db);
-    let mut rows: Vec<Box<dyn InspectorRow>> =
-        vec![Box::new(HeaderRow::new("Pick a vector component, or type an expression"))];
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(HeaderRow::new(
+        "Pick a vector component, or type an expression",
+    ))];
 
     // Pinned above the list, and before the empty-state note: a db with no
     // vector component of its own can still have one computed from it.

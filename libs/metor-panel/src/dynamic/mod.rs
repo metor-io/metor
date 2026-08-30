@@ -13,8 +13,8 @@
 //! `(op, args, parents)` always yields the same `NodeId` and an edit rebuilds
 //! only what actually changed.
 
-mod node;
 pub mod expressions;
+mod node;
 pub mod ops;
 pub mod resolver;
 pub mod tensor;

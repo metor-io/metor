@@ -8,6 +8,7 @@ pub mod component_table;
 pub mod component_text;
 pub mod dashboard;
 pub mod data_table;
+pub mod filter_bar;
 pub mod format;
 pub mod gauge;
 pub(crate) mod instrument;
@@ -40,6 +41,7 @@ pub use component_browser::{BrowserEvent, ComponentBrowser, new_component_browse
 pub use component_table::{ComponentTable, new_component_table};
 pub use component_text::{ComponentText, ComponentTextConfig};
 pub use data_table::{DataTable, new_data_table};
+pub use filter_bar::{FilterBar, FilterBarEvent};
 pub(crate) use format::format_number;
 pub use format::{ElementIndexes, format_element_value, format_value};
 pub use gauge::{Gauge, GaugeConfig, GaugeStyle};

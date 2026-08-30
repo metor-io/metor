@@ -14,6 +14,7 @@ use grouping::{Group, detect_groups};
 
 use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 use super::table::Table;
+use crate::query::Query;
 use crate::theme::theme;
 
 pub type DataTable = ColumnBrowser<DataTableDelegate>;
@@ -35,6 +36,9 @@ pub struct DataTableDelegate {
     selected_group: Option<SharedString>,
     selected_instance: Option<SharedString>,
     grid: Entity<Table<DataTableGrid>>,
+    /// The filter bar's query. A group shows when its name or any of its
+    /// instances matches; a matching group shows all its instances.
+    query: Query,
     _watcher: gpui::Task<()>,
 }
 
@@ -55,6 +59,14 @@ impl DataTableDelegate {
                 db.vtable_gen.wait().await;
             }
         })
+    }
+
+    fn group_shown(&self, group: &Group) -> bool {
+        self.query.matches_name(&group.name)
+            || group
+                .instances
+                .iter()
+                .any(|inst| self.query.matches_name(&inst.name))
     }
 
     fn push_group_to_grid(&self, cx: &mut Context<DataTable>) {
@@ -99,6 +111,7 @@ impl ColumnBrowserDelegate for DataTableDelegate {
     fn root_items(&self, _cx: &App) -> Vec<Self::Item> {
         self.groups
             .iter()
+            .filter(|g| self.group_shown(g))
             .map(|g| DataTableItem::Group {
                 name: g.name.clone(),
             })
@@ -111,9 +124,11 @@ impl ColumnBrowserDelegate for DataTableDelegate {
                 let Some(group) = self.groups.iter().find(|g| &g.name == name) else {
                     return Vec::new();
                 };
+                let all = self.query.matches_name(&group.name);
                 group
                     .instances
                     .iter()
+                    .filter(|inst| all || self.query.matches_name(&inst.name))
                     .map(|inst| DataTableItem::Instance {
                         group: name.clone(),
                         name: inst.name.clone(),
@@ -207,6 +222,26 @@ impl ColumnBrowserDelegate for DataTableDelegate {
             None => SharedString::default(),
         }
     }
+
+    fn filter_placeholder(&self) -> Option<SharedString> {
+        Some(SharedString::new_static("Filter groups…"))
+    }
+
+    fn apply_filter(&mut self, query: &Query, cx: &mut Context<DataTable>) {
+        self.query = query.clone();
+        cx.notify();
+    }
+
+    fn filter_status(&self) -> Option<SharedString> {
+        if self.query.is_empty() {
+            return None;
+        }
+        let shown = self.groups.iter().filter(|g| self.group_shown(g)).count();
+        Some(SharedString::from(format!(
+            "{shown} / {}",
+            self.groups.len()
+        )))
+    }
 }
 
 pub fn new_data_table(db: Arc<DB>, cx: &mut Context<DataTable>) -> DataTable {
@@ -217,6 +252,7 @@ pub fn new_data_table(db: Arc<DB>, cx: &mut Context<DataTable>) -> DataTable {
         selected_group: None,
         selected_instance: None,
         grid,
+        query: Query::default(),
         _watcher: watcher,
     };
     ColumnBrowser::new(delegate, cx)

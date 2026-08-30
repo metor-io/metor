@@ -430,7 +430,8 @@ impl AppRoot {
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
         cx.defer(move |cx: &mut App| {
-            drag.pane.update(cx, |pane, cx| pane.remove_item(drag.ix, cx));
+            drag.pane
+                .update(cx, |pane, cx| pane.remove_item(drag.ix, cx));
             let pane = cx.new(|cx| crate::tiles::Pane::new(vec![drag.item], cx));
             let tiles = cx.new(|cx| TileGroup::from_pane(pane, cx));
             crate::workspace::open_panel_window(
@@ -1175,134 +1176,141 @@ impl PanelApp {
             }
         });
         app.run(move |cx: &mut App| {
-                crate::theme::register_fonts(cx);
-                let cfg = crate::config::load();
-                // Capture the leader before `cfg` moves into the font global; it
-                // parameterizes the chord-menu keybinding below.
-                let leader = cfg.leader.clone();
-                let family = crate::theme::resolve_font_family(cx, &cfg);
-                cx.set_global(crate::theme::FontSettings {
-                    family,
-                    config: cfg,
-                });
-                cx.set_global(crate::theme::ActiveTheme(Arc::new(
-                    crate::theme::DARK.clone(),
-                )));
-                edits::init(cx);
-                ItemRegistry::init(cx);
-                crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
-                crate::views::dashboard::WidgetRegistry::init(cx);
-                crate::dynamic::expressions::Expressions::init(cx);
-                crate::dynamic::worker::DynamicWorker::init(cx);
-                crate::backfill::Backfiller::init(db.clone(), cx);
-                crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
-                crate::alarms::AlarmStore::init(db.clone(), cx);
-                crate::logs::LogStore::init(db.clone(), cx);
-                crate::presets::TargetPresetStore::init(db.clone(), cx);
-                crate::sequences::SequenceStore::init(db.clone(), cx);
-                crate::plot_events::EventSourceRegistry::init(cx);
-                crate::wiring::WiringStore::init(db.clone(), cx);
-                register_pane_item_deserializers(db.clone(), cx);
-                for (kind, spec) in views {
-                    cx.global_mut::<crate::views::dashboard::WidgetRegistry>()
-                        .register(kind, spec);
-                }
-                let registered_tiles = cx
-                    .global::<crate::views::dashboard::WidgetRegistry>()
-                    .tile_specs();
-                for spec in registered_tiles {
-                    cx.global_mut::<crate::tiles::ItemRegistry>()
-                        .register_view(spec, db.clone());
-                }
-
-                // Connections: seed builder-registered targets, hand the
-                // registry to discovery sources, then fire auto-connects.
-                // LoD spawning is a store concern — it starts with the first
-                // local-authority connection rather than at boot.
-                let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
-                if let Some(store) = crate::connections::try_global(cx) {
-                    store.update(cx, |store, cx| {
-                        if let Some(resolver) = address_resolver {
-                            store.set_resolver(resolver);
-                        }
-                        store.set_default_options(default_options);
-                        for target in targets {
-                            store.upsert_target(target, cx);
-                        }
-                        for id in auto_connect {
-                            let Some(target) =
-                                store.state().targets().iter().find(|t| t.id == id).cloned()
-                            else {
-                                tracing::warn!(%id, "auto-connect target not registered");
-                                continue;
-                            };
-                            store.connect(target, cx);
-                        }
-                    });
-                }
-                for source in connection_sources {
-                    source(registry.clone());
-                }
-                register_connection_commands(cx);
-
-                // Inspector requests route to the window they were made in:
-                // the callback resolves the root of whatever `Window` the
-                // caller passed, so one installation serves every window.
-                cx.set_global(OpenInspectorGlobal(Arc::new(|request, window, cx| {
-                    let Some(root) = window.root::<AppRoot>().flatten() else {
-                        return;
-                    };
-                    root.update(cx, |this, cx| {
-                        this.pending_inspector_open = Some(request);
-                        cx.notify();
-                    });
-                })));
-                crate::inspector::palette::register_builtin_providers(db.clone(), cx);
-
-                // Consumer extensions: register custom palette providers, run
-                // init hooks, then build overlays. All happen after the built-in
-                // registries exist so they can call into any of them; overlays
-                // run last so they can rely on anything a hook installed.
-                for (category, provider) in command_providers {
-                    ItemRegistry::register(cx, category, provider);
-                }
-                for hook in init_hooks {
-                    hook(cx);
-                }
-                cx.set_global(OverlayBuilders(overlays));
-
-                set_dock_icon();
-                // `secondary-` resolves to cmd on macOS and ctrl elsewhere
-                // (`cmd-` would be the Win/Super key off-macOS).
-                cx.bind_keys([
-                    KeyBinding::new("secondary-p", OpenPalette, None),
-                    // The leader opens the transient chord menu, and it is a
-                    // bare key — `space` by default — so anything typing into
-                    // it must say so. `TextInput` is that: every host owning
-                    // an editable field declares it beside its own name, and
-                    // one negation covers all of them, including ones that do
-                    // not exist yet. Naming the panes individually is what let
-                    // the program pane swallow its own spacebar.
-                    KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
-                    KeyBinding::new("ctrl-tab", CycleTabForward, None),
-                    KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-                    KeyBinding::new("secondary-l", ToggleCmdLock, None),
-                    KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
-                ]);
-
-                // A non-last close: re-snapshot the survivors right away, so
-                // a quit inside the next autosave interval can't resurrect
-                // the closed window. After the last close this is a no-op,
-                // leaving the should-close snapshot that included it.
-                cx.on_window_closed(|cx| {
-                    if !crate::workspace::panel_windows(cx).is_empty() {
-                        crate::connections::flush_layout_now(cx);
-                    }
-                })
-                .detach();
-
-                crate::workspace::open_panel_window(db.clone(), None, None, true, cx);
+            crate::theme::register_fonts(cx);
+            let cfg = crate::config::load();
+            // Capture the leader before `cfg` moves into the font global; it
+            // parameterizes the chord-menu keybinding below.
+            let leader = cfg.leader.clone();
+            let family = crate::theme::resolve_font_family(cx, &cfg);
+            cx.set_global(crate::theme::FontSettings {
+                family,
+                config: cfg,
             });
+            cx.set_global(crate::theme::ActiveTheme(Arc::new(
+                crate::theme::DARK.clone(),
+            )));
+            edits::init(cx);
+            ItemRegistry::init(cx);
+            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+            crate::views::dashboard::WidgetRegistry::init(cx);
+            crate::dynamic::expressions::Expressions::init(cx);
+            crate::dynamic::worker::DynamicWorker::init(cx);
+            crate::backfill::Backfiller::init(db.clone(), cx);
+            crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
+            crate::alarms::AlarmStore::init(db.clone(), cx);
+            crate::logs::LogStore::init(db.clone(), cx);
+            crate::presets::TargetPresetStore::init(db.clone(), cx);
+            crate::sequences::SequenceStore::init(db.clone(), cx);
+            crate::plot_events::EventSourceRegistry::init(cx);
+            crate::wiring::WiringStore::init(db.clone(), cx);
+            register_pane_item_deserializers(db.clone(), cx);
+            for (kind, spec) in views {
+                cx.global_mut::<crate::views::dashboard::WidgetRegistry>()
+                    .register(kind, spec);
+            }
+            let registered_tiles = cx
+                .global::<crate::views::dashboard::WidgetRegistry>()
+                .tile_specs();
+            for spec in registered_tiles {
+                cx.global_mut::<crate::tiles::ItemRegistry>()
+                    .register_view(spec, db.clone());
+            }
+
+            // Connections: seed builder-registered targets, hand the
+            // registry to discovery sources, then fire auto-connects.
+            // LoD spawning is a store concern — it starts with the first
+            // local-authority connection rather than at boot.
+            let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
+            if let Some(store) = crate::connections::try_global(cx) {
+                store.update(cx, |store, cx| {
+                    if let Some(resolver) = address_resolver {
+                        store.set_resolver(resolver);
+                    }
+                    store.set_default_options(default_options);
+                    for target in targets {
+                        store.upsert_target(target, cx);
+                    }
+                    for id in auto_connect {
+                        let Some(target) =
+                            store.state().targets().iter().find(|t| t.id == id).cloned()
+                        else {
+                            tracing::warn!(%id, "auto-connect target not registered");
+                            continue;
+                        };
+                        store.connect(target, cx);
+                    }
+                });
+            }
+            for source in connection_sources {
+                source(registry.clone());
+            }
+            register_connection_commands(cx);
+
+            // Inspector requests route to the window they were made in:
+            // the callback resolves the root of whatever `Window` the
+            // caller passed, so one installation serves every window.
+            cx.set_global(OpenInspectorGlobal(Arc::new(|request, window, cx| {
+                let Some(root) = window.root::<AppRoot>().flatten() else {
+                    return;
+                };
+                root.update(cx, |this, cx| {
+                    this.pending_inspector_open = Some(request);
+                    cx.notify();
+                });
+            })));
+            crate::inspector::palette::register_builtin_providers(db.clone(), cx);
+
+            // Consumer extensions: register custom palette providers, run
+            // init hooks, then build overlays. All happen after the built-in
+            // registries exist so they can call into any of them; overlays
+            // run last so they can rely on anything a hook installed.
+            for (category, provider) in command_providers {
+                ItemRegistry::register(cx, category, provider);
+            }
+            for hook in init_hooks {
+                hook(cx);
+            }
+            cx.set_global(OverlayBuilders(overlays));
+
+            set_dock_icon();
+            // `secondary-` resolves to cmd on macOS and ctrl elsewhere
+            // (`cmd-` would be the Win/Super key off-macOS).
+            cx.bind_keys([
+                KeyBinding::new("secondary-p", OpenPalette, None),
+                // The leader opens the transient chord menu, and it is a
+                // bare key — `space` by default — so anything typing into
+                // it must say so. `TextInput` is that: every host owning
+                // an editable field declares it beside its own name, and
+                // one negation covers all of them, including ones that do
+                // not exist yet. Naming the panes individually is what let
+                // the program pane swallow its own spacebar.
+                KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
+                KeyBinding::new("ctrl-tab", CycleTabForward, None),
+                KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+                KeyBinding::new("secondary-l", ToggleCmdLock, None),
+                KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
+                // Scoped to a focused browser: the bar is per pane, and
+                // nothing else claims the find chord yet.
+                KeyBinding::new(
+                    "secondary-f",
+                    crate::views::column_browser::ToggleFilterBar,
+                    Some("ColumnBrowser"),
+                ),
+            ]);
+
+            // A non-last close: re-snapshot the survivors right away, so
+            // a quit inside the next autosave interval can't resurrect
+            // the closed window. After the last close this is a no-op,
+            // leaving the should-close snapshot that included it.
+            cx.on_window_closed(|cx| {
+                if !crate::workspace::panel_windows(cx).is_empty() {
+                    crate::connections::flush_layout_now(cx);
+                }
+            })
+            .detach();
+
+            crate::workspace::open_panel_window(db.clone(), None, None, true, cx);
+        });
     }
 }
 

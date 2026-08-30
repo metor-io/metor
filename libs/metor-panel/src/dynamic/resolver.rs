@@ -36,7 +36,10 @@ impl DbResolver {
                 .filter(|(_, meta)| !meta.is_hidden())
                 .filter_map(|(id, meta)| {
                     let schema = &state.get_component(*id)?.schema;
-                    Some((meta.name.clone(), (*id, ty_of(schema.prim_type, &schema.dim)?)))
+                    Some((
+                        meta.name.clone(),
+                        (*id, ty_of(schema.prim_type, &schema.dim)?),
+                    ))
                 })
                 .collect()
         });

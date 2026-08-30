@@ -13,8 +13,7 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 
 use crate::dynamic::node::{
-    BuildError, DynamicNode, NodeImpl, ValueType, default_ring_bytes, hash_id,
-    op_tag, write_sample,
+    BuildError, DynamicNode, NodeImpl, ValueType, default_ring_bytes, hash_id, op_tag, write_sample,
 };
 
 /// Fixed-rate wall-clock generator. Ticks every `1/hz` seconds starting at

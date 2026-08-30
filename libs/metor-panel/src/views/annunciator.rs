@@ -657,7 +657,7 @@ fn compile_pattern(pattern: &str) -> Option<Regex> {
     if pattern.is_empty() {
         return None;
     }
-    crate::views::component_browser::glob_to_regex(pattern).ok()
+    Some(crate::query::glob_to_regex(pattern))
 }
 
 /// Spawn the watcher task that rebuilds the tile list whenever the DB
