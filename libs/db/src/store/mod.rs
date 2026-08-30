@@ -138,17 +138,52 @@ pub struct NodeStaging {
 
 impl NodeStaging {
     pub fn create(component_dir: &std::path::Path, seal: &SealRecord) -> Result<Self, Error> {
+        Self::sized(
+            component_dir,
+            seal.start_ts,
+            seal.element_size,
+            seal.index_len,
+            seal.data_len,
+        )
+    }
+
+    /// Stage a node that is being built sample by sample rather than
+    /// downloaded: there is no seal yet, so the files are sized from an
+    /// expected sample count. `samples` is only a capacity hint — writes
+    /// past it fail with [`Error::MapOverflow`], and a batch that does not
+    /// fit one node belongs in several.
+    pub fn with_capacity(
+        component_dir: &std::path::Path,
+        start_ts: Timestamp,
+        element_size: u64,
+        samples: usize,
+    ) -> Result<Self, Error> {
+        let samples = samples as u64;
+        Self::sized(
+            component_dir,
+            start_ts,
+            element_size,
+            samples * size_of::<Timestamp>() as u64,
+            samples * element_size,
+        )
+    }
+
+    fn sized(
+        component_dir: &std::path::Path,
+        start_ts: Timestamp,
+        element_size: u64,
+        index_len: u64,
+        data_len: u64,
+    ) -> Result<Self, Error> {
         // Each attempt stages into its own directory so concurrent fetches
         // of the same span can never delete or commit each other's files.
         static NEXT_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let attempt = NEXT_STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = component_dir.join(format!("{}.{attempt}.fetching", seal.start_ts.0));
+        let dir = component_dir.join(format!("{}.{attempt}.fetching", start_ts.0));
         std::fs::create_dir_all(&dir)?;
-        let size = NODE_SIZE
-            .max(seal.index_len + 64)
-            .max(seal.data_len + 64);
-        let index = AppendLog::with_size(size, dir.join("index"), seal.start_ts)?;
-        let data = AppendLog::with_size(size, dir.join("data"), seal.element_size)?;
+        let size = NODE_SIZE.max(index_len + 64).max(data_len + 64);
+        let index = AppendLog::with_size(size, dir.join("index"), start_ts)?;
+        let data = AppendLog::with_size(size, dir.join("data"), element_size)?;
         Ok(Self {
             dir,
             index,
@@ -188,6 +223,21 @@ impl NodeStaging {
         Ok(())
     }
 
+    /// Append one sample. The counterpart to [`Self::append`] for nodes
+    /// composed locally instead of downloaded: no seal exists yet to
+    /// verify against, so ordering is the caller's contract.
+    pub fn push(&self, ts: Timestamp, bytes: &[u8]) -> Result<(), Error> {
+        self.index.write(&ts.to_le_bytes())?;
+        self.data.write(bytes)?;
+        Ok(())
+    }
+
+    /// Summarize the staged bytes as they stand. `None` when nothing has
+    /// been staged — an empty node is never worth committing.
+    pub fn seal(&self) -> Option<SealRecord> {
+        SealRecord::compute(&self.node())
+    }
+
     /// Discard staged samples newer than `cover_end` and return the seal
     /// of what remains. This is how a coverage-trimmed span installs: the
     /// fetch moves the peer's whole node, but only the prefix this side
@@ -195,27 +245,28 @@ impl NodeStaging {
     /// Call after the full payload verified against the peer's seal, then
     /// [`Self::commit`] with the returned seal.
     pub fn trim_to(&self, cover_end: Timestamp) -> Result<SealRecord, Error> {
-        let node = TimeSeriesNode {
-            index: self.index.clone(),
-            data: self.data.clone(),
-        };
+        let node = self.node();
         let keep = node.timestamps().partition_point(|ts| ts.0 <= cover_end.0);
         self.index
             .truncate((keep * size_of::<Timestamp>()) as u64);
         self.data
             .truncate((keep * node.element_size()) as u64);
-        SealRecord::compute(&node)
+        self.seal()
             .ok_or_else(|| StoreError::Other("trim left an empty node".to_string()).into())
+    }
+
+    fn node(&self) -> TimeSeriesNode {
+        TimeSeriesNode {
+            index: self.index.clone(),
+            data: self.data.clone(),
+        }
     }
 
     /// Verify the staged bytes against `seal` and promote the directory
     /// into place. Returns the final node directory and the (already
     /// mapped) node.
     pub fn commit(mut self, seal: &SealRecord) -> Result<(PathBuf, TimeSeriesNode), Error> {
-        let node = TimeSeriesNode {
-            index: self.index.clone(),
-            data: self.data.clone(),
-        };
+        let node = self.node();
         if !seal.verify(&node) {
             return Err(StoreError::ChecksumMismatch.into());
         }

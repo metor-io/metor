@@ -58,6 +58,13 @@ pub fn lod_node_max_age() -> Duration {
 pub const LOD_SOURCE_ID_KEY: &str = "lod_source_id";
 pub const LOD_RATIO_KEY: &str = "lod_ratio";
 pub const LOD_BUCKET_US_KEY: &str = "lod_bucket_us";
+/// Set to `"true"` on a hidden component to have the engine downsample it
+/// anyway. Hidden components are DB-internal and so skipped by default;
+/// this is how a producer of derived series (the panel's expression
+/// components) asks for the same wide-plot treatment as raw telemetry,
+/// without the db learning anything about who is asking. LoD levels
+/// themselves stay ineligible — they are hidden *and* LoD-named.
+pub const LOD_OPT_IN_KEY: &str = "lod";
 
 /// Levels whose buckets would span more than this are skipped: a slow
 /// source's raw history is small enough to render directly long before a
@@ -126,7 +133,12 @@ async fn run(db: Arc<DB>) {
 }
 
 fn eligible(meta: &ComponentMetadata) -> bool {
-    !meta.is_hidden() && !meta.is_string() && !is_lod_name(&meta.name)
+    let visible = !meta.is_hidden()
+        || meta
+            .metadata
+            .get(LOD_OPT_IN_KEY)
+            .is_some_and(|opt_in| opt_in == "true");
+    visible && !meta.is_string() && !is_lod_name(&meta.name)
 }
 
 async fn downsample_source(db: Arc<DB>, src: Component) {
@@ -944,5 +956,24 @@ mod tests {
         assert_eq!(name, "cube_sat.imu.accel.__metor_internal__.lod_4096");
         assert!(is_lod_name(&name));
         assert!(!is_lod_name("cube_sat.imu.accel"));
+    }
+
+    #[test]
+    fn hidden_components_are_eligible_only_by_opt_in() {
+        use metor_proto_wkt::MetadataExt as _;
+
+        assert!(eligible(&ComponentMetadata::from("imu.accel")));
+
+        let hidden = ComponentMetadata::from("expr.abcd").with_hidden();
+        assert!(!eligible(&hidden));
+        let mut opted_in = hidden.clone();
+        opted_in.set(LOD_OPT_IN_KEY, "true");
+        assert!(eligible(&opted_in));
+
+        // A level of that component is hidden and LoD-named; the key
+        // never makes one eligible to be downsampled again.
+        let mut level = ComponentMetadata::from(lod_name("expr.abcd", 64).as_str()).with_hidden();
+        level.set(LOD_OPT_IN_KEY, "true");
+        assert!(!eligible(&level));
     }
 }

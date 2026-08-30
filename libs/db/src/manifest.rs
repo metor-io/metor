@@ -89,6 +89,12 @@ pub struct Gap {
 
 pub type GapVec = SmallVec<[Gap; 4]>;
 
+/// Plain time ranges, as reported by
+/// [`TimeSeries::uncovered`](crate::time_series_2::TimeSeries::uncovered):
+/// stretches with no span behind them at all, so there is nothing to
+/// carry but the range itself.
+pub type RangeVec = SmallVec<[Range<Timestamp>; 4]>;
+
 /// How much of a queried range is locally answerable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Coverage {

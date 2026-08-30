@@ -212,23 +212,19 @@ pub fn system(
     };
     let driving = desc.driving.unwrap_or(0);
 
-    let mut layouts = Vec::with_capacity(ports.len());
+    let mut schemas = Vec::with_capacity(ports.len());
+    for source in &ports {
+        schemas.push(require_value(&source.node)?);
+    }
+    let mut held = Held::new(desc, &schemas, clock.is_none().then_some(driving))?;
     let mut readers = Vec::with_capacity(ports.len());
-    let mut latest = Vec::with_capacity(ports.len());
-    for (port, source) in desc.inputs.iter().zip(&ports) {
-        let schema = require_value(&source.node)?;
-        let layout = PortLayout::new(port, &schema)?;
+    for (i, source) in ports.iter().enumerate() {
         // Whatever the host already knows about this port becomes its first
         // held value, so a system is not blind to everything published before
         // it existed.
-        let mut held = Vec::new();
-        if let Some((_, value)) = &source.seed
-            && value.len() == layout.sample_bytes
-        {
-            layout.fill(value, &mut held);
+        if let Some((_, value)) = &source.seed {
+            held.hold(i, value);
         }
-        latest.push(held);
-        layouts.push(layout);
         readers.push(Some(source.node.subscribe()));
     }
     // The driving port's own history is what the system fires from once at
@@ -236,10 +232,7 @@ pub fn system(
     // no such history — its clock ticks immediately.
     let opening = match &clock {
         Some(_) => None,
-        None => ports[driving]
-            .seed
-            .clone()
-            .filter(|(_, value)| value.len() == layouts[driving].sample_bytes),
+        None => ports[driving].seed.clone(),
     };
     let wired = Ports {
         driving: match &clock {
@@ -248,14 +241,12 @@ pub fn system(
                 .take()
                 .expect("the driving port is wired once"),
         },
-        driven_port: clock.is_none().then_some(driving),
         others: readers
             .into_iter()
             .enumerate()
             .filter_map(|(i, reader)| Some((i, reader?)))
             .collect(),
-        latest,
-        layouts,
+        held,
     };
 
     let frame_bytes = desc.output.bytes as usize;
@@ -362,7 +353,7 @@ pub fn schema_of(ty: &Ty) -> ComponentSchema {
 ///
 /// A frame gives every element eight bytes so nothing straddles; a component
 /// gives `bool` one byte, so only that case is more than a copy.
-fn read_field(slot: &[u8], ty: &Ty, out: &mut Vec<u8>) {
+pub(crate) fn read_field(slot: &[u8], ty: &Ty, out: &mut Vec<u8>) {
     out.clear();
     match ty {
         Ty::Bool => out.push(u32::from_le_bytes(slot[..4].try_into().unwrap()) as u8),
@@ -423,6 +414,85 @@ impl PortLayout {
     }
 }
 
+/// What every port last contributed, and the rule for firing over it.
+///
+/// Kept apart from the readers because the rule is the same whether the
+/// samples arrive live or are replayed out of the inputs' history: the
+/// driving port fires an evaluation, every other port holds its newest
+/// value, and nothing fires until each held port has one.
+pub(crate) struct Held {
+    layouts: Vec<PortLayout>,
+    /// The frame bytes each port last contributed. Empty until that port
+    /// publishes, which is what makes the skip decidable.
+    latest: Vec<Vec<u8>>,
+    /// Which port fires the system, or `None` when a clock does.
+    driven_port: Option<usize>,
+    /// Scratch for the driving port's frame, which is never held.
+    sample: Vec<u8>,
+}
+
+impl Held {
+    pub(crate) fn new(
+        desc: &metor_expr::System,
+        schemas: &[ComponentSchema],
+        driven_port: Option<usize>,
+    ) -> Result<Self, BuildError> {
+        let mut layouts = Vec::with_capacity(schemas.len());
+        for (port, schema) in desc.inputs.iter().zip(schemas) {
+            layouts.push(PortLayout::new(port, schema)?);
+        }
+        Ok(Held {
+            latest: vec![Vec::new(); layouts.len()],
+            layouts,
+            driven_port,
+            sample: Vec::new(),
+        })
+    }
+
+    /// A port published `value`, in its component's bytes. A sample of the
+    /// wrong length is not the port's and is ignored.
+    pub(crate) fn hold(&mut self, port: usize, value: &[u8]) {
+        let layout = &self.layouts[port];
+        if value.len() == layout.sample_bytes {
+            layout.fill(value, &mut self.latest[port]);
+        }
+    }
+
+    /// Fire once at `ts`, with `driving` as the driving port's sample when an
+    /// input fires the system. `Ok(None)` is a skip; `Err` is a fault that
+    /// ends the system's evaluating.
+    pub(crate) fn fire<'a>(
+        &mut self,
+        instance: &'a mut Running,
+        ts: Timestamp,
+        driving: Option<&[u8]>,
+    ) -> Result<Option<&'a [u8]>, String> {
+        if let (Some(port), Some(value)) = (self.driven_port, driving) {
+            let layout = &self.layouts[port];
+            if value.len() != layout.sample_bytes {
+                return Ok(None);
+            }
+            layout.fill(value, &mut self.sample);
+        }
+        if self
+            .latest
+            .iter()
+            .enumerate()
+            .any(|(i, held)| Some(i) != self.driven_port && held.is_empty())
+        {
+            return Ok(None);
+        }
+        for (i, held) in self.latest.iter().enumerate() {
+            let bytes = match self.driven_port == Some(i) {
+                true => &self.sample,
+                false => held,
+            };
+            instance.write_port(i, bytes)?;
+        }
+        instance.eval(ts).map(Some)
+    }
+}
+
 /// The ports of one system.
 ///
 /// The driving reader is a field of its own rather than an entry in the list:
@@ -430,15 +500,9 @@ impl PortLayout {
 /// disjoint fields can be.
 struct Ports {
     driving: NodeReader,
-    /// Which port the driving reader fills, or `None` when what fires the
-    /// system is a clock rather than an input.
-    driven_port: Option<usize>,
     /// Every other port's reader, with the index of the port it fills.
     others: Vec<(usize, NodeReader)>,
-    layouts: Vec<PortLayout>,
-    /// The frame bytes each port last contributed. Empty until that port
-    /// publishes, which is what makes the run rule's skip decidable.
-    latest: Vec<Vec<u8>>,
+    held: Held,
 }
 
 async fn run(
@@ -449,25 +513,26 @@ async fn run(
     health: Health,
     state: StateCell,
 ) {
-    let mut sample = Vec::new();
-
     // Evaluate the newest saved driving sample before waiting for live input.
-    if let Some((ts, value)) = &opening {
-        let driving = ports.driven_port.expect("only an input port has a seed");
-        ports.layouts[driving].fill(value, &mut sample);
-        if let Err(why) = evaluate(&mut instance, &ports, &sample, *ts, &output, &state) {
-            health.park(why);
-            parked(ports).await;
-        }
+    if let Some((ts, value)) = &opening
+        && let Err(why) = evaluate(
+            &mut instance,
+            &mut ports.held,
+            *ts,
+            Some(value),
+            &output,
+            &state,
+        )
+    {
+        health.park(why);
+        parked(ports).await;
     }
 
     let fault = 'live: loop {
         let Ports {
             driving: reader,
-            driven_port,
             others,
-            layouts,
-            latest,
+            held,
         } = &mut ports;
         let grant = reader.next().await;
 
@@ -475,35 +540,14 @@ async fn run(
         // before: what an evaluation sees has to be the newest each input has
         // published, not the newest as of the last time this system fired.
         for (i, reader) in others.iter_mut() {
-            drain(reader, &layouts[*i], &mut latest[*i]);
+            drain(reader, *i, held);
         }
 
         for at in 0..grant.sample_count() {
             let (ts, value) = grant.sample_at(at);
-            if let Some(driving) = *driven_port {
-                if value.len() != layouts[driving].sample_bytes {
-                    continue;
-                }
-                layouts[driving].fill(value, &mut sample);
-            }
-            if others.iter().any(|(i, _)| latest[*i].is_empty()) {
-                continue;
-            }
-            for (i, held) in latest.iter().enumerate() {
-                let bytes = match *driven_port == Some(i) {
-                    true => &sample,
-                    false => held,
-                };
-                if let Err(why) = instance.write_port(i, bytes) {
-                    break 'live why;
-                }
-            }
-            match instance.eval(ts) {
-                Ok(frame) => {
-                    write_sample(&output, ts, frame);
-                    *state.0.lock().unwrap() = instance.read_state();
-                }
-                Err(why) => break 'live why,
+            let driving = held.driven_port.is_some().then_some(value);
+            if let Err(why) = evaluate(&mut instance, held, ts, driving, &output, &state) {
+                break 'live why;
             }
         }
     };
@@ -511,32 +555,19 @@ async fn run(
     parked(ports).await;
 }
 
-/// Write every port and evaluate once.
+/// Fire once and publish what came out, keeping the state cell current.
 fn evaluate(
     instance: &mut Running,
-    ports: &Ports,
-    sample: &[u8],
+    held: &mut Held,
     ts: Timestamp,
+    driving: Option<&[u8]>,
     output: &Disruptor,
     state: &StateCell,
 ) -> Result<(), String> {
-    if ports
-        .others
-        .iter()
-        .any(|(i, _)| ports.latest[*i].is_empty())
-    {
-        return Ok(());
+    if let Some(frame) = held.fire(instance, ts, driving)? {
+        write_sample(output, ts, frame);
+        *state.0.lock().unwrap() = instance.read_state();
     }
-    for (i, held) in ports.latest.iter().enumerate() {
-        let bytes = match ports.driven_port == Some(i) {
-            true => sample,
-            false => held.as_slice(),
-        };
-        instance.write_port(i, bytes)?;
-    }
-    let frame = instance.eval(ts)?;
-    write_sample(output, ts, frame);
-    *state.0.lock().unwrap() = instance.read_state();
     Ok(())
 }
 
@@ -546,28 +577,26 @@ async fn parked(mut ports: Ports) -> ! {
     loop {
         while ports.driving.try_next().is_some() {}
         for (i, reader) in ports.others.iter_mut() {
-            drain(reader, &ports.layouts[*i], &mut ports.latest[*i]);
+            drain(reader, *i, &mut ports.held);
         }
         stellarator::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
 /// Take everything waiting on a port's reader, keeping the last sample.
-fn drain(reader: &mut NodeReader, layout: &PortLayout, seen: &mut Vec<u8>) {
+fn drain(reader: &mut NodeReader, port: usize, held: &mut Held) {
     while let Some(grant) = reader.try_next() {
         let count = grant.sample_count();
         if count == 0 {
             continue;
         }
         let (_, value) = grant.sample_at(count - 1);
-        if value.len() == layout.sample_bytes {
-            layout.fill(value, seen);
-        }
+        held.hold(port, value);
     }
 }
 
 /// One instance of the module, driving one system through the region ABI.
-struct Running {
+pub(crate) struct Running {
     store: Store<()>,
     instance: Instance,
     eval: TypedFunc<i64, i32>,
@@ -581,7 +610,7 @@ struct Running {
 }
 
 impl Running {
-    fn new(compiled: &Arc<Compiled>, index: usize, fuel: u64) -> Result<Self, BuildError> {
+    pub(crate) fn new(compiled: &Arc<Compiled>, index: usize, fuel: u64) -> Result<Self, BuildError> {
         let mut store = Store::new(&compiled.engine, ());
         store.set_fuel(fuel).map_err(expr_error)?;
         let instance = Linker::new(&compiled.engine)
@@ -685,7 +714,7 @@ impl Running {
     /// The guard may be left alone precisely because this field's declared
     /// default is zero, so the guest emits no instruction to seed it and the
     /// first evaluation cannot overwrite what was written here.
-    fn seed_rng(&mut self, entropy: u64) {
+    pub(crate) fn seed_rng(&mut self, entropy: u64) {
         let memory = self.memory();
         for (slot, at) in &self.state {
             if slot.key.field == RNG_FIELD {
@@ -694,7 +723,7 @@ impl Running {
         }
     }
 
-    fn read_state(&mut self) -> Snapshot {
+    pub(crate) fn read_state(&mut self) -> Snapshot {
         let memory = self.memory();
         let mut entries = Vec::with_capacity(self.state.len());
         for (slot, at) in &self.state {

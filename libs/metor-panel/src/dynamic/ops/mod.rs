@@ -11,6 +11,9 @@ pub mod clock;
 pub mod db_source;
 pub mod persist;
 pub mod program;
+pub mod replay;
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod program_measure;
 #[cfg(test)]

@@ -13,13 +13,13 @@ use crate::dynamic::ops;
 use crate::dynamic::resolver::DbResolver;
 
 /// A db holding the components a test's expression names.
-struct Bench {
-    db: DB,
+pub(super) struct Bench {
+    pub(super) db: DB,
     _temp: tempfile::TempDir,
 }
 
 impl Bench {
-    fn new(components: &[(&str, PrimType, &[usize])]) -> Self {
+    pub(super) fn new(components: &[(&str, PrimType, &[usize])]) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let db = DB::create(temp.path().join("db")).unwrap();
         for (name, prim, dim) in components {
@@ -41,11 +41,11 @@ impl Bench {
         Bench { db, _temp: temp }
     }
 
-    fn id(&self, name: &str) -> ComponentId {
+    pub(super) fn id(&self, name: &str) -> ComponentId {
         ComponentId::new(name)
     }
 
-    fn push(&self, name: &str, ts: i64, values: &[f64]) {
+    pub(super) fn push(&self, name: &str, ts: i64, values: &[f64]) {
         let component = self
             .db
             .with_state(|s| s.get_component(self.id(name)).cloned())
@@ -58,11 +58,11 @@ impl Bench {
         component.push_buf(Timestamp(ts), &bytes).unwrap();
     }
 
-    fn source(&self, name: &str) -> Arc<dyn DynamicNode> {
+    pub(super) fn source(&self, name: &str) -> Arc<dyn DynamicNode> {
         ops::db_source::from_db(&self.db, self.id(name)).unwrap()
     }
 
-    fn compile(&self, source: &str) -> Arc<Compiled> {
+    pub(super) fn compile(&self, source: &str) -> Arc<Compiled> {
         let resolver = DbResolver::snapshot(&self.db);
         match Compiled::module(source, &resolver) {
             Ok(compiled) => Arc::new(compiled),
@@ -75,12 +75,12 @@ impl Bench {
 ///
 /// Always before the samples are pushed: a disruptor reader begins at the
 /// current write position, so one made afterwards never sees what it missed.
-fn watch(node: &Arc<dyn DynamicNode>) -> NodeReader {
+pub(super) fn watch(node: &Arc<dyn DynamicNode>) -> NodeReader {
     node.subscribe()
 }
 
 /// Read `count` scalars off a watched node, giving up rather than hanging.
-async fn take(reader: &mut NodeReader, count: usize) -> Vec<f64> {
+pub(super) async fn take(reader: &mut NodeReader, count: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..300 {
         while let Some(grant) = reader.try_next() {
@@ -99,12 +99,12 @@ async fn take(reader: &mut NodeReader, count: usize) -> Vec<f64> {
 
 /// Let the spawned tasks run. Nothing here is timing-dependent — this is only
 /// how a test yields to the nodes it is driving.
-async fn settle() {
+pub(super) async fn settle() {
     stellarator::sleep(Duration::from_millis(5)).await;
 }
 
 /// Build one system over db-backed ports, in the manifest's port order.
-fn wire(bench: &Bench, compiled: &Arc<Compiled>, index: usize) -> program::System {
+pub(super) fn wire(bench: &Bench, compiled: &Arc<Compiled>, index: usize) -> program::System {
     let ports: Vec<program::PortSource> = compiled.manifest.systems[index]
         .inputs
         .iter()
