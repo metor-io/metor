@@ -880,14 +880,15 @@ impl OutlineDelegate {
         let scroll = self.pivot_scroll(&pivot.key);
         let cells = pivot.fields.iter().zip(&pivot.cells).map(|(field, &n)| {
             div()
-                .w(px(pivot_cell_width(n)))
+                .w(px(pivot_cell_width(n, field)))
                 .h_full()
+                .flex()
+                .items_center()
                 .flex_shrink_0()
                 .border_r_1()
                 .border_color(theme.border_primary)
                 .px(px(PIVOT_CELL_PAD / 2.0))
                 .overflow_hidden()
-                .text_ellipsis()
                 .whitespace_nowrap()
                 .text_size(px(11.0))
                 .text_color(theme.text_tertiary)
@@ -913,7 +914,7 @@ impl OutlineDelegate {
         let mut cells: Vec<AnyElement> = Vec::with_capacity(pivot.fields.len());
         for (field_ix, (field, &n)) in pivot.fields.iter().zip(&pivot.cells).enumerate() {
             let cell = div()
-                .w(px(pivot_cell_width(n)))
+                .w(px(pivot_cell_width(n, field)))
                 .h_full()
                 .flex_shrink_0()
                 .border_r_1()
@@ -1039,9 +1040,15 @@ impl TableDelegate for OutlineDelegate {
     fn sort_column(&mut self, _col_ix: usize, _sort: ColumnSort, _cx: &App) {}
 }
 
-/// Width of a pivot cell holding an `n`-element strip.
-fn pivot_cell_width(n: usize) -> f32 {
-    strip_row_width(n.max(1)) + PIVOT_CELL_PAD
+/// Approximate advance of one character of the 11px label face; the cell
+/// only needs to be roomy enough that a label isn't clipped.
+const LABEL_CHAR_WIDTH: f32 = 6.8;
+
+/// Width of a pivot cell: the wider of its `n`-element strip and its label.
+fn pivot_cell_width(n: usize, label: &str) -> f32 {
+    let strip = strip_row_width(n.max(1));
+    let text = label.chars().count() as f32 * LABEL_CHAR_WIDTH;
+    strip.max(text) + PIVOT_CELL_PAD
 }
 
 /// The sideways-scrolling row container every pivot row shares the offset
