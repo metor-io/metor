@@ -11,12 +11,13 @@
 //! the pane scales to the whole namespace: only visible rows hold live
 //! strips, kept in a [`VisibleEntityCache`].
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, Pixels,
-    Render, SharedString, Window, div, prelude::*, px,
+    AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton,
+    MouseDownEvent, Pixels, Render, ScrollHandle, SharedString, Window, div, prelude::*, px,
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -35,16 +36,19 @@ use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripStyle, strip_row_width};
 use crate::icons::Icon;
 use crate::inspector::plot_preview::shift_hover_listener;
-use crate::inspector::rows::BoolRow;
+use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
+use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::theme;
-use model::{Disclosure, OutlineRow, component_count, flatten};
+use model::{Disclosure, Layout, OutlineRow, Pivot, RowKind, component_count, flatten};
 
 /// Indent per tree depth, in pixels.
 const INDENT: f32 = 14.0;
 const ROW_HEIGHT: f32 = 30.0;
 /// Row height once sparklines are on — enough for a readable trace.
 const SPARKLINE_ROW_HEIGHT: f32 = 44.0;
+/// Horizontal padding inside one pivot cell.
+const PIVOT_CELL_PAD: f32 = 8.0;
 /// Live strips and sparklines kept alive; well above any visible row count
 /// so scrolling reuses entities while bounding stream tasks.
 const CACHE_CAP: usize = 256;
@@ -143,6 +147,28 @@ impl ComponentOutline {
             delegate.reflatten(cx);
         });
     }
+
+    /// Branches shown as instances × fields, for persistence.
+    pub fn pivoted_paths(&self, cx: &App) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .table
+            .read(cx)
+            .delegate()
+            .pivoted
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        out.sort();
+        out
+    }
+
+    pub fn set_pivoted_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            let delegate = table.delegate_mut();
+            delegate.pivoted = paths.into_iter().map(SharedString::from).collect();
+            delegate.reflatten(cx);
+        });
+    }
 }
 
 impl Focusable for ComponentOutline {
@@ -234,6 +260,12 @@ pub struct OutlineDelegate {
     tree: Arc<ComponentNode>,
     disclosure: Disclosure,
     query: Query,
+    /// Branches rotated into a grid; a pivot only shows while its branch
+    /// is open, so folding one keeps the choice for when it reopens.
+    pivoted: HashSet<SharedString>,
+    /// One scroll offset per pivot, shared by its header and instance rows
+    /// so the grid scrolls sideways as a unit.
+    pivot_scrolls: HashMap<SharedString, ScrollHandle>,
     rows: Vec<OutlineRow>,
     sparklines: bool,
     strips: VisibleEntityCache<ComponentValueStrip>,
@@ -249,6 +281,8 @@ impl OutlineDelegate {
             tree: build_tree_root(),
             disclosure: Disclosure::default(),
             query: Query::default(),
+            pivoted: HashSet::new(),
+            pivot_scrolls: HashMap::new(),
             rows: Vec::new(),
             sparklines: false,
             strips: VisibleEntityCache::new(CACHE_CAP),
@@ -276,8 +310,92 @@ impl OutlineDelegate {
     }
 
     fn reflatten(&mut self, cx: &mut Context<Table<Self>>) {
-        self.rows = flatten(&self.tree, &self.disclosure, &self.query);
+        let db = self.db.clone();
+        self.rows = flatten(
+            &self.tree,
+            &Layout {
+                disclosure: &self.disclosure,
+                pivoted: &self.pivoted,
+                query: &self.query,
+                cell_count: &|id| strip_cell_count(&db, id),
+            },
+        );
         cx.notify();
+    }
+
+    /// Pivoting opens the branch too — a pivot behind a fold would look
+    /// like nothing happened.
+    fn set_pivoted(&mut self, row: &OutlineRow, on: bool, cx: &mut Context<Table<Self>>) {
+        let path = row.node.full_name.clone();
+        if on {
+            self.pivoted.insert(path.clone());
+            self.disclosure.set_expanded(&path, row.depth, true);
+        } else {
+            self.pivoted.remove(&path);
+            self.pivot_scrolls.remove(&path);
+        }
+        self.reflatten(cx);
+    }
+
+    fn pivot_scroll(&mut self, path: &SharedString) -> ScrollHandle {
+        self.pivot_scrolls
+            .entry(path.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Right-click on a branch: pivot it, or open and fold its subtree.
+    fn open_branch_menu(
+        &mut self,
+        row: &OutlineRow,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        let Some(open) = open_inspector(cx) else {
+            return;
+        };
+        let table = cx.entity();
+        let pivoted = row.is_pivoted();
+        let can_pivot = row.node.children.values().any(|c| !c.children.is_empty());
+        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+        if can_pivot {
+            let label = if pivoted { "Unpivot" } else { "Pivot" };
+            let target = row.clone();
+            let table = table.clone();
+            rows.push(Box::new(CommandRow::new(
+                label,
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().set_pivoted(&target, !pivoted, cx);
+                    });
+                }),
+            )));
+        }
+        for (label, expanded) in [("Expand all", true), ("Collapse all", false)] {
+            let target = row.clone();
+            let table = table.clone();
+            rows.push(Box::new(CommandRow::new(
+                label,
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        let delegate = table.delegate_mut();
+                        delegate
+                            .disclosure
+                            .set_subtree(&target.node, target.depth, expanded);
+                        delegate.reflatten(cx);
+                    });
+                }),
+            )));
+        }
+        open(
+            InspectorRequest {
+                rows,
+                mode: InspectorMode::Anchored(position),
+            },
+            window,
+            cx,
+        );
     }
 
     fn set_query(&mut self, query: Query, cx: &mut Context<Table<Self>>) {
@@ -359,7 +477,17 @@ impl OutlineDelegate {
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
-        let is_branch = row.is_branch();
+        // Pivot rows are flat: instances don't disclose, and the header
+        // names nothing. Both still indent under their branch.
+        let (is_branch, label, color) = match &row.kind {
+            RowKind::PivotHeader(_) => (false, SharedString::default(), theme.text_tertiary),
+            RowKind::PivotInstance { .. } => (false, row.node.segment.clone(), theme.text_primary),
+            _ => (
+                row.is_branch(),
+                row.node.segment.clone(),
+                theme.text_primary,
+            ),
+        };
 
         let mut slot = div().w(px(12.0)).flex_shrink_0();
         if is_branch {
@@ -381,23 +509,36 @@ impl OutlineDelegate {
             .pl(px(8.0 + row.depth as f32 * INDENT))
             .pr(px(8.0))
             .text_size(px(13.0))
-            .text_color(theme.text_primary)
+            .text_color(color)
             .child(slot)
             .child(
                 div()
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .child(row.node.segment.clone()),
+                    .child(label),
             );
 
         if is_branch {
-            cell = cell.cursor_pointer().on_click(cx.listener(
-                move |table, event: &ClickEvent, _, cx| {
+            let menu_row = row.clone();
+            cell = cell
+                .cursor_pointer()
+                .on_click(cx.listener(move |table, event: &ClickEvent, _, cx| {
                     let subtree = event.modifiers().alt;
                     table.delegate_mut().toggle_row(row_ix, subtree, cx);
-                },
-            ));
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |table, event: &MouseDownEvent, window, cx| {
+                        table.delegate_mut().open_branch_menu(
+                            &menu_row,
+                            event.position,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }),
+                );
         }
         if let Some(id) = row.node.component_id {
             cell = cell.on_mouse_move(shift_hover_listener(id, SmallVec::new()));
@@ -412,12 +553,26 @@ impl OutlineDelegate {
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
+        match &row.kind {
+            RowKind::PivotHeader(pivot) => {
+                return self.render_pivot_header(row_ix, &row.node.full_name, pivot, cx);
+            }
+            RowKind::PivotInstance { pivot, ix } => {
+                let pivot = pivot.clone();
+                let branch = pivot_branch_path(&row.node.full_name);
+                return self.render_pivot_cells(row_ix, &branch, &pivot, *ix, cx);
+            }
+            _ => {}
+        }
         let Some(id) = row.node.component_id else {
             let n = row.component_count;
-            let label = if n == 1 {
-                "1 component".to_string()
-            } else {
-                format!("{n} components")
+            let label = match &row.kind {
+                RowKind::PivotBranch(pivot) => format!(
+                    "{} × {}",
+                    count_label(pivot.instances.len(), "instance"),
+                    count_label(pivot.fields.len(), "field")
+                ),
+                _ => count_label(n, "component"),
             };
             return div()
                 .px(px(8.0))
@@ -454,6 +609,77 @@ impl OutlineDelegate {
             .child(line);
         scroll.style().restrict_scroll_to_axis = Some(true);
         scroll.into_any_element()
+    }
+
+    /// The field labels of a pivot, laid out on the same cell grid as the
+    /// instance rows beneath and sharing their scroll offset.
+    fn render_pivot_header(
+        &mut self,
+        row_ix: usize,
+        branch: &SharedString,
+        pivot: &Pivot,
+        cx: &mut Context<Table<Self>>,
+    ) -> AnyElement {
+        let theme = theme(cx);
+        let scroll = self.pivot_scroll(branch);
+        let cells = pivot.fields.iter().zip(&pivot.cells).map(|(field, &n)| {
+            div()
+                .w(px(pivot_cell_width(n)))
+                .flex_shrink_0()
+                .px(px(PIVOT_CELL_PAD / 2.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(px(11.0))
+                .text_color(theme.text_tertiary)
+                .child(field.clone())
+        });
+        pivot_scroller(row_ix, scroll)
+            .children(cells)
+            .into_any_element()
+    }
+
+    /// One instance's strips, one fixed-width cell per field.
+    fn render_pivot_cells(
+        &mut self,
+        row_ix: usize,
+        branch: &SharedString,
+        pivot: &Pivot,
+        ix: usize,
+        cx: &mut Context<Table<Self>>,
+    ) -> AnyElement {
+        let theme = theme(cx);
+        let scroll = self.pivot_scroll(branch);
+        let instance = &pivot.instances[ix];
+        let db = self.db.clone();
+        let mut cells: Vec<AnyElement> = Vec::with_capacity(pivot.fields.len());
+        for (field_ix, (field, &n)) in pivot.fields.iter().zip(&pivot.cells).enumerate() {
+            let cell = div()
+                .w(px(pivot_cell_width(n)))
+                .flex_shrink_0()
+                .px(px(PIVOT_CELL_PAD / 2.0))
+                .flex()
+                .items_center();
+            let Some(id) = instance.ids[field_ix] else {
+                cells.push(
+                    cell.text_size(px(12.0))
+                        .text_color(theme.text_tertiary)
+                        .child(SharedString::new_static("—"))
+                        .into_any_element(),
+                );
+                continue;
+            };
+            let strip = self.strip(id, cx);
+            let name = SharedString::from(format!("{}.{}", instance.node.full_name, field));
+            let click = edit_click(db.clone(), id, name);
+            let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
+            behavior.on_element_right_click = Some(right_click_plot(db.clone(), id));
+            strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
+            cells.push(cell.child(strip).into_any_element());
+        }
+        pivot_scroller(row_ix, scroll)
+            .children(cells)
+            .into_any_element()
     }
 
     fn render_text(&self, text: Option<String>, cx: &mut Context<Table<Self>>) -> AnyElement {
@@ -512,6 +738,14 @@ impl TableDelegate for OutlineDelegate {
         match Col::at(col_ix, self.sparklines) {
             Col::Name => self.render_name(row_ix, &row, cx),
             Col::Value => self.render_value(row_ix, &row, cx),
+            Col::Unit | Col::Type | Col::Sparkline
+                if matches!(
+                    row.kind,
+                    RowKind::PivotHeader(_) | RowKind::PivotInstance { .. }
+                ) =>
+            {
+                div().into_any_element()
+            }
             Col::Unit => {
                 let unit = row.node.component_id.and_then(|id| unit(&self.db, id));
                 self.render_text(unit, cx)
@@ -538,6 +772,44 @@ impl TableDelegate for OutlineDelegate {
     }
 
     fn sort_column(&mut self, _col_ix: usize, _sort: ColumnSort, _cx: &App) {}
+}
+
+/// Width of a pivot cell holding an `n`-element strip.
+fn pivot_cell_width(n: usize) -> f32 {
+    strip_row_width(n.max(1)) + PIVOT_CELL_PAD
+}
+
+/// The sideways-scrolling row container every pivot row shares the offset
+/// of. Axis-restricted so the wheel still scrolls the table vertically.
+fn pivot_scroller(row_ix: usize, scroll: ScrollHandle) -> gpui::Stateful<gpui::Div> {
+    let mut scroller = div()
+        .id(("outline-pivot", row_ix))
+        .flex()
+        .flex_row()
+        .items_center()
+        .h_full()
+        .px(px(4.0))
+        .overflow_x_scroll()
+        .track_scroll(&scroll);
+    scroller.style().restrict_scroll_to_axis = Some(true);
+    scroller
+}
+
+/// The pivoted branch an instance row belongs to: its parent path.
+fn pivot_branch_path(instance: &str) -> SharedString {
+    match instance.rfind('.') {
+        Some(ix) => SharedString::from(instance[..ix].to_string()),
+        None => SharedString::default(),
+    }
+}
+
+/// `"1 field"` / `"3 fields"`.
+fn count_label(n: usize, singular: &str) -> String {
+    if n == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{n} {singular}s")
+    }
 }
 
 /// An empty tree to hold until the watcher publishes the first real one.

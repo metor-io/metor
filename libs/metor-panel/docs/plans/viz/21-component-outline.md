@@ -55,10 +55,21 @@ New:
 - Sparkline column exists only when enabled; row height grows to fit it.
 - Persisted: filter text, bar visibility, sparklines flag, toggled paths.
 
+## Pivot (landed)
+
+Right-click a branch → **Pivot**. Its branch children become instance rows
+and the union of their leaf paths (relative, e.g. `motor.temp`) become
+fixed-width cells; leaf children of the branch keep ordinary rows above the
+grid. Detection is structural — no `group_name` opt-in — and a sibling
+missing a field shows `—`. The header row and instance rows share one
+`ScrollHandle` so the grid scrolls sideways as a unit. Pivoted paths
+persist; a folded pivot keeps its choice for when it reopens. The same
+menu offers **Expand all** / **Collapse all**.
+
 ## Follow-ups
 
 - Branch summaries beyond count: worst alarm state, stale leaf count.
   Needs a cheap per-component `last_timestamp` + alarm read (plan 08).
-- Pivot mode (plan #2 in the proposal): rotate a branch of alike siblings
-  into instances × fields inline under the branch row.
+- Two-tier pivot headers (`motor ▸ temp, current`) with collapsible column
+  groups, and a colour cell mode (instances × fields heatmap).
 - Retire the data table pane once this covers its uses.

@@ -773,6 +773,7 @@ pub struct OutlinePanelConfig {
     pub filter_bar: bool,
     pub sparklines: bool,
     pub toggled: Vec<String>,
+    pub pivoted: Vec<String>,
 }
 
 /// Pane item showing the component namespace as a collapsible tree-table.
@@ -797,6 +798,7 @@ impl OutlinePanel {
             outline.set_filter_text(&cfg.filter, cx);
             outline.set_sparklines(cfg.sparklines, cx);
             outline.set_toggled_paths(cfg.toggled, cx);
+            outline.set_pivoted_paths(cfg.pivoted, cx);
         });
         panel
     }
@@ -826,6 +828,7 @@ impl PaneItem for OutlinePanel {
             filter_bar: inner.filter_visible(),
             sparklines: inner.sparklines(cx),
             toggled: inner.toggled_paths(cx),
+            pivoted: inner.pivoted_paths(cx),
         }
     }
 
