@@ -173,7 +173,10 @@ pub fn ceiling(component: &Component, plan: &ReplayPlan) -> Option<Timestamp> {
 }
 
 /// The stretches of `range` a backfill of `component` should compute now:
-/// what nothing accounts for, clipped below the [`ceiling`].
+/// what nothing accounts for, clipped below the [`ceiling`], and only where
+/// the driving input has a sample to fire on. A stretch between two
+/// consecutive input samples is not history waiting to be computed — it is
+/// where none will ever be — and asking for it would only ask again.
 pub fn wanted(
     component: &Component,
     plan: &ReplayPlan,
@@ -187,7 +190,32 @@ pub fn wanted(
     if range.start >= end {
         return;
     }
+    let desc = &plan.compiled.manifest.systems[plan.system];
+    let driving = desc
+        .rate
+        .is_none()
+        .then(|| &plan.ports[desc.driving.unwrap_or(0)]);
+    let from = out.len();
     component.time_series.uncovered(range.start..end, out);
+    if let Some(driving) = driving {
+        let mut at = from;
+        while at < out.len() {
+            if has_sample(driving, &out[at]) {
+                at += 1;
+            } else {
+                out.remove(at);
+            }
+        }
+    }
+}
+
+/// Whether `component` holds at least one sample inside `range`.
+fn has_sample(component: &Component, range: &Range<Timestamp>) -> bool {
+    component.time_series.iter_node_slices().any(|node| {
+        let timestamps = node.timestamps();
+        let at = timestamps.partition_point(|t| t.0 < range.start.0);
+        timestamps.get(at).is_some_and(|t| t.0 < range.end.0)
+    })
 }
 
 /// Compute `range` of `component` under `plan`, landing chunks as it goes.
