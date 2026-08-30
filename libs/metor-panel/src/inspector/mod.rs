@@ -612,28 +612,45 @@ impl Inspector {
             .flex()
             .flex_row()
             .items_center()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
             .px(px(8.0))
             .py(px(4.0))
             .border_b_1()
             .border_color(theme.border_primary)
             .text_size(px(12.0));
 
-        for page in &self.pages[..self.pages.len().saturating_sub(1)] {
-            if let Some(label) = &page.label {
-                bar = bar.child(
-                    div()
-                        .px(px(6.0))
-                        .py(px(1.0))
-                        .mr(px(4.0))
-                        .bg(theme.pill_bg)
-                        .border_1()
-                        .border_color(theme.pill_border)
-                        .rounded(px(3.0))
-                        .text_size(px(10.0))
-                        .text_color(theme.text_secondary)
-                        .child(label.clone()),
-                );
-            }
+        // The trail is context, the field is the point: only the nearest two
+        // crumbs show, each capped, and anything before them folds into one
+        // ellipsis so the field always keeps its room.
+        let crumbs: Vec<&SharedString> = self.pages[..self.pages.len().saturating_sub(1)]
+            .iter()
+            .filter_map(|page| page.label.as_ref())
+            .collect();
+        let shown = crumbs.len().min(2);
+        let mut labels: Vec<SharedString> = Vec::with_capacity(shown + 1);
+        if crumbs.len() > shown {
+            labels.push(SharedString::new_static("…"));
+        }
+        labels.extend(crumbs[crumbs.len() - shown..].iter().map(|l| (*l).clone()));
+        for label in labels {
+            bar = bar.child(
+                div()
+                    .flex_none()
+                    .max_w(px(140.0))
+                    .truncate()
+                    .px(px(6.0))
+                    .py(px(1.0))
+                    .mr(px(4.0))
+                    .bg(theme.pill_bg)
+                    .border_1()
+                    .border_color(theme.pill_border)
+                    .rounded(px(3.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.text_secondary)
+                    .child(label),
+            );
         }
 
         bar = bar.child(div().flex_1().min_w(px(60.0)).child(self.search.element()));
