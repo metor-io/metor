@@ -15,7 +15,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::descriptor::compatible;
 use crate::{
     CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, LogEvent, MsgOut, Out, Output,
-    PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemOutput, buffer_capacity,
+    PortDesc, System, SystemInput, SystemKind, SystemOutput, SystemStatus, buffer_capacity,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ fn write_until_block(mut write: impl FnMut(u32) -> Result<(), WriteError>) -> u3
     unreachable!()
 }
 
-fn latest_health(input: &mut Input<SystemHealth>) -> RecSink {
+fn latest_health(input: &mut Input<SystemStatus>) -> RecSink {
     let record = input
         .latest()
         .expect("ring readable")
@@ -172,7 +172,7 @@ impl CyclicSystem for Filter {
 fn cyclic_filter_end_to_end() {
     let imu_ring = ring_for::<Imu>(8, 2);
     let nav_ring = ring_for::<NavEstimate>(8, 2);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     // Upstream producer and downstream consumer, both built by hand.
@@ -343,10 +343,10 @@ fn descriptor_and_compatibility() {
 fn health_counters_published() {
     let imu_ring = ring_for::<Imu>(8, 1);
     let nav_ring = ring_for::<NavEstimate>(8, 1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
+    let mut health_in = Input::<SystemStatus>::new(health_ring.view(NoWake).unwrap());
 
     let input = FilterIn {
         imu: Input::new(imu_ring.view(NoWake).unwrap()),
@@ -371,10 +371,10 @@ fn health_counters_published() {
     // Read the freshest health record and apply its vtable.
     let sink = latest_health(&mut health_in);
 
-    assert_eq!(sink.values[&ComponentId::new("health.cycles")], 3.0);
-    assert_eq!(sink.values[&ComponentId::new("health.errors")], 3.0);
+    assert_eq!(sink.values[&ComponentId::new("system_status.cycles")], 3.0);
+    assert_eq!(sink.values[&ComponentId::new("system_status.errors")], 3.0);
     assert_eq!(
-        sink.values[&ComponentId::new("health.error_counts.imu_missing")],
+        sink.values[&ComponentId::new("system_status.error_counts.imu_missing")],
         3.0,
         "named domain counter lands via the dynamic-frame path"
     );
@@ -458,9 +458,9 @@ fn publish_drop_folds_to_health() {
         capacity: 16,
         max_readers: 1,
     });
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
+    let mut health_in = Input::<SystemStatus>::new(health_ring.view(NoWake).unwrap());
 
     let input = crate::BindPorts::bind(&mut TestSource {
         rings: vec![],
@@ -474,9 +474,9 @@ fn publish_drop_folds_to_health() {
     runner.step(Timestamp(1));
 
     let sink = latest_health(&mut health_in);
-    assert_eq!(sink.values[&ComponentId::new("health.errors")], 1.0);
+    assert_eq!(sink.values[&ComponentId::new("system_status.errors")], 1.0);
     assert_eq!(
-        sink.values[&ComponentId::new("health.error_counts.publish_dropped")],
+        sink.values[&ComponentId::new("system_status.error_counts.publish_dropped")],
         1.0,
         "the port's counted drop lands as a runner health error"
     );
@@ -609,7 +609,7 @@ fn log_input_guaranteed_delivery_through_runner() {
     }
 
     let ring = msg_ring(1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     let input: GuardIn = crate::BindPorts::bind(&mut TestSource {

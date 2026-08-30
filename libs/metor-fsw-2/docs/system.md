@@ -181,20 +181,20 @@ Function systems and pack tasks use the pack `Driver` contract. Their current dr
 
 ## Health and logs
 
-Each system descriptor adds a `health` frame output and a `log` message output.
+Each system descriptor adds a `system_status` frame output and a `log` message output.
 
 `HealthPort::error("kind")` adds to the total error count and the named count. A kind must not be empty or contain `.`.
 
-`HealthPort::log(level, text)` queues a `LogEvent`. `end_cycle` sends queued events and one `SystemHealth` frame.
+`HealthPort::log(level, text)` queues a `LogEvent`. `end_cycle` sends queued events and one `SystemStatus` frame.
 
-`SystemHealth` contains:
+`SystemStatus` contains:
 
 - cycle count
 - total error count
-- last execute or poll time in microseconds
+- last execute or poll time in microseconds (`last_execute_us`; a wasm occupant reads the host clock for this through the `fsw.monotonic_us` import)
 - a bounded map of named error counts
 
-Logs are postcard messages. They are not fields in the health frame.
+Logs are postcard messages. They are not fields in the status frame.
 
 Cyclic struct drivers, function drivers, and task drivers call `end_cycle` for you. Free-running struct async systems must set their own health update points.
 

@@ -2,7 +2,7 @@
 //!
 //! Systems in this crate never return errors from `execute`. Instead, every
 //! system implicitly owns a pair of output ports, one carrying a
-//! [`SystemHealth`] frame and one carrying [`LogEvent`] messages, and reports
+//! [`SystemStatus`] frame and one carrying [`LogEvent`] messages, and reports
 //! trouble as ordinary telemetry over them. A [`HealthPort`] bundles the two
 //! ports with the counter state behind them.
 //!
@@ -16,7 +16,7 @@
 //! and must choose when to send its queued state.
 //!
 //! Named error counters ride the dynamic [`FrameMap`] tail of the health
-//! frame, so each kind surfaces as its own `health.error_counts.<kind>`
+//! frame, so each kind surfaces as its own `system_status.error_counts.<kind>`
 //! component. Log lines travel as self-describing message records on a log
 //! ring, so the downlink forwards them like any other message and a line is
 //! never truncated to fit a frame slot.
@@ -49,34 +49,34 @@ pub const MAX_ERR_KINDS: usize = 16;
 pub const MAX_LINES: usize = 64;
 
 /// A telemetry frame that snapshots one system's run counters at the end of
-/// each cycle.
+/// each cycle, published as `<instance>.system_status`.
 ///
 /// The scalar counters are maintained by the framework around `execute`;
-/// `error_counts` holds the named counters bumped through
-/// [`HealthPort::error`] and lands as one `health.error_counts.<kind>`
-/// component per kind.
+/// `last_execute_us` is how long that call (or poll) took. `error_counts`
+/// holds the named counters bumped through [`HealthPort::error`] and lands as
+/// one `system_status.error_counts.<kind>` component per kind.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
-#[metor_fsw(name = "health")]
-pub struct SystemHealth {
+#[metor_fsw(name = "system_status")]
+pub struct SystemStatus {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
     pub cycles: u64,
     pub errors: u64,
-    pub last_execute_micros: u64,
+    pub last_execute_us: u64,
     pub error_counts: FrameMap<u64, MAX_ERR_KINDS>,
 }
 
 /// The handle a system uses to report errors and log lines as telemetry.
 ///
-/// It bundles the [`SystemHealth`] and [`LogEvent`] output ports with the
+/// It bundles the [`SystemStatus`] and [`LogEvent`] output ports with the
 /// counter state behind them, and is surfaced to a system as
 /// `output.health()`. See the [module docs](self) for who calls what.
 pub struct HealthPort<WD = NoWake>
 where
     WD: WakeSource,
 {
-    health: Output<SystemHealth, WD>,
+    health: Output<SystemStatus, WD>,
     log: MsgOut<LogEvent, WD>,
     /// The owning system's instance name, stamped into every emitted
     /// [`LogEvent`] as its `source`. Empty until the binder threads it in.
@@ -92,7 +92,7 @@ where
     WD: WakeSource,
 {
     /// Builds the handle from the two framework-allocated output ports.
-    pub fn new(health: Output<SystemHealth, WD>, log: MsgOut<LogEvent, WD>) -> Self {
+    pub fn new(health: Output<SystemStatus, WD>, log: MsgOut<LogEvent, WD>) -> Self {
         Self {
             health,
             log,
@@ -115,7 +115,7 @@ where
     ///
     /// Kinds beyond [`MAX_ERR_KINDS`] still count toward the total but get no
     /// counter of their own. The kind becomes a path segment of the counter's
-    /// component (`health.error_counts.<kind>`), so it must be non-empty and
+    /// component (`system_status.error_counts.<kind>`), so it must be non-empty and
     /// must not contain `.` — a key the map rejects would drop every counter
     /// from the health record. Use `_` to separate words.
     pub fn error(&mut self, kind: &str) {
@@ -149,11 +149,12 @@ where
         }
     }
 
-    /// Closes a cycle by bumping `cycles`, stamping the execute duration, and
-    /// publishing one health record plus one [`LogEvent`] per queued line.
-    pub fn end_cycle(&mut self, timestamp: Timestamp, execute_micros: u64) {
+    /// Closes a cycle by bumping `cycles`, stamping the execute duration in
+    /// microseconds, and publishing one status record plus one [`LogEvent`]
+    /// per queued line.
+    pub fn end_cycle(&mut self, timestamp: Timestamp, execute_us: u64) {
         self.cycles += 1;
-        self.publish_health(timestamp, execute_micros);
+        self.publish_status(timestamp, execute_us);
         self.flush_logs(timestamp);
         // Inside a pack dylib the tracing forward queue is per-dylib and the
         // loop is single-threaded, so everything queued since the last drain
@@ -172,19 +173,19 @@ where
         }
     }
 
-    fn publish_health(&mut self, timestamp: Timestamp, execute_micros: u64) {
-        let frame = SystemHealth {
+    fn publish_status(&mut self, timestamp: Timestamp, execute_us: u64) {
+        let frame = SystemStatus {
             timestamp,
             cycles: self.cycles,
             errors: self.errors,
-            last_execute_micros: execute_micros,
+            last_execute_us: execute_us,
             error_counts: FrameMap::EMPTY,
         };
         let counts = &self.error_counts;
         let result = self.health.write_with(&frame, |fw| {
             let res = fw.map(
                 &frame.error_counts,
-                offset_of!(SystemHealth, error_counts),
+                offset_of!(SystemStatus, error_counts),
                 |m| {
                     for (kind, n) in counts {
                         m.insert(kind, *n);
@@ -196,7 +197,7 @@ where
             debug_assert!(res.is_ok(), "error kind rejected as a map key: {res:?}");
         });
         if result.is_err() {
-            self.error("health_publish_failed");
+            self.error("system_status_publish_failed");
         }
     }
 
@@ -250,14 +251,16 @@ mod tests {
     impl CountSink {
         fn count(&self, kind: &str) -> Option<u64> {
             self.0
-                .get(&ComponentId::new(&format!("health.error_counts.{kind}")))
+                .get(&ComponentId::new(&format!(
+                    "system_status.error_counts.{kind}"
+                )))
                 .copied()
         }
     }
 
-    fn port_with_readers() -> (HealthPort, Input<SystemHealth>, MsgIn<LogEvent>) {
+    fn port_with_readers() -> (HealthPort, Input<SystemStatus>, MsgIn<LogEvent>) {
         let health_ring = RingBuffer::create_in_memory(Config {
-            capacity: buffer_capacity::<SystemHealth>(8),
+            capacity: buffer_capacity::<SystemStatus>(8),
             max_readers: 1,
         });
         let log_ring = RingBuffer::create_in_memory(Config {
@@ -289,7 +292,7 @@ mod tests {
         assert_eq!(grant.timestamp, Timestamp(7));
         assert_eq!(grant.cycles, 1);
         assert_eq!(grant.errors, 3);
-        assert_eq!(grant.last_execute_micros, 12);
+        assert_eq!(grant.last_execute_us, 12);
         let mut counts = CountSink::default();
         grant.apply(&mut counts).unwrap().unwrap();
         assert_eq!(counts.count("imu_missing"), Some(2));

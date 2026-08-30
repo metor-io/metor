@@ -66,7 +66,7 @@
 //! counting that loss for health telemetry.
 //!
 //! Each system has health and log outputs. Cyclic drivers close a health cycle
-//! after each step and send a [`SystemHealth`] frame plus queued [`LogEvent`]
+//! after each step and send a [`SystemStatus`] frame plus queued [`LogEvent`]
 //! messages. A free-running [`AsyncSystem`] controls when it sends its own
 //! health data.
 //!

@@ -32,6 +32,13 @@
 //! boundary once per cycle. The ring format stays unchanged; only the copy
 //! between host and guest address spaces is new.
 //!
+//! ## The one import
+//!
+//! `wasm32-unknown-unknown` has no clock, so the guest's per-execute timer
+//! (`last_execute_us` on its status frame) reads the host's monotonic clock
+//! through `fsw.monotonic_us`, the only import the host links in. A module
+//! that never times anything simply does not import it.
+//!
 //! ## Stable memory and persistent ring roles
 //!
 //! A ring reader owns a persistent slot in the region header, so rebuilding it
@@ -49,6 +56,8 @@
 //! manifest that fails to decode is a clean error rather than a panic, and
 //! every trap — including running out of fuel — becomes an [`WasmError`]
 //! instead of propagating.
+
+use std::time::Instant;
 
 use metor_fsw_2_core::abi::{FSW_ABI_VERSION, FswStatus, PackEntryDesc, PackManifest};
 use metor_fsw_ring::{Config, RingBuffer, region_len};
@@ -302,7 +311,13 @@ impl WasmPack {
         store
             .set_fuel(fuel_per_call)
             .map_err(|e| WasmError::Instantiate(e.to_string()))?;
-        let linker: Linker<StoreState> = Linker::new(&engine);
+        let mut linker: Linker<StoreState> = Linker::new(&engine);
+        let epoch = Instant::now();
+        linker
+            .func_wrap("fsw", "monotonic_us", move || {
+                epoch.elapsed().as_micros() as u64
+            })
+            .map_err(|e| WasmError::Instantiate(e.to_string()))?;
         let instance: Instance = linker
             .instantiate_and_start(&mut store, &module)
             .map_err(|e| WasmError::Instantiate(e.to_string()))?;

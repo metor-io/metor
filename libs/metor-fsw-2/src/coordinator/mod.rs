@@ -643,15 +643,19 @@ impl Coordinator {
                 slot.step(now);
             }
             self.update_status(now);
-            self.drain_forwarded_logs(now);
+            self.drain_forwarded_logs();
+            // The coordinator's own status record closes once per cycle like
+            // any system's, with the time the whole graph took to step.
+            let elapsed = start.elapsed();
+            if matches!(self.config.clock, ClockMode::Wall) && elapsed >= budget {
+                self.telemeter_overrun(elapsed, budget);
+            }
+            self.coord_health.end_cycle(now, elapsed.as_micros() as u64);
             match self.config.clock {
                 // Wall: sleep out the remainder of the cycle budget.
                 ClockMode::Wall => {
-                    let elapsed = start.elapsed();
                     if elapsed < budget {
                         stellarator::sleep(budget - elapsed).await;
-                    } else {
-                        self.telemeter_overrun(now, elapsed, budget);
                     }
                 }
                 // Simulated: no pacing, but still yield once so any spawned
@@ -716,7 +720,6 @@ impl Coordinator {
     fn update_status(&mut self, now: Timestamp) {
         // Boundary and worker failures land on coordinator health because the
         // host cannot report them through the system-owned health port.
-        let mut coord_event = false;
         for slot in &mut self.cyclic {
             let boundary_drops = slot.drain_boundary_drops();
             if boundary_drops > 0 {
@@ -727,7 +730,6 @@ impl Coordinator {
                     dropped = boundary_drops,
                     "async boundary dropped records"
                 );
-                coord_event = true;
             }
             let boundary_corruptions = slot.drain_boundary_corruptions();
             if boundary_corruptions > 0 {
@@ -738,23 +740,17 @@ impl Coordinator {
                     corruptions = boundary_corruptions,
                     "isolated boundary read corrupt"
                 );
-                coord_event = true;
             }
             if slot.drain_timeouts() > 0 {
                 self.coord_health.error("proc_step_timeout");
                 self.coord_health.log(LogLevel::Warn, slot.name());
                 tracing::warn!(system = slot.name(), "worker step missed its deadline");
-                coord_event = true;
             }
             if slot.drain_restarts() > 0 {
                 self.coord_health.error("proc_restart");
                 self.coord_health.log(LogLevel::Warn, slot.name());
                 tracing::warn!(system = slot.name(), "worker restarting");
-                coord_event = true;
             }
-        }
-        if coord_event {
-            self.coord_health.end_cycle(now, 0);
         }
         self.stopped_scratch.clear();
         self.workers_scratch.clear();
@@ -788,7 +784,6 @@ impl Coordinator {
                 self.coord_health.log(LogLevel::Warn, &name);
                 tracing::error!(system = %name, "system stopped");
             }
-            self.coord_health.end_cycle(now, 0);
         }
     }
 
@@ -842,17 +837,14 @@ impl Coordinator {
     /// Drain the tracing forward queue onto the coordinator's log port. Runs
     /// once per cycle (after the slots step) and once more at shutdown;
     /// events fired before the first cycle (build, init) flush here too.
-    fn drain_forwarded_logs(&mut self, now: Timestamp) {
+    fn drain_forwarded_logs(&mut self) {
         let dropped = metor_fsw_2_core::logfwd::drain(|ev| self.coord_health.emit_event(&ev));
-        if dropped > 0 {
-            for _ in 0..dropped {
-                self.coord_health.error("log_dropped");
-            }
-            self.coord_health.end_cycle(now, 0);
+        for _ in 0..dropped {
+            self.coord_health.error("log_dropped");
         }
     }
 
-    fn telemeter_overrun(&mut self, now: Timestamp, elapsed: Duration, budget: Duration) {
+    fn telemeter_overrun(&mut self, elapsed: Duration, budget: Duration) {
         self.coord_health.error("cycle_overrun");
         self.coord_health.log(
             LogLevel::Warn,
@@ -862,7 +854,6 @@ impl Coordinator {
                 budget.as_micros()
             ),
         );
-        self.coord_health.end_cycle(now, elapsed.as_micros() as u64);
     }
 
     /// Cooperative teardown: cancel waits, join tasks that run their shutdown
@@ -896,7 +887,10 @@ impl Coordinator {
             slot.shutdown();
         }
         // Late tracing events (task teardown, slot shutdown) still reach the
-        // downlink's final batches.
-        self.drain_forwarded_logs(Timestamp::now());
+        // downlink's final batches, and a last status record carries any
+        // shutdown errors off-board.
+        self.drain_forwarded_logs();
+        self.coord_health
+            .end_cycle(metor_fsw_2_core::now_or_wall(), 0);
     }
 }

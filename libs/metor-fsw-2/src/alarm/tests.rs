@@ -319,8 +319,8 @@ mod system {
 
     use crate::{
         AlarmSystem, AlarmsParams, BuildSystem, ClockMode, CommandOut, Coordinator,
-        CoordinatorConfig, CyclicSystem, MsgIn, Out, Output, System, SystemHealth, SystemInput,
-        SystemOutput,
+        CoordinatorConfig, CyclicSystem, MsgIn, Out, Output, System, SystemInput, SystemOutput,
+        SystemStatus,
     };
 
     use crate::coordinator::PortRef;
@@ -746,7 +746,7 @@ mod system {
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
         let registry = coord.registry();
         let health_entry = registry
-            .get(ComponentId::new("alarms.health"))
+            .get(ComponentId::new("alarms.system_status"))
             .expect("health entry");
         let mut health_view = health_entry.view().expect("reader slot");
         let mut coord = coord;
@@ -766,7 +766,7 @@ mod system {
             .try_latest()
             .expect("read health")
             .expect("health record");
-        let (health, _) = SystemHealth::ref_from_prefix(&grant).expect("health layout");
+        let (health, _) = SystemStatus::ref_from_prefix(&grant).expect("health layout");
         assert_eq!(health.errors, 3, "ghost + oob + duplicate each count once");
     }
 }

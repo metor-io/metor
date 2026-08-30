@@ -459,7 +459,7 @@ impl Pack {
         let params_schema = spec.schema;
         let inputs = std::mem::take(&mut sink.inputs);
         let mut outputs = std::mem::take(&mut sink.outputs);
-        outputs.push(crate::PortDesc::of::<crate::SystemHealth>());
+        outputs.push(crate::PortDesc::of::<crate::SystemStatus>());
         outputs.push(crate::PortDesc::msg_named::<crate::LogEvent>("log"));
         let descriptor = SystemDescriptor {
             name: name.into(),

@@ -52,7 +52,7 @@ No data flows before these passes finish.
 
 ## Node and port order
 
-Node zero is always the coordinator. It owns health, log, status, sequence registry, and command outputs. A target loaded through the wiring front end also adds a wiring manifest output.
+Node zero is always the coordinator. It owns `system_status`, log, status, sequence registry, and command outputs. A target loaded through the wiring front end also adds a wiring manifest output.
 
 User system order has two roles:
 
@@ -176,9 +176,7 @@ Coordinator health counts host faults such as:
 - cycle overruns
 - async shutdown timeouts
 
-The current run loop closes a coordinator health cycle after a worker event, a stopped-set change, a host log queue drop, or a cycle overrun. Other error calls stay in the health state until a later close. An error near the end of shutdown may not reach a health record.
-
-The coordinator health cycle count does not equal the FSW cycle count.
+The run loop closes the coordinator's `system_status` record once per cycle, after every slot has stepped and the status and log work is done, so its `cycles` count equals the FSW cycle count and `last_execute_us` is the time the whole graph took to step (the sleep that pads out a wall-clock cycle is excluded). Shutdown closes one final record so late errors, such as an async shutdown timeout, still reach the downlink.
 
 ## Shutdown
 

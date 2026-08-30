@@ -87,8 +87,9 @@ fn wasm_pack_loads_and_describes() {
 /// ring and driver reached for one. Claiming a ring slot stamped
 /// `std::process::id`, and every execute timed itself with `Instant::now`;
 /// both are unsupported on that target and panic, which surfaces only as an
-/// opaque trap because the module imports nothing and the target aborts rather
-/// than unwinds, so `catch_unwind` cannot turn the panic into a status word.
+/// opaque trap because the target aborts rather than unwinds, so
+/// `catch_unwind` cannot turn the panic into a status word. The timer now
+/// reads the host clock through the `fsw.monotonic_us` import instead.
 #[test]
 fn wasm_occupant_runs_to_a_terminal_state() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
@@ -908,7 +909,8 @@ def est(gyro_b, temp) -> Est:
     };
     let input = pack.add_ring(cfg, ROLE_INPUT).expect("input ring");
     let output = pack.add_ring(cfg, ROLE_OUTPUT).expect("output ring");
-    pack.bind_init(state, &[input], &[output], "est").expect("bind");
+    pack.bind_init(state, &[input], &[output], "est")
+        .expect("bind");
     pack.pin_memory();
     let base = pack.memory_base();
     // SAFETY: both regions sit inside pinned guest memory for the test's life.

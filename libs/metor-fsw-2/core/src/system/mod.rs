@@ -35,7 +35,7 @@ use metor_proto::types::Timestamp;
 
 use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::{Declarations, PortDesc, SystemDescriptor, SystemKind};
-use crate::health::{HealthPort, LogEvent, SystemHealth};
+use crate::health::{HealthPort, LogEvent, SystemStatus};
 use crate::message::MsgOut;
 use crate::message::MsgTable;
 use crate::port::Output;
@@ -133,7 +133,7 @@ where
 {
     fn decls() -> Declarations {
         let mut decls = O::decls();
-        decls.push(PortDesc::of::<SystemHealth>());
+        decls.push(PortDesc::of::<SystemStatus>());
         decls.push(PortDesc::msg_named::<LogEvent>("log"));
         decls
     }
@@ -155,7 +155,7 @@ where
     /// same order [`decls`](SystemOutput::decls) declares them.
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let ports = O::bind(src);
-        let health: Output<SystemHealth, WD> = Output::bind(src);
+        let health: Output<SystemStatus, WD> = Output::bind(src);
         let log: MsgOut<LogEvent, WD> = MsgOut::bind(src);
         let mut health = HealthPort::new(health, log);
         health.set_instance(src.instance_name());

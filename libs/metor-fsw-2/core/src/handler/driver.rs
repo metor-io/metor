@@ -9,7 +9,7 @@ use core::marker::PhantomData;
 use metor_proto::types::Timestamp;
 
 use crate::binder::{AnySource, RingSource};
-use crate::health::{HealthPort, LogEvent, SystemHealth};
+use crate::health::{HealthPort, LogEvent, SystemStatus};
 use crate::message::MsgOut;
 use crate::pack::{Driver, StepStatus};
 use crate::port::Output;
@@ -73,7 +73,7 @@ where
 /// Bind the implicit health/log output pair every entry's descriptor
 /// appends, after the user ports.
 pub(crate) fn bind_health_tail(src: &mut AnySource) -> HealthPort {
-    let health: Output<SystemHealth> = Output::bind(src);
+    let health: Output<SystemStatus> = Output::bind(src);
     let log: MsgOut<LogEvent> = MsgOut::bind(src);
     let mut port = HealthPort::new(health, log);
     port.set_instance(src.instance_name());

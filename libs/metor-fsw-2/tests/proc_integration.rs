@@ -36,7 +36,7 @@ use metor_fsw_2::metor_proto_wkt::{
 };
 use metor_fsw_2::{
     BuildSystem, CyclicSystem, Frame, Input, MsgIn, Out, Output, SequenceStatus, SlotStatus,
-    StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState,
+    StopReason, System, SystemInput, SystemOutput, SystemStatus, WorkerRunState,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -298,9 +298,9 @@ fn lockstep_end_to_end(lib_path: &Path) {
             .expect("proc message channel registered")
             .expect("reader slot available"),
     );
-    let mut health_view: Input<SystemHealth> = Input::new(
+    let mut health_view: Input<SystemStatus> = Input::new(
         registry
-            .view(ComponentId::new("proc_counter.health"))
+            .view(ComponentId::new("proc_counter.system_status"))
             .expect("proc health registered")
             .expect("reader slot available"),
     );
@@ -450,9 +450,9 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     });
 
     let registry = coord.registry();
-    let mut ticker_health: Input<SystemHealth> = Input::new(
+    let mut ticker_health: Input<SystemStatus> = Input::new(
         registry
-            .view(ComponentId::new("ticker.health"))
+            .view(ComponentId::new("ticker.system_status"))
             .expect("ticker health registered")
             .expect("reader slot available"),
     );
@@ -573,9 +573,9 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
     });
 
     let registry = coord.registry();
-    let mut ticker_health: Input<SystemHealth> = Input::new(
+    let mut ticker_health: Input<SystemStatus> = Input::new(
         registry
-            .view(ComponentId::new("ticker.health"))
+            .view(ComponentId::new("ticker.system_status"))
             .expect("ticker health registered")
             .expect("reader slot available"),
     );

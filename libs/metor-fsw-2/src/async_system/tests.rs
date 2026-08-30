@@ -10,7 +10,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use super::{AsyncContext, AsyncSystem};
 use crate::{
     AsVTable, Frame, FrameList, HealthPort, Input, LogEvent, MsgOut, Out, Output, System,
-    SystemHealth, SystemInput, SystemOutput, buffer_capacity,
+    SystemInput, SystemOutput, SystemStatus, buffer_capacity,
 };
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
@@ -99,7 +99,7 @@ impl AsyncSystem for AsyncFilter {
 async fn async_filter_one_cycle() {
     let imu_ring = ring_for::<Imu>(8, 2);
     let nav_ring = ring_for::<NavEstimate>(8, 2);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     let imu_data = Notifier::default();

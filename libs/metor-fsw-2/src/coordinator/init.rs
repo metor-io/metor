@@ -333,7 +333,7 @@ impl InitGraph {
             kind: SystemKind::Cyclic,
             inputs: vec![PortDesc::msg::<ReloadSequences>()],
             outputs: vec![
-                PortDesc::of::<crate::SystemHealth>().with_conn(PortConn::Host),
+                PortDesc::of::<crate::SystemStatus>().with_conn(PortConn::Host),
                 PortDesc::msg_named::<crate::LogEvent>("log").with_conn(PortConn::Host),
                 PortDesc::of::<CoordinatorStatus>().with_conn(PortConn::Host),
                 // Latest-wins boot state, not an event stream: Snapshot
@@ -1300,7 +1300,7 @@ fn wiring_manifest_max_size(ir_json: &str) -> usize {
 }
 
 /// The reserved instance name the coordinator's own buffers register under
-/// (`coordinator.health`, `coordinator.log`, ...).
+/// (`coordinator.system_status`, `coordinator.log`, ...).
 const COORDINATOR_INSTANCE: &str = "coordinator";
 
 /// Build a [`RegistryEntry`] for one buffer: the instance-qualified key over a

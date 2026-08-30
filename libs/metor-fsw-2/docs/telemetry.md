@@ -39,7 +39,7 @@ downlink = m.add(
     Downlink(
         link,
         instances=["nav", "controller"],
-        frames=["health", "AlarmRaised"],
+        frames=["system_status", "AlarmRaised"],
     ),
 )
 ```

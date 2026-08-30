@@ -64,7 +64,7 @@
 //! counting that loss for health telemetry.
 //!
 //! Each system has health and log outputs. Cyclic drivers close a health cycle
-//! after each step and send a [`SystemHealth`] frame plus queued [`LogEvent`]
+//! after each step and send a [`SystemStatus`] frame plus queued [`LogEvent`]
 //! messages.
 //!
 //! # Packs
@@ -135,7 +135,7 @@ pub use descriptor::{
     Capability, Declarations, Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema,
     SystemDescriptor, SystemKind,
 };
-pub use health::{HealthPort, LogEvent, LogLevel, MAX_ERR_KINDS, MAX_LINES, SystemHealth};
+pub use health::{HealthPort, LogEvent, LogLevel, MAX_ERR_KINDS, MAX_LINES, SystemStatus};
 pub use port::{
     DEFAULT_DEPTH, FrameRef, FrameWriteError, Input, Output, buffer_capacity, capacity_for,
 };

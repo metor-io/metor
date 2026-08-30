@@ -84,7 +84,7 @@ fn descriptor_orders_ports_by_signature() {
         output_ids,
         vec![
             PortId::Component(PkNav::FRAME_ID),
-            PortId::Component(crate::SystemHealth::FRAME_ID),
+            PortId::Component(crate::SystemStatus::FRAME_ID),
             PortId::Packet(metor_proto_wkt::LogEvent::ID),
         ]
     );
@@ -435,7 +435,7 @@ fn shared_state_init_failure_reports() {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn task_cycles_every_cycle_and_folds_drops() {
-    use crate::{ClockMode, SystemHealth};
+    use crate::{ClockMode, SystemStatus};
     use metor_fsw_2_core::sequence::cycle;
     use std::time::Duration;
 
@@ -499,10 +499,10 @@ async fn task_cycles_every_cycle_and_folds_drops() {
         .view(metor_proto::types::ComponentId::new("beat.pk_nav"))
         .expect("the task output is registered")
         .expect("reader slot available");
-    let mut health_view: Input<SystemHealth> = Input::new(
+    let mut health_view: Input<SystemStatus> = Input::new(
         coord
             .registry()
-            .view(metor_proto::types::ComponentId::new("beat.health"))
+            .view(metor_proto::types::ComponentId::new("beat.system_status"))
             .expect("health is registered")
             .expect("reader slot available"),
     );

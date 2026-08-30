@@ -210,7 +210,7 @@ impl UplinkOut {
 impl SystemOutput for UplinkOut {
     fn decls() -> Declarations {
         vec![
-            PortDesc::of::<crate::SystemHealth>(),
+            PortDesc::of::<crate::SystemStatus>(),
             PortDesc::msg_named::<crate::LogEvent>("log"),
         ]
         .into()

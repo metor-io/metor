@@ -33,8 +33,8 @@ use crate::abi::{
 };
 use crate::sequence::{Outcome, SequenceStatus, SlotControlIn, wait};
 use crate::{
-    BuildSystem, CyclicSystem, Frame, HealthPort, Input, Out, Output, Pack, System, SystemHealth,
-    SystemInput, SystemKind, SystemOutput, buffer_capacity,
+    BuildSystem, CyclicSystem, Frame, HealthPort, Input, Out, Output, Pack, System, SystemInput,
+    SystemKind, SystemOutput, SystemStatus, buffer_capacity,
 };
 
 // ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ fn abi_lifecycle_end_to_end() {
     // followed by the implicit health and log ports.
     let in_ring = ring_for::<TickIn>(8, 1);
     let out_ring = ring_for::<TickOut>(8, 1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     // Register the host's view before the system writes; a fresh view only
@@ -562,7 +562,7 @@ extern "C" fn boom_execute(state: *mut c_void, now: u64) -> FswStatus {
 fn abi_panic_is_contained() {
     let in_ring = ring_for::<TickIn>(8, 1);
     let out_ring = ring_for::<TickOut>(8, 1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     let inputs = [handle(&in_ring, ROLE_INPUT)];
@@ -633,7 +633,7 @@ fn seq_abi_runs_to_done() {
     // status].
     let control_ring = ring_for::<SlotControlIn>(8, 1);
     let status_ring = ring_for::<SequenceStatus>(8, 1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     // Register the host's view before the occupant writes.
@@ -878,13 +878,13 @@ fn announce_preserves_element_names() {
 /// Frames with dynamic members (`FrameList`/`FrameMap`, including every
 /// system's implicit `health` frame) realize identically too: the
 /// prefix rewrite carries the instance prefix onto the top-level dynamic path
-/// strings, so `inst.health.error_counts.<kind>` ids match the static path and
+/// strings, so `inst.system_status.error_counts.<kind>` ids match the static path and
 /// two instances of one system never collide on their dynamic paths.
 #[test]
 fn announce_data_path_matches_static_dynamic() {
     for prefix in ["inst", "a.b"] {
         assert_announce_eq::<ProbeDyn>(prefix);
-        assert_announce_eq::<crate::SystemHealth>(prefix);
+        assert_announce_eq::<crate::SystemStatus>(prefix);
     }
 }
 

@@ -15,7 +15,7 @@ use crate::Frame;
 use metor_fsw_2_core::Input;
 use metor_fsw_2_core::MsgIn;
 use metor_fsw_2_core::Registry;
-use metor_fsw_2_core::health::{HealthPort, LogEvent, SystemHealth};
+use metor_fsw_2_core::health::{HealthPort, LogEvent, SystemStatus};
 use metor_fsw_2_core::sequence::{SequenceStatus, SlotControlIn};
 use metor_fsw_2_core::{Binder, BoundInput, BoundPort};
 use metor_fsw_2_core::{FanIn, PortConn, PortId, SystemDescriptor};
@@ -178,10 +178,10 @@ fn bind_coordinator(
             .position(|p| p.id() == pid)
             .expect("the coordinator #0 bundle declares this output")
     };
-    let health_ring = &output_rings[id][out_idx(PortId::Component(SystemHealth::FRAME_ID))];
+    let health_ring = &output_rings[id][out_idx(PortId::Component(SystemStatus::FRAME_ID))];
     let log_ring = &output_rings[id][out_idx(PortId::Packet(LogEvent::ID))];
     let mut health = HealthPort::new(
-        slot_writer::<SystemHealth>(health_ring),
+        slot_writer::<SystemStatus>(health_ring),
         owned_writer::<LogEvent>(log_ring),
     );
     health.set_instance(&desc.name);

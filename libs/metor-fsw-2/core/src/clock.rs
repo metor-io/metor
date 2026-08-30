@@ -43,15 +43,24 @@ pub fn now_or_wall() -> Timestamp {
 }
 
 /// A stopwatch for the per-execute timing that feeds
-/// [`SystemHealth`](crate::SystemHealth)'s `last_execute_micros`.
+/// [`SystemStatus`](crate::SystemStatus)'s `last_execute_us`.
 ///
-/// `wasm32-unknown-unknown` has no monotonic clock — `Instant::now` is
-/// unsupported there and panics — so a guest reports zero rather than trapping
-/// mid-cycle. The measurement is diagnostic, and a sandboxed occupant's real
-/// cost is better read from its fuel draw anyway, which the host meters.
+/// `wasm32-unknown-unknown` has no monotonic clock of its own — `Instant::now`
+/// is unsupported there and panics — so a guest reads the host's through the
+/// `fsw.monotonic_us` import instead, which the wasm host links in beside the
+/// module.
 pub(crate) struct ExecTimer {
     #[cfg(not(target_arch = "wasm32"))]
     start: std::time::Instant,
+    #[cfg(target_arch = "wasm32")]
+    start_us: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "fsw")]
+unsafe extern "C" {
+    /// Microseconds on the host's monotonic clock; the epoch is arbitrary.
+    fn monotonic_us() -> u64;
 }
 
 impl ExecTimer {
@@ -60,10 +69,13 @@ impl ExecTimer {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             start: std::time::Instant::now(),
+            // SAFETY: a plain host import with no arguments or pointers.
+            #[cfg(target_arch = "wasm32")]
+            start_us: unsafe { monotonic_us() },
         }
     }
 
-    /// Microseconds since [`start`](Self::start); always zero on wasm.
+    /// Microseconds since [`start`](Self::start).
     pub(crate) fn elapsed_micros(&self) -> u64 {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -71,7 +83,8 @@ impl ExecTimer {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            0
+            // SAFETY: as above.
+            unsafe { monotonic_us() }.saturating_sub(self.start_us)
         }
     }
 }
