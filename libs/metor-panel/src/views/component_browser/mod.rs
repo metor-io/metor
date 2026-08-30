@@ -539,7 +539,7 @@ impl ComponentBrowser {
 
 /// Build the right-click callback for a strip cell: opens an anchored
 /// inspector with a single "Plot this element" command.
-fn right_click_plot(db: Arc<DB>, component_id: ComponentId) -> StripClick {
+pub(crate) fn right_click_plot(db: Arc<DB>, component_id: ComponentId) -> StripClick {
     Arc::new(move |element_index, position, window, cx| {
         let _ = &db;
         let Some(open) = open_inspector(cx) else {
@@ -582,7 +582,7 @@ fn element_count(db: &DB, component_id: ComponentId) -> usize {
 /// Number of boxes the detail strip renders for a component: strings and
 /// enums collapse into a single cell, everything else gets one per element.
 /// Mirrors `format_cells` so [`strip_row_width`] sizing stays in step.
-fn strip_cell_count(db: &DB, component_id: ComponentId) -> usize {
+pub(crate) fn strip_cell_count(db: &DB, component_id: ComponentId) -> usize {
     let collapses = db.with_state(|state| {
         state
             .get_component_metadata(component_id)
@@ -1061,7 +1061,10 @@ fn build_filter_synth(
 /// node with only its matching descendants kept. Matching nodes
 /// short-circuit with their full subtree so the user can explore
 /// siblings of the thing they were looking for.
-fn prune_to_matches(node: &Arc<ComponentNode>, query: &Query) -> Option<Arc<ComponentNode>> {
+pub(crate) fn prune_to_matches(
+    node: &Arc<ComponentNode>,
+    query: &Query,
+) -> Option<Arc<ComponentNode>> {
     if query.matches_name(node.full_name.as_ref()) {
         return Some(node.clone());
     }

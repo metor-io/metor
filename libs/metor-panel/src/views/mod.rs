@@ -18,6 +18,7 @@ pub mod list_plot;
 pub mod log_panel;
 pub mod meter;
 pub mod monitor;
+pub mod outline;
 pub mod plot_common;
 pub mod scrollbar;
 pub mod sequence_control;
@@ -50,6 +51,7 @@ pub use list_plot::{ListLinePlot, ListPlot, ListPlotPanelConfig, ListTrace, List
 pub use log_panel::{LevelFilter, LogView};
 pub use meter::{Meter, MeterConfig, Orientation};
 pub use monitor::Monitor;
+pub use outline::ComponentOutline;
 pub use scrollbar::Scrollbar;
 pub use sequence_control::{SequenceControl, SequenceControlConfig};
 pub use sequence_grid::SequenceGrid;

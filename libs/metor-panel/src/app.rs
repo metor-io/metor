@@ -16,7 +16,7 @@ use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
     AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, DataTablePanel, LogPanel,
-    PlotPanel, SequenceGridPanel, SequencePanel,
+    OutlinePanel, PlotPanel, SequenceGridPanel, SequencePanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -1296,6 +1296,11 @@ impl PanelApp {
                     crate::views::column_browser::ToggleFilterBar,
                     Some("ColumnBrowser"),
                 ),
+                KeyBinding::new(
+                    "secondary-f",
+                    crate::views::column_browser::ToggleFilterBar,
+                    Some("ComponentOutline"),
+                ),
             ]);
 
             // A non-last close: re-snapshot the survivors right away, so
@@ -1418,6 +1423,7 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
     register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
     register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
+    register_panel::<OutlinePanel>(&mut reg, db.clone(), OutlinePanel::from_config);
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
     register_panel::<crate::canvas::GraphCanvas>(
         &mut reg,

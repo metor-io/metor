@@ -183,6 +183,7 @@ impl InspectorRegistry {
         self.register_pane_builder();
         self.register_component_browser_builder();
         self.register_data_table_builder();
+        self.register_outline_builder();
         self.register_trace_builder(db.clone());
         self.register_xy_trace_builder();
         self.register_list_trace_builder();
@@ -806,6 +807,20 @@ impl InspectorRegistry {
         self.register_type_builder::<DataTable>(Arc::new(|any_entity, _db, _cx| {
             let table: Entity<DataTable> = any_entity.downcast().expect("DataTable type mismatch");
             vec![Box::new(filter_bar_row(table))]
+        }));
+    }
+
+    fn register_outline_builder(&mut self) {
+        use crate::views::ComponentOutline;
+        use crate::views::outline;
+        self.register_type_builder::<ComponentOutline>(Arc::new(|any_entity, _db, _cx| {
+            let outline: Entity<ComponentOutline> = any_entity
+                .downcast()
+                .expect("ComponentOutline type mismatch");
+            vec![
+                Box::new(outline::sparklines_row(outline.clone())),
+                Box::new(outline::filter_bar_row(outline)),
+            ]
         }));
     }
 
