@@ -153,7 +153,7 @@ impl Theme {
     /// blue, translucent enough that the digits still read through it.
     pub fn stale_bg(&self) -> Hsla {
         Hsla {
-            a: 0.45,
+            a: 0.3,
             ..self.line_colors[1]
         }
     }

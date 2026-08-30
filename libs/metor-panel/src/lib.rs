@@ -53,6 +53,13 @@ pub use inspector::palette::{Category, InspectionItem, ItemProvider};
 /// Borrow as a [`ComponentView`] without copying the backing buffer.
 pub trait AsComponentView {
     fn as_component_view(&self) -> ComponentView<'_>;
+
+    /// When the sample was taken, for sources that carry it. Staleness is
+    /// judged by this, not by arrival, so a replay and a slow link both read
+    /// true.
+    fn sample_time(&self) -> Option<Timestamp> {
+        None
+    }
 }
 
 impl AsComponentView for ComponentView<'_> {
@@ -153,6 +160,13 @@ impl AsComponentView for WalView<'_> {
             .parse_value(value_buf)
             .expect("invalid WAL data");
         view
+    }
+
+    /// The `[Timestamp]` framed just ahead of the value.
+    fn sample_time(&self) -> Option<Timestamp> {
+        let start = self.offset - size_of::<Timestamp>();
+        let bytes: [u8; 8] = self._grant[start..self.offset].try_into().ok()?;
+        Some(Timestamp::from_le_bytes(bytes))
     }
 }
 

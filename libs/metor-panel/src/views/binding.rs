@@ -40,9 +40,16 @@ pub(crate) enum StreamUpdate<I, V> {
     Stale,
 }
 
-/// How long a value may go without an update before it is stale. Arrival
-/// time, not the sample's own stamp, so a replay looks live while it runs.
+/// How old a sample may be before it is stale — the age of the data by its
+/// own stamp, not of its arrival, so a value the producer stopped refreshing
+/// reads stale even while the link keeps delivering it.
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(3);
+
+/// How long ago `sample` was taken; zero for a stamp ahead of this clock.
+fn sample_age(sample: Timestamp) -> Duration {
+    let micros = Timestamp::now().0.saturating_sub(sample.0).max(0);
+    Duration::from_micros(micros as u64)
+}
 
 /// The single number an instrument view displays: one element of one
 /// component.
@@ -188,52 +195,66 @@ where
             return;
         }
 
-        // The seed is committed history: it may already be older than the
-        // threshold, in which case it shows as stale from the first paint.
+        // Every sample carries its stamp, so each one either is already
+        // stale or says exactly how long until it will be. That remainder
+        // arms one timer; once it fires the view is told and the task waits,
+        // unarmed, for the sample that ends the silence. `None` means stale.
+        let mut remaining: Option<Duration> = None;
+
+        // The seed is committed history and may already be over the line.
         let seed = db.with_state(|state| {
             let component = state.get_component(component_id)?;
             let latest = component.time_series.latest()?;
             let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
-            let age = Timestamp::now().0.saturating_sub(latest.timestamp().0);
-            Some((decode(view), age > STALE_AFTER.as_micros() as i64))
+            Some((decode(view), sample_age(latest.timestamp())))
         });
-        let mut fresh = true;
-        if let Some((seed, seed_stale)) = seed {
+        if let Some((seed, age)) = seed {
+            remaining = STALE_AFTER.checked_sub(age);
+            let stale = remaining.is_none();
             let result = this.update(cx, |view, cx| {
                 if let Some(seed) = seed {
                     apply(view, StreamUpdate::Value(seed), cx);
                 }
-                if seed_stale {
+                if stale {
                     apply(view, StreamUpdate::Stale, cx);
                 }
             });
             if result.is_err() {
                 return;
             }
-            fresh = !seed_stale;
         }
 
-        // A fresh value arms one timer; when it fires first the view is told
-        // once and then waits, unarmed, for the sample that ends the silence.
         loop {
             let next = async { Some(stream.next().await) };
-            let arrived = if fresh {
-                let timeout = async {
-                    cx.background_executor().timer(STALE_AFTER).await;
-                    None
-                };
-                futures_lite::future::race(next, timeout).await
-            } else {
-                next.await
+            let arrived = match remaining {
+                Some(wait) => {
+                    let timeout = async {
+                        cx.background_executor().timer(wait).await;
+                        None
+                    };
+                    futures_lite::future::race(next, timeout).await
+                }
+                None => next.await,
             };
-            fresh = arrived.is_some();
-            let update = match arrived {
-                Some(sample) => decode(sample.as_component_view()).map(StreamUpdate::Value),
-                None => Some(StreamUpdate::Stale),
+            let (update, stale) = match arrived {
+                Some(sample) => {
+                    // A source without stamps counts from arrival.
+                    let age = sample.sample_time().map(sample_age).unwrap_or_default();
+                    remaining = STALE_AFTER.checked_sub(age);
+                    let value = decode(sample.as_component_view()).map(StreamUpdate::Value);
+                    (value, remaining.is_none())
+                }
+                None => {
+                    remaining = None;
+                    (None, true)
+                }
             };
             let result = this.update(cx, |view, cx| {
                 if let Some(update) = update {
                     apply(view, update, cx);
+                }
+                if stale {
+                    apply(view, StreamUpdate::Stale, cx);
                 }
             });
             if result.is_err() {
