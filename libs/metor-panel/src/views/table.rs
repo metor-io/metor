@@ -212,6 +212,7 @@ impl<D: TableDelegate> Table<D> {
             .flex()
             .flex_row()
             .items_center()
+            .h_full()
             .gap(px(4.0))
             .px(px(12.0))
             .text_size(px(12.0))
