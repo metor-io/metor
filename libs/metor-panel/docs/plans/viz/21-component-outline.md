@@ -66,6 +66,18 @@ missing a field shows `—`. The header row and instance rows share one
 persist; a folded pivot keeps its choice for when it reopens. The same
 menu offers **Expand all** / **Collapse all**.
 
+## Frame types (landed)
+
+Right-click any branch with components → **Pivot alike frames**. Its shape
+(sorted relative leaf paths, `model::signature`) becomes a `FrameType`
+named after the branch's segment, and `model::alike` collects every
+subtree anywhere in the namespace with exactly that shape — `dut1.psu`
+and `dut2.bay.psu` in one grid, rows labelled by full path. Types render
+as synthetic branches (`type:<label>`) above the tree, always as a pivot.
+Right-click a type row → **Focus** (the outline shows only that grid, with
+a bar offering **Show all**) or **Remove type**. A query narrows a type's
+instances by path. Types and focus persist with the pane.
+
 ## Follow-ups
 
 - Branch summaries beyond count: worst alarm state, stale leaf count.

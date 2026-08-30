@@ -774,6 +774,17 @@ pub struct OutlinePanelConfig {
     pub sparklines: bool,
     pub toggled: Vec<String>,
     pub pivoted: Vec<String>,
+    pub types: Vec<FrameTypeConfig>,
+    pub focus: Option<String>,
+}
+
+/// A frame type the outline collected: a label and the leaf paths that
+/// define its shape.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FrameTypeConfig {
+    pub label: String,
+    pub fields: Vec<String>,
 }
 
 /// Pane item showing the component namespace as a collapsible tree-table.
@@ -799,6 +810,11 @@ impl OutlinePanel {
             outline.set_sparklines(cfg.sparklines, cx);
             outline.set_toggled_paths(cfg.toggled, cx);
             outline.set_pivoted_paths(cfg.pivoted, cx);
+            outline.set_types(
+                cfg.types.into_iter().map(|t| (t.label, t.fields)).collect(),
+                cx,
+            );
+            outline.set_focus(cfg.focus, cx);
         });
         panel
     }
@@ -829,6 +845,12 @@ impl PaneItem for OutlinePanel {
             sparklines: inner.sparklines(cx),
             toggled: inner.toggled_paths(cx),
             pivoted: inner.pivoted_paths(cx),
+            types: inner
+                .types(cx)
+                .into_iter()
+                .map(|(label, fields)| FrameTypeConfig { label, fields })
+                .collect(),
+            focus: inner.focus(cx),
         }
     }
 

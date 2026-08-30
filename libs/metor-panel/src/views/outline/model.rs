@@ -13,6 +13,12 @@
 //! how four reaction wheels read as a grid instead of four folded subtrees.
 //! Alike siblings are detected structurally, so nothing in the FSW has to
 //! opt in; siblings missing a field simply get an empty cell.
+//!
+//! The same grid works across the namespace: a [`FrameType`] is a shape —
+//! the sorted leaf paths of a subtree — and its instances are every subtree
+//! anywhere with that shape, so `DUT1.PSU` and `DUT2.PSU` land in one table
+//! labelled by full path. Types show as synthetic branches above the tree,
+//! and the outline can focus on one to show nothing else.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -63,8 +69,11 @@ impl OutlineRow {
     }
 }
 
-/// A branch rotated into instances × fields.
+/// A branch, or a frame type, rotated into instances × fields.
 pub(crate) struct Pivot {
+    /// What the grid belongs to — the branch path or the type key — so
+    /// its rows can share per-grid state such as the scroll offset.
+    pub key: SharedString,
     /// Leaf paths relative to an instance, in name order.
     pub fields: Vec<SharedString>,
     /// Widest strip each field needs, in element cells.
@@ -74,8 +83,61 @@ pub(crate) struct Pivot {
 
 pub(crate) struct PivotInstance {
     pub node: Arc<ComponentNode>,
+    /// Row label: the segment under a branch, the full path in a type.
+    pub label: SharedString,
     /// One slot per field; `None` where this instance lacks it.
     pub ids: Vec<Option<ComponentId>>,
+}
+
+/// A shape shared by alike subtrees: their leaf paths, sorted.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FrameType {
+    pub label: SharedString,
+    pub fields: Vec<SharedString>,
+}
+
+/// The synthetic path a type's branch row toggles under. Namespaced so it
+/// can't collide with a real component.
+pub(crate) fn type_key(label: &str) -> SharedString {
+    SharedString::from(format!("type:{label}"))
+}
+
+/// The shape of `node`: its leaf paths relative to itself, sorted.
+pub(crate) fn signature(node: &Arc<ComponentNode>) -> Vec<SharedString> {
+    let mut leaves = BTreeMap::new();
+    collect_leaves(node, node.full_name.len() + 1, &mut leaves);
+    leaves.into_keys().collect()
+}
+
+/// Every subtree under `root` whose shape is exactly `fields`, in name
+/// order. A match's own subtree is never searched: anything inside it has
+/// fewer leaves, so it can't match too.
+pub(crate) fn alike(root: &Arc<ComponentNode>, fields: &[SharedString]) -> Vec<Arc<ComponentNode>> {
+    let mut out = Vec::new();
+    for child in root.children.values() {
+        collect_alike(child, fields, &mut out);
+    }
+    out
+}
+
+fn collect_alike(
+    node: &Arc<ComponentNode>,
+    fields: &[SharedString],
+    out: &mut Vec<Arc<ComponentNode>>,
+) {
+    if node.children.is_empty() {
+        return;
+    }
+    // Leaf count is a cheap pre-check before building the full signature.
+    if component_count(node) - usize::from(node.component_id.is_some()) == fields.len()
+        && signature(node) == fields
+    {
+        out.push(node.clone());
+        return;
+    }
+    for child in node.children.values() {
+        collect_alike(child, fields, out);
+    }
 }
 
 /// Rotate `branch`: every child that is itself a branch becomes an instance.
@@ -85,17 +147,27 @@ pub(crate) fn build_pivot(
     branch: &ComponentNode,
     cell_count: &dyn Fn(ComponentId) -> usize,
 ) -> Option<Pivot> {
-    let candidates: Vec<&Arc<ComponentNode>> = branch
+    let candidates: Vec<(Arc<ComponentNode>, SharedString)> = branch
         .children
         .values()
         .filter(|c| !c.children.is_empty())
+        .map(|c| (c.clone(), c.segment.clone()))
         .collect();
     if candidates.is_empty() {
         return None;
     }
+    Some(pivot_from(branch.full_name.clone(), candidates, cell_count))
+}
+
+/// Lay `instances` out on the union of their fields.
+fn pivot_from(
+    key: SharedString,
+    candidates: Vec<(Arc<ComponentNode>, SharedString)>,
+    cell_count: &dyn Fn(ComponentId) -> usize,
+) -> Pivot {
     let per_instance: Vec<BTreeMap<SharedString, ComponentId>> = candidates
         .iter()
-        .map(|inst| {
+        .map(|(inst, _)| {
             let mut leaves = BTreeMap::new();
             collect_leaves(inst, inst.full_name.len() + 1, &mut leaves);
             leaves
@@ -108,10 +180,11 @@ pub(crate) fn build_pivot(
         .into_iter()
         .collect();
     let instances: Vec<PivotInstance> = candidates
-        .iter()
+        .into_iter()
         .zip(&per_instance)
-        .map(|(node, leaves)| PivotInstance {
-            node: (*node).clone(),
+        .map(|((node, label), leaves)| PivotInstance {
+            node,
+            label,
             ids: fields.iter().map(|f| leaves.get(f).copied()).collect(),
         })
         .collect();
@@ -126,11 +199,12 @@ pub(crate) fn build_pivot(
                 .max(1)
         })
         .collect();
-    Some(Pivot {
+    Pivot {
+        key,
         fields,
         cells,
         instances,
-    })
+    }
 }
 
 /// Every component under `node` keyed by its name past `prefix_len`.
@@ -215,6 +289,10 @@ pub(crate) fn component_count(node: &ComponentNode) -> usize {
 pub(crate) struct Layout<'a> {
     pub disclosure: &'a Disclosure,
     pub pivoted: &'a HashSet<SharedString>,
+    /// Frame types shown as synthetic branches above the tree.
+    pub types: &'a [FrameType],
+    /// A type label to show alone, hiding the tree and the other types.
+    pub focus: Option<&'a SharedString>,
     pub query: &'a Query,
     /// Strip cells a component renders; sizes pivot columns.
     pub cell_count: &'a dyn Fn(ComponentId) -> usize,
@@ -228,6 +306,15 @@ pub(crate) struct Layout<'a> {
 pub(crate) fn flatten(root: &Arc<ComponentNode>, layout: &Layout) -> Vec<OutlineRow> {
     let mut rows = Vec::new();
     let filtering = !layout.query.is_empty();
+    if let Some(label) = layout.focus {
+        if let Some(t) = layout.types.iter().find(|t| &t.label == label) {
+            push_type_rows(root, t, layout, true, &mut rows);
+        }
+        return rows;
+    }
+    for t in layout.types {
+        push_type_rows(root, t, layout, false, &mut rows);
+    }
     for child in root.children.values() {
         let child = if filtering {
             match prune_to_matches(child, layout.query) {
@@ -281,9 +368,19 @@ fn push_rows(
     for child in node.children.values().filter(|c| c.children.is_empty()) {
         push_rows(child, depth + 1, layout, force_open, rows);
     }
+    push_grid_rows(node, depth + 1, &pivot, rows);
+}
+
+/// The header and instance rows of an open pivot.
+fn push_grid_rows(
+    branch: &Arc<ComponentNode>,
+    depth: usize,
+    pivot: &Arc<Pivot>,
+    rows: &mut Vec<OutlineRow>,
+) {
     rows.push(OutlineRow {
-        node: node.clone(),
-        depth: depth + 1,
+        node: branch.clone(),
+        depth,
         expanded: false,
         component_count: 0,
         kind: RowKind::PivotHeader(pivot.clone()),
@@ -291,7 +388,7 @@ fn push_rows(
     for (ix, instance) in pivot.instances.iter().enumerate() {
         rows.push(OutlineRow {
             node: instance.node.clone(),
-            depth: depth + 1,
+            depth,
             expanded: false,
             component_count: component_count(&instance.node),
             kind: RowKind::PivotInstance {
@@ -299,6 +396,53 @@ fn push_rows(
                 ix,
             },
         });
+    }
+}
+
+/// A type's synthetic branch row and, when open, its grid. Instances are
+/// labelled by full path since they come from anywhere in the tree; a
+/// query narrows them by that path, and a type with no match under the
+/// query drops out. A focused type is always open.
+fn push_type_rows(
+    root: &Arc<ComponentNode>,
+    t: &FrameType,
+    layout: &Layout,
+    focused: bool,
+    rows: &mut Vec<OutlineRow>,
+) {
+    let filtering = !layout.query.is_empty();
+    let instances: Vec<(Arc<ComponentNode>, SharedString)> = alike(root, &t.fields)
+        .into_iter()
+        .filter(|n| !filtering || layout.query.matches_name(&n.full_name))
+        .map(|n| {
+            let label = n.full_name.clone();
+            (n, label)
+        })
+        .collect();
+    if filtering && instances.is_empty() {
+        return;
+    }
+    let key = type_key(&t.label);
+    let node = Arc::new(ComponentNode {
+        segment: t.label.clone(),
+        full_name: key.clone(),
+        component_id: None,
+        children: instances
+            .iter()
+            .map(|(n, _)| (n.full_name.clone(), n.clone()))
+            .collect(),
+    });
+    let expanded = focused || filtering || layout.disclosure.is_expanded(&key, 0);
+    let pivot = Arc::new(pivot_from(key, instances, layout.cell_count));
+    rows.push(OutlineRow {
+        node: node.clone(),
+        depth: 0,
+        expanded,
+        component_count: pivot.instances.len(),
+        kind: RowKind::PivotBranch(pivot.clone()),
+    });
+    if expanded {
+        push_grid_rows(&node, 1, &pivot, rows);
     }
 }
 
@@ -357,6 +501,8 @@ mod tests {
             &Layout {
                 disclosure,
                 pivoted,
+                types: &[],
+                focus: None,
                 query,
                 cell_count: &|_| 1,
             },
@@ -493,5 +639,124 @@ mod tests {
         let rows = rows(&wheels(), &disclosure, &pivoted, &Query::default());
         assert_eq!(names(&rows), ["wheels"]);
         assert!(!rows[0].is_pivoted());
+    }
+
+    /// Two PSUs under different DUTs, plus a decoy with one field fewer.
+    fn duts() -> Arc<ComponentNode> {
+        let psu = |prefix: &str| {
+            branch(
+                &format!("{prefix}.psu"),
+                vec![
+                    leaf(&format!("{prefix}.psu.current")),
+                    leaf(&format!("{prefix}.psu.voltage")),
+                ],
+            )
+        };
+        branch(
+            "",
+            vec![
+                branch("dut1", vec![psu("dut1"), leaf("dut1.serial")]),
+                branch("dut2", vec![branch("dut2.bay", vec![psu("dut2.bay")])]),
+                branch(
+                    "dut3",
+                    vec![branch("dut3.psu", vec![leaf("dut3.psu.current")])],
+                ),
+            ],
+        )
+    }
+
+    fn psu_type(tree: &Arc<ComponentNode>) -> FrameType {
+        let exemplar = tree
+            .children
+            .get("dut1")
+            .unwrap()
+            .children
+            .get("psu")
+            .unwrap();
+        FrameType {
+            label: "psu".into(),
+            fields: signature(exemplar),
+        }
+    }
+
+    #[test]
+    fn alike_finds_the_shape_at_any_depth_and_nothing_else() {
+        let tree = duts();
+        let t = psu_type(&tree);
+        assert_eq!(t.fields, ["current", "voltage"]);
+        let found: Vec<String> = alike(&tree, &t.fields)
+            .iter()
+            .map(|n| n.full_name.to_string())
+            .collect();
+        assert_eq!(found, ["dut1.psu", "dut2.bay.psu"]);
+    }
+
+    #[test]
+    fn types_lead_the_outline_and_label_instances_by_path() {
+        let tree = duts();
+        let types = [psu_type(&tree)];
+        let rows = flatten(
+            &tree,
+            &Layout {
+                disclosure: &Disclosure::default(),
+                pivoted: &HashSet::new(),
+                types: &types,
+                focus: None,
+                query: &Query::default(),
+                cell_count: &|_| 1,
+            },
+        );
+        assert_eq!(
+            names(&rows)[..4],
+            ["type:psu", "type:psu", "dut1.psu", "dut2.bay.psu"]
+        );
+        assert_eq!(names(&rows)[4], "dut1");
+        let RowKind::PivotInstance { pivot, ix } = &rows[3].kind else {
+            panic!("expected an instance row");
+        };
+        assert_eq!(pivot.instances[*ix].label, "dut2.bay.psu");
+        assert_eq!(pivot.key, "type:psu");
+    }
+
+    #[test]
+    fn focus_shows_only_that_type_open() {
+        let tree = duts();
+        let types = [psu_type(&tree)];
+        let mut disclosure = Disclosure::default();
+        disclosure.set_expanded(&type_key("psu"), 0, false);
+        let focus = SharedString::from("psu");
+        let rows = flatten(
+            &tree,
+            &Layout {
+                disclosure: &disclosure,
+                pivoted: &HashSet::new(),
+                types: &types,
+                focus: Some(&focus),
+                query: &Query::default(),
+                cell_count: &|_| 1,
+            },
+        );
+        assert_eq!(
+            names(&rows),
+            ["type:psu", "type:psu", "dut1.psu", "dut2.bay.psu"]
+        );
+    }
+
+    #[test]
+    fn a_query_narrows_type_instances_by_path() {
+        let tree = duts();
+        let types = [psu_type(&tree)];
+        let rows = flatten(
+            &tree,
+            &Layout {
+                disclosure: &Disclosure::default(),
+                pivoted: &HashSet::new(),
+                types: &types,
+                focus: None,
+                query: &Query::parse("bay"),
+                cell_count: &|_| 1,
+            },
+        );
+        assert_eq!(names(&rows)[..3], ["type:psu", "type:psu", "dut2.bay.psu"]);
     }
 }

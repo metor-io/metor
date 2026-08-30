@@ -40,7 +40,10 @@ use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::theme;
-use model::{Disclosure, Layout, OutlineRow, Pivot, RowKind, component_count, flatten};
+use model::{
+    Disclosure, FrameType, Layout, OutlineRow, Pivot, RowKind, component_count, flatten, signature,
+    type_key,
+};
 
 /// Indent per tree depth, in pixels.
 const INDENT: f32 = 14.0;
@@ -169,6 +172,87 @@ impl ComponentOutline {
             delegate.reflatten(cx);
         });
     }
+
+    /// Frame types as `(label, fields)`, for persistence.
+    pub fn types(&self, cx: &App) -> Vec<(String, Vec<String>)> {
+        self.table
+            .read(cx)
+            .delegate()
+            .types
+            .iter()
+            .map(|t| {
+                (
+                    t.label.to_string(),
+                    t.fields.iter().map(|f| f.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn set_types(&mut self, types: Vec<(String, Vec<String>)>, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            let delegate = table.delegate_mut();
+            delegate.types = types
+                .into_iter()
+                .map(|(label, fields)| FrameType {
+                    label: SharedString::from(label),
+                    fields: fields.into_iter().map(SharedString::from).collect(),
+                })
+                .collect();
+            delegate.reflatten(cx);
+        });
+    }
+
+    /// The type label the outline is focused on, if any.
+    pub fn focus(&self, cx: &App) -> Option<String> {
+        self.table
+            .read(cx)
+            .delegate()
+            .focus
+            .as_ref()
+            .map(|f| f.to_string())
+    }
+
+    pub fn set_focus(&mut self, label: Option<String>, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            table
+                .delegate_mut()
+                .set_focus(label.map(SharedString::from), cx);
+        });
+        cx.notify();
+    }
+
+    /// The strip shown while focused on a type: what's showing, and the
+    /// way back.
+    fn render_focus_bar(&self, label: SharedString, cx: &mut Context<Self>) -> AnyElement {
+        let theme = theme(cx);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .h(px(24.0))
+            .px(px(8.0))
+            .gap(px(6.0))
+            .bg(theme.bg_secondary)
+            .border_b_1()
+            .border_color(theme.border_primary)
+            .text_size(px(11.0))
+            .text_color(theme.text_secondary)
+            .child(SharedString::new_static("Focused on"))
+            .child(div().text_color(theme.text_primary).child(label))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("outline-unfocus")
+                    .cursor_pointer()
+                    .text_color(theme.text_tertiary)
+                    .hover(|s| s.text_color(theme.text_primary))
+                    .child(SharedString::new_static("Show all"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_focus(None, cx))),
+            )
+            .into_any_element()
+    }
 }
 
 impl Focusable for ComponentOutline {
@@ -184,6 +268,8 @@ impl Render for ComponentOutline {
             self.filter.update(cx, |bar, _| bar.status = status);
             self.filter.clone()
         });
+        let focus = self.table.read(cx).delegate().focus.clone();
+        let focus_bar = focus.map(|label| self.render_focus_bar(label, cx));
 
         div()
             .key_context("ComponentOutline")
@@ -195,6 +281,7 @@ impl Render for ComponentOutline {
             .flex_col()
             .size_full()
             .children(toolbar)
+            .children(focus_bar)
             .child(div().flex_1().min_h_0().w_full().child(self.table.clone()))
     }
 }
@@ -266,6 +353,10 @@ pub struct OutlineDelegate {
     /// One scroll offset per pivot, shared by its header and instance rows
     /// so the grid scrolls sideways as a unit.
     pivot_scrolls: HashMap<SharedString, ScrollHandle>,
+    /// Frame types the user has collected, shown above the tree.
+    types: Vec<FrameType>,
+    /// A type label shown alone.
+    focus: Option<SharedString>,
     rows: Vec<OutlineRow>,
     sparklines: bool,
     strips: VisibleEntityCache<ComponentValueStrip>,
@@ -283,6 +374,8 @@ impl OutlineDelegate {
             query: Query::default(),
             pivoted: HashSet::new(),
             pivot_scrolls: HashMap::new(),
+            types: Vec::new(),
+            focus: None,
             rows: Vec::new(),
             sparklines: false,
             strips: VisibleEntityCache::new(CACHE_CAP),
@@ -316,6 +409,8 @@ impl OutlineDelegate {
             &Layout {
                 disclosure: &self.disclosure,
                 pivoted: &self.pivoted,
+                types: &self.types,
+                focus: self.focus.as_ref(),
                 query: &self.query,
                 cell_count: &|id| strip_cell_count(&db, id),
             },
@@ -337,11 +432,54 @@ impl OutlineDelegate {
         self.reflatten(cx);
     }
 
+    /// Collect every frame shaped like `exemplar` into a type named after
+    /// it. A second type with the same name gets a numbered label so both
+    /// keep distinct keys.
+    fn add_type(&mut self, exemplar: &Arc<ComponentNode>, cx: &mut Context<Table<Self>>) {
+        let fields = signature(exemplar);
+        if let Some(existing) = self.types.iter().find(|t| t.fields == fields) {
+            let key = type_key(&existing.label);
+            self.disclosure.set_expanded(&key, 0, true);
+            self.reflatten(cx);
+            return;
+        }
+        let base = exemplar.segment.to_string();
+        let mut label = base.clone();
+        let mut n = 2;
+        while self.types.iter().any(|t| t.label.as_ref() == label) {
+            label = format!("{base} ({n})");
+            n += 1;
+        }
+        let label = SharedString::from(label);
+        self.disclosure.set_expanded(&type_key(&label), 0, true);
+        self.types.push(FrameType { label, fields });
+        self.reflatten(cx);
+    }
+
+    fn remove_type(&mut self, label: &SharedString, cx: &mut Context<Table<Self>>) {
+        self.types.retain(|t| &t.label != label);
+        self.pivot_scrolls.remove(&type_key(label));
+        if self.focus.as_ref() == Some(label) {
+            self.focus = None;
+        }
+        self.reflatten(cx);
+    }
+
+    fn set_focus(&mut self, label: Option<SharedString>, cx: &mut Context<Table<Self>>) {
+        self.focus = label;
+        self.reflatten(cx);
+    }
+
+    /// The type a synthetic branch row stands for.
+    fn type_label(&self, row: &OutlineRow) -> Option<SharedString> {
+        self.types
+            .iter()
+            .find(|t| type_key(&t.label) == row.node.full_name)
+            .map(|t| t.label.clone())
+    }
+
     fn pivot_scroll(&mut self, path: &SharedString) -> ScrollHandle {
-        self.pivot_scrolls
-            .entry(path.clone())
-            .or_default()
-            .clone()
+        self.pivot_scrolls.entry(path.clone()).or_default().clone()
     }
 
     /// Right-click on a branch: pivot it, or open and fold its subtree.
@@ -356,9 +494,43 @@ impl OutlineDelegate {
             return;
         };
         let table = cx.entity();
+        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+        if let Some(label) = self.type_label(row) {
+            let focused = self.focus.as_ref() == Some(&label);
+            let (focus_label, next) = if focused {
+                ("Show all", None)
+            } else {
+                ("Focus", Some(label.clone()))
+            };
+            let focus_table = table.clone();
+            rows.push(Box::new(CommandRow::new(
+                focus_label,
+                Arc::new(move |_window, cx| {
+                    focus_table.update(cx, |table, cx| {
+                        table.delegate_mut().set_focus(next.clone(), cx);
+                    });
+                }),
+            )));
+            rows.push(Box::new(CommandRow::new(
+                "Remove type",
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().remove_type(&label, cx);
+                    });
+                }),
+            )));
+            open(
+                InspectorRequest {
+                    rows,
+                    mode: InspectorMode::Anchored(position),
+                },
+                window,
+                cx,
+            );
+            return;
+        }
         let pivoted = row.is_pivoted();
         let can_pivot = row.node.children.values().any(|c| !c.children.is_empty());
-        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
         if can_pivot {
             let label = if pivoted { "Unpivot" } else { "Pivot" };
             let target = row.clone();
@@ -368,6 +540,19 @@ impl OutlineDelegate {
                 Arc::new(move |_window, cx| {
                     table.update(cx, |table, cx| {
                         table.delegate_mut().set_pivoted(&target, !pivoted, cx);
+                    });
+                }),
+            )));
+        }
+        // Any branch with components has a shape worth collecting.
+        if row.component_count > usize::from(row.node.component_id.is_some()) {
+            let exemplar = row.node.clone();
+            let table = table.clone();
+            rows.push(Box::new(CommandRow::new(
+                "Pivot alike frames",
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().add_type(&exemplar, cx);
                     });
                 }),
             )));
@@ -481,7 +666,11 @@ impl OutlineDelegate {
         // names nothing. Both still indent under their branch.
         let (is_branch, label, color) = match &row.kind {
             RowKind::PivotHeader(_) => (false, SharedString::default(), theme.text_tertiary),
-            RowKind::PivotInstance { .. } => (false, row.node.segment.clone(), theme.text_primary),
+            RowKind::PivotInstance { pivot, ix } => (
+                false,
+                pivot.instances[*ix].label.clone(),
+                theme.text_primary,
+            ),
             _ => (
                 row.is_branch(),
                 row.node.segment.clone(),
@@ -555,12 +744,11 @@ impl OutlineDelegate {
         let theme = theme(cx);
         match &row.kind {
             RowKind::PivotHeader(pivot) => {
-                return self.render_pivot_header(row_ix, &row.node.full_name, pivot, cx);
+                return self.render_pivot_header(row_ix, pivot, cx);
             }
             RowKind::PivotInstance { pivot, ix } => {
                 let pivot = pivot.clone();
-                let branch = pivot_branch_path(&row.node.full_name);
-                return self.render_pivot_cells(row_ix, &branch, &pivot, *ix, cx);
+                return self.render_pivot_cells(row_ix, &pivot, *ix, cx);
             }
             _ => {}
         }
@@ -575,6 +763,9 @@ impl OutlineDelegate {
                 _ => count_label(n, "component"),
             };
             return div()
+                .flex()
+                .items_center()
+                .h_full()
                 .px(px(8.0))
                 .text_size(px(12.0))
                 .text_color(theme.text_tertiary)
@@ -616,12 +807,11 @@ impl OutlineDelegate {
     fn render_pivot_header(
         &mut self,
         row_ix: usize,
-        branch: &SharedString,
         pivot: &Pivot,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
-        let scroll = self.pivot_scroll(branch);
+        let scroll = self.pivot_scroll(&pivot.key);
         let cells = pivot.fields.iter().zip(&pivot.cells).map(|(field, &n)| {
             div()
                 .w(px(pivot_cell_width(n)))
@@ -643,13 +833,12 @@ impl OutlineDelegate {
     fn render_pivot_cells(
         &mut self,
         row_ix: usize,
-        branch: &SharedString,
         pivot: &Pivot,
         ix: usize,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
-        let scroll = self.pivot_scroll(branch);
+        let scroll = self.pivot_scroll(&pivot.key);
         let instance = &pivot.instances[ix];
         let db = self.db.clone();
         let mut cells: Vec<AnyElement> = Vec::with_capacity(pivot.fields.len());
@@ -685,6 +874,9 @@ impl OutlineDelegate {
     fn render_text(&self, text: Option<String>, cx: &mut Context<Table<Self>>) -> AnyElement {
         let theme = theme(cx);
         div()
+            .flex()
+            .items_center()
+            .h_full()
             .px(px(8.0))
             .text_size(px(12.0))
             .text_color(theme.text_secondary)
@@ -793,14 +985,6 @@ fn pivot_scroller(row_ix: usize, scroll: ScrollHandle) -> gpui::Stateful<gpui::D
         .track_scroll(&scroll);
     scroller.style().restrict_scroll_to_axis = Some(true);
     scroller
-}
-
-/// The pivoted branch an instance row belongs to: its parent path.
-fn pivot_branch_path(instance: &str) -> SharedString {
-    match instance.rfind('.') {
-        Some(ix) => SharedString::from(instance[..ix].to_string()),
-        None => SharedString::default(),
-    }
 }
 
 /// `"1 field"` / `"3 fields"`.
