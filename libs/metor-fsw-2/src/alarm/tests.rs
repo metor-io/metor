@@ -319,8 +319,8 @@ mod system {
 
     use crate::{
         AlarmSystem, AlarmsParams, BuildSystem, ClockMode, CommandOut, Coordinator,
-        CoordinatorConfig, CyclicSystem, MsgIn, Out, Output, System, SystemInput, SystemOutput,
-        SystemStatus,
+        CoordinatorConfig, CyclicSystem, LogEvent, MsgIn, Out, Output, System, SystemInput,
+        SystemOutput,
     };
 
     use crate::coordinator::PortRef;
@@ -720,10 +720,10 @@ mod system {
         assert!(got_raised[0].message.starts_with("sat1.plant.gyro.rates.1"));
     }
 
-    /// Misconfigured targets disable their alarms and surface through health.
+    /// Misconfigured targets disable their alarms and surface on the log.
     /// The def still broadcasts and nothing ever raises.
     #[stellarator::test]
-    async fn bad_targets_disable_and_report_health() {
+    async fn bad_targets_disable_and_report_faults() {
         let mut b = crate::coordinator::init::InitGraph::new(config());
         b.push_node(cyclic_node(
             Plant::NAME.into(),
@@ -744,11 +744,7 @@ mod system {
         let coord = b.build().unwrap();
         let mut defs = tap::<AlarmDefs>(&coord, "alarms.AlarmDefs");
         let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
-        let registry = coord.registry();
-        let health_entry = registry
-            .get(ComponentId::new("alarms.system_status"))
-            .expect("health entry");
-        let mut health_view = health_entry.view().expect("reader slot");
+        let mut log = tap::<LogEvent>(&coord, "alarms.log");
         let mut coord = coord;
         coord.run_for(4).await;
 
@@ -761,13 +757,26 @@ mod system {
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].def_id, "DUP");
 
-        // The three boot failures land in the standard health frame's error total.
-        let grant = health_view
-            .try_latest()
-            .expect("read health")
-            .expect("health record");
-        let (health, _) = SystemStatus::ref_from_prefix(&grant).expect("health layout");
-        assert_eq!(health.errors, 3, "ghost + oob + duplicate each count once");
+        // The three boot failures each land as one fault line on the log.
+        let mut kinds: Vec<String> = drain(&mut log)
+            .into_iter()
+            .filter_map(|ev| {
+                ev.fields
+                    .into_iter()
+                    .find(|(k, _)| k == "kind")
+                    .map(|(_, v)| v)
+            })
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [
+                "alarms_bad_element",
+                "alarms_duplicate_id",
+                "alarms_unresolved_target"
+            ],
+            "ghost + oob + duplicate each report once"
+        );
     }
 }
 

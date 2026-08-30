@@ -14,9 +14,11 @@ use metor_proto_wkt::{
 use crate::Frame;
 use metor_fsw_2_core::Input;
 use metor_fsw_2_core::MsgIn;
+use metor_fsw_2_core::Output;
 use metor_fsw_2_core::Registry;
-use metor_fsw_2_core::health::{HealthPort, LogEvent, SystemStatus};
+use metor_fsw_2_core::log::{LogEvent, LogPort};
 use metor_fsw_2_core::sequence::{SequenceStatus, SlotControlIn};
+use metor_fsw_2_core::status::{StatusPort, SystemStatus};
 use metor_fsw_2_core::{Binder, BoundInput, BoundPort};
 use metor_fsw_2_core::{FanIn, PortConn, PortId, SystemDescriptor};
 
@@ -26,7 +28,9 @@ use super::init::{
 use super::slot::{
     self, AllowedOccupant, OccupantBacking, SlotReg, SlotRunner, SlotStatus, slot_writer,
 };
-use super::{BoundSystems, CoordinatorPorts, CoordinatorStatus, PendingAsync, WireError};
+use super::{
+    BoundSystems, CoordinatorPorts, CoordinatorStatus, CyclicEntry, PendingAsync, WireError,
+};
 use metor_fsw_2_core::CyclicSlot;
 
 /// What the proc bind arm needs beyond the shared alloc products: the step
@@ -51,7 +55,7 @@ fn bind_static_io(
     cons_edges: &ConsEdges,
     alloc: &RingAlloc,
 ) -> (Vec<BoundPort>, Vec<BoundInput>) {
-    let outs: Vec<BoundPort> = (0..desc.outputs.len())
+    let outs: Vec<BoundPort> = (0..staged_outputs(desc))
         .map(|out_idx| BoundPort::new(alloc.output_rings[id][out_idx].clone()))
         .collect();
     let ins: Vec<BoundInput> = (0..desc.inputs.len())
@@ -92,8 +96,14 @@ pub(super) fn bind_systems(
     registry: &Arc<Registry>,
     proc_ctx: &ProcBindCtx,
 ) -> Result<BoundSystems, WireError> {
-    let mut cyclic: Vec<Box<dyn CyclicSlot>> = Vec::new();
+    let mut cyclic: Vec<CyclicEntry> = Vec::new();
     let mut pending_async: Vec<PendingAsync> = Vec::new();
+    // Every host-stepped slot gets the host's writer for its status record.
+    let entry = |slot: Box<dyn CyclicSlot>, id: usize, desc: &SystemDescriptor| CyclicEntry {
+        status: Some(host_status_writer(desc, &alloc.output_rings[id])),
+        slot,
+        cycles: 0,
+    };
     // The coordinator's own (#0) ports, wrapped by its bind arm below and
     // unwrapped after the loop (`SystemBind::Coordinator` is always registered first).
     let mut coord: Option<CoordinatorPorts> = None;
@@ -103,37 +113,43 @@ pub(super) fn bind_systems(
             SystemBind::Coordinator => {
                 coord = Some(bind_coordinator(id, &desc, cons_edges, &alloc.output_rings))
             }
-            SystemBind::Dl(dl) => cyclic.push(Box::new(bind_dl(
-                id,
-                dl,
-                &desc,
-                &name,
-                cons_edges,
-                &alloc.output_rings,
-            ))),
-            SystemBind::Proc(proc_reg) => cyclic.push(bind_proc(
-                id, proc_reg, &desc, name, cons_edges, alloc, proc_ctx,
-            )?),
-            SystemBind::Wasm(reg) => cyclic.push(Box::new(bind_wasm(
-                id,
-                reg,
-                &desc,
-                &name,
-                cons_edges,
-                &alloc.output_rings,
-                proc_ctx,
-            )?)),
-            SystemBind::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
-                id, slot_reg, &desc, cons_edges, alloc, proc_ctx,
-            )?)),
+            SystemBind::Dl(dl) => {
+                let slot = bind_dl(id, dl, &desc, &name, cons_edges, &alloc.output_rings);
+                cyclic.push(entry(Box::new(slot), id, &desc));
+            }
+            SystemBind::Proc(proc_reg) => {
+                let slot = bind_proc(id, proc_reg, &desc, name, cons_edges, alloc, proc_ctx)?;
+                cyclic.push(entry(slot, id, &desc));
+            }
+            SystemBind::Wasm(reg) => {
+                let slot = bind_wasm(
+                    id,
+                    reg,
+                    &desc,
+                    &name,
+                    cons_edges,
+                    &alloc.output_rings,
+                    proc_ctx,
+                )?;
+                cyclic.push(entry(Box::new(slot), id, &desc));
+            }
+            SystemBind::Slot(slot_reg) => {
+                let slot = bind_slot(id, slot_reg, &desc, cons_edges, alloc, proc_ctx)?;
+                cyclic.push(entry(Box::new(slot), id, &desc));
+            }
             // The static (host-side) kinds: build typed `BoundPort`s
             // (`bind_static_io`) and walk them with a `Binder`. A pack entry
             // rides this arm too (via `PendingDriver`).
             SystemBind::Cyclic(r) => {
                 let (outs, ins) = bind_static_io(id, &desc, cons_edges, alloc);
                 let mut binder = Binder::new(&outs, &ins, registry.clone(), &name);
-                cyclic.push(r.bind(&mut binder));
+                let slot = r.bind(&mut binder);
+                cyclic.push(entry(slot, id, &desc));
             }
+            // An async system's ports are private rings behind a boundary
+            // pump; the bundle binds over the staged prefix and the system's
+            // own `StatusPort` over the host-appended tail. The public status
+            // ring's writer is the pump's, so the boundary entry has none.
             SystemBind::Async(r) => {
                 let plan = plumbing
                     .plans
@@ -144,12 +160,18 @@ pub(super) fn bind_systems(
                     outputs: outs,
                     boundary,
                 } = plan;
+                let (bundle, tail) = outs.split_at(staged_outputs(&desc));
                 let launcher = {
-                    let mut binder = Binder::new(&outs, &ins, registry.clone(), &name);
-                    r.bind(&mut binder)
+                    let mut binder = Binder::new(bundle, &ins, registry.clone(), &name);
+                    let mut tail = Binder::new(tail, &[], registry.clone(), &name);
+                    r.bind(&mut binder, StatusPort::bind(&mut tail))
                 };
                 pending_async.push(PendingAsync { name, launcher });
-                cyclic.push(Box::new(boundary));
+                cyclic.push(CyclicEntry {
+                    slot: Box::new(boundary),
+                    status: None,
+                    cycles: 0,
+                });
             }
         }
     }
@@ -160,6 +182,31 @@ pub(super) fn bind_systems(
         // Always registered by InitGraph::new, so the unwrap is structural.
         coord: coord.expect("coordinator #0 bound its ports"),
     })
+}
+
+/// How many of a node's outputs are staged to the system itself: its own
+/// declared outputs, which precede the first host-connected one. Everything
+/// from there on — the host-appended `system_status`, a slot runner's tail —
+/// is written by the host, so a guest's positional ring array, a bundle's
+/// bind walk, and a worker's file list all stop here.
+pub(super) fn staged_outputs(desc: &SystemDescriptor) -> usize {
+    desc.outputs
+        .iter()
+        .position(|p| p.conn == PortConn::Host)
+        .unwrap_or(desc.outputs.len())
+}
+
+/// The host's writer over a node's `system_status` ring, the one output the
+/// host appends to every registration (see `push_node`).
+fn host_status_writer(desc: &SystemDescriptor, rings: &[RingBuffer]) -> Output<SystemStatus> {
+    let idx = desc
+        .outputs
+        .iter()
+        .position(|p| {
+            p.conn == PortConn::Host && p.id() == PortId::Component(SystemStatus::FRAME_ID)
+        })
+        .expect("every registered node carries the host-appended system_status output");
+    slot_writer::<SystemStatus>(&rings[idx])
 }
 
 /// The coordinator's own bundle: a marker registration, not a cyclic slot (the
@@ -178,13 +225,10 @@ fn bind_coordinator(
             .position(|p| p.id() == pid)
             .expect("the coordinator #0 bundle declares this output")
     };
-    let health_ring = &output_rings[id][out_idx(PortId::Component(SystemStatus::FRAME_ID))];
     let log_ring = &output_rings[id][out_idx(PortId::Packet(LogEvent::ID))];
-    let mut health = HealthPort::new(
-        slot_writer::<SystemStatus>(health_ring),
-        owned_writer::<LogEvent>(log_ring),
-    );
-    health.set_instance(&desc.name);
+    let mut log = LogPort::new(owned_writer::<LogEvent>(log_ring));
+    log.set_instance(&desc.name);
+    let status = host_status_writer(desc, &output_rings[id]);
     let status_idx = out_idx(PortId::Component(CoordinatorStatus::FRAME_ID));
     let status_out = slot_writer::<CoordinatorStatus>(&output_rings[id][status_idx]);
     let seq_registry_out = owned_writer::<SequenceRegistry>(
@@ -223,7 +267,8 @@ fn bind_coordinator(
         .position(|p| p.id() == PortId::Packet(WiringManifest::ID))
         .map(|idx| owned_writer::<WiringManifest>(&output_rings[id][idx]));
     CoordinatorPorts {
-        health,
+        log,
+        status,
         status_out,
         seq_registry_out,
         control_out,
@@ -245,7 +290,7 @@ fn bind_dl(
     output_rings: &[Vec<RingBuffer>],
 ) -> crate::dl::DlSlot {
     use metor_fsw_2_core::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
-    let outputs: Vec<FswRing> = (0..desc.outputs.len())
+    let outputs: Vec<FswRing> = (0..staged_outputs(desc))
         .map(|out_idx| {
             let (base, len) = output_rings[id][out_idx].region();
             FswRing {
@@ -304,7 +349,7 @@ fn bind_proc(
     // Every ring the worker touches, as (host handle, file path): this
     // system's own outputs, then the producer ring behind each input.
     let mut rings: Vec<RingBuffer> = Vec::new();
-    let output_paths: Vec<PathBuf> = (0..desc.outputs.len())
+    let output_paths: Vec<PathBuf> = (0..staged_outputs(desc))
         .map(|out_idx| {
             rings.push(alloc.output_rings[id][out_idx].clone());
             alloc.ring_paths[&(id, out_idx)].clone()
@@ -375,7 +420,7 @@ fn bind_wasm(
     ctx: &ProcBindCtx,
 ) -> Result<crate::wasm::WasmCyclic, WireError> {
     use metor_fsw_2_core::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
-    let outputs: Vec<FswRing> = (0..desc.outputs.len())
+    let outputs: Vec<FswRing> = (0..staged_outputs(desc))
         .map(|out_idx| {
             let (base, len) = output_rings[id][out_idx].region();
             FswRing {
@@ -437,6 +482,11 @@ fn bind_slot(
     } = slot_reg;
     let n_occ_inputs = ports.occupant_inputs.len();
     let n_occ_outputs = ports.occupant_outputs.len();
+    debug_assert_eq!(
+        n_occ_outputs,
+        staged_outputs(desc),
+        "the occupant prefix ends where the host-written tail begins"
+    );
     let proc = if process {
         Some(slot_proc_parts(
             id, desc, &allowed, &ports, cons_edges, alloc, proc_ctx,
@@ -470,7 +520,7 @@ fn bind_slot(
         })
         .collect();
     // Occupant outputs are the prefix of the slot's own buffers (user outputs,
-    // SequenceStatus, health, log, in descriptor order).
+    // log, SequenceStatus, in descriptor order).
     let outputs: Vec<FswRing> = (0..n_occ_outputs)
         .map(|out_idx| {
             let (base, len) = output_rings[id][out_idx].region();

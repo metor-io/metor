@@ -22,7 +22,7 @@
 //! check in the wiring step verifies that the two sides agree.
 
 use metor_fsw_2_core::metor_proto::types::Timestamp;
-use metor_fsw_2_core::{HealthPort, Input, MsgOut, NamedMsg, Output, Pack, system};
+use metor_fsw_2_core::{Input, LogLevel, LogPort, MsgOut, NamedMsg, Output, Pack, system};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -88,16 +88,16 @@ fn count(
     tick: &mut Input<TickIn>,
     out: &mut Output<TickOut>,
     events: &mut MsgOut<TickEvent>,
-    health: &mut HealthPort,
+    log: &mut LogPort,
 ) {
     let value = match tick.latest() {
         Ok(Some(t)) => t.get().value,
         Ok(None) => {
-            health.error("no_tick");
+            log.fault(LogLevel::Warn, "no_tick", "no tick sample", &[]);
             return;
         }
         Err(_) => {
-            health.error("tick_corrupt");
+            log.fault(LogLevel::Error, "tick_corrupt", "tick ring read corrupt", &[]);
             return;
         }
     };

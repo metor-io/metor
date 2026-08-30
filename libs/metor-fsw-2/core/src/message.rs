@@ -139,7 +139,7 @@ where
     /// payload), so a per-cycle emit grows in place instead of allocating.
     scratch: Vec<u8>,
     /// Records dropped by the infallible [`publish`](Self::publish) path,
-    /// folded into health by the runner via `SystemOutput::take_dropped` or a
+    /// reported by the runner via `SystemOutput::take_dropped` or a
     /// future-owning driver's shared cell.
     dropped: crate::port::Drops,
     _m: PhantomData<fn() -> M>,
@@ -160,7 +160,7 @@ impl<M: Msg, WD: WakeSource> MsgOut<M, WD> {
     ///
     /// A write fails on `InsufficientCapacity` (a sizing bug) or `WouldBlock`
     /// (a slow reader backpressuring the ring); either way the record is
-    /// dropped and counted for the runner to fold into health. Callers that
+    /// dropped and counted for the runner to report. Callers that
     /// want to see the error use [`emit`](Self::emit).
     pub fn publish(&mut self, msg: &M) {
         if self.emit(msg).is_err() {
@@ -174,7 +174,7 @@ impl<M: Msg, WD: WakeSource> MsgOut<M, WD> {
     }
 
     /// Count drops through `cell` instead of locally, for a port about to
-    /// move into a future (whose driver folds the cell into health).
+    /// move into a future (whose driver reports the cell's count).
     pub(crate) fn share_drops(&mut self, cell: std::sync::Arc<core::sync::atomic::AtomicU64>) {
         self.dropped.share(cell);
     }

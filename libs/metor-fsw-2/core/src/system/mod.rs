@@ -9,8 +9,8 @@
 //! its own `run` loop and paces itself by awaiting its inputs or a timer.
 //!
 //! Outputs are never handed to a system bare. The framework wraps the user's
-//! bundle in [`Out`], which appends an implicit health/log port pair so that
-//! `output.health()` is always available. Reporting through that handle is a
+//! bundle in [`Out`], which appends an implicit log port so that
+//! `output.log()` is always available. Reporting through that handle is a
 //! system's only failure channel; `execute` and `run` return nothing.
 //!
 //! Construction is split from wiring. [`BuildSystem`] says how a system is
@@ -25,8 +25,9 @@
 //! one.
 //!
 //! [`CyclicRunner`] is the framework shim between the coordinator and a
-//! cyclic system. It owns the bundles between cycles, times each `execute`,
-//! and publishes the standard health record per cycle.
+//! cyclic system. It owns the bundles between cycles and flushes the log
+//! after each `execute`; the host times the step and publishes the run
+//! record.
 
 use core::ops::{Deref, DerefMut};
 
@@ -35,10 +36,9 @@ use metor_proto::types::Timestamp;
 
 use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::{Declarations, PortDesc, SystemDescriptor, SystemKind};
-use crate::health::{HealthPort, LogEvent, SystemStatus};
+use crate::log::{LogEvent, LogLevel, LogPort};
 use crate::message::MsgOut;
 use crate::message::MsgTable;
-use crate::port::Output;
 use crate::slot::{CyclicSlot, SlotState};
 
 /// The read side of a system, a struct whose fields are
@@ -57,14 +57,14 @@ impl SystemInput for () {
 
 /// A system's output bundle: a struct of [`Output<F>`](crate::Output) ports.
 /// Derive with `#[derive(SystemOutput)]`. The framework wraps it in [`Out`]
-/// to add the implicit health/log ports.
+/// to add the implicit log port.
 pub trait SystemOutput {
     /// The ports and bind-time capabilities produced by this bundle.
     fn decls() -> Declarations;
 
     /// Sum and clear the ports' [`publish`](crate::Output::publish) drop
-    /// counters. Derive-generated; the runner folds a nonzero sum into a
-    /// `publish_dropped` health error each cycle. The default returns zero so
+    /// counters. Derive-generated; the runner reports a nonzero sum as a
+    /// `publish_dropped` fault each cycle. The default returns zero so
     /// a hand-written bundle that does not track drops still compiles.
     fn take_dropped(&mut self) -> u64 {
         0
@@ -72,38 +72,37 @@ pub trait SystemOutput {
 }
 
 /// The framework wrapper around a system's output bundle `O`. It carries the
-/// implicit per-system health/log port pair so `output.health()` is always
-/// available, while `Deref`/`DerefMut` expose the user's own ports
-/// (`output.<port>.write(...)`).
+/// implicit per-system log port so `output.log()` is always available, while
+/// `Deref`/`DerefMut` expose the user's own ports (`output.<port>.write(...)`).
 pub struct Out<O, WD = NoWake>
 where
     WD: WakeSource,
 {
     ports: O,
-    health: HealthPort<WD>,
+    log: LogPort<WD>,
 }
 
 impl<O, WD> Out<O, WD>
 where
     WD: WakeSource,
 {
-    /// Bundle a user output struct with its framework-allocated health port.
-    pub fn new(ports: O, health: HealthPort<WD>) -> Self {
-        Self { ports, health }
+    /// Bundle a user output struct with its framework-allocated log port.
+    pub fn new(ports: O, log: LogPort<WD>) -> Self {
+        Self { ports, log }
     }
 
-    /// The handle a system reports through: `output.health().error("kind")`
-    /// and `.log(level, msg)`.
-    pub fn health(&mut self) -> &mut HealthPort<WD> {
-        &mut self.health
+    /// The handle a system reports through: `output.log().fault(..)` and
+    /// `.log(level, msg)`.
+    pub fn log(&mut self) -> &mut LogPort<WD> {
+        &mut self.log
     }
 
-    /// Disjoint borrows of the user ports and the health handle. `health()`
+    /// Disjoint borrows of the user ports and the log handle. `log()`
     /// borrows the whole `Out` and so conflicts with a live `&mut` to one of
     /// the user ports; generated delegation needs to lend both to the user's
     /// `execute` at once.
-    pub fn split(&mut self) -> (&mut O, &mut HealthPort<WD>) {
-        (&mut self.ports, &mut self.health)
+    pub fn split(&mut self) -> (&mut O, &mut LogPort<WD>) {
+        (&mut self.ports, &mut self.log)
     }
 }
 
@@ -133,14 +132,12 @@ where
 {
     fn decls() -> Declarations {
         let mut decls = O::decls();
-        decls.push(PortDesc::of::<SystemStatus>());
         decls.push(PortDesc::msg_named::<LogEvent>("log"));
         decls
     }
 
-    /// Only the user bundle counts drops here; the health port publishes
-    /// through the sizing-aware path, and the log port folds its own drops
-    /// into health as `log_dropped`.
+    /// Only the user bundle counts drops here; the log port reports its own
+    /// drops as `log_dropped` lines.
     fn take_dropped(&mut self) -> u64 {
         self.ports.take_dropped()
     }
@@ -151,15 +148,14 @@ where
     O: BindPorts,
     WD: WakeSource + Default + Clone + 'static,
 {
-    /// Bind the user ports, then the two implicit health/log ports, in the
-    /// same order [`decls`](SystemOutput::decls) declares them.
+    /// Bind the user ports, then the implicit log port, in the same order
+    /// [`decls`](SystemOutput::decls) declares them.
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let ports = O::bind(src);
-        let health: Output<SystemStatus, WD> = Output::bind(src);
         let log: MsgOut<LogEvent, WD> = MsgOut::bind(src);
-        let mut health = HealthPort::new(health, log);
-        health.set_instance(src.instance_name());
-        Out::new(ports, health)
+        let mut log = LogPort::new(log);
+        log.set_instance(src.instance_name());
+        Out::new(ports, log)
     }
 }
 
@@ -225,18 +221,18 @@ pub enum ConfigureError {
 pub trait System {
     /// The read-only inputs this system consumes.
     type Input: SystemInput + BindPorts;
-    /// The owned outputs this system produces (wrapped in [`Out`] for health).
+    /// The owned outputs this system produces (wrapped in [`Out`] for the log).
     type Output: SystemOutput + BindPorts;
 
-    /// The name this system wires under, and the prefix its health frames
+    /// The name this system wires under, and the prefix its status and log
     /// hang off.
     const NAME: &'static str;
 
     /// Runs once before the first `execute`/`run`. May emit initial frames or
-    /// health. Defaults to a no-op.
+    /// log lines. Defaults to a no-op.
     fn init(&mut self, _output: &mut Self::Output) {}
 
-    /// Runs once at teardown. May flush final frames or health. Defaults to a
+    /// Runs once at teardown. May flush final frames or log lines. Defaults to a
     /// no-op.
     fn shutdown(&mut self, _output: &mut Self::Output) {}
 }
@@ -267,7 +263,7 @@ pub fn descriptor_for<I: SystemInput, O: SystemOutput>(
 /// rather than losing data.
 pub trait CyclicSystem: System {
     /// One unit of work: read the latest inputs, write outputs. Trouble is
-    /// reported through `output.health()`, never a return value.
+    /// reported through `output.log()`, never a return value.
     ///
     /// `now` is the coordinator's timestamp for the cycle. Every system in a
     /// cycle sees the same value, and a [`Simulated`](crate::ClockMode) clock
@@ -293,27 +289,39 @@ pub trait CyclicSystem: System {
     }
 }
 
-/// The framework tail every cyclic output bundle carries: the health port
-/// the runner times and publishes through. [`Out`] is the standard carrier;
-/// a hand-written bundle (one whose config-minted ports must trail the
-/// health pair, like the uplink's fan-out) implements it directly.
-pub trait HealthOutput: SystemOutput {
-    fn health(&mut self) -> &mut HealthPort;
+/// The framework tail every cyclic output bundle carries: the log port the
+/// runner flushes after each step. [`Out`] is the standard carrier; a
+/// hand-written bundle (one whose config-minted ports must trail the log
+/// port, like the uplink's fan-out) implements it directly.
+pub trait LogOutput: SystemOutput {
+    fn log(&mut self) -> &mut LogPort;
 }
 
-impl<O: SystemOutput> HealthOutput for Out<O> {
-    fn health(&mut self) -> &mut HealthPort {
-        Out::health(self)
+impl<O: SystemOutput> LogOutput for Out<O> {
+    fn log(&mut self) -> &mut LogPort {
+        Out::log(self)
+    }
+}
+
+/// Report a step's dropped publishes, if any, as one `publish_dropped` fault.
+/// Every cyclic driver folds its drop count through here.
+pub fn report_dropped(log: &mut LogPort, dropped: u64) {
+    if dropped > 0 {
+        log.fault(
+            LogLevel::Warn,
+            "publish_dropped",
+            "output publish dropped",
+            &[("dropped", &dropped)],
+        );
     }
 }
 
 /// Drives a [`CyclicSystem`] on behalf of the coordinator. It owns the port
-/// bundles between cycles, times each `execute`, and publishes a health
-/// record per cycle.
+/// bundles between cycles and flushes the log after each `execute`.
 pub struct CyclicRunner<S>
 where
     S: CyclicSystem,
-    S::Output: HealthOutput,
+    S::Output: LogOutput,
 {
     system: S,
     input: S::Input,
@@ -323,7 +331,7 @@ where
 impl<S> CyclicRunner<S>
 where
     S: CyclicSystem,
-    S::Output: HealthOutput,
+    S::Output: LogOutput,
 {
     /// Assemble a runner from a constructed system and its bound port
     /// bundles.
@@ -340,18 +348,15 @@ where
         self.system.init(&mut self.output);
     }
 
-    /// Run one cycle: time `execute`, then publish health. `now` is threaded
-    /// from the cycle loop so every system in a cycle shares one timestamp.
+    /// Run one cycle: `execute`, then flush the log. `now` is threaded from
+    /// the cycle loop so every system in a cycle shares one timestamp.
     pub fn step(&mut self, now: Timestamp) {
-        let start = crate::clock::ExecTimer::start();
         self.system.execute(now, &mut self.input, &mut self.output);
-        let micros = start.elapsed_micros();
         // Publish is infallible, so a dropped write can only surface here: a
         // nonzero sum means an undersized ring or a backpressuring reader.
-        if self.output.take_dropped() > 0 {
-            self.output.health().error("publish_dropped");
-        }
-        self.output.health().end_cycle(now, micros);
+        let dropped = self.output.take_dropped();
+        report_dropped(self.output.log(), dropped);
+        self.output.log().flush(now);
     }
 
     /// Cyclic runners remain running until their coordinator shuts them down.
@@ -375,7 +380,7 @@ where
 impl<S> CyclicSlot for CyclicRunner<S>
 where
     S: CyclicSystem,
-    S::Output: HealthOutput,
+    S::Output: LogOutput,
 {
     fn init(&mut self) {
         CyclicRunner::init(self)

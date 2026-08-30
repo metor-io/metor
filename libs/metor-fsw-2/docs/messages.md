@@ -120,7 +120,7 @@ The publish calls keep the system step running:
 - `Output::publish_with`
 - `MsgOut::publish`
 
-A publish call drops the new record when the ring is full or too small. It adds to the port's drop count. Cyclic drivers turn a nonzero count into a `publish_dropped` health error after the step.
+A publish call drops the new record when the ring is full or too small. It adds to the port's drop count. Cyclic drivers turn a nonzero count into one `publish_dropped` fault line on the log after the step.
 
 Log delivery does not make writes block. It tells readers and broad taps to drain records instead of taking only the newest one.
 
@@ -128,11 +128,11 @@ Use the fallible call when the producer must choose what to do after a failed wr
 
 ```rust
 if output.write(&frame).is_err() {
-    health.error("output_full");
+    log.fault(LogLevel::Warn, "output_full", "estimate ring full", &[]);
 }
 ```
 
-Use `publish` when the normal rule is to keep the cycle moving and report the drop through standard health data.
+Use `publish` when the normal rule is to keep the cycle moving and report the drop on the log.
 
 ## Ring size
 
@@ -165,7 +165,7 @@ public outputs <- export <- private async outputs
 The boundary calls import and then export without yielding. Import may wake the
 task but cannot run it inline, so that export contains only work completed
 before the boundary. If a destination private or public ring is full, copying
-drops the record and reports coordinator health rather than blocking the cycle.
+drops the record and logs a fault on the coordinator log rather than blocking the cycle.
 
 ## Registry and telemetry
 

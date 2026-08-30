@@ -33,8 +33,8 @@ use crate::abi::{
 };
 use crate::sequence::{Outcome, SequenceStatus, SlotControlIn, wait};
 use crate::{
-    BuildSystem, CyclicSystem, Frame, HealthPort, Input, Out, Output, Pack, System, SystemInput,
-    SystemKind, SystemOutput, SystemStatus, buffer_capacity,
+    BuildSystem, CyclicSystem, Frame, Input, LogLevel, LogPort, Out, Output, Pack, System,
+    SystemInput, SystemKind, SystemOutput, buffer_capacity,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,9 @@ impl CyclicSystem for Counter {
         let value = match input.tick.latest() {
             Ok(Some(t)) => t.get().value,
             _ => {
-                output.health().error("no_tick");
+                output
+                    .log()
+                    .fault(LogLevel::Warn, "no_tick", "no tick sample", &[]);
                 return;
             }
         };
@@ -176,12 +178,12 @@ fn counter_entry(
     now: Timestamp,
     tick: &mut Input<TickIn>,
     out: &mut Output<TickOut>,
-    health: &mut HealthPort,
+    log: &mut LogPort,
 ) {
     let value = match tick.latest() {
         Ok(Some(t)) => t.get().value,
         _ => {
-            health.error("no_tick");
+            log.fault(LogLevel::Warn, "no_tick", "no tick sample", &[]);
             return;
         }
     };
@@ -267,10 +269,9 @@ fn postcard_round_trip<T: Serialize + DeserializeOwned>(value: &T) -> T {
 #[test]
 fn abi_lifecycle_end_to_end() {
     // The host owns the rings. Output descriptor order is the user `out`
-    // followed by the implicit health and log ports.
+    // followed by the implicit log port.
     let in_ring = ring_for::<TickIn>(8, 1);
     let out_ring = ring_for::<TickOut>(8, 1);
-    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     // Register the host's view before the system writes; a fresh view only
@@ -280,7 +281,6 @@ fn abi_lifecycle_end_to_end() {
     let inputs = [handle(&in_ring, ROLE_INPUT)];
     let outputs = [
         handle(&out_ring, ROLE_OUTPUT),
-        handle(&health_ring, ROLE_OUTPUT),
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
@@ -339,7 +339,7 @@ fn abi_lifecycle_end_to_end() {
     }
 
     drop(pack);
-    drop((in_ring, out_ring, health_ring, log_ring, out_view));
+    drop((in_ring, out_ring, log_ring, out_view));
 }
 
 /// An out-of-range entry index is a null state, never a crash; so is a
@@ -424,9 +424,9 @@ fn abi_describe_round_trips() {
     );
     assert_eq!(got.inputs[0].id(), desc.inputs[0].id());
 
-    // The user `out` plus the implicit health and log ports.
+    // The user `out` plus the implicit log port.
     assert_eq!(got.outputs.len(), desc.outputs.len());
-    assert_eq!(got.outputs.len(), 3);
+    assert_eq!(got.outputs.len(), 2);
     assert_eq!(
         got.outputs[0].id().component().expect("table port"),
         TickOut::FRAME_ID
@@ -562,13 +562,11 @@ extern "C" fn boom_execute(state: *mut c_void, now: u64) -> FswStatus {
 fn abi_panic_is_contained() {
     let in_ring = ring_for::<TickIn>(8, 1);
     let out_ring = ring_for::<TickOut>(8, 1);
-    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     let inputs = [handle(&in_ring, ROLE_INPUT)];
     let outputs = [
         handle(&out_ring, ROLE_OUTPUT),
-        handle(&health_ring, ROLE_OUTPUT),
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
@@ -604,7 +602,7 @@ fn abi_panic_is_contained() {
     }
 
     drop(pack);
-    drop((in_ring, out_ring, health_ring, log_ring));
+    drop((in_ring, out_ring, log_ring));
 }
 
 /// [`FswStatus::from_raw`] sits on the trust boundary. The three declared
@@ -624,16 +622,14 @@ fn from_raw_folds_out_of_range_to_panicked() {
 // ---------------------------------------------------------------------------
 // A task entry driven through the pack ABI under the slot-occupant mount:
 // the framework appends the SlotControlIn input after the entry's inputs
-// (none here) and the SequenceStatus output after its health/log tail.
+// (none here) and the SequenceStatus output after its log tail.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn seq_abi_runs_to_done() {
-    // Rings in occupant-mount order: input [control]; outputs [health, log,
-    // status].
+    // Rings in occupant-mount order: input [control]; outputs [log, status].
     let control_ring = ring_for::<SlotControlIn>(8, 1);
     let status_ring = ring_for::<SequenceStatus>(8, 1);
-    let health_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     // Register the host's view before the occupant writes.
@@ -641,7 +637,6 @@ fn seq_abi_runs_to_done() {
 
     let inputs = [handle(&control_ring, ROLE_INPUT)];
     let outputs = [
-        handle(&health_ring, ROLE_OUTPUT),
         handle(&log_ring, ROLE_OUTPUT),
         handle(&status_ring, ROLE_OUTPUT),
     ];
@@ -691,13 +686,7 @@ fn seq_abi_runs_to_done() {
         run_pack_destroy(state);
     }
     drop(pack);
-    drop((
-        control_ring,
-        status_ring,
-        health_ring,
-        log_ring,
-        status_view,
-    ));
+    drop((control_ring, status_ring, log_ring, status_view));
 }
 
 // ---------------------------------------------------------------------------
@@ -875,16 +864,15 @@ fn announce_preserves_element_names() {
     assert_eq!(m.element_names(), "x,y,z");
 }
 
-/// Frames with dynamic members (`FrameList`/`FrameMap`, including every
-/// system's implicit `health` frame) realize identically too: the
-/// prefix rewrite carries the instance prefix onto the top-level dynamic path
-/// strings, so `inst.system_status.error_counts.<kind>` ids match the static path and
-/// two instances of one system never collide on their dynamic paths.
+/// Frames with dynamic members (`FrameList`/`FrameMap`) realize identically
+/// too: the prefix rewrite carries the instance prefix onto the top-level
+/// dynamic path strings, so `inst.probe_dyn.<member>.<key>` ids match the
+/// static path and two instances of one system never collide on their
+/// dynamic paths.
 #[test]
 fn announce_data_path_matches_static_dynamic() {
     for prefix in ["inst", "a.b"] {
         assert_announce_eq::<ProbeDyn>(prefix);
-        assert_announce_eq::<crate::SystemStatus>(prefix);
     }
 }
 

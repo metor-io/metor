@@ -43,7 +43,7 @@
 //! compile-twice pin in the tests holds the whole module to byte equality.
 
 use metor_fsw_2_core::abi::{FSW_ABI_VERSION, PackEntryDesc, PackManifest};
-use metor_fsw_2_core::health::{LogEvent, SystemStatus};
+use metor_fsw_2_core::log::LogEvent;
 use metor_fsw_2_core::{
     Delivery, FanIn, PortConn, PortDesc, PortSchema, SystemDescriptor, SystemKind,
 };
@@ -415,7 +415,7 @@ fn output_port(frame: &Frame, publishes: &[String]) -> PortDesc {
 }
 
 /// One `@system`'s pack entry: the full descriptor (grouped inputs, the
-/// Table output, and the health/log tail every native entry carries), a unit
+/// Table output, and the log tail every native entry carries), a unit
 /// params schema (the params channel carries only the host-injected `@rng`
 /// seed), reloadable.
 fn entry_desc(system: &System, groups: &[Group]) -> PackEntryDesc {
@@ -437,7 +437,6 @@ fn entry_desc(system: &System, groups: &[Group]) -> PackEntryDesc {
         .collect();
     let outputs = vec![
         output_port(&system.output, &system.publishes),
-        PortDesc::of::<SystemStatus>(),
         PortDesc::msg_named::<LogEvent>("log"),
     ];
     PackEntryDesc {

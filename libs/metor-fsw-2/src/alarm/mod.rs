@@ -46,7 +46,7 @@
 //!
 //! A target that fails to resolve (unknown component, out-of-range element,
 //! duplicate alarm id, no reader slot left) disables that alarm and reports
-//! through health; it never panics the target.
+//! on its log; it never panics the target.
 
 use std::collections::HashSet;
 
@@ -60,6 +60,7 @@ use metor_proto_wkt::{
 use serde::Deserialize;
 
 use metor_fsw_2_core::AllOutputs;
+use metor_fsw_2_core::log::LogLevel;
 use metor_fsw_2_core::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, System};
 use metor_fsw_2_core::{MsgIn, MsgOut};
 
@@ -438,7 +439,7 @@ pub struct AlarmOut {
 
 /// A configured alarm bound to its resolved target identity and live
 /// [`AlarmEval`] state. `enabled` drops on a boot-resolution failure,
-/// surfaced through health rather than a panic.
+/// surfaced on the log rather than a panic.
 struct AlarmRuntime {
     spec: AlarmSpec,
     component_id: ComponentId,
@@ -552,7 +553,12 @@ impl CyclicSystem for AlarmSystem {
             }
         });
         if ack_result.is_err() {
-            output.health().error("alarm_ack_corrupt");
+            output.log().fault(
+                LogLevel::Error,
+                "alarm_ack_corrupt",
+                "ack ring read corrupt",
+                &[],
+            );
         }
 
         // Evaluate each watch off its newest record. `try_latest` re-serves
@@ -570,7 +576,12 @@ impl CyclicSystem for AlarmSystem {
                 Ok(Some(record)) => record,
                 Ok(None) => continue,
                 Err(_) => {
-                    output.health().error("alarm_input_corrupt");
+                    output.log().fault(
+                        LogLevel::Error,
+                        "alarm_input_corrupt",
+                        "watched ring read corrupt",
+                        &[],
+                    );
                     continue;
                 }
             };
@@ -629,8 +640,8 @@ impl AlarmSystem {
     /// Resolve every target against the telemetered registry entries and
     /// claim one shared view per distinct entry.
     fn resolve_targets(&mut self, output: &mut Out<AlarmOut>) {
-        // Health reports are deferred because iterating `output.all` borrows
-        // the bundle, and `output.health()` needs a `&mut` borrow.
+        // Log reports are deferred because iterating `output.all` borrows
+        // the bundle, and `output.log()` needs a `&mut` borrow.
         let mut failures: Vec<(&'static str, String)> = Vec::new();
 
         // Duplicate ids would collide on the ack path, so keep the first and
@@ -730,9 +741,7 @@ impl AlarmSystem {
         }
 
         for (kind, line) in failures {
-            let health = output.health();
-            health.error(kind);
-            health.log(metor_fsw_2_core::health::LogLevel::Warn, &line);
+            output.log().fault(LogLevel::Warn, kind, &line, &[]);
         }
     }
 }

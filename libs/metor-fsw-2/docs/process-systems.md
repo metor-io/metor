@@ -112,7 +112,7 @@ seconds. Clean shutdown gets a 1 second grace period before the host kills the
 child.
 
 Each steady-state step has its own deadline. The default is 100 ms. A live but
-late worker adds a coordinator health error and the main loop continues.
+late worker logs a fault on the coordinator log and the main loop continues.
 
 The timeout does not cancel code already running in the child. The next
 doorbell can replace the missed step.

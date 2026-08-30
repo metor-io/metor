@@ -120,7 +120,7 @@ The reader accepts `Msg` packets as commands. It ignores `Table`, the old `MsgSt
 
 The uplink copies the payload without decoding it. Each receiving `MsgIn` decodes its own type and skips a payload that does not decode.
 
-An id outside the uplink list records `uplink_unroutable`. A full output ring records `uplink_dropped`. In both cases the uplink continues to drain its input.
+An id outside the uplink list logs `uplink_unroutable`; a full output ring logs `uplink_dropped`, one line per cycle with the count. In both cases the uplink continues to drain its input.
 
 ## Bounded loss
 
@@ -130,7 +130,7 @@ Each client has at most 1 MiB of pending output. If a new cycle batch would cros
 
 The inbound command FIFO holds 256 messages. A new message is lost when the FIFO is full.
 
-The downlink reports these cases through health:
+The downlink reports these cases as `kind=` fault lines on its log:
 
 - `link_conn_dropped` for a lost client batch
 - `link_inbound_dropped` for a full command FIFO

@@ -114,12 +114,12 @@ impl RingBridge {
     }
 
     /// Records dropped because a destination ring was full, for the slot's
-    /// health.
+    /// fault scan.
     pub fn dropped(&self) -> u64 {
         self.io.dropped()
     }
 
-    /// Drain records dropped since the last health scan.
+    /// Drain records dropped since the last fault scan.
     pub fn drain_dropped(&mut self) -> u64 {
         self.io.drain_dropped()
     }

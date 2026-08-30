@@ -63,12 +63,12 @@
 //! An [`Output`] owns a ring writer. An [`Input`] owns a read view into an
 //! upstream ring. A full ring makes a write return [`WriteError`]. The
 //! `publish` helpers keep the cycle moving by dropping the new record and
-//! counting that loss for health telemetry.
+//! reporting that loss on the log.
 //!
-//! Each system has health and log outputs. Cyclic drivers close a health cycle
-//! after each step and send a [`SystemStatus`] frame plus queued [`LogEvent`]
-//! messages. A free-running [`AsyncSystem`] controls when it sends its own
-//! health data.
+//! Each system has a log output; cyclic drivers flush its queued [`LogEvent`]
+//! messages after each step. The coordinator publishes each system's
+//! [`SystemStatus`] run record itself; a free-running [`AsyncSystem`]
+//! publishes its own through its context.
 //!
 //! # Wiring and loading
 //!

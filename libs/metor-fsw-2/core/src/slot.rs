@@ -129,15 +129,15 @@ pub trait CyclicSlot {
     fn shutdown(&mut self);
     fn name(&self) -> &str;
     fn state(&self) -> &SlotState;
-    /// Host-side step timeouts since last drained. The coordinator folds them
-    /// into its own health (the worker owns the system's health ring, so a
+    /// Host-side step timeouts since last drained. The coordinator reports
+    /// them on its own log (the worker owns the system's log ring, so a
     /// process slot cannot report through it). Overridden by `ProcSlot` and
     /// the process-mode `SlotRunner`.
     fn drain_timeouts(&mut self) -> u64 {
         0
     }
-    /// Worker restarts begun since last drained, folded into coordinator
-    /// health like the timeouts. Only `ProcSlot` overrides: slot occupants
+    /// Worker restarts begun since last drained, reported on the coordinator
+    /// log like the timeouts. Only `ProcSlot` overrides: slot occupants
     /// never auto-restart, so the runner has nothing to report here.
     fn drain_restarts(&mut self) -> u64 {
         0
@@ -147,9 +147,9 @@ pub trait CyclicSlot {
     fn drain_boundary_drops(&mut self) -> u64 {
         0
     }
-    /// Health key used when [`drain_boundary_drops`](Self::drain_boundary_drops)
-    /// reports loss.
-    fn boundary_drop_health_key(&self) -> &'static str {
+    /// The fault kind [`drain_boundary_drops`](Self::drain_boundary_drops)'s
+    /// loss is logged under.
+    fn boundary_drop_kind(&self) -> &'static str {
         "async_boundary_dropped"
     }
     /// Structurally corrupt boundary reads since the last drain.

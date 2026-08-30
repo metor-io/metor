@@ -20,7 +20,7 @@
 //! react to a full ring, while [`Output::publish`] never fails the cycle. A
 //! failed publish means either the ring was undersized or a slow reader is
 //! holding it full, and in both cases the port counts the dropped record so
-//! the runner can surface the count as a health error via
+//! the runner can report the count as a `publish_dropped` fault via
 //! [`Output::take_dropped`].
 
 use core::marker::PhantomData;
@@ -109,7 +109,7 @@ pub fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
 /// Where a port's dropped-publish count accumulates. A runner-owned port
 /// counts locally and the runner drains it with `take_dropped`; a port moved
 /// into a future counts through a cell shared with the driving wrapper,
-/// which folds it into health — the counters stay reachable either way.
+/// which reports it — the counters stay reachable either way.
 /// Only the failure path and the per-cycle drain touch it.
 pub(crate) enum Drops {
     Local(u64),
@@ -189,7 +189,7 @@ impl<F: Frame, WD: WakeSource> Output<F, WD> {
     }
 
     /// Count drops through `cell` instead of locally, for a port about to
-    /// move into a future (whose driver folds the cell into health).
+    /// move into a future (whose driver reports the cell's count).
     pub(crate) fn share_drops(&mut self, cell: std::sync::Arc<core::sync::atomic::AtomicU64>) {
         self.dropped.share(cell);
     }

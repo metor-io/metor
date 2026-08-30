@@ -85,10 +85,13 @@ use crate::descriptor::SystemDescriptor;
 /// schema in the descriptor, so the downlink can announce message schemas
 /// to the ground. Version 11 replaces the `describe` host callback with the
 /// two-call `fsw_pack_describe`/`fsw_pack_manifest_ptr` pair, which a wasm
-/// host can drive (a guest cannot be handed a function pointer).
+/// host can drive (a guest cannot be handed a function pointer). Version 12
+/// drops the implicit `system_status` output from every entry — the host
+/// publishes that record itself — and with it the `fsw.monotonic_us` wasm
+/// import a guest used to time its own execute.
 ///
 /// [`LogEvent`]: crate::LogEvent
-pub const FSW_ABI_VERSION: u32 = 11;
+pub const FSW_ABI_VERSION: u32 = 12;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles

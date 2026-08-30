@@ -11,7 +11,7 @@
 //! Faults degrade, never kill (plan D8). A trap, fuel exhaustion, moved
 //! memory, or a corrupt guest ring latches the instance dead and surfaces as
 //! `SlotState::Stopped`, which the coordinator's status scan folds into its
-//! own health (`system_stopped`) and a log line. A dead instance is never
+//! own log (`system_stopped`). A dead instance is never
 //! re-entered, but its bridge keeps carrying inputs so upstream producers
 //! never backpressure on a reader that stopped moving; what cannot be
 //! delivered counts as `wasm_boundary_dropped`.
@@ -31,7 +31,7 @@ pub(crate) struct WasmCyclic {
     /// The guest's instance pointer from `fsw_pack_create`.
     state: i32,
     bridge: Option<RingBridge>,
-    /// Structurally corrupt bridge reads for the coordinator's health scan.
+    /// Structurally corrupt bridge reads for the coordinator's fault scan.
     boundary_corruptions: u64,
     /// Latched once a cycle has failed; a dead instance is never re-entered.
     dead: bool,
@@ -194,7 +194,7 @@ impl CyclicSlot for WasmCyclic {
         self.bridge.as_mut().map_or(0, RingBridge::drain_dropped)
     }
 
-    fn boundary_drop_health_key(&self) -> &'static str {
+    fn boundary_drop_kind(&self) -> &'static str {
         "wasm_boundary_dropped"
     }
 

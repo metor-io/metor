@@ -15,7 +15,7 @@ and wiring checks.
 
 ## Two crates
 
-`metor-fsw-2-core` is the authoring surface: frames, ports, messages, health,
+`metor-fsw-2-core` is the authoring surface: frames, ports, messages, logs,
 systems, packs, sequences, and the pack ABI. A pack, sequence, or contract
 crate depends on it alone. It compiles for `wasm32-unknown-unknown`.
 
@@ -58,7 +58,7 @@ then stores postcard bytes. Message inputs may read from more than one producer.
 
 Each output has one ring writer. Inputs hold read views. A writer never
 replaces bytes that a reader still holds. A full ring makes a write fail. A
-`publish` helper may drop the new record and report the loss through health.
+`publish` helper may drop the new record and report the loss on the log.
 
 See [Frames](frames.md) and [Ports, messages, and rings](messages.md).
 

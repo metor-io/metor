@@ -361,7 +361,7 @@ impl Pack {
         T: crate::CyclicSystem + crate::BuildSystem + 'static,
         T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
         T::Input: crate::BindPorts + 'static,
-        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
+        T::Output: crate::LogOutput + crate::BindPorts + 'static,
     {
         let mut descriptor = <T as crate::CyclicSystem>::descriptor();
         descriptor.name = name.into();
@@ -451,7 +451,7 @@ impl Pack {
         M: 'static,
         F: crate::handler::AsyncSystemFn<M> + Clone,
     {
-        use crate::handler::{DeclSink, TaskParamsSpec, bind_health_tail};
+        use crate::handler::{DeclSink, TaskParamsSpec, bind_log_tail};
 
         let mut sink = DeclSink::default();
         F::decls(&mut sink);
@@ -459,7 +459,6 @@ impl Pack {
         let params_schema = spec.schema;
         let inputs = std::mem::take(&mut sink.inputs);
         let mut outputs = std::mem::take(&mut sink.outputs);
-        outputs.push(crate::PortDesc::of::<crate::SystemStatus>());
         outputs.push(crate::PortDesc::msg_named::<crate::LogEvent>("log"));
         let descriptor = SystemDescriptor {
             name: name.into(),
@@ -483,13 +482,13 @@ impl Pack {
                     };
                     f.build(&mut cx)
                 };
-                let health = bind_health_tail(src);
-                let inner = crate::handler::FutureDriver::new(future, clock, health, drops);
+                let log = bind_log_tail(src);
+                let inner = crate::handler::FutureDriver::new(future, clock, log, drops);
                 match mount {
                     Mount::Wired => Box::new(inner) as Box<dyn Driver>,
                     // The occupant tail binds after the entry's own ports:
                     // the cancel input past the user inputs, the status
-                    // output past the health/log tail.
+                    // output past the log tail.
                     Mount::SlotOccupant => {
                         let control = crate::Input::bind(src);
                         let status = crate::Output::bind(src);
@@ -593,12 +592,12 @@ fn instance_desc_if_minted<S: crate::CyclicSystem>(
 struct RunnerDriver<S>(crate::CyclicRunner<S>)
 where
     S: crate::CyclicSystem,
-    S::Output: crate::HealthOutput;
+    S::Output: crate::LogOutput;
 
 impl<S> Driver for RunnerDriver<S>
 where
     S: crate::CyclicSystem,
-    S::Output: crate::HealthOutput,
+    S::Output: crate::LogOutput,
 {
     fn init(&mut self) {
         self.0.init()

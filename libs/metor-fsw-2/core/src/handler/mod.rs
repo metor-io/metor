@@ -36,11 +36,10 @@ pub use param::{BindCx, CycleCx, DeclSink, ExecParam};
 pub use task::{AsyncSystemFn, IntoOutcome, Params, TaskParam};
 pub use tuples::{ExecParamSet, ExecuteFn};
 
-pub(crate) use driver::{FnDriver, FutureDriver, OccupantFuture, bind_health_tail, mount_driver};
+pub(crate) use driver::{FnDriver, FutureDriver, OccupantFuture, bind_log_tail, mount_driver};
 pub(crate) use task::TaskParamsSpec;
 
 use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind};
-use crate::health::SystemStatus;
 use crate::pack::{EntryParams, MakeError, PackEntry, Pending, decode_params};
 
 /// Start a fn-authored system from its per-cycle execute fn. The fn takes a
@@ -186,14 +185,13 @@ pub trait IntoPackEntry {
 }
 
 /// The entry descriptor for a parameter set: the declared ports per
-/// direction in parameter order, then the implicit health/log tail — the
+/// direction in parameter order, then the implicit log tail — the
 /// same shape [`Out`](crate::Out) gives a struct system.
 fn descriptor_for<P: ExecParamSet>(name: &'static str) -> SystemDescriptor {
     let mut sink = DeclSink::default();
     P::decls(&mut sink);
     let inputs = sink.inputs;
     let mut outputs = sink.outputs;
-    outputs.push(PortDesc::of::<SystemStatus>());
     outputs.push(PortDesc::msg_named::<crate::LogEvent>("log"));
     SystemDescriptor {
         name: name.into(),

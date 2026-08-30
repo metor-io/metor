@@ -38,7 +38,7 @@
 //! matter what — an undrained view stalls its producer's ring — and framing
 //! is skipped entirely with no connections. A connection that cannot keep up
 //! misses whole batches behind its byte cap (counted per occurrence, folded
-//! into the downlink's health as `link_conn_dropped`) and is never
+//! onto the downlink's log as `link_conn_dropped`) and is never
 //! disconnected; see the [`link`] module doc for the server's policies.
 
 mod discovery;
@@ -53,11 +53,11 @@ use metor_proto_wkt::{ComponentMetadata, MsgMetadata, SetMsgMetadata};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_2_core::Shared;
-use metor_fsw_2_core::health::{HealthPort, LogLevel};
+use metor_fsw_2_core::log::{LogLevel, LogPort};
 use metor_fsw_2_core::{AllOutputs, RegistryEntry};
 use metor_fsw_2_core::{BindPorts, RingSource};
 use metor_fsw_2_core::{
-    BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput, Out, System, SystemOutput,
+    BuildCtx, BuildSystem, ConfigureError, CyclicSystem, LogOutput, Out, System, SystemOutput,
 };
 use metor_fsw_2_core::{Declarations, Delivery, PortDesc, SystemDescriptor};
 use metor_fsw_2_core::{MsgFanOut, NamedMsg, split_record};
@@ -65,7 +65,7 @@ use metor_fsw_2_core::{MsgFanOut, NamedMsg, split_record};
 /// Which registry entries the downlink taps.
 enum TelemetryMode {
     /// Tap every entry: every system's user frames and their implicit
-    /// `health`/`log`, plus the coordinator-owned `health`/`log`/`status`.
+    /// `system_status`/`log`, plus the coordinator-owned `system_status`/`log`/`status`.
     All,
     /// Tap only the entries whose instance name or frame name appears in the
     /// configured lists; matching either is enough.
@@ -181,7 +181,7 @@ impl BuildSystem for UplinkSystem {
     }
 }
 
-/// The uplink's output bundle: the two implicit health/log ports first, then a
+/// The uplink's output bundle: the implicit log port first, then a
 /// [`MsgFanOut`] holding one ordinary message output per configured msg. A
 /// consumer receives a msg only over an explicit edge, and every minted port
 /// is untelemetered, so inbound control is never echoed back on the downlink.
@@ -190,47 +190,42 @@ impl BuildSystem for UplinkSystem {
 /// is decided by configuration. [`MsgFanOut::bind`] drains every ring the
 /// source still holds, so the minted ports must be the descriptor's trailing
 /// outputs, the reverse of the [`Out`] convention of user ports first. The
-/// static [`decls`](SystemOutput::decls) carry only health and log (the
+/// static [`decls`](SystemOutput::decls) carry only the log port (the
 /// empty-config shape); [`UplinkSystem::instance_descriptor`] appends the msg
 /// ports in the same config order the bind walk pops rings, keeping the
-/// positional contract. Its [`HealthOutput`] impl is what lets the ordinary
+/// positional contract. Its [`LogOutput`] impl is what lets the ordinary
 /// cyclic runner drive it.
 pub struct UplinkOut {
     fan: MsgFanOut,
-    health: HealthPort,
+    log: LogPort,
 }
 
 impl UplinkOut {
-    /// Disjoint borrows of the minted ports and the health handle.
-    fn split(&mut self) -> (&mut MsgFanOut, &mut HealthPort) {
-        (&mut self.fan, &mut self.health)
+    /// Disjoint borrows of the minted ports and the log handle.
+    fn split(&mut self) -> (&mut MsgFanOut, &mut LogPort) {
+        (&mut self.fan, &mut self.log)
     }
 }
 
 impl SystemOutput for UplinkOut {
     fn decls() -> Declarations {
-        vec![
-            PortDesc::of::<crate::SystemStatus>(),
-            PortDesc::msg_named::<crate::LogEvent>("log"),
-        ]
-        .into()
+        vec![PortDesc::msg_named::<crate::LogEvent>("log")].into()
     }
 }
 
-impl HealthOutput for UplinkOut {
-    fn health(&mut self) -> &mut HealthPort {
-        &mut self.health
+impl LogOutput for UplinkOut {
+    fn log(&mut self) -> &mut LogPort {
+        &mut self.log
     }
 }
 
 impl BindPorts for UplinkOut {
     fn bind<S: RingSource>(src: &mut S) -> Self {
-        let health = crate::Output::bind(src);
         let log = metor_fsw_2_core::MsgOut::bind(src);
         let fan = MsgFanOut::bind(src);
-        let mut health = HealthPort::new(health, log);
-        health.set_instance(src.instance_name());
-        Self { fan, health }
+        let mut log = LogPort::new(log);
+        log.set_instance(src.instance_name());
+        Self { fan, log }
     }
 }
 
@@ -304,16 +299,21 @@ impl System for UplinkSystem {
     /// last by its `ReceiveAll` capability); a late registration is a
     /// config defect reported here rather than silently unadvertised.
     fn init(&mut self, output: &mut UplinkOut) {
-        let (fan, health) = output.split();
+        let (fan, log) = output.split();
         if self.msgs.is_empty() {
-            health.log(
+            log.log(
                 LogLevel::Warn,
                 "uplink has no msgs configured; it will relay nothing",
             );
         } else if fan.len() != self.msgs.len() {
             // One writer per configured msg is the bind contract; a mismatch
             // means the registered descriptor and this instance diverged.
-            health.error("uplink_bind_mismatch");
+            log.fault(
+                LogLevel::Error,
+                "uplink_bind_mismatch",
+                "uplink ports and msg list diverged",
+                &[],
+            );
         }
 
         let link = self
@@ -322,18 +322,18 @@ impl System for UplinkSystem {
             .expect("uplink attached to a TcpServer state (the builtin link pack's ctor)");
         let ids: Vec<PacketId> = self.msgs.iter().map(|&(_, id)| id).collect();
         if link.get().add_uplink_msgs(&ids).is_err() {
-            let health = output.health();
-            health.error("uplink_announced_late");
-            health.log(
+            output.log().fault(
                 LogLevel::Warn,
+                "uplink_announced_late",
                 "uplink registered after the downlink; its command set is not advertised to clients",
+                &[],
             );
         }
     }
 }
 
 impl CyclicSystem for UplinkSystem {
-    /// The static health/log shape plus one untelemetered message port per
+    /// The static log shape plus one untelemetered message port per
     /// configured msg, in config order. The dispatch and the wired ports
     /// both derive from the one `msgs` list, so they cannot diverge.
     fn instance_descriptor(&self) -> SystemDescriptor {
@@ -347,26 +347,44 @@ impl CyclicSystem for UplinkSystem {
     }
 
     /// Drain the link's inbound queue onto the minted outputs. A msg outside
-    /// the configured set bumps `uplink_unroutable` (a sender/config
-    /// mismatch), a full ring bumps `uplink_dropped`; either way the queue
-    /// drains fully so a bad sender cannot wedge it.
+    /// the configured set counts as `uplink_unroutable` (a sender/config
+    /// mismatch), a full ring as `uplink_dropped`; either way the queue
+    /// drains fully so a bad sender cannot wedge it, and each kind logs one
+    /// line per cycle with its count.
     fn execute(&mut self, _now: Timestamp, _input: &mut (), output: &mut UplinkOut) {
-        let (fan, health) = output.split();
+        let (fan, log) = output.split();
         let link = self
             .link
             .as_ref()
             .expect("uplink attached to a TcpServer state (the builtin link pack's ctor)");
         let msgs = &self.msgs;
+        let (mut dropped, mut unroutable) = (0u64, 0u64);
         link.get().drain_inbound(
             |id, payload| match msgs.iter().position(|&(_, mid)| mid == id) {
                 Some(idx) => {
                     if fan.write_raw(idx, id, payload).is_err() {
-                        health.error("uplink_dropped");
+                        dropped += 1;
                     }
                 }
-                None => health.error("uplink_unroutable"),
+                None => unroutable += 1,
             },
         );
+        if dropped > 0 {
+            log.fault(
+                LogLevel::Warn,
+                "uplink_dropped",
+                "uplink output ring full",
+                &[("dropped", &dropped)],
+            );
+        }
+        if unroutable > 0 {
+            log.fault(
+                LogLevel::Warn,
+                "uplink_unroutable",
+                "uplink msg outside the configured set",
+                &[("dropped", &unroutable)],
+            );
+        }
     }
 }
 
@@ -485,8 +503,8 @@ impl System for TelemetrySystem {
         let mut n_tables = 0usize;
         let mut n_retained = 0usize;
         let mut announced_msgs = std::collections::HashSet::new();
-        // Deferred health reports: iterating `output.all` borrows the output
-        // bundle, so `output.health()` (a `&mut` borrow) runs after the loop.
+        // Deferred log reports: iterating `output.all` borrows the output
+        // bundle, so `output.log()` (a `&mut` borrow) runs after the loop.
         let mut exhausted: Vec<String> = Vec::new();
         for entry in output.all.entries() {
             if !self.mode.matches(entry) {
@@ -556,11 +574,11 @@ impl System for TelemetrySystem {
         }
 
         for key in &exhausted {
-            let health = output.health();
-            health.error("telemetry_reader_slot");
-            health.log(
+            output.log().fault(
                 LogLevel::Warn,
+                "telemetry_reader_slot",
                 &format!("no reader slot left on `{key}` — raise CoordinatorConfig::reader_slack"),
+                &[],
             );
         }
 
@@ -571,11 +589,11 @@ impl System for TelemetrySystem {
         if link.get().set_announces(&announces).is_err() {
             // A second downlink on one server would corrupt the replay every
             // connection decodes against.
-            let health = output.health();
-            health.error("link_announce_conflict");
-            health.log(
+            output.log().fault(
                 LogLevel::Warn,
+                "link_announce_conflict",
                 "another downlink already announced on this link; this instance streams nothing",
+                &[],
             );
             self.link = None;
             return;
@@ -620,16 +638,31 @@ impl CyclicSystem for TelemetrySystem {
         };
         let mut link = link_token.get();
 
-        // Fold the server's counters into this cycle's health and the gauge.
+        // Report the server's counters on this cycle's log and the gauge.
         let stats = link.take_stats();
-        for _ in 0..stats.closed {
-            output.health().error("link_disconnect");
+        if stats.closed > 0 {
+            output.log().fault(
+                LogLevel::Info,
+                "link_disconnect",
+                "link connections closed",
+                &[("closed", &stats.closed)],
+            );
         }
-        for _ in 0..stats.conn_dropped {
-            output.health().error("link_conn_dropped");
+        if stats.conn_dropped > 0 {
+            output.log().fault(
+                LogLevel::Warn,
+                "link_conn_dropped",
+                "client batches dropped",
+                &[("dropped", &stats.conn_dropped)],
+            );
         }
-        for _ in 0..stats.inbound_dropped {
-            output.health().error("link_inbound_dropped");
+        if stats.inbound_dropped > 0 {
+            output.log().fault(
+                LogLevel::Warn,
+                "link_inbound_dropped",
+                "inbound command queue overflowed",
+                &[("dropped", &stats.inbound_dropped)],
+            );
         }
         let connections = link.connections();
         let status = LinkStatus {
@@ -683,7 +716,12 @@ impl CyclicSystem for TelemetrySystem {
                             }
                         },
                         Ok(None) => {}
-                        Err(_) => output.health().error("telemetry_input_corrupt"),
+                        Err(_) => output.log().fault(
+                            LogLevel::Error,
+                            "telemetry_input_corrupt",
+                            "tap ring read corrupt",
+                            &[],
+                        ),
                     }
                 }
                 // Every record, in order.
@@ -696,7 +734,12 @@ impl CyclicSystem for TelemetrySystem {
                         }
                     });
                     if result.is_err() {
-                        output.health().error("telemetry_input_corrupt");
+                        output.log().fault(
+                            LogLevel::Error,
+                            "telemetry_input_corrupt",
+                            "tap ring read corrupt",
+                            &[],
+                        );
                     }
                 }
             }

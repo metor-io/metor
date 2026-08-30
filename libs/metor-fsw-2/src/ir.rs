@@ -188,7 +188,7 @@ pub struct CoordinatorSpec {
     /// Which clock drives the per-cycle timestamp.
     pub clock: ClockSpec,
     /// A dotted prefix stamped onto every component name this target
-    /// registers and announces (`"sat1"` → `sat1.coordinator.health`,
+    /// registers and announces (`"sat1"` → `sat1.coordinator.system_status`,
     /// `sat1.<instance>.<frame>.<field>`). It shifts every telemetry
     /// [`ComponentId`](metor_proto::types::ComponentId) uniformly, so several
     /// targets connected into one db keep disjoint namespaces. `None` is the

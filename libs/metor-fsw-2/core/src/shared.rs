@@ -6,7 +6,7 @@
 //! systems already have: a system runs against `&mut` to a state, so several
 //! systems are granted `&mut` to the *same* state, time-sliced as each takes
 //! its turn on the cycle loop. The attached systems stay distinct — own
-//! instance names, own ports, own health — only the state behind them is
+//! instance names, own ports, own log — only the state behind them is
 //! one.
 //!
 //! [`Pack::shared_state`](crate::Pack::shared_state) declares the instance

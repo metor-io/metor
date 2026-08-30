@@ -38,7 +38,8 @@ use crate::proc::session::SessionDir;
 use metor_fsw_2_core::FrameList;
 use metor_fsw_2_core::Output;
 use metor_fsw_2_core::Registry;
-use metor_fsw_2_core::health::{HealthPort, LogLevel};
+use metor_fsw_2_core::log::{LogLevel, LogPort};
+use metor_fsw_2_core::status::{StatusPort, SystemStatus, publish_status};
 use metor_fsw_2_core::{CyclicSlot, NAME_CAP, SlotState, StoppedSystem, WorkerStatus};
 use metor_fsw_2_core::{Hz, PortId};
 use metor_fsw_2_core::{MsgIn, MsgOut};
@@ -98,15 +99,15 @@ pub struct CoordinatorConfig {
     /// site. Default `4`.
     pub reader_slack: usize,
     /// How long a process system's step waits for the worker's ack before the
-    /// cycle moves on. A lapse with the child alive is telemetered as a
-    /// `proc_step_timeout` coordinator-health error; with the child dead it
+    /// cycle moves on. A lapse with the child alive is logged as a
+    /// `proc_step_timeout` fault on the coordinator log; with the child dead it
     /// stops the slot ([`StopReason::ProcessDied`]) and, budget permitting,
     /// begins a restart. A healthy worker never approaches this — the wall
     /// cycle budget is usually far tighter. Default 100 ms.
     pub proc_step_timeout: Duration,
     /// How many times a process system's worker is respawned after it dies or
     /// its system panics, over the slot's whole life. Each restart is
-    /// telemetered (`proc_restart` on coordinator health, and the worker list
+    /// telemetered (`proc_restart` on the coordinator log, and the worker list
     /// in the status frame); past the budget the stop is permanent, exactly
     /// like an in-process panic. `0` disables restart. Default 3.
     pub proc_max_restarts: u32,
@@ -316,6 +317,7 @@ struct AsyncSlot<S: AsyncSystem> {
     system: S,
     input: S::Input,
     output: S::Output,
+    status: StatusPort,
 }
 
 impl<S> AsyncLauncher for AsyncSlot<S>
@@ -333,8 +335,13 @@ where
             ctx.ready_count.fetch_add(1, Release);
             ctx.ready.wake_all();
             let _ = ctx.go.wait_for(|| ctx.go_flag.load(Acquire)).await;
-            let context = AsyncContext { cancel: ctx.cancel };
-            me.system.run(&context, &mut me.input, &mut me.output).await;
+            let mut context = AsyncContext {
+                cancel: ctx.cancel,
+                status: me.status,
+            };
+            me.system
+                .run(&mut context, &mut me.input, &mut me.output)
+                .await;
             me.system.shutdown(&mut me.output);
         })
     }
@@ -370,7 +377,8 @@ struct PendingAsync {
 
 /// The coordinator's own (#0) bound ports, wrapped by [`bind_coordinator`].
 struct CoordinatorPorts {
-    health: HealthPort,
+    log: LogPort,
+    status: Output<SystemStatus>,
     status_out: Output<CoordinatorStatus>,
     seq_registry_out: MsgOut<SequenceRegistry>,
     control_out: MsgOut<SequenceCommand>,
@@ -380,10 +388,20 @@ struct CoordinatorPorts {
     wiring_out: Option<MsgOut<WiringManifest>>,
 }
 
+/// One position in the step loop: the slot, and the host's writer for its
+/// `system_status` record. The writer is `None` only behind an
+/// [`AsyncBoundary`], whose node's record the async system publishes itself
+/// through the boundary's export pump.
+pub(crate) struct CyclicEntry {
+    pub(crate) slot: Box<dyn CyclicSlot>,
+    pub(crate) status: Option<Output<SystemStatus>>,
+    pub(crate) cycles: u64,
+}
+
 /// The bind pass product: every cyclic slot, every pending async system, and
 /// the coordinator's own ports.
 struct BoundSystems {
-    cyclic: Vec<Box<dyn CyclicSlot>>,
+    cyclic: Vec<CyclicEntry>,
     pending_async: Vec<PendingAsync>,
     coord: CoordinatorPorts,
 }
@@ -467,13 +485,14 @@ impl CoordChannels {
 }
 
 /// The wired, ready flight-software graph. Drives cyclic systems and async
-/// boundaries once per cycle, owns async task lifecycle, and emits
-/// coordinator-level health plus a status frame.
+/// boundaries once per cycle, owns async task lifecycle, publishes every
+/// slot's `system_status` record, and emits its own log and status frame.
 pub struct Coordinator {
     config: CoordinatorConfig,
-    cyclic: Vec<Box<dyn CyclicSlot>>,
+    cyclic: Vec<CyclicEntry>,
     pending_async: Vec<PendingAsync>,
-    coord_health: HealthPort,
+    coord_log: LogPort,
+    coord_status: Output<SystemStatus>,
     status_out: Output<CoordinatorStatus>,
     stopped: Vec<StoppedSystem>,
     /// Scratch for `update_status`'s per-cycle scan, swapped with `stopped` on
@@ -634,23 +653,42 @@ impl Coordinator {
             // that missed the boot message; the drain coalesces a burst of
             // requests into one emission per cycle.
             if self.channels.service_reload().is_err() {
-                self.coord_health.error("reload_input_corrupt");
+                self.coord_log.fault(
+                    LogLevel::Error,
+                    "reload_input_corrupt",
+                    "reload request ring corrupt",
+                    &[],
+                );
             }
             // Each slot drains its own `commands` fan-in at the head of `step`,
             // so a command dispatches the same cycle it lands — no
-            // coordinator-side command stage.
-            for slot in &mut self.cyclic {
-                slot.step(now);
+            // coordinator-side command stage. The host times each step and
+            // publishes the slot's status record right behind it.
+            for e in &mut self.cyclic {
+                let t = Instant::now();
+                e.slot.step(now);
+                if let Some(status) = &mut e.status {
+                    e.cycles += 1;
+                    let us = t.elapsed().as_micros() as u64;
+                    publish_status(status, now, e.cycles, us, e.slot.state().code());
+                }
             }
             self.update_status(now);
             self.drain_forwarded_logs();
-            // The coordinator's own status record closes once per cycle like
-            // any system's, with the time the whole graph took to step.
+            // The coordinator's own record closes once per cycle like any
+            // slot's, with the time the whole graph took to step.
             let elapsed = start.elapsed();
             if matches!(self.config.clock, ClockMode::Wall) && elapsed >= budget {
                 self.telemeter_overrun(elapsed, budget);
             }
-            self.coord_health.end_cycle(now, elapsed.as_micros() as u64);
+            self.coord_log.flush(now);
+            publish_status(
+                &mut self.coord_status,
+                now,
+                self.cycle,
+                elapsed.as_micros() as u64,
+                SlotState::Running.code(),
+            );
             match self.config.clock {
                 // Wall: sleep out the remainder of the cycle budget.
                 ClockMode::Wall => {
@@ -703,8 +741,8 @@ impl Coordinator {
                 .await;
         }
         // Cyclic inits run on the loop's task before the first cycle.
-        for slot in &mut self.cyclic {
-            slot.init();
+        for e in &mut self.cyclic {
+            e.slot.init();
         }
 
         // Release the async tasks into their run loops.
@@ -714,17 +752,22 @@ impl Coordinator {
     }
 
     /// Scan the slots; when the stopped set changes, refresh the status frame
-    /// and log the change to coordinator health. The scan fills a retained
+    /// and log the change on the coordinator log. The scan fills a retained
     /// scratch and swaps it with `stopped` on a change, so nothing allocates
     /// per cycle.
     fn update_status(&mut self, now: Timestamp) {
-        // Boundary and worker failures land on coordinator health because the
-        // host cannot report them through the system-owned health port.
-        for slot in &mut self.cyclic {
+        // Boundary and worker failures land on the coordinator log because
+        // the host cannot report them through the system-owned log port.
+        for e in &mut self.cyclic {
+            let slot = &mut e.slot;
             let boundary_drops = slot.drain_boundary_drops();
             if boundary_drops > 0 {
-                self.coord_health.error(slot.boundary_drop_health_key());
-                self.coord_health.log(LogLevel::Warn, slot.name());
+                self.coord_log.fault(
+                    LogLevel::Warn,
+                    slot.boundary_drop_kind(),
+                    "boundary dropped records",
+                    &[("system", &slot.name()), ("dropped", &boundary_drops)],
+                );
                 tracing::warn!(
                     system = slot.name(),
                     dropped = boundary_drops,
@@ -733,28 +776,42 @@ impl Coordinator {
             }
             let boundary_corruptions = slot.drain_boundary_corruptions();
             if boundary_corruptions > 0 {
-                self.coord_health.error("boundary_corrupt");
-                self.coord_health.log(LogLevel::Error, slot.name());
+                self.coord_log.fault(
+                    LogLevel::Error,
+                    "boundary_corrupt",
+                    "isolated boundary read corrupt",
+                    &[("system", &slot.name()), ("count", &boundary_corruptions)],
+                );
                 tracing::error!(
                     system = slot.name(),
                     corruptions = boundary_corruptions,
                     "isolated boundary read corrupt"
                 );
             }
-            if slot.drain_timeouts() > 0 {
-                self.coord_health.error("proc_step_timeout");
-                self.coord_health.log(LogLevel::Warn, slot.name());
+            let timeouts = slot.drain_timeouts();
+            if timeouts > 0 {
+                self.coord_log.fault(
+                    LogLevel::Error,
+                    "proc_step_timeout",
+                    "worker step missed its deadline",
+                    &[("system", &slot.name()), ("count", &timeouts)],
+                );
                 tracing::warn!(system = slot.name(), "worker step missed its deadline");
             }
             if slot.drain_restarts() > 0 {
-                self.coord_health.error("proc_restart");
-                self.coord_health.log(LogLevel::Warn, slot.name());
+                self.coord_log.fault(
+                    LogLevel::Warn,
+                    "proc_restart",
+                    "worker restarting",
+                    &[("system", &slot.name())],
+                );
                 tracing::warn!(system = slot.name(), "worker restarting");
             }
         }
         self.stopped_scratch.clear();
         self.workers_scratch.clear();
-        for slot in &self.cyclic {
+        for e in &self.cyclic {
+            let slot = &e.slot;
             // Only a hard stop is an error-stop; a runtime slot's
             // Empty/Loaded/Done states are not (the `stop_reason` projection).
             if let Some(reason) = slot.state().stop_reason() {
@@ -780,8 +837,13 @@ impl Coordinator {
         if stopped_changed {
             for i in 0..self.stopped.len() {
                 let name = self.stopped[i].name.clone();
-                self.coord_health.error("system_stopped");
-                self.coord_health.log(LogLevel::Warn, &name);
+                let reason = self.stopped[i].reason;
+                self.coord_log.fault(
+                    LogLevel::Error,
+                    "system_stopped",
+                    "system stopped",
+                    &[("system", &name), ("reason", &reason.code())],
+                );
                 tracing::error!(system = %name, "system stopped");
             }
         }
@@ -830,7 +892,12 @@ impl Coordinator {
             );
         });
         if result.is_err() {
-            self.coord_health.error("status_publish_failed");
+            self.coord_log.fault(
+                LogLevel::Warn,
+                "status_publish_failed",
+                "coordinator status write failed",
+                &[],
+            );
         }
     }
 
@@ -838,21 +905,19 @@ impl Coordinator {
     /// once per cycle (after the slots step) and once more at shutdown;
     /// events fired before the first cycle (build, init) flush here too.
     fn drain_forwarded_logs(&mut self) {
-        let dropped = metor_fsw_2_core::logfwd::drain(|ev| self.coord_health.emit_event(&ev));
-        for _ in 0..dropped {
-            self.coord_health.error("log_dropped");
-        }
+        let dropped = metor_fsw_2_core::logfwd::drain(|ev| self.coord_log.emit_event(&ev));
+        self.coord_log.note_dropped(dropped);
     }
 
     fn telemeter_overrun(&mut self, elapsed: Duration, budget: Duration) {
-        self.coord_health.error("cycle_overrun");
-        self.coord_health.log(
+        self.coord_log.fault(
             LogLevel::Warn,
-            &format!(
-                "cycle overran: {}us > {}us",
-                elapsed.as_micros(),
-                budget.as_micros()
-            ),
+            "cycle_overrun",
+            "cycle overran its budget",
+            &[
+                ("elapsed_us", &elapsed.as_micros()),
+                ("budget_us", &budget.as_micros()),
+            ],
         );
     }
 
@@ -873,24 +938,31 @@ impl Coordinator {
         for mut task in tasks {
             let handle = task.handle.take().expect("task handle");
             if !handle.0.is_complete() {
-                self.coord_health.error("async_shutdown_timeout");
-                self.coord_health.log(
+                self.coord_log.fault(
                     LogLevel::Error,
-                    &format!("async system '{}' exceeded shutdown deadline", task.name),
+                    "async_shutdown_timeout",
+                    "async system exceeded shutdown deadline",
+                    &[("system", &task.name)],
                 );
                 tracing::error!(system = %task.name, "async system exceeded shutdown deadline");
                 let _ = handle.0.cancel();
             }
             let _ = handle.await;
         }
-        for slot in self.cyclic.iter_mut().rev() {
-            slot.shutdown();
+        for e in self.cyclic.iter_mut().rev() {
+            e.slot.shutdown();
         }
         // Late tracing events (task teardown, slot shutdown) still reach the
-        // downlink's final batches, and a last status record carries any
-        // shutdown errors off-board.
+        // downlink's final batches, and a last record closes the run.
         self.drain_forwarded_logs();
-        self.coord_health
-            .end_cycle(metor_fsw_2_core::now_or_wall(), 0);
+        let now = metor_fsw_2_core::now_or_wall();
+        self.coord_log.flush(now);
+        publish_status(
+            &mut self.coord_status,
+            now,
+            self.cycle,
+            0,
+            SlotState::Running.code(),
+        );
     }
 }

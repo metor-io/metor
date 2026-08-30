@@ -87,9 +87,9 @@ fn wasm_pack_loads_and_describes() {
 /// ring and driver reached for one. Claiming a ring slot stamped
 /// `std::process::id`, and every execute timed itself with `Instant::now`;
 /// both are unsupported on that target and panic, which surfaces only as an
-/// opaque trap because the target aborts rather than unwinds, so
-/// `catch_unwind` cannot turn the panic into a status word. The timer now
-/// reads the host clock through the `fsw.monotonic_us` import instead.
+/// opaque trap because the module imports nothing and the target aborts
+/// rather than unwinds, so `catch_unwind` cannot turn the panic into a status
+/// word. Neither remains: the host times each execute itself.
 #[test]
 fn wasm_occupant_runs_to_a_terminal_state() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
@@ -457,7 +457,7 @@ fn a_snapshot_leg_forwards_the_newest_once() {
 }
 
 /// A slot's ring templates for the `waiter` contract: one control input, and
-/// health, log and status outputs. Returns the rings (which must outlive the
+/// log and status outputs. Returns the rings (which must outlive the
 /// occupant) alongside the `FswRing` handles a slot hands its occupant.
 fn slot_rings() -> (Vec<RingBuffer>, Vec<FswRing>, Vec<FswRing>) {
     let make = |max_size: usize, role: u8| {
@@ -468,12 +468,11 @@ fn slot_rings() -> (Vec<RingBuffer>, Vec<FswRing>, Vec<FswRing>) {
         let (base, len) = ring.region();
         (ring, FswRing { base, len, role })
     };
-    // Occupant-mount order: inputs [control]; outputs [health, log, status].
+    // Occupant-mount order: inputs [control]; outputs [log, status].
     let (c, ch) = make(size_of::<SlotControlIn>(), ROLE_INPUT);
-    let (h, hh) = make(1024, ROLE_OUTPUT);
     let (l, lh) = make(4096, ROLE_OUTPUT);
     let (s, sh) = make(size_of::<SequenceStatus>(), ROLE_OUTPUT);
-    (vec![c, h, l, s], vec![ch], vec![hh, lh, sh])
+    (vec![c, l, s], vec![ch], vec![lh, sh])
 }
 
 /// The whole point of Stage B: a wasm occupant bound to a *slot's* rings,
@@ -484,7 +483,7 @@ fn a_wasm_occupant_drives_a_slot_to_done() {
     let (rings, host_in, host_out) = slot_rings();
     // Tap the status ring before the run: a reader joins at the live edge, so
     // one opened afterwards would see nothing.
-    let mut status_tap = rings[3].view(NoWake).expect("status reader slot");
+    let mut status_tap = rings[2].view(NoWake).expect("status reader slot");
 
     let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
     let entry = entry(&pack, "waiter");

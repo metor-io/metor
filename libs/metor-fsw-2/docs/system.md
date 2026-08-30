@@ -22,10 +22,10 @@ fn nav_execute(
     now: Timestamp,
     imu: &mut Input<Imu>,
     estimate: &mut Output<Estimate>,
-    health: &mut HealthPort,
+    log: &mut LogPort,
 ) {
     let Ok(Some(imu)) = imu.latest() else {
-        health.error("no_imu");
+        log.fault(LogLevel::Warn, "no_imu", "no imu sample", &[]);
         return;
     };
 
@@ -37,8 +37,8 @@ pub fn pack() -> Pack {
 }
 ```
 
-The driver stores each port between calls. It times the function, reports
-publish drops, and closes one health cycle after each call.
+The driver stores each port between calls. It reports publish drops and
+flushes the log after each call; the coordinator times the step.
 
 ## Choose a run form
 
@@ -107,7 +107,7 @@ impl AsyncSystem for LinkReader {
         while let Some(next) = context.until_cancelled(input.frames.recv()).await {
             match next {
                 Ok(frame) => self.send(&frame).await,
-                Err(_) => output.health().error("input_corrupt"),
+                Err(_) => output.log().fault(LogLevel::Error, "input_corrupt", "frame ring read corrupt", &[]),
             }
         }
     }
@@ -123,7 +123,7 @@ operations, so newly imported data can first affect graph-visible output on the
 next cycle. Registration order and `connect_delayed` therefore have the same
 visibility meaning at async boundaries as at cyclic systems.
 
-The coordinator does not call `HealthPort::end_cycle` for this form. The system must choose when to publish health and flush queued logs. It must also choose how to report output publish drops.
+The coordinator does not flush the log or publish `system_status` for this form. The system calls `output.log().flush(now)` and `context.status().tick(elapsed_us)` when it chooses, and decides how to report its own publish drops.
 
 Use this form for work driven by I/O or a timer rather than the FSW cycle.
 
@@ -149,7 +149,7 @@ pub fn pack() -> Pack {
 
 A task that returns `Outcome` can run as a sequence or a slot occupant. A task that returns `()` maps to `Outcome::Completed`.
 
-The task driver times each poll, reports publish drops, and closes one health cycle per poll.
+The task driver reports publish drops and flushes the log after each poll; the coordinator times the poll.
 
 Use this form for work that must make progress on cycle boundaries, such as a timed sequence.
 
@@ -179,24 +179,29 @@ For a normal run:
 
 Function systems and pack tasks use the pack `Driver` contract. Their current drivers have no user init or shutdown hook after state construction.
 
-## Health and logs
+## Status
 
-Each system descriptor adds a `system_status` frame output and a `log` message output.
-
-`HealthPort::error("kind")` adds to the total error count and the named count. A kind must not be empty or contain `.`.
-
-`HealthPort::log(level, text)` queues a `LogEvent`. `end_cycle` sends queued events and one `SystemStatus` frame.
+The coordinator appends a `system_status` frame output to every system it registers and publishes it itself, once per cycle, right after stepping the system. No system declares or writes this port; a guest's positional ring arrays never include it.
 
 `SystemStatus` contains:
 
-- cycle count
-- total error count
-- last execute or poll time in microseconds (`last_execute_us`; a wasm occupant reads the host clock for this through the `fsw.monotonic_us` import)
-- a bounded map of named error counts
+- `cycles`: steps the coordinator has issued to the slot
+- `last_execute_us`: how long the last step took on the host's clock. For a process system this is the doorbell-to-ack round trip, scheduling included.
+- `state`: the slot's run state as a `SlotState` code (`Running` for a plain system; `Loaded`, `Done`, `Stopped`, and so on for a runtime slot)
 
-Logs are postcard messages. They are not fields in the status frame.
+The coordinator's own record (`coordinator.system_status`) counts FSW cycles and times the whole graph step.
 
-Cyclic struct drivers, function drivers, and task drivers call `end_cycle` for you. Free-running struct async systems must set their own health update points.
+A free-running async system is the exception: the coordinator never steps it, so it publishes its own record with `context.status().tick(elapsed_us)`.
+
+## Logs
+
+Each system descriptor adds a `log` message output. `output.log()` is the handle:
+
+- `log(level, text)` queues a `LogEvent`.
+- `fault(level, kind, text, fields)` queues a line whose first field is `kind=<kind>`. This is how a system reports a dropped publish, a corrupt input, or a missing sensor: the ground counts lines by kind. A fault that recurs every cycle costs one line per cycle.
+- `flush(now)` stamps and sends the queued lines. Cyclic struct drivers, function drivers, and task drivers call it for you; a free-running async system calls it itself.
+
+Lines are postcard messages, so a long line is never truncated. A line the ring rejects, or one queued past the per-cycle cap, is counted and reported as one `log_dropped` line once the ring has room.
 
 ## Shared pack state
 
@@ -214,7 +219,7 @@ pub fn pack() -> Pack {
 }
 ```
 
-Each attached system gets a scoped `&mut` borrow during its call. Attached systems stay separate. They keep their own instance names, ports, and health data.
+Each attached system gets a scoped `&mut` borrow during its call. Attached systems stay separate. They keep their own instance names, ports, and log.
 
 Shared state works only for cyclic entries. A borrow must not cross an await.
 

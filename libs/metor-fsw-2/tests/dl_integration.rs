@@ -173,8 +173,8 @@ fn dlopen_cyclic_system_end_to_end() {
         desc.inputs[0].id().component().expect("table port"),
         TickIn::FRAME_ID
     );
-    // User `out`, user `events` (the Postcard port), implicit health, implicit log.
-    assert_eq!(desc.outputs.len(), 4);
+    // User `out`, user `events` (the Postcard port), implicit log.
+    assert_eq!(desc.outputs.len(), 3);
     assert_eq!(
         desc.outputs[0].id().component().expect("table port"),
         TickOut::FRAME_ID
@@ -322,7 +322,7 @@ fn dlopen_cyclic_system_end_to_end() {
 
     // 5c. The fixture's `tracing::info!` inside execute crossed the boundary
     //     too: the export shim installs a per-dylib subscriber, and each
-    //     instance's end_cycle drains the dylib's queue onto its own log
+    //     instance's log flush drains the dylib's queue onto its own log
     //     port, re-stamped with the instance name.
     let mut traced: Vec<metor_fsw_2::LogEvent> = Vec::new();
     log_in

@@ -506,7 +506,7 @@ pub(crate) struct SlotRunner {
     /// and the seam `worker_status` keys "is there a worker behind this slot" on.
     proc: Option<ProcParts>,
     /// Occupant-worker steps whose ack deadline lapsed with the worker still
-    /// alive, since the coordinator last drained them into its health.
+    /// alive, since the coordinator last drained them onto its log.
     timeouts: u64,
     /// Unplanned worker deaths (pipeline failures included) over the slot's
     /// life, telemetered in the worker list's `restarts` field: Loads are
@@ -1094,7 +1094,7 @@ impl CyclicSlot for SlotRunner {
         }
     }
 
-    fn boundary_drop_health_key(&self) -> &'static str {
+    fn boundary_drop_kind(&self) -> &'static str {
         "wasm_boundary_dropped"
     }
 

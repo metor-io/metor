@@ -393,7 +393,7 @@ pub struct SlotControlIn {
 // ---------------------------------------------------------------------------
 
 /// Publish one [`SequenceStatus`] record with the given run state and
-/// progress lines. The occupant driver drives its health `end_cycle`
+/// progress lines. The occupant driver drives its log `flush`
 /// separately.
 pub(crate) fn publish_status(
     out: &mut Output<SequenceStatus>,

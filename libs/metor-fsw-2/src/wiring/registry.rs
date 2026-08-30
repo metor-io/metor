@@ -22,7 +22,7 @@ use crate::coordinator::init::{self, Node};
 use metor_fsw_2_core::BindPorts;
 use metor_fsw_2_core::MsgTable;
 use metor_fsw_2_core::SystemDescriptor;
-use metor_fsw_2_core::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, HealthOutput};
+use metor_fsw_2_core::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, LogOutput};
 
 use metor_fsw_2_core::params::{NoParams, ParamErrorKind, decode_value_params};
 
@@ -91,7 +91,7 @@ pub trait IntoNode<Kind>: Sized {
 impl<S> IntoNode<CyclicKind> for S
 where
     S: CyclicSystem + 'static,
-    S::Output: HealthOutput + BindPorts + 'static,
+    S::Output: LogOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     fn into_node(self, name: String) -> Node {

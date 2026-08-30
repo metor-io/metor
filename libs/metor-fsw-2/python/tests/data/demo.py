@@ -21,7 +21,7 @@ ARTIFACT = Artifact(
     lib="demo_systems",
     manifest_hash="sha256:19754293a68b18f45aa4ff7b534df3f99b4950ff93afe9a9b8958f4911a3288e",
     prebuilt=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=11,
+    abi_version=12,
     dist="demo-pack",
     dist_version="1.2.0",
 )
@@ -32,6 +32,10 @@ class Cmd(Frame):
 
 
 class Sensors(Frame):
+    """Frame marker (checker-only)."""
+
+
+class SystemStatus(Frame):
     """Frame marker (checker-only)."""
 
 
@@ -71,6 +75,7 @@ class Widget(System):
     cmd: InPort[Cmd]  # input, latest-wins
     sensors: OutPort[Sensors]  # output, latest-wins, telemetered
     events: OutPort[Msg]  # output, log
+    system_status: OutPort[SystemStatus]  # output, latest-wins, telemetered, host-written
 
 
 def startup() -> System:

@@ -4,15 +4,15 @@
 //! into a [`LogEvent`] — level, target, message, non-message fields, the
 //! active span path, and source location — and pushes it onto a bounded
 //! global queue. The coordinator drains the queue once per cycle onto its own
-//! log port ([`HealthPort::emit_event`](crate::health::HealthPort)), so
+//! log port ([`LogPort::emit_event`](crate::log::LogPort)), so
 //! tracing events ride the same message stream as every system's
-//! [`HealthPort::log`](crate::health::HealthPort::log) lines and reach the
+//! [`LogPort::log`](crate::log::LogPort::log) lines and reach the
 //! ground with no extra downlink plumbing.
 //!
 //! The queue exists because `on_event` can fire from any thread, such as a
 //! build worker or another tracing thread, while ring writes belong to the
 //! single-threaded cycle loop. It is bounded and drop-newest: a runaway log
-//! source costs events, counted and folded into coordinator health as
+//! source costs events, counted and reported on the coordinator log as
 //! `log_dropped`, never memory or cycle time. Events fired before the target
 //! starts (build, init) simply sit in the queue and flush on the first cycle.
 
@@ -45,7 +45,7 @@ pub(crate) fn pack_mode() -> bool {
 
 /// Install the pack-side tracing pipeline: a per-dylib global subscriber
 /// whose only layer is a [`ForwardLayer`] capped at `INFO`, plus the flag
-/// that makes every instance's `end_cycle` drain the dylib's queue onto its
+/// that makes every instance's log `flush` drain the dylib's queue onto its
 /// own log port.
 ///
 /// Called by the `export_pack!` shim from `fsw_pack_open`, once per load. A

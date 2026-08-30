@@ -402,7 +402,7 @@ impl PortDesc {
 /// A dynamic terminal (`Op::List`/`Op::Map`) bakes no leaf id; its members'
 /// ids compose at realize time from the terminal's dotted name string. A
 /// top-level terminal's name carries the full path from the frame root
-/// (`system_status.error_counts`), so the instance prefix belongs on it; a nested
+/// (`alarm_defs.limits`, say), so the instance prefix belongs on it; a nested
 /// terminal inside a member template keeps its element-relative name. Each
 /// top-level terminal's name blob is repointed at a prefixed copy appended to
 /// the data buffer, which shifts no existing offset. The result realizes

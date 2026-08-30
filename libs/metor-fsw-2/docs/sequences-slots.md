@@ -141,7 +141,7 @@ A timeout adds a `timeout in <phase>` progress line and fails the task. A cancel
 
 ## Wired tasks
 
-A wired task is a normal cyclic entry. Its declared ports connect through target edges. It also has the usual health and log outputs.
+A wired task is a normal cyclic entry. Its declared ports connect through target edges. It also has the usual log output, and the coordinator publishes its `system_status`.
 
 It has no slot command input and no `SequenceStatus` output. Calls to `progress` become `Info` log messages after each poll.
 
@@ -155,10 +155,10 @@ A slot is one fixed place in the cyclic schedule. The coordinator owns its rings
 
 Every allowed occupant must have the same user-port contract. The config lists that contract by frame name. Build checks each candidate before the target starts.
 
-Every entry already has health and log outputs after its user outputs. A slot mount then adds two more ports:
+Every entry already has a log output after its user outputs. A slot mount then adds two more ports:
 
 - `SlotControlIn` after the user inputs, written by the slot host
-- `SequenceStatus` after the health and log outputs, read by the slot host
+- `SequenceStatus` after the log output, read by the slot host
 
 The slot itself also has a `SequenceCommand` fan-in, a `slot_status` frame, and a `sequences` event output.
 
@@ -284,7 +284,7 @@ An initial process occupant completes this work during the target init barrier. 
 
 When loading finishes, the slot enters Loaded. `Start` then begins one worker step per cycle.
 
-The coordinator waits up to `proc_step_timeout` for each step reply. A late worker adds `proc_step_timeout` to coordinator health. If the worker still lives, the slot stays Running and a later step can recover. If the worker died, the slot enters Stopped with `ProcessDied`.
+The coordinator waits up to `proc_step_timeout` for each step reply. A late worker logs a `proc_step_timeout` fault on the coordinator log. If the worker still lives, the slot stays Running and a later step can recover. If the worker died, the slot enters Stopped with `ProcessDied`.
 
 A runtime process slot does not restart a dead worker on its own. Use `Reset` or `Load` to create a new worker.
 

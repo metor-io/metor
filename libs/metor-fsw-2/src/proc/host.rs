@@ -126,7 +126,7 @@ pub fn describe_via_worker(
 
 /// Everything `build()` gathers to spawn one run worker.
 pub(crate) struct SpawnSpec {
-    /// The instance name (the worker's health/status identity).
+    /// The instance name (the worker's log identity).
     pub instance: String,
     /// The pack entry the worker instantiates.
     pub system: String,
@@ -339,7 +339,7 @@ enum Phase {
 /// and flips back to `Running` on recovery; the fresh worker's views start
 /// at the rings' current positions, so records committed during the outage
 /// are skipped, not replayed. Restarts are counted, drained into coordinator
-/// health, and carried in the status frame's worker list.
+/// log, and carried in the status frame's worker list.
 pub(crate) struct ProcSlot {
     name: Arc<str>,
     /// The worker process behind this slot, respawned from the persisted
@@ -348,7 +348,7 @@ pub(crate) struct ProcSlot {
     step_timeout: Duration,
     slot_state: SlotState,
     /// Steps whose ack deadline lapsed with the child still alive, since the
-    /// coordinator last drained them into its health.
+    /// coordinator last drained them onto its log.
     timeouts: u64,
     // --- restart machinery -------------------------------------------------
     phase: Phase,

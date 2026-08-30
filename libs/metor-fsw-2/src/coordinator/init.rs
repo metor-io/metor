@@ -77,7 +77,7 @@ use crate::io_bridge::{IoBridge, RingPump};
 use crate::proc::session::SessionDir;
 use metor_fsw_2_core::capacity_for;
 use metor_fsw_2_core::{AnySource, BindPorts, Binder, BoundInput, BoundPort};
-use metor_fsw_2_core::{CyclicRunner, CyclicSystem, HealthOutput};
+use metor_fsw_2_core::{CyclicRunner, CyclicSystem, LogOutput, StatusPort, host_status_port};
 use metor_fsw_2_core::{
     Delivery, FanIn, PortConn, PortDesc, PortSchema, SystemDescriptor, SystemKind, compatible,
 };
@@ -108,7 +108,7 @@ struct CyclicReg<S> {
 impl<S> CyclicRegistration for CyclicReg<S>
 where
     S: CyclicSystem + 'static,
-    S::Output: HealthOutput + BindPorts + 'static,
+    S::Output: LogOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
@@ -119,7 +119,9 @@ where
 }
 
 pub(crate) trait AsyncRegistration {
-    fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn AsyncLauncher>;
+    /// Bind the bundles over `binder`; `status` is the system's own handle on
+    /// the host-appended `system_status` output.
+    fn bind(self: Box<Self>, binder: &mut Binder, status: StatusPort) -> Box<dyn AsyncLauncher>;
 }
 
 struct AsyncReg<S> {
@@ -132,13 +134,14 @@ where
     S::Input: BindPorts + 'static,
     S::Output: BindPorts + 'static,
 {
-    fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn AsyncLauncher> {
+    fn bind(self: Box<Self>, binder: &mut Binder, status: StatusPort) -> Box<dyn AsyncLauncher> {
         let input = <S::Input as BindPorts>::bind(binder);
         let output = <S::Output as BindPorts>::bind(binder);
         Box::new(AsyncSlot {
             system: self.system,
             input,
             output,
+            status,
         })
     }
 }
@@ -229,7 +232,7 @@ pub(crate) struct Node {
 pub(crate) fn cyclic_node<S>(name: String, system: S) -> Node
 where
     S: CyclicSystem + 'static,
-    S::Output: HealthOutput + BindPorts + 'static,
+    S::Output: LogOutput + BindPorts + 'static,
     S::Input: BindPorts + 'static,
 {
     let desc = system.instance_descriptor();
@@ -369,7 +372,15 @@ impl InitGraph {
     /// Record one pre-built [`Node`]; the returned handle indexes `systems`.
     /// Registration order is step order, so a front-end pushes in the order it
     /// wants the systems to run.
-    pub(crate) fn push_node(&mut self, node: Node) -> SystemHandle {
+    ///
+    /// Every node but the coordinator's own gets the host-written
+    /// `system_status` output appended here, after everything it declared:
+    /// the host publishes that record, so no system declares the port and no
+    /// guest is ever staged its ring (see `bind::staged_outputs`).
+    pub(crate) fn push_node(&mut self, mut node: Node) -> SystemHandle {
+        if !matches!(node.bind, SystemBind::Coordinator) {
+            node.desc.outputs.push(host_status_port());
+        }
         let id = self.systems.len();
         self.systems.push(node);
         SystemHandle { id }
@@ -766,7 +777,10 @@ impl InitGraph {
             // How much of the port lists a worker touches: all of a process
             // system's, the occupant prefix of a process slot's.
             let (n_outputs, n_inputs) = match &sys.bind {
-                SystemBind::Proc(_) => (sys.desc.outputs.len(), sys.desc.inputs.len()),
+                SystemBind::Proc(_) => (
+                    super::bind::staged_outputs(&sys.desc),
+                    sys.desc.inputs.len(),
+                ),
                 SystemBind::Slot(slot_reg) if slot_reg.process => (
                     slot_reg.ports.occupant_outputs.len(),
                     slot_reg.ports.occupant_inputs.len(),
@@ -785,7 +799,7 @@ impl InitGraph {
         shared
     }
 
-    /// Allocate one buffer per output port (health/log included) plus a
+    /// Allocate one buffer per output port (status/log included) plus a
     /// dedicated ring per host-connected input, collecting the build-order
     /// registry entries. Each receive-all capability counts one extra reader on
     /// *every* buffer's `max_readers`. A buffer in the
@@ -1104,7 +1118,8 @@ impl InitGraph {
             config,
             cyclic,
             pending_async,
-            coord_health: coord.health,
+            coord_log: coord.log,
+            coord_status: coord.status,
             status_out: coord.status_out,
             stopped: Vec::new(),
             stopped_scratch: Vec::new(),

@@ -186,7 +186,9 @@ impl Codegen {
         format!("{sig}{doc}{body}")
     }
 
-    /// The class-level `port: OutPort[Frame]  # …` annotation block.
+    /// The class-level `port: OutPort[Frame]  # …` annotation block: the
+    /// entry's declared ports, then the `system_status` output the host
+    /// appends to every registration (an operator reads it like any other).
     fn port_annotations(&mut self, desc: &metor_fsw_2_core::SystemDescriptor) -> String {
         let mut out = String::new();
         for port in &desc.inputs {
@@ -195,6 +197,7 @@ impl Codegen {
         for port in &desc.outputs {
             out.push_str(&self.port_line(port, false));
         }
+        out.push_str(&self.port_line(&metor_fsw_2_core::host_status_port(), false));
         out
     }
 
@@ -216,6 +219,9 @@ impl Codegen {
         }
         if port.telemetered {
             notes.push("telemetered".into());
+        }
+        if port.conn == metor_fsw_2_core::PortConn::Host {
+            notes.push("host-written".into());
         }
         format!(
             "    {}: {}[{}]  # {}\n",

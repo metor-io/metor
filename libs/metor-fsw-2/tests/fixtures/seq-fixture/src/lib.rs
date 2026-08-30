@@ -3,7 +3,7 @@
 //! lifecycle commands (load, start, stop, reset, abort).
 //!
 //! `waiter` declares no ports of its own; it carries only the implicit
-//! slot-control input and the status, health, and log outputs every sequence
+//! slot-control input and the status and log outputs every sequence
 //! has. It waits two simulated microseconds and then completes. If the slot
 //! aborts it before the deadline, the wait returns early and the sequence
 //! reports `Aborted`. One sequence therefore covers both the run-to-completion

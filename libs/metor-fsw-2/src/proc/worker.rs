@@ -59,7 +59,7 @@ pub enum WorkerManifest {
         abi_version: u32,
         /// How the step loop folds the system's status (see [`RunMode`]).
         mode: RunMode,
-        /// The instance name (health/status identity inside the `.so`).
+        /// The instance name (log identity inside the `.so`).
         instance: String,
         /// The pack entry to instantiate from the artifact's manifest.
         system: String,

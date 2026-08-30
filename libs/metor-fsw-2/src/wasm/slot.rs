@@ -28,7 +28,7 @@ pub struct WasmSlot {
     /// The guest's instance pointer from `fsw_pack_create`.
     state: i32,
     bridge: Option<RingBridge>,
-    /// Structurally corrupt bridge reads waiting for the coordinator's health
+    /// Structurally corrupt bridge reads waiting for the coordinator's fault
     /// scan. A corruption also stops the occupant; this counter preserves the
     /// specific cause instead of reporting only the generic panic fold.
     boundary_corruptions: u64,
@@ -241,17 +241,17 @@ impl WasmSlot {
         self.pack.set_fuel_per_call(fuel);
     }
 
-    /// Records the bridge could not deliver, for the slot's health.
+    /// Records the bridge could not deliver, for the coordinator's fault scan.
     pub fn dropped(&self) -> u64 {
         self.bridge.as_ref().map_or(0, RingBridge::dropped)
     }
 
-    /// Drain bridge drops for coordinator health.
+    /// Drain bridge drops for the coordinator's fault scan.
     pub fn drain_dropped(&mut self) -> u64 {
         self.bridge.as_mut().map_or(0, RingBridge::drain_dropped)
     }
 
-    /// Drain structurally corrupt bridge reads for coordinator health.
+    /// Drain structurally corrupt bridge reads for the coordinator's fault scan.
     pub fn drain_corruptions(&mut self) -> u64 {
         std::mem::take(&mut self.boundary_corruptions)
     }

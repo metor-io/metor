@@ -9,7 +9,7 @@
 //! Coverage: a describe worker feeding `add_proc_cyclic` (the host never
 //! dlopens the artifact), mmap rings + doorbell lockstep against a static
 //! producer and an in-process dl twin, telemetry taps on the worker's
-//! outputs (user frame, Postcard events, implicit health), clean teardown,
+//! outputs (user frame, Postcard events, host-written status), clean teardown,
 //! and a SIGKILL'd worker: `StopReason::ProcessDied`, ring reclamation, and
 //! the rest of the graph flowing on. The second half covers **process-mode
 //! slots** (see `docs/process-systems.md`): the polled Load pipeline and occupant
@@ -35,8 +35,9 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use metor_fsw_2::{
-    BuildSystem, CyclicSystem, Frame, Input, MsgIn, Out, Output, SequenceStatus, SlotStatus,
-    StopReason, System, SystemInput, SystemOutput, SystemStatus, WorkerRunState,
+    BuildSystem, CyclicSystem, Frame, Input, LogEvent, MsgIn, Out, Output, SequenceStatus,
+    SlotState, SlotStatus, StopReason, System, SystemInput, SystemOutput, SystemStatus,
+    WorkerRunState,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -193,6 +194,19 @@ fn proc_descriptor(lib_path: &Path, system: &str) -> metor_fsw_2::SystemDescript
 /// operator's way). A worker is a re-exec of this very binary, so children
 /// are filtered by our own executable name — which also excludes the `ps`
 /// snapshot process itself, a momentary child of ours.
+/// Whether an instance's log carries no `kind=` fault line since the view
+/// was opened.
+fn no_faults(log: &mut MsgIn<LogEvent>) -> bool {
+    let mut faults = Vec::new();
+    log.drain(|ev| {
+        if ev.fields.iter().any(|(k, _)| k == "kind") {
+            faults.push(ev);
+        }
+    })
+    .expect("log ring readable");
+    faults.is_empty()
+}
+
 fn child_pids() -> Vec<u32> {
     let out = Command::new("ps")
         .args(["-axo", "pid=,ppid=,comm="])
@@ -228,7 +242,7 @@ fn lockstep_end_to_end(lib_path: &Path) {
     let desc = proc_descriptor(lib_path, "DlCounter");
     assert_eq!(desc.name, "DlCounter");
     assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
-    assert_eq!(desc.outputs.len(), 4, "out + events + health + log");
+    assert_eq!(desc.outputs.len(), 3, "out + events + log");
 
     // A static producer, the same fixture entry run as a process system, and
     // the same entry dlopen'd in-process: all three loading modes coexist in
@@ -283,8 +297,8 @@ fn lockstep_end_to_end(lib_path: &Path) {
     assert_eq!(spawned.len(), 1, "exactly one worker child: {spawned:?}");
 
     // Taps over the worker's outputs, through the same registry as any
-    // system's: the user frame, the Postcard events, and the implicit health
-    // the worker's own CyclicRunner publishes from the other process.
+    // system's: the user frame, the Postcard events, the worker's log, and
+    // the status record the host publishes for it.
     let registry = coord.registry();
     let mut out_view: Input<TickOut> = Input::new(
         registry
@@ -298,10 +312,16 @@ fn lockstep_end_to_end(lib_path: &Path) {
             .expect("proc message channel registered")
             .expect("reader slot available"),
     );
-    let mut health_view: Input<SystemStatus> = Input::new(
+    let mut status_view: Input<SystemStatus> = Input::new(
         registry
             .view(ComponentId::new("proc_counter.system_status"))
-            .expect("proc health registered")
+            .expect("proc status registered")
+            .expect("reader slot available"),
+    );
+    let mut log_in: MsgIn<LogEvent> = MsgIn::new(
+        registry
+            .view(ComponentId::new("proc_counter.log"))
+            .expect("proc log registered")
             .expect("reader slot available"),
     );
     let mut dl_out_view: Input<TickOut> = Input::new(
@@ -362,23 +382,25 @@ fn lockstep_end_to_end(lib_path: &Path) {
         (1..=CYCLES as u64).map(|v| 1000 + v).collect::<Vec<_>>(),
         "every-record log semantics across the process boundary"
     );
-    // The implicit health frame flowed from the worker process.
-    let health = health_view
+    // The host published the worker's status record every cycle, and the
+    // worker's log (which did cross the process boundary) carries no faults.
+    let status = status_view
         .latest()
         .expect("ring readable")
-        .expect("worker health flowed");
-    assert_eq!(health.get().errors, 0, "no worker-side errors");
+        .expect("status published");
     assert!(
-        health.get().cycles >= CYCLES as u64,
-        "worker counted its cycles"
+        status.get().cycles >= CYCLES as u64,
+        "the host counted the worker's cycles"
     );
-    drop(health);
+    assert_eq!(status.get().state, SlotState::Running.code());
+    drop(status);
+    assert!(no_faults(&mut log_in), "no worker-side faults");
 
     // Teardown: shutdown reaps the worker; dropping the coordinator unmaps
     // the rings and removes the session dir. Not crashing (and not leaking a
     // child) is the assertion.
     drop(coord);
-    drop((out_view, events_in, health_view, dl_out_view));
+    drop((out_view, events_in, status_view, log_in, dl_out_view));
     assert!(
         child_pids().is_empty(),
         "no worker child survives a clean teardown"
@@ -450,10 +472,10 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     });
 
     let registry = coord.registry();
-    let mut ticker_health: Input<SystemStatus> = Input::new(
+    let mut ticker_log: MsgIn<LogEvent> = MsgIn::new(
         registry
-            .view(ComponentId::new("ticker.system_status"))
-            .expect("ticker health registered")
+            .view(ComponentId::new("ticker.log"))
+            .expect("ticker log registered")
             .expect("reader slot available"),
     );
 
@@ -482,20 +504,14 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     assert_eq!(workers[0].restarts, 0, "restart was opted out");
     // ...whose reader cursors were reclaimed: the producer never saw a full
     // ring (a dead pinned cursor would have surfaced as publish_dropped
-    // errors on the ticker's health well within ~100 post-kill cycles).
-    let health = ticker_health
-        .latest()
-        .expect("ring readable")
-        .expect("ticker health flowed");
-    assert_eq!(
-        health.get().errors,
-        0,
+    // faults on the ticker's log well within ~100 post-kill cycles).
+    assert!(
+        no_faults(&mut ticker_log),
         "producer kept publishing after the reclaim"
     );
-    drop(health);
 
     drop(coord);
-    drop(ticker_health);
+    drop(ticker_log);
     assert!(child_pids().is_empty(), "the dead worker was reaped");
 }
 
@@ -573,10 +589,10 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
     });
 
     let registry = coord.registry();
-    let mut ticker_health: Input<SystemStatus> = Input::new(
+    let mut ticker_log: MsgIn<LogEvent> = MsgIn::new(
         registry
-            .view(ComponentId::new("ticker.system_status"))
-            .expect("ticker health registered")
+            .view(ComponentId::new("ticker.log"))
+            .expect("ticker log registered")
             .expect("reader slot available"),
     );
     let mut out_view: Input<TickOut> = Input::new(
@@ -618,16 +634,11 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
             > 1000,
         "the restarted worker produced"
     );
-    // ...and both reclaims kept the producer flowing: no publish errors.
-    let health = ticker_health
-        .latest()
-        .expect("ring readable")
-        .expect("ticker health flowed");
-    assert_eq!(health.get().errors, 0, "producer never backpressured");
-    drop(health);
+    // ...and both reclaims kept the producer flowing: no publish faults.
+    assert!(no_faults(&mut ticker_log), "producer never backpressured");
 
     drop(coord);
-    drop((ticker_health, out_view));
+    drop((ticker_log, out_view));
     assert!(child_pids().is_empty(), "all workers reaped");
 }
 

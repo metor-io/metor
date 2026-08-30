@@ -1,6 +1,6 @@
 //! The driver behind a fn-authored system: owns the state and the port
-//! states between cycles and generalizes [`CyclicRunner`]'s step timing and
-//! health fold to the parameter-tuple world.
+//! states between cycles and generalizes [`CyclicRunner`]'s drop report and
+//! log flush to the parameter-tuple world.
 //!
 //! [`CyclicRunner`]: crate::CyclicRunner
 
@@ -9,10 +9,10 @@ use core::marker::PhantomData;
 use metor_proto::types::Timestamp;
 
 use crate::binder::{AnySource, RingSource};
-use crate::health::{HealthPort, LogEvent, SystemStatus};
+use crate::log::{LogEvent, LogPort};
 use crate::message::MsgOut;
 use crate::pack::{Driver, StepStatus};
-use crate::port::Output;
+use crate::system::report_dropped;
 
 use super::param::{BindCx, CycleCx};
 use super::tuples::{ExecParamSet, ExecuteFn};
@@ -40,7 +40,7 @@ where
     state: StateAccess<S>,
     execute: F,
     ports: <F::Params as ExecParamSet>::State,
-    health: HealthPort,
+    log: LogPort,
     _m: PhantomData<fn() -> M>,
 }
 
@@ -50,7 +50,7 @@ where
     F: ExecuteFn<S, M>,
 {
     /// Bind the parameter states in declaration order, then the implicit
-    /// health/log tail — the same order the entry's descriptor declares.
+    /// log tail — the same order the entry's descriptor declares.
     pub(crate) fn bind(state: StateAccess<S>, execute: F, src: &mut AnySource) -> Self {
         let ports = {
             let mut cx = BindCx {
@@ -64,18 +64,17 @@ where
             state,
             execute,
             ports,
-            health: bind_health_tail(src),
+            log: bind_log_tail(src),
             _m: PhantomData,
         }
     }
 }
 
-/// Bind the implicit health/log output pair every entry's descriptor
-/// appends, after the user ports.
-pub(crate) fn bind_health_tail(src: &mut AnySource) -> HealthPort {
-    let health: Output<SystemStatus> = Output::bind(src);
+/// Bind the implicit log output every entry's descriptor appends, after the
+/// user ports.
+pub(crate) fn bind_log_tail(src: &mut AnySource) -> LogPort {
     let log: MsgOut<LogEvent> = MsgOut::bind(src);
-    let mut port = HealthPort::new(health, log);
+    let mut port = LogPort::new(log);
     port.set_instance(src.instance_name());
     port
 }
@@ -88,29 +87,26 @@ where
     fn init(&mut self) {}
 
     fn step(&mut self, now: Timestamp) -> StepStatus {
-        let start = crate::clock::ExecTimer::start();
         {
             let Self {
                 state,
                 execute,
                 ports,
-                health,
+                log,
                 ..
             } = self;
             state.with(|state| {
                 let mut cx = CycleCx {
                     now,
-                    health: Some(health),
+                    log: Some(log),
                 };
                 let items = <F::Params as ExecParamSet>::get(ports, &mut cx);
                 execute.call(state, items);
             });
         }
-        let micros = start.elapsed_micros();
-        if <F::Params as ExecParamSet>::take_dropped(&mut self.ports) > 0 {
-            self.health.error("publish_dropped");
-        }
-        self.health.end_cycle(now, micros);
+        let dropped = <F::Params as ExecParamSet>::take_dropped(&mut self.ports);
+        report_dropped(&mut self.log, dropped);
+        self.log.flush(now);
         StepStatus::Running
     }
 
@@ -120,12 +116,12 @@ where
 /// The driver behind an async-fn (task) entry: the future owns its ports and
 /// its state (locals); the driver refreshes the clock and polls once per
 /// cycle with a no-op waker, exactly the sequence execution model. Drops
-/// from the future-owned outputs arrive through the shared cell and fold
-/// into health, same as a runner-owned bundle's.
+/// from the future-owned outputs arrive through the shared cell and are
+/// reported on the log, same as a runner-owned bundle's.
 pub(crate) struct FutureDriver {
     future: core::pin::Pin<Box<dyn core::future::Future<Output = crate::sequence::Outcome>>>,
     clock: std::rc::Rc<crate::sequence::CycleClock>,
-    health: HealthPort,
+    log: LogPort,
     drops: std::sync::Arc<core::sync::atomic::AtomicU64>,
     /// A finished future is never polled again; the terminal is re-served.
     done: Option<crate::sequence::Outcome>,
@@ -135,35 +131,32 @@ impl FutureDriver {
     pub(crate) fn new(
         future: core::pin::Pin<Box<dyn core::future::Future<Output = crate::sequence::Outcome>>>,
         clock: std::rc::Rc<crate::sequence::CycleClock>,
-        health: HealthPort,
+        log: LogPort,
         drops: std::sync::Arc<core::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             future,
             clock,
-            health,
+            log,
             drops,
             done: None,
         }
     }
 
-    /// Poll once under the ambient clock, timing the poll and folding the
-    /// shared drop count; the caller decides what happens to progress lines
-    /// and the outcome.
+    /// Poll once under the ambient clock, reporting the shared drop count
+    /// and flushing the log; the caller decides what happens to progress
+    /// lines and the outcome.
     fn poll_once(&mut self, now: Timestamp) -> core::task::Poll<crate::sequence::Outcome> {
         use core::task::{Context, Waker};
         self.clock.now.set(now);
-        let start = crate::clock::ExecTimer::start();
         let poll = crate::sequence::with_clock(&self.clock, || {
             self.future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
         });
-        let micros = start.elapsed_micros();
-        if self.drops.swap(0, core::sync::atomic::Ordering::Relaxed) > 0 {
-            self.health.error("publish_dropped");
-        }
-        self.health.end_cycle(now, micros);
+        let dropped = self.drops.swap(0, core::sync::atomic::Ordering::Relaxed);
+        report_dropped(&mut self.log, dropped);
+        self.log.flush(now);
         poll
     }
 }
@@ -180,7 +173,7 @@ impl Driver for FutureDriver {
         // A wired task has no SequenceStatus output; progress lines land on
         // the entry's ordinary log so they still flow off-board.
         for line in self.clock.drain_progress() {
-            self.health.log(crate::health::LogLevel::Info, &line);
+            self.log.log(crate::log::LogLevel::Info, &line);
         }
         match poll {
             Poll::Ready(outcome) => {
@@ -198,7 +191,7 @@ impl Driver for FutureDriver {
 /// folded from the [`SlotControlIn`](crate::SlotControlIn) input before each
 /// poll, and a [`SequenceStatus`](crate::sequence::SequenceStatus) record
 /// published after it. Bound AFTER the inner entry's own ports (control
-/// after the user inputs; status after the health/log tail), matching the
+/// after the user inputs; status after the log tail), matching the
 /// occupant tail the host appends around the entry's descriptor.
 pub(crate) struct OccupantFuture {
     inner: FutureDriver,

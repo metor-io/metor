@@ -13,7 +13,7 @@ use metor_proto::types::Timestamp;
 use crate::binder::AnySource;
 use crate::descriptor::PortDesc;
 use crate::frame::Frame;
-use crate::health::HealthPort;
+use crate::log::LogPort;
 use crate::message::{MsgIn, MsgOut, NamedMsg};
 use crate::port::{Input, Output};
 
@@ -26,17 +26,17 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 pub struct DeclSink {
     pub inputs: Vec<PortDesc>,
     pub outputs: Vec<PortDesc>,
-    health_params: u8,
+    log_params: u8,
     /// The typed-params spec a task fn's `Params<P>` parameter records.
     pub(crate) task_params: Option<super::task::TaskParamsSpec>,
 }
 
 impl DeclSink {
-    fn count_health(&mut self) {
-        self.health_params += 1;
+    fn count_log(&mut self) {
+        self.log_params += 1;
         assert!(
-            self.health_params <= 1,
-            "an execute fn takes at most one `&mut HealthPort` parameter"
+            self.log_params <= 1,
+            "an execute fn takes at most one `&mut LogPort` parameter"
         );
     }
 
@@ -55,25 +55,25 @@ pub struct BindCx<'a, 'b, 'c> {
     /// The create-phase decoded `Params<P>` value, taken by its parameter.
     pub(crate) params: Option<Box<dyn core::any::Any>>,
     /// A shared dropped-publish cell every by-value output adopts before it
-    /// moves into the future, so the driver can fold drops into health.
+    /// moves into the future, so the driver can report drops on the log.
     pub(crate) drops: Option<std::sync::Arc<core::sync::atomic::AtomicU64>>,
 }
 
 /// The per-cycle context parameters draw non-port items from.
 pub struct CycleCx<'r> {
     pub now: Timestamp,
-    pub(crate) health: Option<&'r mut HealthPort>,
+    pub(crate) log: Option<&'r mut LogPort>,
 }
 
 /// One parameter of a fn-authored system's execute fn.
 ///
 /// Implemented for `&mut Input<F>`, `&mut MsgIn<M>`, `&mut Output<F>`,
-/// `&mut MsgOut<M>`, `Timestamp`, and `&mut HealthPort`. Anything else in an
+/// `&mut MsgOut<M>`, `Timestamp`, and `&mut LogPort`. Anything else in an
 /// execute signature fails the [`ExecuteFn`](super::ExecuteFn) bound.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a system parameter",
     note = "execute fns take `&mut Input<F>`, `&mut MsgIn<M>`, `&mut Output<F>`, \
-            `&mut MsgOut<M>`, `now: Timestamp`, or `&mut HealthPort` after the \
+            `&mut MsgOut<M>`, `now: Timestamp`, or `&mut LogPort` after the \
             leading `&mut State`; other state belongs in the State type"
 )]
 pub trait ExecParam: Sized {
@@ -184,19 +184,19 @@ impl ExecParam for Timestamp {
     }
 }
 
-impl ExecParam for &mut HealthPort<NoWake> {
+impl ExecParam for &mut LogPort<NoWake> {
     type State = ();
-    type Item<'r> = &'r mut HealthPort;
+    type Item<'r> = &'r mut LogPort;
 
     fn decl(sink: &mut DeclSink) {
-        // The health pair is the driver-owned tail, not a wired parameter;
+        // The log port is the driver-owned tail, not a wired parameter;
         // only the at-most-one rule is checked here.
-        sink.count_health();
+        sink.count_log();
     }
     fn bind(_cx: &mut BindCx) -> Self::State {}
-    fn get<'r>(_state: &'r mut (), cx: &mut CycleCx<'r>) -> &'r mut HealthPort {
-        cx.health
+    fn get<'r>(_state: &'r mut (), cx: &mut CycleCx<'r>) -> &'r mut LogPort {
+        cx.log
             .take()
-            .expect("at most one &mut HealthPort parameter (checked at decl)")
+            .expect("at most one &mut LogPort parameter (checked at decl)")
     }
 }
