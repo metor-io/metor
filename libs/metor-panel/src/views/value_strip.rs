@@ -204,6 +204,9 @@ pub struct ComponentValueStrip {
     behavior: StripBehavior,
     cells: Vec<StripCell>,
     kind: CellKind,
+    /// No sample for [`STALE_AFTER`](super::binding::STALE_AFTER); cells
+    /// tint so a dead producer can't pass for a steady one.
+    stale: bool,
     editing: Option<EditingCell>,
     focus: FocusHandle,
     _task: gpui::Task<()>,
@@ -244,7 +247,9 @@ impl ComponentValueStrip {
                     StreamUpdate::Value((cells, raw_values)) => {
                         this.cells = cells;
                         this.raw_values = raw_values;
+                        this.stale = false;
                     }
+                    StreamUpdate::Stale => this.stale = true,
                 }
                 cx.notify();
             },
@@ -261,6 +266,7 @@ impl ComponentValueStrip {
             behavior,
             cells: Vec::new(),
             kind: CellKind::Unknown,
+            stale: false,
             editing: None,
             focus: cx.focus_handle(),
             _task: task,
@@ -531,6 +537,7 @@ impl Render for ComponentValueStrip {
         let behavior = self.behavior.clone();
         let component_id = self.component_id;
         let editing_index = self.editing.as_ref().map(|e| e.index);
+        let stale = self.stale;
         let editing_error = self.editing.as_ref().map(|e| e.error).unwrap_or(false);
 
         let mut row = div().flex().flex_row().items_center().gap(px(4.0));
@@ -575,6 +582,7 @@ impl Render for ComponentValueStrip {
                     &theme,
                     is_solo,
                     is_pending,
+                    stale,
                     is_bool,
                     bool_value,
                     has_apply_group,
@@ -778,6 +786,7 @@ fn build_cell_chrome(
     theme: &Theme,
     is_solo: bool,
     is_pending: bool,
+    stale: bool,
     is_bool: bool,
     bool_value: bool,
     inside_apply_group: bool,
@@ -798,6 +807,8 @@ fn build_cell_chrome(
         // still reads as a frame.
         let track_color = if is_pending {
             theme.drop_target
+        } else if stale {
+            theme.stale_bg
         } else if bool_value {
             theme.control_active_track
         } else {
@@ -848,6 +859,8 @@ fn build_cell_chrome(
         StripPreset::Boxes => {
             let bg = if is_pending {
                 theme.drop_target
+            } else if stale {
+                theme.stale_bg
             } else {
                 theme.bg_secondary
             };
@@ -856,6 +869,8 @@ fn build_cell_chrome(
         StripPreset::Dashboard => {
             if is_pending {
                 atom = atom.bg(theme.drop_target);
+            } else if stale {
+                atom = atom.bg(theme.stale_bg);
             }
         }
     }

@@ -22,10 +22,11 @@
 //!   the plots read.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{App, Context, Hsla, SharedString};
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType};
+use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType, Timestamp};
 use metor_proto_wkt::Severity;
 use smallvec::SmallVec;
 
@@ -34,7 +35,14 @@ use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 pub(crate) enum StreamUpdate<I, V> {
     Ready(I),
     Value(V),
+    /// No sample has arrived for [`STALE_AFTER`]; the next `Value` ends it.
+    /// Sent once per silence, not repeated.
+    Stale,
 }
+
+/// How long a value may go without an update before it is stale. Arrival
+/// time, not the sample's own stamp, so a replay looks live while it runs.
+pub(crate) const STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// The single number an instrument view displays: one element of one
 /// component.
@@ -180,25 +188,52 @@ where
             return;
         }
 
+        // The seed is committed history: it may already be older than the
+        // threshold, in which case it shows as stale from the first paint.
         let seed = db.with_state(|state| {
             let component = state.get_component(component_id)?;
             let latest = component.time_series.latest()?;
             let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
-            decode(view)
+            let age = Timestamp::now().0.saturating_sub(latest.timestamp().0);
+            Some((decode(view), age > STALE_AFTER.as_micros() as i64))
         });
-        if let Some(seed) = seed
-            && this
-                .update(cx, |view, cx| apply(view, StreamUpdate::Value(seed), cx))
-                .is_err()
-        {
-            return;
+        let mut fresh = true;
+        if let Some((seed, seed_stale)) = seed {
+            let result = this.update(cx, |view, cx| {
+                if let Some(seed) = seed {
+                    apply(view, StreamUpdate::Value(seed), cx);
+                }
+                if seed_stale {
+                    apply(view, StreamUpdate::Stale, cx);
+                }
+            });
+            if result.is_err() {
+                return;
+            }
+            fresh = !seed_stale;
         }
 
+        // A fresh value arms one timer; when it fires first the view is told
+        // once and then waits, unarmed, for the sample that ends the silence.
         loop {
-            let value = decode(stream.next().await.as_component_view());
+            let next = async { Some(stream.next().await) };
+            let arrived = if fresh {
+                let timeout = async {
+                    cx.background_executor().timer(STALE_AFTER).await;
+                    None
+                };
+                futures_lite::future::race(next, timeout).await
+            } else {
+                next.await
+            };
+            fresh = arrived.is_some();
+            let update = match arrived {
+                Some(sample) => decode(sample.as_component_view()).map(StreamUpdate::Value),
+                None => Some(StreamUpdate::Stale),
+            };
             let result = this.update(cx, |view, cx| {
-                if let Some(value) = value {
-                    apply(view, StreamUpdate::Value(value), cx);
+                if let Some(update) = update {
+                    apply(view, update, cx);
                 }
             });
             if result.is_err() {
