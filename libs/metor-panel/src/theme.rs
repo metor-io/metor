@@ -152,10 +152,7 @@ impl Theme {
     /// Value-cell background once its stream has gone quiet: the theme's
     /// blue, translucent enough that the digits still read through it.
     pub fn stale_bg(&self) -> Hsla {
-        Hsla {
-            a: 0.3,
-            ..self.line_colors[1]
-        }
+        self.alarm_tint(0)
     }
 
     /// Tint for a component-frame edge in the system graph — the blue family,

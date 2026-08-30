@@ -22,6 +22,7 @@
 //!   the plots read.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use gpui::{App, Context, Hsla, SharedString};
@@ -45,9 +46,29 @@ pub(crate) enum StreamUpdate<I, V> {
 /// reads stale even while the link keeps delivering it.
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(3);
 
-/// How long ago `sample` was taken; zero for a stamp ahead of this clock.
+/// The producers' clock minus this machine's, as last observed when a
+/// sample arrived. A simulated or skewed producer clock makes wall time the
+/// wrong ruler: judged against it, a sim running ahead never ages and one
+/// running behind is stale on arrival. Measuring age on the producer's own
+/// timeline keeps "3 s" meaning 3 s of its time, and — because the offset is
+/// frozen at the last arrival — a producer that stops still ages out on
+/// this clock. One estimate serves every stream; producers on unrelated
+/// clocks would each want their own.
+static CLOCK_SKEW_MICROS: AtomicI64 = AtomicI64::new(0);
+
+fn note_arrival(sample: Timestamp) {
+    CLOCK_SKEW_MICROS.store(sample.0 - Timestamp::now().0, Ordering::Relaxed);
+}
+
+/// Now, on the producers' clock.
+fn producer_now() -> Timestamp {
+    Timestamp(Timestamp::now().0 + CLOCK_SKEW_MICROS.load(Ordering::Relaxed))
+}
+
+/// How long ago `sample` was taken on its producer's clock; zero for a stamp
+/// still ahead of it.
 fn sample_age(sample: Timestamp) -> Duration {
-    let micros = Timestamp::now().0.saturating_sub(sample.0).max(0);
+    let micros = producer_now().0.saturating_sub(sample.0).max(0);
     Duration::from_micros(micros as u64)
 }
 
@@ -211,6 +232,7 @@ where
         if let Some((seed, age)) = seed {
             remaining = STALE_AFTER.checked_sub(age);
             let stale = remaining.is_none();
+            tracing::debug!(?component_id, ?age, stale, "seeded from history");
             let result = this.update(cx, |view, cx| {
                 if let Some(seed) = seed {
                     apply(view, StreamUpdate::Value(seed), cx);
@@ -239,13 +261,19 @@ where
             let (update, stale) = match arrived {
                 Some(sample) => {
                     // A source without stamps counts from arrival.
-                    let age = sample.sample_time().map(sample_age).unwrap_or_default();
+                    let stamp = sample.sample_time();
+                    if let Some(stamp) = stamp {
+                        note_arrival(stamp);
+                    }
+                    let age = stamp.map(sample_age).unwrap_or_default();
                     remaining = STALE_AFTER.checked_sub(age);
+                    tracing::debug!(?component_id, ?age, stamped = stamp.is_some(), "sample");
                     let value = decode(sample.as_component_view()).map(StreamUpdate::Value);
                     (value, remaining.is_none())
                 }
                 None => {
                     remaining = None;
+                    tracing::debug!(?component_id, "stale: timer elapsed");
                     (None, true)
                 }
             };
@@ -483,5 +511,39 @@ mod tests {
         let mut bound = None;
         assert!(rebound(ElementRef::new(ComponentId(1), 0), &mut bound));
         assert!(!rebound(ElementRef::new(ComponentId(1), 0), &mut bound));
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+    use metor_db::ComponentSchema;
+
+    /// The seed judges age by the stamp the producer wrote, which the WAL
+    /// carries through to the time series unchanged.
+    #[stellarator::test]
+    async fn the_seed_stamp_is_the_producers_not_the_receivers() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DB::create(temp.path().join("db")).unwrap();
+        let id = ComponentId::new("dead.value");
+        db.with_state_mut(|state| {
+            state.insert_component(id, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+        })
+        .unwrap();
+        let component = db
+            .with_state(|state| state.get_component(id).cloned())
+            .unwrap();
+        let stamped = Timestamp(Timestamp::now().0 - 10_000_000);
+        component.push_buf(stamped, &1.5f64.to_le_bytes()).unwrap();
+        for _ in 0..200 {
+            if component.time_series.latest().is_some() {
+                break;
+            }
+            stellarator::sleep(Duration::from_millis(5)).await;
+        }
+        let latest = component.time_series.latest().expect("persisted");
+        assert_eq!(latest.timestamp(), stamped);
+        assert!(sample_age(stamped) >= Duration::from_secs(9));
+        assert!(STALE_AFTER.checked_sub(sample_age(stamped)).is_none());
     }
 }
