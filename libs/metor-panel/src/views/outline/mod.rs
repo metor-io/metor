@@ -937,7 +937,11 @@ impl OutlineDelegate {
             let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
             behavior.on_element_right_click = Some(right_click_plot(db.clone(), id));
             strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
-            cells.push(cell.child(strip).into_any_element());
+            // Hold the strip to one line: the cell is sized for it, and
+            // an element that still doesn't fit should clip, not wrap.
+            let mut line = div().min_w(px(strip_row_width(n))).child(strip);
+            line.style().flex_shrink = Some(0.0);
+            cells.push(cell.child(line).into_any_element());
         }
         pivot_scroller(row_ix, scroll)
             .children(cells)
@@ -1044,11 +1048,12 @@ impl TableDelegate for OutlineDelegate {
 /// only needs to be roomy enough that a label isn't clipped.
 const LABEL_CHAR_WIDTH: f32 = 6.8;
 
-/// Width of a pivot cell: the wider of its `n`-element strip and its label.
+/// Width of a pivot cell: the wider of its `n`-element strip and its label,
+/// plus padding and the divider — a pixel short and the strip wraps.
 fn pivot_cell_width(n: usize, label: &str) -> f32 {
     let strip = strip_row_width(n.max(1));
     let text = label.chars().count() as f32 * LABEL_CHAR_WIDTH;
-    strip.max(text) + PIVOT_CELL_PAD
+    strip.max(text) + PIVOT_CELL_PAD + 1.0
 }
 
 /// The sideways-scrolling row container every pivot row shares the offset
