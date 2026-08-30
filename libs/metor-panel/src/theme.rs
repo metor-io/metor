@@ -80,8 +80,6 @@ pub struct Theme {
     pub text_selection: Hsla,
     /// Translucent overlay drawn over a drop target during drag.
     pub drop_target: Hsla,
-    /// Value-cell background once its stream has gone quiet.
-    pub stale_bg: Hsla,
 
     pub pill_bg: Hsla,
     pub pill_border: Hsla,
@@ -148,6 +146,15 @@ impl Theme {
         Hsla {
             a: 0.4,
             ..self.text_tertiary
+        }
+    }
+
+    /// Value-cell background once its stream has gone quiet: the theme's
+    /// blue, translucent enough that the digits still read through it.
+    pub fn stale_bg(&self) -> Hsla {
+        Hsla {
+            a: 0.45,
+            ..self.line_colors[1]
         }
     }
 
@@ -275,7 +282,6 @@ pub static DARK: Theme = Theme {
     selection_bg: hex(0x36322f, 1.0),
     text_selection: hex(0x2d4a6b, 0.6),
     drop_target: hex(0xe08a30, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x404040, 1.0),
     pill_border: hex(0x595959, 1.0),
@@ -311,7 +317,6 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     selection_bg: hex(0x45475a, 1.0),
     text_selection: hex(0x585b70, 0.6),
     drop_target: hex(0xf9e2af, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x45475a, 1.0),
     pill_border: hex(0x585b70, 1.0),
@@ -356,7 +361,6 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     selection_bg: hex(0x494d64, 1.0),
     text_selection: hex(0x5b6078, 0.6),
     drop_target: hex(0xeed49f, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x494d64, 1.0),
     pill_border: hex(0x5b6078, 1.0),
@@ -401,7 +405,6 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     selection_bg: hex(0xbcc0cc, 1.0),
     text_selection: hex(0x7287fd, 0.3),
     drop_target: hex(0xdf8e1d, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0xccd0da, 1.0),
     pill_border: hex(0xbcc0cc, 1.0),
@@ -446,7 +449,6 @@ pub static AYU_DARK: Theme = Theme {
     selection_bg: hex(0x475266, 1.0),
     text_selection: hex(0x3d4455, 0.6),
     drop_target: hex(0x59c2ff, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x1a1e28, 1.0),
     pill_border: hex(0x2a2e38, 1.0),
@@ -491,7 +493,6 @@ pub static EVERFOREST_DARK: Theme = Theme {
     selection_bg: hex(0x4f585e, 1.0),
     text_selection: hex(0x543a48, 0.6),
     drop_target: hex(0xdbbc7f, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x3d484d, 1.0),
     pill_border: hex(0x4f585e, 1.0),
@@ -536,7 +537,6 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     selection_bg: hex(0xe0dcc7, 1.0),
     text_selection: hex(0xeaedc8, 0.8),
     drop_target: hex(0xdfa000, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0xefebd4, 1.0),
     pill_border: hex(0xe0dcc7, 1.0),
@@ -581,7 +581,6 @@ pub static ROSE_PINE: Theme = Theme {
     selection_bg: hex(0x524f67, 1.0),
     text_selection: hex(0xc4a7e7, 0.3),
     drop_target: hex(0xf6c177, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x403d52, 1.0),
     pill_border: hex(0x524f67, 1.0),
@@ -626,7 +625,6 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     selection_bg: hex(0x56526e, 1.0),
     text_selection: hex(0xc4a7e7, 0.3),
     drop_target: hex(0xf6c177, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x44415a, 1.0),
     pill_border: hex(0x56526e, 1.0),
@@ -671,7 +669,6 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     selection_bg: hex(0xcecacd, 1.0),
     text_selection: hex(0x907aa9, 0.3),
     drop_target: hex(0xea9d34, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0xf2e9e1, 1.0),
     pill_border: hex(0xdfdad9, 1.0),
@@ -716,7 +713,6 @@ pub static MAKING_SOFTWARE: Theme = Theme {
     selection_bg: hex(0xe6ebff, 1.0),
     text_selection: hex(0xffe680, 0.55),
     drop_target: hex(0x1342ff, 0.12),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0xe6ebff, 1.0),
     pill_border: hex(0xb9c7fd, 1.0),
@@ -761,7 +757,6 @@ pub static DEPARTURE: Theme = Theme {
     selection_bg: hex(0x3a2a18, 1.0),
     text_selection: hex(0xf0a040, 0.25),
     drop_target: hex(0xf0a040, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x2a1f12, 1.0),
     pill_border: hex(0x5a3e20, 1.0),
@@ -812,7 +807,6 @@ pub static KINTSUGI: Theme = Theme {
     selection_bg: hex(0x393b31, 1.0),
     text_selection: hex(0x6c7a8a, 0.4),
     drop_target: hex(0xdbad49, 0.15),
-    stale_bg: hex(0x3a7bd5, 0.3),
 
     pill_bg: hex(0x20201f, 1.0),
     pill_border: hex(0x3a3a36, 1.0),

@@ -808,7 +808,7 @@ fn build_cell_chrome(
         let track_color = if is_pending {
             theme.drop_target
         } else if stale {
-            theme.stale_bg
+            theme.stale_bg()
         } else if bool_value {
             theme.control_active_track
         } else {
@@ -860,7 +860,7 @@ fn build_cell_chrome(
             let bg = if is_pending {
                 theme.drop_target
             } else if stale {
-                theme.stale_bg
+                theme.stale_bg()
             } else {
                 theme.bg_secondary
             };
@@ -870,7 +870,7 @@ fn build_cell_chrome(
             if is_pending {
                 atom = atom.bg(theme.drop_target);
             } else if stale {
-                atom = atom.bg(theme.stale_bg);
+                atom = atom.bg(theme.stale_bg());
             }
         }
     }
