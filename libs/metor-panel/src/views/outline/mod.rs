@@ -41,8 +41,8 @@ use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::theme;
 use model::{
-    Disclosure, FrameType, Layout, OutlineRow, Pivot, RowKind, component_count, flatten, signature,
-    type_key,
+    Disclosure, FrameType, Layout, OutlineRow, Pivot, RowKind, alike, common_suffix,
+    component_count, flatten, signature, type_key,
 };
 
 /// Indent per tree depth, in pixels.
@@ -443,7 +443,19 @@ impl OutlineDelegate {
             self.reflatten(cx);
             return;
         }
-        let base = exemplar.segment.to_string();
+        // Name the type by what its instances share, not by the exemplar:
+        // a compressed chain like `alarms.health` would otherwise label a
+        // type whose other instances are `nav.health`, `ctrl.health`, …
+        let instances = alike(&self.tree, &fields);
+        let mut base = common_suffix(instances.iter().map(|n| n.full_name.as_ref()));
+        if base.is_empty() {
+            base = exemplar
+                .full_name
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+        }
         let mut label = base.clone();
         let mut n = 2;
         while self.types.iter().any(|t| t.label.as_ref() == label) {

@@ -102,6 +102,29 @@ pub(crate) fn type_key(label: &str) -> SharedString {
     SharedString::from(format!("type:{label}"))
 }
 
+/// The name a set of alike frames share: the longest trailing run of
+/// segments common to every path, so `dut1.psu` and `dut2.bay.psu` are
+/// "psu" and `cube_sat.nav.health` and `cube_sat.ctrl.health` are
+/// "health". Empty when nothing is shared.
+pub(crate) fn common_suffix<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let mut names = names.into_iter();
+    let Some(first) = names.next() else {
+        return String::new();
+    };
+    let mut shared: Vec<&str> = first.split('.').collect();
+    for name in names {
+        let segments: Vec<&str> = name.split('.').collect();
+        let common = shared
+            .iter()
+            .rev()
+            .zip(segments.iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        shared.drain(..shared.len() - common);
+    }
+    shared.join(".")
+}
+
 /// The shape of `node`: its leaf paths relative to itself, sorted.
 pub(crate) fn signature(node: &Arc<ComponentNode>) -> Vec<SharedString> {
     let mut leaves = BTreeMap::new();
@@ -758,5 +781,17 @@ mod tests {
             },
         );
         assert_eq!(names(&rows)[..3], ["type:psu", "type:psu", "dut2.bay.psu"]);
+    }
+
+    #[test]
+    fn common_suffix_is_the_shared_trailing_segments() {
+        assert_eq!(common_suffix(["dut1.psu", "dut2.bay.psu"]), "psu");
+        assert_eq!(
+            common_suffix(["cube_sat.nav.health", "cube_sat.ctrl.health"]),
+            "health"
+        );
+        assert_eq!(common_suffix(["a.b.c", "x.b.c"]), "b.c");
+        assert_eq!(common_suffix(["a.b", "c.d"]), "");
+        assert_eq!(common_suffix(["only.one"]), "only.one");
     }
 }
