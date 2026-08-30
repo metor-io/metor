@@ -674,10 +674,9 @@ impl OutlineDelegate {
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
-        // Pivot rows are flat: instances don't disclose, and the header
-        // names nothing. Both still indent under their branch.
+        // Instance rows are flat — they don't disclose — but still indent
+        // under their branch.
         let (is_branch, label, color) = match &row.kind {
-            RowKind::PivotHeader(_) => (false, SharedString::default(), theme.text_tertiary),
             RowKind::PivotInstance { pivot, ix } => (
                 false,
                 pivot.instances[*ix].label.clone(),
@@ -719,6 +718,20 @@ impl OutlineDelegate {
                     .whitespace_nowrap()
                     .child(label),
             );
+        if let RowKind::PivotBranch(pivot) = &row.kind {
+            cell = cell.child(
+                div()
+                    .ml(px(4.0))
+                    .whitespace_nowrap()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_tertiary)
+                    .child(SharedString::from(format!(
+                        "{} × {}",
+                        count_label(pivot.instances.len(), "instance"),
+                        count_label(pivot.fields.len(), "field")
+                    ))),
+            );
+        }
 
         if is_branch {
             let menu_row = row.clone();
@@ -755,9 +768,12 @@ impl OutlineDelegate {
     ) -> AnyElement {
         let theme = theme(cx);
         match &row.kind {
-            RowKind::PivotHeader(pivot) => {
+            // An open pivot's branch row doubles as its header; a folded
+            // one (a type kept closed) has nothing to align to.
+            RowKind::PivotBranch(pivot) if row.expanded => {
                 return self.render_pivot_header(row_ix, pivot, cx);
             }
+            RowKind::PivotBranch(_) => return div().into_any_element(),
             RowKind::PivotInstance { pivot, ix } => {
                 let pivot = pivot.clone();
                 return self.render_pivot_cells(row_ix, &pivot, *ix, cx);
@@ -765,15 +781,7 @@ impl OutlineDelegate {
             _ => {}
         }
         let Some(id) = row.node.component_id else {
-            let n = row.component_count;
-            let label = match &row.kind {
-                RowKind::PivotBranch(pivot) => format!(
-                    "{} × {}",
-                    count_label(pivot.instances.len(), "instance"),
-                    count_label(pivot.fields.len(), "field")
-                ),
-                _ => count_label(n, "component"),
-            };
+            let label = count_label(row.component_count, "component");
             return div()
                 .flex()
                 .items_center()
@@ -943,10 +951,7 @@ impl TableDelegate for OutlineDelegate {
             Col::Name => self.render_name(row_ix, &row, cx),
             Col::Value => self.render_value(row_ix, &row, cx),
             Col::Unit | Col::Type | Col::Sparkline
-                if matches!(
-                    row.kind,
-                    RowKind::PivotHeader(_) | RowKind::PivotInstance { .. }
-                ) =>
+                if matches!(row.kind, RowKind::PivotInstance { .. }) =>
             {
                 div().into_any_element()
             }

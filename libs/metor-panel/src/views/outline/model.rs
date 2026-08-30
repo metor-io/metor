@@ -51,10 +51,9 @@ pub(crate) struct OutlineRow {
 pub(crate) enum RowKind {
     /// A plain tree node, `node` being the one it shows.
     Node,
-    /// A pivoted branch; `node` is the branch.
+    /// A pivoted branch; `node` is the branch. Its row carries the grid's
+    /// field labels, so the instances sit directly beneath it.
     PivotBranch(Arc<Pivot>),
-    /// The field labels above a pivot's instances; `node` is the branch.
-    PivotHeader(Arc<Pivot>),
     /// One instance of a pivot; `node` is the instance's own subtree root.
     PivotInstance { pivot: Arc<Pivot>, ix: usize },
 }
@@ -386,28 +385,16 @@ fn push_rows(
         }
         return;
     };
-    // Leaf children aren't instances; they keep their ordinary rows above
-    // the grid.
+    push_grid_rows(depth + 1, &pivot, rows);
+    // Leaf children aren't instances; they keep their ordinary rows, after
+    // the grid so the instances stay under their field labels.
     for child in node.children.values().filter(|c| c.children.is_empty()) {
         push_rows(child, depth + 1, layout, force_open, rows);
     }
-    push_grid_rows(node, depth + 1, &pivot, rows);
 }
 
-/// The header and instance rows of an open pivot.
-fn push_grid_rows(
-    branch: &Arc<ComponentNode>,
-    depth: usize,
-    pivot: &Arc<Pivot>,
-    rows: &mut Vec<OutlineRow>,
-) {
-    rows.push(OutlineRow {
-        node: branch.clone(),
-        depth,
-        expanded: false,
-        component_count: 0,
-        kind: RowKind::PivotHeader(pivot.clone()),
-    });
+/// The instance rows of an open pivot.
+fn push_grid_rows(depth: usize, pivot: &Arc<Pivot>, rows: &mut Vec<OutlineRow>) {
     for (ix, instance) in pivot.instances.iter().enumerate() {
         rows.push(OutlineRow {
             node: instance.node.clone(),
@@ -465,7 +452,7 @@ fn push_type_rows(
         kind: RowKind::PivotBranch(pivot.clone()),
     });
     if expanded {
-        push_grid_rows(&node, 1, &pivot, rows);
+        push_grid_rows(1, &pivot, rows);
     }
 }
 
@@ -636,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pivoted_branch_lists_leaves_then_header_then_instances() {
+    fn a_pivoted_branch_lists_instances_then_leaves() {
         let pivoted: HashSet<SharedString> = ["wheels".into()].into_iter().collect();
         let rows = rows(
             &wheels(),
@@ -646,12 +633,11 @@ mod tests {
         );
         assert_eq!(
             names(&rows),
-            ["wheels", "wheels.count", "wheels", "wheels.0", "wheels.1"]
+            ["wheels", "wheels.0", "wheels.1", "wheels.count"]
         );
         assert!(rows[0].is_pivoted());
-        assert!(matches!(rows[2].kind, RowKind::PivotHeader(_)));
-        assert!(matches!(rows[3].kind, RowKind::PivotInstance { ix: 0, .. }));
-        assert!(matches!(rows[4].kind, RowKind::PivotInstance { ix: 1, .. }));
+        assert!(matches!(rows[1].kind, RowKind::PivotInstance { ix: 0, .. }));
+        assert!(matches!(rows[2].kind, RowKind::PivotInstance { ix: 1, .. }));
     }
 
     #[test]
@@ -729,12 +715,9 @@ mod tests {
                 cell_count: &|_| 1,
             },
         );
-        assert_eq!(
-            names(&rows)[..4],
-            ["type:psu", "type:psu", "dut1.psu", "dut2.bay.psu"]
-        );
-        assert_eq!(names(&rows)[4], "dut1");
-        let RowKind::PivotInstance { pivot, ix } = &rows[3].kind else {
+        assert_eq!(names(&rows)[..3], ["type:psu", "dut1.psu", "dut2.bay.psu"]);
+        assert_eq!(names(&rows)[3], "dut1");
+        let RowKind::PivotInstance { pivot, ix } = &rows[2].kind else {
             panic!("expected an instance row");
         };
         assert_eq!(pivot.instances[*ix].label, "dut2.bay.psu");
@@ -759,10 +742,7 @@ mod tests {
                 cell_count: &|_| 1,
             },
         );
-        assert_eq!(
-            names(&rows),
-            ["type:psu", "type:psu", "dut1.psu", "dut2.bay.psu"]
-        );
+        assert_eq!(names(&rows), ["type:psu", "dut1.psu", "dut2.bay.psu"]);
     }
 
     #[test]
@@ -780,7 +760,7 @@ mod tests {
                 cell_count: &|_| 1,
             },
         );
-        assert_eq!(names(&rows)[..3], ["type:psu", "type:psu", "dut2.bay.psu"]);
+        assert_eq!(names(&rows)[..2], ["type:psu", "dut2.bay.psu"]);
     }
 
     #[test]

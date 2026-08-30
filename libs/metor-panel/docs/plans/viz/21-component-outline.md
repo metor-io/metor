@@ -57,7 +57,7 @@ New:
 
 ## Pivot (landed)
 
-Right-click a branch → **Pivot**. Its branch children become instance rows
+Right-click a branch → **Pivot**. Its row becomes the grid header (field labels in the Value column, `N instances × M fields` beside the name); its branch children become instance rows
 and the union of their leaf paths (relative, e.g. `motor.temp`) become
 fixed-width cells; leaf children of the branch keep ordinary rows above the
 grid. Detection is structural — no `group_name` opt-in — and a sibling
