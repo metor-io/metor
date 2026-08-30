@@ -137,7 +137,7 @@ pub type StripClick = Arc<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + 
 /// Interactive state supplied afresh by the host each render.
 ///
 /// Snapshot pattern keeps the strip decoupled from the pending-edits global
-/// and lets `Monitor`, `ComponentText`, and `ComponentTable` share one
+/// and lets `Monitor`, `ComponentText`, and `ComponentOutline` share one
 /// widget with different policies.
 #[derive(Default, Clone)]
 pub struct StripBehavior {
@@ -191,7 +191,7 @@ struct EditingCell {
 /// Live horizontal row of a component's elements.
 ///
 /// Shared widget between `Monitor`, `ComponentBrowser`, and
-/// `ComponentTable`. The strip owns its stream task; hosts refresh the
+/// `ComponentOutline`. The strip owns its stream task; hosts refresh the
 /// visible [`StripStyle`] and [`StripBehavior`] every render.
 pub struct ComponentValueStrip {
     db: Arc<DB>,

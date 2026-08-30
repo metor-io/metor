@@ -16,10 +16,9 @@ use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
     AlarmListMode, AlarmView, Annunciator, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
-    ComponentOutline, ComponentTable, ComponentText, DataTable, Gauge, GaugeConfig, LevelFilter,
-    LogView, Meter, MeterConfig, OutlineColumns, SequenceControl, SequenceControlConfig,
-    SequenceGrid, SequenceView, StateChip, StateChipConfig, TimeSeriesPlot, TrafficLight,
-    new_component_browser, new_component_table, new_data_table,
+    ComponentOutline, ComponentText, Gauge, GaugeConfig, LevelFilter, LogView, Meter, MeterConfig,
+    OutlineColumns, SequenceControl, SequenceControlConfig, SequenceGrid, SequenceView, StateChip,
+    StateChipConfig, TimeSeriesPlot, TrafficLight, new_component_browser,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -651,116 +650,6 @@ impl PaneItem for AnnunciatorPanel {
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
         Some(self.inner.clone().into_any())
-    }
-}
-
-/// Persisted shape of a [`TablePanel`]. Currently empty — the panel renders
-/// every component in the DB and has no per-instance configuration.
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct TablePanelConfig {}
-
-/// Pane item listing every component in the DB as a flat table.
-pub struct TablePanel {
-    inner: Entity<ComponentTable>,
-    label: SharedString,
-}
-
-impl TablePanel {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| new_component_table(db, cx));
-        Self {
-            inner,
-            label: "Components".into(),
-        }
-    }
-
-    pub fn from_config(_cfg: TablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::new(db, cx)
-    }
-}
-
-impl Render for TablePanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for TablePanel {
-    type Config = TablePanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "component_table"
-    }
-
-    fn to_config(&self, _cx: &App) -> TablePanelConfig {
-        TablePanelConfig {}
-    }
-}
-
-/// Persisted shape of a [`DataTablePanel`]: the filter bar's query and
-/// whether the bar is showing.
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct DataTablePanelConfig {
-    pub filter: String,
-    pub filter_bar: bool,
-}
-
-/// Pane item rendering one row per component, grouped by namespace, with
-/// live values per element. Wraps the same [`DataTable`] view used outside
-/// the tile system.
-pub struct DataTablePanel {
-    inner: Entity<DataTable>,
-    label: SharedString,
-}
-
-impl DataTablePanel {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| new_data_table(db, cx));
-        Self {
-            inner,
-            label: "Data Table".into(),
-        }
-    }
-
-    pub fn from_config(cfg: DataTablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let panel = Self::new(db, cx);
-        panel.inner.update(cx, |table, cx| {
-            table.set_filter_visible(cfg.filter_bar, cx);
-            table.set_filter_text(&cfg.filter, cx);
-        });
-        panel
-    }
-}
-
-impl Render for DataTablePanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for DataTablePanel {
-    type Config = DataTablePanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "data_table"
-    }
-
-    fn to_config(&self, cx: &App) -> DataTablePanelConfig {
-        let inner = self.inner.read(cx);
-        DataTablePanelConfig {
-            filter: inner.filter_text(cx),
-            filter_bar: inner.filter_visible(),
-        }
     }
 }
 
@@ -1524,13 +1413,6 @@ pub(crate) fn new_panel_rows(
         },
     )));
 
-    rows.push(Box::new(CommandRow::new("Component Table", {
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            add_registered_panel(&pane, "component_table", &TablePanelConfig {}, cx);
-        })
-    })));
-
     rows.push(Box::new(CommandRow::new("Outline", {
         let db = db.clone();
         let pane = pane.clone();
@@ -1539,19 +1421,6 @@ pub(crate) fn new_panel_rows(
             pane.update(cx, |pane, cx| {
                 let item: Box<dyn PaneItemHandle> =
                     Box::new(cx.new(|cx| OutlinePanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Data Table", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| DataTablePanel::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })

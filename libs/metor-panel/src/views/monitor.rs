@@ -182,7 +182,7 @@ pub(crate) fn edit_click(
 
 /// Build a fresh [`StripBehavior`] each frame from the global pending-edit state.
 ///
-/// Centralises the snapshot so Monitor, ComponentText, and ComponentTable
+/// Centralises the snapshot so Monitor, ComponentText, and ComponentOutline
 /// share the same edit semantics (highlighted indices and lock state).
 pub(crate) fn behavior_snapshot(
     cx: &gpui::App,

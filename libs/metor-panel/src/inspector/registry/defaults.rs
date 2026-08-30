@@ -182,7 +182,6 @@ impl InspectorRegistry {
         self.register_dashboard_builder(db.clone());
         self.register_pane_builder();
         self.register_component_browser_builder();
-        self.register_data_table_builder();
         self.register_outline_builder();
         self.register_trace_builder(db.clone());
         self.register_xy_trace_builder();
@@ -799,14 +798,6 @@ impl InspectorRegistry {
                 }),
             );
             vec![Box::new(title_row), Box::new(filter_row)]
-        }));
-    }
-
-    fn register_data_table_builder(&mut self) {
-        use crate::views::DataTable;
-        self.register_type_builder::<DataTable>(Arc::new(|any_entity, _db, _cx| {
-            let table: Entity<DataTable> = any_entity.downcast().expect("DataTable type mismatch");
-            vec![Box::new(filter_bar_row(table))]
         }));
     }
 

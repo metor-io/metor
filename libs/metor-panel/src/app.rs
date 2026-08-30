@@ -15,8 +15,8 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, DataTablePanel, LogPanel,
-    OutlinePanel, PlotPanel, SequenceGridPanel, SequencePanel,
+    AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, LogPanel, OutlinePanel,
+    OutlinePanelConfig, PlotPanel, SequenceGridPanel, SequencePanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -1422,8 +1422,19 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     register_panel::<LogPanel>(&mut reg, db.clone(), LogPanel::from_config);
     register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
     register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
-    register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
     register_panel::<OutlinePanel>(&mut reg, db.clone(), OutlinePanel::from_config);
+    // The outline replaced both tables; layouts saved with either key open
+    // as an outline, keeping the data table's filter.
+    for legacy in ["component_table", "data_table"] {
+        let db = db.clone();
+        reg.register_erased(legacy, move |state, cx| {
+            let cfg: OutlinePanelConfig = serde_json::from_str(state).unwrap_or_default();
+            let db = db.clone();
+            Some(Box::new(
+                cx.new(|cx| OutlinePanel::from_config(cfg, db, cx)),
+            ))
+        });
+    }
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
     register_panel::<crate::canvas::GraphCanvas>(
         &mut reg,

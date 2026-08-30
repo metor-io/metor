@@ -275,7 +275,7 @@ mod tests {
                         locked_size: Some((300.0, 200.0)),
                         items: vec![
                             TileItem {
-                                kind: "component_table".into(),
+                                kind: "component_outline".into(),
                                 state: "{}".into(),
                             },
                             TileItem {

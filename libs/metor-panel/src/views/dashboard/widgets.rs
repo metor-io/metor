@@ -19,9 +19,9 @@ use crate::theme::theme;
 use crate::views::time_series::{PlotPanelConfig, TimeSeriesPlot};
 use crate::views::viewer_3d::{Viewer3d, Viewer3dPanelConfig};
 use crate::views::{
-    Annunciator, AttitudeConfig, AttitudeIndicator, ComponentText, Gauge, GaugeConfig, Meter,
-    MeterConfig, Monitor, SequenceControl, SequenceControlConfig, StateChip, StateChipConfig,
-    TrafficLight, new_component_table,
+    Annunciator, AttitudeConfig, AttitudeIndicator, ComponentOutline, ComponentText, Gauge,
+    GaugeConfig, Meter, MeterConfig, Monitor, SequenceControl, SequenceControlConfig, StateChip,
+    StateChipConfig, TrafficLight,
 };
 use crate::views::{ListPlot, ListPlotPanelConfig, XyPlot, XyPlotPanelConfig};
 
@@ -303,11 +303,10 @@ impl WidgetRegistry {
             WidgetKind::table(),
             WidgetSpec::new(
                 (400.0, 300.0),
-                |w| SharedString::from(format!("Table #{}", w.id.0)),
+                |w| SharedString::from(format!("Outline #{}", w.id.0)),
                 build_table,
                 no_snapshot,
-            )
-            .with_tile("component_table", |_| "Components".into()),
+            ),
         );
         self.register(
             WidgetKind::image(),
@@ -724,7 +723,7 @@ fn build_list_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
 }
 
 fn build_table(_config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    as_live(cx.new(|cx| new_component_table(db.clone(), cx)))
+    as_live(cx.new(|cx| ComponentOutline::new(db.clone(), cx)))
 }
 
 fn build_image(config: &str, _db: &Arc<DB>, cx: &mut App) -> WidgetLive {

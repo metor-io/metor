@@ -58,7 +58,7 @@ A unified row-list overlay that serves as both command palette (centered) and ri
 
 ### Views (`src/views/`)
 
-Concrete renderers — plots (`time_series`, `xy_plot`, `list_plot`), tables (`data_table`, `component_table`, `table`), 3D scene (`viewer_3d`, built on Bevy as a render pipeline embedded in gpui via wgpu), traffic lights, value strips, dashboards, etc. They consume `ComponentStream`s and emit `Inspectable` rows.
+Concrete renderers — plots (`time_series`, `xy_plot`, `list_plot`), the component outline (`outline`, a collapsible tree-table with pivots, on the generic `table`), 3D scene (`viewer_3d`, built on Bevy as a render pipeline embedded in gpui via wgpu), traffic lights, value strips, dashboards, etc. They consume `ComponentStream`s and emit `Inspectable` rows.
 
 Scalar instruments (`meter`, `gauge`, `state_chip`, `attitude`) share `views/binding.rs`, which owns stream seeding, late metadata binding, and reading warn/critical limits out of the alarm store. A new instrument binds through it rather than growing its own copy, and never takes limits as configuration.
 
