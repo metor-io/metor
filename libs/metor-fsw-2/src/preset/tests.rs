@@ -98,7 +98,10 @@ mod system {
 
         let hydrated: TileLayout =
             serde_json::from_str(&got[0].presets[0].layout).expect("layout json parses");
-        assert_eq!(hydrated.version, TILE_LAYOUT_VERSION, "publish stamps the version");
+        assert_eq!(
+            hydrated.version, TILE_LAYOUT_VERSION,
+            "publish stamps the version"
+        );
         let TileNode::Pane(pane) = hydrated.root else {
             panic!("expected pane root");
         };

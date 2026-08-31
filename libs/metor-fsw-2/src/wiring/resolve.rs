@@ -179,9 +179,14 @@ pub fn resolve_with(
                 .any(|a| a.id == id && a.kind == ArtifactKind::Wasm)
         });
         let (handle, desc) = match (&spec.artifact, spec.process) {
-            (Some(artifact_id), false) if wasm_backed => {
-                resolve_wasm(spec, artifact_id, wiring, &mut wasm, &mut pending, &mut graph)?
-            }
+            (Some(artifact_id), false) if wasm_backed => resolve_wasm(
+                spec,
+                artifact_id,
+                wiring,
+                &mut wasm,
+                &mut pending,
+                &mut graph,
+            )?,
             (Some(_), true) if wasm_backed => {
                 return Err(LoadErrorKind::WasmSystem(
                     format!(
@@ -237,8 +242,13 @@ pub fn resolve_with(
         .collect();
     for p in &pending {
         let module = &wasm.modules[&p.artifact];
-        let manifest = module.expr.as_ref().expect("pending implies a compiled module");
-        let system = manifest.system(&p.entry).expect("pending keys a manifest entry");
+        let manifest = module
+            .expr
+            .as_ref()
+            .expect("pending implies a compiled module");
+        let system = manifest
+            .system(&p.entry)
+            .expect("pending keys a manifest entry");
         synth_edges(system, manifest, &instances, &added, p, &mut graph)?;
     }
 

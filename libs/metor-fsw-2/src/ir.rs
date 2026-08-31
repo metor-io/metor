@@ -392,6 +392,27 @@ pub struct SystemSpec {
     /// placement to the canvas's auto-layout.
     #[serde(default)]
     pub layout: Option<(f32, f32)>,
+    /// Component-name prefix of this instance's run record — the frame whose
+    /// `last_execute_us` / `state` / `cycles` leaves carry execution telemetry.
+    /// `None`, what every fsw2 front end writes, means the framework
+    /// convention `<namespace.>?<name>.system_status`, which a consumer derives
+    /// itself; set it only to point a foreign or custom timing source at this
+    /// node. Taken literally when set — namespace included — because leaf ids
+    /// hash the full component name and cannot be derived from a frame id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// `true` marks this instance's run record as *encompassing* the others:
+    /// its step spans every sibling's rather than sitting beside them, the way
+    /// the framework's own coordinator record does. A consumer draws it as a
+    /// context band behind the per-system bars instead of as one more bar, and
+    /// takes its timestamps as the authoritative cycle set.
+    ///
+    /// One per target is expected; a consumer meeting several honors the first
+    /// and treats the rest as ordinary systems. Default `false`, and omitted on
+    /// the wire when false, so a document written before the field existed
+    /// round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub encompassing: bool,
 }
 
 impl StateSpec {
@@ -450,6 +471,8 @@ impl SystemSpec {
             scope: None,
             attach: Some("link".to_string()),
             layout: None,
+            status: None,
+            encompassing: false,
         }
     }
 }
@@ -519,6 +542,11 @@ pub struct SlotSpec {
     /// unscoped (always, for the Rust builder).
     #[serde(default)]
     pub scope: Option<usize>,
+    /// Component-name prefix of this slot's run record, with the same meaning
+    /// as [`SystemSpec::status`]: `None` selects the framework convention
+    /// `<namespace.>?<name>.system_status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// One allowed occupant of a [`SlotSpec`]: a pack entry named across the

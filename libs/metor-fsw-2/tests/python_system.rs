@@ -92,6 +92,8 @@ fn python_wiring(artifact_id: &str, source: &str, decls: &[&str], cycle_rate: f6
                 scope: None,
                 attach: None,
                 layout: None,
+                status: None,
+                encompassing: false,
             });
         }
     }
@@ -319,6 +321,7 @@ fn a_python_entry_mounts_as_a_slot_occupant() {
         process: false,
         src: None,
         scope: None,
+        status: None,
     });
     provision_artifacts(&mut wiring, &BuildOptions::default()).expect("compiles");
 

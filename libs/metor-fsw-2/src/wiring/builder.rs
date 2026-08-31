@@ -156,6 +156,8 @@ impl WiringBuilder {
                 scope: None,
                 attach: None,
                 layout: None,
+                status: None,
+                encompassing: false,
             },
         }
     }
@@ -308,6 +310,7 @@ impl WiringBuilder {
                 process: false,
                 src: None,
                 scope: None,
+                status: None,
             },
         }
     }

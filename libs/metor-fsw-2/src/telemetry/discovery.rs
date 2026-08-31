@@ -10,9 +10,7 @@
 use std::net::SocketAddr;
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use metor_proto_wkt::{
-    FSW_SERVICE_TYPE, LINK_PROTOCOL_VERSION, TXT_PROTOCOL_VERSION, TXT_ROLE,
-};
+use metor_proto_wkt::{FSW_SERVICE_TYPE, LINK_PROTOCOL_VERSION, TXT_PROTOCOL_VERSION, TXT_ROLE};
 
 /// Advertise this link over mDNS under `name`, returning the running daemon —
 /// drop it (or [`ServiceDaemon::shutdown`]) to unregister and send a goodbye.
@@ -31,7 +29,10 @@ pub(crate) fn advertise(name: &str, addr: SocketAddr) -> Option<ServiceDaemon> {
             return None;
         }
     };
-    let host = format!("{}.local.", gethostname::gethostname().to_string_lossy());
+    // The daemon is its own mDNS responder, so the host it claims must not be
+    // the OS hostname: the system responder (mDNSResponder, Avahi) treats a
+    // second answerer for its name as a conflict and renames the machine.
+    let host = format!("{name}.metor.local.");
     let protocol_version = LINK_PROTOCOL_VERSION.to_string();
     let props: [(&str, &str); 2] = [
         (TXT_PROTOCOL_VERSION, protocol_version.as_str()),

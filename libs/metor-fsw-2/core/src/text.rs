@@ -8,7 +8,7 @@
 //! through the `[T; N]` blanket [`AsVTable`].
 //!
 //! Truly unbounded text belongs in messages
-//! ([`LogEvent`](crate::health::LogEvent)-style), not in a cyclic frame.
+//! ([`LogEvent`](crate::log::LogEvent)-style), not in a cyclic frame.
 
 use core::mem::size_of;
 
@@ -106,7 +106,11 @@ impl<const CAP: usize> AsVTable for FrameStr<CAP> {
         core::iter::once(raw_field(
             0,
             CAP as u32,
-            schema(PrimType::U8, &[CAP as u64], builder::path_component(&prefix)),
+            schema(
+                PrimType::U8,
+                &[CAP as u64],
+                builder::path_component(&prefix),
+            ),
         ))
     }
 }

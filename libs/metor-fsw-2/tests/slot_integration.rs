@@ -1016,6 +1016,7 @@ fn initial_occupant_outside_allowed_set_is_rejected() {
             process: false,
             src: None,
             scope: None,
+            status: None,
         })
         .build();
     wiring.artifacts[0].path = Some(lib);
