@@ -601,6 +601,7 @@ impl State {
 pub struct ComponentSchema {
     pub prim_type: PrimType,
     pub dim: SmallVec<[usize; 4]>,
+    size: usize,
 }
 
 impl Serialize for ComponentSchema {
@@ -618,13 +619,18 @@ impl<'de> Deserialize<'de> for ComponentSchema {
 }
 
 impl ComponentSchema {
-    pub fn new(prim_type: PrimType, shape: &[usize]) -> Self {
+    pub fn new(prim_type: PrimType, shape: impl Into<SmallVec<[usize; 4]>>) -> Self {
         let dim = shape.into();
-        ComponentSchema { prim_type, dim }
+        let size = dim.iter().product::<usize>() * prim_type.size();
+        ComponentSchema {
+            prim_type,
+            dim,
+            size,
+        }
     }
 
     pub fn size(&self) -> usize {
-        self.dim.iter().product::<usize>() * self.prim_type.size()
+        self.size
     }
 
     pub fn read(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -704,11 +710,7 @@ impl ComponentSchema {
 
 impl From<Schema<Vec<u64>>> for ComponentSchema {
     fn from(value: Schema<Vec<u64>>) -> Self {
-        let prim_type = value.prim_type();
-        ComponentSchema {
-            prim_type,
-            dim: value.shape().into(),
-        }
+        ComponentSchema::new(value.prim_type(), value.shape())
     }
 }
 

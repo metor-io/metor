@@ -94,13 +94,10 @@ pub fn is_lod_name(name: &str) -> bool {
 /// The derived schema: `[2, ..source shape]` f32, one min and one max per
 /// source element, laid out `[min_e0..min_eN, max_e0..max_eN]` per sample.
 pub fn lod_schema(source: &ComponentSchema) -> ComponentSchema {
-    let mut dim = SmallVec::with_capacity(source.dim.len() + 1);
+    let mut dim: SmallVec<[usize; 4]> = SmallVec::with_capacity(source.dim.len() + 1);
     dim.push(2);
     dim.extend(source.dim.iter().copied());
-    ComponentSchema {
-        prim_type: PrimType::F32,
-        dim,
-    }
+    ComponentSchema::new(PrimType::F32, dim)
 }
 
 /// Spawn the engine: watches for new eligible components and runs one

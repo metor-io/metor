@@ -1158,7 +1158,7 @@ mod tests {
     use super::*;
 
     fn test_schema() -> ComponentSchema {
-        ComponentSchema::new(metor_proto::types::PrimType::I64, &[1])
+        ComponentSchema::new(metor_proto::types::PrimType::I64, &[1][..])
     }
 
     fn remote_seal(start: i64, end: i64) -> SealRecord {
