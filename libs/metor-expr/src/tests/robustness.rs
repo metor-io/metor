@@ -131,7 +131,9 @@ fn dented_sources_are_survivable() {
     for source in CORPUS {
         let chars: Vec<char> = source.chars().collect();
         for at in 0..chars.len() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let dent = DENTS[(state >> 33) as usize % DENTS.len()];
 
             let mut substituted = chars.clone();

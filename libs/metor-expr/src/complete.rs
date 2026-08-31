@@ -186,8 +186,7 @@ pub fn complete(
     // the fallback: a keystroke stale at worst, and only ever consulted for
     // *which names are in scope*, never for the replace range.
     let holds = |span: &Span| span.start <= cursor.to_u32() && cursor.to_u32() <= span.end;
-    let enclosing_system =
-        manifest.and_then(|m| m.systems.iter().find(|s| holds(&s.source)));
+    let enclosing_system = manifest.and_then(|m| m.systems.iter().find(|s| holds(&s.source)));
     let enclosing_fn = manifest.and_then(|m| m.functions.iter().find(|f| holds(&f.source)));
     let in_def = enclosing_def.is_some() || enclosing_system.is_some() || enclosing_fn.is_some();
     let in_system_body = match scope {
@@ -206,10 +205,10 @@ pub fn complete(
         let segments = &tokens[chain..before];
         if segments.len() >= 2
             && let Some(system) = enclosing_system
-            && let Some(port) = field_port(system, &source[TextRange::new(
-                segments[0].range().start(),
-                segments[0].range().end(),
-            )])
+            && let Some(port) = field_port(
+                system,
+                &source[TextRange::new(segments[0].range().start(), segments[0].range().end())],
+            )
         {
             let last_dot = segments.iter().rev().find(|t| t.kind() == TokenKind::Dot);
             let field_start = last_dot.map(|d| d.range().end()).unwrap_or(chain_start);
@@ -368,7 +367,9 @@ pub fn complete(
     }
     if scope == Scope::Module && statement_start(tokens, chain) {
         let words: &[&str] = if in_def {
-            &["if", "elif", "else", "for", "while", "return", "break", "continue", "pass"]
+            &[
+                "if", "elif", "else", "for", "while", "return", "break", "continue", "pass",
+            ]
         } else {
             &["def", "class"]
         };

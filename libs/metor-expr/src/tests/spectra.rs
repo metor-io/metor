@@ -21,9 +21,9 @@
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
 
+use super::reject;
 use super::systems::{Table, build as build_system, imu_table, refuse};
 use super::tensors::{bits, evaluate};
-use super::reject;
 
 /// What the panel's Fft node published: `|X[k]|` for `k` in `0..=n/2`.
 fn oracle(signal: &[f64]) -> Vec<f64> {
@@ -31,7 +31,10 @@ fn oracle(signal: &[f64]) -> Vec<f64> {
     FftPlanner::<f64>::new()
         .plan_fft_forward(signal.len())
         .process(&mut buf);
-    buf.iter().take(signal.len() / 2 + 1).map(|c| c.norm()).collect()
+    buf.iter()
+        .take(signal.len() / 2 + 1)
+        .map(|c| c.norm())
+        .collect()
 }
 
 /// The four signal shapes the plan asks for, at one length.
@@ -46,7 +49,9 @@ fn signals(n: usize) -> Vec<(&'static str, Vec<f64>)> {
     let mut state = 0x243F_6A88_85A3_08D3u64;
     let noise = (0..n)
         .map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
         })
         .collect();

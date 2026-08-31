@@ -133,9 +133,7 @@ impl<'a> Template<'a> {
                     for seg in r {
                         let seg = seg.map_err(bad)?;
                         let wasmparser::ElementKind::Active { offset_expr, .. } = seg.kind else {
-                            return Err(TemplateError::Malformed(
-                                "passive element segment".into(),
-                            ));
+                            return Err(TemplateError::Malformed("passive element segment".into()));
                         };
                         t.element_offsets.push(offset_expr);
                         t.elements.push(seg.items);
@@ -238,7 +236,12 @@ impl<'a> Template<'a> {
 
         let kernel_index = kernels
             .iter()
-            .map(|name| ((*name).to_string(), remap[self.export(name).unwrap() as usize]))
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    remap[self.export(name).unwrap() as usize],
+                )
+            })
             .collect();
 
         Ok(Plan {
@@ -476,10 +479,18 @@ impl Splice<'_> {
 
         let mut data_section = wasm_encoder::DataSection::new();
         for (offset, bytes) in &template.data {
-            data_section.active(0, &wasm_encoder::ConstExpr::i32_const(*offset as i32), bytes.iter().copied());
+            data_section.active(
+                0,
+                &wasm_encoder::ConstExpr::i32_const(*offset as i32),
+                bytes.iter().copied(),
+            );
         }
         for (offset, bytes) in &data {
-            data_section.active(0, &wasm_encoder::ConstExpr::i32_const(*offset as i32), bytes.iter().copied());
+            data_section.active(
+                0,
+                &wasm_encoder::ConstExpr::i32_const(*offset as i32),
+                bytes.iter().copied(),
+            );
         }
         module.section(&data_section);
 

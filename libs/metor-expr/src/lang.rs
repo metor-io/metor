@@ -313,7 +313,10 @@ fn resolve_path(
     match resolver.suffix(key).as_slice() {
         [only] => Some(only.clone()),
         [] => {
-            diags.push(span, format!("`{key}` is not defined and names no component"));
+            diags.push(
+                span,
+                format!("`{key}` is not defined and names no component"),
+            );
             None
         }
         many => {

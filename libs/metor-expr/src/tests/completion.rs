@@ -75,7 +75,13 @@ fn at_with_manifest(source: &str, module: &str) -> Completions {
         .manifest;
     let cursor = source.find("$0").expect("fixture needs a $0 cursor");
     let source = source.replace("$0", "");
-    complete(&source, cursor as u32, Scope::Module, &Table, Some(&manifest))
+    complete(
+        &source,
+        cursor as u32,
+        Scope::Module,
+        &Table,
+        Some(&manifest),
+    )
 }
 
 fn labels(c: &Completions) -> Vec<&str> {
@@ -162,10 +168,12 @@ fn definition_positions_offer_nothing() {
             .is_empty()
     );
     assert!(
-        at("def foo() -> f64:\n    for i$0 in range(3):\n        pass\n    return 1.0\n",
-            Scope::Module)
-            .items
-            .is_empty()
+        at(
+            "def foo() -> f64:\n    for i$0 in range(3):\n        pass\n    return 1.0\n",
+            Scope::Module
+        )
+        .items
+        .is_empty()
     );
 }
 
@@ -193,7 +201,10 @@ fn helper_body_offers_params_and_keywords_not_components() {
     let source = "def scaled(x: f64) -> f64:\n    return $0\n";
     let c = at_with_manifest(source, module);
     assert!(has(&c, "x"), "{:?}", labels(&c));
-    assert!(!has(&c, "adcs.omega_b"), "a body sees parameters, not components");
+    assert!(
+        !has(&c, "adcs.omega_b"),
+        "a body sees parameters, not components"
+    );
     assert!(!has(&c, "sine"), "a plain def has no clock");
 
     let source = "def scaled(x: f64) -> f64:\n    r$0\n";
@@ -238,11 +249,7 @@ def filt(imu: Imu) -> f64:
     let c = at_with_manifest(source, SYSTEM_MODULE);
     assert_eq!(c.prefix, "om");
     assert_eq!(labels(&c), vec!["omega", "accel"]);
-    assert!(
-        c.items
-            .iter()
-            .all(|i| i.kind == CompletionKind::Field)
-    );
+    assert!(c.items.iter().all(|i| i.kind == CompletionKind::Field));
 }
 
 #[test]
