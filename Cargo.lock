@@ -9626,10 +9626,12 @@ dependencies = [
  "tempfile",
  "thingbuf",
  "thiserror 2.0.19",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "wasmi",
  "wgpu 29.0.4",
+ "zed-reqwest",
  "zerocopy",
 ]
 

@@ -864,6 +864,36 @@ class Attitude:
 
 
 @dataclass(frozen=True)
+class Map:
+    """A slippy map (OpenStreetMap tiles) plotting a lat/lon component --
+    ``component`` holds latitude and longitude in degrees at ``lat_element``
+    / ``lon_element`` (a ``[lat, lon, alt]`` triple by default)."""
+
+    component: str
+    lat_element: int = 0
+    lon_element: int = 1
+    zoom: float | None = None
+    time_range: str | None = None
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        return PaneState("map", self._state(namespace))._item(namespace)
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "component": _qualify(self.component, namespace),
+                "lat_element": self.lat_element,
+                "lon_element": self.lon_element,
+                "zoom": self.zoom,
+                "time_range": self.time_range,
+            }
+        )
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        return "map", self._state(namespace), (400.0, 300.0)
+
+
+@dataclass(frozen=True)
 class SequenceControl:
     """Start/stop controls for one sequence channel. ``channel`` is the slot
     instance name, which is the address a command carries -- it is not
