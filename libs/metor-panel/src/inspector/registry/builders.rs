@@ -332,6 +332,31 @@ pub(super) fn build_list_trace_add_wizard(
     )
 }
 
+/// Spectrogram counterpart to [`build_list_trace_add_wizard`]. There is no
+/// colour basis to carry: a spectrogram source is coloured by its colormap.
+pub(super) fn build_spectrogram_trace_add_wizard(
+    parent: gpui::AnyEntity,
+    db: &Arc<DB>,
+    _cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    use crate::views::spectrogram::SpectrogramPlot;
+    let on_select: crate::views::spectrogram::trace_picker::OnSpectrogramTraceSelected =
+        Arc::new(move |trace, _w, cx| {
+            let parent: Entity<SpectrogramPlot> =
+                parent.clone().downcast().expect("parent type mismatch");
+            let new_entity = cx.new(|_| trace);
+            parent.update(cx, |plot, cx| {
+                plot.traces.push(new_entity);
+                cx.notify();
+            });
+        });
+
+    crate::views::spectrogram::trace_picker::select_spectrogram_trace_wizard_rows(
+        db.clone(),
+        on_select,
+    )
+}
+
 /// Event-overlay wizard for the "Add" button on a `LinePlot`'s event-overlay
 /// list. Lists the built-in kinds not yet on the plot, then the recorded
 /// message channels the built-ins don't claim (and that aren't already added).

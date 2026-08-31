@@ -40,7 +40,7 @@ impl Bench {
         let db = DB::create(temp.path().join("db")).unwrap();
         let id = ComponentId::new(SOURCE);
         db.with_state_mut(|s| {
-            s.insert_component(id, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+            s.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
         })
         .unwrap();
         db.with_state_mut(|s| {

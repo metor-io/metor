@@ -25,7 +25,7 @@ impl Bench {
         for (name, prim, dim) in components {
             let id = ComponentId::new(name);
             db.with_state_mut(|state| {
-                state.insert_component(id, ComponentSchema::new(*prim, dim), &db.path)
+                state.insert_component(id, ComponentSchema::new(*prim, *dim), &db.path)
             })
             .unwrap();
             let mut metadata = metor_proto_wkt::ComponentMetadata {
@@ -212,7 +212,7 @@ async fn every_output_field_becomes_its_own_node() {
     let spinning = program::field(&compiled, 0, 1, running.node.clone()).unwrap();
     assert_eq!(
         spinning.value_type().schema().unwrap(),
-        &ComponentSchema::new(PrimType::Bool, &[])
+        &ComponentSchema::new(PrimType::Bool, &[][..])
     );
 
     let mut flags = watch(&spinning);
@@ -615,7 +615,7 @@ async fn a_scalar_broadcasts_over_a_vector_component() {
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
     assert_eq!(
         field.value_type().schema().unwrap(),
-        &ComponentSchema::new(PrimType::F64, &[3]),
+        &ComponentSchema::new(PrimType::F64, &[3][..]),
         "and so must the component it publishes as"
     );
 
@@ -697,48 +697,6 @@ async fn an_unclocked_system_with_no_inputs_is_refused() {
         panic!("nothing fires it, so it must not build");
     };
     assert!(format!("{err}").contains("rate="), "{err}");
-}
-
-/// The host wires a resample stage as an ordinary input ring.
-#[stellarator::test]
-async fn a_resample_stage_is_wired_from_the_manifest() {
-    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
-    let compiled = bench.compile("slow = resample_zoh(wheels.rpm, 500.0)\nscaled = slow * 2.0\n");
-
-    let stage = &compiled.manifest.stages[0];
-    assert_eq!(stage.name, "slow");
-    assert_eq!(stage.rate, 500.0);
-    assert_eq!(
-        compiled.manifest.declarations(),
-        vec![metor_expr::Decl::Stage(0), metor_expr::Decl::System(0)],
-        "the host builds in declaration order"
-    );
-
-    // What the pane builds for a stage: the source, a clock at the declared
-    // rate, the resampler, and a component under the binding's name.
-    let input = bench.source("wheels.rpm");
-    let clock = ops::clock::fixed_rate(stage.rate).unwrap();
-    let mode = match stage.kind {
-        metor_expr::Resample::Zoh => ops::resample::ResampleMode::Zoh,
-        metor_expr::Resample::Linear => ops::resample::ResampleMode::Linear,
-    };
-    let resampled = ops::resample::resample(input, clock.clone(), mode).unwrap();
-    let published = ops::persist::persist(&bench.db, stage.name.clone(), resampled).unwrap();
-    let mut reader = watch(&published);
-
-    bench.push("wheels.rpm", 1, &[7.0]);
-    let seen = take(&mut reader, 3).await;
-    assert!(
-        seen.iter().all(|v| *v == 7.0),
-        "a zero-order hold repeats what it last saw: {seen:?}"
-    );
-
-    // And the system downstream reads it by the name the stage published.
-    let downstream = &compiled.manifest.systems[0];
-    assert_eq!(
-        downstream.inputs[0].bindings[0],
-        metor_expr::Binding::Resampled { stage: 0 }
-    );
 }
 
 /// Two seeded vector inputs contracted with `@`: the product must follow

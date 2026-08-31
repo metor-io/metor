@@ -229,7 +229,6 @@ impl Render for Monitor {
             .flex()
             .flex_col()
             .justify_end()
-            .bg(theme.bg_primary)
             .overflow_hidden();
 
         if self.show_sparkline && !self.sparkline.read(cx).is_empty() {

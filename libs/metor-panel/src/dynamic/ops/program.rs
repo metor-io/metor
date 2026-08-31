@@ -253,7 +253,7 @@ pub fn system(
     let health = Health::default();
     let node = NodeImpl::spawn(
         id,
-        ValueType::Value(ComponentSchema::new(PrimType::U8, &[frame_bytes])),
+        ValueType::Value(ComponentSchema::new(PrimType::U8, &[frame_bytes][..])),
         match &clock {
             Some(clock) => clock.parent_clock_id(),
             None => ports[driving].node.parent_clock_id(),
@@ -342,10 +342,10 @@ pub fn latest_sample(
 /// The component a field of the language publishes as.
 pub fn schema_of(ty: &Ty) -> ComponentSchema {
     match ty {
-        Ty::F64 => ComponentSchema::new(PrimType::F64, &[]),
-        Ty::I64 => ComponentSchema::new(PrimType::I64, &[]),
-        Ty::Bool => ComponentSchema::new(PrimType::Bool, &[]),
-        Ty::Tensor { shape, .. } => ComponentSchema::new(PrimType::F64, shape),
+        Ty::F64 => ComponentSchema::new(PrimType::F64, &[][..]),
+        Ty::I64 => ComponentSchema::new(PrimType::I64, &[][..]),
+        Ty::Bool => ComponentSchema::new(PrimType::Bool, &[][..]),
+        Ty::Tensor { shape, .. } => ComponentSchema::new(PrimType::F64, shape.as_slice()),
     }
 }
 

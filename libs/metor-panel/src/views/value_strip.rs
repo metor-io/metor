@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    App, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, Pixels, Point, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use metor_db::DB;
@@ -65,6 +65,35 @@ impl CellKind {
     }
 }
 
+/// The operator's translation of a code space: value → state name, and
+/// optionally the colour the state shows in.
+///
+/// Flight software encodes modes, laws, and health as small integers, and a
+/// strip that shows `2` where the operator thinks in `POINTING` is making
+/// them do the lookup. The table lives with the display instead of in the
+/// reader's head; a cell whose value matches an entry renders as that state.
+#[derive(Clone, PartialEq)]
+pub struct StateTable {
+    pub entries: Vec<(f64, SharedString, Option<Hsla>)>,
+    /// Shown when the live value matches no entry. Empty falls back to
+    /// rendering the raw number, which is more useful than a blank cell when
+    /// the table is out of date with the flight software.
+    pub unknown_label: SharedString,
+}
+
+/// Values are integer codes on the wire but arrive as `f64`, so matching
+/// tolerates the conversion rather than comparing exactly.
+const STATE_MATCH_TOLERANCE: f64 = 0.5;
+
+impl StateTable {
+    /// The entry whose code matches `value`, if the table lists one.
+    fn matched(&self, value: f64) -> Option<&(f64, SharedString, Option<Hsla>)> {
+        self.entries
+            .iter()
+            .find(|(code, _, _)| (code - value).abs() < STATE_MATCH_TOLERANCE)
+    }
+}
+
 /// Visual mode for the strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripPreset {
@@ -90,6 +119,8 @@ pub struct StripStyle {
     pub unit: SharedString,
     /// Displayed before the first sample arrives.
     pub placeholder: SharedString,
+    /// Render numeric cells as the state their value means.
+    pub states: Option<StateTable>,
 }
 
 impl StripStyle {
@@ -101,6 +132,7 @@ impl StripStyle {
             solo_emphasize: true,
             unit: SharedString::default(),
             placeholder: SharedString::new_static("—"),
+            states: None,
         }
     }
 
@@ -112,6 +144,7 @@ impl StripStyle {
             solo_emphasize: false,
             unit: SharedString::default(),
             placeholder: SharedString::new_static("…"),
+            states: None,
         }
     }
 
@@ -122,6 +155,11 @@ impl StripStyle {
 
     pub fn with_intrinsic_width(mut self) -> Self {
         self.intrinsic_width = true;
+        self
+    }
+
+    pub fn with_states(mut self, states: Option<StateTable>) -> Self {
+        self.states = states;
         self
     }
 }
@@ -171,6 +209,7 @@ fn style_equivalent(a: &StripStyle, b: &StripStyle) -> bool {
         && a.solo_emphasize == b.solo_emphasize
         && a.unit == b.unit
         && a.placeholder == b.placeholder
+        && a.states == b.states
 }
 
 fn click_ptr(click: &Option<StripClick>) -> usize {
@@ -562,6 +601,34 @@ impl Render for ComponentValueStrip {
             let has_apply_group =
                 is_pending && !behavior.locked && behavior.on_apply_element.is_some();
 
+            // A state table reinterprets the numeric cell as the state it
+            // means; bool cells keep their toggle rendering, and editing
+            // shows the raw number the operator is typing over.
+            let state = if is_bool {
+                None
+            } else {
+                style.states.as_ref().and_then(|table| {
+                    let value = raw_values.get(idx)?.as_f64();
+                    match table.matched(value) {
+                        Some((_, label, color)) => {
+                            Some((label.clone(), Some(color.unwrap_or(theme.control_active))))
+                        }
+                        None if table.unknown_label.is_empty() => None,
+                        None => Some((table.unknown_label.clone(), None)),
+                    }
+                })
+            };
+            let (display_cell, accent) = match state {
+                Some((text, accent)) => (
+                    StripCell {
+                        label: cell.label.clone(),
+                        value: text,
+                    },
+                    accent,
+                ),
+                None => (cell.clone(), None),
+            };
+
             let atom = if is_editing {
                 build_editing_chrome(
                     component_id,
@@ -577,7 +644,7 @@ impl Render for ComponentValueStrip {
                 build_cell_chrome(
                     component_id,
                     idx,
-                    cell,
+                    &display_cell,
                     &style,
                     &theme,
                     is_solo,
@@ -585,6 +652,7 @@ impl Render for ComponentValueStrip {
                     stale,
                     is_bool,
                     bool_value,
+                    accent,
                     has_apply_group,
                 )
             };
@@ -789,6 +857,7 @@ fn build_cell_chrome(
     stale: bool,
     is_bool: bool,
     bool_value: bool,
+    accent: Option<gpui::Hsla>,
     inside_apply_group: bool,
 ) -> Stateful<gpui::Div> {
     let id_hash = component_id.0.wrapping_mul(31) ^ idx as u64;
@@ -855,12 +924,17 @@ fn build_cell_chrome(
         atom = atom.flex_none();
     }
 
+    // Pending and stale tints outrank the state accent: a chip must not
+    // look healthy while its edit is unsent or its producer is dead.
+    let chip_accent = (!is_pending && !stale).then_some(accent).flatten();
     match style.preset {
         StripPreset::Boxes => {
             let bg = if is_pending {
                 theme.drop_target
             } else if stale {
                 theme.stale_bg()
+            } else if let Some(accent) = chip_accent {
+                Theme::dim(accent, 0.18)
             } else {
                 theme.bg_secondary
             };
@@ -871,8 +945,13 @@ fn build_cell_chrome(
                 atom = atom.bg(theme.drop_target);
             } else if stale {
                 atom = atom.bg(theme.stale_bg());
+            } else if let Some(accent) = chip_accent {
+                atom = atom.bg(Theme::dim(accent, 0.18));
             }
         }
+    }
+    if let Some(accent) = chip_accent {
+        atom = atom.border_1().border_color(accent);
     }
 
     if let Some(label) = cell.label.as_ref() {
@@ -913,7 +992,11 @@ fn build_cell_chrome(
         div()
             .flex_1()
             .text_size(value_size)
-            .text_color(theme.text_primary)
+            .text_color(if stale {
+                theme.stale_text()
+            } else {
+                theme.text_primary
+            })
             .text_right()
             .whitespace_nowrap()
             .overflow_hidden()
@@ -1087,6 +1170,51 @@ mod tests {
             CellKind::from_schema(PrimType::U64, false, None),
             CellKind::Numeric
         );
+    }
+
+    fn table() -> StateTable {
+        StateTable {
+            entries: vec![
+                (0.0, "IDLE".into(), None),
+                (1.0, "SETTLING".into(), None),
+                (2.0, "POINTING".into(), None),
+                (3.0, "SAFE".into(), None),
+            ],
+            unknown_label: SharedString::default(),
+        }
+    }
+
+    #[test]
+    fn integer_codes_match_their_state() {
+        let t = table();
+        assert_eq!(t.matched(0.0).unwrap().1, "IDLE");
+        assert_eq!(t.matched(2.0).unwrap().1, "POINTING");
+        assert_eq!(t.matched(3.0).unwrap().1, "SAFE");
+    }
+
+    #[test]
+    fn float_representation_error_still_matches() {
+        let t = table();
+        assert_eq!(t.matched(2.0000001).unwrap().1, "POINTING");
+        assert_eq!(t.matched(1.9999999).unwrap().1, "POINTING");
+    }
+
+    #[test]
+    fn codes_outside_the_table_do_not_match() {
+        let t = table();
+        assert!(t.matched(7.0).is_none());
+        assert!(t.matched(-1.0).is_none());
+        // Exactly between two codes is not either of them.
+        assert!(t.matched(2.5).is_none());
+    }
+
+    #[test]
+    fn an_empty_table_matches_nothing() {
+        let t = StateTable {
+            entries: Vec::new(),
+            unknown_label: SharedString::default(),
+        };
+        assert!(t.matched(0.0).is_none());
     }
 
     #[test]

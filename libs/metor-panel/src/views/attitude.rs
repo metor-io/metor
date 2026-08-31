@@ -637,7 +637,6 @@ impl Render for AttitudeIndicator {
             .flex_col()
             .items_center()
             .gap(px(3.0))
-            .bg(theme.bg_primary)
             .p(px(6.0));
 
         if !self.label.is_empty() {

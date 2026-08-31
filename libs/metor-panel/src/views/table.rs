@@ -11,7 +11,18 @@ use super::Scrollbar;
 use crate::icons::Icon;
 use crate::theme::theme;
 
-const HEADER_HEIGHT: f32 = 32.0;
+/// Height of the column header, shared with the chip headers of the log,
+/// sequence and alarm panels so a row of tabs lines up across panes.
+pub(crate) const HEADER_HEIGHT: f32 = 32.0;
+/// Height of one body row in the panel's dense tables. The component outline
+/// sets the house style here; panes that only *look* like a table (the
+/// execution timeline's lanes) take the same number so rows line up when two
+/// of them sit side by side.
+pub(crate) const ROW_HEIGHT: f32 = 30.0;
+/// Horizontal padding inside a table cell.
+pub(crate) const CELL_PAD_X: f32 = 12.0;
+/// Font size of table cell text.
+pub(crate) const CELL_FONT_SIZE: f32 = 12.0;
 const RESIZE_HANDLE_WIDTH: f32 = 6.0;
 
 /// Sort state of a column in a [`Table`].

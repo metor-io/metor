@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::theme::theme;
+use crate::views::Map;
 use crate::views::time_series::{PlotPanelConfig, TimeSeriesPlot};
 use crate::views::viewer_3d::{Viewer3d, Viewer3dPanelConfig};
 use crate::views::{
@@ -23,6 +24,7 @@ use crate::views::{
     GaugeConfig, Meter, MeterConfig, Monitor, SequenceControl, SequenceControlConfig, StateChip,
     StateChipConfig, TrafficLight,
 };
+use crate::views::{ExecTimeline, ExecTimelineConfig, Spectrogram, SpectrogramPanelConfig};
 use crate::views::{ListPlot, ListPlotPanelConfig, XyPlot, XyPlotPanelConfig};
 
 use super::{DashboardPanel, DashboardWidget, WidgetKind};
@@ -300,6 +302,40 @@ impl WidgetRegistry {
             }),
         );
         self.register(
+            WidgetKind::new("spectrogram"),
+            WidgetSpec::new(
+                (480.0, 300.0),
+                |w| SharedString::from(format!("Spectrogram #{}", w.id.0)),
+                build_spectrogram,
+                snapshot_spectrogram,
+            )
+            .with_tile("spectrogram", |_| "Spectrogram".into())
+            .with_live_tile_title(|state, _, cx| {
+                state
+                    .clone()
+                    .downcast::<Spectrogram>()
+                    .map(|plot| plot.read(cx).title(cx))
+                    .unwrap_or_else(|_| "Spectrogram".into())
+            }),
+        );
+        self.register(
+            WidgetKind::new("exec_timeline"),
+            WidgetSpec::new(
+                (520.0, 260.0),
+                |w| SharedString::from(format!("Execution Timeline #{}", w.id.0)),
+                build_exec_timeline,
+                snapshot_exec_timeline,
+            )
+            .with_tile("exec_timeline", |_| "Execution".into())
+            .with_live_tile_title(|state, _, cx| {
+                state
+                    .clone()
+                    .downcast::<ExecTimeline>()
+                    .map(|timeline| timeline.read(cx).title(cx))
+                    .unwrap_or_else(|_| "Execution".into())
+            }),
+        );
+        self.register(
             WidgetKind::table(),
             WidgetSpec::new(
                 (400.0, 300.0),
@@ -452,6 +488,26 @@ impl WidgetRegistry {
             }),
         );
         self.register(
+            WidgetKind::map(),
+            WidgetSpec::new(
+                (400.0, 300.0),
+                |w| {
+                    let cfg = parse_or_default::<MapWidgetConfig>(&w.config);
+                    SharedString::from(format!("Map: {}", display_or_unknown(&cfg.component)))
+                },
+                build_map,
+                snapshot_map,
+            )
+            .with_tile("map", |blob| {
+                let cfg = parse_or_default::<MapWidgetConfig>(blob);
+                if cfg.component.is_empty() {
+                    "Map".into()
+                } else {
+                    cfg.component.into()
+                }
+            }),
+        );
+        self.register(
             WidgetKind::attitude(),
             WidgetSpec::new(
                 (220.0, 260.0),
@@ -499,6 +555,7 @@ pub struct MonitorWidgetConfig {
 }
 
 pub use crate::views::AnnunciatorConfig as AnnunciatorWidgetConfig;
+pub use crate::views::MapConfig as MapWidgetConfig;
 pub use crate::views::TrafficLightConfig as TrafficLightWidgetConfig;
 
 /// Parse a widget's JSON blob into its expected config type, falling
@@ -604,6 +661,11 @@ fn snapshot_state_chip(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Opt
     serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
 }
 
+fn snapshot_map(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
+    let entity = entity.clone().downcast::<Map>().ok()?;
+    serde_json::to_string(&entity.read(cx).to_config()).ok()
+}
+
 fn snapshot_attitude(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
     let entity = entity.clone().downcast::<AttitudeIndicator>().ok()?;
     serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
@@ -630,6 +692,16 @@ fn snapshot_xy_plot(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option
 
 fn snapshot_list_plot(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
     let entity = entity.clone().downcast::<ListPlot>().ok()?;
+    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
+}
+
+fn snapshot_spectrogram(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
+    let entity = entity.clone().downcast::<Spectrogram>().ok()?;
+    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
+}
+
+fn snapshot_exec_timeline(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
+    let entity = entity.clone().downcast::<ExecTimeline>().ok()?;
     serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
 }
 
@@ -720,6 +792,21 @@ fn build_list_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
         inspect: plot.read(cx).line_plot().clone().into_any(),
         state: plot.into_any(),
     }
+}
+
+fn build_spectrogram(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
+    let cfg = parse_or_default::<SpectrogramPanelConfig>(config);
+    let plot = cx.new(|cx| Spectrogram::from_config(cfg, db.clone(), cx));
+    WidgetLive {
+        view: AnyView::from(plot.clone()),
+        inspect: plot.read(cx).plot().clone().into_any(),
+        state: plot.into_any(),
+    }
+}
+
+fn build_exec_timeline(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
+    let cfg = parse_or_default::<ExecTimelineConfig>(config);
+    as_live(cx.new(|cx| ExecTimeline::from_config(cfg, db.clone(), cx)))
 }
 
 fn build_table(_config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
@@ -824,6 +911,13 @@ fn build_state_chip(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
         }));
     }
     as_live(cx.new(|cx| StateChip::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_map(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
+    // No placeholder for an empty component: an unbound map is a usable
+    // map, and the one the palette's zero-config row creates.
+    let cfg = parse_or_default::<MapWidgetConfig>(config);
+    as_live(cx.new(|cx| Map::from_config(&cfg, db.clone(), cx)))
 }
 
 fn build_attitude(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {

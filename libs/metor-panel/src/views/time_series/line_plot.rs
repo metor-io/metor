@@ -930,7 +930,7 @@ fn line_plot_gpu_state(lp: &mut LinePlot) -> &mut PlotRenderState {
 /// The LoD companions published for `source`, finest first. Resolved by
 /// the `lod_source_id` metadata key rather than name construction so a
 /// renamed source keeps its levels.
-fn resolve_lod_levels(db: &DB, source: ComponentId) -> Vec<Component> {
+pub(crate) fn resolve_lod_levels(db: &DB, source: ComponentId) -> Vec<Component> {
     let source_key = source.0.to_string();
     db.with_state(|state| {
         let mut levels: Vec<(u64, Component)> = state
@@ -1018,7 +1018,7 @@ mod rebind_tests {
             db.with_state_mut(|s| {
                 s.insert_component(
                     ComponentId::new(name),
-                    ComponentSchema::new(PrimType::F64, &[]),
+                    ComponentSchema::new(PrimType::F64, &[][..]),
                     &db.path,
                 )
             })

@@ -1195,8 +1195,9 @@ impl PanelApp {
             crate::views::dashboard::WidgetRegistry::init(cx);
             crate::dynamic::expressions::Expressions::init(cx);
             crate::dynamic::worker::DynamicWorker::init(cx);
+            crate::views::map::tiles::TileStore::init(cx);
             crate::backfill::Backfiller::init(db.clone(), cx);
-            crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
+            crate::views::exec_timeline::inspector_rows::register_inspector_rows(cx);
             crate::alarms::AlarmStore::init(db.clone(), cx);
             crate::logs::LogStore::init(db.clone(), cx);
             crate::presets::TargetPresetStore::init(db.clone(), cx);
@@ -1436,59 +1437,6 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         });
     }
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
-    register_panel::<crate::canvas::GraphCanvas>(
-        &mut reg,
-        db.clone(),
-        crate::canvas::GraphCanvas::from_config,
-    );
-
-    // The graph tile is the system graph with a second source added, so it
-    // keeps that key and every layout naming it opens unchanged. A layout that
-    // names the program pane opens on the same tile, showing the text it was
-    // saved on — the two were views of one artifact even before they were one
-    // tile.
-    let db_program = db.clone();
-    reg.register_erased("program", move |state, cx| {
-        #[derive(Default, serde::Deserialize)]
-        #[serde(default)]
-        struct Saved {
-            source: String,
-            graph: bool,
-        }
-        let saved: Saved = serde_json::from_str(state).unwrap_or_default();
-        let cfg = crate::canvas::GraphCanvasConfig {
-            program: crate::canvas::ProgramState {
-                source: saved.source,
-                text: !saved.graph,
-            },
-            ..Default::default()
-        };
-        let db = db_program.clone();
-        let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
-        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
-    });
-
-    // A layout that still names the node editor opens on the graph tile with
-    // its graph converted to a program — one declaration per node, positions
-    // carried across. It opens on the *text*, because a conversion is
-    // something to read before it is something to keep, and anything the
-    // converter could not express rides at the top as a comment.
-    let db_nodes = db.clone();
-    reg.register_erased("node_editor", move |state, cx| {
-        let saved: crate::canvas::legacy::NodeEditorConfig =
-            serde_json::from_str(state).unwrap_or_default();
-        let db = db_nodes.clone();
-        let converted = crate::canvas::migrate::convert(&saved, &db);
-        let cfg = crate::canvas::GraphCanvasConfig {
-            program: crate::canvas::ProgramState {
-                source: converted.annotated(),
-                text: true,
-            },
-            ..Default::default()
-        };
-        let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
-        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
-    });
 
     // Layouts written before the annunciator rename still name it
     // `traffic_light_grid`; the alias rehydrates them and they re-save under
@@ -1579,8 +1527,8 @@ mod keybinding_tests {
     /// is what lets one negation cover every editable field.
     #[test]
     fn a_host_can_declare_its_name_and_text_input_together() {
-        let context = KeyContext::try_from("GraphCanvas TextInput").unwrap();
-        assert!(context.contains("GraphCanvas"));
+        let context = KeyContext::try_from("Inspector TextInput").unwrap();
+        assert!(context.contains("Inspector"));
         assert!(context.contains(TEXT_INPUT));
     }
 
@@ -1590,17 +1538,17 @@ mod keybinding_tests {
     #[test]
     fn the_leader_never_fires_while_something_is_being_typed_into() {
         assert!(fires(NOT_TYPING, &["AppRoot"]));
-        assert!(fires(NOT_TYPING, &["AppRoot", "NodeEditor"]));
-        assert!(fires(NOT_TYPING, &["AppRoot", "GraphCanvas"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "ExecTimeline"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "Dashboard"]));
 
         for typing in [
-            &["AppRoot", "GraphCanvas TextInput"][..],
+            &["AppRoot", "Dashboard TextInput"][..],
             &["AppRoot", "Inspector TextInput"][..],
             &["AppRoot", "Inspector TextInput", "RowList TextInput"][..],
             &["AppRoot", "ConnectionPicker TextInput"][..],
             // A field nested under a pane that is not itself a text host: the
             // negation looks at the whole path, not just the leaf.
-            &["AppRoot", "NodeEditor", "RowList TextInput"][..],
+            &["AppRoot", "ExecTimeline", "RowList TextInput"][..],
         ] {
             assert!(
                 !fires(NOT_TYPING, typing),
@@ -1610,15 +1558,5 @@ mod keybinding_tests {
 
         // The chord menu must not re-trigger its own leader.
         assert!(!fires(NOT_TYPING, &["AppRoot", "Transient"]));
-    }
-
-    /// Deleting a card is the graph tile's own key rather than an action, and
-    /// it answers to the same rule: the canvas declares `TextInput` only while
-    /// its editor is showing, so a keystroke meant for the text never reaches
-    /// the graph.
-    #[test]
-    fn deleting_a_card_never_fires_from_inside_a_field() {
-        assert!(fires(NOT_TYPING, &["AppRoot", "GraphCanvas"]));
-        assert!(!fires(NOT_TYPING, &["AppRoot", "GraphCanvas TextInput"]));
     }
 }

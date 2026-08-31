@@ -13,7 +13,7 @@ fn db_with(components: &[(&str, PrimType, &[usize])]) -> (DB, tempfile::TempDir)
     for (name, prim, dim) in components {
         let id = ComponentId::new(name);
         db.with_state_mut(|state| {
-            state.insert_component(id, ComponentSchema::new(*prim, dim), &db.path)
+            state.insert_component(id, ComponentSchema::new(*prim, *dim), &db.path)
         })
         .unwrap();
         let metadata = metor_proto_wkt::ComponentMetadata {
@@ -82,7 +82,7 @@ fn a_later_ambiguity_does_not_disturb_what_was_already_resolved() {
     // A second component ending in `.rpm` arrives.
     let id = ComponentId::new("motor.rpm");
     db.with_state_mut(|state| {
-        state.insert_component(id, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+        state.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
     })
     .unwrap();
     db.with_state_mut(|state| {
@@ -201,7 +201,7 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
     let live = db
         .with_state(|s| s.get_component(component).cloned())
         .expect("an expression registers a component");
-    assert_eq!(live.schema, ComponentSchema::new(PrimType::F64, &[]));
+    assert_eq!(live.schema, ComponentSchema::new(PrimType::F64, &[][..]));
 
     // ...it is labelled by the text, marked hidden, and attributed like any
     // other dynamic output...
@@ -280,7 +280,7 @@ fn db_with_ids(components: &[(&str, ComponentId, PrimType, &[usize])]) -> (DB, t
     let db = DB::create(temp.path().join("db")).unwrap();
     for (name, id, prim, dim) in components {
         db.with_state_mut(|state| {
-            state.insert_component(*id, ComponentSchema::new(*prim, dim), &db.path)
+            state.insert_component(*id, ComponentSchema::new(*prim, *dim), &db.path)
         })
         .unwrap();
         db.with_state_mut(|state| {
@@ -476,7 +476,7 @@ fn an_expression_over_a_vector_plots_every_element() {
     // `xyz + 1.0` would publish.
     let out = ComponentId::new("expr.out");
     db.with_state_mut(|s| {
-        s.insert_component(out, ComponentSchema::new(PrimType::F64, &[3]), &db.path)
+        s.insert_component(out, ComponentSchema::new(PrimType::F64, &[3][..]), &db.path)
     })
     .unwrap();
 
@@ -492,7 +492,11 @@ fn an_expression_over_a_vector_plots_every_element() {
     // A scalar expression is still exactly one trace, labelled by its text.
     let scalar = ComponentId::new("expr.scalar");
     db.with_state_mut(|s| {
-        s.insert_component(scalar, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+        s.insert_component(
+            scalar,
+            ComponentSchema::new(PrimType::F64, &[][..]),
+            &db.path,
+        )
     })
     .unwrap();
     let plotted = crate::inspector::trace_picker::expression_elements(&db, scalar, "=xyz[0] + 1.0");
@@ -575,7 +579,11 @@ async fn an_expression_fills_a_list_trace_element_by_element() {
     // nothing, because a trace with no length draws nothing at all.
     let scalar = ComponentId::new("expr.scalar");
     db.with_state_mut(|s| {
-        s.insert_component(scalar, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+        s.insert_component(
+            scalar,
+            ComponentSchema::new(PrimType::F64, &[][..]),
+            &db.path,
+        )
     })
     .unwrap();
     assert_eq!(expression_len(&db, scalar), 1);

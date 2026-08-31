@@ -925,6 +925,7 @@ mod tests {
                         },
                         kind: WidgetKind::new("registered_test"),
                         config: config.clone(),
+                        frame: true,
                     }],
                     connectors: Vec::new(),
                 })

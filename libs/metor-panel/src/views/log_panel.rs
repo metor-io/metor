@@ -15,7 +15,7 @@ use metor_proto_wkt::LogLevel;
 
 use crate::logs::{self, LogState};
 use crate::theme::{Theme, theme};
-use crate::views::table::{Column, ColumnSort, Table, TableDelegate};
+use crate::views::table::{self, Column, ColumnSort, Table, TableDelegate};
 
 /// The viewer's level floor. `All` shows everything received (the FSW side
 /// already filters what it forwards); the rest hide rows below the floor.
@@ -171,7 +171,7 @@ impl Render for LogView {
             .items_center()
             .gap_2()
             .px_3()
-            .py_2()
+            .h(px(table::HEADER_HEIGHT))
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme.border_primary);

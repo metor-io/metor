@@ -1,100 +1,143 @@
-//! Inspector rows for the system-graph tile.
+//! Inspector rows for the Execution Timeline pane.
 //!
-//! Clicking a node dispatches an `InspectEntity` carrying a
-//! [`SelectedGraphNode`] proxy; the inspector's registry maps that type to
-//! [`build_rows`], which re-derives the node's detail from the live wiring
-//! store. Those rows are read-only — the tile shows topology, it never edits
-//! it. The tile itself (reached from tab right-click and the palette) gets
-//! its view settings: flow direction, and the re-layout that forgets every
-//! hand-placed native position.
+//! Hand-written rather than reflected: what an operator adjusts here is which
+//! *derived* lanes to show, and that list only exists at runtime — there is no
+//! persisted field to point a facet widget at.
+//!
+//! The gutter is a second entry point: clicking a lane's name dispatches an
+//! `InspectEntity` carrying a [`SelectedGraphNode`] proxy, whose rows re-derive
+//! that system, slot, scope, or coordinator from the live wiring store. Those
+//! rows are read-only — a native system's source of truth is Rust and
+//! `target.py`, not a panel.
 
 use std::sync::Arc;
 
-use gpui::{AnyEntity, App, SharedString};
+use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
 use metor_fsw_2::ir::{ParamSource, SourceRef, Wiring};
 
-use crate::graph_layout::Direction;
 use crate::inspector::registry::InspectorRegistry;
-use crate::inspector::rows::{CommandRow, EnumRow, HeaderRow, InspectorRow, TextRow};
+use crate::inspector::rows::{BoolRow, CommandRow, HeaderRow, InspectorRow, NavRow, TextRow};
+use crate::views::time_series::Override;
+use crate::views::time_series::time_range::TimeRangeBehavior;
 
-use crate::canvas::GraphCanvas;
-
-/// Entity placed into the inspector when a graph node is selected. Carries
-/// only the node id; [`build_rows`] looks the details up in the live store so
-/// the rows always reflect the latest manifest.
-pub struct SelectedGraphNode {
-    pub id: SharedString,
-}
+use super::ExecTimeline;
+use super::rows::COORDINATOR;
 
 pub fn register_inspector_rows(cx: &mut App) {
     cx.global_mut::<InspectorRegistry>()
-        .register_type_builder::<SelectedGraphNode>(Arc::new(build_rows));
+        .register_type_builder::<ExecTimeline>(Arc::new(build_rows));
     cx.global_mut::<InspectorRegistry>()
-        .register_type_builder::<GraphCanvas>(Arc::new(build_panel_rows));
+        .register_type_builder::<SelectedGraphNode>(Arc::new(build_node_rows));
 }
 
-fn direction_label(direction: Direction) -> SharedString {
-    SharedString::new_static(match direction {
-        Direction::LeftRight => "Left to right",
-        Direction::TopBottom => "Top to bottom",
-    })
+fn range_summary(timeline: &ExecTimeline) -> SharedString {
+    match timeline.x_range.as_custom() {
+        Some(range) => SharedString::from(range.to_string()),
+        None => SharedString::new_static("Auto"),
+    }
 }
 
-/// Rows for the inspected tile: what the selected card is called, the flow
-/// direction, and the re-layout that forgets hand-placed native positions.
-///
-/// Renaming is here rather than on the card because a name is API — it is the
-/// card's title, its output frame, the prefix of every component it publishes,
-/// and the key its state is restored by — so it belongs where the rest of a
-/// declaration's identity is edited, with room to say so.
-fn build_panel_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
-    let Ok(panel) = any.downcast::<GraphCanvas>() else {
-        return Vec::new();
-    };
-    let direction = panel.read(cx).direction();
-    let selected = panel.read(cx).selected_declaration(cx).map(|(id, _)| id);
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(HeaderRow::new("Graph"))];
-    if let Some(name) = selected {
-        rows.push(Box::new(TextRow::new(
-            SharedString::new_static("Name"),
-            name,
-            Arc::new({
-                let panel = panel.clone();
-                move |value, _window, cx| {
-                    panel.update(cx, |p, cx| p.rename_selected(&value, cx));
-                }
+fn range_rows(timeline: Entity<ExecTimeline>) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
+        SharedString::new_static("Auto (follow app range)"),
+        Arc::new({
+            let timeline = timeline.clone();
+            move |_window, cx| {
+                timeline.update(cx, |t, cx| t.set_x_range(Override::Auto, cx));
+            }
+        }),
+    ))];
+    for (name, preset) in TimeRangeBehavior::PRESETS {
+        let timeline = timeline.clone();
+        let preset = *preset;
+        rows.push(Box::new(CommandRow::new(
+            SharedString::new_static(name),
+            Arc::new(move |_window, cx| {
+                timeline.update(cx, |t, cx| t.set_x_range(Override::Custom(preset), cx));
             }),
         )));
     }
-    rows.extend::<Vec<Box<dyn InspectorRow>>>(vec![
-        Box::new(EnumRow {
-            label: SharedString::new_static("Direction"),
-            selected: direction_label(direction),
-            options: vec![
-                direction_label(Direction::LeftRight),
-                direction_label(Direction::TopBottom),
-            ],
-            on_select: Arc::new({
-                let panel = panel.clone();
-                move |value, _window, cx| {
-                    let direction = if value == direction_label(Direction::TopBottom).as_str() {
-                        Direction::TopBottom
-                    } else {
-                        Direction::LeftRight
-                    };
-                    panel.update(cx, |p, cx| p.set_direction(direction, cx));
-                }
-            }),
-        }),
-        Box::new(CommandRow::new(
-            SharedString::new_static("Re-layout"),
-            Arc::new(move |_window, cx| {
-                panel.update(cx, |p, cx| p.relayout(cx));
+    rows
+}
+
+fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+    let Ok(timeline) = any.downcast::<ExecTimeline>() else {
+        return Vec::new();
+    };
+    let view = timeline.read(cx);
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![
+        Box::new(HeaderRow::new("Execution Timeline")),
+        Box::new(NavRow::new(
+            SharedString::new_static("Time range"),
+            range_summary(view),
+            Box::new({
+                let timeline = timeline.clone();
+                move |_cx| range_rows(timeline.clone())
             }),
         )),
-    ]);
+        Box::new(BoolRow::new(
+            SharedString::new_static("Trigger on latest cycle"),
+            view.trigger,
+            Arc::new({
+                let timeline = timeline.clone();
+                move |value, _window, cx| {
+                    timeline.update(cx, |t, cx| t.set_trigger(value, cx));
+                }
+            }),
+        )),
+        Box::new(BoolRow::new(
+            SharedString::new_static("Show slots"),
+            view.show_slots,
+            Arc::new({
+                let timeline = timeline.clone();
+                move |value, _window, cx| {
+                    timeline.update(cx, |t, cx| {
+                        t.show_slots = value;
+                        cx.notify();
+                    });
+                }
+            }),
+        )),
+        Box::new(BoolRow::new(
+            SharedString::new_static("Show coordinator row"),
+            view.show_coordinator_row,
+            Arc::new({
+                let timeline = timeline.clone();
+                move |value, _window, cx| {
+                    timeline.update(cx, |t, cx| {
+                        t.show_coordinator_row = value;
+                        cx.notify();
+                    });
+                }
+            }),
+        )),
+    ];
+
+    let names = view.row_names();
+    if !names.is_empty() {
+        rows.push(Box::new(HeaderRow::new("Rows")));
+    }
+    for name in names {
+        let visible = !view.is_row_hidden(&name);
+        let timeline = timeline.clone();
+        rows.push(Box::new(BoolRow::new(
+            name.clone(),
+            visible,
+            Arc::new(move |_value, _window, cx| {
+                let name = name.clone();
+                timeline.update(cx, |t, cx| t.toggle_row(name, cx));
+            }),
+        )));
+    }
     rows
+}
+
+/// Entity placed into the inspector when a gutter lane is clicked. Carries
+/// only the lane's name; [`build_node_rows`] looks the details up in the live
+/// store so the rows always reflect the latest manifest.
+pub struct SelectedGraphNode {
+    pub id: SharedString,
 }
 
 fn text_row(label: &'static str, value: impl Into<SharedString>) -> Box<dyn InspectorRow> {
@@ -126,7 +169,7 @@ fn params_summary(params: &ParamSource) -> SharedString {
     }
 }
 
-fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+fn build_node_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let Ok(proxy) = any.downcast::<SelectedGraphNode>() else {
         return Vec::new();
     };
@@ -222,7 +265,7 @@ fn slot_rows(slot: &metor_fsw_2::ir::SlotSpec) -> Vec<Box<dyn InspectorRow>> {
 }
 
 fn scope_or_coordinator_rows(id: &SharedString, wiring: &Wiring) -> Vec<Box<dyn InspectorRow>> {
-    if id.as_str() == super::layout::COORDINATOR_INSTANCE {
+    if id.as_str() == COORDINATOR {
         return vec![
             Box::new(HeaderRow::new("Coordinator")),
             text_row("Name", id.clone()),

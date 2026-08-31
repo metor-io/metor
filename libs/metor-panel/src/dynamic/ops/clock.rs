@@ -3,8 +3,7 @@
 //!
 //! One clock is left, and it is the one a source system asks for: a
 //! `@system(rate=)` declares how often it wants to run and the host answers
-//! with a fixed-rate tick. A resample stage uses the same thing for its target
-//! clock.
+//! with a fixed-rate tick.
 
 use std::hash::Hash;
 use std::sync::Arc;

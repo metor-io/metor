@@ -32,7 +32,7 @@ use super::copy::{copy_name_row, copy_rows};
 use super::filter_bar::{FilterBar, FilterBarEvent};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
-use super::table::{Column, ColumnSort, Table, TableDelegate};
+use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripStyle, strip_row_width};
 use crate::icons::Icon;
@@ -49,7 +49,6 @@ use model::{
 
 /// Indent per tree depth, in pixels.
 const INDENT: f32 = 14.0;
-const ROW_HEIGHT: f32 = 30.0;
 /// Row height once sparklines are on — enough for a readable trace.
 const SPARKLINE_ROW_HEIGHT: f32 = 44.0;
 /// Horizontal padding inside one pivot cell.

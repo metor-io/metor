@@ -480,7 +480,8 @@ impl PaneItem for GaugePanel {
     }
 }
 
-/// Pane item rendering one element of a component as a named discrete state.
+/// Pane item rendering a component's value as the named discrete state it
+/// means — a bare value strip carrying a state table.
 pub struct StateChipPanel {
     inner: Entity<StateChip>,
     label: SharedString,
@@ -1032,6 +1033,7 @@ impl Render for ListPlotPanel {
 }
 
 pub use crate::views::list_plot::{ListPlotPanelConfig, ListTraceConfig};
+pub use crate::views::spectrogram::{SpectrogramPanelConfig, SpectrogramTraceConfig};
 
 impl ListPlotPanel {
     pub fn from_config(cfg: ListPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
@@ -1265,6 +1267,35 @@ pub(crate) fn new_panel_rows(
     )));
 
     rows.push(Box::new(NavRow::new(
+        "Spectrogram",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            let on_open_inspector = on_open_inspector.clone();
+            Box::new(move |_cx| {
+                let db_for_select = db.clone();
+                let pane = pane.clone();
+                let on_open_inspector = on_open_inspector.clone();
+                crate::views::spectrogram::trace_picker::select_spectrogram_trace_wizard_rows(
+                    db.clone(),
+                    Arc::new(move |trace, window, cx| {
+                        let config = SpectrogramPanelConfig {
+                            traces: vec![SpectrogramTraceConfig::from(&trace)],
+                            ..Default::default()
+                        };
+                        if let Some(entity) =
+                            add_registered_panel(&pane, "spectrogram", &config, cx)
+                        {
+                            inspect_created(entity, &db_for_select, &on_open_inspector, window, cx);
+                        }
+                    }),
+                )
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
         "Component Text",
         SharedString::new_static(""),
         {
@@ -1396,6 +1427,28 @@ pub(crate) fn new_panel_rows(
     )));
 
     rows.push(Box::new(NavRow::new(
+        "Map",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                let pane = pane.clone();
+                crate::inspector::trace_picker::component_picker_rows(
+                    db.clone(),
+                    move |_component_id, name, cx| {
+                        let cfg = crate::views::MapConfig {
+                            component: name,
+                            ..Default::default()
+                        };
+                        add_registered_panel(&pane, "map", &cfg, cx);
+                    },
+                )
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
         "Sequence Control",
         SharedString::new_static(""),
         {
@@ -1508,16 +1561,15 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
-    rows.push(Box::new(CommandRow::new("Graph", {
-        let db = db.clone();
+    rows.push(Box::new(CommandRow::new("Execution Timeline", {
         let pane = pane.clone();
         Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| crate::canvas::GraphCanvas::new(db, cx)));
-                pane.add_item(item, cx);
-            });
+            add_registered_panel(
+                &pane,
+                "exec_timeline",
+                &crate::views::ExecTimelineConfig::default(),
+                cx,
+            );
         })
     })));
 
@@ -1666,6 +1718,27 @@ mod tests {
                 .is_ok()
         );
 
+        let timeline = crate::views::ExecTimelineConfig {
+            label: "Steps".into(),
+            x_range: "LAST 30 s".into(),
+            show_slots: false,
+            show_coordinator_row: false,
+            trigger: true,
+            hidden_rows: vec!["downlink".into(), "nav".into()],
+        };
+        let s = serde_json::to_string(&timeline).unwrap();
+        let back: crate::views::ExecTimelineConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.label, "Steps");
+        assert_eq!(back.x_range, "LAST 30 s");
+        assert!(!back.show_slots);
+        assert!(!back.show_coordinator_row);
+        assert!(back.trigger);
+        assert_eq!(back.hidden_rows, vec!["downlink", "nav"]);
+        // The toggles default on and the trigger off, so a document written
+        // before they existed shows every lane on the app-wide range.
+        let bare: crate::views::ExecTimelineConfig = serde_json::from_str("{}").unwrap();
+        assert!(bare.show_slots && bare.show_coordinator_row && !bare.trigger);
+
         let viewer = Viewer3dPanelConfig {
             models: vec![ModelConfig {
                 label: "satellite".into(),
@@ -1729,6 +1802,61 @@ mod tests {
         assert!(matches!(back.x_max_override, Override::Auto));
         assert!(matches!(back.y_min_override, Override::Auto));
         assert!(matches!(back.y_max_override, Override::Custom(v) if (v - 2.5).abs() < 1e-9));
+
+        let spectrogram = SpectrogramPanelConfig {
+            label: "spectrum".into(),
+            traces: vec![SpectrogramTraceConfig {
+                component_id: ComponentId(9),
+                len: 33,
+                visible: true,
+                label: "fft(window(sig, 64))".into(),
+                colormap: crate::views::time_series::Colormap::Mono,
+                scale: crate::views::time_series::IntensityScale::Sqrt,
+                gain: 2.5,
+                expression: Some("=fft(window(sig, 64))".into()),
+            }],
+            custom_title: Override::Custom("Waterfall".into()),
+            x_range: "LAST 30 s".into(),
+            x_time_format: TimeFormat::Utc,
+            y_min_override: Override::Custom(4.0),
+            y_max_override: Override::Auto,
+            intensity_min: Override::Custom(-90.0),
+            intensity_max: Override::Custom(-10.0),
+            sample_rate: Override::Custom(1000.0),
+            show_colorbar: false,
+        };
+        let s = serde_json::to_string(&spectrogram).unwrap();
+        let back: SpectrogramPanelConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.label, "spectrum");
+        assert_eq!(back.traces.len(), 1);
+        assert_eq!(back.traces[0].component_id, ComponentId(9));
+        assert_eq!(back.traces[0].len, 33);
+        assert_eq!(
+            back.traces[0].colormap,
+            crate::views::time_series::Colormap::Mono
+        );
+        assert_eq!(
+            back.traces[0].scale,
+            crate::views::time_series::IntensityScale::Sqrt
+        );
+        assert_eq!(back.traces[0].gain, 2.5);
+        assert_eq!(
+            back.traces[0].expression.as_deref(),
+            Some("=fft(window(sig, 64))")
+        );
+        assert!(matches!(back.custom_title, Override::Custom(s) if s == "Waterfall"));
+        assert_eq!(back.x_range, "LAST 30 s");
+        assert_eq!(back.x_time_format, TimeFormat::Utc);
+        assert!(matches!(back.y_min_override, Override::Custom(v) if (v - 4.0).abs() < 1e-9));
+        assert!(matches!(back.intensity_max, Override::Custom(v) if (v + 10.0).abs() < 1e-9));
+        assert!(matches!(back.sample_rate, Override::Custom(v) if (v - 1000.0).abs() < 1e-9));
+        assert!(!back.show_colorbar);
+
+        // A pane saved before the colorbar existed keeps the legend it had:
+        // absent means "the default", and the default is on.
+        let partial: SpectrogramPanelConfig = serde_json::from_str(r#"{"label":"x"}"#).unwrap();
+        assert!(partial.show_colorbar);
+        assert!(partial.traces.is_empty());
 
         let meter = MeterConfig {
             component: "sat.wheels.h".into(),

@@ -37,8 +37,13 @@ pub use bounds::*;
 mod gpu;
 pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState};
 
+mod heatmap;
+pub use heatmap::{Colormap, IntensityScale};
+pub(crate) use heatmap::{EMPTY_INTENSITY, EMPTY_THRESHOLD, IntensityDraw};
+
 mod line_plot;
 pub use line_plot::LinePlot;
+pub(crate) use line_plot::resolve_lod_levels;
 
 mod override_field;
 pub use override_field::Override;
@@ -162,7 +167,11 @@ fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
 /// `anchor` is the earliest sample for relative labels (so ticks don't
 /// crawl during pan) and Unix epoch `0` for absolute labels (so ticks land
 /// on wall-clock boundaries like `:00`/`:30`).
-fn x_ticks(view: &PlotBounds, target_count: usize, anchor: f64) -> impl Iterator<Item = i64> {
+pub(crate) fn x_ticks(
+    view: &PlotBounds,
+    target_count: usize,
+    anchor: f64,
+) -> impl Iterator<Item = i64> {
     // Backstop: `segment_round` keeps the count near `target_count`, but a
     // paint pass must never be able to loop unbounded if it degenerates.
     const MAX_TICKS: usize = 1024;
@@ -208,7 +217,7 @@ fn x_ticks(view: &PlotBounds, target_count: usize, anchor: f64) -> impl Iterator
 
 /// Anchor passed to [`x_ticks`]: the earliest sample for relative labels,
 /// Unix epoch `0` for absolute ones (so ticks land on wall-clock boundaries).
-fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
+pub(crate) fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
     match fmt {
         TimeFormat::Relative => data_start,
         TimeFormat::Utc | TimeFormat::Local => 0.0,
@@ -222,7 +231,7 @@ fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
 /// range) picks the granularity — date is folded in once the window spans
 /// more than a day. Falls back to the relative label if the timestamp is
 /// outside jiff's representable range.
-fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us: f64) -> String {
+pub(crate) fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us: f64) -> String {
     let relative = || {
         let offset_us = t_us - ref_us;
         if offset_us == 0 {

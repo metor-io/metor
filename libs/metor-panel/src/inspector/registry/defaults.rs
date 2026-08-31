@@ -16,6 +16,7 @@ use crate::inspector::rows::{
 };
 use crate::views::column_browser::filter_bar_row;
 use crate::views::list_plot::{ListLinePlot, ListTrace};
+use crate::views::spectrogram::{SpectrogramPlot, SpectrogramTrace};
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{EventOverlay, LinePlot, Override, Trace, YAxis};
 use crate::views::viewer_3d::Viewer3d;
@@ -132,6 +133,7 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::Meter>();
         self.register_inspectable::<crate::views::Gauge>();
         self.register_inspectable::<crate::views::SequenceControl>();
+        self.register_inspectable::<crate::views::Map>();
         self.register_entity_list::<crate::views::AttitudeIndicator, crate::views::VectorMarker>(
             db.clone(),
             |a| &a.vectors,
@@ -200,6 +202,15 @@ impl InspectorRegistry {
             |lp| &mut lp.traces,
             AddBehavior::Wizard(Arc::new(|parent, db, cx| {
                 builders::build_list_trace_add_wizard(parent, db, cx)
+            })),
+        );
+        self.register_spectrogram_trace_builder();
+        self.register_entity_list::<SpectrogramPlot, SpectrogramTrace>(
+            db.clone(),
+            |p| &p.traces,
+            |p| &mut p.traces,
+            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
+                builders::build_spectrogram_trace_add_wizard(parent, db, cx)
             })),
         );
     }
@@ -665,6 +676,50 @@ impl InspectorRegistry {
         }));
     }
 
+    /// Spectrogram source inspector: the default facet rows — colormap, scale
+    /// and gain all reflect on their own — plus a source picker offering the
+    /// same vector-only page the add wizard does.
+    fn register_spectrogram_trace_builder(&mut self) {
+        self.register_type_builder::<SpectrogramTrace>(Arc::new(|any_entity, db, cx| {
+            let trace: Entity<SpectrogramTrace> = any_entity
+                .clone()
+                .downcast()
+                .expect("SpectrogramTrace type mismatch");
+            let mut rows =
+                crate::inspector::reflect::default_rows_for_any_entity(&any_entity, db, cx);
+            let component = trace.read(cx).component_id;
+            let summary = channel_summary(db, component, 0);
+            let db_for_children = db.clone();
+            let query = binding_query(db, component);
+            rows.push(source_row(
+                summary,
+                query,
+                Box::new(move |_cx| {
+                    let trace = trace.clone();
+                    let on_select: crate::views::spectrogram::trace_picker::OnSpectrogramTraceSelected =
+                        Arc::new(move |picked, _window, cx| {
+                            trace.update(cx, |t, cx| {
+                                t.component_id = picked.component_id;
+                                t.len = picked.len;
+                                t.label = picked.label;
+                                t.expression = picked.expression;
+                                cx.notify();
+                            });
+                            if let Some(plot) = trace.read(cx).plot.clone().and_then(|w| w.upgrade())
+                            {
+                                plot.update(cx, |plot, cx| plot.rebind_trace(&trace, cx));
+                            }
+                        });
+                    crate::views::spectrogram::trace_picker::select_spectrogram_trace_wizard_rows(
+                        db_for_children.clone(),
+                        on_select,
+                    )
+                }),
+            ));
+            rows
+        }));
+    }
+
     fn register_viewer3d_builder(&mut self, _db: Arc<DB>) {
         self.register_type_builder::<Viewer3d>(Arc::new(|any_entity, db, cx| {
             let viewer: Entity<Viewer3d> = any_entity
@@ -845,7 +900,7 @@ mod tests {
             db.with_state_mut(|s| {
                 s.insert_component(
                     ComponentId::new(name),
-                    ComponentSchema::new(PrimType::F64, &[]),
+                    ComponentSchema::new(PrimType::F64, &[][..]),
                     &db.path,
                 )
             })

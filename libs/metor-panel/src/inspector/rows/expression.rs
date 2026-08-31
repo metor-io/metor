@@ -459,7 +459,7 @@ mod tests {
         for name in names {
             let id = ComponentId::new(name);
             db.with_state_mut(|s| {
-                s.insert_component(id, ComponentSchema::new(PrimType::F64, &[3]), &db.path)
+                s.insert_component(id, ComponentSchema::new(PrimType::F64, &[3][..]), &db.path)
             })
             .unwrap();
             let mut metadata = metor_proto_wkt::ComponentMetadata {

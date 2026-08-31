@@ -16,7 +16,7 @@ Run from the workspace root (`/Users/sphw/code/metor/metor`) — this is a membe
 - Build (dev): `cargo build -p metor-panel`
 - Build (release): `cargo build -p metor-panel --release`
 - Test the crate: `cargo test -p metor-panel`
-- Run a single test: `cargo test -p metor-panel <test_name>` (e.g. `cargo test -p metor-panel canvas::migrate::tests::`)
+- Run a single test: `cargo test -p metor-panel <test_name>` (e.g. `cargo test -p metor-panel tiles::tests::`)
 - Lint: `cargo clippy -p metor-panel`
 
 The workspace pins `rustc 1.94.0` (`rust-toolchain.toml`). The `facet` family of crates is patched to a fork (`metor-io/facet`, branch `sphw/facet-gpui`) — see the workspace `[patch.crates-io]` block. Don't bump those past the pinned 0.44.x versions without coordinating the patch chain.
@@ -32,15 +32,11 @@ The central abstraction is `ComponentStream` (`src/lib.rs`), an async iterator t
 
 ### Dynamic nodes (`src/dynamic/`)
 
-User-defined components are computed lazily as a graph of producer tasks. Each `DynamicNode` writes `[Timestamp][value]` samples into its own `Disruptor`. Identity is a content hash, so the same program always yields the same `NodeId` — this is what powers reconciliation in the canvas.
+User-defined components are computed lazily as a graph of producer tasks. Each `DynamicNode` writes `[Timestamp][value]` samples into its own `Disruptor`. Identity is a content hash, so the same program always yields the same `NodeId` — recompiling an unchanged expression reuses the running node instead of starting a second one.
 
-There are no hand-written ops anymore: user computation is metor-expr source, compiled to wasm and run by `ops/program.rs`. The remaining `ops/` modules are infrastructure (`clock`, `db_source`, `resample`, `persist`). Dropping the last `Arc<dyn DynamicNode>` cancels the task. Subscribers either iterate every sample (`NodeReader`, used by downstream derivations) or pull only the latest (`WalComponentStream::from_disruptor`, used by views).
+There are no hand-written ops anymore: user computation is metor-expr source, compiled to wasm and run by `ops/program.rs`. The remaining `ops/` modules are infrastructure (`clock`, `db_source`, `persist`, `replay`). Dropping the last `Arc<dyn DynamicNode>` cancels the task. Subscribers either iterate every sample (`NodeReader`, used by downstream derivations) or pull only the latest (`WalComponentStream::from_disruptor`, used by views).
 
 `expressions.rs` is the `=` one-liner tier: `bind`/`binding_text` turn saved picker text into a component either way, and a compiled expression publishes into a hidden hash-named component every view reads ordinarily. `resolver.rs` (`DbResolver`) answers the compiler's and the completion engine's name questions from a snapshot of the component tree.
-
-### Canvas (`src/canvas/`)
-
-The program tile: one metor-expr module shown as text or as cards (Cmd-G toggles). The source is the single truth — every canvas gesture is a text rewrite (`edit.rs`), debounce-compiled (`mod.rs::rebuild`), reconciled against running systems (`run.rs`), and drawn from the manifest (`model.rs`). The text editor has caret-anchored completion backed by `metor_expr::complete` (`mod.rs::render_completion`). `legacy.rs`/`migrate.rs` read old node-editor layouts into programs.
 
 ### Tiles (`src/tiles/`)
 
@@ -60,11 +56,11 @@ A unified row-list overlay that serves as both command palette (centered) and ri
 
 Concrete renderers — plots (`time_series`, `xy_plot`, `list_plot`), the component outline (`outline`, a collapsible tree-table with pivots, on the generic `table`), 3D scene (`viewer_3d`, built on Bevy as a render pipeline embedded in gpui via wgpu), traffic lights, value strips, dashboards, etc. They consume `ComponentStream`s and emit `Inspectable` rows.
 
-Scalar instruments (`meter`, `gauge`, `state_chip`, `attitude`) share `views/binding.rs`, which owns stream seeding, late metadata binding, and reading warn/critical limits out of the alarm store. A new instrument binds through it rather than growing its own copy, and never takes limits as configuration.
+Scalar instruments (`meter`, `gauge`, `attitude`) share `views/binding.rs`, which owns stream seeding, late metadata binding, and reading warn/critical limits out of the alarm store. A new instrument binds through it rather than growing its own copy, and never takes limits as configuration.
 
 Every one of those is registered on **both** surfaces from a single config type: a `PaneItem` in `tiles/panels.rs` plus a `WidgetKind` in `views/dashboard/widgets.rs`. `TrafficLight` is the reference for the pattern.
 
-`views/dashboard/connectors.rs` adds schematic lines over the dashboard canvas — anchors resolve against live widget rects each frame, `on_top` picks whether a line paints under the widgets (a pipe) or over them (a callout leader), and `bind` colours a line from telemetry. Line geometry lives in `graph_canvas.rs` alongside the node editor's.
+`views/dashboard/connectors.rs` adds schematic lines over the dashboard canvas — anchors resolve against live widget rects each frame, `on_top` picks whether a line paints under the widgets (a pipe) or over them (a callout leader), and `bind` colours a line from telemetry. Line geometry lives in `graph_canvas.rs`, shared with the execution timeline's dependency leaders.
 
 ### Theme (`src/theme.rs`)
 

@@ -57,7 +57,6 @@ impl Render for ComponentText {
         let theme = theme(cx);
         div()
             .text_color(theme.text_primary)
-            .bg(theme.bg_primary)
             .text_size(gpui::px(24.0))
             .size_full()
             .child(

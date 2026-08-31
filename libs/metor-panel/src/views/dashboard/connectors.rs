@@ -405,6 +405,7 @@ mod tests {
             rect,
             kind: super::super::WidgetKind::text(),
             config: "{}".into(),
+            frame: true,
         }
     }
 

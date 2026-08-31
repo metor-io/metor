@@ -141,7 +141,7 @@ pub(crate) fn expression_len(db: &DB, component: ComponentId) -> usize {
 
 /// Components whose schema dim is more than a scalar (i.e. total
 /// element count > 1). Sorted by name for stable display.
-fn list_vector_components(db: &DB) -> Vec<(ComponentId, String, usize)> {
+pub(crate) fn list_vector_components(db: &DB) -> Vec<(ComponentId, String, usize)> {
     let mut out: Vec<(ComponentId, String, usize)> = db.with_state(|state| {
         state
             .component_metadata_iter()

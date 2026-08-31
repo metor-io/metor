@@ -1,8 +1,8 @@
 //! How instrument views attach to a component.
 //!
 //! Plots own their sampling; the small single-value views — traffic lights,
-//! meters, gauges, state chips — all need the same three things instead, and
-//! that overlap is what lives here. A view binds to *one element of one
+//! meters, gauges — all need the same three things instead, and that overlap
+//! is what lives here. A view binds to *one element of one
 //! component* ([`ElementRef`]), drains it with a task that outlives nothing
 //! but the view itself, and reads back whatever the control system declared
 //! about it.
@@ -527,7 +527,7 @@ mod staleness_tests {
         let db = DB::create(temp.path().join("db")).unwrap();
         let id = ComponentId::new("dead.value");
         db.with_state_mut(|state| {
-            state.insert_component(id, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+            state.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
         })
         .unwrap();
         let component = db

@@ -273,10 +273,10 @@ pub fn pixel_to_data_x(
 /// readout box before layout runs, so an approximation is fine.
 const READOUT_CHAR_W: f32 = 6.6;
 /// Line height for one readout row (font size plus leading).
-const READOUT_ROW_H: f32 = 15.0;
+pub(crate) const READOUT_ROW_H: f32 = 15.0;
 /// Inner padding on the readout box, per side.
-const READOUT_PAD_X: f32 = 6.0;
-const READOUT_PAD_Y: f32 = 4.0;
+pub(crate) const READOUT_PAD_X: f32 = 6.0;
+pub(crate) const READOUT_PAD_Y: f32 = 4.0;
 /// Width the color swatch plus its trailing gap reserves ahead of a trace
 /// row's label.
 const READOUT_SWATCH_W: f32 = 14.0;

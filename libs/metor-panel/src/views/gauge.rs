@@ -447,7 +447,6 @@ impl Render for Gauge {
         let mut tile = div()
             .size_full()
             .relative()
-            .bg(theme.bg_primary)
             .p(px(4.0))
             .child(dial.size_full());
 

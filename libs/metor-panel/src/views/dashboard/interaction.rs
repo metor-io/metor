@@ -165,11 +165,22 @@ impl DashboardPanel {
             .left(px(r.x + self.scroll_offset.x))
             .w(px(r.w))
             .h(px(r.h))
-            .overflow_hidden()
-            .border_1()
-            .border_color(theme.border_primary)
-            .rounded(px(4.0))
-            .bg(theme.bg_primary);
+            .overflow_hidden();
+
+        if widget.frame {
+            container = container
+                .border_1()
+                .border_color(theme.border_primary)
+                .rounded(px(4.0))
+                .bg(theme.bg_primary);
+        } else if self.editing {
+            // A frameless widget is invisible chrome-wise; edit mode still
+            // outlines it faintly so it can be found, grabbed, and resized.
+            container = container
+                .border_1()
+                .border_color(theme.border_primary.opacity(0.35))
+                .rounded(px(4.0));
+        }
 
         if let Some(view) = view {
             container = container.child(view.clone());

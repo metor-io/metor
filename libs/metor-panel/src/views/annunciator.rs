@@ -468,7 +468,6 @@ impl Render for Annunciator {
         div()
             .track_focus(&self.focus)
             .size_full()
-            .bg(theme.bg_primary)
             .p(px(8.0))
             .flex()
             .flex_col()

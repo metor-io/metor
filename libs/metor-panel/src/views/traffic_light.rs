@@ -141,7 +141,6 @@ impl Render for TrafficLight {
             .flex()
             .items_center()
             .justify_center()
-            .bg(theme.bg_primary)
             .p(px(8.0))
             .child(traffic_light_swatch(value, color, px(14.0), &theme));
 
