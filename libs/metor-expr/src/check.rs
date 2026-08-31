@@ -3048,7 +3048,7 @@ fn literal_exponent(expr: &ast::Expr) -> Option<u32> {
     let ast::Number::Int(n) = &c.value else {
         return None;
     };
-    n.as_u32().filter(|n| *n <= 16)
+    n.as_u64().filter(|n| *n <= 16).map(|x| x as u32)
 }
 
 fn kernel_log(arg: Expr) -> Expr {
