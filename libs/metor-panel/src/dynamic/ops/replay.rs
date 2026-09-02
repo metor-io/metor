@@ -123,9 +123,9 @@ pub fn replay(
         // A held port begins with what it last said before the range, as a
         // live system begins with what the host already knows.
         if Some(i) != driven_port
-            && let Some(value) = last_before(port, range.start)
+            && let Some((ts, value)) = last_before(port, range.start)
         {
-            held.hold(i, &value);
+            held.hold(i, ts, &value);
         }
         cursors.push(Cursor::new(port, range.clone()));
     }
@@ -154,7 +154,7 @@ pub fn replay(
                 let (ts, _, port) = next;
                 stats.read += 1;
                 if port != driven {
-                    held.hold(port, cursors[port].current());
+                    held.hold(port, ts, cursors[port].current());
                     cursors[port].advance();
                     continue;
                 }
@@ -173,8 +173,8 @@ pub fn replay(
         Some(hz) => {
             for tick in ticks(hz, range.clone()) {
                 for (i, cursor) in cursors.iter_mut().enumerate() {
-                    while cursor.peek().is_some_and(|ts| ts <= tick) {
-                        held.hold(i, cursor.current());
+                    while let Some(ts) = cursor.peek().filter(|ts| *ts <= tick) {
+                        held.hold(i, ts, cursor.current());
                         cursor.advance();
                         stats.read += 1;
                     }
@@ -208,16 +208,19 @@ pub fn ticks(hz: f64, range: Range<Timestamp>) -> impl Iterator<Item = Timestamp
 }
 
 /// The last sample a component holds from strictly before `ts`.
-fn last_before(component: &Component, ts: Timestamp) -> Option<Vec<u8>> {
+fn last_before(component: &Component, ts: Timestamp) -> Option<(Timestamp, Vec<u8>)> {
     let size = component.schema.size();
     // Newest node first, so the first one with anything older is the answer.
     for node in component.time_series.iter_node_slices() {
-        let at = node.timestamps().partition_point(|t| t.0 < ts.0);
+        let timestamps = node.timestamps();
+        let at = timestamps.partition_point(|t| t.0 < ts.0);
         if at == 0 {
             continue;
         }
         let data = node.data();
-        return data.get((at - 1) * size..at * size).map(<[u8]>::to_vec);
+        return data
+            .get((at - 1) * size..at * size)
+            .map(|bytes| (timestamps[at - 1], bytes.to_vec()));
     }
     None
 }

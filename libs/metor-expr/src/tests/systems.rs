@@ -124,6 +124,24 @@ impl Run {
         self
     }
 
+    /// Stamp one input frame the way a host does: the sample's timestamp
+    /// after the frame's bytes.
+    pub(super) fn stamp(&mut self, port: &str, ts: i64) -> &mut Self {
+        let system = &self.program.manifest.systems[self.system];
+        let index = system
+            .inputs
+            .iter()
+            .position(|p| p.param == port)
+            .unwrap_or_else(|| panic!("no port `{port}`"));
+        let offset = system.inputs[index].stamp_offset();
+        let at = self.address("arg_ptr", Some(index as i32)) + offset;
+        let memory = self.instance.get_memory(&self.store, "memory").unwrap();
+        memory
+            .write(&mut self.store, at as usize, &ts.to_le_bytes())
+            .unwrap();
+        self
+    }
+
     pub(super) fn eval(&mut self, now: i64) -> i32 {
         let name = format!("{}_eval", self.name());
         let func = self.instance.get_func(&self.store, &name).unwrap();
@@ -186,7 +204,7 @@ fn nox3(v: [f64; 3]) -> Tensor<f64, Const<3>, ArrayRepr> {
     v.into()
 }
 
-const IMU: &str = "\
+pub(super) const IMU: &str = "\
 class Imu(Frame):
     omega: Tensor[f64, 3]
     accel: Tensor[f64, 3]

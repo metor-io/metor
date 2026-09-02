@@ -480,11 +480,14 @@ pub(crate) struct EntryPlan {
     /// Index of the `@rng` state slot, for the create-time seed write.
     pub(crate) rng_state: Option<usize>,
     pub(crate) frame_bytes: u32,
+    /// Offset of the sample stamp in each argument frame's block.
+    pub(crate) arg_stamps: Vec<u32>,
 }
 
 fn entry_plan(system: &System, groups: Vec<Group>, cycle_rate: f64) -> EntryPlan {
     EntryPlan {
         name: system.name.clone(),
+        arg_stamps: system.inputs.iter().map(|p| p.stamp_offset()).collect(),
         groups,
         rate_reload: system
             .rate

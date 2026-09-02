@@ -1,6 +1,6 @@
 //! `delta`, `deltat`, and `mean(x, n)`: the one-sample memories.
 
-use super::systems::{Table, build, imu_table, refuse};
+use super::systems::{IMU, Table, build, imu_table, refuse};
 use crate::Ty;
 
 /// The first sample has nothing to differ from, so it reads 0 rather than
@@ -25,43 +25,100 @@ def step(rpm) -> f64:
     assert_eq!(seen, vec![0.0, 2.0, 0.0, -4.5]);
 }
 
-/// Timestamps arrive in microseconds; the difference comes back in seconds,
-/// the unit the waveforms already measure the clock in.
+/// An input's block carries its sample's timestamp in microseconds; the gap
+/// between one stamp and the one before comes back in seconds, the unit the
+/// waveforms already measure the clock in. An evaluation that sees the same
+/// stamp again is not a new sample, so the gap holds.
 #[test]
-fn deltat_is_seconds_since_the_previous_tick() {
+fn deltat_is_seconds_between_an_inputs_samples() {
     let source = "\
 @system(\"wheels.rpm\")
 def gap(rpm) -> f64:
-    return deltat()
+    return deltat(rpm)
 ";
     let mut run = build(source, &imu_table(), "gap");
     run.set("rpm", "rpm", &[1.0]);
     let seen: Vec<f64> = [1_000_000, 1_250_000, 1_250_000, 3_000_000]
         .iter()
         .map(|t| {
+            run.stamp("rpm", *t);
             run.eval(*t);
             run.scalar("gap")
         })
         .collect();
-    assert_eq!(seen, vec![0.0, 0.25, 0.0, 1.75]);
+    assert_eq!(seen, vec![0.0, 0.25, 0.25, 1.75]);
 }
 
-/// A rate is the two together, which is the pipeline they exist for. The
-/// memory sits at the call site, so a site a conditional skips does not
-/// advance — the floor keeps the first tick's `0 / 0` out of the result
-/// without hiding a `deltat()` behind a branch.
+/// A held input keeps its newest sample across many evaluations of the
+/// driving one, so its gap is measured between *its* arrivals, whatever the
+/// system's own clock is doing.
+#[test]
+fn deltat_of_a_held_input_follows_its_own_samples() {
+    let source = "\
+@system(\"wheels.rpm\", \"adcs.omega_b\")
+def gap(rpm, omega_b) -> f64:
+    return deltat(omega_b)
+";
+    let mut run = build(source, &imu_table(), "gap");
+    run.set("rpm", "rpm", &[1.0]);
+    run.set("omega_b", "omega_b", &[0.0, 0.0, 0.0]);
+    run.stamp("omega_b", 0);
+    for t in [100_000, 200_000, 300_000] {
+        run.stamp("rpm", t);
+        run.eval(t);
+        assert_eq!(run.scalar("gap"), 0.0);
+    }
+    run.stamp("omega_b", 2_000_000);
+    for t in [2_100_000, 2_200_000] {
+        run.stamp("rpm", t);
+        run.eval(t);
+        assert_eq!(run.scalar("gap"), 2.0);
+    }
+    run.stamp("omega_b", 2_500_000);
+    run.stamp("rpm", 2_600_000);
+    run.eval(2_600_000);
+    assert_eq!(run.scalar("gap"), 0.5);
+}
+
+/// A frame parameter is one input, so it is stamped once — by its own name
+/// or through any of its fields.
+#[test]
+fn deltat_of_a_frame_parameter_or_its_field() {
+    let source = format!(
+        "{IMU}
+@system
+def gap(imu: Imu) -> f64:
+    return deltat(imu) + deltat(imu.omega)
+"
+    );
+    let mut run = build(&source, &imu_table(), "gap");
+    run.set("imu", "omega", &[0.0, 0.0, 0.0]);
+    run.set("imu", "accel", &[0.0, 0.0, 0.0]);
+    run.stamp("imu", 1_000_000);
+    run.eval(1_000_000);
+    assert_eq!(run.scalar("gap"), 0.0);
+    run.stamp("imu", 1_500_000);
+    run.eval(1_500_000);
+    assert_eq!(run.scalar("gap"), 1.0);
+}
+
+/// A rate is the two together, which is the pipeline they exist for. `delta`
+/// counts evaluations and `deltat` counts the input's arrivals, which agree
+/// on the driving input; the floor keeps the first tick's `0 / 0` out.
 #[test]
 fn a_rate_is_delta_over_deltat() {
     let source = "\
 @system(\"wheels.rpm\")
 def accel(rpm) -> f64:
-    return delta(rpm) / max(deltat(), 1e-6)
+    return delta(rpm) / max(deltat(rpm), 1e-6)
 ";
     let mut run = build(source, &imu_table(), "accel");
     run.set("rpm", "rpm", &[10.0]);
+    run.stamp("rpm", 0);
     run.eval(0);
     assert_eq!(run.scalar("accel"), 0.0);
     run.set("rpm", "rpm", &[20.0]);
+    run.stamp("rpm", 500_000);
     run.eval(500_000);
     assert_eq!(run.scalar("accel"), 20.0);
 }
@@ -71,14 +128,14 @@ def accel(rpm) -> f64:
 #[test]
 fn a_delta_is_ordinary_state() {
     let program = crate::compile_module(
-        "@system(\"wheels.rpm\")\ndef both(rpm) -> f64:\n    return delta(rpm) + delta(rpm * 2.0) + deltat()\n",
+        "@system(\"wheels.rpm\")\ndef both(rpm) -> f64:\n    return delta(rpm) + delta(rpm * 2.0) + deltat(rpm)\n",
         &imu_table(),
     )
     .unwrap();
     let state = &program.manifest.system("both").unwrap().state;
     assert_eq!(
         state.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
-        vec!["@delta0", "@delta1", "@deltat2"]
+        vec!["@delta0", "@delta1", "@deltat2.prev", "@deltat2.last"]
     );
     assert!(state.iter().all(|f| f.ty == Ty::F64));
     assert!(
@@ -92,21 +149,22 @@ fn a_delta_is_ordinary_state() {
 /// like one.
 #[test]
 fn a_one_liner_can_difference() {
-    let program = crate::compile_expr("delta(wheels.rpm) / deltat()", &imu_table()).unwrap();
+    let program =
+        crate::compile_expr("delta(wheels.rpm) / deltat(wheels.rpm)", &imu_table()).unwrap();
     assert_eq!(program.manifest.systems.len(), 1);
-    assert_eq!(program.manifest.systems[0].state.len(), 2);
+    assert_eq!(program.manifest.systems[0].state.len(), 3);
 }
 
 #[test]
-fn differencing_needs_a_system() {
+fn differencing_needs_a_system_and_deltat_an_input() {
     for (source, needle) in [
         (
             "def f(x: f64) -> f64:\n    return delta(x)\n",
             "`delta` exists inside a system",
         ),
         (
-            "def f(x: f64) -> f64:\n    return deltat()\n",
-            "`deltat()` exists inside a system",
+            "def f(x: f64) -> f64:\n    return deltat(x)\n",
+            "`deltat` exists inside a system",
         ),
         (
             "def f(x: f64) -> f64:\n    return mean(x, 4)\n",
@@ -115,6 +173,13 @@ fn differencing_needs_a_system() {
     ] {
         let text = refuse(source, &Table::new(&[]));
         assert!(text.contains(needle), "{source}: {text}");
+    }
+    for source in [
+        "@system(\"wheels.rpm\")\ndef f(rpm) -> f64:\n    return deltat(rpm * 2.0)\n",
+        "@system(\"wheels.rpm\")\ndef f(rpm) -> f64:\n    return deltat(0.0)\n",
+    ] {
+        let text = refuse(source, &imu_table());
+        assert!(text.contains("`deltat` needs an input"), "{source}: {text}");
     }
 }
 

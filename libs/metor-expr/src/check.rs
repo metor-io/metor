@@ -16,6 +16,8 @@ use crate::{Dtype, FnSig, Manifest, Resolver, Ty};
 
 /// Maximum expression depth accepted by the checker.
 const MAX_DEPTH: u32 = 512;
+/// The timestamp that trails every input frame in its block.
+const STAMP_BYTES: u32 = 8;
 
 /// Maximum source size accepted by the checker.
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
@@ -406,8 +408,11 @@ fn system(
                 }
             },
         };
-        let block = alloc(buffers, frame.bytes);
+        // An input block is the frame followed by its sample's timestamp,
+        // which is how `deltat` tells one arrival from the next.
+        let block = alloc(buffers, frame.bytes + STAMP_BYTES);
         arg_buffers.push(block);
+        let stamp = Some(field(buffers, block, frame.bytes));
         let fields: Vec<(String, Cell)> = frame
             .fields
             .iter()
@@ -425,11 +430,13 @@ fn system(
             Binding::Cell {
                 cell: fields[0].1.clone(),
                 writable: false,
+                stamp,
             }
         } else {
             Binding::Record {
                 fields,
                 writable: false,
+                stamp,
             }
         };
         names.insert(port.key.clone(), binding);
@@ -461,6 +468,7 @@ fn system(
             .or_insert_with(|| Binding::Record {
                 fields: Vec::new(),
                 writable: true,
+                stamp: None,
             }) {
             Binding::Record { fields, .. } => fields.push((slot.field.name.clone(), cell)),
             _ => {
@@ -798,12 +806,16 @@ enum Binding {
     Cell {
         cell: Cell,
         writable: bool,
+        /// The sample's timestamp, when this is an input port.
+        stamp: Option<BufId>,
     },
     /// A frame or state parameter, addressed field by field. Input frames are
     /// read-only; state is what a system is allowed to keep.
     Record {
         fields: Vec<(String, Cell)>,
         writable: bool,
+        /// The sample's timestamp, when this is an input port.
+        stamp: Option<BufId>,
     },
 }
 
@@ -934,6 +946,7 @@ impl FnChecker<'_> {
                             Some(Binding::Cell {
                                 cell,
                                 writable: true,
+                                ..
                             }) => {
                                 let cell = cell.clone();
                                 let expr =
@@ -993,6 +1006,7 @@ impl FnChecker<'_> {
                     Some(Binding::Cell {
                         cell,
                         writable: true,
+                        ..
                     }) => {
                         let cell = cell.clone();
                         let lhs = (self.read_cell(&cell), cell.ty.clone());
@@ -1167,6 +1181,7 @@ impl FnChecker<'_> {
             Some(Binding::Record {
                 fields,
                 writable: true,
+                ..
             }) => match fields.iter().find(|(name, _)| name == attr.attr.as_str()) {
                 Some((_, cell)) => Some(cell.clone()),
                 None => {
@@ -2239,7 +2254,7 @@ impl FnChecker<'_> {
                 return self.delta(call, depth);
             }
             "deltat" => {
-                if !arity(0, self) {
+                if !arity(1, self) {
                     return None;
                 }
                 return self.deltat(call);
@@ -2796,37 +2811,134 @@ impl FnChecker<'_> {
         Some((self.since(state, value), Ty::F64))
     }
 
-    /// `deltat()`: seconds since the previous evaluation, 0 on the first.
+    /// `deltat(x)`: seconds between the current sample of the input `x` and
+    /// the one before it, 0 until there is one before it.
     ///
-    /// The timestamp is kept as microseconds in an `f64`, which holds it
-    /// exactly, so the previous tick shares the seed and the NaN test with
-    /// `delta` — it is `delta(now())` scaled into the unit the waveforms use.
+    /// The input's block carries its sample's timestamp, and that stamp is
+    /// what tells one sample from the next — not the evaluation, since a held
+    /// input keeps its newest sample across many of them. Two slots per call
+    /// site: the stamps of the newest sample and of the one before, both
+    /// seeded NaN so the arrivals count from zero. Between arrivals the gap
+    /// holds, which is what makes `delta(x) / deltat(x)` a rate a plot can
+    /// read.
     fn deltat(&mut self, call: &ast::ExprCall) -> Option<(Expr, Ty)> {
-        let Some(now) = self.now else {
+        if self.now.is_none() {
             self.diags
-                .push(call.range, "`deltat()` exists inside a system");
+                .push(call.range, "`deltat` exists inside a system");
             return None;
-        };
+        }
+        let stamp = self.port_stamp(&call.arguments.args[0])?;
         let index = self.synthetic.len();
-        let state = self.keep(
-            format!("@deltat{index}"),
+        let prev = self.keep(
+            format!("@deltat{index}.prev"),
             Ty::F64,
             crate::Init::F64(f64::NAN),
         );
-        let micros = Expr::Intrinsic {
-            op: Intrinsic::IntToFloat,
-            args: vec![Expr::Local(now)],
+        let last = self.keep(
+            format!("@deltat{index}.last"),
+            Ty::F64,
+            crate::Init::F64(f64::NAN),
+        );
+
+        let sample = self.temp(Ty::F64);
+        let newest = self.temp(Ty::F64);
+        let older = self.temp(Ty::F64);
+        let sink = self.temp(Ty::F64);
+        let f64_local = |slot: u32| Box::new(Expr::Local(slot));
+        let differs = |a: u32, b: u32| {
+            Box::new(Expr::Cmp {
+                op: Cmp::Ne,
+                ty: Num::F64,
+                lhs: f64_local(a),
+                rhs: f64_local(b),
+            })
         };
-        let elapsed = self.since(state, micros);
-        Some((
-            Expr::Arith {
+        // `a - b` in seconds, or 0 while `b` is still the NaN seed.
+        let gap = |a: u32, b: u32| Expr::Select {
+            cond: differs(b, b),
+            then: Box::new(Expr::F64(0.0)),
+            els: Box::new(Expr::Arith {
                 op: Arith::Mul,
                 ty: Num::F64,
-                lhs: Box::new(elapsed),
+                lhs: Box::new(Expr::Arith {
+                    op: Arith::Sub,
+                    ty: Num::F64,
+                    lhs: f64_local(a),
+                    rhs: f64_local(b),
+                }),
                 rhs: Box::new(Expr::F64(1e-6)),
-            },
-            Ty::F64,
-        ))
+            }),
+            ty: Ty::F64,
+        };
+        let expr = Expr::Store {
+            local: sample,
+            value: Box::new(Expr::Intrinsic {
+                op: Intrinsic::IntToFloat,
+                args: vec![Expr::Load {
+                    buf: stamp,
+                    ty: Ty::I64,
+                }],
+            }),
+            then: Box::new(Expr::Store {
+                local: newest,
+                value: Box::new(Expr::Load {
+                    buf: last,
+                    ty: Ty::F64,
+                }),
+                then: Box::new(Expr::Select {
+                    // A new sample: what was newest becomes the one before.
+                    cond: differs(sample, newest),
+                    then: Box::new(Expr::Store {
+                        local: sink,
+                        value: Box::new(Expr::Exchange {
+                            state: prev,
+                            value: Box::new(Expr::Exchange {
+                                state: last,
+                                value: f64_local(sample),
+                                ty: Ty::F64,
+                            }),
+                            ty: Ty::F64,
+                        }),
+                        then: Box::new(gap(sample, newest)),
+                    }),
+                    els: Box::new(Expr::Store {
+                        local: older,
+                        value: Box::new(Expr::Load {
+                            buf: prev,
+                            ty: Ty::F64,
+                        }),
+                        then: Box::new(gap(newest, older)),
+                    }),
+                    ty: Ty::F64,
+                }),
+            }),
+        };
+        Some((expr, Ty::F64))
+    }
+
+    /// The timestamp slot of the input an expression names: a component
+    /// port by its full path, a frame parameter, or one of its fields.
+    fn port_stamp(&mut self, arg: &ast::Expr) -> Option<BufId> {
+        let stamp_of = |binding: Option<&Binding>| match binding {
+            Some(Binding::Cell { stamp, .. }) | Some(Binding::Record { stamp, .. }) => *stamp,
+            _ => None,
+        };
+        if let Some(path) = lang::dotted(arg)
+            && let Some(stamp) = stamp_of(self.names.get(&path))
+        {
+            return Some(stamp);
+        }
+        if let ast::Expr::Attribute(attr) = arg
+            && let Some(head) = lang::dotted(&attr.value)
+            && let Some(stamp) = stamp_of(self.names.get(&head))
+        {
+            return Some(stamp);
+        }
+        self.diags.push(
+            arg.range(),
+            "`deltat` needs an input: a component, a frame parameter, or one of its fields",
+        );
+        None
     }
 
     /// `value` minus what `state` held, leaving `value` there — and 0 while

@@ -45,7 +45,9 @@ pub struct Field {
 pub struct Frame {
     pub name: String,
     pub fields: Vec<Field>,
-    /// Total bytes, which is what `<system>_arg_ptr(i)` addresses.
+    /// Total bytes of the frame. An input block at `<system>_arg_ptr(i)` is
+    /// this many bytes of frame followed by the sample's timestamp — see
+    /// [`Port::stamp_offset`].
     pub bytes: u32,
 }
 
@@ -109,6 +111,16 @@ pub struct Port {
     pub frame: Frame,
     /// One entry per field of `frame`, in the same order.
     pub bindings: Vec<Binding>,
+}
+
+impl Port {
+    /// Where the sample's timestamp sits in this port's input block: an
+    /// `i64` of microseconds right after the frame. A host writes it along
+    /// with the frame; `deltat` is what reads it. A host that leaves it at
+    /// zero gets a `deltat` that never advances, and nothing else changes.
+    pub fn stamp_offset(&self) -> u32 {
+        self.frame.bytes
+    }
 }
 
 /// A state field: a value that outlives one evaluation.

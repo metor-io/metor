@@ -222,8 +222,8 @@ pub fn system(
         // Whatever the host already knows about this port becomes its first
         // held value, so a system is not blind to everything published before
         // it existed.
-        if let Some((_, value)) = &source.seed {
-            held.hold(i, value);
+        if let Some((ts, value)) = &source.seed {
+            held.hold(i, *ts, value);
         }
         readers.push(Some(source.node.subscribe()));
     }
@@ -425,6 +425,9 @@ pub(crate) struct Held {
     /// The frame bytes each port last contributed. Empty until that port
     /// publishes, which is what makes the skip decidable.
     latest: Vec<Vec<u8>>,
+    /// When each held port's newest sample was published, which is what the
+    /// guest's `deltat` counts arrivals by.
+    stamps: Vec<Timestamp>,
     /// Which port fires the system, or `None` when a clock does.
     driven_port: Option<usize>,
     /// Scratch for the driving port's frame, which is never held.
@@ -443,6 +446,7 @@ impl Held {
         }
         Ok(Held {
             latest: vec![Vec::new(); layouts.len()],
+            stamps: vec![Timestamp(0); layouts.len()],
             layouts,
             driven_port,
             sample: Vec::new(),
@@ -451,10 +455,11 @@ impl Held {
 
     /// A port published `value`, in its component's bytes. A sample of the
     /// wrong length is not the port's and is ignored.
-    pub(crate) fn hold(&mut self, port: usize, value: &[u8]) {
+    pub(crate) fn hold(&mut self, port: usize, ts: Timestamp, value: &[u8]) {
         let layout = &self.layouts[port];
         if value.len() == layout.sample_bytes {
             layout.fill(value, &mut self.latest[port]);
+            self.stamps[port] = ts;
         }
     }
 
@@ -483,11 +488,11 @@ impl Held {
             return Ok(None);
         }
         for (i, held) in self.latest.iter().enumerate() {
-            let bytes = match self.driven_port == Some(i) {
-                true => &self.sample,
-                false => held,
+            let (bytes, stamp) = match self.driven_port == Some(i) {
+                true => (&self.sample, ts),
+                false => (held, self.stamps[i]),
             };
-            instance.write_port(i, bytes)?;
+            instance.write_port(i, bytes, stamp)?;
         }
         instance.eval(ts).map(Some)
     }
@@ -590,8 +595,8 @@ fn drain(reader: &mut NodeReader, port: usize, held: &mut Held) {
         if count == 0 {
             continue;
         }
-        let (_, value) = grant.sample_at(count - 1);
-        held.hold(port, value);
+        let (ts, value) = grant.sample_at(count - 1);
+        held.hold(port, ts, value);
     }
 }
 
@@ -601,6 +606,8 @@ pub(crate) struct Running {
     instance: Instance,
     eval: TypedFunc<i64, i32>,
     args: Vec<u32>,
+    /// Where each port's sample stamp goes, relative to its argument block.
+    stamps: Vec<u32>,
     ret: u32,
     frame_bytes: usize,
     state: Vec<(metor_expr::state::Slot, u32)>,
@@ -671,6 +678,7 @@ impl Running {
             instance,
             eval,
             args,
+            stamps: desc.inputs.iter().map(|p| p.stamp_offset()).collect(),
             ret,
             frame_bytes: desc.output.bytes as usize,
             state,
@@ -686,11 +694,14 @@ impl Running {
             .expect("a compiled module exports its memory")
     }
 
-    fn write_port(&mut self, port: usize, bytes: &[u8]) -> Result<(), String> {
+    /// Fill one input block: the frame, then the stamp of the sample it is.
+    fn write_port(&mut self, port: usize, bytes: &[u8], ts: Timestamp) -> Result<(), String> {
         let at = self.args[port] as usize;
+        let stamp = at + self.stamps[port] as usize;
         let memory = self.memory();
         memory
             .write(&mut self.store, at, bytes)
+            .and_then(|()| memory.write(&mut self.store, stamp, &ts.0.to_le_bytes()))
             .map_err(|err| format!("could not write input frame: {err}"))
     }
 

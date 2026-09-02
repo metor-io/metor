@@ -353,10 +353,10 @@ pub fn builtins() -> &'static [Builtin] {
         },
         Builtin {
             name: "deltat",
-            params: &[],
+            params: &["x"],
             ret: "f64",
             avail: System,
-            doc: "seconds since the previous sample, 0 on the first",
+            doc: "seconds between the input x's newest sample and the one before",
         },
         Builtin {
             name: "resample_zoh",

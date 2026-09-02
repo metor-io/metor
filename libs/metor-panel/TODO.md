@@ -60,7 +60,7 @@ A natural follow-up to Window. Each is `f64 in → f64 out` with one `size` arg.
 - [x] **Sliding Mean** — `mean(x, n)` in an expression, the average of the last `n` samples
 - [ ] **Sliding Min / Max** — running envelope (alarm flooring/ceiling)
 - [ ] **Sliding StdDev / Variance** — noise / jitter quantification
-- [x] **Differentiate** — `delta(x) / deltat()` in an expression (change since the previous sample over seconds elapsed)
+- [x] **Differentiate** — `delta(x) / deltat(x)` in an expression (change since the previous sample over the seconds between samples)
 - [ ] **Integrate** — running sum, with optional reset trigger
 
 ### Proposed: thresholds and triggers
