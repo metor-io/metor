@@ -36,6 +36,7 @@ fn source_of(path: &str) -> Option<ComponentSource> {
         prim,
         shape: shape.to_vec(),
         offset,
+        timestamp_at: None,
     })
 }
 
@@ -49,7 +50,10 @@ impl Resolver for Imu {
                 shape: shape.to_vec(),
             },
         };
-        Some(CompSchema { ty })
+        Some(CompSchema {
+            ty,
+            timestamp: false,
+        })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {

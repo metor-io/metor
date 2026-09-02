@@ -439,19 +439,6 @@ fn execute(
                             for fill in &group.fills {
                                 unpack(&mut body, lay, fill, rp);
                             }
-                            // The cycle the record arrived in is the stamp
-                            // the guest has for it: a ring does not say
-                            // where its producer keeps its own.
-                            let mut stamped: Vec<usize> =
-                                group.fills.iter().map(|f| f.param).collect();
-                            stamped.sort_unstable();
-                            stamped.dedup();
-                            for param in stamped {
-                                let at_stamp = lay.args[param] + entry.arg_stamps[param];
-                                body.instruction(&Instruction::I32Const(at_stamp as i32));
-                                body.instruction(&Instruction::LocalGet(1));
-                                body.instruction(&Instruction::I64Store(at(3)));
-                            }
                             // seen |= 1 << g; held = c.
                             body.instruction(&Instruction::I32Const((lay.block + SEEN) as i32));
                             body.instruction(&Instruction::I32Const((lay.block + SEEN) as i32));

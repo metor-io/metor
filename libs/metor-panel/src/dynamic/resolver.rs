@@ -61,9 +61,11 @@ impl DbResolver {
 
 impl Resolver for DbResolver {
     fn component(&self, path: &str) -> Option<CompSchema> {
-        self.components
-            .get(path)
-            .map(|(_, ty)| CompSchema { ty: ty.clone() })
+        self.components.get(path).map(|(_, ty)| CompSchema {
+            ty: ty.clone(),
+            // A db keeps a timestamp beside every sample.
+            timestamp: true,
+        })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {

@@ -750,6 +750,8 @@ fn imu_source(path: &str) -> Option<metor_expr::ComponentSource> {
         prim,
         shape: shape.to_vec(),
         offset,
+        // The fixture records lead with their stamp, as a Table record does.
+        timestamp_at: Some(0),
     })
 }
 
@@ -763,7 +765,10 @@ impl metor_expr::Resolver for ImuResolver {
                 shape: shape.to_vec(),
             },
         };
-        Some(metor_expr::CompSchema { ty })
+        Some(metor_expr::CompSchema {
+            ty,
+            timestamp: true,
+        })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {
@@ -872,6 +877,61 @@ fn a_compiled_python_system_runs_through_the_pack_host() {
     // A second concurrent create of the same entry would alias the static
     // buffers; the guest refuses it like a failed native create.
     assert!(matches!(pack.create(0, 0, &[]), Err(WasmError::Create(0))));
+
+    pack.shutdown(state).expect("shutdown");
+    pack.destroy(state).expect("destroy");
+    pack.close().expect("close");
+}
+
+/// `deltat` reads the producer's own stamp out of its record — the frame's
+/// timestamp field is filled from the record like any other field — so the
+/// gap it reports is between records, not between the cycles that carried
+/// them.
+#[test]
+fn deltat_reads_the_producers_record_stamp() {
+    let source = "@system(\"imu.sensors.gyro_b\")\n\
+                  def gap(gyro_b) -> f64:\n    return deltat(gyro_b)\n";
+    let program =
+        metor_expr::compile_pack(source, &ImuResolver, 120.0).expect("the program compiles");
+    let mut pack = WasmPack::open(&program.wasm, AMPLE_FUEL).expect("a compiled pack opens");
+    let state = pack.create(0, 0, &[]).expect("create entry 0 wired");
+    let cfg = Config {
+        capacity: capacity_for(32, 8),
+        max_readers: 2,
+    };
+    let input = pack.add_ring(cfg, ROLE_INPUT).expect("input ring");
+    let output = pack.add_ring(cfg, ROLE_OUTPUT).expect("output ring");
+    pack.bind_init(state, &[input], &[output], "gap")
+        .expect("bind");
+    pack.pin_memory();
+    let base = pack.memory_base();
+    // SAFETY: both regions were just formatted inside pinned guest memory,
+    // which outlives the handles below.
+    let in_ring = unsafe { RingBuffer::attach_raw(base.add(input.offset as usize), input.len) }
+        .expect("host attaches the guest input ring");
+    let mut writer = in_ring.writer(NoWake).expect("host writer");
+    // SAFETY: as above.
+    let out_ring = unsafe { RingBuffer::attach_raw(base.add(output.offset as usize), output.len) }
+        .expect("host attaches the guest output ring");
+    let mut view = out_ring.view(NoWake).expect("host view");
+
+    // Record stamps a quarter second apart, carried by cycles a tick apart.
+    let mut seen = Vec::new();
+    for (stamp, now) in [(1_000_000i64, 7u64), (1_250_000, 8)] {
+        let mut record = Vec::new();
+        record.extend_from_slice(&stamp.to_le_bytes());
+        for v in [1.0f64, 2.0, 3.0] {
+            record.extend_from_slice(&v.to_le_bytes());
+        }
+        writer.try_write(&record).expect("input record");
+        assert_eq!(pack.execute(state, now).unwrap(), FswStatus::Running);
+        let grant = view
+            .try_latest()
+            .expect("output ring intact")
+            .expect("a fresh driving record fires the system");
+        seen.push(f64::from_le_bytes(grant[8..16].try_into().unwrap()));
+    }
+    assert_eq!(seen, vec![0.0, 0.25]);
 
     pack.shutdown(state).expect("shutdown");
     pack.destroy(state).expect("destroy");

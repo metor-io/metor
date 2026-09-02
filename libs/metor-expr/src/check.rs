@@ -16,8 +16,6 @@ use crate::{Dtype, FnSig, Manifest, Resolver, Ty};
 
 /// Maximum expression depth accepted by the checker.
 const MAX_DEPTH: u32 = 512;
-/// The timestamp that trails every input frame in its block.
-const STAMP_BYTES: u32 = 8;
 
 /// Maximum source size accepted by the checker.
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
@@ -359,6 +357,7 @@ fn produced_ty(
             Some(systems.get(*system)?.output.fields.get(*field)?.ty.clone())
         }
         manifest::Binding::Resampled { stage } => Some(stages.get(*stage)?.ty.clone()),
+        manifest::Binding::Timestamp => Some(Ty::I64),
     }
 }
 
@@ -406,14 +405,22 @@ fn system(
                     diags.push(decl.span, format!("no component `{path}`"));
                     return None;
                 }
+                manifest::Binding::Timestamp => {
+                    unreachable!("a stamp trails a frame's own fields")
+                }
             },
         };
-        // An input block is the frame followed by its sample's timestamp,
-        // which is how `deltat` tells one arrival from the next.
-        let block = alloc(buffers, frame.bytes + STAMP_BYTES);
+        // A stamped source's frame carries its sample's timestamp as one
+        // more field, which is how `deltat` tells one arrival from the next.
+        // The body never sees that field by name — it reaches it through
+        // `deltat` alone.
+        let (frame, bindings) = match port.stamped {
+            true => lang::stamped(frame, port.bindings.clone()),
+            false => (frame, port.bindings.clone()),
+        };
+        let block = alloc(buffers, frame.bytes);
         arg_buffers.push(block);
-        let stamp = Some(field(buffers, block, frame.bytes));
-        let fields: Vec<(String, Cell)> = frame
+        let mut fields: Vec<(String, Cell)> = frame
             .fields
             .iter()
             .map(|f| {
@@ -426,6 +433,7 @@ fn system(
                 )
             })
             .collect();
+        let stamp = frame.timestamp.map(|i| fields.remove(i).1.buf);
         let binding = if port.projected {
             Binding::Cell {
                 cell: fields[0].1.clone(),
@@ -443,7 +451,7 @@ fn system(
         ports.push(Port {
             param: port.key.clone(),
             frame,
-            bindings: port.bindings.clone(),
+            bindings,
         });
     }
 
@@ -2814,7 +2822,7 @@ impl FnChecker<'_> {
     /// `deltat(x)`: seconds between the current sample of the input `x` and
     /// the one before it, 0 until there is one before it.
     ///
-    /// The input's block carries its sample's timestamp, and that stamp is
+    /// The input's frame carries its sample's timestamp, and that stamp is
     /// what tells one sample from the next — not the evaluation, since a held
     /// input keeps its newest sample across many of them. Two slots per call
     /// site: the stamps of the newest sample and of the one before, both
@@ -2916,29 +2924,41 @@ impl FnChecker<'_> {
         Some((expr, Ty::F64))
     }
 
-    /// The timestamp slot of the input an expression names: a component
+    /// The timestamp field of the input an expression names: a component
     /// port by its full path, a frame parameter, or one of its fields.
     fn port_stamp(&mut self, arg: &ast::Expr) -> Option<BufId> {
-        let stamp_of = |binding: Option<&Binding>| match binding {
-            Some(Binding::Cell { stamp, .. }) | Some(Binding::Record { stamp, .. }) => *stamp,
+        // An input's stamp, or `None` for a name that is not an input.
+        let input = |binding: Option<&Binding>| match binding {
+            Some(Binding::Cell { stamp, .. }) | Some(Binding::Record { stamp, .. }) => Some(*stamp),
             _ => None,
         };
-        if let Some(path) = lang::dotted(arg)
-            && let Some(stamp) = stamp_of(self.names.get(&path))
-        {
-            return Some(stamp);
+        let mut found = None;
+        if let Some(path) = lang::dotted(arg) {
+            found = input(self.names.get(&path));
         }
-        if let ast::Expr::Attribute(attr) = arg
+        if found.is_none()
+            && let ast::Expr::Attribute(attr) = arg
             && let Some(head) = lang::dotted(&attr.value)
-            && let Some(stamp) = stamp_of(self.names.get(&head))
         {
-            return Some(stamp);
+            found = input(self.names.get(&head));
         }
-        self.diags.push(
-            arg.range(),
-            "`deltat` needs an input: a component, a frame parameter, or one of its fields",
-        );
-        None
+        match found {
+            Some(Some(stamp)) => Some(stamp),
+            Some(None) => {
+                self.diags.push(
+                    arg.range(),
+                    "this input's samples carry no timestamp for `deltat` to read",
+                );
+                None
+            }
+            None => {
+                self.diags.push(
+                    arg.range(),
+                    "`deltat` needs an input: a component, a frame parameter, or one of its fields",
+                );
+                None
+            }
+        }
     }
 
     /// `value` minus what `state` held, leaving `value` there — and 0 while

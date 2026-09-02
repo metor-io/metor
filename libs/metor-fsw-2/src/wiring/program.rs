@@ -217,6 +217,7 @@ impl BuildResolver {
                             prim: field.ty,
                             shape: field.shape.to_vec(),
                             offset: field.offset,
+                            timestamp_at: field.timestamp_at,
                         },
                         ty,
                     },
@@ -231,6 +232,7 @@ impl Resolver for BuildResolver {
     fn component(&self, path: &str) -> Option<CompSchema> {
         self.components.get(path).map(|info| CompSchema {
             ty: info.ty.clone(),
+            timestamp: info.source.timestamp_at.is_some(),
         })
     }
 
@@ -247,6 +249,11 @@ impl Resolver for BuildResolver {
         self.frames.get(name).map(|fields| FrameSchema {
             name: name.to_string(),
             fields: fields.clone(),
+            // One record, one stamp: any field's answer is the frame's.
+            timestamp: self
+                .components
+                .values()
+                .any(|info| info.source.port_name == name && info.source.timestamp_at.is_some()),
         })
     }
 }

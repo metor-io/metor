@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 /// The compiler revision a manifest was produced by. Hosts refuse a manifest
 /// they do not recognise rather than guessing at a layout.
-pub const COMPILER_VERSION: u32 = 2;
+pub const COMPILER_VERSION: u32 = 3;
 
 /// One field of a frame or state record.
 ///
@@ -45,15 +45,24 @@ pub struct Field {
 pub struct Frame {
     pub name: String,
     pub fields: Vec<Field>,
-    /// Total bytes of the frame. An input block at `<system>_arg_ptr(i)` is
-    /// this many bytes of frame followed by the sample's timestamp — see
-    /// [`Port::stamp_offset`].
+    /// Total bytes, which is what `<system>_arg_ptr(i)` addresses.
     pub bytes: u32,
+    /// Index into `fields` of the sample's own timestamp, an `i64` of
+    /// microseconds, when the frame carries one. An input frame does when
+    /// its producer stamps its records: the host fills it like any other
+    /// field, and `deltat` is what reads it. Its name is not a Python
+    /// identifier, so no body can shadow it.
+    pub timestamp: Option<usize>,
 }
 
 impl Frame {
     pub fn field(&self, name: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// The sample-timestamp field, when this frame carries one.
+    pub fn timestamp_field(&self) -> Option<&Field> {
+        self.timestamp.map(|i| &self.fields[i])
     }
 }
 
@@ -66,6 +75,9 @@ pub enum Binding {
     Produced { system: usize, field: usize },
     /// The output of a [`Stage`] in this same program.
     Resampled { stage: usize },
+    /// The producer's own timestamp for the sample the frame is, as `i64`
+    /// microseconds — the field [`Frame::timestamp`] names.
+    Timestamp,
 }
 
 /// How a [`Stage`] fills a tick the input did not land on.
@@ -111,16 +123,6 @@ pub struct Port {
     pub frame: Frame,
     /// One entry per field of `frame`, in the same order.
     pub bindings: Vec<Binding>,
-}
-
-impl Port {
-    /// Where the sample's timestamp sits in this port's input block: an
-    /// `i64` of microseconds right after the frame. A host writes it along
-    /// with the frame; `deltat` is what reads it. A host that leaves it at
-    /// zero gets a `deltat` that never advances, and nothing else changes.
-    pub fn stamp_offset(&self) -> u32 {
-        self.frame.bytes
-    }
 }
 
 /// A state field: a value that outlives one evaluation.

@@ -344,6 +344,7 @@ struct WalkCtx<'a> {
     container: Option<&'a str>,
     frame: Option<ComponentId>,
     timestamp: Option<Timestamp>,
+    timestamp_at: Option<usize>,
     depth: usize,
 }
 
@@ -356,6 +357,7 @@ impl Default for WalkCtx<'_> {
             container: None,
             frame: None,
             timestamp: None,
+            timestamp_at: None,
             depth: 0,
         }
     }
@@ -370,6 +372,10 @@ pub struct RealizedField<'a> {
     pub offset: usize,
     pub view: Option<ComponentView<'a>>,
     pub timestamp: Option<Timestamp>,
+    /// Byte offset in the record of the timestamp this field shares, when
+    /// its op chain names one — known without a table, so a consumer can
+    /// read a producer's stamp straight out of the record.
+    pub timestamp_at: Option<usize>,
     /// The frame this field belongs to, if tagged by an [`Op::Frame`].
     pub frame: Option<ComponentId>,
     /// The dynamic-frame element this field came from, if any (`None` for static fields).
@@ -631,18 +637,19 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         // Frame and timestamp are inherited from the enclosing frame, but the field's
         // own `Frame`/`Timestamp` ops override them.
         let mut timestamp: Option<Timestamp> = ctx.timestamp;
+        let mut timestamp_at: Option<usize> = ctx.timestamp_at;
         let mut schema: Option<RealizedSchema<'a>> = None;
         let mut frame: Option<ComponentId> = ctx.frame;
         loop {
             match realized_op {
                 RealizedOp::Component(RealizedComponent { component_id }) => {
-                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, false, None, table, f);
+                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, timestamp_at, false, None, table, f);
                 }
                 RealizedOp::PathComponent(leaf) => {
                     let mut leaf_path = ctx.path;
                     leaf_path.push(leaf.name);
                     let component_id = leaf_path.finish();
-                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, true, Some(leaf.name), table, f);
+                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, timestamp_at, true, Some(leaf.name), table, f);
                 }
                 RealizedOp::Schema(s) => {
                     let s = schema.insert(s);
@@ -651,6 +658,9 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                 RealizedOp::Timestamp(t) => {
                     if t.timestamp.is_some() {
                         timestamp = t.timestamp;
+                    }
+                    if let Some(range) = &t.range {
+                        timestamp_at = Some(range.start);
                     }
                     realized_op = self.realize(t.arg, table)?;
                 }
@@ -662,7 +672,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                     realized_op = self.realize(e.arg, table)?;
                 }
                 RealizedOp::List(dynm) | RealizedOp::Map(dynm) => {
-                    return self.expand_dynamic(field, &ctx, frame, timestamp, &dynm, table, f);
+                    return self.expand_dynamic(field, &ctx, frame, timestamp, timestamp_at, &dynm, table, f);
                 }
                 _ => return Err(Error::InvalidOp),
             }
@@ -680,6 +690,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         frame: Option<ComponentId>,
         schema: &Option<RealizedSchema<'a>>,
         timestamp: Option<Timestamp>,
+        timestamp_at: Option<usize>,
         dynamic: bool,
         member: Option<&'a str>,
         table: Option<&'a [u8]>,
@@ -702,6 +713,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             component_id,
             view,
             timestamp,
+            timestamp_at,
             offset,
             shape,
             ty: schema.ty,
@@ -726,6 +738,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         ctx: &WalkCtx<'a>,
         frame: Option<ComponentId>,
         timestamp: Option<Timestamp>,
+        timestamp_at: Option<usize>,
         dynm: &RealizedDynamic<'a>,
         table: Option<&'a [u8]>,
         f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
@@ -744,6 +757,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                 container: Some(dynm.name),
                 frame,
                 timestamp,
+                timestamp_at,
                 depth: ctx.depth + 1,
             };
             for mi in members_start..members_end {
@@ -790,6 +804,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                 container: Some(dynm.name),
                 frame,
                 timestamp,
+                timestamp_at,
                 depth: ctx.depth + 1,
             };
             for mi in members_start..members_end {

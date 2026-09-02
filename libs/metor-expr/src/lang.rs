@@ -75,6 +75,9 @@ pub(crate) struct PortDecl {
     pub bindings: Vec<Binding>,
     /// A one-field port the body reads *as* the field, not as a record.
     pub projected: bool,
+    /// Whether the source stamps its samples, so the input frame gets a
+    /// timestamp field for `deltat` to read.
+    pub stamped: bool,
 }
 
 pub(crate) struct StateSlot {
@@ -282,7 +285,7 @@ fn stage_decl(
         let Some(path) = resolve_path(&key, resolver, span, diags) else {
             return Some(None);
         };
-        let Some(CompSchema { ty }) = resolver.component(&path) else {
+        let Some(CompSchema { ty, .. }) = resolver.component(&path) else {
             diags.push(span, format!("no component `{path}`"));
             return Some(None);
         };
@@ -553,7 +556,27 @@ pub(crate) fn frame_of(name: &str, fields: impl IntoIterator<Item = (String, Ty)
         name: name.to_string(),
         fields,
         bytes: offset,
+        timestamp: None,
     }
+}
+
+/// The name of the sample-timestamp field an input frame carries. Not a
+/// Python identifier, so a body cannot name it and a producer's component
+/// cannot collide with it.
+pub(crate) const TIMESTAMP_FIELD: &str = "@timestamp";
+
+/// An input frame with its sample's timestamp as a trailing field, and the
+/// binding that fills it.
+pub(crate) fn stamped(mut frame: Frame, mut bindings: Vec<Binding>) -> (Frame, Vec<Binding>) {
+    frame.timestamp = Some(frame.fields.len());
+    frame.fields.push(Field {
+        name: TIMESTAMP_FIELD.to_string(),
+        ty: Ty::I64,
+        offset: frame.bytes,
+    });
+    frame.bytes += bytes_of(&Ty::I64);
+    bindings.push(Binding::Timestamp);
+    (frame, bindings)
 }
 
 pub(crate) fn bytes_of(ty: &Ty) -> u32 {
@@ -599,12 +622,14 @@ fn system_decl<'a>(
                 &frame_name,
                 decl.fields.iter().map(|(n, t, _)| (n.clone(), t.clone())),
             );
-            let bindings = bind_frame(&frame, produced, resolver, def.range.into(), diags)?;
+            let (bindings, stamped) =
+                bind_frame(&frame, produced, resolver, def.range.into(), diags)?;
             ports.push(PortDecl {
                 key: param.clone(),
                 frame: Some(frame),
                 bindings,
                 projected: false,
+                stamped,
             });
         }
     } else {
@@ -656,7 +681,7 @@ fn projected_port(
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<PortDecl> {
-    let Some(CompSchema { ty }) = resolver.component(path) else {
+    let Some(CompSchema { ty, timestamp }) = resolver.component(path) else {
         diags.push(span, format!("no component `{path}`"));
         return None;
     };
@@ -666,27 +691,28 @@ fn projected_port(
         frame: Some(frame_of(path, [(field, ty)])),
         bindings: vec![Binding::Component(path.to_string())],
         projected: true,
+        stamped: timestamp,
     })
 }
 
 /// Every field of a declared frame, against a system that produces it or
-/// against the host's component tree.
+/// against the host's component tree — and whether the samples come
+/// stamped, which for a frame means every field's producer stamps.
 fn bind_frame(
     frame: &Frame,
     produced: &HashMap<String, usize>,
     resolver: &dyn Resolver,
     span: Span,
     diags: &mut Diagnostics,
-) -> Option<Vec<Binding>> {
+) -> Option<(Vec<Binding>, bool)> {
     if let Some(system) = produced.get(&frame.name) {
-        return Some(
-            (0..frame.fields.len())
-                .map(|field| Binding::Produced {
-                    system: *system,
-                    field,
-                })
-                .collect(),
-        );
+        let bindings = (0..frame.fields.len())
+            .map(|field| Binding::Produced {
+                system: *system,
+                field,
+            })
+            .collect();
+        return Some((bindings, true));
     }
     if let Some(schema) = resolver.frame(&frame.name) {
         let want: Vec<(String, Ty)> = frame
@@ -703,10 +729,14 @@ fn bind_frame(
         }
     }
     let mut bindings = Vec::with_capacity(frame.fields.len());
+    let mut stamped = true;
     for field in &frame.fields {
         let path = format!("{}.{}", frame.name, field.name);
         match resolver.component(&path) {
-            Some(schema) if schema.ty == field.ty => bindings.push(Binding::Component(path)),
+            Some(schema) if schema.ty == field.ty => {
+                stamped &= schema.timestamp;
+                bindings.push(Binding::Component(path));
+            }
             Some(schema) => {
                 diags.push(
                     span,
@@ -723,7 +753,7 @@ fn bind_frame(
             }
         }
     }
-    Some(bindings)
+    Some((bindings, stamped))
 }
 
 /// What `@system(...)` said.
@@ -1043,6 +1073,7 @@ fn anonymous<'a>(
                 frame: existing[system].output.clone(),
                 bindings: vec![Binding::Produced { system, field: 0 }],
                 projected: true,
+                stamped: true,
             });
             continue;
         }
@@ -1055,6 +1086,7 @@ fn anonymous<'a>(
                     .map(|ty| frame_of(&key, [(key.clone(), ty)])),
                 bindings: vec![Binding::Resampled { stage }],
                 projected: true,
+                stamped: true,
             });
             continue;
         }

@@ -213,11 +213,14 @@ pub fn complete(
             let last_dot = segments.iter().rev().find(|t| t.kind() == TokenKind::Dot);
             let field_start = last_dot.map(|d| d.range().end()).unwrap_or(chain_start);
             let replace = TextRange::new(field_start, cursor);
+            // The sample stamp is not a name a body can write.
             let items = port
                 .frame
                 .fields
                 .iter()
-                .map(|f| CompletionItem {
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != port.frame.timestamp)
+                .map(|(_, f)| CompletionItem {
                     label: f.name.clone(),
                     detail: f.ty.to_string(),
                     kind: CompletionKind::Field,

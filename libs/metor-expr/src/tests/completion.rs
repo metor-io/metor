@@ -39,7 +39,10 @@ impl Resolver for Table {
         PATHS
             .iter()
             .find(|(p, _)| *p == path)
-            .map(|(_, ty)| CompSchema { ty: ty.clone() })
+            .map(|(_, ty)| CompSchema {
+                ty: ty.clone(),
+                timestamp: true,
+            })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {

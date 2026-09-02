@@ -682,6 +682,8 @@ fn synth_edges(
                         "artifact carries a resample stage the build gate rejects".into(),
                     ));
                 }
+                // The stamp rides the record the frame's fields came from.
+                metor_expr::Binding::Timestamp => continue,
             };
             if seen.contains(&key) {
                 continue;

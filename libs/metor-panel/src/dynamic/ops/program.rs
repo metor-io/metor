@@ -366,8 +366,10 @@ pub(crate) fn read_field(slot: &[u8], ty: &Ty, out: &mut Vec<u8>) {
 
 /// How a component's bytes become a frame's.
 struct PortLayout {
-    /// Offset of the port's single field within its frame.
+    /// Offset of the port's single value field within its frame.
     offset: usize,
+    /// Offset of the frame's timestamp field, filled from the sample's own.
+    stamp: Option<usize>,
     frame_bytes: usize,
     field: Ty,
     source: PrimType,
@@ -378,9 +380,16 @@ struct PortLayout {
 
 impl PortLayout {
     fn new(port: &metor_expr::Port, schema: &ComponentSchema) -> Result<Self, BuildError> {
-        // A port the panel builds is a projection of one component, so it has
-        // Component ports project exactly one field.
-        let [field] = port.frame.fields.as_slice() else {
+        // A port the panel builds is a projection of one component, so its
+        // frame is that one value field plus the sample's timestamp.
+        let mut values = port
+            .frame
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != port.frame.timestamp)
+            .map(|(_, f)| f);
+        let (Some(field), None) = (values.next(), values.next()) else {
             return Err(BuildError::Expr(format!(
                 "`{}` binds a frame of {} fields; the panel binds one component per port",
                 port.param,
@@ -389,6 +398,7 @@ impl PortLayout {
         };
         Ok(PortLayout {
             offset: field.offset as usize,
+            stamp: port.frame.timestamp_field().map(|f| f.offset as usize),
             frame_bytes: port.frame.bytes as usize,
             field: field.ty.clone(),
             source: schema.prim_type,
@@ -398,9 +408,12 @@ impl PortLayout {
     }
 
     /// Render one component sample as this port's frame bytes.
-    fn fill(&self, value: &[u8], out: &mut Vec<u8>) {
+    fn fill(&self, ts: Timestamp, value: &[u8], out: &mut Vec<u8>) {
         out.clear();
         out.resize(self.frame_bytes, 0);
+        if let Some(at) = self.stamp {
+            out[at..at + 8].copy_from_slice(&ts.0.to_le_bytes());
+        }
         let slot = &mut out[self.offset..];
         for i in 0..self.elements {
             let v = read_f64_at(value, self.source, i);
@@ -422,12 +435,10 @@ impl PortLayout {
 /// value, and nothing fires until each held port has one.
 pub(crate) struct Held {
     layouts: Vec<PortLayout>,
-    /// The frame bytes each port last contributed. Empty until that port
-    /// publishes, which is what makes the skip decidable.
+    /// The frame bytes each port last contributed, sample timestamp
+    /// included. Empty until that port publishes, which is what makes the
+    /// skip decidable.
     latest: Vec<Vec<u8>>,
-    /// When each held port's newest sample was published, which is what the
-    /// guest's `deltat` counts arrivals by.
-    stamps: Vec<Timestamp>,
     /// Which port fires the system, or `None` when a clock does.
     driven_port: Option<usize>,
     /// Scratch for the driving port's frame, which is never held.
@@ -446,7 +457,6 @@ impl Held {
         }
         Ok(Held {
             latest: vec![Vec::new(); layouts.len()],
-            stamps: vec![Timestamp(0); layouts.len()],
             layouts,
             driven_port,
             sample: Vec::new(),
@@ -458,8 +468,7 @@ impl Held {
     pub(crate) fn hold(&mut self, port: usize, ts: Timestamp, value: &[u8]) {
         let layout = &self.layouts[port];
         if value.len() == layout.sample_bytes {
-            layout.fill(value, &mut self.latest[port]);
-            self.stamps[port] = ts;
+            layout.fill(ts, value, &mut self.latest[port]);
         }
     }
 
@@ -477,7 +486,7 @@ impl Held {
             if value.len() != layout.sample_bytes {
                 return Ok(None);
             }
-            layout.fill(value, &mut self.sample);
+            layout.fill(ts, value, &mut self.sample);
         }
         if self
             .latest
@@ -488,11 +497,11 @@ impl Held {
             return Ok(None);
         }
         for (i, held) in self.latest.iter().enumerate() {
-            let (bytes, stamp) = match self.driven_port == Some(i) {
-                true => (&self.sample, ts),
-                false => (held, self.stamps[i]),
+            let bytes = match self.driven_port == Some(i) {
+                true => &self.sample,
+                false => held,
             };
-            instance.write_port(i, bytes, stamp)?;
+            instance.write_port(i, bytes)?;
         }
         instance.eval(ts).map(Some)
     }
@@ -606,8 +615,6 @@ pub(crate) struct Running {
     instance: Instance,
     eval: TypedFunc<i64, i32>,
     args: Vec<u32>,
-    /// Where each port's sample stamp goes, relative to its argument block.
-    stamps: Vec<u32>,
     ret: u32,
     frame_bytes: usize,
     state: Vec<(metor_expr::state::Slot, u32)>,
@@ -678,7 +685,6 @@ impl Running {
             instance,
             eval,
             args,
-            stamps: desc.inputs.iter().map(|p| p.stamp_offset()).collect(),
             ret,
             frame_bytes: desc.output.bytes as usize,
             state,
@@ -694,14 +700,11 @@ impl Running {
             .expect("a compiled module exports its memory")
     }
 
-    /// Fill one input block: the frame, then the stamp of the sample it is.
-    fn write_port(&mut self, port: usize, bytes: &[u8], ts: Timestamp) -> Result<(), String> {
+    fn write_port(&mut self, port: usize, bytes: &[u8]) -> Result<(), String> {
         let at = self.args[port] as usize;
-        let stamp = at + self.stamps[port] as usize;
         let memory = self.memory();
         memory
             .write(&mut self.store, at, bytes)
-            .and_then(|()| memory.write(&mut self.store, stamp, &ts.0.to_le_bytes()))
             .map_err(|err| format!("could not write input frame: {err}"))
     }
 

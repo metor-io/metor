@@ -1,7 +1,7 @@
 //! `delta`, `deltat`, and `mean(x, n)`: the one-sample memories.
 
 use super::systems::{IMU, Table, build, imu_table, refuse};
-use crate::Ty;
+use crate::{CompSchema, FrameSchema, Resolver, Ty};
 
 /// The first sample has nothing to differ from, so it reads 0 rather than
 /// itself — and every one after is the difference from its predecessor.
@@ -181,6 +181,51 @@ fn differencing_needs_a_system_and_deltat_an_input() {
         let text = refuse(source, &imu_table());
         assert!(text.contains("`deltat` needs an input"), "{source}: {text}");
     }
+}
+
+/// A host whose samples arrive without a timestamp.
+struct Unstamped;
+
+impl Resolver for Unstamped {
+    fn component(&self, path: &str) -> Option<CompSchema> {
+        (path == "wheels.rpm").then_some(CompSchema {
+            ty: Ty::F64,
+            timestamp: false,
+        })
+    }
+
+    fn suffix(&self, name: &str) -> Vec<String> {
+        match name {
+            "rpm" => vec!["wheels.rpm".to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn frame(&self, _name: &str) -> Option<FrameSchema> {
+        None
+    }
+}
+
+/// The frame carries a timestamp field only when the source stamps its
+/// samples; without one there is nothing for `deltat` to read, and it says
+/// so at compile time rather than counting zeros.
+#[test]
+fn an_unstamped_source_has_no_deltat() {
+    let source = "@system(\"wheels.rpm\")\ndef f(rpm) -> f64:\n    return rpm\n";
+    let program = crate::compile_module(source, &Unstamped).unwrap();
+    let frame = &program.manifest.system("f").unwrap().inputs[0].frame;
+    assert_eq!(frame.timestamp, None);
+    assert_eq!(frame.fields.len(), 1);
+
+    let text = format!(
+        "{}",
+        crate::compile_module(
+            "@system(\"wheels.rpm\")\ndef f(rpm) -> f64:\n    return deltat(rpm)\n",
+            &Unstamped,
+        )
+        .expect_err("nothing to read")
+    );
+    assert!(text.contains("carry no timestamp"), "{text}");
 }
 
 /// `mean(x, n)` is `mean(window(x, n))` and nothing more: the same ring, the

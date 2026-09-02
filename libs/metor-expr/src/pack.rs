@@ -78,6 +78,9 @@ pub struct ComponentSource {
     pub shape: Vec<usize>,
     /// Byte offset of the component in the producer's record.
     pub offset: usize,
+    /// Byte offset of the record's own timestamp, when the producer stamps
+    /// its records — what fills a frame's [`Binding::Timestamp`].
+    pub timestamp_at: Option<usize>,
 }
 
 /// What a pack compile asks of its host beyond the type questions of
@@ -203,6 +206,8 @@ pub(crate) struct Group {
     /// Shortest record that covers every fill; anything shorter is skipped.
     pub(crate) min_len: u32,
     pub(crate) fills: Vec<Fill>,
+    /// Where the record keeps its timestamp, for the frames it stamps.
+    pub(crate) timestamp_at: Option<u32>,
 }
 
 /// One field's copy out of a producer record into an argument frame slot.
@@ -257,7 +262,26 @@ fn group_bindings(
     let mut keys: Vec<(String, String)> = Vec::new();
     for (port_idx, port) in system.inputs.iter().enumerate() {
         let driving = system.driving == Some(port_idx);
+        // The group this frame's first field came from, which is the record
+        // whose timestamp stamps the frame.
+        let mut stamping: Option<usize> = None;
         for (field, binding) in port.frame.fields.iter().zip(&port.bindings) {
+            if matches!(binding, Binding::Timestamp) {
+                if let Some(group) = stamping.map(|g| &mut groups[g])
+                    && let Some(at) = group.timestamp_at
+                {
+                    group.fills.push(Fill {
+                        param: port_idx,
+                        slot_offset: field.offset,
+                        src_offset: at,
+                        prim: PrimType::I64,
+                        elements: 1,
+                        slot: SlotTy::I64,
+                    });
+                    group.min_len = group.min_len.max(at + 8);
+                }
+                continue;
+            }
             let source = match binding {
                 Binding::Component(path) => match resolver.component_source(path) {
                     Some(source) => source,
@@ -276,6 +300,7 @@ fn group_bindings(
                 Binding::Resampled { .. } => {
                     unreachable!("the pack gate rejected every stage")
                 }
+                Binding::Timestamp => unreachable!("filled above, from the frame's own group"),
             };
             let key = (source.instance.clone(), source.port_name.clone());
             let at = match keys.iter().position(|k| *k == key) {
@@ -291,10 +316,12 @@ fn group_bindings(
                         driving: false,
                         min_len: 0,
                         fills: Vec::new(),
+                        timestamp_at: source.timestamp_at.map(|at| at as u32),
                     });
                     groups.len() - 1
                 }
             };
+            stamping.get_or_insert(at);
             let group = &mut groups[at];
             group.driving |= driving;
             let elements = source.shape.iter().product::<usize>().max(1) as u32;
@@ -364,6 +391,7 @@ fn produced_source(producer: &System, field: usize) -> ComponentSource {
         prim,
         shape,
         offset: 8 + f.offset as usize,
+        timestamp_at: Some(0),
     }
 }
 
@@ -480,14 +508,11 @@ pub(crate) struct EntryPlan {
     /// Index of the `@rng` state slot, for the create-time seed write.
     pub(crate) rng_state: Option<usize>,
     pub(crate) frame_bytes: u32,
-    /// Offset of the sample stamp in each argument frame's block.
-    pub(crate) arg_stamps: Vec<u32>,
 }
 
 fn entry_plan(system: &System, groups: Vec<Group>, cycle_rate: f64) -> EntryPlan {
     EntryPlan {
         name: system.name.clone(),
-        arg_stamps: system.inputs.iter().map(|p| p.stamp_offset()).collect(),
         groups,
         rate_reload: system
             .rate

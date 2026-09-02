@@ -239,7 +239,10 @@ fn a_stage_feeds_what_comes_after_it() {
     let scaled = program.manifest.system("scaled").unwrap();
     assert_eq!(
         scaled.inputs[0].bindings,
-        vec![crate::Binding::Resampled { stage: 0 }]
+        vec![
+            crate::Binding::Resampled { stage: 0 },
+            crate::Binding::Timestamp
+        ]
     );
     assert_eq!(scaled.inputs[0].frame.fields[0].ty, Ty::F64);
     assert_eq!(
