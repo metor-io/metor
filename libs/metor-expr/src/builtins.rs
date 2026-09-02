@@ -268,6 +268,13 @@ pub fn builtins() -> &'static [Builtin] {
             doc: "the average of a tensor's elements",
         },
         Builtin {
+            name: "mean",
+            params: &["x", "n"],
+            ret: "f64",
+            avail: System,
+            doc: "the average of the last n samples of x",
+        },
+        Builtin {
             name: "len",
             params: &["t"],
             ret: "i64",
@@ -336,6 +343,20 @@ pub fn builtins() -> &'static [Builtin] {
             ret: "Tensor",
             avail: System,
             doc: "the last n samples of x, oldest first",
+        },
+        Builtin {
+            name: "delta",
+            params: &["x"],
+            ret: "f64",
+            avail: System,
+            doc: "x minus its previous sample, 0 on the first",
+        },
+        Builtin {
+            name: "deltat",
+            params: &[],
+            ret: "f64",
+            avail: System,
+            doc: "seconds since the previous sample, 0 on the first",
         },
         Builtin {
             name: "resample_zoh",

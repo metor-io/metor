@@ -225,6 +225,16 @@ pub(crate) enum Expr {
     /// A buffer's address, for the one kernel that reads *and writes* its
     /// argument: `random()` advances the state word it returns from.
     Address(BufId),
+    /// Write a scalar into a state slot and yield what the slot held.
+    ///
+    /// The one-sample memory `delta` and `deltat` need: the previous value
+    /// comes out as the current one goes in, in a single expression, so a
+    /// difference needs no statement to sequence the two halves.
+    Exchange {
+        state: BufId,
+        value: Box<Expr>,
+        ty: Ty,
+    },
     /// Elementwise arithmetic writing into `dest`, broadcasting per `desc`.
     Elementwise {
         kernel: &'static str,
@@ -535,7 +545,7 @@ fn collect_expr(expr: &Expr, found: &mut Vec<&'static str>) {
             found.push("k_fft");
             collect_expr(source, found);
         }
-        Expr::Splat { value, .. } => collect_expr(value, found),
+        Expr::Splat { value, .. } | Expr::Exchange { value, .. } => collect_expr(value, found),
         Expr::TensorLit { elements, .. } => {
             for element in elements {
                 collect_expr(element, found);

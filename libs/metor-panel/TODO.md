@@ -57,10 +57,10 @@ The node editor exposes a runtime graph that produces components from clocks, si
 
 A natural follow-up to Window. Each is `f64 in → f64 out` with one `size` arg.
 
-- [ ] **Sliding Mean** — moving average (smoothing); distinct from the existing co-clocked `Mean` over multiple inputs
+- [x] **Sliding Mean** — `mean(x, n)` in an expression, the average of the last `n` samples
 - [ ] **Sliding Min / Max** — running envelope (alarm flooring/ceiling)
 - [ ] **Sliding StdDev / Variance** — noise / jitter quantification
-- [ ] **Differentiate** — discrete derivative (e.g. velocity from position)
+- [x] **Differentiate** — `delta(x) / deltat()` in an expression (change since the previous sample over seconds elapsed)
 - [ ] **Integrate** — running sum, with optional reset trigger
 
 ### Proposed: thresholds and triggers

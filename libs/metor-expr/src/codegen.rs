@@ -413,6 +413,7 @@ impl<'a> Emitter<'a> {
                 self.push(load_of(ty));
             }
             Expr::Address(buf) => self.push(Instruction::I32Const(self.layout.at(*buf) as i32)),
+            Expr::Exchange { state, value, ty } => self.exchange(*state, value, ty),
             Expr::Store { local, value, then } => {
                 self.expr(value);
                 self.push(Instruction::LocalSet(*local));
@@ -850,6 +851,22 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+    }
+
+    /// Swap a scalar into a state slot, leaving what the slot held. The old
+    /// value is loaded before the new one is evaluated, so it sits under the
+    /// store's operands and is what remains.
+    fn exchange(&mut self, state: BufId, value: &Expr, ty: &Ty) {
+        let at = self.layout.at(state);
+        self.push(Instruction::I32Const(at as i32));
+        self.push(load_of(ty));
+        self.expr(value);
+        let slot = self.acquire(val_type(ty));
+        self.push(Instruction::LocalSet(slot));
+        self.push(Instruction::I32Const(at as i32));
+        self.push(Instruction::LocalGet(slot));
+        self.push(store_of(ty));
+        self.release(val_type(ty), slot);
     }
 
     /// Push the `f64` at a constant address.

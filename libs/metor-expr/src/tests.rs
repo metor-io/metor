@@ -18,6 +18,7 @@ mod m0;
 mod matmul;
 mod measure;
 mod pack;
+mod rates;
 mod robustness;
 mod scalar;
 mod semantics;

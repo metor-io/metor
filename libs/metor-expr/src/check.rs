@@ -535,23 +535,27 @@ fn system(
     let dependencies = function_dependencies(&body.calls, edges);
     let locals = body.locals;
 
-    // `random()` keeps a word and `window` keeps a ring, and the body is what
-    // says whether either is needed — so their slots are allocated where they
-    // are first asked for and join the declared fields here, before the guard
-    // closes the list. Both start at zero, which is why neither costs a seed
-    // instruction: a fresh linear memory already holds it, and a window
-    // preloaded with zeros is what the panel's Window node published.
+    // `random()` keeps a word, `window` keeps a ring, `delta` keeps a sample,
+    // and the body is what says whether any is needed — so their slots are
+    // allocated where they are first asked for and join the declared fields
+    // here, before the guard closes the list. The word and the ring start at
+    // zero, which a fresh linear memory already holds (and a window preloaded
+    // with zeros is what the panel's Window node published); the sample
+    // starts at NaN, which is seeded like a declared default.
     let mut state = decl
         .state
         .iter()
         .map(|s| s.field.clone())
         .collect::<Vec<_>>();
-    for (name, ty, buf) in body.synthetic {
+    for (name, ty, buf, default) in body.synthetic {
         state_buffers.push(buf);
-        let default = match ty {
-            Ty::I64 => crate::Init::I64(0),
-            _ => crate::Init::Fill(0.0),
-        };
+        if !default.is_zero() {
+            seeds.push(Seed {
+                dest: buf,
+                ty: ty.clone(),
+                value: default.clone(),
+            });
+        }
         state.push(manifest::StateField { name, ty, default });
     }
     // The seed guard sits one past the state fields, so it is reachable
@@ -826,10 +830,11 @@ struct FnChecker<'a> {
     /// The slot `now()` reads, in a system.
     now: Option<u32>,
     /// State the body asked for that no `State` class declared: the word
-    /// `random()` advances, and one ring per `window` call site. Each is
-    /// allocated where it is first needed, so a system that asks for neither
-    /// carries no state at all.
-    synthetic: Vec<(String, Ty, BufId)>,
+    /// `random()` advances, one ring per `window` call site, one previous
+    /// sample per `delta` and `deltat`. Each is allocated where it is first
+    /// needed, with the default it starts from, so a system that asks for
+    /// none carries no state at all.
+    synthetic: Vec<(String, Ty, BufId, crate::Init)>,
     locals: Vec<Ty>,
     names: HashMap<String, Binding>,
     loop_depth: u32,
@@ -2190,10 +2195,14 @@ impl FnChecker<'_> {
                 let buf = match self
                     .synthetic
                     .iter()
-                    .find(|(name, _, _)| name == crate::state::RNG_FIELD)
+                    .find(|(name, ..)| name == crate::state::RNG_FIELD)
                 {
-                    Some((_, _, buf)) => *buf,
-                    None => self.keep(crate::state::RNG_FIELD.to_string(), Ty::I64),
+                    Some((_, _, buf, _)) => *buf,
+                    None => self.keep(
+                        crate::state::RNG_FIELD.to_string(),
+                        Ty::I64,
+                        crate::Init::I64(0),
+                    ),
                 };
                 return Some((
                     Expr::Kernel {
@@ -2222,6 +2231,18 @@ impl FnChecker<'_> {
                     return None;
                 }
                 return self.window(call, depth);
+            }
+            "delta" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                return self.delta(call, depth);
+            }
+            "deltat" => {
+                if !arity(0, self) {
+                    return None;
+                }
+                return self.deltat(call);
             }
             "fft" => {
                 if !arity(1, self) {
@@ -2349,11 +2370,19 @@ impl FnChecker<'_> {
             }
             // Conveniences spelled out of what the language already has, so
             // the prelude stays as it is and a `mean` costs what `sum` does.
+            // `mean(x, n)` is `mean(window(x, n))`: the ring is the same one
+            // `window` keeps, zeros included, so the average ramps in over
+            // the first `n` samples.
             "mean" => {
-                if !arity(1, self) {
-                    return None;
-                }
-                let (source, ty) = self.expr(&call.arguments.args[0], depth)?;
+                let (source, ty) = match call.arguments.args.len() {
+                    2 => self.window(call, depth)?,
+                    _ => {
+                        if !arity(1, self) {
+                            return None;
+                        }
+                        self.expr(&call.arguments.args[0], depth)?
+                    }
+                };
                 if !matches!(ty, Ty::Tensor { .. }) {
                     self.diags
                         .push(call.range, format!("`mean` needs a tensor, found {ty}"));
@@ -2679,9 +2708,9 @@ impl FnChecker<'_> {
     }
 
     /// Claim a state slot the body asked for but no `State` class declared.
-    fn keep(&mut self, name: String, ty: Ty) -> BufId {
+    fn keep(&mut self, name: String, ty: Ty, default: crate::Init) -> BufId {
         let buf = self.buffer(&ty);
-        self.synthetic.push((name, ty, buf));
+        self.synthetic.push((name, ty, buf, default));
         buf
     }
 
@@ -2729,7 +2758,11 @@ impl FnChecker<'_> {
             shape,
         };
         let index = self.synthetic.len();
-        let state = self.keep(format!("@window{index}"), ty.clone());
+        let state = self.keep(
+            format!("@window{index}"),
+            ty.clone(),
+            crate::Init::Fill(0.0),
+        );
         Some((
             Expr::Window {
                 state,
@@ -2739,6 +2772,96 @@ impl FnChecker<'_> {
             },
             ty,
         ))
+    }
+
+    /// `delta(x)`: the change since the previous sample.
+    ///
+    /// The previous sample is a state slot of its own per call site, like a
+    /// window's ring, seeded with NaN so the first evaluation can tell it has
+    /// nothing to differ from and read 0 rather than `x` itself.
+    fn delta(&mut self, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
+        if self.now.is_none() {
+            self.diags
+                .push(call.range, "`delta` exists inside a system");
+            return None;
+        }
+        let (value, ty) = self.expr(&call.arguments.args[0], depth)?;
+        let value = self.as_f64(value, ty, call.arguments.args[0].range())?;
+        let index = self.synthetic.len();
+        let state = self.keep(
+            format!("@delta{index}"),
+            Ty::F64,
+            crate::Init::F64(f64::NAN),
+        );
+        Some((self.since(state, value), Ty::F64))
+    }
+
+    /// `deltat()`: seconds since the previous evaluation, 0 on the first.
+    ///
+    /// The timestamp is kept as microseconds in an `f64`, which holds it
+    /// exactly, so the previous tick shares the seed and the NaN test with
+    /// `delta` — it is `delta(now())` scaled into the unit the waveforms use.
+    fn deltat(&mut self, call: &ast::ExprCall) -> Option<(Expr, Ty)> {
+        let Some(now) = self.now else {
+            self.diags
+                .push(call.range, "`deltat()` exists inside a system");
+            return None;
+        };
+        let index = self.synthetic.len();
+        let state = self.keep(
+            format!("@deltat{index}"),
+            Ty::F64,
+            crate::Init::F64(f64::NAN),
+        );
+        let micros = Expr::Intrinsic {
+            op: Intrinsic::IntToFloat,
+            args: vec![Expr::Local(now)],
+        };
+        let elapsed = self.since(state, micros);
+        Some((
+            Expr::Arith {
+                op: Arith::Mul,
+                ty: Num::F64,
+                lhs: Box::new(elapsed),
+                rhs: Box::new(Expr::F64(1e-6)),
+            },
+            Ty::F64,
+        ))
+    }
+
+    /// `value` minus what `state` held, leaving `value` there — and 0 while
+    /// the slot still holds its NaN seed, since nothing came before.
+    fn since(&mut self, state: BufId, value: Expr) -> Expr {
+        let current = self.temp(Ty::F64);
+        let previous = self.temp(Ty::F64);
+        Expr::Store {
+            local: current,
+            value: Box::new(value),
+            then: Box::new(Expr::Store {
+                local: previous,
+                value: Box::new(Expr::Exchange {
+                    state,
+                    value: Box::new(Expr::Local(current)),
+                    ty: Ty::F64,
+                }),
+                then: Box::new(Expr::Select {
+                    cond: Box::new(Expr::Cmp {
+                        op: Cmp::Ne,
+                        ty: Num::F64,
+                        lhs: Box::new(Expr::Local(previous)),
+                        rhs: Box::new(Expr::Local(previous)),
+                    }),
+                    then: Box::new(Expr::F64(0.0)),
+                    els: Box::new(Expr::Arith {
+                        op: Arith::Sub,
+                        ty: Num::F64,
+                        lhs: Box::new(Expr::Local(current)),
+                        rhs: Box::new(Expr::Local(previous)),
+                    }),
+                    ty: Ty::F64,
+                }),
+            }),
+        }
     }
 
     /// `fft(x)`: one-sided magnitudes along the last axis.
