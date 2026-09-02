@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::theme::theme;
-use crate::views::Map;
 use crate::views::time_series::{PlotPanelConfig, TimeSeriesPlot};
 use crate::views::viewer_3d::{Viewer3d, Viewer3dPanelConfig};
 use crate::views::{
@@ -26,6 +25,7 @@ use crate::views::{
 };
 use crate::views::{ExecTimeline, ExecTimelineConfig, Spectrogram, SpectrogramPanelConfig};
 use crate::views::{ListPlot, ListPlotPanelConfig, XyPlot, XyPlotPanelConfig};
+use crate::views::{Map, SamplesTable};
 
 use super::{DashboardPanel, DashboardWidget, WidgetKind};
 
@@ -508,6 +508,33 @@ impl WidgetRegistry {
             }),
         );
         self.register(
+            WidgetKind::samples_table(),
+            WidgetSpec::new(
+                (480.0, 320.0),
+                |w| {
+                    let cfg = parse_or_default::<SamplesTableWidgetConfig>(&w.config);
+                    SharedString::from(format!("Samples: {}", display_or_unknown(&cfg.component)))
+                },
+                build_samples_table,
+                snapshot_samples_table,
+            )
+            .with_tile("samples_table", |blob| {
+                let cfg = parse_or_default::<SamplesTableWidgetConfig>(blob);
+                if cfg.component.is_empty() {
+                    "Samples".into()
+                } else {
+                    cfg.component.into()
+                }
+            })
+            .with_live_tile_title(|state, _, cx| {
+                state
+                    .clone()
+                    .downcast::<SamplesTable>()
+                    .map(|table| table.read(cx).component().clone())
+                    .unwrap_or_else(|_| "Samples".into())
+            }),
+        );
+        self.register(
             WidgetKind::attitude(),
             WidgetSpec::new(
                 (220.0, 260.0),
@@ -556,6 +583,7 @@ pub struct MonitorWidgetConfig {
 
 pub use crate::views::AnnunciatorConfig as AnnunciatorWidgetConfig;
 pub use crate::views::MapConfig as MapWidgetConfig;
+pub use crate::views::SamplesTableConfig as SamplesTableWidgetConfig;
 pub use crate::views::TrafficLightConfig as TrafficLightWidgetConfig;
 
 /// Parse a widget's JSON blob into its expected config type, falling
@@ -663,6 +691,11 @@ fn snapshot_state_chip(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Opt
 
 fn snapshot_map(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
     let entity = entity.clone().downcast::<Map>().ok()?;
+    serde_json::to_string(&entity.read(cx).to_config()).ok()
+}
+
+fn snapshot_samples_table(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
+    let entity = entity.clone().downcast::<SamplesTable>().ok()?;
     serde_json::to_string(&entity.read(cx).to_config()).ok()
 }
 
@@ -918,6 +951,11 @@ fn build_map(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     // map, and the one the palette's zero-config row creates.
     let cfg = parse_or_default::<MapWidgetConfig>(config);
     as_live(cx.new(|cx| Map::from_config(&cfg, db.clone(), cx)))
+}
+
+fn build_samples_table(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
+    let cfg = parse_or_default::<SamplesTableWidgetConfig>(config);
+    as_live(cx.new(|cx| SamplesTable::from_config(&cfg, db.clone(), cx)))
 }
 
 fn build_attitude(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {

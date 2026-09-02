@@ -117,6 +117,9 @@ impl WidgetKind {
     pub fn map() -> Self {
         Self(SharedString::new_static("map"))
     }
+    pub fn samples_table() -> Self {
+        Self(SharedString::new_static("samples_table"))
+    }
 
     fn default_size(&self, cx: &App) -> (f32, f32) {
         widgets::widget_spec(self, cx).default_size
@@ -1046,6 +1049,17 @@ fn add_widget_rows(
         },
     )));
     rows.push(Box::new(NavRow::new(
+        "Samples",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::samples_table())
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
         "Sequence Control",
         SharedString::new_static(""),
         {
@@ -1177,6 +1191,9 @@ fn component_widget_config(kind: &WidgetKind, component: String) -> String {
             component,
             ..Default::default()
         };
+        serde_json::to_string(&cfg)
+    } else if *kind == WidgetKind::samples_table() {
+        let cfg = widgets::SamplesTableWidgetConfig { component };
         serde_json::to_string(&cfg)
     } else {
         let cfg = widgets::TextWidgetConfig { component };

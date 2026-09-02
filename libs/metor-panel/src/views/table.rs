@@ -181,6 +181,19 @@ impl<D: TableDelegate> Table<D> {
             .scroll_to_item(ix, gpui::ScrollStrategy::Bottom);
     }
 
+    /// Jump back to the first row; the samples table's return-to-live.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_handle
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+    }
+
+    /// Whether the body is scrolled to its first row. A host that prepends
+    /// rows freezes its row model while this is false, so the rows under
+    /// the reader's eye hold still.
+    pub fn at_top(&self) -> bool {
+        self.scroll_handle.0.borrow().base_handle.offset().y >= Pixels::ZERO
+    }
+
     fn sync_col_states(&mut self) {
         let columns = self.delegate.columns();
         if self.col_states.len() != columns.len() {

@@ -15,6 +15,7 @@ use metor_proto_wkt::LogLevel;
 
 use crate::logs::{self, LogState};
 use crate::theme::{Theme, theme};
+use crate::views::format::format_time;
 use crate::views::table::{self, Column, ColumnSort, Table, TableDelegate};
 
 /// The viewer's level floor. `All` shows everything received (the FSW side
@@ -285,18 +286,6 @@ fn level_tint(level: LogLevel, theme: &Theme) -> gpui::Hsla {
         LogLevel::Info => theme.alarm_tint(0),
         LogLevel::Debug | LogLevel::Trace => theme.bg_elevated,
     }
-}
-
-/// `HH:MM:SS.mmm` local time from a payload timestamp (microseconds).
-pub(crate) fn format_time(t_us: i64) -> String {
-    let Ok(ts) = jiff::Timestamp::from_microsecond(t_us) else {
-        return t_us.to_string();
-    };
-    let hms = ts
-        .to_zoned(jiff::tz::TimeZone::system())
-        .strftime("%H:%M:%S")
-        .to_string();
-    format!("{hms}.{:03}", t_us.rem_euclid(1_000_000) / 1000)
 }
 
 const COL_TIME: usize = 0;

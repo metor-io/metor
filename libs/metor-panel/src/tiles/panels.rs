@@ -1449,6 +1449,25 @@ pub(crate) fn new_panel_rows(
     )));
 
     rows.push(Box::new(NavRow::new(
+        "Samples",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                let pane = pane.clone();
+                crate::inspector::trace_picker::component_picker_rows(
+                    db.clone(),
+                    move |_component_id, name, cx| {
+                        let cfg = crate::views::SamplesTableConfig { component: name };
+                        add_registered_panel(&pane, "samples_table", &cfg, cx);
+                    },
+                )
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
         "Sequence Control",
         SharedString::new_static(""),
         {

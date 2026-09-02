@@ -2181,7 +2181,7 @@ fn event_summary_row(ev: &PlotEvent, theme: &crate::theme::Theme) -> impl IntoEl
             div()
                 .text_size(px(LABEL_FONT_SIZE))
                 .text_color(theme.text_tertiary)
-                .child(SharedString::from(crate::views::log_panel::format_time(
+                .child(SharedString::from(crate::views::format::format_time(
                     ev.ts.0,
                 ))),
         )

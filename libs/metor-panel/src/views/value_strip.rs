@@ -642,8 +642,7 @@ impl Render for ComponentValueStrip {
                 )
             } else {
                 build_cell_chrome(
-                    component_id,
-                    idx,
+                    (component_id.0.wrapping_mul(31) ^ idx as u64) as usize,
                     &display_cell,
                     &style,
                     &theme,
@@ -845,10 +844,12 @@ fn build_editing_chrome(
     atom
 }
 
+/// One rendered element box. `id_key` distinguishes it from every other
+/// box in the same parent: the live strip hashes component and element,
+/// a table of samples salts in the row.
 #[allow(clippy::too_many_arguments)]
 fn build_cell_chrome(
-    component_id: ComponentId,
-    idx: usize,
+    id_key: usize,
     cell: &StripCell,
     style: &StripStyle,
     theme: &Theme,
@@ -860,8 +861,7 @@ fn build_cell_chrome(
     accent: Option<gpui::Hsla>,
     inside_apply_group: bool,
 ) -> Stateful<gpui::Div> {
-    let id_hash = component_id.0.wrapping_mul(31) ^ idx as u64;
-    let mut atom = div().id(("strip-cell", id_hash as usize)).flex().flex_row();
+    let mut atom = div().id(("strip-cell", id_key)).flex().flex_row();
     // Round only the left corners when a chevron sits flush against the
     // right edge, so the two halves visually fuse into a single pill.
     if inside_apply_group {
@@ -1042,6 +1042,33 @@ pub fn strip_row_width(n_cells: usize) -> f32 {
         return 0.0;
     }
     n_cells as f32 * STRIP_BOX_CELL_WIDTH + (n_cells.saturating_sub(1)) as f32 * STRIP_CELL_GAP
+}
+
+/// The strip's row of boxes for cells that are already history: no stream,
+/// no editing, no pending tint. A table of past samples paints one of these
+/// per row from the cells it decodes at paint time, and `row_key` keeps the
+/// boxes of different rows distinct.
+pub(crate) fn render_static_cells(
+    row_key: usize,
+    cells: &[StripCell],
+    style: &StripStyle,
+    theme: &Theme,
+) -> gpui::Div {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(STRIP_CELL_GAP));
+    if !style.intrinsic_width {
+        row = row.flex_wrap();
+    }
+    for (idx, cell) in cells.iter().enumerate() {
+        let id_key = row_key.wrapping_mul(64).wrapping_add(idx);
+        row = row.child(build_cell_chrome(
+            id_key, cell, style, theme, false, false, false, false, false, None, false,
+        ));
+    }
+    row
 }
 
 pub(crate) struct ResolvedMetadata {
