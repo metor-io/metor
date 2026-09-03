@@ -3,7 +3,7 @@
 //! The host authors this frame, not the system: the coordinator issues every
 //! cyclic step, so it is the authority on how many steps a system has taken,
 //! how long the last one took, and what state the slot is in. One record per
-//! slot per cycle, from one publishing path, for every cyclic kind — an
+//! slot per cycle, from one publishing path, for every cyclic kind: an
 //! in-process runner, a pack entry, a dylib, a process worker, a wasm guest.
 //! A system reports nothing here; its own channel is the log
 //! ([`crate::log`]).

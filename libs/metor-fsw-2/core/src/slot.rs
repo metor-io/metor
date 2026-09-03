@@ -36,14 +36,13 @@ impl StopReason {
 }
 
 /// Where a cyclic slot sits in its lifecycle, from empty through running to
-/// done or hard-stopped. A static
-/// [`CyclicRunner`](crate::CyclicRunner) and a build-time loaded slot only
-/// ever inhabit `Running`/`Stopped` (once
+/// done or hard-stopped. A static [`CyclicRunner`](crate::CyclicRunner) and a
+/// build-time loaded slot only ever inhabit `Running`/`Stopped` (once
 /// `Stopped` they are never cleared; a sequence-mode worker's `DlSlot` also
 /// latches `Done`, its poll-once guard); a process slot's `Stopped` clears
-/// back to `Running` when its worker restarts (see `docs/process-systems.md`).
-/// A runtime slot uses all six states. Only process mode uses `Loading`.
-/// `Load` or `Reset` can clear a terminal state.
+/// back to `Running` when its worker restarts. A runtime slot uses all six
+/// states. Only process mode uses `Loading`. `Load` or `Reset` can clear a
+/// terminal state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     /// No occupant; `step` is a cheap no-op. (Runtime slots only.)
@@ -52,8 +51,8 @@ pub enum SlotState {
     /// After a hard-drop `Stop` the state returns to `Loaded` with no live
     /// future. (Runtime slots only.)
     Loaded,
-    /// A process slot's occupant worker is mid-pipeline — spawn, attach,
-    /// bind/init — polled forward once per cycle, so a `Load` never stalls
+    /// A process slot's occupant worker is mid-pipeline (spawn, attach,
+    /// bind/init), polled forward once per cycle, so a `Load` never stalls
     /// the loop. Ends at `Loaded` (and its event) when the worker reports
     /// bound, or `Stopped` on a pipeline failure. The command guards need no
     /// new cases: `Load`/`Start`/`Stop` match none of their accepted states

@@ -1,17 +1,16 @@
 //! The clock and status runtime under async-fn systems and sequences.
 //!
-//! A sequence is an `async fn` whose [`Input`](crate::Input) and
-//! [`Output`] ports are moved into
-//! the future it becomes, owned for the future's whole life — registered with
-//! [`Pack::task`](crate::Pack::task) like any async entry. The entry's driver
-//! polls that future once per cycle, and everything time-shaped inside the
-//! body resolves against the host's clock rather than a timer. That makes a
-//! sequence deterministic under a simulated clock, and it makes the poll
-//! protocol simple enough to describe in one paragraph:
+//! A sequence is an `async fn` whose [`Input`](crate::Input) and [`Output`]
+//! ports are moved into the future it becomes, owned for the future's whole
+//! life, registered with [`Pack::task`](crate::Pack::task) like any async
+//! entry. The entry's driver polls that future once per cycle, and everything
+//! time-shaped inside the body resolves against the host's clock rather than
+//! a timer. That makes a sequence deterministic under a simulated clock, and
+//! it makes the poll protocol simple enough to describe in one paragraph:
 //!
 //! Before each poll, the driver (`handler::FutureDriver`) refreshes the shared
-//! [`CycleClock`]. It writes the cycle's `now`, and — when the entry is
-//! mounted as a slot occupant — latches `cancel` if an abort frame arrived on
+//! [`CycleClock`]. It writes the cycle's `now`, and, when the entry is
+//! mounted as a slot occupant, latches `cancel` if an abort frame arrived on
 //! the mount-appended [`SlotControlIn`] input. It then installs the clock as
 //! a thread-local ambient via [`with_clock`] and polls the future
 //! synchronously. Inside the poll, the author-facing free functions [`wait`],
@@ -26,15 +25,15 @@
 //! later `now`, because the host re-polls unconditionally every cycle.
 //!
 //! On top of those primitives sits [`check`], the condition combinator a body
-//! actually reaches for: *hold this predicate for a dwell, give up after a
-//! budget*. Together with [`Check::or_fail`] it turns a phase into one `?`-able
+//! actually reaches for: hold this predicate for a dwell, give up after a
+//! budget. Together with [`Check::or_fail`] it turns a phase into one `?`-able
 //! line, which leaves a body with a single place to publish its safing rather
 //! than one branch per suspension point.
 //!
 //! Port order, ring sizing, and compatibility come from the entry's
-//! descriptor, computed from the fn's parameter types (`crate::handler`);
-//! the [`SlotControlIn`] input and [`SequenceStatus`] output are appended by
-//! the occupant *mount*, never declared by the entry (see `docs/packs.md`).
+//! descriptor, computed from the fn's parameter types (`crate::handler`); the
+//! [`SlotControlIn`] input and [`SequenceStatus`] output are appended by the
+//! occupant mount, never declared by the entry.
 //!
 //! This module is compiled unconditionally (no `wiring` feature gate), since
 //! sequences are a runtime feature independent of the config front-end.
@@ -216,7 +215,7 @@ pub fn aborted() -> bool {
 ///
 /// The general-system suspension point: an async-fn system holds its state
 /// in locals and writes `let now = cycle().await;` at the top of its loop.
-/// Like [`Wait`] there is no waker machinery — the driver re-polls every
+/// Like [`Wait`] there is no waker machinery: the driver re-polls every
 /// cycle, and the future is ready once the ambient clock has advanced past
 /// the value it was armed at. Deterministic under a simulated clock.
 ///
@@ -271,7 +270,7 @@ impl Check {
     /// The `?`-able form: `Ok` when held, otherwise the [`Outcome`] to end on,
     /// recording a progress line naming the phase that timed out.
     ///
-    /// This is what lets a body put its safing in one place — the phases read
+    /// This is what lets a body put its safing in one place: the phases read
     /// `check(..).await.or_fail("warm-up")?` and a single `Err` arm publishes
     /// the safe command.
     pub fn or_fail(self, phase: &str) -> Result<(), Outcome> {
@@ -297,7 +296,7 @@ fn deadline_at(start: Timestamp, budget: Duration) -> Timestamp {
 /// `timeout`.
 ///
 /// The predicate runs once per cycle against that cycle's data, starting with
-/// the cycle `check` is called on — so a condition already true resolves
+/// the cycle `check` is called on, so a condition already true resolves
 /// without suspending when `hold` is [`Duration::ZERO`]. A cycle where the
 /// predicate goes false restarts the dwell. Cancellation wins over both, and
 /// the budget is measured from the call, not from when the predicate first

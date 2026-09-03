@@ -5,7 +5,7 @@
 //! it lends the fn each cycle ([`Item`](ExecParam::Item)), the port
 //! declaration it contributes, and how it binds. The declaration walk and the
 //! bind walk are generated from one tuple expansion, so descriptor order and
-//! bind order cannot drift — the invariant positional binding rests on.
+//! bind order cannot drift, the invariant positional binding rests on.
 
 use metor_fsw_ring::NoWake;
 use metor_proto::types::Timestamp;

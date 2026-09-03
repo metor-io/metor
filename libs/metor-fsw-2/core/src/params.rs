@@ -10,10 +10,10 @@
 //! library exports. [`encode_value_params`] walks that schema to produce the
 //! exact bytes the `Params` struct itself would postcard-encode to, so the
 //! loaded side decodes them as its own type. It overlays the entry's declared
-//! defaults, conforms the value to the schema — [`conform_to_schema`] turns
+//! defaults, conforms the value to the schema ([`conform_to_schema`] turns
 //! unknown keys, missing fields, and type mismatches into [`ParamError`]s and
 //! inserts an explicit `Null` for every absent `Option` field, since
-//! postcard-dyn requires the key to be present — and emits the bytes with
+//! postcard-dyn requires the key to be present), and emits the bytes with
 //! [`postcard_dyn::to_stdvec_dyn`].
 //!
 //! One property of the conformance walk is worth knowing: any schema shape the

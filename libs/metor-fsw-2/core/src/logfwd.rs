@@ -1,8 +1,8 @@
 //! Forwards host `tracing` events onto the downlink as [`LogEvent`]s.
 //!
 //! [`ForwardLayer`] is a `tracing-subscriber` layer that converts each event
-//! into a [`LogEvent`] — level, target, message, non-message fields, the
-//! active span path, and source location — and pushes it onto a bounded
+//! into a [`LogEvent`] (level, target, message, non-message fields, the
+//! active span path, and source location) and pushes it onto a bounded
 //! global queue. The coordinator drains the queue once per cycle onto its own
 //! log port ([`LogPort::emit_event`](crate::log::LogPort)), so
 //! tracing events ride the same message stream as every system's
@@ -34,7 +34,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Set inside a pack dylib by [`init_pack_tracing`]. These statics are
 /// per-dylib (each pack links its own copy of this crate), so the flag is
-/// only ever true in a shared object — the host keeps the coordinator as the
+/// only ever true in a shared object; the host keeps the coordinator as the
 /// single drain and this flag false.
 static PACK_MODE: AtomicBool = AtomicBool::new(false);
 

@@ -12,7 +12,7 @@
 //! The coordinator publishes each cycle's timestamp here before stepping the
 //! graph. A pack dylib links its own copy of this static, so the ABI shim
 //! republishes inside the shared object from the `now` word that already
-//! crosses `fsw_pack_execute` — packs and process workers read the same
+//! crosses `fsw_pack_execute`, so packs and process workers read the same
 //! clock with no extra plumbing. Before the first cycle reaches a linkage
 //! unit (build, bind, init) the clock is unset and readers fall back to wall
 //! time. A simulated run chooses its epoch when `run_for` starts.

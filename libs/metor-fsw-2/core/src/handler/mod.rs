@@ -185,7 +185,7 @@ pub trait IntoPackEntry {
 }
 
 /// The entry descriptor for a parameter set: the declared ports per
-/// direction in parameter order, then the implicit log tail — the
+/// direction in parameter order, then the implicit log tail, the
 /// same shape [`Out`](crate::Out) gives a struct system.
 fn descriptor_for<P: ExecParamSet>(name: &'static str) -> SystemDescriptor {
     let mut sink = DeclSink::default();

@@ -1,12 +1,12 @@
 //! Packs: many systems from one crate, one construction point.
 //!
-//! A [`Pack`] is a list of erased system entries a crate's `pack()` fn builds
-//! (see `docs/packs.md`). One pack serves every loading
-//! mode: [`Registry::register_pack`](crate::Registry) makes each entry a
-//! `type=` in the static registry, and the pack ABI exports the same
-//! entries from a cdylib. Because `pack()` runs once per load, entries can
-//! capture clones of a shared handle built inside it — the construction point
-//! two systems sharing an owned resource (a socket, a bus) never had.
+//! A [`Pack`] is a list of erased system entries a crate's `pack()` fn builds.
+//! One pack serves every loading mode: [`Registry::register_pack`](crate::Registry)
+//! makes each entry a `type=` in the static registry, and the pack ABI exports
+//! the same entries from a cdylib. Because `pack()` runs once per load,
+//! entries can capture clones of a shared handle built inside it, a
+//! construction point two systems sharing an owned resource (a socket, a bus)
+//! never had.
 //!
 //! Construction is two-phase, mirroring the ABI's create/bind split: an
 //! entry's `create` decodes params and builds the user state (fail-fast, no
@@ -301,7 +301,7 @@ impl Pack {
     }
 
     /// Declare this pack's shared state under `name` and hand back the
-    /// [`Shared`](crate::Shared) token attached entries capture — sharing
+    /// [`Shared`](crate::Shared) token attached entries capture. Sharing
     /// is scoped to this pack because nothing outside `pack()` can reach
     /// the token. The state is constructed once, from its own wiring
     /// declaration's params; a fallible `init` makes resource acquisition
@@ -346,7 +346,7 @@ impl Pack {
     /// *by name*: the target's `SystemSpec::attach`
     /// picks which state instance, and the resolver hands `ctor` the resolved
     /// [`Shared`](crate::Shared) token (the second argument) at create time.
-    /// `St` is the concrete shared type the entry binds — a target naming a
+    /// `St` is the concrete shared type the entry binds; a target naming a
     /// state of any other type is an `AttachTypeMismatch`. The driver is
     /// wrapped so the state's [`SharedLifecycle`](crate::SharedLifecycle) hooks
     /// run once across all attached entries. Attached entries are cyclic-only,
@@ -442,7 +442,7 @@ impl Pack {
     }
 
     /// Register an async-fn system under `name`: ports by value, moved into
-    /// the future, state in locals — the sequence authoring model as a
+    /// the future, state in locals, the sequence authoring model as a
     /// general system. The future is polled once per cycle under the
     /// ambient clock, so `wait()`/`now()`/`progress()` work; a future that
     /// returns ends the entry with its [`Outcome`].
@@ -546,7 +546,7 @@ impl Pack {
 }
 
 /// The configured instance's descriptor when it differs from the entry's
-/// static one (a configure step minted ports), else `None` — the static
+/// static one (a configure step minted ports), else `None`, so the static
 /// descriptor stands and hosts skip a clone. Compared by encoding: the
 /// descriptor is plain serializable data with no cheaper equality.
 fn instance_desc_if_minted<S: crate::CyclicSystem>(
@@ -587,7 +587,7 @@ where
 
 /// The wrapper around an entry attached to a pack-shared state: fans the
 /// state's once-per-instance [`SharedLifecycle`](crate::SharedLifecycle)
-/// hooks in around the inner driver's own lifecycle — `start` before the
+/// hooks in around the inner driver's own lifecycle, `start` before the
 /// first attached init, `shutdown` after the last attached shutdown.
 pub(crate) struct AttachedDriver {
     inner: Box<dyn Driver>,

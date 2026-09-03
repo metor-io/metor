@@ -5,8 +5,8 @@
 //! reports trouble as ordinary telemetry over it. A [`LogPort`] is the handle
 //! behind that port: it queues lines during a cycle and flushes them after.
 //!
-//! A fault a system wants counted — a dropped publish, a corrupt input, a
-//! missing sensor — is a log line like any other, tagged with a `kind` field
+//! A fault a system wants counted, a dropped publish, a corrupt input, a
+//! missing sensor, is a log line like any other, tagged with a `kind` field
 //! through [`LogPort::fault`]. There is no counter frame; the ground counts
 //! lines by kind. A fault that recurs every cycle costs one line per cycle.
 //!
@@ -121,7 +121,7 @@ where
         }
         // Inside a pack dylib the tracing forward queue is per-dylib and the
         // loop is single-threaded, so everything queued since the last drain
-        // was fired by this instance's own execute — drain it here, restamped
+        // was fired by this instance's own execute; drain it here, restamped
         // with this instance as the source. False everywhere else (the host
         // coordinator owns the host queue).
         if crate::logfwd::pack_mode() {

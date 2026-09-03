@@ -1,13 +1,12 @@
 //! Pack-shared system state: one state instance, several systems.
 //!
-//! Some resources are naturally owned by more than one system — a link
+//! Some resources are naturally owned by more than one system, a link
 //! server whose connection set the downlink writes and the uplink reads, at
 //! different points in the same cycle. The sharing model reuses the grant
 //! systems already have: a system runs against `&mut` to a state, so several
 //! systems are granted `&mut` to the *same* state, time-sliced as each takes
-//! its turn on the cycle loop. The attached systems stay distinct — own
-//! instance names, own ports, own log — only the state behind them is
-//! one.
+//! its turn on the cycle loop. The attached systems stay distinct, with their
+//! own instance names, ports, and log; only the state behind them is one.
 //!
 //! [`Pack::shared_state`](crate::Pack::shared_state) declares the instance
 //! and returns the [`Shared`] token entries capture; sharing is scoped to
@@ -18,8 +17,8 @@
 //! after the last attached system's shutdown.
 //!
 //! Attachment is cyclic-only. The runtime is a single-threaded cooperative
-//! executor, so a [`RefCell`] time-slices soundly between cyclic steps —
-//! but an async system's state moves into its own task and lives across
+//! executor, so a [`RefCell`] time-slices soundly between cyclic steps, but
+//! an async system's state moves into its own task and lives across
 //! awaits, where a held borrow would collide with the very interleaving the
 //! executor exists to provide. A state that needs background tasks (a
 //! server's accept loop) can instead move the task-owned portion into those
@@ -31,7 +30,7 @@ use std::rc::Rc;
 
 /// Once-per-instance lifecycle of a pack-shared state. Both hooks run on
 /// the coordinator's loop task: `start` before the first attached system's
-/// init (spawn background tasks here — a runtime is up), `shutdown` after
+/// init (spawn background tasks here, a runtime is up), `shutdown` after
 /// the last attached system's shutdown. Dropping the state is the cancel
 /// backstop for anything `start` spawned, so hold spawned tasks as drop
 /// guards.
@@ -73,9 +72,9 @@ impl<S> Shared<S> {
         }))
     }
 
-    /// The scoped `&mut` grant. Panics if the state was never constructed —
-    /// entry create rejects an undeclared state before any system runs, so
-    /// reaching that panic means bypassing the wiring path — or on a
+    /// The scoped `&mut` grant. Panics if the state was never constructed
+    /// (entry create rejects an undeclared state before any system runs, so
+    /// reaching that panic means bypassing the wiring path), or on a
     /// re-entrant borrow, which the sequential cycle loop cannot produce.
     pub fn get(&self) -> RefMut<'_, S> {
         let inner = self.0.state.borrow_mut();

@@ -16,7 +16,7 @@ workspace = true
 metor-proto = { path = "../../metor-proto", features = ["std"] }
 metor-proto-wkt = { path = "../../metor-proto/wkt", features = ["nox", "std"] }
 
-# component model — the frame traits and derives this crate re-exports
+# component model: the frame traits and derives this crate re-exports
 metor-component = { workspace = true }
 metor-fsw-2-macros = { path = "../macros" }
 
@@ -40,7 +40,7 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 inventory = "0.3"
 
 # errors. `default-features = false`: params errors carry a `SourceSpan` and
-# nothing renders here — the host owns the fancy reporter.
+# nothing renders here; the host owns the fancy reporter.
 miette = { version = "7.0", default-features = false }
 thiserror = { version = "2.0" }
 

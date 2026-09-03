@@ -15,14 +15,14 @@
 //! offset 0                            '------------ trailer ------------------'
 //! ```
 //!
-//! The builders write straight into the packet — a pushed list element or
+//! The builders write straight into the packet: a pushed list element or
 //! inserted map entry lands in the trailer as the call returns. The one thing
 //! that cannot land immediately is a map's key pool: it sits after the entry
 //! array, whose length is unknown until the build closure finishes, so key
 //! bytes stage in a small buffer and the entry headers carry pool-relative
 //! offsets that [`map`](FrameWriter::map) rebases once the pool position is
 //! known. Both the packet and that staging buffer travel together as a
-//! [`FrameScratch`], which `Output::write_with` pools per port — a
+//! [`FrameScratch`], which `Output::write_with` pools per port, so a
 //! steady-state publish of a dynamic frame allocates nothing.
 
 use core::marker::PhantomData;
@@ -188,8 +188,8 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
         build(&mut mw);
         let (count, error) = (mw.count, mw.error);
         if let Some(err) = error {
-            // Roll the member back — entries out of the trailer, staged keys
-            // out of the buffer — so the slot stays zeroed, as if the call
+            // Roll the member back: entries out of the trailer, staged keys
+            // out of the buffer, so the slot stays zeroed, as if the call
             // never ran.
             self.truncate_table(entry_array_off);
             self.keys.truncate(keys_mark);

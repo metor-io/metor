@@ -101,10 +101,9 @@ impl RegistryEntry {
 /// The full index over every registered buffer, untelemetered entries
 /// included.
 ///
-/// This surface is reachable only through the host-side
-/// [`Coordinator::registry()`](crate::Coordinator::registry), which serves
-/// debuggers and tests. The in-graph broadcast tap is [`AllOutputs`], which
-/// filters untelemetered entries at the source.
+/// This surface is reachable only through the host's `Coordinator::registry()`,
+/// which serves debuggers and tests. The in-graph broadcast tap is
+/// [`AllOutputs`], which filters untelemetered entries at the source.
 pub struct Registry {
     entries: Vec<RegistryEntry>,
     by_key: HashMap<ComponentId, usize>,
@@ -158,8 +157,7 @@ impl Registry {
 /// The telemetered filter lives here at the source, so a consumer cannot
 /// forget it. An untelemetered entry, such as a command channel or an
 /// opted-out frame, is simply invisible through this surface. The unfiltered
-/// [`Registry`] remains reachable via the host-side
-/// [`Coordinator::registry()`](crate::Coordinator::registry).
+/// [`Registry`] remains reachable via the host's `Coordinator::registry()`.
 ///
 /// A view claimed off an entry starts at the buffer's live edge, so records
 /// emitted before the claim, for example during an earlier-registered

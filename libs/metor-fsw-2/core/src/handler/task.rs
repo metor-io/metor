@@ -3,10 +3,9 @@
 //!
 //! [`Pack::task`](crate::Pack::task) registers an async fn whose parameters
 //! are by-value [`TaskParam`]s, moved into the future at bind. A future that
-//! returns [`Outcome`] is a sequence; one that returns `()` completed. The driver
-//! polls it once per cycle with a no-op waker under the ambient
-//! the framework's per-cycle sequence clock, so `wait()`/`now()`/`progress()` work
-//! unchanged.
+//! returns [`Outcome`] is a sequence; one that returns `()` completed. The
+//! driver polls it once per cycle with a no-op waker under the framework's
+//! per-cycle sequence clock, so `wait()`/`now()`/`progress()` work unchanged.
 
 use core::any::Any;
 use core::future::Future;

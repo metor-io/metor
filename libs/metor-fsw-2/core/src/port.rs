@@ -78,7 +78,7 @@ where
 /// Iterate the `T` elements of a dynamic list member, reading the [`Slot`] at
 /// `slot_off` and copying each element out of the trailer. The interim decode
 /// for a fixed-struct list until the frame derive emits per-member accessors
-/// on the grant (see `docs/frames.md`); flat consumers use the `apply` path.
+/// on the grant; flat consumers use the `apply` path.
 pub fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
     table: &[u8],
     slot_off: usize,
@@ -109,8 +109,8 @@ pub fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
 /// Where a port's dropped-publish count accumulates. A runner-owned port
 /// counts locally and the runner drains it with `take_dropped`; a port moved
 /// into a future counts through a cell shared with the driving wrapper,
-/// which reports it — the counters stay reachable either way.
-/// Only the failure path and the per-cycle drain touch it.
+/// which reports it, so the counters stay reachable either way. Only the
+/// failure path and the per-cycle drain touch it.
 pub(crate) enum Drops {
     Local(u64),
     Shared(std::sync::Arc<core::sync::atomic::AtomicU64>),
@@ -343,7 +343,7 @@ where
 /// without copying. The fixed region is read directly as `F`, and
 /// [`apply`](Self::apply) walks the whole record through the frame's vtable
 /// for consumers that want components rather than the concrete type. There is
-/// no typed dynamic-member accessor on the grant yet (see `docs/frames.md`).
+/// no typed dynamic-member accessor on the grant yet.
 pub struct FrameRef<'a, F> {
     table: &'a [u8],
     _f: PhantomData<F>,

@@ -254,7 +254,7 @@ fn skip_attribute_overrides_default() {
 }
 
 // A nested struct reaches telemetry through the standalone derives (the v1
-// macro crate), not the `Frame` derive — padding must skip on that path too.
+// macro crate), not the `Frame` derive; padding must skip on that path too.
 #[derive(
     AsVTable,
     Metadatatize,

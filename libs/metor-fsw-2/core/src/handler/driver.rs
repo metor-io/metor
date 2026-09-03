@@ -50,7 +50,7 @@ where
     F: ExecuteFn<S, M>,
 {
     /// Bind the parameter states in declaration order, then the implicit
-    /// log tail — the same order the entry's descriptor declares.
+    /// log tail, the same order the entry's descriptor declares.
     pub(crate) fn bind(state: StateAccess<S>, execute: F, src: &mut AnySource) -> Self {
         let ports = {
             let mut cx = BindCx {
@@ -255,7 +255,7 @@ impl Driver for OccupantFuture {
 
 /// The slot-occupant wrapper around a cyclic entry (fn-authored or struct):
 /// a latched cancel stops stepping the inner driver and reports a terminal
-/// `Aborted` — the hard-but-clean stop; cooperative cancellation is the
+/// `Aborted`, the hard-but-clean stop; cooperative cancellation is the
 /// async style's domain. A `SequenceStatus` record is published every step
 /// so the slot runner's status tap works for any occupant.
 pub(crate) struct OccupantCyclic {
@@ -303,7 +303,7 @@ impl Driver for OccupantCyclic {
 }
 
 /// Wrap `bind_inner`'s driver per the mount: wired entries run bare;
-/// slot occupants gain the framework tail — the cancel input bound after the
+/// slot occupants gain the framework tail, the cancel input bound after the
 /// inner inputs and the status output bound after the inner outputs, the
 /// order the host appends the occupant tail in.
 pub(crate) fn mount_driver(

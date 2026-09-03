@@ -1,11 +1,11 @@
 //! [`FrameStr`], a fixed-capacity UTF-8 string frame field.
 //!
 //! A `#[repr(C)]` frame stays fixed-size, so a string member is a `CAP`-byte
-//! buffer NUL-padded to its used length — length is implicit in the first NUL,
-//! never a separate field. It telemeters as a single shaped `U8 × [CAP]`
-//! component tagged `is_string`, which the panel renders as text; the older
-//! `[u8; CAP]` spelling instead fanned out into `CAP` per-byte components
-//! through the `[T; N]` blanket [`AsVTable`].
+//! buffer NUL-padded to its used length, with the length implicit in the
+//! first NUL rather than a separate field. It telemeters as a single shaped
+//! `U8 × [CAP]` component tagged `is_string`, so a consumer renders it as
+//! text; the older `[u8; CAP]` spelling instead fanned out into `CAP`
+//! per-byte components through the `[T; N]` blanket [`AsVTable`].
 //!
 //! Truly unbounded text belongs in messages
 //! ([`LogEvent`](crate::log::LogEvent)-style), not in a cyclic frame.

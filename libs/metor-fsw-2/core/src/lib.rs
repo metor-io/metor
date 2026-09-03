@@ -2,7 +2,7 @@
 //!
 //! This crate is everything a system author writes against, and nothing that
 //! flies a target. `metor-fsw-2` links it, adds the coordinator, the wiring
-//! resolver, the loaders, and the CLI, and re-exports it whole — so a target
+//! resolver, the loaders, and the CLI, and re-exports it whole, so a target
 //! crate still sees one surface, while a pack, a sequence, or a contract crate
 //! depends on this crate alone.
 //!
@@ -74,10 +74,6 @@
 //! three paths use the same descriptors, the same [`RingSource`] binding, and
 //! the same [`CyclicSlot`] step interface, so a system never learns which one
 //! it is under.
-//!
-//! # More detail
-//!
-//! Start with [`docs/README.md`](https://github.com/metor-io/metor/blob/main/libs/metor-fsw-2/docs/README.md).
 
 mod binder;
 mod descriptor;

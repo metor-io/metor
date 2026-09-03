@@ -605,9 +605,9 @@ fn abi_panic_is_contained() {
     drop((in_ring, out_ring, log_ring));
 }
 
-/// [`FswStatus::from_raw`] sits on the trust boundary. The three declared
-/// discriminants round-trip; any other word folds to `Panicked` rather than
-/// being treated as a valid `repr(u32)` value.
+/// The three declared discriminants round-trip through [`FswStatus::from_raw`]
+/// and any other word folds to `Panicked` rather than being treated as a
+/// valid `repr(u32)` value.
 #[test]
 fn from_raw_folds_out_of_range_to_panicked() {
     assert_eq!(FswStatus::from_raw(0), FswStatus::Running);
@@ -692,10 +692,9 @@ fn seq_abi_runs_to_done() {
 // ---------------------------------------------------------------------------
 // Announce equivalence: the data path (carried unprefixed vtable + metadata,
 // re-prefixed on the host) realizes identically to the static announce path.
-// This is the invariant the merged descriptor family rests on. The contract is
-// realized identity — same component ids, types, shapes, frames, and dynamic
-// paths — not byte identity; every consumer realizes the vtable rather than
-// comparing its serialized bytes.
+// The contract is realized identity (same component ids, types, shapes,
+// frames, and dynamic paths), not byte identity; every consumer realizes the
+// vtable rather than comparing its serialized bytes.
 // ---------------------------------------------------------------------------
 
 /// The data announce of `F` under `prefix`: the port carries the unprefixed
@@ -831,8 +830,8 @@ fn announce_data_path_matches_static() {
     }
 }
 
-/// The announce metadata keeps each component's metadata map — element names,
-/// enum variants — under the instance prefix, exactly as the static
+/// The announce metadata keeps each component's metadata map (element names,
+/// enum variants) under the instance prefix, exactly as the static
 /// `metadata(prefix)` path emits it.
 #[test]
 fn announce_preserves_element_names() {
@@ -897,8 +896,8 @@ fn port_desc_round_trips_both_arms() {
 // The allocator entry points a wasm host places ring regions through.
 // ---------------------------------------------------------------------------
 
-/// A region has to be attachable as a ring, so it must come back 8-aligned and
-/// zeroed. `attach_raw` rejects a misaligned base outright.
+/// A region must come back 8-aligned and zeroed, since `attach_raw` rejects a
+/// misaligned base outright.
 #[test]
 fn alloc_is_ring_aligned_and_zeroed() {
     let len = 4096;

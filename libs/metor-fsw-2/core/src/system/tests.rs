@@ -557,8 +557,8 @@ fn msg_log_never_loses_records() {
 }
 
 /// A cyclic consumer of a command log sees every emitted record across
-/// cycles. A full ring holds the emitter back rather than dropping, and the
-/// consumer stays `Running`.
+/// cycles, and a full ring holds the emitter back rather than dropping,
+/// leaving the consumer `Running`.
 #[test]
 fn log_input_guaranteed_delivery_through_runner() {
     #[derive(crate::SystemOutput)]

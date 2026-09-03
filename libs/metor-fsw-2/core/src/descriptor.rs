@@ -236,7 +236,7 @@ pub struct PortDesc {
 
 /// Re-derives `F`'s vtable and metadata under the dotted `prefix` (the
 /// instance name), so the leaves roll the same ids as
-/// `ComponentId::new("<prefix>.<frame>.<field>")` — the static-path oracle
+/// `ComponentId::new("<prefix>.<frame>.<field>")`, the static-path oracle
 /// the announce-equivalence tests compare [`PortDesc::announce`] against.
 #[cfg(test)]
 pub(crate) fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
@@ -382,7 +382,7 @@ impl PortDesc {
 ///
 /// The port carries the frame-relative vtable plus per-component metadata,
 /// and the prefixed ids are reconstructed from that metadata with no static
-/// frame type — the same path whether the port was derived in-process or
+/// frame type, the same path whether the port was derived in-process or
 /// decoded from a pack manifest.
 ///
 /// Each leaf component id is baked as a standalone 8-byte `Op::Data` blob, so
