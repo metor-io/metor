@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton,
-    Pixels, Point, Render, ScrollHandle, Window, div, prelude::*, px,
+    Pixels, Point, Render, ScrollHandle, SharedString, Window, div, prelude::*, px,
 };
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
@@ -21,6 +21,14 @@ use crate::theme::theme;
 pub struct PlotComponentAction {
     pub component_id: ComponentId,
     pub indices: SmallVec<[usize; 4]>,
+}
+
+/// Dispatched by the outline to open another outline tab in the same pane,
+/// rooted on `root` (a full component path).
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct OpenOutlineAction {
+    pub root: SharedString,
 }
 
 /// Dispatched while shift is held over a component name to open a transient

@@ -53,7 +53,7 @@ pub use log_panel::{LevelFilter, LogView};
 pub use map::{Map, MapConfig};
 pub use meter::{Meter, MeterConfig, Orientation};
 pub use monitor::Monitor;
-pub use outline::{ComponentOutline, OutlineColumns};
+pub use outline::{Col, ComponentOutline, OutlineColumns, default_columns};
 pub use samples_table::{SamplesTable, SamplesTableConfig};
 pub use scrollbar::Scrollbar;
 pub use sequence_control::{SequenceControl, SequenceControlConfig};

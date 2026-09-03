@@ -26,13 +26,13 @@ use smallvec::SmallVec;
 pub(crate) mod model;
 
 use super::column_browser::ToggleFilterBar;
-use super::component_browser::component_tree::{ComponentNode, build_tree};
+use super::component_browser::component_tree::{ComponentNode, build_tree, chain_to};
 use super::component_browser::{strip_cell_count, strip_menu};
 use super::copy::{copy_name_row, copy_rows};
 use super::filter_bar::{FilterBar, FilterBarEvent};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
-use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
+use super::table::{Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate, drag_chip};
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripStyle, strip_row_width};
 use crate::icons::Icon;
@@ -41,10 +41,10 @@ use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::theme;
-use crate::tiles::PlotComponentAction;
+use crate::tiles::{OpenOutlineAction, PlotComponentAction};
 use model::{
-    Disclosure, FrameType, Layout, OutlineRow, Pivot, RowKind, alike, common_suffix,
-    component_count, flatten, signature, type_key,
+    Disclosure, FrameType, Layout, OutlineRow, Pivot, PivotLayout, RowKind, alike, common_suffix,
+    component_count, flatten, root_node, signature, take_slot, type_key,
 };
 
 /// Indent per tree depth, in pixels.
@@ -92,13 +92,21 @@ impl ComponentOutline {
         }
     }
 
+    /// The visible columns in display order.
     pub fn columns(&self, cx: &App) -> OutlineColumns {
-        self.table.read(cx).delegate().columns
+        self.table.read(cx).delegate().columns.clone()
     }
 
     pub fn set_columns(&mut self, columns: OutlineColumns, cx: &mut Context<Self>) {
         self.table.update(cx, |table, cx| {
             table.delegate_mut().set_columns(columns, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn set_column_visible(&mut self, col: Col, on: bool, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().set_column_visible(col, on, cx);
         });
         cx.notify();
     }
@@ -139,15 +147,76 @@ impl ComponentOutline {
         cx.notify();
     }
 
-    /// Branch paths flipped away from the default disclosure, for persistence.
-    pub fn toggled_paths(&self, cx: &App) -> Vec<String> {
-        self.table.read(cx).delegate().disclosure.toggled_paths()
+    /// Branch paths opened below the default disclosure, for persistence.
+    pub fn expanded_paths(&self, cx: &App) -> Vec<String> {
+        self.table.read(cx).delegate().disclosure.expanded_paths()
     }
 
-    pub fn set_toggled_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+    /// Branch paths folded above the default disclosure, for persistence.
+    pub fn collapsed_paths(&self, cx: &App) -> Vec<String> {
+        self.table.read(cx).delegate().disclosure.collapsed_paths()
+    }
+
+    pub fn set_disclosure(
+        &mut self,
+        expanded: Vec<String>,
+        collapsed: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.table.update(cx, |table, cx| {
             let delegate = table.delegate_mut();
-            delegate.disclosure = Disclosure::from_paths(paths);
+            delegate.disclosure = Disclosure::from_paths(expanded, collapsed);
+            delegate.reflatten(cx);
+        });
+    }
+
+    /// The branch the outline is rooted on; empty for the whole tree.
+    pub fn root(&self, cx: &App) -> String {
+        self.table.read(cx).delegate().root.to_string()
+    }
+
+    pub fn set_root(&mut self, root: &str, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            table
+                .delegate_mut()
+                .set_root(SharedString::from(root.to_string()), cx);
+        });
+        cx.notify();
+    }
+
+    pub fn descending(&self, cx: &App) -> bool {
+        self.table.read(cx).delegate().descending
+    }
+
+    pub fn set_descending(&mut self, descending: bool, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            table.set_sort(
+                "Name",
+                if descending {
+                    ColumnSort::Descending
+                } else {
+                    ColumnSort::Default
+                },
+            );
+            let delegate = table.delegate_mut();
+            delegate.descending = descending;
+            delegate.reflatten(cx);
+        });
+    }
+
+    /// Every pivot arrangement, keyed by pivot key, for persistence.
+    pub(crate) fn pivot_layouts(&self, cx: &App) -> HashMap<SharedString, PivotLayout> {
+        self.table.read(cx).delegate().layouts.clone()
+    }
+
+    pub(crate) fn set_pivot_layouts(
+        &mut self,
+        layouts: HashMap<SharedString, PivotLayout>,
+        cx: &mut Context<Self>,
+    ) {
+        self.table.update(cx, |table, cx| {
+            let delegate = table.delegate_mut();
+            delegate.layouts = layouts;
             delegate.reflatten(cx);
         });
     }
@@ -223,11 +292,19 @@ impl ComponentOutline {
         cx.notify();
     }
 
-    /// The strip shown while focused on a type: what's showing, and the
-    /// way back.
-    fn render_focus_bar(&self, label: SharedString, cx: &mut Context<Self>) -> AnyElement {
+    /// The strip shown while focused on a type or rooted on a branch:
+    /// what's showing, and the way back. A root reads as a breadcrumb,
+    /// each crumb climbing to that ancestor.
+    fn render_scope_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = theme(cx);
-        div()
+        let delegate = self.table.read(cx).delegate();
+        let focus = delegate.focus.clone();
+        let root = delegate.root.clone();
+        let chain = delegate.root_chain();
+        if focus.is_none() && root.is_empty() {
+            return None;
+        }
+        let mut bar = div()
             .flex()
             .flex_row()
             .items_center()
@@ -239,20 +316,54 @@ impl ComponentOutline {
             .border_b_1()
             .border_color(theme.border_primary)
             .text_size(px(11.0))
-            .text_color(theme.text_secondary)
-            .child(SharedString::new_static("Focused on"))
-            .child(div().text_color(theme.text_primary).child(label))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("outline-unfocus")
-                    .cursor_pointer()
-                    .text_color(theme.text_tertiary)
-                    .hover(|s| s.text_color(theme.text_primary))
-                    .child(SharedString::new_static("Show all"))
-                    .on_click(cx.listener(|this, _, _, cx| this.set_focus(None, cx))),
-            )
-            .into_any_element()
+            .text_color(theme.text_secondary);
+        let show_all: Arc<dyn Fn(&mut Self, &mut Context<Self>)> = if let Some(label) = focus {
+            bar = bar
+                .child(SharedString::new_static("Focused on"))
+                .child(div().text_color(theme.text_primary).child(label));
+            Arc::new(|this, cx| this.set_focus(None, cx))
+        } else if chain.is_empty() {
+            bar = bar
+                .child(SharedString::new_static("Rooted on"))
+                .child(div().text_color(theme.text_tertiary).child(root))
+                .child(SharedString::new_static("(not found)"));
+            Arc::new(|this, cx| this.set_root("", cx))
+        } else {
+            let last = chain.len() - 1;
+            for (ix, node) in chain.iter().enumerate() {
+                if ix > 0 {
+                    bar = bar.child(div().text_color(theme.text_tertiary).child("›"));
+                }
+                let crumb = div().id(("outline-crumb", ix)).child(node.segment.clone());
+                if ix == last {
+                    bar = bar.child(crumb.text_color(theme.text_primary));
+                } else {
+                    let target = node.full_name.clone();
+                    bar = bar.child(
+                        crumb
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.text_primary))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.set_root(&target, cx)),
+                            ),
+                    );
+                }
+            }
+            Arc::new(|this, cx| this.set_root("", cx))
+        };
+        Some(
+            bar.child(div().flex_1())
+                .child(
+                    div()
+                        .id("outline-show-all")
+                        .cursor_pointer()
+                        .text_color(theme.text_tertiary)
+                        .hover(|s| s.text_color(theme.text_primary))
+                        .child(SharedString::new_static("Show all"))
+                        .on_click(cx.listener(move |this, _, _, cx| show_all(this, cx))),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -269,8 +380,7 @@ impl Render for ComponentOutline {
             self.filter.update(cx, |bar, _| bar.status = status);
             self.filter.clone()
         });
-        let focus = self.table.read(cx).delegate().focus.clone();
-        let focus_bar = focus.map(|label| self.render_focus_bar(label, cx));
+        let scope_bar = self.render_scope_bar(cx);
 
         div()
             .key_context("ComponentOutline")
@@ -282,33 +392,25 @@ impl Render for ComponentOutline {
             .flex_col()
             .size_full()
             .children(toolbar)
-            .children(focus_bar)
+            .children(scope_bar)
             .child(div().flex_1().min_h_0().w_full().child(self.table.clone()))
     }
 }
 
-/// The inspector's column toggles for an outline pane, one per optional
-/// column.
+/// The inspector's column toggles for an outline pane, one per column
+/// that can hide.
 pub fn column_rows(outline: Entity<ComponentOutline>) -> Vec<BoolRow> {
-    let toggles: [(&str, fn(&mut OutlineColumns) -> &mut bool); 3] = [
-        ("Unit column", |c| &mut c.unit),
-        ("Type column", |c| &mut c.ty),
-        ("Sparklines", |c| &mut c.sparkline),
-    ];
-    toggles
+    Col::ALL
         .into_iter()
-        .map(|(label, field)| {
+        .filter(|c| *c != Col::Name)
+        .map(|col| {
             let read = outline.clone();
             let write = outline.clone();
             BoolRow::dynamic(
-                label,
-                Arc::new(move |cx| *field(&mut read.read(cx).columns(cx))),
+                format!("{} column", col.label()),
+                Arc::new(move |cx| read.read(cx).columns(cx).contains(&col)),
                 Arc::new(move |on, _window, cx| {
-                    write.update(cx, |outline, cx| {
-                        let mut columns = outline.columns(cx);
-                        *field(&mut columns) = on;
-                        outline.set_columns(columns, cx);
-                    });
+                    write.update(cx, |outline, cx| outline.set_column_visible(col, on, cx));
                 }),
             )
         })
@@ -331,11 +433,10 @@ pub fn filter_bar_row(outline: Entity<ComponentOutline>) -> BoolRow {
     )
 }
 
-/// Column order. Value comes last so it can absorb the remaining width —
-/// wide tensors need it most — and the sparkline column slots in before it
-/// only while enabled.
-#[derive(Clone, Copy)]
-enum Col {
+/// One outline column. Name carries the tree, so it always shows; the
+/// rest hide and sit wherever the user dragged them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Col {
     Name,
     Unit,
     Type,
@@ -343,40 +444,44 @@ enum Col {
     Value,
 }
 
-/// Which optional columns the outline shows. Name and Value always do.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct OutlineColumns {
-    pub unit: bool,
-    pub ty: bool,
-    pub sparkline: bool,
-}
+impl Col {
+    pub const ALL: [Col; 5] = [Col::Name, Col::Unit, Col::Type, Col::Sparkline, Col::Value];
 
-impl Default for OutlineColumns {
-    fn default() -> Self {
-        Self {
-            unit: true,
-            ty: true,
-            sparkline: false,
+    /// The persisted name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Col::Name => "name",
+            Col::Unit => "unit",
+            Col::Type => "type",
+            Col::Sparkline => "sparkline",
+            Col::Value => "value",
+        }
+    }
+
+    pub fn parse(key: &str) -> Option<Col> {
+        Col::ALL.into_iter().find(|c| c.key() == key)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Col::Name => "Name",
+            Col::Unit => "Unit",
+            Col::Type => "Type",
+            Col::Sparkline => "Sparkline",
+            Col::Value => "Value",
         }
     }
 }
 
-impl OutlineColumns {
-    fn order(self) -> SmallVec<[Col; 5]> {
-        let mut cols: SmallVec<[Col; 5]> = SmallVec::new();
-        cols.push(Col::Name);
-        if self.unit {
-            cols.push(Col::Unit);
-        }
-        if self.ty {
-            cols.push(Col::Type);
-        }
-        if self.sparkline {
-            cols.push(Col::Sparkline);
-        }
-        cols.push(Col::Value);
-        cols
-    }
+/// The visible columns in display order.
+pub type OutlineColumns = SmallVec<[Col; 5]>;
+
+/// Value last so it absorbs the remaining width — wide tensors need it
+/// most; sparklines are off until asked for.
+pub fn default_columns() -> OutlineColumns {
+    [Col::Name, Col::Unit, Col::Type, Col::Value]
+        .into_iter()
+        .collect()
 }
 
 /// Row source for the outline table.
@@ -395,10 +500,16 @@ pub struct OutlineDelegate {
     /// One scroll offset per pivot, shared by its header and instance rows
     /// so the grid scrolls sideways as a unit.
     pivot_scrolls: HashMap<SharedString, ScrollHandle>,
+    /// How the user arranged each pivot grid, by pivot key.
+    layouts: HashMap<SharedString, PivotLayout>,
     /// Frame types the user has collected, shown above the tree.
     types: Vec<FrameType>,
     /// A type label shown alone.
     focus: Option<SharedString>,
+    /// The branch whose children form the top level; empty for the tree.
+    root: SharedString,
+    /// Siblings in reverse natural order.
+    descending: bool,
     rows: Vec<OutlineRow>,
     columns: OutlineColumns,
     strips: VisibleEntityCache<ComponentValueStrip>,
@@ -416,10 +527,13 @@ impl OutlineDelegate {
             query: Query::default(),
             pivoted: HashSet::new(),
             pivot_scrolls: HashMap::new(),
+            layouts: HashMap::new(),
             types: Vec::new(),
             focus: None,
+            root: SharedString::default(),
+            descending: false,
             rows: Vec::new(),
-            columns: OutlineColumns::default(),
+            columns: default_columns(),
             strips: VisibleEntityCache::new(CACHE_CAP),
             sparks: VisibleEntityCache::new(CACHE_CAP),
             _watcher: watcher,
@@ -451,8 +565,11 @@ impl OutlineDelegate {
             &Layout {
                 disclosure: &self.disclosure,
                 pivoted: &self.pivoted,
+                layouts: &self.layouts,
                 types: &self.types,
                 focus: self.focus.as_ref(),
+                root: &self.root,
+                descending: self.descending,
                 query: &self.query,
                 cell_count: &|id| strip_cell_count(&db, id),
             },
@@ -470,6 +587,7 @@ impl OutlineDelegate {
         } else {
             self.pivoted.remove(&path);
             self.pivot_scrolls.remove(&path);
+            self.layouts.remove(&path);
         }
         self.reflatten(cx);
     }
@@ -513,6 +631,7 @@ impl OutlineDelegate {
     fn remove_type(&mut self, label: &SharedString, cx: &mut Context<Table<Self>>) {
         self.types.retain(|t| &t.label != label);
         self.pivot_scrolls.remove(&type_key(label));
+        self.layouts.remove(&type_key(label));
         if self.focus.as_ref() == Some(label) {
             self.focus = None;
         }
@@ -522,6 +641,25 @@ impl OutlineDelegate {
     fn set_focus(&mut self, label: Option<SharedString>, cx: &mut Context<Table<Self>>) {
         self.focus = label;
         self.reflatten(cx);
+    }
+
+    fn set_root(&mut self, root: SharedString, cx: &mut Context<Table<Self>>) {
+        self.root = root;
+        self.reflatten(cx);
+    }
+
+    /// The nodes from the tree down to the current root, for the
+    /// breadcrumb; empty when unrooted or while the root doesn't resolve.
+    fn root_chain(&self) -> SmallVec<[Arc<ComponentNode>; 8]> {
+        if self.root.is_empty() {
+            return SmallVec::new();
+        }
+        let chain = chain_to(&self.tree, &self.root);
+        if chain.last().is_some_and(|n| n.full_name == self.root) {
+            chain
+        } else {
+            SmallVec::new()
+        }
     }
 
     /// The type a synthetic branch row stands for.
@@ -586,6 +724,25 @@ impl OutlineDelegate {
         }
         let pivoted = row.is_pivoted();
         let is_branch = row.is_branch() && !matches!(row.kind, RowKind::PivotInstance { .. });
+        if row.is_branch() {
+            let root = row.node.full_name.clone();
+            let table = table.clone();
+            rows.push(Box::new(CommandRow::new(
+                "Focus",
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().set_root(root.clone(), cx);
+                    });
+                }),
+            )));
+            let root = row.node.full_name.clone();
+            rows.push(Box::new(CommandRow::new(
+                "Open in new tab",
+                Arc::new(move |window, cx| {
+                    window.dispatch_action(Box::new(OpenOutlineAction { root: root.clone() }), cx);
+                }),
+            )));
+        }
         let can_pivot = is_branch && row.node.children.values().any(|c| !c.children.is_empty());
         if can_pivot {
             let label = if pivoted { "Unpivot" } else { "Pivot" };
@@ -673,10 +830,189 @@ impl OutlineDelegate {
 
     fn set_columns(&mut self, columns: OutlineColumns, cx: &mut Context<Table<Self>>) {
         self.columns = columns;
-        if !columns.sparkline {
+        if !self.columns.contains(&Col::Sparkline) {
             self.sparks = VisibleEntityCache::new(CACHE_CAP);
         }
         cx.notify();
+    }
+
+    /// A column coming back lands before Value when Value is last, so the
+    /// flexible column keeps the right edge.
+    fn set_column_visible(&mut self, col: Col, on: bool, cx: &mut Context<Table<Self>>) {
+        let mut columns = self.columns.clone();
+        let at = columns.iter().position(|c| *c == col);
+        match (on, at) {
+            (true, None) => {
+                let end = columns.len();
+                let at = if columns.last() == Some(&Col::Value) {
+                    end - 1
+                } else {
+                    end
+                };
+                columns.insert(at, col);
+            }
+            (false, Some(ix)) if col != Col::Name => {
+                columns.remove(ix);
+            }
+            _ => return,
+        }
+        self.set_columns(columns, cx);
+    }
+
+    /// Right-click on a column header: hide it, or bring a hidden one back.
+    fn open_header_menu(
+        &mut self,
+        col: Col,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        let Some(open) = open_inspector(cx) else {
+            return;
+        };
+        let table = cx.entity();
+        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+        if col != Col::Name {
+            let table = table.clone();
+            rows.push(Box::new(CommandRow::new(
+                format!("Hide {} column", col.label()),
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().set_column_visible(col, false, cx);
+                    });
+                }),
+            )));
+        }
+        for hidden in Col::ALL.into_iter().filter(|c| !self.columns.contains(c)) {
+            let table = table.clone();
+            rows.push(Box::new(CommandRow::new(
+                format!("Show {} column", hidden.label()),
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().set_column_visible(hidden, true, cx);
+                    });
+                }),
+            )));
+        }
+        open(
+            InspectorRequest {
+                rows,
+                mode: InspectorMode::Anchored(position),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn layout_mut(&mut self, key: &SharedString) -> &mut PivotLayout {
+        self.layouts.entry(key.clone()).or_default()
+    }
+
+    /// An arrangement back at its default drops out, so a layout only
+    /// persists grids the user touched.
+    fn prune_layout(&mut self, key: &SharedString) {
+        if self.layouts.get(key).is_some_and(PivotLayout::is_empty) {
+            self.layouts.remove(key);
+        }
+    }
+
+    /// Drop field `from` onto field `to`: it takes that slot.
+    fn move_field(
+        &mut self,
+        pivot: &Pivot,
+        from: &SharedString,
+        to: &SharedString,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        let order = take_slot(&pivot.fields, from, to);
+        self.layout_mut(&pivot.key).order = order;
+        self.reflatten(cx);
+    }
+
+    /// Drop instance `from` onto instance `to`: it takes that slot.
+    fn move_row(
+        &mut self,
+        pivot: &Pivot,
+        from: &SharedString,
+        to: &SharedString,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        let labels: Vec<SharedString> = pivot.instances.iter().map(|i| i.label.clone()).collect();
+        let rows = take_slot(&labels, from, to);
+        self.layout_mut(&pivot.key).rows = rows;
+        self.reflatten(cx);
+    }
+
+    fn set_field_hidden(
+        &mut self,
+        key: &SharedString,
+        field: &SharedString,
+        hidden: bool,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        let layout = self.layout_mut(key);
+        if hidden {
+            layout.hidden.insert(field.clone());
+        } else {
+            layout.hidden.remove(field);
+        }
+        self.prune_layout(key);
+        self.reflatten(cx);
+    }
+
+    /// Right-click on a pivot field label: hide it, or bring a hidden one
+    /// back.
+    fn open_field_menu(
+        &mut self,
+        pivot: &Pivot,
+        field: &SharedString,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        let Some(open) = open_inspector(cx) else {
+            return;
+        };
+        let table = cx.entity();
+        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+        {
+            let table = table.clone();
+            let key = pivot.key.clone();
+            let field = field.clone();
+            rows.push(Box::new(CommandRow::new(
+                format!("Hide {field}"),
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        table
+                            .delegate_mut()
+                            .set_field_hidden(&key, &field, true, cx);
+                    });
+                }),
+            )));
+        }
+        for hidden in &pivot.hidden {
+            let table = table.clone();
+            let key = pivot.key.clone();
+            let field = hidden.clone();
+            rows.push(Box::new(CommandRow::new(
+                format!("Show {hidden}"),
+                Arc::new(move |_window, cx| {
+                    table.update(cx, |table, cx| {
+                        table
+                            .delegate_mut()
+                            .set_field_hidden(&key, &field, false, cx);
+                    });
+                }),
+            )));
+        }
+        open(
+            InspectorRequest {
+                rows,
+                mode: InspectorMode::Anchored(position),
+            },
+            window,
+            cx,
+        );
     }
 
     /// Click on a branch row: toggle it, or with alt held, its whole subtree.
@@ -688,7 +1024,7 @@ impl OutlineDelegate {
             self.disclosure
                 .set_subtree(&row.node, row.depth, !row.expanded);
         } else {
-            self.disclosure.toggle(&row.node.full_name);
+            self.disclosure.toggle(&row.node.full_name, row.depth);
         }
         self.reflatten(cx);
     }
@@ -703,7 +1039,7 @@ impl OutlineDelegate {
             .iter()
             .filter(|r| r.node.component_id.is_some())
             .count();
-        let total = component_count(&self.tree);
+        let total = root_node(&self.tree, &self.root).map_or(0, |n| component_count(&n));
         Some(SharedString::from(format!("{shown} / {total}")))
     }
 
@@ -817,6 +1153,27 @@ impl OutlineDelegate {
                 },
             ));
         }
+        // Instance rows drag to reorder within their grid; a drop from
+        // another grid is ignored.
+        if let RowKind::PivotInstance { pivot, ix } = &row.kind {
+            let drop_target = theme.drop_target;
+            let drag = PivotRowDrag {
+                key: pivot.key.clone(),
+                label: pivot.instances[*ix].label.clone(),
+            };
+            let target = drag.label.clone();
+            let pivot = pivot.clone();
+            cell = cell
+                .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                .drag_over::<PivotRowDrag>(move |style, _, _, _| style.bg(drop_target))
+                .on_drop(cx.listener(move |table, drag: &PivotRowDrag, _, cx| {
+                    if drag.key == pivot.key && drag.label != target {
+                        table
+                            .delegate_mut()
+                            .move_row(&pivot, &drag.label, &target, cx);
+                    }
+                }));
+        }
         let menu_row = row.clone();
         cell = cell.on_mouse_down(
             MouseButton::Right,
@@ -900,13 +1257,23 @@ impl OutlineDelegate {
     fn render_pivot_header(
         &mut self,
         row_ix: usize,
-        pivot: &Pivot,
+        pivot: &Arc<Pivot>,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
         let scroll = self.pivot_scroll(&pivot.key);
+        let drop_target = theme.drop_target;
         let cells = pivot.fields.iter().zip(&pivot.cells).map(|(field, &n)| {
+            let drag = PivotFieldDrag {
+                key: pivot.key.clone(),
+                field: field.clone(),
+            };
+            let target = field.clone();
+            let drop_pivot = pivot.clone();
+            let menu_pivot = pivot.clone();
+            let menu_field = field.clone();
             div()
+                .id((field.clone(), row_ix))
                 .w(px(pivot_cell_width(n, field)))
                 .h_full()
                 .flex()
@@ -920,6 +1287,28 @@ impl OutlineDelegate {
                 .text_size(px(11.0))
                 .text_color(theme.text_tertiary)
                 .child(field.clone())
+                .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                .drag_over::<PivotFieldDrag>(move |style, _, _, _| style.bg(drop_target))
+                .on_drop(cx.listener(move |table, drag: &PivotFieldDrag, _, cx| {
+                    if drag.key == drop_pivot.key && drag.field != target {
+                        table
+                            .delegate_mut()
+                            .move_field(&drop_pivot, &drag.field, &target, cx);
+                    }
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |table, event: &MouseDownEvent, window, cx| {
+                        table.delegate_mut().open_field_menu(
+                            &menu_pivot,
+                            &menu_field,
+                            event.position,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }),
+                )
         });
         pivot_scroller(row_ix, scroll)
             .children(cells)
@@ -993,15 +1382,15 @@ impl OutlineDelegate {
 impl TableDelegate for OutlineDelegate {
     fn columns(&self) -> Vec<Column> {
         self.columns
-            .order()
-            .into_iter()
+            .iter()
             .map(|col| match col {
-                Col::Name => Column::new("Name", 280.0).min_width(140.0),
+                Col::Name => Column::new("Name", 280.0).min_width(140.0).sortable(),
                 Col::Unit => Column::new("Unit", 64.0),
                 Col::Type => Column::new("Type", 88.0),
                 Col::Sparkline => Column::new("Sparkline", 200.0).min_width(120.0),
                 Col::Value => Column::new("Value", 320.0).flex().resizable(false),
             })
+            .map(Column::movable)
             .collect()
     }
 
@@ -1010,7 +1399,7 @@ impl TableDelegate for OutlineDelegate {
     }
 
     fn row_height(&self) -> Pixels {
-        if self.columns.sparkline {
+        if self.columns.contains(&Col::Sparkline) {
             px(SPARKLINE_ROW_HEIGHT)
         } else {
             px(ROW_HEIGHT)
@@ -1032,7 +1421,7 @@ impl TableDelegate for OutlineDelegate {
         let Some(row) = self.rows.get(row_ix).cloned() else {
             return div().into_any_element();
         };
-        let Some(col) = self.columns.order().get(col_ix).copied() else {
+        let Some(col) = self.columns.get(col_ix).copied() else {
             return div().into_any_element();
         };
         match col {
@@ -1068,7 +1457,55 @@ impl TableDelegate for OutlineDelegate {
         }
     }
 
-    fn sort_column(&mut self, _col_ix: usize, _sort: ColumnSort, _cx: &App) {}
+    /// Only Name sorts; the default and ascending both read naturally.
+    fn sort_column(&mut self, _col_ix: usize, sort: ColumnSort, cx: &mut Context<Table<Self>>) {
+        self.descending = sort == ColumnSort::Descending;
+        self.reflatten(cx);
+    }
+
+    fn move_column(&mut self, from: usize, to: usize, cx: &mut Context<Table<Self>>) {
+        let col = self.columns.remove(from);
+        self.columns.insert(to, col);
+        cx.notify();
+    }
+
+    fn header_menu(
+        &mut self,
+        col_ix: usize,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Table<Self>>,
+    ) {
+        if let Some(col) = self.columns.get(col_ix).copied() {
+            self.open_header_menu(col, position, window, cx);
+        }
+    }
+}
+
+/// A pivot field label in flight.
+#[derive(Clone)]
+struct PivotFieldDrag {
+    key: SharedString,
+    field: SharedString,
+}
+
+impl Render for PivotFieldDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.field.clone(), cx)
+    }
+}
+
+/// A pivot instance row in flight.
+#[derive(Clone)]
+struct PivotRowDrag {
+    key: SharedString,
+    label: SharedString,
+}
+
+impl Render for PivotRowDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.label.clone(), cx)
+    }
 }
 
 /// Approximate advance of one character of the 11px label face; the cell

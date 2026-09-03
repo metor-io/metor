@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, Pixels, SharedString, Task, Window, div,
-    prelude::*, px,
+    AnyElement, Context, Entity, IntoElement, Pixels, SharedString, Task, Window, div, prelude::*,
+    px,
 };
 use metor_db::time_series::{TimeSeries, TimeSeriesNodeSlice};
 use metor_db::{Component, ComponentSchema, DB};
@@ -429,7 +429,7 @@ impl TableDelegate for SamplesDelegate {
         }
     }
 
-    fn sort_column(&mut self, _col_ix: usize, _sort: ColumnSort, _cx: &App) {}
+    fn sort_column(&mut self, _: usize, _: ColumnSort, _: &mut Context<Table<Self>>) {}
 }
 
 #[cfg(test)]

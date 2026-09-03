@@ -8,8 +8,7 @@
 //! [`LogState::by_seq`](crate::logs::LogState::by_seq) at paint time.
 
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, SharedString, WeakEntity, Window, div,
-    prelude::*, px,
+    AnyElement, Context, Entity, IntoElement, SharedString, WeakEntity, Window, div, prelude::*, px,
 };
 use metor_proto_wkt::LogLevel;
 
@@ -437,5 +436,5 @@ impl TableDelegate for LogDelegate {
         }
     }
 
-    fn sort_column(&mut self, _col_ix: usize, _sort: ColumnSort, _cx: &App) {}
+    fn sort_column(&mut self, _: usize, _: ColumnSort, _: &mut Context<Table<Self>>) {}
 }

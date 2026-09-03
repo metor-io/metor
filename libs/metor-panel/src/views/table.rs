@@ -1,9 +1,9 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, ElementId, Empty, IntoElement, Pixels,
-    Render, ScrollHandle, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
-    uniform_list,
+    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, ElementId, Empty, IntoElement,
+    MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle, SharedString,
+    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 
 use super::Scrollbar;
@@ -47,6 +47,8 @@ impl ColumnSort {
 ///
 /// Width is pixel-based unless `flex` is set, in which case the column
 /// absorbs remaining horizontal space in proportion with other flex columns.
+/// The name doubles as the column's identity: widths and sort state follow
+/// it when the delegate reorders or hides columns.
 pub struct Column {
     pub name: SharedString,
     pub width: Pixels,
@@ -54,6 +56,8 @@ pub struct Column {
     pub max_width: Pixels,
     pub resizable: bool,
     pub sortable: bool,
+    /// Whether the header can be dragged to another position.
+    pub movable: bool,
     pub flex: bool,
 }
 
@@ -66,12 +70,18 @@ impl Column {
             max_width: px(f32::MAX),
             resizable: true,
             sortable: false,
+            movable: false,
             flex: false,
         }
     }
 
     pub fn sortable(mut self) -> Self {
         self.sortable = true;
+        self
+    }
+
+    pub fn movable(mut self) -> Self {
+        self.movable = true;
         self
     }
 
@@ -98,8 +108,9 @@ impl Column {
 
 /// Data source for a [`Table`].
 ///
-/// Implementers own the row model and paint each cell on demand. Sorting is
-/// delegated so backends can use whatever comparator makes sense.
+/// Implementers own the row model and paint each cell on demand. Sorting,
+/// column order and header menus are delegated so backends can use whatever
+/// model makes sense; the table only reports the gesture.
 pub trait TableDelegate: Sized + 'static {
     fn columns(&self) -> Vec<Column>;
     fn rows_count(&self) -> usize;
@@ -113,7 +124,19 @@ pub trait TableDelegate: Sized + 'static {
         window: &mut Window,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement;
-    fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &App);
+    fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &mut Context<Table<Self>>);
+    /// A header was dropped so that its column now sits at `to`, counted
+    /// in the column list with it removed from `from`.
+    fn move_column(&mut self, _from: usize, _to: usize, _cx: &mut Context<Table<Self>>) {}
+    /// A header was right-clicked at `position`.
+    fn header_menu(
+        &mut self,
+        _col_ix: usize,
+        _position: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Table<Self>>,
+    ) {
+    }
     /// Called once after the visible row range has been painted each frame.
     /// Delegates that materialize rows lazily use it to release entities that
     /// scrolled out of view.
@@ -121,9 +144,21 @@ pub trait TableDelegate: Sized + 'static {
 }
 
 struct ColState {
+    name: SharedString,
     width: Pixels,
     sort: ColumnSort,
     bounds: Bounds<Pixels>,
+}
+
+impl ColState {
+    fn seed(col: &Column) -> Self {
+        Self {
+            name: col.name.clone(),
+            width: col.width,
+            sort: ColumnSort::Default,
+            bounds: Bounds::default(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -133,6 +168,42 @@ impl Render for ResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
+}
+
+/// A header in flight; the preview is the column name as a chip.
+#[derive(Clone)]
+struct ColumnDrag {
+    col_ix: usize,
+    name: SharedString,
+}
+
+impl Render for ColumnDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.name.clone(), cx)
+    }
+}
+
+/// The floating label every drag in a table shows under the cursor.
+pub(crate) fn drag_chip(label: SharedString, cx: &App) -> impl IntoElement {
+    let theme = theme(cx);
+    div()
+        .bg(theme.bg_primary)
+        .border_1()
+        .border_color(theme.border_primary)
+        .px(px(8.0))
+        .py(px(4.0))
+        .text_color(theme.text_primary)
+        .text_size(px(12.0))
+        .child(label)
+}
+
+/// Where a dragged item lands relative to the slot it was dropped on:
+/// before it when the cursor is in the slot's left half, else after. The
+/// result is the item's index once removed from `from`, so a drop on its
+/// own slot resolves to `from`.
+pub(crate) fn drop_index(from: usize, over: usize, before: bool) -> usize {
+    let slot = if before { over } else { over + 1 };
+    if from < slot { slot - 1 } else { slot }
 }
 
 /// Virtualized table widget driven by a [`TableDelegate`].
@@ -149,15 +220,7 @@ pub struct Table<D: TableDelegate> {
 
 impl<D: TableDelegate> Table<D> {
     pub fn new(delegate: D) -> Self {
-        let col_states = delegate
-            .columns()
-            .iter()
-            .map(|col| ColState {
-                width: col.width,
-                sort: ColumnSort::Default,
-                bounds: Bounds::default(),
-            })
-            .collect();
+        let col_states = delegate.columns().iter().map(ColState::seed).collect();
         Self {
             delegate,
             col_states,
@@ -194,21 +257,44 @@ impl<D: TableDelegate> Table<D> {
         self.scroll_handle.0.borrow().base_handle.offset().y >= Pixels::ZERO
     }
 
-    fn sync_col_states(&mut self) {
-        let columns = self.delegate.columns();
-        if self.col_states.len() != columns.len() {
-            self.col_states = columns
-                .iter()
-                .map(|col| ColState {
-                    width: col.width,
-                    sort: ColumnSort::Default,
-                    bounds: Bounds::default(),
-                })
-                .collect();
+    /// Show `sort` on the column named `name` and clear every other; a
+    /// restored layout's chevron, since the delegate owns the order itself.
+    pub fn set_sort(&mut self, name: &str, sort: ColumnSort) {
+        for state in &mut self.col_states {
+            state.sort = if state.name.as_ref() == name {
+                sort
+            } else {
+                ColumnSort::Default
+            };
         }
     }
 
-    fn apply_sort(&mut self, col_ix: usize, cx: &App) {
+    /// Follow the delegate's column list, carrying each named column's
+    /// width and sort along wherever it moved.
+    fn sync_col_states(&mut self) {
+        let columns = self.delegate.columns();
+        let unchanged = self.col_states.len() == columns.len()
+            && self
+                .col_states
+                .iter()
+                .zip(&columns)
+                .all(|(s, c)| s.name == c.name);
+        if unchanged {
+            return;
+        }
+        let mut old = std::mem::take(&mut self.col_states);
+        self.col_states = columns
+            .iter()
+            .map(|col| {
+                old.iter()
+                    .position(|s| s.name == col.name)
+                    .map(|ix| old.swap_remove(ix))
+                    .unwrap_or_else(|| ColState::seed(col))
+            })
+            .collect();
+    }
+
+    fn apply_sort(&mut self, col_ix: usize, cx: &mut Context<Self>) {
         let new_sort = self.col_states[col_ix].sort.cycle();
         for (ix, state) in self.col_states.iter_mut().enumerate() {
             if ix == col_ix {
@@ -236,7 +322,7 @@ impl<D: TableDelegate> Table<D> {
             .flex()
             .flex_row()
             .items_center()
-            .h_full()
+            .size_full()
             .gap(px(4.0))
             .px(px(12.0))
             .text_size(px(12.0))
@@ -262,7 +348,37 @@ impl<D: TableDelegate> Table<D> {
                 }));
         }
 
-        cell
+        if col.movable {
+            let drop_target = theme.drop_target;
+            cell = cell
+                .on_drag(
+                    ColumnDrag {
+                        col_ix,
+                        name: col.name.clone(),
+                    },
+                    |drag, _, _, cx| cx.new(|_| drag.clone()),
+                )
+                .drag_over::<ColumnDrag>(move |style, _, _, _| style.bg(drop_target))
+                .on_drop(cx.listener(move |this, drag: &ColumnDrag, window, cx| {
+                    let bounds = this.col_states[col_ix].bounds;
+                    let before = window.mouse_position().x < bounds.center().x;
+                    let to = drop_index(drag.col_ix, col_ix, before);
+                    if to != drag.col_ix {
+                        this.delegate.move_column(drag.col_ix, to, cx);
+                        this.sync_col_states();
+                        cx.notify();
+                    }
+                }));
+        }
+
+        cell.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                this.delegate
+                    .header_menu(col_ix, event.position, window, cx);
+                cx.stop_propagation();
+            }),
+        )
     }
 
     /// The grab zone along a column's right edge. Every cell in the column
@@ -525,5 +641,23 @@ impl<D: TableDelegate> Render for Table<D> {
             outer = outer.child(h);
         }
         outer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_index;
+
+    #[test]
+    fn a_drop_lands_before_or_after_the_slot_under_the_cursor() {
+        // Moving column 0 right: onto 2's left half sits before 2.
+        assert_eq!(drop_index(0, 2, true), 1);
+        assert_eq!(drop_index(0, 2, false), 2);
+        // Moving column 3 left onto 1.
+        assert_eq!(drop_index(3, 1, true), 1);
+        assert_eq!(drop_index(3, 1, false), 2);
+        // Dropping on itself is a no-op either side.
+        assert_eq!(drop_index(2, 2, true), 2);
+        assert_eq!(drop_index(2, 2, false), 2);
     }
 }

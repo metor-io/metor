@@ -18,7 +18,9 @@ use crate::tiles::panels::{
     AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, LogPanel, OutlinePanel,
     OutlinePanelConfig, PlotPanel, SequenceGridPanel, SequencePanel,
 };
-use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
+use crate::tiles::{
+    OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent,
+};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use crate::views::time_series::time_range::GlobalTimeRange;
 use gpui::{
@@ -355,6 +357,24 @@ impl AppRoot {
         pane.update(cx, |pane, cx| pane.add_item(Box::new(plot), cx));
     }
 
+    fn handle_open_outline_action(
+        &mut self,
+        action: &OpenOutlineAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
+            return;
+        };
+        let db = self.db.clone();
+        let cfg = OutlinePanelConfig {
+            root: action.root.to_string(),
+            ..Default::default()
+        };
+        let outline = cx.new(|cx| OutlinePanel::from_config(cfg, db, cx));
+        pane.update(cx, |pane, cx| pane.add_item(Box::new(outline), cx));
+    }
+
     fn handle_preview_plot_action(
         &mut self,
         action: &PreviewPlotAction,
@@ -560,6 +580,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::toggle_cmd_lock))
             .on_action(cx.listener(Self::handle_inspect_entity))
             .on_action(cx.listener(Self::handle_plot_component_action))
+            .on_action(cx.listener(Self::handle_open_outline_action))
             .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))
             .on_action(cx.listener(Self::open_connections))

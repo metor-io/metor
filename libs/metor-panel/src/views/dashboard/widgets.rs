@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::theme::theme;
+use crate::tiles::panels::{OutlinePanelConfig, apply_outline_config, outline_config};
 use crate::views::time_series::{PlotPanelConfig, TimeSeriesPlot};
 use crate::views::viewer_3d::{Viewer3d, Viewer3dPanelConfig};
 use crate::views::{
@@ -339,9 +340,16 @@ impl WidgetRegistry {
             WidgetKind::table(),
             WidgetSpec::new(
                 (400.0, 300.0),
-                |w| SharedString::from(format!("Outline #{}", w.id.0)),
+                |w| {
+                    let cfg = parse_or_default::<OutlinePanelConfig>(&w.config);
+                    if cfg.root.is_empty() {
+                        SharedString::from(format!("Outline #{}", w.id.0))
+                    } else {
+                        SharedString::from(format!("Outline: {}", cfg.root))
+                    }
+                },
                 build_table,
-                no_snapshot,
+                snapshot_table,
             ),
         );
         self.register(
@@ -842,8 +850,18 @@ fn build_exec_timeline(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     as_live(cx.new(|cx| ExecTimeline::from_config(cfg, db.clone(), cx)))
 }
 
-fn build_table(_config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
-    as_live(cx.new(|cx| ComponentOutline::new(db.clone(), cx)))
+fn build_table(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
+    let cfg = parse_or_default::<OutlinePanelConfig>(config);
+    as_live(cx.new(|cx| {
+        let mut outline = ComponentOutline::new(db.clone(), cx);
+        apply_outline_config(&mut outline, cfg, cx);
+        outline
+    }))
+}
+
+fn snapshot_table(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
+    let outline = entity.clone().downcast::<ComponentOutline>().ok()?;
+    serde_json::to_string(&outline_config(outline.read(cx), cx)).ok()
 }
 
 fn build_image(config: &str, _db: &Arc<DB>, cx: &mut App) -> WidgetLive {

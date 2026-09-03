@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div, prelude::*};
@@ -9,6 +10,7 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
+use crate::views::outline::model::{PivotLayout, type_key};
 use crate::views::time_series::{LinePlot, Override, Trace};
 #[cfg(test)]
 use crate::views::time_series::{PlotStyle, TimeFormat};
@@ -20,6 +22,7 @@ use crate::views::{
     OutlineColumns, SequenceControl, SequenceControlConfig, SequenceGrid, SequenceView, StateChip,
     StateChipConfig, TimeSeriesPlot, TrafficLight, new_component_browser,
 };
+use crate::views::{Col, default_columns};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
@@ -654,27 +657,23 @@ impl PaneItem for AnnunciatorPanel {
     }
 }
 
-/// Persisted shape of an [`OutlinePanel`]: the filter bar, the sparkline
-/// column, and which branches the user folded or opened.
+/// Persisted shape of an [`OutlinePanel`]: the filter bar, the columns in
+/// display order, the sort, the root, which branches the user opened or
+/// folded, and every pivot with its arrangement. Paths are full component
+/// names; pivot fields are relative to an instance.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct OutlinePanelConfig {
     pub filter: String,
     pub filter_bar: bool,
-    pub sparklines: bool,
-    #[serde(default = "shown")]
-    pub unit: bool,
-    #[serde(default = "shown")]
-    pub type_column: bool,
-    pub toggled: Vec<String>,
-    pub pivoted: Vec<String>,
+    pub columns: Vec<String>,
+    pub sort: SortDirection,
+    pub root: String,
+    pub expanded: Vec<String>,
+    pub collapsed: Vec<String>,
+    pub pivots: Vec<PivotConfig>,
     pub types: Vec<FrameTypeConfig>,
     pub focus: Option<String>,
-}
-
-/// Columns are on unless a saved layout turned them off.
-fn shown() -> bool {
-    true
 }
 
 impl Default for OutlinePanelConfig {
@@ -682,63 +681,187 @@ impl Default for OutlinePanelConfig {
         Self {
             filter: String::new(),
             filter_bar: false,
-            sparklines: false,
-            unit: true,
-            type_column: true,
-            toggled: Vec::new(),
-            pivoted: Vec::new(),
+            columns: default_columns()
+                .iter()
+                .map(|c| c.key().to_string())
+                .collect(),
+            sort: SortDirection::Ascending,
+            root: String::new(),
+            expanded: Vec::new(),
+            collapsed: Vec::new(),
+            pivots: Vec::new(),
             types: Vec::new(),
             focus: None,
         }
     }
 }
 
-/// A frame type the outline collected: a label and the leaf paths that
-/// define its shape.
+/// Sibling order in the outline's tree.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+/// A pivoted branch and how its grid is arranged: `fields` lead the
+/// columns in that order, `hidden` ones are left out, `rows` lead the
+/// instances by segment.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PivotConfig {
+    pub path: String,
+    pub fields: Vec<String>,
+    pub hidden: Vec<String>,
+    pub rows: Vec<String>,
+}
+
+/// A frame type the outline collected: a label, the leaf paths that
+/// define its shape, and the same arrangement a [`PivotConfig`] carries
+/// (`rows` being full instance paths).
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FrameTypeConfig {
     pub label: String,
     pub fields: Vec<String>,
+    pub order: Vec<String>,
+    pub hidden: Vec<String>,
+    pub rows: Vec<String>,
+}
+
+impl PivotLayout {
+    fn from_config(order: Vec<String>, hidden: Vec<String>, rows: Vec<String>) -> Self {
+        Self {
+            order: order.into_iter().map(SharedString::from).collect(),
+            hidden: hidden.into_iter().map(SharedString::from).collect(),
+            rows: rows.into_iter().map(SharedString::from).collect(),
+        }
+    }
+
+    fn to_config(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut hidden: Vec<String> = self.hidden.iter().map(|s| s.to_string()).collect();
+        hidden.sort();
+        (
+            self.order.iter().map(|s| s.to_string()).collect(),
+            hidden,
+            self.rows.iter().map(|s| s.to_string()).collect(),
+        )
+    }
 }
 
 /// Pane item showing the component namespace as a collapsible tree-table.
 pub struct OutlinePanel {
     inner: Entity<ComponentOutline>,
-    label: SharedString,
 }
 
 impl OutlinePanel {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| ComponentOutline::new(db, cx));
-        Self {
-            inner,
-            label: "Outline".into(),
-        }
+        Self { inner }
     }
 
     pub fn from_config(cfg: OutlinePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let panel = Self::new(db, cx);
-        panel.inner.update(cx, |outline, cx| {
-            outline.set_filter_visible(cfg.filter_bar, cx);
-            outline.set_filter_text(&cfg.filter, cx);
-            outline.set_columns(
-                OutlineColumns {
-                    unit: cfg.unit,
-                    ty: cfg.type_column,
-                    sparkline: cfg.sparklines,
-                },
-                cx,
-            );
-            outline.set_toggled_paths(cfg.toggled, cx);
-            outline.set_pivoted_paths(cfg.pivoted, cx);
-            outline.set_types(
-                cfg.types.into_iter().map(|t| (t.label, t.fields)).collect(),
-                cx,
-            );
-            outline.set_focus(cfg.focus, cx);
-        });
         panel
+            .inner
+            .update(cx, |outline, cx| apply_outline_config(outline, cfg, cx));
+        panel
+    }
+}
+
+/// Restore `cfg` onto a live outline. Shared with the dashboard widget,
+/// which hosts the same view without a pane around it.
+pub fn apply_outline_config(
+    outline: &mut ComponentOutline,
+    cfg: OutlinePanelConfig,
+    cx: &mut Context<ComponentOutline>,
+) {
+    outline.set_filter_visible(cfg.filter_bar, cx);
+    outline.set_filter_text(&cfg.filter, cx);
+    let columns: OutlineColumns = cfg.columns.iter().filter_map(|k| Col::parse(k)).collect();
+    if !columns.is_empty() {
+        outline.set_columns(columns, cx);
+    }
+    outline.set_descending(cfg.sort == SortDirection::Descending, cx);
+    outline.set_root(&cfg.root, cx);
+    outline.set_disclosure(cfg.expanded, cfg.collapsed, cx);
+    let mut layouts = HashMap::new();
+    let mut pivoted = Vec::with_capacity(cfg.pivots.len());
+    for p in cfg.pivots {
+        let layout = PivotLayout::from_config(p.fields, p.hidden, p.rows);
+        if !layout.is_empty() {
+            layouts.insert(SharedString::from(p.path.clone()), layout);
+        }
+        pivoted.push(p.path);
+    }
+    outline.set_pivoted_paths(pivoted, cx);
+    let mut types = Vec::with_capacity(cfg.types.len());
+    for t in cfg.types {
+        let layout = PivotLayout::from_config(t.order, t.hidden, t.rows);
+        if !layout.is_empty() {
+            layouts.insert(type_key(&t.label), layout);
+        }
+        types.push((t.label, t.fields));
+    }
+    outline.set_types(types, cx);
+    outline.set_pivot_layouts(layouts, cx);
+    outline.set_focus(cfg.focus, cx);
+}
+
+/// The persisted shape of a live outline.
+pub fn outline_config(inner: &ComponentOutline, cx: &App) -> OutlinePanelConfig {
+    let layouts = inner.pivot_layouts(cx);
+    let arrangement = |key: &SharedString| {
+        layouts
+            .get(key)
+            .map(PivotLayout::to_config)
+            .unwrap_or_default()
+    };
+    OutlinePanelConfig {
+        filter: inner.filter_text(cx),
+        filter_bar: inner.filter_visible(),
+        columns: inner
+            .columns(cx)
+            .iter()
+            .map(|c| c.key().to_string())
+            .collect(),
+        sort: if inner.descending(cx) {
+            SortDirection::Descending
+        } else {
+            SortDirection::Ascending
+        },
+        root: inner.root(cx),
+        expanded: inner.expanded_paths(cx),
+        collapsed: inner.collapsed_paths(cx),
+        pivots: inner
+            .pivoted_paths(cx)
+            .into_iter()
+            .map(|path| {
+                let (fields, hidden, rows) = arrangement(&SharedString::from(path.clone()));
+                PivotConfig {
+                    path,
+                    fields,
+                    hidden,
+                    rows,
+                }
+            })
+            .collect(),
+        types: inner
+            .types(cx)
+            .into_iter()
+            .map(|(label, fields)| {
+                let (order, hidden, rows) = arrangement(&type_key(&label));
+                FrameTypeConfig {
+                    label,
+                    fields,
+                    order,
+                    hidden,
+                    rows,
+                }
+            })
+            .collect(),
+        focus: inner.focus(cx),
     }
 }
 
@@ -751,8 +874,14 @@ impl Render for OutlinePanel {
 impl PaneItem for OutlinePanel {
     type Config = OutlinePanelConfig;
 
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
+    /// A rooted outline is named for its root's last segment, so a pane of
+    /// them reads `wheels | power | Outline`.
+    fn tab_title(&self, cx: &App) -> SharedString {
+        let root = self.inner.read(cx).root(cx);
+        match root.rsplit('.').next() {
+            Some(last) if !last.is_empty() => SharedString::from(last.to_string()),
+            _ => SharedString::new_static("Outline"),
+        }
     }
 
     fn serialization_key() -> &'static str {
@@ -760,22 +889,7 @@ impl PaneItem for OutlinePanel {
     }
 
     fn to_config(&self, cx: &App) -> OutlinePanelConfig {
-        let inner = self.inner.read(cx);
-        OutlinePanelConfig {
-            filter: inner.filter_text(cx),
-            filter_bar: inner.filter_visible(),
-            sparklines: inner.columns(cx).sparkline,
-            unit: inner.columns(cx).unit,
-            type_column: inner.columns(cx).ty,
-            toggled: inner.toggled_paths(cx),
-            pivoted: inner.pivoted_paths(cx),
-            types: inner
-                .types(cx)
-                .into_iter()
-                .map(|(label, fields)| FrameTypeConfig { label, fields })
-                .collect(),
-            focus: inner.focus(cx),
-        }
+        outline_config(self.inner.read(cx), cx)
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {

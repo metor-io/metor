@@ -183,6 +183,37 @@ pub fn resolve_path(
     out
 }
 
+/// The nodes from `root` down to the one named `name`, matched by full
+/// path so a compressed chain resolves the same as an expanded one. The
+/// chain ends on that node when it exists; otherwise it stops at the last
+/// prefix found, so a caller checks the tail's name to know.
+pub fn chain_to(root: &Arc<ComponentNode>, name: &str) -> SmallVec<[Arc<ComponentNode>; 8]> {
+    let mut out = SmallVec::new();
+    let mut current = root.clone();
+    while current.full_name.as_ref() != name {
+        let next = current
+            .children
+            .values()
+            .find(|c| under(&c.full_name, name))
+            .cloned();
+        let Some(next) = next else {
+            break;
+        };
+        out.push(next.clone());
+        current = next;
+    }
+    out
+}
+
+/// Whether `name` is `prefix` itself or a path beneath it; everything is
+/// under the empty prefix.
+pub fn under(prefix: &str, name: &str) -> bool {
+    prefix.is_empty()
+        || name
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 struct Builder {
     segment: SharedString,
     full_name: String,
@@ -268,6 +299,45 @@ mod tests {
     fn text_runs_stay_bytewise() {
         assert_eq!(sorted(&["b", "B", "a1", "a"]), ["B", "a", "a1", "b"]);
         assert_eq!(sorted(&["x9y", "x10", "x9"]), ["x9", "x9y", "x10"]);
+    }
+
+    #[test]
+    fn chain_to_walks_by_full_path_through_compressed_segments() {
+        let node = |seg: &str, name: &str, children: Children| {
+            Arc::new(ComponentNode {
+                segment: SharedString::from(seg.to_string()),
+                full_name: SharedString::from(name.to_string()),
+                component_id: None,
+                children,
+            })
+        };
+        let tree = node(
+            "",
+            "",
+            [node(
+                "sat.wheels",
+                "sat.wheels",
+                [node("0", "sat.wheels.0", Children::default())]
+                    .into_iter()
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let names = |chain: SmallVec<[Arc<ComponentNode>; 8]>| -> Vec<String> {
+            chain.iter().map(|n| n.full_name.to_string()).collect()
+        };
+        assert_eq!(
+            names(chain_to(&tree, "sat.wheels.0")),
+            ["sat.wheels", "sat.wheels.0"]
+        );
+        assert_eq!(names(chain_to(&tree, "sat.wheels")), ["sat.wheels"]);
+        assert_eq!(names(chain_to(&tree, "sat.wheels.9")), ["sat.wheels"]);
+        assert!(chain_to(&tree, "other").is_empty());
+        assert!(under("sat", "sat.wheels"));
+        assert!(under("sat", "sat"));
+        assert!(!under("sat", "satellite"));
+        assert!(under("", "sat"));
     }
 
     #[test]
