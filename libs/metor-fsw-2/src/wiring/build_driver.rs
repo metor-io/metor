@@ -241,7 +241,7 @@ pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(
             Some(triple) => format!("{} ({triple})", artifact.crate_name),
             None => artifact.crate_name.clone(),
         };
-        let path = build_cdylib("build", &artifact.crate_name, &cdylib, opts, &label)?;
+        let path = build_cdylib(&artifact.crate_name, &cdylib, opts, &label)?;
         if opts.manifest_sidecar {
             write_manifest_sidecar(&artifact.crate_name, &artifact.lib, &path, opts, cross)?;
         }
@@ -333,9 +333,7 @@ fn shipped_triples(dir: &Path) -> Vec<String> {
     triples
 }
 
-/// Runs a cargo-family build and returns the located cdylib path.
-/// `"zigbuild"` runs the `cargo-zigbuild` cross builder with the same
-/// output-location scan.
+/// Runs a cargo build and returns the located cdylib path.
 ///
 /// The build reports through tracing: a `build`-target span for its whole
 /// duration (the CLI renders active spans as a pinned progress line, keyed on
@@ -343,7 +341,6 @@ fn shipped_triples(dir: &Path) -> Vec<String> {
 /// and a `build`-target completion event. Without a subscriber all of it is
 /// silent, so library callers see no output.
 pub(super) fn build_cdylib(
-    subcommand: &str,
     crate_name: &str,
     cdylib: &str,
     opts: &BuildOptions,
@@ -352,7 +349,7 @@ pub(super) fn build_cdylib(
     // Prefer the cargo that invoked this process, falling back to PATH.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(cargo);
-    cmd.args([subcommand, "-p", crate_name, "--message-format=json"]);
+    cmd.args(["build", "-p", crate_name, "--message-format=json"]);
     if opts.release {
         cmd.arg("--release");
     }
@@ -527,7 +524,7 @@ fn write_manifest_sidecar(
         // The host twin's output carries the *host* platform's file name.
         let cdylib = super::cdylib_file_name(lib);
         let label = format!("{crate_name} (host sidecar twin)");
-        build_cdylib("build", crate_name, &cdylib, &host_opts, &label).map_err(|source| {
+        build_cdylib(crate_name, &cdylib, &host_opts, &label).map_err(|source| {
             BuildError::HostBuild {
                 crate_name: crate_name.to_string(),
                 source: Box::new(source),

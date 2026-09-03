@@ -32,8 +32,8 @@ def _project(root):
 
 def _platform_tag() -> str:
     """The wheel platform tag for this host, `sysconfig` convention
-    (`macosx_15_0_arm64`, `linux_x86_64`). manylinux compliance is the
-    phase-2 zigbuild matrix's concern."""
+    (`macosx_15_0_arm64`, `linux_x86_64`). The tag does not claim manylinux
+    compliance."""
     return sysconfig.get_platform().replace("-", "_").replace(".", "_")
 
 

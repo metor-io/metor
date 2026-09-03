@@ -73,9 +73,8 @@ pub use model::{
     Wiring,
 };
 pub use pack_dist::{
-    Builder, DEFAULT_TARGETS, PackBuildOptions, PackBuildReport, PackConfig, PackDevOptions,
-    PackDevReport, PackError, dev_pack_roots, pack_assemble, pack_build, pack_dev, pack_publish,
-    read_pack_config, refresh_dev_packs,
+    PackBuildOptions, PackBuildReport, PackConfig, PackDevOptions, PackDevReport, PackError,
+    dev_pack_roots, pack_build, pack_dev, read_pack_config, refresh_dev_packs,
 };
 pub use py::eval_python_target;
 pub use registry::{AsyncKind, CyclicKind, IntoNode, Registry};

@@ -4,10 +4,10 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, Builder, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions,
-    PackageOptions, Registry, WIRING_FILE_NAME, Wiring, build_target, eval_python_target,
-    load_bundle, locate_artifacts, pack_assemble, pack_build, pack_dev, pack_publish,
-    provision_artifacts, refresh_dev_packs, resolve, unpack_metor, write_bundle,
+    BuildOptions, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions, PackageOptions,
+    Registry, WIRING_FILE_NAME, Wiring, build_target, eval_python_target, load_bundle,
+    locate_artifacts, pack_build, pack_dev, provision_artifacts, refresh_dev_packs, resolve,
+    unpack_metor, write_bundle,
 };
 
 mod ui;
@@ -44,15 +44,8 @@ enum PackCmd {
     /// payload (typed module + `_libs/<triple>/`); what a pack's PEP 517
     /// backend runs on `uv sync`.
     Dev(PackDevArgs),
-    /// Build the pack's wheel payloads for every configured target and
-    /// assemble the fat `py3-none-any` wheel (or stage triples for a CI
-    /// matrix with `--libs-out`).
+    /// Build the pack's `py3-none-any` wheel for the host triple.
     Build(PackBuildArgs),
-    /// Join `--libs` stagings from matrix runners into the fat wheel,
-    /// re-verifying the manifests are identical across triples.
-    Assemble(PackAssembleArgs),
-    /// Build (or take) the pack's wheel and hand it to `uv publish`.
-    Publish(PackPublishArgs),
 }
 
 #[derive(Args, Debug)]
@@ -60,48 +53,9 @@ struct PackBuildArgs {
     /// The pack crate directory (holds `pyproject.toml` + `Cargo.toml`).
     #[arg(default_value = ".")]
     dir: PathBuf,
-    /// Build this triple instead of the config's `targets` (repeatable).
-    #[arg(long = "target", value_name = "TRIPLE")]
-    target: Vec<String>,
-    /// Stage `<triple>/` payloads here without assembling (the CI-matrix
-    /// half; join with `pack assemble`).
-    #[arg(long, value_name = "DIR", conflicts_with = "wheel_out")]
-    libs_out: Option<PathBuf>,
-    /// Write the assembled wheel here (default: `<dir>/dist`).
+    /// Write the wheel here (default: `<dir>/dist`).
     #[arg(long, value_name = "DIR")]
     wheel_out: Option<PathBuf>,
-    /// Override the configured builder for the cargo-family kinds.
-    #[arg(long, value_name = "cargo|zigbuild")]
-    builder: Option<String>,
-}
-
-#[derive(Args, Debug)]
-struct PackAssembleArgs {
-    /// The pack crate directory (holds `pyproject.toml` + `Cargo.toml`).
-    #[arg(default_value = ".")]
-    dir: PathBuf,
-    /// A staging directory of `<triple>/` payloads (repeatable).
-    #[arg(long = "libs", value_name = "DIR", required = true)]
-    libs: Vec<PathBuf>,
-    /// Write the assembled wheel here.
-    #[arg(long, value_name = "DIR", required = true)]
-    wheel_out: PathBuf,
-}
-
-#[derive(Args, Debug)]
-struct PackPublishArgs {
-    /// The pack crate directory (holds `pyproject.toml` + `Cargo.toml`).
-    #[arg(default_value = ".")]
-    dir: PathBuf,
-    /// The index to publish to: a configured index name, or a URL.
-    #[arg(long, value_name = "NAME|URL")]
-    index: Option<String>,
-    /// Publish this wheel instead of building one.
-    #[arg(long, value_name = "FILE")]
-    wheel: Option<PathBuf>,
-    /// Print the `uv publish` invocation instead of running it.
-    #[arg(long)]
-    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -218,64 +172,19 @@ pub async fn run() -> miette::Result<()> {
         Command::Run(a) => cmd_run(a).await,
         Command::Pack(PackCmd::Dev(a)) => cmd_pack_dev(a),
         Command::Pack(PackCmd::Build(a)) => cmd_pack_build(a),
-        Command::Pack(PackCmd::Assemble(a)) => cmd_pack_assemble(a),
-        Command::Pack(PackCmd::Publish(a)) => cmd_pack_publish(a),
     }
 }
 
-/// `pack build`: per-target payloads, then the fat wheel (or a matrix
-/// staging with `--libs-out`).
+/// `pack build`: the host-triple payload and its wheel.
 fn cmd_pack_build(args: PackBuildArgs) -> miette::Result<()> {
-    let builder = match args.builder.as_deref() {
-        None => None,
-        Some("cargo") => Some(Builder::Cargo),
-        Some("zigbuild") => Some(Builder::Zigbuild),
-        Some(other) => {
-            return Err(miette::miette!(
-                "unknown --builder `{other}` (cargo, zigbuild; command templates \
-                 configure via [tool.metor.pack.builder])"
-            ));
-        }
-    };
     let report = pack_build(
         &args.dir,
         &PackBuildOptions {
-            targets: args.target,
-            libs_out: args.libs_out,
             wheel_out: args.wheel_out,
-            builder,
         },
     )
     .into_diagnostic()?;
-    match &report.wheel {
-        Some(wheel) => println!("  {} ({})", wheel.display(), report.triples.join(", ")),
-        None => println!(
-            "  staged {} under {}",
-            report.triples.join(", "),
-            report.staged.display()
-        ),
-    }
-    Ok(())
-}
-
-/// `pack assemble`: join matrix stagings into the fat wheel.
-fn cmd_pack_assemble(args: PackAssembleArgs) -> miette::Result<()> {
-    let report = pack_assemble(&args.dir, &args.libs, &args.wheel_out).into_diagnostic()?;
-    let wheel = report.wheel.expect("assemble always writes a wheel");
-    println!("  {} ({})", wheel.display(), report.triples.join(", "));
-    Ok(())
-}
-
-/// `pack publish`: hand the wheel to `uv publish`.
-fn cmd_pack_publish(args: PackPublishArgs) -> miette::Result<()> {
-    let wheel = pack_publish(
-        &args.dir,
-        args.index.as_deref(),
-        args.wheel.as_deref(),
-        args.dry_run,
-    )
-    .into_diagnostic()?;
-    println!("  {}", wheel.display());
+    println!("  {} ({})", report.wheel.display(), report.triple);
     Ok(())
 }
 
