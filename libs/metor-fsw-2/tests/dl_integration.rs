@@ -52,6 +52,10 @@ fn dl_coordinator() -> CoordinatorSpec {
     }
 }
 
+/// Serializes the tests that write or remove the fixture's manifest sidecar;
+/// `provision_artifacts` in one would race the opt-out check in the other.
+static SIDECAR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A registry with `Ticker` registered as the static producer.
 fn ticker_registry() -> Registry {
     let mut registry = Registry::new();
@@ -280,6 +284,7 @@ fn dlopen_cyclic_system_end_to_end() {
 /// [`PackManifest`]: metor_fsw_2::abi::PackManifest
 #[test]
 fn build_driver_writes_manifest_sidecar() {
+    let _guard = SIDECAR.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = || {
         WiringBuilder::new()
             .artifact(
@@ -400,6 +405,7 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
     use metor_fsw_2::DlError;
     use metor_fsw_2::wiring::LoadErrorKind;
 
+    let _guard = SIDECAR.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // A dl system with `artifact=` but no `type=`: the builder leaves the type
     // unset, so resolve must pick the pack entry itself.
     let mut wiring = WiringBuilder::new()
