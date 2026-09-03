@@ -510,32 +510,6 @@ impl Pack {
         self
     }
 
-    /// As [`task`](Self::task), with declared default params: a config need
-    /// spell only its overrides, on every loading path. `P` must be the
-    /// task's `Params<P>` type (checked against the declared schema here).
-    pub fn task_with_defaults<M, F, P>(mut self, name: &'static str, f: F, defaults: P) -> Self
-    where
-        M: 'static,
-        F: crate::handler::AsyncSystemFn<M> + Clone,
-        P: serde::Serialize + postcard_schema::Schema,
-    {
-        self = self.task(name, f);
-        let entry = self.entries.last_mut().expect("task just pushed");
-        assert!(
-            core::ptr::eq(entry.params_schema, P::SCHEMA)
-                || postcard_schema::schema::owned::OwnedNamedType::from(entry.params_schema)
-                    == postcard_schema::schema::owned::OwnedNamedType::from(P::SCHEMA),
-            "task `{name}` declares Params<{}> but the defaults are a different type",
-            entry.params_schema.name,
-        );
-        entry.params_default = Some(
-            postcard::to_allocvec(&defaults)
-                .expect("params postcard-encode (Serialize is infallible)"),
-        );
-        entry.wrap_create_with_defaults();
-        self
-    }
-
     /// The entry named `name`, for pack-entry registration use.
     pub fn entry_mut(&mut self, name: &str) -> Option<&mut PackEntry> {
         self.entries.iter_mut().find(|e| e.name == name)

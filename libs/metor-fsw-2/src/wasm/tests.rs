@@ -167,7 +167,8 @@ fn a_miserly_fuel_budget_stops_the_guest() {
         panic!("1k fuel should not reach the end of open")
     };
     assert!(
-        is_out_of_fuel(&err) || matches!(err, WasmError::Instantiate(_)),
+        matches!(&err, WasmError::Trap(m) if m.contains("fuel"))
+            || matches!(err, WasmError::Instantiate(_)),
         "expected the budget to bite, got {err:?}"
     );
 

@@ -231,14 +231,6 @@ where
         }
     }
 
-    /// Publish a frame with dynamic members, counting a failed write instead
-    /// of returning it.
-    pub fn publish_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>)) {
-        if self.write_with(fixed, build).is_err() {
-            self.dropped.bump();
-        }
-    }
-
     /// Publish a frame with dynamic `FrameList`/`FrameMap` members. `build`
     /// drives a [`FrameWriter<F>`] to append the trailer, then the finished
     /// table bytes are written as one record.

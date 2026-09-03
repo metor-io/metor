@@ -311,7 +311,7 @@ fn is_dev_pack(dir: &Path) -> bool {
 
 /// The target's dev-pack roots: its pyproject's path sources filtered to
 /// the rebuildable packs.
-pub fn dev_pack_roots(target_dir: &Path) -> Vec<PathBuf> {
+fn dev_pack_roots(target_dir: &Path) -> Vec<PathBuf> {
     super::py::path_source_roots(target_dir)
         .into_iter()
         .filter(|dir| is_dev_pack(dir))

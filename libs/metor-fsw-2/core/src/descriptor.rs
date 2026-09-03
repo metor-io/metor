@@ -336,12 +336,6 @@ impl PortDesc {
         self
     }
 
-    /// Overrides the input fan-in rule.
-    pub fn with_fan_in(mut self, f: FanIn) -> Self {
-        self.fan_in = f;
-        self
-    }
-
     /// Overrides the delivery semantics, for example an every-record
     /// `Table × Log` frame log.
     pub fn with_delivery(mut self, d: Delivery) -> Self {
@@ -642,10 +636,6 @@ mod tests {
     fn modifiers_override_one_axis() {
         let d = PortDesc::of::<AxisProbe>().untelemetered();
         assert!(!d.telemetered);
-        assert_eq!(d.delivery, Delivery::Snapshot);
-
-        let d = PortDesc::of::<AxisProbe>().with_fan_in(FanIn::Many);
-        assert_eq!(d.fan_in, FanIn::Many);
         assert_eq!(d.delivery, Delivery::Snapshot);
 
         // The fourth axis combination, an every-record frame log.

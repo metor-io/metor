@@ -7,7 +7,7 @@
 //! Two sections are `#[cfg(not(miri))]` because Miri cannot run them: the mmap
 //! tests, which need a real temp directory and a real `mmap`, and the async
 //! tests at the end, which need the executor. The async ones exist because
-//! `View::read` and `View::read_into` are reachable from no other test here,
+//! `View::read` is reachable from no other test here,
 //! and Kani and loom cannot reach them either.
 
 use super::*;
@@ -981,7 +981,7 @@ fn reclaim_skips_other_owners() {
 // ----- Async paths -----
 //
 // Excluded from Miri, which cannot drive the executor. These are the only
-// tests that reach `View::read`, `View::read_into` and `Notifier`; everything
+// tests that reach `View::read` and `Notifier`; everything
 // above deliberately sticks to `try_*` so it stays Miri-checkable, which left
 // the awaiting paths — and `port.rs`'s `view.read().await` in `metor-fsw-2` —
 // covered only indirectly.
@@ -989,29 +989,6 @@ fn reclaim_skips_other_owners() {
 // Each spawns the peer and yields first, so the waiting side is already armed
 // when the commit lands. That is what puts the wake path, rather than a record
 // that happened to be ready, on the tested route.
-
-#[cfg(not(miri))]
-#[stellarator::test]
-async fn read_into_awaits_a_commit() {
-    let ring = ring(64, 2);
-    let notifier = Notifier::default();
-    let mut w = ring.writer(notifier.clone()).unwrap();
-    let mut v = ring.view(notifier.clone()).unwrap();
-    assert_eq!(v.committed(), 0);
-
-    let reader = stellarator::spawn(async move {
-        let mut buf = Vec::new();
-        v.read_into(&mut buf).await.expect("never corrupt");
-        (buf, v.cursor())
-    });
-
-    stellarator::yield_now().await;
-    w.try_write(b"awaited!").unwrap();
-
-    let (buf, cursor) = reader.await.unwrap();
-    assert_eq!(&buf[..], b"awaited!");
-    assert_eq!(cursor, frame_len(8) as u64);
-}
 
 #[cfg(not(miri))]
 #[stellarator::test]
@@ -1037,34 +1014,6 @@ async fn read_awaits_a_commit_and_the_grant_consumes_it() {
 
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn read_into_streams_records_in_order() {
-    let ring = ring(64, 2);
-    let notifier = Notifier::default();
-    let mut w = ring.writer(notifier.clone()).unwrap();
-    let mut v = ring.view(notifier.clone()).unwrap();
-
-    let reader = stellarator::spawn(async move {
-        let mut seen = Vec::new();
-        let mut buf = Vec::new();
-        for _ in 0..4u8 {
-            v.read_into(&mut buf).await.expect("never corrupt");
-            seen.push(buf[0]);
-        }
-        seen
-    });
-
-    // One at a time, so the reader waits on every one of them rather than
-    // draining a backlog.
-    for n in 0..4u8 {
-        stellarator::yield_now().await;
-        w.try_write(&[n; 8]).unwrap();
-    }
-
-    assert_eq!(reader.await.unwrap(), vec![0, 1, 2, 3]);
-}
-
-#[cfg(not(miri))]
-#[stellarator::test]
 async fn read_returns_a_ready_record_without_waiting() {
     let ring = ring(64, 2);
     let notifier = Notifier::default();
@@ -1074,9 +1023,8 @@ async fn read_returns_a_ready_record_without_waiting() {
     // Committed before the first poll, so the loop returns on its first pass
     // and never arms the wait.
     w.try_write(b"ready").unwrap();
-    let mut buf = Vec::new();
-    v.read_into(&mut buf).await.expect("never corrupt");
-    assert_eq!(&buf[..], b"ready");
+    let grant = v.read().await.expect("never corrupt");
+    assert_eq!(&grant[..], b"ready");
 }
 
 /// [`NoWake`] resolves as soon as it is polled, which is what makes the async

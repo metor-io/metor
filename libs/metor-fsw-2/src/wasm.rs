@@ -199,13 +199,6 @@ pub enum WasmError {
     },
 }
 
-/// Whether a [`WasmError::Trap`] was the fuel budget running out, as opposed
-/// to a fault in the guest. Both are terminal for the occupant, but only the
-/// first is the host's own policy biting.
-pub fn is_out_of_fuel(err: &WasmError) -> bool {
-    matches!(err, WasmError::Trap(m) if m.contains("fuel"))
-}
-
 /// One port's ring region inside guest memory.
 ///
 /// Deliberately just the geometry used while constructing the persistent

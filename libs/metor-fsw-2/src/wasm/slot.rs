@@ -15,8 +15,8 @@
 //! [`FswStatus::Panicked`], which the runner already maps onto
 //! `SlotState::Stopped` exactly as it does a `.so` panic.
 
-use metor_fsw_2_core::Delivery;
 use metor_fsw_2_core::abi::{FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT};
+use metor_fsw_2_core::{Delivery, Mount};
 use metor_proto::types::Timestamp;
 
 use super::{RingBridge, WasmError, WasmPack};
@@ -77,7 +77,15 @@ impl WasmSlot {
         max_memory: usize,
     ) -> Result<Self, WasmError> {
         let pack = WasmPack::open_with_memory_limit(wasm, fuel_per_call, max_memory)?;
-        Self::bind_opened(pack, index, params, instance, host_inputs, host_outputs)
+        Self::bind_opened(
+            pack,
+            index,
+            params,
+            instance,
+            host_inputs,
+            host_outputs,
+            Mount::SlotOccupant,
+        )
     }
 
     /// Bind a freshly read module by entry name after proving its ABI-relevant
@@ -113,18 +121,24 @@ impl WasmSlot {
             instance,
             host_inputs,
             host_outputs,
+            Mount::SlotOccupant,
         )?;
         slot.set_fuel_per_call(poll_fuel);
         Ok(slot)
     }
 
-    fn bind_opened(
+    /// Create entry `index` under `mount`, mirror the host rings into the
+    /// guest, bind, and pin. A wired mount gets the descriptor's own ports and
+    /// nothing else; a slot occupant also gets the appended control input and
+    /// status output.
+    pub(crate) fn bind_opened(
         mut pack: WasmPack,
         index: u32,
         params: &[u8],
         instance: &str,
         host_inputs: &[FswRing],
         host_outputs: &[FswRing],
+        mount: Mount,
     ) -> Result<Self, WasmError> {
         let entry = pack
             .manifest()
@@ -139,9 +153,11 @@ impl WasmSlot {
             .map(|p| p.delivery)
             .collect();
 
-        // Mount 1 is the slot-occupant mount, which appends the control input
-        // and the status output the entry never declares.
-        let state = pack.create(index, 1, params)?;
+        let mount_word = match mount {
+            Mount::Wired => 0,
+            Mount::SlotOccupant => 1,
+        };
+        let state = pack.create(index, mount_word, params)?;
 
         // One guest region per host region, sized from the host's, so the two
         // sides of a leg always agree on what a record can be.
@@ -157,8 +173,9 @@ impl WasmSlot {
         let hin: Vec<_> = host_inputs.iter().map(host).collect();
         let hout: Vec<_> = host_outputs.iter().map(host).collect();
 
-        // Delivery is known only for the entry's declared ports; the mount tail
-        // is snapshot (control, status), so pad rather than assume alignment.
+        // Delivery is known only for the entry's declared ports; an occupant's
+        // mount tail is snapshot (control, status), so pad rather than assume
+        // alignment. A wired mount has no tail and the resize is a no-op.
         let in_delivery = Self::pad_delivery(in_delivery, hin.len());
         let out_delivery = Self::pad_delivery(out_delivery, hout.len());
 
@@ -215,6 +232,17 @@ impl WasmSlot {
                 self.dead = true;
                 FswStatus::Panicked
             }
+        }
+    }
+
+    /// Carry inputs across without entering the guest, so upstream producers
+    /// never backpressure on a reader that has stopped moving. What cannot be
+    /// delivered counts as dropped.
+    pub(crate) fn carry_inputs(&mut self) {
+        if self.pack.check_memory_stable().is_ok()
+            && let Some(bridge) = self.bridge.as_mut()
+        {
+            let _ = bridge.pump_in();
         }
     }
 

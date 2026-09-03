@@ -188,16 +188,6 @@ pub const SYM_PACK_DESTROY: &[u8] = b"fsw_pack_destroy\0";
 /// `fsw_pack_close` drops the [`Pack`](crate::Pack) itself, after every
 /// instance state has been destroyed.
 pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
-/// `fsw_pack_alloc` hands out ring-aligned bytes from the pack's allocator,
-/// so a wasm host can place ring regions inside guest linear memory.
-pub const SYM_PACK_ALLOC: &[u8] = b"fsw_pack_alloc\0";
-/// `fsw_pack_free` releases a region from `fsw_pack_alloc`.
-pub const SYM_PACK_FREE: &[u8] = b"fsw_pack_free\0";
-/// `fsw_pack_ring_init` formats a ring into a guest-allocated region.
-pub const SYM_PACK_RING_INIT: &[u8] = b"fsw_pack_ring_init\0";
-/// `fsw_pack_set_now` publishes a cycle timestamp on the callee's ambient
-/// clock, so `bind`/`init` need not fall back to wall time.
-pub const SYM_PACK_SET_NOW: &[u8] = b"fsw_pack_set_now\0";
 
 // ---------------------------------------------------------------------------
 // RawBinder

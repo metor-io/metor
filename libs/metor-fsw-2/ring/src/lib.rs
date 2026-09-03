@@ -1040,7 +1040,7 @@ impl RingBuffer {
     /// Register a new view, claiming a free slot in the reader table.
     ///
     /// A fresh view only sees data committed from now on. The async
-    /// [`View::read_into`] and [`View::read`] await `data`.
+    /// [`View::read`] awaits `data`.
     pub fn view<RD: WakeSink>(&self, data: RD) -> Result<View<RD>, FullReaderTable> {
         let mut start = self.inner.committed().load(Acquire);
         for slot in 0..self.inner.max_readers {
@@ -1431,22 +1431,6 @@ impl<RD: WakeSink> View<RD> {
         Ok(true)
     }
 
-    /// Await and copy the next record into `buf`.
-    pub async fn read_into(&mut self, buf: &mut Vec<u8>) -> Result<(), ReadError> {
-        loop {
-            if self.try_read_into(buf)? {
-                return Ok(());
-            }
-            let inner = self.inner.clone();
-            let slot = self.slot;
-            self.data
-                .wait_until(|| {
-                    inner.committed().load(Acquire) > inner.slot_cursor(slot).load(Acquire)
-                })
-                .await;
-        }
-    }
-
     /// Borrow the next record without copying.
     ///
     /// The writer cannot overwrite a record this view has not consumed, so
@@ -1472,8 +1456,7 @@ impl<RD: WakeSink> View<RD> {
         }))
     }
 
-    /// Await the next record and borrow it, the grant twin of
-    /// [`View::read_into`].
+    /// Await the next record and borrow it.
     pub async fn read(&mut self) -> Result<ReadGrant<'_>, ReadError> {
         // Awaiting and borrowing are split for the borrow checker. A grant
         // taken inside the wait loop would pin the `self` borrow across every
