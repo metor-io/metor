@@ -2,8 +2,8 @@
 //!
 //! The target file imports the `metor_config` recorder, builds a target, and
 //! at exit writes the serialized [`Wiring`] IR. This module resolves an
-//! interpreter, materializes the embedded recorder, runs the file, and ingests
-//! the JSON it produced — landing a `Wiring` the shared
+//! interpreter, materializes the embedded recorder, runs the file, and
+//! ingests the JSON it produced, landing a `Wiring` the shared
 //! [`resolve`](super::resolve) consumes, exactly like the Rust
 //! [`WiringBuilder`](super::WiringBuilder).
 //!
@@ -34,7 +34,7 @@ const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
     ),
 ];
 
-/// The embedded recorder's `__version__`, scanned from the embedded source —
+/// The embedded recorder's `__version__`, scanned from the embedded source:
 /// the version this binary pairs with, used to derive the `metor-config`
 /// compatible-range pin stamped into pack wheels.
 pub(super) fn metor_config_version() -> &'static str {
@@ -56,11 +56,11 @@ pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
     let python = resolve_interpreter()?;
 
     // Recorder source, in preference order: a live checkout via
-    // `$METOR_CONFIG_PY`; the interpreter's own environment (a venv that
-    // installed `metor_config` — anything on `PYTHONPATH` would shadow
-    // site-packages, so the embedded copy must stay off the path); else the
-    // embedded copy materialized to a per-run temp dir (dropped when this
-    // returns) so a bare `metor-fsw run` needs no venv.
+    // `$METOR_CONFIG_PY`; the interpreter's own environment, when a venv
+    // already installed `metor_config` (anything on `PYTHONPATH` would
+    // shadow site-packages, so the embedded copy must stay off the path);
+    // else the embedded copy materialized to a per-run temp dir, dropped
+    // when this returns, so a bare `metor-fsw run` needs no venv.
     let materialized;
     let mut roots: Vec<PathBuf> = Vec::new();
     match std::env::var_os("METOR_CONFIG_PY") {
@@ -83,7 +83,8 @@ pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
     // dependency keeps its module in `<pack>/.metor`; putting those build
     // dirs on the path lets a bare `metor-fsw run` (or a Rust test) evaluate
     // the target without the venv active. In a venv they resolve there
-    // first-equal — the contents are the same artifacts the backends expose.
+    // first, equally, since the contents are the same artifacts the backends
+    // expose.
     if let Some(target_dir) = path.parent() {
         let stubs = target_dir.join(".metor");
         if stubs.is_dir() {
@@ -187,9 +188,9 @@ fn imports_metor_config(python: &Path) -> bool {
 
 /// The path-source dependency roots of the target-adjacent
 /// `pyproject.toml`: each `[tool.uv.sources] <dist> = {{ path = … }}` entry,
-/// target-relative, sorted. Direct sources only — a pack's own path-source
+/// target-relative, sorted. Direct sources only; a pack's own path-source
 /// dependencies are not chased, the same limitation as the `PYTHONPATH` scan,
-/// so refresh and import visibility stay symmetric. Best-effort by design —
+/// so refresh and import visibility stay symmetric. Best-effort by design:
 /// no pyproject or no sources means "no roots".
 pub(super) fn path_source_roots(target_dir: &Path) -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(target_dir.join("pyproject.toml")) else {
@@ -217,7 +218,7 @@ pub(super) fn path_source_roots(target_dir: &Path) -> Vec<PathBuf> {
 
 /// The `.metor` build dirs of the target's path-source pack dependencies:
 /// each [`path_source_roots`] entry whose target carries one. Best-effort by
-/// design — a real dependency problem surfaces as Python's own
+/// design: a real dependency problem surfaces as Python's own
 /// `ModuleNotFoundError` with the target traceback.
 fn pack_stub_roots(target_dir: &Path) -> Vec<PathBuf> {
     path_source_roots(target_dir)

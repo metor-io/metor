@@ -35,8 +35,8 @@
 //! # Loss policy
 //!
 //! The link must never backpressure the target. Taps drain every cycle no
-//! matter what — an undrained view stalls its producer's ring — and framing
-//! is skipped entirely with no connections. A connection that cannot keep up
+//! matter what, since an undrained view stalls its producer's ring, and
+//! framing is skipped entirely with no connections. A connection that cannot keep up
 //! misses whole batches behind its byte cap (counted per occurrence, folded
 //! onto the downlink's log as `link_conn_dropped`) and is never
 //! disconnected; see the [`link`] module doc for the server's policies.
@@ -232,7 +232,7 @@ impl BindPorts for UplinkOut {
 /// The command ingest system, the read twin of [`TelemetrySystem`]: a
 /// [`CyclicSystem`] attached to the shared [`LinkState`] that drains the
 /// server's inbound queue each cycle and relays each msg onto its matching
-/// minted output. Register it early — before its consumers — and a command
+/// minted output. Register it early, before its consumers, so a command
 /// received between cycles is consumed the same cycle it is republished. It
 /// is a pure pass-through for any message id: the forward set is
 /// per-instance configuration (`msgs`, or [`with_msg`](Self::with_msg)
@@ -438,7 +438,7 @@ struct Tap {
     last_committed: u64,
     /// Snapshot *message* taps: this tap's slot in the link's retained
     /// store. The newest framed record is held there and replayed to every
-    /// late-joining connection — latest-wins boot state (a wiring manifest,
+    /// late-joining connection: latest-wins boot state (a wiring manifest,
     /// a sequence registry) that would otherwise stream exactly once.
     /// Continuously-republished frames need no retention (a new connection
     /// sees them within a cycle), so frame taps stay `None`.
@@ -680,7 +680,7 @@ impl CyclicSystem for TelemetrySystem {
         }
 
         // With no connections the batch is skipped entirely, but the taps
-        // still drain below — records are consumed and DISCARDED — because an
+        // still drain below (records are consumed and DISCARDED) because an
         // undrained tap view stalls its producer's ring and freezes every
         // consumer of that output, not just telemetry.
         link.prepare_batch(&mut self.batch);
@@ -699,7 +699,7 @@ impl CyclicSystem for TelemetrySystem {
                         Ok(Some(grant)) => match tap.retain_slot {
                             // A retained tap frames once and the bytes go
                             // both ways: appended to this cycle's batch and
-                            // held for future connections' replays — even
+                            // held for future connections' replays, even
                             // with no connection live right now.
                             Some(slot) => {
                                 self.retain_scratch.clear();

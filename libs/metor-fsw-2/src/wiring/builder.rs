@@ -88,17 +88,7 @@ impl WiringBuilder {
         self
     }
 
-    /// Declares a loadable [`Artifact`], one pack (any number of system
-    /// types) per cdylib.
-    ///
-    /// `lib_stem` is the bare library stem (`adcs_plant`), decorated into a
-    /// per-triple file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
-    /// `adcs_plant.dll`) when the artifact is provisioned. A `system` spec's
-    /// `ty` selects the pack entry. The artifact's `path` starts out unset;
-    /// the build driver ([`provision_artifacts`](super::provision_artifacts)) fills it
-    /// in.
-    ///
-    /// Declare a WebAssembly artifact at `path`.
+    /// Declares a WebAssembly artifact at `path`.
     ///
     /// Unlike [`artifact`](Self::artifact) there is no crate or library stem
     /// to build per triple: a `.wasm` is one arch-neutral file, which is the
@@ -122,6 +112,15 @@ impl WiringBuilder {
         self
     }
 
+    /// Declares a loadable [`Artifact`], one pack (any number of system
+    /// types) per cdylib.
+    ///
+    /// `lib_stem` is the bare library stem (`adcs_plant`), decorated into a
+    /// per-triple file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
+    /// `adcs_plant.dll`) when the artifact is provisioned. A `system` spec's
+    /// `ty` selects the pack entry. The artifact's `path` starts out unset;
+    /// the build driver ([`provision_artifacts`](super::provision_artifacts))
+    /// fills it in.
     pub fn artifact(
         mut self,
         id: impl Into<String>,

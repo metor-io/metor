@@ -88,9 +88,9 @@ pub(super) fn render_module(
     Ok(out)
 }
 
-/// The `sha256:<hex>` hash of the manifest postcard bytes — pure code changes
-/// leave the manifest (and this hash) unchanged, so generated modules do not churn.
-/// Shared with the resolve-time staleness check.
+/// The `sha256:<hex>` hash of the manifest postcard bytes. Pure code changes
+/// leave the manifest, and this hash, unchanged, so generated modules do not
+/// churn. Shared with the resolve-time staleness check.
 pub(super) fn manifest_hash(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
@@ -235,7 +235,7 @@ impl Codegen {
     /// The marker class name for a port, generating a `Frame` subclass for a
     /// Table port keyed by frame id (named from its metadata, falling back to
     /// the port name) and using the shared `Msg` marker for a self-describing
-    /// Postcard port. Idempotent per frame id — the first caller's name wins,
+    /// Postcard port. Idempotent per frame id: the first caller's name wins,
     /// so the collection pass and the annotation pass agree.
     fn marker_name(&mut self, port: &PortDesc) -> String {
         match &port.schema {
@@ -307,7 +307,7 @@ impl Codegen {
     }
 
     /// Map a postcard-schema type to its Python annotation, registering any
-    /// nested dataclass it names (design §5.2).
+    /// nested dataclass it names.
     fn py_type(&mut self, nt: &OwnedNamedType) -> String {
         use OwnedDataModelType as T;
         match &nt.ty {
@@ -374,7 +374,7 @@ impl Codegen {
     }
 
     /// A fieldless enum maps to a `Literal[...]`; an enum with data to a union
-    /// of generated variant dataclasses (design §5.2).
+    /// of generated variant dataclasses.
     fn enum_type(
         &mut self,
         nt: &OwnedNamedType,
@@ -694,8 +694,8 @@ mod tests {
     use postcard_schema::Schema;
     use serde::Serialize;
 
-    // A params type exercising the scalar/Option split (the WP6 defaults blob
-    // is the whole struct, so every non-Option field gets a default).
+    // A params type exercising the scalar/Option split: the defaults blob is
+    // the whole struct, so every non-Option field gets a default.
     #[derive(Serialize, Schema, Default)]
     struct Demo {
         count: u64,

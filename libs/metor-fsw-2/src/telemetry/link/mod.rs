@@ -182,7 +182,7 @@ struct ServerState {
     /// receives first. Accepted connections park in `pending` until set.
     announce_blob: Option<Rc<Vec<u8>>>,
     /// The newest framed record of each Snapshot message tap, replayed to
-    /// every new connection right after the announces — latest-wins boot
+    /// every new connection right after the announces: latest-wins boot
     /// state (a wiring manifest, a sequence registry) a late joiner would
     /// otherwise never see. Slot-indexed by the downlink; an empty slot has
     /// no record yet.
@@ -276,7 +276,7 @@ impl LinkState {
     /// from the uplink's init, before the downlink's
     /// [`set_announces`](Self::set_announces) freezes the replay (init
     /// order guarantees it: the downlink's `ReceiveAll` capability defers
-    /// it last). Errors when the replay is already frozen — an uplink
+    /// it last). Errors when the replay is already frozen: an uplink
     /// registered after the downlink, a config defect the caller reports
     /// through its health. Appends with id-dedup, so a second uplink's set
     /// unions in.
@@ -293,9 +293,9 @@ impl LinkState {
     }
 
     /// Encode and install the identity + announce replay every connection
-    /// receives before any data: the [`LinkInfo`] identity packet first —
-    /// its position is what lets a probing client decide the peer's mode
-    /// from the first packet — then the schema announces. Called once, by
+    /// receives before any data: the [`LinkInfo`] identity packet first,
+    /// whose position is what lets a probing client decide the peer's mode
+    /// from the first packet, then the schema announces. Called once, by
     /// the downlink's init; a second downlink on one server is a config
     /// defect its health reports.
     pub(crate) fn set_announces(
@@ -627,8 +627,8 @@ fn enqueue_bytes(outbound: &OutboundProducer, queued: &AtomicUsize, batch: &[u8]
 }
 
 /// A new connection's opening bytes: the identity + announce blob, then
-/// the newest retained record of every Snapshot message tap — schemas
-/// first, then the latest-wins boot state a late joiner missed live.
+/// the newest retained record of every Snapshot message tap. Schemas
+/// come first, then the latest-wins boot state a late joiner missed live.
 fn seed_replay(blob: &[u8], retained: &[Vec<u8>]) -> Vec<u8> {
     let mut seed = blob.to_vec();
     for record in retained {
@@ -694,8 +694,8 @@ async fn write_half(
 /// Read packets until error or EOF: inbound `Msg` packets queue for the
 /// uplink; legacy [`MsgStream`] subscriptions and stray node/link protocol
 /// messages (a client's `GetDbInfo` identity probe) are accepted and
-/// ignored — the same hygiene the db server applies, so probing never
-/// pollutes the command queue; `Table` packets are ignored.
+/// ignored, so probing never pollutes the command queue; `Table` packets
+/// are ignored too.
 async fn read_half(inbound: InboundSender, metrics: Rc<ServerMetrics>, rx: OwnedReader<TcpStream>) {
     let mut stream = PacketStream::new(rx);
     let mut buf = vec![0u8; RECV_BUF];

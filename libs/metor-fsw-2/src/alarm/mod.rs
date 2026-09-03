@@ -429,7 +429,7 @@ pub struct AlarmIn {
 #[derive(crate::SystemOutput)]
 pub struct AlarmOut {
     /// The full def set as one latest-wins snapshot: the downlink retains
-    /// it, so a panel connecting mid-target still learns every alarm.
+    /// it, so a client connecting mid-target still learns every alarm.
     #[fsw(snapshot)]
     defs: MsgOut<AlarmDefs>,
     raised: MsgOut<AlarmRaised>,

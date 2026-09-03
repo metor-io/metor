@@ -1,8 +1,8 @@
 //! The one structural gate every ingested [`Wiring`] passes before resolve.
 //!
 //! [`resolve_with`](super::resolve_with) runs [`validate`] first, so both
-//! front-ends — the serde-ingested Python IR and the Rust
-//! [`WiringBuilder`](super::WiringBuilder) — clear the same checks. The checks
+//! front-ends, the serde-ingested Python IR and the Rust
+//! [`WiringBuilder`](super::WiringBuilder), clear the same checks. The checks
 //! here are the ones that need only the IR itself: version skew, scope-table
 //! indices, name and id uniqueness, and each spec's own well-formedness.
 //! Anything needing the [`Registry`](super::Registry) or the filesystem
@@ -121,7 +121,7 @@ fn check_ir_version(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// Range-check every scope index in the wiring — the specs' `scope` fields and
+/// Range-check every scope index in the wiring: the specs' `scope` fields and
 /// the table's own `parent` links. The table is front-end metadata, so a bad
 /// index is a front-end bug, caught before any system is built.
 fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
@@ -142,8 +142,8 @@ fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// Instance names — systems and slots in one flat namespace, plus the reserved
-/// coordinator — must be unique.
+/// Instance names, systems and slots in one flat namespace plus the reserved
+/// coordinator, must be unique.
 fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
     let mut seen = HashSet::from([RESERVED_INSTANCE]);
     for name in wiring
@@ -211,7 +211,7 @@ fn check_state(state: &StateSpec) -> Result<(), LoadError> {
 /// no [`ParamSource::Postcard`] (the static path has no postcard decoder).
 fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
     // An `attach` must name a declared state, and only a static system can hold
-    // one — a loaded/process pack cannot own shared state (the pack ABI forbids
+    // one: a loaded/process pack cannot own shared state (the pack ABI forbids
     // it). The static shared-vs-plain check needs the registry and lives in
     // `resolve` instead.
     if let Some(attach) = &spec.attach {

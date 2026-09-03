@@ -1,13 +1,13 @@
 //! Terminal presentation for the `metor-fsw` CLI.
 //!
 //! Two pieces: [`init_tracing`] installs the subscriber that turns the build
-//! pipeline's tracing output into a live display — active `build`-target
-//! spans render as a pinned progress line (spinner, label, the crate cargo is
-//! currently compiling, elapsed time) while `cargo`-target events stream
-//! above it — and [`print_preflight`] lists the systems and slots a target
-//! will run before it starts. Both degrade to plain text when stderr is not a
-//! terminal: indicatif hides its bars and events print as ordinary lines,
-//! and the pre-flight colors are gated on stream support.
+//! pipeline's tracing output into a live display (active `build`-target
+//! spans render as a pinned progress line with a spinner, label, the crate
+//! cargo is currently compiling, and elapsed time, while `cargo`-target
+//! events stream above it), and [`print_preflight`] lists the systems and
+//! slots a target will run before it starts. Both degrade to plain text when
+//! stderr is not a terminal: indicatif hides its bars and events print as
+//! ordinary lines, and the pre-flight colors are gated on stream support.
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -23,7 +23,7 @@ use crate::wiring::{ClockSpec, Wiring};
 
 /// Install the CLI's tracing subscriber. `build`-target spans get the pinned
 /// progress line; `cargo` and `build` events print bare (no timestamp, level,
-/// or target — cargo's own output carries that), while runtime events get the
+/// or target, since cargo's own output carries that), while runtime events get the
 /// full default format. The default filter passes `cargo`/`build` at `INFO`,
 /// which `RUST_LOG` overrides for debugging. Runtime events at `INFO` and up
 /// are additionally forwarded onto the downlink as `LogEvent`s
@@ -82,7 +82,7 @@ struct Entry {
 }
 
 /// Print the ordered list of systems and slots `run` is about to start, to
-/// stderr: a header with the effective clock, then one two-line entry each —
+/// stderr: a header with the effective clock, then one two-line entry each,
 /// instance name and type, with the source (pack distribution, crate, or
 /// builtin; a slot's allowed occupants) dimmed underneath. Each entry carries
 /// a colored dot keying its kind: magenta for pack-loaded systems, yellow

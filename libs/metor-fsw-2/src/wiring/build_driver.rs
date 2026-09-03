@@ -10,7 +10,7 @@
 //! only supplies the list of crates and reads back where their outputs landed.
 //!
 //! A **prebuilt** artifact instead names a directory of per-triple libraries
-//! ([`Artifact::prebuilt_dir`](super::Artifact::prebuilt_dir) — an installed
+//! ([`Artifact::prebuilt_dir`](super::Artifact::prebuilt_dir), an installed
 //! pack wheel's `_libs`, or a local pack's `.metor/libs`). Provisioning is a
 //! selection, never a compile: the requested target triple (or the host's)
 //! picks `<dir>/<triple>/<cdylib>`, and a triple the directory does not ship
@@ -30,7 +30,7 @@
 //! [`PackManifest`](metor_fsw_2_core::abi::PackManifest) bytes `fsw_pack_describe`
 //! reports, so downstream consumers (pack codegen, cross-arch resolve) can read the
 //! pack's self-description without running the artifact. Sourcing the sidecar
-//! *does* run the crate's `pack()` once, at build time — the same trust model
+//! *does* run the crate's `pack()` once, at build time, the same trust model
 //! as a `build.rs`. A cross build (`--target` differing from the host) cannot
 //! run its own output, so the crate is additionally built for the host and
 //! that twin is described instead.
@@ -58,7 +58,7 @@ pub struct BuildOptions {
     ///
     /// Sidecar generation executes the crate's `pack()` at build time, the
     /// same trust model as a `build.rs`. Opt out for pack crates that cannot
-    /// be built for the host architecture — a cross build sources its sidecar
+    /// be built for the host architecture: a cross build sources its sidecar
     /// from an additional host-arch build, and that build failing is a hard
     /// error while this flag is on.
     pub manifest_sidecar: bool,
@@ -211,7 +211,7 @@ pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(
     let cross = opts.manifest_sidecar && is_cross(&opts.extra_args);
     let target = requested_target(&opts.extra_args).map(str::to_string);
     // Program artifacts compile last, against the other artifacts' built
-    // manifests — the build-time resolver reads their sidecars.
+    // manifests, which the build-time resolver reads from their sidecars.
     let mut programs: Vec<usize> = Vec::new();
     for (at, artifact) in wiring.artifacts.iter_mut().enumerate() {
         if let Some(dir) = artifact.prebuilt_dir.clone() {
@@ -292,7 +292,7 @@ fn target_root() -> PathBuf {
 }
 
 /// Select a prebuilt artifact's library for `target` (or the host): the
-/// `<dir>/<triple>/<cdylib>` the pack shipped. No compile, no sidecar work —
+/// `<dir>/<triple>/<cdylib>` the pack shipped. No compile, no sidecar work;
 /// the shipped sidecar sits next to the library and resolve verifies it.
 fn select_prebuilt(
     artifact: &super::model::Artifact,
@@ -369,8 +369,8 @@ pub(super) fn build_cdylib(
         let child_stderr = child.stderr.take().expect("stderr piped");
         let mut child_stdout = child.stdout.take().expect("stdout piped");
 
-        // Stream cargo's stderr through tracing as it arrives — keeping a
-        // copy for the failure diagnostic — while this thread drains the JSON
+        // Stream cargo's stderr through tracing as it arrives, keeping a copy
+        // for the failure diagnostic, while this thread drains the JSON
         // stdout. Both pipes are consumed concurrently, so neither can fill
         // and stall cargo. A side benefit of the pipe: cargo emits plain
         // `Compiling` lines instead of its own progress bar.
@@ -381,7 +381,7 @@ pub(super) fn build_cdylib(
                 for line in lines.map_while(Result::ok) {
                     tracing::info!(target: "cargo", "{line}");
                     if let Some(unit) = line.trim_start().strip_prefix("Compiling ") {
-                        // `Compiling <name> <version> (<path>)` — drop the path.
+                        // `Compiling <name> <version> (<path>)`; drop the path.
                         let unit = unit.split(" (").next().unwrap_or(unit);
                         span.pb_set_message(&format!("{label} · {unit}"));
                     }
@@ -436,10 +436,9 @@ pub(super) fn build_cdylib(
 
 /// Fill every artifact path without running cargo (`--no-build`): a prebuilt
 /// artifact selects by triple as always, a crate artifact is searched for
-/// under the workspace target directory. A missing
-/// library is a hard [`BuildError::NotBuilt`]. No sidecar work — a previously
-/// built library has its sidecar adjacent, and resolve's staleness gate
-/// covers it.
+/// under the workspace target directory. A missing library is a hard
+/// [`BuildError::NotBuilt`]. No sidecar work; a previously built library has
+/// its sidecar adjacent, and resolve's staleness gate covers it.
 pub fn locate_artifacts(
     wiring: &mut Wiring,
     target_dir: &Path,
@@ -503,7 +502,7 @@ pub(super) fn locate_built(search_root: &Path, cdylib: &str, release: bool) -> O
 ///
 /// A native build describes the just-built library. A cross build cannot run
 /// its own output, so the crate is additionally built for the host (no
-/// `--target`) and that twin is described instead — a host build failure is a
+/// `--target`) and that twin is described instead; a host build failure is a
 /// hard [`BuildError::HostBuild`], never a silently missing sidecar. And
 /// arch-independence of manifests is verified, not assumed: when the target
 /// library already carries an up-to-date sidecar (say, written by a native
@@ -555,13 +554,12 @@ fn write_manifest_sidecar(
 
 /// Obtain the raw postcard manifest bytes for a host-runnable pack library.
 ///
-/// Prefers a describe worker — the dlopen quarantined in a short-lived child,
-/// the same isolation `resolve` gives process systems — but re-executing this
+/// Prefers a describe worker, the dlopen quarantined in a short-lived child,
+/// the same isolation `resolve` gives process systems, but re-executing this
 /// binary as a worker requires a `main` that installed
 /// [`worker_entry`](crate::proc::worker_entry); a libtest binary would run
-/// its harness instead (the adcs test suites document that constraint).
-/// Without the guard, and on targets without worker machinery, the library is
-/// described in-process.
+/// its harness instead. Without the guard, and on targets without worker
+/// machinery, the library is described in-process.
 fn describe_manifest(so: &Path) -> Result<Vec<u8>, String> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if crate::proc::worker_guard_installed() {
@@ -604,7 +602,7 @@ pub(super) fn requested_target(extra_args: &[String]) -> Option<&str> {
     target
 }
 
-/// `extra_args` with every `--target` (and its value) removed — the args for
+/// `extra_args` with every `--target` (and its value) removed, the args for
 /// the host-arch twin of a cross build.
 fn strip_target_args(extra_args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(extra_args.len());
@@ -624,7 +622,7 @@ fn strip_target_args(extra_args: &[String]) -> Vec<String> {
 /// compares it against the bundle's; prebuilt selection uses it absent a
 /// `--target`.
 ///
-/// The compile-time triple of this binary answers first — the running host is
+/// The compile-time triple of this binary answers first: the running host is
 /// its own witness, and a prebuilt-only consumer has no cargo to ask. An
 /// unlisted platform falls back to `cargo -vV`'s `host:` line.
 pub(super) fn host_triple() -> Option<String> {
@@ -688,8 +686,8 @@ fn cargo_host_triple() -> Option<String> {
 }
 
 /// The existing sidecar's bytes, provided it is at least as new as the
-/// library it sits next to. A stale sidecar describes an older build and must
-/// not be compared against — cargo rewrote the library since.
+/// library it sits next to. A stale sidecar describes an older build that
+/// cargo has since rewritten, so it must not be compared against.
 fn fresh_sidecar(sidecar: &Path, so: &Path) -> Option<Vec<u8>> {
     let sidecar_mtime = std::fs::metadata(sidecar).ok()?.modified().ok()?;
     let so_mtime = std::fs::metadata(so).ok()?.modified().ok()?;
@@ -812,8 +810,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // End-to-end over the dl fixture pack. These share the fixture crate's
     // sidecar in the workspace target dir, so they serialize on one lock, and
-    // they skip (with a note) where the nested cargo build is unavailable —
-    // the same convention as tests/dl_integration.rs.
+    // they skip (with a note) where the nested cargo build is unavailable.
     // -----------------------------------------------------------------------
 
     // Shared with the dl and pack-codegen fixture tests: all three build and
@@ -832,9 +829,8 @@ mod tests {
             .build()
     }
 
-    /// The sidecar is the exact bytes `fsw_pack_describe` reports (the plan's
-    /// sidecar-hash ≡ describe-hash property), and decodes to the fixture's
-    /// entries.
+    /// The sidecar is the exact bytes `fsw_pack_describe` reports, and
+    /// decodes to the fixture's entries.
     #[test]
     #[cfg(not(miri))]
     fn sidecar_matches_describe() {
@@ -856,9 +852,9 @@ mod tests {
     /// The cross arm verifies arch-independence rather than assuming it: an
     /// up-to-date target sidecar whose bytes differ from the host-described
     /// manifest is a hard error, and matching bytes pass. Driven with
-    /// `cross = true` over the host build itself — a real foreign `--target`
-    /// is not buildable in this test environment, but the code path is the
-    /// same: build the host twin, describe it, compare, write.
+    /// `cross = true` over the host build itself, since a real foreign
+    /// `--target` is not buildable in this test environment, but the code
+    /// path is the same: build the host twin, describe it, compare, write.
     #[test]
     #[cfg(not(miri))]
     fn cross_divergence_is_a_hard_error() {
@@ -923,7 +919,7 @@ mod tests {
     /// A prebuilt artifact is a selection, not a build: the host triple picks
     /// `<dir>/<triple>/<cdylib>`, the sidecar rides adjacent for the resolve
     /// gate, and a triple the directory does not ship errors naming the ones
-    /// it does. Laid out from the fixture's host build — exactly the shape
+    /// it does. Laid out from the fixture's host build, exactly the shape
     /// `pack dev` and an installed pack wheel produce.
     #[test]
     #[cfg(not(miri))]
@@ -983,7 +979,7 @@ mod tests {
     }
 
     /// `locate_artifacts` finds an already-built library without cargo, and a
-    /// never-built one is a hard `NotBuilt` — the `run --no-build` contract.
+    /// never-built one is a hard `NotBuilt`, the `run --no-build` contract.
     #[test]
     #[cfg(not(miri))]
     fn locate_artifacts_finds_built_and_refuses_missing() {

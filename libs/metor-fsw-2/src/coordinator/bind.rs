@@ -84,7 +84,7 @@ fn bind_static_io(
 }
 
 /// Bind every system's ports over the allocated rings, consuming the
-/// registrations. Each arm mirrors one registration kind; the static
+/// registrations. Each arm handles one registration kind; the static
 /// (host-side) arms build their typed `BoundPort`s with [`bind_static_io`]
 /// and walk them with a [`Binder`]. Only the proc arm can fail (its worker
 /// spawn is the one bind-time step that leaves the process).
@@ -186,9 +186,9 @@ pub(super) fn bind_systems(
 
 /// How many of a node's outputs are staged to the system itself: its own
 /// declared outputs, which precede the first host-connected one. Everything
-/// from there on — the host-appended `system_status`, a slot runner's tail —
-/// is written by the host, so a guest's positional ring array, a bundle's
-/// bind walk, and a worker's file list all stop here.
+/// from there on, the host-appended `system_status`, a slot runner's tail, is
+/// written by the host, so a guest's positional ring array, a bundle's bind
+/// walk, and a worker's file list all stop here.
 pub(super) fn staged_outputs(desc: &SystemDescriptor) -> usize {
     desc.outputs
         .iter()
@@ -408,8 +408,8 @@ fn bind_proc(
 
 /// The wired wasm arm: gather the same per-port regions as the dl arm, in
 /// the identical positional order, and bind a
-/// [`WasmCyclic`](crate::wasm::WasmCyclic) over them — its own interpreter
-/// instance, `Mount::Wired`, the descriptor's own delivery lists, no tail.
+/// [`WasmCyclic`](crate::wasm::WasmCyclic) over them, with its own interpreter
+/// instance, `Mount::Wired`, the descriptor's own delivery lists, and no tail.
 fn bind_wasm(
     id: usize,
     reg: WasmReg,
@@ -462,9 +462,8 @@ fn bind_wasm(
 /// A runtime slot: gather the same per-port regions as the dl arm, but locate
 /// the runner's tail ports by their declared shape and hand the runner the
 /// control/status writers. No occupant is created here; only `init`/`Load`
-/// (runtime) does — for a process slot that also means **no worker is
-/// spawned at build**, only the per-occupant manifests are written
-/// ([`slot_proc_parts`]).
+/// (runtime) does, so for a process slot **no worker is spawned at build**,
+/// only the per-occupant manifests are written ([`slot_proc_parts`]).
 fn bind_slot(
     id: usize,
     slot_reg: SlotReg,
@@ -604,7 +603,7 @@ fn bind_slot(
 /// order the `FswRing` arrays use (so the worker-side bind contract is
 /// untouched), collect the host handles of the same rings for reclamation
 /// after each worker ends, and write one sequence-mode manifest per allowed
-/// occupant — the rings are the slot's, so the manifests differ only in
+/// occupant. The rings are the slot's, so the manifests differ only in
 /// artifact and params, and a runtime `Load` just picks one and spawns.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn slot_proc_parts(

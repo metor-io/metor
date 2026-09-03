@@ -287,7 +287,7 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
 /// The raw manifest bytes alone, for the worker's describe mode and the build
 /// driver's manifest sidecar: the object is loaded, ABI-checked, described,
 /// and unloaded *in this process*. The worker's host decodes the bytes
-/// without ever loading the object itself (see `docs/process-systems.md`).
+/// without ever loading the object itself.
 pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> {
     // Dropping the PackLib closes the pack and unloads the library.
     open_and_describe(path.as_ref()).map(|(_lib, buf)| buf)
@@ -295,7 +295,7 @@ pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> 
 
 /// The manifest sidecar path for a built pack library: `<so_path>.manifest`,
 /// the raw postcard [`PackManifest`](abi::PackManifest) bytes the build
-/// driver wrote next to the `.so` (see `docs/wiring.md`).
+/// driver wrote next to the `.so`.
 pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
     let mut name = so_path.as_os_str().to_owned();
     name.push(".manifest");
@@ -315,7 +315,7 @@ pub(crate) fn manifest_sidecar_bytes(so_path: &Path) -> Option<Vec<u8>> {
 #[cfg(all(test, not(miri)))]
 pub(crate) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Decode a manifest payload into its per-entry descriptors — the shared
+/// Decode a manifest payload into its per-entry descriptors, the shared
 /// tail of [`DlPack::open`] and the process path's describe-worker decode,
 /// host-capability rejection included.
 pub(crate) fn decode_pack_manifest(bytes: &[u8]) -> Result<Vec<PackEntryDesc>, DlError> {
@@ -604,7 +604,7 @@ impl DlSlot {
 
     /// One sequence-mode step for the worker's run loop: like
     /// [`execute_raw`](Self::execute_raw), but terminal statuses are
-    /// **latched** — a later call re-serves the terminal without touching the
+    /// **latched**: a later call re-serves the terminal without touching the
     /// export. That makes poll-once a worker invariant: a `Ready` future is
     /// never polled again, however long a skewed or buggy host keeps ringing
     /// the doorbell.

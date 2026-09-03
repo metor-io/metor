@@ -1,11 +1,10 @@
 //! Pack-crate packaging: `[tool.metor.pack]` config and the `pack dev`
-//! editable layout (`docs/packaging.md`).
+//! editable layout.
 //!
 //! A pack crate is also a Python project: its `pyproject.toml` names the
-//! distribution (`[project]`) and the pack (`[tool.metor.pack]` — artifact
+//! distribution (`[project]`) and the pack (`[tool.metor.pack]`: artifact
 //! id, cargo crate, lib stem, module name), with the cargo facts defaulted
-//! from `Cargo.toml`. `pack dev` is the consumer of that
-//! config this phase: it builds the host triple and lays out
+//! from `Cargo.toml`. `pack dev` builds the host triple and lays out
 //!
 //! ```text
 //! <pack>/.metor/
@@ -15,7 +14,7 @@
 //!   <module>/_libs/<triple>/<cdylib>.manifest
 //! ```
 //!
-//! — the same shape an installed pack wheel unpacks to, so the recorder,
+//! the same shape an installed pack wheel unpacks to, so the recorder,
 //! provisioning, and pyright cannot tell a local editable pack from a
 //! published one. A pack's PEP 517 backend runs this on `uv sync`. The same
 //! module also builds the pack's wheel.
@@ -232,7 +231,7 @@ pub fn pack_dev(dir: &Path, opts: &PackDevOptions) -> Result<PackDevReport, Pack
     // Build (host by default; an explicit `--target` lays out that triple,
     // with the sidecar sourced from the usual host twin). The pack's own
     // manifest anchors the build when it has one, so the workspace resolves
-    // from the pack rather than the process cwd — `run` invokes this from
+    // from the pack rather than the process cwd: `run` invokes this from
     // the target dir, which need not be a cargo workspace at all.
     let mut cargo_args = opts.cargo_args.clone();
     let manifest = dir.join("Cargo.toml");
@@ -320,9 +319,9 @@ fn dev_pack_roots(target_dir: &Path) -> Vec<PathBuf> {
 
 /// Re-run [`pack_dev`] for every dev pack `target_dir`'s pyproject
 /// references, so their `.metor/` payloads (module + lib) are current before
-/// the target is evaluated. Cheap when nothing changed — cargo's build is
-/// incremental and the layout rewrite is byte-identical. The first failing
-/// pack aborts.
+/// the target is evaluated. Cheap when nothing changed, since cargo's build
+/// is incremental and the layout rewrite is byte-identical. The first
+/// failing pack aborts.
 pub fn refresh_dev_packs(
     target_dir: &Path,
     opts: &PackDevOptions,
@@ -334,7 +333,7 @@ pub fn refresh_dev_packs(
 }
 
 // ---------------------------------------------------------------------------
-// pack build (docs/packaging.md)
+// pack build
 // ---------------------------------------------------------------------------
 
 /// Knobs for [`pack_build`].
@@ -365,7 +364,10 @@ pub fn pack_build(dir: &Path, opts: &PackBuildOptions) -> Result<PackBuildReport
     ];
     let manifest_path = dir.join("Cargo.toml");
     if manifest_path.is_file() {
-        cargo_args.extend(["--manifest-path".into(), manifest_path.display().to_string()]);
+        cargo_args.extend([
+            "--manifest-path".into(),
+            manifest_path.display().to_string(),
+        ]);
     }
     let mut wiring = WiringBuilder::new()
         .artifact(&config.id, &config.crate_name, &config.lib)
@@ -584,7 +586,7 @@ mod tests {
     }
 
     /// A dev pack needs both its own `Cargo.toml` and an explicit
-    /// `[tool.metor.pack]` table — a plain Python dist (the `metor-config`
+    /// `[tool.metor.pack]` table; a plain Python dist (the `metor-config`
     /// shape) and a bare crate both fail the filter.
     #[test]
     fn dev_pack_needs_crate_and_pack_table() {
@@ -707,8 +709,8 @@ mod integration {
     use super::*;
     use crate::dl::FIXTURE_LOCK;
 
-    /// `pack dev` lays out exactly the wheel shape: prebuilt-flavor module,
-    /// `py.typed`, and `_libs/<host-triple>/{cdylib, sidecar}` — and the
+    /// `pack dev` lays out exactly the wheel shape, prebuilt-flavor module,
+    /// `py.typed`, and `_libs/<host-triple>/{cdylib, sidecar}`, and the
     /// layout provisions and resolves as a prebuilt artifact.
     #[test]
     fn pack_dev_layout_provisions() {
@@ -796,7 +798,6 @@ mod integration {
                 tmp.path(),
                 &PackBuildOptions {
                     wheel_out: Some(tmp.path().join(out)),
-                    ..PackBuildOptions::default()
                 },
             )
         };

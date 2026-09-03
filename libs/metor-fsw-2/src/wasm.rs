@@ -2,7 +2,7 @@
 //!
 //! [`WasmPack`] is the sandboxed twin of [`DlPack`](crate::dl::DlPack): it
 //! drives the very same pack ABI, over the same `fsw_pack_*` entry points, in
-//! the same order — only the boundary changes. A `.so` is `dlopen`'d into the
+//! the same order, and only the boundary changes. A `.so` is `dlopen`'d into the
 //! host's address space and hands back raw pointers; a `.wasm` is instantiated
 //! under an interpreter whose pointers are offsets into a linear memory the
 //! host can read but the guest cannot escape.
@@ -53,7 +53,7 @@
 //! returns is trusted as a Rust value. `fsw_pack_execute` yields a raw `u32`
 //! that is validated and folded to [`FswStatus::Panicked`] when unknown, a
 //! manifest that fails to decode is a clean error rather than a panic, and
-//! every trap — including running out of fuel — becomes an [`WasmError`]
+//! every trap, including running out of fuel, becomes a [`WasmError`]
 //! instead of propagating.
 
 use metor_fsw_2_core::abi::{FSW_ABI_VERSION, FswStatus, PackEntryDesc, PackManifest};
@@ -176,7 +176,7 @@ pub enum WasmError {
         /// Length of the region.
         len: usize,
     },
-    /// The guest trapped — including exhausting its fuel budget.
+    /// The guest trapped, including by exhausting its fuel budget.
     #[error("wasm trap: {0}")]
     Trap(String),
     /// A ring's reader table was full, so the bridge could not register.
@@ -261,8 +261,8 @@ pub struct WasmPack {
     ///
     /// A host handle over a guest region is a raw pointer into the
     /// interpreter's backing buffer, and `memory.grow` reallocates that
-    /// buffer. A guest's allocator grows when it needs heap — a sequence
-    /// calling `progress` allocates a `String` — so growth is not
+    /// buffer. A guest's allocator grows when it needs heap (a sequence
+    /// calling `progress` allocates a `String`), so growth is not
     /// hypothetical, and a stale handle would be a use-after-free rather than
     /// a wrong answer. [`check_memory_stable`](Self::check_memory_stable)
     /// turns that into a clean occupant failure.
@@ -271,7 +271,7 @@ pub struct WasmPack {
 
 impl WasmPack {
     /// Instantiate `wasm`, check its ABI word, open its pack, and decode the
-    /// manifest — the wasm shape of `DlPack::open`.
+    /// manifest, the wasm shape of `DlPack::open`.
     ///
     /// `fuel_per_call` bounds every subsequent guest call. It is granted
     /// before instantiation too, because the module's start section is itself
@@ -512,7 +512,7 @@ impl WasmPack {
     ///
     /// Required before [`bind_init`](Self::bind_init): the guest's clock is
     /// unset until the first `execute` republishes it, and anything init
-    /// stamps would otherwise reach for wall time — which
+    /// stamps would otherwise reach for wall time, which
     /// `wasm32-unknown-unknown` does not have, so `SystemTime::now` panics
     /// and the guest traps.
     pub fn set_now(&mut self, now: u64) -> Result<(), WasmError> {
@@ -627,8 +627,8 @@ impl WasmPack {
         Ok(self.slice_mut(offset, len)?.to_vec())
     }
 
-    /// Call one export under a fresh fuel budget, mapping a trap — including
-    /// exhaustion — to [`WasmError::Trap`].
+    /// Call one export under a fresh fuel budget, mapping a trap, including
+    /// exhaustion, to [`WasmError::Trap`].
     fn call<P, R>(
         &mut self,
         pick: impl Fn(&Exports) -> TypedFunc<P, R>,

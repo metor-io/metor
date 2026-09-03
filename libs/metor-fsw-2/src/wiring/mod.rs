@@ -26,7 +26,7 @@
 //!
 //! ## Params
 //!
-//! Params reach `resolve` as a [`ParamSource`] — a value tree
+//! Params reach `resolve` as a [`ParamSource`]: a value tree
 //! ([`ParamSource::Value`], the Python front-end's format), the Rust builder's
 //! pre-encoded postcard bytes ([`ParamSource::Postcard`]), or nothing
 //! ([`ParamSource::None`]). A static system deserializes a typed `S::Params`
@@ -101,7 +101,7 @@ pub fn cdylib_file_name(stem: &str) -> String {
 /// The shared-object file name for a library `stem` on a `triple`, the
 /// arch-parameterized sibling of [`cdylib_file_name`]. The IR carries the bare
 /// stem ([`Artifact::lib`]); this is where a target triple turns it into a
-/// file name — at provision, bundle, and `pack dev` time.
+/// file name, at provision, bundle, and `pack dev` time.
 pub fn cdylib_file_name_for(triple: &str, stem: &str) -> String {
     if triple.contains("-apple-") {
         format!("lib{stem}.dylib")

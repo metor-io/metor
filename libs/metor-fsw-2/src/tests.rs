@@ -199,7 +199,7 @@ fn prebuilt_state_is_move_once() {
 
 // ---------------------------------------------------------------------------
 // The async form: a task entry owning its ports, polled per cycle under the
-// ambient clock — a sequence as an ordinary wired system.
+// ambient clock, a sequence as an ordinary wired system.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
@@ -428,8 +428,8 @@ fn shared_state_init_failure_reports() {
 }
 
 /// The host publishes a `system_status` record for every slot it steps, and
-/// one for itself, once per cycle: the cycle count, the step time, and the
-/// slot's run state. No entry declares or writes the port.
+/// one for itself, once per cycle, carrying the cycle count, the step time,
+/// and the slot's run state, with no entry declaring or writing the port.
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn host_publishes_a_status_record_for_every_slot() {

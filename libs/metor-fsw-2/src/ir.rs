@@ -1,21 +1,20 @@
 //! The [`Wiring`] data model, a plain serializable description of a target.
 //!
-//! This module is the target IR: pure data plus its serde/serde_json codec,
-//! carrying no runtime types, so an evaluated front-end can emit it and the
-//! host can re-ingest it. The Python-eval path, the Rust builder, and the
-//! shared resolver live under the [`wiring`](crate::wiring) module, which
-//! re-exports these types.
+//! This is the target IR: pure data with a serde/serde_json codec and no
+//! runtime types, so a front-end can emit it and the host can re-ingest it.
+//! The Python-eval path, the Rust builder, and the shared resolver live under
+//! [`wiring`](crate::wiring), which re-exports these types.
 //!
-//! Both front-ends produce this type. The Python `metor_config` recorder emits
-//! it as JSON and the [`wiring::WiringBuilder`](crate::wiring::WiringBuilder)
-//! builds it directly, and the one shared `wiring::resolve` consumes it, so
+//! Both front-ends produce this type: the Python `metor_config` recorder
+//! emits it as JSON, [`WiringBuilder`](crate::wiring::WiringBuilder) builds it
+//! directly, and the one shared `wiring::resolve` consumes either, so
 //! anything one front-end can express the other can express too.
 //!
-//! The specs here deliberately hold no runtime values. A [`ClockSpec`] mirrors
-//! [`ClockMode`](crate::ClockMode) with a plain `f64` in place of a `Duration`,
-//! a [`CoordinatorSpec`] mirrors [`CoordinatorConfig`](crate::CoordinatorConfig)
-//! without a clock value, and so on. Conversion into the runtime types happens
-//! in `wiring::resolve`, leaving this module a pure serde data format.
+//! The specs here hold no runtime values. [`ClockSpec`] takes a plain `f64`
+//! where [`ClockMode`](crate::ClockMode) takes a `Duration`, [`CoordinatorSpec`]
+//! drops the clock value [`CoordinatorConfig`](crate::CoordinatorConfig)
+//! carries, and so on; conversion into the runtime types happens in
+//! `wiring::resolve`, leaving this module a pure serde data format.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -73,12 +72,12 @@ pub struct Wiring {
 
 impl Wiring {
     /// A clone with every [`Artifact::path`] and [`Artifact::prebuilt_dir`]
-    /// cleared: the relocatable, reproducible form of the IR. Both point into
-    /// a build tree or an installed environment, so they are provenance rather
-    /// than identity — [`resolve`](crate::wiring::resolve) re-derives them on
-    /// load. Stripping them is what lets the bundle's `wiring.json` stay
-    /// byte-reproducible and a `WiringManifest` describe the same topology
-    /// regardless of where it was built.
+    /// cleared, the relocatable form of the IR. Both point into a build tree
+    /// or an installed environment, so they are provenance rather than
+    /// identity; [`resolve`](crate::wiring::resolve) re-derives them on load.
+    /// Stripping them keeps a bundle's `wiring.json` byte-reproducible and a
+    /// `WiringManifest` describe the same topology regardless of where it was
+    /// built.
     pub fn path_stripped(&self) -> Wiring {
         let mut w = self.clone();
         for artifact in &mut w.artifacts {
@@ -105,7 +104,7 @@ pub struct SourceRef {
 }
 
 /// One entry in [`Wiring::scopes`]: a named grouping of systems and slots,
-/// nested through `parent`. Purely descriptive — consumers reconstruct the
+/// nested through `parent`. Purely descriptive; consumers reconstruct the
 /// block tree from it without parsing instance names.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScopeSpec {
@@ -135,15 +134,14 @@ pub const DOWNLINK_TYPE: &str = "Downlink";
 /// [`UplinkParams`](crate::UplinkParams).
 pub const UPLINK_TYPE: &str = "Uplink";
 
-/// The captured Python program of one target: every `Frame`/`State` class
-/// the target file declared plus each `@system` function the target *added*,
-/// assembled in definition order into a single compilation unit (bindings
-/// between systems only work inside one unit; step order is the added specs'
-/// list order, independent of this). Compiled once by `metor-expr` at
-/// build/provision time into the target's program-built wasm [`Artifact`];
-/// each added `@system` is an ordinary [`SystemSpec`] addressing that
-/// artifact's pack entry through `ty`, under the instance name the add
-/// chose.
+/// The captured Python program of one target: every `Frame`/`State` class the
+/// target file declares, plus each `@system` function it adds, assembled in
+/// definition order into one compilation unit. Bindings between systems only
+/// resolve inside that unit; step order comes from the added specs' list
+/// order instead, independent of assembly order. Compiled once, at build or
+/// provision time, into the target's program-built wasm [`Artifact`]; each
+/// added `@system` is an ordinary [`SystemSpec`] addressing that artifact's
+/// pack entry through `ty`, under the instance name the add chose.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProgramSpec {
     /// The assembled module source.
@@ -157,7 +155,7 @@ pub struct ProgramSpec {
 /// back to a `target.py` line rather than a synthetic-module one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProgramDecl {
-    /// The declaration's name — a function or class name; a program-built
+    /// The declaration's name, a function or class name; a program-built
     /// entry's spec references its declaration through this.
     pub name: String,
     /// Where the declaration was written.
@@ -175,7 +173,7 @@ impl ProgramSpec {
     }
 }
 
-/// Coordinator-wide configuration, the serializable mirror of
+/// Coordinator-wide configuration, the plain-data counterpart to
 /// [`CoordinatorConfig`](crate::CoordinatorConfig).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorSpec {
@@ -192,7 +190,7 @@ pub struct CoordinatorSpec {
     /// `sat1.<instance>.<frame>.<field>`). It shifts every telemetry
     /// [`ComponentId`](metor_proto::types::ComponentId) uniformly, so several
     /// targets connected into one db keep disjoint namespaces. `None` is the
-    /// unprefixed identity — names and ids are byte-identical to an
+    /// unprefixed identity: names and ids are byte-identical to an
     /// un-namespaced target. Wiring resolves on the bare instance names
     /// regardless; the prefix rides only the registry/announce seam.
     #[serde(default)]
@@ -206,7 +204,7 @@ pub struct CoordinatorSpec {
     pub wasm_memory_limit_bytes: Option<u64>,
 }
 
-/// Which clock drives the run loop, the serializable mirror of
+/// Which clock drives the run loop, the plain-data counterpart to
 /// [`ClockMode`](crate::ClockMode). Holds plain `f64` seconds rather than a
 /// `Duration` so the model carries no runtime type.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -245,8 +243,8 @@ impl ArtifactKind {
 
 /// A loadable pack shared object and the crate it comes from.
 ///
-/// Each cdylib exports one **pack** — any number of system types — through
-/// the fixed `fsw_pack_*` symbols; a `system` node's `type=` selects an entry
+/// Each cdylib exports one **pack**, any number of system types, through the
+/// fixed `fsw_pack_*` symbols; a `system` node's `type=` selects an entry
 /// from the opened pack's manifest. Several [`SystemSpec`]s may reference the
 /// same artifact (and the same entry) to instance it more than once; the
 /// loader opens the object once and runs the create phase per instance.
@@ -281,11 +279,10 @@ pub struct Artifact {
     pub path: Option<PathBuf>,
     /// Where a prebuilt artifact's per-triple libraries live: a directory
     /// with one `<triple>/` subdirectory per shipped target, each holding the
-    /// cdylib and its `.manifest` sidecar — an installed pack wheel's `_libs`
-    /// dir, or a local pack's `.metor/libs`. `None` for a crate-built
-    /// artifact, which the build driver compiles instead
-    /// (`docs/packaging.md`). Provenance like `path`: stripped by
-    /// [`Wiring::path_stripped`].
+    /// cdylib and its `.manifest` sidecar, such as an installed pack wheel's
+    /// `_libs` dir or a local pack's `.metor/libs`. `None` for a crate-built
+    /// artifact, which the build driver compiles instead. Provenance like
+    /// `path`: stripped by [`Wiring::path_stripped`].
     #[serde(default)]
     pub prebuilt_dir: Option<PathBuf>,
     /// The published distribution this artifact came from, if any. Pure
@@ -333,8 +330,9 @@ pub struct DistRef {
 /// One pack-shared state instance: a `type=` declared by a statically
 /// registered pack via [`Pack::shared_state`](crate::Pack::shared_state),
 /// constructed once from `params` before any system. A system binds to it by
-/// naming it in [`SystemSpec::attach`] — the reference lives on the *system*
-/// side; a state carries only its own construction params (a listen address).
+/// naming it in [`SystemSpec::attach`]; the reference lives on the *system*
+/// side, since a state carries only its own construction params (a listen
+/// address).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StateSpec {
     /// The instance name, for diagnostics and host lookups.
@@ -366,10 +364,9 @@ pub struct SystemSpec {
     pub artifact: Option<String>,
     /// Where this system's params come from.
     pub params: ParamSource,
-    /// `true` runs the artifact in its own worker process (`process=#true`,
-    /// `docs/process-systems.md`); requires `artifact`. Default `false`: a
-    /// loaded system runs in-process. A document that omits the property
-    /// deserializes unchanged.
+    /// `true` runs the artifact in its own worker process (`process=#true`);
+    /// requires `artifact`. Default `false` runs a loaded system in-process;
+    /// a document that omits the property deserializes unchanged.
     #[serde(default)]
     pub process: bool,
     /// Where this system was declared.
@@ -386,19 +383,20 @@ pub struct SystemSpec {
     /// rejected too.
     #[serde(default)]
     pub attach: Option<String>,
-    /// Where this system's canvas card sits, from the declaration site: the
-    /// `@node(x=, y=)` decorator on a `@system` function, the
+    /// Where this system's card sits, from the declaration site: the
+    /// `@node(x=, y=)` decorator on a `@system` function, or the
     /// `Target.add(..., node=(x, y))` kwarg on a native one. `None` leaves
-    /// placement to the canvas's auto-layout.
+    /// placement to auto-layout.
     #[serde(default)]
     pub layout: Option<(f32, f32)>,
-    /// Component-name prefix of this instance's run record — the frame whose
-    /// `last_execute_us` / `state` / `cycles` leaves carry execution telemetry.
-    /// `None`, what every fsw2 front end writes, means the framework
-    /// convention `<namespace.>?<name>.system_status`, which a consumer derives
-    /// itself; set it only to point a foreign or custom timing source at this
-    /// node. Taken literally when set — namespace included — because leaf ids
-    /// hash the full component name and cannot be derived from a frame id.
+    /// Component-name prefix of this instance's run record: the frame whose
+    /// `last_execute_us` / `state` / `cycles` leaves carry execution
+    /// telemetry. `None`, what every front end writes, means the framework
+    /// convention `<namespace.>?<name>.system_status`, which a consumer
+    /// derives itself; set it only to point a foreign or custom timing source
+    /// at this node. Taken literally when set, namespace included, because
+    /// leaf ids hash the full component name and cannot be derived from a
+    /// frame id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// `true` marks this instance's run record as *encompassing* the others:
@@ -426,7 +424,7 @@ impl StateSpec {
     }
 
     /// [`tcp_server`](Self::tcp_server) with an advertised node name folded
-    /// into the params — the value the mDNS advertiser publishes. `None`
+    /// into the params, the value the mDNS advertiser publishes. `None`
     /// emits identical params to `tcp_server`, so an unnamed server's IR is
     /// unchanged.
     pub fn tcp_server_named(name: &str, addr: SocketAddr, node_name: Option<&str>) -> Self {
@@ -483,8 +481,8 @@ impl SystemSpec {
 /// the canonical postcard `Params` bytes that cross `fsw_pack_create` for a loaded
 /// system, or a typed `S::Params` value for a static one. Which decoder runs
 /// is decided by [`SystemSpec::artifact`], not by the variant.
-/// [`Value`](ParamSource::Value) carries a plain value tree — the format the
-/// evaluated Python front-end emits — conformed against the object's exported
+/// [`Value`](ParamSource::Value) carries a plain value tree, the format the
+/// evaluated Python front-end emits, conformed against the object's exported
 /// `Params` schema and postcard-encoded for a loaded system, or
 /// serde-deserialized (field defaults honored) for a static one.
 /// [`Postcard`](ParamSource::Postcard) carries a `Params` value the Rust
@@ -527,12 +525,12 @@ pub struct SlotSpec {
     pub allow: Vec<AllowedOccupantSpec>,
     /// The occupant to apply at startup, if any.
     pub initial: Option<InitialOccupantSpec>,
-    /// `true` runs every occupant out of process (`process=#true`,
-    /// `docs/process-systems.md`): resolve describes each allowed occupant
-    /// through a worker instead of dlopening it, and every `Load` spawns a
-    /// worker over the slot's session-dir rings. Per-slot means all-occupants,
-    /// so a `Load` can never change the slot's fault domain. Default `false`;
-    /// a document that omits the property deserializes unchanged.
+    /// `true` runs every occupant out of process (`process=#true`): resolve
+    /// describes each allowed occupant through a worker instead of dlopening
+    /// it, and every `Load` spawns a worker over the slot's session-dir
+    /// rings. Per-slot means all-occupants, so a `Load` can never change the
+    /// slot's fault domain. Default `false`; a document that omits the
+    /// property deserializes unchanged.
     #[serde(default)]
     pub process: bool,
     /// Where this slot was declared.

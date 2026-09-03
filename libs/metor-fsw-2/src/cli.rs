@@ -33,7 +33,7 @@ enum Command {
     Package(PackageArgs),
     /// Run a target: a source `.py` (built automatically) or a bundle dir.
     Run(RunArgs),
-    /// Pack-crate commands (`docs/cli.md`).
+    /// Pack-crate commands.
     #[command(subcommand)]
     Pack(PackCmd),
 }
@@ -219,8 +219,7 @@ fn merge_target(cargo_args: &[String], target: Option<&str>) -> Vec<String> {
 }
 
 /// Load a source target into a [`Wiring`]. Targets are Python: a `.py` file
-/// is evaluated by a subprocess CPython. A `.kdl` file gets a clear
-/// removed-feature error; any other extension is unrecognized.
+/// is evaluated by a subprocess CPython; any other extension is unrecognized.
 fn load_source(path: &Path) -> miette::Result<Wiring> {
     if path.extension().is_some_and(|e| e == "py") {
         return eval_python_target(path);
@@ -231,8 +230,8 @@ fn load_source(path: &Path) -> miette::Result<Wiring> {
     ))
 }
 
-/// Refresh a source target's dev packs — the path-source pack dependencies
-/// its pyproject names — so the generated modules (manifest hashes, params)
+/// Refresh a source target's dev packs, the path-source pack dependencies
+/// its pyproject names, so the generated modules (manifest hashes, params)
 /// the target imports are current before it is evaluated. Prebuilt pack
 /// artifacts are only *selected* at provisioning, so this is where their
 /// sources get rebuilt; cargo's incremental build makes a clean tree a no-op.
@@ -313,7 +312,7 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
 
 /// `package --check-ir <bundle>`: re-evaluate the bundle's provenance source
 /// and diff the produced IR against the frozen `wiring.json`, exiting non-zero
-/// on any drift — the determinism backstop, runnable in CI.
+/// on any drift: the determinism backstop, runnable in CI.
 ///
 /// Both sides are normalized before the diff: artifact `path`s are stripped
 /// (never in the frozen IR anyway) and `src` file names cleared, since the
@@ -565,7 +564,7 @@ mod tests {
 
     /// Normalized IR clears the `src` file name (the provenance copy sits at a
     /// different path than the original source), so the same target evaluated
-    /// from two paths is not spurious drift — but a real emission change is.
+    /// from two paths is not spurious drift, but a real emission change is.
     #[test]
     fn normalized_ir_ignores_source_path_but_not_content() {
         use crate::wiring::{SourceRef, WiringBuilder};

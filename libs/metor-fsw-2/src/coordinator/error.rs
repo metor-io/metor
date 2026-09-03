@@ -4,8 +4,7 @@ use metor_fsw_2_core::{Hz, PortId};
 
 use metor_fsw_2_core::NAME_CAP;
 
-/// A defect in the declared graph, reported during graph build before any
-/// byte flows.
+/// A defect in the declared graph.
 ///
 /// Not `Eq`: [`InvalidCycleRate`](WireError::InvalidCycleRate) carries the
 /// offending `f64` rate so the message can name it.
@@ -72,14 +71,11 @@ pub enum WireError {
         "{system} input {port:?} is host-connected: its counterpart is held by the system's runner, not an edge — remove the edge"
     )]
     HostPort { system: String, port: PortId },
-    /// A non-delayed snapshot edge points backward between two scheduled
-    /// cycle positions. The loop runs in registration order, so the consumer
-    /// boundary would run before its producer every cycle and
-    /// permanently read the previous cycle's value, exactly the staleness
-    /// `connect_delayed` exists to make explicit. Fix by registering the
-    /// producer before the consumer, or
-    /// declare the one-cycle delay with `connect_delayed`. Log edges are
-    /// exempt; async import/export boundaries participate in the order.
+    /// A non-delayed frame edge points backward between two scheduled cycle
+    /// positions: the consumer would run before its producer every cycle and
+    /// permanently read a stale value, exactly what `connect_delayed` exists
+    /// to make explicit. Log edges are exempt, and async import/export
+    /// boundaries count as scheduled positions.
     #[error(
         "{consumer} is registered before {producer} but consumes its {port:?} output: it would step first every cycle and permanently read the previous cycle's value — register {producer} before {consumer}, or declare the one-cycle delay with connect_delayed"
     )]
@@ -89,22 +85,20 @@ pub enum WireError {
         port: PortId,
     },
     /// The configured `cycle_rate` cannot pace a
-    /// [`Wall`](crate::ClockMode::Wall)
-    /// clock. It must be finite and positive to become a per-cycle `Duration`
-    /// budget; a zero, negative, NaN, or infinite rate would panic in
-    /// `Duration::from_secs_f64` at run time. A
-    /// [`Simulated`](crate::ClockMode::Simulated) clock ignores the rate, so it is not
-    /// validated there.
+    /// [`Wall`](crate::ClockMode::Wall) clock: it must be finite and positive
+    /// to become a per-cycle `Duration` budget, since a zero, negative, NaN,
+    /// or infinite rate would panic in `Duration::from_secs_f64` at run time.
+    /// A [`Simulated`](crate::ClockMode::Simulated) clock ignores the rate and
+    /// skips this check.
     #[error("cycle_rate {rate} cannot pace a Wall clock — it must be finite and positive")]
     InvalidCycleRate { rate: Hz },
     /// A simulated clock must advance on every cycle.
     #[error("simulated clock step {dt:?} must be positive")]
     InvalidSimulatedStep { dt: std::time::Duration },
-    /// A feedback loop was left unbroken. A cycle remains in the graph once
-    /// the intentional one-cycle-delayed edges (`connect_delayed`) are removed;
-    /// every feedback loop must break exactly one of its edges that way, so
-    /// that the one-cycle-late sampling is explicit rather than an artifact of
-    /// registration order. `systems` names the cycle members in loop order.
+    /// A feedback loop was left unbroken: every cycle in the graph must break
+    /// exactly one of its edges with `connect_delayed`, so the one-cycle-late
+    /// sampling is explicit rather than an artifact of registration order.
+    /// `systems` names the cycle members in loop order.
     #[error(
         "unbroken feedback cycle {cycle} — break one edge with connect_delayed",
         cycle = .systems.join(" -> ")
@@ -128,14 +122,13 @@ pub enum WireError {
         max = NAME_CAP
     )]
     SlotNameTooLong { name: String, len: usize },
-    /// A cycle participant without a receive-all port was registered after one
-    /// with it (the telemetry downlink). The downlink's end-of-cycle snapshot
-    /// only observes systems that step before it, so a later registration
-    /// would telemeter one cycle stale. Enforced rather than silently
-    /// reordered, because reordering would change the step order the
-    /// stale-edge diagnostics validate. Fix by registering `system` before the
-    /// receive-all system. Async boundaries are included because they export
-    /// at their registered positions. Both fields are instance names.
+    /// A system without a receive-all port was registered after one that has
+    /// it (the telemetry downlink). The downlink's end-of-cycle snapshot only
+    /// sees systems that stepped before it, so a later registration would
+    /// telemeter one cycle stale; enforced rather than silently reordered,
+    /// since reordering would change the step order the stale-edge
+    /// diagnostics validate. Async boundaries count too, since they export at
+    /// their registered position.
     #[error(
         "system '{system}' is registered after the receive-all system '{receive_all}' (the telemetry downlink), whose end-of-cycle snapshot would miss it; register '{system}' before the telemetry downlink"
     )]

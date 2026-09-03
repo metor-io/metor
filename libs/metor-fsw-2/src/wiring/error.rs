@@ -10,7 +10,6 @@ use crate::dl::DlError;
 /// A reason a wiring failed to validate or resolve into a runnable system
 /// graph, from missing params through graph-level [`WireError`]s and
 /// shared-library loading failures ([`DlError`]).
-///
 #[derive(Debug)]
 pub struct LoadError {
     pub kind: LoadErrorKind,
@@ -172,7 +171,7 @@ pub enum LoadErrorKind {
     UnknownArtifact { system: String, artifact: String },
 
     /// The generated pack module for this artifact was produced against a
-    /// different pack manifest than the one now built — its params, ports, or
+    /// different pack manifest than the one now built: its params, ports, or
     /// entries have changed. Fails before any dlopen, naming the one command
     /// that fixes it. Only a generated artifact (whose `ARTIFACT` constant
     /// carries the recorded hash) can trigger this; a builder-authored
@@ -251,8 +250,8 @@ pub enum LoadErrorKind {
     #[error("state `{name}` is declared more than once")]
     DuplicateState { name: String },
 
-    /// A shared state's own init fn failed — resource acquisition, like a
-    /// listener bind — or its params did not decode.
+    /// A shared state's own init fn failed, such as a resource acquisition
+    /// like a listener bind, or its params did not decode.
     #[error("state `{name}` (type `{ty}`) failed to construct: {message}")]
     StateInit {
         name: String,

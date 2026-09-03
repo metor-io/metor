@@ -6,8 +6,8 @@
 //! anchors, scopes, and per-artifact manifest hashes intact, but artifact
 //! `path`s stripped so the bundle stays relocatable and byte-reproducible),
 //! `meta.json` is a plain-serde [`BundleMeta`] sidecar, and every artifact's
-//! built `cdylib` — plus its `<cdylib>.manifest` sidecar when the build driver
-//! wrote one — is copied in alongside. The `target.py` that produced the
+//! built `cdylib`, plus its `<cdylib>.manifest` sidecar when the build driver
+//! wrote one, is copied in alongside. The `target.py` that produced the
 //! target rides along as verbatim provenance and is never consumed on load:
 //! the run path needs no Python and no config parse, strictly more hermetic
 //! than re-evaluating source on target.
@@ -18,10 +18,10 @@
 //! backstop CI diffs), and the `metor_config` recorder version the target was
 //! evaluated with. [`load_bundle`] checks the ABI and target. The later
 //! resolve pass checks the IR version. A triple mismatch is a clean
-//! [`BundleError::TargetMismatch`] before any dlopen, where an arch mismatch
-//! used to surface as a dlopen mystery. It verifies the frozen IR digest and
-//! each recorded manifest hash. A manifest hash checks interface compatibility;
-//! it is not a digest of the shared-object bytes.
+//! [`BundleError::TargetMismatch`] before any dlopen, rather than an opaque
+//! dlopen failure. It verifies the frozen IR digest and each recorded
+//! manifest hash. A manifest hash checks interface compatibility; it is not
+//! a digest of the shared-object bytes.
 //!
 //! [`write_bundle`] produces a bundle from a built [`Wiring`] plus a
 //! [`PackageOptions`]. [`load_bundle`] reads one back into a [`Wiring`] whose
@@ -73,14 +73,13 @@ pub struct BundleMeta {
     /// deliberately excluded from [`ir_sha256`](Self::ir_sha256) so it does
     /// not perturb reproducibility.
     pub built_at_unix: u64,
-    /// `sha256:<hex>` of the `wiring.json` bytes — the determinism backstop CI
+    /// `sha256:<hex>` of the `wiring.json` bytes, the determinism backstop CI
     /// re-evaluates and diffs (`metor-fsw package --check-ir`).
     pub ir_sha256: String,
     /// Per-artifact provenance: what was actually packaged, hashed from the
-    /// exact bytes copied into the bundle. The flight record that outlives
-    /// the packaging venv (`docs/packaging.md`); recording only,
-    /// the load gates (ABI, IR hash, triple, manifest hash) cover integrity.
-    /// Serde-defaulted so pre-provenance bundles load unchanged.
+    /// exact bytes copied into the bundle. Recording only; the load gates
+    /// (ABI, IR hash, triple, manifest hash) cover integrity. Serde-defaulted
+    /// so pre-provenance bundles load unchanged.
     #[serde(default)]
     pub packs: Vec<PackProvenance>,
 }
@@ -94,8 +93,8 @@ pub struct PackProvenance {
     pub dist: Option<super::model::DistRef>,
     /// How the artifact was provisioned.
     pub source: PackSourceKind,
-    /// `sha256:<hex>` of the shared-object bytes copied into the bundle —
-    /// a digest of the code itself, where `manifest_hash` digests only the
+    /// `sha256:<hex>` of the shared-object bytes copied into the bundle: a
+    /// digest of the code itself, where `manifest_hash` digests only the
     /// interface.
     pub cdylib_sha256: String,
     /// The recorded pack-manifest hash, when the artifact carried one.
@@ -171,8 +170,8 @@ pub enum BundleError {
         expected: u32,
     },
     /// The bundle's `.so`s were built for a different target triple than this
-    /// host runs — the clean load-time verdict that used to surface as an
-    /// opaque dlopen failure.
+    /// host runs, caught here instead of surfacing as an opaque dlopen
+    /// failure.
     #[error(
         "bundle was built for target `{found}`, but this host is `{expected}` \
          (rebuild the bundle for this target)"
@@ -298,7 +297,7 @@ pub fn write_bundle(wiring: &Wiring, opts: &PackageOptions, out: &Path) -> Resul
     }
 }
 
-/// One bundle member: its file name and where its bytes come from — inline
+/// One bundle member: its file name and where its bytes come from, inline
 /// (the freshly built `meta.json` / `wiring.json`) or a source file to copy
 /// (`.so`s, sidecars, the provenance source).
 enum MemberSource {
@@ -306,7 +305,7 @@ enum MemberSource {
     Path(PathBuf),
 }
 
-/// The bundle's members in canonical order — `meta.json`, `wiring.json`, then
+/// The bundle's members in canonical order: `meta.json`, `wiring.json`, then
 /// each artifact's `.so` and `.manifest` sorted by artifact id, then the
 /// provenance copy. One ordering both the directory and single-file writers
 /// share, so the two forms carry identical content, and the `.metor` tar is
@@ -391,8 +390,8 @@ fn bundle_members(
 }
 
 /// The member file name of an artifact's loadable: a cdylib's is derived
-/// from the bundle's recorded target triple (or the host's convention when
-/// the bundle records none — the load-time triple check is skipped by the
+/// from the bundle's recorded target triple, or the host's convention when
+/// the bundle records none (the load-time triple check is skipped by the
 /// same fallback, so writer and reader agree); a wasm module is one
 /// arch-neutral `<id>.wasm` regardless of triple.
 fn member_artifact_name(target: Option<&str>, artifact: &super::model::Artifact) -> String {
@@ -507,8 +506,8 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
         });
     }
     // The triple check needs both a recorded target and a determinable host;
-    // absent either, it cannot render a verdict and is skipped (the dlopen
-    // path stays the backstop, as before Phase 3).
+    // absent either, it cannot render a verdict and is skipped, leaving
+    // dlopen as the backstop.
     if let (Some(found), Some(expected)) = (&meta.target, super::build_driver::host_triple())
         && found != &expected
     {

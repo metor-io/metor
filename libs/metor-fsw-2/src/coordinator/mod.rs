@@ -1,8 +1,8 @@
 //! The cyclic run loop.
 //!
 //! This module is the runtime: a ready [`Coordinator`] and the supervision it
-//! runs. The graph construction that produces one — collecting systems and
-//! edges, validating, sizing, binding — lives in [`init`]; a `Coordinator`
+//! runs. The graph construction that produces one, collecting systems and
+//! edges, validating, sizing, and binding, lives in [`init`]; a `Coordinator`
 //! arrives already wired, from the wiring front-end
 //! ([`resolve`](crate::wiring::resolve)) via [`init::InitGraph::build`].
 //! [`Coordinator::run_for`] drives the lifecycle: spawn the async systems, init
@@ -102,7 +102,7 @@ pub struct CoordinatorConfig {
     /// cycle moves on. A lapse with the child alive is logged as a
     /// `proc_step_timeout` fault on the coordinator log; with the child dead it
     /// stops the slot ([`StopReason::ProcessDied`]) and, budget permitting,
-    /// begins a restart. A healthy worker never approaches this — the wall
+    /// begins a restart. A healthy worker never approaches this: the wall
     /// cycle budget is usually far tighter. Default 100 ms.
     pub proc_step_timeout: Duration,
     /// How many times a process system's worker is respawned after it dies or
@@ -448,8 +448,8 @@ struct CoordChannels {
     /// The sole writer of the coordinator's `wiring` channel, present only when
     /// a front-end supplied a manifest.
     wiring_out: Option<MsgOut<WiringManifest>>,
-    /// The full target IR to broadcast on the `wiring` channel; `None` mirrors
-    /// `wiring_out`.
+    /// The full target IR to broadcast on the `wiring` channel; `None` exactly
+    /// when `wiring_out` is.
     wiring_manifest: Option<WiringManifest>,
     /// The [`ReloadSequences`] fan-in, drained each cycle: any request re-emits
     /// the registry and manifest, so a consumer that connected after boot can
@@ -562,18 +562,12 @@ impl Coordinator {
     /// convenience for driving slots `Load`/`Start`/`Stop`/`Abort`/`Reset`.
     /// The host or a test [`emit`](MsgOut::emit)s [`SequenceCommand`]s the
     /// slots drain once per cycle, the same mechanism an uplink system uses,
-    /// just over an in-proc channel instead of a wire one. Address a slot by
-    /// its instance name (`SequenceCommand::channel`), the same key the
-    /// wiring, the telemetry prefix, and the boot [`SequenceRegistry`] use.
+    /// addressing a slot by its instance name (`SequenceCommand::channel`).
     ///
-    /// The channel has exactly one writer (the ring's writer claim enforces
-    /// it), minted at `build()` and handed out here once: the first call
-    /// returns it, every later call returns `None`. Take it once and hold it
-    /// for the run, so driving commands from one place is structural.
-    ///
+    /// The channel has exactly one writer, minted at `build()` and handed out
+    /// here once: the first call returns it, every later call returns `None`.
     /// Commands reach a slot only over an explicit `"coordinator" -> <slot>`
-    /// edge; with no edge the handle is inert but the wiring shows it, so the
-    /// gap is diagnosable from the graph.
+    /// edge; with no edge the handle is inert but the wiring shows it.
     pub fn control_handle(&mut self) -> Option<MsgOut<SequenceCommand>> {
         self.channels.take_control()
     }
@@ -661,7 +655,7 @@ impl Coordinator {
                 );
             }
             // Each slot drains its own `commands` fan-in at the head of `step`,
-            // so a command dispatches the same cycle it lands — no
+            // so a command dispatches the same cycle it lands; there is no
             // coordinator-side command stage. The host times each step and
             // publishes the slot's status record right behind it.
             for e in &mut self.cyclic {

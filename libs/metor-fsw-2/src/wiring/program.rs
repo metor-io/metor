@@ -1,26 +1,24 @@
 //! Compiling a target's captured Python program at provision time.
 //!
-//! The build driver's wasm arm: the program the recorder captured into
-//! [`Wiring::program`] is compiled by `metor-expr` into the pack artifact its
-//! `@system` specs address — at the same seam that builds path-source
-//! cdylibs, so the vehicle only ever loads a finished module and a bad
-//! program fails the *build* with a `target.py`-line diagnostic, mapped
-//! through the program's per-declaration offsets.
+//! The program the recorder captured into [`Wiring::program`] is compiled
+//! into the pack artifact its `@system` specs address, at the same seam that
+//! builds path-source cdylibs, so the vehicle only ever loads a finished
+//! module and a bad program fails the *build* with a `target.py`-line
+//! diagnostic, mapped through the program's per-declaration offsets.
 //!
 //! ## The build-time resolver
 //!
 //! The compiler's questions are answered from the *other* artifacts' decoded
 //! pack manifests: every Table output port of every artifact-backed system
 //! (and every slot's occupant contract) is realized field by field into an
-//! addressable component, its id and record offset **carried** from the
-//! descriptor — `ComponentId::new` masks the FNV top bit, so re-hashing a
-//! name agrees with the real id for only about half of names, and the
-//! failure mode would look like a component that never publishes. A cdylib's
-//! manifest comes from its `.manifest` sidecar when the build wrote one
-//! (no dlopen), else an in-process describe; a wasm artifact's through the
-//! interpreter. Statically registered systems have no manifest to read, so
-//! their outputs are not bindable from Python — a diagnostic, not a silent
-//! misbind.
+//! addressable component, with its id and record offset carried straight
+//! from the descriptor rather than re-derived, since `ComponentId::new`
+//! masks the FNV top bit and re-hashing a name agrees with the real id for
+//! only about half of names. A cdylib's manifest comes from its `.manifest`
+//! sidecar when the build wrote one, else an in-process describe; a wasm
+//! artifact's comes through the interpreter. Statically registered systems
+//! have no manifest to read, so their outputs are not bindable from Python:
+//! a diagnostic, not a silent misbind.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -119,7 +117,7 @@ struct BuildResolver {
     /// Every addressable component by full instance-prefixed path, in a
     /// `BTreeMap` so nothing about iteration depends on hash order.
     components: BTreeMap<String, CompInfo>,
-    /// Frame shapes by frame (port) name, fields in realized order — the
+    /// Frame shapes by frame (port) name, fields in realized order, the
     /// `frame()` hook a `bind=`-to-host-frame class is checked against.
     frames: HashMap<String, Vec<(String, Ty)>>,
 }
@@ -264,9 +262,8 @@ impl PackResolver for BuildResolver {
     }
 }
 
-/// A component's type in the language: the panel host's mapping, duplicated
-/// so a promoted expression sees the identical world. Everything numeric is
-/// `f64` (which is also how the runner fills a frame slot), `bool` stays
+/// A component's type in the expression language. Everything numeric is
+/// `f64`, which is also how the runner fills a frame slot; `bool` stays
 /// itself, and a shaped bool has no tensor type to be.
 fn ty_of(prim: PrimType, shape: &[usize]) -> Option<Ty> {
     match (prim, shape.is_empty()) {
@@ -283,7 +280,7 @@ fn ty_of(prim: PrimType, shape: &[usize]) -> Option<Ty> {
 /// The decoded pack manifests the resolver reads, one per artifact: a
 /// cdylib's from its sidecar (else an in-process describe), a wasm module's
 /// through the interpreter. `None` for the program artifact itself and for
-/// anything unreadable — an unbindable producer, not a build failure.
+/// anything unreadable: an unbindable producer, not a build failure.
 #[derive(Default)]
 struct Manifests {
     decoded: HashMap<String, Option<Vec<PackEntryDesc>>>,

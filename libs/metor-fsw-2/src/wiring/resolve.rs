@@ -1,19 +1,33 @@
 //! Walk a [`Wiring`] IR into a built [`Coordinator`].
 //!
-//! [`resolve`]/[`resolve_with`] are the whole front-end's single exit: validate
-//! the IR ([`validate`](super::validate)), broadcast it as a [`WiringManifest`](metor_proto_wkt::WiringManifest),
-//! then run the systems, slots, deferred receive-all, and edges passes onto an
-//! [`InitGraph`](crate::coordinator::init::InitGraph) before handing it to
+//! [`resolve`]/[`resolve_with`] are the front-end's single entry point:
+//! validate the IR ([`validate`](super::validate)), broadcast it as a
+//! [`WiringManifest`](metor_proto_wkt::WiringManifest), then build an
+//! [`InitGraph`](crate::coordinator::init::InitGraph) through six passes
+//! (states, systems, slots, deferred receive-all systems, synthesized edges,
+//! and declared edges) before handing it to
 //! [`InitGraph::build`](crate::coordinator::init::InitGraph::build). Both
 //! front-ends (Python eval and the Rust [`WiringBuilder`](super::WiringBuilder))
 //! land here, so every graph check runs identically for either.
 //!
-//! A static system is instantiated through the [`Registry`] factory; a dl
-//! system is opened from its built [`Artifact`] and a `process=#true` system is
-//! described by a short-lived worker (the host never dlopens it). The three
-//! paths converge on [`resolve_occupant`], the one open→select→encode step.
-//! Host-environment policy (worker executable, session root, process timing)
-//! rides in via [`ResolveOptions`] rather than the portable IR.
+//! Pack-shared states construct first, so an attaching system's create finds
+//! its instance already in place. Systems come next: a static system is
+//! instantiated through the [`Registry`] factory, a dl system is opened from
+//! its built [`Artifact`], a `process=#true` system is described by a
+//! short-lived worker instead of dlopened, and a wasm system is described
+//! through the interpreter. All four paths converge on [`resolve_occupant`],
+//! the one open, select, and encode step. A static `ReceiveAll` system is
+//! deferred past every other system and slot, so it lands last in cyclic
+//! order, where [`InitGraph::build`] requires it. A compiled Python entry's
+//! implied bindings are wired only after every instance is registered, as
+//! synthesized edges, so a spec's list position never decides whether its
+//! producer is visible; declared edges resolve last, against the finished
+//! instance map.
+//!
+//! Host-environment policy, the worker executable, the shared-memory session
+//! root, and process step timing, rides in via [`ResolveOptions`] rather than
+//! the portable IR, since these are deployment decisions rather than target
+//! topology.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -55,15 +69,14 @@ enum Dir {
 
 /// Resolve-time overrides that a [`Wiring`] does not itself carry.
 ///
-/// A `Wiring` is a portable target description, so host-environment policy —
-/// where a process worker's executable lives, where the shared-memory session
-/// dir is rooted, how a worker's steps are timed and its crashes recovered — is
-/// supplied here at [`resolve_with`] time rather than baked into the IR. These
-/// are deployment decisions, not target topology, so they stay off the
-/// serialized IR (`wiring.json` is unaffected); each override falls back to the
-/// matching [`CoordinatorConfig`] default when `None`. The defaults (re-exec
-/// the host binary as the worker, `/dev/shm` or the OS temp dir for sessions,
-/// the config's step-timeout and restart policy) are what [`resolve`] uses.
+/// Where a process worker's executable lives, where the shared-memory session
+/// dir is rooted, and how a worker's steps are timed and crashes recovered
+/// are supplied here at [`resolve_with`] time rather than baked into the
+/// portable IR, so they never touch the serialized `wiring.json`. Each
+/// override falls back to the matching [`CoordinatorConfig`] default when
+/// `None`; those defaults (re-exec the host binary as the worker, `/dev/shm`
+/// or the OS temp dir for sessions, the config's step-timeout and restart
+/// policy) are what [`resolve`] uses.
 #[derive(Default, Clone, Debug)]
 pub struct ResolveOptions {
     /// The process-worker executable, instead of re-executing the host binary.
@@ -106,13 +119,12 @@ pub fn resolve_with(
     opts: ResolveOptions,
 ) -> Result<Coordinator, LoadError> {
     // The one structural gate: version, scope indices, name/id uniqueness, and
-    // each spec's well-formedness (`validate` module). Everything past here is
-    // registry- or filesystem-dependent.
+    // each spec's well-formedness. Everything past here is registry- or
+    // filesystem-dependent.
     validate::validate(wiring)?;
     check_manifest_hashes(wiring)?;
     let mut config = coordinator_config(&wiring.coordinator)?;
-    // Host-environment policy overrides (see `ResolveOptions`): applied onto the
-    // config the IR derived, never onto the IR itself.
+    // ResolveOptions apply onto the derived config, never onto the IR itself.
     if let Some(timeout) = opts.proc_step_timeout {
         config.proc_step_timeout = timeout;
     }
@@ -125,12 +137,12 @@ pub fn resolve_with(
     let mut graph = InitGraph::new(config);
     graph.worker_exe = opts.worker_exe;
     graph.shm_dir = opts.shm_dir;
-    // The target namespace rides the registry/announce seam (`InitGraph::qualify`)
-    // and is threaded into each static system's `configure` via `LoadCtx`.
+    // Rides the registry/announce seam and is threaded into each static
+    // system's `configure` via `LoadCtx`.
     graph.namespace = wiring.coordinator.namespace.clone();
 
-    // Serialized path-stripped so the telemetered topology matches the
-    // bundle's `wiring.json` byte-for-byte regardless of the build tree.
+    // Path-stripped so the telemetered topology matches the bundle's
+    // `wiring.json` byte-for-byte regardless of the build tree.
     let ir_json = serde_json::to_string(&wiring.path_stripped())
         .expect("a resolvable Wiring serializes to JSON");
     graph.set_wiring_manifest(metor_proto_wkt::WiringManifest {
@@ -138,20 +150,17 @@ pub fn resolve_with(
         ir_json,
     });
 
-    // --- States pass: pack-shared states construct before any system, so
-    //     an attached entry's create finds its instance in place. Each
-    //     construction yields the token a by-name attach downcasts, keyed by
-    //     the state's declaration name for the systems pass.
+    // --- States pass ---
     let mut state_tokens: HashMap<&str, metor_fsw_2_core::AttachTarget> = HashMap::new();
     for spec in &wiring.states {
         let target = resolve_state(spec, registry)?;
         state_tokens.insert(spec.name.as_str(), target);
     }
 
-    // --- Systems pass: static via the Registry, dl via the loader --------
+    // --- Systems pass ---
     let mut instances: HashMap<String, Instance> = HashMap::new();
-    // The coordinator joins the instance namespace up front so command edges
-    // can name it; `validate` already rejected any user spec of that name.
+    // Joins the instance namespace up front so command edges can name it;
+    // `validate` already rejected any user spec of that name.
     let coord_handle = graph.coordinator_handle();
     instances.insert(
         "coordinator".to_string(),
@@ -161,17 +170,15 @@ pub fn resolve_with(
         },
     );
     // A static `ReceiveAll` system must be the last cyclic registration or
-    // `build()` rejects the graph with `ReceiveAllNotLast`, so it is deferred
-    // behind every other system and slot. Deferral also gives it the right
-    // step position, after every producer and before telemetry. Only the
-    // static branch defers; dl systems never carry capabilities.
+    // `build()` rejects the graph with `ReceiveAllNotLast`. Only the static
+    // branch defers; dl systems never carry capabilities.
     let mut deferred: Vec<&SystemSpec> = Vec::new();
     let mut packs = PackCache::default();
     let mut wasm = WasmCache::default();
     let mut pending: Vec<PendingSynth> = Vec::new();
     for spec in &wiring.systems {
-        // The artifact's kind picks the loader; the dl and proc arms must
-        // never see a wasm module (dlopen on one would fail obscurely).
+        // The dl and proc arms must never see a wasm module: dlopen on one
+        // would fail obscurely.
         let wasm_backed = spec.artifact.as_deref().is_some_and(|id| {
             wiring
                 .artifacts
@@ -217,25 +224,20 @@ pub fn resolve_with(
         instances.insert(spec.name.clone(), Instance { handle, desc });
     }
 
-    // --- Slots pass: a slot `connect`s by name like a system, so it joins
-    //     `instances` before the edges pass.
+    // --- Slots pass: a slot connects by name like a system ---
     for slot in &wiring.slots {
         let (handle, desc) = resolve_slot(slot, wiring, &mut packs, &mut wasm, &mut graph)?;
         instances.insert(slot.name.clone(), Instance { handle, desc });
     }
 
-    // --- Deferred receive-all systems: the last cyclic registrations, still
-    //     ahead of the edges pass, which only needs the finished instance map.
+    // --- Deferred receive-all systems ---
     for spec in deferred {
         let (handle, desc) = resolve_static(spec, registry, &state_tokens, &mut graph)?;
         instances.insert(spec.name.clone(), Instance { handle, desc });
     }
 
-    // --- Synthesized edges: the bindings a compiled Python entry bakes are
-    //     wired only now, over the finished instance map, so a spec's list
-    //     position never decides whether its producer is visible. Staleness
-    //     stays uniform with explicit edges: a compiled system listed ahead
-    //     of a producer it reads fails at build like any native pair.
+    // --- Synthesized edges: a compiled system listed ahead of a producer it
+    //     reads fails at build like any native pair.
     let added: HashMap<(&str, &str), &str> = pending
         .iter()
         .map(|p| ((p.artifact.as_str(), p.entry.as_str()), p.instance.as_str()))
@@ -253,9 +255,8 @@ pub fn resolve_with(
     }
 
     // Every declared state must have gained an attachment by now (attach
-    // counts at entry create): a state serving nobody is a config defect —
-    // a link server with no downlink serves silence — so it fails like any
-    // other wiring mistake.
+    // counts at entry create): a state serving nobody, a link server with no
+    // downlink, is a config defect and fails like any other wiring mistake.
     for spec in &wiring.states {
         let entry = registry
             .states
@@ -270,7 +271,7 @@ pub fn resolve_with(
         }
     }
 
-    // --- Edges pass ------------------------------------------------------
+    // --- Edges pass ---
     for edge in &wiring.edges {
         let (producer, consumer) = match edge.kind {
             EdgeKind::Frame => (
@@ -279,11 +280,10 @@ pub fn resolve_with(
             ),
             EdgeKind::Msg => resolve_msg_edge(&instances, edge)?,
         };
-        // One `connect` entry point for every edge; its behavior is inferred
-        // from the connected ports' descriptors, and `EdgeKind` only picked
-        // the name-lookup space above. The edge is validated at build, where a
-        // defect (`delayed=#true` into a Log input, an incompatible pair) is a
-        // `WireError`.
+        // `EdgeKind` only picked the name-lookup space above; a `connect`'s
+        // actual behavior is inferred from the connected ports' descriptors.
+        // Build validates the edge, where a defect (`delayed=#true` into a
+        // Log input, an incompatible pair) becomes a `WireError`.
         if edge.delayed {
             graph.connect_delayed(producer, consumer);
         } else {
@@ -452,7 +452,7 @@ impl PackCache {
 
 /// The per-resolve cache of described wasm artifacts, the [`PackCache`] twin:
 /// bytes read once, the pack manifest decoded through a short-lived describe
-/// instance, and — for a compiled Python pack — the expr manifest read
+/// instance, and, for a compiled Python pack, the expr manifest read
 /// alongside, since edge synthesis and `@rng` seeding both key off it.
 #[derive(Default)]
 struct WasmCache {
@@ -559,7 +559,7 @@ fn wasm_entry<'e>(
 /// systems pass and wired after every instance is registered.
 struct PendingSynth {
     artifact: String,
-    /// The pack entry (declaration) name — the manifest's key.
+    /// The pack entry (declaration) name, the manifest's key.
     entry: String,
     /// The instance name of this registration, the spec's own (possibly
     /// scope-prefixed, and free to differ from the entry name).
@@ -567,12 +567,11 @@ struct PendingSynth {
     handle: SystemHandle,
 }
 
-/// Resolve a wired wasm system (plan D6): describe the artifact once per
-/// resolve, select the entry, encode its params — a compiled Python entry
-/// with an `@rng` slot takes a host-entropy seed on the params channel
-/// instead (plan D9) — and register it. The edges its compiled bindings
-/// imply (plan D7) are queued on `pending` and synthesized after the systems
-/// pass.
+/// Resolve a wired wasm system: describe the artifact once per resolve,
+/// select the entry, encode its params (a compiled Python entry with an
+/// `@rng` slot takes a host-entropy seed on the params channel instead), and
+/// register it. The edges its compiled bindings imply are queued on
+/// `pending` and synthesized after the systems pass.
 fn resolve_wasm(
     spec: &SystemSpec,
     artifact_id: &str,
@@ -639,12 +638,12 @@ fn resolve_wasm(
     Ok((handle, desc))
 }
 
-/// Wire the edges a compiled entry's bindings imply (plan D7): one edge per
-/// distinct producing port, in the same first-appearance order the compiler
-/// grouped the descriptor's inputs by. The two walks share their key — the
-/// binding list — so a mismatch is artifact/wiring drift and fails loudly.
-/// A `Produced` binding names a *declaration*; `added` maps it to the
-/// instance the declaration was registered under.
+/// Wire the edges a compiled entry's bindings imply: one edge per distinct
+/// producing port, in the same first-appearance order the compiler grouped
+/// the descriptor's inputs by. The two walks share their key, the binding
+/// list, so a mismatch is artifact/wiring drift and fails loudly. A
+/// `Produced` binding names a *declaration*; `added` maps it to the instance
+/// the declaration was registered under.
 fn synth_edges(
     system: &metor_expr::System,
     manifest: &metor_expr::Manifest,
@@ -859,7 +858,7 @@ impl OccupantEntry {
 
 /// Select `entry` from an artifact's self-description (or its sole entry
 /// when the spec named none) and encode `params` against the entry's
-/// exported `Params` schema — the one open→select→encode path behind
+/// exported `Params` schema, the one open, select, and encode path behind
 /// [`resolve_dl`], [`resolve_proc`], and both of [`resolve_slot`]'s occupant
 /// loops.
 ///
@@ -1007,10 +1006,10 @@ fn find_built_artifact<'w>(
     Ok(artifact)
 }
 
-/// Resolve a `process=#true` system (`docs/process-systems.md`): run a
-/// **describe-mode worker** over the built artifact — the host never dlopens
-/// it — decode the descriptor and `Params` schema from the worker's bytes,
-/// encode the spec's params against that schema, and register through
+/// Resolve a `process=#true` system: run a **describe-mode worker** over the
+/// built artifact, since the host never dlopens it, decode the descriptor and
+/// `Params` schema from the worker's bytes, encode the spec's params against
+/// that schema, and register through
 /// [`InitGraph::add_proc_cyclic`](crate::coordinator::init::InitGraph::add_proc_cyclic). The run worker is spawned later,
 /// at `build()`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1137,8 +1136,8 @@ fn occupant_artifact(
     }
 }
 
-/// Map a [`SlotConfigError`] — from the shared pure-spec validation or from
-/// [`plan_slot`](crate::coordinator::slot::plan_slot) — onto the resolver's
+/// Map a [`SlotConfigError`], from the shared pure-spec validation or from
+/// [`plan_slot`](crate::coordinator::slot::plan_slot), onto the resolver's
 /// public error variants.
 pub(super) fn slot_config_error(err: SlotConfigError, slot: &SlotSpec) -> LoadError {
     let name = slot.name.clone();
@@ -1168,15 +1167,10 @@ pub(super) fn slot_config_error(err: SlotConfigError, slot: &SlotSpec) -> LoadEr
     }
 }
 
-/// Resolve a [`SlotSpec`] into a registered slot: each allowed occupant goes
-/// through [`resolve_occupant`] (or, for a `process=#true` slot,
-/// [`describe_occupants`]), and the descriptor returned for the edges pass is
-/// the one [`plan_slot`](crate::coordinator::slot::plan_slot) derives, not a
-/// raw occupant descriptor.
-/// Describe one wasm occupant: open the module under the interpreter, find the
-/// named entry in its manifest, and encode its params.
+/// Describe one wasm occupant: open the module under the interpreter, find
+/// the named entry in its manifest, and encode its params.
 ///
-/// The module is opened only to be *described* — the returned backing carries
+/// The module is opened only to be *described*; the returned backing carries
 /// its path, and the slot loads a fresh instance per `Load`.
 fn resolve_wasm_occupant(
     art: &crate::ir::Artifact,
@@ -1221,6 +1215,11 @@ fn resolve_wasm_occupant(
     })
 }
 
+/// Resolve a [`SlotSpec`] into a registered slot: each allowed occupant goes
+/// through [`resolve_occupant`] (or, for a `process=#true` slot,
+/// [`describe_occupants`]), and the descriptor returned for the edges pass is
+/// the one [`plan_slot`](crate::coordinator::slot::plan_slot) derives, not a
+/// raw occupant descriptor.
 fn resolve_slot(
     slot: &SlotSpec,
     wiring: &Wiring,
@@ -1228,10 +1227,10 @@ fn resolve_slot(
     wasm: &mut WasmCache,
     graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    // The pure-spec checks (non-empty allow set, `initial` inside it) ran in
-    // `validate` before any artifact was opened. Open and param-encode each
-    // allowed occupant; a process slot takes the describe-worker path instead,
-    // and the backing decides the slot's mode in `plan_slot`.
+    // Pure-spec checks (non-empty allow set, `initial` inside it) already ran
+    // in `validate`. A process slot takes the describe-worker path instead of
+    // opening artifacts directly; the backing decides the slot's mode in
+    // `plan_slot`.
     let allowed: Vec<AllowedOccupant> = if slot.process {
         describe_occupants(slot, wiring)?
     } else {
@@ -1314,11 +1313,10 @@ fn resolve_slot(
     Ok((handle, desc))
 }
 
-/// Resolve a process slot's allowed set (`docs/process-systems.md`): the
-/// [`resolve_proc`] recipe once per allowed occupant, so the host never
-/// dlopens any occupant artifact. The resulting [`AllowedOccupant`]s carry
-/// [`OccupantBacking::Artifact`], which is what makes [`plan_slot`] register
-/// the slot process-mode.
+/// Resolve a process slot's allowed set: the [`resolve_proc`] recipe once
+/// per allowed occupant, so the host never dlopens any occupant artifact.
+/// The resulting [`AllowedOccupant`]s carry [`OccupantBacking::Artifact`],
+/// which is what makes [`plan_slot`] register the slot process-mode.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn describe_occupants(slot: &SlotSpec, wiring: &Wiring) -> Result<Vec<AllowedOccupant>, LoadError> {
     // Manifests by artifact id, so a slot allowing several entries of one

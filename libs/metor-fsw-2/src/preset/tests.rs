@@ -19,9 +19,9 @@ fn layout() -> TileLayout {
     }
 }
 
-/// Params deserialize from the JSON shape the Python builder emits — the
+/// Params deserialize from the JSON shape the Python builder emits; the
 /// layout arrives as the structured tree, so a malformed preset fails at
-/// resolution rather than reaching the panel.
+/// resolution rather than reaching a client.
 #[test]
 fn params_deserialize_from_builder_json() {
     let json = r#"{"preset":[{"name":"ops","layout":{
@@ -38,7 +38,7 @@ fn params_deserialize_from_builder_json() {
 }
 
 /// Pins the id the Python recorder's `component_id()` computes for a
-/// qualified name against `ComponentId::new` — the two must agree or preset
+/// qualified name against `ComponentId::new`; the two must agree or preset
 /// traces silently point at nothing.
 #[test]
 fn python_component_id_parity() {

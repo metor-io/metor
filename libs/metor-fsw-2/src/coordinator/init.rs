@@ -1,12 +1,13 @@
 //! The build-time init pipeline: collect systems and edges into an [`InitGraph`],
 //! then [`build`](InitGraph::build) it into a ready [`Coordinator`](super::Coordinator).
 //!
-//! An [`InitGraph`] is the wiring graph as plain data — the registered systems
+//! An [`InitGraph`] is the wiring graph as plain data: the registered systems
 //! (each a [`Node`]: its type-erased [`SystemBind`], its descriptor, its
 //! instance name), the edges between their ports, and the run-scoped overrides.
-//! [`build`](InitGraph::build) runs the passes in order — validation, edge resolution, fan-out
-//! counting, ring allocation, registry freeze, async-boundary planning, bind — each
-//! handing its product to the next, and assembles the `Coordinator` literal.
+//! [`build`](InitGraph::build) runs the passes in order: validation, edge
+//! resolution, fan-out counting, ring allocation, registry freeze,
+//! async-boundary planning, bind. Each hands its product to the next, and the
+//! last assembles the `Coordinator` literal.
 //!
 //! # Ordering invariants
 //!
@@ -199,7 +200,7 @@ pub(crate) struct WasmReg {
 pub(crate) enum SystemBind {
     /// The coordinator itself, system #0: a marker registration whose bind arm
     /// wraps the allocated rings into the coordinator's own fields (it is never
-    /// pushed into `cyclic` — the coordinator is the loop).
+    /// pushed into `cyclic`, since the coordinator is the loop).
     Coordinator,
     /// A created host system, erased; binds via a [`Binder`]. A pack entry rides
     /// this path too (via [`PendingDriver`]).
@@ -393,7 +394,7 @@ impl InitGraph {
 
     /// Qualify a telemetry instance name with the target
     /// [`namespace`](Self::namespace): `"sat1.<instance>"` when set, the bare
-    /// name otherwise. This is the one seam the prefix rides — registry keys,
+    /// name otherwise. This is the one seam the prefix rides; registry keys,
     /// the announce prefix, and file-backed ring names all pass through it,
     /// while wiring/edge resolution keeps using the unprefixed
     /// [`Node::name`]. The reserved `"coordinator"` bundle is qualified here
@@ -530,11 +531,7 @@ impl InitGraph {
         Ok(())
     }
 
-    /// Receive-all (telemetry) systems must register last. The downlink's
-    /// end-of-cycle snapshot only observes systems stepping before it, so a
-    /// participant registered after it would telemeter one cycle stale.
-    /// Enforced, not silently reordered: async boundaries export at their
-    /// registration position just like cyclic systems publish at theirs.
+    /// Enforces the module doc's receive-all-last invariant.
     fn validate_receive_all_last(&self) -> Result<(), WireError> {
         let mut first_receive_all: Option<usize> = None;
         for (s, sys) in self.systems.iter().enumerate() {
@@ -767,8 +764,8 @@ impl InitGraph {
     /// Which output buffers cross a process boundary and must therefore be
     /// file-backed: every output of a process system, plus every output some
     /// process system consumes over an edge. A process slot crosses only its
-    /// occupant *prefix* — the occupant's outputs and its Edge inputs'
-    /// producers — because the runner tail (the `commands` fan-in, the
+    /// occupant *prefix* (the occupant's outputs and its Edge inputs'
+    /// producers), because the runner tail (the `commands` fan-in, the
     /// self-tap, the status/events outputs) never leaves the coordinator.
     /// Everything else stays heap.
     pub(crate) fn shared_outputs(&self, cons_edges: &ConsEdges) -> HashSet<(usize, usize)> {

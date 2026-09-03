@@ -3,9 +3,10 @@
 //! A wasm occupant cannot be wired into the graph the way a `.so` one is. A
 //! `.so` attaches to the coordinator's own ring regions and reads and writes
 //! the same atomics every other system does; a guest cannot, because nothing
-//! maps host memory into a wasm linear memory. The privilege runs one way — the
-//! host can see all of the guest's memory, never the reverse — so the two sides
-//! keep separate rings and the host copies between them once per cycle.
+//! maps host memory into a wasm linear memory. The privilege runs one way,
+//! the host can see all of the guest's memory and never the reverse, so the
+//! two sides keep separate rings and the host copies between them once per
+//! cycle.
 //!
 //! Keeping the coordinator's rings **host-owned** is the point, not an
 //! accident. Putting them inside the guest instead would remove the copy, but
@@ -14,8 +15,8 @@
 //! That would trade away the property the substrate exists for. Here a guest
 //! can corrupt only its own copy, and the host validates at the boundary.
 //!
-//! The copy is affordable: the Phase 0 spike measured marshalling at 7 ns
-//! against a 2,873 ns cycle.
+//! The copy is affordable: marshalling costs about 7 ns against a 2,873 ns
+//! cycle.
 //!
 //! ## Why the handles persist
 //!
@@ -23,7 +24,7 @@
 //! and its cursor lives in that slot, so a view re-attached each cycle would
 //! rejoin at the live edge and silently drop everything written since the last
 //! one. The guest-side handles are raw pointers into the interpreter's backing
-//! buffer, which `memory.grow` reallocates — hence
+//! buffer, which `memory.grow` reallocates, hence
 //! [`WasmPack::check_memory_stable`](super::WasmPack::check_memory_stable),
 //! which every pump runs before touching them.
 
@@ -48,7 +49,7 @@ impl RingBridge {
     /// # Safety
     /// `guest_base` is the current base of the guest's linear memory, and every
     /// `GuestRing` names a formatted region inside it. The caller keeps that
-    /// memory from moving for the bridge's whole life — see
+    /// memory from moving for the bridge's whole life; see
     /// [`WasmPack::check_memory_stable`](super::WasmPack::check_memory_stable).
     /// Each host region must likewise outlive the bridge.
     pub unsafe fn new(

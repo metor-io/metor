@@ -1,15 +1,15 @@
-//! Target-shipped panel presets.
+//! Target-shipped tile-layout presets.
 //!
-//! A target declares recommended panel layouts statically — `m.add("presets",
-//! Presets([...]))` in a `target.py` — and this system broadcasts them as one
+//! A target declares recommended layouts statically (`m.add("presets",
+//! Presets([...]))` in a `target.py`), and this system broadcasts them as one
 //! latest-wins [`PresetDefs`] snapshot. The downlink retains snapshot
-//! messages, so a panel connecting mid-target still receives the set and can
-//! offer the layouts on connect.
+//! messages, so a client connecting mid-target still receives the set and
+//! can offer the layouts on connect.
 //!
 //! Layouts deserialize into the typed [`TileLayout`] tree at build, so a
-//! malformed preset fails resolution instead of reaching the panel. Component
+//! malformed preset fails resolution instead of reaching a client. Component
 //! references live inside each item's opaque `state` blob, which this system
-//! cannot rewrite — namespace-qualifying them is the config builder's job.
+//! cannot rewrite; namespace-qualifying them is the config builder's job.
 
 #[cfg(test)]
 mod tests;

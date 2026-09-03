@@ -51,7 +51,7 @@ fn step(eval: &mut AlarmEval, v: f64, next: &mut u64) -> Option<EvalEvent> {
 // ---------------------------------------------------------------------------
 
 /// A breach must hold for `debounce` consecutive cycles to raise, and a
-/// recovery likewise to clear. A shorter blip does neither.
+/// recovery likewise to clear, so a shorter blip does neither.
 #[test]
 fn debounce_gates_raise_and_clear() {
     let mut eval = eval_with(3, 0.0, false);
@@ -137,8 +137,8 @@ fn nan_freezes_the_alarm() {
     );
 }
 
-/// Escalation re-raises the same occurrence at the higher severity, and
-/// severity only ratchets up. Dropping back to the warning band emits nothing.
+/// Escalation re-raises the same occurrence at the higher severity, severity
+/// only ratchets up, and dropping back to the warning band emits nothing.
 #[test]
 fn escalation_reuses_the_occurrence_and_ratchets() {
     let mut eval = eval_with(1, 0.0, false);
@@ -538,10 +538,9 @@ mod system {
         assert_eq!(run(2, 8).await, 1, "latched alarm clears once acked");
     }
 
-    /// Under a target namespace the engine prefixes its authored targets, so
-    /// they resolve against the namespace-qualified registry and the broadcast
-    /// def carries the qualified component id. `configure` is the seam the
-    /// front-end threads the namespace through.
+    /// Under a target namespace the engine prefixes its authored targets
+    /// through `configure`, so they resolve against the namespace-qualified
+    /// registry and the broadcast def carries the qualified component id.
     #[stellarator::test]
     async fn namespace_prefixes_alarm_targets() {
         use crate::{BuildCtx, MsgTable};
@@ -591,8 +590,8 @@ mod system {
         assert!(got_raised[0].message.starts_with("sat1.plant.gyro.rates.1"));
     }
 
-    /// Misconfigured targets disable their alarms and surface on the log.
-    /// The def still broadcasts and nothing ever raises.
+    /// Misconfigured targets disable their alarms and surface on the log,
+    /// though the def still broadcasts and nothing ever raises.
     #[stellarator::test]
     async fn bad_targets_disable_and_report_faults() {
         let mut b = crate::coordinator::init::InitGraph::new(config());

@@ -2,8 +2,8 @@
 //!
 //! [`WasmSlot`] is to [`WasmPack`] what `DlSlot` is to `DlPack`: it owns one
 //! bound instance and advances it once per cycle. The lifecycle is the same
-//! ABI in the same order, so the slot runner drives all three backings — dl,
-//! process worker, and wasm — through the same `execute → FswStatus` shape.
+//! ABI in the same order, so the slot runner drives all three backings (dl,
+//! process worker, and wasm) through the same `execute → FswStatus` shape.
 //!
 //! What differs is the cycle body. A dl occupant shares the coordinator's
 //! rings and simply executes; a guest cannot reach them, so each cycle is
@@ -213,8 +213,8 @@ impl WasmSlot {
     /// One cycle: carry the inputs in, advance the guest, carry the outputs
     /// back out.
     ///
-    /// Returns the raw [`FswStatus`] the runner folds, with every failure —
-    /// trap, fuel exhaustion, moved memory — reported as
+    /// Returns the raw [`FswStatus`] the runner folds, with every failure
+    /// (trap, fuel exhaustion, moved memory) reported as
     /// [`FswStatus::Panicked`]. That is the same word a `.so` occupant returns
     /// when its panic is caught, so the runner's terminal handling needs no
     /// wasm-specific case.
@@ -263,7 +263,7 @@ impl WasmSlot {
     /// Tighten (or loosen) the budget each later cycle runs under.
     ///
     /// Binding costs far more fuel than a cycle does, so a slot binds under a
-    /// generous budget and then applies its configured per-poll one — which is
+    /// generous budget and then applies its configured per-poll one, which is
     /// what actually bounds the occupant.
     pub fn set_fuel_per_call(&mut self, fuel: u64) {
         self.pack.set_fuel_per_call(fuel);

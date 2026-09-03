@@ -4,14 +4,14 @@
 //! An app builds a [`Registry`] (usually from [`with_builtins`](Registry::with_builtins))
 //! and calls [`register`](Registry::register)/[`register_pack`](Registry::register_pack)
 //! to add its own systems, each keyed by a `type=` string. A registered entry
-//! carries a boxed factory — decode params, `new` the system, run its
-//! host-side configure step, erase it to a [`Node`] — plus the static
+//! carries a boxed factory (decode params, `new` the system, run its
+//! host-side configure step, erase it to a [`Node`]) plus the static
 //! descriptor, available without construction so the resolver can order
 //! registrations by capability. The cyclic-versus-async branch is inferred
 //! from the [`IntoNode`] blanket impls, so a system registers by implementing
 //! [`BuildSystem`](crate::BuildSystem) alone.
 //!
-//! Params reach a factory as a [`StaticParams`] surface — a value tree decoded
+//! Params reach a factory as a [`StaticParams`] surface: a value tree decoded
 //! through serde (field defaults honored, unknown keys rejected), or a
 //! paramless surface that decodes an all-defaults value.
 
@@ -207,7 +207,7 @@ pub struct Registry {
     /// [`NamedMsg::NAME`](crate::NamedMsg). Config name tokens (an uplink's
     /// `msgs` list) resolve against this table in [`BuildSystem::configure`].
     pub(super) msgs: MsgTable,
-    /// Pack-declared shared states, keyed by their declaration name — the
+    /// Pack-declared shared states, keyed by their declaration name, the
     /// `type=` a [`StateSpec`](super::StateSpec) constructs through.
     pub(super) states: HashMap<&'static str, std::cell::RefCell<metor_fsw_2_core::StateEntry>>,
 }
@@ -219,9 +219,9 @@ impl Registry {
     }
 
     /// A registry pre-loaded with the built-in systems under their `type=`
-    /// names — the alarm engine (`"Alarms"`) and the link pack: one shared
+    /// names: the alarm engine (`"Alarms"`) and the link pack, one shared
     /// `"TcpServer"` state serving the `"Downlink"` and `"Uplink"` systems
-    /// attached to it — plus the well-known message set in the message table
+    /// attached to it, plus the well-known message set in the message table
     /// so a target's `msgs` list can name any of them out of the box. An
     /// app-built registry starts here and adds its own systems.
     pub fn with_builtins() -> Self {
@@ -238,8 +238,7 @@ impl Registry {
         link_pack.shared_state("TcpServer", |p: LinkParams| {
             LinkState::bind(p.addr).map(|s| s.with_name(p.name))
         });
-        // The `Downlink`/`Uplink` entries no longer capture the link token:
-        // the resolver hands each `ctor` the `Shared<LinkState>` a target
+        // The resolver hands each `ctor` the `Shared<LinkState>` a target
         // named via `attach=`, and the ctor attaches it.
         let link_pack = link_pack
             .system_type_shared::<TelemetrySystem, LinkState>("Downlink", |p, link| {
@@ -316,7 +315,7 @@ impl Registry {
             let factory = Box::new(move |ctx: &mut LoadCtx| {
                 let mut entry = entry.borrow_mut();
                 // A paramless surface conforms an empty object against the
-                // entry's schema, so its declared defaults fill in — the pack
+                // entry's schema, so its declared defaults fill in, the pack
                 // twin of the static `NoParams` decode.
                 let empty = serde_json::Value::Object(serde_json::Map::new());
                 let value = match &ctx.params {
