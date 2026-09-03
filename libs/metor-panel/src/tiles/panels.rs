@@ -697,7 +697,7 @@ impl Default for OutlinePanelConfig {
 }
 
 /// Sibling order in the outline's tree.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum SortDirection {
     #[default]
@@ -2155,5 +2155,45 @@ mod tests {
         assert!(!legacy.show_values);
         assert!(!legacy.latch);
         assert_eq!(legacy.columns, 0);
+    }
+
+    /// Cross-language pin: the outline the Python preset builder emits
+    /// (`metor_config.Outline`) must parse into this config exactly.
+    /// `test_golden.py` asserts the builder still produces the fixture;
+    /// this asserts the panel still reads every field of it.
+    #[test]
+    fn the_golden_python_outline_parses() {
+        let blob = include_str!("../../../metor-fsw-2/tests/golden/outline.json");
+        let cfg: OutlinePanelConfig = serde_json::from_str(blob).unwrap();
+        assert_eq!(cfg.root, "sat1.wheels");
+        assert_eq!(cfg.columns, ["name", "value", "unit"]);
+        assert_eq!(cfg.sort, SortDirection::Descending);
+        assert_eq!(cfg.filter, "speed");
+        assert!(cfg.filter_bar);
+        assert_eq!(cfg.expanded, ["sat1.wheels.wheels.0"]);
+        assert_eq!(cfg.collapsed, ["sat1.wheels.status"]);
+        assert_eq!(cfg.pivots.len(), 1);
+        assert_eq!(cfg.pivots[0].path, "sat1.wheels.wheels");
+        assert_eq!(cfg.pivots[0].fields, ["speed", "torque"]);
+        assert_eq!(cfg.pivots[0].hidden, ["motor.temp"]);
+        assert_eq!(cfg.pivots[0].rows, ["3", "0"]);
+        assert_eq!(cfg.types.len(), 1);
+        assert_eq!(cfg.types[0].label, "psu");
+        assert_eq!(cfg.types[0].fields, ["current", "voltage"]);
+        assert_eq!(cfg.types[0].order, ["voltage"]);
+        assert!(cfg.types[0].hidden.is_empty());
+        assert_eq!(cfg.types[0].rows, ["sat1.dut2.psu"]);
+        assert_eq!(cfg.focus.as_deref(), Some("psu"));
+    }
+
+    /// An empty pane state — what the legacy `ComponentTable()` and
+    /// `DataTable()` builders emit — is the default outline.
+    #[test]
+    fn an_empty_outline_state_is_the_default() {
+        let cfg: OutlinePanelConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.columns, ["name", "unit", "type", "value"]);
+        assert_eq!(cfg.sort, SortDirection::Ascending);
+        assert!(cfg.root.is_empty());
+        assert!(cfg.pivots.is_empty());
     }
 }

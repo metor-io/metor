@@ -682,6 +682,118 @@ def DataTable() -> PaneState:  # noqa: N802
     return PaneState("data_table", {})
 
 
+_OUTLINE_COLUMNS = ("name", "unit", "type", "sparkline", "value")
+_OUTLINE_SORTS = ("ascending", "descending")
+
+
+def _qualify_all(paths: list[str] | None, namespace: str | None) -> list[str] | None:
+    return None if paths is None else [_qualify(p, namespace) for p in paths]
+
+
+@dataclass(frozen=True)
+class Pivot:
+    """A branch the outline shows as instances × fields. ``fields`` lead the
+    columns in that order (unlisted ones follow in natural order), ``hidden``
+    fields are left out, and ``rows`` lead the instances by their segment
+    under the branch. Field names are leaf paths relative to an instance."""
+
+    path: str
+    fields: list[str] | None = None
+    hidden: list[str] | None = None
+    rows: list[str] | None = None
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "path": _qualify(self.path, namespace),
+                "fields": self.fields,
+                "hidden": self.hidden,
+                "rows": self.rows,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class FrameType:
+    """A shape the outline pivots across the whole namespace: every subtree
+    whose leaf paths are exactly ``fields`` lands in one grid labelled
+    ``label``. ``order``, ``hidden`` and ``rows`` arrange it like a
+    :class:`Pivot`; ``rows`` are full instance paths."""
+
+    label: str
+    fields: list[str]
+    order: list[str] | None = None
+    hidden: list[str] | None = None
+    rows: list[str] | None = None
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "label": self.label,
+                "fields": list(self.fields),
+                "order": self.order,
+                "hidden": self.hidden,
+                "rows": _qualify_all(self.rows, namespace),
+            }
+        )
+
+
+@dataclass(frozen=True)
+class Outline:
+    """The component outline: the namespace as a collapsible tree-table.
+
+    ``root`` lists only that branch's children; ``columns`` are the visible
+    columns in display order, from ``name``, ``unit``, ``type``,
+    ``sparkline`` and ``value``; ``sort`` is ``"ascending"`` or
+    ``"descending"``. ``expanded`` and ``collapsed`` name branches to open
+    or fold away from the default (top level open, the rest folded).
+    Paths are namespace-relative. Unset fields keep the panel's defaults."""
+
+    root: str | None = None
+    columns: list[str] | None = None
+    sort: str | None = None
+    filter: str | None = None
+    filter_bar: bool | None = None
+    expanded: list[str] | None = None
+    collapsed: list[str] | None = None
+    pivots: list[Pivot] | None = None
+    types: list[FrameType] | None = None
+    focus: str | None = None
+
+    def __post_init__(self) -> None:
+        for column in self.columns or ():
+            if column not in _OUTLINE_COLUMNS:
+                raise ValueError(f"unknown outline column {column!r}")
+        if self.sort is not None and self.sort not in _OUTLINE_SORTS:
+            raise ValueError(f"unknown outline sort {self.sort!r}")
+
+    def _item(self, namespace: str | None) -> dict[str, Any]:
+        return PaneState("component_outline", self._state(namespace))._item(namespace)
+
+    def _state(self, namespace: str | None) -> dict[str, Any]:
+        return _drop_none(
+            {
+                "root": _qualify(self.root, namespace) if self.root else None,
+                "columns": self.columns,
+                "sort": self.sort,
+                "filter": self.filter,
+                "filter_bar": self.filter_bar,
+                "expanded": _qualify_all(self.expanded, namespace),
+                "collapsed": _qualify_all(self.collapsed, namespace),
+                "pivots": None
+                if self.pivots is None
+                else [p._state(namespace) for p in self.pivots],
+                "types": None
+                if self.types is None
+                else [t._state(namespace) for t in self.types],
+                "focus": self.focus,
+            }
+        )
+
+    def _widget(self, namespace: str | None) -> tuple[str, dict[str, Any], tuple[float, float]]:
+        return "table", self._state(namespace), (400.0, 300.0)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard widgets and connectors
 # ---------------------------------------------------------------------------

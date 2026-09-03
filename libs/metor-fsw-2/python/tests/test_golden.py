@@ -8,7 +8,8 @@ envelope field).
 panel: a dashboard preset covering every widget kind and both connector
 layers. The panel's ``DashboardPanelConfig`` test parses that same file, so a
 rename on either side breaks a test instead of silently degrading a shipped
-preset into placeholder tiles."""
+preset into placeholder tiles. ``tests/golden/outline.json`` pins the outline
+pane's config the same way, every field set."""
 
 import json
 import os
@@ -29,9 +30,12 @@ from metor_config import (
     Connector,
     Dashboard,
     Edge,
+    FrameType,
     Gauge,
     Image,
     Meter,
+    Outline,
+    Pivot,
     Place,
     SequenceControl,
     State,
@@ -57,6 +61,9 @@ GOLDEN = os.path.join(
 )
 DASHBOARD_GOLDEN = os.path.join(
     os.path.dirname(__file__), "..", "..", "tests", "golden", "dashboard.json"
+)
+OUTLINE_GOLDEN = os.path.join(
+    os.path.dirname(__file__), "..", "..", "tests", "golden", "outline.json"
 )
 FIXTURE_PNG = os.path.join(os.path.dirname(__file__), "data", "pixel.png")
 
@@ -117,6 +124,36 @@ def build_dashboard() -> Dashboard:
             ),
             Connector([meter, At(900.0, 30.0)], shape="straight"),
         ],
+    )
+
+
+def build_outline() -> Outline:
+    """An outline pane with every field set."""
+    return Outline(
+        root="wheels",
+        columns=["name", "value", "unit"],
+        sort="descending",
+        filter="speed",
+        filter_bar=True,
+        expanded=["wheels.wheels.0"],
+        collapsed=["wheels.status"],
+        pivots=[
+            Pivot(
+                "wheels.wheels",
+                fields=["speed", "torque"],
+                hidden=["motor.temp"],
+                rows=["3", "0"],
+            )
+        ],
+        types=[
+            FrameType(
+                "psu",
+                fields=["current", "voltage"],
+                order=["voltage"],
+                rows=["dut2.psu"],
+            )
+        ],
+        focus="psu",
     )
 
 
@@ -220,6 +257,17 @@ class GoldenTest(unittest.TestCase):
         with open(DASHBOARD_GOLDEN, encoding="utf-8") as f:
             expected = json.load(f)
         self.assertEqual(build_dashboard()._state("sat1"), expected)
+
+    def test_emits_the_golden_outline(self):
+        with open(OUTLINE_GOLDEN, encoding="utf-8") as f:
+            expected = json.load(f)
+        self.assertEqual(build_outline()._state("sat1"), expected)
+
+    def test_outline_rejects_unknown_columns_and_sorts(self):
+        with self.assertRaises(ValueError):
+            Outline(columns=["names"])
+        with self.assertRaises(ValueError):
+            Outline(sort="up")
 
 
 if __name__ == "__main__":
