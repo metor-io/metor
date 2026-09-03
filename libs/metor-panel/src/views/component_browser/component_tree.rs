@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -15,9 +16,88 @@ pub struct ComponentNode {
     pub segment: SharedString,
     pub full_name: SharedString,
     pub component_id: Option<ComponentId>,
-    /// Children keyed by segment; `BTreeMap` keeps iteration order stable
-    /// so columns don't shuffle between renders.
-    pub children: BTreeMap<SharedString, Arc<ComponentNode>>,
+    pub children: Children,
+}
+
+/// A node's children in natural segment order, so `slot2` lists before
+/// `slot10` everywhere the tree is drawn. Frozen once built: the tree is a
+/// snapshot, and every derived tree (pruned, compressed, synthetic) is
+/// collected fresh.
+#[derive(Clone, Default)]
+pub struct Children(Vec<Arc<ComponentNode>>);
+
+impl Children {
+    pub fn get(&self, segment: &str) -> Option<&Arc<ComponentNode>> {
+        self.0
+            .binary_search_by(|c| natural_cmp(&c.segment, segment))
+            .ok()
+            .map(|ix| &self.0[ix])
+    }
+
+    pub fn values(&self) -> std::slice::Iter<'_, Arc<ComponentNode>> {
+        self.0.iter()
+    }
+
+    pub fn first(&self) -> Option<&Arc<ComponentNode>> {
+        self.0.first()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl FromIterator<Arc<ComponentNode>> for Children {
+    fn from_iter<I: IntoIterator<Item = Arc<ComponentNode>>>(iter: I) -> Self {
+        let mut nodes: Vec<Arc<ComponentNode>> = iter.into_iter().collect();
+        nodes.sort_by(|a, b| natural_cmp(&a.segment, &b.segment));
+        Self(nodes)
+    }
+}
+
+/// Natural order: runs of digits compare by value, everything else
+/// bytewise, so `slot1 < slot2 < slot10`. Strings whose runs all tie
+/// (`wheel_2` and `wheel_02`) fall back to bytewise order, keeping the
+/// order total.
+pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (mut x, mut y) = (a.as_bytes(), b.as_bytes());
+    loop {
+        let (Some(&cx), Some(&cy)) = (x.first(), y.first()) else {
+            return x.len().cmp(&y.len()).then_with(|| a.cmp(b));
+        };
+        let ord = if cx.is_ascii_digit() && cy.is_ascii_digit() {
+            let (dx, rx) = split_run(x, |c| c.is_ascii_digit());
+            let (dy, ry) = split_run(y, |c| c.is_ascii_digit());
+            let (dx, dy) = (trim_zeros(dx), trim_zeros(dy));
+            (x, y) = (rx, ry);
+            dx.len().cmp(&dy.len()).then_with(|| dx.cmp(dy))
+        } else {
+            let (tx, rx) = split_run(x, |c| !c.is_ascii_digit());
+            let (ty, ry) = split_run(y, |c| !c.is_ascii_digit());
+            (x, y) = (rx, ry);
+            tx.cmp(ty)
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+}
+
+fn split_run(s: &[u8], pred: impl Fn(u8) -> bool) -> (&[u8], &[u8]) {
+    let end = s.iter().position(|&c| !pred(c)).unwrap_or(s.len());
+    s.split_at(end)
+}
+
+fn trim_zeros(digits: &[u8]) -> &[u8] {
+    let start = digits
+        .iter()
+        .position(|&c| c != b'0')
+        .unwrap_or(digits.len());
+    &digits[start..]
 }
 
 /// Snapshot every component in `db` into a tree rooted at a synthetic node.
@@ -40,17 +120,15 @@ pub fn build_tree(db: &DB) -> Arc<ComponentNode> {
         }
     });
     let raw = root.freeze();
-    let compressed_children: BTreeMap<SharedString, Arc<ComponentNode>> = raw
-        .children
-        .values()
-        .map(|c| compress_subtree(c.clone()))
-        .map(|c| (c.segment.clone(), c))
-        .collect();
     Arc::new(ComponentNode {
         segment: raw.segment,
         full_name: raw.full_name,
         component_id: raw.component_id,
-        children: compressed_children,
+        children: raw
+            .children
+            .values()
+            .map(|c| compress_subtree(c.clone()))
+            .collect(),
     })
 }
 
@@ -83,10 +161,7 @@ pub(crate) fn compress_subtree(node: Arc<ComponentNode>) -> Arc<ComponentNode> {
         segment: node.segment.clone(),
         full_name: node.full_name.clone(),
         component_id: node.component_id,
-        children: compressed
-            .into_iter()
-            .map(|c| (c.segment.clone(), c))
-            .collect(),
+        children: compressed.into_iter().collect(),
     })
 }
 
@@ -132,8 +207,8 @@ impl Builder {
             component_id: self.component_id,
             children: self
                 .children
-                .into_iter()
-                .map(|(k, v)| (k, Arc::new(v.freeze())))
+                .into_values()
+                .map(|v| Arc::new(v.freeze()))
                 .collect(),
         }
     }
@@ -161,5 +236,55 @@ fn insert(root: &mut Builder, full_name: &str, id: ComponentId) {
         if ix == last_ix {
             current.component_id = Some(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sorted<'a>(names: &[&'a str]) -> Vec<&'a str> {
+        let mut v = names.to_vec();
+        v.sort_by(|a, b| natural_cmp(a, b));
+        v
+    }
+
+    #[test]
+    fn digit_runs_compare_by_value() {
+        assert_eq!(
+            sorted(&["slot10", "slot2", "slot1", "slot11"]),
+            ["slot1", "slot2", "slot10", "slot11"]
+        );
+    }
+
+    #[test]
+    fn leading_zeros_tie_then_fall_back_to_bytes() {
+        assert_eq!(natural_cmp("wheel_2", "wheel_02"), Ordering::Greater);
+        assert_eq!(natural_cmp("wheel_02", "wheel_2"), Ordering::Less);
+        assert_eq!(natural_cmp("a", "a"), Ordering::Equal);
+    }
+
+    #[test]
+    fn text_runs_stay_bytewise() {
+        assert_eq!(sorted(&["b", "B", "a1", "a"]), ["B", "a", "a1", "b"]);
+        assert_eq!(sorted(&["x9y", "x10", "x9"]), ["x9", "x9y", "x10"]);
+    }
+
+    #[test]
+    fn children_look_up_by_segment_in_natural_order() {
+        let leaf = |seg: &str| {
+            Arc::new(ComponentNode {
+                segment: SharedString::from(seg.to_string()),
+                full_name: SharedString::from(seg.to_string()),
+                component_id: None,
+                children: Children::default(),
+            })
+        };
+        let children: Children = ["w10", "w2", "w1"].into_iter().map(leaf).collect();
+        let order: Vec<&str> = children.values().map(|c| c.segment.as_ref()).collect();
+        assert_eq!(order, ["w1", "w2", "w10"]);
+        assert_eq!(children.get("w10").map(|c| c.segment.as_ref()), Some("w10"));
+        assert!(children.get("w3").is_none());
+        assert_eq!(children.first().map(|c| c.segment.as_ref()), Some("w1"));
     }
 }

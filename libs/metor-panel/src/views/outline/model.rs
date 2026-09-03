@@ -27,7 +27,7 @@ use gpui::SharedString;
 use metor_proto::types::ComponentId;
 
 use crate::query::Query;
-use crate::views::component_browser::component_tree::ComponentNode;
+use crate::views::component_browser::component_tree::{ComponentNode, natural_cmp};
 use crate::views::component_browser::prune_to_matches;
 
 /// Depth below which branches start open: the top-level namespaces are
@@ -73,7 +73,7 @@ pub(crate) struct Pivot {
     /// What the grid belongs to — the branch path or the type key — so
     /// its rows can share per-grid state such as the scroll offset.
     pub key: SharedString,
-    /// Leaf paths relative to an instance, in name order.
+    /// Leaf paths relative to an instance, in natural name order.
     pub fields: Vec<SharedString>,
     /// Widest strip each field needs, in element cells.
     pub cells: Vec<usize>,
@@ -195,12 +195,13 @@ fn pivot_from(
             leaves
         })
         .collect();
-    let fields: Vec<SharedString> = per_instance
+    let mut fields: Vec<SharedString> = per_instance
         .iter()
         .flat_map(|m| m.keys().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    fields.sort_by(|a, b| natural_cmp(a, b));
     let instances: Vec<PivotInstance> = candidates
         .into_iter()
         .zip(&per_instance)
@@ -437,10 +438,7 @@ fn push_type_rows(
         segment: t.label.clone(),
         full_name: key.clone(),
         component_id: None,
-        children: instances
-            .iter()
-            .map(|(n, _)| (n.full_name.clone(), n.clone()))
-            .collect(),
+        children: instances.iter().map(|(n, _)| n.clone()).collect(),
     });
     let expanded = focused || filtering || layout.disclosure.is_expanded(&key, 0);
     let pivot = Arc::new(pivot_from(key, instances, layout.cell_count));
@@ -459,14 +457,14 @@ fn push_type_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use crate::views::component_browser::component_tree::Children;
 
     fn leaf(name: &str) -> Arc<ComponentNode> {
         Arc::new(ComponentNode {
             segment: SharedString::from(name.rsplit('.').next().unwrap().to_string()),
             full_name: SharedString::from(name.to_string()),
             component_id: Some(metor_proto::types::ComponentId::new(name)),
-            children: BTreeMap::new(),
+            children: Children::default(),
         })
     }
 
@@ -475,10 +473,7 @@ mod tests {
             segment: SharedString::from(name.rsplit('.').next().unwrap().to_string()),
             full_name: SharedString::from(name.to_string()),
             component_id: None,
-            children: children
-                .into_iter()
-                .map(|c| (c.segment.clone(), c))
-                .collect(),
+            children: children.into_iter().collect(),
         })
     }
 

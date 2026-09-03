@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +26,7 @@ use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::query::Query;
 use crate::theme::{Theme, theme};
 use crate::tiles::PlotComponentAction;
-use component_tree::{ComponentNode, build_tree, compress_subtree, resolve_path};
+use component_tree::{Children, ComponentNode, build_tree, compress_subtree, resolve_path};
 
 /// [`ColumnBrowser`] specialized for the DB component namespace.
 pub type ComponentBrowser = ColumnBrowser<ComponentBrowserDelegate>;
@@ -260,7 +259,7 @@ impl ComponentBrowserDelegate {
         if label.is_empty() {
             return Err(SharedString::new_static("filter label cannot be empty"));
         }
-        if self.tree.children.contains_key(&label) {
+        if self.tree.children.get(&label).is_some() {
             return Err(SharedString::new_static(
                 "filter label collides with a top-level prefix",
             ));
@@ -926,7 +925,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             if tail.children.len() != 1 {
                 break;
             }
-            let seg = tail.children.keys().next().cloned().expect("len == 1");
+            let seg = tail.children.first().expect("len == 1").segment.clone();
             self.selection.path.push(seg);
             changed = true;
         }
@@ -998,7 +997,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
 
     fn filter_hint(&self) -> Option<SharedString> {
         let live = self.live.as_ref()?;
-        let taken = self.tree.children.contains_key(&live.label)
+        let taken = self.tree.children.get(&live.label).is_some()
             || self.filters.iter().any(|f| f.label == live.label);
         (!taken).then(|| SharedString::new_static("↵ save filter"))
     }
@@ -1013,7 +1012,7 @@ pub fn new_component_browser(db: Arc<DB>, cx: &mut Context<ComponentBrowser>) ->
             segment: SharedString::new_static(""),
             full_name: SharedString::new_static(""),
             component_id: None,
-            children: BTreeMap::new(),
+            children: Children::default(),
         }),
         selection: Selection::empty(),
         filters: Vec::new(),
@@ -1065,13 +1064,13 @@ fn build_filter_synth(
         .map(compress_subtree)
         .collect();
 
-    let children: BTreeMap<SharedString, Arc<ComponentNode>> = if pruned.len() == 1
+    let children: Children = if pruned.len() == 1
         && pruned[0].component_id.is_none()
         && !pruned[0].children.is_empty()
     {
         pruned[0].children.clone()
     } else {
-        pruned.into_iter().map(|c| (c.segment.clone(), c)).collect()
+        pruned.into_iter().collect()
     };
 
     Arc::new(ComponentNode {
@@ -1093,11 +1092,10 @@ pub(crate) fn prune_to_matches(
     if query.matches_name(node.full_name.as_ref()) {
         return Some(node.clone());
     }
-    let children: BTreeMap<SharedString, Arc<ComponentNode>> = node
+    let children: Children = node
         .children
         .values()
         .filter_map(|child| prune_to_matches(child, query))
-        .map(|c| (c.segment.clone(), c))
         .collect();
     if children.is_empty() {
         return None;
