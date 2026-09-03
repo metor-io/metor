@@ -62,7 +62,8 @@ fn registration_races_backpressure() {
         let mut w = ring.writer(NoWake).unwrap();
         // One record already committed, so a view registering below sits at a
         // nonzero cursor and the writer's next write has to wrap around it.
-        w.try_write(&payload(1)).expect("empty ring fits one record");
+        w.try_write(&payload(1))
+            .expect("empty ring fits one record");
 
         let reader = ring.clone();
         let t = thread::spawn(move || {
@@ -162,7 +163,9 @@ fn writer_claim_handoff() {
             b.writer(NoWake)
                 .map(|mut w| w.try_write(&payload(2)).is_ok())
         });
-        let mine = a.writer(NoWake).map(|mut w| w.try_write(&payload(1)).is_ok());
+        let mine = a
+            .writer(NoWake)
+            .map(|mut w| w.try_write(&payload(1)).is_ok());
         let theirs = t.join().unwrap();
 
         // The claim is a CAS, so they cannot hold it at once. Both succeeding

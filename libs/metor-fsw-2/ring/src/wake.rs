@@ -1,22 +1,20 @@
-//! Cross-process wait/wake on a shared `AtomicU32` — a futex, in its
+//! Cross-process wait/wake on a shared `AtomicU32`, a futex in its
 //! shared-memory form.
 //!
 //! This is the wake primitive for regions mapped into more than one process:
 //! a waiter parks on a word inside a `MAP_SHARED` mapping and a peer process
-//! wakes it through its own mapping of the same page. The API mirrors the
-//! `atomic-wait` crate deliberately, but that crate cannot serve here: its
-//! backends are process-private on every platform (Linux passes
-//! `FUTEX_PRIVATE_FLAG`, which keys the futex by `(mm, uaddr)` instead of by
-//! the underlying page; macOS goes through libc++'s per-process contention
-//! table; Windows `WaitOnAddress` is documented process-local). Do not
-//! "simplify" this module back to it.
+//! wakes it through its own mapping of the same page. A private futex
+//! backend cannot serve this: Linux's `FUTEX_PRIVATE_FLAG` keys the futex by
+//! `(mm, uaddr)` rather than by the underlying page, macOS's default path
+//! goes through libc++'s per-process contention table, and Windows'
+//! `WaitOnAddress` is documented process-local with no shared form at all.
 //!
 //! The backends:
 //!
 //! - **Linux**: the `futex(2)` syscall with plain `FUTEX_WAIT`/`FUTEX_WAKE`
 //!   (no private flag), keyed by the underlying page.
 //! - **macOS**: `os_sync_wait_on_address` and friends with the `SHARED`
-//!   flag — the public futex API, available since macOS 14.4.
+//!   flag, the public futex API available since macOS 14.4.
 //!
 //! # Contract
 //!
@@ -25,8 +23,8 @@
 //! **spuriously**. Callers must re-check their predicate in a loop; none of
 //! these functions communicate state on their own. [`wait_timeout`]
 //! additionally returns [`WaitOutcome::TimedOut`] once the timeout lapses,
-//! and that verdict is likewise advisory: a wake can race the timeout, so
-//! the caller's predicate — not the outcome — decides what happened.
+//! and that verdict is likewise advisory: a wake can race the timeout, so the
+//! caller's predicate, not the outcome, decides what happened.
 //!
 //! Waking is stateless and never blocks. Waking with no waiter is a no-op,
 //! and a waker may pass a word the waiter's process has since unmapped (the
@@ -35,7 +33,7 @@
 use core::sync::atomic::AtomicU32;
 use std::time::Duration;
 
-/// How a [`wait_timeout`] returned. Advisory only — see the module contract.
+/// How a [`wait_timeout`] returned. Advisory only; see the module contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     /// Woken, value changed, interrupted, or spurious.
@@ -95,9 +93,7 @@ mod platform {
         };
         // EAGAIN (value already differed) and EINTR both fold into `Woken`;
         // the caller's predicate loop sorts out what actually happened.
-        if rc == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ETIMEDOUT)
-        {
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ETIMEDOUT) {
             WaitOutcome::TimedOut
         } else {
             WaitOutcome::Woken
@@ -129,12 +125,8 @@ mod platform {
     const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
 
     unsafe extern "C" {
-        fn os_sync_wait_on_address(
-            addr: *mut c_void,
-            value: u64,
-            size: usize,
-            flags: u32,
-        ) -> c_int;
+        fn os_sync_wait_on_address(addr: *mut c_void, value: u64, size: usize, flags: u32)
+        -> c_int;
         fn os_sync_wait_on_address_with_timeout(
             addr: *mut c_void,
             value: u64,
@@ -167,8 +159,8 @@ mod platform {
             },
         };
         // Success returns the count of remaining waiters (>= 0). Everything
-        // except a timeout — EINTR, EFAULT on a racing unmap, a value
-        // mismatch — folds into `Woken` for the caller's predicate loop.
+        // except a timeout (EINTR, EFAULT on a racing unmap, a value
+        // mismatch) folds into `Woken` for the caller's predicate loop.
         if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ETIMEDOUT) {
             WaitOutcome::TimedOut
         } else {
@@ -200,7 +192,10 @@ mod tests {
     fn changed_value_returns_immediately() {
         let a = AtomicU32::new(1);
         wait(&a, 0); // must not hang
-        assert_eq!(wait_timeout(&a, 0, Duration::from_secs(5)), WaitOutcome::Woken);
+        assert_eq!(
+            wait_timeout(&a, 0, Duration::from_secs(5)),
+            WaitOutcome::Woken
+        );
     }
 
     /// A wait on a silent word times out, and not meaningfully early.
@@ -210,7 +205,11 @@ mod tests {
         let start = Instant::now();
         let outcome = wait_timeout(&a, 0, Duration::from_millis(50));
         assert_eq!(outcome, WaitOutcome::TimedOut);
-        assert!(start.elapsed() >= Duration::from_millis(40), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     /// A store + wake releases a parked waiter. The store-before-wake order

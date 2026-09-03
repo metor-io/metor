@@ -5,17 +5,17 @@ version.workspace = true
 repository.workspace = true
 edition = "2024"
 publish = false
-description = "Shared-memory ring buffer for metor-fsw-2"
+description = "Single-writer, multi-reader ring buffer over shared memory, with cross-process backpressure and reclaim"
 authors = ["sascha@metor.io"]
 
 [lints]
 workspace = true
 
-# Both default-on. A host wants them; a guest built for `wasm32-unknown-unknown`
-# takes `default-features = false`, since `memmap2` has no mapping to offer
-# there and `stellarator` reaches syscalls the target does not have. Neither
-# feature touches the region format or the reader protocol, so a ring created
-# with one set is readable with the other.
+# Both default-on. A target without a filesystem or OS threads, such as
+# `wasm32-unknown-unknown`, takes `default-features = false`, since `memmap2`
+# has no mapping to offer there and `stellarator` reaches syscalls the target
+# does not have. Neither feature touches the region format or the reader
+# protocol, so a ring created with one set is readable with the other.
 [features]
 default = ["mmap", "notify"]
 # File-backed regions: `RingBuffer::create_mmap` / `attach_mmap`.
