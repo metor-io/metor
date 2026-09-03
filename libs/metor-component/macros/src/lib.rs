@@ -16,7 +16,6 @@
 //!
 //! [`metor_component`]: ../metor_component/index.html
 
-use darling::FromField;
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
@@ -27,81 +26,6 @@ mod as_vtable;
 mod componentize;
 mod decomponentize;
 mod metadatatize;
-
-#[derive(Debug, FromField)]
-#[darling(attributes(fsw, metor_fsw))]
-struct Field {
-    ident: Option<syn::Ident>,
-    ty: syn::Type,
-    component_id: Option<String>,
-    #[darling(default)]
-    timestamp: bool,
-    /// Descend into a sub-frame/struct instead of treating the field as a leaf
-    /// scalar (Componentize/Decomponentize recurse through the trait).
-    #[darling(default)]
-    nest: bool,
-    /// Max cardinality for a `FrameList`/`FrameMap` field (frames.md §3.4). The
-    /// const-generic on the type is the source of truth; this is accepted for
-    /// forward-compat but unused by the derives.
-    #[darling(default)]
-    #[allow(dead_code)]
-    max: Option<usize>,
-    /// `#[metor_fsw(skip)]` force-hides a field from telemetry;
-    /// `#[metor_fsw(skip = false)]` opts a `_`-prefixed field back in. Absent,
-    /// a field is skipped iff its name starts with `_` — the convention for
-    /// `#[repr(C)]` padding.
-    #[darling(default)]
-    skip: Option<bool>,
-}
-
-impl Field {
-    pub fn component_name(&self) -> String {
-        match &self.component_id {
-            Some(c) => c.clone(),
-            None => {
-                let ident = self.ident.as_ref().expect("field must have ident");
-                ident.to_string()
-            }
-        }
-    }
-
-    /// Alias for [`component_name`](Field::component_name) used by the
-    /// Componentize/Decomponentize derives.
-    pub fn component_id(&self) -> String {
-        self.component_name()
-    }
-
-    /// Whether the field is omitted from telemetry: never becomes a component
-    /// and never round-trips through encode/decode. `_`-prefixed fields skip by
-    /// default (padding), overridable in either direction with
-    /// `#[metor_fsw(skip)]`.
-    pub fn skipped(&self) -> bool {
-        self.skip.unwrap_or_else(|| {
-            self.ident
-                .as_ref()
-                .is_some_and(|i| i.to_string().starts_with('_'))
-        })
-    }
-
-    /// Whether this field should recurse rather than emit a scalar leaf: either
-    /// explicitly `#[metor_fsw(nest)]`, or a dynamic `FrameList`/`FrameMap` whose
-    /// slot carries no in-struct value.
-    pub fn is_nested(&self) -> bool {
-        self.nest || self.is_dynamic()
-    }
-
-    /// Whether the field type's outermost path segment is `FrameList`/`FrameMap`.
-    /// Used to size the trailer in `Componentize::MAX_SIZE` and to skip the
-    /// (slot-only) field on the scalar Componentize/Decomponentize paths.
-    pub fn is_dynamic(&self) -> bool {
-        if let syn::Type::Path(p) = &self.ty
-            && let Some(seg) = p.path.segments.last()
-        {
-            return seg.ident == "FrameList" || seg.ident == "FrameMap";
-        }
-        false
-    }
-}
 
 #[proc_macro_derive(Metadatatize, attributes(fsw, metor_fsw))]
 pub fn metadatize(input: TokenStream) -> TokenStream {

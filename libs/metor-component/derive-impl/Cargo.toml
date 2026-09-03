@@ -1,21 +1,17 @@
 [package]
-name = "metor-component-macros"
+name = "metor-component-derive-impl"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition = "2024"
-description = "Derives for the metor component model."
+description = "Shared derive-emitter internals behind metor-component's and metor-fsw-2's component derives."
 repository = "https://github.com/metor-sys/metor"
 
 [lints]
 workspace = true
 
-[lib]
-proc-macro = true
-
 [dependencies]
 darling = "0.20.3"
-metor-component-derive-impl = { path = "../derive-impl" }
 proc-macro2 = "1.0.66"
 quote = "1.0.33"
 syn = "2.0.31"
-proc-macro-crate = "3.0.0"
+convert_case = "0.6.0"

@@ -2,21 +2,21 @@ use convert_case::{Case, Casing};
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 
-use crate::frame::FrameArgs;
+use crate::input::StructInput;
 
 /// Generates the `Decomponentize` impl, which routes an incoming component
 /// value to the matching field by comparing against per-field `ComponentId`
 /// constants. Unmatched ids and values that fail conversion are silently
 /// skipped. See [`componentize_impl`](crate::componentize::componentize_impl)
 /// for the `crate_name` root-path contract.
-pub fn decomponentize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> TokenStream2 {
-    let FrameArgs {
+pub fn decomponentize_impl(input: &StructInput, crate_name: &TokenStream2) -> TokenStream2 {
+    let StructInput {
         ident,
         generics,
         fields,
-        frame_name: parent,
+        parent,
         ..
-    } = args;
+    } = input;
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
     let if_arms = fields.iter().filter(|f| !f.timestamp && !f.skipped()).map(|field| {

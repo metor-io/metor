@@ -1,19 +1,19 @@
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 
-use crate::frame::FrameArgs;
+use crate::input::StructInput;
 
 /// Generates the `Componentize` impl. `crate_name` is the path prefix the
-/// generated code uses to name the trait surface, so the same expansion works
-/// from whichever crate re-exports it.
-pub fn componentize_impl(args: &FrameArgs, crate_name: &TokenStream2) -> TokenStream2 {
-    let FrameArgs {
+/// generated code uses to name the trait surface, so the same expansion
+/// works from whichever crate re-exports it.
+pub fn componentize_impl(input: &StructInput, crate_name: &TokenStream2) -> TokenStream2 {
+    let StructInput {
         ident,
         generics,
         fields,
-        frame_name: parent,
+        parent,
         ..
-    } = args;
+    } = input;
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
 
