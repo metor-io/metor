@@ -9398,11 +9398,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "metor-component-macros"
+name = "metor-component-derive-impl"
 version = "0.14.2"
 dependencies = [
  "convert_case 0.6.0",
  "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "metor-component-macros"
+version = "0.14.2"
+dependencies = [
+ "darling 0.20.11",
+ "metor-component-derive-impl",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
@@ -9523,6 +9534,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "stellarator",
+ "tar",
  "tempfile",
  "thingbuf",
  "thiserror 2.0.19",
@@ -14346,6 +14358,16 @@ dependencies = [
  "core-foundation-sys",
  "libc",
  "objc",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
 ]
 
 [[package]]
