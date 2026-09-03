@@ -123,7 +123,7 @@ after the last attached system shutdown. Attached entries can instantiate once
 and cannot fill slots. Each worker calls `pack()` in its own process, so pack
 state does not cross a process boundary.
 
-## ABI v10
+## ABI v12
 
 The current pack ABI version is 10. The host checks the version before any
 other call.

@@ -117,7 +117,6 @@ The fallible calls return an error:
 The publish calls keep the system step running:
 
 - `Output::publish`
-- `Output::publish_with`
 - `MsgOut::publish`
 
 A publish call drops the new record when the ring is full or too small. It adds to the port's drop count. Cyclic drivers turn a nonzero count into one `publish_dropped` fault line on the log after the step.
@@ -166,6 +165,15 @@ The boundary calls import and then export without yielding. Import may wake the
 task but cannot run it inline, so that export contains only work completed
 before the boundary. If a destination private or public ring is full, copying
 drops the record and logs a fault on the coordinator log rather than blocking the cycle.
+
+Two limits of this shape are worth knowing. A snapshot input is latest-wins
+per cycle, but the private ring holds `default_depth` records and `recv`
+reads them in order, so a task that falls behind sees samples up to that many
+cycles old before it reaches the live edge. And a log-delivery frame input
+that a task drains slowly fills its private ring; the coordinator drops the
+overflow for that task alone, whereas an idle reader attached directly to a
+graph ring, such as a registry tap opened after build and never drained,
+holds the producer's records for every consumer once the ring is full.
 
 ## Registry and telemetry
 
