@@ -28,18 +28,16 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod common;
-use common::{drain_msgs, locate_fixture};
+use common::{CounterParams, TickEvent, TickOut, Ticker, drain_msgs, locate_fixture};
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
+use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use metor_fsw_2::{
-    BuildSystem, CyclicSystem, Frame, Input, LogEvent, MsgIn, Out, Output, SequenceStatus,
-    SlotState, SlotStatus, StopReason, System, SystemInput, SystemOutput, SystemStatus,
+    Input, LogEvent, MsgIn, SequenceStatus, SlotState, SlotStatus, StopReason, SystemStatus,
     WorkerRunState,
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 fn main() {
     // The whole point of this harness: a spawned worker child never reaches
@@ -96,76 +94,6 @@ fn main() {
         &seq_lib,
     );
     let _ = std::fs::remove_file(&canary);
-}
-
-// ---------------------------------------------------------------------------
-// Host-side mirrors of the fixture's frames/params/messages
-// (byte-identical to `tests/fixtures/dl-fixture`).
-// ---------------------------------------------------------------------------
-
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
-#[repr(C)]
-#[metor_fsw(name = "tick_in")]
-struct TickIn {
-    #[metor_fsw(timestamp)]
-    timestamp: Timestamp,
-    value: u64,
-}
-
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
-#[repr(C)]
-#[metor_fsw(name = "tick_out")]
-struct TickOut {
-    #[metor_fsw(timestamp)]
-    timestamp: Timestamp,
-    count: u64,
-}
-
-#[derive(serde::Serialize, Default)]
-struct CounterParams {
-    start: u64,
-    scale: f64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema, Debug)]
-struct TickEvent {
-    count: u64,
-}
-
-/// Emits `tick_in.value = 1, 2, 3, ...` (see `dl_integration.rs`).
-struct Ticker {
-    n: u64,
-}
-
-#[derive(SystemInput)]
-struct TickerIn {}
-
-#[derive(SystemOutput)]
-struct TickerOut {
-    tick: Output<TickIn>,
-}
-
-impl System for Ticker {
-    type Input = TickerIn;
-    type Output = Out<TickerOut>;
-    const NAME: &'static str = "ticker";
-}
-
-impl CyclicSystem for Ticker {
-    fn execute(&mut self, now: Timestamp, _input: &mut TickerIn, output: &mut Out<TickerOut>) {
-        self.n += 1;
-        let _ = output.tick.write(&TickIn {
-            timestamp: now,
-            value: self.n,
-        });
-    }
-}
-
-impl BuildSystem for Ticker {
-    type Params = ();
-    fn new(_params: ()) -> Self {
-        Ticker { n: 0 }
-    }
 }
 
 // ---------------------------------------------------------------------------

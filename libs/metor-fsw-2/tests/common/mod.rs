@@ -1,11 +1,91 @@
-//! Shared fixture build/locate helpers for the integration tests.
+//! Shared fixture build/locate helpers and the host-side mirrors of the
+//! dl fixture's frames, for the integration tests.
+
+// Each integration target compiles this module independently and uses a
+// different subset of it.
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::process::Command;
 
-use metor_fsw_2::metor_proto::types::Msg;
+use metor_fsw_2::metor_proto::types::{Msg, Timestamp};
 use metor_fsw_2::ring::{NoWake, View};
-use metor_fsw_2::split_record;
+use metor_fsw_2::{
+    BuildSystem, CyclicSystem, Frame, Out, Output, System, SystemInput, SystemOutput, split_record,
+};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+// The dl fixture's frames, params, and message, byte for byte: that layout
+// agreement is the contract `compatible()` checks against the descriptor
+// reconstructed from the shared object.
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "tick_in")]
+pub struct TickIn {
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
+    pub value: u64,
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "tick_out")]
+pub struct TickOut {
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
+    pub count: u64,
+}
+
+#[derive(serde::Serialize, Default)]
+pub struct CounterParams {
+    pub start: u64,
+    pub scale: f64,
+}
+
+/// The shared schema name hashes to the same `PacketId` as the fixture's, so
+/// the host decodes the loaded system's records from the id alone.
+#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema, Debug)]
+pub struct TickEvent {
+    pub count: u64,
+}
+
+/// A statically linked producer feeding the loaded consumer: emits
+/// `tick_in.value = 1, 2, 3, ...`, so after `n` cycles the freshest value is `n`.
+pub struct Ticker {
+    n: u64,
+}
+
+#[derive(SystemInput)]
+pub struct TickerIn {}
+
+#[derive(SystemOutput)]
+pub struct TickerOut {
+    tick: Output<TickIn>,
+}
+
+impl System for Ticker {
+    type Input = TickerIn;
+    type Output = Out<TickerOut>;
+    const NAME: &'static str = "ticker";
+}
+
+impl CyclicSystem for Ticker {
+    fn execute(&mut self, now: Timestamp, _input: &mut TickerIn, output: &mut Out<TickerOut>) {
+        self.n += 1;
+        let _ = output.tick.write(&TickIn {
+            timestamp: now,
+            value: self.n,
+        });
+    }
+}
+
+impl BuildSystem for Ticker {
+    type Params = ();
+    fn new(_params: ()) -> Self {
+        Ticker { n: 0 }
+    }
+}
 
 /// The platform file name of a `cdylib` with library stem `stem`.
 pub fn fixture_lib_name(stem: &str) -> String {
@@ -54,9 +134,6 @@ pub fn locate_fixture(package: &str, stem: &str) -> Option<PathBuf> {
 }
 
 /// Drain a message ring, checking and decoding every record as `M`.
-// Each integration target compiles this module independently; the dl-only
-// target uses the fixture helpers but has no raw message tap.
-#[allow(dead_code)]
 pub fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(view: &mut View<NoWake>) -> Vec<M> {
     let mut out = Vec::new();
     let mut buf = Vec::new();

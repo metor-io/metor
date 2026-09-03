@@ -772,81 +772,62 @@ struct ProbeAxes {
     omega_b: Axes,
 }
 
-/// Everything registration-mode realization surfaces about one field: the
-/// component identity, its schema, its frame tag, and whether it came through
-/// a dynamic terminal.
-#[derive(Debug, PartialEq)]
-struct RealizedShape {
-    component_id: ComponentId,
-    ty: metor_proto::types::PrimType,
-    shape: Vec<usize>,
-    frame: Option<ComponentId>,
-    dynamic: bool,
-}
-
-fn realized_shapes(vt: &VTable) -> Vec<RealizedShape> {
-    vt.realize_fields(None)
-        .map(|f| {
-            let f = f.expect("announce vtable realizes");
-            RealizedShape {
-                component_id: f.component_id,
-                ty: f.ty,
-                shape: f.shape.to_vec(),
-                frame: f.frame,
-                dynamic: f.dynamic,
-            }
-        })
-        .collect()
-}
-
-/// The resolved name strings of every dynamic terminal (`Op::List`/`Op::Map`),
-/// in op order — the strings the prefix rewrite must carry the instance name
-/// onto for top-level dynamics and leave element-relative for nested ones.
-fn dynamic_terminal_names(vt: &VTable) -> Vec<String> {
-    use metor_proto::vtable::Op;
-    vt.ops
-        .iter()
-        .filter_map(|op| {
-            let name = match op {
-                Op::List { name, .. } | Op::Map { name, .. } => *name,
-                _ => return None,
-            };
-            let Ok(Op::Data { offset, len }) = vt.get_op(name) else {
-                return None;
-            };
-            let bytes = &vt.data.as_slice()[offset.to_index()..offset.to_index() + *len as usize];
-            Some(String::from_utf8(bytes.to_vec()).expect("dynamic name is UTF-8"))
-        })
-        .collect()
-}
-
 /// Assert the data announce realizes identically to the static announce of
-/// `F`: the full realized field set, the metadata vector, and the resolved
-/// dynamic path strings.
+/// `F`: the realized field set, the metadata vector, and the resolved dynamic
+/// path strings (the instance prefix must reach top-level dynamic members, so
+/// two instances of one system never collide on their dynamic paths).
 fn assert_announce_eq<F: Frame>(prefix: &str) {
+    use metor_proto::vtable::Op;
+    let realized = |vt: &VTable| {
+        vt.realize_fields(None)
+            .map(|f| {
+                let f = f.expect("announce vtable realizes");
+                (f.component_id, f.ty, f.shape.to_vec(), f.frame, f.dynamic)
+            })
+            .collect::<Vec<_>>()
+    };
+    let dynamic_names = |vt: &VTable| {
+        vt.ops
+            .iter()
+            .filter_map(|op| {
+                let name = match op {
+                    Op::List { name, .. } | Op::Map { name, .. } => *name,
+                    _ => return None,
+                };
+                let Ok(Op::Data { offset, len }) = vt.get_op(name) else {
+                    return None;
+                };
+                let bytes =
+                    &vt.data.as_slice()[offset.to_index()..offset.to_index() + *len as usize];
+                Some(String::from_utf8(bytes.to_vec()).expect("dynamic name is UTF-8"))
+            })
+            .collect::<Vec<_>>()
+    };
     let (svt, smeta) = crate::descriptor::announce_of::<F>(prefix);
     let (dvt, dmeta) = data_announce::<F>(prefix);
     assert_eq!(
-        realized_shapes(&svt),
-        realized_shapes(&dvt),
+        realized(&svt),
+        realized(&dvt),
         "realized field sets match for prefix {prefix:?}"
     );
     assert_eq!(smeta, dmeta, "metadata matches for prefix {prefix:?}");
     assert_eq!(
-        dynamic_terminal_names(&svt),
-        dynamic_terminal_names(&dvt),
+        dynamic_names(&svt),
+        dynamic_names(&dvt),
         "dynamic paths match for prefix {prefix:?}"
     );
 }
 
-/// For a frame of plain scalar fields, the metadata-driven leaf-id rewrite the
-/// data path performs realizes identically to the static announce.
+/// The metadata-driven rewrite the data path performs realizes identically
+/// to the static announce: plain scalar frames, an element-named vector, and
+/// a frame with dynamic members.
 #[test]
-fn announce_data_path_matches_static_scalar() {
+fn announce_data_path_matches_static() {
     for prefix in ["inst", "a.b"] {
         assert_announce_eq::<TickIn>(prefix);
         assert_announce_eq::<TickOut>(prefix);
         assert_announce_eq::<ProbeAxes>(prefix);
+        assert_announce_eq::<ProbeDyn>(prefix);
     }
 }
 
@@ -862,18 +843,6 @@ fn announce_preserves_element_names() {
         .find(|m| m.name == "inst.probe_axes.omega_b")
         .expect("the axes component is announced");
     assert_eq!(m.element_names(), "x,y,z");
-}
-
-/// Frames with dynamic members (`FrameList`/`FrameMap`) realize identically
-/// too: the prefix rewrite carries the instance prefix onto the top-level
-/// dynamic path strings, so `inst.probe_dyn.<member>.<key>` ids match the
-/// static path and two instances of one system never collide on their
-/// dynamic paths.
-#[test]
-fn announce_data_path_matches_static_dynamic() {
-    for prefix in ["inst", "a.b"] {
-        assert_announce_eq::<ProbeDyn>(prefix);
-    }
 }
 
 // ---------------------------------------------------------------------------

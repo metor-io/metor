@@ -734,8 +734,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    use metor_proto::types::{IntoLenPacket as _, LenPacket};
-    use stellarator::io::{AsyncRead as _, AsyncWrite as _};
+    use metor_proto::types::LenPacket;
+    use stellarator::io::AsyncRead as _;
 
     use super::*;
 

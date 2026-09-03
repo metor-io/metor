@@ -9589,14 +9589,6 @@ name = "metor-fsw-2-seq-fixture"
 version = "0.14.2"
 dependencies = [
  "metor-fsw-2-core",
- "zerocopy",
-]
-
-[[package]]
-name = "metor-fsw-2-seq-param-fixture"
-version = "0.14.2"
-dependencies = [
- "metor-fsw-2-core",
  "postcard-schema",
  "serde",
  "zerocopy",
