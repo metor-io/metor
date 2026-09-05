@@ -22,7 +22,8 @@ pub(crate) fn scale_seeds_for_traces(db: &DB, traces: &[Trace], cx: &App) -> Vec
             let at = ElementRef::new(trace.component_id, trace.element_index);
             let (min, max) = super::meter::suggested_scale(at, cx);
             ScaleSeed {
-                component: component_meta(db, trace.component_id).name.to_string(),
+                component: crate::dynamic::expressions::binding_text(db, trace.component_id)
+                    .unwrap_or_else(|| component_meta(db, trace.component_id).name.to_string()),
                 element: trace.element_index,
                 label: trace.label.to_string(),
                 min,

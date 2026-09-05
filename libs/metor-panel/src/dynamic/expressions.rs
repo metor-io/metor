@@ -126,7 +126,7 @@ impl Expressions {
         self.len() == 0
     }
 
-    /// Take ownership of a running expression, keyed by what it publishes.
+    /// Register a weak lookup; the caller retains ownership.
     pub fn insert(&mut self, expression: Expression) {
         self.live
             .retain(|_, expression| expression.strong_count() > 0);
@@ -333,8 +333,7 @@ pub fn resolve(text: &str, db: &Arc<DB>, cx: &mut App) -> Result<Expression, Exp
         .ok_or_else(|| ExprError::Unbound("the node worker is gone".into()))?
         .map_err(|e| ExprError::Unbound(e.to_string()))?;
 
-    // The registry keeps it running. Nothing else will: the caller is handed
-    // a component id, and an id cannot own anything.
+    // Views own the returned handle; the registry only supports discovery.
     cx.global_mut::<Expressions>().insert(built.clone());
     Ok(built)
 }

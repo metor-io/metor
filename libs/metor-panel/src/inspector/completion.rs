@@ -81,7 +81,7 @@ fn rank_by(
 
     let items = &mut completions.items;
     if unfiltered {
-        items.sort_by(|a, b| tier(a.kind).cmp(&tier(b.kind)));
+        items.sort_by_key(|a| tier(a.kind));
         return;
     }
 

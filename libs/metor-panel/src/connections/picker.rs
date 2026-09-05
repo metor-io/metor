@@ -255,10 +255,7 @@ impl ConnectionPicker {
 
     fn load_layout(&mut self, layout: String, window: &mut Window, cx: &mut Context<Self>) {
         let db = self.store.read(cx).db().clone();
-        if crate::workspace::restore_workspace(&layout, window, cx, db) {
-            self.store
-                .update(cx, |store, _| store.note_loaded_layout(layout));
-        }
+        crate::workspace::restore_workspace(&layout, window, cx, db);
         self.dismiss(window, cx);
     }
 

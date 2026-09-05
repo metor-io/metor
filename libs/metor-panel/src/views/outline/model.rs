@@ -642,6 +642,7 @@ mod tests {
 
     /// Every knob of a [`Layout`] with a default, so a test names only
     /// what it exercises.
+    #[derive(Default)]
     struct Knobs<'a> {
         disclosure: Disclosure,
         pivoted: HashSet<SharedString>,
@@ -651,21 +652,6 @@ mod tests {
         root: &'a str,
         descending: bool,
         query: Query,
-    }
-
-    impl Default for Knobs<'_> {
-        fn default() -> Self {
-            Self {
-                disclosure: Disclosure::default(),
-                pivoted: HashSet::new(),
-                layouts: HashMap::new(),
-                types: Vec::new(),
-                focus: None,
-                root: "",
-                descending: false,
-                query: Query::default(),
-            }
-        }
     }
 
     impl Knobs<'_> {
@@ -752,8 +738,10 @@ mod tests {
 
     #[test]
     fn descending_reverses_siblings_at_every_level_and_instances() {
-        let mut knobs = Knobs::default();
-        knobs.descending = true;
+        let mut knobs = Knobs {
+            descending: true,
+            ..Default::default()
+        };
         knobs.disclosure.set_expanded(&"sat.imu".into(), 1, true);
         let rows = knobs.rows(&tree());
         assert_eq!(
@@ -770,8 +758,10 @@ mod tests {
 
     #[test]
     fn a_root_lists_its_children_at_depth_zero() {
-        let mut knobs = Knobs::default();
-        knobs.root = "sat.imu";
+        let mut knobs = Knobs {
+            root: "sat.imu",
+            ..Default::default()
+        };
         let rows = knobs.rows(&tree());
         assert_eq!(names(&rows), ["sat.imu.gyro", "sat.imu.temp"]);
         assert!(rows.iter().all(|r| r.depth == 0));
@@ -786,8 +776,10 @@ mod tests {
 
     #[test]
     fn an_unresolved_root_shows_nothing_until_it_appears() {
-        let mut knobs = Knobs::default();
-        knobs.root = "sat.gps";
+        let knobs = Knobs {
+            root: "sat.gps",
+            ..Default::default()
+        };
         assert!(knobs.rows(&tree()).is_empty());
         assert!(root_node(&tree(), "sat.gps").is_none());
         assert!(root_node(&tree(), "").is_some());
@@ -845,8 +837,10 @@ mod tests {
 
     #[test]
     fn a_pivoted_branch_lists_instances_then_leaves() {
-        let mut knobs = Knobs::default();
-        knobs.pivoted = pivoted("wheels");
+        let knobs = Knobs {
+            pivoted: pivoted("wheels"),
+            ..Default::default()
+        };
         let rows = knobs.rows(&wheels());
         assert_eq!(
             names(&rows),
@@ -859,8 +853,10 @@ mod tests {
 
     #[test]
     fn a_folded_pivot_hides_its_grid() {
-        let mut knobs = Knobs::default();
-        knobs.pivoted = pivoted("wheels");
+        let mut knobs = Knobs {
+            pivoted: pivoted("wheels"),
+            ..Default::default()
+        };
         knobs.disclosure.set_expanded(&"wheels".into(), 0, false);
         let rows = knobs.rows(&wheels());
         assert_eq!(names(&rows), ["wheels"]);
@@ -877,8 +873,10 @@ mod tests {
 
     #[test]
     fn layout_order_leads_and_new_fields_follow_naturally() {
-        let mut knobs = Knobs::default();
-        knobs.pivoted = pivoted("wheels");
+        let mut knobs = Knobs {
+            pivoted: pivoted("wheels"),
+            ..Default::default()
+        };
         knobs.layouts.insert(
             "wheels".into(),
             PivotLayout {
@@ -894,8 +892,10 @@ mod tests {
 
     #[test]
     fn hidden_fields_leave_the_grid() {
-        let mut knobs = Knobs::default();
-        knobs.pivoted = pivoted("wheels");
+        let mut knobs = Knobs {
+            pivoted: pivoted("wheels"),
+            ..Default::default()
+        };
         knobs.layouts.insert(
             "wheels".into(),
             PivotLayout {
@@ -911,8 +911,10 @@ mod tests {
 
     #[test]
     fn row_order_leads_and_the_rest_stay_sorted() {
-        let mut knobs = Knobs::default();
-        knobs.pivoted = pivoted("wheels");
+        let mut knobs = Knobs {
+            pivoted: pivoted("wheels"),
+            ..Default::default()
+        };
         knobs.layouts.insert(
             "wheels".into(),
             PivotLayout {
@@ -980,8 +982,10 @@ mod tests {
     #[test]
     fn types_lead_the_outline_and_label_instances_by_path() {
         let tree = duts();
-        let mut knobs = Knobs::default();
-        knobs.types = vec![psu_type(&tree)];
+        let knobs = Knobs {
+            types: vec![psu_type(&tree)],
+            ..Default::default()
+        };
         let rows = knobs.rows(&tree);
         assert_eq!(names(&rows)[..3], ["type:psu", "dut1.psu", "dut2.bay.psu"]);
         assert_eq!(names(&rows)[3], "dut1");
@@ -995,8 +999,10 @@ mod tests {
     #[test]
     fn focus_shows_only_that_type_open() {
         let tree = duts();
-        let mut knobs = Knobs::default();
-        knobs.types = vec![psu_type(&tree)];
+        let mut knobs = Knobs {
+            types: vec![psu_type(&tree)],
+            ..Default::default()
+        };
         knobs.disclosure.set_expanded(&type_key("psu"), 0, false);
         knobs.focus = Some("psu".into());
         let rows = knobs.rows(&tree);
@@ -1006,9 +1012,11 @@ mod tests {
     #[test]
     fn a_query_narrows_type_instances_by_path() {
         let tree = duts();
-        let mut knobs = Knobs::default();
-        knobs.types = vec![psu_type(&tree)];
-        knobs.query = Query::parse("bay");
+        let knobs = Knobs {
+            types: vec![psu_type(&tree)],
+            query: Query::parse("bay"),
+            ..Default::default()
+        };
         let rows = knobs.rows(&tree);
         assert_eq!(names(&rows)[..2], ["type:psu", "dut2.bay.psu"]);
     }
@@ -1016,9 +1024,11 @@ mod tests {
     #[test]
     fn types_under_a_root_keep_only_instances_beneath_it() {
         let tree = duts();
-        let mut knobs = Knobs::default();
-        knobs.types = vec![psu_type(&tree)];
-        knobs.root = "dut2";
+        let knobs = Knobs {
+            types: vec![psu_type(&tree)],
+            root: "dut2",
+            ..Default::default()
+        };
         let rows = knobs.rows(&tree);
         assert_eq!(
             names(&rows),

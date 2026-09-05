@@ -138,20 +138,13 @@ pub fn replay(
     match desc.rate {
         None => {
             let driven = driven_port.expect("an input fires an unclocked system");
-            loop {
-                // The oldest waiting sample fires or holds. Among equals a
-                // held port goes first, so a same-instant input is visible to
-                // the evaluation — the replay's reading of "drain after the
-                // driving sample arrives".
-                let Some(next) = cursors
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| c.peek().map(|ts| (ts, i == driven, i)))
-                    .min()
-                else {
-                    break;
-                };
-                let (ts, _, port) = next;
+            // At equal timestamps, update held ports before firing the driver.
+            while let Some((ts, _, port)) = cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.peek().map(|ts| (ts, i == driven, i)))
+                .min()
+            {
                 stats.read += 1;
                 if port != driven {
                     held.hold(port, ts, cursors[port].current());

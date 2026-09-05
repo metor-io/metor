@@ -331,7 +331,7 @@ impl Inspector {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by_key(|a| std::cmp::Reverse(a.1));
         scored.into_iter().map(|(i, _)| i).collect()
     }
 
@@ -507,10 +507,8 @@ impl Inspector {
                     }
                     cx.notify();
                 }
-                "backspace" => {
-                    if self.pages.len() > 1 {
-                        self.pop_page(cx);
-                    }
+                "backspace" if self.pages.len() > 1 => {
+                    self.pop_page(cx);
                 }
                 _ => {}
             }

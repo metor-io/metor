@@ -84,9 +84,7 @@ impl Default for MeterConfig {
 /// Single-element bar meter.
 #[derive(facet::Facet)]
 pub struct Meter {
-    /// What this meter reads. Editable: picking another component or element
-    /// in the inspector rebinds the stream on the next frame. Declared first
-    /// so the binding heads the inspector page — fields are walked in order.
+    /// Component and element edited by the inspector. Binding fields lead the page.
     pub component_id: ComponentId,
     pub element: usize,
     pub label: SharedString,
@@ -192,7 +190,7 @@ impl Meter {
     /// the old one, and carrying them across would leave a bar labelled
     /// `gyro_b.x` reading wheel momentum. A value from the previous binding
     /// is dropped rather than left on screen under the new scale.
-    fn rebind(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
         let want = self.at();
         if !binding::rebound(want, &mut self.bound) {
             return;

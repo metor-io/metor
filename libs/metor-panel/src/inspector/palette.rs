@@ -122,7 +122,7 @@ impl ItemRegistry {
         for (_, rows) in groups.iter_mut() {
             rows.sort_by_key(|r| (item_rank(r.label()), r.label().to_lowercase()));
         }
-        groups.sort_by(|(a, _), (b, _)| category_rank(a).cmp(&category_rank(b)));
+        groups.sort_by_key(|(category, _)| category_rank(category));
 
         let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
         for (category, group) in groups {

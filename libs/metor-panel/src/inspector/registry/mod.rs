@@ -135,6 +135,18 @@ impl InspectorRegistry {
     /// call directly when registering a type that has no field widgets or
     /// list handlers but still needs to be inspected.
     pub fn register_inspectable<T: Facet<'static> + 'static>(&mut self) {
+        if !self.entity_adapters.contains_key(&TypeId::of::<T>()) {
+            self.register_inspectable_with_edit::<T>(|_, _| {});
+        }
+    }
+
+    /// Register reflection and a synchronous hook for edits that update resources.
+    /// The hook runs before the editor releases temporary handles, such as a
+    /// newly compiled expression being assigned to a component field.
+    pub fn register_inspectable_with_edit<T: Facet<'static> + 'static>(
+        &mut self,
+        on_edit: impl Fn(&mut T, &mut gpui::Context<T>) + 'static,
+    ) {
         let peek: Arc<dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>)> =
             Arc::new(|any_entity, cx, visit| {
                 let Ok(entity) = any_entity.clone().downcast::<T>() else {
@@ -145,12 +157,13 @@ impl InspectorRegistry {
                 visit(&peek);
             });
         let poke: Arc<dyn for<'v> Fn(&AnyEntity, &mut App, &mut PokeAdapterVisitor<'v>)> =
-            Arc::new(|any_entity, cx, visit| {
+            Arc::new(move |any_entity, cx, visit| {
                 let Ok(entity) = any_entity.clone().downcast::<T>() else {
                     return;
                 };
                 entity.update(cx, |target, cx| {
                     visit(Poke::new(target));
+                    on_edit(target, cx);
                     cx.notify();
                 });
             });

@@ -231,7 +231,7 @@ impl Map {
     }
 
     /// Restart the streams when the inspector has re-pointed the binding.
-    fn rebind(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
         let want = (self.component_id, self.lat_element, self.lon_element);
         if self.bound == Some(want) {
             return;
@@ -502,7 +502,7 @@ fn resolve_tiles(
         for _ in 0..FALLBACK_DEPTH {
             let Some(up) = ancestor.parent() else { break };
             ancestor = up;
-            let Some(image) = store.ready(ancestor) else {
+            let Some(image) = store.ready(ancestor, source) else {
                 continue;
             };
             let (fb_origin, fb_size) = fallback_rect(id, ancestor, origin, size);

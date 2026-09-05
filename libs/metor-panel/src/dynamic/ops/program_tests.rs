@@ -627,8 +627,10 @@ async fn a_scalar_broadcasts_over_a_vector_component() {
         if let Some(grant) = reader.try_next() {
             let (_, value) = grant.sample_at(grant.sample_count() - 1);
             let got: Vec<f64> = value
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect();
             assert_eq!(got, vec![2.0, 3.0, 4.0]);
             return;

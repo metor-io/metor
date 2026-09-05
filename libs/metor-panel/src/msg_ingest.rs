@@ -4,13 +4,14 @@
 //! clear for a raise the store never saw is dropped, as is an event for an
 //! undeclared channel. Replaying each log to completion in turn would misorder any
 //! history that interleaves across logs (a clear folding before its raise), so the
-//! persisted history replays as one timestamp-sorted merge across every source;
-//! only the live tail runs per log.
+//! history and each live batch merge in timestamp order across every source.
 
 use std::cmp::Ordering;
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
+use std::task::Poll;
 
-use gpui::{AsyncApp, Task, WeakEntity};
+use gpui::{AsyncApp, WeakEntity};
 use metor_db::DB;
 use metor_db::disruptor::Reader;
 use metor_db::msg_log::read_msg;
@@ -56,7 +57,7 @@ impl<S> IngestSource<S> {
 }
 
 /// Backfill the persisted history of every source as one timestamp-sorted merge,
-/// then live-tail each source's WAL into the store entity `this`. The store is
+/// then merge available WAL messages into the store entity `this`. The store is
 /// notified once after the backfill and after each applied live batch. The loop
 /// ends when the entity is dropped.
 ///
@@ -70,7 +71,7 @@ pub(crate) async fn ingest_all<S: 'static>(
     cx: &mut AsyncApp,
 ) {
     let mut kept: Vec<IngestSource<S>> = Vec::new();
-    let mut tails: Vec<(Reader, Timestamp, Vec<Vec<u8>>)> = Vec::new();
+    let mut tails = Vec::new();
     let mut entries: Vec<(Timestamp, usize, Vec<u8>)> = Vec::new();
 
     for source in sources {
@@ -114,34 +115,109 @@ pub(crate) async fn ingest_all<S: 'static>(
         let idx = kept.len();
         entries.extend(backfill.into_iter().map(|(ts, bytes)| (ts, idx, bytes)));
         kept.push(source);
-        tails.push((reader, backfill_max, boundary));
+        tails.push(LiveSource {
+            reader,
+            backfill_max,
+            boundary,
+        });
     }
 
-    let kept_ref = &mut kept;
-    let applied = this.update(cx, move |store, cx| {
-        apply_backfill(store, kept_ref, entries);
-        cx.notify();
-    });
-    if applied.is_err() {
-        return;
-    }
-
-    let tasks: Vec<Task<()>> = kept
-        .into_iter()
-        .zip(tails)
-        .map(|(source, (reader, backfill_max, boundary))| {
-            let this = this.clone();
-            cx.spawn(async move |cx| {
-                tail_source(source, reader, backfill_max, boundary, this, cx).await
-            })
-        })
-        .collect();
-    for task in tasks {
-        task.await;
+    // Include writes made while snapshots were being read before folding either
+    // history or live data. The DB lock makes draining a coherent ingress cut.
+    drain_sources(&db, &mut tails, &mut entries);
+    loop {
+        if !entries.is_empty() {
+            let batch = std::mem::take(&mut entries);
+            if this
+                .update(cx, |store, cx| {
+                    apply_backfill(store, &mut kept, batch);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+        if tails.is_empty() {
+            return;
+        }
+        entries = wait_for_source(&mut tails).await;
+        drain_sources(&db, &mut tails, &mut entries);
     }
 }
 
-/// Fold a multi-log backfill into the store in timestamp order. Entries are
+struct LiveSource {
+    reader: Reader,
+    backfill_max: Timestamp,
+    boundary: Vec<Vec<u8>>,
+}
+
+type Entry = (Timestamp, usize, Vec<u8>);
+
+fn collect_messages(
+    index: usize,
+    mut buf: &[u8],
+    backfill_max: Timestamp,
+    boundary: &mut Vec<Vec<u8>>,
+    entries: &mut Vec<Entry>,
+) {
+    while let Some((rest, ts, msg)) = read_msg(buf) {
+        buf = rest;
+        if !replays_snapshot(ts, msg, backfill_max, boundary) {
+            entries.push((ts, index, msg.to_vec()));
+        }
+    }
+}
+
+fn drain_sources(db: &DB, tails: &mut [LiveSource], entries: &mut Vec<Entry>) {
+    // DB::push_msg holds the state lock. Excluding writers across the complete
+    // scan prevents a later log's effect being read before an earlier log's cause.
+    db.with_state_mut(|_| {
+        for (index, source) in tails.iter_mut().enumerate() {
+            while let Some(grant) = source.reader.try_next() {
+                collect_messages(
+                    index,
+                    &grant,
+                    source.backfill_max,
+                    &mut source.boundary,
+                    entries,
+                );
+            }
+        }
+    });
+}
+
+async fn wait_for_source(tails: &mut [LiveSource]) -> Vec<Entry> {
+    let mut waits: Vec<_> = tails
+        .iter_mut()
+        .enumerate()
+        .map(|(index, source)| {
+            Box::pin(async move {
+                let grant = source.reader.next().await;
+                let mut entries = Vec::new();
+                collect_messages(
+                    index,
+                    &grant,
+                    source.backfill_max,
+                    &mut source.boundary,
+                    &mut entries,
+                );
+                entries
+            })
+        })
+        .collect();
+    poll_fn(|cx| {
+        for wait in &mut waits {
+            if let Poll::Ready(entries) = wait.as_mut().poll(cx) {
+                return Poll::Ready(entries);
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Fold a history or live batch into the store in timestamp order. Entries are
 /// `(timestamp, source index, payload)`; equal timestamps fold in source
 /// declaration order, so callers list sources cause before effect (defs before
 /// raises, the registry before its events).
@@ -153,41 +229,6 @@ pub(crate) fn apply_backfill<S>(
     entries.sort_by_key(|&(ts, idx, _)| (ts, idx));
     for (ts, idx, bytes) in entries {
         (sources[idx].apply)(store, ts, &bytes);
-    }
-}
-
-async fn tail_source<S: 'static>(
-    mut source: IngestSource<S>,
-    mut reader: Reader,
-    backfill_max: Timestamp,
-    mut boundary: Vec<Vec<u8>>,
-    this: WeakEntity<S>,
-    cx: &mut AsyncApp,
-) {
-    loop {
-        let grant = reader.next().await;
-        let mut msgs: Vec<(Timestamp, &[u8])> = Vec::new();
-        let mut buf: &[u8] = &grant;
-        while let Some((rest, ts, msg)) = read_msg(buf) {
-            buf = rest;
-            if !replays_snapshot(ts, msg, backfill_max, &mut boundary) {
-                msgs.push((ts, msg));
-            }
-        }
-        if msgs.is_empty() {
-            continue;
-        }
-
-        let apply = &mut source.apply;
-        let applied = this.update(cx, move |store, cx| {
-            for (ts, msg) in msgs {
-                apply(store, ts, msg);
-            }
-            cx.notify();
-        });
-        if applied.is_err() {
-            break;
-        }
     }
 }
 
@@ -214,5 +255,51 @@ fn replays_snapshot(
             }
             None => false,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_overlap_absorbs_only_persisted_boundary_occurrences() {
+        let mut boundary = vec![b"a".to_vec(), b"a".to_vec()];
+        assert!(replays_snapshot(
+            Timestamp(9),
+            b"old",
+            Timestamp(10),
+            &mut boundary
+        ));
+        assert!(replays_snapshot(
+            Timestamp(10),
+            b"a",
+            Timestamp(10),
+            &mut boundary
+        ));
+        assert!(!replays_snapshot(
+            Timestamp(10),
+            b"b",
+            Timestamp(10),
+            &mut boundary
+        ));
+        assert!(replays_snapshot(
+            Timestamp(10),
+            b"a",
+            Timestamp(10),
+            &mut boundary
+        ));
+        assert!(!replays_snapshot(
+            Timestamp(10),
+            b"a",
+            Timestamp(10),
+            &mut boundary
+        ));
+        assert!(!replays_snapshot(
+            Timestamp(11),
+            b"new",
+            Timestamp(10),
+            &mut boundary
+        ));
     }
 }

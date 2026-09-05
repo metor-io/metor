@@ -146,7 +146,7 @@ impl VectorMarker {
     /// Restart the stream when the inspector has re-pointed the marker.
     /// Driven from the ball's render, since a marker is data rather than a
     /// view and never gets a render pass of its own.
-    fn rebind(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
         if self.bound == Some(self.component_id) {
             return;
         }
@@ -269,7 +269,7 @@ impl AttitudeIndicator {
 
     /// Restart the quaternion stream when the inspector has re-pointed the
     /// ball, and let each marker do the same for itself.
-    fn rebind(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
         for marker in self.vectors.clone() {
             marker.update(cx, |m, cx| m.rebind(cx));
         }

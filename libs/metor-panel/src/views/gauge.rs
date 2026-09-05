@@ -191,7 +191,7 @@ impl Gauge {
     /// Restart the stream when the inspector has re-pointed the dial. Label
     /// and unit are re-derived: they described the old component, and a dial
     /// labelled `ω x` reading wheel momentum is worse than no label.
-    fn rebind(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
         let want = self.at();
         if !binding::rebound(want, &mut self.bound) {
             return;

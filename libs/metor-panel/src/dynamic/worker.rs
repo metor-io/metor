@@ -1,23 +1,6 @@
-//! Long-lived stellarator thread that runs every dynamic-node producer task.
-//!
-//! Why this exists: dynamic node constructors (`ops::clock::fixed_rate`,
-//! `ops::generators::waveform`, `ops::persist::persist`, ...) all call
-//! `stellarator::spawn` to launch their producer tasks. `stellarator::spawn`
-//! reads a thread-local `Executor`. The panel's main thread runs gpui's
-//! event loop and never installs a stellarator runtime, so spawned tasks
-//! land on the default empty executor and are never polled. Clocks never
-//! tick, generators never produce, the `persist` task never copies samples
-//! into the DB component WAL — so no data shows up downstream.
-//!
-//! `DynamicWorker` owns its own OS thread that runs `stellarator::run(...)`.
-//! Build closures are sent over a channel; the worker thread executes them
-//! locally so any `stellarator::spawn` calls inside the constructor target
-//! its own scheduler. The producer tasks then live and tick on that thread.
-//!
-//! Build is synchronous from the caller's perspective (gpui main) — we
-//! recv-block on the reply. Builds are cheap (allocate ring + spawn task)
-//! so the worker turns around in well under a frame even with the 2 ms
-//! poll interval, and rebuilds are debounced 200 ms upstream.
+//! Runs dynamic-node constructors and producers on a dedicated stellarator
+//! executor. Builds use a synchronous request/reply channel; node disposal
+//! runs on the same thread to keep timer cancellation on its owning executor.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,9 +72,7 @@ impl WorkerHandle {
 
 pub struct DynamicWorker {
     handle: WorkerHandle,
-    /// Hold the worker thread handle so it lives as long as the global.
-    /// gpui doesn't surface a clean app-shutdown hook so we don't bother
-    /// joining; the OS reaps the thread on process exit.
+    /// Detached on drop; producers run until process exit.
     _thread: stellarator::struc_con::Thread<Option<()>>,
 }
 

@@ -471,3 +471,54 @@ fn backfill_breaks_equal_timestamp_ties_by_source_index() {
 
     assert!(state.active_sorted().is_empty());
 }
+
+#[gpui::test]
+fn live_ingestion_orders_ack_before_a_buffered_escalation(cx: &mut gpui::TestAppContext) {
+    use std::sync::Arc;
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
+    cx.update(|cx| super::AlarmStore::init(db.clone(), cx));
+    cx.run_until_parked();
+    // All three events arrive before any UI reader gets another poll.
+    db.push_msg(
+        ts(10),
+        AlarmRaised::ID,
+        &postcard::to_allocvec(&raised(1, Severity::Warning)).unwrap(),
+    )
+    .unwrap();
+    db.push_msg(
+        ts(20),
+        AlarmAck::ID,
+        &postcard::to_allocvec(&AlarmAck {
+            def_id: "A".into(),
+            occurrence: 1,
+            operator: "test".into(),
+            note: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    db.push_msg(
+        ts(30),
+        AlarmRaised::ID,
+        &postcard::to_allocvec(&raised(1, Severity::Critical)).unwrap(),
+    )
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let store = super::try_global(cx).unwrap();
+        let state = store.read(cx).state();
+        let pending = state.pending_sorted();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].state, TileState::AlarmUnacked);
+        assert_eq!(pending[0].alarm.severity, Severity::Critical);
+        assert_eq!(
+            state
+                .history()
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            vec![ts(10), ts(20), ts(30)]
+        );
+    });
+}

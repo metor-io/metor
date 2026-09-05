@@ -1564,11 +1564,7 @@ fn select_minmax_indices(
 ) {
     out.clear();
     let elem_size = schema.size();
-    let max_sample = if elem_size == 0 {
-        0
-    } else {
-        data.len() / elem_size
-    };
+    let max_sample = data.len().checked_div(elem_size).unwrap_or(0);
     if max_sample == 0 {
         return;
     }
@@ -1806,11 +1802,7 @@ fn convert_element_strided(
     out: &mut Vec<f32>,
 ) {
     let elem_size = schema.size();
-    let max_sample = if elem_size == 0 {
-        0
-    } else {
-        full_data.len() / elem_size
-    };
+    let max_sample = full_data.len().checked_div(elem_size).unwrap_or(0);
     out.clear();
     out.reserve(to - from);
 

@@ -117,6 +117,18 @@ fn channel_summary(db: &DB, component: ComponentId, element: usize) -> SharedStr
 
 impl InspectorRegistry {
     pub(super) fn register_defaults(&mut self, db: Arc<DB>) {
+        self.register_inspectable_with_edit::<crate::views::Meter>(crate::views::Meter::rebind);
+        self.register_inspectable_with_edit::<crate::views::Gauge>(crate::views::Gauge::rebind);
+        self.register_inspectable_with_edit::<crate::views::Map>(crate::views::Map::rebind);
+        self.register_inspectable_with_edit::<crate::views::StateChip>(
+            crate::views::StateChip::rebind,
+        );
+        self.register_inspectable_with_edit::<crate::views::AttitudeIndicator>(
+            crate::views::AttitudeIndicator::rebind,
+        );
+        self.register_inspectable_with_edit::<crate::views::VectorMarker>(
+            crate::views::VectorMarker::rebind,
+        );
         self.register_hsla();
         self.register_shared_string();
         self.register_component_id(db.clone());

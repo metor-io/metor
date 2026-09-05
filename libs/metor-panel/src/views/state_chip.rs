@@ -174,7 +174,7 @@ impl StateChip {
     /// space, not something derived from the component, and rebinding
     /// between two components that share an encoding (a commanded mode and
     /// the reported one) is the reason to edit the binding at all.
-    fn rebind(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
         if self.bound == Some(self.component_id) {
             return;
         }

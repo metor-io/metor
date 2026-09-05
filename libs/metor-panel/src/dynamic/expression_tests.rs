@@ -780,8 +780,10 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
         .expect("the bound component receives data");
     let values: Vec<f64> = latest
         .data()
-        .chunks_exact(8)
-        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| f64::from_le_bytes(*c))
         .collect();
     assert_eq!(values, vec![2.0, 4.0, 6.0]);
 }
@@ -1331,4 +1333,69 @@ fn wait_for_latest(component: &metor_db::Component, at: i64) {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     panic!("the component never persisted its sample at {at}");
+}
+
+#[gpui::test]
+fn an_inspector_rebind_retains_the_expression_before_the_next_render(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::inspector::registry::InspectorRegistry;
+    use crate::inspector::rows::RowAction;
+    use crate::views::{Meter, MeterConfig};
+    use gpui::AppContext;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let published = expression_target(&db, "rpm * 2.0", ComponentId::new("rpm"));
+    let window = cx.add_empty_window();
+    let meter = window.update(|window, cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+        InspectorRegistry::init(db.clone(), cx);
+        let meter = cx.new(|cx| {
+            Meter::from_config(
+                &MeterConfig {
+                    component: "rpm".into(),
+                    ..Default::default()
+                },
+                db.clone(),
+                cx,
+            )
+        });
+        let mut rows = crate::inspector::reflect::rows_for_entity(&meter, &db, cx);
+        let RowAction::Cascade(picker) = rows[0].activate(window, cx) else {
+            panic!("component picker")
+        };
+        let mut candidates = picker[0].query_rows("=rpm * 2.0", 10, cx).unwrap();
+        let compute = candidates
+            .iter_mut()
+            .find(|r| r.label() == "compute")
+            .unwrap();
+        assert!(matches!(compute.activate(window, cx), RowAction::Dismiss));
+        assert_eq!(meter.read(cx).component_id, published);
+        assert!(
+            expressions::running(published, cx).is_some(),
+            "the picker released its handle before rendering"
+        );
+        meter
+    });
+    assert_eq!(
+        feed_and_await(&db, ComponentId::new("rpm"), published, 100, 7.0),
+        14.0
+    );
+    window.update(|_, cx| {
+        crate::inspector::reflect::set_field(
+            &meter.clone().into_any(),
+            0,
+            ComponentId::new("rpm"),
+            cx,
+        );
+        assert!(
+            expressions::running(published, cx).is_none(),
+            "rebinding releases the computation"
+        );
+    });
 }

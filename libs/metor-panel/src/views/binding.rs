@@ -1,29 +1,9 @@
-//! How instrument views attach to a component.
-//!
-//! Plots own their sampling; the small single-value views — traffic lights,
-//! meters, gauges — all need the same three things instead, and that overlap
-//! is what lives here. A view binds to *one element of one
-//! component* ([`ElementRef`]), drains it with a task that outlives nothing
-//! but the view itself, and reads back whatever the control system declared
-//! about it.
-//!
-//! Three details are easy to get wrong alone and are therefore centralized:
-//!
-//! - **Seeding.** A fresh WAL reader only sees samples committed from now on.
-//!   Without an explicit read of the last committed value, a meter placed on a
-//!   slow component sits blank until the next sample — so the spawn helpers
-//!   paint the seed before entering their loop.
-//! - **Late binding.** A view can be placed, or restored from a layout, before
-//!   its producer registers. [`spawn_meta_resolver`] waits on the DB's vtable
-//!   generation and re-reads metadata once the schema appears.
-//! - **Limits.** Warn/critical thresholds are already declared by the control
-//!   system's alarm definitions, so an instrument should never be configured
-//!   with them by hand. [`limit_marks`] and [`alarm_tint`] read the same store
-//!   the plots read.
+//! Instrument bindings: seed the last committed value, stream updates, and
+//! resolve metadata for late-registering components. Alarm limits and colors
+//! come from the shared alarm store.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{App, Context, Hsla, SharedString};
 use metor_db::DB;
@@ -46,30 +26,45 @@ pub(crate) enum StreamUpdate<I, V> {
 /// reads stale even while the link keeps delivering it.
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(3);
 
-/// The producers' clock minus this machine's, as last observed when a
-/// sample arrived. A simulated or skewed producer clock makes wall time the
-/// wrong ruler: judged against it, a sim running ahead never ages and one
-/// running behind is stale on arrival. Measuring age on the producer's own
-/// timeline keeps "3 s" meaning 3 s of its time, and — because the offset is
-/// frozen at the last arrival — a producer that stops still ages out on
-/// this clock. One estimate serves every stream; producers on unrelated
-/// clocks would each want their own.
-static CLOCK_SKEW_MICROS: AtomicI64 = AtomicI64::new(0);
-
-fn note_arrival(sample: Timestamp) {
-    CLOCK_SKEW_MICROS.store(sample.0 - Timestamp::now().0, Ordering::Relaxed);
+/// Per-stream freshness. Timestamps are absolute; future-dated samples age
+/// from receipt, and repeated or regressing stamps never restart the timer.
+struct Freshness {
+    latest: Option<Timestamp>,
+    advanced_at: Instant,
+    age_at_advance: Duration,
 }
 
-/// Now, on the producers' clock.
-fn producer_now() -> Timestamp {
-    Timestamp(Timestamp::now().0 + CLOCK_SKEW_MICROS.load(Ordering::Relaxed))
+impl Freshness {
+    fn new(now: Instant) -> Self {
+        Self {
+            latest: None,
+            advanced_at: now,
+            age_at_advance: Duration::ZERO,
+        }
+    }
+
+    fn observe(&mut self, stamp: Option<Timestamp>, wall: Timestamp, now: Instant) -> Duration {
+        let age = stamp
+            .map(|stamp| sample_age(stamp, wall))
+            .unwrap_or_default();
+        if stamp.is_none()
+            || self
+                .latest
+                .is_none_or(|last| stamp.is_some_and(|ts| ts > last))
+        {
+            self.latest = stamp;
+            self.advanced_at = now;
+            self.age_at_advance = age;
+        }
+        age.max(
+            self.age_at_advance
+                .saturating_add(now.duration_since(self.advanced_at)),
+        )
+    }
 }
 
-/// How long ago `sample` was taken on its producer's clock; zero for a stamp
-/// still ahead of it.
-fn sample_age(sample: Timestamp) -> Duration {
-    let micros = producer_now().0.saturating_sub(sample.0).max(0);
-    Duration::from_micros(micros as u64)
+fn sample_age(sample: Timestamp, now: Timestamp) -> Duration {
+    Duration::from_micros(now.0.saturating_sub(sample.0).max(0) as u64)
 }
 
 /// The single number an instrument view displays: one element of one
@@ -175,11 +170,8 @@ pub(crate) fn component_name(db: &DB, component: ComponentId) -> Option<SharedSt
 /// Whether an instrument's editable binding has moved off what its stream
 /// task is actually reading, recording the new target if so.
 ///
-/// The inspector writes a view's fields straight through facet's `Poke` and
-/// then repaints; there is no hook to run a side effect. So a view whose
-/// binding is editable compares the two at the top of its `render` and
-/// respawns when they disagree — the same shape
-/// [`Annunciator`](super::Annunciator) uses to recompile its glob.
+/// Inspector edit hooks call this synchronously; render-time checks also
+/// catch programmatic changes to reflected fields.
 pub(crate) fn rebound(want: ElementRef, bound: &mut Option<ElementRef>) -> bool {
     if *bound == Some(want) {
         return false;
@@ -221,15 +213,17 @@ where
         // arms one timer; once it fires the view is told and the task waits,
         // unarmed, for the sample that ends the silence. `None` means stale.
         let mut remaining: Option<Duration> = None;
+        let mut freshness = Freshness::new(Instant::now());
 
         // The seed is committed history and may already be over the line.
         let seed = db.with_state(|state| {
             let component = state.get_component(component_id)?;
             let latest = component.time_series.latest()?;
             let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
-            Some((decode(view), sample_age(latest.timestamp())))
+            Some((decode(view), latest.timestamp()))
         });
-        if let Some((seed, age)) = seed {
+        if let Some((seed, stamp)) = seed {
+            let age = freshness.observe(Some(stamp), Timestamp::now(), Instant::now());
             remaining = STALE_AFTER.checked_sub(age);
             let stale = remaining.is_none();
             tracing::debug!(?component_id, ?age, stale, "seeded from history");
@@ -262,10 +256,7 @@ where
                 Some(sample) => {
                     // A source without stamps counts from arrival.
                     let stamp = sample.sample_time();
-                    if let Some(stamp) = stamp {
-                        note_arrival(stamp);
-                    }
-                    let age = stamp.map(sample_age).unwrap_or_default();
+                    let age = freshness.observe(stamp, Timestamp::now(), Instant::now());
                     remaining = STALE_AFTER.checked_sub(age);
                     tracing::debug!(?component_id, ?age, stamped = stamp.is_some(), "sample");
                     let value = decode(sample.as_component_view()).map(StreamUpdate::Value);
@@ -517,6 +508,60 @@ mod tests {
 #[cfg(test)]
 mod staleness_tests {
     use super::*;
+
+    #[test]
+    fn delayed_and_repeated_samples_do_not_refresh_their_age() {
+        let now = Instant::now();
+        let mut clock = Freshness::new(now);
+        assert_eq!(
+            clock.observe(Some(Timestamp(0)), Timestamp(10_000_000), now),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            clock.observe(
+                Some(Timestamp(0)),
+                Timestamp(11_000_000),
+                now + Duration::from_secs(1)
+            ),
+            Duration::from_secs(11)
+        );
+        assert_eq!(
+            clock.observe(
+                Some(Timestamp(11_000_000)),
+                Timestamp(11_000_000),
+                now + Duration::from_secs(1)
+            ),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn future_stamps_age_from_receipt_and_clocks_are_independent() {
+        let now = Instant::now();
+        let mut future = Freshness::new(now);
+        let mut ordinary = Freshness::new(now);
+        assert_eq!(
+            future.observe(Some(Timestamp(i64::MAX)), Timestamp(0), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            ordinary.observe(Some(Timestamp(0)), Timestamp(5_000_000), now),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            future.observe(
+                Some(Timestamp(i64::MAX)),
+                Timestamp(5_000_000),
+                now + Duration::from_secs(5)
+            ),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            ordinary.observe(None, Timestamp(5_000_000), now + Duration::from_secs(5)),
+            Duration::ZERO
+        );
+    }
+
     use metor_db::ComponentSchema;
 
     /// The seed judges age by the stamp the producer wrote, which the WAL
@@ -543,7 +588,11 @@ mod staleness_tests {
         }
         let latest = component.time_series.latest().expect("persisted");
         assert_eq!(latest.timestamp(), stamped);
-        assert!(sample_age(stamped) >= Duration::from_secs(9));
-        assert!(STALE_AFTER.checked_sub(sample_age(stamped)).is_none());
+        assert!(sample_age(stamped, Timestamp::now()) >= Duration::from_secs(9));
+        assert!(
+            STALE_AFTER
+                .checked_sub(sample_age(stamped, Timestamp::now()))
+                .is_none()
+        );
     }
 }

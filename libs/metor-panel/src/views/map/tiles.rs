@@ -90,9 +90,23 @@ impl TileSource {
     }
 }
 
-/// Ready tiles kept in memory. At 256 KiB of BGRA per tile this caps the
-/// atlas footprint near 96 MiB — several full screens at any zoom.
-const MEMORY_TILE_CAP: usize = 384;
+/// Decoded BGRA bytes retained in the ready cache, excluding GPU copies.
+const MEMORY_BYTE_CAP: usize = 96 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TileKey {
+    id: TileId,
+    provider: u64,
+}
+
+impl TileKey {
+    fn new(id: TileId, source: &TileSource) -> Self {
+        Self {
+            id,
+            provider: source.cache_bucket(),
+        }
+    }
+}
 
 /// How long a failed tile stays failed before a repaint may retry it.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -120,14 +134,12 @@ enum TileState {
 }
 
 struct TileJob {
-    id: TileId,
+    key: TileKey,
     url: String,
-    /// Disk-cache bucket of the provider the URL came from.
-    bucket: u64,
 }
 
 struct TileResult {
-    id: TileId,
+    key: TileKey,
     image: Option<Arc<RenderImage>>,
 }
 
@@ -142,9 +154,10 @@ pub fn try_global(cx: &App) -> Option<Entity<TileStore>> {
 }
 
 pub struct TileStore {
-    tiles: HashMap<TileId, TileState>,
+    tiles: HashMap<TileKey, TileState>,
     /// Ready tiles in touch order, oldest first.
-    lru: VecDeque<TileId>,
+    lru: VecDeque<TileKey>,
+    ready_bytes: usize,
     /// Evicted images awaiting a window to release their atlas slot.
     orphaned: Vec<Arc<RenderImage>>,
     job_tx: mpsc::Sender<TileJob>,
@@ -162,6 +175,7 @@ impl TileStore {
         let store = cx.new(|_| TileStore {
             tiles: HashMap::new(),
             lru: VecDeque::new(),
+            ready_bytes: 0,
             orphaned: Vec::new(),
             job_tx,
         });
@@ -218,10 +232,11 @@ impl TileStore {
     /// store notifies. A shed request (full queue) or a fresh failure also
     /// return `None`; the failure retries once [`RETRY_AFTER`] has passed.
     pub fn request(&mut self, id: TileId, source: &TileSource) -> Option<Arc<RenderImage>> {
-        match self.tiles.get(&id) {
+        let key = TileKey::new(id, source);
+        match self.tiles.get(&key) {
             Some(TileState::Ready(image)) => {
                 let image = image.clone();
-                self.touch(id);
+                self.touch(key);
                 return Some(image);
             }
             Some(TileState::Pending) => return None,
@@ -229,23 +244,23 @@ impl TileStore {
             Some(TileState::Failed(_)) | None => {}
         }
         let job = TileJob {
-            id,
+            key,
             url: tile_url(&source.template, id),
-            bucket: source.cache_bucket(),
         };
         if self.job_tx.try_send(job).is_ok() {
-            self.tiles.insert(id, TileState::Pending);
+            self.tiles.insert(key, TileState::Pending);
         } else {
             // Queue full mid-pan: forget the entry so a calmer frame retries.
-            self.tiles.remove(&id);
+            self.tiles.remove(&key);
         }
         None
     }
 
     /// The tile if it is ready, with no side effects — the probe the
     /// parent-fallback walk uses, which must never fetch ancestors.
-    pub fn ready(&self, id: TileId) -> Option<Arc<RenderImage>> {
-        match self.tiles.get(&id) {
+    pub fn ready(&self, id: TileId, source: &TileSource) -> Option<Arc<RenderImage>> {
+        let key = TileKey::new(id, source);
+        match self.tiles.get(&key) {
             Some(TileState::Ready(image)) => Some(image.clone()),
             _ => None,
         }
@@ -260,30 +275,44 @@ impl TileStore {
     fn install(&mut self, result: TileResult) {
         match result.image {
             Some(image) => {
-                self.tiles.insert(result.id, TileState::Ready(image));
-                self.touch(result.id);
-                while self.lru.len() > MEMORY_TILE_CAP {
+                self.ready_bytes += image_bytes(&image);
+                if let Some(TileState::Ready(previous)) =
+                    self.tiles.insert(result.key, TileState::Ready(image))
+                {
+                    self.ready_bytes -= image_bytes(&previous);
+                    self.orphaned.push(previous);
+                }
+                self.touch(result.key);
+                while self.ready_bytes > MEMORY_BYTE_CAP {
                     let Some(evict) = self.lru.pop_front() else {
                         break;
                     };
                     if let Some(TileState::Ready(image)) = self.tiles.remove(&evict) {
+                        self.ready_bytes -= image_bytes(&image);
                         self.orphaned.push(image);
                     }
                 }
             }
             None => {
                 self.tiles
-                    .insert(result.id, TileState::Failed(Instant::now()));
+                    .insert(result.key, TileState::Failed(Instant::now()));
             }
         }
     }
 
-    fn touch(&mut self, id: TileId) {
+    fn touch(&mut self, id: TileKey) {
         if let Some(pos) = self.lru.iter().position(|t| *t == id) {
             self.lru.remove(pos);
         }
         self.lru.push_back(id);
     }
+}
+
+fn image_bytes(image: &RenderImage) -> usize {
+    (0..image.frame_count())
+        .filter_map(|i| image.as_bytes(i))
+        .map(<[u8]>::len)
+        .sum()
 }
 
 fn tile_url(template: &str, id: TileId) -> String {
@@ -352,7 +381,10 @@ fn run_fetcher(mut job_rx: mpsc::Receiver<TileJob>, done_tx: Sender<TileResult>)
                 if image.is_none() {
                     tracing::warn!(url = %job.url, "tile fetch failed");
                 }
-                let _ = done_tx.send(TileResult { id: job.id, image });
+                let _ = done_tx.send(TileResult {
+                    key: job.key,
+                    image,
+                });
             });
         }
     });
@@ -365,7 +397,7 @@ fn run_fetcher(mut job_rx: mpsc::Receiver<TileJob>, done_tx: Sender<TileResult>)
 /// the fetcher thread would stall every download behind it. On the pool,
 /// decodes spread across cores and overlap the network waits.
 async fn fetch_tile(client: &reqwest::Client, job: &TileJob) -> Option<Arc<RenderImage>> {
-    let path = cache_path(job.id, job.bucket);
+    let path = cache_path(job.key.id, job.key.provider);
     if let Some(path) = &path {
         let path = path.clone();
         let cached = tokio::task::spawn_blocking(move || {
@@ -414,7 +446,7 @@ fn write_cached(path: &std::path::Path, bytes: &[u8]) {
 /// swizzle gpui's own image loader performs.
 fn decode_tile(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     let mut data = image::load_from_memory(bytes).ok()?.into_rgba8();
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Some(Arc::new(RenderImage::new(SmallVec::from_elem(
@@ -434,6 +466,103 @@ impl TileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store() -> (TileStore, mpsc::Receiver<TileJob>) {
+        let (job_tx, rx) = mpsc::channel(QUEUE_CAP);
+        (
+            TileStore {
+                tiles: HashMap::new(),
+                lru: VecDeque::new(),
+                ready_bytes: 0,
+                orphaned: Vec::new(),
+                job_tx,
+            },
+            rx,
+        )
+    }
+
+    fn image(edge: u32) -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(smallvec::smallvec![Frame::new(
+            image::RgbaImage::new(edge, edge)
+        )]))
+    }
+
+    #[test]
+    fn providers_do_not_share_pending_ready_or_failed_tiles() {
+        let (mut store, mut jobs) = store();
+        let id = TileId {
+            zoom: 3,
+            x: 1,
+            y: 2,
+        };
+        let a = source_for(OSM_TILE_URL);
+        let b = source_for("https://example.com/{z}/{x}/{y}.png");
+        assert!(store.request(id, &a).is_none());
+        assert!(store.request(id, &b).is_none());
+        let ja = jobs.try_recv().unwrap();
+        let jb = jobs.try_recv().unwrap();
+        assert_ne!(ja.key, jb.key);
+        let tile = image(256);
+        store.install(TileResult {
+            key: ja.key,
+            image: Some(tile.clone()),
+        });
+        store.install(TileResult {
+            key: jb.key,
+            image: None,
+        });
+        assert!(Arc::ptr_eq(&store.ready(id, &a).unwrap(), &tile));
+        assert!(store.ready(id, &b).is_none());
+        assert!(store.request(id, &b).is_none());
+        assert!(jobs.try_recv().is_err());
+    }
+
+    #[test]
+    fn eviction_uses_decoded_bytes_and_keeps_recent_tiles() {
+        let (mut store, _) = store();
+        let source = source_for("");
+        let tile = image(1024);
+        let count = MEMORY_BYTE_CAP / image_bytes(&tile);
+        assert_eq!(count, 24);
+        for x in 0..count as u32 {
+            store.install(TileResult {
+                key: TileKey::new(TileId { zoom: 8, x, y: 0 }, &source),
+                image: Some(tile.clone()),
+            });
+        }
+        let first = TileId {
+            zoom: 8,
+            x: 0,
+            y: 0,
+        };
+        store.request(first, &source);
+        store.install(TileResult {
+            key: TileKey::new(
+                TileId {
+                    zoom: 8,
+                    x: count as u32,
+                    y: 0,
+                },
+                &source,
+            ),
+            image: Some(tile),
+        });
+        assert_eq!(store.ready_bytes, MEMORY_BYTE_CAP);
+        assert!(store.ready(first, &source).is_some());
+        assert!(
+            store
+                .ready(
+                    TileId {
+                        zoom: 8,
+                        x: 1,
+                        y: 0
+                    },
+                    &source
+                )
+                .is_none()
+        );
+        assert_eq!(store.take_orphans().len(), 1);
+    }
 
     #[test]
     fn templates_substitute_tile_coordinates() {

@@ -192,5 +192,4 @@ fn apply_shipped_preset(store: Entity<TargetPresetStore>, cx: &mut App) {
         return;
     };
     load_into_tiles(&layout, &tiles, cx);
-    connections.update(cx, |conns, _| conns.note_loaded_layout(layout));
 }
