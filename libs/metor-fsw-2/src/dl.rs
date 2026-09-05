@@ -1,47 +1,15 @@
-//! Loading and driving pack shared objects.
+//! Load and drive native packs through the C ABI.
 //!
-//! [`DlPack::open`] loads a pack `cdylib`, checks its ABI version word,
-//! resolves the `fsw_pack_*` exports named by the [`abi`]
-//! constants, opens the pack (`fsw_pack_open`, which runs the crate's
-//! `pack()` once), and decodes its manifest into per-entry
-//! [`SystemDescriptor`]s. [`DlPack::system`] selects one entry as a
-//! [`DlSystem`], and from there the builder treats it like any statically
-//! linked system; wiring, validation, and ring sizing all run against the
-//! descriptor. At `build()` the coordinator binds a loaded slot in place of a
-//! typed runner. The slot forwards `init`, `step`, and `shutdown` across the
-//! C ABI, handing the shared object its per-port ring regions as raw
-//! [`FswRing`] handles. Timestamps cross the ABI as the raw `Timestamp` tick,
-//! in whatever unit the coordinator's clock produces.
+//! [`DlPack::open`] checks the ABI version, resolves exports, and decodes the
+//! manifest. [`DlPack::system`] selects an entry; binding passes host ring
+//! regions to it as [`FswRing`] handles without copying records.
 //!
-//! Everything stays in one process. The shared object attaches to the host's
-//! ring regions in place, so it reads and writes the same atomics the host's
-//! statically linked systems do; there is no copy and no IPC.
+//! Status words are validated before conversion to [`FswStatus`]. Invalid
+//! manifests and unsupported capabilities return [`DlError`] at load time.
 //!
-//! ## The trust boundary
-//!
-//! The shared object is foreign code the host does not control, so nothing it
-//! returns is trusted as a Rust value. `fsw_pack_execute` returns a raw `u32`
-//! rather than an [`FswStatus`], because materializing a `repr(u32)` enum from
-//! an out-of-range discriminant is immediate undefined behavior. Every call
-//! site validates the raw word and folds unknown values to
-//! `Panicked`. Likewise a manifest that fails to decode, or an entry that
-//! declares capabilities the host cannot grant across the ABI, is a clean
-//! [`DlError`] at load time rather than a panic later.
-//!
-//! ## Teardown ordering
-//!
-//! Each loaded slot owns a shared library handle and the opaque `*mut state`
-//! returned by `fsw_pack_create`. Its `Drop` calls `fsw_pack_destroy` before
-//! the library handle can drop, because the handle field drops after `Drop`
-//! runs. `PackLib`'s own field order then closes the pack (`fsw_pack_close`)
-//! before the `Library` unloads. And the coordinator drops its slots before
-//! its ring table, so no non-owning ring attach outlives its region and no
-//! shared-object code runs after the object is unloaded:
-//! destroy states → pack_close → dlclose → rings free.
-//!
-//! A slot whose system panics is destroyed immediately rather than at
-//! teardown. A stopped system's live input views would otherwise keep holding
-//! their reader slots and backpressure every upstream producer forever.
+//! Teardown order is part of the safety contract: destroy system states,
+//! close the pack, unload the library, then free the rings. Panicked systems
+//! are destroyed immediately to release readers that could block producers.
 
 use core::ffi::c_void;
 use std::ffi::OsStr;
@@ -58,10 +26,6 @@ use postcard_schema::schema::owned::OwnedNamedType;
 use metor_fsw_2_core::SystemDescriptor;
 use metor_fsw_2_core::abi::{self, FSW_ABI_VERSION, FswRing, FswStatus, PackEntryDesc};
 use metor_fsw_2_core::{CyclicSlot, SlotState, StopReason};
-
-// ---------------------------------------------------------------------------
-// Resolved C-ABI function-pointer types
-// ---------------------------------------------------------------------------
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type PackOpenFn = unsafe extern "C" fn() -> *mut c_void;
@@ -95,10 +59,6 @@ struct PackFns {
     shutdown: ShutdownFn,
     destroy: DestroyFn,
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
 
 /// A failure loading or describing a pack shared object. A bad artifact is
 /// always a clean error, never a crash of the host.
@@ -143,10 +103,6 @@ pub enum DlError {
     },
 }
 
-// ---------------------------------------------------------------------------
-// PackLib, the opened pack + its library
-// ---------------------------------------------------------------------------
-
 /// Closes the pack (`fsw_pack_close`) on drop. Null-safe so a stub or a
 /// failed open drops cleanly.
 struct PackGuard {
@@ -185,10 +141,6 @@ impl PackLib {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Open + describe
-// ---------------------------------------------------------------------------
-
 /// Resolves a required symbol by its NUL-terminated name, mapping a miss to
 /// [`DlError::MissingSymbol`].
 ///
@@ -218,7 +170,7 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
     // safer form.
     let lib = unsafe { Library::new(path) }.map_err(DlError::Open)?;
 
-    // --- Check the ABI word before any other call -----------------------
+    // Check the ABI word before any other call
     let found = {
         // SAFETY: the export is a `fn() -> u32`.
         let f: Symbol<AbiVersionFn> =
@@ -239,7 +191,7 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
         });
     }
 
-    // --- Open the pack (runs the crate's pack() once) -------------------
+    // Open the pack (runs the crate's pack() once)
     // Resolve close first so a successful open can always be undone.
     let close = *unsafe { resolve::<PackCloseFn>(&lib, abi::SYM_PACK_CLOSE, "fsw_pack_close")? };
     let open = *unsafe { resolve::<PackOpenFn>(&lib, abi::SYM_PACK_OPEN, "fsw_pack_open")? };
@@ -256,7 +208,7 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
         return Err(DlError::PackOpen);
     }
 
-    // --- Describe --------------------------------------------------------
+    // Describe
     // Two calls: the length, then the base of the bytes the pack keeps alive
     // until it closes. The host only copies, so no allocation crosses.
     // SAFETY: the export is `fsw_pack_describe(pack) -> i64`.
@@ -339,10 +291,6 @@ fn reject_capabilities(entry: PackEntryDesc) -> Result<PackEntryDesc, DlError> {
     }
     Ok(entry)
 }
-
-// ---------------------------------------------------------------------------
-// DlPack + DlSystem, the loaded handles
-// ---------------------------------------------------------------------------
 
 /// A loaded pack: the shared library handle, the decoded per-entry descriptors,
 /// and the resolved lifecycle pointers. [`system`](Self::system) selects one
@@ -548,10 +496,6 @@ impl DlSystem {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DlSlot, a dlopen'd system behind the CyclicSlot interface
-// ---------------------------------------------------------------------------
-
 /// A running instance of a loaded pack entry, driven by the coordinator
 /// through the same `Box<dyn CyclicSlot>` interface as a statically linked
 /// runner. `init` hands the shared object its per-port [`FswRing`] arrays,
@@ -724,118 +668,4 @@ impl Drop for DlSlot {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A `DlSlot` over stub exports, no artifact involved: `lib` is a handle
-    /// to this very process (with no pack to close) and `state` a dangling
-    /// non-null the stubs never dereference.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
-    fn stub_slot(execute: ExecuteFn, destroy: DestroyFn) -> DlSlot {
-        unsafe extern "C" fn bind(
-            _: *mut c_void,
-            _: *const FswRing,
-            _: usize,
-            _: *const FswRing,
-            _: usize,
-            _: *const u8,
-            _: usize,
-        ) {
-        }
-        unsafe extern "C" fn nop(_: *mut c_void) {}
-        DlSlot {
-            lib: Rc::new(PackLib {
-                pack: PackGuard {
-                    ptr: core::ptr::null_mut(),
-                    close: None,
-                },
-                lib: libloading::os::unix::Library::this().into(),
-            }),
-            bind_init: bind,
-            execute,
-            shutdown: nop,
-            destroy,
-            state: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            name: Arc::from("stub"),
-            instance: Arc::from("stub"),
-            slot_state: SlotState::Running,
-        }
-    }
-
-    /// The poll-once guard: `step_seq` latches a terminal `Done` and
-    /// re-serves it without ever reaching the execute export again.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
-    #[test]
-    fn step_seq_latches_done() {
-        use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
-        static POLLS: AtomicU32 = AtomicU32::new(0);
-        unsafe extern "C" fn exec(_: *mut c_void, _: u64) -> u32 {
-            POLLS.fetch_add(1, Relaxed);
-            FswStatus::Done as u32
-        }
-        unsafe extern "C" fn nop(_: *mut c_void) {}
-        let mut slot = stub_slot(exec, nop);
-        assert_eq!(slot.step_seq(Timestamp(1)), FswStatus::Done);
-        assert_eq!(slot.step_seq(Timestamp(2)), FswStatus::Done);
-        assert_eq!(POLLS.load(Relaxed), 1, "a Ready future is never re-polled");
-        assert!(matches!(slot.slot_state, SlotState::Done { .. }));
-    }
-
-    /// `Panicked` destroys the foreign state exactly once (releasing its
-    /// ring roles, the same policy as `step`) and is re-served from the
-    /// latch; the nulled state keeps `Drop` a no-op.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
-    #[test]
-    fn step_seq_panicked_destroys_once() {
-        use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
-        static POLLS: AtomicU32 = AtomicU32::new(0);
-        static DESTROYS: AtomicU32 = AtomicU32::new(0);
-        unsafe extern "C" fn exec(_: *mut c_void, _: u64) -> u32 {
-            POLLS.fetch_add(1, Relaxed);
-            FswStatus::Panicked as u32
-        }
-        unsafe extern "C" fn destroy(_: *mut c_void) {
-            DESTROYS.fetch_add(1, Relaxed);
-        }
-        let mut slot = stub_slot(exec, destroy);
-        assert_eq!(slot.step_seq(Timestamp(1)), FswStatus::Panicked);
-        assert_eq!(slot.step_seq(Timestamp(2)), FswStatus::Panicked);
-        assert_eq!(POLLS.load(Relaxed), 1);
-        drop(slot);
-        assert_eq!(
-            DESTROYS.load(Relaxed),
-            1,
-            "destroyed at the panic, not at Drop"
-        );
-    }
-
-    /// An entry declaring a host capability is a clean load rejection,
-    /// never a bind-time panic; an empty list (every real export) passes.
-    #[test]
-    fn load_rejects_declared_capabilities() {
-        let mk = |capabilities| PackEntryDesc {
-            descriptor: crate::SystemDescriptor {
-                name: "rogue".to_string(),
-                kind: crate::SystemKind::Cyclic,
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-                capabilities,
-            },
-            params_schema: OwnedNamedType::from(<() as postcard_schema::Schema>::SCHEMA),
-            params_docs: Vec::new(),
-            reloadable: true,
-            params_default: None,
-        };
-
-        assert!(reject_capabilities(mk(Vec::new())).is_ok());
-        let err = reject_capabilities(mk(vec![crate::Capability::ReceiveAll]))
-            .map(|_| ())
-            .expect_err("host-only capability rejected");
-        assert!(
-            matches!(&err, DlError::UnsupportedCapabilities(c) if c == &[crate::Capability::ReceiveAll]),
-            "{err:?}"
-        );
-    }
-}
+mod tests;

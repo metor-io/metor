@@ -332,10 +332,6 @@ pub fn refresh_dev_packs(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// pack build
-// ---------------------------------------------------------------------------
-
 /// Knobs for [`pack_build`].
 #[derive(Clone, Debug, Default)]
 pub struct PackBuildOptions {
@@ -704,8 +700,8 @@ mod tests {
 #[cfg(all(test, not(miri)))]
 mod integration {
     //! End-to-end over the dl fixture pack, following the build_driver test
-    //! convention (serialize on the fixture lock, skip where the nested
-    //! cargo build is unavailable).
+    //! convention (serialize on the fixture lock and require the nested
+    //! cargo build to succeed).
     use super::*;
     use crate::dl::FIXTURE_LOCK;
 
@@ -726,13 +722,8 @@ mod integration {
         )
         .unwrap();
 
-        let report = match pack_dev(tmp.path(), &PackDevOptions::default()) {
-            Ok(report) => report,
-            Err(e) => {
-                eprintln!("skipping: pack_dev failed: {e}");
-                return;
-            }
-        };
+        let report =
+            pack_dev(tmp.path(), &PackDevOptions::default()).expect("required pack fixture builds");
         assert!(report.module_dir.join("__init__.py").exists());
         assert!(report.module_dir.join("py.typed").exists());
         assert!(report.lib_path.exists());
@@ -776,13 +767,8 @@ mod integration {
         let _guard = FIXTURE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let host = match super::super::build_driver::build_target(&[]) {
-            Some(host) => host,
-            None => {
-                eprintln!("skipping: host triple undeterminable");
-                return;
-            }
-        };
+        let host = super::super::build_driver::build_target(&[])
+            .expect("determine host triple for the required wheel fixture");
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("pyproject.toml"),
@@ -801,13 +787,7 @@ mod integration {
                 },
             )
         };
-        let a = match build("a") {
-            Ok(report) => report.wheel,
-            Err(e) => {
-                eprintln!("skipping: pack_build failed: {e}");
-                return;
-            }
-        };
+        let a = build("a").expect("required wheel fixture builds").wheel;
         assert_eq!(
             a.file_name().and_then(|n| n.to_str()),
             Some("fixture_pack-0.1.0-py3-none-any.whl")

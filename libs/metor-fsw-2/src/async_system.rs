@@ -1,10 +1,7 @@
-//! The free-running authoring form, and the cancellation handle it waits on.
+//! Free-running systems managed by the host executor.
 //!
-//! Every other system form lives in `metor-fsw-2-core`, because a pack, a
-//! shared library, or a wasm guest can construct one. An [`AsyncSystem`]
-//! cannot: it owns a task the coordinator's executor spawns once and never
-//! ticks, so it exists only where there is a runtime to own it. That is why it
-//! is here rather than beside [`CyclicSystem`](crate::CyclicSystem).
+//! The coordinator spawns each [`AsyncSystem`] once. Its task owns pacing,
+//! input waits, and status publication; [`AsyncContext`] provides cancellation.
 
 use core::future::Future;
 

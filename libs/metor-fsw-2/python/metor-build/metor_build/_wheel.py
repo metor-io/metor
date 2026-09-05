@@ -108,7 +108,9 @@ def write_wheel(
     return wheel_name
 
 
-def write_editable_wheel(wheel_directory: str, name: str, version: str, pth_content: str) -> str:
+def write_editable_wheel(
+    wheel_directory: str, name: str, version: str, pth_content: str
+) -> str:
     """Write ``<dist>-<ver>-py3-none-any.whl`` whose payload is one ``.pth``.
 
     The ``.pth`` carries absolute path lines, which both the interpreter and

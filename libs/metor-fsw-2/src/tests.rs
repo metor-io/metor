@@ -741,7 +741,7 @@ fn system_type_shared_registers_instance_descriptor() {
         .unwrap()
         .create(mint_params(&plain, &msgs, &attach))
         .unwrap();
-    assert!(matches!(created.instance_desc, None));
+    assert!(created.instance_desc.is_none());
 
     // A second instantiation is rejected, so re-register for the minting one.
     let (mut pack, attach) = mint_pack();
@@ -759,4 +759,80 @@ fn system_type_shared_registers_instance_descriptor() {
             .any(|p| p.id() == PortId::Packet(SequenceCommand::ID)),
         "the minted port reached the registered descriptor"
     );
+}
+
+#[stellarator::test]
+async fn overrun_cycles_allow_async_progress() {
+    use crate::wiring::{Registry, resolve};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    fn slow(_: &mut ()) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_micros(10) {
+            std::hint::spin_loop();
+        }
+    }
+    let mut registry = Registry::new();
+    registry.register_pack(Pack::new().system("slow", system(slow)));
+    let wiring = crate::WiringBuilder::new()
+        .coordinator(1e9, crate::ClockSpec::Wall)
+        .system("slow")
+        .ty("slow")
+        .end()
+        .build();
+    let mut coordinator = resolve(&wiring, &registry).unwrap();
+    let polls = Rc::new(Cell::new(0));
+    let observed = polls.clone();
+    let task = stellarator::spawn(async move {
+        loop {
+            observed.set(observed.get() + 1);
+            stellarator::yield_now().await;
+        }
+    })
+    .drop_guard();
+    stellarator::yield_now().await;
+    let before = polls.get();
+    coordinator.run_for(10).await;
+    assert!(polls.get() > before, "overruns must not starve async tasks");
+    drop(task);
+}
+
+#[test]
+fn invalid_timer_periods_and_ring_sizes_are_build_errors() {
+    use crate::coordinator::init::InitGraph;
+    for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-300, 1e-11, 1e300] {
+        let result = InitGraph::new(CoordinatorConfig {
+            cycle_rate: rate,
+            ..config()
+        })
+        .build();
+        assert!(
+            matches!(result, Err(crate::WireError::InvalidCycleRate { .. })),
+            "rate {rate}"
+        );
+    }
+    for cfg in [
+        CoordinatorConfig {
+            default_depth: usize::MAX,
+            ..config()
+        },
+        CoordinatorConfig {
+            reader_slack: usize::MAX,
+            ..config()
+        },
+    ] {
+        assert!(matches!(
+            InitGraph::new(cfg).build(),
+            Err(crate::WireError::InvalidRingSize { .. })
+        ));
+    }
+    let simulated = CoordinatorConfig {
+        cycle_rate: f64::NAN,
+        clock: ClockMode::Simulated {
+            dt: std::time::Duration::from_micros(1),
+        },
+        ..config()
+    };
+    assert!(InitGraph::new(simulated).build().is_ok());
 }

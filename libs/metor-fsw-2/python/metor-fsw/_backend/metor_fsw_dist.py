@@ -40,8 +40,16 @@ def _platform_tag() -> str:
 def _build_binary(root) -> bytes:
     """Cargo-build the release binary and return its bytes."""
     out = subprocess.run(
-        ["cargo", "build", "--release", "-p", "metor-fsw-2", "--bin", "metor-fsw",
-         "--message-format=json"],
+        [
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            "metor-fsw-2",
+            "--bin",
+            "metor-fsw",
+            "--message-format=json",
+        ],
         cwd=root,
         check=True,
         stdout=subprocess.PIPE,
@@ -83,7 +91,9 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     project = _project(os.getcwd())
-    return _wheel.write_metadata(metadata_directory, project["name"], project["version"])
+    return _wheel.write_metadata(
+        metadata_directory, project["name"], project["version"]
+    )
 
 
 def get_requires_for_build_wheel(config_settings=None):

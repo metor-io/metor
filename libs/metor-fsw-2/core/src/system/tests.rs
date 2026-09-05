@@ -16,10 +16,6 @@ use crate::{
     MsgOut, Out, Output, PortDesc, System, SystemInput, SystemKind, SystemOutput, buffer_capacity,
 };
 
-// ---------------------------------------------------------------------------
-// Frames under test: an `Imu` input, a `NavEstimate` output with a dynamic member.
-// ---------------------------------------------------------------------------
-
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]
@@ -84,10 +80,6 @@ fn field<'a>(ev: &'a LogEvent, key: &str) -> Option<&'a str> {
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
 }
-
-// ---------------------------------------------------------------------------
-// A sample cyclic system: a unit-gain filter consuming `Imu`, producing `NavEstimate`.
-// ---------------------------------------------------------------------------
 
 struct Filter {
     gain: f64,
@@ -250,10 +242,6 @@ fn idle_input_backpressures_writer_and_latest_frees() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// SystemDescriptor + compatibility (subset / ty-shape).
-// ---------------------------------------------------------------------------
-
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]
@@ -313,10 +301,6 @@ fn descriptor_and_compatibility() {
     // A different frame id fails.
     assert!(!compatible(&producer, &PortDesc::of::<NavEstimate>()));
 }
-
-// ---------------------------------------------------------------------------
-// Faults: a named fault lands on the log port, one line per cycle it fires.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn faults_land_on_the_log() {
@@ -433,7 +417,7 @@ fn publish_drop_is_reported_on_the_log() {
     let log_ring = log_ring_for(1);
     let mut log_in = MsgIn::<LogEvent>::new(log_ring.view(NoWake).unwrap());
 
-    let input = crate::BindPorts::bind(&mut TestSource {
+    let (): () = crate::BindPorts::bind(&mut TestSource {
         rings: vec![],
         next: 0,
     });
@@ -441,7 +425,7 @@ fn publish_drop_is_reported_on_the_log() {
         rings: vec![tiny, log_ring.clone()],
         next: 0,
     });
-    let mut runner = CyclicRunner::new(Chatter, input, output);
+    let mut runner = CyclicRunner::new(Chatter, (), output);
     runner.step(Timestamp(1));
 
     let events = drain_log(&mut log_in);
@@ -457,10 +441,6 @@ fn publish_drop_is_reported_on_the_log() {
         "a drop is an error, not a stop"
     );
 }
-
-// ---------------------------------------------------------------------------
-// #[fsw(...)] attribute lowering + message-log delivery guarantees.
-// ---------------------------------------------------------------------------
 
 use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
 

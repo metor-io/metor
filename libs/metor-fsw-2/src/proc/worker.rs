@@ -1,32 +1,9 @@
-//! The worker process, the other end of the [`ctl`](super::ctl) protocol.
+//! Worker-side implementation of the [`ctl`](super::ctl) protocol.
 //!
-//! A worker is not a separate binary; it is the **host executable
-//! re-executed** with [`WORKER_ENV`] naming a postcard [`WorkerManifest`].
-//! [`worker_entry`] is the guard that routes such a child into the worker
-//! instead of the application's own `main`.
-//!
-//! The manifest selects one of two modes:
-//!
-//! - **Describe**: dlopen the artifact, run `fsw_pack_describe`, write the
-//!   raw postcard pack-manifest bytes to the output file, exit. This is what
-//!   keeps the host free of foreign code: it decodes these bytes instead of
-//!   loading the object itself, and one describe covers every entry the
-//!   artifact exports.
-//! - **Run**: attach the control block and every ring file, open the pack
-//!   ([`DlPack::open`](crate::dl::DlPack), which runs the crate's `pack()` in
-//!   this process), select the manifest's entry by name, and drive an
-//!   ordinary [`DlSlot`](crate::dl) through the [`ctl`](super::ctl)
-//!   lifecycle: `fsw_pack_create` at attach, `fsw_pack_bind_init` on the
-//!   init request, one `fsw_pack_execute` per doorbell, and
-//!   `fsw_pack_shutdown`/`fsw_pack_destroy` on the shutdown request. A
-//!   [`RunMode`] on the manifest picks the step fold: `Cyclic` for a
-//!   steady-state system, `Sequence` for a process slot's occupant.
-//!
-//! Everything downstream of the manifest reuses the dl machinery verbatim:
-//! the ring files attach as regions, regions become positional
-//! [`FswRing`](metor_fsw_2_core::abi::FswRing) handles, and the slot binds exactly as
-//! it would in-process. The maps outlive the slot (drop order below), so the
-//! dl teardown-ordering contract holds unchanged.
+//! The host executable is re-executed with `METOR_FSW_WORKER` pointing to a
+//! postcard [`WorkerManifest`]. [`worker_entry`] dispatches to either manifest
+//! description or execution. Execution attaches the shared rings and drives
+//! the entry through the native pack loader. Ring mappings outlive the slot.
 
 use std::path::{Path, PathBuf};
 
@@ -121,7 +98,7 @@ pub(crate) fn worker_guard_installed() -> bool {
 /// Route a re-executed host binary into the worker. **Call this first in
 /// `main`** of any binary that runs process systems (the `metor-fsw` CLI
 /// does; an application embedding the framework must do so itself). When
-/// [`WORKER_ENV`] is unset this is one environment read and returns
+/// `METOR_FSW_WORKER` is unset this is one environment read and returns
 /// immediately; when set, the process *is* a worker: it runs to completion
 /// and exits, never returning to the caller's `main`.
 pub fn worker_entry() {

@@ -37,14 +37,17 @@ class TypedCoreTest(unittest.TestCase):
 
     def test_defaults_and_overrides(self):
         # Every field carries a default from the manifest blob.
-        self.assertEqual(demo.Widget().params, {
-            "count": 0,
-            "gain": 0.0,
-            "label": "",
-            "armed": False,
-            "limit": None,
-            "offsets": [0.0, 0.0, 0.0],
-        })
+        self.assertEqual(
+            demo.Widget().params,
+            {
+                "count": 0,
+                "gain": 0.0,
+                "label": "",
+                "armed": False,
+                "limit": None,
+                "offsets": [0.0, 0.0, 0.0],
+            },
+        )
         # Overrides flow through; a tuple param JSON-ifies to a list.
         w = demo.Widget(count=3, offsets=(1.0, 2.0, 3.0))
         self.assertEqual(w.params["count"], 3)
@@ -77,10 +80,19 @@ class RecordTest(unittest.TestCase):
         sys_node = ir["systems"][0]
         self.assertEqual(sys_node["ty"], "Widget")
         self.assertEqual(sys_node["artifact"], "demo")
-        self.assertEqual(sys_node["params"], {"Value": {
-            "count": 5, "gain": 0.0, "label": "", "armed": False,
-            "limit": None, "offsets": [0.0, 0.0, 0.0],
-        }})
+        self.assertEqual(
+            sys_node["params"],
+            {
+                "Value": {
+                    "count": 5,
+                    "gain": 0.0,
+                    "label": "",
+                    "armed": False,
+                    "limit": None,
+                    "offsets": [0.0, 0.0, 0.0],
+                }
+            },
+        )
 
         # A port reference off the returned handle is a plain (instance, port).
         ref = w.sensors
@@ -99,7 +111,9 @@ class RecordTest(unittest.TestCase):
         # The occupant's artifact is auto-registered from the allow set.
         self.assertEqual([a["id"] for a in ir["artifacts"]], ["demo"])
         self.assertEqual(ir["slots"][0]["allow"][0]["occupant"], "startup")
-        self.assertEqual(ir["slots"][0]["initial"], {"occupant": "startup", "state": "Running"})
+        self.assertEqual(
+            ir["slots"][0]["initial"], {"occupant": "startup", "state": "Running"}
+        )
         self.assertEqual(mode.name, "mode")
 
     def test_duplicate_artifact_ids_dedupe(self):

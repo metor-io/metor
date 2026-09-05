@@ -1,24 +1,12 @@
-//! Compiling a target's captured Python program at provision time.
+//! Compile captured Python systems into a WebAssembly pack at build time.
 //!
-//! The program the recorder captured into [`Wiring::program`] is compiled
-//! into the pack artifact its `@system` specs address, at the same seam that
-//! builds path-source cdylibs, so the vehicle only ever loads a finished
-//! module and a bad program fails the *build* with a `target.py`-line
-//! diagnostic, mapped through the program's per-declaration offsets.
+//! Input components are resolved from other artifacts' manifests. Their IDs
+//! and offsets come directly from descriptors; rehashing names would lose
+//! information because `ComponentId::new` masks the FNV top bit.
 //!
-//! ## The build-time resolver
-//!
-//! The compiler's questions are answered from the *other* artifacts' decoded
-//! pack manifests: every Table output port of every artifact-backed system
-//! (and every slot's occupant contract) is realized field by field into an
-//! addressable component, with its id and record offset carried straight
-//! from the descriptor rather than re-derived, since `ComponentId::new`
-//! masks the FNV top bit and re-hashing a name agrees with the real id for
-//! only about half of names. A cdylib's manifest comes from its `.manifest`
-//! sidecar when the build wrote one, else an in-process describe; a wasm
-//! artifact's comes through the interpreter. Statically registered systems
-//! have no manifest to read, so their outputs are not bindable from Python:
-//! a diagnostic, not a silent misbind.
+//! Static systems have no artifact manifest, so their outputs cannot be bound
+//! from Python. Compilation errors use the recorded source offsets to report
+//! locations in `target.py`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

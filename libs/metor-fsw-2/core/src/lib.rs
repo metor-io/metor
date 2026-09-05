@@ -135,6 +135,7 @@ pub use descriptor::{
 pub use log::{LogEvent, LogLevel, LogPort, MAX_LINES};
 pub use port::{
     DEFAULT_DEPTH, FrameRef, FrameWriteError, Input, Output, buffer_capacity, capacity_for,
+    checked_capacity_for,
 };
 pub use status::{StatusPort, SystemStatus, host_status_port, publish_status};
 

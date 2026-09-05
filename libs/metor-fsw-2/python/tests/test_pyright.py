@@ -49,7 +49,9 @@ class PyrightTest(unittest.TestCase):
         try:
             report = json.loads(result.stdout)
         except json.JSONDecodeError:
-            self.fail(f"pyright produced no JSON report:\n{result.stdout}\n{result.stderr}")
+            self.fail(
+                f"pyright produced no JSON report:\n{result.stdout}\n{result.stderr}"
+            )
         errors = report.get("summary", {}).get("errorCount", 0)
         self.assertEqual(
             errors,

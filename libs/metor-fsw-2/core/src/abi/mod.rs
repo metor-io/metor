@@ -62,20 +62,12 @@ use serde::{Deserialize, Serialize};
 use crate::binder::RingSource;
 use crate::descriptor::SystemDescriptor;
 
-// ---------------------------------------------------------------------------
-// Version + identity
-// ---------------------------------------------------------------------------
-
 /// The ABI word a host checks for equality before any other call.
 ///
 /// Bump this on any change to the C surface or to the manifest's serialized
 /// shape, once per released ABI shape. A mismatch fails the load cleanly
 /// instead of risking a crash on a stale binary.
 pub const FSW_ABI_VERSION: u32 = 12;
-
-// ---------------------------------------------------------------------------
-// repr(C) handles
-// ---------------------------------------------------------------------------
 
 /// A ring handle points a system at one host-mapped memory region, which the
 /// system attaches as a ring via [`RingBuffer::attach_raw`] at bind time.
@@ -138,10 +130,6 @@ impl FswStatus {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Symbol-name constants
-// ---------------------------------------------------------------------------
-
 /// `fsw_abi_version` returns the ABI word ([`FSW_ABI_VERSION`]).
 pub const SYM_ABI_VERSION: &[u8] = b"fsw_abi_version\0";
 /// `fsw_pack_open` constructs the crate's [`Pack`](crate::Pack) once and
@@ -168,10 +156,6 @@ pub const SYM_PACK_DESTROY: &[u8] = b"fsw_pack_destroy\0";
 /// `fsw_pack_close` drops the [`Pack`](crate::Pack) itself, after every
 /// instance state has been destroyed.
 pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
-
-// ---------------------------------------------------------------------------
-// RawBinder
-// ---------------------------------------------------------------------------
 
 /// A raw binder walks the host-provided [`FswRing`] arrays, attaching each
 /// region as a ring while the port bundles bind; it is the `.so`-side
@@ -243,10 +227,6 @@ impl<'a> RingSource for RawBinder<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The pack manifest (postcard)
-// ---------------------------------------------------------------------------
-
 /// One pack entry's manifest form: its [`SystemDescriptor`] verbatim, plus
 /// the entry facts that live beside the descriptor rather than in it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -273,10 +253,6 @@ pub struct PackEntryDesc {
 pub struct PackManifest {
     pub systems: Vec<PackEntryDesc>,
 }
-
-// ---------------------------------------------------------------------------
-// Pack export helpers
-// ---------------------------------------------------------------------------
 
 /// The heap allocation behind the opaque pack pointer: the crate's [`Pack`],
 /// constructed once by [`run_pack_open`] and dropped by [`run_pack_close`].

@@ -1,55 +1,21 @@
 //! Limit alarms over telemetered components.
 //!
-//! The alarm engine sends alarm state through standard message ports.
-//! [`AlarmSystem`] is a [`CyclicSystem`](crate::CyclicSystem) that
-//! watches telemetered components through an [`AllOutputs`](crate::AllOutputs)
-//! tap and publishes over ordinary message ports. It emits an [`AlarmDef`] per
-//! configured alarm at boot, then [`AlarmRaised`] and [`AlarmCleared`] as
-//! alarms transition. Anything that consumes telemetered messages sees them
-//! with no extra plumbing.
+//! [`AlarmSystem`] resolves configured targets at init and evaluates them each
+//! cycle. It publishes definitions on the first execute, after consumers have
+//! claimed their taps, then emits raise and clear events as alarms transition.
+//! Unresolvable targets disable the affected alarm and produce a log entry.
 //!
-//! The module has three parts:
-//!
-//! - the config surface ([`AlarmsParams`], [`AlarmSpec`]), the serde types a
-//!   target file's `system "alarms" type="Alarms" { alarm … }` node
-//!   deserializes into, validated at load so a bad spec is a spanned config
-//!   error rather than a runtime surprise;
-//! - the evaluation state machine ([`AlarmEval`]), pure per-alarm state with
-//!   no ports of its own;
-//! - the system ([`AlarmSystem`]), which resolves targets, extracts values
-//!   each cycle, and turns evaluation events into wire messages.
-//!
-//! # Evaluation
-//!
-//! Each cycle the target's value classifies one of three ways. It is
-//! *breaching* when some configured band is violated, *in band* when every
-//! configured threshold is respected by at least the `hysteresis` margin, and
-//! otherwise in the *dead zone* between the two. Breaching cycles advance a
-//! raise counter and in-band cycles advance a clear counter; either counter
-//! must reach `debounce` before the alarm transitions, and a dead-zone cycle
-//! resets both, so chatter around a boundary neither raises nor clears. A NaN
-//! value lands in the dead zone and freezes the alarm where it is.
-//!
-//! Each raise mints an occurrence id. While an occurrence is active, a breach
-//! of a worse band re-raises the same occurrence at the higher severity. A
-//! latching alarm holds its occurrence after recovery until an operator ack
-//! arrives; a non-latching one clears as soon as the recovery debounce
-//! completes.
-//!
-//! # Boot order
-//!
-//! Targets resolve and watch views are claimed in `init`, when the registry
-//! is already frozen, so values from the very first cycle evaluate. The def
-//! broadcast waits for the first `execute` instead, because consumers claim
-//! their taps in their own `init`, which may run after this system's. Defs
-//! are latest-wins on the wire, so the delayed emit is always safe.
-//!
-//! A target that fails to resolve (unknown component, out-of-range element,
-//! duplicate alarm id, no reader slot left) disables that alarm and reports
-//! on its log; it never panics the target.
+//! Breaching and in-band samples advance separate debounce counters; samples
+//! inside the hysteresis margin reset both. NaN leaves the alarm state unchanged.
+//! A worse breach raises the same occurrence at the higher severity. Latching
+//! alarms require both recovery and acknowledgement before clearing.
 
 use std::collections::HashSet;
 
+use metor_fsw_2_core::log::LogLevel;
+use metor_fsw_2_core::{
+    AllOutputs, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, MsgIn, MsgOut, Out, System,
+};
 use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto::vtable::VTable;
@@ -58,11 +24,6 @@ use metor_proto_wkt::{
     OccurrenceId, Severity,
 };
 use serde::Deserialize;
-
-use metor_fsw_2_core::AllOutputs;
-use metor_fsw_2_core::log::LogLevel;
-use metor_fsw_2_core::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, System};
-use metor_fsw_2_core::{MsgIn, MsgOut};
 
 /// The set of alarms one [`AlarmSystem`] instance evaluates, one
 /// [`AlarmSpec`] per repeated `alarm` child node. An alarm-less instance is
@@ -254,10 +215,6 @@ impl AlarmSpec {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The evaluation state machine
-// ---------------------------------------------------------------------------
-
 /// What one [`AlarmEval`] step (or an ack) asks the caller to emit. The
 /// caller owns the wire types, since it has the value and target name the
 /// messages carry.
@@ -408,10 +365,6 @@ impl AlarmEval {
         None
     }
 }
-
-// ---------------------------------------------------------------------------
-// The system
-// ---------------------------------------------------------------------------
 
 /// Operator acks flowing into [`AlarmSystem`] over an ordinary message edge
 /// (`connect "uplink" -> "alarms" msg="AlarmAck"`), its only input. Zero

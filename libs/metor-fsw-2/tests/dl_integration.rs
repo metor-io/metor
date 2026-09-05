@@ -12,9 +12,7 @@
 //! The fixture is built by a nested `cargo build` inside the test, which is
 //! safe because the outer `cargo test` lock is released before the test binary
 //! runs. If the build cannot produce a usable shared object,
-//! [`locate_fixture`] returns `None` and the test skips with a message on
-//! stderr instead of failing; `tests_abi` keeps the loader logic covered
-//! regardless.
+//! [`locate_fixture`] fails the test with the build diagnostics.
 
 #![cfg(not(miri))]
 
@@ -34,8 +32,8 @@ use metor_fsw_2::{
 // Build and locate the fixture cdylib
 // ---------------------------------------------------------------------------
 
-/// Build the fixture crate and locate its `cdylib`, skipping on failure.
-fn locate_fixture() -> Option<PathBuf> {
+/// Build and locate the required fixture cdylib.
+fn locate_fixture() -> PathBuf {
     common::locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
 }
 
@@ -69,10 +67,7 @@ fn ticker_registry() -> Registry {
 
 #[test]
 fn dlopen_cyclic_system_end_to_end() {
-    let Some(lib_path) = locate_fixture() else {
-        // Build plumbing unavailable; tests_abi covers the loader in-binary.
-        return;
-    };
+    let lib_path = locate_fixture();
 
     // 1. Open the shared object directly to check the pack's exported entry
     //    names and validate the selected entry's reconstructed descriptor —
@@ -284,7 +279,9 @@ fn dlopen_cyclic_system_end_to_end() {
 /// [`PackManifest`]: metor_fsw_2::abi::PackManifest
 #[test]
 fn build_driver_writes_manifest_sidecar() {
-    let _guard = SIDECAR.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = SIDECAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = || {
         WiringBuilder::new()
             .artifact(
@@ -295,10 +292,7 @@ fn build_driver_writes_manifest_sidecar() {
             .build()
     };
     let mut wiring = fixture();
-    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: provision_artifacts failed: {e}");
-        return;
-    }
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("required fixture builds");
     let so = wiring.artifacts[0].path.clone().expect("path filled");
     let mut sidecar = so.clone().into_os_string();
     sidecar.push(".manifest");
@@ -337,10 +331,7 @@ fn build_driver_writes_manifest_sidecar() {
 /// first cycle, exactly like a lapped input or an in-cycle panic would.
 #[test]
 fn dlopen_null_create_reports_stopped() {
-    let Some(lib_path) = locate_fixture() else {
-        // Build plumbing unavailable; tests_abi covers the loader in-binary.
-        return;
-    };
+    let lib_path = locate_fixture();
 
     // `CounterParams` is `{ start: u64, scale: f64 }`; three bytes cannot
     // decode as either field, so the fixture's `fsw_pack_create` panics inside its
@@ -405,7 +396,9 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
     use metor_fsw_2::DlError;
     use metor_fsw_2::wiring::LoadErrorKind;
 
-    let _guard = SIDECAR.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = SIDECAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A dl system with `artifact=` but no `type=`: the builder leaves the type
     // unset, so resolve must pick the pack entry itself.
     let mut wiring = WiringBuilder::new()
@@ -429,10 +422,7 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
         "no explicit type on the dl system"
     );
 
-    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: provision_artifacts failed: {e}");
-        return;
-    }
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("required fixture builds");
 
     // The fixture pack exports two entries, so the type-less spec cannot pick
     // one; resolve reports the choices instead of guessing.

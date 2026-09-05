@@ -1072,3 +1072,32 @@ fn create_raw_rejects_bad_regions() {
     let small = unsafe { RingBuffer::create_raw(base, len - 1, cfg) };
     assert!(matches!(small, Err(AttachError::TooSmall)));
 }
+
+#[test]
+fn checked_region_size_rejects_unrepresentable_geometry() {
+    for cfg in [
+        Config {
+            capacity: 8,
+            max_readers: usize::MAX,
+        },
+        Config {
+            capacity: 1usize << (usize::BITS - 1),
+            max_readers: 1,
+        },
+        Config {
+            capacity: 8,
+            max_readers: 0,
+        },
+        Config {
+            capacity: 3,
+            max_readers: 1,
+        },
+    ] {
+        assert_eq!(checked_region_len(&cfg), None);
+    }
+    let cfg = Config {
+        capacity: 64,
+        max_readers: 2,
+    };
+    assert_eq!(checked_region_len(&cfg), Some(region_len(&cfg)));
+}

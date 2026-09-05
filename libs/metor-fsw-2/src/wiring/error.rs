@@ -166,7 +166,7 @@ pub enum LoadErrorKind {
         source: WireError,
     },
 
-    // --- dl-open resolution -------------------------------------------------
+    // dl-open resolution
     #[error("system `{system}` references unknown artifact `{artifact}`")]
     UnknownArtifact { system: String, artifact: String },
 
@@ -324,7 +324,7 @@ pub enum LoadErrorKind {
     )]
     OccupantNotReloadable { slot: String, occupant: String },
 
-    // --- slots ---------------------------------------------------------------
+    // slots
     #[error("`slot \"{slot}\"` has no `allow` occupant (a slot needs at least one)")]
     EmptySlot { slot: String },
 

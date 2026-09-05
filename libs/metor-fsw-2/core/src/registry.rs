@@ -140,10 +140,6 @@ impl Registry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AllOutputs
-// ---------------------------------------------------------------------------
-
 /// A broadcast tap over every telemetered buffer in the graph.
 ///
 /// `AllOutputs` is not a port but a [`Capability::ReceiveAll`] grant. It

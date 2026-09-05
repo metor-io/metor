@@ -128,6 +128,10 @@ pub trait CyclicSlot {
     fn shutdown(&mut self);
     fn name(&self) -> &str;
     fn state(&self) -> &SlotState;
+    /// Status records dropped since the coordinator last reported them.
+    fn drain_status_drops(&mut self) -> u64 {
+        0
+    }
     /// Host-side step timeouts since last drained. The coordinator reports
     /// them on its own log (the worker owns the system's log ring, so a
     /// process slot cannot report through it). Overridden by `ProcSlot` and

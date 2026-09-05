@@ -102,7 +102,7 @@ pub(crate) const fn map_stride<V>() -> u32 {
 /// addressed by position (`processes.0.pid`). `MAX` bounds the element count
 /// for buffer sizing.
 ///
-/// `#[repr(transparent)]` over its [`Slot`] (the `PhantomData` is a ZST), so
+/// `#[repr(transparent)]` over its internal slot (the `PhantomData` is a ZST), so
 /// the field is exactly the 8-byte slot and stays trivially `IntoBytes`. The
 /// elements themselves live in the trailer; see the module doc for the
 /// layout.

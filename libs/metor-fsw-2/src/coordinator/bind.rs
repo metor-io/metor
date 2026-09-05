@@ -5,22 +5,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use metor_fsw_2_core::log::{LogEvent, LogPort};
+use metor_fsw_2_core::sequence::{SequenceStatus, SlotControlIn};
+use metor_fsw_2_core::status::{StatusPort, SystemStatus};
+use metor_fsw_2_core::{
+    Binder, BoundInput, BoundPort, CyclicSlot, FanIn, Input, MsgIn, Output, PortConn, PortId,
+    Registry, SystemDescriptor,
+};
 use metor_fsw_ring::{NoWake, RingBuffer};
 use metor_proto::types::Msg;
 use metor_proto_wkt::{
     ReloadSequences, SequenceChannelEvent, SequenceCommand, SequenceRegistry, WiringManifest,
 };
-
-use crate::Frame;
-use metor_fsw_2_core::Input;
-use metor_fsw_2_core::MsgIn;
-use metor_fsw_2_core::Output;
-use metor_fsw_2_core::Registry;
-use metor_fsw_2_core::log::{LogEvent, LogPort};
-use metor_fsw_2_core::sequence::{SequenceStatus, SlotControlIn};
-use metor_fsw_2_core::status::{StatusPort, SystemStatus};
-use metor_fsw_2_core::{Binder, BoundInput, BoundPort};
-use metor_fsw_2_core::{FanIn, PortConn, PortId, SystemDescriptor};
 
 use super::init::{
     AsyncPlumbing, ConsEdges, DlReg, Node, ProcReg, RingAlloc, SystemBind, WasmReg, owned_writer,
@@ -31,7 +27,7 @@ use super::slot::{
 use super::{
     BoundSystems, CoordinatorPorts, CoordinatorStatus, CyclicEntry, PendingAsync, WireError,
 };
-use metor_fsw_2_core::CyclicSlot;
+use crate::Frame;
 
 /// What the proc bind arm needs beyond the shared alloc products: the step
 /// deadline and the worker-executable override, both builder-scoped.
@@ -100,6 +96,7 @@ pub(super) fn bind_systems(
     let mut pending_async: Vec<PendingAsync> = Vec::new();
     // Every host-stepped slot gets the host's writer for its status record.
     let entry = |slot: Box<dyn CyclicSlot>, id: usize, desc: &SystemDescriptor| CyclicEntry {
+        name: Arc::from(slot.name()),
         status: Some(host_status_writer(desc, &alloc.output_rings[id])),
         slot,
         cycles: 0,
@@ -152,7 +149,6 @@ pub(super) fn bind_systems(
             // ring's writer is the pump's, so the boundary entry has none.
             SystemBind::Async(r) => {
                 let plan = plumbing
-                    .plans
                     .remove(&id)
                     .expect("every async registration has one I/O plan");
                 let super::init::AsyncIoPlan {
@@ -168,6 +164,7 @@ pub(super) fn bind_systems(
                 };
                 pending_async.push(PendingAsync { name, launcher });
                 cyclic.push(CyclicEntry {
+                    name: Arc::from(boundary.name()),
                     slot: Box::new(boundary),
                     status: None,
                     cycles: 0,
@@ -313,7 +310,7 @@ fn bind_dl(
         .collect();
     // SAFETY: every region named here is a `RingTable`-owned ring that outlives
     // the slot; the coordinator drops `cyclic` (this slot, whose `Drop` calls
-    // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after;
+    // `fsw_pack_destroy`) before `rings`. The `DlSystem` handle drops right after;
     // the slot keeps its own `Arc<Library>`.
     // Status identity stays type-level (`desc.name`, like a static system's
     // `System::NAME`); the instance name rides separately for log attribution.
@@ -531,7 +528,7 @@ fn bind_slot(
         })
         .collect();
 
-    // --- The runner's tail ports, read straight off the port plan --------------
+    // The runner's tail ports, read straight off the port plan
     // Host cancel writer over the SlotControlIn input's dedicated ring.
     let control_in_idx = n_occ_inputs - 1;
     debug_assert_eq!(

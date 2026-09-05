@@ -1,19 +1,8 @@
-//! The system registry: the `type="..."` → factory map [`resolve`](super::resolve)
-//! instantiates static systems through.
+//! Factories for statically linked systems and pack entries.
 //!
-//! An app builds a [`Registry`] (usually from [`with_builtins`](Registry::with_builtins))
-//! and calls [`register`](Registry::register)/[`register_pack`](Registry::register_pack)
-//! to add its own systems, each keyed by a `type=` string. A registered entry
-//! carries a boxed factory (decode params, `new` the system, run its
-//! host-side configure step, erase it to a [`Node`]) plus the static
-//! descriptor, available without construction so the resolver can order
-//! registrations by capability. The cyclic-versus-async branch is inferred
-//! from the [`IntoNode`] blanket impls, so a system registers by implementing
-//! [`BuildSystem`](crate::BuildSystem) alone.
-//!
-//! Params reach a factory as a [`StaticParams`] surface: a value tree decoded
-//! through serde (field defaults honored, unknown keys rejected), or a
-//! paramless surface that decodes an all-defaults value.
+//! [`Registry`] maps configured type names to constructors. Factories decode
+//! parameters and return graph nodes to the resolver. [`Registry::with_builtins`]
+//! registers the standard telemetry, alarm, and preset systems.
 
 use std::collections::HashMap;
 

@@ -199,10 +199,6 @@ fn block_of(map: &memmap2::MmapMut) -> &CtlBlock {
     unsafe { &*(map.as_ptr() as *const CtlBlock) }
 }
 
-// ---------------------------------------------------------------------------
-// Host half
-// ---------------------------------------------------------------------------
-
 /// The host's end of one worker's control block. Created before the worker
 /// is spawned; dropped after the worker is dead or done.
 pub struct CtlHost {
@@ -309,10 +305,6 @@ impl CtlHost {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Worker half
-// ---------------------------------------------------------------------------
 
 /// The worker's end of the control block. Attached from the file path the
 /// launch manifest names, after the host created it.

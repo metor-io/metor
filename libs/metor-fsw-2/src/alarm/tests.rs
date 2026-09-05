@@ -46,10 +46,6 @@ fn step(eval: &mut AlarmEval, v: f64, next: &mut u64) -> Option<EvalEvent> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// AlarmEval
-// ---------------------------------------------------------------------------
-
 /// A breach must hold for `debounce` consecutive cycles to raise, and a
 /// recovery likewise to clear, so a shorter blip does neither.
 #[test]
@@ -263,10 +259,6 @@ fn below_thresholds_breach_downward() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Spec validation + to_def
-// ---------------------------------------------------------------------------
-
 #[test]
 fn try_from_rejects_bad_specs() {
     // No band at all.
@@ -305,10 +297,6 @@ fn spec_defaults() {
     let s = spec(raw(None, band(Some(2.0), None)));
     assert_eq!(s.severity, Severity::Critical);
 }
-
-// ---------------------------------------------------------------------------
-// The system, end to end (coordinator-built, registry-observed)
-// ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
 mod system {

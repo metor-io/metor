@@ -1,29 +1,13 @@
-//! Pack-shared system state: one state instance, several systems.
+//! Pack-shared state borrowed by attached cyclic systems.
 //!
-//! Some resources are naturally owned by more than one system, a link
-//! server whose connection set the downlink writes and the uplink reads, at
-//! different points in the same cycle. The sharing model reuses the grant
-//! systems already have: a system runs against `&mut` to a state, so several
-//! systems are granted `&mut` to the *same* state, time-sliced as each takes
-//! its turn on the cycle loop. The attached systems stay distinct, with their
-//! own instance names, ports, and log; only the state behind them is one.
+//! [`Pack::shared_state`](crate::Pack::shared_state) returns a [`Shared`] token.
+//! The state is constructed from its wiring declaration. [`SharedLifecycle`]
+//! starts it before the first attached system initializes and shuts it down
+//! after the last attached system stops.
 //!
-//! [`Pack::shared_state`](crate::Pack::shared_state) declares the instance
-//! and returns the [`Shared`] token entries capture; sharing is scoped to
-//! the declaring pack by construction, since the token is only reachable
-//! inside the `pack()` that made it. The state is constructed once, from
-//! its own wiring declaration's params, and its [`SharedLifecycle`] hooks
-//! run once: `start` before the first attached system's init, `shutdown`
-//! after the last attached system's shutdown.
-//!
-//! Attachment is cyclic-only. The runtime is a single-threaded cooperative
-//! executor, so a [`RefCell`] time-slices soundly between cyclic steps, but
-//! an async system's state moves into its own task and lives across
-//! awaits, where a held borrow would collide with the very interleaving the
-//! executor exists to provide. A state that needs background tasks (a
-//! server's accept loop) can instead move the task-owned portion into those
-//! tasks and communicate over channels. The systems' `&mut S` remains the
-//! sole mutable grant of the shared state struct itself.
+//! Borrows use [`RefCell`] and must stay within a cyclic step. Async tasks may
+//! own separate resources and communicate through channels; they must not
+//! hold a shared-state borrow across an await.
 
 use core::cell::{Cell, RefCell, RefMut};
 use std::rc::Rc;

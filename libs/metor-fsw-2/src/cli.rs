@@ -320,17 +320,13 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
 /// would otherwise read as spurious drift. The line/column of every anchor is
 /// kept, so a genuine emission change is still caught.
 fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
-    // Materialize a readable directory: a `.metor` unpacks to a temp dir held
-    // for the duration of the check, a directory is read in place.
-    let _held;
-    let dir = if bundle.is_file() && bundle.extension().is_some_and(|e| e == METOR_EXTENSION) {
-        let unpacked = unpack_metor(bundle).into_diagnostic()?;
-        let path = unpacked.path().to_path_buf();
-        _held = Some(unpacked);
-        path
-    } else {
-        bundle.to_path_buf()
-    };
+    let unpacked =
+        if bundle.is_file() && bundle.extension().is_some_and(|ext| ext == METOR_EXTENSION) {
+            Some(unpack_metor(bundle).into_diagnostic()?)
+        } else {
+            None
+        };
+    let dir = unpacked.as_ref().map_or(bundle, |temp| temp.path());
 
     let frozen_text = read_file(&dir.join(WIRING_FILE_NAME))?;
     let frozen: Wiring = serde_json::from_str(&frozen_text).map_err(|e| {
@@ -340,7 +336,7 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
         )
     })?;
 
-    let source = find_provenance(&dir).ok_or_else(|| {
+    let source = find_provenance(dir).ok_or_else(|| {
         miette::miette!(
             "bundle `{}` carries no provenance source (target.py); cannot --check-ir",
             bundle.display()
@@ -411,7 +407,6 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     let cycles = args.cycles.unwrap_or(usize::MAX);
     let mut coord = resolve(&wiring, &Registry::with_builtins())?;
 
-    // `run_for` does init, the cycle loop, and shutdown.
     coord.run_for(cycles).await;
 
     // A hard-stopped system is a failed run: name each one and exit non-zero,

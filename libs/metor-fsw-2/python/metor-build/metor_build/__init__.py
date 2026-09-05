@@ -40,7 +40,9 @@ def _config(root):
         doc = tomllib.load(f)
     project = doc["project"]
     build = doc.get("tool", {}).get("metor", {}).get("build", {})
-    extra = [os.path.normpath(os.path.join(root, p)) for p in build.get("extra-pth", [])]
+    extra = [
+        os.path.normpath(os.path.join(root, p)) for p in build.get("extra-pth", [])
+    ]
     return project["name"], project["version"], extra, build.get("pack-dev-command")
 
 
@@ -49,9 +51,7 @@ def _supports_pack(fsw):
     capability handshake that keeps a stale binary on `PATH` from serving a
     build it cannot perform."""
     try:
-        probe = subprocess.run(
-            [fsw, "pack", "--help"], capture_output=True, timeout=30
-        )
+        probe = subprocess.run([fsw, "pack", "--help"], capture_output=True, timeout=30)
     except OSError:
         return False
     return probe.returncode == 0
@@ -87,7 +87,17 @@ def _run_fsw(root, args, override):
     elif (fsw := shutil.which("metor-fsw")) and _supports_pack(fsw):
         cmd = [fsw, *args]
     else:
-        cmd = ["cargo", "run", "-q", "-p", "metor-fsw-2", "--bin", "metor-fsw", "--", *args]
+        cmd = [
+            "cargo",
+            "run",
+            "-q",
+            "-p",
+            "metor-fsw-2",
+            "--bin",
+            "metor-fsw",
+            "--",
+            *args,
+        ]
     # Output passes through to the frontend, which shows it on failure (or -v).
     subprocess.run(cmd, cwd=root, check=True)
 
@@ -130,6 +140,5 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
 def build_sdist(sdist_directory, config_settings=None):
     raise NotImplementedError(
-        "metor packs are published as binary wheels, never sdists "
-        "(docs/packaging.md)"
+        "metor packs are published as binary wheels, never sdists (docs/packaging.md)"
     )

@@ -435,7 +435,7 @@ impl std::error::Error for WriterClaimed {}
 pub enum AttachError {
     BadMagic,
     BadVersion,
-    /// Pointer width or endianness mismatch (see [`arch_tag`]).
+    /// Pointer width or endianness mismatch (see `arch_tag`).
     ArchMismatch,
     /// Region shorter than the fixed header.
     TooSmall,
@@ -1119,24 +1119,33 @@ pub fn region_len(cfg: &Config) -> usize {
 /// Compute `(reader_table_offset, data_offset, total_size)` and validate the
 /// config.
 fn layout(cfg: &Config) -> (usize, usize, usize) {
-    assert!(
-        cfg.capacity.is_power_of_two(),
-        "capacity must be a power of two, got {}",
-        cfg.capacity
-    );
-    // Below one record header no write could ever succeed, and `read_len`'s
-    // `phys + 8 <= capacity` contract would break. `read_header` performs the
-    // same check on attach.
-    assert!(
-        cfg.capacity >= 8,
-        "capacity must hold at least one record header (8 bytes), got {}",
-        cfg.capacity
-    );
-    assert!(cfg.max_readers > 0, "max_readers must be > 0");
-    let reader_table_offset = HEADER_SIZE;
-    let data_offset = HEADER_SIZE + cfg.max_readers * READER_SLOT_SIZE;
-    let total = data_offset + cfg.capacity;
-    (reader_table_offset, data_offset, total)
+    checked_layout(cfg)
+        .expect("ring capacity and reader table must form a valid, representable region")
+}
+
+/// The region size, or `None` if the capacity, reader count, or total size
+/// cannot be represented by the ring format and a Rust allocation.
+pub fn checked_region_len(cfg: &Config) -> Option<usize> {
+    checked_layout(cfg).map(|(_, _, total)| total)
+}
+
+fn checked_layout(cfg: &Config) -> Option<(usize, usize, usize)> {
+    if !cfg.capacity.is_power_of_two()
+        || cfg.capacity < 8
+        || cfg.max_readers == 0
+        || u32::try_from(cfg.max_readers).is_err()
+    {
+        return None;
+    }
+    let data_offset = cfg
+        .max_readers
+        .checked_mul(READER_SLOT_SIZE)?
+        .checked_add(HEADER_SIZE)?;
+    let total = data_offset.checked_add(cfg.capacity)?;
+    if total > isize::MAX as usize {
+        return None;
+    }
+    Some((HEADER_SIZE, data_offset, total))
 }
 
 /// Write the header and initialize the control words and reader slots.

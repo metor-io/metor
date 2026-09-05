@@ -1,16 +1,9 @@
-//! The host half of a worker process: spawning it, driving it in lockstep
-//! with the cycle, and cleaning up after its death.
+//! Spawn, supervise, and clean up worker processes.
 //!
-//! Two lifecycles share one core. [`ProcSlot`] is the process twin of
-//! [`DlSlot`](crate::dl): a fixed system driven for the whole run, restarted
-//! on death within a budget. [`SeqWorker`] is the per-Load twin behind a
-//! process slot's occupant: spawned by `Load`, stepped while the occupant
-//! runs, and ended (kill, reap, reclaim) when the occupant is stopped,
-//! reset, unloaded, or replaced. Both embed
-//! [`WorkerHandle`], the spawn/poll/kill mechanics; what differs is policy
-//! (restart vs. latch-and-report). [`describe_via_worker`] is the
-//! resolve-time helper that obtains a system's descriptor bytes without ever
-//! loading the artifact into this process.
+//! [`ProcSlot`] restarts a wired system within its configured budget.
+//! [`SeqWorker`] belongs to one loaded occupant and reports failure without
+//! restarting. Both use [`WorkerHandle`] for process and ring ownership.
+//! [`describe_via_worker`] reads a pack manifest without loading it in the host.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -156,10 +149,6 @@ pub(crate) struct SpawnSpec {
     pub name: Arc<str>,
 }
 
-// ---------------------------------------------------------------------------
-// WorkerHandle, the shared spawn/poll/kill core
-// ---------------------------------------------------------------------------
-
 /// The process-management core [`ProcSlot`] and [`SeqWorker`] share: the ctl
 /// block, the child, the host handles of every ring the worker attaches (the
 /// reclaim set), and the paths a spawn needs. It owns the mechanics: spawn
@@ -227,7 +216,7 @@ impl WorkerHandle {
 
     /// The live child's pid, or `0` between workers.
     fn pid(&self) -> u32 {
-        self.child.as_ref().map(|c| c.id()).unwrap_or(0)
+        self.child.as_ref().map_or(0, Child::id)
     }
 
     /// End the child for certain and free everything it claimed: kill (a
@@ -301,10 +290,6 @@ impl Drop for WorkerHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ProcSlot, the whole-run worker behind a process system
-// ---------------------------------------------------------------------------
-
 /// Where a process slot is in its worker's lifecycle, beyond the coarse
 /// [`SlotState`]. `Running` is the steady state; the middle three are the
 /// non-blocking restart pipeline (each polled once per cycle, so a respawn
@@ -350,7 +335,7 @@ pub(crate) struct ProcSlot {
     /// Steps whose ack deadline lapsed with the child still alive, since the
     /// coordinator last drained them onto its log.
     timeouts: u64,
-    // --- restart machinery -------------------------------------------------
+    // restart machinery
     phase: Phase,
     max_restarts: u32,
     backoff: Duration,
@@ -560,10 +545,6 @@ impl CyclicSlot for ProcSlot {
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// SeqWorker, the per-Load worker behind a process slot occupant
-// ---------------------------------------------------------------------------
 
 /// How far a [`SeqWorker`]'s load pipeline has advanced. The waiting phases
 /// carry their deadline; the terminal phases are latched, so a poll past the

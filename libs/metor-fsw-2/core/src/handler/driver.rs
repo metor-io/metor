@@ -1,17 +1,25 @@
-//! The driver behind a fn-authored system: owns the state and the port
-//! states between cycles and generalizes [`CyclicRunner`]'s drop report and
-//! log flush to the parameter-tuple world.
+//! Drivers for function and future-based pack entries.
 //!
-//! [`CyclicRunner`]: crate::CyclicRunner
+//! Drivers own ports, flush logs, and report dropped output records. Future
+//! drivers poll once per cycle under the sequence clock.
 
+use core::future::Future;
 use core::marker::PhantomData;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use core::task::{Context, Poll, Waker};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use metor_proto::types::Timestamp;
 
+use crate::Shared;
 use crate::binder::{AnySource, RingSource};
-use crate::log::{LogEvent, LogPort};
+use crate::log::{LogEvent, LogLevel, LogPort};
 use crate::message::MsgOut;
-use crate::pack::{Driver, StepStatus};
+use crate::pack::{Driver, Mount, StepStatus};
+use crate::port::{Input, Output};
+use crate::sequence::{self, CycleClock, Outcome, SequenceStatus, SlotControlIn};
 use crate::system::report_dropped;
 
 use super::param::{BindCx, CycleCx};
@@ -21,7 +29,7 @@ use super::tuples::{ExecParamSet, ExecuteFn};
 /// default), or the scoped borrow of a pack-shared instance.
 pub(crate) enum StateAccess<S> {
     Owned(S),
-    Shared(crate::Shared<S>),
+    Shared(Shared<S>),
 }
 
 impl<S> StateAccess<S> {
@@ -41,7 +49,7 @@ where
     execute: F,
     ports: <F::Params as ExecParamSet>::State,
     log: LogPort,
-    _m: PhantomData<fn() -> M>,
+    _marker: PhantomData<fn() -> M>,
 }
 
 impl<S, M, F> FnDriver<S, M, F>
@@ -65,7 +73,7 @@ where
             execute,
             ports,
             log: bind_log_tail(src),
-            _m: PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -113,26 +121,22 @@ where
     fn shutdown(&mut self) {}
 }
 
-/// The driver behind an async-fn (task) entry: the future owns its ports and
-/// its state (locals); the driver refreshes the clock and polls once per
-/// cycle with a no-op waker, exactly the sequence execution model. Drops
-/// from the future-owned outputs arrive through the shared cell and are
-/// reported on the log, same as a runner-owned bundle's.
+/// Poll a task once per cycle, tracking its outcome and output drops.
 pub(crate) struct FutureDriver {
-    future: core::pin::Pin<Box<dyn core::future::Future<Output = crate::sequence::Outcome>>>,
-    clock: std::rc::Rc<crate::sequence::CycleClock>,
+    future: Pin<Box<dyn Future<Output = Outcome>>>,
+    clock: Rc<CycleClock>,
     log: LogPort,
-    drops: std::sync::Arc<core::sync::atomic::AtomicU64>,
+    drops: Arc<AtomicU64>,
     /// A finished future is never polled again; the terminal is re-served.
-    done: Option<crate::sequence::Outcome>,
+    done: Option<Outcome>,
 }
 
 impl FutureDriver {
     pub(crate) fn new(
-        future: core::pin::Pin<Box<dyn core::future::Future<Output = crate::sequence::Outcome>>>,
-        clock: std::rc::Rc<crate::sequence::CycleClock>,
+        future: Pin<Box<dyn Future<Output = Outcome>>>,
+        clock: Rc<CycleClock>,
         log: LogPort,
-        drops: std::sync::Arc<core::sync::atomic::AtomicU64>,
+        drops: Arc<AtomicU64>,
     ) -> Self {
         Self {
             future,
@@ -146,15 +150,14 @@ impl FutureDriver {
     /// Poll once under the ambient clock, reporting the shared drop count
     /// and flushing the log; the caller decides what happens to progress
     /// lines and the outcome.
-    fn poll_once(&mut self, now: Timestamp) -> core::task::Poll<crate::sequence::Outcome> {
-        use core::task::{Context, Waker};
+    fn poll_once(&mut self, now: Timestamp) -> Poll<Outcome> {
         self.clock.now.set(now);
-        let poll = crate::sequence::with_clock(&self.clock, || {
+        let poll = sequence::with_clock(&self.clock, || {
             self.future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
         });
-        let dropped = self.drops.swap(0, core::sync::atomic::Ordering::Relaxed);
+        let dropped = self.drops.swap(0, Relaxed);
         report_dropped(&mut self.log, dropped);
         self.log.flush(now);
         poll
@@ -165,7 +168,6 @@ impl Driver for FutureDriver {
     fn init(&mut self) {}
 
     fn step(&mut self, now: Timestamp) -> StepStatus {
-        use core::task::Poll;
         if let Some(outcome) = self.done {
             return StepStatus::Done(outcome);
         }
@@ -173,7 +175,7 @@ impl Driver for FutureDriver {
         // A wired task has no SequenceStatus output; progress lines land on
         // the entry's ordinary log so they still flow off-board.
         for line in self.clock.drain_progress() {
-            self.log.log(crate::log::LogLevel::Info, &line);
+            self.log.log(LogLevel::Info, &line);
         }
         match poll {
             Poll::Ready(outcome) => {
@@ -187,23 +189,21 @@ impl Driver for FutureDriver {
     fn shutdown(&mut self) {}
 }
 
-/// The slot-occupant wrapper around a future-driven entry: the cancel latch
-/// folded from the [`SlotControlIn`](crate::SlotControlIn) input before each
-/// poll, and a [`SequenceStatus`](crate::sequence::SequenceStatus) record
-/// published after it. Bound AFTER the inner entry's own ports (control
-/// after the user inputs; status after the log tail), matching the
-/// occupant tail the host appends around the entry's descriptor.
+/// Add cancellation and sequence status to a future-driven entry.
+///
+/// Control and status bind after the entry's own ports, matching the
+/// occupant descriptor's appended ports.
 pub(crate) struct OccupantFuture {
     inner: FutureDriver,
-    control: crate::port::Input<crate::sequence::SlotControlIn>,
-    status: crate::port::Output<crate::sequence::SequenceStatus>,
+    control: Input<SlotControlIn>,
+    status: Output<SequenceStatus>,
 }
 
 impl OccupantFuture {
     pub(crate) fn new(
         inner: FutureDriver,
-        control: crate::port::Input<crate::sequence::SlotControlIn>,
-        status: crate::port::Output<crate::sequence::SequenceStatus>,
+        control: Input<SlotControlIn>,
+        status: Output<SequenceStatus>,
     ) -> Self {
         Self {
             inner,
@@ -217,7 +217,6 @@ impl Driver for OccupantFuture {
     fn init(&mut self) {}
 
     fn step(&mut self, now: Timestamp) -> StepStatus {
-        use core::task::Poll;
         if let Some(outcome) = self.inner.done {
             return StepStatus::Done(outcome);
         }
@@ -226,7 +225,7 @@ impl Driver for OccupantFuture {
         match self.control.latest() {
             Ok(Some(f)) if f.cancel != 0 => self.inner.clock.cancel.set(true),
             Err(_) => {
-                let outcome = crate::sequence::Outcome::Failed;
+                let outcome = Outcome::Failed;
                 self.inner.done = Some(outcome);
                 return StepStatus::Done(outcome);
             }
@@ -238,9 +237,9 @@ impl Driver for OccupantFuture {
             Poll::Ready(outcome) => Some(outcome),
             Poll::Pending => None,
         };
-        let run_state = outcome.map_or(0, crate::sequence::Outcome::run_state);
-        if crate::sequence::publish_status(&mut self.status, now, run_state, &lines).is_err() {
-            outcome = Some(crate::sequence::Outcome::Failed);
+        let run_state = outcome.map_or(0, Outcome::run_state);
+        if sequence::publish_status(&mut self.status, now, run_state, &lines).is_err() {
+            outcome = Some(Outcome::Failed);
         }
         if let Some(outcome) = outcome {
             self.inner.done = Some(outcome);
@@ -260,9 +259,9 @@ impl Driver for OccupantFuture {
 /// so the slot runner's status tap works for any occupant.
 pub(crate) struct OccupantCyclic {
     inner: Box<dyn Driver>,
-    control: crate::port::Input<crate::sequence::SlotControlIn>,
-    status: crate::port::Output<crate::sequence::SequenceStatus>,
-    done: Option<crate::sequence::Outcome>,
+    control: Input<SlotControlIn>,
+    status: Output<SequenceStatus>,
+    done: Option<Outcome>,
 }
 
 impl Driver for OccupantCyclic {
@@ -271,7 +270,6 @@ impl Driver for OccupantCyclic {
     }
 
     fn step(&mut self, now: Timestamp) -> StepStatus {
-        use crate::sequence::Outcome;
         if let Some(outcome) = self.done {
             return StepStatus::Done(outcome);
         }
@@ -288,7 +286,7 @@ impl Driver for OccupantCyclic {
             StepStatus::Running => 0,
             StepStatus::Done(outcome) => outcome.run_state(),
         };
-        if crate::sequence::publish_status(&mut self.status, now, run_state, &[]).is_err() {
+        if sequence::publish_status(&mut self.status, now, run_state, &[]).is_err() {
             status = StepStatus::Done(Outcome::Failed);
         }
         if let StepStatus::Done(outcome) = status {
@@ -308,15 +306,15 @@ impl Driver for OccupantCyclic {
 /// order the host appends the occupant tail in.
 pub(crate) fn mount_driver(
     src: &mut AnySource,
-    mount: crate::pack::Mount,
+    mount: Mount,
     bind_inner: impl FnOnce(&mut AnySource) -> Box<dyn Driver>,
 ) -> Box<dyn Driver> {
     match mount {
-        crate::pack::Mount::Wired => bind_inner(src),
-        crate::pack::Mount::SlotOccupant => {
+        Mount::Wired => bind_inner(src),
+        Mount::SlotOccupant => {
             let inner = bind_inner(src);
-            let control = crate::port::Input::bind(src);
-            let status = crate::port::Output::bind(src);
+            let control = Input::bind(src);
+            let status = Output::bind(src);
             Box::new(OccupantCyclic {
                 inner,
                 control,

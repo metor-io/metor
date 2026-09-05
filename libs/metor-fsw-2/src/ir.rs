@@ -1,20 +1,8 @@
-//! The [`Wiring`] data model, a plain serializable description of a target.
+//! Serializable target descriptions.
 //!
-//! This is the target IR: pure data with a serde/serde_json codec and no
-//! runtime types, so a front-end can emit it and the host can re-ingest it.
-//! The Python-eval path, the Rust builder, and the shared resolver live under
-//! [`wiring`](crate::wiring), which re-exports these types.
-//!
-//! Both front-ends produce this type: the Python `metor_config` recorder
-//! emits it as JSON, [`WiringBuilder`](crate::wiring::WiringBuilder) builds it
-//! directly, and the one shared `wiring::resolve` consumes either, so
-//! anything one front-end can express the other can express too.
-//!
-//! The specs here hold no runtime values. [`ClockSpec`] takes a plain `f64`
-//! where [`ClockMode`](crate::ClockMode) takes a `Duration`, [`CoordinatorSpec`]
-//! drops the clock value [`CoordinatorConfig`](crate::CoordinatorConfig)
-//! carries, and so on; conversion into the runtime types happens in
-//! `wiring::resolve`, leaving this module a pure serde data format.
+//! Python's recorder and [`WiringBuilder`](crate::wiring::WiringBuilder) both
+//! produce [`Wiring`]. The resolver converts these specs into runtime types;
+//! the IR itself contains no runtime state.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

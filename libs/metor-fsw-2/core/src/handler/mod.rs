@@ -51,7 +51,7 @@ where
     SystemDef {
         execute,
         init: NoInit,
-        _m: PhantomData,
+        _marker: PhantomData,
     }
 }
 
@@ -60,7 +60,7 @@ where
 pub struct SystemDef<S, M, F, I> {
     execute: F,
     init: I,
-    _m: PhantomData<fn() -> (S, M)>,
+    _marker: PhantomData<fn() -> (S, M)>,
 }
 
 /// No construction given: the state is `Default` and the entry takes no
@@ -72,7 +72,7 @@ pub struct NoInit;
 pub struct InitWith<G, M2> {
     init: G,
     defaults: Option<Vec<u8>>,
-    _m: PhantomData<fn() -> M2>,
+    _marker: PhantomData<fn() -> M2>,
 }
 
 /// A prebuilt state moved into the entry (instantiable once).
@@ -96,9 +96,9 @@ where
             init: InitWith {
                 init,
                 defaults: None,
-                _m: PhantomData,
+                _marker: PhantomData,
             },
-            _m: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -109,7 +109,7 @@ where
         SystemDef {
             execute: self.execute,
             init: Prebuilt(Some(state)),
-            _m: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -124,7 +124,7 @@ where
         SystemDef {
             execute: self.execute,
             init: Attached(token.clone()),
-            _m: PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -142,8 +142,7 @@ where
         G::Params: serde::Serialize,
     {
         self.init.defaults = Some(
-            postcard::to_allocvec(&value)
-                .expect("params postcard-encode (Serialize is infallible)"),
+            postcard::to_allocvec(&value).expect("default parameters must serialize to postcard"),
         );
         self
     }

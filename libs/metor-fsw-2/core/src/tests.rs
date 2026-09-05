@@ -12,7 +12,7 @@ use crate::{
     DynamicWriteError, Frame, FrameList, FrameMap, FrameWriteError, FrameWriter, KeyError, Output,
 };
 
-// --- Shared recording sink ---
+// Shared recording sink
 
 #[derive(Default)]
 struct RecSink {
@@ -40,7 +40,7 @@ fn components<F: Frame>(table: &[u8]) -> RecSink {
     sink
 }
 
-// --- Frame tag, shared timestamp, and timestamp suppression ---
+// Frame tag, shared timestamp, and timestamp suppression
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
@@ -93,7 +93,7 @@ fn imu_frame_tag_and_timestamp_suppression() {
     assert_eq!(imu.timestamp(), Timestamp(4242));
 }
 
-// --- Static-frame Componentize / Decomponentize round-trip ---
+// Static-frame Componentize / Decomponentize round-trip
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default, Debug, PartialEq)]
 #[repr(C)]
@@ -123,7 +123,7 @@ fn static_frame_componentize_round_trip() {
     assert_eq!(dst.timestamp, Timestamp(0));
 }
 
-// --- Array (`[T; N]`) frame field ---
+// Array (`[T; N]`) frame field
 
 #[derive(Default)]
 struct VecSink {
@@ -186,7 +186,7 @@ fn array_field_frame_round_trip() {
     assert_eq!(sink.values[&ComponentId::new("arr.n")], vec![42.0]);
 }
 
-// --- Skipped fields: `_`-prefixed padding and explicit overrides ---
+// Skipped fields: `_`-prefixed padding and explicit overrides
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
@@ -317,7 +317,7 @@ fn nested_struct_pad_field_skipped() {
     assert!(names.iter().all(|n| !n.contains("_pad")), "{names:?}");
 }
 
-// --- FrameList / FrameMap: build, serialize, apply ---
+// FrameList / FrameMap: build, serialize, apply
 
 #[derive(AsVTable, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 #[repr(C)]
@@ -603,7 +603,7 @@ fn frame_scratch_reuse_is_byte_identical() {
     assert_eq!(reused.table(), &want[..]);
 }
 
-// --- Nested dynamics: processes.htop.threads.0.state ---
+// Nested dynamics: processes.htop.threads.0.state
 
 #[derive(AsVTable, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 #[repr(C)]
@@ -671,7 +671,7 @@ fn nested_dynamic_prefix_rule() {
     );
 }
 
-// --- MAX_SIZE formula ---
+// MAX_SIZE formula
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
@@ -694,4 +694,14 @@ fn max_size_formula() {
     assert_eq!(<SysBoth as Componentize>::MAX_SIZE, expected);
     // Concretely: 24 fixed + 128 list + 160 map + 8 pad = 320.
     assert_eq!(<SysBoth as Componentize>::MAX_SIZE, 320);
+}
+
+#[test]
+fn checked_capacity_rejects_unrepresentable_records_and_depths() {
+    use crate::checked_capacity_for;
+    assert_eq!(checked_capacity_for(8, 2), Some(32));
+    assert_eq!(checked_capacity_for(8, 0), Some(32));
+    assert_eq!(checked_capacity_for(8, usize::MAX), None);
+    assert_eq!(checked_capacity_for(usize::MAX, 2), None);
+    assert_eq!(checked_capacity_for(8, usize::MAX / 16), None);
 }

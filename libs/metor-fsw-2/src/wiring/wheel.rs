@@ -133,10 +133,6 @@ fn metadata_contents(meta: &WheelMeta) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
-// The stored-only zip encoder
-// ---------------------------------------------------------------------------
-
 // 1980-01-01 00:00:00, the earliest DOS timestamp, fixed so archives stay
 // reproducible.
 const DOS_DATE: u16 = 0x0021;

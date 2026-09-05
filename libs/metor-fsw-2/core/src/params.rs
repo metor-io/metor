@@ -2,16 +2,16 @@
 //! the diagnostics both raise.
 //!
 //! A statically linked system has its `Params` type in hand, so
-//! [`decode_value_params`] is plain serde: `#[serde(default)]` is honoured and
+//! [`decode_value_params`](crate::params::decode_value_params) is plain serde: `#[serde(default)]` is honoured and
 //! `serde_ignored` supplies the typo guard serde_json lacks.
 //!
 //! A dynamically loaded one does not. Its `Params` type is never linked into
 //! the host; what the host has instead is the postcard schema the shared
-//! library exports. [`encode_value_params`] walks that schema to produce the
+//! library exports. [`encode_value_params`](crate::params::encode_value_params) walks that schema to produce the
 //! exact bytes the `Params` struct itself would postcard-encode to, so the
 //! loaded side decodes them as its own type. It overlays the entry's declared
-//! defaults, conforms the value to the schema ([`conform_to_schema`] turns
-//! unknown keys, missing fields, and type mismatches into [`ParamError`]s and
+//! defaults, conforms the value to the schema (`conform_to_schema` turns
+//! unknown keys, missing fields, and type mismatches into [`ParamError`](crate::params::ParamError)s and
 //! inserts an explicit `Null` for every absent `Option` field, since
 //! postcard-dyn requires the key to be present), and emits the bytes with
 //! [`postcard_dyn::to_stdvec_dyn`].
@@ -19,12 +19,12 @@
 //! One property of the conformance walk is worth knowing: any schema shape the
 //! walk does not model (tuples, maps, enums) passes through unchecked; if
 //! postcard-dyn cannot encode it, the failure surfaces as
-//! [`ParamErrorKind::DlParamEncode`] rather than as silently wrong bytes.
+//! [`ParamErrorKind::DlParamEncode`](crate::params::ParamErrorKind::DlParamEncode) rather than as silently wrong bytes.
 //! Errors anchor to the whole value-tree surface, which carries no document
 //! spans.
 //!
 //! The errors stop here rather than at a `miette::Diagnostic`: the host owns
-//! the wiring diagnostic (`LoadError`), which absorbs a [`ParamErrorKind`] as
+//! the wiring diagnostic (`LoadError`), which absorbs a [`ParamErrorKind`](crate::params::ParamErrorKind) as
 //! one of its variants. This crate carries no reporter.
 
 use std::collections::HashMap;
@@ -54,13 +54,11 @@ pub struct ParamError {
 /// What went wrong decoding or encoding a system's params.
 #[derive(Error, Debug)]
 pub enum ParamErrorKind {
-    /// A required params field has no matching property or child on the node.
+    /// A required parameter is missing from the value object.
     #[error("missing required param `{property}` for system `{system}`")]
     MissingParam { property: String, system: String },
 
-    /// A params value that does not decode as the field's type, or a malformed
-    /// params surface such as a stray positional argument or a repeated
-    /// property.
+    /// A parameter value does not match its field's type.
     #[error("invalid value for `{property}` on system `{system}`: expected {expected}")]
     InvalidParam {
         property: String,
@@ -68,9 +66,7 @@ pub enum ParamErrorKind {
         expected: String,
     },
 
-    /// A property or child with no matching params field, usually a typo or a
-    /// stale config. Both the typed deserializer and the dynamic schema
-    /// validation raise this same variant.
+    /// An object key has no matching parameter field.
     #[error("unknown param `{property}` for system `{system}`")]
     UnknownParam { property: String, system: String },
 
@@ -268,7 +264,7 @@ fn merge_onto_defaults(base: Value, config: Value) -> Result<Value, String> {
 
 /// What the schema walk reports when a value does not fit, either a spanned
 /// params diagnostic ready to surface as-is or a description of a schema shape
-/// the walk cannot express (reported as [`ParamErrorKind::DlParamEncode`]).
+/// the walk cannot express (reported as [`ParamErrorKind::DlParamEncode`](crate::params::ParamErrorKind::DlParamEncode)).
 enum Conform {
     Param(Box<ParamError>),
     Shape(String),

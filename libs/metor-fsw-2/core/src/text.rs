@@ -163,7 +163,7 @@ mod tests {
         s.set("go");
         assert_eq!(s.as_str(), "go");
         // The 'm','m','i'… from the longer prior value are gone, not just hidden.
-        assert_eq!(s.is_empty(), false);
+        assert!(!s.is_empty());
         assert_eq!(&s.buf[2..], &[0u8; 6]);
     }
 

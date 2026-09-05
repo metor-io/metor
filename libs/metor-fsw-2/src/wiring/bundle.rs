@@ -1,32 +1,13 @@
-//! Relocatable bundles, directories that carry everything a target needs to
-//! run without a source tree, a cargo install, or any config front-end.
+//! Write and load relocatable target bundles.
 //!
-//! A bundle holds the frozen target IR side by side with the code it names:
-//! `wiring.json` is the versioned [`Wiring`] serialized as JSON (source
-//! anchors, scopes, and per-artifact manifest hashes intact, but artifact
-//! `path`s stripped so the bundle stays relocatable and byte-reproducible),
-//! `meta.json` is a plain-serde [`BundleMeta`] sidecar, and every artifact's
-//! built `cdylib`, plus its `<cdylib>.manifest` sidecar when the build driver
-//! wrote one, is copied in alongside. The `target.py` that produced the
-//! target rides along as verbatim provenance and is never consumed on load:
-//! the run path needs no Python and no config parse, strictly more hermetic
-//! than re-evaluating source on target.
+//! A bundle contains `wiring.json`, `meta.json`, compiled artifacts, and any
+//! manifest sidecars. Artifact paths are stripped from the frozen IR and
+//! resolved relative to the bundle on load. `target.py` is optional provenance;
+//! running a bundle does not evaluate Python.
 //!
-//! [`BundleMeta`] records the ABI version and IR version the bundle was built
-//! against, the target triple its `.so`s were compiled for, the build profile,
-//! a timestamp, the `sha256` of the `wiring.json` bytes (the determinism
-//! backstop CI diffs), and the `metor_config` recorder version the target was
-//! evaluated with. [`load_bundle`] checks the ABI and target. The later
-//! resolve pass checks the IR version. A triple mismatch is a clean
-//! [`BundleError::TargetMismatch`] before any dlopen, rather than an opaque
-//! dlopen failure. It verifies the frozen IR digest and each recorded
-//! manifest hash. A manifest hash checks interface compatibility; it is not
-//! a digest of the shared-object bytes.
-//!
-//! [`write_bundle`] produces a bundle from a built [`Wiring`] plus a
-//! [`PackageOptions`]. [`load_bundle`] reads one back into a [`Wiring`] whose
-//! artifact paths point at the copied `.so`s, ready to run without invoking
-//! cargo.
+//! Loading checks the ABI, target triple, IR digest, and recorded manifest
+//! hashes. The resolver checks the IR version. Manifest hashes describe
+//! interface compatibility, not the contents of the library binary.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};

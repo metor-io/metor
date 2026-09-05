@@ -1,33 +1,8 @@
-//! The traits a user's system implements, and the shims the framework wraps
-//! around it.
+//! Struct-based systems and their input/output bundles.
 //!
-//! A system is a struct with a typed input bundle and a typed output bundle.
-//! [`System`] carries the surface every system shares (the bundle types, the
-//! wiring name, and the init/shutdown hooks), and a user implements exactly
-//! one of two leaf traits on top of it. A [`CyclicSystem`] is driven by the
-//! coordinator, which calls `execute` once per cycle. An `AsyncSystem` owns
-//! its own `run` loop and paces itself by awaiting its inputs or a timer.
-//!
-//! Outputs are never handed to a system bare. The framework wraps the user's
-//! bundle in [`Out`], which appends an implicit log port so that
-//! `output.log()` is always available. Reporting through that handle is a
-//! system's only failure channel; `execute` and `run` return nothing.
-//!
-//! Construction is split from wiring. [`BuildSystem`] says how a system is
-//! made from a decoded params value and knows nothing about config formats,
-//! so the same impl can serve statically registered systems. Rings are
-//! likewise backing-erased: one
-//! `impl System` binds over heap rings or over memory regions a host maps in,
-//! with no backing generic anywhere.
-//!
-//! The fourth authoring form, `AsyncSystem`, lives in the host crate: it is a
-//! free-running task the coordinator's executor owns, and no pack can build
-//! one.
-//!
-//! [`CyclicRunner`] is the framework shim between the coordinator and a
-//! cyclic system. It owns the bundles between cycles and flushes the log
-//! after each `execute`; the host times the step and publishes the run
-//! record.
+//! [`CyclicRunner`] owns the bundles, calls [`CyclicSystem::execute`] once per
+//! cycle, and flushes the log. The host times execution and publishes status.
+//! The host crate also provides `AsyncSystem` for free-running tasks.
 
 use core::ops::{Deref, DerefMut};
 
@@ -159,10 +134,6 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// System construction (config-independent)
-// ---------------------------------------------------------------------------
-
 /// How a concrete system is constructed from its typed params.
 ///
 /// The trait carries no config-format coupling. The static registry decodes
@@ -266,7 +237,7 @@ pub trait CyclicSystem: System {
     /// reported through `output.log()`, never a return value.
     ///
     /// `now` is the coordinator's timestamp for the cycle. Every system in a
-    /// cycle sees the same value, and a [`Simulated`](crate::ClockMode) clock
+    /// cycle sees the same value, and a simulated clock
     /// advances it, so stamp output frames with `now` rather than reading the
     /// wall clock.
     ///

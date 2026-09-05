@@ -37,10 +37,6 @@ use crate::{
     SystemInput, SystemKind, SystemOutput, buffer_capacity,
 };
 
-// ---------------------------------------------------------------------------
-// Fixture frames and a small cyclic system exported through the ABI.
-// ---------------------------------------------------------------------------
-
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "tick_in")]
@@ -232,10 +228,6 @@ impl Drop for OpenPack {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Host-emulation helpers.
-// ---------------------------------------------------------------------------
-
 fn ring_for<F: Frame>(depth: usize, readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
@@ -261,10 +253,6 @@ fn postcard_round_trip<T: Serialize + DeserializeOwned>(value: &T) -> T {
     let bytes = postcard::to_allocvec(value).expect("test value encodes");
     postcard::from_bytes(&bytes).expect("test value decodes")
 }
-
-// ---------------------------------------------------------------------------
-// Lifecycle end-to-end: create, bind, write, execute, read back.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn abi_lifecycle_end_to_end() {
@@ -363,10 +351,6 @@ fn pack_create_bounds_and_reuse() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Manifest round-trip through fsw_pack_describe and postcard.
-// ---------------------------------------------------------------------------
-
 /// Read the manifest back the way a host does: describe for the length, then
 /// copy that many bytes from the pointer the pack still owns.
 fn describe(pack: *mut c_void) -> Vec<u8> {
@@ -450,10 +434,6 @@ fn abi_describe_round_trips() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Telemetry-prefix rewrite on a reconstructed descriptor's outputs.
-// ---------------------------------------------------------------------------
-
 /// Every component id a vtable realizes in registration mode, so a test can
 /// assert exactly which ids the schema bakes in.
 fn realized_ids(vt: &VTable) -> Vec<ComponentId> {
@@ -505,10 +485,6 @@ fn dl_announce_prefixes_vtable_ids() {
         "PortDesc.vtable stays unprefixed for compatibility: {unprefixed:?}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Panic containment: a panicking execute returns Panicked, never unwinds.
-// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct Boom;
@@ -844,10 +820,6 @@ fn announce_preserves_element_names() {
     assert_eq!(m.element_names(), "x,y,z");
 }
 
-// ---------------------------------------------------------------------------
-// PortDesc: both schema arms round-trip through postcard with their axes.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn port_desc_round_trips_both_arms() {
     use metor_proto::types::Msg;
@@ -891,10 +863,6 @@ fn port_desc_round_trips_both_arms() {
         &PortDesc::of::<TickOut>()
     ));
 }
-
-// ---------------------------------------------------------------------------
-// The allocator entry points a wasm host places ring regions through.
-// ---------------------------------------------------------------------------
 
 /// A region must come back 8-aligned and zeroed, since `attach_raw` rejects a
 /// misaligned base outright.

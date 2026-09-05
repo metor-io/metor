@@ -1,11 +1,12 @@
-//! The per-parameter trait behind fn-authored systems.
+//! Parameter declarations, binding, and per-cycle borrows for function systems.
 //!
-//! Each parameter type an execute fn may take implements [`ExecParam`]: what
-//! the driver owns for it between cycles ([`State`](ExecParam::State)), what
-//! it lends the fn each cycle ([`Item`](ExecParam::Item)), the port
-//! declaration it contributes, and how it binds. The declaration walk and the
-//! bind walk are generated from one tuple expansion, so descriptor order and
-//! bind order cannot drift, the invariant positional binding rests on.
+//! [`ExecParam`] defines the state a parameter owns and the value lent to the
+//! execute function. Tuple implementations walk declarations and bindings in
+//! the same order to preserve positional port binding.
+
+use core::any::Any;
+use core::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 use metor_fsw_ring::NoWake;
 use metor_proto::types::Timestamp;
@@ -53,10 +54,10 @@ impl DeclSink {
 pub struct BindCx<'a, 'b, 'c> {
     pub(crate) src: &'a mut AnySource<'b, 'c>,
     /// The create-phase decoded `Params<P>` value, taken by its parameter.
-    pub(crate) params: Option<Box<dyn core::any::Any>>,
+    pub(crate) params: Option<Box<dyn Any>>,
     /// A shared dropped-publish cell every by-value output adopts before it
     /// moves into the future, so the driver can report drops on the log.
-    pub(crate) drops: Option<std::sync::Arc<core::sync::atomic::AtomicU64>>,
+    pub(crate) drops: Option<Arc<AtomicU64>>,
 }
 
 /// The per-cycle context parameters draw non-port items from.

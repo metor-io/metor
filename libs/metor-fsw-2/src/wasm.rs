@@ -1,60 +1,16 @@
-//! Loading and driving pack modules compiled to WebAssembly.
+//! Load and execute WebAssembly packs through the `fsw_pack_*` ABI.
 //!
-//! [`WasmPack`] is the sandboxed twin of [`DlPack`](crate::dl::DlPack): it
-//! drives the very same pack ABI, over the same `fsw_pack_*` entry points, in
-//! the same order, and only the boundary changes. A `.so` is `dlopen`'d into the
-//! host's address space and hands back raw pointers; a `.wasm` is instantiated
-//! under an interpreter whose pointers are offsets into a linear memory the
-//! host can read but the guest cannot escape.
+//! [`WasmPack`] meters execution with fuel and turns traps and invalid ABI
+//! results into [`WasmError`]s. Guest pointers are offsets into linear memory;
+//! the host copies records between guest and host rings each cycle.
 //!
-//! Two properties come out of that, and they are the reason this exists:
+//! Ring regions are allocated through the guest's allocator. Growing memory
+//! from the host could let the guest allocator reuse those pages. After bind,
+//! linear memory is frozen so persistent ring handles keep valid addresses.
+//! Bridge handles must be dropped before the store releases that memory.
 //!
-//! - **A poll is bounded.** Execution is metered in *fuel*, so a guest that
-//!   will not stop is cut off mid-instruction and reported as a failure rather
-//!   than stalling the cycle. Nothing bounds a natively linked occupant.
-//! - **A fault is contained.** An out-of-bounds access traps the guest and
-//!   leaves the host untouched, where the equivalent in a `.so` is memory
-//!   corruption.
-//!
-//! ## Where the rings live
-//!
-//! A guest cannot follow a pointer into the host, so the ring regions live
-//! *inside guest linear memory*: the host asks the guest's own allocator for
-//! each region (`fsw_pack_alloc`), formats a ring into it with
-//! [`RingBuffer::create_raw`], and passes the guest offsets through
-//! `fsw_pack_bind_init` exactly as the `.so` path passes host addresses.
-//!
-//! The regions must be guest-allocated rather than carved out of host-grown
-//! pages: Rust's wasm allocator finds its heap through `memory.size`, so pages
-//! the host grows behind its back can later be handed out again by the guest.
-//!
-//! The host keeps matching rings on both sides and pumps records across the
-//! boundary once per cycle. The ring format stays unchanged; only the copy
-//! between host and guest address spaces is new.
-//!
-//! ## No imports
-//!
-//! A guest module imports nothing. `wasm32-unknown-unknown` has no clock, and
-//! nothing in a guest needs one: the host times each execute and publishes
-//! the `system_status` record itself.
-//!
-//! ## Stable memory and persistent ring roles
-//!
-//! A ring reader owns a persistent slot in the region header, so rebuilding it
-//! each cycle would rejoin at the live edge and lose queued records. The host
-//! therefore retains bridge handles over guest memory. The store enforces the
-//! target's memory ceiling during load and bind, then freezes linear memory
-//! before those handles are constructed. A later `memory.grow` traps, and the
-//! bridge is explicitly dropped before the store releases the backing bytes.
-//!
-//! ## The trust boundary
-//!
-//! Same discipline as `dl.rs`: the module is foreign code, so nothing it
-//! returns is trusted as a Rust value. `fsw_pack_execute` yields a raw `u32`
-//! that is validated and folded to [`FswStatus::Panicked`] when unknown, a
-//! manifest that fails to decode is a clean error rather than a panic, and
-//! every trap, including running out of fuel, becomes a [`WasmError`]
-//! instead of propagating.
+//! Guest modules have no imports. The host supplies cycle timestamps and
+//! publishes execution status.
 
 use metor_fsw_2_core::abi::{FSW_ABI_VERSION, FswStatus, PackEntryDesc, PackManifest};
 use metor_fsw_ring::{Config, RingBuffer, region_len};
@@ -580,7 +536,7 @@ impl WasmPack {
         self.call(|e| e.close, pack)
     }
 
-    // --- guest memory and calls -------------------------------------------
+    // guest memory and calls
 
     /// Write the `FswRing` array a `bind_init` argument points at.
     fn stage_rings(&mut self, rings: &[GuestRing]) -> Result<i32, WasmError> {
@@ -591,7 +547,7 @@ impl WasmPack {
         // byte, padded to the struct's 4-byte alignment.
         const STRIDE: usize = 12;
         let mut buf = vec![0u8; rings.len() * STRIDE];
-        for (slot, ring) in buf.chunks_exact_mut(STRIDE).zip(rings) {
+        for (slot, ring) in buf.as_chunks_mut::<STRIDE>().0.iter_mut().zip(rings) {
             slot[0..4].copy_from_slice(&ring.offset.to_le_bytes());
             slot[4..8].copy_from_slice(&(ring.len as u32).to_le_bytes());
             slot[8] = ring.role;

@@ -1,19 +1,9 @@
-//! Packs: many systems from one crate, one construction point.
+//! System entries and their construction lifecycle.
 //!
-//! A [`Pack`] is a list of erased system entries a crate's `pack()` fn builds.
-//! One pack serves every loading mode: [`Registry::register_pack`](crate::Registry)
-//! makes each entry a `type=` in the static registry, and the pack ABI exports
-//! the same entries from a cdylib. Because `pack()` runs once per load,
-//! entries can capture clones of a shared handle built inside it, a
-//! construction point two systems sharing an owned resource (a socket, a bus)
-//! never had.
-//!
-//! Construction is two-phase, mirroring the ABI's create/bind split: an
-//! entry's `create` decodes params and builds the user state (fail-fast, no
-//! rings yet), returning a [`Pending`] that later binds ports over a ring
-//! source and yields the runnable [`Driver`]. Descriptors are computed from
-//! the parameter *types* at registration, so describing a pack constructs no
-//! user state.
+//! A [`Pack`] exposes the same entries to static registration and the pack ABI.
+//! An entry's create phase decodes params and constructs state, returning a
+//! [`Pending`] that binds ports and produces a [`Driver`]. Describing an entry
+//! reads its descriptor without constructing user state.
 
 use metor_proto::types::Timestamp;
 use postcard_schema::schema::NamedType;
@@ -25,10 +15,7 @@ use crate::handler::IntoPackEntry;
 use crate::sequence::Outcome;
 use crate::slot::{CyclicSlot, SlotState};
 
-/// One runnable system instance, whatever style authored it. The pack-side
-/// convergence of [`CyclicRunner`](crate::CyclicRunner) and the sequence
-/// stack: the coordinator (or the ABI shim) inits it once, steps it once per
-/// cycle, and shuts it down once.
+/// A system instance initialized once, stepped each cycle, and shut down once.
 pub trait Driver {
     fn init(&mut self);
     fn step(&mut self, now: Timestamp) -> StepStatus;
@@ -74,10 +61,7 @@ pub enum EntryParams<'a> {
     },
 }
 
-/// The resolved shared state a system attaches to: the erased `Shared<St>`
-/// token a shared entry downcasts at create, plus the state's registry type
-/// key for the mismatch diagnostic. Built by the resolver's states pass and
-/// threaded through [`EntryParams::Value`]; its fields are crate-internal.
+/// A resolved shared-state token and its type name for diagnostics.
 pub struct AttachTarget {
     pub ty: &'static str,
     pub token: std::rc::Rc<dyn core::any::Any>,
@@ -157,7 +141,7 @@ pub fn resolve_defaults(
     schema: &'static NamedType,
 ) -> Result<Vec<u8>, MakeError> {
     match params {
-        EntryParams::Postcard(bytes) if bytes.is_empty() => Ok(defaults.to_vec()),
+        EntryParams::Postcard([]) => Ok(defaults.to_vec()),
         EntryParams::Postcard(bytes) => Ok(bytes.to_vec()),
         EntryParams::Value { value, name, .. } => {
             let owned = postcard_schema::schema::owned::OwnedNamedType::from(schema);

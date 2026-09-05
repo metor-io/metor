@@ -20,8 +20,7 @@
 //!
 //! The fixture cdylibs are `metor-fsw-2-dl-fixture` and
 //! `metor-fsw-2-seq-fixture`, built by nested cargo invocations exactly as
-//! in `dl_integration.rs`; if one cannot be produced the tests skip with a
-//! message rather than fail.
+//! in `dl_integration.rs`; fixture build failures fail the suite.
 
 use std::path::Path;
 use std::process::Command;
@@ -43,14 +42,8 @@ fn main() {
     // The whole point of this harness: a spawned worker child never reaches
     // the tests below.
     metor_fsw_2::proc::worker_entry();
-    let Some(lib_path) = locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture") else {
-        eprintln!("skipping proc_integration: fixture build unavailable");
-        return;
-    };
-    let Some(seq_lib) = locate_fixture("metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture") else {
-        eprintln!("skipping proc_integration: seq fixture build unavailable");
-        return;
-    };
+    let lib_path = locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture");
+    let seq_lib = locate_fixture("metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture");
     // The isolation canary (see the seq fixture): every process that maps the
     // occupant artifact appends its pid to this file, workers included, since
     // they inherit the environment. Set once, before any coordinator exists,
@@ -91,6 +84,11 @@ fn main() {
     run(
         "proc_slot_abort_crosses_the_boundary",
         proc_slot_abort_crosses_the_boundary,
+        &seq_lib,
+    );
+    run(
+        "stalled_status_reader_does_not_stop_process_slot",
+        stalled_status_reader_does_not_stop_process_slot,
         &seq_lib,
     );
     let _ = std::fs::remove_file(&canary);
@@ -1088,4 +1086,21 @@ fn proc_slot_abort_crosses_the_boundary(seq_lib: &Path) {
     drop(coord);
     drop(events_view);
     assert!(child_pids().is_empty(), "all workers reaped");
+}
+
+fn stalled_status_reader_does_not_stop_process_slot(lib: &Path) {
+    use metor_fsw_2::wiring::{Registry, resolve};
+    use metor_fsw_2::{ClockSpec, SlotInitState, WiringBuilder};
+    let mut wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.001 })
+        .artifact("seqs", "metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture")
+        .slot("adcs")
+        .allow("beater")
+        .process()
+        .initial("beater", SlotInitState::Running)
+        .end()
+        .build();
+    wiring.artifacts[0].path = Some(lib.to_path_buf());
+    let coord = resolve(&wiring, &Registry::new()).unwrap();
+    stellarator::run(|| common::assert_status_backpressure(coord, "adcs"));
 }

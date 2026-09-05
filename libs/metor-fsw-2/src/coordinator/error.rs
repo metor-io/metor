@@ -84,14 +84,21 @@ pub enum WireError {
         consumer: String,
         port: PortId,
     },
-    /// The configured `cycle_rate` cannot pace a
-    /// [`Wall`](crate::ClockMode::Wall) clock: it must be finite and positive
-    /// to become a per-cycle `Duration` budget, since a zero, negative, NaN,
-    /// or infinite rate would panic in `Duration::from_secs_f64` at run time.
-    /// A [`Simulated`](crate::ClockMode::Simulated) clock ignores the rate and
-    /// skips this check.
-    #[error("cycle_rate {rate} cannot pace a Wall clock — it must be finite and positive")]
+    /// The wall-clock rate must yield a nonzero, representable timer period.
+    /// Simulated clocks ignore the rate.
+    #[error(
+        "cycle_rate {rate} must be finite and positive and yield a nonzero, representable timer period"
+    )]
     InvalidCycleRate { rate: Hz },
+    /// A port's depth, record size, or reader budget cannot fit a ring.
+    #[error(
+        "invalid ring size: record limit {max_size} bytes, depth {depth}, reader budget {max_readers}"
+    )]
+    InvalidRingSize {
+        max_size: usize,
+        depth: usize,
+        max_readers: usize,
+    },
     /// A simulated clock must advance on every cycle.
     #[error("simulated clock step {dt:?} must be positive")]
     InvalidSimulatedStep { dt: std::time::Duration },

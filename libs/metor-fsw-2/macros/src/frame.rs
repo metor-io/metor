@@ -65,7 +65,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
     // depends only on metor_fsw_2_core can use the derive without depending on the
     // protocol crate directly.
     let fsw2 = crate::metor_fsw_2_crate_name();
-    let impeller = quote! { #fsw2::metor_proto };
+    let proto = quote! { #fsw2::metor_proto };
 
     // Explicit `name`/`parent` wins, else snake_case of the ident. This is both
     // the dotted component prefix and the `FRAME_ID`.
@@ -73,7 +73,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
         .parent
         .clone()
         .unwrap_or_else(|| struct_input.ident.to_string().to_case(Case::Snake));
-    let frame_id = quote! { #impeller::types::ComponentId::new(#frame_name) };
+    let frame_id = quote! { #proto::types::ComponentId::new(#frame_name) };
 
     // The shared timestamp accessor reads the `#[metor_fsw(timestamp)]` field.
     // A frame with neither the marker nor the `no_timestamp` opt-out is a
@@ -93,7 +93,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
             let id = f.ident.as_ref().expect("named field");
             quote! { self.#id }
         }
-        (None, true) => quote! { #impeller::types::Timestamp::default() },
+        (None, true) => quote! { #proto::types::Timestamp::default() },
         (None, false) => {
             return syn::Error::new_spanned(
                 &struct_input.ident,
@@ -123,8 +123,8 @@ pub fn frame(input: TokenStream) -> TokenStream {
     let frame_trait = quote! {
         impl #fsw2::Frame for #ident #generics #where_clause {
             const NAME: &'static str = #frame_name;
-            const FRAME_ID: #impeller::types::ComponentId = #frame_id;
-            fn timestamp(&self) -> #impeller::types::Timestamp {
+            const FRAME_ID: #proto::types::ComponentId = #frame_id;
+            fn timestamp(&self) -> #proto::types::Timestamp {
                 #timestamp_body
             }
         }

@@ -26,8 +26,30 @@ const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
         "metor_config/__init__.py",
         include_str!("../../python/metor-config/metor_config/__init__.py"),
     ),
-    // The `py.typed` marker travels too, so a materialized recorder is a typed
-    // package pyright checks against.
+    (
+        "metor_config/_version.py",
+        include_str!("../../python/metor-config/metor_config/_version.py"),
+    ),
+    (
+        "metor_config/_model.py",
+        include_str!("../../python/metor-config/metor_config/_model.py"),
+    ),
+    (
+        "metor_config/_program.py",
+        include_str!("../../python/metor-config/metor_config/_program.py"),
+    ),
+    (
+        "metor_config/_builtins.py",
+        include_str!("../../python/metor-config/metor_config/_builtins.py"),
+    ),
+    (
+        "metor_config/_dashboard.py",
+        include_str!("../../python/metor-config/metor_config/_dashboard.py"),
+    ),
+    (
+        "metor_config/_target.py",
+        include_str!("../../python/metor-config/metor_config/_target.py"),
+    ),
     (
         "metor_config/py.typed",
         include_str!("../../python/metor-config/metor_config/py.typed"),
@@ -38,7 +60,11 @@ const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
 /// the version this binary pairs with, used to derive the `metor-config`
 /// compatible-range pin stamped into pack wheels.
 pub(super) fn metor_config_version() -> &'static str {
-    let source = EMBEDDED_PACKAGE[0].1;
+    let source = EMBEDDED_PACKAGE
+        .iter()
+        .find(|(name, _)| *name == "metor_config/_version.py")
+        .expect("embedded version module")
+        .1;
     source
         .lines()
         .find_map(|line| line.strip_prefix("__version__ = \""))
@@ -97,6 +123,10 @@ pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
         .arg(path)
         .env("PYTHONPATH", prepend_pythonpath(&roots))
         .env("METOR_IR_OUT", ir_file.path())
+        .env(
+            "METOR_FSW_ABI_VERSION",
+            metor_fsw_2_core::abi::FSW_ABI_VERSION.to_string(),
+        )
         .status()
         .map_err(|e| miette!("failed to run `{}`: {e}", python.display()))?;
 

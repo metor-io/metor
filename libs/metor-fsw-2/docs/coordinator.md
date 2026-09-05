@@ -154,7 +154,7 @@ Slots drain their own command inputs at the start of their step. A command can a
 
 ## Clocks
 
-Wall mode reads the current time at the start of each cycle. The coordinator sleeps for the rest of the cycle budget. If work uses the full budget, it logs a `cycle_overrun` fault.
+Wall mode reads the current time at the start of each cycle. The coordinator sleeps for the rest of the cycle budget. If work uses the full budget, it logs a `cycle_overrun` fault and yields so async tasks still make progress.
 
 Simulated mode starts from one epoch. Cycle `k` uses `epoch + k * dt`. It does not sleep, but it yields once per cycle so spawned tasks can run.
 
@@ -171,7 +171,7 @@ Host-observed faults land on the coordinator's log as `kind=` lines, one per aff
 - `proc_step_timeout` and `proc_restart`
 - `async_boundary_dropped`, `wasm_boundary_dropped`, and `boundary_corrupt`
 - `system_stopped`
-- `status_publish_failed`
+- `status_publish_failed` when a status reader backpressures a slot or the coordinator; the slot continues running
 - `reload_input_corrupt`
 - `cycle_overrun`
 - `async_shutdown_timeout`

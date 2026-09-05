@@ -1,20 +1,8 @@
-//! Proc macros behind the `metor_fsw_2_core` authoring surface.
+//! Derive macros for frames, port bundles, and parameter documentation.
 //!
-//! User code never depends on this crate directly. Every macro is re-exported
-//! by the framework crate, and every expansion refers back to that crate
-//! through a path resolved at expansion time (see
-//! [`metor_fsw_2_crate_name`]), so the generated code works no matter what
-//! the consumer renamed the dependency to.
-//!
-//! The surface is small:
-//!
-//! - [`#[derive(Frame)]`](derive@Frame) turns a struct into a frame in one
-//!   annotation.
-//! - [`#[derive(SystemInput)]`](derive@SystemInput) /
-//!   [`#[derive(SystemOutput)]`](derive@SystemOutput) describe port bundles.
-//!
-//! Field and struct attributes live under `#[fsw(...)]`; the longer
-//! `#[metor_fsw(...)]` spelling is accepted as an alias.
+//! The framework re-exports these macros. Expansions resolve its dependency
+//! name so renamed dependencies work. Frame attributes accept both `fsw`
+//! and `metor_fsw`; port bundle attributes use `fsw`.
 
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};

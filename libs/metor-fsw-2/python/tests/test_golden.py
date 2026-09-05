@@ -74,9 +74,19 @@ def build_dashboard() -> Dashboard:
         Meter("wheels.h", element=1, min=-0.04, max=0.04, unit="N m s"), 20, 20
     )
     gauge = Place(
-        Gauge("sensors.gyro_b", label="rate y", element=1, min=-0.2, max=0.2,
-              style="needle", sweep=200.0),
-        120, 20, 150, 140,
+        Gauge(
+            "sensors.gyro_b",
+            label="rate y",
+            element=1,
+            min=-0.2,
+            max=0.2,
+            style="needle",
+            sweep=200.0,
+        ),
+        120,
+        20,
+        150,
+        140,
     )
     chip = Place(
         StateChip(
@@ -84,14 +94,16 @@ def build_dashboard() -> Dashboard:
             states=[State(0, "IDLE"), State(3, "SAFE", "#f38ba8ff")],
             unknown="UNKNOWN",
         ),
-        280, 20,
+        280,
+        20,
     )
     att = Place(
         Attitude(
             "nav.attitude_estimate.q_hat_b_eci",
             vectors=[VectorMarker("sensors.mag_b", "mag", "#89b4faff")],
         ),
-        20, 200,
+        20,
+        200,
     )
     seq = Place(SequenceControl("mode", compact=True), 280, 100)
     light = Place(TrafficLight("world.illuminated"), 440, 20, 70, 60)
@@ -188,18 +200,20 @@ def build_target() -> Target:
         m.add("gyro_norm", gyro_norm)
     m.add(
         "alarms",
-        Alarms(alarms=[
-            Alarm(
-                id="ADCS_RATE_HIGH",
-                name="Body Rate High",
-                description="Measured body-Y rate exceeds the detumbled envelope",
-                target=Component("block.plant.sensors.gyro_b", element=1),
-                warning=band(above=0.05, below=-0.05),
-                critical=band(above=0.15, below=-0.15),
-                debounce=2,
-                hysteresis=0.005,
-            )
-        ]),
+        Alarms(
+            alarms=[
+                Alarm(
+                    id="ADCS_RATE_HIGH",
+                    name="Body Rate High",
+                    description="Measured body-Y rate exceeds the detumbled envelope",
+                    target=Component("block.plant.sensors.gyro_b", element=1),
+                    warning=band(above=0.05, below=-0.05),
+                    critical=band(above=0.15, below=-0.15),
+                    debounce=2,
+                    hysteresis=0.005,
+                )
+            ]
+        ),
         node=(40, 80),
     )
     link = m.state("link", TcpServer(addr="127.0.0.1:2240"))

@@ -33,6 +33,7 @@ fn fixture() -> &'static [u8] {
                 "--target",
                 "wasm32-unknown-unknown",
                 "--release",
+                "--message-format=json",
             ])
             .current_dir(workspace_root())
             .output()
@@ -40,11 +41,22 @@ fn fixture() -> &'static [u8] {
         assert!(
             out.status.success(),
             "building the wasm fixture failed (is the wasm32-unknown-unknown \
-             target installed? `rustup target add wasm32-unknown-unknown`):\n{}",
-            String::from_utf8_lossy(&out.stderr)
+             target installed? `rustup target add wasm32-unknown-unknown`):\n{}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
         );
-        let path = workspace_root()
-            .join("target/wasm32-unknown-unknown/release/metor_fsw_2_seq_fixture.wasm");
+        let path = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter_map(|message| message["filenames"].as_array().cloned())
+            .flatten()
+            .filter_map(|file| file.as_str().map(PathBuf::from))
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == "metor_fsw_2_seq_fixture.wasm")
+            })
+            .expect("cargo reports the wasm fixture path");
         std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
     })
 }
@@ -686,7 +698,7 @@ fn resolve_rejects_an_unknown_wasm_entry() {
     );
 }
 
-// --- Compiled Python packs: the pack ABI meets the wasm host -------------
+// Compiled Python packs: the pack ABI meets the wasm host
 
 /// The build-time resolver a provision pass would derive, reduced to one
 /// producer: instance `imu`, port `sensors`, a 3-vector at offset 8 behind
@@ -776,7 +788,7 @@ def est(gyro_b, temp) -> Est:
     let program = metor_expr::compile_pack(source, &ImuResolver, 120.0).expect("compiles");
     const FRAME_BYTES: usize = 8 + 24; // norm, then doubled
 
-    // --- the vehicle host: records in, records out --------------------------
+    // the vehicle host: records in, records out
     let mut pack = WasmPack::open(&program.wasm, AMPLE_FUEL).expect("opens");
     let state = pack.create(0, 0, &[]).expect("create");
     let cfg = Config {
@@ -797,7 +809,7 @@ def est(gyro_b, temp) -> Est:
         .expect("attach output");
     let mut view = out_ring.view(NoWake).expect("view");
 
-    // --- the pointer-call host: argument frames in, the return frame out ----
+    // the pointer-call host: argument frames in, the return frame out
     let engine = wasmi::Engine::default();
     let module = wasmi::Module::new(&engine, &program.wasm[..]).expect("validates");
     let mut store = wasmi::Store::new(&engine, ());
@@ -853,4 +865,49 @@ def est(gyro_b, temp) -> Est:
 
         assert_eq!(vehicle, panel, "cycle {cycle}: the two hosts diverged");
     }
+}
+
+#[stellarator::test]
+async fn stalled_status_reader_does_not_stop_wasm_slot() {
+    use crate::wiring::{Registry, resolve};
+    use crate::{ClockSpec, SlotInitState, WiringBuilder};
+    use metor_proto::types::ComponentId;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seq.wasm");
+    std::fs::write(&path, fixture()).unwrap();
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.001 })
+        .wasm_artifact("seqs", &path)
+        .slot("mode")
+        .allow_from("beater", "seqs")
+        .initial("beater", SlotInitState::Running)
+        .end()
+        .build();
+    let mut coord = resolve(&wiring, &Registry::new()).unwrap();
+    let tap = coord
+        .registry()
+        .view(ComponentId::new("mode.slot_status"))
+        .unwrap()
+        .unwrap();
+    let log = coord
+        .registry()
+        .view(ComponentId::new("coordinator.log"))
+        .unwrap()
+        .unwrap();
+    let mut logs = crate::MsgIn::<crate::LogEvent>::new(log);
+    coord.run_for(100).await;
+    assert!(
+        coord.stopped().is_empty(),
+        "status backpressure stopped the wasm slot"
+    );
+    let mut reported = false;
+    logs.drain(|event| {
+        reported |= event
+            .fields
+            .iter()
+            .any(|(key, value)| key == "kind" && value == "status_publish_failed");
+    })
+    .unwrap();
+    assert!(reported);
+    drop(tap);
 }
