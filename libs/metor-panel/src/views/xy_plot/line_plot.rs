@@ -88,9 +88,13 @@ pub struct XyLinePlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     tracking: HashMap<EntityId, XyTraceTracking>,
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
+    #[facet(opaque)]
+    inputs: crate::data_binding::InputChanges,
     #[facet(opaque)]
     view_override: Option<PlotBounds>,
     #[facet(opaque)]
@@ -111,9 +115,11 @@ impl XyLinePlot {
             y_min_override: Override::Auto,
             y_max_override: Override::Auto,
             custom_title: Override::Auto,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
+            inputs: Default::default(),
             view_override: None,
             last_overrides: OverrideSnapshot {
                 x_min: None,
@@ -127,7 +133,14 @@ impl XyLinePlot {
     }
 
     pub fn bind_traces(&mut self, traces: Vec<XyTrace>, cx: &mut Context<Self>) {
-        self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
+        self.traces = traces
+            .into_iter()
+            .map(|mut t| {
+                t.x_source.resolve(&self.db, cx);
+                t.y_source.resolve(&self.db, cx);
+                cx.new(|_| t)
+            })
+            .collect();
         cx.notify();
     }
 
@@ -153,6 +166,13 @@ impl XyLinePlot {
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        for trace in &self.traces {
+            trace.update(cx, |trace, cx| {
+                trace.x_source.resolve(&self.db, cx);
+                trace.y_source.resolve(&self.db, cx);
+            });
+        }
+
         // Point each trace back at this plot so its inspector page can reach
         // the plot to rebind. Mutating without notifying cannot re-enter
         // reconcile: the plot does not observe its traces.
@@ -169,6 +189,21 @@ impl XyLinePlot {
                     t.line_plot = Some(self_weak.clone());
                 }
             });
+        }
+
+        for id in self.inputs.changed(
+            &self.traces,
+            &self.db,
+            |trace| {
+                vec![
+                    (trace.x_source.id(), trace.x_element_index),
+                    (trace.y_source.id(), trace.y_element_index),
+                ]
+            },
+            cx,
+        ) {
+            self.tracking.remove(&id);
+            self.tasks.remove(&id);
         }
 
         let db = self.db.clone();
@@ -267,7 +302,7 @@ impl XyLinePlot {
         cx.spawn(async move |this, cx| {
             let (x_id, y_id) = match this.update(cx, |_, cx| {
                 let t = trace.read(cx);
-                (t.x_component_id, t.y_component_id)
+                (t.x_source.id(), t.y_source.id())
             }) {
                 Ok(ids) => ids,
                 Err(_) => return,

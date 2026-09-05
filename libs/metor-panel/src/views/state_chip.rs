@@ -71,7 +71,7 @@ pub struct StateChip {
     /// What this chip reads. Editable: picking another component in the
     /// inspector rebinds the strip on the next frame. Declared first so the
     /// binding heads the inspector page — fields are walked in order.
-    pub component_id: ComponentId,
+    pub source: crate::data_binding::Binding,
     pub states: Vec<Entity<StateEntry>>,
     pub unknown_label: SharedString,
     /// Carried for the tab title and the config round trip; never drawn.
@@ -90,11 +90,11 @@ pub struct StateChip {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     strip: Entity<ComponentValueStrip>,
     #[facet(opaque)]
     click: StripClick,
-    #[facet(opaque)]
-    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl StateChip {
@@ -104,10 +104,8 @@ impl StateChip {
     /// text with `element` 0.
     pub fn from_config(cfg: &StateChipConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let text = binding_text(cfg);
-        let (component_id, expression) = match crate::dynamic::expressions::bind(&text, &db, cx) {
-            Ok(bound) => (bound.id, bound.expression),
-            Err(_) => (ComponentId::new(&text), None),
-        };
+        let source = crate::data_binding::Binding::from_text(&text, &db, cx);
+        let component_id = source.id();
 
         let name = binding::component_name(&db, component_id)
             .unwrap_or_else(|| SharedString::from(text.clone()));
@@ -115,7 +113,7 @@ impl StateChip {
         let strip = new_strip(db.clone(), component_id, click.clone(), cx);
 
         Self {
-            component_id,
+            source,
             states: cfg
                 .states
                 .iter()
@@ -132,10 +130,10 @@ impl StateChip {
             label: cfg.label.clone().map(SharedString::from),
             saved_component: SharedString::from(text),
             bound: Some(component_id),
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
             strip,
             click,
-            _expression: expression,
         }
     }
 
@@ -145,11 +143,7 @@ impl StateChip {
             // what gets saved. An expression's component is named by a
             // content hash and labelled with the text that made it, so what
             // round-trips is the text — a name would rehydrate onto nothing.
-            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
-                .or_else(|| {
-                    binding::component_name(&self.db, self.component_id).map(|n| n.to_string())
-                })
-                .unwrap_or_else(|| self.saved_component.to_string()),
+            component: self.source.text(&self.db),
             element: 0,
             label: self.label.as_ref().map(|l| l.to_string()),
             states: self
@@ -175,12 +169,13 @@ impl StateChip {
     /// between two components that share an encoding (a commanded mode and
     /// the reported one) is the reason to edit the binding at all.
     pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
-        if self.bound == Some(self.component_id) {
+        self.source.resolve(&self.db, cx);
+        if self.bound == Some(self.source.id()) {
             return;
         }
-        self.bound = Some(self.component_id);
-        let component_id = self.component_id;
-        self._expression = crate::dynamic::expressions::running(component_id, cx);
+        self.bound = Some(self.source.id());
+        let component_id = self.source.id();
+
         if let Some(name) = binding::component_name(&self.db, component_id) {
             self.saved_component = name;
         }
@@ -233,8 +228,7 @@ impl Render for StateChip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.rebind(cx);
         let style = self.style(cx);
-        let behavior =
-            behavior_snapshot(cx, self.db.clone(), self.component_id, self.click.clone());
+        let behavior = behavior_snapshot(cx, self.db.clone(), self.source.id(), self.click.clone());
         self.strip.update(cx, |strip, cx| {
             strip.set_style(style, cx);
             strip.set_behavior(behavior, cx);

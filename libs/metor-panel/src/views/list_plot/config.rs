@@ -61,7 +61,7 @@ impl Default for ListTraceConfig {
 impl From<&ListTrace> for ListTraceConfig {
     fn from(trace: &ListTrace) -> Self {
         Self {
-            component_id: trace.component_id,
+            component_id: trace.source.id(),
             len: trace.len,
             color: trace.color,
             style: trace.style,
@@ -69,7 +69,7 @@ impl From<&ListTrace> for ListTraceConfig {
             label: trace.label.to_string(),
             stroke_width: trace.stroke_width,
             // Filled by `to_config`, which has the database to ask.
-            expression: None,
+            expression: trace.source.expression_text(),
         }
     }
 }
@@ -77,14 +77,16 @@ impl From<&ListTrace> for ListTraceConfig {
 impl From<ListTraceConfig> for ListTrace {
     fn from(config: ListTraceConfig) -> Self {
         Self {
-            component_id: config.component_id,
+            source: crate::data_binding::Binding::unresolved(
+                config.component_id,
+                config.expression,
+            ),
             len: config.len,
             color: config.color,
             style: config.style,
             visible: config.visible,
             label: config.label.into(),
             stroke_width: config.stroke_width,
-            expression: None,
             line_plot: None,
         }
     }
@@ -98,21 +100,10 @@ impl ListPlot {
         let traces = config
             .traces
             .into_iter()
-            .map(|mut trace| {
-                let expression = trace
-                    .expression
-                    .clone()
-                    .or_else(|| crate::dynamic::expressions::binding_text(&db, trace.component_id));
-                if let Some(text) = expression
-                    && let Ok(bound) = crate::dynamic::expressions::bind(&text, &db, cx)
-                {
-                    trace.component_id = bound.id;
-                    trace.expression = Some(text);
-                    let mut built = ListTrace::from(trace);
-                    built.expression = bound.expression;
-                    return built;
-                }
-                ListTrace::from(trace)
+            .map(|config| {
+                let mut trace = ListTrace::from(config);
+                trace.source.resolve(&db, cx);
+                trace
             })
             .collect();
         let plot = Self::new(db, traces, cx);
@@ -134,15 +125,7 @@ impl ListPlot {
             traces: line_plot
                 .traces()
                 .iter()
-                .map(|trace| {
-                    let trace = trace.read(cx);
-                    let mut config = ListTraceConfig::from(trace);
-                    config.expression = crate::dynamic::expressions::binding_text(
-                        line_plot.db(),
-                        trace.component_id,
-                    );
-                    config
-                })
+                .map(|trace| ListTraceConfig::from(trace.read(cx)))
                 .collect(),
             custom_title: line_plot
                 .custom_title

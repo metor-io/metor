@@ -8,7 +8,6 @@ use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
 use super::{XyPlot, XyTrace};
-use crate::dynamic::expressions;
 use crate::views::time_series::{Override, PlotStyle};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -69,9 +68,9 @@ impl Default for XyTraceConfig {
 impl From<&XyTrace> for XyTraceConfig {
     fn from(trace: &XyTrace) -> Self {
         Self {
-            x_component_id: trace.x_component_id,
+            x_component_id: trace.x_source.id(),
             x_element_index: trace.x_element_index,
-            y_component_id: trace.y_component_id,
+            y_component_id: trace.y_source.id(),
             y_element_index: trace.y_element_index,
             color: trace.color,
             style: trace.style,
@@ -79,8 +78,8 @@ impl From<&XyTrace> for XyTraceConfig {
             label: trace.label.to_string(),
             stroke_width: trace.stroke_width,
             // Filled by `to_config`, which has the database to ask.
-            x_expression: None,
-            y_expression: None,
+            x_expression: trace.x_source.expression_text(),
+            y_expression: trace.y_source.expression_text(),
         }
     }
 }
@@ -88,17 +87,21 @@ impl From<&XyTrace> for XyTraceConfig {
 impl From<XyTraceConfig> for XyTrace {
     fn from(config: XyTraceConfig) -> Self {
         Self {
-            x_component_id: config.x_component_id,
+            x_source: crate::data_binding::Binding::unresolved(
+                config.x_component_id,
+                config.x_expression,
+            ),
             x_element_index: config.x_element_index,
-            y_component_id: config.y_component_id,
+            y_source: crate::data_binding::Binding::unresolved(
+                config.y_component_id,
+                config.y_expression,
+            ),
             y_element_index: config.y_element_index,
             color: config.color,
             style: config.style,
             visible: config.visible,
             label: config.label.into(),
             stroke_width: config.stroke_width,
-            x_expression: None,
-            y_expression: None,
             line_plot: None,
         }
     }
@@ -112,42 +115,11 @@ impl XyPlot {
         let traces = config
             .traces
             .into_iter()
-            .map(|mut trace| {
-                let (mut x_live, mut y_live) = (None, None);
-                let x = trace
-                    .x_expression
-                    .clone()
-                    .or_else(|| expressions::binding_text(&db, trace.x_component_id));
-                let y = trace
-                    .y_expression
-                    .clone()
-                    .or_else(|| expressions::binding_text(&db, trace.y_component_id));
-                for (text, id, saved, live) in [
-                    (
-                        x,
-                        &mut trace.x_component_id,
-                        &mut trace.x_expression,
-                        &mut x_live,
-                    ),
-                    (
-                        y,
-                        &mut trace.y_component_id,
-                        &mut trace.y_expression,
-                        &mut y_live,
-                    ),
-                ] {
-                    let Some(text) = text else { continue };
-                    let Ok(bound) = expressions::bind(&text, &db, cx) else {
-                        continue;
-                    };
-                    *id = bound.id;
-                    *saved = Some(text);
-                    *live = bound.expression;
-                }
-                let mut built = XyTrace::from(trace);
-                built.x_expression = x_live;
-                built.y_expression = y_live;
-                built
+            .map(|config| {
+                let mut trace = XyTrace::from(config);
+                trace.x_source.resolve(&db, cx);
+                trace.y_source.resolve(&db, cx);
+                trace
             })
             .collect();
         let plot = Self::new(db, traces, cx);
@@ -169,17 +141,7 @@ impl XyPlot {
             traces: line_plot
                 .traces()
                 .iter()
-                .map(|trace| {
-                    let trace = trace.read(cx);
-                    let mut config = XyTraceConfig::from(trace);
-                    // An axis bound to an expression saves the text that made
-                    // it; the id alone would come back as history with nothing
-                    // computing into it.
-                    let db = line_plot.db();
-                    config.x_expression = expressions::binding_text(db, trace.x_component_id);
-                    config.y_expression = expressions::binding_text(db, trace.y_component_id);
-                    config
-                })
+                .map(|trace| XyTraceConfig::from(trace.read(cx)))
                 .collect(),
             custom_title: line_plot
                 .custom_title

@@ -127,7 +127,7 @@ pub(crate) fn expression_trace(
     let color = theme.line_colors[(color_basis)(cx) % theme.line_colors.len()];
     let mut trace = ListTrace::new(component, expression_len(db, component), color);
     trace.label = SharedString::from(expressions::body(text).to_string());
-    trace.expression = expressions::running(component, cx);
+    trace.source = crate::data_binding::Binding::selected(component, text, cx);
     trace
 }
 

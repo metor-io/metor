@@ -67,9 +67,13 @@ pub struct ListLinePlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     tracking: HashMap<EntityId, ListTraceTracking>,
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
+    #[facet(opaque)]
+    inputs: crate::data_binding::InputChanges,
     #[facet(opaque)]
     view_override: Option<PlotBounds>,
     #[facet(opaque)]
@@ -90,9 +94,11 @@ impl ListLinePlot {
             y_min_override: Override::Auto,
             y_max_override: Override::Auto,
             custom_title: Override::Auto,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
+            inputs: Default::default(),
             view_override: None,
             last_overrides: OverrideSnapshot {
                 x_min: None,
@@ -106,7 +112,13 @@ impl ListLinePlot {
     }
 
     pub fn bind_traces(&mut self, traces: Vec<ListTrace>, cx: &mut Context<Self>) {
-        self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
+        self.traces = traces
+            .into_iter()
+            .map(|mut t| {
+                t.source.resolve(&self.db, cx);
+                cx.new(|_| t)
+            })
+            .collect();
         cx.notify();
     }
 
@@ -132,6 +144,18 @@ impl ListLinePlot {
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        for trace in &self.traces {
+            trace.update(cx, |trace, cx| {
+                trace.source.resolve(&self.db, cx);
+                if let Some(len) = self.db.with_state(|s| {
+                    s.get_component(trace.source.id())
+                        .map(|c| c.schema.dim.iter().product::<usize>().max(1))
+                }) {
+                    trace.len = len;
+                }
+            });
+        }
+
         // Point each trace back at this plot so its inspector page can reach
         // the plot to rebind. Mutating without notifying cannot re-enter
         // reconcile: the plot does not observe its traces.
@@ -148,6 +172,16 @@ impl ListLinePlot {
                     t.line_plot = Some(self_weak.clone());
                 }
             });
+        }
+
+        for id in self.inputs.changed(
+            &self.traces,
+            &self.db,
+            |trace| vec![(trace.source.id(), trace.len)],
+            cx,
+        ) {
+            self.tracking.remove(&id);
+            self.tasks.remove(&id);
         }
 
         let db = self.db.clone();
@@ -238,7 +272,7 @@ impl ListLinePlot {
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let component_id = match this.update(cx, |_, cx| trace.read(cx).component_id) {
+            let component_id = match this.update(cx, |_, cx| trace.read(cx).source.id()) {
                 Ok(id) => id,
                 Err(_) => return,
             };

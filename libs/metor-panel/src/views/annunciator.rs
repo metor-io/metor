@@ -54,6 +54,8 @@ pub enum AnnunciatorSource {
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct AnnunciatorConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<String>,
     pub pattern: String,
     pub color: Option<Hsla>,
     pub source: AnnunciatorSource,
@@ -64,8 +66,15 @@ pub struct AnnunciatorConfig {
     pub columns: usize,
 }
 
+/// An explicitly owned condition, edited through the common binding field.
+#[derive(Default, facet::Facet)]
+pub struct Condition {
+    pub source: crate::data_binding::Binding,
+}
+
 /// One matched component's tile.
 struct Tile {
+    _binding: crate::data_binding::Binding,
     id: ComponentId,
     name: SharedString,
     /// `name` with the glob's literal parts removed — the part the pattern's
@@ -95,6 +104,11 @@ struct Tile {
 /// owns their latch, and the acks they publish are wire events.
 #[derive(facet::Facet)]
 pub struct Annunciator {
+    pub conditions: Vec<gpui::Entity<Condition>>,
+    #[facet(opaque)]
+    condition_inputs: crate::data_binding::InputChanges,
+    #[facet(opaque)]
+    bound_conditions: Vec<ComponentId>,
     pub pattern: SharedString,
     pub color: Hsla,
     #[facet(inspect::variants = "Components,Alarms")]
@@ -154,7 +168,19 @@ impl Annunciator {
         if let Some(store) = crate::alarms::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
         }
+        let conditions = cfg
+            .conditions
+            .iter()
+            .map(|text| {
+                cx.new(|cx| Condition {
+                    source: crate::data_binding::Binding::from_text(text, &db, cx),
+                })
+            })
+            .collect();
         Self {
+            conditions,
+            condition_inputs: Default::default(),
+            bound_conditions: Vec::new(),
             compiled_pattern: pattern.clone(),
             pattern,
             color: cfg.color.unwrap_or_else(|| theme(cx).control_active),
@@ -174,8 +200,13 @@ impl Annunciator {
         }
     }
 
-    pub fn to_config(&self) -> AnnunciatorConfig {
+    pub fn to_config(&self, cx: &App) -> AnnunciatorConfig {
         AnnunciatorConfig {
+            conditions: self
+                .conditions
+                .iter()
+                .map(|c| c.read(cx).source.text(&self.db))
+                .collect(),
             pattern: self.pattern.to_string(),
             color: Some(self.color),
             source: self.source,
@@ -223,13 +254,23 @@ impl Annunciator {
             cx.notify();
             return;
         }
-        let matches: Vec<(ComponentId, String)> = match &self.regex {
+        let mut matches: Vec<(ComponentId, String)> = match &self.regex {
             Some(re) => crate::inspector::trace_picker::list_components(&self.db)
                 .into_iter()
                 .filter(|(_, name)| re.is_match(name))
                 .collect(),
             None => Vec::new(),
         };
+
+        for condition in &self.conditions {
+            let source = &condition.read(cx).source;
+            if source.id() != ComponentId(0) && !matches.iter().any(|(id, _)| *id == source.id()) {
+                matches.push((
+                    source.id(),
+                    crate::dynamic::expressions::body(&source.text(&self.db)).to_string(),
+                ));
+            }
+        }
 
         self.tiles
             .retain(|t| matches.iter().any(|(id, _)| *id == t.id));
@@ -398,6 +439,20 @@ impl Focusable for Annunciator {
 
 impl Render for Annunciator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for condition in &self.conditions {
+            condition.update(cx, |condition, cx| condition.source.resolve(&self.db, cx));
+        }
+        self.condition_inputs
+            .changed(&self.conditions, &self.db, |c| vec![(c.source.id(), 0)], cx);
+        let conditions: Vec<_> = self
+            .conditions
+            .iter()
+            .map(|c| c.read(cx).source.id())
+            .collect();
+        if conditions != self.bound_conditions {
+            self.bound_conditions = conditions;
+            self.reconcile_tiles(cx);
+        }
         if self.compiled_pattern != self.pattern {
             self.recompile_and_reconcile(cx);
         }
@@ -721,6 +776,7 @@ fn build_tile(
     label: SharedString,
     cx: &mut Context<Annunciator>,
 ) -> Tile {
+    let binding = crate::data_binding::Binding::from_legacy(id, None, &db, cx);
     let meta = component_meta(&db, id);
     let task = spawn_on_stream(db, id, cx, move |grid, on, value, cx| {
         let inverted = grid.alarm_when == AlarmWhen::Off;
@@ -734,6 +790,7 @@ fn build_tile(
     });
 
     Tile {
+        _binding: binding,
         id,
         name,
         label,

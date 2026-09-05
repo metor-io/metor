@@ -25,7 +25,6 @@ use super::binding::component_name;
 use super::format::{ValueFormatter, format_time};
 use super::table::{CELL_PAD_X, Column, ColumnSort, ROW_HEIGHT, Table, TableDelegate};
 use super::value_strip::{StripStyle, render_static_cells, resolve_metadata, strip_row_width};
-use crate::dynamic::expressions::{self, Expression};
 use crate::theme::theme;
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -40,7 +39,7 @@ pub struct SamplesTableConfig {
 pub struct SamplesTable {
     /// The component whose samples are listed. Editable: picking another
     /// rebinds on the next frame.
-    pub component_id: ComponentId,
+    pub source: crate::data_binding::Binding,
     /// Display name, or the saved text until something registers it.
     #[facet(skip)]
     component: SharedString,
@@ -56,7 +55,11 @@ pub struct SamplesTable {
     head: Option<Timestamp>,
     /// `(anchor, newest stamp)` the index was built against.
     #[facet(opaque)]
-    built: Option<(Timestamp, Timestamp)>,
+    built: Option<(Timestamp, Timestamp, u64)>,
+    #[facet(opaque)]
+    history_task: gpui::Task<()>,
+    #[facet(opaque)]
+    history_start: Option<Timestamp>,
     /// Samples newer than the anchor, shown while the reader is scrolled
     /// away from the top.
     #[facet(skip)]
@@ -66,33 +69,28 @@ pub struct SamplesTable {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _expression: Option<Expression>,
+    _binding_changes: gpui::Task<()>,
     #[facet(opaque)]
     _task: Task<()>,
 }
 
 impl SamplesTable {
     pub fn from_config(cfg: &SamplesTableConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let (component_id, expression) = if cfg.component.is_empty() {
-            (ComponentId(0), None)
-        } else {
-            match expressions::bind(&cfg.component, &db, cx) {
-                Ok(bound) => (bound.id, bound.expression),
-                Err(_) => (ComponentId::new(&cfg.component), None),
-            }
-        };
+        let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
         let table = cx.new(|_| Table::new(SamplesDelegate::new()));
         let mut view = Self {
-            component_id,
+            source,
             component: SharedString::from(cfg.component.clone()),
             bound: None,
             series: None,
             head: None,
             built: None,
+            history_task: gpui::Task::ready(()),
+            history_start: None,
             newer: 0,
             table,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
-            _expression: expression,
             _task: Task::ready(()),
         };
         view.rebind(cx);
@@ -101,11 +99,7 @@ impl SamplesTable {
 
     pub fn to_config(&self) -> SamplesTableConfig {
         SamplesTableConfig {
-            component: expressions::binding_text(&self.db, self.component_id)
-                .or_else(|| {
-                    component_name(&self.db, self.component_id).map(|name| name.to_string())
-                })
-                .unwrap_or_else(|| self.component.to_string()),
+            component: self.source.text(&self.db),
         }
     }
 
@@ -115,27 +109,30 @@ impl SamplesTable {
 
     /// Restart the tail when the inspector has re-pointed the binding.
     fn rebind(&mut self, cx: &mut Context<Self>) {
-        if self.bound == Some(self.component_id) {
+        self.source.resolve(&self.db, cx);
+        if self.bound == Some(self.source.id()) {
             return;
         }
-        self.bound = Some(self.component_id);
+        self.bound = Some(self.source.id());
         self.series = None;
         self.head = None;
         self.built = None;
+        self.history_start = None;
         self.newer = 0;
         self.table.update(cx, |table, cx| {
             table.delegate_mut().unbind();
             cx.notify();
         });
-        if self.component_id == ComponentId(0) {
-            self._expression = None;
+        if self.source.id() == ComponentId(0) {
             self._task = Task::ready(());
             return;
         }
-        self._expression = expressions::running(self.component_id, cx);
-        if let Some(name) = component_name(&self.db, self.component_id) {
+
+        if let Some(name) = component_name(&self.db, self.source.id()) {
             self.component = name;
         }
+        self.history_task =
+            crate::data_binding::watch_history(self.db.clone(), self.source.id(), cx);
         self._task = self.spawn_tail(cx);
     }
 
@@ -143,7 +140,7 @@ impl SamplesTable {
     /// the index every time the series grows.
     fn spawn_tail(&self, cx: &mut Context<Self>) -> Task<()> {
         let db = self.db.clone();
-        let component_id = self.component_id;
+        let component_id = self.source.id();
         cx.spawn(async move |this, cx| {
             let component = crate::wait_for_component(&db, component_id).await;
             let meta = resolve_metadata(&db, component_id);
@@ -182,19 +179,39 @@ impl SamplesTable {
         let Some(component) = &self.series else {
             return;
         };
-        let Some(latest) = component.time_series.latest().map(|l| l.timestamp()) else {
+        let history = crate::data_binding::BoundHistory::for_binding(&self.source, &self.db, cx);
+        let Some(latest) = component
+            .time_series
+            .latest()
+            .map(|l| l.timestamp())
+            .or_else(|| {
+                history
+                    .as_ref()
+                    .and_then(|h| h.extent())
+                    .map(|r| Timestamp(r.end.0.saturating_sub(1)))
+            })
+        else {
             return;
         };
         if self.head.is_none() || self.table.read(cx).at_top() {
             self.head = Some(latest);
         }
         let head = self.head.expect("anchored above");
-        if self.built == Some((head, latest)) {
+        if let Some(history) = history {
+            // Request a bounded page, even before the expression has emitted
+            // its first sample (for example, a windowed spectrum).
+            let start = self
+                .history_start
+                .get_or_insert(Timestamp(head.0.saturating_sub(60_000_000)));
+            history.request(*start..Timestamp(head.0.saturating_add(1)), cx);
+        }
+        let revision = component.time_series.manifest().generation;
+        if self.built == Some((head, latest, revision)) {
             return;
         }
         let index = SampleIndex::build(&component.time_series, head);
         self.newer = index.newer;
-        self.built = Some((head, latest));
+        self.built = Some((head, latest, revision));
         self.table.update(cx, |table, cx| {
             table.delegate_mut().index = index;
             cx.notify();
@@ -223,7 +240,7 @@ impl Render for SamplesTable {
             .text_color(theme.text_primary)
             .text_size(px(12.0));
 
-        if self.component_id == ComponentId(0) {
+        if self.source.id() == ComponentId(0) {
             return root.child(
                 div()
                     .flex()
@@ -235,6 +252,23 @@ impl Render for SamplesTable {
             );
         }
 
+        root = root.child(
+            div()
+                .id("samples-older")
+                .h(px(20.0))
+                .cursor_pointer()
+                .child("Load older samples")
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|view, _, _, cx| {
+                        if let Some(start) = view.history_start.as_mut() {
+                            *start = Timestamp(start.0.saturating_sub(60_000_000));
+                        }
+                        view.refresh(cx);
+                        cx.notify();
+                    }),
+                ),
+        );
         if self.newer > 0 {
             root = root.child(
                 div()

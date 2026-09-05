@@ -44,13 +44,9 @@ pub mod trace_picker;
 #[derive(Clone, facet::Facet)]
 #[facet(pod)]
 pub struct XyTrace {
-    #[facet(skip)]
-    pub x_component_id: ComponentId,
-    #[facet(skip)]
+    pub x_source: crate::data_binding::Binding,
     pub x_element_index: usize,
-    #[facet(skip)]
-    pub y_component_id: ComponentId,
-    #[facet(skip)]
+    pub y_source: crate::data_binding::Binding,
     pub y_element_index: usize,
     pub color: Hsla,
     #[facet(inspect::variants = "Line,Scatter")]
@@ -59,12 +55,6 @@ pub struct XyTrace {
     pub label: SharedString,
     #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
-    /// The `=` expression behind each axis, when it is one; the trace's
-    /// share is what keeps it computing.
-    #[facet(opaque)]
-    pub x_expression: Option<crate::dynamic::expressions::Expression>,
-    #[facet(opaque)]
-    pub y_expression: Option<crate::dynamic::expressions::Expression>,
     /// Back-reference to the owning plot, set by [`XyLinePlot::reconcile`],
     /// so the trace's inspector can ask the plot to follow a new source.
     #[facet(opaque)]
@@ -80,17 +70,15 @@ impl XyTrace {
         color: Hsla,
     ) -> Self {
         Self {
-            x_component_id: x_component_id.into(),
+            x_source: crate::data_binding::Binding::from(x_component_id.into()),
             x_element_index,
-            y_component_id: y_component_id.into(),
+            y_source: crate::data_binding::Binding::from(y_component_id.into()),
             y_element_index,
             color,
             style: PlotStyle::Scatter,
             visible: true,
             label: SharedString::new_static(""),
             stroke_width: 1.5,
-            x_expression: None,
-            y_expression: None,
             line_plot: None,
         }
     }

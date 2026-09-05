@@ -107,6 +107,6 @@ pub(crate) fn expression_trace(
 ) -> SpectrogramTrace {
     let mut trace = SpectrogramTrace::new(component, expression_len(db, component));
     trace.label = SharedString::from(expressions::body(text).to_string());
-    trace.expression = expressions::running(component, cx);
+    trace.source = crate::data_binding::Binding::selected(component, text, cx);
     trace
 }

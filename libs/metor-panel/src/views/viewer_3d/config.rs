@@ -23,6 +23,10 @@ pub struct ModelConfig {
     pub path: String,
     pub position_binding: Option<ComponentId>,
     pub orientation_binding: Option<ComponentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_expression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation_expression: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,19 +80,31 @@ impl From<&ModelEntry> for ModelConfig {
             path: model.path.clone(),
             position_binding: model.position_binding_component(),
             orientation_binding: model.orientation_binding_component(),
+            position_expression: model.position_binding.expression_text(),
+            orientation_expression: model.orientation_binding.expression_text(),
         }
     }
 }
 
 impl Viewer3d {
     pub fn from_config(config: Viewer3dPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let mut viewer = Self::with_db(db, cx);
+        let mut viewer = Self::with_db(db.clone(), cx);
         for model in config.models {
             viewer.add_model(model.label, model.path, cx);
             if let Some(entry) = viewer.models.last().cloned() {
                 entry.update(cx, |entry, cx| {
-                    entry.position_binding = model.position_binding;
-                    entry.orientation_binding = model.orientation_binding;
+                    entry.position_binding = crate::data_binding::Binding::from_legacy(
+                        model.position_binding.unwrap_or(ComponentId(0)),
+                        model.position_expression.as_deref(),
+                        &db,
+                        cx,
+                    );
+                    entry.orientation_binding = crate::data_binding::Binding::from_legacy(
+                        model.orientation_binding.unwrap_or(ComponentId(0)),
+                        model.orientation_expression.as_deref(),
+                        &db,
+                        cx,
+                    );
                     cx.notify();
                 });
             }

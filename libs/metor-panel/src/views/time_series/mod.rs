@@ -572,7 +572,7 @@ fn alarm_plot_tint(lp: &LinePlot, cx: &gpui::App) -> Option<Hsla> {
         if !cfg.visible {
             continue;
         }
-        if let Some(severity) = state.active_severity_for(cfg.component_id, cfg.element_index) {
+        if let Some(severity) = state.active_severity_for(cfg.source.id(), cfg.element_index) {
             let idx = crate::alarms::severity_index(severity);
             worst = Some(worst.map_or(idx, |w| w.max(idx)));
         }
@@ -598,7 +598,7 @@ fn alarm_limit_lines(lp: &LinePlot, cx: &gpui::App) -> Vec<(usize, f64, Hsla, Sh
         if !cfg.visible {
             continue;
         }
-        for limit in state.limits_for(cfg.component_id, cfg.element_index) {
+        for limit in state.limits_for(cfg.source.id(), cfg.element_index) {
             let idx = crate::alarms::severity_index(limit.severity);
             let label = limit.label.map(SharedString::from).unwrap_or_default();
             lines.push((cfg.axis_index, limit.value, theme.alarm_color(idx), label));
@@ -1094,9 +1094,7 @@ pub enum TimeFormat {
 #[derive(Clone, facet::Facet)]
 #[facet(pod)]
 pub struct Trace {
-    #[facet(skip)]
-    pub component_id: ComponentId,
-    #[facet(skip)]
+    pub source: crate::data_binding::Binding,
     pub element_index: usize,
     pub color: Hsla,
     pub style: PlotStyle,
@@ -1113,17 +1111,12 @@ pub struct Trace {
     /// `MeasurementCursor`'s plot handle). `None` until reconcile runs.
     #[facet(opaque)]
     pub line_plot: Option<gpui::WeakEntity<LinePlot>>,
-    /// The `=` expression this trace plots, when it is one. The trace holds
-    /// the share that keeps it computing: removing the trace is what stops
-    /// it, and nothing else has to remember to.
-    #[facet(opaque)]
-    pub expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl Trace {
     pub fn new(component_id: impl Into<ComponentId>, element_index: usize, color: Hsla) -> Self {
         Self {
-            component_id: component_id.into(),
+            source: crate::data_binding::Binding::from(component_id.into()),
             element_index,
             color,
             style: PlotStyle::default(),
@@ -1132,7 +1125,6 @@ impl Trace {
             stroke_width: 1.5,
             axis_index: 0,
             line_plot: None,
-            expression: None,
         }
     }
 }
@@ -1221,7 +1213,7 @@ pub fn traces_for_component(
                 .map(|n| format!("{}.{}", comp_name, n))
                 .unwrap_or_else(|| format!("{}[{}]", comp_name, idx));
             Trace {
-                component_id,
+                source: crate::data_binding::Binding::from(component_id),
                 element_index: idx,
                 color: theme.line_colors[i % theme.line_colors.len()],
                 style: PlotStyle::default(),
@@ -1230,7 +1222,6 @@ pub fn traces_for_component(
                 stroke_width: 1.5,
                 axis_index: 0,
                 line_plot: None,
-                expression: None,
             }
         })
         .collect()

@@ -837,7 +837,9 @@ fn rebinding_to_an_expression_survives_the_save(cx: &mut gpui::TestAppContext) {
         // hands over the component the expression publishes into.
         let bound = expressions::bind(typed, &db, cx).expect("the expression compiles");
         assert_eq!(bound.id, published);
-        meter.update(cx, |meter, _cx| meter.component_id = bound.id);
+        meter.update(cx, |meter, cx| {
+            meter.source = crate::data_binding::Binding::selected(bound.id, typed, cx)
+        });
 
         // Saved. The text is what has to come back, not the label.
         meter.read(cx).to_config().component
@@ -862,7 +864,7 @@ fn rebinding_to_an_expression_survives_the_save(cx: &mut gpui::TestAppContext) {
             )
         });
         assert_eq!(
-            meter.read(cx).component_id,
+            meter.read(cx).source.id(),
             published,
             "the reloaded meter reads what the expression publishes"
         );
@@ -937,8 +939,8 @@ fn an_xy_axis_binds_an_expression_independently(cx: &mut gpui::TestAppContext) {
         let plot = cx.new(|cx| XyPlot::from_config(saved, db.clone(), cx));
         let line_plot = plot.read(cx).line_plot().read(cx);
         let trace = line_plot.traces()[0].read(cx);
-        assert_eq!(trace.y_component_id, published);
-        assert_eq!(trace.x_component_id, ComponentId::new("rpm"));
+        assert_eq!(trace.y_source.id(), published);
+        assert_eq!(trace.x_source.id(), ComponentId::new("rpm"));
         assert!(
             cx.global::<expressions::Expressions>().is_live(published),
             "reloading an expression axis starts it"
@@ -1044,7 +1046,7 @@ fn a_time_series_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::
     let (reloaded, _plot) = cx.update(|cx| {
         let plot = cx.new(|cx| TimeSeriesPlot::from_config(saved, db.clone(), cx));
         let line_plot = plot.read(cx).line_plot().read(cx);
-        let id = line_plot.traces()[0].read(cx).component_id;
+        let id = line_plot.traces()[0].read(cx).source.id();
         assert!(
             cx.global::<expressions::Expressions>().is_live(published),
             "reloading has to start the expression again"
@@ -1099,7 +1101,7 @@ fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestApp
     let (reloaded, _plot) = cx.update(|cx| {
         let plot = cx.new(|cx| ListPlot::from_config(saved, db.clone(), cx));
         let line_plot = plot.read(cx).line_plot().read(cx);
-        let id = line_plot.traces()[0].read(cx).component_id;
+        let id = line_plot.traces()[0].read(cx).source.id();
         assert!(
             cx.global::<expressions::Expressions>().is_live(published),
             "reloading has to start the expression again"
@@ -1217,7 +1219,7 @@ fn a_trace_added_from_the_picker_keeps_its_expression_alive(cx: &mut gpui::TestA
             let basis: crate::inspector::trace_picker::ColorBasis = Arc::new(|_: &gpui::App| 0);
             expression_traces(&db, id, &text, &basis, cx)
         };
-        let id = traces[0].component_id;
+        let id = traces[0].source.id();
         assert!(
             expressions::running(id, cx).is_some(),
             "the trace's share must outlive the picker's"
@@ -1366,16 +1368,21 @@ fn an_inspector_rebind_retains_the_expression_before_the_next_render(
             )
         });
         let mut rows = crate::inspector::reflect::rows_for_entity(&meter, &db, cx);
-        let RowAction::Cascade(picker) = rows[0].activate(window, cx) else {
+        let RowAction::CascadeWith {
+            rows: picker,
+            query,
+        } = rows[0].activate(window, cx)
+        else {
             panic!("component picker")
         };
+        assert_eq!(query, "rpm");
         let mut candidates = picker[0].query_rows("=rpm * 2.0", 10, cx).unwrap();
         let compute = candidates
             .iter_mut()
             .find(|r| r.label() == "compute")
             .unwrap();
         assert!(matches!(compute.activate(window, cx), RowAction::Dismiss));
-        assert_eq!(meter.read(cx).component_id, published);
+        assert_eq!(meter.read(cx).source.id(), published);
         assert!(
             expressions::running(published, cx).is_some(),
             "the picker released its handle before rendering"
@@ -1390,12 +1397,282 @@ fn an_inspector_rebind_retains_the_expression_before_the_next_render(
         crate::inspector::reflect::set_field(
             &meter.clone().into_any(),
             0,
-            ComponentId::new("rpm"),
+            crate::data_binding::Binding::from(ComponentId::new("rpm")),
             cx,
         );
         assert!(
             expressions::running(published, cx).is_none(),
             "rebinding releases the computation"
+        );
+    });
+}
+
+/// Exercise the real reflected editor for every input type, without letting
+/// a render or a sibling view rescue the expression's temporary ownership.
+#[gpui::test]
+fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppContext) {
+    use crate::data_binding::Binding as DataBinding;
+    use crate::inspector::{registry::InspectorRegistry, rows::RowAction};
+    use crate::views::*;
+    use facet::Facet;
+    use gpui::AppContext;
+    use std::sync::Arc;
+    let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        crate::inspector::edits::init(cx);
+        expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        InspectorRegistry::init(db.clone(), cx);
+        let id = ComponentId::new("rpm");
+        let color = gpui::Hsla::default();
+        let views = vec![
+            cx.new(|cx| Meter::from_config(&MeterConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| Gauge::from_config(&GaugeConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| StateChip::from_config(&StateChipConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| Map::from_config(&MapConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| SamplesTable::from_config(&SamplesTableConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| AttitudeIndicator::from_config(&AttitudeConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|_| VectorMarker::empty(db.clone())).into_any(),
+            cx.new(|cx| ComponentText::new(db.clone(), id, cx))
+                .into_any(),
+            cx.new(|cx| Monitor::new(db.clone(), id, cx)).into_any(),
+            cx.new(|cx| TrafficLight::new(db.clone(), id, cx))
+                .into_any(),
+            cx.new(|_| time_series::Trace::new(id, 0, color)).into_any(),
+            cx.new(|_| XyTrace::new(id, 0, id, 0, color)).into_any(),
+            cx.new(|_| ListTrace::new(id, 1, color)).into_any(),
+            cx.new(|_| SpectrogramTrace::new(id, 1)).into_any(),
+            cx.new(|_| viewer_3d::ModelEntry::empty()).into_any(),
+            cx.new(|_| annunciator::Condition::default()).into_any(),
+        ];
+        let text = "=rpm * 7.0";
+        let mut checked = 0;
+        for view in views {
+            let adapter = cx
+                .global::<InspectorRegistry>()
+                .entity_adapter(view.entity_type())
+                .unwrap()
+                .clone();
+            let mut fields = Vec::new();
+            (adapter.peek)(&view, cx, &mut |peek| {
+                let value = peek.into_struct().unwrap();
+                for (idx, field) in value.ty().fields.iter().enumerate() {
+                    if field.shape().id == DataBinding::SHAPE.id {
+                        fields.push((idx, field.name));
+                    }
+                }
+            });
+            assert!(!fields.is_empty(), "each widget exposes an input");
+            for (idx, name) in fields {
+                let mut rows =
+                    crate::inspector::reflect::rows_for_any_entity(&view, &db, cx).unwrap();
+                let row = rows.iter_mut().find(|row| row.label() == name).unwrap();
+                let RowAction::CascadeWith { rows: picker, .. } = row.activate(window, cx) else {
+                    panic!("binding editor")
+                };
+                let mut candidates = picker[0].query_rows(text, text.len(), cx).unwrap();
+                let compute = candidates
+                    .iter_mut()
+                    .find(|r| r.label() == "compute")
+                    .unwrap();
+                assert!(matches!(compute.activate(window, cx), RowAction::Dismiss));
+                drop(candidates);
+                let binding =
+                    crate::inspector::reflect::get_field::<DataBinding>(&view, idx, cx).unwrap();
+                let published = binding.id();
+                assert_eq!(binding.text(&db), text);
+                assert!(expressions::running(published, cx).is_some());
+                drop(binding);
+                let mut rows =
+                    crate::inspector::reflect::rows_for_any_entity(&view, &db, cx).unwrap();
+                let row = rows.iter_mut().find(|row| row.label() == name).unwrap();
+                let RowAction::CascadeWith { mut rows, query } = row.activate(window, cx) else {
+                    panic!("binding editor")
+                };
+                assert_eq!(query, text, "editing starts with the saved expression");
+                rows.iter_mut()
+                    .find(|r| r.label() == "Clear")
+                    .unwrap()
+                    .activate(window, cx);
+                assert!(
+                    expressions::running(published, cx).is_none(),
+                    "clearing releases {name}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 18, "includes both XY axes and both model inputs");
+    });
+}
+
+#[gpui::test]
+fn widget_snapshots_preserve_expression_syntax_and_unbound_inputs(cx: &mut gpui::TestAppContext) {
+    use crate::views::dashboard::{WidgetKind, WidgetRegistry};
+    use std::sync::Arc;
+    let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        crate::inspector::edits::init(cx);
+        expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+        WidgetRegistry::init(cx);
+        for kind in [
+            WidgetKind::text(),
+            WidgetKind::monitor(),
+            WidgetKind::traffic_light(),
+            WidgetKind::meter(),
+            WidgetKind::gauge(),
+            WidgetKind::map(),
+            WidgetKind::samples_table(),
+            WidgetKind::state_chip(),
+            WidgetKind::attitude(),
+        ] {
+            let spec = cx.global::<WidgetRegistry>().spec(&kind).unwrap();
+            for text in ["=rpm * 2.0", "", "=missing * 2.0"] {
+                let config = serde_json::json!({"component": text}).to_string();
+                let live = (spec.build)(&config, &db, cx);
+                let saved = (spec.snapshot)(&live.state, &config, cx)
+                    .expect("every input snapshots its state");
+                let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+                assert_eq!(saved["component"], text, "{}", kind.0);
+                assert!(
+                    crate::inspector::reflect::rows_for_any_entity(&live.inspect, &db, cx)
+                        .is_some(),
+                    "unbound inputs stay editable"
+                );
+            }
+        }
+    });
+}
+
+#[gpui::test]
+fn binding_history_discovers_and_fills_preexisting_input_history(cx: &mut gpui::TestAppContext) {
+    use crate::data_binding::{Binding as DataBinding, BoundHistory};
+    use metor_proto::types::Timestamp;
+    use std::sync::Arc;
+    let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let source = db
+        .with_state(|s| s.get_component(ComponentId::new("rpm")).cloned())
+        .unwrap();
+    let recorded: Vec<_> = (1..=5)
+        .map(|ts| (Timestamp(ts), (ts as f64).to_le_bytes()))
+        .collect();
+    source
+        .time_series
+        .install_samples(
+            8,
+            recorded.iter().map(|(ts, bytes)| (*ts, bytes.as_slice())),
+            metor_db::manifest::SpanSource::LocalIngest,
+        )
+        .unwrap();
+    cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        let binding = DataBinding::from_text("=rpm * 3.0", &db, cx);
+        let history = BoundHistory::for_binding(&binding, &db, cx).unwrap();
+        assert_eq!(history.extent().unwrap().start, Timestamp(1));
+        let before = history.component.time_series.manifest().generation;
+        crate::backfill::fill(
+            &db,
+            binding.id(),
+            Timestamp(1)..Timestamp(5),
+            history.plan.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            history.component.time_series.manifest().generation > before,
+            "old history invalidates consumer caches"
+        );
+        let saved = binding.text(&db);
+        drop(binding);
+        let restored = DataBinding::from_text(&saved, &db, cx);
+        assert!(expressions::running(restored.id(), cx).is_some());
+    });
+}
+
+#[gpui::test]
+fn unavailable_bindings_retry_and_model_expressions_survive_a_cold_database(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::data_binding::Binding as DataBinding;
+    use std::sync::Arc;
+    let (db, _temp) = db_with(&[]);
+    let db = Arc::new(db);
+    let saved = cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        let mut binding = DataBinding::from_text("=rpm * 2.0", &db, cx);
+        assert_eq!(binding.id(), ComponentId(0));
+        assert!(binding.error().is_some());
+        assert_eq!(binding.text(&db), "=rpm * 2.0");
+        let id = ComponentId::new("rpm");
+        db.with_state_mut(|s| {
+            s.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
+        })
+        .unwrap();
+        db.with_state_mut(|s| {
+            s.set_component_metadata(
+                metor_proto_wkt::ComponentMetadata {
+                    component_id: id,
+                    name: "rpm".into(),
+                    metadata: Default::default(),
+                },
+                &db.path,
+            )
+        })
+        .unwrap();
+        db.vtable_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        binding.resolve(&db, cx);
+        assert!(binding.error().is_none());
+        let model = crate::views::viewer_3d::ModelEntry {
+            position_binding: binding.clone(),
+            orientation_binding: binding,
+            ..crate::views::viewer_3d::ModelEntry::empty()
+        };
+        serde_json::to_string(&crate::views::ModelConfig::from(&model)).unwrap()
+    });
+    let (fresh, _temp2) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let fresh = Arc::new(fresh);
+    cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        let config: crate::views::ModelConfig = serde_json::from_str(&saved).unwrap();
+        let position = DataBinding::from_legacy(
+            config.position_binding.unwrap(),
+            config.position_expression.as_deref(),
+            &fresh,
+            cx,
+        );
+        let orientation = DataBinding::from_legacy(
+            config.orientation_binding.unwrap(),
+            config.orientation_expression.as_deref(),
+            &fresh,
+            cx,
+        );
+        let id = position.id();
+        assert_ne!(id, ComponentId(0));
+        assert_eq!(orientation.id(), id);
+        drop(position);
+        assert!(
+            expressions::running(id, cx).is_some(),
+            "second input owns its share"
+        );
+        drop(orientation);
+        assert!(
+            expressions::running(id, cx).is_none(),
+            "last input releases computation"
         );
     });
 }

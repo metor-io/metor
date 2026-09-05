@@ -111,6 +111,8 @@ pub struct Viewer3d {
     #[facet(opaque)]
     db: Option<Arc<DB>>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     camera: OrbitCamera,
 
     pub models: Vec<gpui::Entity<ModelEntry>>,
@@ -180,25 +182,25 @@ impl CameraSnapshot {
 pub struct ModelEntry {
     pub label: SharedString,
     pub path: String,
-    pub position_binding: Option<ComponentId>,
-    pub orientation_binding: Option<ComponentId>,
+    pub position_binding: crate::data_binding::Binding,
+    pub orientation_binding: crate::data_binding::Binding,
 }
 
 impl ModelEntry {
     pub fn position_binding_component(&self) -> Option<ComponentId> {
-        self.position_binding
+        (!self.position_binding.is_unbound()).then_some(self.position_binding.id())
     }
 
     pub fn orientation_binding_component(&self) -> Option<ComponentId> {
-        self.orientation_binding
+        (!self.orientation_binding.is_unbound()).then_some(self.orientation_binding.id())
     }
 
     pub fn empty() -> Self {
         Self {
             label: SharedString::new_static(""),
             path: String::new(),
-            position_binding: None,
-            orientation_binding: None,
+            position_binding: crate::data_binding::Binding::default(),
+            orientation_binding: crate::data_binding::Binding::default(),
         }
     }
 }
@@ -330,6 +332,10 @@ impl Viewer3d {
         let mut viewer = Self {
             entities,
             render_layer,
+            _binding_changes: db
+                .as_ref()
+                .map(|db| crate::data_binding::watch_registrations(db.clone(), cx))
+                .unwrap_or_else(|| gpui::Task::ready(())),
             db,
             camera,
             models: Vec::new(),
@@ -418,6 +424,14 @@ impl Viewer3d {
             work = true;
         }
 
+        if let Some(db) = &self.db {
+            for model in &self.models {
+                model.update(cx, |model, cx| {
+                    model.position_binding.resolve(db, cx);
+                    model.orientation_binding.resolve(db, cx);
+                });
+            }
+        }
         // Snapshot up-front so we can borrow `self.tracking` mutably
         // without aliasing `self.models`.
         let layer = self.render_layer;
@@ -439,8 +453,8 @@ impl Viewer3d {
                     id,
                     m.clone(),
                     entry.path.clone(),
-                    entry.position_binding,
-                    entry.orientation_binding,
+                    entry.position_binding_component(),
+                    entry.orientation_binding_component(),
                 )
             })
             .collect();
@@ -560,8 +574,8 @@ impl Viewer3d {
         let entry = ModelEntry {
             label: label.into(),
             path: path.into(),
-            position_binding: None,
-            orientation_binding: None,
+            position_binding: crate::data_binding::Binding::default(),
+            orientation_binding: crate::data_binding::Binding::default(),
         };
         self.models.push(cx.new(|_| entry));
         cx.notify();

@@ -55,8 +55,7 @@ const COLORBAR_STEPS: usize = 32;
 #[derive(Clone, facet::Facet)]
 #[facet(pod)]
 pub struct SpectrogramTrace {
-    #[facet(skip)]
-    pub component_id: ComponentId,
+    pub source: crate::data_binding::Binding,
     #[facet(skip)]
     pub len: usize,
     pub visible: bool,
@@ -67,10 +66,6 @@ pub struct SpectrogramTrace {
     /// band can be pushed into the visible part of the ramp.
     #[facet(inspect::range(min = "0.1", max = "100.0"))]
     pub gain: f32,
-    /// The `=` expression this source plots, when it is one; the source's
-    /// share is what keeps it computing.
-    #[facet(opaque)]
-    pub expression: Option<crate::dynamic::expressions::Expression>,
     /// Back-reference to the owning plot, set by `SpectrogramPlot::reconcile`,
     /// so the source's inspector can ask the plot to follow a new component.
     #[facet(opaque)]
@@ -80,14 +75,13 @@ pub struct SpectrogramTrace {
 impl SpectrogramTrace {
     pub fn new(component_id: impl Into<ComponentId>, len: usize) -> Self {
         Self {
-            component_id: component_id.into(),
+            source: crate::data_binding::Binding::from(component_id.into()),
             len,
             visible: true,
             label: SharedString::new_static(""),
             colormap: Colormap::default(),
             scale: IntensityScale::default(),
             gain: 1.0,
-            expression: None,
             plot: None,
         }
     }

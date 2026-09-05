@@ -84,17 +84,6 @@ pub struct WidgetLive {
     pub state: gpui::AnyEntity,
 }
 
-struct ExpressionView<T: Render + 'static> {
-    inner: Entity<T>,
-    _expression: crate::dynamic::expressions::Expression,
-}
-
-impl<T: Render + 'static> Render for ExpressionView<T> {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.inner.clone()
-    }
-}
-
 impl WidgetSpec {
     /// Define a view kind in one place: construction, display naming, and
     /// live persistence. Register it through [`WidgetRegistry::register`]
@@ -262,7 +251,7 @@ impl WidgetRegistry {
                     SharedString::from(format!("Text: {}", display_or_unknown(&cfg.component)))
                 },
                 build_text,
-                no_snapshot,
+                snapshot_text,
             )
             .with_tile("component_text", |blob| {
                 parse_or_default::<TextWidgetConfig>(blob).component.into()
@@ -642,19 +631,23 @@ fn snapshot_plot(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<St
     serde_json::to_string(&plot.read(cx).to_config(cx)).ok()
 }
 
-fn snapshot_traffic_light(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
-    let tl = entity.clone().downcast::<TrafficLight>().ok()?;
-    let v = tl.read(cx);
-    serde_json::to_string(&TrafficLightWidgetConfig {
-        component: v.name().to_string(),
-        color: Some(v.color()),
+fn snapshot_text(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
+    let entity = entity.clone().downcast::<ComponentText>().ok()?;
+    serde_json::to_string(&TextWidgetConfig {
+        component: entity.read(cx).binding_text(),
     })
     .ok()
 }
 
+fn snapshot_traffic_light(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
+    let tl = entity.clone().downcast::<TrafficLight>().ok()?;
+    let v = tl.read(cx);
+    serde_json::to_string(&v.to_config()).ok()
+}
+
 fn snapshot_annunciator(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String> {
     let annunciator = entity.clone().downcast::<Annunciator>().ok()?;
-    serde_json::to_string(&annunciator.read(cx).to_config()).ok()
+    serde_json::to_string(&annunciator.read(cx).to_config(cx)).ok()
 }
 
 fn snapshot_typed<T>(entity: &gpui::AnyEntity, _config: &str, cx: &App) -> Option<String>
@@ -716,6 +709,7 @@ fn snapshot_monitor(entity: &gpui::AnyEntity, config: &str, cx: &App) -> Option<
     let entity = entity.clone().downcast::<Monitor>().ok()?;
     let v = entity.read(cx);
     let mut cfg = parse_or_default::<MonitorWidgetConfig>(config);
+    cfg.component = v.binding_text();
     cfg.unit = Some(v.unit.to_string());
     cfg.show_sparkline = Some(v.show_sparkline);
     serde_json::to_string(&cfg).ok()
@@ -766,23 +760,6 @@ fn as_live<T: Render + 'static>(e: Entity<T>) -> WidgetLive {
     }
 }
 
-fn expression_live<T: Render + 'static>(
-    entity: Entity<T>,
-    expression: crate::dynamic::expressions::Expression,
-    cx: &mut App,
-) -> WidgetLive {
-    let any = entity.clone().into_any();
-    let view = cx.new(|_| ExpressionView {
-        inner: entity,
-        _expression: expression,
-    });
-    WidgetLive {
-        view: AnyView::from(view),
-        inspect: any.clone(),
-        state: any,
-    }
-}
-
 fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     // Only LinePlot has Facet adapters, so expose it — not the outer
     // TimeSeriesPlot — as the inspectable entity.
@@ -798,21 +775,13 @@ fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
 
 fn build_text(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     let cfg = parse_or_default::<TextWidgetConfig>(config);
-    if cfg.component.is_empty() {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::new_static("?"),
-        }));
-    }
-    let Ok(bound) = crate::dynamic::expressions::bind(&cfg.component, db, cx) else {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::from(cfg.component.clone()),
-        }));
-    };
-    let entity = cx.new(|cx| ComponentText::new(db.clone(), bound.id, cx));
-    match bound.expression {
-        Some(expression) => expression_live(entity, expression, cx),
-        None => as_live(entity),
-    }
+    let binding = crate::data_binding::Binding::from_text(&cfg.component, db, cx);
+    let entity = cx.new(|cx| {
+        let mut view = ComponentText::new(db.clone(), binding.id(), cx);
+        view.source = binding;
+        view
+    });
+    as_live(entity)
 }
 
 fn build_xy_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
@@ -871,28 +840,12 @@ fn build_image(config: &str, _db: &Arc<DB>, cx: &mut App) -> WidgetLive {
 
 fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     let cfg = parse_or_default::<MonitorWidgetConfig>(config);
-    if cfg.component.is_empty() {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::new_static("?"),
-        }));
-    }
-    // Bind by component id, not by the node: an expression publishes into a
-    // real component, so the monitor reads its metadata, its element count,
-    // its seed and its sparkline through the ordinary path and never learns it
-    // was an expression at all. The monitor additionally keeps the handle, so
-    // it can show the text the operator typed instead of a content hash.
-    let Ok(bound) = crate::dynamic::expressions::bind(&cfg.component, db, cx) else {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::from(cfg.component.clone()),
-        }));
-    };
-    let entity = cx.new(|cx| Monitor::new(db.clone(), bound.id, cx));
-    if let Some(expression) = bound.expression {
-        let label = crate::dynamic::expressions::body(&cfg.component).to_string();
-        entity.update(cx, |monitor, _cx| {
-            monitor.bind_expression(expression, label);
-        });
-    }
+    let binding = crate::data_binding::Binding::from_text(&cfg.component, db, cx);
+    let entity = cx.new(|cx| {
+        let mut view = Monitor::new(db.clone(), binding.id(), cx);
+        view.source = binding;
+        view
+    });
     if cfg.unit.is_some() || cfg.show_sparkline.is_some() {
         entity.update(cx, |m, cx| {
             if let Some(unit) = cfg.unit {
@@ -914,53 +867,30 @@ fn build_viewer3d(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
 
 fn build_traffic_light(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     let cfg = parse_or_default::<TrafficLightWidgetConfig>(config);
-    if cfg.component.is_empty() {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::new_static("?"),
-        }));
-    }
-    let Ok(bound) = crate::dynamic::expressions::bind(&cfg.component, db, cx) else {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::from(cfg.component.clone()),
-        }));
-    };
-    let entity = cx.new(|cx| TrafficLight::new(db.clone(), bound.id, cx));
+    let binding = crate::data_binding::Binding::from_text(&cfg.component, db, cx);
+    let entity = cx.new(|cx| {
+        let mut view = TrafficLight::new(db.clone(), binding.id(), cx);
+        view.source = binding;
+        view
+    });
     if let Some(color) = cfg.color {
         entity.update(cx, |t, cx| t.set_color(color, cx));
     }
-    match bound.expression {
-        Some(expression) => expression_live(entity, expression, cx),
-        None => as_live(entity),
-    }
+    as_live(entity)
 }
 
 fn build_meter(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     let cfg = parse_or_default::<MeterConfig>(config);
-    if cfg.component.is_empty() {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::new_static("?"),
-        }));
-    }
     as_live(cx.new(|cx| Meter::from_config(&cfg, db.clone(), cx)))
 }
 
 fn build_gauge(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     let cfg = parse_or_default::<GaugeConfig>(config);
-    if cfg.component.is_empty() {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::new_static("?"),
-        }));
-    }
     as_live(cx.new(|cx| Gauge::from_config(&cfg, db.clone(), cx)))
 }
 
 fn build_state_chip(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     let cfg = parse_or_default::<StateChipConfig>(config);
-    if cfg.component.is_empty() {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::new_static("?"),
-        }));
-    }
     as_live(cx.new(|cx| StateChip::from_config(&cfg, db.clone(), cx)))
 }
 
@@ -978,11 +908,6 @@ fn build_samples_table(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
 
 fn build_attitude(config: &str, db: &Arc<DB>, cx: &mut App) -> WidgetLive {
     let cfg = parse_or_default::<AttitudeConfig>(config);
-    if cfg.component.is_empty() {
-        return as_live(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::new_static("?"),
-        }));
-    }
     as_live(cx.new(|cx| AttitudeIndicator::from_config(&cfg, db.clone(), cx)))
 }
 

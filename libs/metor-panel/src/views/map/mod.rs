@@ -106,7 +106,7 @@ impl Default for MapConfig {
 pub struct Map {
     /// The position component. Editable: picking another rebinds on the
     /// next frame.
-    pub component_id: ComponentId,
+    pub source: crate::data_binding::Binding,
     pub lat_element: usize,
     pub lon_element: usize,
     /// Keep the camera centered on the latest sample. Panning clears it;
@@ -133,7 +133,9 @@ pub struct Map {
     /// What `trail` was decoded from: `(range start, range end, series id,
     /// newest stamp)`. Matching key, current trail.
     #[facet(opaque)]
-    trail_key: Option<(i64, i64, ComponentId, i64)>,
+    trail_key: Option<(i64, i64, ComponentId, i64, u64)>,
+    #[facet(opaque)]
+    history_task: gpui::Task<()>,
     /// The component's LoD companions (`metor_db::lod`), finest first, and
     /// the vtable generation they were resolved at.
     #[facet(opaque)]
@@ -155,7 +157,7 @@ pub struct Map {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _expression: Option<crate::dynamic::expressions::Expression>,
+    _binding_changes: gpui::Task<()>,
     #[facet(opaque)]
     _store_observation: Option<gpui::Subscription>,
     #[facet(opaque)]
@@ -164,20 +166,13 @@ pub struct Map {
 
 impl Map {
     pub fn from_config(cfg: &MapConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let (component_id, expression) = if cfg.component.is_empty() {
-            (ComponentId(0), None)
-        } else {
-            match crate::dynamic::expressions::bind(&cfg.component, &db, cx) {
-                Ok(bound) => (bound.id, bound.expression),
-                Err(_) => (ComponentId::new(&cfg.component), None),
-            }
-        };
+        let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
         let time_range = match cfg.time_range.parse::<TimeRangeBehavior>() {
             Ok(behavior) if !cfg.time_range.is_empty() => Override::Custom(behavior),
             _ => Override::Auto,
         };
         let mut map = Self {
-            component_id,
+            source,
             lat_element: cfg.lat_element,
             lon_element: cfg.lon_element,
             follow: cfg.follow,
@@ -191,14 +186,15 @@ impl Map {
             position: None,
             trail: Vec::new(),
             trail_key: None,
+            history_task: gpui::Task::ready(()),
             lod_levels: Vec::new(),
             lod_resolved_gen: None,
             over_budget: false,
             tile_url: SharedString::from(cfg.tile_url.clone()),
             drag: None,
             last_bounds: Bounds::default(),
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
-            _expression: expression,
             _store_observation: tiles::TileStore::observe(cx),
             _task: gpui::Task::ready(()),
         };
@@ -209,12 +205,7 @@ impl Map {
     pub fn to_config(&self) -> MapConfig {
         let (center_lat, center_lon) = unproject(self.camera.center);
         MapConfig {
-            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
-                .or_else(|| {
-                    super::binding::component_name(&self.db, self.component_id)
-                        .map(|name| name.to_string())
-                })
-                .unwrap_or_else(|| self.component.to_string()),
+            component: self.source.text(&self.db),
             lat_element: self.lat_element,
             lon_element: self.lon_element,
             tile_url: self.tile_url.to_string(),
@@ -232,7 +223,8 @@ impl Map {
 
     /// Restart the streams when the inspector has re-pointed the binding.
     pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
-        let want = (self.component_id, self.lat_element, self.lon_element);
+        self.source.resolve(&self.db, cx);
+        let want = (self.source.id(), self.lat_element, self.lon_element);
         if self.bound == Some(want) {
             return;
         }
@@ -243,18 +235,19 @@ impl Map {
         self.lod_levels.clear();
         self.lod_resolved_gen = None;
         self.over_budget = false;
-        if self.component_id == ComponentId(0) {
-            self._expression = None;
+        if self.source.id() == ComponentId(0) {
             self._task = gpui::Task::ready(());
             return;
         }
-        self._expression = crate::dynamic::expressions::running(self.component_id, cx);
-        self.component = component_meta(&self.db, self.component_id).name;
+
+        self.history_task =
+            crate::data_binding::watch_history(self.db.clone(), self.source.id(), cx);
+        self.component = component_meta(&self.db, self.source.id()).name;
         let (lat_el, lon_el) = (self.lat_element, self.lon_element);
         let count = lat_el.max(lon_el) + 1;
         self._task = spawn_elements_stream(
             self.db.clone(),
-            self.component_id,
+            self.source.id(),
             count,
             cx,
             move |map, values, cx| {
@@ -307,27 +300,31 @@ impl Map {
     /// live data that is once per arriving sample, bounded by
     /// [`TRAIL_POINTS`] via the LoD switch and stride decimation.
     fn rebuild_trail(&mut self, cx: &gpui::App) {
-        if self.component_id == ComponentId(0) {
+        if self.source.id() == ComponentId(0) {
             return;
         }
         let Some(component) = self
             .db
-            .with_state(|state| state.get_component(self.component_id).cloned())
+            .with_state(|state| state.get_component(self.source.id()).cloned())
         else {
             return;
         };
-        let Some(extent) = series_extent(&component) else {
+        let history = crate::data_binding::BoundHistory::for_binding(&self.source, &self.db, cx);
+        let Some(extent) = history.as_ref().and_then(|h| h.extent()) else {
             return;
         };
         let range = self
             .resolved_time_range(cx)
             .calculate_range(extent.start, extent.end);
+        if let Some(history) = history {
+            history.request(range.clone(), cx);
+        }
 
         // Raw-vs-LoD choice, the plots' `update_lod_state` in miniature.
         let vtable_gen = self.db.vtable_gen.latest();
         if self.lod_resolved_gen != Some(vtable_gen) {
             self.lod_levels =
-                crate::views::time_series::resolve_lod_levels(&self.db, self.component_id);
+                crate::views::time_series::resolve_lod_levels(&self.db, self.source.id());
             self.lod_resolved_gen = Some(vtable_gen);
         }
         let estimate = component.time_series.estimate_samples(range.clone());
@@ -367,35 +364,19 @@ impl Map {
             .latest()
             .map(|l| l.timestamp().0)
             .unwrap_or_default();
-        let key = (range.start.0, range.end.0, series.component_id, newest);
+        let key = (
+            range.start.0,
+            range.end.0,
+            series.component_id,
+            newest,
+            series.time_series.manifest().generation,
+        );
         if self.trail_key == Some(key) {
             return;
         }
         self.trail = decode_trail(series, range, self.lat_element, self.lon_element);
         self.trail_key = Some(key);
     }
-}
-
-/// The stamps a series spans, resident nodes and manifest both — the
-/// manifest is what lets a full-range window cover remote-only history.
-fn series_extent(component: &Component) -> Option<std::ops::Range<Timestamp>> {
-    let series = &component.time_series;
-    let mut start = i64::MAX;
-    let mut end = i64::MIN;
-    if let Some(s) = series.start_timestamp() {
-        start = start.min(s.0);
-    }
-    if let Some(l) = series.latest() {
-        end = end.max(l.timestamp().0);
-    }
-    let manifest = series.manifest();
-    if let Some(span) = manifest.spans.first() {
-        start = start.min(span.seal.start_ts.0);
-    }
-    if let Some(span) = manifest.spans.last() {
-        end = end.max(span.cover_end.0);
-    }
-    (start < end).then_some(Timestamp(start)..Timestamp(end))
 }
 
 /// Decode a series' positions over `range` into at most [`TRAIL_POINTS`]
@@ -700,7 +681,7 @@ impl Render for Map {
                 .child(attribution),
         );
 
-        if self.component_id == ComponentId(0) {
+        if self.source.id() == ComponentId(0) {
             root = root.child(
                 div()
                     .absolute()

@@ -116,9 +116,13 @@ pub struct SpectrogramPlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     tracking: HashMap<EntityId, SourceTracking>,
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
+    #[facet(opaque)]
+    inputs: crate::data_binding::InputChanges,
     #[facet(opaque)]
     view_override: Option<PlotBounds>,
     #[facet(opaque)]
@@ -147,9 +151,11 @@ impl SpectrogramPlot {
             sample_rate: Override::Auto,
             show_colorbar: true,
             custom_title: Override::Auto,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
+            inputs: Default::default(),
             view_override: None,
             last_overrides: OverrideSnapshot {
                 y_min: None,
@@ -163,7 +169,13 @@ impl SpectrogramPlot {
     }
 
     pub fn bind_traces(&mut self, traces: Vec<SpectrogramTrace>, cx: &mut Context<Self>) {
-        self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
+        self.traces = traces
+            .into_iter()
+            .map(|mut t| {
+                t.source.resolve(&self.db, cx);
+                cx.new(|_| t)
+            })
+            .collect();
         cx.notify();
     }
 
@@ -387,7 +399,7 @@ impl SpectrogramPlot {
                 continue;
             };
             if tracking.lod_resolved_gen != Some(vtable_gen) {
-                tracking.lod_levels = resolve_lod_levels(&self.db, cfg.component_id);
+                tracking.lod_levels = resolve_lod_levels(&self.db, cfg.source.id());
                 tracking.lod_resolved_gen = Some(vtable_gen);
             }
             let len = cfg.len.max(1) as u64;
@@ -442,13 +454,11 @@ impl SpectrogramPlot {
         let Some(component) = tracking.component.as_ref() else {
             return bands;
         };
-        let component_id = trace.read(cx).component_id;
+        let component_id = trace.read(cx).source.id();
         let span = view.width().max(1.0);
         let visible = Timestamp(view.min_x as i64)..Timestamp(view.max_x as i64);
         let hydrator = crate::hydration::hydrator(cx);
-        let backfiller = crate::backfill::backfiller(cx);
         let mut gaps = metor_db::manifest::GapVec::new();
-        let mut uncovered = metor_db::manifest::RangeVec::new();
 
         let (series, hydrate_id, hydrate) = match tracking.selected_lod() {
             Some(lod) => (&lod.time_series, lod.component_id, true),
@@ -474,19 +484,29 @@ impl SpectrogramPlot {
         }
         // What an expression has never computed is a gap of the other kind:
         // nothing to fetch, something to compute.
-        if let Some(plan) = &tracking.plan {
-            crate::backfill::wanted(component, plan, visible, &mut uncovered);
-            for range in &uncovered {
-                if let Some(backfiller) = &backfiller {
-                    backfiller.request(component_id, range.clone(), plan.clone());
-                }
-                band(range);
-            }
+        let history = crate::data_binding::BoundHistory {
+            component: component.clone(),
+            plan: tracking.plan.clone(),
+        };
+        for range in history.request_replay(visible.clone(), cx) {
+            band(&range);
         }
         bands
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        for trace in &self.traces {
+            trace.update(cx, |trace, cx| {
+                trace.source.resolve(&self.db, cx);
+                if let Some(len) = self.db.with_state(|s| {
+                    s.get_component(trace.source.id())
+                        .map(|c| c.schema.dim.iter().product::<usize>().max(1))
+                }) {
+                    trace.len = len;
+                }
+            });
+        }
+
         // Point each source back at this plot so its inspector page can reach
         // the plot to rebind. Mutating without notifying cannot re-enter
         // reconcile: the plot does not observe its traces.
@@ -503,6 +523,16 @@ impl SpectrogramPlot {
                     t.plot = Some(self_weak.clone());
                 }
             });
+        }
+
+        for id in self.inputs.changed(
+            &self.traces,
+            &self.db,
+            |trace| vec![(trace.source.id(), trace.len)],
+            cx,
+        ) {
+            self.tracking.remove(&id);
+            self.tasks.remove(&id);
         }
 
         let db = self.db.clone();
@@ -540,7 +570,7 @@ impl SpectrogramPlot {
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let component_id = match this.update(cx, |_, cx| trace.read(cx).component_id) {
+            let component_id = match this.update(cx, |_, cx| trace.read(cx).source.id()) {
                 Ok(id) => id,
                 Err(_) => return,
             };

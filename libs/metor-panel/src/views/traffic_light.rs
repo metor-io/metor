@@ -33,7 +33,10 @@ pub struct TrafficLight {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    component_id: ComponentId,
+    _binding_changes: gpui::Task<()>,
+    pub source: crate::data_binding::Binding,
+    #[facet(skip)]
+    bound: ComponentId,
     #[facet(opaque)]
     element_names: Vec<SharedString>,
     #[facet(skip)]
@@ -55,6 +58,7 @@ impl TrafficLight {
         cx: &mut Context<Self>,
     ) -> Self {
         let component_id = source.component_id();
+        let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
         let default_color = theme(cx).control_active;
 
         let meta = component_meta(&db, component_id);
@@ -73,8 +77,10 @@ impl TrafficLight {
         Self {
             name: meta.name,
             color: default_color,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
-            component_id,
+            source: binding,
+            bound: component_id,
             element_names: meta.element_names,
             is_bool: meta.is_bool,
             latest_on: None,
@@ -84,8 +90,15 @@ impl TrafficLight {
         }
     }
 
+    pub fn to_config(&self) -> TrafficLightConfig {
+        TrafficLightConfig {
+            component: self.source.text(&self.db),
+            color: Some(self.color),
+        }
+    }
+
     pub fn component_id(&self) -> ComponentId {
-        self.component_id
+        self.source.id()
     }
 
     pub fn name(&self) -> &SharedString {
@@ -111,7 +124,7 @@ impl TrafficLight {
         let next = !self.latest_on.unwrap_or(false);
         crate::inspector::edits::upsert_element_value(
             &self.db,
-            self.component_id,
+            self.source.id(),
             self.name.clone(),
             self.element_names.clone(),
             0,
@@ -130,6 +143,14 @@ impl Focusable for TrafficLight {
 
 impl Render for TrafficLight {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.source.resolve(&self.db, cx);
+        if self.bound != self.source.id() {
+            let source = self.source.clone();
+            let color = self.color;
+            *self = Self::new(self.db.clone(), source.id(), cx);
+            self.source = source;
+            self.color = color;
+        }
         let theme = theme(cx);
         let value = self.latest_on;
         let color = self.color;

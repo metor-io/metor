@@ -66,7 +66,7 @@ pub fn select_xy_trace_wizard_rows(
 pub(crate) fn xy_trace(x: Channel, y: Channel, color: gpui::Hsla) -> XyTrace {
     let mut t = XyTrace::new(x.component, x.element, y.component, y.element, color);
     t.label = SharedString::from(format!("{} vs {}", x.label, y.label));
-    t.x_expression = x.expression;
-    t.y_expression = y.expression;
+    t.x_source = x.binding;
+    t.y_source = y.binding;
     t
 }

@@ -19,6 +19,7 @@ pub mod app;
 pub mod backfill;
 pub mod config;
 pub mod connections;
+pub mod data_binding;
 pub mod dynamic;
 pub mod gpu_context;
 pub(crate) mod graph_canvas;

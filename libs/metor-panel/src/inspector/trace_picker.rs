@@ -82,6 +82,20 @@ pub(crate) fn component_picker_rows(
     rows
 }
 
+/// Creation and editing share the same owned selection contract.
+pub(crate) fn binding_picker_rows(
+    db: Arc<DB>,
+    on_select: impl Fn(crate::data_binding::Binding, &mut App) + 'static,
+) -> Vec<Box<dyn InspectorRow>> {
+    let resolve_db = db.clone();
+    component_picker_rows(db, move |id, text, cx| {
+        let binding = crate::data_binding::Binding::from_legacy(id, Some(&text), &resolve_db, cx);
+        if binding.error().is_none() {
+            on_select(binding, cx);
+        }
+    })
+}
+
 /// Element labels for `component_id`, derived from its schema dimension.
 /// Empty when the component is missing from the DB.
 pub fn element_names_for_component(db: &DB, component_id: ComponentId) -> Vec<String> {
@@ -111,7 +125,7 @@ pub(crate) struct Channel {
     pub component: ComponentId,
     pub element: usize,
     pub label: String,
-    pub expression: Option<crate::dynamic::expressions::Expression>,
+    pub binding: crate::data_binding::Binding,
 }
 
 /// Invoked with the one [`Channel`] the user picked; decides what the page
@@ -135,9 +149,9 @@ pub(crate) fn channel_picker_rows(
         let db = db.clone();
         let on_pick = on_pick.clone();
         Arc::new(move |component, text, window, cx| {
-            let expression = crate::dynamic::expressions::running(component, cx);
+            let binding = crate::data_binding::Binding::selected(component, &text, cx);
             let elements = expression_elements(&db, component, &text);
-            channel_element_rows(elements, component, expression, &on_pick, window, cx)
+            channel_element_rows(elements, component, binding, &on_pick, window, cx)
         })
     };
     let component_row: crate::inspector::rows::ComponentRowBuilder = {
@@ -193,7 +207,7 @@ fn channel_component_row(
                         component,
                         element,
                         label: label.clone(),
-                        expression: None,
+                        binding: crate::data_binding::Binding::from(component),
                     },
                     window,
                     cx,
@@ -208,7 +222,13 @@ fn channel_component_row(
             elements
                 .iter()
                 .map(|(element, label)| {
-                    channel_element_row(component, *element, label.clone(), None, &on_pick)
+                    channel_element_row(
+                        component,
+                        *element,
+                        label.clone(),
+                        crate::data_binding::Binding::from(component),
+                        &on_pick,
+                    )
                 })
                 .collect()
         }),
@@ -220,7 +240,7 @@ fn channel_component_row(
 fn channel_element_rows(
     elements: Vec<(usize, String)>,
     component: ComponentId,
-    expression: Option<crate::dynamic::expressions::Expression>,
+    binding: crate::data_binding::Binding,
     on_pick: &OnChannel,
     window: &mut Window,
     cx: &mut App,
@@ -231,7 +251,7 @@ fn channel_element_rows(
                 component,
                 element: *element,
                 label: label.clone(),
-                expression,
+                binding,
             },
             window,
             cx,
@@ -241,7 +261,7 @@ fn channel_element_rows(
         elements
             .into_iter()
             .map(|(element, label)| {
-                channel_element_row(component, element, label, expression.clone(), on_pick)
+                channel_element_row(component, element, label, binding.clone(), on_pick)
             })
             .collect(),
     )
@@ -251,7 +271,7 @@ fn channel_element_row(
     component: ComponentId,
     element: usize,
     label: String,
-    expression: Option<crate::dynamic::expressions::Expression>,
+    binding: crate::data_binding::Binding,
     on_pick: &OnChannel,
 ) -> Box<dyn InspectorRow> {
     let on_pick = on_pick.clone();
@@ -263,7 +283,7 @@ fn channel_element_row(
                     component,
                     element,
                     label: label.clone(),
-                    expression: expression.clone(),
+                    binding: binding.clone(),
                 },
                 window,
                 cx,
@@ -681,7 +701,7 @@ pub(crate) fn expression_traces(
             let color = theme.line_colors[(base + index) % theme.line_colors.len()];
             let mut trace = Trace::new(component, index, color);
             trace.label = SharedString::from(label);
-            trace.expression = crate::dynamic::expressions::running(component, cx);
+            trace.source = crate::data_binding::Binding::selected(component, text, cx);
             trace
         })
         .collect()
@@ -877,7 +897,7 @@ mod tests {
             let channel = slot.lock().unwrap().take().expect("an element commits");
             assert_eq!(channel.label, "adcs.omega_b * 2.0.y");
             assert!(
-                channel.expression.is_some(),
+                channel.binding.expression_text().is_some(),
                 "the pick must keep the expression computing"
             );
             assert!(expressions::running(channel.component, cx).is_some());

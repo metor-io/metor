@@ -81,6 +81,27 @@ pub(super) fn build_component_picker(
     rows
 }
 
+/// Every data input commits its source and running owner as one value.
+pub(super) fn build_binding_picker(
+    db: &Arc<DB>,
+    entity: AnyEntity,
+    idx: usize,
+) -> Vec<Box<dyn InspectorRow>> {
+    use crate::data_binding::Binding;
+    let target = entity.clone();
+    let mut rows =
+        crate::inspector::trace_picker::binding_picker_rows(db.clone(), move |binding, cx| {
+            crate::inspector::reflect::set_field(&target, idx, binding, cx);
+        });
+    rows.push(Box::new(CommandRow::new(
+        "Clear",
+        Arc::new(move |_, cx| {
+            crate::inspector::reflect::set_field(&entity, idx, Binding::default(), cx);
+        }),
+    )));
+    rows
+}
+
 /// Name of the matching preset, or `None` when `value` is a custom range.
 pub(super) fn preset_label(value: &TimeRangeBehavior) -> Option<&'static str> {
     TimeRangeBehavior::PRESETS

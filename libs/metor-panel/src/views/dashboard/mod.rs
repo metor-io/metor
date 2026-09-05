@@ -1119,51 +1119,13 @@ fn component_picker_rows(
     db: Arc<DB>,
     kind: WidgetKind,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-
-    // Every widget behind this picker resolves its binding through
-    // `expressions::bind`, so every one of them can be given an expression.
-    // The row used to be gated to the monitor because it was the only builder
-    // that could honour one.
-    let commit: crate::inspector::rows::OnExpression = {
-        let dashboard = dashboard.clone();
-        let kind = kind.clone();
-        Arc::new(move |_id, text, _window, cx| {
-            let config = component_widget_config(&kind, text);
-            let kind = kind.clone();
-            dashboard.update(cx, |this, cx| {
-                this.add_widget(kind, config, cx);
-            });
-            crate::inspector::rows::RowAction::Dismiss
-        })
-    };
-    rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(
-        db.clone(),
-        commit.clone(),
-        crate::inspector::rows::ExpressionRow::commit_component_row(commit),
-        None,
-    )));
-
-    rows.extend(
-        crate::inspector::trace_picker::list_components(&db)
-            .into_iter()
-            .map(|(_id, name)| {
-                let dashboard = dashboard.clone();
-                let name_clone = name.clone();
-                let kind = kind.clone();
-                Box::new(CommandRow::new(
-                    SharedString::from(name),
-                    Arc::new(move |_window, cx| {
-                        let config = component_widget_config(&kind, name_clone.clone());
-                        let kind = kind.clone();
-                        dashboard.update(cx, |this, cx| {
-                            this.add_widget(kind, config, cx);
-                        });
-                    }),
-                )) as Box<dyn InspectorRow>
-            }),
-    );
-    rows
+    let config_db = db.clone();
+    crate::inspector::trace_picker::binding_picker_rows(db, move |binding, cx| {
+        let config = component_widget_config(&kind, binding.text(&config_db));
+        dashboard.update(cx, |this, cx| {
+            this.add_widget(kind.clone(), config, cx);
+        });
+    })
 }
 
 /// The config blob a component-bound widget of `kind` stores.

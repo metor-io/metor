@@ -87,7 +87,7 @@ pub struct AttitudeConfig {
 #[derive(facet::Facet)]
 pub struct VectorMarker {
     /// The 3-vector this marker plots. Editable, like the ball's own binding.
-    pub component_id: ComponentId,
+    pub source: crate::data_binding::Binding,
     pub label: SharedString,
     pub color: Option<Hsla>,
     /// Fallback name for a component nothing has registered.
@@ -102,29 +102,25 @@ pub struct VectorMarker {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _expression: Option<crate::dynamic::expressions::Expression>,
+    _binding_changes: gpui::Task<()>,
     #[facet(opaque)]
     _task: gpui::Task<()>,
 }
 
 impl VectorMarker {
     fn from_config(cfg: &VectorMarkerConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
-        let component_id = bound
-            .as_ref()
-            .map(|bound| bound.id)
-            .unwrap_or_else(|| ComponentId::new(&cfg.component));
-        let expression = bound.and_then(|bound| bound.expression);
+        let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
+        let component_id = source.id();
         let task = spawn_marker_stream(&db, component_id, cx);
         Self {
-            component_id,
+            source,
             label: SharedString::from(cfg.label.clone()),
             color: cfg.color,
             component: SharedString::from(cfg.component.clone()),
             bound: Some(component_id),
             value: None,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
-            _expression: expression,
             _task: task,
         }
     }
@@ -133,11 +129,7 @@ impl VectorMarker {
         VectorMarkerConfig {
             // An expression's component is named by a content hash, so what
             // round-trips is the text that made it.
-            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
-                .or_else(|| {
-                    binding::component_name(&self.db, self.component_id).map(|n| n.to_string())
-                })
-                .unwrap_or_else(|| self.component.to_string()),
+            component: self.source.text(&self.db),
             label: self.label.to_string(),
             color: self.color,
         }
@@ -147,14 +139,15 @@ impl VectorMarker {
     /// Driven from the ball's render, since a marker is data rather than a
     /// view and never gets a render pass of its own.
     pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
-        if self.bound == Some(self.component_id) {
+        self.source.resolve(&self.db, cx);
+        if self.bound == Some(self.source.id()) {
             return;
         }
-        self.bound = Some(self.component_id);
-        self._expression = crate::dynamic::expressions::running(self.component_id, cx);
-        self.component = component_meta(&self.db, self.component_id).name;
+        self.bound = Some(self.source.id());
+
+        self.component = component_meta(&self.db, self.source.id()).name;
         self.value = None;
-        self._task = spawn_marker_stream(&self.db, self.component_id, cx);
+        self._task = spawn_marker_stream(&self.db, self.source.id(), cx);
     }
 
     /// An empty marker, as the inspector's "add" affordance creates it. It
@@ -162,14 +155,14 @@ impl VectorMarker {
     /// then acts on.
     pub fn empty(db: Arc<DB>) -> Self {
         Self {
-            component_id: ComponentId(0),
+            source: crate::data_binding::Binding::default(),
             label: SharedString::new_static(""),
             color: None,
             component: SharedString::new_static(""),
             bound: Some(ComponentId(0)),
             value: None,
+            _binding_changes: gpui::Task::ready(()),
             db,
-            _expression: None,
             _task: gpui::Task::ready(()),
         }
     }
@@ -191,7 +184,7 @@ fn spawn_marker_stream(
 pub struct AttitudeIndicator {
     /// The quaternion this ball reads, and where in the frame it starts.
     /// Editable: picking another component rebinds on the next frame.
-    pub component_id: ComponentId,
+    pub source: crate::data_binding::Binding,
     pub element_offset: usize,
     pub label: SharedString,
     pub show_readout: bool,
@@ -208,7 +201,7 @@ pub struct AttitudeIndicator {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _expression: Option<crate::dynamic::expressions::Expression>,
+    _binding_changes: gpui::Task<()>,
     #[facet(opaque)]
     _task: gpui::Task<()>,
     #[facet(opaque)]
@@ -217,12 +210,8 @@ pub struct AttitudeIndicator {
 
 impl AttitudeIndicator {
     pub fn from_config(cfg: &AttitudeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
-        let component_id = bound
-            .as_ref()
-            .map(|bound| bound.id)
-            .unwrap_or_else(|| ComponentId::new(&cfg.component));
-        let expression = bound.and_then(|bound| bound.expression);
+        let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
+        let component_id = source.id();
         let meta = component_meta(&db, component_id);
         let offset = cfg.element_offset;
 
@@ -256,12 +245,12 @@ impl AttitudeIndicator {
             show_readout: !cfg.hide_readout,
             vectors,
             component: SharedString::from(cfg.component.clone()),
-            component_id,
+            source,
             element_offset: offset,
             bound: Some(ElementRef::new(component_id, offset)),
             quat: None,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
-            _expression: expression,
             _task: task,
             _resolver_task: resolver_task,
         }
@@ -270,15 +259,16 @@ impl AttitudeIndicator {
     /// Restart the quaternion stream when the inspector has re-pointed the
     /// ball, and let each marker do the same for itself.
     pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
+        self.source.resolve(&self.db, cx);
         for marker in self.vectors.clone() {
             marker.update(cx, |m, cx| m.rebind(cx));
         }
 
-        let want = ElementRef::new(self.component_id, self.element_offset);
+        let want = ElementRef::new(self.source.id(), self.element_offset);
         if !binding::rebound(want, &mut self.bound) {
             return;
         }
-        self._expression = crate::dynamic::expressions::running(want.component, cx);
+
         let offset = want.element;
         let meta = component_meta(&self.db, want.component);
         self.label = meta.name.clone();
@@ -294,12 +284,7 @@ impl AttitudeIndicator {
 
     pub fn to_config(&self, cx: &gpui::App) -> AttitudeConfig {
         AttitudeConfig {
-            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
-                .or_else(|| {
-                    binding::component_name(&self.db, self.component_id)
-                        .map(|name| name.to_string())
-                })
-                .unwrap_or_else(|| self.component.to_string()),
+            component: self.source.text(&self.db),
             element_offset: self.element_offset,
             label: Some(self.label.to_string()),
             vectors: self

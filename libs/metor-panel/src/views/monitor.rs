@@ -23,16 +23,15 @@ use crate::theme::theme;
 pub struct Monitor {
     #[facet(skip)]
     name: SharedString,
-    /// Held for its drop when this monitor is bound to a `=` expression: the
-    /// expression runs while a view wants it, and this is that view.
-    #[facet(opaque)]
-    _expression: Option<crate::dynamic::expressions::Expression>,
     pub unit: SharedString,
     pub show_sparkline: bool,
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    component_id: ComponentId,
+    _binding_changes: gpui::Task<()>,
+    pub source: crate::data_binding::Binding,
+    #[facet(skip)]
+    bound: ComponentId,
     #[facet(opaque)]
     sparkline: Entity<LinePlot>,
     #[facet(opaque)]
@@ -52,7 +51,13 @@ impl Monitor {
         label: impl Into<SharedString>,
     ) {
         self.name = label.into();
-        self._expression = Some(expression);
+        let text = crate::dynamic::expressions::binding_text(&self.db, expression.component_id())
+            .unwrap_or_else(|| self.name.to_string());
+        self.source = crate::data_binding::Binding::from_expression(expression, text);
+    }
+
+    pub fn binding_text(&self) -> String {
+        self.source.text(&self.db)
     }
 
     pub fn new(
@@ -61,6 +66,7 @@ impl Monitor {
         cx: &mut Context<Self>,
     ) -> Self {
         let component_id = source.component_id();
+        let binding = crate::data_binding::Binding::from_legacy(component_id, None, &db, cx);
         let line_colors = theme(cx).line_colors;
 
         let (name, unit) = db.with_state(|state| {
@@ -129,9 +135,10 @@ impl Monitor {
             name: name_shared,
             unit: unit_shared,
             show_sparkline: true,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
-            component_id,
-            _expression: None,
+            source: binding,
+            bound: component_id,
             sparkline,
             strip,
             click,
@@ -214,11 +221,20 @@ pub(crate) fn apply_click(db: Arc<DB>, component_id: ComponentId) -> StripClick 
 
 impl Render for Monitor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.source.resolve(&self.db, cx);
+        if self.bound != self.source.id() {
+            let source = self.source.clone();
+            let unit = self.unit.clone();
+            let show = self.show_sparkline;
+            *self = Self::new(self.db.clone(), source.id(), cx);
+            self.source = source;
+            self.unit = unit;
+            self.show_sparkline = show;
+        }
         let theme = theme(cx);
 
         let style = StripStyle::dashboard().with_unit(self.unit.clone());
-        let behavior =
-            behavior_snapshot(cx, self.db.clone(), self.component_id, self.click.clone());
+        let behavior = behavior_snapshot(cx, self.db.clone(), self.source.id(), self.click.clone());
         self.strip.update(cx, |strip, cx| {
             strip.set_style(style, cx);
             strip.set_behavior(behavior, cx);
@@ -251,7 +267,7 @@ impl Render for Monitor {
                 .pb(px(4.0))
                 .text_size(px(11.0))
                 .text_color(theme.text_primary)
-                .on_mouse_move(shift_hover_listener(self.component_id, SmallVec::new()))
+                .on_mouse_move(shift_hover_listener(self.source.id(), SmallVec::new()))
                 .child(self.name.clone()),
         );
 

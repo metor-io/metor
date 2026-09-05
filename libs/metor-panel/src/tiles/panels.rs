@@ -33,7 +33,6 @@ pub use crate::views::ComponentTextConfig as TextPanelConfig;
 pub struct TextPanel {
     inner: Entity<ComponentText>,
     label: SharedString,
-    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl TextPanel {
@@ -47,18 +46,13 @@ impl TextPanel {
         Self {
             inner,
             label: label.into(),
-            _expression: None,
         }
     }
 
     pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
-        let component_id = bound
-            .as_ref()
-            .map(|bound| bound.id)
-            .unwrap_or_else(|| ComponentId::new(&cfg.component));
-        let mut panel = Self::new(db, component_id, cfg.component, cx);
-        panel._expression = bound.and_then(|bound| bound.expression);
+        let binding = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
+        let panel = Self::new(db, binding.id(), cfg.component, cx);
+        panel.inner.update(cx, |view, _| view.source = binding);
         panel
     }
 }
@@ -80,10 +74,14 @@ impl PaneItem for TextPanel {
         "component_text"
     }
 
-    fn to_config(&self, _cx: &App) -> TextPanelConfig {
+    fn to_config(&self, cx: &App) -> TextPanelConfig {
         TextPanelConfig {
-            component: self.label.to_string(),
+            component: self.inner.read(cx).binding_text(),
         }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
     }
 }
 
@@ -335,7 +333,6 @@ pub use crate::views::TrafficLightConfig as TrafficLightPanelConfig;
 pub struct TrafficLightPanel {
     inner: Entity<TrafficLight>,
     label: SharedString,
-    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl TrafficLightPanel {
@@ -349,25 +346,19 @@ impl TrafficLightPanel {
         Self {
             inner,
             label: label.into(),
-            _expression: None,
         }
     }
 
     pub fn from_config(cfg: TrafficLightPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
-        let component_id = bound
-            .as_ref()
-            .map(|bound| bound.id)
-            .unwrap_or_else(|| ComponentId::new(&cfg.component));
-        let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
-        if let Some(color) = cfg.color {
-            inner.update(cx, |t, cx| t.set_color(color, cx));
-        }
-        Self {
-            inner,
-            label: cfg.component.into(),
-            _expression: bound.and_then(|bound| bound.expression),
-        }
+        let binding = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
+        let panel = Self::new(db, binding.id(), cfg.component, cx);
+        panel.inner.update(cx, |view, cx| {
+            view.source = binding;
+            if let Some(color) = cfg.color {
+                view.set_color(color, cx);
+            }
+        });
+        panel
     }
 }
 
@@ -389,10 +380,7 @@ impl PaneItem for TrafficLightPanel {
     }
 
     fn to_config(&self, cx: &App) -> TrafficLightPanelConfig {
-        TrafficLightPanelConfig {
-            component: self.label.to_string(),
-            color: Some(self.inner.read(cx).color()),
-        }
+        self.inner.read(cx).to_config()
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -649,7 +637,7 @@ impl PaneItem for AnnunciatorPanel {
     }
 
     fn to_config(&self, cx: &App) -> AnnunciatorPanelConfig {
-        self.inner.read(cx).to_config()
+        self.inner.read(cx).to_config(cx)
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1335,10 +1323,11 @@ impl PanelMenu {
             "",
             Box::new(move |_| {
                 let pane = menu.pane.clone();
-                crate::inspector::trace_picker::component_picker_rows(
+                let db = menu.db.clone();
+                crate::inspector::trace_picker::binding_picker_rows(
                     menu.db.clone(),
-                    move |_, name, cx| {
-                        add_registered_panel(&pane, key, &configure(name), cx);
+                    move |binding, cx| {
+                        add_registered_panel(&pane, key, &configure(binding.text(&db)), cx);
                     },
                 )
             }),
@@ -1738,6 +1727,8 @@ mod tests {
                 label: "satellite".into(),
                 path: "sat.glb".into(),
                 position_binding: Some(ComponentId(7)),
+                position_expression: None,
+                orientation_expression: None,
                 orientation_binding: None,
             }],
             camera: CameraConfig {
@@ -1979,6 +1970,7 @@ mod tests {
         assert!(!partial.hide_readout);
 
         let annunciator = AnnunciatorPanelConfig {
+            conditions: vec![],
             pattern: "*.healthy".into(),
             color: Some(Hsla::default()),
             source: crate::views::AnnunciatorSource::Alarms,

@@ -89,7 +89,7 @@ impl Default for SpectrogramTraceConfig {
 impl From<&SpectrogramTrace> for SpectrogramTraceConfig {
     fn from(trace: &SpectrogramTrace) -> Self {
         Self {
-            component_id: trace.component_id,
+            component_id: trace.source.id(),
             len: trace.len,
             visible: trace.visible,
             label: trace.label.to_string(),
@@ -97,7 +97,7 @@ impl From<&SpectrogramTrace> for SpectrogramTraceConfig {
             scale: trace.scale,
             gain: trace.gain,
             // Filled by `to_config`, which has the database to ask.
-            expression: None,
+            expression: trace.source.expression_text(),
         }
     }
 }
@@ -105,14 +105,16 @@ impl From<&SpectrogramTrace> for SpectrogramTraceConfig {
 impl From<SpectrogramTraceConfig> for SpectrogramTrace {
     fn from(config: SpectrogramTraceConfig) -> Self {
         Self {
-            component_id: config.component_id,
+            source: crate::data_binding::Binding::unresolved(
+                config.component_id,
+                config.expression,
+            ),
             len: config.len,
             visible: config.visible,
             label: config.label.into(),
             colormap: config.colormap,
             scale: config.scale,
             gain: config.gain,
-            expression: None,
             plot: None,
         }
     }
@@ -130,21 +132,10 @@ impl Spectrogram {
         let traces = config
             .traces
             .into_iter()
-            .map(|mut trace| {
-                let expression = trace
-                    .expression
-                    .clone()
-                    .or_else(|| crate::dynamic::expressions::binding_text(&db, trace.component_id));
-                if let Some(text) = expression
-                    && let Ok(bound) = crate::dynamic::expressions::bind(&text, &db, cx)
-                {
-                    trace.component_id = bound.id;
-                    trace.expression = Some(text);
-                    let mut built = SpectrogramTrace::from(trace);
-                    built.expression = bound.expression;
-                    return built;
-                }
-                SpectrogramTrace::from(trace)
+            .map(|config| {
+                let mut trace = SpectrogramTrace::from(config);
+                trace.source.resolve(&db, cx);
+                trace
             })
             .collect();
         let plot = Self::new(db, traces, cx);
@@ -172,13 +163,7 @@ impl Spectrogram {
             traces: plot
                 .traces()
                 .iter()
-                .map(|trace| {
-                    let trace = trace.read(cx);
-                    let mut config = SpectrogramTraceConfig::from(trace);
-                    config.expression =
-                        crate::dynamic::expressions::binding_text(plot.db(), trace.component_id);
-                    config
-                })
+                .map(|trace| SpectrogramTraceConfig::from(trace.read(cx)))
                 .collect(),
             custom_title: plot.custom_title.as_ref().map(|title| title.to_string()),
             x_range: plot

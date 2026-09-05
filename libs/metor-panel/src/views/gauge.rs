@@ -19,7 +19,6 @@ use gpui::{
     div, point, prelude::*, px,
 };
 use metor_db::DB;
-use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
 use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
@@ -89,7 +88,7 @@ pub struct Gauge {
     /// What this dial reads. Editable: picking another component or element
     /// in the inspector rebinds the stream on the next frame. Declared first
     /// so the binding heads the inspector page — fields are walked in order.
-    pub component_id: ComponentId,
+    pub source: crate::data_binding::Binding,
     pub element: usize,
     pub label: SharedString,
     pub min: f64,
@@ -113,7 +112,7 @@ pub struct Gauge {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _expression: Option<crate::dynamic::expressions::Expression>,
+    _binding_changes: gpui::Task<()>,
     #[facet(opaque)]
     _task: gpui::Task<()>,
     #[facet(opaque)]
@@ -122,12 +121,8 @@ pub struct Gauge {
 
 impl Gauge {
     pub fn from_config(cfg: &GaugeConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
-        let component_id = bound
-            .as_ref()
-            .map(|bound| bound.id)
-            .unwrap_or_else(|| ComponentId::new(&cfg.component));
-        let expression = bound.and_then(|bound| bound.expression);
+        let source = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
+        let component_id = source.id();
         let element = cfg.element;
         let meta = component_meta(&db, component_id);
 
@@ -172,12 +167,12 @@ impl Gauge {
             show_value: !cfg.hide_value,
             show_limits: !cfg.hide_limits,
             component: SharedString::from(cfg.component.clone()),
-            component_id,
+            source,
             element,
             bound: Some(ElementRef::new(component_id, element)),
             value: None,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
-            _expression: expression,
             _task: task,
             _resolver_task: resolver_task,
         }
@@ -185,18 +180,19 @@ impl Gauge {
 
     /// Where this dial currently reads from.
     fn at(&self) -> ElementRef {
-        ElementRef::new(self.component_id, self.element)
+        ElementRef::new(self.source.id(), self.element)
     }
 
     /// Restart the stream when the inspector has re-pointed the dial. Label
     /// and unit are re-derived: they described the old component, and a dial
     /// labelled `ω x` reading wheel momentum is worse than no label.
     pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
+        self.source.resolve(&self.db, cx);
         let want = self.at();
         if !binding::rebound(want, &mut self.bound) {
             return;
         }
-        self._expression = crate::dynamic::expressions::running(want.component, cx);
+
         let element = want.element;
         let meta = component_meta(&self.db, want.component);
         self.label = super::meter::default_label(&meta.element_names, element, &meta.name);
@@ -232,11 +228,7 @@ impl Gauge {
             // An expression's component is named by a content hash and
             // labelled with the text that made it, so what round-trips is the
             // text — a name would rehydrate onto nothing.
-            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
-                .or_else(|| {
-                    binding::component_name(&self.db, self.component_id).map(|n| n.to_string())
-                })
-                .unwrap_or_else(|| self.component.to_string()),
+            component: self.source.text(&self.db),
             element: self.element,
             label: Some(self.label.to_string()),
             min: self.min,

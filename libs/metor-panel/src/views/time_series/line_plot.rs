@@ -147,9 +147,13 @@ pub struct LinePlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     tracking: HashMap<EntityId, TraceTracking>,
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
+    #[facet(opaque)]
+    inputs: crate::data_binding::InputChanges,
     #[facet(opaque)]
     view_override: Option<PlotView>,
     #[facet(opaque)]
@@ -177,9 +181,11 @@ impl LinePlot {
             custom_title: Override::Auto,
             show_alarm_limits: true,
             show_alarm_color: true,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
+            inputs: Default::default(),
             view_override: None,
             last_overrides: OverrideSnapshot {
                 axes: smallvec::SmallVec::new(),
@@ -195,7 +201,13 @@ impl LinePlot {
     /// Convenience for callers (sparklines, table rows) that don't need a
     /// persistent `Entity<Trace>` handle for each series.
     pub fn bind_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
-        self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
+        self.traces = traces
+            .into_iter()
+            .map(|mut t| {
+                t.source.resolve(&self.db, cx);
+                cx.new(|_| t)
+            })
+            .collect();
         cx.notify();
     }
 
@@ -261,7 +273,7 @@ impl LinePlot {
                 continue;
             }
             if tracking.lod_resolved_gen != Some(vtable_gen) {
-                tracking.lod_levels = resolve_lod_levels(&self.db, cfg.component_id);
+                tracking.lod_levels = resolve_lod_levels(&self.db, cfg.source.id());
                 tracking.lod_resolved_gen = Some(vtable_gen);
             }
             let estimate = component.time_series.estimate_samples(range.clone());
@@ -308,9 +320,7 @@ impl LinePlot {
         let span = (max_x - min_x).max(1.0);
         let visible = Timestamp(min_x as i64)..Timestamp(max_x as i64);
         let hydrator = crate::hydration::hydrator(cx);
-        let backfiller = crate::backfill::backfiller(cx);
         let mut gaps = metor_db::manifest::GapVec::new();
-        let mut uncovered = metor_db::manifest::RangeVec::new();
         for trace in &self.traces {
             let cfg = trace.read(cx);
             if !cfg.visible {
@@ -326,8 +336,8 @@ impl LinePlot {
                 Some(lod) => (&lod.time_series, lod.component_id, true),
                 // Over budget with no published level yet: show raw gaps
                 // but never pull the raw archive for a wide view.
-                None if tracking.over_budget => (&component.time_series, cfg.component_id, false),
-                None => (&component.time_series, cfg.component_id, true),
+                None if tracking.over_budget => (&component.time_series, cfg.source.id(), false),
+                None => (&component.time_series, cfg.source.id(), true),
             };
             gaps.clear();
             series.coverage(visible.clone(), &mut gaps);
@@ -350,15 +360,12 @@ impl LinePlot {
             // What an expression has never computed is a gap of the other
             // kind: nothing to fetch, something to compute. Always against
             // the raw series — a LoD level is derived from it afterwards.
-            if let Some(plan) = &tracking.plan {
-                uncovered.clear();
-                crate::backfill::wanted(component, plan, visible.clone(), &mut uncovered);
-                for range in &uncovered {
-                    if let Some(backfiller) = &backfiller {
-                        backfiller.request(cfg.component_id, range.clone(), plan.clone());
-                    }
-                    band(range);
-                }
+            let history = crate::data_binding::BoundHistory {
+                component: component.clone(),
+                plan: tracking.plan.clone(),
+            };
+            for range in history.request_replay(visible.clone(), cx) {
+                band(&range);
             }
         }
         // A year-wide view over a sparse archive yields hundreds of
@@ -383,6 +390,12 @@ impl LinePlot {
     /// drops trackers for removed traces, and resets the pan/zoom override
     /// when an inspector edit changes the reflected view knobs.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        for trace in &self.traces {
+            trace.update(cx, |trace, cx| {
+                trace.source.resolve(&self.db, cx);
+            });
+        }
+
         // Always keep at least the primary axis so traces have a home and
         // the chrome has something to render, and never exceed the chrome
         // budget (the generic "Add" doesn't gate, so cap here).
@@ -412,6 +425,16 @@ impl LinePlot {
                     t.axis_index = 0;
                 }
             });
+        }
+
+        for id in self.inputs.changed(
+            &self.traces,
+            &self.db,
+            |trace| vec![(trace.source.id(), trace.element_index)],
+            cx,
+        ) {
+            self.tracking.remove(&id);
+            self.tasks.remove(&id);
         }
 
         let db = self.db.clone();
@@ -681,7 +704,7 @@ impl LinePlot {
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let trace_id = match this.update(cx, |_, cx| trace.read(cx).component_id) {
+            let trace_id = match this.update(cx, |_, cx| trace.read(cx).source.id()) {
                 Ok(id) => id,
                 Err(_) => return,
             };
@@ -966,7 +989,7 @@ fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> Share
     let mut order: Vec<ComponentId> = Vec::new();
     for trace in traces {
         let t = trace.read(cx);
-        let id = t.component_id;
+        let id = t.source.id();
         groups
             .entry(id)
             .or_insert_with(|| {
@@ -1047,8 +1070,10 @@ mod rebind_tests {
         assert_eq!(tracked, Some(ComponentId::new("adcs.rate")));
 
         cx.update(|cx| {
-            trace.update(cx, |t, _| t.component_id = ComponentId::new("wheels.rpm"));
-            plot.update(cx, |lp, cx| lp.rebind_trace(&trace, cx));
+            trace.update(cx, |t, cx| {
+                t.source = crate::data_binding::Binding::from(ComponentId::new("wheels.rpm"));
+                cx.notify();
+            });
         });
         cx.run_until_parked();
         let tracked = cx.update(|cx| {
