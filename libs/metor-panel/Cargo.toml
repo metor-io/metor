@@ -48,6 +48,14 @@ image = "0.25"
 # a panel that has never seen the target's filesystem.
 base64 = "0.22"
 glam = "0.32"
+# Map-tile fetching: the reqwest fork gpui already ships, on a dedicated
+# current-thread tokio runtime. The feature set is a subset of
+# gpui_http_client's so the build stays fully shared.
+reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = [
+    "http2",
+    "rustls-tls-native-roots",
+] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 crossbeam-channel = "0.5"
 futures-lite = "2.5.0"
 thingbuf = "0.1"

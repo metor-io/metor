@@ -17,6 +17,7 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, is_resettable, run_state_index, run_state_label};
 use crate::theme::theme;
+use crate::views::table;
 
 /// Run-state chips to surface in the header, in display order. `Idle` is omitted as noise.
 const CHIP_STATES: [SequenceRunState; 5] = [
@@ -213,10 +214,16 @@ impl Render for SequenceView {
             .items_center()
             .gap_2()
             .px_3()
-            .py_2()
+            .h(px(table::HEADER_HEIGHT))
             .flex_shrink_0()
             .border_b_1()
-            .border_color(theme.border_primary);
+            .border_color(theme.border_primary)
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_tertiary)
+                    .child("Live"),
+            );
 
         if let Some(store) = &store {
             let store = store.read(cx);

@@ -91,7 +91,6 @@ impl Render for SequenceControl {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.bg_primary)
                 .text_size(px(12.0))
                 .text_color(theme.text_tertiary)
                 .child(if store.is_none() {
@@ -107,6 +106,12 @@ impl Render for SequenceControl {
         let arming = self.arming_stop;
 
         let header = div()
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_tertiary)
+                    .child("Live"),
+            )
             .flex()
             .flex_row()
             .items_center()
@@ -176,7 +181,6 @@ impl Render for SequenceControl {
             .flex()
             .flex_col()
             .gap(px(4.0))
-            .bg(theme.bg_primary)
             .p(px(8.0))
             .child(header);
 

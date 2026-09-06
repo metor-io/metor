@@ -7,26 +7,11 @@ use super::{InspectorRow, RowAction, row_base};
 use crate::dynamic::tensor::TypedScalar;
 use crate::theme::theme;
 
-/// Inspector row for a numeric field.
-///
-/// Shows the current value as text; activation starts inline editing.
-/// Unparsable input is silently dropped rather than raising an error.
-///
-/// The current value is cached in an `Rc<RefCell<f64>>` so that on commit
-/// the row redraws with the new value immediately, instead of waiting for
-/// the underlying entity to refresh.
-///
-/// When constructed via [`ScalarRow::typed`], a `dtype` is stashed and
-/// used to format the displayed text (no decimals for integer dtypes) and to
-/// reject inputs that don't fit the dtype's lexical shape (e.g. a `1.5`
-/// typed into an `i32` field).
+/// Numeric editor that preserves the field's type and rejects out-of-range input.
 pub struct ScalarRow {
     pub label: SharedString,
-    pub value: Rc<RefCell<f64>>,
-    pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
-    /// When `Some`, the row formats and parses according to this dtype.
-    /// `None` keeps the historic float-only behavior.
-    dtype: Option<PrimType>,
+    pub value: Rc<RefCell<TypedScalar>>,
+    pub on_change: Arc<dyn Fn(TypedScalar, &mut Window, &mut App)>,
 }
 
 impl ScalarRow {
@@ -35,70 +20,74 @@ impl ScalarRow {
         value: f64,
         on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
     ) -> Self {
-        Self {
+        Self::typed(
             label,
-            value: Rc::new(RefCell::new(value)),
-            on_change,
-            dtype: None,
-        }
+            TypedScalar::F64(value),
+            Arc::new(move |v, w, cx| {
+                on_change(v.as_f64(), w, cx);
+            }),
+        )
     }
 
-    /// Dtype-aware constructor. The displayed value is formatted to the
-    /// dtype, and on commit the parsed `f64` is cast back through
-    /// `TypedScalar::from_f64(v, dtype)` before reaching `on_change`.
     pub fn typed(
         label: SharedString,
         value: TypedScalar,
         on_change: Arc<dyn Fn(TypedScalar, &mut Window, &mut App)>,
     ) -> Self {
-        let dtype = value.dtype();
-        let on_change = Arc::new(move |v: f64, w: &mut Window, cx: &mut App| {
-            on_change(TypedScalar::from_f64(v, dtype), w, cx);
-        });
         Self {
             label,
-            value: Rc::new(RefCell::new(value.as_f64())),
+            value: Rc::new(RefCell::new(value)),
             on_change,
-            dtype: Some(dtype),
         }
     }
 
     fn format_value(&self) -> String {
-        format_f64_for_dtype(*self.value.borrow(), self.dtype)
+        format_scalar(*self.value.borrow())
     }
 }
 
-fn format_f64_for_dtype(v: f64, dtype: Option<PrimType>) -> String {
-    match dtype {
-        None | Some(PrimType::F32) | Some(PrimType::F64) => format!("{v}"),
-        Some(PrimType::Bool) => {
-            if v != 0.0 {
-                "true".into()
-            } else {
-                "false".into()
-            }
-        }
-        Some(_) => format!("{}", v as i64),
+fn format_scalar(value: TypedScalar) -> String {
+    match value {
+        TypedScalar::U8(v) => v.to_string(),
+        TypedScalar::U16(v) => v.to_string(),
+        TypedScalar::U32(v) => v.to_string(),
+        TypedScalar::U64(v) => v.to_string(),
+        TypedScalar::I8(v) => v.to_string(),
+        TypedScalar::I16(v) => v.to_string(),
+        TypedScalar::I32(v) => v.to_string(),
+        TypedScalar::I64(v) => v.to_string(),
+        TypedScalar::F32(v) => v.to_string(),
+        TypedScalar::F64(v) => v.to_string(),
+        TypedScalar::Bool(v) => v.to_string(),
     }
 }
 
-/// Parse text per dtype. Floats accept any `f64` literal; integer dtypes
-/// require an integer-shaped string (no decimal point). Bool accepts
-/// `true`/`false`/`0`/`1`.
-fn parse_for_dtype(text: &str, dtype: Option<PrimType>) -> Option<f64> {
-    let trimmed = text.trim();
-    match dtype {
-        None | Some(PrimType::F32) | Some(PrimType::F64) => trimmed.parse::<f64>().ok(),
-        Some(PrimType::Bool) => match trimmed {
-            "true" | "1" => Some(1.0),
-            "false" | "0" => Some(0.0),
-            _ => None,
-        },
-        Some(_) => trimmed.parse::<i64>().ok().map(|n| n as f64),
-    }
+fn parse_for_dtype(text: &str, dtype: PrimType) -> Option<TypedScalar> {
+    let text = text.trim();
+    Some(match dtype {
+        PrimType::U8 => TypedScalar::U8(text.parse().ok()?),
+        PrimType::U16 => TypedScalar::U16(text.parse().ok()?),
+        PrimType::U32 => TypedScalar::U32(text.parse().ok()?),
+        PrimType::U64 => TypedScalar::U64(text.parse().ok()?),
+        PrimType::I8 => TypedScalar::I8(text.parse().ok()?),
+        PrimType::I16 => TypedScalar::I16(text.parse().ok()?),
+        PrimType::I32 => TypedScalar::I32(text.parse().ok()?),
+        PrimType::I64 => TypedScalar::I64(text.parse().ok()?),
+        PrimType::F32 => TypedScalar::F32(text.parse().ok()?),
+        PrimType::F64 => TypedScalar::F64(text.parse().ok()?),
+        PrimType::Bool => TypedScalar::Bool(match text {
+            "true" | "1" => true,
+            "false" | "0" => false,
+            _ => return None,
+        }),
+    })
 }
 
 impl InspectorRow for ScalarRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }
@@ -139,7 +128,7 @@ impl InspectorRow for ScalarRow {
     fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
         let on_change = self.on_change.clone();
         let cached = self.value.clone();
-        let dtype = self.dtype;
+        let dtype = self.value.borrow().dtype();
         RowAction::StartEdit {
             current_text: self.format_value(),
             on_commit: Box::new(move |text, window, cx| {
@@ -157,34 +146,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_int_drops_decimals() {
-        assert_eq!(format_f64_for_dtype(2.5, Some(PrimType::I32)), "2");
-        assert_eq!(format_f64_for_dtype(-7.9, Some(PrimType::I32)), "-7");
-        assert_eq!(format_f64_for_dtype(255.0, Some(PrimType::U8)), "255");
+    fn integers_round_trip_without_float_conversion() {
+        for v in [
+            TypedScalar::U64(u64::MAX),
+            TypedScalar::I64(i64::MIN),
+            TypedScalar::U64(9_007_199_254_740_993),
+            TypedScalar::I8(-128),
+        ] {
+            assert_eq!(parse_for_dtype(&format_scalar(v), v.dtype()), Some(v));
+        }
     }
 
     #[test]
-    fn format_bool_uses_words() {
-        assert_eq!(format_f64_for_dtype(0.0, Some(PrimType::Bool)), "false");
-        assert_eq!(format_f64_for_dtype(1.0, Some(PrimType::Bool)), "true");
+    fn integers_reject_fractional_and_out_of_range_input() {
+        for text in ["1.5", "NaN", "inf", "-1", "256"] {
+            assert_eq!(parse_for_dtype(text, PrimType::U8), None);
+        }
+        assert_eq!(parse_for_dtype("18446744073709551616", PrimType::U64), None);
+        assert_eq!(parse_for_dtype("128", PrimType::I8), None);
     }
 
     #[test]
-    fn format_float_round_trips() {
-        assert_eq!(format_f64_for_dtype(1.5, Some(PrimType::F64)), "1.5");
-        assert_eq!(format_f64_for_dtype(1.5, None), "1.5");
-    }
-
-    #[test]
-    fn parse_int_rejects_decimal() {
-        assert!(parse_for_dtype("1.5", Some(PrimType::I32)).is_none());
-        assert_eq!(parse_for_dtype("42", Some(PrimType::I32)), Some(42.0));
-    }
-
-    #[test]
-    fn parse_bool_accepts_word_or_number() {
-        assert_eq!(parse_for_dtype("true", Some(PrimType::Bool)), Some(1.0));
-        assert_eq!(parse_for_dtype("0", Some(PrimType::Bool)), Some(0.0));
-        assert!(parse_for_dtype("maybe", Some(PrimType::Bool)).is_none());
+    fn floats_and_bools_keep_their_input_forms() {
+        assert_eq!(
+            parse_for_dtype("1.5", PrimType::F32),
+            Some(TypedScalar::F32(1.5))
+        );
+        assert_eq!(
+            parse_for_dtype("true", PrimType::Bool),
+            Some(TypedScalar::Bool(true))
+        );
+        assert_eq!(
+            parse_for_dtype("0", PrimType::Bool),
+            Some(TypedScalar::Bool(false))
+        );
     }
 }

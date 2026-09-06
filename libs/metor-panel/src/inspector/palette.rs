@@ -62,6 +62,68 @@ pub enum InspectionItem {
 /// Closure run on every palette open to snapshot a category's items.
 pub type ItemProvider = Arc<dyn Fn(&App) -> Vec<InspectionItem>>;
 
+#[derive(Clone)]
+struct PaletteTarget(gpui::WeakEntity<TileGroup>);
+impl Global for PaletteTarget {}
+
+fn palette_tiles(cx: &App) -> Option<Entity<TileGroup>> {
+    match cx.try_global::<PaletteTarget>() {
+        Some(target) => target.0.upgrade(),
+        None => crate::workspace::active_tiles(cx),
+    }
+}
+
+type PaneStamp = (gpui::EntityId, usize, Vec<(gpui::EntityId, SharedString)>);
+
+/// Tracks the palette's owning tree so background window updates cannot retarget it.
+pub(super) struct LivePalette {
+    db: Arc<DB>,
+    tiles: gpui::WeakEntity<TileGroup>,
+    stamp: Option<(Vec<PaneStamp>, Option<gpui::EntityId>, Vec<gpui::WindowId>)>,
+}
+
+impl LivePalette {
+    pub(super) fn new(db: Arc<DB>, tiles: &Entity<TileGroup>) -> Self {
+        Self {
+            db,
+            tiles: tiles.downgrade(),
+            stamp: None,
+        }
+    }
+
+    pub(super) fn refresh(&mut self, cx: &mut App) -> Option<Vec<Box<dyn InspectorRow>>> {
+        let tiles = self.tiles.upgrade()?;
+        let tree = tiles.read(cx);
+        let panes = tree
+            .panes()
+            .iter()
+            .map(|pane| {
+                let state = pane.read(cx);
+                (
+                    pane.entity_id(),
+                    state.active_index(),
+                    state
+                        .items()
+                        .iter()
+                        .map(|item| (item.entity_id(), item.tab_title(cx)))
+                        .collect(),
+                )
+            })
+            .collect();
+        let active = tree.active_pane(cx).map(|pane| pane.entity_id());
+        let windows = crate::workspace::panel_windows(cx)
+            .iter()
+            .map(|window| window.window_id())
+            .collect();
+        let stamp = (panes, active, windows);
+        if self.stamp.as_ref() == Some(&stamp) {
+            return None;
+        }
+        self.stamp = Some(stamp);
+        Some(ItemRegistry::root_rows_for(&self.db, &tiles, cx))
+    }
+}
+
 /// Global holding the category-keyed provider list.
 pub struct ItemRegistry {
     providers: Vec<(Category, ItemProvider)>,
@@ -70,6 +132,22 @@ pub struct ItemRegistry {
 impl Global for ItemRegistry {}
 
 impl ItemRegistry {
+    pub(crate) fn root_rows_for(
+        db: &Arc<DB>,
+        tiles: &Entity<TileGroup>,
+        cx: &mut App,
+    ) -> Vec<Box<dyn InspectorRow>> {
+        let previous = cx.try_global::<PaletteTarget>().cloned();
+        cx.set_global(PaletteTarget(tiles.downgrade()));
+        let rows = Self::root_rows(db, cx);
+        match previous {
+            Some(previous) => cx.set_global(previous),
+            None => {
+                cx.remove_global::<PaletteTarget>();
+            }
+        }
+        rows
+    }
     pub fn init(cx: &mut App) {
         cx.set_global(Self {
             providers: Vec::new(),
@@ -122,7 +200,7 @@ impl ItemRegistry {
         for (_, rows) in groups.iter_mut() {
             rows.sort_by_key(|r| (item_rank(r.label()), r.label().to_lowercase()));
         }
-        groups.sort_by(|(a, _), (b, _)| category_rank(a).cmp(&category_rank(b)));
+        groups.sort_by_key(|(category, _)| category_rank(category));
 
         let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
         for (category, group) in groups {
@@ -164,17 +242,21 @@ fn item_to_row(item: InspectionItem, db: Arc<DB>, tag: SharedString) -> Box<dyn 
             label,
             summary,
             entity,
-        } => Box::new(
-            NavRow::new(
-                label,
-                summary,
-                Box::new(move |cx| {
-                    crate::inspector::reflect::rows_for_any_entity(&entity, &db, cx)
-                        .unwrap_or_default()
-                }),
+        } => {
+            let identity = format!("entity:{}:{:?}", tag, entity.entity_id()).into();
+            Box::new(
+                NavRow::new(
+                    label,
+                    summary,
+                    Box::new(move |cx| {
+                        crate::inspector::reflect::rows_for_any_entity(&entity, &db, cx)
+                            .unwrap_or_default()
+                    }),
+                )
+                .with_tag(tag)
+                .with_identity(identity),
             )
-            .with_tag(tag),
-        ),
+        }
         InspectionItem::Command { label, callback } => {
             Box::new(CommandRow::new(label, callback).with_tag(tag))
         }
@@ -182,7 +264,14 @@ fn item_to_row(item: InspectionItem, db: Arc<DB>, tag: SharedString) -> Box<dyn 
             label,
             summary,
             build,
-        } => Box::new(NavRow::new(label, summary, Box::new(move |cx| build(cx))).with_tag(tag)),
+        } => {
+            let identity = format!("submenu:{}:{}", tag, label).into();
+            Box::new(
+                NavRow::new(label, summary, Box::new(move |cx| build(cx)))
+                    .with_tag(tag)
+                    .with_identity(identity),
+            )
+        }
     }
 }
 
@@ -203,7 +292,7 @@ pub fn register_builtin_providers(db: Arc<DB>, cx: &mut App) {
 /// Reachable even when the tab bar is hidden.
 fn register_pane_settings_provider(cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
-        let Some(tiles) = crate::workspace::active_tiles(cx) else {
+        let Some(tiles) = palette_tiles(cx) else {
             return Vec::new();
         };
         let panes = tiles.read(cx).panes().to_vec();
@@ -228,7 +317,7 @@ fn register_pane_settings_provider(cx: &mut App) {
 
 fn register_panel_provider(cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
-        let Some(tiles) = crate::workspace::active_tiles(cx) else {
+        let Some(tiles) = palette_tiles(cx) else {
             return Vec::new();
         };
         let panes = tiles.read(cx).panes().to_vec();
@@ -257,7 +346,7 @@ fn register_panel_provider(cx: &mut App) {
 
 fn register_widget_provider(cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
-        let Some(tiles) = crate::workspace::active_tiles(cx) else {
+        let Some(tiles) = palette_tiles(cx) else {
             return Vec::new();
         };
         let panes = tiles.read(cx).panes().to_vec();
@@ -287,7 +376,7 @@ fn register_widget_provider(cx: &mut App) {
 fn register_command_provider(db: Arc<DB>, cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
         let mut items: Vec<InspectionItem> = Vec::new();
-        let tiles = crate::workspace::active_tiles(cx);
+        let tiles = palette_tiles(cx);
         let on_open_inspector = crate::inspector::open_inspector(cx);
 
         // New Panel targets the current pane so palette-created panels land in
@@ -384,6 +473,28 @@ fn register_command_provider(db: Arc<DB>, cx: &mut App) {
             build: Arc::new(font_rows),
         });
 
+        items.push(InspectionItem::SubMenu {
+            label: "Motion".into(),
+            summary: "Short fades and tab movement, or reduced motion".into(),
+            build: Arc::new(|_| {
+                use crate::config::MotionPreference;
+                [
+                    ("Standard motion", MotionPreference::Full),
+                    ("Reduced motion", MotionPreference::Reduced),
+                ]
+                .into_iter()
+                .map(|(label, preference)| {
+                    Box::new(CommandRow::new(
+                        label,
+                        Arc::new(move |_, cx| {
+                            crate::motion::set_preference(preference, cx);
+                        }),
+                    )) as Box<dyn InspectorRow>
+                })
+                .collect()
+            }),
+        });
+
         items.push(InspectionItem::Command {
             label: if crate::inspector::edits::pending_edits(cx).locked {
                 "Unlock Editing".into()
@@ -416,7 +527,7 @@ fn read_and_load(path: &Path, tiles: &Entity<TileGroup>, cx: &mut App) {
 /// file dialog is reachable without a separate top-level command.
 fn register_preset_provider(cx: &mut App) {
     let provider: ItemProvider = Arc::new(move |cx: &App| {
-        let Some(tiles) = crate::workspace::active_tiles(cx) else {
+        let Some(tiles) = palette_tiles(cx) else {
             return Vec::new();
         };
         let mut items: Vec<InspectionItem> = Vec::new();
@@ -565,4 +676,82 @@ pub(crate) fn preset_load_rows(tiles: Entity<TileGroup>, cx: &App) -> Vec<Box<dy
         }),
     )));
     rows
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::inspector::{Inspector, InspectorMode};
+    use crate::tiles::item::PaneItem;
+    use gpui::{AppContext as _, Context, Render, div, prelude::*};
+
+    struct Item(SharedString);
+    impl Render for Item {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+    impl PaneItem for Item {
+        type Config = ();
+        fn tab_title(&self, _: &App) -> SharedString {
+            self.0.clone()
+        }
+        fn serialization_key() -> &'static str {
+            "live-palette-test"
+        }
+        fn to_config(&self, _: &App) {}
+    }
+
+    #[gpui::test]
+    fn live_palette_keeps_query_and_entity_selection_through_tab_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let (tiles, first, second) = cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            ItemRegistry::init(cx);
+            register_panel_provider(cx);
+            let first = cx.new(|_| Item("Same".into()));
+            let second = cx.new(|_| Item("Same".into()));
+            let tiles = cx.new(|cx| {
+                TileGroup::new(vec![Box::new(first.clone()), Box::new(second.clone())], cx)
+            });
+            (tiles, first, second)
+        });
+        let (inspector, cx) = cx.add_window_view(|_, cx| {
+            let mut inspector = Inspector::new(vec![], InspectorMode::Centered, cx);
+            inspector.follow_palette(db.clone(), &tiles);
+            inspector
+        });
+        cx.refresh().unwrap();
+        let selected = cx.update(|_, cx| {
+            inspector.update(cx, |inspector, _| {
+                inspector.search.set_text("Same");
+                inspector.selected_index = 1;
+                let index = inspector.filtered_indices()[1];
+                inspector.current_rows().unwrap()[index].identity()
+            })
+        });
+        cx.update(|_, cx| {
+            second.update(cx, |item, cx| {
+                item.0 = "Same renamed".into();
+                cx.notify();
+            });
+            let pane = tiles.read(cx).panes()[0].clone();
+            pane.update(cx, |pane, cx| pane.remove_item(0, cx));
+            let other = cx.new(|cx| TileGroup::new(vec![Box::new(first.clone())], cx));
+            let _ = ItemRegistry::root_rows_for(&db, &other, cx);
+        });
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            let inspector = inspector.read(cx);
+            assert_eq!(inspector.search.text, "Same");
+            let indices = inspector.filtered_indices();
+            assert_eq!(indices.len(), 1);
+            let row = &inspector.current_rows().unwrap()[indices[inspector.selected_index]];
+            assert_eq!(row.identity(), selected);
+            assert_eq!(row.label(), "Same renamed");
+        });
+    }
 }

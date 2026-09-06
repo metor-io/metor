@@ -1,23 +1,9 @@
-//! Self-describing message records and the ports that carry them.
+//! Typed postcard message ports.
 //!
-//! A message is the second payload kind beside frames. Where a
-//! [`Frame`](crate::Frame) is a fixed component group announced through a
-//! vtable, a message record describes itself: the 2-byte [`Msg::ID`] followed
-//! by the postcard-serialized payload, written verbatim onto a byte ring. The
-//! id alone names the schema, so any consumer decodes a record from the bytes
-//! in front of it. Message rings use log delivery, so readers drain each
-//! producer's records in order instead of taking only the latest one. A full
-//! ring makes [`emit`](MsgOut::emit) fail. [`publish`](MsgOut::publish) drops
-//! the new record and counts the loss.
-//!
-//! [`MsgOut<M>`](MsgOut) and [`MsgIn<M>`](MsgIn) are the message twins of
-//! [`Output<F>`](crate::Output) and [`Input<F>`](crate::Input). Each is typed
-//! on a single [`Msg`] type `M`, and the wiring edge key is `M::ID`, exactly
-//! parallel to a frame port keyed on its frame id. A channel that carries
-//! several message types is simply several typed ports, possibly sharing a
-//! ring; a consumer's [`drain`](MsgIn::drain) skips records whose id is not
-//! `M::ID`. Message inputs also allow fan-in, so a [`MsgIn`] holds one
-//! [`View`] per wired producer and drains them all.
+//! Each record starts with a two-byte [`Msg::ID`] followed by its payload.
+//! [`MsgIn`] drains each producer in order and skips other message IDs.
+//! [`MsgOut::emit`] returns an error on a full ring; [`MsgOut::publish`] drops
+//! the record and counts the loss.
 
 use core::marker::PhantomData;
 
@@ -119,10 +105,6 @@ pub fn split_record(rec: &[u8]) -> Option<(PacketId, &[u8])> {
     Some((*id, payload))
 }
 
-// ---------------------------------------------------------------------------
-// MsgOut
-// ---------------------------------------------------------------------------
-
 /// A [`Writer`] that serializes values of a single [`Msg`] type `M` onto a
 /// byte ring, one self-describing record per emit.
 ///
@@ -139,7 +121,7 @@ where
     /// payload), so a per-cycle emit grows in place instead of allocating.
     scratch: Vec<u8>,
     /// Records dropped by the infallible [`publish`](Self::publish) path,
-    /// folded into health by the runner via `SystemOutput::take_dropped` or a
+    /// reported by the runner via `SystemOutput::take_dropped` or a
     /// future-owning driver's shared cell.
     dropped: crate::port::Drops,
     _m: PhantomData<fn() -> M>,
@@ -160,7 +142,7 @@ impl<M: Msg, WD: WakeSource> MsgOut<M, WD> {
     ///
     /// A write fails on `InsufficientCapacity` (a sizing bug) or `WouldBlock`
     /// (a slow reader backpressuring the ring); either way the record is
-    /// dropped and counted for the runner to fold into health. Callers that
+    /// dropped and counted for the runner to report. Callers that
     /// want to see the error use [`emit`](Self::emit).
     pub fn publish(&mut self, msg: &M) {
         if self.emit(msg).is_err() {
@@ -174,7 +156,7 @@ impl<M: Msg, WD: WakeSource> MsgOut<M, WD> {
     }
 
     /// Count drops through `cell` instead of locally, for a port about to
-    /// move into a future (whose driver folds the cell into health).
+    /// move into a future (whose driver reports the cell's count).
     pub(crate) fn share_drops(&mut self, cell: std::sync::Arc<core::sync::atomic::AtomicU64>) {
         self.dropped.share(cell);
     }
@@ -230,10 +212,6 @@ where
 /// resolves through the alias to the plain, telemetered `MsgOut` descriptor.
 pub type CommandOut<M, WD = NoWake> = MsgOut<M, WD>;
 
-// ---------------------------------------------------------------------------
-// MsgFanOut
-// ---------------------------------------------------------------------------
-
 /// A bank of raw ring writers, one per message output minted from an
 /// instance's config rather than declared in its bundle type.
 ///
@@ -276,6 +254,11 @@ impl MsgFanOut {
         self.writers.len()
     }
 
+    /// Whether no output ports were bound.
+    pub fn is_empty(&self) -> bool {
+        self.writers.is_empty()
+    }
+
     /// Write one already-encoded record, `id` then `payload` verbatim, onto
     /// writer `idx`. Only the ring write can fail, on backpressure or an
     /// oversized record.
@@ -291,10 +274,6 @@ impl MsgFanOut {
         self.writers[idx].try_write(&self.scratch)
     }
 }
-
-// ---------------------------------------------------------------------------
-// MsgIn
-// ---------------------------------------------------------------------------
 
 /// The consuming half of a message channel, decoding committed ring records
 /// into values of the [`Msg`] type `M`.

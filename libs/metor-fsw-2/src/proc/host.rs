@@ -1,16 +1,9 @@
-//! The host half of a worker process: spawning it, driving it in lockstep
-//! with the cycle, and cleaning up after its death.
+//! Spawn, supervise, and clean up worker processes.
 //!
-//! Two lifecycles share one core. [`ProcSlot`] is the process twin of
-//! [`DlSlot`](crate::dl): a fixed system driven for the whole run, restarted
-//! on death within a budget. [`SeqWorker`] is the per-Load twin behind a
-//! process slot's occupant (`docs/process-systems.md`): spawned by `Load`,
-//! stepped while the occupant runs, and ended — kill, reap, reclaim — when
-//! the occupant is stopped, reset, unloaded, or replaced. Both embed
-//! [`WorkerHandle`], the spawn/poll/kill mechanics; what differs is policy
-//! (restart vs. latch-and-report). [`describe_via_worker`] is the
-//! resolve-time helper that obtains a system's descriptor bytes without ever
-//! loading the artifact into this process.
+//! [`ProcSlot`] restarts a wired system within its configured budget.
+//! [`SeqWorker`] belongs to one loaded occupant and reports failure without
+//! restarting. Both use [`WorkerHandle`] for process and ring ownership.
+//! [`describe_via_worker`] reads a pack manifest without loading it in the host.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -66,7 +59,7 @@ pub(crate) fn resolve_worker_exe(overridden: Option<&Path>) -> Result<PathBuf, P
 }
 
 /// Run a describe-mode worker over `artifact` and return the raw postcard
-/// [`PackManifest`](metor_fsw_2_core::abi::PackManifest) bytes it wrote — the host-side
+/// [`PackManifest`](metor_fsw_2_core::abi::PackManifest) bytes it wrote, the host-side
 /// twin of `fsw_pack_describe`, with the dlopen quarantined in a short-lived
 /// child. Decode the bytes with
 /// [`decode_pack_manifest`](crate::dl) and register via the wiring resolver's
@@ -126,7 +119,7 @@ pub fn describe_via_worker(
 
 /// Everything `build()` gathers to spawn one run worker.
 pub(crate) struct SpawnSpec {
-    /// The instance name (the worker's health/status identity).
+    /// The instance name (the worker's log identity).
     pub instance: String,
     /// The pack entry the worker instantiates.
     pub system: String,
@@ -138,7 +131,7 @@ pub(crate) struct SpawnSpec {
     pub ctl_path: PathBuf,
     /// Session-dir file for this worker's manifest.
     pub manifest_path: PathBuf,
-    /// Ring files in descriptor order — the positional bind contract.
+    /// Ring files in descriptor order, the positional bind contract.
     pub input_paths: Vec<PathBuf>,
     pub output_paths: Vec<PathBuf>,
     /// Host handles of every ring the worker will attach (its outputs plus
@@ -156,16 +149,12 @@ pub(crate) struct SpawnSpec {
     pub name: Arc<str>,
 }
 
-// ---------------------------------------------------------------------------
-// WorkerHandle, the shared spawn/poll/kill core
-// ---------------------------------------------------------------------------
-
 /// The process-management core [`ProcSlot`] and [`SeqWorker`] share: the ctl
 /// block, the child, the host handles of every ring the worker attaches (the
-/// reclaim set), and the paths a spawn needs. It owns the mechanics — spawn
+/// reclaim set), and the paths a spawn needs. It owns the mechanics: spawn
 /// over a fresh control block, one non-blocking poll toward a wanted state,
-/// end-for-certain — while the policy (when to spawn, what a failure means)
-/// stays with the embedding type.
+/// end-for-certain; the policy (when to spawn, what a failure means) stays
+/// with the embedding type.
 struct WorkerHandle {
     ctl: CtlHost,
     /// The live child; `None` before the first spawn and between reap and respawn.
@@ -227,7 +216,7 @@ impl WorkerHandle {
 
     /// The live child's pid, or `0` between workers.
     fn pid(&self) -> u32 {
-        self.child.as_ref().map(|c| c.id()).unwrap_or(0)
+        self.child.as_ref().map_or(0, Child::id)
     }
 
     /// End the child for certain and free everything it claimed: kill (a
@@ -301,10 +290,6 @@ impl Drop for WorkerHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ProcSlot, the whole-run worker behind a process system
-// ---------------------------------------------------------------------------
-
 /// Where a process slot is in its worker's lifecycle, beyond the coarse
 /// [`SlotState`]. `Running` is the steady state; the middle three are the
 /// non-blocking restart pipeline (each polled once per cycle, so a respawn
@@ -331,15 +316,15 @@ enum Phase {
 ///
 /// # Restart
 ///
-/// A worker that dies — or whose system panics, which in a worker is safely
-/// quarantined — is respawned up to `max_restarts` times over the slot's
+/// A worker that dies, or whose system panics (safely quarantined in a
+/// worker), is respawned up to `max_restarts` times over the slot's
 /// life: kill/reap/reclaim, wait out the backoff, respawn from the same
 /// on-disk manifest (same ring files, same params), and re-init. While
 /// restarting, `slot_state` reports the stop (so the outage is telemetered)
 /// and flips back to `Running` on recovery; the fresh worker's views start
 /// at the rings' current positions, so records committed during the outage
 /// are skipped, not replayed. Restarts are counted, drained into coordinator
-/// health, and carried in the status frame's worker list.
+/// log, and carried in the status frame's worker list.
 pub(crate) struct ProcSlot {
     name: Arc<str>,
     /// The worker process behind this slot, respawned from the persisted
@@ -348,9 +333,9 @@ pub(crate) struct ProcSlot {
     step_timeout: Duration,
     slot_state: SlotState,
     /// Steps whose ack deadline lapsed with the child still alive, since the
-    /// coordinator last drained them into its health.
+    /// coordinator last drained them onto its log.
     timeouts: u64,
-    // --- restart machinery -------------------------------------------------
+    // restart machinery
     phase: Phase,
     max_restarts: u32,
     backoff: Duration,
@@ -362,7 +347,7 @@ pub(crate) struct ProcSlot {
 
 impl ProcSlot {
     /// Create the control block, write the manifest, spawn the worker, and
-    /// wait for `Attached`. Any failure kills the child and reports why —
+    /// wait for `Attached`. Any failure kills the child and reports why;
     /// `build()` maps the message into a `WireError`. This first spawn is the
     /// only blocking one; respawns are polled from `step`.
     pub(crate) fn spawn(spec: SpawnSpec) -> Result<Self, String> {
@@ -561,10 +546,6 @@ impl CyclicSlot for ProcSlot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SeqWorker, the per-Load worker behind a process slot occupant
-// ---------------------------------------------------------------------------
-
 /// How far a [`SeqWorker`]'s load pipeline has advanced. The waiting phases
 /// carry their deadline; the terminal phases are latched, so a poll past the
 /// end re-serves the answer instead of re-driving the ctl block.
@@ -589,18 +570,18 @@ pub(crate) enum LoadPoll {
     Failed { stage: &'static str },
 }
 
-/// The worker behind one process-slot occupant Load (`docs/process-systems.md`):
-/// where [`ProcSlot`] drives a fixed system for the whole run, a `SeqWorker`
-/// lives exactly one Load cycle — spawned when the runner loads an occupant,
-/// stepped while it runs, and ended (kill + reap + reclaim, the process twin
-/// of the slot's hard-drop) on `Stop`/`Reset`/`Unload` or the next `Load`.
+/// The worker behind one process-slot occupant Load. Where [`ProcSlot`]
+/// drives a fixed system for the whole run, a `SeqWorker` lives exactly one
+/// Load cycle: spawned when the runner loads an occupant, stepped while it
+/// runs, and ended (kill, reap, reclaim, the process twin of the slot's
+/// hard-drop) on `Stop`/`Reset`/`Unload` or the next `Load`.
 ///
 /// It shares [`ProcSlot`]'s spawn/poll/kill core through [`WorkerHandle`];
 /// what differs is the policy. The load pipeline is `ProcSlot`'s restart
 /// machine minus the backoff, and a failure anywhere in it does not respawn:
 /// it is latched (stage and all) for the runner to fold into the slot's
-/// terminal states, because re-running a sequence re-issues its side effects
-/// — an operator decision, not a supervisor default.
+/// terminal states, because re-running a sequence re-issues its side effects,
+/// an operator decision rather than a supervisor default.
 pub(crate) struct SeqWorker {
     handle: WorkerHandle,
     /// Per-step ack deadline
@@ -614,7 +595,7 @@ impl SeqWorker {
     /// the polled pipeline. Non-blocking, and nothing is killed here: tearing
     /// down any previous worker is the caller's job, *before* this spawn, so
     /// the fresh worker's `fsw_pack_bind_init` claims ring roles only after the
-    /// old ones were reclaimed — the reader-budget invariant.
+    /// old ones were reclaimed, the reader-budget invariant.
     pub(crate) fn spawn(
         exe: &Path,
         ctl_path: &Path,
@@ -674,10 +655,10 @@ impl SeqWorker {
         }
     }
 
-    /// Drive the pipeline to completion, blocking on the ctl word — the
-    /// init-barrier variant for a slot's initial occupant, mirroring the
-    /// deliberately blocking build-time [`ProcSlot::spawn`]: init is not
-    /// cycle time. `Err` carries the failed stage; the worker is already
+    /// Drive the pipeline to completion, blocking on the ctl word: the
+    /// init-barrier variant for a slot's initial occupant, matching the
+    /// deliberately blocking build-time [`ProcSlot::spawn`], since init is
+    /// not cycle time. `Err` carries the failed stage; the worker is already
     /// ended.
     pub(crate) fn wait_ready(&mut self) -> Result<(), &'static str> {
         loop {
@@ -718,7 +699,7 @@ impl SeqWorker {
     }
 
     /// The pipeline died at `stage` (failure report, early exit, deadline):
-    /// end the half-born worker — it may already hold ring claims — and
+    /// end the half-born worker, which may already hold ring claims, and
     /// latch the failure for the runner's fold.
     fn fail_stage(&mut self, stage: &'static str) -> LoadPoll {
         self.end();
@@ -736,7 +717,7 @@ impl SeqWorker {
         self.handle.pid()
     }
 
-    /// Whether the worker process is certainly gone — the step-timeout fork:
+    /// Whether the worker process is certainly gone, the step-timeout fork:
     /// dead means the occupant will never ack, alive means merely late.
     pub(crate) fn child_dead(&mut self) -> bool {
         self.handle.child_dead()
@@ -751,8 +732,8 @@ impl SeqWorker {
         self.handle.kill_reap_reclaim();
     }
 
-    /// Target teardown: the graceful exit `Stop` deliberately skips —
-    /// shutdown request, grace window, then kill — matching [`ProcSlot`]'s,
+    /// Target teardown: the graceful exit `Stop` deliberately skips,
+    /// shutdown request, grace window, then kill, matching [`ProcSlot`]'s,
     /// since blocking is acceptable there.
     pub(crate) fn shutdown(&mut self) {
         self.handle.shutdown_graceful();

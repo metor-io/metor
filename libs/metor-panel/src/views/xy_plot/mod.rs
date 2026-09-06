@@ -44,13 +44,9 @@ pub mod trace_picker;
 #[derive(Clone, facet::Facet)]
 #[facet(pod)]
 pub struct XyTrace {
-    #[facet(skip)]
-    pub x_component_id: ComponentId,
-    #[facet(skip)]
+    pub x_source: crate::data_binding::Binding,
     pub x_element_index: usize,
-    #[facet(skip)]
-    pub y_component_id: ComponentId,
-    #[facet(skip)]
+    pub y_source: crate::data_binding::Binding,
     pub y_element_index: usize,
     pub color: Hsla,
     #[facet(inspect::variants = "Line,Scatter")]
@@ -59,6 +55,10 @@ pub struct XyTrace {
     pub label: SharedString,
     #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
+    /// Back-reference to the owning plot, set by [`XyLinePlot::reconcile`],
+    /// so the trace's inspector can ask the plot to follow a new source.
+    #[facet(opaque)]
+    pub line_plot: Option<gpui::WeakEntity<XyLinePlot>>,
 }
 
 impl XyTrace {
@@ -70,15 +70,16 @@ impl XyTrace {
         color: Hsla,
     ) -> Self {
         Self {
-            x_component_id: x_component_id.into(),
+            x_source: crate::data_binding::Binding::from(x_component_id.into()),
             x_element_index,
-            y_component_id: y_component_id.into(),
+            y_source: crate::data_binding::Binding::from(y_component_id.into()),
             y_element_index,
             color,
             style: PlotStyle::Scatter,
             visible: true,
             label: SharedString::new_static(""),
             stroke_width: 1.5,
+            line_plot: None,
         }
     }
 }
@@ -90,7 +91,6 @@ impl XyTrace {
 /// [`XyLinePlot`]; this entity owns drag state and chrome only.
 pub struct XyPlot {
     line_plot: Entity<XyLinePlot>,
-    _expressions: Vec<crate::dynamic::expressions::Expression>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
@@ -107,7 +107,6 @@ impl XyPlot {
         cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
         Self {
             line_plot,
-            _expressions: Vec::new(),
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,

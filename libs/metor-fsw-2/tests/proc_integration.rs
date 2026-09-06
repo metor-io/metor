@@ -9,7 +9,7 @@
 //! Coverage: a describe worker feeding `add_proc_cyclic` (the host never
 //! dlopens the artifact), mmap rings + doorbell lockstep against a static
 //! producer and an in-process dl twin, telemetry taps on the worker's
-//! outputs (user frame, Postcard events, implicit health), clean teardown,
+//! outputs (user frame, Postcard events, host-written status), clean teardown,
 //! and a SIGKILL'd worker: `StopReason::ProcessDied`, ring reclamation, and
 //! the rest of the graph flowing on. The second half covers **process-mode
 //! slots** (see `docs/process-systems.md`): the polled Load pipeline and occupant
@@ -20,38 +20,30 @@
 //!
 //! The fixture cdylibs are `metor-fsw-2-dl-fixture` and
 //! `metor-fsw-2-seq-fixture`, built by nested cargo invocations exactly as
-//! in `dl_integration.rs`; if one cannot be produced the tests skip with a
-//! message rather than fail.
+//! in `dl_integration.rs`; fixture build failures fail the suite.
 
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod common;
-use common::{drain_msgs, locate_fixture};
+use common::{CounterParams, TickEvent, TickOut, Ticker, drain_msgs, locate_fixture};
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
+use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use metor_fsw_2::{
-    BuildSystem, CyclicSystem, Frame, Input, MsgIn, Out, Output, SequenceStatus, SlotStatus,
-    StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState,
+    Input, LogEvent, MsgIn, SequenceStatus, SlotState, SlotStatus, StopReason, SystemStatus,
+    WorkerRunState,
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 fn main() {
     // The whole point of this harness: a spawned worker child never reaches
     // the tests below.
     metor_fsw_2::proc::worker_entry();
-    let Some(lib_path) = locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture") else {
-        eprintln!("skipping proc_integration: fixture build unavailable");
-        return;
-    };
-    let Some(seq_lib) = locate_fixture("metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture") else {
-        eprintln!("skipping proc_integration: seq fixture build unavailable");
-        return;
-    };
+    let lib_path = locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture");
+    let seq_lib = locate_fixture("metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture");
     // The isolation canary (see the seq fixture): every process that maps the
     // occupant artifact appends its pid to this file, workers included, since
     // they inherit the environment. Set once, before any coordinator exists,
@@ -94,77 +86,12 @@ fn main() {
         proc_slot_abort_crosses_the_boundary,
         &seq_lib,
     );
+    run(
+        "stalled_status_reader_does_not_stop_process_slot",
+        stalled_status_reader_does_not_stop_process_slot,
+        &seq_lib,
+    );
     let _ = std::fs::remove_file(&canary);
-}
-
-// ---------------------------------------------------------------------------
-// Host-side mirrors of the fixture's frames/params/messages
-// (byte-identical to `tests/fixtures/dl-fixture`).
-// ---------------------------------------------------------------------------
-
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
-#[repr(C)]
-#[metor_fsw(name = "tick_in")]
-struct TickIn {
-    #[metor_fsw(timestamp)]
-    timestamp: Timestamp,
-    value: u64,
-}
-
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
-#[repr(C)]
-#[metor_fsw(name = "tick_out")]
-struct TickOut {
-    #[metor_fsw(timestamp)]
-    timestamp: Timestamp,
-    count: u64,
-}
-
-#[derive(serde::Serialize, Default)]
-struct CounterParams {
-    start: u64,
-    scale: f64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema, Debug)]
-struct TickEvent {
-    count: u64,
-}
-
-/// Emits `tick_in.value = 1, 2, 3, ...` (see `dl_integration.rs`).
-struct Ticker {
-    n: u64,
-}
-
-#[derive(SystemInput)]
-struct TickerIn {}
-
-#[derive(SystemOutput)]
-struct TickerOut {
-    tick: Output<TickIn>,
-}
-
-impl System for Ticker {
-    type Input = TickerIn;
-    type Output = Out<TickerOut>;
-    const NAME: &'static str = "ticker";
-}
-
-impl CyclicSystem for Ticker {
-    fn execute(&mut self, now: Timestamp, _input: &mut TickerIn, output: &mut Out<TickerOut>) {
-        self.n += 1;
-        let _ = output.tick.write(&TickIn {
-            timestamp: now,
-            value: self.n,
-        });
-    }
-}
-
-impl BuildSystem for Ticker {
-    type Params = ();
-    fn new(_params: ()) -> Self {
-        Ticker { n: 0 }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +120,19 @@ fn proc_descriptor(lib_path: &Path, system: &str) -> metor_fsw_2::SystemDescript
 /// operator's way). A worker is a re-exec of this very binary, so children
 /// are filtered by our own executable name — which also excludes the `ps`
 /// snapshot process itself, a momentary child of ours.
+/// Whether an instance's log carries no `kind=` fault line since the view
+/// was opened.
+fn no_faults(log: &mut MsgIn<LogEvent>) -> bool {
+    let mut faults = Vec::new();
+    log.drain(|ev| {
+        if ev.fields.iter().any(|(k, _)| k == "kind") {
+            faults.push(ev);
+        }
+    })
+    .expect("log ring readable");
+    faults.is_empty()
+}
+
 fn child_pids() -> Vec<u32> {
     let out = Command::new("ps")
         .args(["-axo", "pid=,ppid=,comm="])
@@ -228,7 +168,7 @@ fn lockstep_end_to_end(lib_path: &Path) {
     let desc = proc_descriptor(lib_path, "DlCounter");
     assert_eq!(desc.name, "DlCounter");
     assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
-    assert_eq!(desc.outputs.len(), 4, "out + events + health + log");
+    assert_eq!(desc.outputs.len(), 3, "out + events + log");
 
     // A static producer, the same fixture entry run as a process system, and
     // the same entry dlopen'd in-process: all three loading modes coexist in
@@ -283,8 +223,8 @@ fn lockstep_end_to_end(lib_path: &Path) {
     assert_eq!(spawned.len(), 1, "exactly one worker child: {spawned:?}");
 
     // Taps over the worker's outputs, through the same registry as any
-    // system's: the user frame, the Postcard events, and the implicit health
-    // the worker's own CyclicRunner publishes from the other process.
+    // system's: the user frame, the Postcard events, the worker's log, and
+    // the status record the host publishes for it.
     let registry = coord.registry();
     let mut out_view: Input<TickOut> = Input::new(
         registry
@@ -298,10 +238,16 @@ fn lockstep_end_to_end(lib_path: &Path) {
             .expect("proc message channel registered")
             .expect("reader slot available"),
     );
-    let mut health_view: Input<SystemHealth> = Input::new(
+    let mut status_view: Input<SystemStatus> = Input::new(
         registry
-            .view(ComponentId::new("proc_counter.health"))
-            .expect("proc health registered")
+            .view(ComponentId::new("proc_counter.system_status"))
+            .expect("proc status registered")
+            .expect("reader slot available"),
+    );
+    let mut log_in: MsgIn<LogEvent> = MsgIn::new(
+        registry
+            .view(ComponentId::new("proc_counter.log"))
+            .expect("proc log registered")
             .expect("reader slot available"),
     );
     let mut dl_out_view: Input<TickOut> = Input::new(
@@ -362,23 +308,25 @@ fn lockstep_end_to_end(lib_path: &Path) {
         (1..=CYCLES as u64).map(|v| 1000 + v).collect::<Vec<_>>(),
         "every-record log semantics across the process boundary"
     );
-    // The implicit health frame flowed from the worker process.
-    let health = health_view
+    // The host published the worker's status record every cycle, and the
+    // worker's log (which did cross the process boundary) carries no faults.
+    let status = status_view
         .latest()
         .expect("ring readable")
-        .expect("worker health flowed");
-    assert_eq!(health.get().errors, 0, "no worker-side errors");
+        .expect("status published");
     assert!(
-        health.get().cycles >= CYCLES as u64,
-        "worker counted its cycles"
+        status.get().cycles >= CYCLES as u64,
+        "the host counted the worker's cycles"
     );
-    drop(health);
+    assert_eq!(status.get().state, SlotState::Running.code());
+    drop(status);
+    assert!(no_faults(&mut log_in), "no worker-side faults");
 
     // Teardown: shutdown reaps the worker; dropping the coordinator unmaps
     // the rings and removes the session dir. Not crashing (and not leaking a
     // child) is the assertion.
     drop(coord);
-    drop((out_view, events_in, health_view, dl_out_view));
+    drop((out_view, events_in, status_view, log_in, dl_out_view));
     assert!(
         child_pids().is_empty(),
         "no worker child survives a clean teardown"
@@ -450,10 +398,10 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     });
 
     let registry = coord.registry();
-    let mut ticker_health: Input<SystemHealth> = Input::new(
+    let mut ticker_log: MsgIn<LogEvent> = MsgIn::new(
         registry
-            .view(ComponentId::new("ticker.health"))
-            .expect("ticker health registered")
+            .view(ComponentId::new("ticker.log"))
+            .expect("ticker log registered")
             .expect("reader slot available"),
     );
 
@@ -482,20 +430,14 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     assert_eq!(workers[0].restarts, 0, "restart was opted out");
     // ...whose reader cursors were reclaimed: the producer never saw a full
     // ring (a dead pinned cursor would have surfaced as publish_dropped
-    // errors on the ticker's health well within ~100 post-kill cycles).
-    let health = ticker_health
-        .latest()
-        .expect("ring readable")
-        .expect("ticker health flowed");
-    assert_eq!(
-        health.get().errors,
-        0,
+    // faults on the ticker's log well within ~100 post-kill cycles).
+    assert!(
+        no_faults(&mut ticker_log),
         "producer kept publishing after the reclaim"
     );
-    drop(health);
 
     drop(coord);
-    drop(ticker_health);
+    drop(ticker_log);
     assert!(child_pids().is_empty(), "the dead worker was reaped");
 }
 
@@ -573,10 +515,10 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
     });
 
     let registry = coord.registry();
-    let mut ticker_health: Input<SystemHealth> = Input::new(
+    let mut ticker_log: MsgIn<LogEvent> = MsgIn::new(
         registry
-            .view(ComponentId::new("ticker.health"))
-            .expect("ticker health registered")
+            .view(ComponentId::new("ticker.log"))
+            .expect("ticker log registered")
             .expect("reader slot available"),
     );
     let mut out_view: Input<TickOut> = Input::new(
@@ -618,16 +560,11 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
             > 1000,
         "the restarted worker produced"
     );
-    // ...and both reclaims kept the producer flowing: no publish errors.
-    let health = ticker_health
-        .latest()
-        .expect("ring readable")
-        .expect("ticker health flowed");
-    assert_eq!(health.get().errors, 0, "producer never backpressured");
-    drop(health);
+    // ...and both reclaims kept the producer flowing: no publish faults.
+    assert!(no_faults(&mut ticker_log), "producer never backpressured");
 
     drop(coord);
-    drop((ticker_health, out_view));
+    drop((ticker_log, out_view));
     assert!(child_pids().is_empty(), "all workers reaped");
 }
 
@@ -1149,4 +1086,21 @@ fn proc_slot_abort_crosses_the_boundary(seq_lib: &Path) {
     drop(coord);
     drop(events_view);
     assert!(child_pids().is_empty(), "all workers reaped");
+}
+
+fn stalled_status_reader_does_not_stop_process_slot(lib: &Path) {
+    use metor_fsw_2::wiring::{Registry, resolve};
+    use metor_fsw_2::{ClockSpec, SlotInitState, WiringBuilder};
+    let mut wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.001 })
+        .artifact("seqs", "metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture")
+        .slot("adcs")
+        .allow("beater")
+        .process()
+        .initial("beater", SlotInitState::Running)
+        .end()
+        .build();
+    wiring.artifacts[0].path = Some(lib.to_path_buf());
+    let coord = resolve(&wiring, &Registry::new()).unwrap();
+    stellarator::run(|| common::assert_status_backpressure(coord, "adcs"));
 }

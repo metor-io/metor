@@ -408,6 +408,12 @@ fn the_inner_product_and_sum_agree_with_nox() {
     driver.run().unwrap();
     assert_eq!(driver.read_scalar(), (a[0] + a[1]) + a[2]);
 
+    let wasm = build("def avg(v: Tensor[f64, 3]) -> f64:\n    return mean(v)\n");
+    let mut driver = Driver::new(&wasm, "avg");
+    driver.write(0, &a);
+    driver.run().unwrap();
+    assert_eq!(driver.read_scalar(), ((a[0] + a[1]) + a[2]) / 3.0);
+
     let wasm = build("def size(v: Tensor[f64, 3]) -> i64:\n    return len(v)\n");
     let mut driver = Driver::new(&wasm, "size");
     driver.write(0, &a);

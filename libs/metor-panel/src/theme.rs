@@ -105,6 +105,11 @@ pub struct Theme {
     /// envelope (LoD buckets) instead of raw samples, so operators can
     /// tell the two apart at a glance.
     pub plot_envelope_alpha: f32,
+    /// Tone ramp for intensity fields — spectrogram magnitude, value
+    /// density. Ordered low intensity to high and monotonic in lightness,
+    /// starting near `bg_secondary` so a barely-occupied cell fades into
+    /// the plot and ending far from it so a hot cell cannot be missed.
+    pub density_stops: [Hsla; 5],
 
     /// "On" color for checkboxes, switches, and traffic-light tiles. Replaces
     /// per-call-site indexing into `line_colors`.
@@ -149,6 +154,22 @@ impl Theme {
         }
     }
 
+    /// Text of a value cell once its stream has gone quiet — the theme's
+    /// blue, so the digits themselves say the reading is old.
+    pub fn stale_text(&self) -> Hsla {
+        self.alarm_color(0)
+    }
+
+    /// Background behind [`stale_text`](Self::stale_text): the same blue at
+    /// the weight the sequence run-state chips use, so the two read as one
+    /// family of "status" tints.
+    pub fn stale_bg(&self) -> Hsla {
+        Hsla {
+            a: 0.12,
+            ..self.stale_text()
+        }
+    }
+
     /// Tint for a component-frame edge in the system graph — the blue family,
     /// the calmer of the two edge kinds since frame edges dominate a target.
     pub fn frame_edge_color(&self) -> Hsla {
@@ -159,6 +180,19 @@ impl Theme {
     /// apart from the frame-edge blue so the two kinds read at a glance.
     pub fn msg_edge_color(&self) -> Hsla {
         self.line_colors[4]
+    }
+
+    /// Current-position marker on the map view — the orange family, the
+    /// one hue basemaps never paint terrain or water in, so the dot never
+    /// dissolves into the land greens and ocean blues around it.
+    pub fn map_marker(&self) -> Hsla {
+        self.line_colors[0]
+    }
+
+    /// Ground-track trail behind the map marker — the blue family, which
+    /// stays legible over both OSM land and ocean tints.
+    pub fn map_trail(&self) -> Hsla {
+        self.line_colors[1]
     }
 
     /// Solid color for an alarm severity (`severity_index`: 0 = info, 1 = warning,
@@ -209,6 +243,60 @@ impl Theme {
             ..self.run_state_color(run_state_index)
         }
     }
+
+    /// Solid color for a cyclic slot's run state, indexed by the FSW's
+    /// `SlotState::code` (0 = empty, 1 = loaded, 2 = loading, 3 = running,
+    /// 4 = done, 5 = stopped). Distinct from
+    /// [`run_state_color`](Self::run_state_color), which indexes the sequence
+    /// run states — the two ladders share neither order nor meaning, and
+    /// painting a running slot with the sequence table would read as "aborted".
+    pub fn slot_state_color(&self, state_code: usize) -> Hsla {
+        match state_code {
+            1 => self.text_secondary, // loaded — built, not polling
+            2 => hex(0xe0a030, 1.0),  // loading — amber, mid-pipeline
+            3 => self.control_active, // running
+            4 => hex(0x4090e0, 1.0),  // done — calm blue
+            5 => hex(0xe06820, 1.0),  // stopped — orange (hard stop)
+            _ => self.text_tertiary,  // empty / unknown
+        }
+    }
+
+    /// Low-alpha [`slot_state_color`](Self::slot_state_color) for lane
+    /// backgrounds and summarized strips.
+    pub fn slot_state_tint(&self, state_code: usize) -> Hsla {
+        Hsla {
+            a: 0.12,
+            ..self.slot_state_color(state_code)
+        }
+    }
+
+    /// Sample the [`density_stops`](Self::density_stops) ramp at `t`, clamped
+    /// to `0..=1`. Interpolation is component-wise in RGB, which is what the
+    /// GPU LUT reproduces, so the CPU-painted colorbar and the shader agree.
+    pub fn density_color(&self, t: f32) -> Hsla {
+        let last = self.density_stops.len() - 1;
+        let pos = t.clamp(0.0, 1.0) * last as f32;
+        let i = (pos.floor() as usize).min(last - 1);
+        lerp_color(
+            self.density_stops[i],
+            self.density_stops[i + 1],
+            pos - i as f32,
+        )
+    }
+}
+
+/// Component-wise RGB blend of `a` into `b` by `t`, keeping `a`'s alpha.
+fn lerp_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
+    let x = gpui::Rgba::from(a);
+    let y = gpui::Rgba::from(b);
+    let lerp = |p: f32, q: f32| p + (q - p) * t;
+    gpui::Rgba {
+        r: lerp(x.r, y.r),
+        g: lerp(x.g, y.g),
+        b: lerp(x.b, y.b),
+        a: x.a,
+    }
+    .into()
 }
 
 /// Global wrapper that makes the active [`Theme`] addressable from any view.
@@ -286,6 +374,13 @@ pub static DARK: Theme = Theme {
     zero_line_color: hex(0x6b6560, 1.0),
     plot_gap_band: hex(0x6b6560, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x201e1c, 1.0),
+        hex(0x175684, 1.0),
+        hex(0x882ccd, 1.0),
+        hex(0xff9e59, 1.0),
+        hex(0xebdecc, 1.0),
+    ],
 
     control_active: hex(0x40b060, 1.0),
     control_active_track: hex(0x40b060, 0.7),
@@ -330,6 +425,13 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     zero_line_color: hex(0x585b70, 1.0),
     plot_gap_band: hex(0x585b70, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x181828, 1.0),
+        hex(0x063e98, 1.0),
+        hex(0x7515e7, 1.0),
+        hex(0xf89b61, 1.0),
+        hex(0xc4cff2, 1.0),
+    ],
 
     control_active: hex(0xa6e3a1, 1.0),
     control_active_track: hex(0xa6e3a1, 0.7),
@@ -374,6 +476,13 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     zero_line_color: hex(0x5b6078, 1.0),
     plot_gap_band: hex(0x5b6078, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x25283e, 1.0),
+        hex(0x1042a8, 1.0),
+        hex(0x7b22ea, 1.0),
+        hex(0xf49e6e, 1.0),
+        hex(0xc3cdf4, 1.0),
+    ],
 
     control_active: hex(0xa6da95, 1.0),
     control_active_track: hex(0xa6da95, 0.7),
@@ -418,6 +527,13 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     zero_line_color: hex(0xbcc0cc, 1.0),
     plot_gap_band: hex(0xbcc0cc, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0xd6dbe6, 1.0),
+        hex(0xfea46f, 1.0),
+        hex(0x8432ee, 1.0),
+        hex(0x0949c9, 1.0),
+        hex(0x383a4d, 1.0),
+    ],
 
     control_active: hex(0x40a02b, 1.0),
     control_active_track: hex(0x40a02b, 0.7),
@@ -462,6 +578,13 @@ pub static AYU_DARK: Theme = Theme {
     zero_line_color: hex(0x2a2e38, 1.0),
     plot_gap_band: hex(0x2a2e38, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x161c28, 1.0),
+        hex(0x00629c, 1.0),
+        hex(0x7c00fa, 1.0),
+        hex(0xeac16e, 1.0),
+        hex(0xdeddd9, 1.0),
+    ],
 
     control_active: hex(0x7fd962, 1.0),
     control_active_track: hex(0x7fd962, 0.7),
@@ -506,6 +629,13 @@ pub static EVERFOREST_DARK: Theme = Theme {
     zero_line_color: hex(0x56635f, 1.0),
     plot_gap_band: hex(0x56635f, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x2b353b, 1.0),
+        hex(0x407972, 1.0),
+        hex(0xba5484, 1.0),
+        hex(0xe79d7b, 1.0),
+        hex(0xe7dfd0, 1.0),
+    ],
 
     control_active: hex(0xa7c080, 1.0),
     control_active_track: hex(0xa7c080, 0.7),
@@ -550,6 +680,13 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     zero_line_color: hex(0xbdc3af, 1.0),
     plot_gap_band: hex(0xbdc3af, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0xefe9c4, 1.0),
+        hex(0xf8a96f, 1.0),
+        hex(0xd745a9, 1.0),
+        hex(0x2f79a1, 1.0),
+        hex(0x3b4449, 1.0),
+    ],
 
     control_active: hex(0x8da101, 1.0),
     control_active_track: hex(0x8da101, 0.7),
@@ -594,6 +731,13 @@ pub static ROSE_PINE: Theme = Theme {
     zero_line_color: hex(0x524f67, 1.0),
     plot_gap_band: hex(0x524f67, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x211e31, 1.0),
+        hex(0x2b667e, 1.0),
+        hex(0x7b3ac9, 1.0),
+        hex(0xf5ba68, 1.0),
+        hex(0xcdc9ed, 1.0),
+    ],
 
     control_active: hex(0x9ccfd8, 1.0),
     control_active_track: hex(0x9ccfd8, 0.7),
@@ -638,6 +782,13 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     zero_line_color: hex(0x56526e, 1.0),
     plot_gap_band: hex(0x56526e, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x2a2844, 1.0),
+        hex(0x32728d, 1.0),
+        hex(0x8245cc, 1.0),
+        hex(0xf5bd6e, 1.0),
+        hex(0xcdc9ed, 1.0),
+    ],
 
     control_active: hex(0x9ccfd8, 1.0),
     control_active_track: hex(0x9ccfd8, 0.7),
@@ -682,6 +833,13 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     zero_line_color: hex(0xcecacd, 1.0),
     plot_gap_band: hex(0xcecacd, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0xf5e8d9, 1.0),
+        hex(0xf3c689, 1.0),
+        hex(0x937eab, 1.0),
+        hex(0x3284a5, 1.0),
+        hex(0x39364f, 1.0),
+    ],
 
     control_active: hex(0x56949f, 1.0),
     control_active_track: hex(0x56949f, 0.7),
@@ -726,6 +884,13 @@ pub static MAKING_SOFTWARE: Theme = Theme {
     zero_line_color: hex(0x97acff, 1.0),
     plot_gap_band: hex(0x97acff, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0xdbdfed, 1.0),
+        hex(0xffdd78, 1.0),
+        hex(0x8651d5, 1.0),
+        hex(0x002ad5, 1.0),
+        hex(0x363c4e, 1.0),
+    ],
 
     control_active: hex(0x1342ff, 1.0),
     control_active_track: hex(0x1342ff, 0.7),
@@ -770,6 +935,13 @@ pub static DEPARTURE: Theme = Theme {
     zero_line_color: hex(0x5a3e20, 1.0),
     plot_gap_band: hex(0x5a3e20, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x1f1d19, 1.0),
+        hex(0x1f7878, 1.0),
+        hex(0xc2358c, 1.0),
+        hex(0xf3b264, 1.0),
+        hex(0xfbe6bb, 1.0),
+    ],
 
     control_active: hex(0xf0a040, 1.0),
     control_active_track: hex(0xf0a040, 0.7),
@@ -820,6 +992,13 @@ pub static KINTSUGI: Theme = Theme {
     zero_line_color: hex(0x5c584f, 1.0),
     plot_gap_band: hex(0x5c584f, 0.12),
     plot_envelope_alpha: 0.55,
+    density_stops: [
+        hex(0x1c1c1f, 1.0),
+        hex(0x444c57, 1.0),
+        hex(0x6e51a8, 1.0),
+        hex(0xe4c074, 1.0),
+        hex(0xdbdbdb, 1.0),
+    ],
 
     control_active: hex(0xdbad49, 1.0),
     control_active_track: hex(0xdbad49, 0.7),
@@ -912,4 +1091,56 @@ pub fn set_font(cx: &mut App, font: FontConfig) {
         tracing::error!(%e, "save config failed");
     }
     cx.set_global(FontSettings { family, config });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: Hsla, b: Hsla) -> bool {
+        (a.h - b.h).abs() < 1e-5
+            && (a.s - b.s).abs() < 1e-5
+            && (a.l - b.l).abs() < 1e-5
+            && (a.a - b.a).abs() < 1e-5
+    }
+
+    /// The ramp's ends are the tables' end stops: a colorbar labelled with the
+    /// intensity extremes has to paint the colors those extremes map to.
+    #[test]
+    fn density_color_hits_the_stops() {
+        for theme in all_themes() {
+            let stops = &theme.density_stops;
+            assert!(
+                approx(theme.density_color(0.0), stops[0]),
+                "{} low end",
+                theme.name
+            );
+            assert!(
+                approx(theme.density_color(1.0), stops[4]),
+                "{} high end",
+                theme.name
+            );
+            assert!(
+                approx(theme.density_color(0.5), stops[2]),
+                "{} midpoint",
+                theme.name
+            );
+            // Out-of-range intensity clamps rather than extrapolating off the
+            // ramp into a color the palette never chose.
+            assert!(approx(theme.density_color(-1.0), stops[0]));
+            assert!(approx(theme.density_color(2.0), stops[4]));
+        }
+    }
+
+    /// Intensity has to read as intensity even in greyscale, so every ramp
+    /// moves steadily away from its background rather than wandering.
+    #[test]
+    fn density_stops_are_monotonic_in_lightness() {
+        for theme in all_themes() {
+            let l: Vec<f32> = theme.density_stops.iter().map(|c| c.l).collect();
+            let rising = l.windows(2).all(|w| w[0] < w[1]);
+            let falling = l.windows(2).all(|w| w[0] > w[1]);
+            assert!(rising || falling, "{} stops: {l:?}", theme.name);
+        }
+    }
 }

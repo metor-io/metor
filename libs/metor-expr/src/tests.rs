@@ -11,12 +11,14 @@
 //! the two must agree bit for bit.
 
 mod abi;
+mod completion;
 mod differential;
 mod layout;
 mod m0;
 mod matmul;
 mod measure;
 mod pack;
+mod rates;
 mod robustness;
 mod scalar;
 mod semantics;

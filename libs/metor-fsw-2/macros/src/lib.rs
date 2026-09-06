@@ -1,109 +1,18 @@
-//! Proc macros behind the `metor_fsw_2_core` authoring surface.
+//! Derive macros for frames, port bundles, and parameter documentation.
 //!
-//! User code never depends on this crate directly. Every macro is re-exported
-//! by the framework crate, and every expansion refers back to that crate
-//! through a path resolved at expansion time (see
-//! [`metor_fsw_2_crate_name`]), so the generated code works no matter what
-//! the consumer renamed the dependency to.
-//!
-//! The surface is small:
-//!
-//! - [`#[derive(Frame)]`](derive@Frame) turns a struct into a frame in one
-//!   annotation.
-//! - [`#[derive(SystemInput)]`](derive@SystemInput) /
-//!   [`#[derive(SystemOutput)]`](derive@SystemOutput) describe port bundles.
-//!
-//! Field and struct attributes live under `#[fsw(...)]`; the longer
-//! `#[metor_fsw(...)]` spelling is accepted as an alias.
+//! The framework re-exports these macros. Expansions resolve its dependency
+//! name so renamed dependencies work. Frame attributes accept both `fsw`
+//! and `metor_fsw`; port bundle attributes use `fsw`.
 
-use darling::FromField;
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
 use quote::quote;
 use syn::Ident;
 
-mod as_vtable;
-mod componentize;
-mod decomponentize;
 mod frame;
-mod metadatatize;
 mod params_docs;
 mod system;
-
-/// A single struct field as parsed by the frame derives, pairing its ident
-/// and type with the `#[fsw(...)]` attributes they all share.
-#[derive(Debug, FromField)]
-#[darling(attributes(fsw, metor_fsw))]
-struct Field {
-    ident: Option<syn::Ident>,
-    ty: syn::Type,
-    component_id: Option<String>,
-    #[darling(default)]
-    timestamp: bool,
-    /// Descend into a sub-frame through the component traits instead of
-    /// treating the field as a leaf scalar.
-    #[darling(default)]
-    nest: bool,
-    /// `#[fsw(skip)]` force-hides a field from telemetry; `#[fsw(skip = false)]`
-    /// opts a `_`-prefixed field back in. Absent, a field is skipped iff its
-    /// name starts with `_` — the convention for `#[repr(C)]` padding.
-    #[darling(default)]
-    skip: Option<bool>,
-}
-
-impl Field {
-    /// The field's component id, defaulting to the field name.
-    fn component_name(&self) -> String {
-        match &self.component_id {
-            Some(c) => c.clone(),
-            None => {
-                let ident = self.ident.as_ref().expect("field must have ident");
-                ident.to_string()
-            }
-        }
-    }
-
-    /// The component id under an optional frame prefix.
-    fn qualified_component_name(&self, parent: Option<&str>) -> String {
-        let name = self.component_name();
-        match parent {
-            Some(parent) => format!("{parent}.{name}"),
-            None => name,
-        }
-    }
-
-    /// Whether the field is omitted from telemetry: never becomes a component
-    /// and never round-trips through encode/decode. `_`-prefixed fields skip by
-    /// default (padding), overridable in either direction with `#[fsw(skip)]`.
-    fn skipped(&self) -> bool {
-        self.skip.unwrap_or_else(|| {
-            self.ident
-                .as_ref()
-                .is_some_and(|i| i.to_string().starts_with('_'))
-        })
-    }
-
-    /// Whether the field recurses through the component traits rather than
-    /// emitting a scalar leaf, either explicitly via `#[fsw(nest)]` or
-    /// implicitly because it is dynamic.
-    fn is_nested(&self) -> bool {
-        self.nest || self.is_dynamic()
-    }
-
-    /// Whether the field type's outermost path segment is `FrameList` or
-    /// `FrameMap`. Such fields carry no in-struct value, so the scalar
-    /// encode/decode paths skip them and `MAX_SIZE` sizes their trailer
-    /// instead.
-    fn is_dynamic(&self) -> bool {
-        if let syn::Type::Path(p) = &self.ty
-            && let Some(seg) = p.path.segments.last()
-        {
-            return seg.ident == "FrameList" || seg.ident == "FrameMap";
-        }
-        false
-    }
-}
 
 /// Derives the four component sub-traits and `Frame` itself, making a struct
 /// a frame with a single annotation. Fields are configured with

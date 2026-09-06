@@ -86,7 +86,12 @@ impl RowList {
             // list, enum variant pickers, etc.) consistent with the
             // palette / right-click UX, while inline rows handle the
             // cheap Scalar/Text edits themselves.
-            RowAction::Cascade(child_rows) => {
+            // A seeded query is the overlay's affair — an inline list opens
+            // the child page in a fresh inspector, which starts blank.
+            RowAction::Cascade(child_rows)
+            | RowAction::CascadeWith {
+                rows: child_rows, ..
+            } => {
                 if let Some(open) = open_inspector(cx) {
                     open(
                         InspectorRequest {
@@ -98,8 +103,12 @@ impl RowList {
                     );
                 }
             }
-            // Embedded RowList has no page stack and no overlay to dismiss.
-            RowAction::Pop | RowAction::Dismiss | RowAction::CascadeView { .. } => {}
+            // Embedded RowList has no page stack, no overlay to dismiss, and
+            // no search field to rewrite.
+            RowAction::Pop
+            | RowAction::Dismiss
+            | RowAction::CascadeView { .. }
+            | RowAction::ReplaceQuery { .. } => {}
         }
     }
 

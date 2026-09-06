@@ -1,10 +1,10 @@
 //! A deterministic wheel (zip) writer, the sibling of [`bundle`](super::bundle)'s
 //! reproducible tar: entries sorted by archive name, timestamps fixed at the
 //! DOS epoch, unix modes in the central directory's external attributes, and
-//! every entry **stored** rather than compressed — identical inputs produce
+//! every entry **stored** rather than compressed. Identical inputs produce
 //! byte-identical wheels with no compressor in the loop, and installers
-//! accept stored entries per the zip and wheel specs. Pack payloads are a
-//! few MB of shared objects. See `docs/packaging.md` for the wheel layout.
+//! accept stored entries per the zip and wheel specs; pack payloads are only
+//! a few MB of shared objects.
 //!
 //! [`write_wheel`] assembles the `dist-info` (`METADATA`, `WHEEL`, a sha256
 //! `RECORD`) around the caller's files and writes
@@ -34,8 +34,8 @@ pub struct WheelMeta {
 }
 
 /// One payload file: archive name, contents, and unix mode (`0o644` for
-/// text, `0o755` for the shared objects — installers extract the mode from
-/// the central directory, which is how a packaged binary stays executable).
+/// text, `0o755` for the shared objects). Installers extract the mode from
+/// the central directory, which is how a packaged binary stays executable.
 #[derive(Clone, Debug)]
 pub struct WheelFile {
     /// The archive path, `/`-separated.
@@ -133,12 +133,8 @@ fn metadata_contents(meta: &WheelMeta) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
-// The stored-only zip encoder
-// ---------------------------------------------------------------------------
-
-// 1980-01-01 00:00:00, the earliest DOS timestamp — the fixed value that
-// makes archives reproducible.
+// 1980-01-01 00:00:00, the earliest DOS timestamp, fixed so archives stay
+// reproducible.
 const DOS_DATE: u16 = 0x0021;
 const DOS_TIME: u16 = 0;
 
@@ -171,7 +167,7 @@ fn zip_stored(entries: &[WheelFile]) -> Vec<u8> {
 
         // Central directory entry.
         central.write_all(&0x02014b50u32.to_le_bytes()).unwrap();
-        // Made by: unix (3) << 8 | zip spec 2.0 — carries the external attrs.
+        // Made by: unix (3) << 8 | zip spec 2.0, which carries the external attrs.
         central.write_all(&0x031eu16.to_le_bytes()).unwrap();
         central.write_all(&20u16.to_le_bytes()).unwrap();
         central.write_all(&0u16.to_le_bytes()).unwrap();

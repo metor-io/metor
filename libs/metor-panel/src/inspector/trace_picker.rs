@@ -7,6 +7,7 @@ use metor_proto::types::ComponentId;
 
 use crate::inspector::rows::PreviewSpec;
 
+use crate::inspector::rows::HeaderRow;
 use crate::inspector::rows::{
     BoolRow, CommandRow, ExpressionRow, InspectorRow, NavRow, RowAction, row_base,
 };
@@ -58,13 +59,19 @@ pub(crate) fn component_picker_rows(
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
 ) -> Vec<Box<dyn InspectorRow>> {
     let on_select = Arc::new(on_select);
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(db.clone(), {
+    let commit: crate::inspector::rows::OnExpression = {
         let on_select = on_select.clone();
         Arc::new(move |id, text, _window, cx| {
             on_select(id, text, cx);
             RowAction::Dismiss
         })
-    }))];
+    };
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(
+        db.clone(),
+        commit.clone(),
+        ExpressionRow::commit_component_row(commit),
+        None,
+    ))];
     rows.extend(list_components(&db).into_iter().map(|(id, name)| {
         let on_select = on_select.clone();
         Box::new(CommandRow::new(
@@ -73,6 +80,20 @@ pub(crate) fn component_picker_rows(
         )) as Box<dyn InspectorRow>
     }));
     rows
+}
+
+/// Creation and editing share the same owned selection contract.
+pub(crate) fn binding_picker_rows(
+    db: Arc<DB>,
+    on_select: impl Fn(crate::data_binding::Binding, &mut App) + 'static,
+) -> Vec<Box<dyn InspectorRow>> {
+    let resolve_db = db.clone();
+    component_picker_rows(db, move |id, text, cx| {
+        let binding = crate::data_binding::Binding::from_legacy(id, Some(&text), &resolve_db, cx);
+        if binding.error().is_none() {
+            on_select(binding, cx);
+        }
+    })
 }
 
 /// Element labels for `component_id`, derived from its schema dimension.
@@ -94,6 +115,182 @@ pub type OnTracesSelected = Arc<dyn Fn(Vec<Trace>, &mut Window, &mut App)>;
 /// Used by the "Plot Component" palette command to push a transient plot
 /// preview onto the inspector's page stack instead of dismissing.
 pub type BuildPreview = Arc<dyn Fn(Vec<Trace>, &mut App) -> PreviewSpec>;
+
+/// One channel to plot: an element of a component, or of what an expression
+/// publishes. `label` is how a trace would name it — `component.element`,
+/// or the expression's text — and `expression` is the share that keeps a
+/// computed channel alive, which the picker takes while the compute row's
+/// own handle still exists.
+pub(crate) struct Channel {
+    pub component: ComponentId,
+    pub element: usize,
+    pub label: String,
+    pub binding: crate::data_binding::Binding,
+}
+
+/// Invoked with the one [`Channel`] the user picked; decides what the page
+/// does next.
+pub(crate) type OnChannel = Arc<dyn Fn(Channel, &mut Window, &mut App) -> RowAction>;
+
+/// A single-pick page: one component or expression, then one element.
+///
+/// The counterpart to the multi-select wizard for every place that wants
+/// exactly one channel — an XY axis, or rebinding a trace that already exists.
+/// A scalar commits at once; a vector drills into its elements. An
+/// expression cascades the same way, carrying its running handle into the
+/// element page so the pick lands on a channel that is still computing.
+pub(crate) fn channel_picker_rows(
+    db: Arc<DB>,
+    header: impl Into<SharedString>,
+    on_pick: OnChannel,
+) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(HeaderRow::new(header))];
+    let commit: crate::inspector::rows::OnExpression = {
+        let db = db.clone();
+        let on_pick = on_pick.clone();
+        Arc::new(move |component, text, window, cx| {
+            let binding = crate::data_binding::Binding::selected(component, &text, cx);
+            let elements = expression_elements(&db, component, &text);
+            channel_element_rows(elements, component, binding, &on_pick, window, cx)
+        })
+    };
+    let component_row: crate::inspector::rows::ComponentRowBuilder = {
+        let db = db.clone();
+        let on_pick = on_pick.clone();
+        Arc::new(move |id, item, _cx| {
+            Some(channel_component_row(&db, id, item.label.clone(), &on_pick))
+        })
+    };
+    rows.push(Box::new(ExpressionRow::new(
+        db.clone(),
+        commit,
+        component_row,
+        None,
+    )));
+    for (id, name) in list_components(&db) {
+        rows.push(channel_component_row(&db, id, name, &on_pick));
+    }
+    rows
+}
+
+/// Elements of `component`, labelled the way [`traces_for_component`] would.
+fn component_elements(db: &DB, component: ComponentId, name: &str) -> Vec<(usize, String)> {
+    let names = element_names_for_component(db, component);
+    if names.len() <= 1 {
+        return vec![(0, name.to_string())];
+    }
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(index, element)| match element.is_empty() {
+            true => (index, format!("{name}[{index}]")),
+            false => (index, format!("{name}.{element}")),
+        })
+        .collect()
+}
+
+fn channel_component_row(
+    db: &Arc<DB>,
+    component: ComponentId,
+    name: String,
+    on_pick: &OnChannel,
+) -> Box<dyn InspectorRow> {
+    let elements = component_elements(db, component, &name);
+    let on_pick = on_pick.clone();
+    if let [(element, label)] = elements.as_slice() {
+        let (element, label) = (*element, label.clone());
+        return Box::new(CommandRow::action(
+            SharedString::from(name),
+            Arc::new(move |window, cx| {
+                on_pick(
+                    Channel {
+                        component,
+                        element,
+                        label: label.clone(),
+                        binding: crate::data_binding::Binding::from(component),
+                    },
+                    window,
+                    cx,
+                )
+            }),
+        ));
+    }
+    Box::new(NavRow::new(
+        SharedString::from(name),
+        SharedString::new_static(""),
+        Box::new(move |_cx| {
+            elements
+                .iter()
+                .map(|(element, label)| {
+                    channel_element_row(
+                        component,
+                        *element,
+                        label.clone(),
+                        crate::data_binding::Binding::from(component),
+                        &on_pick,
+                    )
+                })
+                .collect()
+        }),
+    ))
+}
+
+/// Land a pick with `elements` to choose from: straight to `on_pick` for one,
+/// a page of them otherwise.
+fn channel_element_rows(
+    elements: Vec<(usize, String)>,
+    component: ComponentId,
+    binding: crate::data_binding::Binding,
+    on_pick: &OnChannel,
+    window: &mut Window,
+    cx: &mut App,
+) -> RowAction {
+    if let [(element, label)] = elements.as_slice() {
+        return on_pick(
+            Channel {
+                component,
+                element: *element,
+                label: label.clone(),
+                binding,
+            },
+            window,
+            cx,
+        );
+    }
+    RowAction::Cascade(
+        elements
+            .into_iter()
+            .map(|(element, label)| {
+                channel_element_row(component, element, label, binding.clone(), on_pick)
+            })
+            .collect(),
+    )
+}
+
+fn channel_element_row(
+    component: ComponentId,
+    element: usize,
+    label: String,
+    binding: crate::data_binding::Binding,
+    on_pick: &OnChannel,
+) -> Box<dyn InspectorRow> {
+    let on_pick = on_pick.clone();
+    Box::new(CommandRow::action(
+        SharedString::from(label.clone()),
+        Arc::new(move |window, cx| {
+            on_pick(
+                Channel {
+                    component,
+                    element,
+                    label: label.clone(),
+                    binding: binding.clone(),
+                },
+                window,
+                cx,
+            )
+        }),
+    ))
+}
 
 /// Starting index into the theme's categorical color palette.
 ///
@@ -227,12 +424,12 @@ fn component_list_rows(
 
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    // Typing `=` commits its traces on its own rather than joining the
+    // An expression commits its traces on its own rather than joining the
     // multi-select: an expression is one channel already, so there is nothing
     // to check off — but a channel is not one *number*. An expression over a
     // vector broadcasts to a vector, and it plots the way that component
     // would: one trace per element.
-    rows.push(Box::new(ExpressionRow::new(db.clone(), {
+    let commit_expression: crate::inspector::rows::OnExpression = {
         let db = db.clone();
         let on_continue = on_continue.clone();
         let color_basis = color_basis.clone();
@@ -246,7 +443,44 @@ fn component_list_rows(
                 ContinueAction::CascadeView(build) => RowAction::CascadeView(build(traces, cx)),
             }
         })
-    })));
+    };
+    // A matched component keeps the wizard's own spelling — the element-page
+    // NavRow — and the Continue row rides below the candidates, so a query
+    // never takes the multi-select away.
+    let nav_row: crate::inspector::rows::ComponentRowBuilder = {
+        let db = db.clone();
+        let selection = selection.clone();
+        Arc::new(move |id, item, _cx| {
+            let elem_count = element_names_for_component(&db, id).len().max(1);
+            Some(wizard_component_row(
+                &db,
+                &selection,
+                id,
+                item.label.clone(),
+                elem_count,
+            ))
+        })
+    };
+    let continue_row: crate::inspector::rows::TailRowBuilder = {
+        let selection = selection.clone();
+        let db = db.clone();
+        let color_basis = color_basis.clone();
+        let on_continue = on_continue.clone();
+        Arc::new(move || {
+            Box::new(ContinueRow {
+                selection: selection.clone(),
+                db: db.clone(),
+                color_basis: color_basis.clone(),
+                on_continue: on_continue.clone(),
+            })
+        })
+    };
+    rows.push(Box::new(ExpressionRow::new(
+        db.clone(),
+        commit_expression,
+        nav_row,
+        Some(continue_row),
+    )));
 
     rows.push(Box::new(ContinueRow {
         selection: selection.clone(),
@@ -256,36 +490,50 @@ fn component_list_rows(
     }));
 
     for (comp_id, comp_name, elem_count) in components {
-        let sel_for_summary = selection.clone();
-        let sel_for_cascade = selection.clone();
-        let db_for_cascade = db.clone();
-        let name_for_cascade = comp_name.clone();
-
-        rows.push(Box::new(NavRow::with_dynamic_summary(
-            SharedString::from(comp_name),
-            Box::new(move |_cx| {
-                let n = sel_for_summary.lock().unwrap().count_for(comp_id);
-                if n == 0 {
-                    SharedString::new_static("")
-                } else if n == elem_count {
-                    SharedString::new_static("all")
-                } else {
-                    SharedString::from(format!("{n} selected"))
-                }
-            }),
-            Box::new(move |_cx| {
-                element_page_rows(
-                    db_for_cascade.clone(),
-                    comp_id,
-                    name_for_cascade.clone(),
-                    elem_count,
-                    sel_for_cascade.clone(),
-                )
-            }),
-        )));
+        rows.push(wizard_component_row(
+            &db, &selection, comp_id, comp_name, elem_count,
+        ));
     }
 
     rows
+}
+
+/// One component's line in the wizard: its selection summary, cascading into
+/// the element checkboxes. Shared by the unfiltered list and the completion
+/// provider so a query changes what is offered, never what a row does.
+fn wizard_component_row(
+    db: &Arc<DB>,
+    selection: &Arc<Mutex<TraceSelection>>,
+    comp_id: ComponentId,
+    comp_name: String,
+    elem_count: usize,
+) -> Box<dyn InspectorRow> {
+    let sel_for_summary = selection.clone();
+    let sel_for_cascade = selection.clone();
+    let db_for_cascade = db.clone();
+    let name_for_cascade = comp_name.clone();
+    Box::new(NavRow::with_dynamic_summary(
+        SharedString::from(comp_name),
+        Box::new(move |_cx| {
+            let n = sel_for_summary.lock().unwrap().count_for(comp_id);
+            if n == 0 {
+                SharedString::new_static("")
+            } else if n == elem_count {
+                SharedString::new_static("all")
+            } else {
+                SharedString::from(format!("{n} selected"))
+            }
+        }),
+        Box::new(move |_cx| {
+            element_page_rows(
+                db_for_cascade.clone(),
+                comp_id,
+                name_for_cascade.clone(),
+                elem_count,
+                sel_for_cascade.clone(),
+            )
+        }),
+    ))
 }
 
 fn element_page_rows(
@@ -346,6 +594,10 @@ struct ContinueRow {
 }
 
 impl InspectorRow for ContinueRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         "Continue"
     }
@@ -401,6 +653,10 @@ impl InspectorRow for ContinueRow {
 struct DoneRow;
 
 impl InspectorRow for DoneRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         "Done"
     }
@@ -453,6 +709,7 @@ pub(crate) fn expression_traces(
             let color = theme.line_colors[(base + index) % theme.line_colors.len()];
             let mut trace = Trace::new(component, index, color);
             trace.label = SharedString::from(label);
+            trace.source = crate::data_binding::Binding::selected(component, text, cx);
             trace
         })
         .collect()
@@ -545,4 +802,113 @@ pub(crate) fn element_names(shape: &[usize]) -> Vec<String> {
     let mut out = Vec::new();
     walk(shape, "", &mut out);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dynamic::expressions;
+    use metor_db::ComponentSchema;
+    use metor_proto::types::PrimType;
+
+    fn db_with(components: &[(&str, &[usize])]) -> (Arc<DB>, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DB::create(temp.path().join("db")).unwrap();
+        for (name, dim) in components {
+            let id = ComponentId::new(name);
+            db.with_state_mut(|s| {
+                s.insert_component(id, ComponentSchema::new(PrimType::F64, *dim), &db.path)
+            })
+            .unwrap();
+            let mut metadata = metor_proto_wkt::ComponentMetadata {
+                component_id: id,
+                name: name.to_string(),
+                metadata: Default::default(),
+            };
+            use metor_proto_wkt::MetadataExt;
+            metadata.set("source", "test");
+            db.with_state_mut(|s| s.set_component_metadata(metadata, &db.path))
+                .unwrap();
+        }
+        (Arc::new(db), temp)
+    }
+
+    fn picked() -> (OnChannel, Arc<Mutex<Option<Channel>>>) {
+        let slot: Arc<Mutex<Option<Channel>>> = Default::default();
+        let sink = slot.clone();
+        let on_pick: OnChannel = Arc::new(move |channel, _window, _cx| {
+            *sink.lock().unwrap() = Some(channel);
+            RowAction::Pop
+        });
+        (on_pick, slot)
+    }
+
+    /// A scalar commits from its own row; a vector drills into elements.
+    #[gpui::test]
+    fn a_component_pick_lands_on_one_element(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = db_with(&[("adcs.rate", &[]), ("adcs.omega_b", &[3])]);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            let (on_pick, slot) = picked();
+            let mut rows = channel_picker_rows(db.clone(), "Pick", on_pick);
+
+            let scalar = rows.iter_mut().find(|r| r.label() == "adcs.rate").unwrap();
+            assert!(matches!(scalar.activate(window, cx), RowAction::Pop));
+            let channel = slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("a scalar commits at once");
+            assert_eq!((channel.element, channel.label.as_str()), (0, "adcs.rate"));
+
+            let vector = rows
+                .iter_mut()
+                .find(|r| r.label() == "adcs.omega_b")
+                .unwrap();
+            let RowAction::Cascade(mut elements) = vector.activate(window, cx) else {
+                panic!("a vector drills into its elements");
+            };
+            assert!(matches!(elements[2].activate(window, cx), RowAction::Pop));
+            let channel = slot.lock().unwrap().take().expect("an element commits");
+            assert_eq!(channel.component, ComponentId::new("adcs.omega_b"));
+            assert_eq!(
+                (channel.element, channel.label.as_str()),
+                (2, "adcs.omega_b.z")
+            );
+        });
+    }
+
+    /// An expression over a vector cascades into its elements, and the pick
+    /// made there still holds the expression's running handle — the compute
+    /// row's own share is long gone by then.
+    #[gpui::test]
+    fn an_expression_pick_carries_its_handle_into_the_element_page(cx: &mut gpui::TestAppContext) {
+        let (db, _temp) = db_with(&[("adcs.omega_b", &[3])]);
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            expressions::Expressions::init(cx);
+            crate::dynamic::worker::DynamicWorker::init(cx);
+            let (on_pick, slot) = picked();
+            let rows = channel_picker_rows(db.clone(), "Pick", on_pick);
+            let provider = rows.iter().find(|r| r.label() == "Expression").unwrap();
+            let mut page = provider
+                .query_rows("adcs.omega_b * 2.0", 18, cx)
+                .expect("a query takes the page");
+            let compute = page.iter_mut().find(|r| r.label() == "compute").unwrap();
+            let RowAction::Cascade(mut elements) = compute.activate(window, cx) else {
+                panic!("a vector expression drills into its elements");
+            };
+            assert_eq!(elements.len(), 3);
+            assert!(matches!(elements[1].activate(window, cx), RowAction::Pop));
+            let channel = slot.lock().unwrap().take().expect("an element commits");
+            assert_eq!(channel.label, "adcs.omega_b * 2.0.y");
+            assert!(
+                channel.binding.expression_text().is_some(),
+                "the pick must keep the expression computing"
+            );
+            assert!(expressions::running(channel.component, cx).is_some());
+        });
+    }
 }

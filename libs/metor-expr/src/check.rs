@@ -2,9 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use num_traits::ToPrimitive;
-use rustpython_parser::ast::{self, Ranged};
-use rustpython_parser::{Parse, text_size::TextRange};
+use ruff_python_ast as ast;
+use ruff_text_size::{Ranged, TextRange};
 
 use crate::diag::{Diagnostics, Span};
 use crate::ir::{
@@ -83,14 +82,17 @@ fn check_inner(
 ) -> Result<(Program, Manifest), Diagnostics> {
     let mut diags = Diagnostics::default();
 
-    let module = match ast::Suite::parse(source, "<expr>") {
-        Ok(module) => module,
-        Err(err) => {
-            let at = u32::from(err.offset).min(source.len() as u32);
-            diags.push(Span::new(at, at), format!("{}", err.error));
-            return Err(diags);
+    let parsed = ruff_python_parser::parse_unchecked_source(source, ast::PySourceType::Python);
+    if !parsed.has_valid_syntax() {
+        // The parser recovered a tree anyway, but checking it would report
+        // ghosts of the recovery alongside the real mistake. Every syntax
+        // error is reported — recovery is what lets there be more than one.
+        for err in parsed.errors() {
+            diags.push(err.location, format!("{}", err.error));
         }
-    };
+        return Err(diags);
+    }
+    let module = parsed.into_syntax().body;
 
     let decls = match entry {
         Entry::Module => lang::collect(&module, source, resolver, &mut diags),
@@ -123,7 +125,7 @@ fn check_inner(
     for def in defs {
         let name = def.name.as_str().to_string();
         let mut params = Vec::new();
-        let args = &def.args;
+        let args = &def.parameters;
         if !args.posonlyargs.is_empty()
             || !args.kwonlyargs.is_empty()
             || args.vararg.is_some()
@@ -133,16 +135,16 @@ fn check_inner(
         }
         for arg in &args.args {
             if arg.default.is_some() {
-                diags.push(arg.def.range, "default arguments are not supported");
+                diags.push(arg.parameter.range, "default arguments are not supported");
             }
-            let ty = match &arg.def.annotation {
+            let ty = match &arg.parameter.annotation {
                 Some(ann) => annotation(ann, &mut diags),
                 None => {
-                    diags.push(arg.def.range, "parameters must be annotated");
+                    diags.push(arg.parameter.range, "parameters must be annotated");
                     Ty::F64
                 }
             };
-            params.push((arg.def.arg.as_str().to_string(), ty));
+            params.push((arg.parameter.name.as_str().to_string(), ty));
         }
         let ret = match &def.returns {
             Some(ann) => annotation(ann, &mut diags),
@@ -355,6 +357,7 @@ fn produced_ty(
             Some(systems.get(*system)?.output.fields.get(*field)?.ty.clone())
         }
         manifest::Binding::Resampled { stage } => Some(stages.get(*stage)?.ty.clone()),
+        manifest::Binding::Timestamp => Some(Ty::I64),
     }
 }
 
@@ -402,11 +405,22 @@ fn system(
                     diags.push(decl.span, format!("no component `{path}`"));
                     return None;
                 }
+                manifest::Binding::Timestamp => {
+                    unreachable!("a stamp trails a frame's own fields")
+                }
             },
+        };
+        // A stamped source's frame carries its sample's timestamp as one
+        // more field, which is how `deltat` tells one arrival from the next.
+        // The body never sees that field by name — it reaches it through
+        // `deltat` alone.
+        let (frame, bindings) = match port.stamped {
+            true => lang::stamped(frame, port.bindings.clone()),
+            false => (frame, port.bindings.clone()),
         };
         let block = alloc(buffers, frame.bytes);
         arg_buffers.push(block);
-        let fields: Vec<(String, Cell)> = frame
+        let mut fields: Vec<(String, Cell)> = frame
             .fields
             .iter()
             .map(|f| {
@@ -419,22 +433,25 @@ fn system(
                 )
             })
             .collect();
+        let stamp = frame.timestamp.map(|i| fields.remove(i).1.buf);
         let binding = if port.projected {
             Binding::Cell {
                 cell: fields[0].1.clone(),
                 writable: false,
+                stamp,
             }
         } else {
             Binding::Record {
                 fields,
                 writable: false,
+                stamp,
             }
         };
         names.insert(port.key.clone(), binding);
         ports.push(Port {
             param: port.key.clone(),
             frame,
-            bindings: port.bindings.clone(),
+            bindings,
         });
     }
 
@@ -459,6 +476,7 @@ fn system(
             .or_insert_with(|| Binding::Record {
                 fields: Vec::new(),
                 writable: true,
+                stamp: None,
             }) {
             Binding::Record { fields, .. } => fields.push((slot.field.name.clone(), cell)),
             _ => {
@@ -533,23 +551,27 @@ fn system(
     let dependencies = function_dependencies(&body.calls, edges);
     let locals = body.locals;
 
-    // `random()` keeps a word and `window` keeps a ring, and the body is what
-    // says whether either is needed — so their slots are allocated where they
-    // are first asked for and join the declared fields here, before the guard
-    // closes the list. Both start at zero, which is why neither costs a seed
-    // instruction: a fresh linear memory already holds it, and a window
-    // preloaded with zeros is what the panel's Window node published.
+    // `random()` keeps a word, `window` keeps a ring, `delta` keeps a sample,
+    // and the body is what says whether any is needed — so their slots are
+    // allocated where they are first asked for and join the declared fields
+    // here, before the guard closes the list. The word and the ring start at
+    // zero, which a fresh linear memory already holds (and a window preloaded
+    // with zeros is what the panel's Window node published); the sample
+    // starts at NaN, which is seeded like a declared default.
     let mut state = decl
         .state
         .iter()
         .map(|s| s.field.clone())
         .collect::<Vec<_>>();
-    for (name, ty, buf) in body.synthetic {
+    for (name, ty, buf, default) in body.synthetic {
         state_buffers.push(buf);
-        let default = match ty {
-            Ty::I64 => crate::Init::I64(0),
-            _ => crate::Init::Fill(0.0),
-        };
+        if !default.is_zero() {
+            seeds.push(Seed {
+                dest: buf,
+                ty: ty.clone(),
+                value: default.clone(),
+            });
+        }
         state.push(manifest::StateField { name, ty, default });
     }
     // The seed guard sits one past the state fields, so it is reachable
@@ -734,13 +756,13 @@ fn tensor_annotation(sub: &ast::ExprSubscript, diags: &mut Diagnostics) -> Ty {
     }
     let mut shape = Vec::with_capacity(dims.len());
     for dim in dims {
-        let ast::Expr::Constant(c) = dim else {
+        let ast::Expr::NumberLiteral(c) = dim else {
             return bad(sub, diags);
         };
-        let ast::Constant::Int(n) = &c.value else {
+        let ast::Number::Int(n) = &c.value else {
             return bad(sub, diags);
         };
-        match n.to_usize() {
+        match n.as_usize() {
             Some(n) if n > 0 => shape.push(n),
             _ => return bad(sub, diags),
         }
@@ -792,12 +814,16 @@ enum Binding {
     Cell {
         cell: Cell,
         writable: bool,
+        /// The sample's timestamp, when this is an input port.
+        stamp: Option<BufId>,
     },
     /// A frame or state parameter, addressed field by field. Input frames are
     /// read-only; state is what a system is allowed to keep.
     Record {
         fields: Vec<(String, Cell)>,
         writable: bool,
+        /// The sample's timestamp, when this is an input port.
+        stamp: Option<BufId>,
     },
 }
 
@@ -824,10 +850,11 @@ struct FnChecker<'a> {
     /// The slot `now()` reads, in a system.
     now: Option<u32>,
     /// State the body asked for that no `State` class declared: the word
-    /// `random()` advances, and one ring per `window` call site. Each is
-    /// allocated where it is first needed, so a system that asks for neither
-    /// carries no state at all.
-    synthetic: Vec<(String, Ty, BufId)>,
+    /// `random()` advances, one ring per `window` call site, one previous
+    /// sample per `delta` and `deltat`. Each is allocated where it is first
+    /// needed, with the default it starts from, so a system that asks for
+    /// none carries no state at all.
+    synthetic: Vec<(String, Ty, BufId, crate::Init)>,
     locals: Vec<Ty>,
     names: HashMap<String, Binding>,
     loop_depth: u32,
@@ -927,6 +954,7 @@ impl FnChecker<'_> {
                             Some(Binding::Cell {
                                 cell,
                                 writable: true,
+                                ..
                             }) => {
                                 let cell = cell.clone();
                                 let expr =
@@ -986,6 +1014,7 @@ impl FnChecker<'_> {
                     Some(Binding::Cell {
                         cell,
                         writable: true,
+                        ..
                     }) => {
                         let cell = cell.clone();
                         let lhs = (self.read_cell(&cell), cell.ty.clone());
@@ -1026,7 +1055,7 @@ impl FnChecker<'_> {
             ast::Stmt::If(branch) => {
                 let cond = self.condition(&branch.test, depth)?;
                 let then = self.block(&branch.body, depth + 1);
-                let els = self.block(&branch.orelse, depth + 1);
+                let els = self.otherwise(&branch.elif_else_clauses, depth + 1);
                 Some(vec![Stmt::If { cond, then, els }])
             }
             ast::Stmt::While(loop_) => {
@@ -1040,7 +1069,7 @@ impl FnChecker<'_> {
                 self.loop_depth -= 1;
                 Some(vec![Stmt::While { cond, body }])
             }
-            ast::Stmt::For(loop_) => self.for_range(loop_, depth),
+            ast::Stmt::For(loop_) if !loop_.is_async => self.for_range(loop_, depth),
             ast::Stmt::Break(b) => {
                 if self.loop_depth == 0 {
                     self.diags.push(b.range, "`break` outside a loop");
@@ -1073,6 +1102,27 @@ impl FnChecker<'_> {
                 None
             }
         }
+    }
+
+    /// The `elif`/`else` tail of an `if`, nested back into the chain of
+    /// two-armed branches the IR is written in.
+    fn otherwise(&mut self, clauses: &[ast::ElifElseClause], depth: u32) -> Vec<Stmt> {
+        let Some((clause, rest)) = clauses.split_first() else {
+            return Vec::new();
+        };
+        let Some(test) = &clause.test else {
+            return self.block(&clause.body, depth);
+        };
+        if depth > MAX_DEPTH {
+            self.diags.push(clause.range, "nested too deeply");
+            return Vec::new();
+        }
+        let Some(cond) = self.condition(test, depth) else {
+            return Vec::new();
+        };
+        let then = self.block(&clause.body, depth + 1);
+        let els = self.otherwise(rest, depth + 1);
+        vec![Stmt::If { cond, then, els }]
     }
 
     fn read(&mut self, name: &str, range: TextRange) -> Option<(Expr, Ty)> {
@@ -1139,6 +1189,7 @@ impl FnChecker<'_> {
             Some(Binding::Record {
                 fields,
                 writable: true,
+                ..
             }) => match fields.iter().find(|(name, _)| name == attr.attr.as_str()) {
                 Some((_, cell)) => Some(cell.clone()),
                 None => {
@@ -1193,7 +1244,7 @@ impl FnChecker<'_> {
             return None;
         };
         let named = matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == class);
-        if !named || !call.args.is_empty() {
+        if !named || !call.arguments.args.is_empty() {
             self.diags.push(
                 value.range(),
                 format!("a system returns `{class}(...)` with one keyword per field"),
@@ -1204,6 +1255,7 @@ impl FnChecker<'_> {
         let mut writes = Vec::with_capacity(frame.fields.len());
         for (field, dest) in frame.fields.iter().zip(&fields) {
             let Some(keyword) = call
+                .arguments
                 .keywords
                 .iter()
                 .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == field.name))
@@ -1220,7 +1272,7 @@ impl FnChecker<'_> {
                 ty: field.ty.clone(),
             });
         }
-        for keyword in &call.keywords {
+        for keyword in &call.arguments.keywords {
             let unknown = keyword
                 .arg
                 .as_ref()
@@ -1273,13 +1325,13 @@ impl FnChecker<'_> {
             return None;
         };
         let is_range = matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "range");
-        if !is_range || call.args.is_empty() || call.args.len() > 3 {
+        if !is_range || call.arguments.args.is_empty() || call.arguments.args.len() > 3 {
             self.diags
                 .push(loop_.iter.range(), "`for` iterates `range(...)` only");
             return None;
         }
         let mut bounds = Vec::new();
-        for arg in &call.args {
+        for arg in &call.arguments.args {
             let (expr, ty) = self.expr(arg, depth)?;
             bounds.push(self.coerce(expr, ty, &Ty::I64, arg.range())?);
         }
@@ -1651,10 +1703,9 @@ impl FnChecker<'_> {
         }
         let depth = depth + 1;
         match expr {
-            ast::Expr::Constant(c) => match &c.value {
-                ast::Constant::Float(f) => Some((Expr::F64(*f), Ty::F64)),
-                ast::Constant::Bool(b) => Some((Expr::Bool(*b), Ty::Bool)),
-                ast::Constant::Int(i) => match i.to_i64() {
+            ast::Expr::NumberLiteral(c) => match &c.value {
+                ast::Number::Float(f) => Some((Expr::F64(*f), Ty::F64)),
+                ast::Number::Int(i) => match i.as_i64() {
                     Some(v) => Some((Expr::I64(v), Ty::I64)),
                     None => {
                         self.diags.push(
@@ -1664,12 +1715,21 @@ impl FnChecker<'_> {
                         None
                     }
                 },
-                _ => {
+                ast::Number::Complex { .. } => {
                     self.diags
                         .push(c.range, "only numeric and bool literals are supported");
                     None
                 }
             },
+            ast::Expr::BooleanLiteral(b) => Some((Expr::Bool(b.value), Ty::Bool)),
+            ast::Expr::StringLiteral(_)
+            | ast::Expr::BytesLiteral(_)
+            | ast::Expr::NoneLiteral(_)
+            | ast::Expr::EllipsisLiteral(_) => {
+                self.diags
+                    .push(expr.range(), "only numeric and bool literals are supported");
+                None
+            }
             ast::Expr::Name(name) => self.read(name.id.as_str(), name.range),
             ast::Expr::Attribute(attr) => {
                 // A projected port's key is the whole dotted path the operator
@@ -1787,7 +1847,7 @@ impl FnChecker<'_> {
                 Some((acc, Ty::Bool))
             }
             ast::Expr::Compare(c) => self.compare(c, depth),
-            ast::Expr::IfExp(c) => {
+            ast::Expr::If(c) => {
                 let cond = self.condition(&c.test, depth)?;
                 let (then, then_ty) = self.expr(&c.body, depth)?;
                 let (els, els_ty) = self.expr(&c.orelse, depth)?;
@@ -2023,7 +2083,7 @@ impl FnChecker<'_> {
     }
 
     fn call(&mut self, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
-        if !call.keywords.is_empty() {
+        if !call.arguments.keywords.is_empty() {
             self.diags
                 .push(call.range, "keyword arguments are not supported");
             return None;
@@ -2037,9 +2097,9 @@ impl FnChecker<'_> {
 
         if let Some(index) = self.by_name.get(name).copied() {
             let sig = &self.sigs[index as usize];
-            if sig.params.len() != call.args.len() {
+            if sig.params.len() != call.arguments.args.len() {
                 let want = sig.params.len();
-                let got = call.args.len();
+                let got = call.arguments.args.len();
                 self.diags.push(
                     call.range,
                     format!("`{name}` takes {want} arguments, found {got}"),
@@ -2051,7 +2111,7 @@ impl FnChecker<'_> {
             let ret = sig.ret.clone();
             let buffer_abi = self.frames[index as usize].buffer_abi;
             let mut args = Vec::with_capacity(wanted.len());
-            for (arg, want) in call.args.iter().zip(&wanted) {
+            for (arg, want) in call.arguments.args.iter().zip(&wanted) {
                 let (lowered, got) = self.expr(arg, depth)?;
                 args.push(self.coerce(lowered, got, want, arg.range())?);
             }
@@ -2076,12 +2136,15 @@ impl FnChecker<'_> {
 
     fn builtin(&mut self, name: &str, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
         let arity = |n: usize, this: &mut Self| -> bool {
-            if call.args.len() == n {
+            if call.arguments.args.len() == n {
                 true
             } else {
                 this.diags.push(
                     call.range,
-                    format!("`{name}` takes {n} arguments, found {}", call.args.len()),
+                    format!(
+                        "`{name}` takes {n} arguments, found {}",
+                        call.arguments.args.len()
+                    ),
                 );
                 false
             }
@@ -2097,7 +2160,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (source, ty) = self.expr(&call.args[0], depth)?;
+                let (source, ty) = self.expr(&call.arguments.args[0], depth)?;
                 if !matches!(ty, Ty::Tensor { .. }) {
                     self.diags
                         .push(call.range, format!("`sum` needs a tensor, found {ty}"));
@@ -2133,7 +2196,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                return self.expr(&call.args[0], depth);
+                return self.expr(&call.arguments.args[0], depth);
             }
             "sine" | "cosine" | "square" | "sawtooth" => {
                 if !arity(2, self) {
@@ -2155,10 +2218,14 @@ impl FnChecker<'_> {
                 let buf = match self
                     .synthetic
                     .iter()
-                    .find(|(name, _, _)| name == crate::state::RNG_FIELD)
+                    .find(|(name, ..)| name == crate::state::RNG_FIELD)
                 {
-                    Some((_, _, buf)) => *buf,
-                    None => self.keep(crate::state::RNG_FIELD.to_string(), Ty::I64),
+                    Some((_, _, buf, _)) => *buf,
+                    None => self.keep(
+                        crate::state::RNG_FIELD.to_string(),
+                        Ty::I64,
+                        crate::Init::I64(0),
+                    ),
                 };
                 return Some((
                     Expr::Kernel {
@@ -2188,6 +2255,18 @@ impl FnChecker<'_> {
                 }
                 return self.window(call, depth);
             }
+            "delta" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                return self.delta(call, depth);
+            }
+            "deltat" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                return self.deltat(call);
+            }
             "fft" => {
                 if !arity(1, self) {
                     return None;
@@ -2198,7 +2277,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (_, ty) = self.expr(&call.args[0], depth)?;
+                let (_, ty) = self.expr(&call.arguments.args[0], depth)?;
                 let Ty::Tensor { shape, .. } = &ty else {
                     self.diags
                         .push(call.range, format!("`len` needs a tensor, found {ty}"));
@@ -2213,8 +2292,8 @@ impl FnChecker<'_> {
             if !arity(1, self) {
                 return None;
             }
-            let (arg, ty) = self.expr(&call.args[0], depth)?;
-            let arg = self.as_f64(arg, ty, call.args[0].range())?;
+            let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+            let arg = self.as_f64(arg, ty, call.arguments.args[0].range())?;
             return Some((
                 Expr::Kernel {
                     name: kernel,
@@ -2236,8 +2315,8 @@ impl FnChecker<'_> {
             if !arity(1, self) {
                 return None;
             }
-            let (arg, ty) = self.expr(&call.args[0], depth)?;
-            let arg = self.as_f64(arg, ty, call.args[0].range())?;
+            let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+            let arg = self.as_f64(arg, ty, call.arguments.args[0].range())?;
             return Some((
                 Expr::Intrinsic {
                     op,
@@ -2252,10 +2331,10 @@ impl FnChecker<'_> {
                 if !arity(2, self) {
                     return None;
                 }
-                let (a, at) = self.expr(&call.args[0], depth)?;
-                let a = self.as_f64(a, at, call.args[0].range())?;
-                let (b, bt) = self.expr(&call.args[1], depth)?;
-                let b = self.as_f64(b, bt, call.args[1].range())?;
+                let (a, at) = self.expr(&call.arguments.args[0], depth)?;
+                let a = self.as_f64(a, at, call.arguments.args[0].range())?;
+                let (b, bt) = self.expr(&call.arguments.args[1], depth)?;
+                let b = self.as_f64(b, bt, call.arguments.args[1].range())?;
                 let kernel = if name == "atan2" { "atan2" } else { "pow" };
                 Some((
                     Expr::Kernel {
@@ -2269,7 +2348,7 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (arg, ty) = self.expr(&call.args[0], depth)?;
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
                 let op = match ty {
                     Ty::F64 => Intrinsic::AbsF64,
                     Ty::I64 => Intrinsic::AbsI64,
@@ -2291,8 +2370,8 @@ impl FnChecker<'_> {
                 if !arity(2, self) {
                     return None;
                 }
-                let a = self.expr(&call.args[0], depth)?;
-                let b = self.expr(&call.args[1], depth)?;
+                let a = self.expr(&call.arguments.args[0], depth)?;
+                let b = self.expr(&call.arguments.args[1], depth)?;
                 let (l, r, num) = self.unify(a, b, call.range)?;
                 let op = match (name, num) {
                     ("min", Num::F64) => Intrinsic::MinF64,
@@ -2312,11 +2391,220 @@ impl FnChecker<'_> {
                     ty,
                 ))
             }
+            // Conveniences spelled out of what the language already has, so
+            // the prelude stays as it is and a `mean` costs what `sum` does.
+            // `mean(x, n)` is `mean(window(x, n))`: the ring is the same one
+            // `window` keeps, zeros included, so the average ramps in over
+            // the first `n` samples.
+            "mean" => {
+                let (source, ty) = match call.arguments.args.len() {
+                    2 => self.window(call, depth)?,
+                    _ => {
+                        if !arity(1, self) {
+                            return None;
+                        }
+                        self.expr(&call.arguments.args[0], depth)?
+                    }
+                };
+                if !matches!(ty, Ty::Tensor { .. }) {
+                    self.diags
+                        .push(call.range, format!("`mean` needs a tensor, found {ty}"));
+                    return None;
+                }
+                let count = elems(&ty);
+                Some((
+                    Expr::Arith {
+                        op: Arith::Div,
+                        ty: Num::F64,
+                        lhs: Box::new(Expr::Sum {
+                            source: Box::new(source),
+                            elems: count,
+                            emit: emit_for(count as usize),
+                        }),
+                        rhs: Box::new(Expr::F64(count as f64)),
+                    },
+                    Ty::F64,
+                ))
+            }
+            "clamp" => {
+                if !arity(3, self) {
+                    return None;
+                }
+                let x = self.expr(&call.arguments.args[0], depth)?;
+                let lo = self.expr(&call.arguments.args[1], depth)?;
+                let hi = self.expr(&call.arguments.args[2], depth)?;
+                let (x, lo, num) = self.unify(x, lo, call.range)?;
+                let ty = match num {
+                    Num::F64 => Ty::F64,
+                    Num::I64 => Ty::I64,
+                };
+                let floor = Expr::Intrinsic {
+                    op: match num {
+                        Num::F64 => Intrinsic::MaxF64,
+                        Num::I64 => Intrinsic::MaxI64,
+                    },
+                    args: vec![x, lo],
+                };
+                let (floor, hi, num) = self.unify((floor, ty), hi, call.range)?;
+                let ty = match num {
+                    Num::F64 => Ty::F64,
+                    Num::I64 => Ty::I64,
+                };
+                Some((
+                    Expr::Intrinsic {
+                        op: match num {
+                            Num::F64 => Intrinsic::MinF64,
+                            Num::I64 => Intrinsic::MinI64,
+                        },
+                        args: vec![floor, hi],
+                    },
+                    ty,
+                ))
+            }
+            "sign" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+                let num = match ty {
+                    Ty::F64 => Num::F64,
+                    Ty::I64 => Num::I64,
+                    other => {
+                        self.diags
+                            .push(call.range, format!("`sign` needs a number, found {other}"));
+                        return None;
+                    }
+                };
+                let lit = |v: i64| match num {
+                    Num::F64 => Expr::F64(v as f64),
+                    Num::I64 => Expr::I64(v),
+                };
+                let slot = self.temp(ty.clone());
+                let cmp = |op| Expr::Cmp {
+                    op,
+                    ty: num,
+                    lhs: Box::new(Expr::Local(slot)),
+                    rhs: Box::new(lit(0)),
+                };
+                Some((
+                    Expr::Store {
+                        local: slot,
+                        value: Box::new(arg),
+                        then: Box::new(Expr::Select {
+                            cond: Box::new(cmp(Cmp::Gt)),
+                            then: Box::new(lit(1)),
+                            els: Box::new(Expr::Select {
+                                cond: Box::new(cmp(Cmp::Lt)),
+                                then: Box::new(lit(-1)),
+                                els: Box::new(lit(0)),
+                                ty: ty.clone(),
+                            }),
+                            ty: ty.clone(),
+                        }),
+                    },
+                    ty,
+                ))
+            }
+            "hypot" => {
+                if !arity(2, self) {
+                    return None;
+                }
+                let (a, at) = self.expr(&call.arguments.args[0], depth)?;
+                let a = self.as_f64(a, at, call.arguments.args[0].range())?;
+                let (b, bt) = self.expr(&call.arguments.args[1], depth)?;
+                let b = self.as_f64(b, bt, call.arguments.args[1].range())?;
+                let (x, y) = (self.temp(Ty::F64), self.temp(Ty::F64));
+                let square = |slot| Expr::Arith {
+                    op: Arith::Mul,
+                    ty: Num::F64,
+                    lhs: Box::new(Expr::Local(slot)),
+                    rhs: Box::new(Expr::Local(slot)),
+                };
+                Some((
+                    Expr::Store {
+                        local: x,
+                        value: Box::new(a),
+                        then: Box::new(Expr::Store {
+                            local: y,
+                            value: Box::new(b),
+                            then: Box::new(Expr::Intrinsic {
+                                op: Intrinsic::SqrtF64,
+                                args: vec![Expr::Arith {
+                                    op: Arith::Add,
+                                    ty: Num::F64,
+                                    lhs: Box::new(square(x)),
+                                    rhs: Box::new(square(y)),
+                                }],
+                            }),
+                        }),
+                    },
+                    Ty::F64,
+                ))
+            }
+            "lerp" => {
+                if !arity(3, self) {
+                    return None;
+                }
+                let mut args = Vec::with_capacity(3);
+                for arg in &call.arguments.args {
+                    let (e, ty) = self.expr(arg, depth)?;
+                    args.push(self.as_f64(e, ty, arg.range())?);
+                }
+                let t = args.pop()?;
+                let b = args.pop()?;
+                let a = args.pop()?;
+                let slot = self.temp(Ty::F64);
+                Some((
+                    Expr::Store {
+                        local: slot,
+                        value: Box::new(a),
+                        then: Box::new(Expr::Arith {
+                            op: Arith::Add,
+                            ty: Num::F64,
+                            lhs: Box::new(Expr::Local(slot)),
+                            rhs: Box::new(Expr::Arith {
+                                op: Arith::Mul,
+                                ty: Num::F64,
+                                lhs: Box::new(Expr::Arith {
+                                    op: Arith::Sub,
+                                    ty: Num::F64,
+                                    lhs: Box::new(b),
+                                    rhs: Box::new(Expr::Local(slot)),
+                                }),
+                                rhs: Box::new(t),
+                            }),
+                        }),
+                    },
+                    Ty::F64,
+                ))
+            }
+            "log2" | "log10" | "degrees" | "radians" => {
+                if !arity(1, self) {
+                    return None;
+                }
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+                let arg = self.as_f64(arg, ty, call.arguments.args[0].range())?;
+                let (lhs, scale) = match name {
+                    "log2" => (kernel_log(arg), 1.0 / std::f64::consts::LN_2),
+                    "log10" => (kernel_log(arg), 1.0 / std::f64::consts::LN_10),
+                    "degrees" => (arg, 180.0 / std::f64::consts::PI),
+                    _ => (arg, std::f64::consts::PI / 180.0),
+                };
+                Some((
+                    Expr::Arith {
+                        op: Arith::Mul,
+                        ty: Num::F64,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(Expr::F64(scale)),
+                    },
+                    Ty::F64,
+                ))
+            }
             "int" => {
                 if !arity(1, self) {
                     return None;
                 }
-                let (arg, ty) = self.expr(&call.args[0], depth)?;
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
                 match ty {
                     Ty::I64 => Some((arg, Ty::I64)),
                     Ty::F64 => Some((
@@ -2337,8 +2625,8 @@ impl FnChecker<'_> {
                 if !arity(1, self) {
                     return None;
                 }
-                let (arg, ty) = self.expr(&call.args[0], depth)?;
-                let arg = self.as_f64(arg, ty, call.args[0].range())?;
+                let (arg, ty) = self.expr(&call.arguments.args[0], depth)?;
+                let arg = self.as_f64(arg, ty, call.arguments.args[0].range())?;
                 Some((arg, Ty::F64))
             }
             other => {
@@ -2443,9 +2731,9 @@ impl FnChecker<'_> {
     }
 
     /// Claim a state slot the body asked for but no `State` class declared.
-    fn keep(&mut self, name: String, ty: Ty) -> BufId {
+    fn keep(&mut self, name: String, ty: Ty, default: crate::Init) -> BufId {
         let buf = self.buffer(&ty);
-        self.synthetic.push((name, ty, buf));
+        self.synthetic.push((name, ty, buf, default));
         buf
     }
 
@@ -2461,17 +2749,20 @@ impl FnChecker<'_> {
                 .push(call.range, "`window` exists inside a system");
             return None;
         }
-        let Some(len) = literal_count(&call.args[1]) else {
+        let Some(len) = literal_count(&call.arguments.args[1]) else {
             self.diags.push(
-                call.args[1].range(),
+                call.arguments.args[1].range(),
                 "a window's length is a positive integer literal",
             );
             return None;
         };
-        let (value, ty) = self.expr(&call.args[0], depth)?;
+        let (value, ty) = self.expr(&call.arguments.args[0], depth)?;
         let (value, sample) = match ty {
             Ty::Tensor { .. } => (value, ty.clone()),
-            other => (self.as_f64(value, other, call.args[0].range())?, Ty::F64),
+            other => (
+                self.as_f64(value, other, call.arguments.args[0].range())?,
+                Ty::F64,
+            ),
         };
 
         let mut shape = vec![len];
@@ -2490,7 +2781,11 @@ impl FnChecker<'_> {
             shape,
         };
         let index = self.synthetic.len();
-        let state = self.keep(format!("@window{index}"), ty.clone());
+        let state = self.keep(
+            format!("@window{index}"),
+            ty.clone(),
+            crate::Init::Fill(0.0),
+        );
         Some((
             Expr::Window {
                 state,
@@ -2502,6 +2797,205 @@ impl FnChecker<'_> {
         ))
     }
 
+    /// `delta(x)`: the change since the previous sample.
+    ///
+    /// The previous sample is a state slot of its own per call site, like a
+    /// window's ring, seeded with NaN so the first evaluation can tell it has
+    /// nothing to differ from and read 0 rather than `x` itself.
+    fn delta(&mut self, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
+        if self.now.is_none() {
+            self.diags
+                .push(call.range, "`delta` exists inside a system");
+            return None;
+        }
+        let (value, ty) = self.expr(&call.arguments.args[0], depth)?;
+        let value = self.as_f64(value, ty, call.arguments.args[0].range())?;
+        let index = self.synthetic.len();
+        let state = self.keep(
+            format!("@delta{index}"),
+            Ty::F64,
+            crate::Init::F64(f64::NAN),
+        );
+        Some((self.since(state, value), Ty::F64))
+    }
+
+    /// `deltat(x)`: seconds between the current sample of the input `x` and
+    /// the one before it, 0 until there is one before it.
+    ///
+    /// The input's frame carries its sample's timestamp, and that stamp is
+    /// what tells one sample from the next — not the evaluation, since a held
+    /// input keeps its newest sample across many of them. Two slots per call
+    /// site: the stamps of the newest sample and of the one before, both
+    /// seeded NaN so the arrivals count from zero. Between arrivals the gap
+    /// holds, which is what makes `delta(x) / deltat(x)` a rate a plot can
+    /// read.
+    fn deltat(&mut self, call: &ast::ExprCall) -> Option<(Expr, Ty)> {
+        if self.now.is_none() {
+            self.diags
+                .push(call.range, "`deltat` exists inside a system");
+            return None;
+        }
+        let stamp = self.port_stamp(&call.arguments.args[0])?;
+        let index = self.synthetic.len();
+        let prev = self.keep(
+            format!("@deltat{index}.prev"),
+            Ty::F64,
+            crate::Init::F64(f64::NAN),
+        );
+        let last = self.keep(
+            format!("@deltat{index}.last"),
+            Ty::F64,
+            crate::Init::F64(f64::NAN),
+        );
+
+        let sample = self.temp(Ty::F64);
+        let newest = self.temp(Ty::F64);
+        let older = self.temp(Ty::F64);
+        let sink = self.temp(Ty::F64);
+        let f64_local = |slot: u32| Box::new(Expr::Local(slot));
+        let differs = |a: u32, b: u32| {
+            Box::new(Expr::Cmp {
+                op: Cmp::Ne,
+                ty: Num::F64,
+                lhs: f64_local(a),
+                rhs: f64_local(b),
+            })
+        };
+        // `a - b` in seconds, or 0 while `b` is still the NaN seed.
+        let gap = |a: u32, b: u32| Expr::Select {
+            cond: differs(b, b),
+            then: Box::new(Expr::F64(0.0)),
+            els: Box::new(Expr::Arith {
+                op: Arith::Mul,
+                ty: Num::F64,
+                lhs: Box::new(Expr::Arith {
+                    op: Arith::Sub,
+                    ty: Num::F64,
+                    lhs: f64_local(a),
+                    rhs: f64_local(b),
+                }),
+                rhs: Box::new(Expr::F64(1e-6)),
+            }),
+            ty: Ty::F64,
+        };
+        let expr = Expr::Store {
+            local: sample,
+            value: Box::new(Expr::Intrinsic {
+                op: Intrinsic::IntToFloat,
+                args: vec![Expr::Load {
+                    buf: stamp,
+                    ty: Ty::I64,
+                }],
+            }),
+            then: Box::new(Expr::Store {
+                local: newest,
+                value: Box::new(Expr::Load {
+                    buf: last,
+                    ty: Ty::F64,
+                }),
+                then: Box::new(Expr::Select {
+                    // A new sample: what was newest becomes the one before.
+                    cond: differs(sample, newest),
+                    then: Box::new(Expr::Store {
+                        local: sink,
+                        value: Box::new(Expr::Exchange {
+                            state: prev,
+                            value: Box::new(Expr::Exchange {
+                                state: last,
+                                value: f64_local(sample),
+                                ty: Ty::F64,
+                            }),
+                            ty: Ty::F64,
+                        }),
+                        then: Box::new(gap(sample, newest)),
+                    }),
+                    els: Box::new(Expr::Store {
+                        local: older,
+                        value: Box::new(Expr::Load {
+                            buf: prev,
+                            ty: Ty::F64,
+                        }),
+                        then: Box::new(gap(newest, older)),
+                    }),
+                    ty: Ty::F64,
+                }),
+            }),
+        };
+        Some((expr, Ty::F64))
+    }
+
+    /// The timestamp field of the input an expression names: a component
+    /// port by its full path, a frame parameter, or one of its fields.
+    fn port_stamp(&mut self, arg: &ast::Expr) -> Option<BufId> {
+        // An input's stamp, or `None` for a name that is not an input.
+        let input = |binding: Option<&Binding>| match binding {
+            Some(Binding::Cell { stamp, .. }) | Some(Binding::Record { stamp, .. }) => Some(*stamp),
+            _ => None,
+        };
+        let mut found = None;
+        if let Some(path) = lang::dotted(arg) {
+            found = input(self.names.get(&path));
+        }
+        if found.is_none()
+            && let ast::Expr::Attribute(attr) = arg
+            && let Some(head) = lang::dotted(&attr.value)
+        {
+            found = input(self.names.get(&head));
+        }
+        match found {
+            Some(Some(stamp)) => Some(stamp),
+            Some(None) => {
+                self.diags.push(
+                    arg.range(),
+                    "this input's samples carry no timestamp for `deltat` to read",
+                );
+                None
+            }
+            None => {
+                self.diags.push(
+                    arg.range(),
+                    "`deltat` needs an input: a component, a frame parameter, or one of its fields",
+                );
+                None
+            }
+        }
+    }
+
+    /// `value` minus what `state` held, leaving `value` there — and 0 while
+    /// the slot still holds its NaN seed, since nothing came before.
+    fn since(&mut self, state: BufId, value: Expr) -> Expr {
+        let current = self.temp(Ty::F64);
+        let previous = self.temp(Ty::F64);
+        Expr::Store {
+            local: current,
+            value: Box::new(value),
+            then: Box::new(Expr::Store {
+                local: previous,
+                value: Box::new(Expr::Exchange {
+                    state,
+                    value: Box::new(Expr::Local(current)),
+                    ty: Ty::F64,
+                }),
+                then: Box::new(Expr::Select {
+                    cond: Box::new(Expr::Cmp {
+                        op: Cmp::Ne,
+                        ty: Num::F64,
+                        lhs: Box::new(Expr::Local(previous)),
+                        rhs: Box::new(Expr::Local(previous)),
+                    }),
+                    then: Box::new(Expr::F64(0.0)),
+                    els: Box::new(Expr::Arith {
+                        op: Arith::Sub,
+                        ty: Num::F64,
+                        lhs: Box::new(Expr::Local(current)),
+                        rhs: Box::new(Expr::Local(previous)),
+                    }),
+                    ty: Ty::F64,
+                }),
+            }),
+        }
+    }
+
     /// `fft(x)`: one-sided magnitudes along the last axis.
     ///
     /// Radix-2 wants a power of two and there is no padding rule worth
@@ -2509,7 +3003,7 @@ impl FnChecker<'_> {
     /// output replaces the last axis with `N / 2 + 1`, which is what the
     /// panel's Fft node published.
     fn fft(&mut self, call: &ast::ExprCall, depth: u32) -> Option<(Expr, Ty)> {
-        let (source, ty) = self.expr(&call.args[0], depth)?;
+        let (source, ty) = self.expr(&call.arguments.args[0], depth)?;
         let Ty::Tensor { shape, .. } = &ty else {
             self.diags
                 .push(call.range, format!("`fft` needs a tensor, found {ty}"));
@@ -2562,10 +3056,10 @@ impl FnChecker<'_> {
                 .push(call.range, format!("`{kind}` exists inside a system"));
             return None;
         };
-        let (freq, freq_ty) = self.expr(&call.args[0], depth)?;
-        let freq = self.as_f64(freq, freq_ty, call.args[0].range())?;
-        let (amp, amp_ty) = self.expr(&call.args[1], depth)?;
-        let amp = self.as_f64(amp, amp_ty, call.args[1].range())?;
+        let (freq, freq_ty) = self.expr(&call.arguments.args[0], depth)?;
+        let freq = self.as_f64(freq, freq_ty, call.arguments.args[0].range())?;
+        let (amp, amp_ty) = self.expr(&call.arguments.args[1], depth)?;
+        let amp = self.as_f64(amp, amp_ty, call.arguments.args[1].range())?;
 
         let seconds = Expr::Arith {
             op: Arith::Mul,
@@ -2793,23 +3287,30 @@ fn batches(
 
 /// A positive integer literal, for the lengths that have to be static.
 fn literal_count(expr: &ast::Expr) -> Option<usize> {
-    let ast::Expr::Constant(c) = expr else {
+    let ast::Expr::NumberLiteral(c) = expr else {
         return None;
     };
-    let ast::Constant::Int(n) = &c.value else {
+    let ast::Number::Int(n) = &c.value else {
         return None;
     };
-    n.to_usize().filter(|n| *n > 0)
+    n.as_usize().filter(|n| *n > 0)
 }
 
 fn literal_exponent(expr: &ast::Expr) -> Option<u32> {
-    let ast::Expr::Constant(c) = expr else {
+    let ast::Expr::NumberLiteral(c) = expr else {
         return None;
     };
-    let ast::Constant::Int(n) = &c.value else {
+    let ast::Number::Int(n) = &c.value else {
         return None;
     };
-    n.to_u32().filter(|n| *n <= 16)
+    n.as_u64().filter(|n| *n <= 16).map(|x| x as u32)
+}
+
+fn kernel_log(arg: Expr) -> Expr {
+    Expr::Kernel {
+        name: "log",
+        args: vec![arg],
+    }
 }
 
 fn transcendental(name: &str) -> Option<&'static str> {
@@ -2841,16 +3342,14 @@ fn always_returns(stmts: &[Stmt]) -> bool {
 
 fn refusal(stmt: &ast::Stmt) -> &'static str {
     match stmt {
-        ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) => {
-            "nested functions and closures are not supported"
-        }
+        ast::Stmt::FunctionDef(_) => "nested functions and closures are not supported",
         ast::Stmt::ClassDef(_) => "classes are not supported in this phase",
         ast::Stmt::Delete(_) => "`del` is not supported",
-        ast::Stmt::AsyncFor(_) => "`async for` is not supported",
-        ast::Stmt::With(_) | ast::Stmt::AsyncWith(_) => "`with` is not supported",
+        ast::Stmt::For(_) => "`async for` is not supported",
+        ast::Stmt::With(_) => "`with` is not supported",
         ast::Stmt::Match(_) => "`match` is not supported",
         ast::Stmt::Raise(_) => "`raise` is not supported; a fault is a trap here",
-        ast::Stmt::Try(_) | ast::Stmt::TryStar(_) => "`try` is not supported",
+        ast::Stmt::Try(_) => "`try` is not supported",
         ast::Stmt::Assert(_) => "`assert` is not supported",
         ast::Stmt::Import(_) | ast::Stmt::ImportFrom(_) => "imports are not supported",
         ast::Stmt::Global(_) | ast::Stmt::Nonlocal(_) => "globals cannot be mutated",
@@ -2865,13 +3364,13 @@ fn expr_refusal(expr: &ast::Expr) -> &'static str {
         ast::Expr::Dict(_) | ast::Expr::DictComp(_) => "dicts are not supported",
         ast::Expr::Set(_) | ast::Expr::SetComp(_) => "sets are not supported",
         ast::Expr::ListComp(_) => "list comprehensions are not supported",
-        ast::Expr::GeneratorExp(_) => "generators are not supported",
+        ast::Expr::Generator(_) => "generators are not supported",
         ast::Expr::Await(_) | ast::Expr::Yield(_) | ast::Expr::YieldFrom(_) => {
             "`await` and `yield` are not supported"
         }
-        ast::Expr::JoinedStr(_) | ast::Expr::FormattedValue(_) => "strings are not supported",
+        ast::Expr::FString(_) => "strings are not supported",
         ast::Expr::Starred(_) => "argument unpacking is not supported",
-        ast::Expr::NamedExpr(_) => "`:=` is not supported",
+        ast::Expr::Named(_) => "`:=` is not supported",
         ast::Expr::Attribute(_) => "attribute access is only supported for frame fields",
         ast::Expr::Slice(_) => "slicing is not supported in this phase",
         ast::Expr::Tuple(_) => "tuples are not supported",

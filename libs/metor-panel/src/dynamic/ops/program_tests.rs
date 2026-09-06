@@ -13,19 +13,19 @@ use crate::dynamic::ops;
 use crate::dynamic::resolver::DbResolver;
 
 /// A db holding the components a test's expression names.
-struct Bench {
-    db: DB,
+pub(super) struct Bench {
+    pub(super) db: DB,
     _temp: tempfile::TempDir,
 }
 
 impl Bench {
-    fn new(components: &[(&str, PrimType, &[usize])]) -> Self {
+    pub(super) fn new(components: &[(&str, PrimType, &[usize])]) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let db = DB::create(temp.path().join("db")).unwrap();
         for (name, prim, dim) in components {
             let id = ComponentId::new(name);
             db.with_state_mut(|state| {
-                state.insert_component(id, ComponentSchema::new(*prim, dim), &db.path)
+                state.insert_component(id, ComponentSchema::new(*prim, *dim), &db.path)
             })
             .unwrap();
             let mut metadata = metor_proto_wkt::ComponentMetadata {
@@ -41,11 +41,11 @@ impl Bench {
         Bench { db, _temp: temp }
     }
 
-    fn id(&self, name: &str) -> ComponentId {
+    pub(super) fn id(&self, name: &str) -> ComponentId {
         ComponentId::new(name)
     }
 
-    fn push(&self, name: &str, ts: i64, values: &[f64]) {
+    pub(super) fn push(&self, name: &str, ts: i64, values: &[f64]) {
         let component = self
             .db
             .with_state(|s| s.get_component(self.id(name)).cloned())
@@ -58,11 +58,11 @@ impl Bench {
         component.push_buf(Timestamp(ts), &bytes).unwrap();
     }
 
-    fn source(&self, name: &str) -> Arc<dyn DynamicNode> {
+    pub(super) fn source(&self, name: &str) -> Arc<dyn DynamicNode> {
         ops::db_source::from_db(&self.db, self.id(name)).unwrap()
     }
 
-    fn compile(&self, source: &str) -> Arc<Compiled> {
+    pub(super) fn compile(&self, source: &str) -> Arc<Compiled> {
         let resolver = DbResolver::snapshot(&self.db);
         match Compiled::module(source, &resolver) {
             Ok(compiled) => Arc::new(compiled),
@@ -75,12 +75,12 @@ impl Bench {
 ///
 /// Always before the samples are pushed: a disruptor reader begins at the
 /// current write position, so one made afterwards never sees what it missed.
-fn watch(node: &Arc<dyn DynamicNode>) -> NodeReader {
+pub(super) fn watch(node: &Arc<dyn DynamicNode>) -> NodeReader {
     node.subscribe()
 }
 
 /// Read `count` scalars off a watched node, giving up rather than hanging.
-async fn take(reader: &mut NodeReader, count: usize) -> Vec<f64> {
+pub(super) async fn take(reader: &mut NodeReader, count: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..300 {
         while let Some(grant) = reader.try_next() {
@@ -99,12 +99,12 @@ async fn take(reader: &mut NodeReader, count: usize) -> Vec<f64> {
 
 /// Let the spawned tasks run. Nothing here is timing-dependent — this is only
 /// how a test yields to the nodes it is driving.
-async fn settle() {
+pub(super) async fn settle() {
     stellarator::sleep(Duration::from_millis(5)).await;
 }
 
 /// Build one system over db-backed ports, in the manifest's port order.
-fn wire(bench: &Bench, compiled: &Arc<Compiled>, index: usize) -> program::System {
+pub(super) fn wire(bench: &Bench, compiled: &Arc<Compiled>, index: usize) -> program::System {
     let ports: Vec<program::PortSource> = compiled.manifest.systems[index]
         .inputs
         .iter()
@@ -212,7 +212,7 @@ async fn every_output_field_becomes_its_own_node() {
     let spinning = program::field(&compiled, 0, 1, running.node.clone()).unwrap();
     assert_eq!(
         spinning.value_type().schema().unwrap(),
-        &ComponentSchema::new(PrimType::Bool, &[])
+        &ComponentSchema::new(PrimType::Bool, &[][..])
     );
 
     let mut flags = watch(&spinning);
@@ -615,7 +615,7 @@ async fn a_scalar_broadcasts_over_a_vector_component() {
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
     assert_eq!(
         field.value_type().schema().unwrap(),
-        &ComponentSchema::new(PrimType::F64, &[3]),
+        &ComponentSchema::new(PrimType::F64, &[3][..]),
         "and so must the component it publishes as"
     );
 
@@ -627,8 +627,10 @@ async fn a_scalar_broadcasts_over_a_vector_component() {
         if let Some(grant) = reader.try_next() {
             let (_, value) = grant.sample_at(grant.sample_count() - 1);
             let got: Vec<f64> = value
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect();
             assert_eq!(got, vec![2.0, 3.0, 4.0]);
             return;
@@ -699,44 +701,36 @@ async fn an_unclocked_system_with_no_inputs_is_refused() {
     assert!(format!("{err}").contains("rate="), "{err}");
 }
 
-/// The host wires a resample stage as an ordinary input ring.
+/// Two seeded vector inputs contracted with `@`: the product must follow
+/// both channels after the opening sample, not stop at one.
 #[stellarator::test]
-async fn a_resample_stage_is_wired_from_the_manifest() {
-    let bench = Bench::new(&[("wheels.rpm", PrimType::F64, &[])]);
-    let compiled = bench.compile("slow = resample_zoh(wheels.rpm, 500.0)\nscaled = slow * 2.0\n");
+async fn a_dot_of_two_seeded_inputs_keeps_following_both() {
+    let bench = Bench::new(&[
+        ("imu.a", PrimType::F64, &[3]),
+        ("imu.b", PrimType::F64, &[3]),
+    ]);
+    let compiled = bench.compile("d = imu.a @ imu.b\n");
 
-    let stage = &compiled.manifest.stages[0];
-    assert_eq!(stage.name, "slow");
-    assert_eq!(stage.rate, 500.0);
-    assert_eq!(
-        compiled.manifest.declarations(),
-        vec![metor_expr::Decl::Stage(0), metor_expr::Decl::System(0)],
-        "the host builds in declaration order"
-    );
+    bench.push("imu.a", 1, &[1.0, 0.0, 0.0]);
+    bench.push("imu.b", 1, &[2.0, 0.0, 0.0]);
+    stellarator::sleep(Duration::from_millis(20)).await;
 
-    // What the pane builds for a stage: the source, a clock at the declared
-    // rate, the resampler, and a component under the binding's name.
-    let input = bench.source("wheels.rpm");
-    let clock = ops::clock::fixed_rate(stage.rate).unwrap();
-    let mode = match stage.kind {
-        metor_expr::Resample::Zoh => ops::resample::ResampleMode::Zoh,
-        metor_expr::Resample::Linear => ops::resample::ResampleMode::Linear,
-    };
-    let resampled = ops::resample::resample(input, clock.clone(), mode).unwrap();
-    let published = ops::persist::persist(&bench.db, stage.name.clone(), resampled).unwrap();
-    let mut reader = watch(&published);
+    let ports: Vec<program::PortSource> = ["imu.a", "imu.b"]
+        .iter()
+        .map(|name| program::PortSource {
+            node: bench.source(name),
+            seed: program::latest_sample(&bench.db, bench.id(name)),
+        })
+        .collect();
+    let system = program::system(&compiled, 0, ports, DEFAULT_FUEL, None).unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let mut out = watch(&field);
 
-    bench.push("wheels.rpm", 1, &[7.0]);
-    let seen = take(&mut reader, 3).await;
-    assert!(
-        seen.iter().all(|v| *v == 7.0),
-        "a zero-order hold repeats what it last saw: {seen:?}"
-    );
-
-    // And the system downstream reads it by the name the stage published.
-    let downstream = &compiled.manifest.systems[0];
-    assert_eq!(
-        downstream.inputs[0].bindings[0],
-        metor_expr::Binding::Resampled { stage: 0 }
-    );
+    for step in 2..=5 {
+        let v = f64::from(step as i32);
+        bench.push("imu.a", step, &[v, 0.0, 0.0]);
+        bench.push("imu.b", step, &[2.0, 0.0, 0.0]);
+    }
+    assert_eq!(take(&mut out, 5).await, vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+    assert_eq!(system.health.fault(), None);
 }

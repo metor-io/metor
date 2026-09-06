@@ -1,5 +1,6 @@
-//! The rigid-body **plant** of the `adcs-fsw2` target. It propagates a real 400 km orbit
-//! (gravity + drag) and the full Euler attitude dynamics — including the gyroscopic coupling
+//! The rigid-body **plant** of the `adcs-fsw2` target. It propagates a real orbit — a
+//! 400 km sun-synchronous one by default, gravity + drag — and the full Euler attitude
+//! dynamics — including the gyroscopic coupling
 //! of the stored reaction-wheel momentum — under the environmental disturbance torques a
 //! small spacecraft actually lives on (gravity gradient, aero drag about the CP–CG offset,
 //! residual magnetic dipole, SRP), driven by two actuators: three reaction wheels (bearing
@@ -20,10 +21,10 @@
 //! signature the port set — the crate's [`pack`](crate::pack) registers all three.
 
 use adcs_contracts::{
-    ALTITUDE, BodyState, DT, Disturbances, EARTH_RADIUS, Gps, MASS, MU, MagneticModel, MtqCmd,
-    PlantParams, Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX, ReactionWheel, Sensors, TorqueCmd, V3,
-    Wheels, World, clamp_dipole, epoch_at, in_earth_shadow, inertia_diag, mag_field_eci,
-    sun_dir_eci,
+    BodyState, DT, Disturbances, EARTH_RADIUS, Gps, MASS, MU, MagneticModel, MtqCmd, PlantParams,
+    Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX, ReactionWheel, Sensors, TorqueCmd, V3, Wheels, World,
+    clamp_dipole, eci_to_geodetic, epoch_at, in_earth_shadow, inertia_diag, mag_field_eci,
+    orbit_pos_vel, raan_for_ltan, sun_dir_eci, target_epoch,
 };
 use metor_fsw_2_core::{Input, Output, Timestamp};
 use nox::{
@@ -291,17 +292,16 @@ pub fn propagate(body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> B
 }
 
 impl PlantState {
-    /// Build the plant's state from its params: a 400 km circular orbit, booted
-    /// `init_orbit_phase` radians around it — phase zero is the classic +X position / +Y
-    /// velocity (cube-sat `CubeSat::default`), and the eclipse tests crank the phase to start in
-    /// Earth shadow — with the body rotated `init_angle` about [1,1,1] from the (identity)
-    /// reference and a small initial tumble about the same axis.
+    /// Build the plant's state from its params: a circular orbit at `altitude`, in the
+    /// plane `inclination` and `ltan_hours` pick (sun-synchronous by default), booted
+    /// `init_orbit_phase` radians past the ascending node — phase zero is sunlit at the
+    /// default LTAN, and the eclipse tests crank the phase to start in Earth shadow — with
+    /// the body rotated `init_angle` about [1,1,1] from the (identity) reference and a
+    /// small initial tumble about the same axis.
     pub fn new(p: PlantParams) -> PlantState {
-        let radius = EARTH_RADIUS + ALTITUDE;
-        let v_orbit = (MU / radius).sqrt();
-        let (sin_th, cos_th) = p.init_orbit_phase.sin_cos();
-        let pos0 = tensor![cos_th, sin_th, 0.0] * radius;
-        let vel0 = tensor![-sin_th, cos_th, 0.0] * v_orbit;
+        let radius = EARTH_RADIUS + p.altitude;
+        let raan = raan_for_ltan(target_epoch(), p.ltan_hours);
+        let (pos0, vel0) = orbit_pos_vel(radius, p.inclination, raan, p.init_orbit_phase);
 
         let axis: V3 = tensor![1.0, 1.0, 1.0];
         let q0 = Quaternion::from_axis_angle(axis, p.init_angle);
@@ -420,6 +420,9 @@ pub fn execute(
     state.gps_pos_err = gps_phi * state.gps_pos_err + state.noise(gps_drive_sigma);
     let gps_pos_eci = pos_eci + state.gps_pos_err;
     let gps_vel_eci = vel_eci + state.noise(GPS_VEL_SIGMA);
+    // The receiver's geodetic fix, from the noisy position it actually measured.
+    // Deterministic — no RNG draws, so the sensor noise stream is untouched.
+    let (gps_lat, gps_lon, gps_alt) = eci_to_geodetic(epoch, &gps_pos_eci);
 
     // The disturbance environment at the pre-step true state, and the magnetorquer
     // torque (the commanded dipole clamped to the torquer's authority, crossed with the
@@ -445,6 +448,7 @@ pub fn execute(
         timestamp: now,
         pos_eci: gps_pos_eci,
         vel_eci: gps_vel_eci,
+        lla: V3::from_buf([gps_lat.to_degrees(), gps_lon.to_degrees(), gps_alt]),
     });
     world.publish(&World::new(now, sun_eci, mag_eci, illuminated));
     // Per-wheel telemetry — the wheels themselves, the same structs the plant integrates.
@@ -481,7 +485,7 @@ pub fn execute(
 
 #[cfg(test)]
 mod tests {
-    use adcs_contracts::{MTQ_MAX_DIPOLE, RW_TORQUE_MAX, detumble_dipole};
+    use adcs_contracts::{ALTITUDE, MTQ_MAX_DIPOLE, RW_TORQUE_MAX, detumble_dipole};
 
     use super::*;
 
@@ -635,6 +639,9 @@ mod tests {
             cr: 1.5,
             mtq_max_dipole: MTQ_MAX_DIPOLE,
             init_wheel_h: 0.0,
+            altitude: ALTITUDE,
+            inclination: 0.0,
+            ltan_hours: 12.0,
             init_orbit_phase: 0.0,
         };
         let radius = EARTH_RADIUS + ALTITUDE;

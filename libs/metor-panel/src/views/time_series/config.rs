@@ -117,7 +117,7 @@ impl Default for TraceConfig {
 impl From<&Trace> for TraceConfig {
     fn from(trace: &Trace) -> Self {
         Self {
-            component_id: trace.component_id,
+            component_id: trace.source.id(),
             element_index: trace.element_index,
             color: trace.color,
             style: trace.style,
@@ -126,7 +126,7 @@ impl From<&Trace> for TraceConfig {
             stroke_width: trace.stroke_width,
             axis_index: trace.axis_index,
             // Filled by `to_config`, which has the database to ask.
-            expression: None,
+            expression: trace.source.expression_text(),
         }
     }
 }
@@ -134,7 +134,10 @@ impl From<&Trace> for TraceConfig {
 impl From<TraceConfig> for Trace {
     fn from(config: TraceConfig) -> Self {
         Self {
-            component_id: config.component_id,
+            source: crate::data_binding::Binding::unresolved(
+                config.component_id,
+                config.expression,
+            ),
             element_index: config.element_index,
             color: config.color,
             style: config.style,
@@ -195,27 +198,16 @@ impl TimeSeriesPlot {
         // is built, so what it binds is the component now publishing rather
         // than the one that did last session — which would come back as
         // history with nothing writing into it.
-        let mut expressions = Vec::new();
         let traces = config
             .traces
             .into_iter()
-            .map(|mut trace| {
-                let expression = trace
-                    .expression
-                    .clone()
-                    .or_else(|| crate::dynamic::expressions::binding_text(&db, trace.component_id));
-                if let Some(text) = expression
-                    && let Ok(bound) = crate::dynamic::expressions::bind(&text, &db, cx)
-                {
-                    trace.component_id = bound.id;
-                    trace.expression = Some(text);
-                    expressions.extend(bound.expression);
-                }
-                Trace::from(trace)
+            .map(|config| {
+                let mut trace = Trace::from(config);
+                trace.source.resolve(&db, cx);
+                trace
             })
             .collect();
         let mut plot = Self::new(db, traces, cx);
-        plot._expressions = expressions;
         plot.line_plot.update(cx, |line_plot, cx| {
             line_plot.custom_title = config.custom_title.map(SharedString::from);
             if let Ok(range) = config.x_range.parse() {
@@ -244,7 +236,7 @@ impl TimeSeriesPlot {
                     }))
                 })
                 .collect();
-            cx.notify();
+            line_plot.configuration_changed(cx);
         });
         plot.restore_cursors(&config.cursors, cx);
         plot.panel_position = config.measurement_panel.into();
@@ -280,15 +272,7 @@ impl TimeSeriesPlot {
             traces: line_plot
                 .traces()
                 .iter()
-                .map(|trace| {
-                    let trace = trace.read(cx);
-                    let mut config = TraceConfig::from(trace);
-                    config.expression = crate::dynamic::expressions::binding_text(
-                        line_plot.db(),
-                        trace.component_id,
-                    );
-                    config
-                })
+                .map(|trace| TraceConfig::from(trace.read(cx)))
                 .collect(),
             custom_title: line_plot
                 .custom_title

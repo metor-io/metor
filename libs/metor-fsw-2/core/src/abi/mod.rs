@@ -62,37 +62,12 @@ use serde::{Deserialize, Serialize};
 use crate::binder::RingSource;
 use crate::descriptor::SystemDescriptor;
 
-// ---------------------------------------------------------------------------
-// Version + identity
-// ---------------------------------------------------------------------------
-
 /// The ABI word a host checks for equality before any other call.
 ///
 /// Bump this on any change to the C surface or to the manifest's serialized
 /// shape, once per released ABI shape. A mismatch fails the load cleanly
 /// instead of risking a crash on a stale binary.
-///
-/// Version 5 is the pack ABI: one cdylib exports many systems through the
-/// `fsw_pack_*` surface, replacing the one-system `fsw_describe`/`fsw_create`
-/// family entirely. Version 6 adds per-params-field doc strings to the
-/// manifest so generated pack modules carry the units and prose that make params
-/// usable. Version 7 drops the never-populated per-entry and per-port doc
-/// slots. Version 8 serializes [`SystemDescriptor`] directly in the manifest,
-/// replacing the `*Msg` mirror family. Version 9 passes the instance name to
-/// `fsw_pack_bind_init` (stamped into the entry's [`LogEvent`] records as
-/// their `source`) and carries the implicit log port as a message channel
-/// instead of a frame. Version 10 carries each Postcard port's payload
-/// schema in the descriptor, so the downlink can announce message schemas
-/// to the ground. Version 11 replaces the `describe` host callback with the
-/// two-call `fsw_pack_describe`/`fsw_pack_manifest_ptr` pair, which a wasm
-/// host can drive (a guest cannot be handed a function pointer).
-///
-/// [`LogEvent`]: crate::LogEvent
-pub const FSW_ABI_VERSION: u32 = 11;
-
-// ---------------------------------------------------------------------------
-// repr(C) handles
-// ---------------------------------------------------------------------------
+pub const FSW_ABI_VERSION: u32 = 12;
 
 /// A ring handle points a system at one host-mapped memory region, which the
 /// system attaches as a ring via [`RingBuffer::attach_raw`] at bind time.
@@ -155,10 +130,6 @@ impl FswStatus {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Symbol-name constants
-// ---------------------------------------------------------------------------
-
 /// `fsw_abi_version` returns the ABI word ([`FSW_ABI_VERSION`]).
 pub const SYM_ABI_VERSION: &[u8] = b"fsw_abi_version\0";
 /// `fsw_pack_open` constructs the crate's [`Pack`](crate::Pack) once and
@@ -185,20 +156,6 @@ pub const SYM_PACK_DESTROY: &[u8] = b"fsw_pack_destroy\0";
 /// `fsw_pack_close` drops the [`Pack`](crate::Pack) itself, after every
 /// instance state has been destroyed.
 pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
-/// `fsw_pack_alloc` hands out ring-aligned bytes from the pack's allocator,
-/// so a wasm host can place ring regions inside guest linear memory.
-pub const SYM_PACK_ALLOC: &[u8] = b"fsw_pack_alloc\0";
-/// `fsw_pack_free` releases a region from `fsw_pack_alloc`.
-pub const SYM_PACK_FREE: &[u8] = b"fsw_pack_free\0";
-/// `fsw_pack_ring_init` formats a ring into a guest-allocated region.
-pub const SYM_PACK_RING_INIT: &[u8] = b"fsw_pack_ring_init\0";
-/// `fsw_pack_set_now` publishes a cycle timestamp on the callee's ambient
-/// clock, so `bind`/`init` need not fall back to wall time.
-pub const SYM_PACK_SET_NOW: &[u8] = b"fsw_pack_set_now\0";
-
-// ---------------------------------------------------------------------------
-// RawBinder
-// ---------------------------------------------------------------------------
 
 /// A raw binder walks the host-provided [`FswRing`] arrays, attaching each
 /// region as a ring while the port bundles bind; it is the `.so`-side
@@ -270,10 +227,6 @@ impl<'a> RingSource for RawBinder<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The pack manifest (postcard)
-// ---------------------------------------------------------------------------
-
 /// One pack entry's manifest form: its [`SystemDescriptor`] verbatim, plus
 /// the entry facts that live beside the descriptor rather than in it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -294,16 +247,12 @@ pub struct PackEntryDesc {
 }
 
 /// The whole pack's manifest, what `fsw_pack_describe` sends: one
-/// [`PackEntryDesc`] per entry, in registration order — the order
+/// [`PackEntryDesc`] per entry, in the registration order that
 /// `fsw_pack_create` indexes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PackManifest {
     pub systems: Vec<PackEntryDesc>,
 }
-
-// ---------------------------------------------------------------------------
-// Pack export helpers
-// ---------------------------------------------------------------------------
 
 /// The heap allocation behind the opaque pack pointer: the crate's [`Pack`],
 /// constructed once by [`run_pack_open`] and dropped by [`run_pack_close`].
@@ -453,16 +402,16 @@ pub unsafe fn run_pack_manifest_ptr(pack: *mut c_void) -> *const u8 {
         .map_or(core::ptr::null(), |bytes| bytes.as_ptr())
 }
 
-/// `fsw_pack_create`: run entry `index`'s create phase — decode the postcard
-/// params, build the user state — and box the unbound instance state. Returns
+/// `fsw_pack_create`: run entry `index`'s create phase (decode the postcard
+/// params, build the user state) and box the unbound instance state. Returns
 /// null for a null pack, an out-of-range index, or a create failure (bad
 /// params, a moved-in state already taken, a panic).
 ///
 /// # Safety
 /// `pack` is a live pointer from [`run_pack_open`]; `params`/`params_len`
 /// name a readable byte range (or null/0). The returned pointer is owned by
-/// the caller and passed only to the other `run_pack_*` helpers, then
-/// [`run_pack_destroy`] — all before [`run_pack_close`].
+/// the caller and passed only to the other `run_pack_*` helpers, then to
+/// [`run_pack_destroy`], all before [`run_pack_close`].
 pub unsafe fn run_pack_create(
     pack: *mut c_void,
     index: u32,
@@ -673,8 +622,8 @@ pub fn run_pack_alloc(len: usize) -> *mut u8 {
 /// time.
 ///
 /// A linkage unit's clock is unset until the first `fsw_pack_execute`
-/// republishes it, so anything stamped during `bind`/`init` — a `LogEvent`
-/// from the forward layer, say — reaches for [`Timestamp::now`]. That is
+/// republishes it, so anything stamped during `bind`/`init`, a `LogEvent`
+/// from the forward layer say, reaches for [`Timestamp::now`]. That is
 /// merely inaccurate in a `.so` (wall time instead of the cycle's) and fatal
 /// in wasm, where `wasm32-unknown-unknown` has no wall clock at all and
 /// `SystemTime::now` panics. Calling this first gives init the same time axis
@@ -702,7 +651,7 @@ pub unsafe fn run_pack_ring_init(ptr: *mut u8, len: usize, capacity: u32, max_re
         max_readers: max_readers as usize,
     };
     // `create_raw` asserts on an invalid config, and an unwind must not cross
-    // the boundary — on wasm it cannot even be caught, since that target
+    // the boundary; on wasm it cannot even be caught, since that target
     // aborts rather than unwinds.
     let formatted = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: caller asserts a live, exclusively-owned region.

@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use gpui::AppContext as _;
 use gpui::{Entity, Hsla, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -14,7 +16,9 @@ use metor_proto::types::ComponentId;
 use crate::inspector::rows::{
     BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
 };
+use crate::views::column_browser::filter_bar_row;
 use crate::views::list_plot::{ListLinePlot, ListTrace};
+use crate::views::spectrogram::{SpectrogramPlot, SpectrogramTrace};
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{EventOverlay, LinePlot, Override, Trace, YAxis};
 use crate::views::viewer_3d::Viewer3d;
@@ -22,8 +26,58 @@ use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
 use super::{AddBehavior, InspectorRegistry, builders};
 
+/// What the add wizard produced, in place of the trace being edited.
+///
+/// The first new trace inherits how the old one was drawn — colour, style,
+/// width, axis, visibility — so editing a source does not restyle it; an
+/// expression over a vector yields one trace per element, and the rest
+/// follow it in the plot's list with the palette colours the wizard chose.
+#[cfg(test)]
+fn replace_trace(trace: &Entity<Trace>, picked: Vec<Trace>, cx: &mut gpui::App) {
+    let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) else {
+        return;
+    };
+    lp.update(cx, |lp, cx| {
+        let Some(at) = lp
+            .traces
+            .iter()
+            .position(|t| t.entity_id() == trace.entity_id())
+        else {
+            return;
+        };
+        let old = trace.read(cx);
+        let (color, style, stroke_width, axis_index, visible) = (
+            old.color,
+            old.style,
+            old.stroke_width,
+            old.axis_index,
+            old.visible,
+        );
+        let replacements: Vec<Entity<Trace>> = picked
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut t)| {
+                if i == 0 {
+                    t.color = color;
+                    t.style = style;
+                    t.stroke_width = stroke_width;
+                }
+                t.axis_index = axis_index;
+                t.visible = visible;
+                cx.new(|_| t)
+            })
+            .collect();
+        lp.traces.splice(at..at + 1, replacements);
+        lp.configuration_changed(cx);
+    });
+}
+
 impl InspectorRegistry {
     pub(super) fn register_defaults(&mut self, db: Arc<DB>) {
+        self.register_inspectable_with_edit::<LinePlot>(LinePlot::configuration_changed);
+        self.register_binding(db.clone());
+        self.register_inspectable::<crate::views::AttitudeIndicator>();
+        self.register_inspectable::<crate::views::VectorMarker>();
         self.register_hsla();
         self.register_shared_string();
         self.register_component_id(db.clone());
@@ -32,6 +86,7 @@ impl InspectorRegistry {
         self.register_override_hsla();
         self.register_time_range_behavior();
         self.register_override_time_range_behavior();
+        self.register_inspectable::<crate::views::ComponentText>();
         self.register_inspectable::<crate::views::Monitor>();
         self.register_inspectable::<crate::views::AlarmView>();
         self.register_inspectable::<crate::views::SequenceView>();
@@ -40,6 +95,8 @@ impl InspectorRegistry {
         self.register_inspectable::<crate::views::Meter>();
         self.register_inspectable::<crate::views::Gauge>();
         self.register_inspectable::<crate::views::SequenceControl>();
+        self.register_inspectable::<crate::views::Map>();
+        self.register_inspectable::<crate::views::SamplesTable>();
         self.register_entity_list::<crate::views::AttitudeIndicator, crate::views::VectorMarker>(
             db.clone(),
             |a| &a.vectors,
@@ -79,6 +136,10 @@ impl InspectorRegistry {
                 builders::build_event_overlay_wizard(parent, db, cx)
             })),
         );
+        self.register_entity_list::<crate::views::Annunciator, crate::views::annunciator::Condition>(
+            db.clone(), |v| &v.conditions, |v| &mut v.conditions,
+            AddBehavior::Default(Arc::new(|_| crate::views::annunciator::Condition::default())),
+        );
         self.register_entity_list::<Viewer3d, crate::views::viewer_3d::ModelEntry>(
             db.clone(),
             |v| &v.models,
@@ -90,6 +151,7 @@ impl InspectorRegistry {
         self.register_dashboard_builder(db.clone());
         self.register_pane_builder();
         self.register_component_browser_builder();
+        self.register_outline_builder();
         self.register_trace_builder(db.clone());
         self.register_entity_list::<XyLinePlot, XyTrace>(
             db.clone(),
@@ -105,6 +167,14 @@ impl InspectorRegistry {
             |lp| &mut lp.traces,
             AddBehavior::Wizard(Arc::new(|parent, db, cx| {
                 builders::build_list_trace_add_wizard(parent, db, cx)
+            })),
+        );
+        self.register_entity_list::<SpectrogramPlot, SpectrogramTrace>(
+            db.clone(),
+            |p| &p.traces,
+            |p| &mut p.traces,
+            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
+                builders::build_spectrogram_trace_add_wizard(parent, db, cx)
             })),
         );
     }
@@ -144,6 +214,30 @@ impl InspectorRegistry {
                     );
                 }),
             ))
+        }));
+    }
+
+    fn register_binding(&mut self, db: Arc<DB>) {
+        use crate::data_binding::Binding;
+        self.register_field_widget::<Binding>(Arc::new(move |ctx, peek, entity, idx| {
+            let binding = peek.get::<Binding>().expect("binding field");
+            let query = binding.text(&db);
+            let summary = binding.error().map(str::to_string).unwrap_or_else(|| {
+                if query.is_empty() {
+                    "Unbound".to_string()
+                } else {
+                    query.clone()
+                }
+            });
+            let db = db.clone();
+            Box::new(
+                NavRow::new(
+                    ctx.label.clone(),
+                    summary,
+                    Box::new(move |_| builders::build_binding_picker(&db, entity.clone(), idx)),
+                )
+                .with_query(query),
+            )
         }));
     }
 
@@ -294,6 +388,7 @@ impl InspectorRegistry {
                                 &entity, idx, value, cx,
                             );
                         }),
+                        cx,
                     )
                 }),
             ))
@@ -340,12 +435,20 @@ impl InspectorRegistry {
                             .as_custom()
                             .map(|b| SharedString::from(format!("{b}")))
                             .unwrap_or_default();
-                        rows.extend(crate::views::time_series::time_range::picker_rows(
-                            current_text,
-                            Arc::new(move |value, _w, cx| {
-                                set_override(Override::Custom(value), cx)
+                        rows.push(Box::new(NavRow::new(
+                            "Independent range…",
+                            current_text.clone(),
+                            Box::new(move |cx| {
+                                let set_override = set_override.clone();
+                                crate::views::time_series::time_range::picker_rows(
+                                    current_text.clone(),
+                                    Arc::new(move |value, _w, cx| {
+                                        set_override(Override::Custom(value), cx)
+                                    }),
+                                    cx,
+                                )
                             }),
-                        ));
+                        )));
                         rows
                     }),
                 ))
@@ -363,9 +466,11 @@ impl InspectorRegistry {
         }));
     }
 
-    /// Trace inspector: the default facet rows plus an axis picker. The
-    /// picker reads the owning plot's `axes` (via the trace's back-ref) and
-    /// writes `axis_index`; it's hidden when the plot has a single axis.
+    /// Trace inspector: the default facet rows, a source picker, and an axis
+    /// picker. The source picker rebinds the trace in place and asks the
+    /// owning plot (via the trace's back-ref) to follow the new channel; the
+    /// axis picker reads the plot's `axes` and writes `axis_index`, and is
+    /// hidden when the plot has a single axis.
     fn register_trace_builder(&mut self, _db: Arc<DB>) {
         self.register_type_builder::<Trace>(Arc::new(|any_entity, db, cx| {
             let trace: Entity<Trace> = any_entity.clone().downcast().expect("Trace type mismatch");
@@ -529,7 +634,8 @@ impl InspectorRegistry {
             let label = SharedString::new_static("Title");
             let nav_browser = browser.clone();
             let label_for_nav = label.clone();
-            vec![Box::new(NavRow::new(
+            let filter_row = filter_bar_row(browser.clone());
+            let title_row = NavRow::new(
                 label.clone(),
                 summary,
                 Box::new(move |cx| {
@@ -562,7 +668,24 @@ impl InspectorRegistry {
                         )) as Box<dyn InspectorRow>,
                     ]
                 }),
-            ))]
+            );
+            vec![Box::new(title_row), Box::new(filter_row)]
+        }));
+    }
+
+    fn register_outline_builder(&mut self) {
+        use crate::views::ComponentOutline;
+        use crate::views::outline;
+        self.register_type_builder::<ComponentOutline>(Arc::new(|any_entity, _db, _cx| {
+            let outline: Entity<ComponentOutline> = any_entity
+                .downcast()
+                .expect("ComponentOutline type mismatch");
+            let mut rows: Vec<Box<dyn InspectorRow>> = outline::column_rows(outline.clone())
+                .into_iter()
+                .map(|row| Box::new(row) as Box<dyn InspectorRow>)
+                .collect();
+            rows.push(Box::new(outline::filter_bar_row(outline)));
+            rows
         }));
     }
 
@@ -574,5 +697,77 @@ impl InspectorRegistry {
                 crate::views::dashboard::dashboard_rows(entity, db.clone(), cx)
             },
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metor_db::ComponentSchema;
+    use metor_proto::types::PrimType;
+
+    /// Editing a source runs the add wizard, and what it yields stands in
+    /// for the trace: the first keeps how the old one was drawn, the rest
+    /// follow it in the list.
+    #[gpui::test]
+    fn the_wizards_traces_replace_the_edited_one_in_place(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        for name in ["a", "b", "c"] {
+            db.with_state_mut(|s| {
+                s.insert_component(
+                    ComponentId::new(name),
+                    ComponentSchema::new(PrimType::F64, &[][..]),
+                    &db.path,
+                )
+            })
+            .unwrap();
+        }
+        let palette = crate::theme::DARK.line_colors;
+        let plot = cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.new(|cx| {
+                let mut lp = LinePlot::new(db.clone(), cx);
+                let mut edited = Trace::new(ComponentId::new("a"), 0, palette[3]);
+                edited.stroke_width = 4.0;
+                let after = Trace::new(ComponentId::new("c"), 0, palette[1]);
+                lp.bind_traces(vec![edited, after], cx);
+                lp
+            })
+        });
+        cx.run_until_parked();
+        let edited = cx.update(|cx| plot.read(cx).traces()[0].clone());
+
+        cx.update(|cx| {
+            let picked = vec![
+                Trace::new(ComponentId::new("b"), 0, palette[0]),
+                Trace::new(ComponentId::new("b"), 1, palette[1]),
+            ];
+            replace_trace(&edited, picked, cx);
+        });
+        cx.update(|cx| {
+            let lp = plot.read(cx);
+            let ids: Vec<(ComponentId, usize)> = lp
+                .traces()
+                .iter()
+                .map(|t| (t.read(cx).source.id(), t.read(cx).element_index))
+                .collect();
+            assert_eq!(
+                ids,
+                vec![
+                    (ComponentId::new("b"), 0),
+                    (ComponentId::new("b"), 1),
+                    (ComponentId::new("c"), 0),
+                ]
+            );
+            let first = lp.traces()[0].read(cx);
+            assert_eq!(first.color, palette[3], "the edited trace keeps its colour");
+            assert_eq!(first.stroke_width, 4.0);
+            assert_eq!(
+                lp.traces()[1].read(cx).color,
+                palette[1],
+                "extras keep the wizard's"
+            );
+        });
     }
 }

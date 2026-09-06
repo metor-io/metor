@@ -131,7 +131,9 @@ fn dented_sources_are_survivable() {
     for source in CORPUS {
         let chars: Vec<char> = source.chars().collect();
         for at in 0..chars.len() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let dent = DENTS[(state >> 33) as usize % DENTS.len()];
 
             let mut substituted = chars.clone();
@@ -217,14 +219,15 @@ fn deeply_nested_sources_are_diagnostics() {
         assert!(compile(source).is_err(), "deep nesting must be refused");
     }
 
-    // Parentheses group without nesting the AST, so this is merely long.
+    // Parentheses group without nesting the AST, but they do nest the parser,
+    // which refuses them before a tree ever reaches the checker.
     let parens = format!(
         "def f() -> f64:\n    return {}1.0{}\n",
         "(".repeat(60_000),
         ")".repeat(60_000)
     );
     survives(&parens);
-    assert!(compile(&parens).is_ok());
+    assert!(compile(&parens).is_err(), "deep nesting must be refused");
 }
 
 /// Past the size cap the answer is a diagnostic, immediately.

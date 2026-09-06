@@ -24,6 +24,7 @@ use metor_expr::{CompSchema, Dtype, FrameSchema, Resolver, Ty};
 use metor_proto::types::{ComponentId, PrimType};
 
 /// The component tree as it stood when a compile began.
+#[derive(PartialEq)]
 pub struct DbResolver {
     components: BTreeMap<String, (ComponentId, Ty)>,
 }
@@ -36,17 +37,14 @@ impl DbResolver {
                 .filter(|(_, meta)| !meta.is_hidden())
                 .filter_map(|(id, meta)| {
                     let schema = &state.get_component(*id)?.schema;
-                    Some((meta.name.clone(), (*id, ty_of(schema.prim_type, &schema.dim)?)))
+                    Some((
+                        meta.name.clone(),
+                        (*id, ty_of(schema.prim_type, &schema.dim)?),
+                    ))
                 })
                 .collect()
         });
         DbResolver { components }
-    }
-
-    /// Every component the language can address, for the picker's expression
-    /// mode to offer as completions.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.components.keys().map(String::as_str)
     }
 
     /// The id of a component this resolver resolved.
@@ -64,9 +62,11 @@ impl DbResolver {
 
 impl Resolver for DbResolver {
     fn component(&self, path: &str) -> Option<CompSchema> {
-        self.components
-            .get(path)
-            .map(|(_, ty)| CompSchema { ty: ty.clone() })
+        self.components.get(path).map(|(_, ty)| CompSchema {
+            ty: ty.clone(),
+            // A db keeps a timestamp beside every sample.
+            timestamp: true,
+        })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {
@@ -83,6 +83,11 @@ impl Resolver for DbResolver {
     /// `bind=` target can name a frame the host already defines.
     fn frame(&self, _name: &str) -> Option<FrameSchema> {
         None
+    }
+
+    /// Every component the language can address, for completion to offer.
+    fn paths(&self) -> Vec<String> {
+        self.components.keys().cloned().collect()
     }
 }
 

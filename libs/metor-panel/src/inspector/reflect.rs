@@ -174,7 +174,7 @@ pub fn set_enum_variant(
 }
 
 /// Low-level enum write. Returns `false` when `field_idx` is not an enum,
-/// the variant name is unknown, or the discriminant type is unsupported.
+/// any variant has a payload, the name is unknown, or the repr is unsupported.
 fn set_enum_by_name(
     ps: &mut PokeStruct<'_, 'static>,
     field_idx: usize,
@@ -186,6 +186,14 @@ fn set_enum_by_name(
     let Ok(poke_enum) = field_poke.into_enum() else {
         return false;
     };
+    // A discriminant-only write cannot initialize or drop variant payloads.
+    if poke_enum
+        .variants()
+        .iter()
+        .any(|v| !v.data.fields.is_empty())
+    {
+        return false;
+    }
     let enum_repr = poke_enum.enum_repr();
     let Some(variant) = poke_enum.variants().iter().find(|v| v.name == variant_name) else {
         return false;
@@ -198,15 +206,84 @@ fn set_enum_by_name(
     let data = inner.data_mut();
     match enum_repr {
         facet::EnumRepr::U8 => unsafe {
+            // SAFETY: all variants are fieldless, the discriminant belongs to a
+            // declared variant, and repr(u8) stores its tag at offset zero.
             data.as_mut_byte_ptr().write(discriminant as u8);
         },
         facet::EnumRepr::U16 => unsafe {
+            // SAFETY: as above; repr(u16) also guarantees tag alignment.
             (data.as_mut_byte_ptr() as *mut u16).write(discriminant as u16);
         },
         facet::EnumRepr::U32 => unsafe {
+            // SAFETY: as above; repr(u32) also guarantees tag alignment.
             (data.as_mut_byte_ptr() as *mut u32).write(discriminant as u32);
         },
         _ => return false,
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Facet, Debug, PartialEq)]
+    #[repr(u8)]
+    enum Mode {
+        Off,
+        Named(String),
+    }
+
+    #[derive(Facet)]
+    struct Config {
+        mode: Mode,
+    }
+
+    #[test]
+    fn discriminant_edits_refuse_payload_enums_in_both_directions() {
+        let mut config = Config { mode: Mode::Off };
+        assert!(!set_enum_by_name(
+            &mut facet::Poke::new(&mut config).into_struct().unwrap(),
+            0,
+            "Named"
+        ));
+        assert_eq!(config.mode, Mode::Off);
+        config.mode = Mode::Named("retained".into());
+        assert!(!set_enum_by_name(
+            &mut facet::Poke::new(&mut config).into_struct().unwrap(),
+            0,
+            "Off"
+        ));
+        assert_eq!(config.mode, Mode::Named("retained".into()));
+    }
+
+    #[derive(Facet, Debug, PartialEq)]
+    #[repr(u16)]
+    enum Choice {
+        First = 3,
+        Second = 300,
+    }
+    #[derive(Facet)]
+    struct Plain {
+        choice: Choice,
+    }
+
+    #[test]
+    fn fieldless_enum_edits_preserve_explicit_discriminants() {
+        let mut config = Plain {
+            choice: Choice::First,
+        };
+        assert!(set_enum_by_name(
+            &mut facet::Poke::new(&mut config).into_struct().unwrap(),
+            0,
+            "Second"
+        ));
+        assert_eq!(config.choice, Choice::Second);
+        assert!(!set_enum_by_name(
+            &mut facet::Poke::new(&mut config).into_struct().unwrap(),
+            0,
+            "Missing"
+        ));
+        assert_eq!(config.choice, Choice::Second);
+    }
 }

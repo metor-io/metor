@@ -13,8 +13,8 @@
 //! `(op, args, parents)` always yields the same `NodeId` and an edit rebuilds
 //! only what actually changed.
 
-mod node;
 pub mod expressions;
+mod node;
 pub mod ops;
 pub mod resolver;
 pub mod tensor;
@@ -25,7 +25,7 @@ mod expression_tests;
 
 pub use node::{
     BuildError, DynamicNode, DynamicNodeExt, NodeGrant, NodeId, NodeImpl, NodeReader, ValueType,
-    default_ring_bytes, hash_id, op_tag, require_clock, require_value, write_sample,
+    default_ring_bytes, hash_id, op_tag, require_value, write_sample,
 };
 pub use tensor::TypedScalar;
 

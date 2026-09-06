@@ -14,7 +14,7 @@ use metor_db::{Component, DB};
 
 use crate::views::plot_common::reconcile_trackers;
 use crate::views::time_series::{
-    AxisSource, LineDraw, Override, PlotBounds, PlotRenderState, expand_latest_sample_bounds,
+    AxisSource, LineDraw, Override, PlotBounds, PlotRenderState, expand_sample_bounds,
 };
 use crate::wait_for_component;
 
@@ -24,6 +24,7 @@ use super::ListTrace;
 struct ListTraceTracking {
     component: Option<Component>,
     y_bounds: Option<(f64, f64)>,
+    sample: Option<crate::temporal::samples::SelectedSample>,
 }
 
 impl ListTraceTracking {
@@ -31,6 +32,7 @@ impl ListTraceTracking {
         Self {
             component: None,
             y_bounds: None,
+            sample: None,
         }
     }
 }
@@ -67,9 +69,13 @@ pub struct ListLinePlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     tracking: HashMap<EntityId, ListTraceTracking>,
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
+    #[facet(opaque)]
+    inputs: crate::data_binding::InputChanges,
     #[facet(opaque)]
     view_override: Option<PlotBounds>,
     #[facet(opaque)]
@@ -78,6 +84,8 @@ pub struct ListLinePlot {
     title_cache: SharedString,
     #[facet(opaque)]
     gpu_state: PlotRenderState,
+    #[facet(skip)]
+    temporal_revision: u64,
 }
 
 impl ListLinePlot {
@@ -90,9 +98,11 @@ impl ListLinePlot {
             y_min_override: Override::Auto,
             y_max_override: Override::Auto,
             custom_title: Override::Auto,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
+            inputs: Default::default(),
             view_override: None,
             last_overrides: OverrideSnapshot {
                 x_min: None,
@@ -102,11 +112,28 @@ impl ListLinePlot {
             },
             title_cache: "List Plot".into(),
             gpu_state: PlotRenderState::default(),
+            temporal_revision: 0,
         }
     }
 
     pub fn bind_traces(&mut self, traces: Vec<ListTrace>, cx: &mut Context<Self>) {
-        self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
+        self.traces = traces
+            .into_iter()
+            .map(|mut t| {
+                t.source.resolve(&self.db, cx);
+                cx.new(|_| t)
+            })
+            .collect();
+        cx.notify();
+    }
+
+    /// Forget what `trace` was tracking, so the next reconcile follows the
+    /// component it names now — the inspector's rebind, after the tracker
+    /// latched its component at start.
+    pub fn rebind_trace(&mut self, trace: &Entity<ListTrace>, cx: &mut Context<Self>) {
+        let id = trace.entity_id();
+        self.tracking.remove(&id);
+        self.tasks.remove(&id);
         cx.notify();
     }
 
@@ -122,6 +149,46 @@ impl ListLinePlot {
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        for trace in &self.traces {
+            trace.update(cx, |trace, cx| {
+                trace.source.resolve(&self.db, cx);
+                if let Some(len) = self.db.with_state(|s| {
+                    s.get_component(trace.source.id())
+                        .map(|c| c.schema.dim.iter().product::<usize>().max(1))
+                }) {
+                    trace.len = len;
+                }
+            });
+        }
+
+        // Point each trace back at this plot so its inspector page can reach
+        // the plot to rebind. Mutating without notifying cannot re-enter
+        // reconcile: the plot does not observe its traces.
+        let self_weak = cx.entity().downgrade();
+        let self_id = cx.entity().entity_id();
+        for trace in &self.traces {
+            trace.update(cx, |t, _| {
+                let linked = t
+                    .line_plot
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .map(|e| e.entity_id());
+                if linked != Some(self_id) {
+                    t.line_plot = Some(self_weak.clone());
+                }
+            });
+        }
+
+        for id in self.inputs.changed(
+            &self.traces,
+            &self.db,
+            |trace| vec![(trace.source.id(), trace.len)],
+            cx,
+        ) {
+            self.tracking.remove(&id);
+            self.tasks.remove(&id);
+        }
+
         let db = self.db.clone();
         reconcile_trackers(
             &self.traces,
@@ -210,7 +277,7 @@ impl ListLinePlot {
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let component_id = match this.update(cx, |_, cx| trace.read(cx).component_id) {
+            let component_id = match this.update(cx, |_, cx| trace.read(cx).source.id()) {
                 Ok(id) => id,
                 Err(_) => return,
             };
@@ -228,34 +295,47 @@ impl ListLinePlot {
                 return;
             }
 
+            let Ok(reader) = this.update(cx, |_, cx| {
+                crate::temporal::samples::acquire(db.clone(), component_id, cx)
+            }) else {
+                return;
+            };
+            let Ok(changed) = this.update(cx, |_, cx| reader.read(cx).changed.clone()) else {
+                return;
+            };
             loop {
-                let inputs = this.update(cx, |lp, cx| {
-                    let tracking = lp.tracking.get_mut(&id)?;
-                    let comp = tracking.component.clone()?;
-                    let len = trace.read(cx).len;
-                    Some((comp, len))
+                let revision = changed.latest();
+                let inputs = this.update(cx, |_, cx| {
+                    (reader.read(cx).selection.sample.clone(), trace.read(cx).len)
                 });
-                let Ok(Some((comp, len))) = inputs else {
+                let Ok((sample, len)) = inputs else {
                     break;
                 };
-
+                let comp = component.clone();
+                let bytes = sample.as_ref().map(|s| s.bytes.clone());
                 let bounds = cx
                     .background_executor()
-                    .spawn(async move { expand_latest_sample_bounds(&comp, len) })
+                    .spawn(async move {
+                        bytes.and_then(|bytes| expand_sample_bounds(&comp, len, &bytes))
+                    })
                     .await;
-
                 let installed = this.update(cx, |lp, cx| {
+                    if changed.latest() != revision {
+                        return true;
+                    }
                     let Some(tracking) = lp.tracking.get_mut(&id) else {
                         return false;
                     };
                     tracking.y_bounds = bounds;
+                    tracking.sample = sample;
+                    lp.gpu_state.clear_frame();
                     cx.notify();
                     true
                 });
                 if !matches!(installed, Ok(true)) {
                     break;
                 }
-                component.time_series.wait().await;
+                changed.wait_for(|next| next != revision).await;
             }
         })
     }
@@ -263,6 +343,24 @@ impl ListLinePlot {
 
 impl Render for ListLinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let revision = crate::temporal::snapshot(cx).map_or(0, |s| s.revision);
+        if revision != self.temporal_revision {
+            self.temporal_revision = revision;
+            self.gpu_state.clear_frame();
+            for tracking in self.tracking.values_mut() {
+                let selected = tracking
+                    .component
+                    .as_ref()
+                    .and_then(|c| crate::temporal::samples::current(&self.db, c.component_id, cx))
+                    .and_then(|s| s.sample);
+                if tracking.sample.as_ref().map(|s| (s.timestamp, &s.bytes))
+                    != selected.as_ref().map(|s| (s.timestamp, &s.bytes))
+                {
+                    tracking.sample = None;
+                    tracking.y_bounds = None;
+                }
+            }
+        }
         let weak = cx.entity().downgrade();
         canvas(
             move |bounds, window, cx| {
@@ -284,6 +382,7 @@ impl Render for ListLinePlot {
                                         x: AxisSource::LatestSampleIndex { len: config.len },
                                         y: AxisSource::LatestSampleElements {
                                             component,
+                                            sample: &tracking.sample.as_ref()?.bytes,
                                             len: config.len,
                                         },
                                         y_min: view.min_y,
@@ -292,6 +391,7 @@ impl Render for ListLinePlot {
                                         color: config.color,
                                         stroke_width: config.stroke_width,
                                         x_clip: None,
+                                        time_clip: None,
                                     })
                                 })
                                 .collect();

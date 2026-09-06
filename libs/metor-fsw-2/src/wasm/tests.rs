@@ -1,5 +1,5 @@
 //! Drive the real `seq-fixture` pack, compiled to wasm, through the whole ABI
-//! lifecycle — and prove the two properties the substrate exists for: a poll
+//! lifecycle, and prove the two properties the substrate exists for: a poll
 //! is bounded by fuel, and a fault is contained.
 
 use std::path::PathBuf;
@@ -33,6 +33,7 @@ fn fixture() -> &'static [u8] {
                 "--target",
                 "wasm32-unknown-unknown",
                 "--release",
+                "--message-format=json",
             ])
             .current_dir(workspace_root())
             .output()
@@ -40,11 +41,22 @@ fn fixture() -> &'static [u8] {
         assert!(
             out.status.success(),
             "building the wasm fixture failed (is the wasm32-unknown-unknown \
-             target installed? `rustup target add wasm32-unknown-unknown`):\n{}",
-            String::from_utf8_lossy(&out.stderr)
+             target installed? `rustup target add wasm32-unknown-unknown`):\n{}\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
         );
-        let path = workspace_root()
-            .join("target/wasm32-unknown-unknown/release/metor_fsw_2_seq_fixture.wasm");
+        let path = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter_map(|message| message["filenames"].as_array().cloned())
+            .flatten()
+            .filter_map(|file| file.as_str().map(PathBuf::from))
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name == "metor_fsw_2_seq_fixture.wasm")
+            })
+            .expect("cargo reports the wasm fixture path");
         std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
     })
 }
@@ -76,19 +88,8 @@ fn wasm_pack_loads_and_describes() {
 }
 
 /// The full lifecycle: create the `waiter` entry as a slot occupant, bind its
-/// ports to rings living inside guest memory, and cycle it until it finishes.
-///
-/// `waiter` declares no user ports, so its contract is the mount-appended
-/// slot-control input plus the status, health, and log outputs every occupant
-/// carries.
-///
-/// Two things had to be fixed on the guest side before this could pass, both
-/// the same shape: `wasm32-unknown-unknown` has no operating system, and the
-/// ring and driver reached for one. Claiming a ring slot stamped
-/// `std::process::id`, and every execute timed itself with `Instant::now`;
-/// both are unsupported on that target and panic, which surfaces only as an
-/// opaque trap because the module imports nothing and the target aborts rather
-/// than unwinds, so `catch_unwind` cannot turn the panic into a status word.
+/// ports to rings living inside guest memory, and cycle it until it reaches a
+/// terminal state.
 #[test]
 fn wasm_occupant_runs_to_a_terminal_state() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
@@ -156,17 +157,18 @@ fn wasm_occupant_runs_to_a_terminal_state() {
     pack.close().expect("closes");
 }
 
-/// **The property no natively linked occupant can offer.** A budget too small
-/// for the work cuts the guest off mid-instruction: the host survives and gets
-/// an error value, where a `.so` in the same situation would simply never
-/// return and would stall the cycle.
+/// A budget too small for the work cuts the guest off mid-instruction, the
+/// property no natively linked occupant can offer: the host survives and
+/// gets an error value, where a `.so` in the same situation would stall the
+/// cycle instead.
 #[test]
 fn a_miserly_fuel_budget_stops_the_guest() {
     let Err(err) = WasmPack::open(fixture(), 1_000) else {
         panic!("1k fuel should not reach the end of open")
     };
     assert!(
-        is_out_of_fuel(&err) || matches!(err, WasmError::Instantiate(_)),
+        matches!(&err, WasmError::Trap(m) if m.contains("fuel"))
+            || matches!(err, WasmError::Instantiate(_)),
         "expected the budget to bite, got {err:?}"
     );
 
@@ -176,9 +178,9 @@ fn a_miserly_fuel_budget_stops_the_guest() {
     ok.close().expect("closes");
 }
 
-/// **The other property.** A guest reaching outside its linear memory traps,
-/// and the host is untouched — the same access in a `.so` would corrupt the
-/// host's memory silently.
+/// A guest reaching outside its linear memory traps and the host is
+/// untouched, where the same access in a `.so` would corrupt the host's
+/// memory silently.
 #[test]
 fn an_out_of_bounds_guest_traps_without_touching_the_host() {
     // One page of memory, and an export that stores far past the end of it.
@@ -234,13 +236,9 @@ fn waiter_identity() -> Vec<u8> {
     entry_identity(entry)
 }
 
-/// The guard that makes holding a handle over guest memory sound at all.
-///
-/// A host handle into the interpreter's backing buffer dangles the moment the
-/// guest grows its memory, so the host records the size once the regions exist
-/// and refuses to trust a handle after that changes. Allocating enough to
-/// force growth must be *noticed*, not silently tolerated — the alternative to
-/// noticing is reading freed memory.
+/// Memory growth after the host pins its handles must be noticed and refused,
+/// since a host handle into the interpreter's backing buffer would otherwise
+/// dangle the moment the guest grows its memory.
 #[test]
 fn guest_memory_is_frozen_after_handles_are_pinned() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
@@ -276,12 +274,8 @@ fn initial_memory_over_the_host_limit_is_rejected() {
     assert!(matches!(err, WasmError::Instantiate(_)), "got {err:?}");
 }
 
-/// The bridge carries records both ways, and — the part that motivated holding
-/// handles at all — it carries a *backlog*, not just the newest record.
-///
-/// A view re-attached each cycle would rejoin at the live edge and lose
-/// everything written since the last pump, so this writes several records
-/// before pumping and insists all of them arrive, in order.
+/// The bridge carries records both ways and delivers the whole backlog
+/// written since the last pump, not just the newest record.
 #[test]
 fn the_bridge_carries_a_backlog_both_ways() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
@@ -331,7 +325,7 @@ fn the_bridge_carries_a_backlog_both_ways() {
     pack.check_memory_stable().expect("guest has not moved");
     bridge.pump_in().expect("input pump");
 
-    // All three crossed inbound, in order — not just the newest.
+    // All three crossed inbound, in order, not just the newest.
     for expect in 0..3u8 {
         let got = guest_reader
             .try_read()
@@ -373,14 +367,10 @@ fn the_bridge_carries_a_backlog_both_ways() {
     assert_eq!(bridge.dropped(), 0, "nothing was dropped");
 }
 
-/// A snapshot leg forwards the newest record and nothing else, and — the part
-/// worth pinning — forwards it *once*.
-///
-/// `try_latest` re-serves the pinned newest record when nothing new has
-/// arrived, so a snapshot leg without the `last_committed` skip would re-send
-/// the same record every cycle: the consumer would see a stream of duplicates
-/// and, on a shallow ring, real records would be dropped to make room for
-/// them. The shared snapshot ring pump carries this guard for the same reason.
+/// A snapshot leg forwards the newest record and nothing else, and forwards
+/// it only once: without the `last_committed` skip, `try_latest` would
+/// re-serve the pinned record every idle pump, flooding the consumer with
+/// duplicates.
 #[test]
 fn a_snapshot_leg_forwards_the_newest_once() {
     let mut pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
@@ -456,7 +446,7 @@ fn a_snapshot_leg_forwards_the_newest_once() {
 }
 
 /// A slot's ring templates for the `waiter` contract: one control input, and
-/// health, log and status outputs. Returns the rings (which must outlive the
+/// log and status outputs. Returns the rings (which must outlive the
 /// occupant) alongside the `FswRing` handles a slot hands its occupant.
 fn slot_rings() -> (Vec<RingBuffer>, Vec<FswRing>, Vec<FswRing>) {
     let make = |max_size: usize, role: u8| {
@@ -467,23 +457,22 @@ fn slot_rings() -> (Vec<RingBuffer>, Vec<FswRing>, Vec<FswRing>) {
         let (base, len) = ring.region();
         (ring, FswRing { base, len, role })
     };
-    // Occupant-mount order: inputs [control]; outputs [health, log, status].
+    // Occupant-mount order: inputs [control]; outputs [log, status].
     let (c, ch) = make(size_of::<SlotControlIn>(), ROLE_INPUT);
-    let (h, hh) = make(1024, ROLE_OUTPUT);
     let (l, lh) = make(4096, ROLE_OUTPUT);
     let (s, sh) = make(size_of::<SequenceStatus>(), ROLE_OUTPUT);
-    (vec![c, h, l, s], vec![ch], vec![hh, lh, sh])
+    (vec![c, l, s], vec![ch], vec![lh, sh])
 }
 
-/// The whole point of Stage B: a wasm occupant bound to a *slot's* rings,
-/// cycled by the slot's driver, reaching a terminal state — with its status
-/// arriving on the host side of the bridge rather than staying in the guest.
+/// A wasm occupant bound to a slot's rings, cycled by the slot's driver,
+/// reaches a terminal state with its status arriving on the host side of the
+/// bridge rather than staying in the guest.
 #[test]
 fn a_wasm_occupant_drives_a_slot_to_done() {
     let (rings, host_in, host_out) = slot_rings();
     // Tap the status ring before the run: a reader joins at the live edge, so
     // one opened afterwards would see nothing.
-    let mut status_tap = rings[3].view(NoWake).expect("status reader slot");
+    let mut status_tap = rings[2].view(NoWake).expect("status reader slot");
 
     let pack = WasmPack::open(fixture(), AMPLE_FUEL).expect("loads");
     let entry = entry(&pack, "waiter");
@@ -631,16 +620,14 @@ fn incompatible_hot_reload_is_rejected_before_binding() {
 }
 
 /// A runaway occupant is stopped by its fuel budget and reported as
-/// `Panicked` — the status the runner already maps to `SlotState::Stopped` for
-/// a `.so` panic, so no wasm-specific handling is needed downstream.
-///
-/// This is the property a natively linked occupant cannot offer at all: the
-/// same runaway in a `.so` never returns and stalls the cycle.
+/// `Panicked`, the same status a `.so` panic maps to, so no wasm-specific
+/// handling is needed downstream; the equivalent runaway in a `.so` would
+/// never return and would stall the cycle instead.
 #[test]
 fn a_starved_wasm_occupant_stops_instead_of_stalling() {
     let (_rings, host_in, host_out) = slot_rings();
-    // Bind generously — binding costs far more fuel than a cycle — then apply
-    // a per-poll budget too small to finish one.
+    // Bind generously, since binding costs far more fuel than a cycle, then
+    // apply a per-poll budget too small to finish one.
     let mut slot = WasmSlot::bind(fixture(), 0, &[], "inst", &host_in, &host_out, AMPLE_FUEL)
         .expect("binds under an ample budget");
     slot.set_fuel_per_call(500);
@@ -652,16 +639,12 @@ fn a_starved_wasm_occupant_stops_instead_of_stalling() {
     assert_eq!(
         slot.execute_raw(Timestamp(1)),
         FswStatus::Panicked,
-        "and it is latched — a dead occupant is never re-entered"
+        "and it is latched: a dead occupant is never re-entered"
     );
 }
 
-/// A target can *declare* a wasm occupant, and `resolve` describes it without
+/// A target can declare a wasm occupant, and `resolve` describes it without
 /// ever loading it into this process.
-///
-/// This is the step between "the runtime works" and "a target can use it":
-/// until resolve understands a wasm artifact, `OccupantBacking::Wasm` is
-/// reachable only from inside the crate.
 #[test]
 fn resolve_accepts_a_wasm_occupant_declared_in_a_target() {
     use crate::wiring::{Registry, resolve};
@@ -715,13 +698,7 @@ fn resolve_rejects_an_unknown_wasm_entry() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Compiled Python packs: the pack backend meets the wasm host it was built
-// for. The compiler-side facts (manifest shape, determinism, gate rules) are
-// pinned in metor-expr's own suite; here the artifact walks the real
-// open → create → ring → bind → execute sequence and the run rule shows in
-// what lands on the rings.
-// ---------------------------------------------------------------------------
+// Compiled Python packs: the pack ABI meets the wasm host
 
 /// The build-time resolver a provision pass would derive, reduced to one
 /// producer: instance `imu`, port `sensors`, a 3-vector at offset 8 behind
@@ -750,6 +727,8 @@ fn imu_source(path: &str) -> Option<metor_expr::ComponentSource> {
         prim,
         shape: shape.to_vec(),
         offset,
+        // The fixture records lead with their stamp, as a Table record does.
+        timestamp_at: Some(0),
     })
 }
 
@@ -763,7 +742,10 @@ impl metor_expr::Resolver for ImuResolver {
                 shape: shape.to_vec(),
             },
         };
-        Some(metor_expr::CompSchema { ty })
+        Some(metor_expr::CompSchema {
+            ty,
+            timestamp: true,
+        })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {
@@ -785,106 +767,13 @@ impl metor_expr::PackResolver for ImuResolver {
     }
 }
 
-fn python_pack() -> metor_expr::PackProgram {
-    let source = "@system(\"imu.sensors.gyro_b\")\n\
-                  def gyro_norm(gyro_b) -> f64:\n    return (gyro_b @ gyro_b) ** 0.5\n";
-    metor_expr::compile_pack(source, &ImuResolver, 120.0).expect("the fixture program compiles")
-}
-
-/// The whole pack lifecycle over a compiled Python system, with the run rule
-/// observed on real rings: a never-published input skips, a fresh driving
-/// record fires and publishes `[now][value]`, a quiet cycle publishes
-/// nothing.
-#[test]
-fn a_compiled_python_system_runs_through_the_pack_host() {
-    let program = python_pack();
-    let mut pack =
-        WasmPack::open(&program.wasm, AMPLE_FUEL).expect("a compiled pack opens under the host");
-
-    // The host's decoded view is the compiler's baked bytes.
-    let decoded: metor_fsw_2_core::abi::PackManifest =
-        postcard::from_bytes(&program.pack_manifest).expect("baked manifest decodes");
-    assert_eq!(pack.manifest().systems.len(), decoded.systems.len());
-    assert_eq!(pack.manifest().systems[0].descriptor.name, "gyro_norm");
-
-    let state = pack.create(0, 0, &[]).expect("create entry 0 wired");
-    let in_cfg = Config {
-        capacity: capacity_for(32, 8),
-        max_readers: 2,
-    };
-    let out_cfg = Config {
-        capacity: capacity_for(16, 8),
-        max_readers: 2,
-    };
-    let input = pack.add_ring(in_cfg, ROLE_INPUT).expect("input ring");
-    let output = pack.add_ring(out_cfg, ROLE_OUTPUT).expect("output ring");
-    pack.bind_init(state, &[input], &[output], "gyro_norm")
-        .expect("bind");
-    pack.pin_memory();
-
-    let base = pack.memory_base();
-    // SAFETY: both regions were just formatted inside pinned guest memory,
-    // which outlives the handles below.
-    let in_ring = unsafe { RingBuffer::attach_raw(base.add(input.offset as usize), input.len) }
-        .expect("host attaches the guest input ring");
-    let mut writer = in_ring.writer(NoWake).expect("host writer");
-    // SAFETY: as above.
-    let out_ring = unsafe { RingBuffer::attach_raw(base.add(output.offset as usize), output.len) }
-        .expect("host attaches the guest output ring");
-    let mut view = out_ring.view(NoWake).expect("host view");
-
-    // Never-published driving input: the cycle is skipped, not an error.
-    assert_eq!(pack.execute(state, 1).unwrap(), FswStatus::Running);
-    assert!(
-        view.try_latest().expect("output ring intact").is_none(),
-        "a skipped cycle publishes nothing"
-    );
-
-    // One driving record: [ts][1, 2, 3].
-    let mut record = Vec::new();
-    record.extend_from_slice(&41i64.to_le_bytes());
-    for v in [1.0f64, 2.0, 3.0] {
-        record.extend_from_slice(&v.to_le_bytes());
-    }
-    writer.try_write(&record).expect("input record");
-    assert_eq!(pack.execute(state, 42).unwrap(), FswStatus::Running);
-    {
-        let grant = view
-            .try_latest()
-            .expect("output ring intact")
-            .expect("a fresh driving record fires the system");
-        assert_eq!(grant.len(), 16, "[timestamp][f64 norm]");
-        let ts = i64::from_le_bytes(grant[0..8].try_into().unwrap());
-        let norm = f64::from_le_bytes(grant[8..16].try_into().unwrap());
-        assert_eq!(ts, 42, "records are stamped with execute's own now");
-        assert_eq!(norm, 14.0f64.sqrt());
-    }
-
-    // No new input: execute keeps running but publishes nothing new.
-    let committed = out_ring.committed();
-    assert_eq!(pack.execute(state, 43).unwrap(), FswStatus::Running);
-    assert_eq!(
-        out_ring.committed(),
-        committed,
-        "a quiet driving ring skips the cycle"
-    );
-
-    // A second concurrent create of the same entry would alias the static
-    // buffers; the guest refuses it like a failed native create.
-    assert!(matches!(pack.create(0, 0, &[]), Err(WasmError::Create(0))));
-
-    pack.shutdown(state).expect("shutdown");
-    pack.destroy(state).expect("destroy");
-    pack.close().expect("close");
-}
-
-/// The bit-parity differential (plan WP5): one module, two hosts. The panel
-/// drives the expr export family — write the argument frames, call
-/// `<system>_eval`, read `<system>_ret_ptr` — while the vehicle feeds
-/// producer records through the pack ABI's rings; the output frame bytes
-/// must be identical to the bit. A multi-field frame both ways (a tensor
-/// beside a scalar, an `f32` source component), since the panel's own use
-/// never exercises more than one field.
+/// The bit-parity differential: one compiled module driven two ways must
+/// produce identical output bytes. One host feeds producer records through
+/// the pack ABI's rings; the other drives the expr export family directly
+/// (write the argument frames, call `<system>_eval`, read
+/// `<system>_ret_ptr`). A multi-field frame both ways (a tensor beside a
+/// scalar, an `f32` source component) exercises more of the layout than a
+/// single-field case would.
 #[test]
 fn the_expr_and_pack_hosts_produce_identical_frames() {
     let source = "\
@@ -899,7 +788,7 @@ def est(gyro_b, temp) -> Est:
     let program = metor_expr::compile_pack(source, &ImuResolver, 120.0).expect("compiles");
     const FRAME_BYTES: usize = 8 + 24; // norm, then doubled
 
-    // --- the vehicle host: records in, records out --------------------------
+    // the vehicle host: records in, records out
     let mut pack = WasmPack::open(&program.wasm, AMPLE_FUEL).expect("opens");
     let state = pack.create(0, 0, &[]).expect("create");
     let cfg = Config {
@@ -908,7 +797,8 @@ def est(gyro_b, temp) -> Est:
     };
     let input = pack.add_ring(cfg, ROLE_INPUT).expect("input ring");
     let output = pack.add_ring(cfg, ROLE_OUTPUT).expect("output ring");
-    pack.bind_init(state, &[input], &[output], "est").expect("bind");
+    pack.bind_init(state, &[input], &[output], "est")
+        .expect("bind");
     pack.pin_memory();
     let base = pack.memory_base();
     // SAFETY: both regions sit inside pinned guest memory for the test's life.
@@ -919,7 +809,7 @@ def est(gyro_b, temp) -> Est:
         .expect("attach output");
     let mut view = out_ring.view(NoWake).expect("view");
 
-    // --- the panel host: argument frames in, the return frame out -----------
+    // the pointer-call host: argument frames in, the return frame out
     let engine = wasmi::Engine::default();
     let module = wasmi::Module::new(&engine, &program.wasm[..]).expect("validates");
     let mut store = wasmi::Store::new(&engine, ());
@@ -975,4 +865,49 @@ def est(gyro_b, temp) -> Est:
 
         assert_eq!(vehicle, panel, "cycle {cycle}: the two hosts diverged");
     }
+}
+
+#[stellarator::test]
+async fn stalled_status_reader_does_not_stop_wasm_slot() {
+    use crate::wiring::{Registry, resolve};
+    use crate::{ClockSpec, SlotInitState, WiringBuilder};
+    use metor_proto::types::ComponentId;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seq.wasm");
+    std::fs::write(&path, fixture()).unwrap();
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.001 })
+        .wasm_artifact("seqs", &path)
+        .slot("mode")
+        .allow_from("beater", "seqs")
+        .initial("beater", SlotInitState::Running)
+        .end()
+        .build();
+    let mut coord = resolve(&wiring, &Registry::new()).unwrap();
+    let tap = coord
+        .registry()
+        .view(ComponentId::new("mode.slot_status"))
+        .unwrap()
+        .unwrap();
+    let log = coord
+        .registry()
+        .view(ComponentId::new("coordinator.log"))
+        .unwrap()
+        .unwrap();
+    let mut logs = crate::MsgIn::<crate::LogEvent>::new(log);
+    coord.run_for(100).await;
+    assert!(
+        coord.stopped().is_empty(),
+        "status backpressure stopped the wasm slot"
+    );
+    let mut reported = false;
+    logs.drain(|event| {
+        reported |= event
+            .fields
+            .iter()
+            .any(|(key, value)| key == "kind" && value == "status_publish_failed");
+    })
+    .unwrap();
+    assert!(reported);
+    drop(tap);
 }

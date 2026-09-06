@@ -47,13 +47,19 @@ pub(super) fn build_component_picker(
     idx: usize,
     _cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(db.clone(), {
+    let commit: crate::inspector::rows::OnExpression = {
         let any_entity = any_entity.clone();
         Arc::new(move |id, _text, _w, cx| {
             crate::inspector::reflect::set_field::<ComponentId>(&any_entity, idx, id, cx);
             RowAction::Dismiss
         })
-    }))];
+    };
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(ExpressionRow::new(
+        db.clone(),
+        commit.clone(),
+        ExpressionRow::commit_component_row(commit),
+        None,
+    ))];
     rows.extend(
         crate::inspector::trace_picker::list_components(db)
             .into_iter()
@@ -72,6 +78,27 @@ pub(super) fn build_component_picker(
                 )) as Box<dyn InspectorRow>
             }),
     );
+    rows
+}
+
+/// Every data input commits its source and running owner as one value.
+pub(super) fn build_binding_picker(
+    db: &Arc<DB>,
+    entity: AnyEntity,
+    idx: usize,
+) -> Vec<Box<dyn InspectorRow>> {
+    use crate::data_binding::Binding;
+    let target = entity.clone();
+    let mut rows =
+        crate::inspector::trace_picker::binding_picker_rows(db.clone(), move |binding, cx| {
+            crate::inspector::reflect::set_field(&target, idx, binding, cx);
+        });
+    rows.push(Box::new(CommandRow::new(
+        "Clear",
+        Arc::new(move |_, cx| {
+            crate::inspector::reflect::set_field(&entity, idx, Binding::default(), cx);
+        }),
+    )));
     rows
 }
 
@@ -185,8 +212,7 @@ pub(super) fn build_option_row(
                 )));
             } else {
                 let any_expr = any_entity.clone();
-                rows.push(Box::new(ExpressionRow::new(
-                    db.clone(),
+                let commit: crate::inspector::rows::OnExpression =
                     Arc::new(move |id, _text, _w, cx| {
                         crate::inspector::reflect::set_field::<Option<ComponentId>>(
                             &any_expr,
@@ -195,7 +221,12 @@ pub(super) fn build_option_row(
                             cx,
                         );
                         RowAction::Dismiss
-                    }),
+                    });
+                rows.push(Box::new(ExpressionRow::new(
+                    db.clone(),
+                    commit.clone(),
+                    ExpressionRow::commit_component_row(commit),
+                    None,
                 )));
                 for (id, name) in crate::inspector::trace_picker::list_components(&db) {
                     let any_entity = any_entity.clone();
@@ -243,7 +274,7 @@ pub(super) fn build_trace_add_wizard(
             let new_entities: Vec<_> = traces.into_iter().map(|t| cx.new(|_| t)).collect();
             parent.update(cx, |lp, cx| {
                 lp.traces.extend(new_entities);
-                cx.notify();
+                lp.configuration_changed(cx);
             });
         });
 
@@ -318,6 +349,31 @@ pub(super) fn build_list_trace_add_wizard(
     crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
         db.clone(),
         color_basis,
+        on_select,
+    )
+}
+
+/// Spectrogram counterpart to [`build_list_trace_add_wizard`]. There is no
+/// colour basis to carry: a spectrogram source is coloured by its colormap.
+pub(super) fn build_spectrogram_trace_add_wizard(
+    parent: gpui::AnyEntity,
+    db: &Arc<DB>,
+    _cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    use crate::views::spectrogram::SpectrogramPlot;
+    let on_select: crate::views::spectrogram::trace_picker::OnSpectrogramTraceSelected =
+        Arc::new(move |trace, _w, cx| {
+            let parent: Entity<SpectrogramPlot> =
+                parent.clone().downcast().expect("parent type mismatch");
+            let new_entity = cx.new(|_| trace);
+            parent.update(cx, |plot, cx| {
+                plot.traces.push(new_entity);
+                cx.notify();
+            });
+        });
+
+    crate::views::spectrogram::trace_picker::select_spectrogram_trace_wizard_rows(
+        db.clone(),
         on_select,
     )
 }

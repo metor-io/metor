@@ -90,13 +90,21 @@ pub(super) fn agrees_over(
 pub(super) fn py_floordiv(a: i64, b: i64) -> i64 {
     let q = a.wrapping_div(b);
     let r = a.wrapping_rem(b);
-    if r != 0 && (r < 0) != (b < 0) { q - 1 } else { q }
+    if r != 0 && (r < 0) != (b < 0) {
+        q - 1
+    } else {
+        q
+    }
 }
 
 /// Python's `%` on integers, whose sign follows the divisor.
 pub(super) fn py_rem(a: i64, b: i64) -> i64 {
     let r = a.wrapping_rem(b);
-    if r != 0 && (r < 0) != (b < 0) { r + b } else { r }
+    if r != 0 && (r < 0) != (b < 0) {
+        r + b
+    } else {
+        r
+    }
 }
 
 #[test]

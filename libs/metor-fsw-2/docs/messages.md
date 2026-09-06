@@ -117,10 +117,9 @@ The fallible calls return an error:
 The publish calls keep the system step running:
 
 - `Output::publish`
-- `Output::publish_with`
 - `MsgOut::publish`
 
-A publish call drops the new record when the ring is full or too small. It adds to the port's drop count. Cyclic drivers turn a nonzero count into a `publish_dropped` health error after the step.
+A publish call drops the new record when the ring is full or too small. It adds to the port's drop count. Cyclic drivers turn a nonzero count into one `publish_dropped` fault line on the log after the step.
 
 Log delivery does not make writes block. It tells readers and broad taps to drain records instead of taking only the newest one.
 
@@ -128,11 +127,11 @@ Use the fallible call when the producer must choose what to do after a failed wr
 
 ```rust
 if output.write(&frame).is_err() {
-    health.error("output_full");
+    log.fault(LogLevel::Warn, "output_full", "estimate ring full", &[]);
 }
 ```
 
-Use `publish` when the normal rule is to keep the cycle moving and report the drop through standard health data.
+Use `publish` when the normal rule is to keep the cycle moving and report the drop on the log.
 
 ## Ring size
 
@@ -165,7 +164,16 @@ public outputs <- export <- private async outputs
 The boundary calls import and then export without yielding. Import may wake the
 task but cannot run it inline, so that export contains only work completed
 before the boundary. If a destination private or public ring is full, copying
-drops the record and reports coordinator health rather than blocking the cycle.
+drops the record and logs a fault on the coordinator log rather than blocking the cycle.
+
+Two limits of this shape are worth knowing. A snapshot input is latest-wins
+per cycle, but the private ring holds `default_depth` records and `recv`
+reads them in order, so a task that falls behind sees samples up to that many
+cycles old before it reaches the live edge. And a log-delivery frame input
+that a task drains slowly fills its private ring; the coordinator drops the
+overflow for that task alone, whereas an idle reader attached directly to a
+graph ring, such as a registry tap opened after build and never drained,
+holds the producer's records for every consumer once the ring is full.
 
 ## Registry and telemetry
 

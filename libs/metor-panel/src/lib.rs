@@ -16,22 +16,25 @@ use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod alarms;
 pub mod app;
-pub mod canvas;
+pub mod backfill;
 pub mod config;
 pub mod connections;
+pub mod data_binding;
 pub mod dynamic;
 pub mod gpu_context;
 pub(crate) mod graph_canvas;
-pub(crate) mod graph_layout;
 pub mod hydration;
 pub mod icons;
 pub mod inspect;
 pub mod inspector;
 pub mod logs;
+pub(crate) mod motion;
 pub(crate) mod msg_ingest;
 pub mod plot_events;
 pub mod presets;
+pub mod query;
 pub mod sequences;
+pub mod temporal;
 pub mod theme;
 pub mod tiles;
 pub mod transient;
@@ -51,6 +54,13 @@ pub use inspector::palette::{Category, InspectionItem, ItemProvider};
 /// Borrow as a [`ComponentView`] without copying the backing buffer.
 pub trait AsComponentView {
     fn as_component_view(&self) -> ComponentView<'_>;
+
+    /// When the sample was taken, for sources that carry it. Staleness is
+    /// judged by this, not by arrival, so a replay and a slow link both read
+    /// true.
+    fn sample_time(&self) -> Option<Timestamp> {
+        None
+    }
 }
 
 impl AsComponentView for ComponentView<'_> {
@@ -143,6 +153,12 @@ pub struct WalView<'a> {
     offset: usize,
 }
 
+impl WalView<'_> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self._grant[self.offset..self.offset + self.schema.size()]
+    }
+}
+
 impl AsComponentView for WalView<'_> {
     fn as_component_view(&self) -> ComponentView<'_> {
         let value_buf = &self._grant[self.offset..];
@@ -151,6 +167,13 @@ impl AsComponentView for WalView<'_> {
             .parse_value(value_buf)
             .expect("invalid WAL data");
         view
+    }
+
+    /// The `[Timestamp]` framed just ahead of the value.
+    fn sample_time(&self) -> Option<Timestamp> {
+        let start = self.offset - size_of::<Timestamp>();
+        let bytes: [u8; 8] = self._grant[start..self.offset].try_into().ok()?;
+        Some(Timestamp::from_le_bytes(bytes))
     }
 }
 

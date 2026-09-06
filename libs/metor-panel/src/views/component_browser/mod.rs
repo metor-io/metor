@@ -1,11 +1,10 @@
-use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, IntoElement, MouseButton, Pixels, Point,
-    SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    AnyElement, App, Context, Entity, EventEmitter, IntoElement, MouseButton, SharedString,
+    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -14,6 +13,7 @@ use smallvec::{SmallVec, smallvec};
 pub mod component_tree;
 
 use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
+use super::copy::{copy_name_row, copy_rows};
 use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::time_series::Override;
@@ -23,9 +23,10 @@ use super::value_strip::{
 use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
+use crate::query::Query;
 use crate::theme::{Theme, theme};
 use crate::tiles::PlotComponentAction;
-use component_tree::{ComponentNode, build_tree, compress_subtree, resolve_path};
+use component_tree::{Children, ComponentNode, build_tree, compress_subtree, resolve_path};
 
 /// [`ColumnBrowser`] specialized for the DB component namespace.
 pub type ComponentBrowser = ColumnBrowser<ComponentBrowserDelegate>;
@@ -41,27 +42,30 @@ pub enum BrowserEvent {
 
 impl EventEmitter<BrowserEvent> for ColumnBrowser<ComponentBrowserDelegate> {}
 
-/// User-defined view into the namespace.
+/// A view into the namespace — one the user saved, or the one the filter
+/// bar is typing.
 ///
 /// `synth` is a pruned mirror of the real tree kept only to branches whose
-/// full names match `regex`; it's refreshed on filter add and on every
+/// full names match `query`; it's refreshed on filter add and on every
 /// real-tree rebuild so lookups are O(1) cache reads instead of recursing
 /// the whole namespace per render.
 struct FilterEntry {
     label: SharedString,
-    regex: regex::Regex,
+    query: Query,
     synth: Arc<ComponentNode>,
 }
 
 /// Which tree the current selection is navigating.
 ///
 /// `Filter(label)` means the user drilled into the synthetic filter row at
-/// the real tree root; `Real` means straight real-tree navigation (with or
-/// without a reroot).
+/// the real tree root; `Live` means the filter bar has a query and the
+/// columns start inside its pruned tree; `Real` means straight real-tree
+/// navigation (with or without a reroot).
 #[derive(Clone)]
 enum SelectionRoot {
     Real,
     Filter(SharedString),
+    Live,
 }
 
 /// Absolute selection path plus the root context it's interpreted under.
@@ -88,26 +92,6 @@ impl Selection {
     }
 }
 
-/// Translate a glob-like pattern (`*`, `?`) into an anchored regex.
-///
-/// Everything that isn't a wildcard is passed through `regex::escape`, so
-/// dots in component names match literally. `*` maps to `.*` and `?` to
-/// `.` — both traverse segment boundaries, which matches the user's
-/// expectation that `*.health` picks up `cube_sat.imu.health`.
-pub(crate) fn glob_to_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    let mut out = String::with_capacity(pattern.len() + 2);
-    out.push('^');
-    for ch in pattern.chars() {
-        match ch {
-            '*' => out.push_str(".*"),
-            '?' => out.push('.'),
-            other => out.push_str(&regex::escape(&other.to_string())),
-        }
-    }
-    out.push('$');
-    regex::Regex::new(&out)
-}
-
 /// Browses the dot-delimited component namespace.
 ///
 /// Selection is stored as absolute path segments, so a DB rebuild (or a
@@ -119,6 +103,12 @@ pub struct ComponentBrowserDelegate {
     tree: Arc<ComponentNode>,
     selection: Selection,
     filters: Vec<FilterEntry>,
+    /// The filter bar's query, pruned to a tree the columns navigate while
+    /// it is non-empty. Built against the rerooted tree, so filtering
+    /// inside a reroot narrows what the reroot shows.
+    live: Option<FilterEntry>,
+    /// Components in the whole namespace, for the bar's `shown / total`.
+    component_total: usize,
     /// Flat, name-sorted list of every component under the current detail
     /// target. Cheap to rebuild on selection change; live strips are
     /// materialized lazily for the visible range via `strip_cache`.
@@ -166,7 +156,12 @@ impl ComponentBrowserDelegate {
     fn refresh_filter_synths(&mut self) {
         let tree = self.tree.clone();
         for filter in &mut self.filters {
-            filter.synth = build_filter_synth(&filter.regex, filter.label.clone(), &tree);
+            filter.synth = build_filter_synth(&filter.query, filter.label.clone(), &tree);
+        }
+        self.component_total = component_count(&tree);
+        let root = self.real_root();
+        if let Some(live) = &mut self.live {
+            live.synth = build_filter_synth(&live.query, live.label.clone(), &root);
         }
     }
 
@@ -185,12 +180,19 @@ impl ComponentBrowserDelegate {
         }
     }
 
+    /// How many leading `selection.path` entries the reroot accounts for.
+    /// Only real-tree paths carry the reroot prefix; filter and live paths
+    /// start at their synth root.
     fn override_depth(&self) -> usize {
-        self.selection
-            .root_override
-            .as_ref()
-            .map(|p| p.len())
-            .unwrap_or(0)
+        match self.selection.root {
+            SelectionRoot::Real => self
+                .selection
+                .root_override
+                .as_ref()
+                .map(|p| p.len())
+                .unwrap_or(0),
+            SelectionRoot::Filter(_) | SelectionRoot::Live => 0,
+        }
     }
 
     fn resolved_chain(&self) -> SmallVec<[Arc<ComponentNode>; 8]> {
@@ -226,13 +228,28 @@ impl ComponentBrowserDelegate {
                 }
                 out
             }
+            SelectionRoot::Live => {
+                let Some(live) = &self.live else {
+                    return SmallVec::new();
+                };
+                let mut out = SmallVec::new();
+                let mut current = live.synth.clone();
+                for seg in &self.selection.path {
+                    let Some(next) = current.children.get(seg).cloned() else {
+                        break;
+                    };
+                    out.push(next.clone());
+                    current = next;
+                }
+                out
+            }
         }
     }
 
-    /// Append a new filter with `label` and `pattern`, compiling the glob.
-    /// Returns the filter label on success; on failure (invalid glob or a
-    /// label collision with another filter or a top-level real segment),
-    /// returns an error message suitable for inspector surface.
+    /// Append a new filter with `label` and `pattern`, read as a
+    /// [`Query`]. On failure (an empty pattern or a label collision with
+    /// another filter or a top-level real segment), returns an error
+    /// message suitable for inspector surface.
     fn add_filter(
         &mut self,
         label: SharedString,
@@ -242,7 +259,7 @@ impl ComponentBrowserDelegate {
         if label.is_empty() {
             return Err(SharedString::new_static("filter label cannot be empty"));
         }
-        if self.tree.children.contains_key(&label) {
+        if self.tree.children.get(&label).is_some() {
             return Err(SharedString::new_static(
                 "filter label collides with a top-level prefix",
             ));
@@ -250,12 +267,14 @@ impl ComponentBrowserDelegate {
         if self.filters.iter().any(|f| f.label == label) {
             return Err(SharedString::new_static("filter label already in use"));
         }
-        let regex = glob_to_regex(pattern.as_ref())
-            .map_err(|_| SharedString::new_static("invalid glob pattern"))?;
-        let synth = build_filter_synth(&regex, label.clone(), &self.tree);
+        let query = Query::parse(pattern.as_ref());
+        if !query.has_terms() {
+            return Err(SharedString::new_static("filter pattern cannot be empty"));
+        }
+        let synth = build_filter_synth(&query, label.clone(), &self.tree);
         self.filters.push(FilterEntry {
             label,
-            regex,
+            query,
             synth,
         });
         self.rebuild_detail_list(cx);
@@ -287,6 +306,7 @@ impl ComponentBrowserDelegate {
         browser: gpui::WeakEntity<ComponentBrowser>,
     ) -> Vec<Box<dyn InspectorRow>> {
         let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+        let live = self.live.is_some();
 
         // "Add filter…": always available. Cascades into a page whose
         // only row is a `DefaultActionRow` that consumes the search
@@ -330,10 +350,11 @@ impl ComponentBrowserDelegate {
 
         if let Some(node) = item {
             // A column-0 row whose segment matches a filter label (only
-            // possible when no reroot is active, since rerooted columns
-            // don't surface filter siblings) is the synthetic filter
-            // root — offer Remove instead of the real-component actions.
-            let filter_label = if column_ix == 0 && self.selection.root_override.is_none() {
+            // possible when no reroot or live query is active, since neither
+            // surfaces filter siblings) is the synthetic filter root — offer
+            // Remove instead of the real-component actions.
+            let filter_label = if column_ix == 0 && self.selection.root_override.is_none() && !live
+            {
                 self.find_filter(&node.segment).map(|f| f.label.clone())
             } else {
                 None
@@ -355,10 +376,11 @@ impl ComponentBrowserDelegate {
                 && node.children.is_empty()
             {
                 let db = self.db.clone();
+                let db_for_plot = db.clone();
                 rows.push(Box::new(CommandRow::new(
                     SharedString::new_static("Plot component"),
                     Arc::new(move |window, cx| {
-                        let count = element_count(&db, component_id);
+                        let count = element_count(&db_for_plot, component_id);
                         let indices: SmallVec<[usize; 4]> = (0..count).collect();
                         window.dispatch_action(
                             Box::new(PlotComponentAction {
@@ -369,6 +391,7 @@ impl ComponentBrowserDelegate {
                         );
                     }),
                 )));
+                rows.extend(copy_rows(db, component_id, node.full_name.clone(), None));
             } else {
                 let reroot_column = column_ix;
                 let browser_reroot = browser.clone();
@@ -383,6 +406,12 @@ impl ComponentBrowserDelegate {
                         }
                     }),
                 )));
+                match node.component_id {
+                    Some(id) => {
+                        rows.extend(copy_rows(self.db.clone(), id, node.full_name.clone(), None))
+                    }
+                    None => rows.push(copy_name_row(node.full_name.clone())),
+                }
             }
         }
 
@@ -404,10 +433,12 @@ impl ComponentBrowserDelegate {
     }
 
     fn detail_target(&self) -> Arc<ComponentNode> {
-        self.resolved_chain()
-            .last()
-            .cloned()
-            .unwrap_or_else(|| self.real_root())
+        self.resolved_chain().last().cloned().unwrap_or_else(|| {
+            self.live
+                .as_ref()
+                .map(|live| live.synth.clone())
+                .unwrap_or_else(|| self.real_root())
+        })
     }
 
     /// Rebuild the flat list of components under the current detail target.
@@ -443,7 +474,7 @@ impl ComponentBrowserDelegate {
     fn derive_title(&self) -> SharedString {
         match &self.selection.root {
             SelectionRoot::Filter(label) => label.clone(),
-            SelectionRoot::Real => match &self.selection.root_override {
+            SelectionRoot::Real | SelectionRoot::Live => match &self.selection.root_override {
                 Some(segs) if !segs.is_empty() => SharedString::from(
                     segs.iter()
                         .map(|s| s.as_ref())
@@ -514,15 +545,15 @@ impl ComponentBrowser {
     }
 }
 
-/// Build the right-click callback for a strip cell: opens an anchored
-/// inspector with a single "Plot this element" command.
-fn right_click_plot(db: Arc<DB>, component_id: ComponentId) -> StripClick {
+/// The right-click menu of a strip cell: plot the element, or copy it or
+/// the component's name.
+pub(crate) fn strip_menu(db: Arc<DB>, component_id: ComponentId) -> StripClick {
     Arc::new(move |element_index, position, window, cx| {
-        let _ = &db;
         let Some(open) = open_inspector(cx) else {
             return;
         };
-        let rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
+        let name = component_name(&db, component_id);
+        let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
             SharedString::from(format!("Plot element [{}]", element_index)),
             Arc::new(move |window, cx| {
                 window.dispatch_action(
@@ -534,6 +565,12 @@ fn right_click_plot(db: Arc<DB>, component_id: ComponentId) -> StripClick {
                 );
             }),
         ))];
+        rows.extend(copy_rows(
+            db.clone(),
+            component_id,
+            name,
+            Some(element_index),
+        ));
         open(
             InspectorRequest {
                 rows,
@@ -542,6 +579,16 @@ fn right_click_plot(db: Arc<DB>, component_id: ComponentId) -> StripClick {
             window,
             cx,
         );
+    })
+}
+
+/// A component's registered name, or empty until it registers.
+fn component_name(db: &DB, component_id: ComponentId) -> SharedString {
+    db.with_state(|state| {
+        state
+            .get_component_metadata(component_id)
+            .map(|m| SharedString::from(m.name.clone()))
+            .unwrap_or_default()
     })
 }
 
@@ -559,7 +606,7 @@ fn element_count(db: &DB, component_id: ComponentId) -> usize {
 /// Number of boxes the detail strip renders for a component: strings and
 /// enums collapse into a single cell, everything else gets one per element.
 /// Mirrors `format_cells` so [`strip_row_width`] sizing stays in step.
-fn strip_cell_count(db: &DB, component_id: ComponentId) -> usize {
+pub(crate) fn strip_cell_count(db: &DB, component_id: ComponentId) -> usize {
     let collapses = db.with_state(|state| {
         state
             .get_component_metadata(component_id)
@@ -581,10 +628,14 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
     }
 
     fn root_items(&self, _cx: &App) -> Vec<Self::Item> {
-        // Rerooted columns show only the rerooted node's real children.
-        // At the true root (no override), filter synth roots appear as
+        // A live query replaces column 0 with its matches. Otherwise
+        // rerooted columns show only the rerooted node's real children,
+        // and at the true root (no override) filter synth roots appear as
         // virtual siblings of the real top-level prefixes — the user sees
         // and enters them from column 0 just like a real prefix.
+        if let Some(live) = &self.live {
+            return live.synth.children.values().cloned().collect();
+        }
         if self.selection.root_override.is_some() {
             return self.real_root().children.values().cloned().collect();
         }
@@ -624,8 +675,9 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
     fn column_label(&self, parent: Option<&Self::Item>) -> SharedString {
         match parent {
             Some(node) => node.full_name.clone(),
-            None => match &self.selection.root_override {
-                Some(segments) if !segments.is_empty() => SharedString::from(
+            None => match (&self.live, &self.selection.root_override) {
+                (Some(live), _) => live.label.clone(),
+                (None, Some(segments)) if !segments.is_empty() => SharedString::from(
                     segments
                         .iter()
                         .map(|s| s.as_ref())
@@ -647,14 +699,19 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         item: &Self::Item,
         cx: &mut Context<ComponentBrowser>,
     ) {
-        // Column-0 clicks reset which tree the selection anchors on:
-        // filter siblings switch into `Filter` mode, real prefixes
-        // switch back to `Real`. Reroots short-circuit this since their
-        // column 0 never surfaces filter siblings.
-        if column_ix == 0 && self.selection.root_override.is_none() {
-            self.selection.root = match self.find_filter(&item.segment) {
-                Some(filter) => SelectionRoot::Filter(filter.label.clone()),
-                None => SelectionRoot::Real,
+        // Column-0 clicks reset which tree the selection anchors on: a
+        // live query anchors on its synth, filter siblings switch into
+        // `Filter` mode, real prefixes switch back to `Real`. Reroots
+        // short-circuit this since their column 0 never surfaces filter
+        // siblings.
+        if column_ix == 0 && (self.live.is_some() || self.selection.root_override.is_none()) {
+            self.selection.root = if self.live.is_some() {
+                SelectionRoot::Live
+            } else {
+                match self.find_filter(&item.segment) {
+                    Some(filter) => SelectionRoot::Filter(filter.label.clone()),
+                    None => SelectionRoot::Real,
+                }
             };
             self.selection.path.clear();
             self.selection.path.push(item.segment.clone());
@@ -665,10 +722,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         // Deeper clicks truncate-and-push. Node segments can be compound
         // (path-compressed prefixes, filter children's full names) so
         // splitting `full_name` on `.` would miss the real child-map keys.
-        let keep = match &self.selection.root {
-            SelectionRoot::Real => column_ix + self.override_depth(),
-            SelectionRoot::Filter(_) => column_ix,
-        };
+        let keep = column_ix + self.override_depth();
         self.selection.path.truncate(keep);
         self.selection.path.push(item.segment.clone());
         self.rebuild_detail_list(cx);
@@ -779,7 +833,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
                         // Refresh the pending-edit snapshot each frame; click
                         // callbacks are cheap Arc captures (`db.clone()` + id).
                         let click = edit_click(db.clone(), id, full_name.clone());
-                        let right_click = right_click_plot(db.clone(), id);
+                        let right_click = strip_menu(db.clone(), id);
                         let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
                         behavior.on_element_right_click = Some(right_click);
                         strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
@@ -812,6 +866,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
     fn detail_label(&self, tail: Option<&Self::Item>) -> SharedString {
         match tail {
             Some(node) => node.full_name.clone(),
+            None if self.live.is_some() => SharedString::new_static("Matches"),
             None => match &self.selection.root_override {
                 Some(segments) if !segments.is_empty() => SharedString::from(
                     segments
@@ -870,7 +925,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             if tail.children.len() != 1 {
                 break;
             }
-            let seg = tail.children.keys().next().cloned().expect("len == 1");
+            let seg = tail.children.first().expect("len == 1").segment.clone();
             self.selection.path.push(seg);
             changed = true;
         }
@@ -879,30 +934,72 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         }
     }
 
-    fn on_context_menu(
+    fn context_rows(
         &mut self,
         column_ix: usize,
         item: Option<&Self::Item>,
-        position: Point<Pixels>,
-        window: &mut Window,
         cx: &mut Context<ComponentBrowser>,
-    ) {
-        let Some(open) = open_inspector(cx) else {
-            return;
-        };
-        let browser = cx.entity().downgrade();
-        let rows = self.build_context_rows(column_ix, item, browser);
-        if rows.is_empty() {
-            return;
+    ) -> Vec<Box<dyn InspectorRow>> {
+        self.build_context_rows(column_ix, item, cx.entity().downgrade())
+    }
+
+    fn filter_placeholder(&self) -> Option<SharedString> {
+        Some(SharedString::new_static("Filter components…"))
+    }
+
+    fn apply_filter(&mut self, query: &Query, cx: &mut Context<ComponentBrowser>) {
+        if query.has_terms() {
+            let label = SharedString::from(query.text().trim().to_string());
+            let synth = build_filter_synth(query, label.clone(), &self.real_root());
+            self.live = Some(FilterEntry {
+                label,
+                query: query.clone(),
+                synth,
+            });
+            self.selection.root = SelectionRoot::Live;
+            self.selection.path.clear();
+        } else {
+            self.live = None;
+            if matches!(self.selection.root, SelectionRoot::Live) {
+                self.selection.root = SelectionRoot::Real;
+                self.selection.path.clear();
+                if let Some(prefix) = &self.selection.root_override {
+                    self.selection.path = prefix.clone();
+                }
+            }
         }
-        open(
-            InspectorRequest {
-                rows,
-                mode: InspectorMode::Anchored(position),
-            },
-            window,
-            cx,
-        );
+        self.rebuild_detail_list(cx);
+    }
+
+    /// Enter keeps the query: it becomes a saved filter named after itself,
+    /// and the columns move into it so nothing changes on screen.
+    fn submit_filter(&mut self, query: &Query, cx: &mut Context<ComponentBrowser>) -> bool {
+        let label = SharedString::from(query.text().trim().to_string());
+        if self.add_filter(label.clone(), label.clone(), cx).is_err() {
+            return false;
+        }
+        self.live = None;
+        self.selection.root = SelectionRoot::Filter(label.clone());
+        self.selection.path.clear();
+        self.selection.path.push(label);
+        self.rebuild_detail_list(cx);
+        true
+    }
+
+    fn filter_status(&self) -> Option<SharedString> {
+        let live = self.live.as_ref()?;
+        Some(SharedString::from(format!(
+            "{} / {}",
+            component_count(&live.synth),
+            self.component_total
+        )))
+    }
+
+    fn filter_hint(&self) -> Option<SharedString> {
+        let live = self.live.as_ref()?;
+        let taken = self.tree.children.get(&live.label).is_some()
+            || self.filters.iter().any(|f| f.label == live.label);
+        (!taken).then(|| SharedString::new_static("↵ save filter"))
     }
 }
 
@@ -915,10 +1012,12 @@ pub fn new_component_browser(db: Arc<DB>, cx: &mut Context<ComponentBrowser>) ->
             segment: SharedString::new_static(""),
             full_name: SharedString::new_static(""),
             component_id: None,
-            children: BTreeMap::new(),
+            children: Children::default(),
         }),
         selection: Selection::empty(),
         filters: Vec::new(),
+        live: None,
+        component_total: 0,
         detail_components: Vec::new(),
         strip_cache: VisibleEntityCache::new(DETAIL_STRIP_CACHE_CAP),
         detail_scroll_handle: UniformListScrollHandle::new(),
@@ -938,6 +1037,11 @@ fn collect_component_nodes(node: &Arc<ComponentNode>, out: &mut Vec<Arc<Componen
     }
 }
 
+fn component_count(node: &Arc<ComponentNode>) -> usize {
+    usize::from(node.component_id.is_some())
+        + node.children.values().map(component_count).sum::<usize>()
+}
+
 /// Build the synthetic filter root: a pruned real tree run through
 /// `compress_subtree` so the same single-child collapse rules apply to
 /// filter navigation as to plain navigation.
@@ -949,24 +1053,24 @@ fn collect_component_nodes(node: &Arc<ComponentNode>, out: &mut Vec<Arc<Componen
 /// `cube_sat` column before the branches. A component-at-branch child
 /// is kept so it stays clickable.
 fn build_filter_synth(
-    regex: &regex::Regex,
+    query: &Query,
     label: SharedString,
     tree: &Arc<ComponentNode>,
 ) -> Arc<ComponentNode> {
     let pruned: Vec<Arc<ComponentNode>> = tree
         .children
         .values()
-        .filter_map(|child| prune_to_matches(child, regex))
+        .filter_map(|child| prune_to_matches(child, query))
         .map(compress_subtree)
         .collect();
 
-    let children: BTreeMap<SharedString, Arc<ComponentNode>> = if pruned.len() == 1
+    let children: Children = if pruned.len() == 1
         && pruned[0].component_id.is_none()
         && !pruned[0].children.is_empty()
     {
         pruned[0].children.clone()
     } else {
-        pruned.into_iter().map(|c| (c.segment.clone(), c)).collect()
+        pruned.into_iter().collect()
     };
 
     Arc::new(ComponentNode {
@@ -977,19 +1081,21 @@ fn build_filter_synth(
     })
 }
 
-/// Return the original `node` when it matches `regex`, otherwise a new
+/// Return the original `node` when it matches `query`, otherwise a new
 /// node with only its matching descendants kept. Matching nodes
 /// short-circuit with their full subtree so the user can explore
 /// siblings of the thing they were looking for.
-fn prune_to_matches(node: &Arc<ComponentNode>, regex: &regex::Regex) -> Option<Arc<ComponentNode>> {
-    if regex.is_match(node.full_name.as_ref()) {
+pub(crate) fn prune_to_matches(
+    node: &Arc<ComponentNode>,
+    query: &Query,
+) -> Option<Arc<ComponentNode>> {
+    if query.matches_name(node.full_name.as_ref()) {
         return Some(node.clone());
     }
-    let children: BTreeMap<SharedString, Arc<ComponentNode>> = node
+    let children: Children = node
         .children
         .values()
-        .filter_map(|child| prune_to_matches(child, regex))
-        .map(|c| (c.segment.clone(), c))
+        .filter_map(|child| prune_to_matches(child, query))
         .collect();
     if children.is_empty() {
         return None;
@@ -1017,6 +1123,44 @@ struct PreviewRow {
     full_name: SharedString,
     strip: Entity<ComponentValueStrip>,
     db: Arc<DB>,
+}
+
+/// The right-click menu of a detail row's name: plot every element, or
+/// copy the value or the name.
+fn open_detail_menu(
+    db: &Arc<DB>,
+    component_id: ComponentId,
+    name: &SharedString,
+    position: gpui::Point<gpui::Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(open) = open_inspector(cx) else {
+        return;
+    };
+    let count = element_count(db, component_id);
+    let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
+        "Plot component",
+        Arc::new(move |window, cx| {
+            let indices: SmallVec<[usize; 4]> = (0..count).collect();
+            window.dispatch_action(
+                Box::new(PlotComponentAction {
+                    component_id,
+                    indices,
+                }),
+                cx,
+            );
+        }),
+    ))];
+    rows.extend(copy_rows(db.clone(), component_id, name.clone(), None));
+    open(
+        InspectorRequest {
+            rows,
+            mode: InspectorMode::Anchored(position),
+        },
+        window,
+        cx,
+    );
 }
 
 fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
@@ -1097,6 +1241,21 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
                             component_id,
                             SmallVec::new(),
                         ))
+                        .on_mouse_down(MouseButton::Right, {
+                            let db = row.db.clone();
+                            let name = row.full_name.clone();
+                            move |event: &gpui::MouseDownEvent, window, cx| {
+                                open_detail_menu(
+                                    &db,
+                                    component_id,
+                                    &name,
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }
+                        })
                         .child(row.full_name.clone()),
                 )
                 .child(plot_icon),

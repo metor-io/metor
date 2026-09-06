@@ -16,6 +16,7 @@ use gpui::{
 };
 
 use crate::inspector::rows::tag_pill;
+use crate::motion::{self, Fade};
 use crate::theme::theme;
 use node::{ChordAction, ChordNode};
 
@@ -36,6 +37,8 @@ pub struct Transient {
     focus_handle: FocusHandle,
     parent_focus: Option<FocusHandle>,
     pub dismissed: bool,
+    fade: Fade,
+    exit_complete: bool,
 }
 
 impl Transient {
@@ -46,6 +49,8 @@ impl Transient {
             focus_handle: cx.focus_handle(),
             parent_focus: None,
             dismissed: false,
+            fade: Fade::entrance(motion::TRANSIENT_ENTER),
+            exit_complete: false,
         }
     }
 
@@ -57,13 +62,20 @@ impl Transient {
         &self.stack.last().expect("stack is never empty").nodes
     }
 
-    fn dismiss(&mut self, window: &mut Window) {
-        self.dismissed = true;
-        if let Some(parent) = &self.parent_focus {
-            parent.focus(window);
-        } else {
-            window.blur();
+    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dismissed {
+            return;
         }
+        self.dismissed = true;
+        self.fade.exit(motion::PALETTE_EXIT);
+        if self.focus_handle.contains_focused(window, cx) {
+            if let Some(parent) = &self.parent_focus {
+                parent.focus(window);
+            } else {
+                window.blur();
+            }
+        }
+        cx.notify();
     }
 
     /// Pop one level; dismiss when already at the root.
@@ -72,7 +84,7 @@ impl Transient {
             self.stack.pop();
             cx.notify();
         } else {
-            self.dismiss(window);
+            self.dismiss(window, cx);
             cx.notify();
         }
     }
@@ -83,6 +95,9 @@ impl Transient {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.dismissed {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         match key {
             "escape" | "backspace" => {
@@ -108,7 +123,7 @@ impl Transient {
             }
             Some((_, ChordAction::Command(callback))) => {
                 callback(window, cx);
-                self.dismiss(window);
+                self.dismiss(window, cx);
                 cx.notify();
             }
             // Unknown key at this level: ignore so a stray press is harmless.
@@ -117,6 +132,8 @@ impl Transient {
     }
 }
 
+impl gpui::EventEmitter<motion::Closed> for Transient {}
+
 impl Focusable for Transient {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
@@ -124,8 +141,13 @@ impl Focusable for Transient {
 }
 
 impl Render for Transient {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.dismissed {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let opacity = self.fade.opacity(window, cx);
+        if self.dismissed && opacity == 0.0 {
+            if !self.exit_complete {
+                self.exit_complete = true;
+                cx.emit(motion::Closed);
+            }
             return div().into_any_element();
         }
         let theme = theme(cx);
@@ -153,7 +175,7 @@ impl Render for Transient {
             .gap_x(px(16.0))
             .gap_y(px(2.0))
             .min_h_0()
-            .overflow_y_scroll()
+            .when(!self.dismissed, |grid| grid.overflow_y_scroll())
             .text_size(px(12.0));
         for node in self.current_nodes() {
             grid = grid.child(
@@ -178,15 +200,19 @@ impl Render for Transient {
 
         let panel = div()
             .id("transient-panel")
-            .key_context("Transient")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.handle_key_down(event, window, cx);
-            }))
-            .on_mouse_down_out(cx.listener(|this, _: &gpui::MouseDownEvent, window, _cx| {
-                this.dismiss(window);
-            }))
-            .occlude()
+            .when(!self.dismissed, |panel| {
+                panel
+                    .key_context("Transient")
+                    .track_focus(&self.focus_handle)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        this.handle_key_down(event, window, cx);
+                    }))
+                    .on_mouse_down_out(cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
+                        this.dismiss(window, cx);
+                    }))
+                    .occlude()
+            })
+            .opacity(opacity)
             .absolute()
             .bottom(px(12.0))
             .left(px(12.0))

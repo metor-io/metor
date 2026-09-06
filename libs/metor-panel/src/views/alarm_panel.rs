@@ -18,6 +18,7 @@ use crate::alarms::{self, AlarmEventKind, AlarmState, MAX_SHELF_DURATION};
 use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::theme::theme;
+use crate::views::table;
 
 /// Which set the alarm list shows.
 #[derive(
@@ -168,10 +169,16 @@ impl Render for AlarmView {
             .items_center()
             .gap_2()
             .px_3()
-            .py_2()
+            .h(px(table::HEADER_HEIGHT))
             .flex_shrink_0()
             .border_b_1()
-            .border_color(theme.border_primary);
+            .border_color(theme.border_primary)
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_tertiary)
+                    .child("Live"),
+            );
 
         if let Some(store) = &store {
             let state = store.read(cx).state();

@@ -16,7 +16,7 @@ use metor_db::DB;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
+use crate::inspector::rows::{BoolRow, CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::theme::theme;
 use crate::views::Scrollbar;
 
@@ -114,6 +114,12 @@ impl WidgetKind {
     pub fn attitude() -> Self {
         Self(SharedString::new_static("attitude"))
     }
+    pub fn map() -> Self {
+        Self(SharedString::new_static("map"))
+    }
+    pub fn samples_table() -> Self {
+        Self(SharedString::new_static("samples_table"))
+    }
 
     fn default_size(&self, cx: &App) -> (f32, f32) {
         widgets::widget_spec(self, cx).default_size
@@ -131,6 +137,15 @@ pub struct DashboardWidget {
     pub rect: WidgetRect,
     pub kind: WidgetKind,
     pub config: String,
+    /// Background and outline around the widget. Off, the content sits
+    /// directly on the canvas — the P&ID look, where a readout belongs to the
+    /// diagram rather than to a card.
+    #[serde(default = "default_frame")]
+    pub frame: bool,
+}
+
+fn default_frame() -> bool {
+    true
 }
 
 /// Canvas panel that lays out [`DashboardWidget`]s at absolute pixel
@@ -301,6 +316,7 @@ impl DashboardPanel {
             rect,
             kind,
             config,
+            frame: true,
         };
         self.widgets.push(widget);
         self.widget_live.insert(id, live);
@@ -336,22 +352,54 @@ impl DashboardPanel {
         }
     }
 
+    /// The widget's reflected settings page, plus the rows that belong to
+    /// its placement on the dashboard rather than to the view itself.
     fn open_widget_inspector(
         &self,
         widget_id: WidgetId,
         position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) {
-        if let Some(live) = self.widget_live.get(&widget_id) {
-            window.dispatch_action(
-                Box::new(crate::inspector::InspectEntity {
-                    entity: live.inspect.clone(),
-                    position,
-                }),
-                cx,
-            );
-        }
+        let Some(live) = self.widget_live.get(&widget_id) else {
+            return;
+        };
+        let Some(open) = crate::inspector::open_inspector(cx) else {
+            return;
+        };
+        let mut rows = crate::inspector::reflect::rows_for_any_entity(&live.inspect, &self.db, cx)
+            .unwrap_or_default();
+        let dashboard = cx.entity();
+        rows.push(Box::new(BoolRow::dynamic(
+            "Frame",
+            Arc::new({
+                let dashboard = dashboard.clone();
+                move |cx| {
+                    dashboard
+                        .read(cx)
+                        .widgets
+                        .iter()
+                        .find(|w| w.id == widget_id)
+                        .is_none_or(|w| w.frame)
+                }
+            }),
+            Arc::new(move |on, _window, cx| {
+                dashboard.update(cx, |this, cx| {
+                    if let Some(w) = this.widgets.iter_mut().find(|w| w.id == widget_id) {
+                        w.frame = on;
+                        cx.notify();
+                    }
+                });
+            }),
+        )));
+        open(
+            crate::inspector::InspectorRequest {
+                rows,
+                mode: crate::inspector::InspectorMode::Anchored(position),
+            },
+            window,
+            cx,
+        );
     }
 
     fn ensure_views(&mut self, cx: &mut Context<Self>) {
@@ -990,6 +1038,28 @@ fn add_widget_rows(
         },
     )));
     rows.push(Box::new(NavRow::new(
+        "Map",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::map())
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
+        "Samples",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::samples_table())
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
         "Sequence Control",
         SharedString::new_static(""),
         {
@@ -1049,43 +1119,13 @@ fn component_picker_rows(
     db: Arc<DB>,
     kind: WidgetKind,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-
-    // Every widget behind this picker resolves its binding through
-    // `expressions::bind`, so every one of them can be given an expression.
-    // The row used to be gated to the monitor because it was the only builder
-    // that could honour one.
-    rows.push(Box::new(crate::inspector::rows::ExpressionRow::new(db.clone(), {
-        let dashboard = dashboard.clone();
-        let kind = kind.clone();
-        Arc::new(move |_id, text, _window, cx| {
-            let config = component_widget_config(&kind, text);
-            let kind = kind.clone();
-            dashboard.update(cx, |this, cx| {
-                this.add_widget(kind, config, cx);
-            });
-            crate::inspector::rows::RowAction::Dismiss
-        })
-    })));
-
-    rows.extend(crate::inspector::trace_picker::list_components(&db)
-        .into_iter()
-        .map(|(_id, name)| {
-            let dashboard = dashboard.clone();
-            let name_clone = name.clone();
-            let kind = kind.clone();
-            Box::new(CommandRow::new(
-                SharedString::from(name),
-                Arc::new(move |_window, cx| {
-                    let config = component_widget_config(&kind, name_clone.clone());
-                    let kind = kind.clone();
-                    dashboard.update(cx, |this, cx| {
-                        this.add_widget(kind, config, cx);
-                    });
-                }),
-            )) as Box<dyn InspectorRow>
-        }));
-    rows
+    let config_db = db.clone();
+    crate::inspector::trace_picker::binding_picker_rows(db, move |binding, cx| {
+        let config = component_widget_config(&kind, binding.text(&config_db));
+        dashboard.update(cx, |this, cx| {
+            this.add_widget(kind.clone(), config, cx);
+        });
+    })
 }
 
 /// The config blob a component-bound widget of `kind` stores.
@@ -1107,6 +1147,15 @@ fn component_widget_config(kind: &WidgetKind, component: String) -> String {
             component,
             color: None,
         };
+        serde_json::to_string(&cfg)
+    } else if *kind == WidgetKind::map() {
+        let cfg = widgets::MapWidgetConfig {
+            component,
+            ..Default::default()
+        };
+        serde_json::to_string(&cfg)
+    } else if *kind == WidgetKind::samples_table() {
+        let cfg = widgets::SamplesTableWidgetConfig { component };
         serde_json::to_string(&cfg)
     } else {
         let cfg = widgets::TextWidgetConfig { component };

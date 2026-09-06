@@ -29,6 +29,8 @@ use super::XyTrace;
 struct XyTraceTracking {
     x_component: Option<Component>,
     y_component: Option<Component>,
+    x_history: Option<crate::data_binding::BoundHistory>,
+    y_history: Option<crate::data_binding::BoundHistory>,
     x_bounds: Option<(f64, f64)>,
     y_bounds: Option<(f64, f64)>,
     /// Per-axis caches keyed by node identity. Reset when the cached
@@ -44,6 +46,8 @@ impl XyTraceTracking {
         Self {
             x_component: None,
             y_component: None,
+            x_history: None,
+            y_history: None,
             x_bounds: None,
             y_bounds: None,
             x_node_bounds: NodeBoundsCache::default(),
@@ -88,9 +92,13 @@ pub struct XyLinePlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     tracking: HashMap<EntityId, XyTraceTracking>,
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
+    #[facet(opaque)]
+    inputs: crate::data_binding::InputChanges,
     #[facet(opaque)]
     view_override: Option<PlotBounds>,
     #[facet(opaque)]
@@ -111,9 +119,11 @@ impl XyLinePlot {
             y_min_override: Override::Auto,
             y_max_override: Override::Auto,
             custom_title: Override::Auto,
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
+            inputs: Default::default(),
             view_override: None,
             last_overrides: OverrideSnapshot {
                 x_min: None,
@@ -127,7 +137,24 @@ impl XyLinePlot {
     }
 
     pub fn bind_traces(&mut self, traces: Vec<XyTrace>, cx: &mut Context<Self>) {
-        self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
+        self.traces = traces
+            .into_iter()
+            .map(|mut t| {
+                t.x_source.resolve(&self.db, cx);
+                t.y_source.resolve(&self.db, cx);
+                cx.new(|_| t)
+            })
+            .collect();
+        cx.notify();
+    }
+
+    /// Forget what `trace` was tracking, so the next reconcile follows the
+    /// component it names now — the inspector's rebind, after the tracker
+    /// latched its component at start.
+    pub fn rebind_trace(&mut self, trace: &Entity<XyTrace>, cx: &mut Context<Self>) {
+        let id = trace.entity_id();
+        self.tracking.remove(&id);
+        self.tasks.remove(&id);
         cx.notify();
     }
 
@@ -143,6 +170,46 @@ impl XyLinePlot {
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        for trace in &self.traces {
+            trace.update(cx, |trace, cx| {
+                trace.x_source.resolve(&self.db, cx);
+                trace.y_source.resolve(&self.db, cx);
+            });
+        }
+
+        // Point each trace back at this plot so its inspector page can reach
+        // the plot to rebind. Mutating without notifying cannot re-enter
+        // reconcile: the plot does not observe its traces.
+        let self_weak = cx.entity().downgrade();
+        let self_id = cx.entity().entity_id();
+        for trace in &self.traces {
+            trace.update(cx, |t, _| {
+                let linked = t
+                    .line_plot
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .map(|e| e.entity_id());
+                if linked != Some(self_id) {
+                    t.line_plot = Some(self_weak.clone());
+                }
+            });
+        }
+
+        for id in self.inputs.changed(
+            &self.traces,
+            &self.db,
+            |trace| {
+                vec![
+                    (trace.x_source.id(), trace.x_element_index),
+                    (trace.y_source.id(), trace.y_element_index),
+                ]
+            },
+            cx,
+        ) {
+            self.tracking.remove(&id);
+            self.tasks.remove(&id);
+        }
+
         let db = self.db.clone();
         reconcile_trackers(
             &self.traces,
@@ -239,7 +306,7 @@ impl XyLinePlot {
         cx.spawn(async move |this, cx| {
             let (x_id, y_id) = match this.update(cx, |_, cx| {
                 let t = trace.read(cx);
-                (t.x_component_id, t.y_component_id)
+                (t.x_source.id(), t.y_source.id())
             }) {
                 Ok(ids) => ids,
                 Err(_) => return,
@@ -256,6 +323,11 @@ impl XyLinePlot {
                 if let Some(tracking) = lp.tracking.get_mut(&id) {
                     tracking.x_component = Some(x_component.clone());
                     tracking.y_component = Some(y_component.clone());
+                    let trace = trace.read(cx);
+                    tracking.x_history =
+                        crate::data_binding::BoundHistory::for_binding(&trace.x_source, &db, cx);
+                    tracking.y_history =
+                        crate::data_binding::BoundHistory::for_binding(&trace.y_source, &db, cx);
                     cx.notify();
                     true
                 } else {
@@ -320,12 +392,18 @@ impl XyLinePlot {
                 if !matches!(installed, Ok(true)) {
                     break;
                 }
-                // Wake on Y-component data, matching the time-series
-                // tracker. Co-recorded components share cadence in
-                // practice, so X bounds are refreshed in the same
-                // iteration. Cross-cadence pairs lag by one Y tick on
-                // X-bound updates — acceptable for v1.
-                y_component.time_series.wait().await;
+                // Either axis can hydrate first or receive data independently.
+                let mut x_wait = std::pin::pin!(x_component.time_series.wait());
+                let mut y_wait = std::pin::pin!(y_component.time_series.wait());
+                std::future::poll_fn(|cx| {
+                    use std::future::Future;
+                    if x_wait.as_mut().poll(cx).is_ready() || y_wait.as_mut().poll(cx).is_ready() {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
             }
         })
     }
@@ -333,6 +411,22 @@ impl XyLinePlot {
 
 impl Render for XyLinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let range = crate::temporal::snapshot(cx).and_then(|snapshot| snapshot.range);
+        if let Some(range) = &range {
+            for trace in &self.traces {
+                if !trace.read(cx).visible {
+                    continue;
+                }
+                if let Some(tracking) = self.tracking.get(&trace.entity_id()) {
+                    for history in [&tracking.x_history, &tracking.y_history]
+                        .into_iter()
+                        .flatten()
+                    {
+                        history.request(range.clone(), cx);
+                    }
+                }
+            }
+        }
         let weak = cx.entity().downgrade();
         canvas(
             move |bounds, window, cx| {
@@ -366,6 +460,7 @@ impl Render for XyLinePlot {
                                         color: config.color,
                                         stroke_width: config.stroke_width,
                                         x_clip: None,
+                                        time_clip: range.as_ref().map(|r| (r.start.0, r.end.0)),
                                     })
                                 })
                                 .collect();

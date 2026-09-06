@@ -1,14 +1,13 @@
 //! The synchronous tests stick to the `try_*` APIs plus `std::thread` so they
 //! run under Miri, which cannot drive the async runtime, and exercise the
 //! unsafe pointer and atomic paths for provenance, leaks, and data races.
-//! `MIRI.md` in the crate root describes the coverage. Loop bounds shrink
+//! `MIRI.md` in the crate root describes the coverage, and loop bounds shrink
 //! under `cfg!(miri)`.
 //!
-//! Two sections are `#[cfg(not(miri))]` because Miri cannot run them: the mmap
-//! tests, which need a real temp directory and a real `mmap`, and the async
-//! tests at the end, which need the executor. The async ones exist because
-//! `View::read` and `View::read_into` are reachable from no other test here,
-//! and Kani and loom cannot reach them either.
+//! Two sections are `#[cfg(not(miri))]` because Miri cannot run them: the
+//! mmap tests, which need a real temp directory and a real `mmap`, and the
+//! async tests at the end, which need the executor and are the only tests
+//! that reach `View::read`.
 
 use super::*;
 
@@ -270,9 +269,9 @@ fn concurrent_full_stream() {
     assert_eq!(got, expected, "reader lost or reordered data");
 }
 
-/// Register and drop views from several threads while a writer runs. This
-/// stresses the CAS slot claim and the wait-free slot free. A live churner
-/// view can backpressure the writer, so `WouldBlock` is tolerated.
+/// Several threads register and drop views while a writer runs, stressing
+/// the CAS slot claim and the wait-free slot free; `WouldBlock` is tolerated
+/// since a live churner can backpressure the writer.
 #[test]
 fn concurrent_reader_churn() {
     let churn = if cfg!(miri) { 3 } else { 8 };
@@ -324,8 +323,8 @@ fn concurrent_reader_churn() {
 // ----- attach_raw (non-owning, same-process) -----
 
 /// A non-owning handle reconstructed over the same region sees the identical
-/// atomics. Records written through one handle are read through the other, in
-/// both directions.
+/// atomics, so records written through either handle read back through the
+/// other.
 #[test]
 fn raw_attach_same_process_roundtrip() {
     let rb = ring(1024, 4);
@@ -350,8 +349,8 @@ fn raw_attach_same_process_roundtrip() {
     }
 }
 
-/// Geometry is recovered from the region header, not passed to `attach_raw`.
-/// The committed position and the capacity both match the original handle.
+/// Geometry recovered from the region header, not passed to `attach_raw`,
+/// matches the original handle's committed position and capacity.
 #[test]
 fn raw_attach_recovers_geometry() {
     let rb = ring(256, 3);
@@ -401,14 +400,12 @@ fn raw_attach_bad_region_rejected() {
 // ----- Writer/view re-acquisition over a long-lived region -----
 
 /// Dropping a writer and view and creating a fresh pair over the same
-/// `RingBuffer` re-acquires the writer role and a reader slot, and the new
-/// view starts at the live edge, never seeing the previous pair's data.
-///
-/// `max_readers = 1` makes the reclaim load-bearing. A leaked slot would make
-/// the second `view()` fail, and its cursor would backpressure the new writer
-/// forever.
+/// `RingBuffer` re-acquires the writer role and a reader slot, with the new
+/// view starting at the live edge.
 #[test]
 fn swap_writer_and_reader_reacquire() {
+    // max_readers = 1 makes the reclaim load-bearing: a leaked slot would
+    // fail the second `view()` and backpressure the new writer forever.
     let rb = ring(256, 1);
     let mut buf = Vec::new();
 
@@ -442,10 +439,9 @@ fn swap_writer_and_reader_reacquire() {
     assert_eq!(&buf[..], b"occ2");
 }
 
-/// The same cycle through `attach_raw`. Each round attaches a fresh
+/// The same cycle through `attach_raw`: each round attaches a fresh
 /// non-owning handle over a region that outlives it, claims a writer and a
-/// view, and drops all three; the next round re-attaches and re-acquires the
-/// freed slot.
+/// view, drops all three, then re-attaches and re-acquires the freed slot.
 #[test]
 fn raw_attach_swap_reacquire() {
     let owner = ring(256, 1); // keeps the region alive across both rounds
@@ -483,8 +479,7 @@ fn raw_attach_swap_reacquire() {
 // ----- mmap backing -----
 //
 // Excluded from Miri: these need a real temp directory and a real `mmap`,
-// neither of which Miri provides. They used to be excluded by a feature gate
-// that no longer exists.
+// neither of which Miri provides.
 
 #[test]
 #[cfg(not(miri))]
@@ -511,10 +506,10 @@ fn mmap_roundtrip() {
 
 // ----- Corrupt length fields -----
 
-/// A record whose length field was scribbled to `0xFFFF_FFFF` is structural
-/// corruption. Both the copying and the borrowing read must return `Corrupt`
-/// instead of building an out-of-bounds slice, and under Miri this proves no
-/// out-of-bounds access happens.
+/// A record whose length field is scribbled to `0xFFFF_FFFF` is structural
+/// corruption that both the copying and the borrowing read must report as
+/// `Corrupt` rather than build an out-of-bounds slice, which under Miri
+/// proves no out-of-bounds access happens.
 #[test]
 fn garbage_length_is_corrupt() {
     let rb = ring(64, 1);
@@ -609,21 +604,15 @@ fn writer_claim_shared_across_attach() {
     let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
 
     let w1 = rb.writer(NoWake).unwrap();
-    assert!(
-        raw.writer(NoWake).is_err(),
-        "claim visible cross-handle"
-    );
+    assert!(raw.writer(NoWake).is_err(), "claim visible cross-handle");
     drop(w1);
     let mut w2 = raw.writer(NoWake).unwrap();
     w2.try_write(b"raw side").unwrap();
-    assert!(
-        rb.writer(NoWake).is_err(),
-        "claim visible in reverse"
-    );
+    assert!(rb.writer(NoWake).is_err(), "claim visible in reverse");
 }
 
-/// Claim/drop churn from several threads. The CAS admits exactly one writer
-/// at a time, and the claim is free once every thread is done.
+/// Claim/drop churn from several threads shows the CAS admits exactly one
+/// writer at a time and the claim is free once every thread is done.
 #[test]
 fn concurrent_writer_claim_churn() {
     let threads: u64 = if cfg!(miri) { 3 } else { 8 };
@@ -662,9 +651,7 @@ fn concurrent_writer_claim_churn() {
 // ----- Wrap-gap skip -----
 
 /// A reader parked exactly on a wrap-gap start must skip it and read the
-/// post-wrap record. With capacity 64, the records at 0..24 and 24..48 are
-/// drained (cursor at 48), and a third 16-byte payload forces the gap
-/// (high-water mark 48, record at 64..88).
+/// post-wrap record.
 #[test]
 fn reader_on_gap_start_reads_through() {
     let rb = ring(64, 1);
@@ -726,10 +713,10 @@ fn attach_rejects_bad_capacity() {
     assert!(unsafe { RingBuffer::attach_raw(base, len) }.is_ok());
 }
 
-/// Out-of-bounds and overlapping offsets are `BadGeometry`. Covered here are
-/// a reader table running into the data region, a data region past
-/// `total_size`, a misaligned `data_offset`, and an offset chosen so the
-/// bounds math would overflow.
+/// Out-of-bounds and overlapping offsets are all `BadGeometry`: a reader
+/// table running into the data region, a data region past `total_size`, a
+/// misaligned `data_offset`, and an offset chosen so the bounds math would
+/// overflow.
 #[test]
 fn attach_rejects_oob_offsets() {
     let (_rb, base, len) = valid_region();
@@ -817,11 +804,9 @@ fn attach_mmap_rejects_truncated_file() {
 
 // ----- View churn under a live writer -----
 
-/// One bounded writer, one fast drainer, and a churner that repeatedly
-/// registers a fresh view, borrow-reads one record with content validation,
-/// and drops it. Without the registration handshake the writer's cursor scan
-/// could miss the fresh claim and write past it, handing the borrow
-/// overwritten bytes. With it, every borrowed record is coherent.
+/// A bounded writer, a fast drainer, and a churner that repeatedly registers
+/// a fresh view and borrow-reads one record together prove the registration
+/// handshake keeps every borrowed record coherent.
 #[test]
 fn concurrent_view_churn() {
     let n: u64 = if cfg!(miri) { 32 } else { 2_000 };
@@ -929,9 +914,7 @@ fn reclaim_frees_dead_reader() {
 }
 
 /// A dead writer's claim is reclaimed by owner tag, and a new writer
-/// continues the same absolute stream. The dead owner is a *foreign* pid —
-/// reclaiming one's own pid would also free this process's live views,
-/// which the reclaim contract forbids.
+/// continues the same absolute stream.
 #[test]
 fn reclaim_frees_dead_writer_claim() {
     const DEAD_PID: u64 = 4242;
@@ -971,47 +954,18 @@ fn reclaim_skips_other_owners() {
     // SAFETY: reclaim by our pid; the planted foreign tags must not match.
     unsafe { rb.reclaim_owner(std::process::id() as u64) };
     assert_eq!(rb.reader_count(), 1, "foreign reader survives");
-    assert!(
-        rb.writer(NoWake).is_err(),
-        "foreign writer claim survives"
-    );
+    assert!(rb.writer(NoWake).is_err(), "foreign writer claim survives");
     drop(v);
 }
 
 // ----- Async paths -----
 //
 // Excluded from Miri, which cannot drive the executor. These are the only
-// tests that reach `View::read`, `View::read_into` and `Notifier`; everything
-// above deliberately sticks to `try_*` so it stays Miri-checkable, which left
-// the awaiting paths — and `port.rs`'s `view.read().await` in `metor-fsw-2` —
-// covered only indirectly.
+// tests that reach `View::read` and `Notifier`.
 //
 // Each spawns the peer and yields first, so the waiting side is already armed
-// when the commit lands. That is what puts the wake path, rather than a record
-// that happened to be ready, on the tested route.
-
-#[cfg(not(miri))]
-#[stellarator::test]
-async fn read_into_awaits_a_commit() {
-    let ring = ring(64, 2);
-    let notifier = Notifier::default();
-    let mut w = ring.writer(notifier.clone()).unwrap();
-    let mut v = ring.view(notifier.clone()).unwrap();
-    assert_eq!(v.committed(), 0);
-
-    let reader = stellarator::spawn(async move {
-        let mut buf = Vec::new();
-        v.read_into(&mut buf).await.expect("never corrupt");
-        (buf, v.cursor())
-    });
-
-    stellarator::yield_now().await;
-    w.try_write(b"awaited!").unwrap();
-
-    let (buf, cursor) = reader.await.unwrap();
-    assert_eq!(&buf[..], b"awaited!");
-    assert_eq!(cursor, frame_len(8) as u64);
-}
+// when the commit lands, putting the wake path rather than an already-ready
+// record on the tested route.
 
 #[cfg(not(miri))]
 #[stellarator::test]
@@ -1037,34 +991,6 @@ async fn read_awaits_a_commit_and_the_grant_consumes_it() {
 
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn read_into_streams_records_in_order() {
-    let ring = ring(64, 2);
-    let notifier = Notifier::default();
-    let mut w = ring.writer(notifier.clone()).unwrap();
-    let mut v = ring.view(notifier.clone()).unwrap();
-
-    let reader = stellarator::spawn(async move {
-        let mut seen = Vec::new();
-        let mut buf = Vec::new();
-        for _ in 0..4u8 {
-            v.read_into(&mut buf).await.expect("never corrupt");
-            seen.push(buf[0]);
-        }
-        seen
-    });
-
-    // One at a time, so the reader waits on every one of them rather than
-    // draining a backlog.
-    for n in 0..4u8 {
-        stellarator::yield_now().await;
-        w.try_write(&[n; 8]).unwrap();
-    }
-
-    assert_eq!(reader.await.unwrap(), vec![0, 1, 2, 3]);
-}
-
-#[cfg(not(miri))]
-#[stellarator::test]
 async fn read_returns_a_ready_record_without_waiting() {
     let ring = ring(64, 2);
     let notifier = Notifier::default();
@@ -1074,15 +1000,12 @@ async fn read_returns_a_ready_record_without_waiting() {
     // Committed before the first poll, so the loop returns on its first pass
     // and never arms the wait.
     w.try_write(b"ready").unwrap();
-    let mut buf = Vec::new();
-    v.read_into(&mut buf).await.expect("never corrupt");
-    assert_eq!(&buf[..], b"ready");
+    let grant = v.read().await.expect("never corrupt");
+    assert_eq!(&grant[..], b"ready");
 }
 
-/// [`NoWake`] resolves as soon as it is polled, which is what makes the async
-/// paths degenerate to caller-driven polling under it. Called directly: a view
-/// using it would spin without yielding, so it never reaches the wait in a
-/// test that has data to find.
+/// [`NoWake`] resolves as soon as it is polled, called directly here since a
+/// view using it would spin without yielding instead of reaching the wait.
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn no_wake_resolves_immediately() {
@@ -1096,10 +1019,9 @@ async fn no_wake_resolves_immediately() {
     assert!(polled, "NoWake must poll its readiness predicate");
 }
 
-/// `create_raw` formats a ring into memory the caller owns, and the result is
-/// a normal ring: a record written through it reads back through a fresh
-/// `attach_raw` over the same bytes. This is the path a wasm host uses to put
-/// a region inside guest linear memory.
+/// `create_raw` formats a ring into memory the caller owns, and a record
+/// written through it reads back through a fresh `attach_raw` over the same
+/// bytes.
 #[test]
 fn create_raw_formats_a_caller_owned_region() {
     let cfg = Config {
@@ -1115,16 +1037,19 @@ fn create_raw_formats_a_caller_owned_region() {
     let ring = unsafe { RingBuffer::create_raw(base, region.len(), cfg) }.expect("formats");
     let mut writer = ring.writer(NoWake).expect("sole writer");
 
-    // A second attach over the same bytes is what the guest does after the
-    // host formats the region: it reads the geometry back out of the header
-    // and registers its own reader slot. Register before writing, since a
-    // slot joins at the live edge rather than replaying a backlog.
+    // A second, independent attach over the same bytes reads the geometry
+    // back out of the header and registers its own reader slot. Register
+    // before writing, since a slot joins at the live edge rather than
+    // replaying a backlog.
     // SAFETY: same live region, still owned by `region`.
     let attached = unsafe { RingBuffer::attach_raw(base, len) }.expect("attaches");
     let mut view = attached.view(NoWake).expect("reader slot");
 
     writer.try_write(&[1u8; 16]).expect("record fits");
-    assert_eq!(&view.try_latest().unwrap().expect("the record")[..], &[1u8; 16]);
+    assert_eq!(
+        &view.try_latest().unwrap().expect("the record")[..],
+        &[1u8; 16]
+    );
 }
 
 /// The two rejections `create_raw` owns: a base the ring cannot attach to, and
@@ -1146,4 +1071,33 @@ fn create_raw_rejects_bad_regions() {
     // SAFETY: same, one byte short of the computed layout.
     let small = unsafe { RingBuffer::create_raw(base, len - 1, cfg) };
     assert!(matches!(small, Err(AttachError::TooSmall)));
+}
+
+#[test]
+fn checked_region_size_rejects_unrepresentable_geometry() {
+    for cfg in [
+        Config {
+            capacity: 8,
+            max_readers: usize::MAX,
+        },
+        Config {
+            capacity: 1usize << (usize::BITS - 1),
+            max_readers: 1,
+        },
+        Config {
+            capacity: 8,
+            max_readers: 0,
+        },
+        Config {
+            capacity: 3,
+            max_readers: 1,
+        },
+    ] {
+        assert_eq!(checked_region_len(&cfg), None);
+    }
+    let cfg = Config {
+        capacity: 64,
+        max_readers: 2,
+    };
+    assert_eq!(checked_region_len(&cfg), Some(region_len(&cfg)));
 }

@@ -10,6 +10,7 @@ use std::{
 };
 
 use metor_proto::types::{ComponentView, Timestamp};
+use smallvec::SmallVec;
 
 use crate::ComponentSchema;
 use stellarator::sync::WaitQueue;
@@ -21,7 +22,10 @@ use crate::{
     append_log::AppendLog,
     arc_ring::{AtomicNode, AtomicStack, AtomicStackIter},
     disruptor::ArcAtomic,
-    manifest::{ComponentManifest, Coverage, GapVec, ManifestCell, NodeSpan, SpanSource, SpanState},
+    manifest::{
+        ComponentManifest, Coverage, GapVec, ManifestCell, NodeSpan, RangeVec, SpanSource,
+        SpanState,
+    },
     seal::{SealRecord, SealRecordExt, seal_node},
 };
 
@@ -409,6 +413,52 @@ impl TimeSeries {
         }
     }
 
+    /// Append the stretches of `range` that no one has ever produced data
+    /// for, in time order. Never blocks and never allocates beyond `out`'s
+    /// spill; safe to call from a render loop.
+    ///
+    /// The complement to [`Self::coverage`]: a gap there is history that
+    /// exists but is not *here* (a remote-only span a fetch can hydrate),
+    /// while an uncovered stretch is answered by nothing at all — no
+    /// resident node, no manifest span in any state. That makes this the
+    /// question a backfill asks ("what must I compute?") where hydration
+    /// asks [`Self::coverage`] ("what must I fetch?").
+    pub fn uncovered(&self, range: Range<Timestamp>, out: &mut RangeVec) {
+        let manifest = self.manifest.load();
+        // Inclusive `(start, end)` pairs; residency and state are
+        // irrelevant here, only whether anything claims the time.
+        let mut claimed: SmallVec<[(i64, i64); 8]> = manifest
+            .spans
+            .iter()
+            .map(|span| (span.seal.start_ts.0, span.cover_end.0))
+            .collect();
+        claimed.extend(self.list.iter().filter_map(|node| {
+            let timestamps = node.timestamps();
+            Some((timestamps.first()?.0, timestamps.last()?.0))
+        }));
+        claimed.sort_unstable();
+
+        let mut cursor = range.start.0;
+        for (start, end) in claimed {
+            if end < cursor {
+                continue;
+            }
+            if start >= range.end.0 {
+                break;
+            }
+            if start > cursor {
+                out.push(Timestamp(cursor)..Timestamp(start));
+            }
+            cursor = end.saturating_add(1);
+            if cursor >= range.end.0 {
+                return;
+            }
+        }
+        if cursor < range.end.0 {
+            out.push(Timestamp(cursor)..range.end);
+        }
+    }
+
     /// Seal every resident node the writer has rolled past, summarize it,
     /// and record it in the manifest. Returns true when anything changed.
     /// Runs on the lifecycle task; checksums and fsyncs
@@ -449,9 +499,10 @@ impl TimeSeries {
         Ok(true)
     }
 
-    /// Woken whenever [`Self::seal_rolled_nodes`] adds spans — i.e. when
-    /// new history has become final and derivations over sealed data can
-    /// advance.
+    /// Woken whenever a sealed span appears — [`Self::seal_rolled_nodes`]
+    /// sealing what the writer rolled past, or [`Self::install_node`]
+    /// splicing one in. Either way new history has become final and
+    /// derivations over sealed data can advance.
     pub fn seal_waiter(&self) -> Arc<WaitQueue> {
         self.seal_waker.clone()
     }
@@ -711,7 +762,53 @@ impl TimeSeries {
             spans.push(NodeSpan::whole(*seal, SpanState::Resident, source, acked));
         })?;
         self.data_waker.wake_all();
+        // A span that arrives whole is as final as one the lifecycle task
+        // seals, and the LoD engine sleeps on this queue.
+        self.seal_waker.wake_all();
         Ok(())
+    }
+
+    /// Stage `samples` as one sealed node and splice it in behind the live
+    /// head. Backfill's counterpart to the writer: [`TimerSeriesWriter`]
+    /// only ever appends forward, so history computed after the fact has
+    /// to arrive as a node of its own. Returns the installed seal so the
+    /// caller can refresh bookkeeping derived from it (the DB's earliest
+    /// timestamp); an empty batch installs nothing.
+    ///
+    /// Timestamps must be non-decreasing and every sample exactly
+    /// `element_size` bytes. A violation errors with nothing installed —
+    /// staged bytes only ever become a node at [`Self::install_node`], and
+    /// the staging directory is removed when it is dropped instead.
+    pub fn install_samples<'a>(
+        &self,
+        element_size: usize,
+        samples: impl IntoIterator<Item = (Timestamp, &'a [u8])>,
+        source: SpanSource,
+    ) -> Result<Option<SealRecord>, Error> {
+        let mut samples = samples.into_iter().peekable();
+        let Some(&(start_ts, _)) = samples.peek() else {
+            return Ok(None);
+        };
+        let staging = crate::store::NodeStaging::with_capacity(
+            &self.path,
+            start_ts,
+            element_size as u64,
+            samples.size_hint().0,
+        )?;
+        let mut prev = start_ts;
+        for (timestamp, bytes) in samples {
+            if bytes.len() != element_size {
+                return Err(Error::SchemaMismatch);
+            }
+            if timestamp.0 < prev.0 {
+                return Err(Error::TimeTravel);
+            }
+            staging.push(timestamp, bytes)?;
+            prev = timestamp;
+        }
+        let seal = staging.seal().expect("staged batch is non-empty");
+        self.install_node(staging, &seal, source)?;
+        Ok(Some(seal))
     }
 
     /// Merge a peer's sealed-node manifest into this component as
@@ -1061,7 +1158,7 @@ mod tests {
     use super::*;
 
     fn test_schema() -> ComponentSchema {
-        ComponentSchema::new(metor_proto::types::PrimType::I64, &[1])
+        ComponentSchema::new(metor_proto::types::PrimType::I64, &[1][..])
     }
 
     fn remote_seal(start: i64, end: i64) -> SealRecord {
@@ -1458,5 +1555,197 @@ mod tests {
             series.coverage(Timestamp(500)..Timestamp(600), &mut gaps),
             Coverage::Complete
         );
+    }
+
+    #[test]
+    fn uncovered_reports_never_written_stretches() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = TimeSeriesNode::create(dir.path().join("100"), Timestamp(100), 8).unwrap();
+        for ts in [100i64, 101] {
+            node.data.write(&ts.to_le_bytes()).unwrap();
+            node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
+        }
+        let series = TimeSeries::open(dir.path()).unwrap();
+        series.merge_remote_spans([remote_seal(200, 299)]).unwrap();
+
+        let mut out = RangeVec::new();
+        series.uncovered(Timestamp(0)..Timestamp(400), &mut out);
+        assert_eq!(
+            out.as_slice(),
+            &[
+                Timestamp(0)..Timestamp(100),
+                Timestamp(102)..Timestamp(200),
+                Timestamp(300)..Timestamp(400),
+            ]
+        );
+
+        // Coverage sees only the stretch that exists but is elsewhere.
+        let mut gaps = GapVec::new();
+        assert_eq!(
+            series.coverage(Timestamp(0)..Timestamp(400), &mut gaps),
+            Coverage::Partial
+        );
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].range, Timestamp(200)..Timestamp(300));
+    }
+
+    fn backfill(range: std::ops::Range<i64>, step: i64) -> Vec<(Timestamp, [u8; 8])> {
+        range
+            .step_by(step as usize)
+            .map(|ts| (Timestamp(ts), ts.to_le_bytes()))
+            .collect()
+    }
+
+    fn samples(batch: &[(Timestamp, [u8; 8])]) -> impl Iterator<Item = (Timestamp, &[u8])> {
+        batch.iter().map(|(ts, bytes)| (*ts, bytes.as_slice()))
+    }
+
+    fn staging_dirs(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "fetching")
+            })
+            .count()
+    }
+
+    #[test]
+    fn install_samples_lands_behind_a_live_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        for ts in [500i64, 501] {
+            writer.push_buf(Timestamp(ts), &ts.to_le_bytes()).unwrap();
+        }
+
+        let batch = backfill(0..100, 10);
+        let seal = series
+            .install_samples(8, samples(&batch), SpanSource::LocalIngest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seal.start_ts, Timestamp(0));
+        assert_eq!(seal.end_ts, Timestamp(90));
+
+        // The live head is untouched and still the newest data.
+        assert_eq!(series.latest().unwrap().timestamp(), Timestamp(501));
+        assert_eq!(series.start_timestamp().unwrap(), Timestamp(0));
+        let manifest = series.manifest();
+        assert_eq!(
+            manifest.span(Timestamp(0)).unwrap().state,
+            SpanState::Resident
+        );
+
+        let mut out = RangeVec::new();
+        series.uncovered(Timestamp(0)..Timestamp(502), &mut out);
+        assert_eq!(out.as_slice(), &[Timestamp(91)..Timestamp(500)]);
+        // Past the newest sample there is no history either, so a range
+        // running into the future reports that stretch too.
+        out.clear();
+        series.uncovered(Timestamp(0)..Timestamp(600), &mut out);
+        assert_eq!(
+            out.as_slice(),
+            &[
+                Timestamp(91)..Timestamp(500),
+                Timestamp(502)..Timestamp(600),
+            ]
+        );
+
+        writer
+            .push_buf(Timestamp(502), &502i64.to_le_bytes())
+            .unwrap();
+        assert_eq!(series.latest().unwrap().timestamp(), Timestamp(502));
+        assert_eq!(series.list.iter().count(), 2);
+    }
+
+    #[test]
+    fn install_samples_into_an_empty_series_then_live_writes_roll() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let batch = backfill(0..40, 10);
+        series
+            .install_samples(8, samples(&batch), SpanSource::LocalIngest)
+            .unwrap()
+            .unwrap();
+
+        let mut writer = series.writer().unwrap();
+        writer
+            .push_buf(Timestamp(100), &100i64.to_le_bytes())
+            .unwrap();
+
+        // The installed node is sealed, so the writer rolls above it
+        // rather than appending into it.
+        assert_eq!(series.list.iter().count(), 2);
+        let manifest = series.manifest();
+        assert_eq!(manifest.spans.len(), 1);
+        assert_eq!(manifest.spans[0].seal.start_ts, Timestamp(0));
+        assert_eq!(manifest.spans[0].seal.end_ts, Timestamp(30));
+        assert!(manifest.span(Timestamp(100)).is_none());
+        assert_eq!(series.latest().unwrap().timestamp(), Timestamp(100));
+    }
+
+    #[test]
+    fn install_samples_rejects_out_of_order_and_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let mut writer = series.writer().unwrap();
+        writer
+            .push_buf(Timestamp(50), &50i64.to_le_bytes())
+            .unwrap();
+
+        let descending = [
+            (Timestamp(10), 10i64.to_le_bytes()),
+            (Timestamp(5), 5i64.to_le_bytes()),
+        ];
+        assert!(
+            series
+                .install_samples(8, samples(&descending), SpanSource::LocalIngest)
+                .is_err()
+        );
+
+        let overlapping = backfill(40..70, 10);
+        assert!(
+            series
+                .install_samples(8, samples(&overlapping), SpanSource::LocalIngest)
+                .is_err()
+        );
+
+        assert_eq!(series.latest().unwrap().timestamp(), Timestamp(50));
+        assert!(series.manifest().spans.is_empty());
+        assert_eq!(staging_dirs(dir.path()), 0);
+    }
+
+    #[test]
+    fn install_samples_of_an_empty_batch_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let empty: [(Timestamp, [u8; 8]); 0] = [];
+        assert!(
+            series
+                .install_samples(8, samples(&empty), SpanSource::LocalIngest)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(staging_dirs(dir.path()), 0);
+    }
+
+    #[test]
+    fn install_node_wakes_seal_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        let waiter = series.seal_waiter();
+        let mut wait = std::pin::pin!(waiter.wait());
+        // Register the way the LoD engine does before it sleeps.
+        assert!(wait.as_mut().subscribe().is_pending());
+
+        let batch = backfill(0..40, 10);
+        series
+            .install_samples(8, samples(&batch), SpanSource::LocalIngest)
+            .unwrap()
+            .unwrap();
+        assert!(wait.as_mut().subscribe().is_ready());
     }
 }

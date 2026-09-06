@@ -5,8 +5,9 @@
 //!
 //! Both runs use the static path (plant/nav/ctrl as rlibs, the `momentum.rs` pattern) off a
 //! patched `target.py`: `init_orbit_phase` places the boot inside / just before the
-//! shadow arc — the phase is **computed** by scanning [`in_earth_shadow`] at the target
-//! epoch, never hardcoded. The `mode` slot starts empty (ctrl holds its identity reference)
+//! shadow arc — the phase is **computed** by scanning [`in_earth_shadow`] around the orbit
+//! `target.py` configures, at the target epoch, never hardcoded. The `mode` slot starts
+//! empty (ctrl holds its identity reference)
 //! so the estimator behavior under sun loss is the whole subject. Deterministic: seeded
 //! RNG, fixed epoch, no wall clock. Gated off `miri` (provision_artifacts builds the sequence
 //! cdylibs the slot loads even when unoccupied).
@@ -19,8 +20,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use adcs_contracts::{
-    ALTITUDE, AttitudeEstimate, BodyState, CSS_THRESHOLD, Disturbances, EARTH_RADIUS, Quat,
-    Sensors, V3, World, in_earth_shadow, target_epoch, sun_dir_eci,
+    AttitudeEstimate, BodyState, CSS_THRESHOLD, Disturbances, EARTH_RADIUS, PlantParams, Quat,
+    Sensors, World, in_earth_shadow, orbit_pos_vel, raan_for_ltan, sun_dir_eci, target_epoch,
 };
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
@@ -33,12 +34,13 @@ fn target_py() -> std::path::PathBuf {
 
 mod common;
 
-/// The first lit→dark orbit phase at the target epoch, by scanning the shadow function
-/// around the boot orbit (equatorial, radius `EARTH_RADIUS + ALTITUDE`) in 0.1° steps.
-fn shadow_entry_phase() -> f64 {
+/// The first lit→dark phase of the boot orbit `p` configures, at the target epoch, by
+/// scanning the shadow function around the ring in 0.1° steps.
+fn shadow_entry_phase(p: &PlantParams) -> f64 {
     let sun = sun_dir_eci(target_epoch());
-    let r = EARTH_RADIUS + ALTITUDE;
-    let pos = |theta: f64| -> V3 { V3::from_buf([theta.cos(), theta.sin(), 0.0]) * r };
+    let radius = EARTH_RADIUS + p.altitude;
+    let raan = raan_for_ltan(target_epoch(), p.ltan_hours);
+    let pos = |theta: f64| orbit_pos_vel(radius, p.inclination, raan, theta).0;
     let step = 0.1f64.to_radians();
     let mut theta = 0.0;
     while theta < TAU {
@@ -47,11 +49,12 @@ fn shadow_entry_phase() -> f64 {
         }
         theta += step;
     }
-    panic!("an equatorial 400 km orbit at the target epoch always crosses Earth shadow");
+    panic!("the boot orbit at the target epoch always crosses Earth shadow");
 }
 
-/// The patched target: boot at `phase` radians of orbit, slot empty (no commissioning).
-fn build_static(phase: f64) -> Option<Coordinator> {
+/// The patched target: boot `offset` radians past the orbit's shadow-entry phase, slot
+/// empty (no commissioning).
+fn build_static(offset: f64) -> Option<Coordinator> {
     if !common::ensure_stubs() {
         return None;
     }
@@ -62,7 +65,8 @@ fn build_static(phase: f64) -> Option<Coordinator> {
             return None;
         }
     };
-    // Boot the plant `phase` radians into its orbit — the eclipse-arc anchor.
+    // Boot the plant relative to the shadow arc of whatever orbit `target.py` configured —
+    // the eclipse-arc anchor.
     let plant = wiring
         .systems
         .iter_mut()
@@ -71,7 +75,12 @@ fn build_static(phase: f64) -> Option<Coordinator> {
     let ParamSource::Value(serde_json::Value::Object(params)) = &mut plant.params else {
         panic!("plant carries a params value tree");
     };
-    params.insert("init_orbit_phase".into(), phase.into());
+    let p: PlantParams = serde_json::from_value(serde_json::Value::Object(params.clone()))
+        .expect("the plant params deserialize");
+    params.insert(
+        "init_orbit_phase".into(),
+        (shadow_entry_phase(&p) + offset).into(),
+    );
     // Static rlib systems, in-process (test binaries can't host a process worker);
     // the compiled Python system keeps its wasm artifact.
     common::link_statically(&mut wiring);
@@ -161,8 +170,8 @@ async fn run_and_sample(mut coord: Coordinator, cycles: usize) -> Vec<Sample> {
 #[stellarator::test]
 async fn eclipse_darkens_sensors_and_nav_stays_bounded() {
     let _guard = common::link_port_guard();
-    // ~11.5° past entry — inside the ~137° shadow arc for the whole 2000-cycle window.
-    let Some(coord) = build_static(shadow_entry_phase() + 0.2) else {
+    // ~11.5° past entry — inside the >120° shadow arc for the whole 2000-cycle window.
+    let Some(coord) = build_static(0.2) else {
         return;
     };
     let samples = run_and_sample(coord, 2000).await;
@@ -209,7 +218,7 @@ async fn eclipse_darkens_sensors_and_nav_stays_bounded() {
 async fn shadow_entry_flips_sensors_in_lockstep_and_nav_rides_through() {
     let _guard = common::link_port_guard();
     // 1° before entry ≈ 15 s of orbit; the 3000-cycle (25 s) window crosses mid-run.
-    let Some(coord) = build_static(shadow_entry_phase() - 1.0f64.to_radians()) else {
+    let Some(coord) = build_static(-1.0f64.to_radians()) else {
         return;
     };
     let samples = run_and_sample(coord, 3000).await;

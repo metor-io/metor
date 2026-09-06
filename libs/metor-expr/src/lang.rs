@@ -32,7 +32,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustpython_parser::ast::{self, Ranged};
+use ruff_python_ast as ast;
+use ruff_text_size::Ranged;
 
 use crate::diag::{Diagnostics, Span};
 use crate::manifest::{Binding, Field, Form, Frame, Init, Layout, Resample, StateField};
@@ -74,6 +75,9 @@ pub(crate) struct PortDecl {
     pub bindings: Vec<Binding>,
     /// A one-field port the body reads *as* the field, not as a record.
     pub projected: bool,
+    /// Whether the source stamps its samples, so the input frame gets a
+    /// timestamp field for `deltat` to read.
+    pub stamped: bool,
 }
 
 pub(crate) struct StateSlot {
@@ -143,8 +147,10 @@ pub(crate) fn collect<'a>(
                     classes.insert(class.name.as_str().to_string(), decl);
                 }
             }
-            ast::Stmt::FunctionDef(def) if def.decorator_list.is_empty() => functions.push(def),
-            ast::Stmt::FunctionDef(def) => systems.push(def),
+            ast::Stmt::FunctionDef(def) if !def.is_async && def.decorator_list.is_empty() => {
+                functions.push(def)
+            }
+            ast::Stmt::FunctionDef(def) if !def.is_async => systems.push(def),
             ast::Stmt::Assign(assign) => bindings.push(assign),
             other => diags.push(
                 other.range(),
@@ -241,26 +247,30 @@ fn stage_decl(
         );
         return Some(None);
     };
-    if call.args.len() != 2 || !call.keywords.is_empty() {
+    if call.arguments.args.len() != 2 || !call.arguments.keywords.is_empty() {
         diags.push(
             call.range,
             format!("`{}` takes a source and a rate in hertz", callee.id),
         );
         return Some(None);
     }
-    let Some(rate) = number_of(&call.args[1]).filter(|hz| hz.is_finite() && *hz > 0.0) else {
+    let Some(rate) = number_of(&call.arguments.args[1]).filter(|hz| hz.is_finite() && *hz > 0.0)
+    else {
         diags.push(
-            call.args[1].range(),
+            call.arguments.args[1].range(),
             "a resample rate is a positive number of hertz",
         );
         return Some(None);
     };
-    let Some(key) = dotted(&call.args[0]) else {
-        diags.push(call.args[0].range(), "a resample reads one channel");
+    let Some(key) = dotted(&call.arguments.args[0]) else {
+        diags.push(
+            call.arguments.args[0].range(),
+            "a resample reads one channel",
+        );
         return Some(None);
     };
 
-    let span: Span = call.args[0].range().into();
+    let span: Span = call.arguments.args[0].range().into();
     let (source, ty) = if let Some(stage) = stages.iter().position(|s| s.name == key) {
         (Binding::Resampled { stage }, stages[stage].ty.clone())
     } else if let Some(system) = systems.iter().position(|s| s.name == key) {
@@ -275,7 +285,7 @@ fn stage_decl(
         let Some(path) = resolve_path(&key, resolver, span, diags) else {
             return Some(None);
         };
-        let Some(CompSchema { ty }) = resolver.component(&path) else {
+        let Some(CompSchema { ty, .. }) = resolver.component(&path) else {
             diags.push(span, format!("no component `{path}`"));
             return Some(None);
         };
@@ -306,7 +316,10 @@ fn resolve_path(
     match resolver.suffix(key).as_slice() {
         [only] => Some(only.clone()),
         [] => {
-            diags.push(span, format!("`{key}` is not defined and names no component"));
+            diags.push(
+                span,
+                format!("`{key}` is not defined and names no component"),
+            );
             None
         }
         many => {
@@ -326,7 +339,7 @@ pub(crate) fn expression<'a>(
 }
 
 fn class_decl(class: &ast::StmtClassDef, diags: &mut Diagnostics) -> Option<ClassDecl> {
-    let kind = match class.bases.as_slice() {
+    let kind = match class.bases() {
         [ast::Expr::Name(base)] => base.id.as_str(),
         _ => {
             diags.push(
@@ -399,23 +412,21 @@ fn default_of(value: &ast::Expr, ty: &Ty, diags: &mut Diagnostics) -> Option<Ini
         ast::Expr::UnaryOp(u) if matches!(u.op, ast::UnaryOp::USub) => (true, u.operand.as_ref()),
         other => (false, other),
     };
-    let ast::Expr::Constant(c) = inner else {
-        return bad(diags);
-    };
     let sign = if negate { -1.0 } else { 1.0 };
-    match (&c.value, ty) {
-        (ast::Constant::Float(f), Ty::F64) => Some(Init::F64(sign * f)),
-        (ast::Constant::Int(i), Ty::F64) => {
-            Some(Init::F64(sign * num_traits::ToPrimitive::to_f64(i)?))
-        }
-        (ast::Constant::Int(i), Ty::I64) => {
-            let v: i64 = num_traits::ToPrimitive::to_i64(i)?;
-            Some(Init::I64(if negate { -v } else { v }))
-        }
-        (ast::Constant::Bool(b), Ty::Bool) if !negate => Some(Init::Bool(*b)),
-        (ast::Constant::Float(f), Ty::Tensor { .. }) => Some(Init::Fill(sign * f)),
-        (ast::Constant::Int(i), Ty::Tensor { .. }) => {
-            Some(Init::Fill(sign * num_traits::ToPrimitive::to_f64(i)?))
+    match inner {
+        ast::Expr::NumberLiteral(c) => match (&c.value, ty) {
+            (ast::Number::Float(f), Ty::F64) => Some(Init::F64(sign * f)),
+            (ast::Number::Int(i), Ty::F64) => Some(Init::F64(sign * i.as_i64()? as f64)),
+            (ast::Number::Int(i), Ty::I64) => {
+                let v = i.as_i64()?;
+                Some(Init::I64(if negate { -v } else { v }))
+            }
+            (ast::Number::Float(f), Ty::Tensor { .. }) => Some(Init::Fill(sign * f)),
+            (ast::Number::Int(i), Ty::Tensor { .. }) => Some(Init::Fill(sign * i.as_i64()? as f64)),
+            _ => bad(diags),
+        },
+        ast::Expr::BooleanLiteral(b) if matches!(ty, Ty::Bool) && !negate => {
+            Some(Init::Bool(b.value))
         }
         _ => bad(diags),
     }
@@ -436,7 +447,7 @@ fn signature(
     classes: &HashMap<String, ClassDecl>,
     diags: &mut Diagnostics,
 ) -> Option<Signature> {
-    let args = &def.args;
+    let args = &def.parameters;
     if !args.posonlyargs.is_empty()
         || !args.kwonlyargs.is_empty()
         || args.vararg.is_some()
@@ -449,8 +460,8 @@ fn signature(
     let mut params = Vec::new();
     let mut state = Vec::new();
     for arg in &args.args {
-        let name = arg.def.arg.as_str().to_string();
-        let class = match &arg.def.annotation {
+        let name = arg.parameter.name.as_str().to_string();
+        let class = match &arg.parameter.annotation {
             Some(ann) => match ann.as_ref() {
                 ast::Expr::Name(n) => Some(n.id.as_str().to_string()),
                 other => {
@@ -545,7 +556,27 @@ pub(crate) fn frame_of(name: &str, fields: impl IntoIterator<Item = (String, Ty)
         name: name.to_string(),
         fields,
         bytes: offset,
+        timestamp: None,
     }
+}
+
+/// The name of the sample-timestamp field an input frame carries. Not a
+/// Python identifier, so a body cannot name it and a producer's component
+/// cannot collide with it.
+pub(crate) const TIMESTAMP_FIELD: &str = "@timestamp";
+
+/// An input frame with its sample's timestamp as a trailing field, and the
+/// binding that fills it.
+pub(crate) fn stamped(mut frame: Frame, mut bindings: Vec<Binding>) -> (Frame, Vec<Binding>) {
+    frame.timestamp = Some(frame.fields.len());
+    frame.fields.push(Field {
+        name: TIMESTAMP_FIELD.to_string(),
+        ty: Ty::I64,
+        offset: frame.bytes,
+    });
+    frame.bytes += bytes_of(&Ty::I64);
+    bindings.push(Binding::Timestamp);
+    (frame, bindings)
 }
 
 pub(crate) fn bytes_of(ty: &Ty) -> u32 {
@@ -591,12 +622,14 @@ fn system_decl<'a>(
                 &frame_name,
                 decl.fields.iter().map(|(n, t, _)| (n.clone(), t.clone())),
             );
-            let bindings = bind_frame(&frame, produced, resolver, def.range.into(), diags)?;
+            let (bindings, stamped) =
+                bind_frame(&frame, produced, resolver, def.range.into(), diags)?;
             ports.push(PortDecl {
                 key: param.clone(),
                 frame: Some(frame),
                 bindings,
                 projected: false,
+                stamped,
             });
         }
     } else {
@@ -648,7 +681,7 @@ fn projected_port(
     span: Span,
     diags: &mut Diagnostics,
 ) -> Option<PortDecl> {
-    let Some(CompSchema { ty }) = resolver.component(path) else {
+    let Some(CompSchema { ty, timestamp }) = resolver.component(path) else {
         diags.push(span, format!("no component `{path}`"));
         return None;
     };
@@ -658,27 +691,28 @@ fn projected_port(
         frame: Some(frame_of(path, [(field, ty)])),
         bindings: vec![Binding::Component(path.to_string())],
         projected: true,
+        stamped: timestamp,
     })
 }
 
 /// Every field of a declared frame, against a system that produces it or
-/// against the host's component tree.
+/// against the host's component tree — and whether the samples come
+/// stamped, which for a frame means every field's producer stamps.
 fn bind_frame(
     frame: &Frame,
     produced: &HashMap<String, usize>,
     resolver: &dyn Resolver,
     span: Span,
     diags: &mut Diagnostics,
-) -> Option<Vec<Binding>> {
+) -> Option<(Vec<Binding>, bool)> {
     if let Some(system) = produced.get(&frame.name) {
-        return Some(
-            (0..frame.fields.len())
-                .map(|field| Binding::Produced {
-                    system: *system,
-                    field,
-                })
-                .collect(),
-        );
+        let bindings = (0..frame.fields.len())
+            .map(|field| Binding::Produced {
+                system: *system,
+                field,
+            })
+            .collect();
+        return Some((bindings, true));
     }
     if let Some(schema) = resolver.frame(&frame.name) {
         let want: Vec<(String, Ty)> = frame
@@ -695,10 +729,14 @@ fn bind_frame(
         }
     }
     let mut bindings = Vec::with_capacity(frame.fields.len());
+    let mut stamped = true;
     for field in &frame.fields {
         let path = format!("{}.{}", frame.name, field.name);
         match resolver.component(&path) {
-            Some(schema) if schema.ty == field.ty => bindings.push(Binding::Component(path)),
+            Some(schema) if schema.ty == field.ty => {
+                stamped &= schema.timestamp;
+                bindings.push(Binding::Component(path));
+            }
             Some(schema) => {
                 diags.push(
                     span,
@@ -715,7 +753,7 @@ fn bind_frame(
             }
         }
     }
-    Some(bindings)
+    Some((bindings, stamped))
 }
 
 /// What `@system(...)` said.
@@ -735,7 +773,7 @@ struct Decorator {
 /// whatever is drawing the graph.
 fn node_decorator(call: &ast::ExprCall, diags: &mut Diagnostics) -> Option<(f32, f32)> {
     let (mut x, mut y) = (None, None);
-    for keyword in &call.keywords {
+    for keyword in &call.arguments.keywords {
         let value = number_of(&keyword.value).filter(|v| v.is_finite());
         match (keyword.arg.as_ref().map(|a| a.as_str()), value) {
             (Some("x"), Some(v)) => x = Some(v as f32),
@@ -824,7 +862,7 @@ fn decorator(
     // what is left is the one decorator that says what the function *is*.
     let mut system = Vec::new();
     for entry in &def.decorator_list {
-        let node = match entry {
+        let node = match &entry.expression {
             ast::Expr::Call(call) => {
                 matches!(call.func.as_ref(), ast::Expr::Name(n) if n.id.as_str() == "node")
                     .then_some(call)
@@ -839,7 +877,7 @@ fn decorator(
                     form: Form::Decorator,
                 };
             }
-            None => system.push(entry),
+            None => system.push(&entry.expression),
         }
     }
     // An unplaced declaration's annotation belongs above whatever decorators
@@ -872,7 +910,7 @@ fn decorator(
                 diags.push(call.range, "the only decorator is @system");
                 return None;
             }
-            for arg in &call.args {
+            for arg in &call.arguments.args {
                 match string_of(arg) {
                     Some(path) => out.paths.push(path),
                     None => {
@@ -884,17 +922,18 @@ fn decorator(
                     }
                 }
             }
-            for keyword in &call.keywords {
+            for keyword in &call.arguments.keywords {
                 match keyword.arg.as_ref().map(|a| a.as_str()) {
                     Some("bind") => {
                         let ast::Expr::Dict(dict) = &keyword.value else {
                             diags.push(keyword.range, "`bind` takes a dict of parameter to frame");
                             return None;
                         };
-                        for (key, value) in dict.keys.iter().zip(&dict.values) {
-                            let (Some(key), Some(value)) =
-                                (key.as_ref().and_then(string_of), string_of(value))
-                            else {
+                        for item in &dict.items {
+                            let (Some(key), Some(value)) = (
+                                item.key.as_ref().and_then(string_of),
+                                string_of(&item.value),
+                            ) else {
                                 diags.push(keyword.range, "`bind` maps strings to strings");
                                 return None;
                             };
@@ -965,19 +1004,16 @@ fn driving_port(
 
 fn string_of(expr: &ast::Expr) -> Option<String> {
     match expr {
-        ast::Expr::Constant(c) => match &c.value {
-            ast::Constant::Str(s) => Some(s.clone()),
-            _ => None,
-        },
+        ast::Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
         _ => None,
     }
 }
 
 fn number_of(expr: &ast::Expr) -> Option<f64> {
     match expr {
-        ast::Expr::Constant(c) => match &c.value {
-            ast::Constant::Float(f) => Some(*f),
-            ast::Constant::Int(i) => num_traits::ToPrimitive::to_f64(i),
+        ast::Expr::NumberLiteral(c) => match &c.value {
+            ast::Number::Float(f) => Some(*f),
+            ast::Number::Int(i) => i.as_i64().map(|v| v as f64),
             _ => None,
         },
         _ => None,
@@ -1037,6 +1073,7 @@ fn anonymous<'a>(
                 frame: existing[system].output.clone(),
                 bindings: vec![Binding::Produced { system, field: 0 }],
                 projected: true,
+                stamped: true,
             });
             continue;
         }
@@ -1049,6 +1086,7 @@ fn anonymous<'a>(
                     .map(|ty| frame_of(&key, [(key.clone(), ty)])),
                 bindings: vec![Binding::Resampled { stage }],
                 projected: true,
+                stamped: true,
             });
             continue;
         }
@@ -1083,10 +1121,10 @@ fn gather(expr: &ast::Expr, out: &mut Vec<(String, Span)>) {
     }
     match expr {
         ast::Expr::Call(call) => {
-            for arg in &call.args {
+            for arg in &call.arguments.args {
                 gather(arg, out);
             }
-            for keyword in &call.keywords {
+            for keyword in &call.arguments.keywords {
                 gather(&keyword.value, out);
             }
         }
@@ -1106,7 +1144,7 @@ fn gather(expr: &ast::Expr, out: &mut Vec<(String, Span)>) {
                 gather(cmp, out);
             }
         }
-        ast::Expr::IfExp(c) => {
+        ast::Expr::If(c) => {
             gather(&c.test, out);
             gather(&c.body, out);
             gather(&c.orelse, out);

@@ -8,14 +8,14 @@
 //! [`LogState::by_seq`](crate::logs::LogState::by_seq) at paint time.
 
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, SharedString, WeakEntity, Window, div,
-    prelude::*, px,
+    AnyElement, Context, Entity, IntoElement, SharedString, WeakEntity, Window, div, prelude::*, px,
 };
 use metor_proto_wkt::LogLevel;
 
 use crate::logs::{self, LogState};
 use crate::theme::{Theme, theme};
-use crate::views::table::{Column, ColumnSort, Table, TableDelegate};
+use crate::views::format::format_time;
+use crate::views::table::{self, Column, ColumnSort, Table, TableDelegate};
 
 /// The viewer's level floor. `All` shows everything received (the FSW side
 /// already filters what it forwards); the rest hide rows below the floor.
@@ -171,7 +171,7 @@ impl Render for LogView {
             .items_center()
             .gap_2()
             .px_3()
-            .py_2()
+            .h(px(table::HEADER_HEIGHT))
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme.border_primary);
@@ -285,18 +285,6 @@ fn level_tint(level: LogLevel, theme: &Theme) -> gpui::Hsla {
         LogLevel::Info => theme.alarm_tint(0),
         LogLevel::Debug | LogLevel::Trace => theme.bg_elevated,
     }
-}
-
-/// `HH:MM:SS.mmm` local time from a payload timestamp (microseconds).
-pub(crate) fn format_time(t_us: i64) -> String {
-    let Ok(ts) = jiff::Timestamp::from_microsecond(t_us) else {
-        return t_us.to_string();
-    };
-    let hms = ts
-        .to_zoned(jiff::tz::TimeZone::system())
-        .strftime("%H:%M:%S")
-        .to_string();
-    format!("{hms}.{:03}", t_us.rem_euclid(1_000_000) / 1000)
 }
 
 const COL_TIME: usize = 0;
@@ -448,5 +436,5 @@ impl TableDelegate for LogDelegate {
         }
     }
 
-    fn sort_column(&mut self, _col_ix: usize, _sort: ColumnSort, _cx: &App) {}
+    fn sort_column(&mut self, _: usize, _: ColumnSort, _: &mut Context<Table<Self>>) {}
 }

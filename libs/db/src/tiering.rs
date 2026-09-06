@@ -301,7 +301,7 @@ mod tests {
                     .unwrap();
             }
         }
-        ComponentSchema::new(PrimType::U64, &[1])
+        ComponentSchema::new(PrimType::U64, &[1][..])
             .write(comp_dir.join("schema"))
             .unwrap();
         ComponentMetadata {

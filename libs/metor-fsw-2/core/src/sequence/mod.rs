@@ -1,43 +1,13 @@
-//! The clock and status runtime under async-fn systems and sequences.
+//! Cycle-based waits, cancellation, and status for task entries.
 //!
-//! A sequence is an `async fn` whose [`Input`](crate::Input) and
-//! [`Output`] ports are moved into
-//! the future it becomes, owned for the future's whole life — registered with
-//! [`Pack::task`](crate::Pack::task) like any async entry. The entry's driver
-//! polls that future once per cycle, and everything time-shaped inside the
-//! body resolves against the host's clock rather than a timer. That makes a
-//! sequence deterministic under a simulated clock, and it makes the poll
-//! protocol simple enough to describe in one paragraph:
+//! The driver polls each task once per cycle with an ambient clock. [`wait`],
+//! [`now`], [`progress`], [`aborted`], and [`cycle`] use that clock, so simulated
+//! execution follows coordinator time. Pending waits need no waker because the
+//! driver polls again next cycle.
 //!
-//! Before each poll, the driver (`handler::FutureDriver`) refreshes the shared
-//! [`CycleClock`]. It writes the cycle's `now`, and — when the entry is
-//! mounted as a slot occupant — latches `cancel` if an abort frame arrived on
-//! the mount-appended [`SlotControlIn`] input. It then installs the clock as
-//! a thread-local ambient via [`with_clock`] and polls the future
-//! synchronously. Inside the poll, the author-facing free functions [`wait`],
-//! [`now`], [`progress`], [`aborted`], and [`cycle`] read that ambient clock;
-//! a [`Wait`] future resolves by comparing its stored deadline against
-//! `CycleClock::now`, returning [`Step::Aborted`] early if `cancel` was
-//! latched. After the poll, an occupant's driver drains the accumulated
-//! progress lines and publishes a [`SequenceStatus`] record for the cycle.
-//!
-//! There is no waker machinery in any of this. A pending [`Wait`] (or
-//! [`NextCycle`]) simply stays pending until the next cycle's poll observes a
-//! later `now`, because the host re-polls unconditionally every cycle.
-//!
-//! On top of those primitives sits [`check`], the condition combinator a body
-//! actually reaches for: *hold this predicate for a dwell, give up after a
-//! budget*. Together with [`Check::or_fail`] it turns a phase into one `?`-able
-//! line, which leaves a body with a single place to publish its safing rather
-//! than one branch per suspension point.
-//!
-//! Port order, ring sizing, and compatibility come from the entry's
-//! descriptor, computed from the fn's parameter types (`crate::handler`);
-//! the [`SlotControlIn`] input and [`SequenceStatus`] output are appended by
-//! the occupant *mount*, never declared by the entry (see `docs/packs.md`).
-//!
-//! This module is compiled unconditionally (no `wiring` feature gate), since
-//! sequences are a runtime feature independent of the config front-end.
+//! Slot occupants receive cancellation through [`SlotControlIn`] and publish
+//! [`SequenceStatus`] after polling. [`check`] waits for a predicate to hold
+//! for a dwell period, with a timeout and cancellation support.
 
 use core::cell::{Cell, RefCell};
 use core::future::Future;
@@ -146,7 +116,7 @@ impl Step {
     }
 }
 
-/// A timer future driven entirely by the ambient [`CycleClock`].
+/// A timer future driven entirely by the ambient `CycleClock`.
 ///
 /// It resolves once `CycleClock::now` reaches its stored deadline, or
 /// immediately with [`Step::Aborted`] once `cancel` is latched. It never
@@ -216,7 +186,7 @@ pub fn aborted() -> bool {
 ///
 /// The general-system suspension point: an async-fn system holds its state
 /// in locals and writes `let now = cycle().await;` at the top of its loop.
-/// Like [`Wait`] there is no waker machinery — the driver re-polls every
+/// Like [`Wait`] there is no waker machinery: the driver re-polls every
 /// cycle, and the future is ready once the ambient clock has advanced past
 /// the value it was armed at. Deterministic under a simulated clock.
 ///
@@ -252,10 +222,6 @@ impl Future for NextCycle {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Condition combinators
-// ---------------------------------------------------------------------------
-
 /// How a [`check`] resolved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Check {
@@ -271,7 +237,7 @@ impl Check {
     /// The `?`-able form: `Ok` when held, otherwise the [`Outcome`] to end on,
     /// recording a progress line naming the phase that timed out.
     ///
-    /// This is what lets a body put its safing in one place — the phases read
+    /// This is what lets a body put its safing in one place: the phases read
     /// `check(..).await.or_fail("warm-up")?` and a single `Err` arm publishes
     /// the safe command.
     pub fn or_fail(self, phase: &str) -> Result<(), Outcome> {
@@ -297,7 +263,7 @@ fn deadline_at(start: Timestamp, budget: Duration) -> Timestamp {
 /// `timeout`.
 ///
 /// The predicate runs once per cycle against that cycle's data, starting with
-/// the cycle `check` is called on — so a condition already true resolves
+/// the cycle `check` is called on, so a condition already true resolves
 /// without suspending when `hold` is [`Duration::ZERO`]. A cycle where the
 /// predicate goes false restarts the dwell. Cancellation wins over both, and
 /// the budget is measured from the call, not from when the predicate first
@@ -329,10 +295,6 @@ pub async fn check(mut pred: impl FnMut() -> bool, hold: Duration, timeout: Dura
         cycle().await;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Frames
-// ---------------------------------------------------------------------------
 
 /// Capacity of one progress line's message; longer lines are truncated.
 pub const PROGRESS_MSG_CAP: usize = 64;
@@ -377,7 +339,7 @@ pub struct SequenceStatus {
 
 /// The implicit cancel input the occupant mount appends after an entry's own
 /// inputs. An abort command lands here as ordinary ring data and is folded
-/// into [`CycleClock::cancel`] at the top of the next poll.
+/// into `CycleClock::cancel` at the top of the next poll.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "slot_control")]
@@ -388,12 +350,8 @@ pub struct SlotControlIn {
     pub _pad: [u8; 7],
 }
 
-// ---------------------------------------------------------------------------
-// The per-cycle status writer
-// ---------------------------------------------------------------------------
-
 /// Publish one [`SequenceStatus`] record with the given run state and
-/// progress lines. The occupant driver drives its health `end_cycle`
+/// progress lines. The occupant driver drives its log `flush`
 /// separately.
 pub(crate) fn publish_status(
     out: &mut Output<SequenceStatus>,

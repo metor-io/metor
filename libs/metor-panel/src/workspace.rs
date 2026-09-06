@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, Bounds, Entity, Pixels, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowId, WindowOptions, point, px, size,
+    App, AppContext as _, Bounds, Entity, Pixels, TitlebarOptions, WeakEntity, Window,
+    WindowBounds, WindowHandle, WindowId, WindowOptions, point, px, size,
 };
 use metor_db::DB;
 
@@ -52,15 +52,43 @@ pub(crate) fn panel_windows(cx: &App) -> Vec<WindowHandle<AppRoot>> {
     windows
 }
 
-/// The tile tree of the active window, falling back to the first panel
+/// Window-id-keyed tile trees, maintained by [`open_panel_window`].
+///
+/// This map exists because a window mid-dispatch has its gpui slot taken,
+/// making its root view unreachable through `WindowHandle::read` — exactly
+/// when the palette, opened from inside that window's dispatch, asks for
+/// its tiles. Entities read fine regardless, so the tree is reachable by
+/// window id when the root view is not. Weak entries die with their window
+/// and are pruned on the next insert.
+#[derive(Default)]
+struct WindowTiles(Vec<(WindowId, WeakEntity<TileGroup>)>);
+
+impl gpui::Global for WindowTiles {}
+
+fn register_window_tiles(id: WindowId, tiles: &Entity<TileGroup>, cx: &mut App) {
+    let map = cx.default_global::<WindowTiles>();
+    map.0.retain(|(_, weak)| weak.upgrade().is_some());
+    map.0.push((id, tiles.downgrade()));
+    cx.refresh_windows();
+}
+
+/// The tile tree of the active window, falling back to the lowest-id live
 /// window. For a callback holding a `Window`, prefer [`tiles_for`] — it
 /// names the window precisely instead of trusting focus.
 pub(crate) fn active_tiles(cx: &App) -> Option<Entity<TileGroup>> {
-    let handle = cx
-        .active_window()
-        .and_then(|w| w.downcast::<AppRoot>())
-        .or_else(|| panel_windows(cx).into_iter().next())?;
-    Some(handle.read(cx).ok()?.tiles().clone())
+    let map = cx.try_global::<WindowTiles>()?;
+    let active = cx.active_window().map(|w| w.window_id());
+    if let Some(tiles) = active
+        .and_then(|id| map.0.iter().find(|(wid, _)| *wid == id))
+        .and_then(|(_, weak)| weak.upgrade())
+    {
+        return Some(tiles);
+    }
+    map.0
+        .iter()
+        .filter_map(|(id, weak)| weak.upgrade().map(|tiles| (*id, tiles)))
+        .min_by_key(|(id, _)| *id)
+        .map(|(_, tiles)| tiles)
 }
 
 /// The tile tree owned by `window`'s root, when it is a panel window.
@@ -72,10 +100,13 @@ pub(crate) fn tiles_for(window: &Window, cx: &App) -> Option<Entity<TileGroup>> 
 /// Whether any panel window holds an item: the multi-window blank-slate
 /// test consent checks use before replacing what's on screen.
 pub(crate) fn any_window_has_items(cx: &App) -> bool {
-    panel_windows(cx)
+    let Some(map) = cx.try_global::<WindowTiles>() else {
+        return false;
+    };
+    map.0
         .iter()
-        .filter_map(|w| w.read(cx).ok())
-        .any(|root| root.tiles().read(cx).has_items(cx))
+        .filter_map(|(_, weak)| weak.upgrade())
+        .any(|tiles| tiles.read(cx).has_items(cx))
 }
 
 /// Open one panel window. `bounds` places it in screen coordinates
@@ -120,7 +151,12 @@ pub(crate) fn open_panel_window(
                 crate::connections::flush_layout_including(window, cx);
                 true
             });
-            cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx))
+            let root = cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx));
+            cx.observe_release(&root, |_, cx| cx.refresh_windows())
+                .detach();
+            let tiles = root.read(cx).tiles().clone();
+            register_window_tiles(window.window_handle().window_id(), &tiles, cx);
+            root
         },
     )
     .inspect_err(|err| tracing::error!(%err, "open panel window failed"))
@@ -289,6 +325,7 @@ mod tests {
         TileLayout {
             version,
             global_time_range: String::new(),
+            temporal: None,
             root: TileNode::Pane(TilePane {
                 active_index: 0,
                 tab_orientation: Default::default(),
@@ -345,9 +382,15 @@ mod tests {
     #[test]
     fn bounds_on_a_live_display_are_visible() {
         let displays = [bounds(0.0, 0.0, 1920.0, 1080.0)];
-        assert!(bounds_visible(&bounds(100.0, 100.0, 800.0, 600.0), &displays));
+        assert!(bounds_visible(
+            &bounds(100.0, 100.0, 800.0, 600.0),
+            &displays
+        ));
         // Partially off-screen still counts — the user can drag it back.
-        assert!(bounds_visible(&bounds(1800.0, 900.0, 800.0, 600.0), &displays));
+        assert!(bounds_visible(
+            &bounds(1800.0, 900.0, 800.0, 600.0),
+            &displays
+        ));
     }
 
     #[test]

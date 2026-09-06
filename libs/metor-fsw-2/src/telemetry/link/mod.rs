@@ -128,18 +128,10 @@ enum CommandKind {
     Cycle,
 }
 
+#[derive(Default)]
 struct RetainedUpdate {
     slot: usize,
     framed: Vec<u8>,
-}
-
-impl Default for RetainedUpdate {
-    fn default() -> Self {
-        Self {
-            slot: 0,
-            framed: Vec::new(),
-        }
-    }
 }
 
 /// One recycled thingbuf slot. `batch` and every retained buffer deliberately
@@ -182,7 +174,7 @@ struct ServerState {
     /// receives first. Accepted connections park in `pending` until set.
     announce_blob: Option<Rc<Vec<u8>>>,
     /// The newest framed record of each Snapshot message tap, replayed to
-    /// every new connection right after the announces — latest-wins boot
+    /// every new connection right after the announces: latest-wins boot
     /// state (a wiring manifest, a sequence registry) a late joiner would
     /// otherwise never see. Slot-indexed by the downlink; an empty slot has
     /// no record yet.
@@ -276,7 +268,7 @@ impl LinkState {
     /// from the uplink's init, before the downlink's
     /// [`set_announces`](Self::set_announces) freezes the replay (init
     /// order guarantees it: the downlink's `ReceiveAll` capability defers
-    /// it last). Errors when the replay is already frozen — an uplink
+    /// it last). Errors when the replay is already frozen: an uplink
     /// registered after the downlink, a config defect the caller reports
     /// through its health. Appends with id-dedup, so a second uplink's set
     /// unions in.
@@ -293,9 +285,9 @@ impl LinkState {
     }
 
     /// Encode and install the identity + announce replay every connection
-    /// receives before any data: the [`LinkInfo`] identity packet first —
-    /// its position is what lets a probing client decide the peer's mode
-    /// from the first packet — then the schema announces. Called once, by
+    /// receives before any data: the [`LinkInfo`] identity packet first,
+    /// whose position is what lets a probing client decide the peer's mode
+    /// from the first packet, then the schema announces. Called once, by
     /// the downlink's init; a second downlink on one server is a config
     /// defect its health reports.
     pub(crate) fn set_announces(
@@ -627,8 +619,8 @@ fn enqueue_bytes(outbound: &OutboundProducer, queued: &AtomicUsize, batch: &[u8]
 }
 
 /// A new connection's opening bytes: the identity + announce blob, then
-/// the newest retained record of every Snapshot message tap — schemas
-/// first, then the latest-wins boot state a late joiner missed live.
+/// the newest retained record of every Snapshot message tap. Schemas
+/// come first, then the latest-wins boot state a late joiner missed live.
 fn seed_replay(blob: &[u8], retained: &[Vec<u8>]) -> Vec<u8> {
     let mut seed = blob.to_vec();
     for record in retained {
@@ -694,8 +686,8 @@ async fn write_half(
 /// Read packets until error or EOF: inbound `Msg` packets queue for the
 /// uplink; legacy [`MsgStream`] subscriptions and stray node/link protocol
 /// messages (a client's `GetDbInfo` identity probe) are accepted and
-/// ignored — the same hygiene the db server applies, so probing never
-/// pollutes the command queue; `Table` packets are ignored.
+/// ignored, so probing never pollutes the command queue; `Table` packets
+/// are ignored too.
 async fn read_half(inbound: InboundSender, metrics: Rc<ServerMetrics>, rx: OwnedReader<TcpStream>) {
     let mut stream = PacketStream::new(rx);
     let mut buf = vec![0u8; RECV_BUF];
@@ -730,122 +722,4 @@ fn push_inbound(inbound: &InboundSender, metrics: &ServerMetrics, id: PacketId, 
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::SocketAddr;
-    use std::time::Duration;
-
-    use metor_proto::types::{IntoLenPacket as _, LenPacket};
-    use stellarator::io::{AsyncRead as _, AsyncWrite as _};
-
-    use super::*;
-
-    #[test]
-    fn inbound_slots_reuse_payload_capacity() {
-        let (tx, rx) = thingbuf::mpsc::with_recycle(1, InboundRecycle);
-        {
-            let mut msg = tx.try_send_ref().unwrap();
-            msg.payload.extend_from_slice(&[0x55; RECV_BUF]);
-        }
-        let capacity = {
-            let msg = rx.try_recv_ref().unwrap();
-            msg.payload.capacity()
-        };
-        let msg = tx.try_send_ref().unwrap();
-        assert!(msg.payload.is_empty());
-        assert_eq!(msg.payload.capacity(), capacity);
-    }
-
-    #[test]
-    fn outbound_queue_enforces_the_byte_cap_and_reuses_storage() {
-        let queue: ArcBBQueue<BoxedSlice, AtomicCoord, MaiNotSpsc> =
-            ArcBBQueue::new_with_storage(BoxedSlice::new(PENDING_CAP + 1));
-        let tx = queue.stream_producer();
-        let rx = queue.stream_consumer();
-        let queued = AtomicUsize::new(0);
-
-        assert!(enqueue_bytes(&tx, &queued, &[0x55; PENDING_CAP]));
-        assert!(!enqueue_bytes(&tx, &queued, &[0x55]));
-
-        let grant = rx.read().unwrap();
-        assert_eq!(grant.len(), PENDING_CAP);
-        grant.release(PENDING_CAP);
-        queued.fetch_sub(PENDING_CAP, Relaxed);
-        assert!(rx.read().is_err());
-        assert!(enqueue_bytes(&tx, &queued, &[0xAA; PENDING_CAP]));
-
-        // Reusing a completely consumed ring may wrap once, but bbqueue
-        // exposes the two regions without allocating either one.
-        let first = rx.read().unwrap();
-        let first_len = first.len();
-        assert_eq!(&*first, &[0xAA; 1]);
-        first.release(first_len);
-        let second = rx.read().unwrap();
-        assert_eq!(first_len + second.len(), PENDING_CAP);
-        assert!(second.iter().all(|byte| *byte == 0xAA));
-    }
-
-    #[test]
-    fn link_replays_fans_out_and_ingests_without_per_message_buffers() {
-        stellarator::run(|| async {
-            let mut link = LinkState::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-            let addr = link.local_addr;
-            crate::SharedLifecycle::start(&mut link);
-
-            // This connection is accepted before the replay exists and parks.
-            let first = TcpStream::connect(addr).await.unwrap();
-            let command_id = [0x12, 0x34];
-            assert!(link.add_uplink_msgs(&[command_id]).is_ok());
-            assert!(link.set_announces(&[]).is_ok());
-            link.set_retained_slots(1);
-
-            let info = LinkInfo {
-                protocol_version: LINK_PROTOCOL_VERSION,
-                features: 0,
-                command_ids: vec![command_id],
-            }
-            .into_len_packet()
-            .inner;
-            let replay = vec![0; info.len()];
-            let (res, replay) = first.read_exact(replay).await;
-            res.unwrap();
-            assert_eq!(replay, info);
-
-            // Retention and live fan-out travel in one recycled cycle slot.
-            let mut retained = b"retained".to_vec();
-            link.retain(0, &mut retained);
-            let mut live = b"live".to_vec();
-            link.broadcast_buffer(&mut live);
-            link.flush();
-
-            let live_read = vec![0; 4];
-            let (res, live_read) = first.read_exact(live_read).await;
-            res.unwrap();
-            assert_eq!(live_read, b"live");
-
-            // A late joiner receives schemas first and the actor-owned newest
-            // retained bytes second.
-            let second = TcpStream::connect(addr).await.unwrap();
-            let mut expected = info.clone();
-            expected.extend_from_slice(b"retained");
-            let replay = vec![0; expected.len()];
-            let (res, replay) = second.read_exact(replay).await;
-            res.unwrap();
-            assert_eq!(replay, expected);
-
-            let mut msg = LenPacket::msg(command_id, 3);
-            msg.extend_from_slice(b"cmd");
-            first.write_all(msg.inner).await.0.unwrap();
-            let mut received = Vec::new();
-            for _ in 0..8 {
-                stellarator::sleep(Duration::from_millis(1)).await;
-                link.drain_inbound(|id, payload| received.push((id, payload.to_vec())));
-                if !received.is_empty() {
-                    break;
-                }
-            }
-            assert_eq!(received, vec![(command_id, b"cmd".to_vec())]);
-
-            crate::SharedLifecycle::shutdown(&mut link);
-        });
-    }
-}
+mod tests;

@@ -10,6 +10,7 @@ use gpui::{AnyEntity, App, SharedString};
 use crate::inspector::rows::{BoolRow, EnumRow, InspectorRow, ScalarRow, SliderRow, TextRow};
 
 use super::{FieldBuildCtx, InspectorRegistry, builders};
+use crate::dynamic::tensor::TypedScalar;
 
 impl InspectorRegistry {
     /// Resolve the row for one struct field.
@@ -64,7 +65,7 @@ impl InspectorRegistry {
         }
 
         if let Some(scalar) = peek.scalar_type()
-            && let Some(val) = scalar_as_f64(peek, scalar)
+            && let Some(val) = scalar_value(peek, scalar)
         {
             let label = ctx.label.clone();
             if let Some((min, max)) = crate::inspect::field_range(ctx.field_def) {
@@ -78,16 +79,27 @@ impl InspectorRegistry {
                     min,
                     max,
                     on_change: Arc::new(move |v, _w, cx| {
-                        write_scalar(&write_entity, field_idx, scalar, v, cx);
+                        let value = if matches!(val, TypedScalar::F32(_) | TypedScalar::F64(_)) {
+                            v
+                        } else {
+                            v.round()
+                        };
+                        write_value(
+                            &write_entity,
+                            field_idx,
+                            scalar,
+                            TypedScalar::from_f64(value, val.dtype()),
+                            cx,
+                        );
                     }),
                 }));
             }
             let any_entity = any_entity.clone();
-            return Some(Box::new(ScalarRow::new(
+            return Some(Box::new(ScalarRow::typed(
                 label,
                 val,
                 Arc::new(move |v, _w, cx| {
-                    write_scalar(&any_entity, field_idx, scalar, v, cx);
+                    write_value(&any_entity, field_idx, scalar, v, cx);
                 }),
             )));
         }
@@ -114,6 +126,13 @@ impl InspectorRegistry {
         }
 
         if let Ok(peek_enum) = (*peek).into_enum() {
+            if peek_enum
+                .variants()
+                .iter()
+                .any(|v| !v.data.fields.is_empty())
+            {
+                return None;
+            }
             let selected = peek_enum
                 .variant_name_active()
                 .unwrap_or("unknown")
@@ -143,68 +162,138 @@ impl InspectorRegistry {
     }
 }
 
-fn scalar_as_f64(peek: &Peek<'_, '_>, scalar: ScalarType) -> Option<f64> {
-    match scalar {
-        ScalarType::F32 => peek.get::<f32>().ok().map(|v| *v as f64),
-        ScalarType::F64 => peek.get::<f64>().ok().copied(),
-        ScalarType::I32 => peek.get::<i32>().ok().map(|v| *v as f64),
-        ScalarType::I64 => peek.get::<i64>().ok().map(|v| *v as f64),
-        ScalarType::U32 => peek.get::<u32>().ok().map(|v| *v as f64),
-        ScalarType::U64 => peek.get::<u64>().ok().map(|v| *v as f64),
-        ScalarType::USize => peek.get::<usize>().ok().map(|v| *v as f64),
-        _ => None,
+fn scalar_value(peek: &Peek<'_, '_>, scalar: ScalarType) -> Option<TypedScalar> {
+    Some(match scalar {
+        ScalarType::F32 => TypedScalar::F32(*peek.get::<f32>().ok()?),
+        ScalarType::F64 => TypedScalar::F64(*peek.get::<f64>().ok()?),
+        ScalarType::I8 => TypedScalar::I8(*peek.get::<i8>().ok()?),
+        ScalarType::I16 => TypedScalar::I16(*peek.get::<i16>().ok()?),
+        ScalarType::I32 => TypedScalar::I32(*peek.get::<i32>().ok()?),
+        ScalarType::I64 => TypedScalar::I64(*peek.get::<i64>().ok()?),
+        ScalarType::U8 => TypedScalar::U8(*peek.get::<u8>().ok()?),
+        ScalarType::U16 => TypedScalar::U16(*peek.get::<u16>().ok()?),
+        ScalarType::U32 => TypedScalar::U32(*peek.get::<u32>().ok()?),
+        ScalarType::U64 => TypedScalar::U64(*peek.get::<u64>().ok()?),
+        ScalarType::USize => {
+            if usize::BITS == 32 {
+                TypedScalar::U32(*peek.get::<usize>().ok()? as u32)
+            } else {
+                TypedScalar::U64(*peek.get::<usize>().ok()? as u64)
+            }
+        }
+        ScalarType::ISize => {
+            if isize::BITS == 32 {
+                TypedScalar::I32(*peek.get::<isize>().ok()? as i32)
+            } else {
+                TypedScalar::I64(*peek.get::<isize>().ok()? as i64)
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn write_value(
+    entity: &AnyEntity,
+    idx: usize,
+    scalar: ScalarType,
+    value: TypedScalar,
+    cx: &mut App,
+) {
+    use crate::inspector::reflect::set_field;
+    match (scalar, value) {
+        (ScalarType::USize, TypedScalar::U32(v)) => set_field(entity, idx, v as usize, cx),
+        (ScalarType::ISize, TypedScalar::I32(v)) => set_field(entity, idx, v as isize, cx),
+        (ScalarType::USize, TypedScalar::U64(v)) => {
+            if let Ok(v) = usize::try_from(v) {
+                set_field(entity, idx, v, cx);
+            }
+        }
+        (ScalarType::ISize, TypedScalar::I64(v)) => {
+            if let Ok(v) = isize::try_from(v) {
+                set_field(entity, idx, v, cx);
+            }
+        }
+        (_, TypedScalar::F32(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::F64(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::I8(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::I16(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::I32(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::I64(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::U8(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::U16(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::U32(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::U64(v)) => set_field(entity, idx, v, cx),
+        (_, TypedScalar::Bool(v)) => set_field(entity, idx, v, cx),
     }
 }
 
 fn read_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, cx: &App) -> f64 {
-    match scalar {
-        ScalarType::F32 => {
-            crate::inspector::reflect::get_field::<f32>(any_entity, idx, cx).map(|v| v as f64)
+    let Some(adapter) = cx
+        .global::<InspectorRegistry>()
+        .entity_adapter(any_entity.entity_type())
+    else {
+        return 0.0;
+    };
+    let mut value = 0.0;
+    (adapter.peek)(any_entity, cx, &mut |peek| {
+        let Ok(fields) = (*peek).into_struct() else {
+            return;
+        };
+        let Ok(field) = fields.field(idx) else {
+            return;
+        };
+        if let Some(scalar) = scalar_value(&field, scalar) {
+            value = scalar.as_f64();
         }
-        ScalarType::F64 => crate::inspector::reflect::get_field::<f64>(any_entity, idx, cx),
-        ScalarType::I32 => {
-            crate::inspector::reflect::get_field::<i32>(any_entity, idx, cx).map(|v| v as f64)
-        }
-        ScalarType::I64 => {
-            crate::inspector::reflect::get_field::<i64>(any_entity, idx, cx).map(|v| v as f64)
-        }
-        ScalarType::U32 => {
-            crate::inspector::reflect::get_field::<u32>(any_entity, idx, cx).map(|v| v as f64)
-        }
-        ScalarType::U64 => {
-            crate::inspector::reflect::get_field::<u64>(any_entity, idx, cx).map(|v| v as f64)
-        }
-        ScalarType::USize => {
-            crate::inspector::reflect::get_field::<usize>(any_entity, idx, cx).map(|v| v as f64)
-        }
-        _ => None,
-    }
-    .unwrap_or(0.0)
+    });
+    value
 }
 
-fn write_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, v: f64, cx: &mut App) {
-    match scalar {
-        ScalarType::F32 => {
-            crate::inspector::reflect::set_field::<f32>(any_entity, idx, v as f32, cx)
-        }
-        ScalarType::F64 => crate::inspector::reflect::set_field::<f64>(any_entity, idx, v, cx),
-        ScalarType::I32 => {
-            crate::inspector::reflect::set_field::<i32>(any_entity, idx, v as i32, cx)
-        }
-        ScalarType::I64 => {
-            crate::inspector::reflect::set_field::<i64>(any_entity, idx, v as i64, cx)
-        }
-        ScalarType::U32 => {
-            crate::inspector::reflect::set_field::<u32>(any_entity, idx, v as u32, cx)
-        }
-        ScalarType::U64 => {
-            crate::inspector::reflect::set_field::<u64>(any_entity, idx, v as u64, cx)
-        }
-        // `usize` is what the crate indexes elements with, so a view exposing
-        // one would otherwise have its field silently skipped.
-        ScalarType::USize => {
-            crate::inspector::reflect::set_field::<usize>(any_entity, idx, v.max(0.0) as usize, cx)
-        }
-        _ => {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inspector::rows::RowAction;
+    use gpui::AppContext;
+
+    #[derive(Facet)]
+    struct Numbers {
+        counter: u64,
+        small: u8,
+    }
+
+    #[gpui::test]
+    fn reflected_integer_edits_preserve_precision_and_reject_invalid_values(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            InspectorRegistry::init(db.clone(), cx);
+            cx.global_mut::<InspectorRegistry>()
+                .register_inspectable::<Numbers>();
+            let entity = cx.new(|_| Numbers {
+                counter: 9_007_199_254_740_993,
+                small: 7,
+            });
+            let mut rows = crate::inspector::reflect::rows_for_entity(&entity, &db, cx);
+            let RowAction::StartEdit {
+                current_text,
+                on_commit,
+            } = rows[0].activate(window, cx)
+            else {
+                panic!("numeric editor")
+            };
+            assert_eq!(current_text, "9007199254740993");
+            on_commit("18446744073709551615".into(), window, cx);
+            assert_eq!(entity.read(cx).counter, u64::MAX);
+            for invalid in ["256", "-1", "1.5"] {
+                let RowAction::StartEdit { on_commit, .. } = rows[1].activate(window, cx) else {
+                    panic!("numeric editor")
+                };
+                on_commit(invalid.into(), window, cx);
+                assert_eq!(entity.read(cx).small, 7);
+            }
+        });
     }
 }

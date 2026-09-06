@@ -90,6 +90,8 @@ fn maximal() -> Wiring {
                 scope: Some(0),
                 attach: None,
                 layout: Some((40.0, 80.0)),
+                status: Some("nav.system_status".into()),
+                encompassing: true,
             },
             SystemSpec {
                 name: "postcard_sys".into(),
@@ -101,6 +103,8 @@ fn maximal() -> Wiring {
                 scope: Some(1),
                 attach: None,
                 layout: None,
+                status: None,
+                encompassing: false,
             },
             SystemSpec {
                 name: "bare".into(),
@@ -112,6 +116,8 @@ fn maximal() -> Wiring {
                 scope: None,
                 attach: Some("link".into()),
                 layout: None,
+                status: None,
+                encompassing: false,
             },
             // A registered `@system`: an ordinary spec, free to sit anywhere
             // in the list, carry a scope, and name its instance apart from
@@ -126,6 +132,8 @@ fn maximal() -> Wiring {
                 scope: Some(0),
                 attach: None,
                 layout: Some((420.0, 180.0)),
+                status: None,
+                encompassing: false,
             },
         ],
         slots: vec![SlotSpec {
@@ -153,6 +161,7 @@ fn maximal() -> Wiring {
             process: false,
             src: src(8),
             scope: Some(0),
+            status: Some("mode.system_status".into()),
         }],
         edges: vec![
             EdgeSpec {
@@ -259,6 +268,20 @@ fn representation_is_externally_tagged() {
     // Layout renders as a two-element array, absent as null.
     assert_eq!(v["systems"][0]["layout"], json!([40.0, 80.0]));
     assert_eq!(v["systems"][1]["layout"], Value::Null);
+
+    // The run-record override is a plain dotted prefix string, and is omitted
+    // entirely when unset — the shape every existing front end emits, so the
+    // goldens and the Python emitter stay untouched.
+    assert_eq!(v["systems"][0]["status"], json!("nav.system_status"));
+    assert_eq!(v["slots"][0]["status"], json!("mode.system_status"));
+    assert!(v["systems"][1].get("status").is_none());
+    assert!(v["systems"][2].get("status").is_none());
+
+    // The encompassing marker renders as a bare `true` and, like `status`,
+    // vanishes when unset — a document written before it existed is unchanged.
+    assert_eq!(v["systems"][0]["encompassing"], json!(true));
+    assert!(v["systems"][1].get("encompassing").is_none());
+    assert!(v["systems"][3].get("encompassing").is_none());
 
     // The captured program: a Python system is an ordinary spec addressing
     // the program artifact's pack entry by `ty`, its instance name and scope

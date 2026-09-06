@@ -1,7 +1,7 @@
 use gpui::App;
 use metor_db::DB;
 
-use super::binding::{ElementRef, component_meta};
+use super::binding::ElementRef;
 use super::time_series::Trace;
 use super::{GaugeConfig, MeterConfig};
 
@@ -19,10 +19,10 @@ pub(crate) fn scale_seeds_for_traces(db: &DB, traces: &[Trace], cx: &App) -> Vec
     traces
         .iter()
         .map(|trace| {
-            let at = ElementRef::new(trace.component_id, trace.element_index);
+            let at = ElementRef::new(trace.source.id(), trace.element_index);
             let (min, max) = super::meter::suggested_scale(at, cx);
             ScaleSeed {
-                component: component_meta(db, trace.component_id).name.to_string(),
+                component: trace.source.text(db),
                 element: trace.element_index,
                 label: trace.label.to_string(),
                 min,

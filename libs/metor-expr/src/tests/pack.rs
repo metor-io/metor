@@ -36,6 +36,7 @@ fn source_of(path: &str) -> Option<ComponentSource> {
         prim,
         shape: shape.to_vec(),
         offset,
+        timestamp_at: None,
     })
 }
 
@@ -49,7 +50,10 @@ impl Resolver for Imu {
                 shape: shape.to_vec(),
             },
         };
-        Some(CompSchema { ty })
+        Some(CompSchema {
+            ty,
+            timestamp: false,
+        })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {
@@ -96,7 +100,7 @@ fn the_baked_manifest_is_the_hosts_own_type_and_the_module_answers_it() {
     assert!(entry.reloadable);
     assert!(entry.params_default.is_none());
     // One grouped input port named for its producer, the Table output, and
-    // the health/log tail every native entry carries.
+    // the log tail every native entry carries.
     assert_eq!(entry.descriptor.inputs.len(), 1);
     assert_eq!(entry.descriptor.inputs[0].name, "sensors");
     assert_eq!(entry.descriptor.inputs[0].max_size, 40);
@@ -106,7 +110,7 @@ fn the_baked_manifest_is_the_hosts_own_type_and_the_module_answers_it() {
         .iter()
         .map(|p| p.name.as_str())
         .collect();
-    assert_eq!(names, ["gyro_norm", "health", "log"]);
+    assert_eq!(names, ["gyro_norm", "log"]);
 
     // The module's own answers: the ABI word, and the manifest bytes behind
     // `fsw_pack_describe`/`fsw_pack_manifest_ptr` are the returned ones.

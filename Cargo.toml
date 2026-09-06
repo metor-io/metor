@@ -7,6 +7,7 @@ members = [
     #"apps/metor",
     "libs/metor-component",
     "libs/metor-component/macros",
+    "libs/metor-component/derive-impl",
     "libs/metor-adcs",
     "libs/wmm",
     "libs/metor-proto",
@@ -38,7 +39,6 @@ members = [
     "libs/metor-expr",
     "libs/metor-fsw-2/tests/fixtures/dl-fixture",
     "libs/metor-fsw-2/tests/fixtures/seq-fixture",
-    "libs/metor-fsw-2/tests/fixtures/seq-param-fixture",
     "examples/adcs-fsw2",
     "examples/adcs-fsw2/contracts",
     "examples/adcs-fsw2/systems/adcs-systems",
@@ -99,6 +99,22 @@ wmm.path = "libs/wmm"
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+# Image decode (map tiles, image widgets, GLTF textures) is 10x+ slower
+# unoptimized; keep just the codec crates fast in dev builds without
+# slowing the workspace's own rebuild loop.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
 
 # Route the published facet crates through our fork so the gpui Entity/Hsla/SharedString
 # impls and the inspect attribute grammar are present everywhere — including in

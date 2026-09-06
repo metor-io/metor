@@ -36,14 +36,13 @@ impl StopReason {
 }
 
 /// Where a cyclic slot sits in its lifecycle, from empty through running to
-/// done or hard-stopped. A static
-/// [`CyclicRunner`](crate::CyclicRunner) and a build-time loaded slot only
-/// ever inhabit `Running`/`Stopped` (once
+/// done or hard-stopped. A static [`CyclicRunner`](crate::CyclicRunner) and a
+/// build-time loaded slot only ever inhabit `Running`/`Stopped` (once
 /// `Stopped` they are never cleared; a sequence-mode worker's `DlSlot` also
 /// latches `Done`, its poll-once guard); a process slot's `Stopped` clears
-/// back to `Running` when its worker restarts (see `docs/process-systems.md`).
-/// A runtime slot uses all six states. Only process mode uses `Loading`.
-/// `Load` or `Reset` can clear a terminal state.
+/// back to `Running` when its worker restarts. A runtime slot uses all six
+/// states. Only process mode uses `Loading`. `Load` or `Reset` can clear a
+/// terminal state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     /// No occupant; `step` is a cheap no-op. (Runtime slots only.)
@@ -52,8 +51,8 @@ pub enum SlotState {
     /// After a hard-drop `Stop` the state returns to `Loaded` with no live
     /// future. (Runtime slots only.)
     Loaded,
-    /// A process slot's occupant worker is mid-pipeline — spawn, attach,
-    /// bind/init — polled forward once per cycle, so a `Load` never stalls
+    /// A process slot's occupant worker is mid-pipeline (spawn, attach,
+    /// bind/init), polled forward once per cycle, so a `Load` never stalls
     /// the loop. Ends at `Loaded` (and its event) when the worker reports
     /// bound, or `Stopped` on a pipeline failure. The command guards need no
     /// new cases: `Load`/`Start`/`Stop` match none of their accepted states
@@ -129,15 +128,19 @@ pub trait CyclicSlot {
     fn shutdown(&mut self);
     fn name(&self) -> &str;
     fn state(&self) -> &SlotState;
-    /// Host-side step timeouts since last drained. The coordinator folds them
-    /// into its own health (the worker owns the system's health ring, so a
+    /// Status records dropped since the coordinator last reported them.
+    fn drain_status_drops(&mut self) -> u64 {
+        0
+    }
+    /// Host-side step timeouts since last drained. The coordinator reports
+    /// them on its own log (the worker owns the system's log ring, so a
     /// process slot cannot report through it). Overridden by `ProcSlot` and
     /// the process-mode `SlotRunner`.
     fn drain_timeouts(&mut self) -> u64 {
         0
     }
-    /// Worker restarts begun since last drained, folded into coordinator
-    /// health like the timeouts. Only `ProcSlot` overrides: slot occupants
+    /// Worker restarts begun since last drained, reported on the coordinator
+    /// log like the timeouts. Only `ProcSlot` overrides: slot occupants
     /// never auto-restart, so the runner has nothing to report here.
     fn drain_restarts(&mut self) -> u64 {
         0
@@ -147,9 +150,9 @@ pub trait CyclicSlot {
     fn drain_boundary_drops(&mut self) -> u64 {
         0
     }
-    /// Health key used when [`drain_boundary_drops`](Self::drain_boundary_drops)
-    /// reports loss.
-    fn boundary_drop_health_key(&self) -> &'static str {
+    /// The fault kind [`drain_boundary_drops`](Self::drain_boundary_drops)'s
+    /// loss is logged under.
+    fn boundary_drop_kind(&self) -> &'static str {
         "async_boundary_dropped"
     }
     /// Structurally corrupt boundary reads since the last drain.

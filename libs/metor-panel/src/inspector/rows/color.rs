@@ -19,6 +19,10 @@ pub struct ColorRow {
 }
 
 impl InspectorRow for ColorRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }

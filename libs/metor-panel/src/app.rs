@@ -15,12 +15,13 @@ use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegi
 use crate::inspector::rows::InspectorRow;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, DataTablePanel, LogPanel,
-    PlotPanel, SequenceGridPanel, SequencePanel,
+    AlarmPanel, AnnunciatorPanel, AnnunciatorPanelConfig, BrowserPanel, LogPanel, OutlinePanel,
+    OutlinePanelConfig, PlotPanel, SequenceGridPanel, SequencePanel,
 };
-use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
+use crate::tiles::{
+    OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent,
+};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
-use crate::views::time_series::time_range::GlobalTimeRange;
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
     MouseUpEvent, Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px,
@@ -66,8 +67,8 @@ pub(crate) struct AppRoot {
     pending_inspector_request: Option<(Box<dyn crate::tiles::PaneItemHandle>, Point<Pixels>)>,
     pending_pane_inspector_request: Option<(Entity<crate::tiles::Pane>, Point<Pixels>)>,
     pending_inspector_open: Option<InspectorRequest>,
-    /// The transient chord menu, present only while open. Dropped (and focus
-    /// returned to the root) once it dismisses, mirroring `inspector`.
+    /// The transient chord menu, retained through its passive exit fade.
+    /// Logical dismissal releases focus before the visual is removed.
     transient: Option<Entity<crate::transient::Transient>>,
     /// The connection picker, present only while open, mirroring `inspector`.
     connection_picker: Option<Entity<crate::connections::ConnectionPicker>>,
@@ -150,6 +151,20 @@ impl AppRoot {
             insp.set_parent_focus(parent_focus);
             insp
         });
+        cx.subscribe(
+            &inspector,
+            |this, inspector, _: &crate::motion::Closed, cx| {
+                if this
+                    .inspector
+                    .as_ref()
+                    .is_some_and(|current| current == &inspector)
+                {
+                    this.inspector = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         inspector.focus_handle(cx).focus(window);
         self.inspector = Some(inspector);
         cx.notify();
@@ -163,14 +178,17 @@ impl AppRoot {
         if let Some(inspector) = &self.inspector
             && !inspector.read(cx).dismissed
         {
-            self.inspector = None;
-            self.focus_handle.focus(window);
-            cx.notify();
+            inspector.update(cx, |inspector, cx| inspector.dismiss(window, cx));
             return;
         }
 
-        let rows = ItemRegistry::root_rows(&self.db, cx);
+        let rows = ItemRegistry::root_rows_for(&self.db, &self.tiles, cx);
         self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
+        if let Some(inspector) = &self.inspector {
+            inspector.update(cx, |inspector, _| {
+                inspector.follow_palette(self.db.clone(), &self.tiles)
+            });
+        }
     }
 
     /// Open the transient chord menu. The leader keybinding is suppressed while
@@ -194,6 +212,20 @@ impl AppRoot {
             t.set_parent_focus(parent_focus);
             t
         });
+        cx.subscribe(
+            &transient,
+            |this, transient, _: &crate::motion::Closed, cx| {
+                if this
+                    .transient
+                    .as_ref()
+                    .is_some_and(|current| current == &transient)
+                {
+                    this.transient = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         transient.focus_handle(cx).focus(window);
         self.transient = Some(transient);
         cx.notify();
@@ -355,6 +387,24 @@ impl AppRoot {
         pane.update(cx, |pane, cx| pane.add_item(Box::new(plot), cx));
     }
 
+    fn handle_open_outline_action(
+        &mut self,
+        action: &OpenOutlineAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
+            return;
+        };
+        let db = self.db.clone();
+        let cfg = OutlinePanelConfig {
+            root: action.root.to_string(),
+            ..Default::default()
+        };
+        let outline = cx.new(|cx| OutlinePanel::from_config(cfg, db, cx));
+        pane.update(cx, |pane, cx| pane.add_item(Box::new(outline), cx));
+    }
+
     fn handle_preview_plot_action(
         &mut self,
         action: &PreviewPlotAction,
@@ -430,7 +480,10 @@ impl AppRoot {
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
         cx.defer(move |cx: &mut App| {
-            drag.pane.update(cx, |pane, cx| pane.remove_item(drag.ix, cx));
+            let Some(index) = drag.pane.read(cx).index_of(drag.item.entity_id()) else {
+                return;
+            };
+            drag.pane.update(cx, |pane, cx| pane.remove_item(index, cx));
             let pane = cx.new(|cx| crate::tiles::Pane::new(vec![drag.item], cx));
             let tiles = cx.new(|cx| TileGroup::from_pane(pane, cx));
             crate::workspace::open_panel_window(
@@ -488,20 +541,6 @@ impl Focusable for AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(inspector) = &self.inspector
-            && inspector.read(cx).dismissed
-        {
-            self.inspector = None;
-            self.focus_handle.focus(window);
-        }
-
-        if let Some(transient) = &self.transient
-            && transient.read(cx).dismissed
-        {
-            self.transient = None;
-            self.focus_handle.focus(window);
-        }
-
         if let Some(picker) = &self.connection_picker
             && picker.read(cx).dismissed
         {
@@ -559,6 +598,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::toggle_cmd_lock))
             .on_action(cx.listener(Self::handle_inspect_entity))
             .on_action(cx.listener(Self::handle_plot_component_action))
+            .on_action(cx.listener(Self::handle_open_outline_action))
             .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))
             .on_action(cx.listener(Self::open_connections))
@@ -831,25 +871,118 @@ impl AppRoot {
             .gap(px(6.0))
             .pr(px(8.0));
 
-        // Global time range: the window every Auto-range plot follows;
-        // clicking opens a preset/custom picker.
-        let range_label = SharedString::from(format!("{}", GlobalTimeRange::get(cx)));
+        let time = crate::temporal::snapshot(cx);
+        let mode = if time.as_ref().is_some_and(|t| t.playing) {
+            "Playing"
+        } else if crate::temporal::is_live(cx) {
+            "Live"
+        } else {
+            "Paused"
+        };
+        let config = crate::temporal::config(cx);
+        let view_label = if mode == "Live" {
+            "Live".to_string()
+        } else {
+            format!(
+                "{mode} {}",
+                crate::temporal::view_time(cx)
+                    .map(|t| crate::temporal::display::label(t, cx))
+                    .unwrap_or_else(|| "Unavailable".into())
+            )
+        };
         right = right.child(
-            Self::titlebar_segment(theme, "global-time-range")
-                .child(range_label)
-                .child(crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary))
+            Self::titlebar_segment(theme, "global-view-time")
+                .child(SharedString::from(view_label))
+                .tooltip(|_, cx| {
+                    let c = crate::temporal::config(cx);
+                    let text = crate::temporal::view_time(cx)
+                        .map(|t| crate::temporal::model::timestamp_text(t, &c.timezone))
+                        .unwrap_or_else(|| "Unavailable".into());
+                    crate::views::tooltip::TooltipText::build(text.into(), cx)
+                })
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
-                    let Some(open) = crate::inspector::open_inspector(cx) else {
-                        return;
-                    };
-                    open(
-                        InspectorRequest {
-                            rows: global_time_range_rows(cx),
-                            mode: InspectorMode::Anchored(event.position),
-                        },
+                    crate::temporal::picker::open(
+                        Some(crate::temporal::picker::Target::View),
+                        InspectorMode::Anchored(event.position),
                         window,
                         cx,
-                    );
+                    )
+                })
+                .on_mouse_down(gpui::MouseButton::Right, |event, window, cx| {
+                    crate::temporal::picker::open(
+                        None,
+                        InspectorMode::Anchored(event.position),
+                        window,
+                        cx,
+                    )
+                }),
+        );
+        if mode != "Live" {
+            right = right.child(
+                Self::titlebar_segment(theme, "time-go-live")
+                    .child(crate::icons::Icon::SkipForward.svg_color(14.0, theme.text_secondary))
+                    .tooltip(|_, cx| {
+                        crate::views::tooltip::TooltipText::build("Go live".into(), cx)
+                    })
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        let _ = crate::temporal::dispatch(crate::temporal::TimeAction::Live, cx);
+                    }),
+            );
+        }
+        right = right.child(
+            Self::titlebar_segment(theme, "global-time-range")
+                .child(SharedString::from(time.as_ref().map_or_else(
+                    || config.range.to_string(),
+                    |t| crate::temporal::display::range(config.range, &config, &t.context),
+                )))
+                .child(crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary))
+                .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
+                    crate::temporal::picker::open(
+                        Some(crate::temporal::picker::Target::Range),
+                        InspectorMode::Anchored(event.position),
+                        window,
+                        cx,
+                    )
+                })
+                .on_mouse_down(gpui::MouseButton::Right, |event, window, cx| {
+                    crate::temporal::picker::open(
+                        None,
+                        InspectorMode::Anchored(event.position),
+                        window,
+                        cx,
+                    )
+                }),
+        );
+        let action = if mode == "Paused" {
+            crate::temporal::TimeAction::Play { from_start: false }
+        } else {
+            crate::temporal::TimeAction::Pause
+        };
+        right = right.child(
+            Self::titlebar_segment(theme, "time-transport")
+                .child(
+                    if mode == "Paused" {
+                        crate::icons::Icon::Play
+                    } else {
+                        crate::icons::Icon::Pause
+                    }
+                    .svg_color(14.0, theme.text_secondary),
+                )
+                .tooltip(move |_, cx| {
+                    crate::views::tooltip::TooltipText::build(
+                        if mode == "Paused" { "Play" } else { "Pause" }.into(),
+                        cx,
+                    )
+                })
+                .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                    if crate::temporal::dispatch(action.clone(), cx).is_err() {
+                        crate::temporal::picker::open(
+                            None,
+                            InspectorMode::Anchored(event.position),
+                            window,
+                            cx,
+                        );
+                    }
                 }),
         );
 
@@ -939,15 +1072,6 @@ impl AppRoot {
             )
             .into_any_element()
     }
-}
-
-/// Picker rows for the global time range: every preset plus a freeform
-/// text field using `TimeRangeBehavior`'s string grammar.
-fn global_time_range_rows(cx: &gpui::App) -> Vec<Box<dyn InspectorRow>> {
-    crate::views::time_series::time_range::picker_rows(
-        SharedString::from(format!("{}", GlobalTimeRange::get(cx))),
-        Arc::new(|behavior, _window, cx| GlobalTimeRange::set(cx, behavior)),
-    )
 }
 
 /// Builder that owns construction of the panel application.
@@ -1175,133 +1299,150 @@ impl PanelApp {
             }
         });
         app.run(move |cx: &mut App| {
-                crate::theme::register_fonts(cx);
-                let cfg = crate::config::load();
-                // Capture the leader before `cfg` moves into the font global; it
-                // parameterizes the chord-menu keybinding below.
-                let leader = cfg.leader.clone();
-                let family = crate::theme::resolve_font_family(cx, &cfg);
-                cx.set_global(crate::theme::FontSettings {
-                    family,
-                    config: cfg,
-                });
-                cx.set_global(crate::theme::ActiveTheme(Arc::new(
-                    crate::theme::DARK.clone(),
-                )));
-                edits::init(cx);
-                ItemRegistry::init(cx);
-                crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
-                crate::views::dashboard::WidgetRegistry::init(cx);
-                crate::dynamic::expressions::Expressions::init(cx);
-                crate::dynamic::worker::DynamicWorker::init(cx);
-                crate::views::system_graph::inspector_rows::register_inspector_rows(cx);
-                crate::alarms::AlarmStore::init(db.clone(), cx);
-                crate::logs::LogStore::init(db.clone(), cx);
-                crate::presets::TargetPresetStore::init(db.clone(), cx);
-                crate::sequences::SequenceStore::init(db.clone(), cx);
-                crate::plot_events::EventSourceRegistry::init(cx);
-                crate::wiring::WiringStore::init(db.clone(), cx);
-                register_pane_item_deserializers(db.clone(), cx);
-                for (kind, spec) in views {
-                    cx.global_mut::<crate::views::dashboard::WidgetRegistry>()
-                        .register(kind, spec);
-                }
-                let registered_tiles = cx
-                    .global::<crate::views::dashboard::WidgetRegistry>()
-                    .tile_specs();
-                for spec in registered_tiles {
-                    cx.global_mut::<crate::tiles::ItemRegistry>()
-                        .register_view(spec, db.clone());
-                }
-
-                // Connections: seed builder-registered targets, hand the
-                // registry to discovery sources, then fire auto-connects.
-                // LoD spawning is a store concern — it starts with the first
-                // local-authority connection rather than at boot.
-                let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
-                if let Some(store) = crate::connections::try_global(cx) {
-                    store.update(cx, |store, cx| {
-                        if let Some(resolver) = address_resolver {
-                            store.set_resolver(resolver);
-                        }
-                        store.set_default_options(default_options);
-                        for target in targets {
-                            store.upsert_target(target, cx);
-                        }
-                        for id in auto_connect {
-                            let Some(target) =
-                                store.state().targets().iter().find(|t| t.id == id).cloned()
-                            else {
-                                tracing::warn!(%id, "auto-connect target not registered");
-                                continue;
-                            };
-                            store.connect(target, cx);
-                        }
-                    });
-                }
-                for source in connection_sources {
-                    source(registry.clone());
-                }
-                register_connection_commands(cx);
-
-                // Inspector requests route to the window they were made in:
-                // the callback resolves the root of whatever `Window` the
-                // caller passed, so one installation serves every window.
-                cx.set_global(OpenInspectorGlobal(Arc::new(|request, window, cx| {
-                    let Some(root) = window.root::<AppRoot>().flatten() else {
-                        return;
-                    };
-                    root.update(cx, |this, cx| {
-                        this.pending_inspector_open = Some(request);
-                        cx.notify();
-                    });
-                })));
-                crate::inspector::palette::register_builtin_providers(db.clone(), cx);
-
-                // Consumer extensions: register custom palette providers, run
-                // init hooks, then build overlays. All happen after the built-in
-                // registries exist so they can call into any of them; overlays
-                // run last so they can rely on anything a hook installed.
-                for (category, provider) in command_providers {
-                    ItemRegistry::register(cx, category, provider);
-                }
-                for hook in init_hooks {
-                    hook(cx);
-                }
-                cx.set_global(OverlayBuilders(overlays));
-
-                set_dock_icon();
-                // `secondary-` resolves to cmd on macOS and ctrl elsewhere
-                // (`cmd-` would be the Win/Super key off-macOS).
-                cx.bind_keys([
-                    KeyBinding::new("secondary-p", OpenPalette, None),
-                    // The leader opens the transient chord menu, and it is a
-                    // bare key — `space` by default — so anything typing into
-                    // it must say so. `TextInput` is that: every host owning
-                    // an editable field declares it beside its own name, and
-                    // one negation covers all of them, including ones that do
-                    // not exist yet. Naming the panes individually is what let
-                    // the program pane swallow its own spacebar.
-                    KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
-                    KeyBinding::new("ctrl-tab", CycleTabForward, None),
-                    KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-                    KeyBinding::new("secondary-l", ToggleCmdLock, None),
-                    KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
-                ]);
-
-                // A non-last close: re-snapshot the survivors right away, so
-                // a quit inside the next autosave interval can't resurrect
-                // the closed window. After the last close this is a no-op,
-                // leaving the should-close snapshot that included it.
-                cx.on_window_closed(|cx| {
-                    if !crate::workspace::panel_windows(cx).is_empty() {
-                        crate::connections::flush_layout_now(cx);
-                    }
-                })
-                .detach();
-
-                crate::workspace::open_panel_window(db.clone(), None, None, true, cx);
+            crate::theme::register_fonts(cx);
+            let cfg = crate::config::load();
+            // Capture the leader before `cfg` moves into the font global; it
+            // parameterizes the chord-menu keybinding below.
+            let leader = cfg.leader.clone();
+            let family = crate::theme::resolve_font_family(cx, &cfg);
+            cx.set_global(crate::theme::FontSettings {
+                family,
+                config: cfg,
             });
+            cx.set_global(crate::theme::ActiveTheme(Arc::new(
+                crate::theme::DARK.clone(),
+            )));
+            edits::init(cx);
+            crate::temporal::TemporalController::init(db.clone(), cx);
+            ItemRegistry::init(cx);
+            crate::temporal::picker::register(cx);
+            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+            crate::views::dashboard::WidgetRegistry::init(cx);
+            crate::dynamic::expressions::Expressions::init(cx);
+            crate::dynamic::worker::DynamicWorker::init(cx);
+            crate::views::map::tiles::TileStore::init(cx);
+            crate::backfill::Backfiller::init(db.clone(), cx);
+            crate::views::exec_timeline::inspector_rows::register_inspector_rows(cx);
+            crate::views::Timeline::register(cx);
+            crate::alarms::AlarmStore::init(db.clone(), cx);
+            crate::logs::LogStore::init(db.clone(), cx);
+            crate::presets::TargetPresetStore::init(db.clone(), cx);
+            crate::sequences::SequenceStore::init(db.clone(), cx);
+            crate::plot_events::EventSourceRegistry::init(cx);
+            crate::wiring::WiringStore::init(db.clone(), cx);
+            register_pane_item_deserializers(db.clone(), cx);
+            for (kind, spec) in views {
+                cx.global_mut::<crate::views::dashboard::WidgetRegistry>()
+                    .register(kind, spec);
+            }
+            let registered_tiles = cx
+                .global::<crate::views::dashboard::WidgetRegistry>()
+                .tile_specs();
+            for spec in registered_tiles {
+                cx.global_mut::<crate::tiles::ItemRegistry>()
+                    .register_view(spec, db.clone());
+            }
+
+            // Connections: seed builder-registered targets, hand the
+            // registry to discovery sources, then fire auto-connects.
+            // LoD spawning is a store concern — it starts with the first
+            // local-authority connection rather than at boot.
+            let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
+            if let Some(store) = crate::connections::try_global(cx) {
+                store.update(cx, |store, cx| {
+                    if let Some(resolver) = address_resolver {
+                        store.set_resolver(resolver);
+                    }
+                    store.set_default_options(default_options);
+                    for target in targets {
+                        store.upsert_target(target, cx);
+                    }
+                    for id in auto_connect {
+                        let Some(target) =
+                            store.state().targets().iter().find(|t| t.id == id).cloned()
+                        else {
+                            tracing::warn!(%id, "auto-connect target not registered");
+                            continue;
+                        };
+                        store.connect(target, cx);
+                    }
+                });
+            }
+            for source in connection_sources {
+                source(registry.clone());
+            }
+            register_connection_commands(cx);
+
+            // Inspector requests route to the window they were made in:
+            // the callback resolves the root of whatever `Window` the
+            // caller passed, so one installation serves every window.
+            cx.set_global(OpenInspectorGlobal(Arc::new(|request, window, cx| {
+                let Some(root) = window.root::<AppRoot>().flatten() else {
+                    return;
+                };
+                root.update(cx, |this, cx| {
+                    this.pending_inspector_open = Some(request);
+                    cx.notify();
+                });
+            })));
+            crate::inspector::palette::register_builtin_providers(db.clone(), cx);
+
+            // Consumer extensions: register custom palette providers, run
+            // init hooks, then build overlays. All happen after the built-in
+            // registries exist so they can call into any of them; overlays
+            // run last so they can rely on anything a hook installed.
+            for (category, provider) in command_providers {
+                ItemRegistry::register(cx, category, provider);
+            }
+            for hook in init_hooks {
+                hook(cx);
+            }
+            cx.set_global(OverlayBuilders(overlays));
+
+            set_dock_icon();
+            // `secondary-` resolves to cmd on macOS and ctrl elsewhere
+            // (`cmd-` would be the Win/Super key off-macOS).
+            cx.bind_keys([
+                KeyBinding::new("secondary-p", OpenPalette, None),
+                // The leader opens the transient chord menu, and it is a
+                // bare key — `space` by default — so anything typing into
+                // it must say so. `TextInput` is that: every host owning
+                // an editable field declares it beside its own name, and
+                // one negation covers all of them, including ones that do
+                // not exist yet. Naming the panes individually is what let
+                // the program pane swallow its own spacebar.
+                KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
+                KeyBinding::new("ctrl-tab", CycleTabForward, None),
+                KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+                KeyBinding::new("secondary-l", ToggleCmdLock, None),
+                KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
+                // Scoped to a focused browser: the bar is per pane, and
+                // nothing else claims the find chord yet.
+                KeyBinding::new(
+                    "secondary-f",
+                    crate::views::column_browser::ToggleFilterBar,
+                    Some("ColumnBrowser"),
+                ),
+                KeyBinding::new(
+                    "secondary-f",
+                    crate::views::column_browser::ToggleFilterBar,
+                    Some("ComponentOutline"),
+                ),
+            ]);
+
+            // A non-last close: re-snapshot the survivors right away, so
+            // a quit inside the next autosave interval can't resurrect
+            // the closed window. After the last close this is a no-op,
+            // leaving the should-close snapshot that included it.
+            cx.on_window_closed(|cx| {
+                if !crate::workspace::panel_windows(cx).is_empty() {
+                    crate::connections::flush_layout_now(cx);
+                }
+            })
+            .detach();
+
+            crate::workspace::open_panel_window(db.clone(), None, None, true, cx);
+        });
     }
 }
 
@@ -1334,21 +1475,45 @@ fn register_connection_commands(cx: &mut App) {
                     }),
                 });
             }
-            let configurable: Vec<ConnectionTarget> = store
+            // Every configurable target would otherwise add its own top-level
+            // "{name} · options" row, swamping the palette when discovery
+            // registers one target per deployment. Nest them under a single
+            // submenu whose children are rebuilt on entry, so the target list
+            // stays live without flooding the root page.
+            let has_configurable = store
                 .read(cx)
                 .state()
                 .targets()
                 .iter()
-                .filter(|t| !store.read(cx).state().spec_for(t).is_empty())
-                .cloned()
-                .collect();
-            for target in configurable {
+                .any(|t| !store.read(cx).state().spec_for(t).is_empty());
+            if has_configurable {
                 let store = store.clone();
                 items.push(InspectionItem::SubMenu {
-                    label: SharedString::from(format!("{} \u{00b7} options", target.name)),
-                    summary: target.detail.clone(),
+                    label: SharedString::new_static("Connection options\u{2026}"),
+                    summary: SharedString::new_static(""),
                     build: Arc::new(move |cx| {
-                        crate::connections::options::option_rows(store.clone(), target.clone(), cx)
+                        store
+                            .read(cx)
+                            .state()
+                            .targets()
+                            .iter()
+                            .filter(|t| !store.read(cx).state().spec_for(t).is_empty())
+                            .cloned()
+                            .map(|target| {
+                                let store = store.clone();
+                                Box::new(crate::inspector::rows::NavRow::new(
+                                    target.name.clone(),
+                                    target.detail.clone(),
+                                    Box::new(move |cx| {
+                                        crate::connections::options::option_rows(
+                                            store.clone(),
+                                            target.clone(),
+                                            cx,
+                                        )
+                                    }),
+                                )) as Box<dyn InspectorRow>
+                            })
+                            .collect()
                     }),
                 });
             }
@@ -1384,61 +1549,20 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     register_panel::<LogPanel>(&mut reg, db.clone(), LogPanel::from_config);
     register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
     register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
-    register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
+    register_panel::<OutlinePanel>(&mut reg, db.clone(), OutlinePanel::from_config);
+    // The outline replaced both tables; layouts saved with either key open
+    // as an outline, keeping the data table's filter.
+    for legacy in ["component_table", "data_table"] {
+        let db = db.clone();
+        reg.register_erased(legacy, move |state, cx| {
+            let cfg: OutlinePanelConfig = serde_json::from_str(state).unwrap_or_default();
+            let db = db.clone();
+            Some(Box::new(
+                cx.new(|cx| OutlinePanel::from_config(cfg, db, cx)),
+            ))
+        });
+    }
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
-    register_panel::<crate::canvas::GraphCanvas>(
-        &mut reg,
-        db.clone(),
-        crate::canvas::GraphCanvas::from_config,
-    );
-
-    // The graph tile is the system graph with a second source added, so it
-    // keeps that key and every layout naming it opens unchanged. A layout that
-    // names the program pane opens on the same tile, showing the text it was
-    // saved on — the two were views of one artifact even before they were one
-    // tile.
-    let db_program = db.clone();
-    reg.register_erased("program", move |state, cx| {
-        #[derive(Default, serde::Deserialize)]
-        #[serde(default)]
-        struct Saved {
-            source: String,
-            graph: bool,
-        }
-        let saved: Saved = serde_json::from_str(state).unwrap_or_default();
-        let cfg = crate::canvas::GraphCanvasConfig {
-            program: crate::canvas::ProgramState {
-                source: saved.source,
-                text: !saved.graph,
-            },
-            ..Default::default()
-        };
-        let db = db_program.clone();
-        let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
-        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
-    });
-
-    // A layout that still names the node editor opens on the graph tile with
-    // its graph converted to a program — one declaration per node, positions
-    // carried across. It opens on the *text*, because a conversion is
-    // something to read before it is something to keep, and anything the
-    // converter could not express rides at the top as a comment.
-    let db_nodes = db.clone();
-    reg.register_erased("node_editor", move |state, cx| {
-        let saved: crate::canvas::legacy::NodeEditorConfig =
-            serde_json::from_str(state).unwrap_or_default();
-        let db = db_nodes.clone();
-        let converted = crate::canvas::migrate::convert(&saved, &db);
-        let cfg = crate::canvas::GraphCanvasConfig {
-            program: crate::canvas::ProgramState {
-                source: converted.annotated(),
-                text: true,
-            },
-            ..Default::default()
-        };
-        let entity = cx.new(|cx| crate::canvas::GraphCanvas::from_config(cfg, db, cx));
-        Some(Box::new(entity) as Box<dyn crate::tiles::PaneItemHandle>)
-    });
 
     // Layouts written before the annunciator rename still name it
     // `traffic_light_grid`; the alias rehydrates them and they re-save under
@@ -1529,8 +1653,8 @@ mod keybinding_tests {
     /// is what lets one negation cover every editable field.
     #[test]
     fn a_host_can_declare_its_name_and_text_input_together() {
-        let context = KeyContext::try_from("GraphCanvas TextInput").unwrap();
-        assert!(context.contains("GraphCanvas"));
+        let context = KeyContext::try_from("Inspector TextInput").unwrap();
+        assert!(context.contains("Inspector"));
         assert!(context.contains(TEXT_INPUT));
     }
 
@@ -1540,17 +1664,17 @@ mod keybinding_tests {
     #[test]
     fn the_leader_never_fires_while_something_is_being_typed_into() {
         assert!(fires(NOT_TYPING, &["AppRoot"]));
-        assert!(fires(NOT_TYPING, &["AppRoot", "NodeEditor"]));
-        assert!(fires(NOT_TYPING, &["AppRoot", "GraphCanvas"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "ExecTimeline"]));
+        assert!(fires(NOT_TYPING, &["AppRoot", "Dashboard"]));
 
         for typing in [
-            &["AppRoot", "GraphCanvas TextInput"][..],
+            &["AppRoot", "Dashboard TextInput"][..],
             &["AppRoot", "Inspector TextInput"][..],
             &["AppRoot", "Inspector TextInput", "RowList TextInput"][..],
             &["AppRoot", "ConnectionPicker TextInput"][..],
             // A field nested under a pane that is not itself a text host: the
             // negation looks at the whole path, not just the leaf.
-            &["AppRoot", "NodeEditor", "RowList TextInput"][..],
+            &["AppRoot", "ExecTimeline", "RowList TextInput"][..],
         ] {
             assert!(
                 !fires(NOT_TYPING, typing),
@@ -1560,15 +1684,5 @@ mod keybinding_tests {
 
         // The chord menu must not re-trigger its own leader.
         assert!(!fires(NOT_TYPING, &["AppRoot", "Transient"]));
-    }
-
-    /// Deleting a card is the graph tile's own key rather than an action, and
-    /// it answers to the same rule: the canvas declares `TextInput` only while
-    /// its editor is showing, so a keystroke meant for the text never reaches
-    /// the graph.
-    #[test]
-    fn deleting_a_card_never_fires_from_inside_a_field() {
-        assert!(fires(NOT_TYPING, &["AppRoot", "GraphCanvas"]));
-        assert!(!fires(NOT_TYPING, &["AppRoot", "GraphCanvas TextInput"]));
     }
 }

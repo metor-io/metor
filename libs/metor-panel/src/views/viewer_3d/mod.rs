@@ -88,6 +88,9 @@ const POST_LOAD_WINDOW: Duration = Duration::from_millis(500);
 ///
 /// The entity ids are stable even across render-target resizes, so
 /// mutation closures can cache them freely.
+#[derive(Component)]
+struct ReadbackChild(Entity);
+
 #[derive(Clone, Copy)]
 struct ViewerEntities {
     camera: Entity,
@@ -111,6 +114,8 @@ pub struct Viewer3d {
     #[facet(opaque)]
     db: Option<Arc<DB>>,
     #[facet(opaque)]
+    _binding_changes: gpui::Task<()>,
+    #[facet(opaque)]
     camera: OrbitCamera,
 
     pub models: Vec<gpui::Entity<ModelEntry>>,
@@ -127,6 +132,10 @@ pub struct Viewer3d {
     pending_release: Option<Arc<RenderImage>>,
     #[facet(skip)]
     needs_render: bool,
+    #[facet(skip)]
+    temporal_revision: u64,
+    #[facet(skip)]
+    frame_generation: u64,
     #[facet(opaque)]
     loading_until: Option<Instant>,
     #[facet(opaque)]
@@ -180,25 +189,25 @@ impl CameraSnapshot {
 pub struct ModelEntry {
     pub label: SharedString,
     pub path: String,
-    pub position_binding: Option<ComponentId>,
-    pub orientation_binding: Option<ComponentId>,
+    pub position_binding: crate::data_binding::Binding,
+    pub orientation_binding: crate::data_binding::Binding,
 }
 
 impl ModelEntry {
     pub fn position_binding_component(&self) -> Option<ComponentId> {
-        self.position_binding
+        (!self.position_binding.is_unbound()).then_some(self.position_binding.id())
     }
 
     pub fn orientation_binding_component(&self) -> Option<ComponentId> {
-        self.orientation_binding
+        (!self.orientation_binding.is_unbound()).then_some(self.orientation_binding.id())
     }
 
     pub fn empty() -> Self {
         Self {
             label: SharedString::new_static(""),
             path: String::new(),
-            position_binding: None,
-            orientation_binding: None,
+            position_binding: crate::data_binding::Binding::default(),
+            orientation_binding: crate::data_binding::Binding::default(),
         }
     }
 }
@@ -282,6 +291,7 @@ impl Viewer3d {
                         FrameSink {
                             queue,
                             size: (w, h),
+                            generation: 0,
                         },
                     ))
                     .id();
@@ -330,6 +340,10 @@ impl Viewer3d {
         let mut viewer = Self {
             entities,
             render_layer,
+            _binding_changes: db
+                .as_ref()
+                .map(|db| crate::data_binding::watch_registrations(db.clone(), cx))
+                .unwrap_or_else(|| gpui::Task::ready(())),
             db,
             camera,
             models: Vec::new(),
@@ -339,6 +353,8 @@ impl Viewer3d {
             current_frame: None,
             pending_release: None,
             needs_render: true,
+            temporal_revision: 0,
+            frame_generation: 0,
             loading_until: None,
             drag: None,
             tracking: HashMap::new(),
@@ -418,6 +434,14 @@ impl Viewer3d {
             work = true;
         }
 
+        if let Some(db) = &self.db {
+            for model in &self.models {
+                model.update(cx, |model, cx| {
+                    model.position_binding.resolve(db, cx);
+                    model.orientation_binding.resolve(db, cx);
+                });
+            }
+        }
         // Snapshot up-front so we can borrow `self.tracking` mutably
         // without aliasing `self.models`.
         let layer = self.render_layer;
@@ -439,8 +463,8 @@ impl Viewer3d {
                     id,
                     m.clone(),
                     entry.path.clone(),
-                    entry.position_binding,
-                    entry.orientation_binding,
+                    entry.position_binding_component(),
+                    entry.orientation_binding_component(),
                 )
             })
             .collect();
@@ -504,7 +528,11 @@ impl Viewer3d {
                     cx.update_global::<BevyBridge, _>(|bridge, _| {
                         bridge.with_world(move |world| {
                             if let Some(e) = cell_for_reset.get().copied() {
-                                world.entity_mut(e).insert(LiveDelta::default());
+                                world.entity_mut(e).insert(LiveDelta {
+                                    position_missing: pos_bind.is_some(),
+                                    rotation_missing: orient_bind.is_some(),
+                                    ..LiveDelta::default()
+                                });
                             }
                         });
                     });
@@ -517,7 +545,10 @@ impl Viewer3d {
                             component_id,
                             cx,
                             pick_position,
-                            |v, delta| delta.translation = Some(v),
+                            |v, delta| {
+                                delta.translation = v;
+                                delta.position_missing = v.is_none();
+                            },
                         ));
                     }
                     if let Some(component_id) = orient_bind {
@@ -527,7 +558,10 @@ impl Viewer3d {
                             component_id,
                             cx,
                             pick_attitude,
-                            |q, delta| delta.rotation = Some(q),
+                            |q, delta| {
+                                delta.rotation = q;
+                                delta.rotation_missing = q.is_none();
+                            },
                         ));
                     }
                     let track = self.tracking.get_mut(&id).expect("inserted above");
@@ -560,8 +594,8 @@ impl Viewer3d {
         let entry = ModelEntry {
             label: label.into(),
             path: path.into(),
-            position_binding: None,
-            orientation_binding: None,
+            position_binding: crate::data_binding::Binding::default(),
+            orientation_binding: crate::data_binding::Binding::default(),
         };
         self.models.push(cx.new(|_| entry));
         cx.notify();
@@ -631,11 +665,50 @@ impl Viewer3d {
             world
                 .entity_mut(ents.camera)
                 .insert(RenderTarget::from(new_handle.clone()));
-            let mut readback = world.entity_mut(ents.readback);
+            let id = world
+                .get::<ReadbackChild>(ents.readback)
+                .map_or(ents.readback, |c| c.0);
+            let mut readback = world.entity_mut(id);
             readback.insert(Readback::texture(new_handle));
             if let Some(mut sink) = readback.get_mut::<FrameSink>() {
                 sink.size = (w, h);
             }
+        });
+    }
+
+    /// A new readback entity prevents an in-flight image from an earlier seek
+    /// being tagged as the current pose when its GPU callback finally arrives.
+    fn invalidate_time_frame(&mut self, cx: &mut Context<Self>) {
+        let revision = crate::temporal::snapshot(cx).map_or(0, |s| s.revision);
+        if revision == self.temporal_revision {
+            return;
+        }
+        self.temporal_revision = revision;
+        self.frame_generation = self.frame_generation.wrapping_add(1);
+        self.pending_release = self.current_frame.take();
+        let generation = self.frame_generation;
+        self.with_entities(cx, move |world, ents| {
+            let old = world
+                .get::<ReadbackChild>(ents.readback)
+                .map_or(ents.readback, |c| c.0);
+            let Some(readback) = world.get::<Readback>(old).cloned() else {
+                return;
+            };
+            let Some(sink) = world.get::<FrameSink>(old) else {
+                return;
+            };
+            let sink = FrameSink {
+                queue: sink.queue.clone(),
+                size: sink.size,
+                generation,
+            };
+            if old == ents.readback {
+                world.entity_mut(old).remove::<(Readback, FrameSink)>();
+            } else {
+                world.despawn(old);
+            }
+            let child = world.spawn((readback, sink, ChildOf(ents.readback))).id();
+            world.entity_mut(ents.readback).insert(ReadbackChild(child));
         });
     }
 
@@ -670,7 +743,7 @@ impl Viewer3d {
         component_id: ComponentId,
         cx: &mut Context<Self>,
         extract: fn(&ComponentView<'_>) -> T,
-        apply: fn(T, &mut LiveDelta),
+        apply: fn(Option<T>, &mut LiveDelta),
     ) -> gpui::Task<()> {
         spawn_seeded_stream(
             db,
@@ -678,8 +751,10 @@ impl Viewer3d {
             cx,
             move |_, _| ((), move |view| Some(extract(&view))),
             move |this, update, cx| {
-                let StreamUpdate::Value(value) = update else {
-                    return;
+                let value = match update {
+                    StreamUpdate::Value(value) => Some(value),
+                    StreamUpdate::Unavailable => None,
+                    _ => return,
                 };
                 let cell = entity_cell.clone();
                 cx.update_global::<BevyBridge, _>(|bridge, _| {
@@ -709,6 +784,7 @@ fn spawn_model(world: &mut World, render_layer: usize, path: &str) -> Entity {
             .spawn((
                 Transform::IDENTITY,
                 LiveDelta::default(),
+                Visibility::Inherited,
                 layers,
                 PropagateRenderLayers,
             ))
@@ -722,6 +798,7 @@ fn spawn_model(world: &mut World, render_layer: usize, path: &str) -> Entity {
             WorldAssetRoot(handle),
             Transform::IDENTITY,
             LiveDelta::default(),
+            Visibility::Inherited,
             layers,
             PropagateRenderLayers,
         ))
@@ -750,6 +827,9 @@ impl Viewer3d {
         let Some(mut slot) = self.frame_queue.pop_ref() else {
             return;
         };
+        if slot.generation != self.frame_generation {
+            return;
+        }
         let (w, h) = (slot.width, slot.height);
         let bytes = std::mem::take(&mut slot.bytes);
         drop(slot);
@@ -846,6 +926,7 @@ impl Render for Viewer3d {
                             // releases, then request a render when dirty.
                             let (frame, releases) = this
                                 .update(cx, |this, cx| {
+                                    this.invalidate_time_frame(cx);
                                     this.maybe_resize(new_size, cx);
                                     this.consume_frame();
 

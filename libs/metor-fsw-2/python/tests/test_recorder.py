@@ -5,6 +5,8 @@ import io
 import os
 import sys
 import unittest
+from unittest.mock import patch
+from dataclasses import replace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "metor-config"))
 
@@ -35,6 +37,68 @@ class RecorderTest(unittest.TestCase):
         # The capture trackers are module-global; isolate each test.
         mc._targets.clear()
         mc._program.clear()
+
+    def test_artifact_conflicts_are_rejected_without_mutating_ir(self):
+        original = Artifact(
+            "pack",
+            "crate",
+            "lib",
+            manifest_hash="hash",
+            prebuilt="/a",
+            abi_version=12,
+            dist="pack-dist",
+            dist_version="1",
+        )
+        for key, value in {
+            "crate": "other",
+            "lib": "other",
+            "kind": "wasm",
+            "manifest_hash": "other",
+            "prebuilt": "/b",
+            "abi_version": 13,
+            "dist": "other",
+            "dist_version": "2",
+        }.items():
+            with self.subTest(field=key), patch.dict(os.environ, {}, clear=True):
+                target = Target(100)
+                target.add("first", System("Entry", original))
+                before = target.to_ir()["artifacts"].copy()
+                with self.assertRaisesRegex(ValueError, "conflicting " + key):
+                    target.add(
+                        "second", System("Entry", replace(original, **{key: value}))
+                    )
+                self.assertEqual(target.to_ir()["artifacts"], before)
+
+    def test_artifacts_merge_missing_provenance_and_deduplicate(self):
+        target = Target(100)
+        original = Artifact("pack", "crate", "lib")
+        target.add("first", System("Entry", original))
+        complete = replace(
+            original,
+            manifest_hash="hash",
+            prebuilt="/a",
+            dist="pack-dist",
+            dist_version="1",
+        )
+        target.add("second", System("Entry", complete))
+        target.add("third", System("Entry", original))
+        artifacts = target.to_ir()["artifacts"]
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["manifest_hash"], "hash")
+        self.assertEqual(artifacts[0]["prebuilt_dir"], "/a")
+        self.assertEqual(artifacts[0]["dist"], {"name": "pack-dist", "version": "1"})
+
+    def test_host_abi_is_checked_before_artifact_registration(self):
+        target = Target(100)
+        with patch.dict(os.environ, {"METOR_FSW_ABI_VERSION": "12"}):
+            with self.assertRaisesRegex(
+                ValueError, "FSW ABI 11 differs from host ABI 12"
+            ):
+                target.add(
+                    "old",
+                    System("Entry", Artifact("pack", "crate", "lib", abi_version=11)),
+                )
+        self.assertEqual(target.to_ir()["artifacts"], [])
 
     def test_coordinator_clock_and_knobs(self):
         wall = Target(cycle_rate=100.0).to_ir()["coordinator"]
@@ -79,7 +143,10 @@ class RecorderTest(unittest.TestCase):
         self.assertIsNone(ir["systems"][0]["attach"])
         self.assertEqual(ir["systems"][1]["attach"], "link")
         edge = ir["edges"][0]
-        self.assertEqual((edge["from"], edge["out"], edge["to"], edge["in_"]), ("a", "out", "b", "feed"))
+        self.assertEqual(
+            (edge["from"], edge["out"], edge["to"], edge["in_"]),
+            ("a", "out", "b", "feed"),
+        )
         self.assertEqual(edge["kind"], "Frame")
         self.assertFalse(edge["delayed"])
 
@@ -146,7 +213,9 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(slot["allow"][0]["artifact"], "seqs")
         self.assertEqual(slot["allow"][0]["params"], {"Value": {"rate": 1.0}})
         self.assertEqual(slot["allow"][1]["params"], "None")
-        self.assertEqual(slot["initial"], {"occupant": "commissioning", "state": "Running"})
+        self.assertEqual(
+            slot["initial"], {"occupant": "commissioning", "state": "Running"}
+        )
 
     def test_source_ref_anchors_to_this_file(self):
         m = Target(cycle_rate=100.0)
@@ -157,18 +226,20 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(src["col"], 1)
 
     def test_alarms_emit_the_rust_field_names(self):
-        spec = Alarms(alarms=[
-            Alarm(
-                id="RATE_HIGH",
-                name="Rate High",
-                description="body rate high",
-                target=Component("plant.gyro", element=1),
-                warning=band(above=0.05, below=-0.05),
-                critical=band(above=0.15),
-                debounce=2,
-                hysteresis=0.005,
-            )
-        ])
+        spec = Alarms(
+            alarms=[
+                Alarm(
+                    id="RATE_HIGH",
+                    name="Rate High",
+                    description="body rate high",
+                    target=Component("plant.gyro", element=1),
+                    warning=band(above=0.05, below=-0.05),
+                    critical=band(above=0.15),
+                    debounce=2,
+                    hysteresis=0.005,
+                )
+            ]
+        )
         params = spec._param_source()["Value"]
         self.assertIn("alarm", params)  # the field is singular in AlarmsParams
         a = params["alarm"][0]
@@ -184,7 +255,9 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(uplink._param_source()["Value"], {"msgs": ["Cmd"]})
         self.assertEqual(uplink.attach, "link")
         self.assertEqual(Downlink(link).attach, "link")
-        self.assertEqual(TcpServer(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"})
+        self.assertEqual(
+            TcpServer(addr="1.2.3.4:5")._param_source()["Value"], {"addr": "1.2.3.4:5"}
+        )
 
     def test_added_systems_assemble_the_program(self):
         m = Target(cycle_rate=100.0)
@@ -221,7 +294,7 @@ class RecorderTest(unittest.TestCase):
         # (a decorated function's chunk starts at its decorators).
         ends = [d["offset"] for d in program["decls"][1:]] + [len(program["source"])]
         for decl, end in zip(program["decls"], ends):
-            chunk = program["source"][decl["offset"]:end]
+            chunk = program["source"][decl["offset"] : end]
             self.assertRegex(chunk, rf"(def|class) {decl['name']}\b")
         self.assertTrue(program["decls"][0]["src"]["file"].endswith("test_recorder.py"))
 
@@ -239,8 +312,9 @@ class RecorderTest(unittest.TestCase):
 
         # The handle's `.out` names the output port: the function itself for
         # the sugar form, the snake-cased Frame class for the canonical form.
-        self.assertEqual((omega_norm.out.instance, omega_norm.out.port),
-                         ("omega_norm", "omega_norm"))
+        self.assertEqual(
+            (omega_norm.out.instance, omega_norm.out.port), ("omega_norm", "omega_norm")
+        )
         self.assertEqual(smooth.out.port, "rate_estimate")
 
     def test_added_python_system_scopes_renames_and_interleaves(self):
@@ -257,7 +331,9 @@ class RecorderTest(unittest.TestCase):
 
         ir = m.to_ir()
         # The spec sits at the add call's position, between the native adds.
-        self.assertEqual([s["name"] for s in ir["systems"]], ["a", "adcs.rate_mag", "b"])
+        self.assertEqual(
+            [s["name"] for s in ir["systems"]], ["a", "adcs.rate_mag", "b"]
+        )
         spec = ir["systems"][1]
         self.assertEqual(spec["ty"], "omega_norm")
         self.assertEqual(spec["scope"], 0)
@@ -368,9 +444,7 @@ class PresetTest(unittest.TestCase):
     def test_component_id_masks_and_hashes(self):
         # Pinned against the Rust `ComponentId::new` (see the parity test in
         # src/preset/tests.rs) — the two must agree byte-for-byte.
-        self.assertEqual(
-            mc.component_id("sat1.plant.gyro.rates"), 3325449500645109259
-        )
+        self.assertEqual(mc.component_id("sat1.plant.gyro.rates"), 3325449500645109259)
         self.assertEqual(mc.component_id("x") >> 63, 0)
 
     def test_presets_qualify_and_embed(self):
@@ -385,7 +459,9 @@ class PresetTest(unittest.TestCase):
                         name="ops",
                         time_range="LAST 30m",
                         layout=mc.VSplit(
-                            mc.TimeSeriesPlot([mc.Trace("plant.gyro.rates", element=1)]),
+                            mc.TimeSeriesPlot(
+                                [mc.Trace("plant.gyro.rates", element=1)]
+                            ),
                             mc.Pane([mc.Logs(), mc.AlarmList()], active=1),
                             flexes=[2.0, 1.0],
                         ),
@@ -418,9 +494,7 @@ class PresetTest(unittest.TestCase):
 
         tab_pane = split["children"][1]["Pane"]
         self.assertEqual(tab_pane["active_index"], 1)
-        self.assertEqual(
-            [i["kind"] for i in tab_pane["items"]], ["logs", "alarm"]
-        )
+        self.assertEqual([i["kind"] for i in tab_pane["items"]], ["logs", "alarm"])
 
     def test_presets_flex_arity_is_checked(self):
         Target(cycle_rate=100.0)
@@ -463,7 +537,11 @@ class DashboardTest(unittest.TestCase):
                         mc.Meter("plant.wheels.h", element=1, min=-0.04, max=0.04), 0, 0
                     ),
                     mc.Place(
-                        mc.Gauge("plant.sensors.gyro_b", style="needle"), 100, 0, 120, 120
+                        mc.Gauge("plant.sensors.gyro_b", style="needle"),
+                        100,
+                        0,
+                        120,
+                        120,
                     ),
                 ],
             )
@@ -493,7 +571,9 @@ class DashboardTest(unittest.TestCase):
         left = mc.Place(mc.Meter("a"), 0, 0, 100, 100)
         right = mc.Place(mc.Meter("b"), 400, 0, 100, 100)
         state = self._dashboard_state(
-            mc.Dashboard(widgets=[left, right], connectors=[mc.Connector([left, right])])
+            mc.Dashboard(
+                widgets=[left, right], connectors=[mc.Connector([left, right])]
+            )
         )
         anchors = state["connectors"][0]["points"]
         # Left box exits right; the right box is entered from its left.
@@ -506,7 +586,9 @@ class DashboardTest(unittest.TestCase):
         top = mc.Place(mc.Meter("a"), 0, 0, 100, 100)
         bottom = mc.Place(mc.Meter("b"), 0, 400, 100, 100)
         state = self._dashboard_state(
-            mc.Dashboard(widgets=[top, bottom], connectors=[mc.Connector([top, bottom])])
+            mc.Dashboard(
+                widgets=[top, bottom], connectors=[mc.Connector([top, bottom])]
+            )
         )
         anchors = state["connectors"][0]["points"]
         self.assertEqual(anchors[0]["Widget"]["side"], "Bottom")

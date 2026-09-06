@@ -2,8 +2,8 @@
 //!
 //! The coordinator builds one [`RegistryEntry`] per registered buffer, in
 //! build order. That covers every system's user frames plus their implicit
-//! `health` and `log` outputs, every message channel, and the
-//! coordinator-owned `health`, `log`, `status`, `sequences`, and `commands`
+//! `system_status` and `log` outputs, every message channel, and the
+//! coordinator-owned `system_status`, `log`, `status`, `sequences`, and `commands`
 //! buffers. A target with a wiring manifest also has a `wiring` output.
 //! Broad or dynamic readers (a downlink, a logger, a recorder, a
 //! debugger) all reach outputs through this one index rather than through any
@@ -101,10 +101,9 @@ impl RegistryEntry {
 /// The full index over every registered buffer, untelemetered entries
 /// included.
 ///
-/// This surface is reachable only through the host-side
-/// [`Coordinator::registry()`](crate::Coordinator::registry), which serves
-/// debuggers and tests. The in-graph broadcast tap is [`AllOutputs`], which
-/// filters untelemetered entries at the source.
+/// This surface is reachable only through the host's `Coordinator::registry()`,
+/// which serves debuggers and tests. The in-graph broadcast tap is
+/// [`AllOutputs`], which filters untelemetered entries at the source.
 pub struct Registry {
     entries: Vec<RegistryEntry>,
     by_key: HashMap<ComponentId, usize>,
@@ -141,10 +140,6 @@ impl Registry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AllOutputs
-// ---------------------------------------------------------------------------
-
 /// A broadcast tap over every telemetered buffer in the graph.
 ///
 /// `AllOutputs` is not a port but a [`Capability::ReceiveAll`] grant. It
@@ -158,8 +153,7 @@ impl Registry {
 /// The telemetered filter lives here at the source, so a consumer cannot
 /// forget it. An untelemetered entry, such as a command channel or an
 /// opted-out frame, is simply invisible through this surface. The unfiltered
-/// [`Registry`] remains reachable via the host-side
-/// [`Coordinator::registry()`](crate::Coordinator::registry).
+/// [`Registry`] remains reachable via the host's `Coordinator::registry()`.
 ///
 /// A view claimed off an entry starts at the buffer's live edge, so records
 /// emitted before the claim, for example during an earlier-registered

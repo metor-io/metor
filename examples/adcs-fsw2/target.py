@@ -1,3 +1,5 @@
+import math
+
 from metor_config import (
     Alarm,
     AlarmList,
@@ -13,6 +15,7 @@ from metor_config import (
     Gauge,
     HSplit,
     Logs,
+    Map,
     Meter,
     Pane,
     Place,
@@ -63,6 +66,14 @@ plant = m.add(
         cr=1.5,  # SRP reflectivity coefficient
         mtq_max_dipole=0.2,  # per-axis magnetorquer authority (A*m^2)
         init_wheel_h=0.0,  # per-wheel stored-momentum preload (N*m*s)
+        # A 400 km sun-synchronous orbit, ascending node at ~10:30 local solar time
+        # (morning SSO - the phase-zero boot is sunlit).
+        altitude=400e3,  # orbit altitude (m)
+        inclination=math.radians(97.03),  # SSO inclination at 400 km
+        ltan_hours=10.5,  # local time of ascending node (hours)
+        # The old equatorial orbit:
+        # inclination=0.0,
+        # ltan_hours=12.0,
         init_orbit_phase=0.0,  # in-plane boot phase (rad) - eclipse tests start in shadow
     ),
     process=True,
@@ -342,6 +353,12 @@ presets = m.add(
                 ),
                 flexes=[2.0, 1.0],
             ),
+        ),
+        # The GPS fix on a world map: the ground track the orbit traces out.
+        Preset(
+            name="adcs-ground-track",
+            time_range="LAST 5m",
+            layout=Map("plant.gps.lla"),
         ),
     ]),
 )

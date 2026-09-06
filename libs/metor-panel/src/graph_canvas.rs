@@ -1,24 +1,19 @@
-//! Shared canvas primitives for node-and-wire panes.
+//! Shared line primitives for the panes that draw connectors.
 //!
-//! The node editor and the system-graph tile both paint a scrolling grid,
-//! draw bezier wires between sockets, and hit-test those wires against the
-//! pointer. Those routines are pure geometry — they carry no knowledge of a
-//! particular graph's data model — so they live here, parameterized only on
-//! the caller's colors and edge-id type. Both panes share the same `screen =
-//! graph - viewport` convention and drive these functions from their own
-//! render pass.
+//! The dashboard's schematic connectors and the execution timeline's
+//! dependency leaders both need the same thing: a polyline turned into a
+//! stroke, an arrowhead at its tip, and a distance from the pointer that
+//! matches what was painted. That is pure geometry — it carries no knowledge
+//! of a particular pane's data model — so it lives here, parameterized only on
+//! the caller's colors. Callers work in canvas-local coordinates and pass the
+//! canvas origin in.
 //!
-//! A wire is a *route*: two or more canvas-local points (boundary anchors
-//! plus any interior waypoints from the layout engine), rendered as a chain
-//! of cubic beziers. Painting and hit-testing both derive their curves from
-//! [`route_segments`], so what the pointer feels always matches what the eye
-//! sees.
-//!
-//! The dashboard's schematic connectors reuse the same geometry through
-//! [`LineShape`], which adds the right-angle routing a P&ID or a circuit
-//! diagram needs alongside the node editor's curves.
+//! [`LineShape`] picks between the curve, the straight run, and the
+//! right-angle routing a P&ID or a circuit diagram wants. Painting and
+//! hit-testing both derive their samples from [`drawn_polyline`], so what the
+//! pointer feels always matches what the eye sees.
 
-use gpui::{Axis, Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
+use gpui::{Axis, Hsla, PathBuilder, Pixels, Point, Window, point, px};
 use smallvec::SmallVec;
 
 // `LineShape` lives with the connector config it is serialized as part of,
@@ -38,43 +33,12 @@ pub(crate) struct LineStyle {
 const DASH: [Pixels; 2] = [px(6.0), px(4.0)];
 const CURVE_SAMPLES_PER_SEGMENT: usize = 8;
 
-/// A wire's canvas-local polyline: source anchor, interior waypoints, target
-/// anchor.
-pub(crate) type RoutePoints = SmallVec<[Point<Pixels>; 6]>;
-
 /// One cubic bezier piece of a route, in canvas-local f32 coordinates.
 struct Segment {
     p0: (f32, f32),
     c1: (f32, f32),
     c2: (f32, f32),
     p1: (f32, f32),
-}
-
-/// Paint the 24px background grid across `bounds`. The grid is fixed to the
-/// canvas (it doesn't scroll) so it reads as a static backdrop rather than a
-/// world-space overlay.
-pub(crate) fn paint_grid(bounds: Bounds<Pixels>, grid_color: Hsla, window: &mut Window) {
-    let step = 24.0_f32;
-    let mut path = PathBuilder::stroke(px(0.5));
-    let origin_x = f32::from(bounds.origin.x);
-    let origin_y = f32::from(bounds.origin.y);
-    let end_x = origin_x + f32::from(bounds.size.width);
-    let end_y = origin_y + f32::from(bounds.size.height);
-    let mut x = origin_x;
-    while x < end_x {
-        path.move_to(point(px(x), bounds.origin.y));
-        path.line_to(point(px(x), bounds.origin.y + bounds.size.height));
-        x += step;
-    }
-    let mut y = origin_y;
-    while y < end_y {
-        path.move_to(point(bounds.origin.x, px(y)));
-        path.line_to(point(bounds.origin.x + bounds.size.width, px(y)));
-        y += step;
-    }
-    if let Ok(p) = path.build() {
-        window.paint_path(p, grid_color);
-    }
 }
 
 /// The cubic chain for a route. Endpoint tangents run along the flow axis
@@ -181,79 +145,6 @@ fn sample_curve(segments: &[Segment]) -> SmallVec<[(f32, f32); 24]> {
     points
 }
 
-/// Paint a route (canvas-local points) as a smooth cubic chain, shifted by
-/// `canvas_origin` into window space. `dashed` selects the thinner stroke
-/// used for drafts and delayed edges.
-pub(crate) fn paint_route(
-    canvas_origin: Point<Pixels>,
-    route: &[Point<Pixels>],
-    flow: Axis,
-    color: Hsla,
-    dashed: bool,
-    window: &mut Window,
-) {
-    let segments = curve_segments(route, flow);
-    if segments.is_empty() {
-        return;
-    }
-    let stroke = if dashed { px(1.0) } else { px(1.5) };
-    let mut path = PathBuilder::stroke(stroke);
-    append_curve(&mut path, canvas_origin, &segments);
-    if let Ok(p) = path.build() {
-        window.paint_path(p, color);
-    }
-}
-
-/// Find the first edge whose route passes within `HIT_RADIUS` pixels of
-/// `pointer` (pointer is in canvas-local coordinates). Each edge gets a cheap
-/// bounding-box precheck, then its curve — the same one [`paint_route`]
-/// draws — is sampled per segment. Generic over the caller's edge id so both
-/// panes can recover their own selection key.
-pub(crate) fn hit_test_edges<E: Clone>(
-    edges: &[(E, RoutePoints)],
-    pointer: Point<Pixels>,
-    flow: Axis,
-) -> Option<E> {
-    const HIT_RADIUS: f32 = 6.0;
-    let p = (f32::from(pointer.x), f32::from(pointer.y));
-    let mut best: Option<(f32, E)> = None;
-    for (edge, route) in edges {
-        let segments = curve_segments(route, flow);
-        if segments.is_empty() {
-            continue;
-        }
-        // The curve is contained in the convex hull of its control points, so
-        // an inflated box over all of them is a safe reject.
-        let mut min = (f32::INFINITY, f32::INFINITY);
-        let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for s in &segments {
-            for q in [s.p0, s.c1, s.c2, s.p1] {
-                min = (min.0.min(q.0), min.1.min(q.1));
-                max = (max.0.max(q.0), max.1.max(q.1));
-            }
-        }
-        if p.0 < min.0 - HIT_RADIUS
-            || p.0 > max.0 + HIT_RADIUS
-            || p.1 < min.1 - HIT_RADIUS
-            || p.1 > max.1 + HIT_RADIUS
-        {
-            continue;
-        }
-
-        let min_dist = sample_curve(&segments)
-            .windows(2)
-            .map(|points| point_segment_distance(p, points[0], points[1]))
-            .fold(f32::INFINITY, f32::min);
-        if min_dist <= HIT_RADIUS {
-            match &best {
-                Some((d, _)) if *d <= min_dist => {}
-                _ => best = Some((min_dist, edge.clone())),
-            }
-        }
-    }
-    best.map(|(_, e)| e)
-}
-
 /// Expand a polyline into right-angle elbows.
 ///
 /// Each leg turns at its midpoint on the dominant axis, giving the Z-shaped
@@ -315,8 +206,7 @@ pub(crate) fn paint_line(
         return;
     }
     if style.shape == LineShape::Curved {
-        let route: RoutePoints = points.iter().copied().collect();
-        paint_curve(canvas_origin, &route, style, color, window);
+        paint_curve(canvas_origin, points, style, color, window);
         return;
     }
 
@@ -334,8 +224,7 @@ pub(crate) fn paint_line(
     }
 }
 
-/// Paint a curved connector, honouring dashes and width — [`paint_route`]
-/// predates both and hard-codes its stroke for the node editor.
+/// Paint a curved connector, honouring the style's dashes and width.
 fn paint_curve(
     canvas_origin: Point<Pixels>,
     route: &[Point<Pixels>],

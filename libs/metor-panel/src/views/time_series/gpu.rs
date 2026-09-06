@@ -33,8 +33,10 @@ use metor_db::{Component, ComponentSchema};
 use metor_proto::types::{PrimType, Timestamp};
 use smallvec::SmallVec;
 
+use super::heatmap::{HeatmapPipeline, HeatmapState, IntensityDraw};
 use super::{PlotBounds, PlotStyle};
 use crate::gpu_context::GpuContext;
+use crate::theme::Theme;
 
 const VALUE_CAPACITY: u32 = 1 << 22;
 const VALUE_BUF_BYTES: u64 = VALUE_CAPACITY as u64 * 4;
@@ -67,6 +69,7 @@ pub(crate) enum AxisSource<'a> {
     },
     LatestSampleElements {
         component: &'a Component,
+        sample: &'a [u8],
         len: usize,
     },
     /// A derived min/max LoD component (`metor_db::lod`): each sample holds
@@ -113,6 +116,8 @@ pub(crate) struct LineDraw<'a> {
     /// trace render twice in one frame without overlap — min/max buckets
     /// for summarized history plus raw samples clipped to the live tail.
     pub x_clip: Option<(f64, f64)>,
+    /// Acquisition-time window for paired XY samples, independent of numeric axes.
+    pub time_clip: Option<(i64, i64)>,
 }
 
 /// Snap a decimation stride to the nearest power of 4.
@@ -265,6 +270,7 @@ pub(crate) struct ReadbackHandle {
     /// Travels with the frame so the degraded badge always describes the
     /// image actually on screen.
     truncated: bool,
+    generation: u64,
 }
 
 impl ReadbackHandle {
@@ -298,6 +304,7 @@ impl ReadbackHandle {
     ) {
         cx.spawn(async move |this, cx| {
             let truncated = self.truncated;
+            let generation = self.generation;
             let image = cx
                 .background_executor()
                 .spawn(async move { self.read_image() })
@@ -306,7 +313,9 @@ impl ReadbackHandle {
                 return;
             };
             let _ = this.update(cx, |t, cx| {
-                access(t).set_frame(img, truncated);
+                if access(t).generation == generation {
+                    access(t).set_frame(img, truncated);
+                }
                 cx.notify();
             });
         })
@@ -323,6 +332,7 @@ pub(super) struct PlotGpu {
     line_pipeline: wgpu::RenderPipeline,
     scatter_pipeline: wgpu::RenderPipeline,
     bars_pipeline: wgpu::RenderPipeline,
+    heatmap: HeatmapPipeline,
     view_buf: wgpu::Buffer,
     view_bg: wgpu::BindGroup,
     line_buf: wgpu::Buffer,
@@ -450,6 +460,10 @@ impl PlotGpu {
         let line_pipeline = make_pipeline("line pipeline", &line_shader);
         let scatter_pipeline = make_pipeline("scatter pipeline", &scatter_shader);
         let bars_pipeline = make_pipeline("bars pipeline", &bars_shader);
+        // Its own layout (no storage buffers, no view uniform), but the same
+        // multisampled target: the tonemap draws into the existing pass, so
+        // the readback path is untouched.
+        let heatmap = HeatmapPipeline::new(device, TARGET_FORMAT, SAMPLE_COUNT);
 
         let view_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("view uniform"),
@@ -515,6 +529,7 @@ impl PlotGpu {
             line_pipeline,
             scatter_pipeline,
             bars_pipeline,
+            heatmap,
             view_buf,
             view_bg,
             line_buf,
@@ -531,14 +546,22 @@ impl PlotGpu {
 
     /// Encode and submit one plot's frame into `target`.
     ///
+    /// `field` paints an intensity grid under the traces; `heatmap_state`
+    /// carries the caller's own field texture and colormap across frames.
+    ///
     /// Returns `true` when real work was submitted (the caller starts a
-    /// readback), `false` when every trace decimated to nothing.
+    /// readback), `false` when there was nothing to draw — every trace
+    /// decimated to nothing and no field.
+    #[allow(clippy::too_many_arguments)]
     fn submit(
         &mut self,
         target: &RenderTarget,
         view: PlotBounds,
         scale: f32,
         traces: &[LineDraw<'_>],
+        field: Option<&IntensityDraw<'_>>,
+        heatmap_state: &mut Option<HeatmapState>,
+        theme: &Theme,
     ) -> bool {
         self.cache.cursor = 0;
         self.cache.epoch_x = view.min_x;
@@ -573,7 +596,8 @@ impl PlotGpu {
                 "plot uploads clamped to buffer capacity"
             );
         }
-        if plans.iter().all(|p| p.spans.is_empty()) {
+        // A field-only frame (no traces at all) still has an image to produce.
+        if plans.iter().all(|p| p.spans.is_empty()) && field.is_none() {
             return false;
         }
 
@@ -639,8 +663,12 @@ impl PlotGpu {
             );
             live_traces.push((i, trace.style, plan));
         }
-        if live_traces.is_empty() {
+        if live_traces.is_empty() && field.is_none() {
             return false;
+        }
+
+        if let Some(field) = field {
+            self.heatmap.prepare(&self.ctx, heatmap_state, field, theme);
         }
 
         let mut encoder = self
@@ -666,6 +694,11 @@ impl PlotGpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // The field paints first so line overlays land on top of it.
+            if let (Some(_), Some(state)) = (field, heatmap_state.as_ref()) {
+                self.heatmap.draw(&mut pass, state);
+            }
+
             pass.set_bind_group(0, &self.view_bg, &[]);
             pass.set_bind_group(2, &self.storage_bg, &[]);
 
@@ -721,6 +754,11 @@ pub(crate) struct PlotRenderState {
     pending_release: Option<Arc<RenderImage>>,
     in_flight: Arc<AtomicBool>,
     degraded: bool,
+    generation: u64,
+    /// Intensity-field texture and colormap, allocated on the first frame
+    /// that draws one. Per caller, like `target`, since the field is sized to
+    /// that caller's grid.
+    heatmap: Option<HeatmapState>,
 }
 
 impl Default for PlotRenderState {
@@ -731,6 +769,8 @@ impl Default for PlotRenderState {
             pending_release: None,
             in_flight: Arc::new(AtomicBool::new(false)),
             degraded: false,
+            generation: 0,
+            heatmap: None,
         }
     }
 }
@@ -750,13 +790,29 @@ impl PlotRenderState {
         view: PlotBounds,
         traces: &[LineDraw<'_>],
     ) -> Option<ReadbackHandle> {
+        self.render_with_field(cx, bounds, scale_factor, view, traces, None)
+    }
+
+    /// [`Self::render`] plus an intensity field painted under the traces.
+    ///
+    /// A frame may carry only a field: the spectrogram has no lines at all.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_with_field(
+        &mut self,
+        cx: &mut gpui::App,
+        bounds: Bounds<Pixels>,
+        scale_factor: f32,
+        view: PlotBounds,
+        traces: &[LineDraw<'_>],
+        field: Option<&IntensityDraw<'_>>,
+    ) -> Option<ReadbackHandle> {
         if self.in_flight.load(Ordering::Acquire) {
             return None;
         }
         let scale = scale_factor.max(1.0);
         let width = ((f32::from(bounds.size.width) * scale).round() as u32).max(1);
         let height = ((f32::from(bounds.size.height) * scale).round() as u32).max(1);
-        if traces.is_empty() {
+        if traces.is_empty() && field.is_none() {
             self.degraded = false;
             return None;
         }
@@ -765,6 +821,7 @@ impl PlotRenderState {
             let gpu = PlotGpu::try_new()?;
             cx.set_global(gpu);
         }
+        let theme = crate::theme::theme(cx);
         cx.update_global::<PlotGpu, _>(|gpu, _| {
             if self
                 .target
@@ -773,10 +830,24 @@ impl PlotRenderState {
             {
                 self.target = Some(RenderTarget::new(&gpu.ctx.device, width, height));
             }
-            let target = self.target.as_ref()?;
-            if !gpu.submit(target, view, scale, traces) {
+            let mut heatmap = self.heatmap.take();
+            let drew = match self.target.as_ref() {
+                Some(target) => gpu.submit(
+                    target,
+                    view,
+                    scale,
+                    traces,
+                    field,
+                    &mut heatmap,
+                    theme.as_ref(),
+                ),
+                None => false,
+            };
+            self.heatmap = heatmap;
+            if !drew {
                 return None;
             }
+            let target = self.target.as_ref()?;
             self.in_flight.store(true, Ordering::Release);
             target
                 .staging
@@ -790,6 +861,7 @@ impl PlotRenderState {
                 padded_bytes_per_row: target.padded_bytes_per_row,
                 in_flight: self.in_flight.clone(),
                 truncated: gpu.cache.truncated,
+                generation: self.generation,
             })
         })
     }
@@ -798,6 +870,13 @@ impl PlotRenderState {
     pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>, truncated: bool) {
         self.pending_release = self.current_frame.replace(image);
         self.degraded = truncated;
+    }
+
+    pub(crate) fn clear_frame(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.current_frame.is_some() {
+            self.pending_release = self.current_frame.take();
+        }
     }
 
     pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
@@ -946,6 +1025,7 @@ fn plan_trace(
         AxisSource::LatestSampleIndex { len: x_len },
         AxisSource::LatestSampleElements {
             component,
+            sample,
             len: y_len,
             ..
         },
@@ -960,6 +1040,7 @@ fn plan_trace(
             x_buf,
             y_buf,
             component,
+            sample,
             len,
             trace.style,
             y_epoch,
@@ -1037,10 +1118,21 @@ fn plan_trace(
                 .take(n)
                 .map(|(xn, yn)| {
                     let cap = xn.timestamps().len().min(yn.timestamps().len());
-                    NodePair {
-                        x: NodeView::from_full_slice_capped(xn, cap),
-                        y: NodeView::from_full_slice_capped(yn, cap),
+                    let mut x = NodeView::from_full_slice_capped(xn, cap);
+                    let mut y = NodeView::from_full_slice_capped(yn, cap);
+                    if let Some((start, end)) = trace.time_clip {
+                        let lo = x.full_timestamps()[..cap]
+                            .partition_point(|t| t.0 < start)
+                            .max(y.full_timestamps()[..cap].partition_point(|t| t.0 < start));
+                        let hi = x.full_timestamps()[..cap]
+                            .partition_point(|t| t.0 < end)
+                            .min(y.full_timestamps()[..cap].partition_point(|t| t.0 < end));
+                        x.visible_start = lo;
+                        y.visible_start = lo;
+                        x.visible_len = hi.saturating_sub(lo);
+                        y.visible_len = x.visible_len;
                     }
+                    NodePair { x, y }
                 })
                 .collect()
         }
@@ -1502,11 +1594,7 @@ fn select_minmax_indices(
 ) {
     out.clear();
     let elem_size = schema.size();
-    let max_sample = if elem_size == 0 {
-        0
-    } else {
-        data.len() / elem_size
-    };
+    let max_sample = data.len().checked_div(elem_size).unwrap_or(0);
     if max_sample == 0 {
         return;
     }
@@ -1744,11 +1832,7 @@ fn convert_element_strided(
     out: &mut Vec<f32>,
 ) {
     let elem_size = schema.size();
-    let max_sample = if elem_size == 0 {
-        0
-    } else {
-        full_data.len() / elem_size
-    };
+    let max_sample = full_data.len().checked_div(elem_size).unwrap_or(0);
     out.clear();
     out.reserve(to - from);
 
@@ -1790,7 +1874,7 @@ fn convert_element_strided(
 
 /// Plan one list-plot trace from the component's latest sample.
 ///
-/// Reads `component.time_series.latest()` once, decimates the resulting
+/// Uses the selected sample bytes, decimates the resulting
 /// vector to `pixel_budget`, uploads `(index, value)` pairs and emits a
 /// single draw span. Skipped silently when the component has no samples
 /// yet — the legend/auto-fit path will simply not see this trace.
@@ -1803,6 +1887,7 @@ fn plan_list_trace(
     x_buf: &wgpu::Buffer,
     y_buf: &wgpu::Buffer,
     component: &Component,
+    sample_bytes: &[u8],
     len: usize,
     style: PlotStyle,
     y_epoch: f64,
@@ -1813,10 +1898,6 @@ fn plan_list_trace(
     if len == 0 || pixel_budget == 0 {
         return TracePlan { spans };
     }
-    let Some(latest) = component.time_series.latest() else {
-        return TracePlan { spans };
-    };
-    let sample_bytes = latest.data();
     let schema = &component.schema;
     let prim_size = schema.prim_type.size();
     if prim_size == 0 || sample_bytes.len() < len * prim_size {
@@ -1928,6 +2009,7 @@ fn convert_latest_sample_strided(
 
 #[cfg(test)]
 mod tests {
+    use super::super::heatmap::{Colormap, EMPTY_INTENSITY, IntensityScale};
     use super::*;
     use metor_db::disruptor::Disruptor;
     use metor_db::time_series::{TimeSeries, TimeSeriesNode};
@@ -1936,7 +2018,7 @@ mod tests {
     use stellarator::util::AtomicCell;
 
     fn f64_schema() -> ComponentSchema {
-        ComponentSchema::new(PrimType::F64, &[1])
+        ComponentSchema::new(PrimType::F64, &[1][..])
     }
 
     #[test]
@@ -1996,6 +2078,74 @@ mod tests {
         }
     }
 
+    /// A field-only frame must render: the spectrogram submits no traces at
+    /// all, empty cells must stay transparent so the plot background shows
+    /// through, and the ramp must actually vary across the value range.
+    #[test]
+    fn tonemap_colors_covered_cells_and_skips_empty_ones() {
+        let Some(mut gpu) = PlotGpu::try_new() else {
+            eprintln!("skipping: no GPU available");
+            return;
+        };
+        let target = RenderTarget::new(&gpu.ctx.device, 4, 4);
+        // Column 0 is uncovered; columns 1..4 hold the values 1, 2, 3.
+        let mut grid = vec![EMPTY_INTENSITY; 16];
+        for row in 0..4 {
+            for col in 1..4 {
+                grid[row * 4 + col] = col as f32;
+            }
+        }
+        let draw = IntensityDraw {
+            grid: &grid,
+            cols: 4,
+            rows: 4,
+            lo: 1.0,
+            hi: 3.0,
+            gain: 1.0,
+            scale: IntensityScale::Linear,
+            colormap: Colormap::Heat,
+            trace_color: crate::theme::DARK.line_colors[0],
+            row_view: (0.0, 4.0),
+        };
+        let mut state = None;
+        let drew = gpu.submit(
+            &target,
+            PlotBounds::new(0.0, 0.0, 1.0, 1.0),
+            1.0,
+            &[],
+            Some(&draw),
+            &mut state,
+            &crate::theme::DARK,
+        );
+        assert!(drew, "a field-only frame submitted nothing");
+
+        target
+            .staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |_| {});
+        let _ = gpu.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let bytes = read_mapped_bytes(&target.staging, 4, 4, target.padded_bytes_per_row);
+        target.staging.unmap();
+
+        let pixel = |x: usize, y: usize| {
+            let i = (y * 4 + x) * 4;
+            [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]
+        };
+        for y in 0..4 {
+            assert_eq!(pixel(0, y)[3], 0, "empty cell painted at row {y}");
+            assert_ne!(
+                pixel(3, y)[3],
+                0,
+                "covered cell left transparent at row {y}"
+            );
+        }
+        assert_ne!(
+            &pixel(1, 0)[..3],
+            &pixel(3, 0)[..3],
+            "the ramp's ends resolved to the same color"
+        );
+    }
+
     /// Long sessions at realistic microsecond epochs must keep drawing at
     /// every zoom level: uploads stay inside the shared buffers and the
     /// epoch rebase keeps materialized x values small and ordered.
@@ -2038,9 +2188,18 @@ mod tests {
                 },
                 stroke_width: 1.0,
                 x_clip: None,
+                time_clip: None,
             };
             let view = PlotBounds::new(min_x as f64, 0.0, max_x as f64, 1.0);
-            let drew = gpu.submit(&target, view, 1.0, std::slice::from_ref(&draw));
+            let drew = gpu.submit(
+                &target,
+                view,
+                1.0,
+                std::slice::from_ref(&draw),
+                None,
+                &mut None,
+                &crate::theme::DARK,
+            );
             let span_secs = (max_x - min_x) as f64 * 1e-6;
             assert!(drew, "no spans drawn for window of {span_secs}s");
             assert!(

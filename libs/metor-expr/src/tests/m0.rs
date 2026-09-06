@@ -15,8 +15,25 @@ fn prelude_is_closed_and_exports_its_kernels() {
     assert_eq!(imports(PRELUDE), 0);
     let template = Template::parse(PRELUDE).unwrap();
     for kernel in [
-        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow", "fmod_floor",
-        "k_add", "k_sub", "k_mul", "k_div", "k_neg", "k_dot", "k_matmul", "k_sum",
+        "sin",
+        "cos",
+        "tan",
+        "asin",
+        "acos",
+        "atan",
+        "atan2",
+        "exp",
+        "log",
+        "pow",
+        "fmod_floor",
+        "k_add",
+        "k_sub",
+        "k_mul",
+        "k_div",
+        "k_neg",
+        "k_dot",
+        "k_matmul",
+        "k_sum",
     ] {
         assert!(template.export(kernel).is_some(), "missing kernel {kernel}");
     }
@@ -26,7 +43,10 @@ fn prelude_is_closed_and_exports_its_kernels() {
 /// under wasmi.
 #[test]
 fn generated_function_calls_a_prelude_kernel() {
-    let plan = Template::parse(PRELUDE).unwrap().plan(&["sin", "pow"]).unwrap();
+    let plan = Template::parse(PRELUDE)
+        .unwrap()
+        .plan(&["sin", "pow"])
+        .unwrap();
     let mut splice = plan.splice();
 
     let sin = splice.kernel("sin");
@@ -138,8 +158,25 @@ fn unreachable_kernels_are_dropped() {
 
     // Every kernel a program can reach is still callable after the walk.
     let all: Vec<&str> = vec![
-        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow", "fmod_floor",
-        "k_add", "k_sub", "k_mul", "k_div", "k_neg", "k_dot", "k_matmul", "k_sum",
+        "sin",
+        "cos",
+        "tan",
+        "asin",
+        "acos",
+        "atan",
+        "atan2",
+        "exp",
+        "log",
+        "pow",
+        "fmod_floor",
+        "k_add",
+        "k_sub",
+        "k_mul",
+        "k_div",
+        "k_neg",
+        "k_dot",
+        "k_matmul",
+        "k_sum",
     ];
     let plan = Template::parse(PRELUDE).unwrap().plan(&all).unwrap();
     let fat_kept = plan.kept() as usize;
@@ -246,8 +283,24 @@ fn module_size_tracks_what_the_program_reaches() {
             "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow",
         ],
         vec![
-            "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "pow",
-            "fmod_floor", "k_add", "k_sub", "k_mul", "k_div", "k_neg", "k_dot", "k_matmul",
+            "sin",
+            "cos",
+            "tan",
+            "asin",
+            "acos",
+            "atan",
+            "atan2",
+            "exp",
+            "log",
+            "pow",
+            "fmod_floor",
+            "k_add",
+            "k_sub",
+            "k_mul",
+            "k_div",
+            "k_neg",
+            "k_dot",
+            "k_matmul",
             "k_sum",
         ],
     ]

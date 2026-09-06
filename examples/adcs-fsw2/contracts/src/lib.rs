@@ -14,7 +14,7 @@
 
 use hifitime::{Duration, Epoch};
 use metor_fsw_2_core::metor_proto::types::Timestamp;
-use nox::{ArrayRepr, Quaternion, Vector, tensor};
+use nox::{ArrayRepr, Matrix6, Quaternion, Vector, tensor};
 use nox_frames::earth::{ecef_to_eci, eci_to_ecef, ned_to_ecef};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
@@ -48,8 +48,11 @@ pub const MU: f64 = G * M;
 pub const MASS: f64 = 2825.2 / 1000.0;
 /// Earth radius (m).
 pub const EARTH_RADIUS: f64 = 6378.1e3;
-/// Orbit altitude (m) — a 400 km circular orbit.
+/// Default orbit altitude (m) — a 400 km circular orbit.
 pub const ALTITUDE: f64 = 400.0e3;
+/// Default orbit inclination (rad) — sun-synchronous at 400 km: the retrograde tilt whose
+/// J2 nodal precession matches the mean sun's ~0.9856°/day.
+pub const SSO_INCLINATION: f64 = 97.03 * core::f64::consts::PI / 180.0;
 
 /// Principal moments of inertia (kg·m²) — the cube-sat values. Shared by the plant
 /// (dynamics) and the controller (LQR gain synthesis), so it lives in the contract.
@@ -101,14 +104,20 @@ pub fn ecef_to_geodetic(ecef: &V3) -> (f64, f64, f64) {
     (lat, lon, alt)
 }
 
+/// ECI Cartesian → WGS84 geodetic `(latitude_rad, longitude_rad, altitude_m)` at `epoch`:
+/// the ECEF rotation chained onto [`ecef_to_geodetic`]. Shared by the WMM lookup below and
+/// the plant's GPS lat/lon output.
+pub fn eci_to_geodetic(epoch: Epoch, pos_eci: &V3) -> (f64, f64, f64) {
+    ecef_to_geodetic(&eci_to_ecef(epoch).dot(pos_eci))
+}
+
 /// The Earth magnetic field in ECI (Tesla) at an inertial position `pos_eci` and `epoch`, from
 /// the NOAA WMM: rotate the position into ECEF, convert to geodetic, evaluate the model (WMM
 /// wants latitude/longitude in degrees and height above the ellipsoid in **km**), then rotate
 /// the NED field back through ECEF into ECI. Returned **un-normalized**. Shared by the plant
 /// (true field at its real position) and nav (reference field at the GPS position).
 pub fn mag_field_eci(model: &mut MagneticModel, epoch: Epoch, pos_eci: &V3) -> V3 {
-    let ecef = eci_to_ecef(epoch).dot(pos_eci);
-    let (lat, lon, alt) = ecef_to_geodetic(&ecef);
+    let (lat, lon, alt) = eci_to_geodetic(epoch, pos_eci);
     let geodetic = GeodeticCoords::with_elliposid_height(
         lat.to_degrees(),
         lon.to_degrees(),
@@ -157,6 +166,35 @@ pub fn in_earth_shadow(pos_eci: &V3, sun_eci: &V3) -> bool {
     let perp = *pos_eci - s * along;
     let perp: f64 = perp.norm().into_buf();
     perp < EARTH_RADIUS
+}
+
+// --- Boot orbit -----------------------------------------------------------------
+// The circular orbit the plant boots onto, parametrized in `PlantParams`. Shared by the
+// plant (the boot state) and the eclipse test (which scans the same ring for the shadow
+// arc), so the geometry lives in the contract.
+
+/// The RAAN (rad) that puts an orbit's ascending node at `ltan_hours` local mean solar time
+/// at `epoch`: the sun's right ascension plus 15°/h of offset from local noon.
+pub fn raan_for_ltan(epoch: Epoch, ltan_hours: f64) -> f64 {
+    let [x, y, _] = sun_dir_eci(epoch).into_buf();
+    y.atan2(x) + (ltan_hours - 12.0) / 24.0 * core::f64::consts::TAU
+}
+
+/// The ECI position/velocity at in-plane phase `theta` (rad) of a circular orbit of radius
+/// `radius`, inclined `inclination` about the node line at `raan`. Phase zero is the
+/// ascending node.
+pub fn orbit_pos_vel(radius: f64, inclination: f64, raan: f64, theta: f64) -> (V3, V3) {
+    let (sin_o, cos_o) = raan.sin_cos();
+    let (sin_i, cos_i) = inclination.sin_cos();
+    // The in-plane basis: the node line and the 90°-ahead direction the orbit climbs toward.
+    let node: V3 = tensor![cos_o, sin_o, 0.0];
+    let climb: V3 = tensor![-sin_o * cos_i, cos_o * cos_i, sin_i];
+    let (sin_th, cos_th) = theta.sin_cos();
+    let v_orbit = (MU / radius).sqrt();
+    (
+        (node * cos_th + climb * sin_th) * radius,
+        (climb * cos_th - node * sin_th) * v_orbit,
+    )
 }
 
 // --- Coarse sun sensing ---------------------------------------------------------
@@ -210,6 +248,10 @@ pub struct Gps {
     pub pos_eci: V3,
     /// Measured inertial (ECI) velocity (m/s).
     pub vel_eci: V3,
+    /// The measured position as WGS84 geodetic `[latitude_deg, longitude_deg, altitude_m]` —
+    /// what a real receiver reports, derived from the **noisy** `pos_eci`. Degrees because
+    /// this is display/plotting telemetry (the panel's map view reads it directly).
+    pub lla: V3,
 }
 
 /// The navigation filter's attitude estimate.
@@ -225,6 +267,7 @@ pub struct AttitudeEstimate {
     pub omega_b: V3,
     /// Estimated gyro bias in the body frame (rad/s).
     pub b_hat_b: V3,
+    pub p: Matrix6<f64, ArrayRepr>,
 }
 
 /// The plant's ground-truth **body state**: the true attitude + body rate and the inertial
@@ -346,7 +389,13 @@ impl World {
     /// The truth environment for one cycle (`_pad` keeps the `#[repr(C)]` layout
     /// padding-free, zerocopy `IntoBytes` requires it).
     pub fn new(timestamp: Timestamp, sun_eci: V3, mag_eci: V3, illuminated: bool) -> Self {
-        Self { timestamp, sun_eci, mag_eci, illuminated: illuminated as u8, _pad: [0; 7] }
+        Self {
+            timestamp,
+            sun_eci,
+            mag_eci,
+            illuminated: illuminated as u8,
+            _pad: [0; 7],
+        }
     }
 }
 
@@ -426,7 +475,12 @@ impl ModeCmd {
     /// `now` handle; the field is telemetry ordering only — the slot's `SequenceStatus`
     /// carries the authoritative run state).
     const fn at(mode: u8, law: u8) -> Self {
-        Self { timestamp: Timestamp(0), mode, law, _pad: [0; 6] }
+        Self {
+            timestamp: Timestamp(0),
+            mode,
+            law,
+            _pad: [0; 6],
+        }
     }
 
     /// Idle — no active pointing (holds nadir).
@@ -623,14 +677,36 @@ pub struct PlantParams {
     /// dump at boot. Defaults to zero.
     #[serde(default)]
     pub init_wheel_h: f64,
-    /// Initial in-plane orbit phase (rad): rotates the boot position/velocity around the
-    /// orbit, `r·(cos θ, sin θ, 0)` / `v·(−sin θ, cos θ, 0)`. Zero is the classic +X boot
-    /// (entirely sunlit for the test windows); the eclipse tests crank it to start in or
-    /// near Earth shadow. Deterministic — no RNG involved.
+    /// Orbit altitude (m) — the boot orbit is circular at `EARTH_RADIUS + altitude`.
+    /// Defaults to 400 km.
+    #[serde(default = "default_altitude")]
+    pub altitude: f64,
+    /// Orbit inclination (rad). Defaults to [`SSO_INCLINATION`] — sun-synchronous at the
+    /// default altitude.
+    #[serde(default = "default_inclination")]
+    pub inclination: f64,
+    /// Local mean solar time of the ascending node (hours) at the boot epoch, fixing the
+    /// node against the sun. Defaults to 10.5 — the morning-SSO convention, which keeps the
+    /// phase-zero boot sunlit. (Gravity is point-mass here, so the node holds its LTAN
+    /// only geometrically — there is no J2 to precess it.)
+    #[serde(default = "default_ltan")]
+    pub ltan_hours: f64,
+    /// Initial in-plane orbit phase (rad) past the ascending node. Zero boots at the node
+    /// (sunlit for the test windows at the default LTAN); the eclipse tests crank it to
+    /// start in or near Earth shadow. Deterministic — no RNG involved.
     #[serde(default)]
     pub init_orbit_phase: f64,
 }
 
+fn default_altitude() -> f64 {
+    ALTITUDE
+}
+fn default_inclination() -> f64 {
+    SSO_INCLINATION
+}
+fn default_ltan() -> f64 {
+    10.5
+}
 fn default_rho() -> f64 {
     3e-12
 }
@@ -762,15 +838,27 @@ mod tests {
         let sun: V3 = (tensor![0.2, -0.9, -0.4] as V3).normalize();
         let r = EARTH_RADIUS + ALTITUDE;
         assert!(!in_earth_shadow(&(sun * r), &sun), "sub-solar point is lit");
-        assert!(in_earth_shadow(&(sun * -r), &sun), "anti-solar point is shadowed");
+        assert!(
+            in_earth_shadow(&(sun * -r), &sun),
+            "anti-solar point is shadowed"
+        );
         // A direction perpendicular to the sun line: on the terminator, outside the cylinder.
         let perp = sun.cross(&tensor![0.0, 0.0, 1.0]).normalize();
-        assert!(!in_earth_shadow(&(perp * r), &sun), "terminator point is lit");
+        assert!(
+            !in_earth_shadow(&(perp * r), &sun),
+            "terminator point is lit"
+        );
         // Anti-sun but laterally offset past the cylinder radius: lit.
         let graze = (sun * -r) + perp * (EARTH_RADIUS * 1.01);
-        assert!(!in_earth_shadow(&graze, &sun), "outside the shadow cylinder is lit");
+        assert!(
+            !in_earth_shadow(&graze, &sun),
+            "outside the shadow cylinder is lit"
+        );
         let inside = (sun * -r) + perp * (EARTH_RADIUS * 0.99);
-        assert!(in_earth_shadow(&inside, &sun), "inside the shadow cylinder is dark");
+        assert!(
+            in_earth_shadow(&inside, &sun),
+            "inside the shadow cylinder is dark"
+        );
     }
 
     /// Both magnetorquer laws produce a torque `m × B` that opposes their regulated quantity
@@ -786,7 +874,10 @@ mod tests {
         ] {
             let tau = desat_dipole(0.1, &x, &b).cross(&b);
             let along: f64 = tau.dot(&x).into_buf();
-            assert!(along < 0.0, "desat torque does not oppose momentum: {along}");
+            assert!(
+                along < 0.0,
+                "desat torque does not oppose momentum: {along}"
+            );
             let tau = detumble_dipole(0.1, &x, &b).cross(&b);
             let along: f64 = tau.dot(&x).into_buf();
             assert!(along < 0.0, "detumble torque does not oppose rate: {along}");
@@ -807,7 +898,10 @@ mod tests {
     fn geodetic_recovers_equatorial_altitude() {
         let radius = EARTH_RADIUS + ALTITUDE;
         let (lat, _lon, alt) = ecef_to_geodetic(&tensor![radius, 0.0, 0.0]);
-        assert!(lat.abs() < 1e-9, "equatorial point has ~zero latitude, got {lat}");
+        assert!(
+            lat.abs() < 1e-9,
+            "equatorial point has ~zero latitude, got {lat}"
+        );
         assert!(
             (alt - (radius - WGS84_A)).abs() < 1.0,
             "recovered altitude within 1 m of |r| - a: {alt}"

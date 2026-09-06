@@ -20,13 +20,13 @@
 //! react to a full ring, while [`Output::publish`] never fails the cycle. A
 //! failed publish means either the ring was undersized or a slow reader is
 //! holding it full, and in both cases the port counts the dropped record so
-//! the runner can surface the count as a health error via
+//! the runner can report the count as a `publish_dropped` fault via
 //! [`Output::take_dropped`].
 
 use core::marker::PhantomData;
 
 use metor_component::Decomponentize;
-use metor_fsw_ring::{NoWake, ReadError, ReadGrant, View, WakeSink, WakeSource, Writer, frame_len};
+use metor_fsw_ring::{NoWake, ReadError, ReadGrant, View, WakeSink, WakeSource, Writer};
 use metor_proto::error::Error as ProtoError;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -51,9 +51,28 @@ pub enum FrameWriteError {
 pub const DEFAULT_DEPTH: usize = 8;
 
 /// Power-of-two ring capacity for `depth` records of at most `max_size` table
-/// bytes each. `frame_len` accounts for the record header and payload padding.
+/// bytes each, including the record header and payload padding.
+///
+/// # Panics
+/// Panics if the record size or capacity cannot be represented. Use
+/// [`checked_capacity_for`] to validate sizes supplied by configuration.
 pub fn capacity_for(max_size: usize, depth: usize) -> usize {
-    (frame_len(max_size) * depth.max(2)).next_power_of_two()
+    checked_capacity_for(max_size, depth)
+        .expect("ring capacity must fit usize and the record format")
+}
+
+/// The capacity for a record limit and depth, or `None` on overflow.
+/// Records carry a 32-bit payload length in the ring format.
+pub fn checked_capacity_for(max_size: usize, depth: usize) -> Option<usize> {
+    u32::try_from(max_size).ok()?;
+    let record_size = max_size
+        .checked_add(7)?
+        .checked_div(8)?
+        .checked_mul(8)?
+        .checked_add(8)?;
+    record_size
+        .checked_mul(depth.max(2))?
+        .checked_next_power_of_two()
 }
 
 /// As [`capacity_for`], reading the worst-case size from the frame type.
@@ -75,10 +94,10 @@ where
     Ok(())
 }
 
-/// Iterate the `T` elements of a dynamic list member, reading the [`Slot`] at
+/// Iterate the `T` elements of a dynamic list member, reading the internal slot at
 /// `slot_off` and copying each element out of the trailer. The interim decode
 /// for a fixed-struct list until the frame derive emits per-member accessors
-/// on the grant (see `docs/frames.md`); flat consumers use the `apply` path.
+/// on the grant; flat consumers use the `apply` path.
 pub fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
     table: &[u8],
     slot_off: usize,
@@ -89,11 +108,7 @@ pub fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
         .map(|(s, _)| s)
         .unwrap_or_default();
     let stride = core::mem::size_of::<T>();
-    let count = if stride == 0 {
-        0
-    } else {
-        slot.byte_len as usize / stride
-    };
+    let count = (slot.byte_len as usize).checked_div(stride).unwrap_or(0);
     (0..count).filter_map(move |i| {
         let start = slot.trailer_off as usize + i * stride;
         table
@@ -102,15 +117,11 @@ pub fn frame_list_iter<T: FromBytes + KnownLayout + Immutable>(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Output
-// ---------------------------------------------------------------------------
-
 /// Where a port's dropped-publish count accumulates. A runner-owned port
 /// counts locally and the runner drains it with `take_dropped`; a port moved
 /// into a future counts through a cell shared with the driving wrapper,
-/// which folds it into health — the counters stay reachable either way.
-/// Only the failure path and the per-cycle drain touch it.
+/// which reports it, so the counters stay reachable either way. Only the
+/// failure path and the per-cycle drain touch it.
 pub(crate) enum Drops {
     Local(u64),
     Shared(std::sync::Arc<core::sync::atomic::AtomicU64>),
@@ -189,7 +200,7 @@ impl<F: Frame, WD: WakeSource> Output<F, WD> {
     }
 
     /// Count drops through `cell` instead of locally, for a port about to
-    /// move into a future (whose driver folds the cell into health).
+    /// move into a future (whose driver reports the cell's count).
     pub(crate) fn share_drops(&mut self, cell: std::sync::Arc<core::sync::atomic::AtomicU64>) {
         self.dropped.share(cell);
     }
@@ -231,14 +242,6 @@ where
         }
     }
 
-    /// Publish a frame with dynamic members, counting a failed write instead
-    /// of returning it.
-    pub fn publish_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>)) {
-        if self.write_with(fixed, build).is_err() {
-            self.dropped.bump();
-        }
-    }
-
     /// Publish a frame with dynamic `FrameList`/`FrameMap` members. `build`
     /// drives a [`FrameWriter<F>`] to append the trailer, then the finished
     /// table bytes are written as one record.
@@ -261,10 +264,6 @@ where
         res
     }
 }
-
-// ---------------------------------------------------------------------------
-// Input
-// ---------------------------------------------------------------------------
 
 /// An input consumes the frames an upstream [`Output`] publishes, through a
 /// read-only [`View`] of that output's ring. Records are read in place and
@@ -343,15 +342,11 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// FrameRef / FrameGrant
-// ---------------------------------------------------------------------------
-
 /// A frame ref reads one record's table bytes in place, giving typed access
 /// without copying. The fixed region is read directly as `F`, and
 /// [`apply`](Self::apply) walks the whole record through the frame's vtable
 /// for consumers that want components rather than the concrete type. There is
-/// no typed dynamic-member accessor on the grant yet (see `docs/frames.md`).
+/// no typed dynamic-member accessor on the grant yet.
 pub struct FrameRef<'a, F> {
     table: &'a [u8],
     _f: PhantomData<F>,

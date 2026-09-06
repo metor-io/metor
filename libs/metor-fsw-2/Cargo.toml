@@ -61,7 +61,7 @@ libloading = { version = "0.8" }
 metor-expr = { path = "../metor-expr" }
 
 # The wasm occupant backing: a pure-Rust interpreter with fuel metering, so a
-# guest poll is bounded rather than able to stall the cycle (docs/plans/wasm-occupant.md).
+# guest poll is bounded rather than able to stall the cycle (docs/wasm.md).
 wasmi = { version = "1.1", default-features = false, features = ["std"] }
 wasmi_core = "1.1"
 
@@ -72,6 +72,10 @@ thiserror = { version = "2.0" }
 # cli
 clap = { version = "4", features = ["derive"] }
 tempfile = { version = "3.13" }
+
+# reads/writes the `.metor` bundle archive; xattr support is off, bundles
+# carry only plain regular files
+tar = { version = "0.4", default-features = false }
 
 # Runtime instrumentation: lifecycle events across the coordinator, slots,
 # and links, plus the forwarding layer that downlinks them as `LogEvent`

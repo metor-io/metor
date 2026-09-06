@@ -6,7 +6,7 @@
 //! construct outside the subset — comes back as a [`Diagnostic`] carrying the
 //! byte range that provoked it.
 
-use rustpython_parser::text_size::TextRange;
+use ruff_text_size::TextRange;
 
 /// A byte range in the source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

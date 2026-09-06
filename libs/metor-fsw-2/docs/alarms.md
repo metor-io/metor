@@ -84,9 +84,9 @@ Parameter decoding rejects these cases:
 
 The system resolves component references in `init`. It uses one ring view for each source entry, even when several alarms read fields from that entry.
 
-It disables an alarm when it finds a duplicate id, an unresolved component, a bad element index, or no free reader slot. It logs the cause and adds a health error. It does not stop the target.
+It disables an alarm when it finds a duplicate id, an unresolved component, a bad element index, or no free reader slot. It logs the cause as a fault line. It does not stop the target.
 
-The health keys are:
+The fault kinds are:
 
 - `alarms_duplicate_id`
 - `alarms_bad_element`

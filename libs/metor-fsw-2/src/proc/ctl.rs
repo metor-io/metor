@@ -34,7 +34,7 @@
 //!
 //! [`CtlHost::step`] stores the timestamp, bumps the doorbell (the Release
 //! pair that publishes the timestamp), wakes the worker, and waits for the
-//! ack to reach the new sequence — bounded by a deadline, so a hung worker
+//! ack to reach the new sequence, bounded by a deadline, so a hung worker
 //! costs a [`StepOutcome::TimedOut`] instead of a stalled cycle. Lateness is
 //! self-healing: the worker always serves the *newest* doorbell value it
 //! observes and acks exactly what it served, so a worker that slept through
@@ -94,7 +94,7 @@ struct CtlBlock {
     doorbell: AtomicU32,
     /// The last sequence the worker completed. The host's futex word.
     ack: AtomicU32,
-    /// The last step's raw [`FswStatus`] word — untrusted, folded through
+    /// The last step's raw [`FswStatus`] word, untrusted until folded through
     /// [`FswStatus::from_raw`] on the host side. While `state` is
     /// [`Failed`](WorkerState::Failed) it instead carries the worker's
     /// failure code.
@@ -170,7 +170,7 @@ pub enum CtlError {
 pub enum StepOutcome {
     /// The worker completed this sequence; here is its status.
     Acked(FswStatus),
-    /// The deadline lapsed first. The worker may still be computing — the
+    /// The deadline lapsed first. The worker may still be computing; the
     /// caller decides between "slow" and "dead" (e.g. by `try_wait`ing the
     /// child).
     TimedOut,
@@ -191,17 +191,13 @@ pub enum WorkerCmd {
 /// The mapping must be at least [`CTL_FILE_SIZE`] bytes (checked by both
 /// constructors) and, on the attach side, header-validated. Every mutable
 /// field is atomic and the header is written before the worker exists, so a
-/// shared `&CtlBlock` over the live mapping is sound — the same argument as
+/// shared `&CtlBlock` over the live mapping is sound, the same argument as
 /// the ring's `Control`.
 fn block_of(map: &memmap2::MmapMut) -> &CtlBlock {
     debug_assert!(map.len() >= CTL_FILE_SIZE);
     // SAFETY: see above; mmap bases are page-aligned, far beyond align(8).
     unsafe { &*(map.as_ptr() as *const CtlBlock) }
 }
-
-// ---------------------------------------------------------------------------
-// Host half
-// ---------------------------------------------------------------------------
 
 /// The host's end of one worker's control block. Created before the worker
 /// is spawned; dropped after the worker is dead or done.
@@ -285,8 +281,8 @@ impl CtlHost {
         }
     }
 
-    /// Ring one step: publish `now`, bump the doorbell, and wait for the ack
-    /// — at most `deadline`.
+    /// Ring one step: publish `now`, bump the doorbell, and wait for the ack,
+    /// at most `deadline`.
     pub fn step(&self, now: Timestamp, deadline: Duration) -> StepOutcome {
         let b = self.block();
         b.now.store(now.0 as u64, Relaxed);
@@ -309,10 +305,6 @@ impl CtlHost {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Worker half
-// ---------------------------------------------------------------------------
 
 /// The worker's end of the control block. Attached from the file path the
 /// launch manifest names, after the host created it.

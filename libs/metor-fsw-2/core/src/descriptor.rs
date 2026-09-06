@@ -1,34 +1,11 @@
-//! Static self-description of a system's ports, read before any port exists.
+//! Serializable system and port descriptions used before binding.
 //!
-//! A coordinator sizes rings, validates wiring, and allocates buffers from a
-//! [`SystemDescriptor`] alone, so everything here is derived from static
-//! metadata (`F::FRAME_ID`, `F::as_vtable()`, `M::ID`) and never needs a
-//! constructed system.
+//! Ports specify schema (table or postcard), delivery (snapshot or log), and
+//! fan-in (one or many producers). [`PortConn`] identifies the other endpoint;
+//! [`Capability`] grants access that is not represented by a port.
 //!
-//! There is one port concept with three orthogonal axes:
-//!
-//! ```text
-//! schema     Table(VTable) | Postcard(PacketId)      what a record is
-//! delivery   Snapshot | Log                          what a consumer reads
-//! fan-in     One | Many                              how many producers an input takes
-//! ```
-//!
-//! A "frame port" and a "message port" are two configurations of that one
-//! concept. [`PortDesc::of`] mints `Table × Snapshot × One` and
-//! [`PortDesc::msg`] mints `Postcard × Log × Many`. Beside the axes sit two
-//! more pieces of shape: [`PortConn`] names who provides the other end of a
-//! port, and a [`Capability`] is a bind-time grant that is not a port at all.
-//!
-//! Descriptors are plain serializable data, so the same [`SystemDescriptor`]
-//! a statically linked system derives is what a pack manifest carries across
-//! the load boundary and what a describe worker ships between processes. A
-//! Table port holds its frame-relative (unprefixed) vtable and metadata; the
-//! instance-prefixed announce form is re-derived on demand by
-//! [`PortDesc::announce`], the one prefixing path for static and loaded ports
-//! alike.
-//!
-//! [`compatible`] is the one check that decides whether a producer output may
-//! feed a consumer input.
+//! Table descriptors store frame-relative metadata. [`PortDesc::announce`]
+//! adds the instance prefix. [`compatible`] checks output/input compatibility.
 
 use std::collections::HashMap;
 
@@ -120,7 +97,7 @@ pub enum FanIn {
     /// Zero, one, or many edges. Requires [`Delivery::Log`], since latest-wins
     /// across several producers is ill-defined; a Snapshot input declaring
     /// `Many` fails wiring with
-    /// [`WireError::SnapshotFanIn`](crate::WireError::SnapshotFanIn).
+    /// `WireError::SnapshotFanIn`.
     Many,
 }
 
@@ -140,12 +117,12 @@ pub enum PortConn {
     /// handed to the system. A Host output is still ring-allocated and
     /// registry-tapped like any output and may be consumed over ordinary
     /// edges. A Host input is exempt from the unconnected-input check and
-    /// rejects edges with [`WireError::HostPort`](crate::WireError::HostPort).
+    /// rejects edges with `WireError::HostPort`.
     Host,
     /// A declared reader over one of this system's own outputs, named by
     /// [`PortId`]. Allocates no ring, counts one extra reader on that output,
     /// and hands the read view to the runner. Inputs only; edges are rejected
-    /// with [`WireError::HostPort`](crate::WireError::HostPort).
+    /// with `WireError::HostPort`.
     SelfTap(PortId),
 }
 
@@ -236,7 +213,7 @@ pub struct PortDesc {
 
 /// Re-derives `F`'s vtable and metadata under the dotted `prefix` (the
 /// instance name), so the leaves roll the same ids as
-/// `ComponentId::new("<prefix>.<frame>.<field>")` — the static-path oracle
+/// `ComponentId::new("<prefix>.<frame>.<field>")`, the static-path oracle
 /// the announce-equivalence tests compare [`PortDesc::announce`] against.
 #[cfg(test)]
 pub(crate) fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
@@ -336,12 +313,6 @@ impl PortDesc {
         self
     }
 
-    /// Overrides the input fan-in rule.
-    pub fn with_fan_in(mut self, f: FanIn) -> Self {
-        self.fan_in = f;
-        self
-    }
-
     /// Overrides the delivery semantics, for example an every-record
     /// `Table × Log` frame log.
     pub fn with_delivery(mut self, d: Delivery) -> Self {
@@ -388,7 +359,7 @@ impl PortDesc {
 ///
 /// The port carries the frame-relative vtable plus per-component metadata,
 /// and the prefixed ids are reconstructed from that metadata with no static
-/// frame type — the same path whether the port was derived in-process or
+/// frame type, the same path whether the port was derived in-process or
 /// decoded from a pack manifest.
 ///
 /// Each leaf component id is baked as a standalone 8-byte `Op::Data` blob, so
@@ -402,7 +373,7 @@ impl PortDesc {
 /// A dynamic terminal (`Op::List`/`Op::Map`) bakes no leaf id; its members'
 /// ids compose at realize time from the terminal's dotted name string. A
 /// top-level terminal's name carries the full path from the frame root
-/// (`health.error_counts`), so the instance prefix belongs on it; a nested
+/// (`alarm_defs.limits`, say), so the instance prefix belongs on it; a nested
 /// terminal inside a member template keeps its element-relative name. Each
 /// top-level terminal's name blob is repointed at a prefixed copy appended to
 /// the data buffer, which shifts no existing offset. The result realizes
@@ -642,10 +613,6 @@ mod tests {
     fn modifiers_override_one_axis() {
         let d = PortDesc::of::<AxisProbe>().untelemetered();
         assert!(!d.telemetered);
-        assert_eq!(d.delivery, Delivery::Snapshot);
-
-        let d = PortDesc::of::<AxisProbe>().with_fan_in(FanIn::Many);
-        assert_eq!(d.fan_in, FanIn::Many);
         assert_eq!(d.delivery, Delivery::Snapshot);
 
         // The fourth axis combination, an every-record frame log.

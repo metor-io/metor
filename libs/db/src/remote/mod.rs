@@ -37,7 +37,7 @@ mod tests {
     }
 
     fn component_schema() -> crate::ComponentSchema {
-        crate::ComponentSchema::new(PrimType::U64, &[1])
+        crate::ComponentSchema::new(PrimType::U64, &[1][..])
     }
 
     /// Three nodes at starts 10/20/30 with 4 samples each; 10 and 20 end

@@ -44,7 +44,10 @@ impl Live {
     }
 
     fn state_ptr(&mut self, slot: &Slot) -> u32 {
-        let name = format!("{}_state_ptr", self.program.manifest.systems[slot.system].name);
+        let name = format!(
+            "{}_state_ptr",
+            self.program.manifest.systems[slot.system].name
+        );
         self.call(&name, &[Val::I32(slot.index as i32)]) as u32
     }
 
@@ -224,7 +227,10 @@ fn a_changed_triple_resets_that_field_and_nothing_else() {
         LOWPASS
             .replace("filtered: f64 = 10.0", "filtered: Tensor[f64, 3] = 10.0")
             .replace("return s.filtered", "return s.filtered[0]")
-            .replace("s.filtered = 0.5 * rpm + 0.5 * s.filtered", "s.filtered = s.filtered * 0.5"),
+            .replace(
+                "s.filtered = 0.5 * rpm + 0.5 * s.filtered",
+                "s.filtered = s.filtered * 0.5",
+            ),
     ] {
         let new = compile_module(&edited, &imu_table()).unwrap();
         assert!(
@@ -257,7 +263,8 @@ fn the_snapshot_keys_are_the_design_docs_triple() {
     );
     assert_eq!(state::guards(&program.manifest), vec![(0, 1)]);
 
-    let stateless = compile_expr("wheels.rpm * 2.0", &Table::new(&[("wheels.rpm", Ty::F64)])).unwrap();
+    let stateless =
+        compile_expr("wheels.rpm * 2.0", &Table::new(&[("wheels.rpm", Ty::F64)])).unwrap();
     assert!(state::slots(&stateless.manifest).is_empty());
     assert!(state::guards(&stateless.manifest).is_empty());
 }

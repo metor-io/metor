@@ -1,26 +1,12 @@
-//! Compiling a target's captured Python program at provision time.
+//! Compile captured Python systems into a WebAssembly pack at build time.
 //!
-//! The build driver's wasm arm: the program the recorder captured into
-//! [`Wiring::program`] is compiled by `metor-expr` into the pack artifact its
-//! `@system` specs address — at the same seam that builds path-source
-//! cdylibs, so the vehicle only ever loads a finished module and a bad
-//! program fails the *build* with a `target.py`-line diagnostic, mapped
-//! through the program's per-declaration offsets.
+//! Input components are resolved from other artifacts' manifests. Their IDs
+//! and offsets come directly from descriptors; rehashing names would lose
+//! information because `ComponentId::new` masks the FNV top bit.
 //!
-//! ## The build-time resolver
-//!
-//! The compiler's questions are answered from the *other* artifacts' decoded
-//! pack manifests: every Table output port of every artifact-backed system
-//! (and every slot's occupant contract) is realized field by field into an
-//! addressable component, its id and record offset **carried** from the
-//! descriptor — `ComponentId::new` masks the FNV top bit, so re-hashing a
-//! name agrees with the real id for only about half of names, and the
-//! failure mode would look like a component that never publishes. A cdylib's
-//! manifest comes from its `.manifest` sidecar when the build wrote one
-//! (no dlopen), else an in-process describe; a wasm artifact's through the
-//! interpreter. Statically registered systems have no manifest to read, so
-//! their outputs are not bindable from Python — a diagnostic, not a silent
-//! misbind.
+//! Static systems have no artifact manifest, so their outputs cannot be bound
+//! from Python. Compilation errors use the recorded source offsets to report
+//! locations in `target.py`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -119,7 +105,7 @@ struct BuildResolver {
     /// Every addressable component by full instance-prefixed path, in a
     /// `BTreeMap` so nothing about iteration depends on hash order.
     components: BTreeMap<String, CompInfo>,
-    /// Frame shapes by frame (port) name, fields in realized order — the
+    /// Frame shapes by frame (port) name, fields in realized order, the
     /// `frame()` hook a `bind=`-to-host-frame class is checked against.
     frames: HashMap<String, Vec<(String, Ty)>>,
 }
@@ -217,6 +203,7 @@ impl BuildResolver {
                             prim: field.ty,
                             shape: field.shape.to_vec(),
                             offset: field.offset,
+                            timestamp_at: field.timestamp_at,
                         },
                         ty,
                     },
@@ -231,6 +218,7 @@ impl Resolver for BuildResolver {
     fn component(&self, path: &str) -> Option<CompSchema> {
         self.components.get(path).map(|info| CompSchema {
             ty: info.ty.clone(),
+            timestamp: info.source.timestamp_at.is_some(),
         })
     }
 
@@ -247,6 +235,11 @@ impl Resolver for BuildResolver {
         self.frames.get(name).map(|fields| FrameSchema {
             name: name.to_string(),
             fields: fields.clone(),
+            // One record, one stamp: any field's answer is the frame's.
+            timestamp: self
+                .components
+                .values()
+                .any(|info| info.source.port_name == name && info.source.timestamp_at.is_some()),
         })
     }
 }
@@ -257,9 +250,8 @@ impl PackResolver for BuildResolver {
     }
 }
 
-/// A component's type in the language: the panel host's mapping, duplicated
-/// so a promoted expression sees the identical world. Everything numeric is
-/// `f64` (which is also how the runner fills a frame slot), `bool` stays
+/// A component's type in the expression language. Everything numeric is
+/// `f64`, which is also how the runner fills a frame slot; `bool` stays
 /// itself, and a shaped bool has no tensor type to be.
 fn ty_of(prim: PrimType, shape: &[usize]) -> Option<Ty> {
     match (prim, shape.is_empty()) {
@@ -276,7 +268,7 @@ fn ty_of(prim: PrimType, shape: &[usize]) -> Option<Ty> {
 /// The decoded pack manifests the resolver reads, one per artifact: a
 /// cdylib's from its sidecar (else an in-process describe), a wasm module's
 /// through the interpreter. `None` for the program artifact itself and for
-/// anything unreadable — an unbindable producer, not a build failure.
+/// anything unreadable: an unbindable producer, not a build failure.
 #[derive(Default)]
 struct Manifests {
     decoded: HashMap<String, Option<Vec<PackEntryDesc>>>,

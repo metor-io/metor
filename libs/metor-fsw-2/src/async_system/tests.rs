@@ -9,8 +9,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::{AsyncContext, AsyncSystem};
 use crate::{
-    AsVTable, Frame, FrameList, HealthPort, Input, LogEvent, MsgOut, Out, Output, System,
-    SystemHealth, SystemInput, SystemOutput, buffer_capacity,
+    AsVTable, Frame, FrameList, Input, LogEvent, LogPort, MsgOut, Out, Output, SlotState,
+    StatusPort, System, SystemInput, SystemOutput, SystemStatus, buffer_capacity,
 };
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
@@ -75,7 +75,7 @@ impl System for AsyncFilter {
 impl AsyncSystem for AsyncFilter {
     async fn run(
         &mut self,
-        context: &AsyncContext,
+        context: &mut AsyncContext,
         input: &mut Self::Input,
         output: &mut Self::Output,
     ) {
@@ -90,6 +90,8 @@ impl AsyncSystem for AsyncFilter {
                 residuals: FrameList::EMPTY,
             };
             let _ = output.nav.write(&nav);
+            // A free-running system closes its own status record.
+            context.status().tick(0);
         }
     }
 }
@@ -99,7 +101,7 @@ impl AsyncSystem for AsyncFilter {
 async fn async_filter_one_cycle() {
     let imu_ring = ring_for::<Imu>(8, 2);
     let nav_ring = ring_for::<NavEstimate>(8, 2);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let status_ring = ring_for::<SystemStatus>(8, 1);
     let log_ring = log_ring_for(1);
 
     let imu_data = Notifier::default();
@@ -109,16 +111,17 @@ async fn async_filter_one_cycle() {
         imu: Input::new(imu_ring.view(imu_data.clone()).unwrap()),
     };
     let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake).unwrap());
-    let health = HealthPort::new(
-        Output::new(health_ring.writer(Notifier::default()).unwrap()),
-        MsgOut::<LogEvent, Notifier>::new(log_ring.writer(Notifier::default()).unwrap()),
-    );
+    let mut status_in = Input::<SystemStatus>::new(status_ring.view(NoWake).unwrap());
+    let log = LogPort::new(MsgOut::<LogEvent, Notifier>::new(
+        log_ring.writer(Notifier::default()).unwrap(),
+    ));
     let mut output = Out::new(
         AsyncOut {
             nav: Output::new(nav_ring.writer(nav_data.clone()).unwrap()),
         },
-        health,
+        log,
     );
+    let status = StatusPort::new(Output::new(status_ring.writer(NoWake).unwrap()));
 
     // Feed one IMU sample from a spawned task; the system's `run` awaits it.
     let writer = {
@@ -144,9 +147,9 @@ async fn async_filter_one_cycle() {
         stellarator::yield_now().await;
         cancel_after_one.cancel();
     });
-    let context = AsyncContext { cancel };
+    let mut context = AsyncContext { cancel, status };
     let mut sys = AsyncFilter;
-    sys.run(&context, &mut input, &mut output).await;
+    sys.run(&mut context, &mut input, &mut output).await;
     let _ = canceller.await;
     let _ = writer.await;
 
@@ -156,4 +159,11 @@ async fn async_filter_one_cycle() {
         .expect("async system produced a nav");
     assert_eq!(nav.get().angle, 2.0);
     assert_eq!(nav.get().timestamp, Timestamp(7));
+    // The loop ticked its own status once per iteration.
+    let status = status_in
+        .latest()
+        .expect("ring readable")
+        .expect("the system published its status");
+    assert_eq!(status.cycles, 1);
+    assert_eq!(status.state, SlotState::Running.code());
 }

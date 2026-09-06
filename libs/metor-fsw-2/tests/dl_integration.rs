@@ -12,115 +12,28 @@
 //! The fixture is built by a nested `cargo build` inside the test, which is
 //! safe because the outer `cargo test` lock is released before the test binary
 //! runs. If the build cannot produce a usable shared object,
-//! [`locate_fixture`] returns `None` and the test skips with a message on
-//! stderr instead of failing; `tests_abi` keeps the loader logic covered
-//! regardless.
+//! [`locate_fixture`] fails the test with the build diagnostics.
 
 #![cfg(not(miri))]
 
 use std::path::PathBuf;
 
 mod common;
+use common::{CounterParams, TickEvent, TickIn, TickOut, Ticker};
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
+use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
 use metor_fsw_2::{
-    BuildSystem, ClockSpec, CoordinatorSpec, CyclicSystem, Delivery, DlPack, FanIn, Frame, Input,
-    MsgIn, Out, Output, ParamSource, PortId, StopReason, System, SystemInput, SystemKind,
-    SystemOutput, WiringBuilder,
-    wiring::{Registry, resolve},
+    ClockSpec, CoordinatorSpec, Delivery, DlPack, FanIn, Frame, Input, MsgIn, ParamSource, PortId,
+    StopReason, SystemKind, WiringBuilder,
+    wiring::{BuildOptions, Registry, provision_artifacts, resolve},
 };
-use postcard_schema::Schema;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-// ---------------------------------------------------------------------------
-// Host-side frames
-// ---------------------------------------------------------------------------
-
-// These must stay byte-for-byte identical to the fixture's frames; that layout
-// agreement is the contract `compatible()` checks against the descriptor
-// reconstructed from the shared object.
-
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
-#[repr(C)]
-#[metor_fsw(name = "tick_in")]
-struct TickIn {
-    #[metor_fsw(timestamp)]
-    timestamp: Timestamp,
-    value: u64,
-}
-
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
-#[repr(C)]
-#[metor_fsw(name = "tick_out")]
-struct TickOut {
-    #[metor_fsw(timestamp)]
-    timestamp: Timestamp,
-    count: u64,
-}
-
-/// Mirror of the fixture's `CounterParams`. The same fields in the same order
-/// encode to the same postcard bytes.
-#[derive(serde::Serialize, Default)]
-struct CounterParams {
-    start: u64,
-    scale: f64,
-}
-
-/// Mirror of the fixture's `TickEvent` message. The shared schema name hashes
-/// to the same `PacketId`, so the host decodes the loaded system's Postcard
-/// records from the id alone, with no vtable and no announce step.
-#[derive(serde::Serialize, serde::Deserialize, Schema, Debug)]
-struct TickEvent {
-    count: u64,
-}
-
-// ---------------------------------------------------------------------------
-// A statically linked producer feeding the loaded consumer
-// ---------------------------------------------------------------------------
-
-/// Emits `tick_in.value = 1, 2, 3, ...`, incrementing before each write, so
-/// after `n` cycles the freshest value is `n`.
-struct Ticker {
-    n: u64,
-}
-
-#[derive(SystemInput)]
-struct TickerIn {}
-
-#[derive(SystemOutput)]
-struct TickerOut {
-    tick: Output<TickIn>,
-}
-
-impl System for Ticker {
-    type Input = TickerIn;
-    type Output = Out<TickerOut>;
-    const NAME: &'static str = "ticker";
-}
-
-impl CyclicSystem for Ticker {
-    fn execute(&mut self, now: Timestamp, _input: &mut TickerIn, output: &mut Out<TickerOut>) {
-        self.n += 1;
-        let _ = output.tick.write(&TickIn {
-            timestamp: now,
-            value: self.n,
-        });
-    }
-}
-
-impl BuildSystem for Ticker {
-    type Params = ();
-    fn new(_params: ()) -> Self {
-        Ticker { n: 0 }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Build and locate the fixture cdylib
 // ---------------------------------------------------------------------------
 
-/// Build the fixture crate and locate its `cdylib`, skipping on failure.
-fn locate_fixture() -> Option<PathBuf> {
+/// Build and locate the required fixture cdylib.
+fn locate_fixture() -> PathBuf {
     common::locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
 }
 
@@ -137,6 +50,10 @@ fn dl_coordinator() -> CoordinatorSpec {
     }
 }
 
+/// Serializes the tests that write or remove the fixture's manifest sidecar;
+/// `provision_artifacts` in one would race the opt-out check in the other.
+static SIDECAR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A registry with `Ticker` registered as the static producer.
 fn ticker_registry() -> Registry {
     let mut registry = Registry::new();
@@ -150,10 +67,7 @@ fn ticker_registry() -> Registry {
 
 #[test]
 fn dlopen_cyclic_system_end_to_end() {
-    let Some(lib_path) = locate_fixture() else {
-        // Build plumbing unavailable; tests_abi covers the loader in-binary.
-        return;
-    };
+    let lib_path = locate_fixture();
 
     // 1. Open the shared object directly to check the pack's exported entry
     //    names and validate the selected entry's reconstructed descriptor —
@@ -173,8 +87,8 @@ fn dlopen_cyclic_system_end_to_end() {
         desc.inputs[0].id().component().expect("table port"),
         TickIn::FRAME_ID
     );
-    // User `out`, user `events` (the Postcard port), implicit health, implicit log.
-    assert_eq!(desc.outputs.len(), 4);
+    // User `out`, user `events` (the Postcard port), implicit log.
+    assert_eq!(desc.outputs.len(), 3);
     assert_eq!(
         desc.outputs[0].id().component().expect("table port"),
         TickOut::FRAME_ID
@@ -322,7 +236,7 @@ fn dlopen_cyclic_system_end_to_end() {
 
     // 5c. The fixture's `tracing::info!` inside execute crossed the boundary
     //     too: the export shim installs a per-dylib subscriber, and each
-    //     instance's end_cycle drains the dylib's queue onto its own log
+    //     instance's log flush drains the dylib's queue onto its own log
     //     port, re-stamped with the instance name.
     let mut traced: Vec<metor_fsw_2::LogEvent> = Vec::new();
     log_in
@@ -365,8 +279,9 @@ fn dlopen_cyclic_system_end_to_end() {
 /// [`PackManifest`]: metor_fsw_2::abi::PackManifest
 #[test]
 fn build_driver_writes_manifest_sidecar() {
-    use metor_fsw_2::wiring::{BuildOptions, WiringBuilder, provision_artifacts};
-
+    let _guard = SIDECAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = || {
         WiringBuilder::new()
             .artifact(
@@ -377,10 +292,7 @@ fn build_driver_writes_manifest_sidecar() {
             .build()
     };
     let mut wiring = fixture();
-    if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
-        eprintln!("skipping: provision_artifacts failed: {e}");
-        return;
-    }
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("required fixture builds");
     let so = wiring.artifacts[0].path.clone().expect("path filled");
     let mut sidecar = so.clone().into_os_string();
     sidecar.push(".manifest");
@@ -419,10 +331,7 @@ fn build_driver_writes_manifest_sidecar() {
 /// first cycle, exactly like a lapped input or an in-cycle panic would.
 #[test]
 fn dlopen_null_create_reports_stopped() {
-    let Some(lib_path) = locate_fixture() else {
-        // Build plumbing unavailable; tests_abi covers the loader in-binary.
-        return;
-    };
+    let lib_path = locate_fixture();
 
     // `CounterParams` is `{ start: u64, scale: f64 }`; three bytes cannot
     // decode as either field, so the fixture's `fsw_pack_create` panics inside its
@@ -473,5 +382,89 @@ fn dlopen_null_create_reports_stopped() {
     assert_eq!(&*stopped[0].name, "DlCounter");
     assert_eq!(stopped[0].reason, StopReason::Panicked);
 
+    drop(coord);
+}
+
+/// `type=` selects the pack entry a dl system instantiates. Over a
+/// multi-entry pack an omitted `type=` is a clean `PackTypeRequired` error
+/// listing the choices, and a `type=` naming no exported entry fails with
+/// `PackSystem` wrapping [`DlError::UnknownPackSystem`].
+///
+/// [`DlError::UnknownPackSystem`]: metor_fsw_2::DlError::UnknownPackSystem
+#[test]
+fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
+    use metor_fsw_2::DlError;
+    use metor_fsw_2::wiring::LoadErrorKind;
+
+    let _guard = SIDECAR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A dl system with `artifact=` but no `type=`: the builder leaves the type
+    // unset, so resolve must pick the pack entry itself.
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(dl_coordinator())
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
+        .system("ticker")
+        .ty("Ticker")
+        .end()
+        .system("counter")
+        .from_artifact("counter")
+        .params_value(serde_json::json!({ "start": 5, "scale": 1.0 }))
+        .end()
+        .connect("ticker", "tick_in", "counter", "tick_in")
+        .build();
+    assert_eq!(
+        wiring.systems[1].ty, None,
+        "no explicit type on the dl system"
+    );
+
+    provision_artifacts(&mut wiring, &BuildOptions::default()).expect("required fixture builds");
+
+    // The fixture pack exports two entries, so the type-less spec cannot pick
+    // one; resolve reports the choices instead of guessing.
+    let registry = ticker_registry();
+    let err = match resolve(&wiring, &registry) {
+        Ok(_) => panic!("expected PackTypeRequired"),
+        Err(e) => e,
+    };
+    match err.kind {
+        LoadErrorKind::PackTypeRequired {
+            system, available, ..
+        } => {
+            assert_eq!(system, "counter");
+            assert_eq!(available, "DlCounter, DlEcho");
+        }
+        other => panic!("expected PackTypeRequired, got {other:?}"),
+    }
+
+    // A `type=` the pack does not export is rejected, naming the exports.
+    let mut bad = wiring.clone();
+    bad.systems[1].ty = Some("WrongType".to_string());
+    let err = match resolve(&bad, &registry) {
+        Ok(_) => panic!("expected PackSystem"),
+        Err(e) => e,
+    };
+    match err.kind {
+        LoadErrorKind::PackSystem { system, source, .. } => {
+            assert_eq!(system, "counter");
+            match *source {
+                DlError::UnknownPackSystem { name, available } => {
+                    assert_eq!(name, "WrongType");
+                    assert_eq!(available, ["DlCounter", "DlEcho"]);
+                }
+                other => panic!("expected UnknownPackSystem, got {other:?}"),
+            }
+        }
+        other => panic!("expected PackSystem, got {other:?}"),
+    }
+
+    // Naming a real entry resolves and runs.
+    let mut good = wiring.clone();
+    good.systems[1].ty = Some("DlCounter".to_string());
+    let coord = resolve(&good, &registry).expect("an exported type= resolves");
     drop(coord);
 }

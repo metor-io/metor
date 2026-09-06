@@ -89,7 +89,10 @@ def scaled(rpm) -> f64:
     assert_eq!(position_of(bare, "scaled"), None);
 
     let placed = moved(bare, "scaled", 300.0, 40.0);
-    assert!(placed.starts_with("@node(x=300, y=40)\n@system"), "{placed}");
+    assert!(
+        placed.starts_with("@node(x=300, y=40)\n@system"),
+        "{placed}"
+    );
     assert_eq!(position_of(&placed, "scaled"), Some((300.0, 40.0)));
 
     // Moving it again replaces the annotation rather than stacking another.
@@ -179,7 +182,11 @@ def scaled(rpm) -> f64:
     }
 
     // And a malformed one is a diagnostic rather than a silent default.
-    for bad in ["@node(x=1)", "@node(x=1, y=\"far\")", "@node(x=1, y=2, z=3)"] {
+    for bad in [
+        "@node(x=1)",
+        "@node(x=1, y=\"far\")",
+        "@node(x=1, y=2, z=3)",
+    ] {
         let text = refuse(
             &format!("{bad}\n@system\ndef f() -> f64:\n    return 1.0\n"),
             &Table::new(&[]),

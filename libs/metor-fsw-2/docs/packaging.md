@@ -47,16 +47,10 @@ id = "adcs"
 crate = "adcs-systems"
 lib = "adcs_systems"
 module = "adcs_pack"
-targets = [
-  "aarch64-unknown-linux-gnu",
-  "x86_64-unknown-linux-gnu",
-  "aarch64-apple-darwin",
-]
 ```
 
 The project name and version identify the distribution. The pack table links
-that distribution to a Cargo package, library stem, Python module, and target
-set.
+that distribution to a Cargo package, library stem, and Python module.
 
 The Cargo package and library stem default from `Cargo.toml`. The module
 defaults to a normalized form of the distribution name. The artifact id
@@ -65,7 +59,7 @@ defaults to the module name.
 ## Pack manifests
 
 Each pack library describes its entries, params, ports, and message schemas
-through ABI v10. The description is stored as postcard bytes in a manifest
+through ABI v12. The description is stored as postcard bytes in a manifest
 sidecar beside the library:
 
 ```text
@@ -78,8 +72,8 @@ current process. Pack module generation, wiring checks, and cross-target builds 
 use the same description.
 
 A pack manifest must not change by target. The Rust types, params, and ports
-form one contract even when the native code has several builds. A multi-target
-wheel or CI matrix fails if its manifest sidecars differ.
+form one contract even when the native code has several builds. A cross build
+fails if the target sidecar differs from the host description.
 
 ## Editable pack layout
 
@@ -106,21 +100,15 @@ path source and an indexed wheel without changing `target.py`.
 
 ## Pack wheel layout
 
-A published pack uses one `py3-none-any` wheel for all configured targets. The
-wheel is not tied to one Python platform because its Python code selects a
-native payload by Rust target triple.
+A pack wheel is tagged `py3-none-any`. The tag names no platform because the
+wheel's Python code selects a native payload by Rust target triple. `pack
+build` ships the triple it runs on.
 
 ```text
 adcs_pack/
   __init__.py
   py.typed
   _libs/
-    aarch64-unknown-linux-gnu/
-      libadcs_systems.so
-      libadcs_systems.so.manifest
-    x86_64-unknown-linux-gnu/
-      libadcs_systems.so
-      libadcs_systems.so.manifest
     aarch64-apple-darwin/
       libadcs_systems.dylib
       libadcs_systems.dylib.manifest
@@ -129,9 +117,7 @@ adcs_pack/
 At provision time, the host selects `_libs/<target-triple>/<library>`. An
 unsupported target fails with the targets that the wheel does provide.
 
-Pack wheels use release, stripped libraries. Builders may use Cargo,
-`cargo-zigbuild`, or a project command that leaves the target library in the
-normal Cargo target directory.
+Pack wheels use release, stripped libraries built with Cargo.
 
 The wheel records an exact `metor-fsw-abi` requirement. It also records a
 compatible minor range for `metor-config` unless the project already declares
@@ -155,7 +141,7 @@ target.bundle/
 The `.metor` form contains the same members in an uncompressed tar archive.
 The archive uses a fixed member order and clears variable tar metadata.
 
-`wiring.json` holds wiring IR v8 with build paths removed. It is the target
+`wiring.json` holds wiring IR v9 with build paths removed. It is the target
 definition that the host will resolve and run.
 
 `target.py` records provenance. Bundle load never evaluates it. A CI check
@@ -211,7 +197,3 @@ that description beside the target library.
 
 This works because the pack interface must stay the same across targets. A
 fresh target sidecar that differs from the host description fails the build.
-
-CI may build each native target on a separate runner and assemble the wheel
-later. Assembly requires byte-identical manifests from every runner. This
-detects source, feature, or tool skew before publication.

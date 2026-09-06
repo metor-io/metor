@@ -1,39 +1,77 @@
-//! How instrument views attach to a component.
-//!
-//! Plots own their sampling; the small single-value views — traffic lights,
-//! meters, gauges, state chips — all need the same three things instead, and
-//! that overlap is what lives here. A view binds to *one element of one
-//! component* ([`ElementRef`]), drains it with a task that outlives nothing
-//! but the view itself, and reads back whatever the control system declared
-//! about it.
-//!
-//! Three details are easy to get wrong alone and are therefore centralized:
-//!
-//! - **Seeding.** A fresh WAL reader only sees samples committed from now on.
-//!   Without an explicit read of the last committed value, a meter placed on a
-//!   slow component sits blank until the next sample — so the spawn helpers
-//!   paint the seed before entering their loop.
-//! - **Late binding.** A view can be placed, or restored from a layout, before
-//!   its producer registers. [`spawn_meta_resolver`] waits on the DB's vtable
-//!   generation and re-reads metadata once the schema appears.
-//! - **Limits.** Warn/critical thresholds are already declared by the control
-//!   system's alarm definitions, so an instrument should never be configured
-//!   with them by hand. [`limit_marks`] and [`alarm_tint`] read the same store
-//!   the plots read.
+//! Instrument bindings: seed the last committed value, stream updates, and
+//! resolve metadata for late-registering components. Alarm limits and colors
+//! come from the shared alarm store.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{App, Context, Hsla, SharedString};
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType};
+use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType, Timestamp};
 use metor_proto_wkt::Severity;
 use smallvec::SmallVec;
 
-use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
+use crate::ComponentStreamBuilder;
 
 pub(crate) enum StreamUpdate<I, V> {
     Ready(I),
     Value(V),
+    /// No sample has arrived for [`STALE_AFTER`]; the next `Value` ends it.
+    /// Sent once per silence, not repeated.
+    Stale,
+    /// No valid sample at the selected instant; discard the previous value.
+    Unavailable,
+}
+
+/// How old a sample may be before it is stale — the age of the data by its
+/// own stamp, not of its arrival, so a value the producer stopped refreshing
+/// reads stale even while the link keeps delivering it.
+pub(crate) const STALE_AFTER: Duration = Duration::from_secs(3);
+
+/// Per-stream freshness. Timestamps are absolute; future-dated samples age
+/// from receipt, and repeated or regressing stamps never restart the timer.
+pub(crate) struct Freshness {
+    latest: Option<Timestamp>,
+    advanced_at: Instant,
+    age_at_advance: Duration,
+}
+
+impl Freshness {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            latest: None,
+            advanced_at: now,
+            age_at_advance: Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        stamp: Option<Timestamp>,
+        wall: Timestamp,
+        now: Instant,
+    ) -> Duration {
+        let age = stamp
+            .map(|stamp| sample_age(stamp, wall))
+            .unwrap_or_default();
+        if stamp.is_none()
+            || self
+                .latest
+                .is_none_or(|last| stamp.is_some_and(|ts| ts > last))
+        {
+            self.latest = stamp;
+            self.advanced_at = now;
+            self.age_at_advance = age;
+        }
+        age.max(
+            self.age_at_advance
+                .saturating_add(now.duration_since(self.advanced_at)),
+        )
+    }
+}
+
+fn sample_age(sample: Timestamp, now: Timestamp) -> Duration {
+    Duration::from_micros(now.0.saturating_sub(sample.0).max(0) as u64)
 }
 
 /// The single number an instrument view displays: one element of one
@@ -139,11 +177,8 @@ pub(crate) fn component_name(db: &DB, component: ComponentId) -> Option<SharedSt
 /// Whether an instrument's editable binding has moved off what its stream
 /// task is actually reading, recording the new target if so.
 ///
-/// The inspector writes a view's fields straight through facet's `Poke` and
-/// then repaints; there is no hook to run a side effect. So a view whose
-/// binding is editable compares the two at the top of its `render` and
-/// respawns when they disagree — the same shape
-/// [`Annunciator`](super::Annunciator) uses to recompile its glob.
+/// Inspector edit hooks call this synchronously; render-time checks also
+/// catch programmatic changes to reflected fields.
 pub(crate) fn rebound(want: ElementRef, bound: &mut Option<ElementRef>) -> bool {
     if *bound == Some(want) {
         return false;
@@ -170,41 +205,39 @@ where
     A: Fn(&mut E, StreamUpdate<I, V>, &mut Context<E>) + Send + 'static,
 {
     let component_id = source.component_id();
+    let reader = crate::temporal::samples::acquire(db.clone(), component_id, cx);
     cx.spawn(async move |this, cx| {
-        let mut stream = source.into_stream(&db).await;
+        let component = crate::wait_for_component(&db, component_id).await;
         let (initial, decode) = prepare(&db, component_id);
-        if this
-            .update(cx, |view, cx| apply(view, StreamUpdate::Ready(initial), cx))
-            .is_err()
-        {
-            return;
-        }
-
-        let seed = db.with_state(|state| {
-            let component = state.get_component(component_id)?;
-            let latest = component.time_series.latest()?;
-            let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
-            decode(view)
-        });
-        if let Some(seed) = seed
-            && this
-                .update(cx, |view, cx| apply(view, StreamUpdate::Value(seed), cx))
-                .is_err()
-        {
-            return;
-        }
-
-        loop {
-            let value = decode(stream.next().await.as_component_view());
-            let result = this.update(cx, |view, cx| {
-                if let Some(value) = value {
-                    apply(view, StreamUpdate::Value(value), cx);
+        let subscription = this.update(cx, |view, cx| {
+            apply(view, StreamUpdate::Ready(initial), cx);
+            let deliver = move |view: &mut E,
+                                reader: &gpui::Entity<crate::temporal::samples::SelectedReader>,
+                                cx: &mut Context<E>| {
+                let selection = reader.read(cx).selection.clone();
+                match selection.sample {
+                    Some(sample) => {
+                        if let Ok((_, value)) = component.schema.parse_value(&sample.bytes)
+                            && let Some(value) = decode(value)
+                        {
+                            apply(view, StreamUpdate::Value(value), cx);
+                            if selection.stale {
+                                apply(view, StreamUpdate::Stale, cx);
+                            }
+                        } else {
+                            apply(view, StreamUpdate::Unavailable, cx);
+                        }
+                    }
+                    None => apply(view, StreamUpdate::Unavailable, cx),
                 }
-            });
-            if result.is_err() {
-                break;
-            }
-        }
+            };
+            deliver(view, &reader, cx);
+            cx.observe(&reader, move |view, reader, cx| deliver(view, &reader, cx))
+        });
+        // The task owns both the source and the shared-reader lease. GPUI observations
+        // clear cached widget state in the same update cycle as a seek.
+        std::future::pending::<()>().await;
+        drop((subscription, reader, source));
     })
 }
 
@@ -222,7 +255,7 @@ pub(crate) fn spawn_scalar_stream<E, F>(
 ) -> gpui::Task<()>
 where
     E: 'static,
-    F: Fn(&mut E, f64, &mut Context<E>) + Send + 'static,
+    F: Fn(&mut E, Option<f64>, &mut Context<E>) + Send + 'static,
 {
     spawn_seeded_stream(
         db,
@@ -233,10 +266,10 @@ where
                 view.iter().nth(element).map(|value| value.as_f64())
             })
         },
-        move |view, update, cx| {
-            if let StreamUpdate::Value(value) = update {
-                apply(view, value, cx);
-            }
+        move |view, update, cx| match update {
+            StreamUpdate::Value(value) => apply(view, Some(value), cx),
+            StreamUpdate::Unavailable => apply(view, None, cx),
+            _ => {}
         },
     )
 }
@@ -256,7 +289,7 @@ pub(crate) fn spawn_elements_stream<E, F>(
 ) -> gpui::Task<()>
 where
     E: 'static,
-    F: Fn(&mut E, &[f64], &mut Context<E>) + Send + 'static,
+    F: Fn(&mut E, Option<&[f64]>, &mut Context<E>) + Send + 'static,
 {
     spawn_seeded_stream(
         db,
@@ -272,10 +305,10 @@ where
                 (values.len() == count).then_some(values)
             })
         },
-        move |view, update, cx| {
-            if let StreamUpdate::Value(values) = update {
-                apply(view, &values, cx);
-            }
+        move |view, update, cx| match update {
+            StreamUpdate::Value(values) => apply(view, Some(&values), cx),
+            StreamUpdate::Unavailable => apply(view, None, cx),
+            _ => {}
         },
     )
 }
@@ -296,7 +329,7 @@ pub(crate) fn spawn_on_stream<E, F>(
 ) -> gpui::Task<()>
 where
     E: 'static,
-    F: Fn(&mut E, bool, Option<f64>, &mut Context<E>) + Send + 'static,
+    F: Fn(&mut E, Option<bool>, Option<f64>, &mut Context<E>) + Send + 'static,
 {
     spawn_seeded_stream(
         db,
@@ -308,10 +341,10 @@ where
                 Some((any_on(view.iter()), leading))
             })
         },
-        move |view, update, cx| {
-            if let StreamUpdate::Value((on, value)) = update {
-                apply(view, on, value, cx);
-            }
+        move |view, update, cx| match update {
+            StreamUpdate::Value((on, value)) => apply(view, Some(on), value, cx),
+            StreamUpdate::Unavailable => apply(view, None, None, cx),
+            _ => {}
         },
     )
 }
@@ -358,6 +391,9 @@ pub(crate) fn limit_marks(at: ElementRef, cx: &App) -> SmallVec<[(f64, Hsla); 4]
 
 /// Severity of the worst alarm currently raised against `at`, if any.
 pub(crate) fn active_severity(at: ElementRef, cx: &App) -> Option<Severity> {
+    if !crate::temporal::is_live(cx) {
+        return None;
+    }
     crate::alarms::try_global(cx)?
         .read(cx)
         .state()
@@ -427,5 +463,97 @@ mod tests {
         let mut bound = None;
         assert!(rebound(ElementRef::new(ComponentId(1), 0), &mut bound));
         assert!(!rebound(ElementRef::new(ComponentId(1), 0), &mut bound));
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_and_repeated_samples_do_not_refresh_their_age() {
+        let now = Instant::now();
+        let mut clock = Freshness::new(now);
+        assert_eq!(
+            clock.observe(Some(Timestamp(0)), Timestamp(10_000_000), now),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            clock.observe(
+                Some(Timestamp(0)),
+                Timestamp(11_000_000),
+                now + Duration::from_secs(1)
+            ),
+            Duration::from_secs(11)
+        );
+        assert_eq!(
+            clock.observe(
+                Some(Timestamp(11_000_000)),
+                Timestamp(11_000_000),
+                now + Duration::from_secs(1)
+            ),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn future_stamps_age_from_receipt_and_clocks_are_independent() {
+        let now = Instant::now();
+        let mut future = Freshness::new(now);
+        let mut ordinary = Freshness::new(now);
+        assert_eq!(
+            future.observe(Some(Timestamp(i64::MAX)), Timestamp(0), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            ordinary.observe(Some(Timestamp(0)), Timestamp(5_000_000), now),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            future.observe(
+                Some(Timestamp(i64::MAX)),
+                Timestamp(5_000_000),
+                now + Duration::from_secs(5)
+            ),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            ordinary.observe(None, Timestamp(5_000_000), now + Duration::from_secs(5)),
+            Duration::ZERO
+        );
+    }
+
+    use metor_db::ComponentSchema;
+
+    /// The seed judges age by the stamp the producer wrote, which the WAL
+    /// carries through to the time series unchanged.
+    #[stellarator::test]
+    async fn the_seed_stamp_is_the_producers_not_the_receivers() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = DB::create(temp.path().join("db")).unwrap();
+        let id = ComponentId::new("dead.value");
+        db.with_state_mut(|state| {
+            state.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
+        })
+        .unwrap();
+        let component = db
+            .with_state(|state| state.get_component(id).cloned())
+            .unwrap();
+        let stamped = Timestamp(Timestamp::now().0 - 10_000_000);
+        component.push_buf(stamped, &1.5f64.to_le_bytes()).unwrap();
+        for _ in 0..200 {
+            if component.time_series.latest().is_some() {
+                break;
+            }
+            stellarator::sleep(Duration::from_millis(5)).await;
+        }
+        let latest = component.time_series.latest().expect("persisted");
+        assert_eq!(latest.timestamp(), stamped);
+        assert!(sample_age(stamped, Timestamp::now()) >= Duration::from_secs(9));
+        assert!(
+            STALE_AFTER
+                .checked_sub(sample_age(stamped, Timestamp::now()))
+                .is_none()
+        );
     }
 }

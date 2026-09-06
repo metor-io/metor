@@ -231,7 +231,11 @@ fn validate_header_hostile() {
     assert!(g.reader_table_offset.is_multiple_of(8));
     let table_end = g
         .reader_table_offset
-        .checked_add((g.max_readers as usize).checked_mul(READER_SLOT_SIZE).unwrap())
+        .checked_add(
+            (g.max_readers as usize)
+                .checked_mul(READER_SLOT_SIZE)
+                .unwrap(),
+        )
         .unwrap();
     assert!(table_end <= g.data_offset);
 
@@ -329,11 +333,11 @@ fn layout_roundtrip() {
 /// The harnesses below attach to one of these rather than calling
 /// `create_in_memory`. That constructor builds its backing by collecting an
 /// iterator into a `Box<[Word]>`, and behind that collect sit `RawVec` growth,
-/// reallocation and allocation-failure paths — all of which CBMC unrolls to
-/// the harness's unwind bound. It costs far more than everything these proofs
-/// are actually about. Attaching keeps the real geometry, the real header
-/// validation and the real reader and writer paths, and leaves only the `Arc`
-/// inside `RingBuffer` allocating at all.
+/// reallocation and allocation-failure paths, all of which CBMC unrolls to
+/// the harness's unwind bound and which cost far more than everything these
+/// proofs are actually about. Attaching keeps the real geometry, the real
+/// header validation and the real reader and writer paths, and leaves only
+/// the `Arc` inside `RingBuffer` allocating at all.
 #[repr(C, align(8))]
 struct Region([u8; REGION]);
 
@@ -377,7 +381,8 @@ fn write_read_roundtrip() {
     let len: usize = kani::any();
     kani::assume(len <= 8);
 
-    w.try_write(&bytes[..len]).expect("empty ring fits a record");
+    w.try_write(&bytes[..len])
+        .expect("empty ring fits a record");
     let grant = v.try_read().unwrap().expect("a record was committed");
     assert_eq!(grant.len(), len);
     assert_eq!(&grant[..], &bytes[..len]);
@@ -435,7 +440,7 @@ fn backpressure_is_exact() {
 ///
 /// It also bounds `locate`'s gap-skip loop. Kani's unwind bound is per-harness
 /// rather than per-loop, so the claim it discharges is the weaker "every loop
-/// here closes", but a gap skip that could re-trigger would not close at all —
+/// here closes"; a gap skip that could re-trigger would not close at all, but
 /// the doc comment at the skip argues it cannot, because `hwm` strictly
 /// increases.
 #[kani::proof]

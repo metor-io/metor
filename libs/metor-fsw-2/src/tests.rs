@@ -10,8 +10,8 @@ use metor_proto_wkt::SequenceCommand;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    ClockMode, CoordinatorConfig, HealthPort, Input, MsgIn, Output, Pack, PortId, SystemKind,
-    system,
+    ClockMode, CoordinatorConfig, Input, LogEvent, LogLevel, LogPort, MsgIn, Output, Pack, PortId,
+    SystemKind, system,
 };
 use metor_fsw_2_core::Frame;
 use metor_fsw_2_core::{EntryParams, MakeError};
@@ -46,7 +46,7 @@ fn config() -> CoordinatorConfig {
 }
 
 /// The descriptor lists ports per direction in signature order, appends the
-/// health/log tail, and non-port params (`Timestamp`, `&mut HealthPort`)
+/// log tail, and non-port params (`Timestamp`, `&mut LogPort`)
 /// contribute nothing to the cursor walk.
 #[test]
 fn descriptor_orders_ports_by_signature() {
@@ -56,7 +56,7 @@ fn descriptor_orders_ports_by_signature() {
         _a: &mut Input<PkImu>,
         _cmds: &mut MsgIn<SequenceCommand>,
         _b: &mut Output<PkNav>,
-        _h: &mut HealthPort,
+        _h: &mut LogPort,
     ) {
     }
 
@@ -84,7 +84,6 @@ fn descriptor_orders_ports_by_signature() {
         output_ids,
         vec![
             PortId::Component(PkNav::FRAME_ID),
-            PortId::Component(crate::SystemHealth::FRAME_ID),
             PortId::Packet(metor_proto_wkt::LogEvent::ID),
         ]
     );
@@ -111,14 +110,14 @@ struct ConsState {
     seen: Rc<RefCell<Vec<f64>>>,
 }
 
-fn consume(s: &mut ConsState, imu: &mut Input<PkImu>, health: &mut HealthPort) {
+fn consume(s: &mut ConsState, imu: &mut Input<PkImu>, log: &mut LogPort) {
     if let Ok(Some(r)) = imu.latest() {
         // Field access through the grant's Deref; no `.get()`.
         if s.seen.borrow().last() != Some(&r.omega) {
             s.seen.borrow_mut().push(r.omega);
         }
     } else {
-        health.error("no_sample");
+        log.fault(LogLevel::Warn, "no_sample", "no imu sample", &[]);
     }
 }
 
@@ -200,7 +199,7 @@ fn prebuilt_state_is_move_once() {
 
 // ---------------------------------------------------------------------------
 // The async form: a task entry owning its ports, polled per cycle under the
-// ambient clock — a sequence as an ordinary wired system.
+// ambient clock, a sequence as an ordinary wired system.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
@@ -428,14 +427,111 @@ fn shared_state_init_failure_reports() {
     ));
 }
 
-/// A wired task loops on `cycle().await`: state in locals, exactly one
-/// publish per coordinator cycle, and drops from the future-owned output
-/// (forced by a stalled broad reader) fold into its health — the counter
-/// asymmetry the ports-in-future design used to have.
+/// The host publishes a `system_status` record for every slot it steps, and
+/// one for itself, once per cycle, carrying the cycle count, the step time,
+/// and the slot's run state, with no entry declaring or writing the port.
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn task_cycles_every_cycle_and_folds_drops() {
-    use crate::{ClockMode, SystemHealth};
+async fn host_publishes_a_status_record_for_every_slot() {
+    use crate::{ClockMode, SlotState, SystemStatus};
+    use metor_fsw_2_core::sequence::cycle;
+    use std::time::Duration;
+
+    async fn beat(mut nav: Output<PkNav>) {
+        loop {
+            let now = cycle().await;
+            nav.publish(&PkNav {
+                timestamp: now,
+                angle: 1.0,
+            });
+        }
+    }
+
+    let mut pack = Pack::new().task("beat", beat).system(
+        "watch",
+        system(watch_nav).state(NavWatch {
+            seen: Rc::new(RefCell::new(Vec::new())),
+        }),
+    );
+    let mut b = crate::coordinator::init::InitGraph::new(CoordinatorConfig {
+        cycle_rate: 1000.0,
+        clock: ClockMode::Simulated {
+            dt: Duration::from_millis(1),
+        },
+        ..CoordinatorConfig::default()
+    });
+    let beat_h = b.push_node(
+        pending_node(
+            "beat".into(),
+            pack.entry_mut("beat").unwrap(),
+            EntryParams::Postcard(&[]),
+        )
+        .expect("create task"),
+    );
+    let watch_h = b.push_node(
+        pending_node(
+            "watch".into(),
+            pack.entry_mut("watch").unwrap(),
+            EntryParams::Postcard(&[]),
+        )
+        .expect("create watcher"),
+    );
+    b.connect(
+        PortRef {
+            system: beat_h,
+            port: PortId::Component(PkNav::FRAME_ID),
+        },
+        PortRef {
+            system: watch_h,
+            port: PortId::Component(PkNav::FRAME_ID),
+        },
+    );
+    // Neither entry declares the port; the host appended it at registration.
+    for h in [beat_h, watch_h] {
+        let outputs = &b.descriptor_of(h).outputs;
+        let last = outputs.last().expect("outputs");
+        assert_eq!(last.id(), PortId::Component(SystemStatus::FRAME_ID));
+        assert_eq!(last.conn, crate::PortConn::Host);
+    }
+    let mut coord = b.build().unwrap();
+
+    let mut views: Vec<Input<SystemStatus>> = ["beat", "watch", "coordinator"]
+        .iter()
+        .map(|inst| {
+            Input::new(
+                coord
+                    .registry()
+                    .view(metor_proto::types::ComponentId::new(&format!(
+                        "{inst}.system_status"
+                    )))
+                    .expect("the host-appended status is registered")
+                    .expect("reader slot available"),
+            )
+        })
+        .collect();
+
+    // Fewer cycles than the ring depth, so these undrained views never pin
+    // the writer and the newest record is the last cycle's.
+    coord.run_for(5).await;
+
+    for view in &mut views {
+        let status = view
+            .latest()
+            .expect("ring readable")
+            .expect("status published");
+        assert_eq!(status.cycles, 5);
+        assert_eq!(status.state, SlotState::Running.code());
+    }
+}
+
+/// A wired task loops on `cycle().await`: state in locals, exactly one
+/// publish per coordinator cycle, drops from the future-owned output (forced
+/// by a stalled broad reader) reported on its log, and the host publishing
+/// its `system_status` record like any other slot's.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn task_cycles_every_cycle_and_reports_drops() {
+    use crate::{ClockMode, SlotState, SystemStatus};
     use metor_fsw_2_core::sequence::cycle;
     use std::time::Duration;
 
@@ -499,11 +595,18 @@ async fn task_cycles_every_cycle_and_folds_drops() {
         .view(metor_proto::types::ComponentId::new("beat.pk_nav"))
         .expect("the task output is registered")
         .expect("reader slot available");
-    let mut health_view: Input<SystemHealth> = Input::new(
+    let mut log_in: MsgIn<LogEvent> = MsgIn::new(
         coord
             .registry()
-            .view(metor_proto::types::ComponentId::new("beat.health"))
-            .expect("health is registered")
+            .view(metor_proto::types::ComponentId::new("beat.log"))
+            .expect("the log is registered")
+            .expect("reader slot available"),
+    );
+    let mut status_in: Input<SystemStatus> = Input::new(
+        coord
+            .registry()
+            .view(metor_proto::types::ComponentId::new("beat.system_status"))
+            .expect("the host-appended status is registered")
             .expect("reader slot available"),
     );
 
@@ -515,17 +618,30 @@ async fn task_cycles_every_cycle_and_folds_drops() {
     for w in seen.windows(2) {
         assert_eq!(w[1] - w[0], 1.0, "exactly one publish per cycle: {seen:?}");
     }
-    // The stalled reader forced drops, and they landed on the task's health
+    // The stalled reader forced drops, and they landed on the task's log
     // through the shared cell.
-    let health = health_view
+    let mut faults = Vec::new();
+    log_in.drain(|ev| faults.push(ev)).unwrap();
+    assert!(
+        faults.iter().any(|ev| ev
+            .fields
+            .iter()
+            .any(|(k, v)| k == "kind" && v == "publish_dropped")),
+        "future-owned drops are reported on the log: {faults:?}"
+    );
+    // The host authored the task's status record. This view never drained,
+    // so it pinned the ring once it filled: the newest readable record is
+    // one of the first depth's worth, not the last cycle's.
+    let status = status_in
         .latest()
         .expect("ring readable")
-        .expect("health published");
+        .expect("status published");
     assert!(
-        health.errors > 0,
-        "future-owned drops fold into health (errors = {})",
-        health.errors
+        (1..=30).contains(&status.cycles),
+        "cycles = {}",
+        status.cycles
     );
+    assert_eq!(status.state, SlotState::Running.code());
     drop(stalled);
 }
 
@@ -625,7 +741,7 @@ fn system_type_shared_registers_instance_descriptor() {
         .unwrap()
         .create(mint_params(&plain, &msgs, &attach))
         .unwrap();
-    assert!(matches!(created.instance_desc, None));
+    assert!(created.instance_desc.is_none());
 
     // A second instantiation is rejected, so re-register for the minting one.
     let (mut pack, attach) = mint_pack();
@@ -643,4 +759,80 @@ fn system_type_shared_registers_instance_descriptor() {
             .any(|p| p.id() == PortId::Packet(SequenceCommand::ID)),
         "the minted port reached the registered descriptor"
     );
+}
+
+#[stellarator::test]
+async fn overrun_cycles_allow_async_progress() {
+    use crate::wiring::{Registry, resolve};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    fn slow(_: &mut ()) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_micros(10) {
+            std::hint::spin_loop();
+        }
+    }
+    let mut registry = Registry::new();
+    registry.register_pack(Pack::new().system("slow", system(slow)));
+    let wiring = crate::WiringBuilder::new()
+        .coordinator(1e9, crate::ClockSpec::Wall)
+        .system("slow")
+        .ty("slow")
+        .end()
+        .build();
+    let mut coordinator = resolve(&wiring, &registry).unwrap();
+    let polls = Rc::new(Cell::new(0));
+    let observed = polls.clone();
+    let task = stellarator::spawn(async move {
+        loop {
+            observed.set(observed.get() + 1);
+            stellarator::yield_now().await;
+        }
+    })
+    .drop_guard();
+    stellarator::yield_now().await;
+    let before = polls.get();
+    coordinator.run_for(10).await;
+    assert!(polls.get() > before, "overruns must not starve async tasks");
+    drop(task);
+}
+
+#[test]
+fn invalid_timer_periods_and_ring_sizes_are_build_errors() {
+    use crate::coordinator::init::InitGraph;
+    for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-300, 1e-11, 1e300] {
+        let result = InitGraph::new(CoordinatorConfig {
+            cycle_rate: rate,
+            ..config()
+        })
+        .build();
+        assert!(
+            matches!(result, Err(crate::WireError::InvalidCycleRate { .. })),
+            "rate {rate}"
+        );
+    }
+    for cfg in [
+        CoordinatorConfig {
+            default_depth: usize::MAX,
+            ..config()
+        },
+        CoordinatorConfig {
+            reader_slack: usize::MAX,
+            ..config()
+        },
+    ] {
+        assert!(matches!(
+            InitGraph::new(cfg).build(),
+            Err(crate::WireError::InvalidRingSize { .. })
+        ));
+    }
+    let simulated = CoordinatorConfig {
+        cycle_rate: f64::NAN,
+        clock: ClockMode::Simulated {
+            dt: std::time::Duration::from_micros(1),
+        },
+        ..config()
+    };
+    assert!(InitGraph::new(simulated).build().is_ok());
 }

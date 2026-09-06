@@ -21,7 +21,7 @@
 use std::{
     collections::HashSet,
     sync::{Arc, atomic},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     Component, ComponentSchema, DB, Error,
-    manifest::SpanState,
+    manifest::{ComponentManifest, RangeVec, SpanSource, SpanState},
     time_series_2::{TimeSeries, TimeSeriesNodeSlice, TimerSeriesWriter},
 };
 
@@ -58,6 +58,13 @@ pub fn lod_node_max_age() -> Duration {
 pub const LOD_SOURCE_ID_KEY: &str = "lod_source_id";
 pub const LOD_RATIO_KEY: &str = "lod_ratio";
 pub const LOD_BUCKET_US_KEY: &str = "lod_bucket_us";
+/// Set to `"true"` on a hidden component to have the engine downsample it
+/// anyway. Hidden components are DB-internal and so skipped by default;
+/// this is how a producer of derived series (the panel's expression
+/// components) asks for the same wide-plot treatment as raw telemetry,
+/// without the db learning anything about who is asking. LoD levels
+/// themselves stay ineligible — they are hidden *and* LoD-named.
+pub const LOD_OPT_IN_KEY: &str = "lod";
 
 /// Levels whose buckets would span more than this are skipped: a slow
 /// source's raw history is small enough to render directly long before a
@@ -69,6 +76,12 @@ const MAX_BUCKETS_PER_PASS: i64 = 16_384;
 const PASS_PAUSE: Duration = Duration::from_millis(10);
 /// Backstop for the lost-wakeup race between a pass and `seal_waiter`.
 const IDLE_RECHECK: Duration = Duration::from_secs(60);
+/// How long the source's manifest must hold still before a bucket behind the
+/// cursor that touches a stretch with no data is folded. History arriving
+/// behind the head lands node by node, and a bucket straddling the seam
+/// between one node and the next would otherwise fold before the next one
+/// lands — and, its midpoint then covered, never fold again.
+const BEHIND_SETTLE: Duration = Duration::from_secs(5);
 
 pub fn lod_name(source: &str, ratio: u64) -> String {
     format!("{source}{LOD_INFIX}{ratio}")
@@ -81,13 +94,10 @@ pub fn is_lod_name(name: &str) -> bool {
 /// The derived schema: `[2, ..source shape]` f32, one min and one max per
 /// source element, laid out `[min_e0..min_eN, max_e0..max_eN]` per sample.
 pub fn lod_schema(source: &ComponentSchema) -> ComponentSchema {
-    let mut dim = SmallVec::with_capacity(source.dim.len() + 1);
+    let mut dim: SmallVec<[usize; 4]> = SmallVec::with_capacity(source.dim.len() + 1);
     dim.push(2);
     dim.extend(source.dim.iter().copied());
-    ComponentSchema {
-        prim_type: PrimType::F32,
-        dim,
-    }
+    ComponentSchema::new(PrimType::F32, dim)
 }
 
 /// Spawn the engine: watches for new eligible components and runs one
@@ -126,7 +136,12 @@ async fn run(db: Arc<DB>) {
 }
 
 fn eligible(meta: &ComponentMetadata) -> bool {
-    !meta.is_hidden() && !meta.is_string() && !is_lod_name(&meta.name)
+    let visible = !meta.is_hidden()
+        || meta
+            .metadata
+            .get(LOD_OPT_IN_KEY)
+            .is_some_and(|opt_in| opt_in == "true");
+    visible && !meta.is_string() && !is_lod_name(&meta.name)
 }
 
 async fn downsample_source(db: Arc<DB>, src: Component) {
@@ -165,6 +180,10 @@ async fn downsample_source(db: Arc<DB>, src: Component) {
     loop {
         let mut pending = false;
         for level in levels.iter_mut() {
+            match level.fill_behind(&src) {
+                Ok(more) => pending |= more,
+                Err(err) => warn!(?err, src = %meta.name, "lod behind-fill failed"),
+            }
             match level.run_pass(&src) {
                 Ok(more) => pending |= more,
                 Err(err) => warn!(?err, src = %meta.name, "lod pass failed"),
@@ -239,6 +258,9 @@ pub fn summarized_frontier(db: &DB, source_id: ComponentId) -> Option<i64> {
 
 struct Level {
     writer: TimerSeriesWriter,
+    /// The level's own series, for splicing folded history in behind what
+    /// the writer has emitted.
+    series: TimeSeries,
     bucket_us: i64,
     /// End of the last scanned bucket window. Seeded from the LoD
     /// component's own latest sample (restart-safe, no sidecar state) and
@@ -265,6 +287,9 @@ struct Level {
     /// [`MAX_BUCKETS_PER_PASS`] times per pass.
     emit_buf: Vec<u8>,
     emit_index: Vec<(Timestamp, u32)>,
+    /// The source manifest generation last seen behind the cursor, and
+    /// since when; see [`BEHIND_SETTLE`].
+    behind: Option<(u64, Instant)>,
 }
 
 /// Resolve or create the LoD companions for `src`. Existing levels are
@@ -300,8 +325,7 @@ fn setup_levels(db: &Arc<DB>, src: &Component, src_name: &str, period_us: i64) -
                 continue;
             }
             None => {
-                let bucket_us =
-                    (period_us as i128 * ratio as i128).min(i64::MAX as i128) as i64;
+                let bucket_us = (period_us as i128 * ratio as i128).min(i64::MAX as i128) as i64;
                 if bucket_us > MAX_BUCKET_US {
                     continue;
                 }
@@ -335,7 +359,13 @@ fn setup_levels(db: &Arc<DB>, src: &Component, src_name: &str, period_us: i64) -
                 .map(|s| s.seal.start_ts.0.div_euclid(bucket_us) * bucket_us)
                 .unwrap_or(0),
         };
-        levels.push(Level::new(writer, bucket_us, cursor, &src.schema));
+        levels.push(Level::new(
+            writer,
+            lod.time_series.clone(),
+            bucket_us,
+            cursor,
+            &src.schema,
+        ));
     }
     levels
 }
@@ -380,6 +410,7 @@ impl Level {
     /// start empty and warm their capacity on the first pass.
     fn new(
         writer: TimerSeriesWriter,
+        series: TimeSeries,
         bucket_us: i64,
         cursor: i64,
         src_schema: &ComponentSchema,
@@ -387,6 +418,7 @@ impl Level {
         let n = src_schema.dim.iter().product::<usize>().max(1);
         Level {
             writer,
+            series,
             bucket_us,
             cursor,
             mins: vec![f64::INFINITY; n],
@@ -395,6 +427,7 @@ impl Level {
             node_slices: Vec::new(),
             emit_buf: Vec::new(),
             emit_index: Vec::new(),
+            behind: None,
         }
     }
 
@@ -416,9 +449,41 @@ impl Level {
         if self.cursor >= emit_end {
             return Ok(false);
         }
-        let pass_end =
-            emit_end.min(self.cursor.saturating_add(d.saturating_mul(MAX_BUCKETS_PER_PASS)));
+        let pass_end = emit_end.min(
+            self.cursor
+                .saturating_add(d.saturating_mul(MAX_BUCKETS_PER_PASS)),
+        );
+        let cursor = self.cursor;
+        self.scan(src, &manifest, cursor, pass_end);
 
+        // If history shifted under us mid-fold (a seal, install, or purge
+        // bumped the manifest), the buffered buckets may be built from a
+        // window that no longer reflects the data. Drop them and re-run
+        // next pass over a consistent snapshot rather than emit or advance.
+        if src.time_series.manifest().generation != gen_before {
+            return Ok(true);
+        }
+        let mut offset = 0usize;
+        for (ts, len) in self.emit_index.iter() {
+            let len = *len as usize;
+            self.writer
+                .push_buf(*ts, &self.emit_buf[offset..offset + len])?;
+            offset += len;
+        }
+        self.cursor = pass_end;
+        Ok(pass_end < emit_end)
+    }
+
+    /// Fold every complete bucket of `[from, to)` into the emit arena.
+    ///
+    /// Buckets touching raw history that is not locally resident are
+    /// skipped: pre-existing RemoteOnly history (e.g. a seeded mirror's
+    /// un-hydrated past) has no local bytes to fold. Tiering no longer
+    /// purges in-window resident spans (it gates on
+    /// [`summarized_frontier`]), so this only fires for history that was
+    /// never local to begin with.
+    fn scan(&mut self, src: &Component, manifest: &ComponentManifest, from: i64, to: i64) {
+        let d = self.bucket_us;
         // Disjoint borrows of the per-level scratch: the node walk reads
         // `node_slices` while the fold writes `mins`/`maxs`/`emit_*`, which a
         // single `&mut self` would forbid.
@@ -429,17 +494,9 @@ impl Level {
             node_slices,
             emit_buf,
             emit_index,
-            writer,
-            cursor,
             ..
         } = self;
 
-        // Buckets touching raw history that is not locally resident are
-        // skipped: pre-existing RemoteOnly history (e.g. a seeded mirror's
-        // un-hydrated past) has no local bytes to fold. Tiering no longer
-        // purges in-window resident spans (it gates on
-        // [`summarized_frontier`]), so this only fires for history that was
-        // never local to begin with.
         holes.clear();
         holes.extend(
             manifest
@@ -447,7 +504,7 @@ impl Level {
                 .iter()
                 .filter(|s| s.state != SpanState::Resident)
                 .map(|s| (s.seal.start_ts.0, s.cover_end.0))
-                .filter(|(start, end)| *start < pass_end && *end >= *cursor),
+                .filter(|(start, end)| *start < to && *end >= from),
         );
 
         let n = src.schema.dim.iter().product::<usize>().max(1);
@@ -459,16 +516,13 @@ impl Level {
         mins.fill(f64::INFINITY);
         maxs.fill(f64::NEG_INFINITY);
         // Folded buckets are buffered (flat arena + index) and only written
-        // after the manifest generation re-check below, so a snapshot that
-        // shifted under us emits nothing rather than a bucket built from
-        // partial data.
+        // after the caller's manifest generation re-check, so a snapshot
+        // that shifted underneath emits nothing rather than a bucket built
+        // from partial data.
         emit_buf.clear();
         emit_index.clear();
 
-        if let Some(slice) = src
-            .time_series
-            .get_range(Timestamp(*cursor)..Timestamp(pass_end))
-        {
+        if let Some(slice) = src.time_series.get_range(Timestamp(from)..Timestamp(to)) {
             // Newest-first node order, reversed so buckets emit in time
             // order; nearest-match boundaries can hand back samples just
             // outside the window, so every sample is range-checked.
@@ -478,7 +532,7 @@ impl Level {
                 let timestamps = node_slice.timestamps();
                 let data = node_slice.data();
                 for (i, ts) in timestamps.iter().enumerate() {
-                    if ts.0 < *cursor || ts.0 >= pass_end {
+                    if ts.0 < from || ts.0 >= to {
                         continue;
                     }
                     let bucket = ts.0.div_euclid(d) * d;
@@ -516,22 +570,105 @@ impl Level {
                 Self::fold_bucket(d, bucket_start, mins, maxs, holes, emit_buf, emit_index);
             }
         }
+    }
 
-        // If history shifted under us mid-fold (a seal, install, or purge
-        // bumped the manifest), the buffered buckets may be built from a
-        // window that no longer reflects the data. Drop them and re-run
-        // next pass over a consistent snapshot rather than emit or advance.
-        if src.time_series.manifest().generation != gen_before {
-            return Ok(true);
+    /// Fold raw history that arrived behind the cursor — a backfill or a
+    /// hydration of the source's past — and splice the buckets in behind
+    /// the level's own head. Returns true when more remains.
+    ///
+    /// The cursor only moves forward, so what it has passed is accounted
+    /// for by the level's own coverage: a bucket is unfolded exactly when
+    /// its midpoint, where its sample lands, is uncovered. Buckets over
+    /// raw stretches that hold nothing yet wait for the source to settle
+    /// (see [`BEHIND_SETTLE`]); the rest fold at once.
+    fn fill_behind(&mut self, src: &Component) -> Result<bool, Error> {
+        let d = self.bucket_us;
+        let manifest = src.time_series.manifest();
+        let Some(first) = manifest.spans.first() else {
+            return Ok(false);
+        };
+        let floor = first.seal.start_ts.0.div_euclid(d) * d;
+        if self.series.list.head().is_none() {
+            // Nothing to splice behind, and an install could not outrank a
+            // writer's empty head anyway; the forward pass starts from the
+            // oldest span instead.
+            self.cursor = self.cursor.min(floor);
+            return Ok(false);
+        }
+        if floor >= self.cursor {
+            return Ok(false);
+        }
+        let settled = match self.behind {
+            Some((generation, since)) if generation == manifest.generation => {
+                since.elapsed() >= BEHIND_SETTLE
+            }
+            _ => {
+                self.behind = Some((manifest.generation, Instant::now()));
+                false
+            }
+        };
+
+        let window = Timestamp(floor)..Timestamp(self.cursor);
+        let mut missing = RangeVec::new();
+        self.series.uncovered(window.clone(), &mut missing);
+        let mut empty = RangeVec::new();
+        src.time_series.uncovered(window, &mut empty);
+        let touches_empty = |bucket: i64| {
+            empty
+                .iter()
+                .any(|gap| bucket < gap.end.0 && gap.start.0 < bucket + d)
+        };
+
+        let mut budget = MAX_BUCKETS_PER_PASS;
+        for gap in &missing {
+            // The buckets whose midpoints fall inside the gap.
+            let lo = (gap.start.0 - d / 2).div_euclid(d) * d;
+            let lo = if lo + d / 2 < gap.start.0 { lo + d } else { lo };
+            let hi = (gap.end.0 - d / 2 - 1).div_euclid(d) * d + d;
+            let mut run_start: Option<i64> = None;
+            let mut bucket = lo;
+            while bucket < hi && budget > 0 {
+                if settled || !touches_empty(bucket) {
+                    run_start.get_or_insert(bucket);
+                    budget -= 1;
+                } else if let Some(start) = run_start.take() {
+                    self.fold_behind(src, &manifest, start, bucket)?;
+                }
+                bucket += d;
+            }
+            if let Some(start) = run_start.take() {
+                self.fold_behind(src, &manifest, start, bucket)?;
+            }
+            if budget == 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fold `[from, to)` and install what came out as one node.
+    fn fold_behind(
+        &mut self,
+        src: &Component,
+        manifest: &ComponentManifest,
+        from: i64,
+        to: i64,
+    ) -> Result<(), Error> {
+        self.scan(src, manifest, from, to);
+        if src.time_series.manifest().generation != manifest.generation {
+            return Ok(());
         }
         let mut offset = 0usize;
-        for (ts, len) in emit_index.iter() {
+        let samples = self.emit_index.iter().map(|(ts, len)| {
             let len = *len as usize;
-            writer.push_buf(*ts, &emit_buf[offset..offset + len])?;
+            let bytes = &self.emit_buf[offset..offset + len];
             offset += len;
-        }
-        *cursor = pass_end;
-        Ok(pass_end < emit_end)
+            (*ts, bytes)
+        });
+        let size = self.emit_index.first().map_or(0, |(_, len)| *len as usize);
+        self.series
+            .install_samples(size, samples, SpanSource::LocalIngest)?;
+        Ok(())
     }
 
     /// Fold one bucket into the emit arena as a sample at the bucket's
@@ -628,7 +765,9 @@ mod tests {
         )
         .unwrap();
         head.data.write(&0f64.to_le_bytes()).unwrap();
-        head.index.write(&Timestamp(head_start).to_le_bytes()).unwrap();
+        head.index
+            .write(&Timestamp(head_start).to_le_bytes())
+            .unwrap();
 
         let time_series = TimeSeries::open(&component_path).unwrap();
         time_series.seal_rolled_nodes().unwrap();
@@ -652,7 +791,14 @@ mod tests {
             .first()
             .map(|s| s.seal.start_ts.0.div_euclid(bucket_us) * bucket_us)
             .unwrap_or(0);
-        (lod, Level::new(writer, bucket_us, cursor, &src.schema))
+        let level = Level::new(
+            writer,
+            lod.time_series.clone(),
+            bucket_us,
+            cursor,
+            &src.schema,
+        );
+        (lod, level)
     }
 
     fn lod_samples(lod: &Component) -> Vec<(i64, Vec<f32>)> {
@@ -795,8 +941,7 @@ mod tests {
                 .write(&Timestamp(100 + i * 10).to_le_bytes())
                 .unwrap();
         }
-        let head =
-            TimeSeriesNode::create(component_path.join("400"), Timestamp(400), 16).unwrap();
+        let head = TimeSeriesNode::create(component_path.join("400"), Timestamp(400), 16).unwrap();
         for v in [0f64, 0f64] {
             head.data.write(&v.to_le_bytes()).unwrap();
         }
@@ -836,12 +981,9 @@ mod tests {
         for (start, count, spike, spike_at) in
             [(100i64, 10usize, -5.0f64, 5usize), (200, 20, 9.0, 5)]
         {
-            let node = TimeSeriesNode::create(
-                component_path.join(start.to_string()),
-                Timestamp(start),
-                8,
-            )
-            .unwrap();
+            let node =
+                TimeSeriesNode::create(component_path.join(start.to_string()), Timestamp(start), 8)
+                    .unwrap();
             for i in 0..count {
                 let v = if i == spike_at { spike } else { 1.0 };
                 node.data.write(&v.to_le_bytes()).unwrap();
@@ -850,8 +992,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let head =
-            TimeSeriesNode::create(component_path.join("400"), Timestamp(400), 8).unwrap();
+        let head = TimeSeriesNode::create(component_path.join("400"), Timestamp(400), 8).unwrap();
         head.data.write(&0f64.to_le_bytes()).unwrap();
         head.index.write(&Timestamp(400).to_le_bytes()).unwrap();
         let time_series = TimeSeries::open(&component_path).unwrap();
@@ -883,12 +1024,9 @@ mod tests {
         let component_path = dir.path().join(component_id.to_string());
         // Two sealed nodes plus a head; the older node is then purged.
         for (start, count) in [(100i64, 10usize), (200, 20)] {
-            let node = TimeSeriesNode::create(
-                component_path.join(start.to_string()),
-                Timestamp(start),
-                8,
-            )
-            .unwrap();
+            let node =
+                TimeSeriesNode::create(component_path.join(start.to_string()), Timestamp(start), 8)
+                    .unwrap();
             for i in 0..count {
                 node.data.write(&4.0f64.to_le_bytes()).unwrap();
                 node.index
@@ -896,8 +1034,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let head =
-            TimeSeriesNode::create(component_path.join("400"), Timestamp(400), 8).unwrap();
+        let head = TimeSeriesNode::create(component_path.join("400"), Timestamp(400), 8).unwrap();
         head.data.write(&0f64.to_le_bytes()).unwrap();
         head.index.write(&Timestamp(400).to_le_bytes()).unwrap();
         TimeSeries::open(&component_path)
@@ -914,7 +1051,11 @@ mod tests {
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
         };
         assert_eq!(
-            src.time_series.manifest().span(Timestamp(100)).unwrap().state,
+            src.time_series
+                .manifest()
+                .span(Timestamp(100))
+                .unwrap()
+                .state,
             SpanState::RemoteOnly
         );
 
@@ -928,6 +1069,70 @@ mod tests {
             vec![250]
         );
         assert_eq!(samples[0].1, vec![4.0, 4.0]);
+    }
+
+    /// Raw history that lands behind what a level has already folded — a
+    /// backfill of an expression's past — folds into a node spliced behind
+    /// the level's own head. A bucket straddling the seam between that
+    /// history and a stretch still holding nothing waits for the source to
+    /// settle, and nothing folds twice.
+    #[stellarator::test]
+    async fn history_installed_behind_the_cursor_is_folded_into_an_installed_lod_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = sealed_source(dir.path(), 1000, &vec![1.0f64; 40]);
+        let (lod, mut level) = level_for(dir.path(), &src, 100);
+        assert!(!level.run_pass(&src).unwrap());
+        assert_eq!(
+            lod_samples(&lod)
+                .iter()
+                .map(|(ts, _)| *ts)
+                .collect::<Vec<_>>(),
+            vec![1050, 1150, 1250]
+        );
+
+        // The past arrives: samples every 10 µs over [100, 490], with the
+        // second bucket's min and the last bucket's max standing out.
+        let mut values = vec![2.0f64; 40];
+        values[15] = -3.0; // t = 250
+        values[38] = 8.0; // t = 480
+        let batch: Vec<(Timestamp, [u8; 8])> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (Timestamp(100 + i as i64 * 10), v.to_le_bytes()))
+            .collect();
+        src.time_series
+            .install_samples(
+                8,
+                batch.iter().map(|(ts, b)| (*ts, b.as_slice())),
+                SpanSource::LocalIngest,
+            )
+            .unwrap();
+
+        // Complete buckets fold at once; [400, 500) touches the empty
+        // stretch up to 1000 and waits.
+        assert!(!level.fill_behind(&src).unwrap());
+        let samples = lod_samples(&lod);
+        assert_eq!(
+            samples.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![150, 250, 350, 1050, 1150, 1250]
+        );
+        assert_eq!(samples[1].1, vec![-3.0, 2.0]);
+
+        // Once the source has held still, the straddler folds too.
+        let (generation, _) = level.behind.expect("the source was seen");
+        level.behind = Some((generation, Instant::now() - BEHIND_SETTLE));
+        assert!(!level.fill_behind(&src).unwrap());
+        let samples = lod_samples(&lod);
+        assert_eq!(
+            samples.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![150, 250, 350, 450, 1050, 1150, 1250]
+        );
+        assert_eq!(samples[3].1, vec![2.0, 8.0]);
+
+        // Nothing is left behind, and nothing folds twice.
+        assert!(!level.fill_behind(&src).unwrap());
+        assert!(!level.run_pass(&src).unwrap());
+        assert_eq!(lod_samples(&lod), samples);
     }
 
     #[test]
@@ -944,5 +1149,24 @@ mod tests {
         assert_eq!(name, "cube_sat.imu.accel.__metor_internal__.lod_4096");
         assert!(is_lod_name(&name));
         assert!(!is_lod_name("cube_sat.imu.accel"));
+    }
+
+    #[test]
+    fn hidden_components_are_eligible_only_by_opt_in() {
+        use metor_proto_wkt::MetadataExt as _;
+
+        assert!(eligible(&ComponentMetadata::from("imu.accel")));
+
+        let hidden = ComponentMetadata::from("expr.abcd").with_hidden();
+        assert!(!eligible(&hidden));
+        let mut opted_in = hidden.clone();
+        opted_in.set(LOD_OPT_IN_KEY, "true");
+        assert!(eligible(&opted_in));
+
+        // A level of that component is hidden and LoD-named; the key
+        // never makes one eligible to be downsampled again.
+        let mut level = ComponentMetadata::from(lod_name("expr.abcd", 64).as_str()).with_hidden();
+        level.set(LOD_OPT_IN_KEY, "true");
+        assert!(!eligible(&level));
     }
 }

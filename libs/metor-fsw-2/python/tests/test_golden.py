@@ -8,7 +8,8 @@ envelope field).
 panel: a dashboard preset covering every widget kind and both connector
 layers. The panel's ``DashboardPanelConfig`` test parses that same file, so a
 rename on either side breaks a test instead of silently degrading a shipped
-preset into placeholder tiles."""
+preset into placeholder tiles. ``tests/golden/outline.json`` pins the outline
+pane's config the same way, every field set."""
 
 import json
 import os
@@ -29,9 +30,12 @@ from metor_config import (
     Connector,
     Dashboard,
     Edge,
+    FrameType,
     Gauge,
     Image,
     Meter,
+    Outline,
+    Pivot,
     Place,
     SequenceControl,
     State,
@@ -58,6 +62,9 @@ GOLDEN = os.path.join(
 DASHBOARD_GOLDEN = os.path.join(
     os.path.dirname(__file__), "..", "..", "tests", "golden", "dashboard.json"
 )
+OUTLINE_GOLDEN = os.path.join(
+    os.path.dirname(__file__), "..", "..", "tests", "golden", "outline.json"
+)
 FIXTURE_PNG = os.path.join(os.path.dirname(__file__), "data", "pixel.png")
 
 
@@ -67,9 +74,19 @@ def build_dashboard() -> Dashboard:
         Meter("wheels.h", element=1, min=-0.04, max=0.04, unit="N m s"), 20, 20
     )
     gauge = Place(
-        Gauge("sensors.gyro_b", label="rate y", element=1, min=-0.2, max=0.2,
-              style="needle", sweep=200.0),
-        120, 20, 150, 140,
+        Gauge(
+            "sensors.gyro_b",
+            label="rate y",
+            element=1,
+            min=-0.2,
+            max=0.2,
+            style="needle",
+            sweep=200.0,
+        ),
+        120,
+        20,
+        150,
+        140,
     )
     chip = Place(
         StateChip(
@@ -77,14 +94,16 @@ def build_dashboard() -> Dashboard:
             states=[State(0, "IDLE"), State(3, "SAFE", "#f38ba8ff")],
             unknown="UNKNOWN",
         ),
-        280, 20,
+        280,
+        20,
     )
     att = Place(
         Attitude(
             "nav.attitude_estimate.q_hat_b_eci",
             vectors=[VectorMarker("sensors.mag_b", "mag", "#89b4faff")],
         ),
-        20, 200,
+        20,
+        200,
     )
     seq = Place(SequenceControl("mode", compact=True), 280, 100)
     light = Place(TrafficLight("world.illuminated"), 440, 20, 70, 60)
@@ -120,6 +139,36 @@ def build_dashboard() -> Dashboard:
     )
 
 
+def build_outline() -> Outline:
+    """An outline pane with every field set."""
+    return Outline(
+        root="wheels",
+        columns=["name", "value", "unit"],
+        sort="descending",
+        filter="speed",
+        filter_bar=True,
+        expanded=["wheels.wheels.0"],
+        collapsed=["wheels.status"],
+        pivots=[
+            Pivot(
+                "wheels.wheels",
+                fields=["speed", "torque"],
+                hidden=["motor.temp"],
+                rows=["3", "0"],
+            )
+        ],
+        types=[
+            FrameType(
+                "psu",
+                fields=["current", "voltage"],
+                order=["voltage"],
+                rows=["dut2.psu"],
+            )
+        ],
+        focus="psu",
+    )
+
+
 def build_target() -> Target:
     """The target whose IR is the golden fixture."""
     m = Target(cycle_rate=120.0, sim_dt=0.5)
@@ -151,18 +200,20 @@ def build_target() -> Target:
         m.add("gyro_norm", gyro_norm)
     m.add(
         "alarms",
-        Alarms(alarms=[
-            Alarm(
-                id="ADCS_RATE_HIGH",
-                name="Body Rate High",
-                description="Measured body-Y rate exceeds the detumbled envelope",
-                target=Component("block.plant.sensors.gyro_b", element=1),
-                warning=band(above=0.05, below=-0.05),
-                critical=band(above=0.15, below=-0.15),
-                debounce=2,
-                hysteresis=0.005,
-            )
-        ]),
+        Alarms(
+            alarms=[
+                Alarm(
+                    id="ADCS_RATE_HIGH",
+                    name="Body Rate High",
+                    description="Measured body-Y rate exceeds the detumbled envelope",
+                    target=Component("block.plant.sensors.gyro_b", element=1),
+                    warning=band(above=0.05, below=-0.05),
+                    critical=band(above=0.15, below=-0.15),
+                    debounce=2,
+                    hysteresis=0.005,
+                )
+            ]
+        ),
         node=(40, 80),
     )
     link = m.state("link", TcpServer(addr="127.0.0.1:2240"))
@@ -220,6 +271,17 @@ class GoldenTest(unittest.TestCase):
         with open(DASHBOARD_GOLDEN, encoding="utf-8") as f:
             expected = json.load(f)
         self.assertEqual(build_dashboard()._state("sat1"), expected)
+
+    def test_emits_the_golden_outline(self):
+        with open(OUTLINE_GOLDEN, encoding="utf-8") as f:
+            expected = json.load(f)
+        self.assertEqual(build_outline()._state("sat1"), expected)
+
+    def test_outline_rejects_unknown_columns_and_sorts(self):
+        with self.assertRaises(ValueError):
+            Outline(columns=["names"])
+        with self.assertRaises(ValueError):
+            Outline(sort="up")
 
 
 if __name__ == "__main__":

@@ -1,19 +1,9 @@
-//! Packs: many systems from one crate, one construction point.
+//! System entries and their construction lifecycle.
 //!
-//! A [`Pack`] is a list of erased system entries a crate's `pack()` fn builds
-//! (see `docs/packs.md`). One pack serves every loading
-//! mode: [`Registry::register_pack`](crate::Registry) makes each entry a
-//! `type=` in the static registry, and the pack ABI exports the same
-//! entries from a cdylib. Because `pack()` runs once per load, entries can
-//! capture clones of a shared handle built inside it — the construction point
-//! two systems sharing an owned resource (a socket, a bus) never had.
-//!
-//! Construction is two-phase, mirroring the ABI's create/bind split: an
-//! entry's `create` decodes params and builds the user state (fail-fast, no
-//! rings yet), returning a [`Pending`] that later binds ports over a ring
-//! source and yields the runnable [`Driver`]. Descriptors are computed from
-//! the parameter *types* at registration, so describing a pack constructs no
-//! user state.
+//! A [`Pack`] exposes the same entries to static registration and the pack ABI.
+//! An entry's create phase decodes params and constructs state, returning a
+//! [`Pending`] that binds ports and produces a [`Driver`]. Describing an entry
+//! reads its descriptor without constructing user state.
 
 use metor_proto::types::Timestamp;
 use postcard_schema::schema::NamedType;
@@ -25,10 +15,7 @@ use crate::handler::IntoPackEntry;
 use crate::sequence::Outcome;
 use crate::slot::{CyclicSlot, SlotState};
 
-/// One runnable system instance, whatever style authored it. The pack-side
-/// convergence of [`CyclicRunner`](crate::CyclicRunner) and the sequence
-/// stack: the coordinator (or the ABI shim) inits it once, steps it once per
-/// cycle, and shuts it down once.
+/// A system instance initialized once, stepped each cycle, and shut down once.
 pub trait Driver {
     fn init(&mut self);
     fn step(&mut self, now: Timestamp) -> StepStatus;
@@ -74,10 +61,7 @@ pub enum EntryParams<'a> {
     },
 }
 
-/// The resolved shared state a system attaches to: the erased `Shared<St>`
-/// token a shared entry downcasts at create, plus the state's registry type
-/// key for the mismatch diagnostic. Built by the resolver's states pass and
-/// threaded through [`EntryParams::Value`]; its fields are crate-internal.
+/// A resolved shared-state token and its type name for diagnostics.
 pub struct AttachTarget {
     pub ty: &'static str,
     pub token: std::rc::Rc<dyn core::any::Any>,
@@ -157,7 +141,7 @@ pub fn resolve_defaults(
     schema: &'static NamedType,
 ) -> Result<Vec<u8>, MakeError> {
     match params {
-        EntryParams::Postcard(bytes) if bytes.is_empty() => Ok(defaults.to_vec()),
+        EntryParams::Postcard([]) => Ok(defaults.to_vec()),
         EntryParams::Postcard(bytes) => Ok(bytes.to_vec()),
         EntryParams::Value { value, name, .. } => {
             let owned = postcard_schema::schema::owned::OwnedNamedType::from(schema);
@@ -301,7 +285,7 @@ impl Pack {
     }
 
     /// Declare this pack's shared state under `name` and hand back the
-    /// [`Shared`](crate::Shared) token attached entries capture — sharing
+    /// [`Shared`](crate::Shared) token attached entries capture. Sharing
     /// is scoped to this pack because nothing outside `pack()` can reach
     /// the token. The state is constructed once, from its own wiring
     /// declaration's params; a fallible `init` makes resource acquisition
@@ -346,7 +330,7 @@ impl Pack {
     /// *by name*: the target's `SystemSpec::attach`
     /// picks which state instance, and the resolver hands `ctor` the resolved
     /// [`Shared`](crate::Shared) token (the second argument) at create time.
-    /// `St` is the concrete shared type the entry binds — a target naming a
+    /// `St` is the concrete shared type the entry binds; a target naming a
     /// state of any other type is an `AttachTypeMismatch`. The driver is
     /// wrapped so the state's [`SharedLifecycle`](crate::SharedLifecycle) hooks
     /// run once across all attached entries. Attached entries are cyclic-only,
@@ -361,7 +345,7 @@ impl Pack {
         T: crate::CyclicSystem + crate::BuildSystem + 'static,
         T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
         T::Input: crate::BindPorts + 'static,
-        T::Output: crate::HealthOutput + crate::BindPorts + 'static,
+        T::Output: crate::LogOutput + crate::BindPorts + 'static,
     {
         let mut descriptor = <T as crate::CyclicSystem>::descriptor();
         descriptor.name = name.into();
@@ -442,7 +426,7 @@ impl Pack {
     }
 
     /// Register an async-fn system under `name`: ports by value, moved into
-    /// the future, state in locals — the sequence authoring model as a
+    /// the future, state in locals, the sequence authoring model as a
     /// general system. The future is polled once per cycle under the
     /// ambient clock, so `wait()`/`now()`/`progress()` work; a future that
     /// returns ends the entry with its [`Outcome`].
@@ -451,7 +435,7 @@ impl Pack {
         M: 'static,
         F: crate::handler::AsyncSystemFn<M> + Clone,
     {
-        use crate::handler::{DeclSink, TaskParamsSpec, bind_health_tail};
+        use crate::handler::{DeclSink, TaskParamsSpec, bind_log_tail};
 
         let mut sink = DeclSink::default();
         F::decls(&mut sink);
@@ -459,7 +443,6 @@ impl Pack {
         let params_schema = spec.schema;
         let inputs = std::mem::take(&mut sink.inputs);
         let mut outputs = std::mem::take(&mut sink.outputs);
-        outputs.push(crate::PortDesc::of::<crate::SystemHealth>());
         outputs.push(crate::PortDesc::msg_named::<crate::LogEvent>("log"));
         let descriptor = SystemDescriptor {
             name: name.into(),
@@ -483,13 +466,13 @@ impl Pack {
                     };
                     f.build(&mut cx)
                 };
-                let health = bind_health_tail(src);
-                let inner = crate::handler::FutureDriver::new(future, clock, health, drops);
+                let log = bind_log_tail(src);
+                let inner = crate::handler::FutureDriver::new(future, clock, log, drops);
                 match mount {
                     Mount::Wired => Box::new(inner) as Box<dyn Driver>,
                     // The occupant tail binds after the entry's own ports:
                     // the cancel input past the user inputs, the status
-                    // output past the health/log tail.
+                    // output past the log tail.
                     Mount::SlotOccupant => {
                         let control = crate::Input::bind(src);
                         let status = crate::Output::bind(src);
@@ -508,32 +491,6 @@ impl Pack {
             shared: false,
             create,
         });
-        self
-    }
-
-    /// As [`task`](Self::task), with declared default params: a config need
-    /// spell only its overrides, on every loading path. `P` must be the
-    /// task's `Params<P>` type (checked against the declared schema here).
-    pub fn task_with_defaults<M, F, P>(mut self, name: &'static str, f: F, defaults: P) -> Self
-    where
-        M: 'static,
-        F: crate::handler::AsyncSystemFn<M> + Clone,
-        P: serde::Serialize + postcard_schema::Schema,
-    {
-        self = self.task(name, f);
-        let entry = self.entries.last_mut().expect("task just pushed");
-        assert!(
-            core::ptr::eq(entry.params_schema, P::SCHEMA)
-                || postcard_schema::schema::owned::OwnedNamedType::from(entry.params_schema)
-                    == postcard_schema::schema::owned::OwnedNamedType::from(P::SCHEMA),
-            "task `{name}` declares Params<{}> but the defaults are a different type",
-            entry.params_schema.name,
-        );
-        entry.params_default = Some(
-            postcard::to_allocvec(&defaults)
-                .expect("params postcard-encode (Serialize is infallible)"),
-        );
-        entry.wrap_create_with_defaults();
         self
     }
 
@@ -573,7 +530,7 @@ impl Pack {
 }
 
 /// The configured instance's descriptor when it differs from the entry's
-/// static one (a configure step minted ports), else `None` — the static
+/// static one (a configure step minted ports), else `None`, so the static
 /// descriptor stands and hosts skip a clone. Compared by encoding: the
 /// descriptor is plain serializable data with no cheaper equality.
 fn instance_desc_if_minted<S: crate::CyclicSystem>(
@@ -593,12 +550,12 @@ fn instance_desc_if_minted<S: crate::CyclicSystem>(
 struct RunnerDriver<S>(crate::CyclicRunner<S>)
 where
     S: crate::CyclicSystem,
-    S::Output: crate::HealthOutput;
+    S::Output: crate::LogOutput;
 
 impl<S> Driver for RunnerDriver<S>
 where
     S: crate::CyclicSystem,
-    S::Output: crate::HealthOutput,
+    S::Output: crate::LogOutput,
 {
     fn init(&mut self) {
         self.0.init()
@@ -614,7 +571,7 @@ where
 
 /// The wrapper around an entry attached to a pack-shared state: fans the
 /// state's once-per-instance [`SharedLifecycle`](crate::SharedLifecycle)
-/// hooks in around the inner driver's own lifecycle — `start` before the
+/// hooks in around the inner driver's own lifecycle, `start` before the
 /// first attached init, `shutdown` after the last attached shutdown.
 pub(crate) struct AttachedDriver {
     inner: Box<dyn Driver>,

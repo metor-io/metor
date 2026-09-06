@@ -1,32 +1,13 @@
-//! Relocatable bundles, directories that carry everything a target needs to
-//! run without a source tree, a cargo install, or any config front-end.
+//! Write and load relocatable target bundles.
 //!
-//! A bundle holds the frozen target IR side by side with the code it names:
-//! `wiring.json` is the versioned [`Wiring`] serialized as JSON (source
-//! anchors, scopes, and per-artifact manifest hashes intact, but artifact
-//! `path`s stripped so the bundle stays relocatable and byte-reproducible),
-//! `meta.json` is a plain-serde [`BundleMeta`] sidecar, and every artifact's
-//! built `cdylib` — plus its `<cdylib>.manifest` sidecar when the build driver
-//! wrote one — is copied in alongside. The `target.py` that produced the
-//! target rides along as verbatim provenance and is never consumed on load:
-//! the run path needs no Python and no config parse, strictly more hermetic
-//! than re-evaluating source on target.
+//! A bundle contains `wiring.json`, `meta.json`, compiled artifacts, and any
+//! manifest sidecars. Artifact paths are stripped from the frozen IR and
+//! resolved relative to the bundle on load. `target.py` is optional provenance;
+//! running a bundle does not evaluate Python.
 //!
-//! [`BundleMeta`] records the ABI version and IR version the bundle was built
-//! against, the target triple its `.so`s were compiled for, the build profile,
-//! a timestamp, the `sha256` of the `wiring.json` bytes (the determinism
-//! backstop CI diffs), and the `metor_config` recorder version the target was
-//! evaluated with. [`load_bundle`] checks the ABI and target. The later
-//! resolve pass checks the IR version. A triple mismatch is a clean
-//! [`BundleError::TargetMismatch`] before any dlopen, where an arch mismatch
-//! used to surface as a dlopen mystery. It verifies the frozen IR digest and
-//! each recorded manifest hash. A manifest hash checks interface compatibility;
-//! it is not a digest of the shared-object bytes.
-//!
-//! [`write_bundle`] produces a bundle from a built [`Wiring`] plus a
-//! [`PackageOptions`]. [`load_bundle`] reads one back into a [`Wiring`] whose
-//! artifact paths point at the copied `.so`s, ready to run without invoking
-//! cargo.
+//! Loading checks the ABI, target triple, IR digest, and recorded manifest
+//! hashes. The resolver checks the IR version. Manifest hashes describe
+//! interface compatibility, not the contents of the library binary.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -51,6 +32,9 @@ const PROVENANCE_STEM: &str = "target";
 /// directory layout.
 pub const METOR_EXTENSION: &str = "metor";
 
+/// Maximum member-name bytes a ustar header's name field holds.
+const NAME_CAP: usize = 100;
+
 /// The plain-serde metadata sidecar (`meta.json`) written beside a bundle's
 /// `wiring.json`. Everything here is either a compatibility gate checked at
 /// load ([`abi_version`](Self::abi_version), [`target`](Self::target)) or
@@ -70,14 +54,13 @@ pub struct BundleMeta {
     /// deliberately excluded from [`ir_sha256`](Self::ir_sha256) so it does
     /// not perturb reproducibility.
     pub built_at_unix: u64,
-    /// `sha256:<hex>` of the `wiring.json` bytes — the determinism backstop CI
+    /// `sha256:<hex>` of the `wiring.json` bytes, the determinism backstop CI
     /// re-evaluates and diffs (`metor-fsw package --check-ir`).
     pub ir_sha256: String,
     /// Per-artifact provenance: what was actually packaged, hashed from the
-    /// exact bytes copied into the bundle. The flight record that outlives
-    /// the packaging venv (`docs/packaging.md`); recording only,
-    /// the load gates (ABI, IR hash, triple, manifest hash) cover integrity.
-    /// Serde-defaulted so pre-provenance bundles load unchanged.
+    /// exact bytes copied into the bundle. Recording only; the load gates
+    /// (ABI, IR hash, triple, manifest hash) cover integrity. Serde-defaulted
+    /// so pre-provenance bundles load unchanged.
     #[serde(default)]
     pub packs: Vec<PackProvenance>,
 }
@@ -91,8 +74,8 @@ pub struct PackProvenance {
     pub dist: Option<super::model::DistRef>,
     /// How the artifact was provisioned.
     pub source: PackSourceKind,
-    /// `sha256:<hex>` of the shared-object bytes copied into the bundle —
-    /// a digest of the code itself, where `manifest_hash` digests only the
+    /// `sha256:<hex>` of the shared-object bytes copied into the bundle: a
+    /// digest of the code itself, where `manifest_hash` digests only the
     /// interface.
     pub cdylib_sha256: String,
     /// The recorded pack-manifest hash, when the artifact carried one.
@@ -168,8 +151,8 @@ pub enum BundleError {
         expected: u32,
     },
     /// The bundle's `.so`s were built for a different target triple than this
-    /// host runs — the clean load-time verdict that used to surface as an
-    /// opaque dlopen failure.
+    /// host runs, caught here instead of surfacing as an opaque dlopen
+    /// failure.
     #[error(
         "bundle was built for target `{found}`, but this host is `{expected}` \
          (rebuild the bundle for this target)"
@@ -248,10 +231,10 @@ fn validate_member_name(name: &str) -> Result<(), BundleError> {
             reason: "expected one normal path component".to_string(),
         });
     }
-    if name.len() > tar::NAME_CAP {
+    if name.len() > NAME_CAP {
         return Err(BundleError::InvalidMemberName {
             name: name.to_string(),
-            reason: format!("name exceeds the {}-byte archive limit", tar::NAME_CAP),
+            reason: format!("name exceeds the {NAME_CAP}-byte archive limit"),
         });
     }
     Ok(())
@@ -295,7 +278,7 @@ pub fn write_bundle(wiring: &Wiring, opts: &PackageOptions, out: &Path) -> Resul
     }
 }
 
-/// One bundle member: its file name and where its bytes come from — inline
+/// One bundle member: its file name and where its bytes come from, inline
 /// (the freshly built `meta.json` / `wiring.json`) or a source file to copy
 /// (`.so`s, sidecars, the provenance source).
 enum MemberSource {
@@ -303,7 +286,7 @@ enum MemberSource {
     Path(PathBuf),
 }
 
-/// The bundle's members in canonical order — `meta.json`, `wiring.json`, then
+/// The bundle's members in canonical order: `meta.json`, `wiring.json`, then
 /// each artifact's `.so` and `.manifest` sorted by artifact id, then the
 /// provenance copy. One ordering both the directory and single-file writers
 /// share, so the two forms carry identical content, and the `.metor` tar is
@@ -388,8 +371,8 @@ fn bundle_members(
 }
 
 /// The member file name of an artifact's loadable: a cdylib's is derived
-/// from the bundle's recorded target triple (or the host's convention when
-/// the bundle records none — the load-time triple check is skipped by the
+/// from the bundle's recorded target triple, or the host's convention when
+/// the bundle records none (the load-time triple check is skipped by the
 /// same fallback, so writer and reader agree); a wasm module is one
 /// arch-neutral `<id>.wasm` regardless of triple.
 fn member_artifact_name(target: Option<&str>, artifact: &super::model::Artifact) -> String {
@@ -428,16 +411,26 @@ fn write_dir(members: &[(String, MemberSource)], dir: &Path) -> Result<(), Bundl
 }
 
 /// Write the members as a single uncompressed `.metor` tar with zeroed entry
-/// timestamps, so identical inputs produce byte-identical archives.
+/// mode/ids/timestamps, so identical inputs produce byte-identical archives.
 fn write_archive(members: &[(String, MemberSource)], path: &Path) -> Result<(), BundleError> {
-    let mut out = Vec::new();
+    let file = fs::File::create(path).map_err(io_at(path))?;
+    let mut builder = tar::Builder::new(file);
     for (name, source) in members {
         let bytes = member_bytes(source)?;
-        tar::write_entry(&mut out, name, &bytes);
+        let mut header = tar::Header::new_ustar();
+        header.set_path(name).map_err(io_at(path))?;
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, bytes.as_slice())
+            .map_err(io_at(path))?;
     }
-    // Two zero blocks mark end-of-archive.
-    out.extend_from_slice(&[0u8; tar::BLOCK * 2]);
-    fs::write(path, out).map_err(io_at(path))
+    builder.finish().map_err(io_at(path))
 }
 
 /// The provenance copy's file name: `target.<ext>` keeping the source's
@@ -494,8 +487,8 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
         });
     }
     // The triple check needs both a recorded target and a determinable host;
-    // absent either, it cannot render a verdict and is skipped (the dlopen
-    // path stays the backstop, as before Phase 3).
+    // absent either, it cannot render a verdict and is skipped, leaving
+    // dlopen as the backstop.
     if let (Some(found), Some(expected)) = (&meta.target, super::build_driver::host_triple())
         && found != &expected
     {
@@ -563,14 +556,36 @@ pub fn unpack_metor(path: &Path) -> Result<tempfile::TempDir, BundleError> {
 /// Unpack a `.metor` archive into a fresh temp directory, writing every member
 /// as a real file so the directory loader (and dlopen) can proceed unchanged.
 fn unpack_archive(path: &Path) -> Result<tempfile::TempDir, BundleError> {
-    let bytes = fs::read(path).map_err(io_at(path))?;
+    let bad = |reason: String| BundleError::BadMeta {
+        reason: format!("malformed `.{METOR_EXTENSION}` archive: {reason}"),
+    };
+    let file = fs::File::open(path).map_err(io_at(path))?;
     let dir = tempfile::Builder::new()
         .prefix("metor-bundle-")
         .tempdir()
         .map_err(io_at(path))?;
-    let members = tar::read(&bytes).map_err(|reason| BundleError::BadMeta {
-        reason: format!("malformed `.{METOR_EXTENSION}` archive: {reason}"),
-    })?;
+    let mut archive = tar::Archive::new(file);
+    let mut members = Vec::new();
+    for entry in archive.entries().map_err(|e| bad(e.to_string()))? {
+        let mut entry = entry.map_err(|e| bad(e.to_string()))?;
+        if entry.header().entry_type() != tar::EntryType::Regular {
+            return Err(bad(format!(
+                "unsupported tar entry type {:?}",
+                entry.header().entry_type()
+            )));
+        }
+        let name = entry
+            .path()
+            .map_err(|e| bad(e.to_string()))?
+            .to_str()
+            .ok_or_else(|| bad("tar member name is not UTF-8".to_string()))?
+            .to_string();
+        let size = usize::try_from(entry.size())
+            .map_err(|_| bad(format!("entry `{name}` size does not fit this platform")))?;
+        let mut content = Vec::with_capacity(size);
+        std::io::Read::read_to_end(&mut entry, &mut content).map_err(|e| bad(e.to_string()))?;
+        members.push((name, content));
+    }
     validate_member_names(members.iter().map(|(name, _)| name.as_str()))?;
     for (name, content) in members {
         let dst = dir.path().join(&name);
@@ -579,154 +594,31 @@ fn unpack_archive(path: &Path) -> Result<tempfile::TempDir, BundleError> {
     Ok(dir)
 }
 
-/// A byte-exact, dependency-free uncompressed `ustar` reader/writer, just
-/// enough for the flat bundle layout (short names, regular files). Reproducible
-/// by construction: zeroed timestamps, ids, and mode, so identical inputs
-/// produce identical bytes.
-mod tar {
-    /// The tar block size; headers and padded payloads are multiples of it.
-    pub(super) const BLOCK: usize = 512;
-    /// Maximum name bytes in the ustar header's name field.
-    pub(super) const NAME_CAP: usize = 100;
-
-    /// Append one regular-file entry (`name` header + padded `data`) to `out`.
-    pub(super) fn write_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) {
-        let mut header = [0u8; BLOCK];
-        let name_bytes = name.as_bytes();
-        header[..name_bytes.len()].copy_from_slice(name_bytes);
-        // mode 0644, zeroed uid/gid — all octal fields are `len-1` digits + NUL.
-        octal(&mut header, 100, 8, 0o644);
-        octal(&mut header, 108, 8, 0);
-        octal(&mut header, 116, 8, 0);
-        octal(&mut header, 124, 12, data.len() as u64);
-        octal(&mut header, 136, 12, 0); // mtime zeroed: reproducible archives
-        header[156] = b'0'; // typeflag: regular file
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-        checksum(&mut header);
-
-        out.extend_from_slice(&header);
-        out.extend_from_slice(data);
-        let rem = data.len() % BLOCK;
-        if rem != 0 {
-            out.extend(std::iter::repeat_n(0u8, BLOCK - rem));
-        }
-    }
-
-    /// Parse every regular-file entry into `(name, bytes)`, in archive order.
-    pub(super) fn read(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
-        let mut out = Vec::new();
-        let mut off = 0usize;
-        loop {
-            let header_end = off
-                .checked_add(BLOCK)
-                .ok_or_else(|| "archive header offset overflow".to_string())?;
-            if header_end > bytes.len() {
-                if off == bytes.len() {
-                    break;
-                }
-                return Err("truncated archive header".to_string());
-            }
-            let header = &bytes[off..header_end];
-            // A zeroed header block ends the archive.
-            if header.iter().all(|&b| b == 0) {
-                break;
-            }
-            verify_checksum(header)?;
-            if !matches!(header[156], 0 | b'0') {
-                return Err(format!("unsupported tar entry type {:#x}", header[156]));
-            }
-            let name = cstr(&header[..NAME_CAP])?;
-            let size = usize::try_from(parse_octal(&header[124..136])?)
-                .map_err(|_| format!("entry `{name}` size does not fit this platform"))?;
-            let data_start = header_end;
-            let data_end = data_start
-                .checked_add(size)
-                .ok_or_else(|| format!("entry `{name}` size overflows the archive"))?;
-            if data_end > bytes.len() {
-                return Err(format!("entry `{name}` runs past the archive"));
-            }
-            out.push((name, bytes[data_start..data_end].to_vec()));
-            // Advance past the payload, rounded up to a block boundary.
-            let padded = size
-                .checked_add(BLOCK - 1)
-                .ok_or_else(|| "archive entry padding overflow".to_string())?
-                / BLOCK
-                * BLOCK;
-            off = data_start
-                .checked_add(padded)
-                .ok_or_else(|| "archive entry offset overflow".to_string())?;
-        }
-        Ok(out)
-    }
-
-    fn verify_checksum(header: &[u8]) -> Result<(), String> {
-        let recorded = parse_octal(&header[148..156])?;
-        let actual: u64 = header
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| if (148..156).contains(&i) { b' ' } else { b } as u64)
-            .sum();
-        if recorded != actual {
-            return Err(format!(
-                "tar header checksum mismatch: recorded {recorded}, computed {actual}"
-            ));
-        }
-        Ok(())
-    }
-
-    /// Write `value` as a right-justified `len-1`-digit octal field with a
-    /// trailing NUL at `header[at..at+len]`.
-    fn octal(header: &mut [u8; BLOCK], at: usize, len: usize, value: u64) {
-        let digits = format!("{value:0width$o}", width = len - 1);
-        header[at..at + len - 1].copy_from_slice(digits.as_bytes());
-        header[at + len - 1] = 0;
-    }
-
-    /// Fill the checksum field (offset 148, 8 bytes): the unsigned sum of every
-    /// header byte with the field itself read as spaces, stored as 6 octal
-    /// digits, a NUL, then a space (the ustar convention).
-    pub(super) fn checksum(header: &mut [u8; BLOCK]) {
-        for b in &mut header[148..156] {
-            *b = b' ';
-        }
-        let sum: u32 = header.iter().map(|&b| b as u32).sum();
-        let digits = format!("{sum:06o}");
-        header[148..154].copy_from_slice(digits.as_bytes());
-        header[154] = 0;
-        header[155] = b' ';
-    }
-
-    /// A NUL-terminated (or full-width) string field as an owned `String`.
-    fn cstr(field: &[u8]) -> Result<String, String> {
-        let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-        std::str::from_utf8(&field[..end])
-            .map(str::to_owned)
-            .map_err(|_| "tar member name is not UTF-8".to_string())
-    }
-
-    /// Parse a NUL/space-padded octal field.
-    fn parse_octal(field: &[u8]) -> Result<u64, String> {
-        let text = cstr(field)?;
-        let trimmed = text.trim_matches(|c: char| c == ' ' || c == '\0');
-        if trimmed.is_empty() {
-            return Ok(0);
-        }
-        u64::from_str_radix(trimmed, 8).map_err(|_| format!("bad octal field `{trimmed}`"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Build a raw `.metor`-shaped archive from possibly-invalid entries, to
+    /// exercise [`unpack_archive`]'s own validation rather than the `tar`
+    /// crate's.
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for (name, content) in entries {
-            tar::write_entry(&mut bytes, name, content);
+        let mut out = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut out);
+            for (name, content) in entries {
+                let mut header = tar::Header::new_ustar();
+                // `set_path` rejects `..` components; write the raw name field
+                // directly so the escaping-member case below can be built.
+                let name_field = &mut header.as_ustar_mut().unwrap().name;
+                name_field[..name.len()].copy_from_slice(name.as_bytes());
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, *content).unwrap();
+            }
+            builder.finish().unwrap();
         }
-        bytes.extend_from_slice(&[0; tar::BLOCK * 2]);
-        bytes
+        out
     }
 
     #[test]
@@ -758,31 +650,5 @@ mod tests {
             assert!(unpack_archive(&path).is_err(), "accepted {name}");
         }
         assert!(!tmp.path().join("escape").exists());
-    }
-
-    #[test]
-    fn tar_rejects_bad_checksum_and_non_file_entries() {
-        let mut bad_checksum = archive(&[("file", b"data")]);
-        bad_checksum[0] ^= 1;
-        assert!(tar::read(&bad_checksum).unwrap_err().contains("checksum"));
-
-        let mut directory = archive(&[("directory", b"")]);
-        directory[156] = b'5';
-        let header: &mut [u8; tar::BLOCK] = (&mut directory[..tar::BLOCK]).try_into().unwrap();
-        tar::checksum(header);
-        assert!(tar::read(&directory).unwrap_err().contains("entry type"));
-    }
-
-    #[test]
-    fn tar_rejects_truncated_and_oversized_entries_without_panicking() {
-        let truncated = vec![1; tar::BLOCK - 1];
-        assert!(tar::read(&truncated).is_err());
-
-        let mut oversized = archive(&[("file", b"")]);
-        // Maximum eleven-digit octal size, far beyond this small archive.
-        oversized[124..136].copy_from_slice(b"77777777777\0");
-        let header: &mut [u8; tar::BLOCK] = (&mut oversized[..tar::BLOCK]).try_into().unwrap();
-        tar::checksum(header);
-        assert!(tar::read(&oversized).is_err());
     }
 }

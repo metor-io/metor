@@ -193,6 +193,20 @@ impl Executor<DefaultReactor> {
             f(&mut reactor)
         })
     }
+
+    /// Like [`Self::with_reactor`], but a no-op when the executor is gone or
+    /// the reactor is busy — for drop paths that may run during teardown.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) fn try_with_reactor(f: impl for<'a> FnOnce(&'a mut DefaultReactor)) {
+        EXEC.with(|exec| {
+            let exec = unsafe { &*exec.get() };
+            if let Some(exec) = exec.as_ref()
+                && let Ok(mut reactor) = exec.reactor.try_borrow_mut()
+            {
+                f(&mut reactor);
+            }
+        })
+    }
 }
 
 pub fn spawn<F>(f: F) -> JoinHandle<F::Output>

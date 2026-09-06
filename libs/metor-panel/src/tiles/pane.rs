@@ -1,13 +1,15 @@
 use gpui::{
-    AnyElement, App, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton,
-    Pixels, Point, Render, ScrollHandle, Window, div, prelude::*, px,
+    Bounds, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton, Pixels, Point, Render,
+    ScrollHandle, SharedString, Window, div, prelude::*, px,
 };
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
+use std::rc::Rc;
 
 use super::drag::{DraggedTab, SplitDirection, detect_split_zone};
 use super::item::PaneItemHandle;
-use crate::icons::Icon;
+use super::motion::{MovingTab, Rail, TabSizes};
+use super::tab::{HEIGHT as TAB_HEIGHT, RAIL_WIDTH as TAB_RAIL_WIDTH};
 use crate::theme::theme;
 
 /// Dispatched by views inside a pane to spawn a new plot tab in that pane.
@@ -23,6 +25,14 @@ pub struct PlotComponentAction {
     pub indices: SmallVec<[usize; 4]>,
 }
 
+/// Dispatched by the outline to open another outline tab in the same pane,
+/// rooted on `root` (a full component path).
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct OpenOutlineAction {
+    pub root: SharedString,
+}
+
 /// Dispatched while shift is held over a component name to open a transient
 /// plot preview anchored at the cursor. An empty `indices` means all
 /// elements; surfaces with per-element granularity (value strips) pass a
@@ -35,10 +45,6 @@ pub struct PreviewPlotAction {
     pub indices: SmallVec<[usize; 4]>,
     pub anchor: Point<Pixels>,
 }
-
-const TAB_HEIGHT: f32 = 28.0;
-const TAB_CLOSE_SIZE: f32 = 16.0;
-const TAB_RAIL_WIDTH: f32 = 160.0;
 
 pub use super::serial::TabOrientation;
 
@@ -75,12 +81,38 @@ impl EventEmitter<PaneEvent> for Pane {}
 pub struct Pane {
     items: Vec<Box<dyn PaneItemHandle>>,
     active_index: usize,
-    drag_split_direction: Option<SplitDirection>,
     content_bounds: Bounds<Pixels>,
     tab_scroll: ScrollHandle,
+    tab_sizes: TabSizes,
+    tab_drag_preview: Option<TabDragPreview>,
+    lifted_tab: Option<gpui::EntityId>,
     tab_orientation: TabOrientation,
     hide_tab_bar: bool,
     locked_size: Option<gpui::Size<f32>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct TabDragPreview {
+    item: gpui::EntityId,
+    before: Option<gpui::EntityId>,
+    extent: Pixels,
+}
+
+/// Use committed slot centres, not animated hitboxes, so a stationary pointer
+/// cannot repeatedly swap the target as neighbours slide past it.
+fn insertion_before(
+    slots: impl IntoIterator<Item = (gpui::EntityId, Pixels)>,
+    dragged: gpui::EntityId,
+    pointer: Pixels,
+) -> Option<gpui::EntityId> {
+    let mut start = px(0.0);
+    for (id, extent) in slots {
+        if id != dragged && pointer < start + extent / 2.0 {
+            return Some(id);
+        }
+        start += extent;
+    }
+    None
 }
 
 /// New active-tab index after removing the tab at `removed_ix`, given the
@@ -108,9 +140,11 @@ impl Pane {
         Self {
             items,
             active_index: 0,
-            drag_split_direction: None,
             content_bounds: Bounds::default(),
             tab_scroll: ScrollHandle::new(),
+            tab_sizes: TabSizes::default(),
+            tab_drag_preview: None,
+            lifted_tab: None,
             tab_orientation: TabOrientation::default(),
             hide_tab_bar: false,
             locked_size: None,
@@ -160,8 +194,16 @@ impl Pane {
         cx.notify();
     }
 
+    pub(super) fn content_bounds(&self) -> Bounds<Pixels> {
+        self.content_bounds
+    }
+
     pub fn items(&self) -> &[Box<dyn PaneItemHandle>] {
         &self.items
+    }
+
+    pub(crate) fn index_of(&self, id: gpui::EntityId) -> Option<usize> {
+        self.items.iter().position(|item| item.entity_id() == id)
     }
 
     pub fn active_index(&self) -> usize {
@@ -178,7 +220,8 @@ impl Pane {
         if ix >= self.items.len() {
             return;
         }
-        self.items.remove(ix);
+        let removed = self.items.remove(ix);
+        self.tab_sizes.borrow_mut().remove(&removed.entity_id());
         if self.items.is_empty() {
             cx.emit(PaneEvent::Empty);
         } else {
@@ -216,8 +259,79 @@ impl Pane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.drag_split_direction = None;
+        let target_ix = self
+            .tab_drag_preview
+            .take()
+            .filter(|preview| preview.item == dragged.item.entity_id())
+            .map(|preview| {
+                preview
+                    .before
+                    .and_then(|id| self.index_of(id))
+                    .unwrap_or(self.items.len())
+            })
+            .unwrap_or(target_ix);
         self.drop_tab(dragged, target_ix, cx);
+    }
+
+    fn handle_tab_bar_drag_move(
+        &mut self,
+        event: &DragMoveEvent<DraggedTab>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = event.bounds.contains(&event.event.position).then(|| {
+            let dragged = event.drag(cx);
+            let item = dragged.item.entity_id();
+            let axis = |size: gpui::Size<Pixels>| match self.tab_orientation {
+                TabOrientation::Horizontal => size.width,
+                TabOrientation::Vertical => size.height,
+            };
+            let sizes = self.tab_sizes.borrow();
+            let extent = if self.tab_orientation == TabOrientation::Vertical {
+                px(TAB_HEIGHT)
+            } else if dragged.pane.entity_id() == cx.entity_id() {
+                sizes
+                    .get(&item)
+                    .copied()
+                    .map(axis)
+                    .unwrap_or(px(TAB_RAIL_WIDTH))
+            } else {
+                let source = dragged.pane.read(cx);
+                if source.tab_orientation == self.tab_orientation {
+                    source
+                        .tab_sizes
+                        .borrow()
+                        .get(&item)
+                        .copied()
+                        .map(axis)
+                        .unwrap_or(px(TAB_RAIL_WIDTH))
+                } else {
+                    px(TAB_RAIL_WIDTH)
+                }
+            };
+            let relative = event.event.position - event.bounds.origin - self.tab_scroll.offset();
+            let pointer = match self.tab_orientation {
+                TabOrientation::Horizontal => relative.x,
+                TabOrientation::Vertical => relative.y,
+            };
+            let before = insertion_before(
+                self.items.iter().map(|item| {
+                    let id = item.entity_id();
+                    (id, sizes.get(&id).copied().map(axis).unwrap_or(extent))
+                }),
+                item,
+                pointer,
+            );
+            TabDragPreview {
+                item,
+                before,
+                extent,
+            }
+        });
+        if self.tab_drag_preview != next {
+            self.tab_drag_preview = next;
+            cx.notify();
+        }
     }
 
     /// Content-area drops split the pane when near an edge, otherwise insert
@@ -228,9 +342,20 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.drag_split_direction = None;
+        self.drop_in_content(
+            dragged,
+            detect_split_zone(window.mouse_position(), self.content_bounds),
+            cx,
+        );
+    }
 
-        match detect_split_zone(window.mouse_position(), self.content_bounds) {
+    pub(super) fn drop_in_content(
+        &mut self,
+        dragged: &DraggedTab,
+        direction: Option<SplitDirection>,
+        cx: &mut Context<Self>,
+    ) {
+        match direction {
             Some(direction) => self.split_or_move(dragged, direction, cx),
             None => self.drop_tab(dragged, self.items.len(), cx),
         }
@@ -243,13 +368,21 @@ impl Pane {
     /// back to a single pane. Bailing early also dodges the ordering hazard
     /// where [`Pane::remove_item`] emits [`PaneEvent::Empty`] — dropping this
     /// pane from the tree — before the [`PaneEvent::Split`] targeting it runs.
-    fn split_or_move(
+    pub(super) fn split_or_move(
         &mut self,
         dragged: &DraggedTab,
         direction: SplitDirection,
         cx: &mut Context<Self>,
     ) {
         let same_pane = cx.entity().entity_id() == dragged.pane.entity_id();
+        let source_index = if same_pane {
+            self.index_of(dragged.item.entity_id())
+        } else {
+            dragged.pane.read(cx).index_of(dragged.item.entity_id())
+        };
+        let Some(source_index) = source_index else {
+            return;
+        };
         if same_pane {
             if self.items.len() == 1 {
                 return;
@@ -257,7 +390,7 @@ impl Pane {
             // Re-entrant update on the same entity is forbidden; remove the tab
             // locally before asking the tile group to split.
             let item = dragged.item.clone_handle();
-            self.remove_item(dragged.ix, cx);
+            self.remove_item(source_index, cx);
             cx.emit(PaneEvent::Split { direction, item });
         } else {
             cx.emit(PaneEvent::Split {
@@ -265,16 +398,24 @@ impl Pane {
                 item: dragged.item.clone_handle(),
             });
             dragged.pane.update(cx, |source, cx| {
-                source.remove_item(dragged.ix, cx);
+                source.remove_item(source_index, cx);
             });
         }
     }
 
     fn drop_tab(&mut self, dragged: &DraggedTab, target_ix: usize, cx: &mut Context<Self>) {
         let same_pane = cx.entity().entity_id() == dragged.pane.entity_id();
+        let source_index = if same_pane {
+            self.index_of(dragged.item.entity_id())
+        } else {
+            dragged.pane.read(cx).index_of(dragged.item.entity_id())
+        };
+        let Some(source_index) = source_index else {
+            return;
+        };
         if same_pane {
-            let from = dragged.ix;
-            let to = target_ix.min(self.items.len().saturating_sub(1));
+            let from = source_index;
+            let to = target_ix.min(self.items.len());
             if from != to && from < self.items.len() {
                 let item = self.items.remove(from);
                 let insert_at = reorder_insert_index(from, to);
@@ -289,41 +430,27 @@ impl Pane {
             self.active_index = insert_at;
             cx.notify();
             dragged.pane.update(cx, |source, cx| {
-                source.remove_item(dragged.ix, cx);
+                source.remove_item(source_index, cx);
             });
         }
     }
 
-    fn handle_content_drag_move(
-        &mut self,
-        event: &DragMoveEvent<DraggedTab>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let position = event.event.position;
-        let new_direction = if self.content_bounds.contains(&position) {
-            detect_split_zone(position, self.content_bounds)
-        } else {
-            None
-        };
-        if new_direction != self.drag_split_direction {
-            self.drag_split_direction = new_direction;
-            cx.notify();
-        }
-    }
-
     fn render_tab(
-        &self,
+        &mut self,
         ix: usize,
         orientation: TabOrientation,
-        _window: &mut Window,
+        rail: Rc<Rail>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = theme(cx);
         let item = &self.items[ix];
+        let item_id = item.entity_id();
         let title = item.tab_title(cx);
         let is_active = ix == self.active_index;
         let can_close = item.can_close(cx);
+        let text_style = window.text_style();
+        let ghost_title = title.clone();
 
         let pane_entity = cx.entity().clone();
         let item_handle = item.clone_handle();
@@ -333,22 +460,9 @@ impl Pane {
         let bg_primary = theme.bg_primary;
         let text_primary = theme.text_primary;
 
-        let mut tab = div()
-            .id(("tab", ix))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(4.0))
-            .px(px(8.0))
-            .h(px(TAB_HEIGHT))
-            .text_size(px(12.0))
-            .cursor_pointer()
-            .border_color(border_primary);
-
-        tab = match orientation {
-            TabOrientation::Horizontal => tab.border_r_1(),
-            TabOrientation::Vertical => tab.w_full().justify_between().border_b_1(),
-        };
+        let mut tab = super::tab::header(&theme, orientation)
+            .id(("tab", item_id))
+            .cursor_pointer();
 
         if is_active {
             tab = tab.bg(bg_primary).text_color(text_primary);
@@ -360,13 +474,18 @@ impl Pane {
         }
 
         tab = tab.on_click(cx.listener(move |this, _, _, cx| {
-            this.activate_item(ix, cx);
+            if let Some(index) = this.index_of(item_id) {
+                this.activate_item(index, cx);
+            }
         }));
 
         tab = tab.on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
-                this.activate_item(ix, cx);
+                let Some(index) = this.index_of(item_id) else {
+                    return;
+                };
+                this.activate_item(index, cx);
                 cx.emit(PaneEvent::Inspect {
                     item: inspect_handle.clone_handle(),
                     position: event.position,
@@ -378,88 +497,59 @@ impl Pane {
             DraggedTab {
                 pane: pane_entity,
                 item: item_handle,
-                ix,
             },
-            |dragged, _, window, cx| {
+            move |dragged, _, window, cx| {
                 // Mirror the drag app-side so a mouse-up outside the window
                 // (which gpui otherwise swallows) can tear the tab out.
                 super::drag::set_active_tab_drag(
                     super::drag::ActiveTabDrag {
                         pane: dragged.pane.clone(),
                         item: dragged.item.clone_handle(),
-                        ix: dragged.ix,
                         source_window: window.window_handle(),
                     },
                     cx,
                 );
-                cx.new(|_| DraggedTab {
-                    pane: dragged.pane.clone(),
-                    item: dragged.item.clone_handle(),
-                    ix: dragged.ix,
+                let size = dragged.pane.update(cx, |pane, cx| {
+                    pane.lifted_tab = Some(dragged.item.entity_id());
+                    cx.notify();
+                    pane.tab_sizes
+                        .borrow()
+                        .get(&dragged.item.entity_id())
+                        .copied()
+                        .unwrap_or(gpui::size(px(TAB_RAIL_WIDTH), px(TAB_HEIGHT)))
+                });
+                cx.new(|_| super::drag::TabDragGhost {
+                    title: ghost_title.clone(),
+                    size,
+                    text_style: text_style.clone(),
+                    can_close,
+                    orientation,
                 })
             },
         );
-
-        tab = tab.on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-            this.handle_tab_bar_drop(dragged, ix, window, cx);
-        }));
-
-        tab = tab.drag_over::<DraggedTab>(move |style, _, _, _| style.bg(border_primary));
 
         tab = tab.child(title);
 
         if can_close {
             tab = tab.child(
-                div()
-                    .id(("tab-close", ix))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(TAB_CLOSE_SIZE))
-                    .h(px(TAB_CLOSE_SIZE))
-                    .rounded(px(3.0))
-                    .text_color(theme.text_tertiary)
+                super::tab::close_icon(&theme)
+                    .id(("tab-close", item_id))
                     .hover(move |s| s.bg(border_primary).text_color(text_primary))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.remove_item(ix, cx);
-                    }))
-                    .child(Icon::Close.svg(10.0)),
+                        cx.stop_propagation();
+                        if let Some(index) = this.index_of(item_id) {
+                            this.remove_item(index, cx);
+                        }
+                    })),
             );
         }
 
-        tab
-    }
-
-    fn render_split_overlay(&self, cx: &App) -> Option<AnyElement> {
-        let theme = theme(cx);
-        let direction = self.drag_split_direction?;
-        let highlight = theme.drop_target;
-
-        let overlay = match direction {
-            SplitDirection::Left => div().w_1_2().h_full().bg(highlight),
-            SplitDirection::Right => div()
-                .flex()
-                .flex_row_reverse()
-                .w_full()
-                .h_full()
-                .child(div().w_1_2().h_full().bg(highlight)),
-            SplitDirection::Up => div().w_full().h_1_2().bg(highlight),
-            SplitDirection::Down => div()
-                .flex()
-                .flex_col_reverse()
-                .w_full()
-                .h_full()
-                .child(div().w_full().h_1_2().bg(highlight)),
-        };
-
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .child(overlay)
-                .into_any_element(),
+        MovingTab::new(
+            item_id,
+            tab,
+            rail,
+            !cx.has_active_drag() || self.tab_drag_preview.is_some() || self.lifted_tab.is_some(),
+            orientation == TabOrientation::Vertical,
         )
     }
 }
@@ -469,14 +559,33 @@ impl Render for Pane {
         let theme = theme(cx);
         let orientation = self.tab_orientation;
         let tab_count = self.items.len();
+        if !cx.has_active_drag() {
+            self.tab_drag_preview = None;
+            self.lifted_tab = None;
+        }
 
         let tab_bar = (!self.hide_tab_bar).then(|| {
+            let rail = Rc::new(Rail::new(self.tab_sizes.clone()));
+            let tracker = rail.clone();
             let mut tab_bar = div()
                 .id("pane-tab-bar")
+                .relative()
+                .child(
+                    gpui::canvas(
+                        move |bounds, _, _| tracker.bounds.set(bounds),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
                 .flex()
                 .bg(theme.bg_secondary)
                 .border_color(theme.border_primary)
-                .track_scroll(&self.tab_scroll);
+                .track_scroll(&self.tab_scroll)
+                .on_drag_move(cx.listener(Self::handle_tab_bar_drag_move))
+                .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                    this.handle_tab_bar_drop(dragged, this.items.len(), window, cx);
+                }));
             tab_bar = match orientation {
                 TabOrientation::Horizontal => tab_bar
                     .flex_row()
@@ -493,20 +602,43 @@ impl Render for Pane {
             };
             tab_bar.style().restrict_scroll_to_axis = Some(true);
 
-            for ix in 0..tab_count {
-                tab_bar = tab_bar.child(self.render_tab(ix, orientation, window, cx));
+            let preview = self.tab_drag_preview;
+            let mut order: Vec<_> = (0..tab_count)
+                .filter(|ix| {
+                    let id = self.items[*ix].entity_id();
+                    Some(id) != self.lifted_tab && preview.is_none_or(|preview| id != preview.item)
+                })
+                .map(Some)
+                .collect();
+            if let Some(preview) = preview {
+                let slot = order
+                    .iter()
+                    .position(|ix| Some(self.items[ix.unwrap()].entity_id()) == preview.before)
+                    .unwrap_or(order.len());
+                let original_slot = self.index_of(preview.item);
+                // Lifting closes the source gap immediately. Only open an
+                // insertion gap when hovering a different slot or another pane.
+                if original_slot != Some(slot) {
+                    order.insert(slot, None);
+                }
+            }
+            for ix in order {
+                if let Some(ix) = ix {
+                    tab_bar =
+                        tab_bar.child(self.render_tab(ix, orientation, rail.clone(), window, cx));
+                } else if let Some(preview) = preview {
+                    let gap = div().flex_shrink_0();
+                    tab_bar = tab_bar.child(match orientation {
+                        TabOrientation::Horizontal => gap.w(preview.extent).h_full(),
+                        TabOrientation::Vertical => gap.h(preview.extent).w_full(),
+                    });
+                }
             }
 
             let mut drop_zone = div()
                 .id("tab-bar-drop-zone")
+                .debug_selector(|| "tab-bar-drop-zone".into())
                 .flex_1()
-                .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-                    this.handle_tab_bar_drop(dragged, tab_count, window, cx);
-                }))
-                .drag_over::<DraggedTab>({
-                    let border = theme.border_primary;
-                    move |style, _, _, _| style.bg(border)
-                })
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |_this, event: &gpui::MouseDownEvent, _window, cx| {
@@ -549,15 +681,9 @@ impl Render for Pane {
         }
 
         // Drop on content area (split-on-drop at edges, add-as-tab in center)
-        content = content
-            .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
-                this.handle_content_drop(dragged, window, cx);
-            }))
-            .on_drag_move(cx.listener(Self::handle_content_drag_move));
-
-        if let Some(overlay) = self.render_split_overlay(cx) {
-            content = content.child(overlay);
-        }
+        content = content.on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
+            this.handle_content_drop(dragged, window, cx);
+        }));
 
         let mut outer = div().flex().size_full();
         outer = match orientation {
@@ -661,6 +787,239 @@ mod tests {
     }
 
     #[gpui::test]
+    fn dragging_previews_order_until_release_in_both_orientations(cx: &mut gpui::TestAppContext) {
+        for orientation in [TabOrientation::Horizontal, TabOrientation::Vertical] {
+            let (pane, cx) = cx.add_window_view(|_, cx| {
+                crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
+                let mut pane = Pane::new(vec![item(cx), item(cx), item(cx)], cx);
+                pane.tab_orientation = orientation;
+                pane
+            });
+            cx.refresh().unwrap();
+            let ids = cx.update(|_, cx| {
+                pane.read(cx)
+                    .items
+                    .iter()
+                    .map(|item| item.entity_id())
+                    .collect::<Vec<_>>()
+            });
+            let start = gpui::point(px(8.0), px(12.0));
+            let source_size = cx.update(|_, cx| pane.read(cx).tab_sizes.borrow()[&ids[0]]);
+            let before_lift = cx.debug_bounds("tab-bar-drop-zone").unwrap();
+            let end = match orientation {
+                TabOrientation::Horizontal => gpui::point(px(350.0), px(12.0)),
+                TabOrientation::Vertical => gpui::point(px(8.0), px(130.0)),
+            };
+            cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_move(
+                start + gpui::point(px(4.0), px(0.0)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.refresh().unwrap();
+            let after_lift = cx.debug_bounds("tab-bar-drop-zone").unwrap();
+            assert_eq!(
+                cx.debug_bounds("tab-drag-ghost").unwrap().size,
+                source_size,
+                "floating tab retains its measured size"
+            );
+            match orientation {
+                TabOrientation::Horizontal => assert_eq!(
+                    after_lift.origin.x,
+                    before_lift.origin.x - source_size.width
+                ),
+                TabOrientation::Vertical => assert_eq!(
+                    after_lift.origin.y,
+                    before_lift.origin.y - source_size.height
+                ),
+            }
+            cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::default());
+            cx.refresh().unwrap();
+            cx.update(|_, cx| {
+                let pane = pane.read(cx);
+                let preview = pane
+                    .tab_drag_preview
+                    .expect("drag previews an insertion gap");
+                assert_eq!(preview.item, ids[0]);
+                assert_eq!(preview.before, None);
+                assert_eq!(
+                    pane.items[0].entity_id(),
+                    ids[0],
+                    "preview does not mutate saved order"
+                );
+            });
+            // Repeated moves at the same position must not oscillate as tabs animate.
+            cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+            cx.refresh().unwrap();
+            cx.update(|_, cx| {
+                let pane = pane.read(cx);
+                assert!(pane.tab_drag_preview.is_none());
+                assert!(pane.lifted_tab.is_none());
+                assert_eq!(
+                    pane.items
+                        .iter()
+                        .map(|item| item.entity_id())
+                        .collect::<Vec<_>>(),
+                    vec![ids[1], ids[2], ids[0]]
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn dragging_between_panes_previews_a_gap_and_transfers_once(cx: &mut gpui::TestAppContext) {
+        struct Host {
+            source: gpui::Entity<Pane>,
+            destination: gpui::Entity<Pane>,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .flex()
+                    .size_full()
+                    .child(
+                        div()
+                            .w(px(400.0))
+                            .h_full()
+                            .flex_shrink_0()
+                            .child(self.source.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(400.0))
+                            .h_full()
+                            .flex_shrink_0()
+                            .child(self.destination.clone()),
+                    )
+            }
+        }
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
+            Host {
+                source: cx.new(|cx| Pane::new(vec![item(cx), item(cx)], cx)),
+                destination: cx.new(|cx| Pane::new(vec![item(cx), item(cx)], cx)),
+            }
+        });
+        cx.refresh().unwrap();
+        let (source, destination, dragged_id, width) = cx.update(|_, cx| {
+            let host = host.read(cx);
+            let source = host.source.read(cx);
+            let id = source.items[0].entity_id();
+            (
+                host.source.clone(),
+                host.destination.clone(),
+                id,
+                source.tab_sizes.borrow()[&id].width,
+            )
+        });
+        let initial_tail = cx.debug_bounds("tab-bar-drop-zone").unwrap();
+        let start = gpui::point(px(8.0), px(12.0));
+        let end = gpui::point(px(410.0), px(12.0));
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(4.0), px(0.0)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::default());
+        cx.refresh().unwrap();
+        assert_eq!(
+            cx.debug_bounds("tab-bar-drop-zone").unwrap().origin.x,
+            initial_tail.origin.x + width
+        );
+        cx.update(|_, cx| {
+            let target = destination.read(cx);
+            assert_eq!(
+                target.tab_drag_preview.unwrap().before,
+                Some(target.items[0].entity_id())
+            );
+            assert_eq!(target.items.len(), 2);
+            assert_eq!(source.read(cx).items.len(), 2);
+        });
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            assert_eq!(source.read(cx).items.len(), 1);
+            let target = destination.read(cx);
+            assert_eq!(target.items.len(), 3);
+            assert_eq!(target.items[0].entity_id(), dragged_id);
+            assert!(target.tab_drag_preview.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn leaving_the_tab_bar_discards_the_preview(cx: &mut gpui::TestAppContext) {
+        let (pane, cx) = cx.add_window_view(|_, cx| {
+            crate::theme::set_theme(cx, std::sync::Arc::new(crate::theme::DARK.clone()));
+            Pane::new(vec![item(cx), item(cx), item(cx)], cx)
+        });
+        cx.refresh().unwrap();
+        let first = cx.update(|_, cx| pane.read(cx).items[0].entity_id());
+        let start = gpui::point(px(8.0), px(12.0));
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(4.0), px(0.0)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            gpui::point(px(350.0), px(12.0)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.update(|_, cx| assert!(pane.read(cx).tab_drag_preview.is_some()));
+        let outside = gpui::point(px(-30.0), px(-30.0));
+        cx.simulate_mouse_move(outside, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_up(outside, MouseButton::Left, gpui::Modifiers::default());
+        cx.refresh().unwrap();
+        cx.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert!(pane.tab_drag_preview.is_none());
+            assert_eq!(pane.items[0].entity_id(), first);
+            assert_eq!(pane.items.len(), 3);
+        });
+    }
+
+    #[gpui::test]
+    fn drop_at_tail_resolves_tab_identity_after_live_removal(cx: &mut gpui::TestAppContext) {
+        let pane = cx.update(|cx| cx.new(|cx| Pane::new(vec![item(cx), item(cx), item(cx)], cx)));
+        cx.update(|cx| {
+            let dragged = DraggedTab {
+                pane: pane.clone(),
+                item: pane.read(cx).items()[1].clone_handle(),
+            };
+            let last_id = pane.read(cx).items()[2].entity_id();
+            pane.update(cx, |pane, cx| {
+                pane.remove_item(0, cx);
+                pane.drop_tab(&dragged, pane.items.len(), cx);
+                assert_eq!(pane.items.len(), 2);
+                assert_eq!(pane.items[0].entity_id(), last_id);
+                assert_eq!(pane.items[1].entity_id(), dragged.item.entity_id());
+                assert_eq!(pane.active_index, 1);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn dropping_a_closed_tab_does_not_resurrect_it(cx: &mut gpui::TestAppContext) {
+        let source = cx.update(|cx| cx.new(|cx| Pane::new(vec![item(cx), item(cx)], cx)));
+        let destination = cx.update(|cx| cx.new(|cx| Pane::new(vec![item(cx)], cx)));
+        cx.update(|cx| {
+            let dragged = DraggedTab {
+                pane: source.clone(),
+                item: source.read(cx).items()[0].clone_handle(),
+            };
+            source.update(cx, |pane, cx| pane.remove_item(0, cx));
+            destination.update(cx, |pane, cx| {
+                pane.drop_tab(&dragged, 1, cx);
+                assert_eq!(pane.items.len(), 1);
+            });
+            assert_eq!(source.read(cx).items.len(), 1);
+        });
+    }
+
+    #[gpui::test]
     fn focus_or_open_activates_existing_tab(cx: &mut gpui::TestAppContext) {
         let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx), other_item(cx)], cx)));
         let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
@@ -715,7 +1074,6 @@ mod tests {
             let dragged = DraggedTab {
                 pane: pane.clone(),
                 item: handle,
-                ix: 0,
             };
             pane.update(cx, |p, cx| {
                 p.split_or_move(&dragged, SplitDirection::Right, cx)
@@ -736,7 +1094,6 @@ mod tests {
             let dragged = DraggedTab {
                 pane: pane.clone(),
                 item: handle,
-                ix: 1,
             };
             pane.update(cx, |p, cx| {
                 p.split_or_move(&dragged, SplitDirection::Right, cx)

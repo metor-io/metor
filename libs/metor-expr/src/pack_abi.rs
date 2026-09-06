@@ -291,7 +291,8 @@ fn create(plan: &PackPlan, entries: &[EntryLayout]) -> Function {
 /// `fsw_pack_bind_init(state, inputs, n_in, outputs, n_out, name, name_len)`:
 /// open a view over each declared input's region and the writer over the
 /// first output's, in the positional order the host stages the `FswRing`
-/// arrays. Extra rings — a slot mount's tail — are simply never opened.
+/// arrays. Extra rings — the log port, a slot mount's tail — are simply
+/// never opened; the host writes the entry's `system_status` itself.
 /// Any failure leaves the instance unbound, which `execute` reports as
 /// `Panicked`, matching the native ABI's caught-panic shape.
 fn bind_init(splice: &Splice<'_>, plan: &PackPlan, entries: &[EntryLayout]) -> Function {

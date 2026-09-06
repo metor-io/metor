@@ -36,7 +36,7 @@ pub fn sun_from_css(css: &[f64; 6]) -> Option<V3> {
 
 /// The filter's state: the MEKF itself plus the reference models it evaluates each cycle.
 pub struct NavState {
-    state: metor_adcs::mekf::State,
+    mekf: metor_adcs::mekf::State,
     sigma: f64,
     /// The NOAA WMM handle for the reference magnetic field (built once — holds C-library state).
     mag_model: MagneticModel,
@@ -53,10 +53,10 @@ pub struct NavState {
 
 impl NavState {
     pub fn new(p: NavParams) -> NavState {
-        let state =
+        let mekf =
             metor_adcs::mekf::State::new(tensor![0.01, 0.01, 0.01], tensor![0.01, 0.01, 0.01], DT);
         NavState {
-            state,
+            mekf,
             sigma: p.meas_sigma,
             mag_model: MagneticModel::default(),
             t_sim: 0.0,
@@ -98,7 +98,7 @@ impl NavState {
         let sun_eci = sun_dir_eci(epoch);
         let mag_eci = mag_field_eci(&mut state.mag_model, epoch, &gps_pos).normalize();
 
-        state.state.omega = s.gyro_b;
+        state.mekf.omega = s.gyro_b;
         // The magnetometer reads the physical field (Tesla); the MEKF's vector observations
         // stay unit vectors, so normalize the measurement like the reference. The sun
         // observation comes from the CSS reconstruction — when the heads are dark (eclipse)
@@ -114,25 +114,26 @@ impl NavState {
             _ => {}
         }
         state.sun_visible = Some(sun_b.is_some());
-        state.state = match sun_b {
-            Some(sun_b) => state.state.clone().estimate_attitude(
+        state.mekf = match sun_b {
+            Some(sun_b) => state.mekf.clone().estimate_attitude(
                 [sun_b, s.mag_b.normalize()],
                 [sun_eci, mag_eci],
                 [state.sigma, state.sigma],
             ),
-            None => state.state.clone().estimate_attitude(
+            None => state.mekf.clone().estimate_attitude(
                 [s.mag_b.normalize()],
                 [mag_eci],
                 [state.sigma],
             ),
         };
-        state.state.reset_if_invalid();
+        state.mekf.reset_if_invalid();
 
         estimate.publish(&AttitudeEstimate {
             timestamp: now,
-            q_hat_b_eci: state.state.q_hat,
+            q_hat_b_eci: state.mekf.q_hat,
             omega_b: s.gyro_b, // pass the measured body rate through to the controller
-            b_hat_b: state.state.b_hat,
+            b_hat_b: state.mekf.b_hat,
+            p: state.mekf.p,
         });
     }
 }

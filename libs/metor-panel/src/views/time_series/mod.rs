@@ -1,3 +1,4 @@
+use crate::plot_events::popover::event_summary_row;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,7 +13,11 @@ use metor_proto::types::{ComponentId, PrimType, Timestamp};
 #[allow(unused_imports)]
 use crate::inspect;
 use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
+use crate::temporal::display::elapsed;
 use crate::views::json_tree::JsonTree;
+use crate::views::popover::readout_card;
+
+mod render;
 
 mod axis;
 pub use axis::YAxis;
@@ -37,8 +42,13 @@ pub use bounds::*;
 mod gpu;
 pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState};
 
+mod heatmap;
+pub use heatmap::{Colormap, IntensityScale};
+pub(crate) use heatmap::{EMPTY_INTENSITY, EMPTY_THRESHOLD, IntensityDraw};
+
 mod line_plot;
 pub use line_plot::LinePlot;
+pub(crate) use line_plot::resolve_lod_levels;
 
 mod override_field;
 pub use override_field::Override;
@@ -162,7 +172,11 @@ fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
 /// `anchor` is the earliest sample for relative labels (so ticks don't
 /// crawl during pan) and Unix epoch `0` for absolute labels (so ticks land
 /// on wall-clock boundaries like `:00`/`:30`).
-fn x_ticks(view: &PlotBounds, target_count: usize, anchor: f64) -> impl Iterator<Item = i64> {
+pub(crate) fn x_ticks(
+    view: &PlotBounds,
+    target_count: usize,
+    anchor: f64,
+) -> impl Iterator<Item = i64> {
     // Backstop: `segment_round` keeps the count near `target_count`, but a
     // paint pass must never be able to loop unbounded if it degenerates.
     const MAX_TICKS: usize = 1024;
@@ -208,7 +222,7 @@ fn x_ticks(view: &PlotBounds, target_count: usize, anchor: f64) -> impl Iterator
 
 /// Anchor passed to [`x_ticks`]: the earliest sample for relative labels,
 /// Unix epoch `0` for absolute ones (so ticks land on wall-clock boundaries).
-fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
+pub(crate) fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
     match fmt {
         TimeFormat::Relative => data_start,
         TimeFormat::Utc | TimeFormat::Local => 0.0,
@@ -217,28 +231,17 @@ fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
 
 /// Render one X-axis tick label.
 ///
-/// `Relative` shows the offset from `ref_us` (`"0"`, `"1 min 30 s"`).
+/// `Relative` uses the shared compact T0 offset from `ref_us` (`"T+0"`, `"T+01:30"`).
 /// `Utc`/`Local` render absolute wall-clock time; `span_us` (the visible
 /// range) picks the granularity — date is folded in once the window spans
 /// more than a day. Falls back to the relative label if the timestamp is
 /// outside jiff's representable range.
-fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us: f64) -> String {
-    let relative = || {
-        let offset_us = t_us - ref_us;
-        if offset_us == 0 {
-            "0".to_string()
-        } else {
-            format!(
-                "{}",
-                hifitime::Duration::from_microseconds(offset_us as f64)
-            )
-        }
-    };
+pub(crate) fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us: f64) -> String {
     match fmt {
-        TimeFormat::Relative => relative(),
+        TimeFormat::Relative => elapsed(Timestamp(t_us), Timestamp(ref_us)),
         TimeFormat::Utc | TimeFormat::Local => {
             let Ok(ts) = jiff::Timestamp::from_microsecond(t_us) else {
-                return relative();
+                return elapsed(Timestamp(t_us), Timestamp(ref_us));
             };
             let pattern = if span_us > 86_400.0 * 1e6 {
                 "%m-%d %H:%M"
@@ -280,10 +283,6 @@ pub(crate) const LABEL_FONT_SIZE: f32 = 11.0;
 /// Gap between the pointer and the hover readout box so the box never sits
 /// under the cursor.
 const HOVER_READOUT_OFFSET: f32 = 14.0;
-/// Inner padding on the hover readout box; mirrors the estimate in
-/// [`cursor::estimate_readout_size`] so placement matches the painted box.
-const READOUT_PAD_X: f32 = 6.0;
-const READOUT_PAD_Y: f32 = 4.0;
 
 /// One readout line: the trace's color, its label, and the formatted value
 /// at the crosshair timestamp.
@@ -460,7 +459,11 @@ pub fn expand_value_bounds(
 /// for one element index; this scans across many element indices for one
 /// sample. Used by list plots, which redraw fully whenever a new sample
 /// arrives — there is no cross-tick caching opportunity.
-pub fn expand_latest_sample_bounds(component: &Component, len: usize) -> Option<(f64, f64)> {
+pub fn expand_sample_bounds(
+    component: &Component,
+    len: usize,
+    sample: &[u8],
+) -> Option<(f64, f64)> {
     if len == 0 {
         return None;
     }
@@ -469,8 +472,6 @@ pub fn expand_latest_sample_bounds(component: &Component, len: usize) -> Option<
     if prim_size == 0 {
         return None;
     }
-    let latest = component.time_series.latest()?;
-    let sample = latest.data();
     if sample.len() < len * prim_size {
         return None;
     }
@@ -561,7 +562,7 @@ fn alarm_plot_tint(lp: &LinePlot, cx: &gpui::App) -> Option<Hsla> {
         if !cfg.visible {
             continue;
         }
-        if let Some(severity) = state.active_severity_for(cfg.component_id, cfg.element_index) {
+        if let Some(severity) = state.active_severity_for(cfg.source.id(), cfg.element_index) {
             let idx = crate::alarms::severity_index(severity);
             worst = Some(worst.map_or(idx, |w| w.max(idx)));
         }
@@ -587,7 +588,7 @@ fn alarm_limit_lines(lp: &LinePlot, cx: &gpui::App) -> Vec<(usize, f64, Hsla, Sh
         if !cfg.visible {
             continue;
         }
-        for limit in state.limits_for(cfg.component_id, cfg.element_index) {
+        for limit in state.limits_for(cfg.source.id(), cfg.element_index) {
             let idx = crate::alarms::severity_index(limit.severity);
             let label = limit.label.map(SharedString::from).unwrap_or_default();
             lines.push((cfg.axis_index, limit.value, theme.alarm_color(idx), label));
@@ -1063,7 +1064,7 @@ impl PlotStyle {
 /// How the X axis renders timestamps.
 ///
 /// `Relative` (the default) labels ticks as offsets from the earliest
-/// sample (`"0"`, `"1 min 30 s"`). The absolute variants render wall-clock
+/// sample (`"T+0"`, `"T+01:30"`). The absolute variants render wall-clock
 /// time so events can be read against real-world clocks; `Utc` uses UTC and
 /// `Local` the machine's timezone. Data positions are unchanged — only the
 /// tick labels and their anchoring differ.
@@ -1083,9 +1084,7 @@ pub enum TimeFormat {
 #[derive(Clone, facet::Facet)]
 #[facet(pod)]
 pub struct Trace {
-    #[facet(skip)]
-    pub component_id: ComponentId,
-    #[facet(skip)]
+    pub source: crate::data_binding::Binding,
     pub element_index: usize,
     pub color: Hsla,
     pub style: PlotStyle,
@@ -1107,7 +1106,7 @@ pub struct Trace {
 impl Trace {
     pub fn new(component_id: impl Into<ComponentId>, element_index: usize, color: Hsla) -> Self {
         Self {
-            component_id: component_id.into(),
+            source: crate::data_binding::Binding::from(component_id.into()),
             element_index,
             color,
             style: PlotStyle::default(),
@@ -1138,7 +1137,6 @@ struct CursorDrag {
 /// `TimeSeriesPlot` only owns drag state and chrome.
 pub struct TimeSeriesPlot {
     line_plot: Entity<LinePlot>,
-    _expressions: Vec<crate::dynamic::expressions::Expression>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotView>,
     drag_zone: AxisZone,
@@ -1205,7 +1203,7 @@ pub fn traces_for_component(
                 .map(|n| format!("{}.{}", comp_name, n))
                 .unwrap_or_else(|| format!("{}[{}]", comp_name, idx));
             Trace {
-                component_id,
+                source: crate::data_binding::Binding::from(component_id),
                 element_index: idx,
                 color: theme.line_colors[i % theme.line_colors.len()],
                 style: PlotStyle::default(),
@@ -1236,7 +1234,6 @@ impl TimeSeriesPlot {
         }
         Self {
             line_plot,
-            _expressions: Vec::new(),
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
@@ -1479,6 +1476,37 @@ impl TimeSeriesPlot {
         };
         let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view.x_bounds(), cx)
         else {
+            use crate::inspector::{
+                InspectorMode, InspectorRequest,
+                rows::{CommandRow, InspectorRow, NavRow},
+            };
+            let t = Timestamp(cursor::pixel_to_data_x(position.x, pa, view.x_bounds()) as i64);
+            let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
+                "Set view time here",
+                Arc::new(move |_, cx| {
+                    let _ = crate::temporal::dispatch(
+                        crate::temporal::TimeAction::Seek(crate::temporal::TimeExpr::fixed(t)),
+                        cx,
+                    );
+                }),
+            ))];
+            rows.push(Box::new(NavRow::new(
+                "Time controls",
+                "",
+                Box::new(crate::temporal::picker::rows),
+            )));
+            rows.extend(crate::temporal::picker::plot_actions(view.x));
+            if let Some(open) = crate::inspector::open_inspector(cx) {
+                open(
+                    InspectorRequest {
+                        rows,
+                        mode: InspectorMode::Anchored(position),
+                    },
+                    window,
+                    cx,
+                );
+            }
+            cx.stop_propagation();
             return;
         };
         let entity = hit.into_any();
@@ -1599,7 +1627,7 @@ impl TimeSeriesPlot {
                 });
             }
             lp.set_view_override(None, cx);
-            cx.notify();
+            lp.configuration_changed(cx);
         });
     }
 
@@ -1729,22 +1757,7 @@ impl TimeSeriesPlot {
             pa.origin.y - px(PADDING),
         );
 
-        let mut boxed = div()
-            .flex()
-            .flex_col()
-            .gap_y_0()
-            .px(px(READOUT_PAD_X))
-            .py(px(READOUT_PAD_Y))
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border_primary)
-            .rounded(px(3.0))
-            .child(
-                div()
-                    .text_size(px(LABEL_FONT_SIZE))
-                    .text_color(theme.text_secondary)
-                    .child(SharedString::from(header)),
-            );
+        let mut boxed = readout_card(cx).child(div().child(SharedString::from(header)));
         for (color, label, value) in rows {
             boxed = boxed.child(
                 div()
@@ -1825,19 +1838,7 @@ impl TimeSeriesPlot {
         target: gpui::AnyEntity,
         cx: &mut Context<Self>,
     ) -> Option<Subscription> {
-        if let Ok(store) = target.clone().downcast::<crate::logs::LogStore>() {
-            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
-        }
-        if let Ok(store) = target.clone().downcast::<crate::alarms::AlarmStore>() {
-            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
-        }
-        if let Ok(store) = target.clone().downcast::<crate::sequences::SequenceStore>() {
-            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
-        }
-        if let Ok(store) = target.downcast::<crate::plot_events::MsgEventStore>() {
-            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
-        }
-        None
+        crate::plot_events::observe_target(target, cx)
     }
 
     /// Query this frame's sources over the visible window and cluster the
@@ -1926,7 +1927,6 @@ impl TimeSeriesPlot {
         let cluster = self.event_clusters.get(idx)?;
         let pa = self.last_plot_area?;
         let view = self.line_plot.read(cx).effective_view(cx)?;
-        let theme = crate::theme::theme(cx);
 
         let count = cluster.events.len();
         let first = cluster.events.first()?;
@@ -1936,25 +1936,11 @@ impl TimeSeriesPlot {
             first.label.clone()
         };
 
-        let mut boxed = div()
-            .flex()
-            .flex_col()
-            .gap_y_0()
-            .px(px(READOUT_PAD_X))
-            .py(px(READOUT_PAD_Y))
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border_primary)
-            .rounded(px(3.0))
-            .child(
-                div()
-                    .text_size(px(LABEL_FONT_SIZE))
-                    .text_color(theme.text_secondary)
-                    .child(header),
-            );
-        for ev in cluster.events.iter().take(EVENT_POPOVER_ROWS) {
-            boxed = boxed.child(event_summary_row(ev, &theme));
-        }
+        let boxed = crate::plot_events::popover::event_card(
+            header,
+            cluster.events.iter().take(EVENT_POPOVER_ROWS),
+            cx,
+        );
 
         let shown = count.min(EVENT_POPOVER_ROWS);
         let size = gpui::Size {
@@ -2066,15 +2052,9 @@ impl TimeSeriesPlot {
 
         let detail = self.event_detail_element(&cluster.events[selected].detail, &theme);
 
-        let panel = div()
-            .flex()
-            .flex_col()
+        let panel = readout_card(cx)
             .gap_1()
             .w(px(300.0))
-            .px(px(READOUT_PAD_X))
-            .py(px(READOUT_PAD_Y))
-            .bg(theme.bg_elevated)
-            .border_1()
             .border_color(theme.selection_bg)
             .rounded(px(4.0))
             .occlude()
@@ -2110,44 +2090,13 @@ impl TimeSeriesPlot {
         theme: &crate::theme::Theme,
     ) -> AnyElement {
         let mut body = div().flex().flex_col().gap_y_0().pt_1();
-        match detail {
-            EventDetail::Log(ev) => {
-                body = body
-                    .child(kv_row("level", format!("{:?}", ev.level), theme))
-                    .child(kv_row("source", ev.source.clone(), theme))
-                    .child(kv_row("message", ev.message.clone(), theme));
-                for (k, v) in &ev.fields {
-                    body = body.child(kv_row(k, v.clone(), theme));
-                }
-            }
-            EventDetail::Alarm(ev) => {
-                body = body
-                    .child(kv_row("alarm", ev.def_id.clone(), theme))
-                    .child(kv_row("severity", format!("{:?}", ev.severity), theme));
-                if !ev.detail.is_empty() {
-                    body = body.child(kv_row("detail", ev.detail.clone(), theme));
-                }
-            }
-            EventDetail::Sequence(entry) => {
-                body = body
-                    .child(kv_row("channel", entry.channel_name.to_string(), theme))
-                    .child(kv_row("event", entry.label.to_string(), theme));
-            }
-            EventDetail::Json(_) => {
-                if let Some(tree) = &self.event_json_tree {
-                    body = body.child(tree.clone());
-                }
-            }
-            EventDetail::Raw(len) => {
-                body = body.child(
-                    div()
-                        .text_size(px(LABEL_FONT_SIZE))
-                        .text_color(theme.text_secondary)
-                        .child(SharedString::from(format!(
-                            "{len} bytes (no schema announced)"
-                        ))),
-                );
-            }
+        for (key, value) in crate::plot_events::details::fields(detail) {
+            body = body.child(kv_row(&key, value, theme));
+        }
+        if matches!(detail, EventDetail::Json(_))
+            && let Some(tree) = &self.event_json_tree
+        {
+            body = body.child(tree.clone());
         }
         body.into_any_element()
     }
@@ -2157,30 +2106,6 @@ impl TimeSeriesPlot {
 const EVENT_POPOVER_ROWS: usize = 8;
 
 /// One event summary line: time, a color dot, and the one-line label.
-fn event_summary_row(ev: &PlotEvent, theme: &crate::theme::Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .child(
-            div()
-                .text_size(px(LABEL_FONT_SIZE))
-                .text_color(theme.text_tertiary)
-                .child(SharedString::from(crate::views::log_panel::format_time(
-                    ev.ts.0,
-                ))),
-        )
-        .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(ev.color))
-        .child(
-            div()
-                .flex_1()
-                .text_size(px(LABEL_FONT_SIZE))
-                .text_color(theme.text_secondary)
-                .child(ev.label.clone()),
-        )
-}
-
 /// One `key: value` detail row in the pinned popover.
 fn kv_row(
     key: &str,
@@ -2203,427 +2128,6 @@ fn kv_row(
                 .text_color(theme.text_primary)
                 .child(value.into()),
         )
-}
-
-impl Render for TimeSeriesPlot {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = crate::theme::theme(cx);
-        // Resolve this frame's event sources (and refresh their repaint subs)
-        // before building canvases, so the flag canvas can query them in paint.
-        self.sync_event_sources(cx);
-        let trace_entities: Vec<Entity<Trace>> = self.line_plot.read(cx).traces().to_vec();
-        let show_legend = trace_entities.len() >= 2;
-        // Drives the left chrome width: one Y_LABEL_WIDTH column per axis.
-        let axis_count = self.line_plot.read(cx).axes.len();
-        let chrome_left = px(left_margin(axis_count));
-
-        let underlay_lp = self.line_plot.clone();
-        let overlay_lp = self.line_plot.clone();
-        let cursors_lp = self.line_plot.clone();
-        let cursors_weak = cx.entity().downgrade();
-        let hover_weak = cx.entity().downgrade();
-        let flags_weak = cx.entity().downgrade();
-
-        let mut root = div().flex().flex_col().size_full().bg(theme.bg_secondary);
-
-        let mut inner = div()
-            .id((
-                "time-series-plot",
-                cx.entity().entity_id().as_u64() as usize,
-            ))
-            .flex_1()
-            .min_h_0()
-            .relative()
-            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
-                if !*hovered {
-                    this.clear_hover(cx);
-                }
-            }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                    this.clear_hover(cx);
-                    if event.click_count == 2 {
-                        this.reset_view(cx);
-                        return;
-                    }
-                    // Alt+left-drag opens a measurement cursor —
-                    // gpui's mac trackpad backend delivers right-
-                    // mouse-down but not the matching drag/up, so
-                    // the gesture has to ride on the left button.
-                    if event.modifiers.alt {
-                        this.start_cursor_drag(event, window, cx);
-                        return;
-                    }
-                    // A click on a flag pins its popover; any other plot click
-                    // clears an open pin before falling through to pan setup.
-                    if let Some(pa) = this.last_plot_area
-                        && let Some(idx) = this.event_cluster_at(event.position, pa)
-                    {
-                        let x_ts = this.event_clusters[idx].ts().0;
-                        this.pinned_event = Some(PinnedEvent { x_ts, selected: 0 });
-                        this.sync_pinned_json_tree(cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                        return;
-                    }
-                    if this.pinned_event.take().is_some() {
-                        this.event_json_tree = None;
-                        cx.notify();
-                    }
-                    let axis_count = this.line_plot.read(cx).axes.len();
-                    let zone = this
-                        .last_plot_area
-                        .map(|pa| axis_zone(event.position, pa, axis_count))
-                        .unwrap_or(AxisZone::Plot);
-                    this.drag_start = Some(event.position);
-                    this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
-                    this.drag_zone = zone;
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
-                    if this.end_panel_drag() {
-                        return;
-                    }
-                    if this.cursor_drag.is_some() {
-                        this.finish_cursor_drag(event, window, cx);
-                        return;
-                    }
-                    this.drag_start = None;
-                    this.drag_start_view = None;
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                    this.clear_hover(cx);
-                    this.open_cursor_inspector_at(event.position, window, cx);
-                }),
-            )
-            .on_mouse_move(
-                cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
-                    if !event.dragging() {
-                        this.update_hover(event, cx);
-                        return;
-                    }
-                    if this.advance_panel_drag(event.position, cx) {
-                        return;
-                    }
-                    if this.cursor_drag.is_some() {
-                        this.handle_cursor_drag_move(event, cx);
-                        return;
-                    }
-                    let (Some(start), Some(start_view), Some(pa)) = (
-                        this.drag_start,
-                        this.drag_start_view.clone(),
-                        this.last_plot_area,
-                    ) else {
-                        return;
-                    };
-
-                    let dx = event.position.x - start.x;
-                    let dy = event.position.y - start.y;
-                    let (nx, ny) = start_view.x_bounds().screen_delta_to_norm(pa, dx, dy);
-                    let new_view = match this.drag_zone {
-                        AxisZone::Plot => start_view.offset_x(-nx).offset_y_all(ny),
-                        AxisZone::XAxis => start_view.offset_x(-nx),
-                        AxisZone::YAxis(i) => start_view.offset_axis_y(i, ny),
-                    };
-                    this.line_plot
-                        .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
-                }),
-            )
-            .on_scroll_wheel(
-                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                    this.clear_hover(cx);
-                    let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
-                        return;
-                    };
-                    let Some(pa) = this.last_plot_area else {
-                        return;
-                    };
-
-                    let delta = event.delta.pixel_delta(px(20.0));
-                    let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
-                    let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
-
-                    let zone = axis_zone(event.position, pa, view.axis_count());
-                    let (ax, ay) = view.x_bounds().screen_anchor(pa, event.position);
-                    let new_view = match zone {
-                        AxisZone::Plot => view.zoom_x(factor, ax).zoom_y_all(factor, 1.0 - ay),
-                        AxisZone::XAxis => view.zoom_x(factor, ax),
-                        AxisZone::YAxis(i) => view.zoom_axis_y(i, factor, 1.0 - ay),
-                    };
-                    this.line_plot
-                        .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
-                    cx.stop_propagation();
-                }),
-            )
-            .child(
-                canvas(
-                    {
-                        let this = cx.entity().downgrade();
-                        move |bounds, _window, cx| {
-                            let lp = underlay_lp.read(cx);
-                            let axis_count = lp.axes.len();
-                            let view = lp.effective_view(cx);
-                            let data_start = lp.data_start().unwrap_or(0.0);
-                            let fmt = lp.x_time_format;
-                            let tint = alarm_plot_tint(lp, cx);
-                            let _ = this.update(cx, |this, _| {
-                                this.last_plot_area = Some(plot_area(bounds, axis_count));
-                            });
-                            (bounds, view, data_start, fmt, tint)
-                        }
-                    },
-                    move |_, (bounds, view, data_start, fmt, tint), window, cx| {
-                        if let Some(view) = view {
-                            paint_underlay(bounds, &view, data_start, fmt, tint, window, cx);
-                        }
-                    },
-                )
-                .absolute()
-                .inset_0(),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(chrome_left)
-                    .top(px(PADDING))
-                    .right(px(PADDING))
-                    .bottom(px(X_LABEL_HEIGHT + PADDING))
-                    .child(self.line_plot.clone()),
-            )
-            .child(
-                canvas(
-                    move |bounds, _window, cx| {
-                        let lp = overlay_lp.read(cx);
-                        let view = lp.effective_view(cx);
-                        let colors = lp.axis_colors(cx);
-                        // Per-trace axis markers: value at the visible left edge,
-                        // only meaningful once there's more than one axis.
-                        let mut markers: Vec<(usize, f64, Hsla)> = Vec::new();
-                        if let Some(v) = &view
-                            && v.axis_count() > 1
-                        {
-                            let left = Timestamp(v.x.0 as i64);
-                            for trace in lp.traces() {
-                                let cfg = trace.read(cx);
-                                if !cfg.visible {
-                                    continue;
-                                }
-                                if let Some(val) = lp.trace_value_at(trace.entity_id(), left, cx) {
-                                    markers.push((cfg.axis_index, val, cfg.color));
-                                }
-                            }
-                        }
-                        let limit_lines = alarm_limit_lines(lp, cx);
-                        (
-                            bounds,
-                            view,
-                            colors,
-                            markers,
-                            limit_lines,
-                            lp.data_start().unwrap_or(0.0),
-                            lp.x_time_format,
-                        )
-                    },
-                    move |_,
-                          (bounds, view, colors, markers, limit_lines, data_start, fmt),
-                          window,
-                          cx| {
-                        if let Some(view) = view {
-                            paint_overlay(
-                                bounds,
-                                &view,
-                                &colors,
-                                &markers,
-                                &limit_lines,
-                                data_start,
-                                fmt,
-                                window,
-                                cx,
-                            );
-                        }
-                    },
-                )
-                .absolute()
-                .inset_0(),
-            )
-            .child(
-                canvas(
-                    move |bounds, _window, cx| {
-                        let mut out = None;
-                        let _ = flags_weak.update(cx, |this, cx| {
-                            let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
-                                return;
-                            };
-                            let pa = plot_area(bounds, view.axis_count());
-                            let clusters = this.build_event_clusters(&view, pa, cx);
-                            let theme = crate::theme::theme(cx);
-                            let paints: Vec<ClusterPaint> = clusters
-                                .iter()
-                                .map(|c| ClusterPaint {
-                                    x: c.x,
-                                    color: c.color(&theme),
-                                    label: c.chip_label(),
-                                })
-                                .collect();
-                            this.event_clusters = clusters;
-                            out = Some((view, paints));
-                        });
-                        (bounds, out)
-                    },
-                    move |_, (bounds, data), window, cx| {
-                        if let Some((view, paints)) = data {
-                            paint_event_flags(bounds, &view, &paints, window, cx);
-                        }
-                    },
-                )
-                .absolute()
-                .inset_0(),
-            )
-            .child(
-                canvas(
-                    move |bounds, _window, cx| {
-                        let view = cursors_lp.read(cx).effective_view(cx);
-                        let mut snapshots: Vec<CursorPaint> = Vec::new();
-                        let _ = cursors_weak.update(cx, |this, cx| {
-                            let active_id = this.cursor_drag.as_ref().map(|d| d.cursor.read(cx).id);
-                            let lp = this.line_plot.read(cx);
-                            for cursor in &this.cursors {
-                                let c = cursor.read(cx);
-                                let mut markers: Vec<(f64, f64, Hsla)> = Vec::new();
-                                for trace in lp.traces() {
-                                    let cfg = trace.read(cx);
-                                    if !cfg.visible {
-                                        continue;
-                                    }
-                                    let v_start =
-                                        lp.trace_value_at(trace.entity_id(), c.t_start, cx);
-                                    let v_end = lp.trace_value_at(trace.entity_id(), c.t_end, cx);
-                                    if let (Some(vs), Some(ve)) = (v_start, v_end) {
-                                        // Pre-normalize to [0,1] against the
-                                        // trace's axis so paint can map with a
-                                        // single fixed 0..1 Y range.
-                                        let (ns, ne) = match &view {
-                                            Some(v) => {
-                                                let b = v.axis_bounds(cfg.axis_index);
-                                                let h = (b.max_y - b.min_y).max(1e-12);
-                                                ((vs - b.min_y) / h, (ve - b.min_y) / h)
-                                            }
-                                            None => (vs, ve),
-                                        };
-                                        markers.push((ns, ne, cfg.color));
-                                    }
-                                }
-                                snapshots.push(CursorPaint {
-                                    t_start: c.t_start,
-                                    t_end: c.t_end,
-                                    active: Some(c.id) == active_id,
-                                    trace_markers: markers,
-                                });
-                            }
-                        });
-                        (bounds, view, snapshots)
-                    },
-                    move |_, (bounds, view, cursors), window, cx| {
-                        if let Some(view) = view {
-                            // Markers carry normalized [0,1] Y; lines use X only.
-                            paint_cursors(bounds, &view, &cursors, window, cx);
-                        }
-                    },
-                )
-                .absolute()
-                .inset_0(),
-            )
-            .child(
-                canvas(
-                    move |bounds, _window, cx| {
-                        let mut out = None;
-                        let _ = hover_weak.update(cx, |this, cx| {
-                            let Some(pointer) = this.hover else {
-                                return;
-                            };
-                            let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
-                                return;
-                            };
-                            // Same lookup as the readout box, pre-normalized
-                            // per axis the way `CursorPaint` markers are.
-                            let markers = this
-                                .hover_samples(cx)
-                                .map(|(_, samples)| {
-                                    samples
-                                        .into_iter()
-                                        .map(|s| {
-                                            let b = view.axis_bounds(s.axis_index);
-                                            let h = (b.max_y - b.min_y).max(1e-12);
-                                            (s.ts.0 as f64, (s.value - b.min_y) / h, s.color)
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            out = Some((
-                                view,
-                                HoverPaint {
-                                    pointer_x: pointer.x,
-                                    markers,
-                                },
-                            ));
-                        });
-                        (bounds, out)
-                    },
-                    move |_, (bounds, data), window, cx| {
-                        if let Some((view, hover)) = data {
-                            paint_hover_crosshair(bounds, &view, hover.pointer_x, window, cx);
-                            paint_hover_markers(bounds, &view, &hover.markers, window);
-                        }
-                    },
-                )
-                .absolute()
-                .inset_0(),
-            );
-
-        // Measurement panels: a native div tree positioned on top of
-        // the cursor overlays. In Track mode this is one mini panel per
-        // cursor; in Pinned mode it's a single consolidated panel.
-        let panels = measurement_panel::render_panels(self, cx);
-        for panel in panels {
-            // Panel origins are plot-area-local; the outer container's
-            // origin is offset by (left_margin, PADDING).
-            let left = panel.origin.x + chrome_left;
-            let top = panel.origin.y + px(PADDING);
-            inner = inner.child(div().absolute().left(left).top(top).child(panel.element));
-        }
-
-        if let Some(readout) = self.hover_readout(cx) {
-            inner = inner.child(readout);
-        }
-
-        // Event-flag popovers: a pinned one wins over the transient hover one.
-        if let Some(popover) = self.event_pinned_popover(cx) {
-            inner = inner.child(popover);
-        } else if let Some(popover) = self.event_hover_popover(cx) {
-            inner = inner.child(popover);
-        }
-
-        root = root.child(inner);
-
-        if show_legend {
-            root = root.child(crate::views::plot_common::plot_legend(
-                &trace_entities,
-                self.line_plot.clone(),
-                chrome_left,
-                |trace| (trace.label.clone(), trace.color, trace.visible),
-                |trace| trace.visible = !trace.visible,
-                cx,
-            ));
-        }
-
-        root
-    }
 }
 
 #[cfg(test)]

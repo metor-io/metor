@@ -36,11 +36,10 @@ pub use param::{BindCx, CycleCx, DeclSink, ExecParam};
 pub use task::{AsyncSystemFn, IntoOutcome, Params, TaskParam};
 pub use tuples::{ExecParamSet, ExecuteFn};
 
-pub(crate) use driver::{FnDriver, FutureDriver, OccupantFuture, bind_health_tail, mount_driver};
+pub(crate) use driver::{FnDriver, FutureDriver, OccupantFuture, bind_log_tail, mount_driver};
 pub(crate) use task::TaskParamsSpec;
 
 use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind};
-use crate::health::SystemHealth;
 use crate::pack::{EntryParams, MakeError, PackEntry, Pending, decode_params};
 
 /// Start a fn-authored system from its per-cycle execute fn. The fn takes a
@@ -52,7 +51,7 @@ where
     SystemDef {
         execute,
         init: NoInit,
-        _m: PhantomData,
+        _marker: PhantomData,
     }
 }
 
@@ -61,7 +60,7 @@ where
 pub struct SystemDef<S, M, F, I> {
     execute: F,
     init: I,
-    _m: PhantomData<fn() -> (S, M)>,
+    _marker: PhantomData<fn() -> (S, M)>,
 }
 
 /// No construction given: the state is `Default` and the entry takes no
@@ -73,7 +72,7 @@ pub struct NoInit;
 pub struct InitWith<G, M2> {
     init: G,
     defaults: Option<Vec<u8>>,
-    _m: PhantomData<fn() -> M2>,
+    _marker: PhantomData<fn() -> M2>,
 }
 
 /// A prebuilt state moved into the entry (instantiable once).
@@ -97,9 +96,9 @@ where
             init: InitWith {
                 init,
                 defaults: None,
-                _m: PhantomData,
+                _marker: PhantomData,
             },
-            _m: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -110,7 +109,7 @@ where
         SystemDef {
             execute: self.execute,
             init: Prebuilt(Some(state)),
-            _m: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -125,7 +124,7 @@ where
         SystemDef {
             execute: self.execute,
             init: Attached(token.clone()),
-            _m: PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -143,8 +142,7 @@ where
         G::Params: serde::Serialize,
     {
         self.init.defaults = Some(
-            postcard::to_allocvec(&value)
-                .expect("params postcard-encode (Serialize is infallible)"),
+            postcard::to_allocvec(&value).expect("default parameters must serialize to postcard"),
         );
         self
     }
@@ -186,14 +184,13 @@ pub trait IntoPackEntry {
 }
 
 /// The entry descriptor for a parameter set: the declared ports per
-/// direction in parameter order, then the implicit health/log tail — the
+/// direction in parameter order, then the implicit log tail, the
 /// same shape [`Out`](crate::Out) gives a struct system.
 fn descriptor_for<P: ExecParamSet>(name: &'static str) -> SystemDescriptor {
     let mut sink = DeclSink::default();
     P::decls(&mut sink);
     let inputs = sink.inputs;
     let mut outputs = sink.outputs;
-    outputs.push(PortDesc::of::<SystemHealth>());
     outputs.push(PortDesc::msg_named::<crate::LogEvent>("log"));
     SystemDescriptor {
         name: name.into(),

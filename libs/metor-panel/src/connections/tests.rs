@@ -343,3 +343,38 @@ fn schemed_recents_rematerialize_and_replace_by_id() {
     assert_eq!(index.recents.len(), 1);
     assert_eq!(index.recents[0].address.as_deref(), Some("10.0.0.5:2240"));
 }
+
+#[test]
+fn unchanged_layouts_save_for_new_targets_and_retry_failed_writes() {
+    let mut saved = super::SavedLayouts::default();
+    let a = TargetId("a".into());
+    let b = TargetId("b".into());
+    let dir = tempfile::tempdir().unwrap();
+    let write = |id: &TargetId, json: &str| std::fs::write(dir.path().join(id.as_str()), json);
+    saved.save(&a, "layout", write).unwrap();
+    saved
+        .save(&a, "layout", |_, _| panic!("unchanged successful save"))
+        .unwrap();
+    assert!(
+        saved
+            .save(&b, "layout", |_, _| Err(std::io::Error::other("disk full")))
+            .is_err()
+    );
+    saved.save(&b, "layout", write).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b")).unwrap(),
+        "layout"
+    );
+    assert!(
+        saved
+            .save(&a, "changed", |_, _| Err(std::io::Error::other(
+                "disk full"
+            )))
+            .is_err()
+    );
+    saved.save(&a, "changed", write).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a")).unwrap(),
+        "changed"
+    );
+}

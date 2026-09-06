@@ -27,6 +27,15 @@ pub enum FontConfig {
     Family(String),
 }
 
+/// Whether decorative fades run or UI state is shown immediately.
+#[derive(facet::Facet, Clone, Copy, Debug, PartialEq, Default)]
+#[repr(u8)]
+pub enum MotionPreference {
+    #[default]
+    Full,
+    Reduced,
+}
+
 /// Root of the on-disk panel config document.
 ///
 /// `Default` is hand-written rather than derived: the derived impl would seed
@@ -37,6 +46,8 @@ pub enum FontConfig {
 pub struct PanelConfig {
     #[facet(default)]
     pub font: FontConfig,
+    #[facet(default)]
+    pub motion: MotionPreference,
     /// gpui keystroke that opens the transient chord menu (e.g. `"space"`,
     /// `"cmd-k"`).
     #[facet(default = default_leader())]
@@ -47,6 +58,7 @@ impl Default for PanelConfig {
     fn default() -> Self {
         Self {
             font: FontConfig::default(),
+            motion: MotionPreference::default(),
             leader: default_leader(),
         }
     }
@@ -125,6 +137,19 @@ mod tests {
         let cfg: PanelConfig = facet_json::from_str("{}").expect("deserialize");
         assert_eq!(cfg.font, FontConfig::Auto);
         assert_eq!(cfg.leader, "space");
+        assert_eq!(cfg.motion, MotionPreference::Full);
+    }
+
+    #[test]
+    fn reduced_motion_round_trips_with_existing_preferences() {
+        let config = PanelConfig {
+            motion: MotionPreference::Reduced,
+            leader: "cmd-k".into(),
+            ..Default::default()
+        };
+        let restored = round_trip(&config);
+        assert_eq!(restored.motion, MotionPreference::Reduced);
+        assert_eq!(restored.leader, "cmd-k");
     }
 
     #[test]

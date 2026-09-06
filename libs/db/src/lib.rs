@@ -325,7 +325,7 @@ impl DB {
                         }
                         // Name the keyed member by its dotted path before
                         // `insert_component` falls back to the numeric id, so the
-                        // panel shows `health.error_counts.<kind>`. A member that
+                        // panel shows `alarm_defs.limits.<key>`. A member that
                         // reappears already has real metadata, so leave it be.
                         if !state.component_metadata.contains_key(&rf.component_id)
                             && let Some(name) = dynamic_member_name(&rf)
@@ -441,7 +441,7 @@ impl DB {
 
 /// The dotted display name of a lazily-realized dynamic map/list member,
 /// joining the container path, the element key, and the member leaf
-/// (`health.error_counts.publish_dropped`). `None` for a static field or a
+/// (`alarm_defs.limits.gyro`). `None` for a static field or a
 /// member template, which carry no runtime key.
 fn dynamic_member_name(rf: &RealizedField) -> Option<String> {
     let container = rf.container?;
@@ -601,6 +601,7 @@ impl State {
 pub struct ComponentSchema {
     pub prim_type: PrimType,
     pub dim: SmallVec<[usize; 4]>,
+    size: usize,
 }
 
 impl Serialize for ComponentSchema {
@@ -618,13 +619,18 @@ impl<'de> Deserialize<'de> for ComponentSchema {
 }
 
 impl ComponentSchema {
-    pub fn new(prim_type: PrimType, shape: &[usize]) -> Self {
+    pub fn new(prim_type: PrimType, shape: impl Into<SmallVec<[usize; 4]>>) -> Self {
         let dim = shape.into();
-        ComponentSchema { prim_type, dim }
+        let size = dim.iter().product::<usize>() * prim_type.size();
+        ComponentSchema {
+            prim_type,
+            dim,
+            size,
+        }
     }
 
     pub fn size(&self) -> usize {
-        self.dim.iter().product::<usize>() * self.prim_type.size()
+        self.size
     }
 
     pub fn read(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -704,11 +710,7 @@ impl ComponentSchema {
 
 impl From<Schema<Vec<u64>>> for ComponentSchema {
     fn from(value: Schema<Vec<u64>>) -> Self {
-        let prim_type = value.prim_type();
-        ComponentSchema {
-            prim_type,
-            dim: value.shape().into(),
-        }
+        ComponentSchema::new(value.prim_type(), value.shape())
     }
 }
 
@@ -2377,7 +2379,7 @@ mod dynamic_ingest_tests {
         assert_eq!(sink.values[&ComponentId::new("processes.init.cpu_usage")], 0.25);
     }
 
-    /// A scalar-valued map (the `SystemHealth.error_counts` shape) has an empty
+    /// A scalar-valued map (a `FrameMap<u64, N>` member) has an empty
     /// member leaf, so the keyed member is named `<container>.<key>` directly.
     #[stellarator::test]
     async fn scalar_map_member_named_by_key() {

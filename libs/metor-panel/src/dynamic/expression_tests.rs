@@ -13,7 +13,7 @@ fn db_with(components: &[(&str, PrimType, &[usize])]) -> (DB, tempfile::TempDir)
     for (name, prim, dim) in components {
         let id = ComponentId::new(name);
         db.with_state_mut(|state| {
-            state.insert_component(id, ComponentSchema::new(*prim, dim), &db.path)
+            state.insert_component(id, ComponentSchema::new(*prim, *dim), &db.path)
         })
         .unwrap();
         let metadata = metor_proto_wkt::ComponentMetadata {
@@ -82,7 +82,7 @@ fn a_later_ambiguity_does_not_disturb_what_was_already_resolved() {
     // A second component ending in `.rpm` arrives.
     let id = ComponentId::new("motor.rpm");
     db.with_state_mut(|state| {
-        state.insert_component(id, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+        state.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
     })
     .unwrap();
     db.with_state_mut(|state| {
@@ -201,7 +201,7 @@ async fn an_expression_publishes_a_real_but_hidden_component() {
     let live = db
         .with_state(|s| s.get_component(component).cloned())
         .expect("an expression registers a component");
-    assert_eq!(live.schema, ComponentSchema::new(PrimType::F64, &[]));
+    assert_eq!(live.schema, ComponentSchema::new(PrimType::F64, &[][..]));
 
     // ...it is labelled by the text, marked hidden, and attributed like any
     // other dynamic output...
@@ -280,7 +280,7 @@ fn db_with_ids(components: &[(&str, ComponentId, PrimType, &[usize])]) -> (DB, t
     let db = DB::create(temp.path().join("db")).unwrap();
     for (name, id, prim, dim) in components {
         db.with_state_mut(|state| {
-            state.insert_component(*id, ComponentSchema::new(*prim, dim), &db.path)
+            state.insert_component(*id, ComponentSchema::new(*prim, *dim), &db.path)
         })
         .unwrap();
         db.with_state_mut(|state| {
@@ -453,7 +453,13 @@ async fn the_registry_does_not_keep_an_unused_expression_alive() {
         .unwrap();
         let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
         let published = expressions::publish(&db, &name, field.clone(), "adcs.rate + 1.0").unwrap();
-        expressions::Expression::new(published, ComponentId::new(&name), system.node, field)
+        let plan = crate::dynamic::ops::replay::ReplayPlan {
+            compiled: compiled.clone(),
+            system: 0,
+            ports: vec![source.clone()],
+            outputs: vec![(0, ComponentId::new(&name))],
+        };
+        expressions::Expression::new(published, system.node, field, plan)
     };
     registry.insert(expression.clone());
     assert!(registry.is_live(ComponentId::new(&name)));
@@ -470,7 +476,7 @@ fn an_expression_over_a_vector_plots_every_element() {
     // `xyz + 1.0` would publish.
     let out = ComponentId::new("expr.out");
     db.with_state_mut(|s| {
-        s.insert_component(out, ComponentSchema::new(PrimType::F64, &[3]), &db.path)
+        s.insert_component(out, ComponentSchema::new(PrimType::F64, &[3][..]), &db.path)
     })
     .unwrap();
 
@@ -486,7 +492,11 @@ fn an_expression_over_a_vector_plots_every_element() {
     // A scalar expression is still exactly one trace, labelled by its text.
     let scalar = ComponentId::new("expr.scalar");
     db.with_state_mut(|s| {
-        s.insert_component(scalar, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+        s.insert_component(
+            scalar,
+            ComponentSchema::new(PrimType::F64, &[][..]),
+            &db.path,
+        )
     })
     .unwrap();
     let plotted = crate::inspector::trace_picker::expression_elements(&db, scalar, "=xyz[0] + 1.0");
@@ -569,7 +579,11 @@ async fn an_expression_fills_a_list_trace_element_by_element() {
     // nothing, because a trace with no length draws nothing at all.
     let scalar = ComponentId::new("expr.scalar");
     db.with_state_mut(|s| {
-        s.insert_component(scalar, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+        s.insert_component(
+            scalar,
+            ComponentSchema::new(PrimType::F64, &[][..]),
+            &db.path,
+        )
     })
     .unwrap();
     assert_eq!(expression_len(&db, scalar), 1);
@@ -587,10 +601,13 @@ async fn wait_for_bounds(
     len: usize,
     want: (f64, f64),
 ) -> (f64, f64) {
-    use crate::views::time_series::expand_latest_sample_bounds;
+    use crate::views::time_series::expand_sample_bounds;
     let mut seen = None;
     for _ in 0..300 {
-        seen = expand_latest_sample_bounds(component, len);
+        seen = component
+            .time_series
+            .latest()
+            .and_then(|sample| expand_sample_bounds(component, len, sample.data()));
         if seen == Some(want) {
             break;
         }
@@ -766,8 +783,10 @@ fn a_view_bound_to_an_expression_rehydrates_onto_what_it_publishes(cx: &mut gpui
         .expect("the bound component receives data");
     let values: Vec<f64> = latest
         .data()
-        .chunks_exact(8)
-        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| f64::from_le_bytes(*c))
         .collect();
     assert_eq!(values, vec![2.0, 4.0, 6.0]);
 }
@@ -821,7 +840,9 @@ fn rebinding_to_an_expression_survives_the_save(cx: &mut gpui::TestAppContext) {
         // hands over the component the expression publishes into.
         let bound = expressions::bind(typed, &db, cx).expect("the expression compiles");
         assert_eq!(bound.id, published);
-        meter.update(cx, |meter, _cx| meter.component_id = bound.id);
+        meter.update(cx, |meter, cx| {
+            meter.source = crate::data_binding::Binding::selected(bound.id, typed, cx)
+        });
 
         // Saved. The text is what has to come back, not the label.
         meter.read(cx).to_config().component
@@ -846,7 +867,7 @@ fn rebinding_to_an_expression_survives_the_save(cx: &mut gpui::TestAppContext) {
             )
         });
         assert_eq!(
-            meter.read(cx).component_id,
+            meter.read(cx).source.id(),
             published,
             "the reloaded meter reads what the expression publishes"
         );
@@ -921,8 +942,8 @@ fn an_xy_axis_binds_an_expression_independently(cx: &mut gpui::TestAppContext) {
         let plot = cx.new(|cx| XyPlot::from_config(saved, db.clone(), cx));
         let line_plot = plot.read(cx).line_plot().read(cx);
         let trace = line_plot.traces()[0].read(cx);
-        assert_eq!(trace.y_component_id, published);
-        assert_eq!(trace.x_component_id, ComponentId::new("rpm"));
+        assert_eq!(trace.y_source.id(), published);
+        assert_eq!(trace.x_source.id(), ComponentId::new("rpm"));
         assert!(
             cx.global::<expressions::Expressions>().is_live(published),
             "reloading an expression axis starts it"
@@ -1028,7 +1049,7 @@ fn a_time_series_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::
     let (reloaded, _plot) = cx.update(|cx| {
         let plot = cx.new(|cx| TimeSeriesPlot::from_config(saved, db.clone(), cx));
         let line_plot = plot.read(cx).line_plot().read(cx);
-        let id = line_plot.traces()[0].read(cx).component_id;
+        let id = line_plot.traces()[0].read(cx).source.id();
         assert!(
             cx.global::<expressions::Expressions>().is_live(published),
             "reloading has to start the expression again"
@@ -1083,7 +1104,7 @@ fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestApp
     let (reloaded, _plot) = cx.update(|cx| {
         let plot = cx.new(|cx| ListPlot::from_config(saved, db.clone(), cx));
         let line_plot = plot.read(cx).line_plot().read(cx);
-        let id = line_plot.traces()[0].read(cx).component_id;
+        let id = line_plot.traces()[0].read(cx).source.id();
         assert!(
             cx.global::<expressions::Expressions>().is_live(published),
             "reloading has to start the expression again"
@@ -1093,4 +1114,568 @@ fn a_list_trace_bound_to_an_expression_restarts_on_reload(cx: &mut gpui::TestApp
     assert_eq!(reloaded, published);
 
     assert_eq!(feed_and_await(&db, source, published, 200, 4.0), 12.0);
+}
+
+/// The user's report, verbatim in shape: a vector component contracted with
+/// itself, parenthesised, through `resolve`'s exact path.
+#[stellarator::test]
+async fn a_self_dot_seeds_then_tails() {
+    use crate::dynamic::ops::{db_source, program};
+    use metor_proto::types::Timestamp;
+
+    let path = "cube_sat.plant.body.omega_b";
+    let (db, _temp) = db_with_ids(&[(path, ComponentId::new(path), PrimType::F64, &[3])]);
+    let source_id = ComponentId::new(path);
+    let source = db
+        .with_state(|s| s.get_component(source_id).cloned())
+        .unwrap();
+
+    source
+        .push_buf(Timestamp(100), &sample(&[1.0, 0.0, 0.0]))
+        .unwrap();
+    stellarator::sleep(std::time::Duration::from_millis(20)).await;
+
+    let text = format!("({path} @ {path})");
+    let resolver = DbResolver::snapshot(&db);
+    let compiled = std::sync::Arc::new(program::Compiled::expression(&text, &resolver).unwrap());
+    let inputs = &compiled.manifest.systems[0].inputs;
+    assert_eq!(
+        inputs.len(),
+        1,
+        "{:?}",
+        inputs.iter().map(|p| &p.bindings).collect::<Vec<_>>()
+    );
+    let name = expressions::component_name(program::field_id(
+        compiled.system_hash(0, &[db_source::from_db_id(source_id)]),
+        0,
+    ));
+
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource {
+            node: db_source::from_db(&db, source_id).unwrap(),
+            seed: program::latest_sample(&db, source_id),
+        }],
+        program::DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
+    let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
+    let _published = expressions::publish(&db, &name, field, &text).unwrap();
+
+    for step in 1..=4 {
+        let v = 1.0 + step as f64;
+        source
+            .push_buf(Timestamp(100 + step), &sample(&[v, 0.0, 0.0]))
+            .unwrap();
+    }
+
+    let component = db
+        .with_state(|s| s.get_component(ComponentId::new(&name)).cloned())
+        .expect("the expression's component");
+    for _ in 0..300 {
+        if component
+            .time_series
+            .latest()
+            .is_some_and(|l| l.timestamp() == Timestamp(104))
+        {
+            break;
+        }
+        stellarator::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let latest = component.time_series.latest().expect("history");
+    assert_eq!(
+        latest.timestamp(),
+        Timestamp(104),
+        "fault: {:?}; the expression stopped at {:?}",
+        system.health.fault(),
+        latest.timestamp()
+    );
+    assert_eq!(f64::from_le_bytes(latest.data().try_into().unwrap()), 25.0);
+}
+
+/// The user's report: `(omega_b @ omega_b)` typed into an existing plot showed
+/// one sample and stopped. The picker resolves the expression and hands the
+/// plot bare traces; once its own handle drops, nothing keeps the system
+/// computing. The traces must carry the share.
+#[gpui::test]
+fn a_trace_added_from_the_picker_keeps_its_expression_alive(cx: &mut gpui::TestAppContext) {
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::inspector::trace_picker::expression_traces;
+    use std::sync::Arc;
+
+    let path = "cube_sat.plant.body.omega_b";
+    let (db, _temp) = db_with_ids(&[(path, ComponentId::new(path), PrimType::F64, &[3])]);
+    let db = Arc::new(db);
+    let text = format!("=({path} @ {path})");
+
+    cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+
+        // What `ComputeRow::activate` does: resolve, hand out the id, drop.
+        let traces = {
+            let expression = expressions::resolve(&text, &db, cx).expect("compiles and starts");
+            let id = expression.component_id();
+            let basis: crate::inspector::trace_picker::ColorBasis = Arc::new(|_: &gpui::App| 0);
+            expression_traces(&db, id, &text, &basis, cx)
+        };
+        let id = traces[0].source.id();
+        assert!(
+            expressions::running(id, cx).is_some(),
+            "the trace's share must outlive the picker's"
+        );
+        drop(traces);
+        assert!(
+            expressions::running(id, cx).is_none(),
+            "and removing the trace is what stops the expression"
+        );
+    });
+}
+
+/// The history an expression's inputs already hold is computed on request
+/// and lands behind what the live system publishes.
+///
+/// Binding starts the expression, which seeds itself with the input's newest
+/// sample — that is the live head. Everything older is uncovered until a
+/// backfill computes it, and afterwards the component reads as one series:
+/// the computed history, the seed, and whatever arrives next.
+#[gpui::test]
+fn an_expression_backfills_the_history_its_inputs_already_have(cx: &mut gpui::TestAppContext) {
+    use crate::backfill;
+    use crate::dynamic::worker::DynamicWorker;
+    use metor_db::manifest::RangeVec;
+    use metor_proto::types::Timestamp;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with_ids(&[("rpm", ComponentId::new("rpm"), PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let source = ComponentId::new("rpm");
+    // History already on disk, as a target that ran before this session
+    // leaves it. (The test thread runs no persist task, so the WAL is not
+    // the way to put it there.)
+    let input = db.with_state(|s| s.get_component(source).cloned()).unwrap();
+    let recorded: Vec<(Timestamp, [u8; 8])> = (1..=50i64)
+        .map(|ts| (Timestamp(ts), (ts as f64).to_le_bytes()))
+        .collect();
+    input
+        .time_series
+        .install_samples(
+            8,
+            recorded.iter().map(|(ts, bytes)| (*ts, bytes.as_slice())),
+            metor_db::manifest::SpanSource::LocalIngest,
+        )
+        .unwrap();
+
+    let published = expression_target(&db, "rpm * 2.0", source);
+    // Held as a view would hold it: dropping the binding stops the expression.
+    let (bound, plan) = cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+        let bound = expressions::bind("=rpm * 2.0", &db, cx).expect("the expression compiles");
+        assert_eq!(bound.id, published);
+        let plan =
+            expressions::replay_plan(published, &db, cx).expect("a running expression has a plan");
+        (bound, plan)
+    });
+    let output = db
+        .with_state(|s| s.get_component(published).cloned())
+        .unwrap();
+    // The seed evaluation is the live head; nothing may be written at it.
+    wait_for_latest(&output, 50);
+    assert_eq!(backfill::ceiling(&output, &plan), Some(Timestamp(50)));
+
+    let filled = backfill::fill(&db, published, Timestamp(1)..Timestamp(51), &plan).unwrap();
+    assert_eq!(filled, 49, "everything before the seed, and only that");
+
+    let mut left = RangeVec::new();
+    backfill::wanted(&output, &plan, Timestamp(1)..Timestamp(51), &mut left);
+    assert!(left.is_empty(), "nothing is left to compute: {left:?}");
+
+    let mut nodes: Vec<_> = output.time_series.iter_node_slices().collect();
+    nodes.reverse();
+    let history: Vec<(i64, f64)> = nodes
+        .iter()
+        .flat_map(|node| {
+            node.iter_values(&output.schema)
+                .map(|(ts, view)| (ts.0, view.to_f64()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let expected: Vec<(i64, f64)> = (1..=50).map(|ts| (ts, ts as f64 * 2.0)).collect();
+    assert_eq!(
+        history, expected,
+        "computed history, then the seed, as one series"
+    );
+
+    // The live tail still lands after the install.
+    assert_eq!(feed_and_await(&db, source, published, 60, 7.0), 14.0);
+
+    // A later session has no running expression; the component's own record
+    // of what it computes is enough to compute more of it.
+    drop(bound);
+    cx.update(expressions::Expressions::init);
+    let reloaded = cx.update(|cx| expressions::replay_plan(published, &db, cx));
+    let reloaded = reloaded.expect("the recorded text recompiles to this component");
+    assert_eq!(reloaded.outputs, vec![(0, published)]);
+    assert_eq!(reloaded.ports[0].component_id, source);
+}
+
+/// Wait for the persist task to land `component`'s sample at `at`.
+fn wait_for_latest(component: &metor_db::Component, at: i64) {
+    use metor_proto::types::Timestamp;
+    for _ in 0..400 {
+        if component
+            .time_series
+            .latest()
+            .is_some_and(|latest| latest.timestamp() >= Timestamp(at))
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the component never persisted its sample at {at}");
+}
+
+#[gpui::test]
+fn an_inspector_rebind_retains_the_expression_before_the_next_render(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::dynamic::worker::DynamicWorker;
+    use crate::inspector::registry::InspectorRegistry;
+    use crate::inspector::rows::RowAction;
+    use crate::views::{Meter, MeterConfig};
+    use gpui::AppContext;
+    use std::sync::Arc;
+
+    let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let published = expression_target(&db, "rpm * 2.0", ComponentId::new("rpm"));
+    let window = cx.add_empty_window();
+    let meter = window.update(|window, cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        expressions::Expressions::init(cx);
+        DynamicWorker::init(cx);
+        InspectorRegistry::init(db.clone(), cx);
+        let meter = cx.new(|cx| {
+            Meter::from_config(
+                &MeterConfig {
+                    component: "rpm".into(),
+                    ..Default::default()
+                },
+                db.clone(),
+                cx,
+            )
+        });
+        let mut rows = crate::inspector::reflect::rows_for_entity(&meter, &db, cx);
+        let RowAction::CascadeWith {
+            rows: picker,
+            query,
+        } = rows[0].activate(window, cx)
+        else {
+            panic!("component picker")
+        };
+        assert_eq!(query, "rpm");
+        let mut candidates = picker[0].query_rows("=rpm * 2.0", 10, cx).unwrap();
+        let compute = candidates
+            .iter_mut()
+            .find(|r| r.label() == "compute")
+            .unwrap();
+        assert!(matches!(compute.activate(window, cx), RowAction::Dismiss));
+        assert_eq!(meter.read(cx).source.id(), published);
+        assert!(
+            expressions::running(published, cx).is_some(),
+            "the picker released its handle before rendering"
+        );
+        meter
+    });
+    assert_eq!(
+        feed_and_await(&db, ComponentId::new("rpm"), published, 100, 7.0),
+        14.0
+    );
+    window.update(|_, cx| {
+        crate::inspector::reflect::set_field(
+            &meter.clone().into_any(),
+            0,
+            crate::data_binding::Binding::from(ComponentId::new("rpm")),
+            cx,
+        );
+        assert!(
+            expressions::running(published, cx).is_none(),
+            "rebinding releases the computation"
+        );
+    });
+}
+
+/// Exercise the real reflected editor for every input type, without letting
+/// a render or a sibling view rescue the expression's temporary ownership.
+#[gpui::test]
+fn all_widget_inputs_commit_and_clear_owned_bindings(cx: &mut gpui::TestAppContext) {
+    use crate::data_binding::Binding as DataBinding;
+    use crate::inspector::{registry::InspectorRegistry, rows::RowAction};
+    use crate::views::*;
+    use facet::Facet;
+    use gpui::AppContext;
+    use std::sync::Arc;
+    let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        crate::inspector::edits::init(cx);
+        expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        InspectorRegistry::init(db.clone(), cx);
+        let id = ComponentId::new("rpm");
+        let color = gpui::Hsla::default();
+        let views = vec![
+            cx.new(|cx| Meter::from_config(&MeterConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| Gauge::from_config(&GaugeConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| StateChip::from_config(&StateChipConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| Map::from_config(&MapConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| SamplesTable::from_config(&SamplesTableConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|cx| AttitudeIndicator::from_config(&AttitudeConfig::default(), db.clone(), cx))
+                .into_any(),
+            cx.new(|_| VectorMarker::empty(db.clone())).into_any(),
+            cx.new(|cx| ComponentText::new(db.clone(), id, cx))
+                .into_any(),
+            cx.new(|cx| Monitor::new(db.clone(), id, cx)).into_any(),
+            cx.new(|cx| TrafficLight::new(db.clone(), id, cx))
+                .into_any(),
+            cx.new(|_| time_series::Trace::new(id, 0, color)).into_any(),
+            cx.new(|_| XyTrace::new(id, 0, id, 0, color)).into_any(),
+            cx.new(|_| ListTrace::new(id, 1, color)).into_any(),
+            cx.new(|_| SpectrogramTrace::new(id, 1)).into_any(),
+            cx.new(|_| viewer_3d::ModelEntry::empty()).into_any(),
+            cx.new(|_| annunciator::Condition::default()).into_any(),
+        ];
+        let text = "=rpm * 7.0";
+        let mut checked = 0;
+        for view in views {
+            let adapter = cx
+                .global::<InspectorRegistry>()
+                .entity_adapter(view.entity_type())
+                .unwrap()
+                .clone();
+            let mut fields = Vec::new();
+            (adapter.peek)(&view, cx, &mut |peek| {
+                let value = peek.into_struct().unwrap();
+                for (idx, field) in value.ty().fields.iter().enumerate() {
+                    if field.shape().id == DataBinding::SHAPE.id {
+                        fields.push((idx, field.name));
+                    }
+                }
+            });
+            assert!(!fields.is_empty(), "each widget exposes an input");
+            for (idx, name) in fields {
+                let mut rows =
+                    crate::inspector::reflect::rows_for_any_entity(&view, &db, cx).unwrap();
+                let row = rows.iter_mut().find(|row| row.label() == name).unwrap();
+                let RowAction::CascadeWith { rows: picker, .. } = row.activate(window, cx) else {
+                    panic!("binding editor")
+                };
+                let mut candidates = picker[0].query_rows(text, text.len(), cx).unwrap();
+                let compute = candidates
+                    .iter_mut()
+                    .find(|r| r.label() == "compute")
+                    .unwrap();
+                assert!(matches!(compute.activate(window, cx), RowAction::Dismiss));
+                drop(candidates);
+                let binding =
+                    crate::inspector::reflect::get_field::<DataBinding>(&view, idx, cx).unwrap();
+                let published = binding.id();
+                assert_eq!(binding.text(&db), text);
+                assert!(expressions::running(published, cx).is_some());
+                drop(binding);
+                let mut rows =
+                    crate::inspector::reflect::rows_for_any_entity(&view, &db, cx).unwrap();
+                let row = rows.iter_mut().find(|row| row.label() == name).unwrap();
+                let RowAction::CascadeWith { mut rows, query } = row.activate(window, cx) else {
+                    panic!("binding editor")
+                };
+                assert_eq!(query, text, "editing starts with the saved expression");
+                rows.iter_mut()
+                    .find(|r| r.label() == "Clear")
+                    .unwrap()
+                    .activate(window, cx);
+                assert!(
+                    expressions::running(published, cx).is_none(),
+                    "clearing releases {name}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 18, "includes both XY axes and both model inputs");
+    });
+}
+
+#[gpui::test]
+fn widget_snapshots_preserve_expression_syntax_and_unbound_inputs(cx: &mut gpui::TestAppContext) {
+    use crate::views::dashboard::{WidgetKind, WidgetRegistry};
+    use std::sync::Arc;
+    let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    cx.update(|cx| {
+        crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+        crate::inspector::edits::init(cx);
+        expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+        WidgetRegistry::init(cx);
+        for kind in [
+            WidgetKind::text(),
+            WidgetKind::monitor(),
+            WidgetKind::traffic_light(),
+            WidgetKind::meter(),
+            WidgetKind::gauge(),
+            WidgetKind::map(),
+            WidgetKind::samples_table(),
+            WidgetKind::state_chip(),
+            WidgetKind::attitude(),
+        ] {
+            let spec = cx.global::<WidgetRegistry>().spec(&kind).unwrap();
+            for text in ["=rpm * 2.0", "", "=missing * 2.0"] {
+                let config = serde_json::json!({"component": text}).to_string();
+                let live = (spec.build)(&config, &db, cx);
+                let saved = (spec.snapshot)(&live.state, &config, cx)
+                    .expect("every input snapshots its state");
+                let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+                assert_eq!(saved["component"], text, "{}", kind.0);
+                assert!(
+                    crate::inspector::reflect::rows_for_any_entity(&live.inspect, &db, cx)
+                        .is_some(),
+                    "unbound inputs stay editable"
+                );
+            }
+        }
+    });
+}
+
+#[gpui::test]
+fn binding_history_discovers_and_fills_preexisting_input_history(cx: &mut gpui::TestAppContext) {
+    use crate::data_binding::{Binding as DataBinding, BoundHistory};
+    use metor_proto::types::Timestamp;
+    use std::sync::Arc;
+    let (db, _temp) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let db = Arc::new(db);
+    let source = db
+        .with_state(|s| s.get_component(ComponentId::new("rpm")).cloned())
+        .unwrap();
+    let recorded: Vec<_> = (1..=5)
+        .map(|ts| (Timestamp(ts), (ts as f64).to_le_bytes()))
+        .collect();
+    source
+        .time_series
+        .install_samples(
+            8,
+            recorded.iter().map(|(ts, bytes)| (*ts, bytes.as_slice())),
+            metor_db::manifest::SpanSource::LocalIngest,
+        )
+        .unwrap();
+    cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        let binding = DataBinding::from_text("=rpm * 3.0", &db, cx);
+        let history = BoundHistory::for_binding(&binding, &db, cx).unwrap();
+        assert_eq!(history.extent().unwrap().start, Timestamp(1));
+        let before = history.component.time_series.manifest().generation;
+        crate::backfill::fill(
+            &db,
+            binding.id(),
+            Timestamp(1)..Timestamp(5),
+            history.plan.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            history.component.time_series.manifest().generation > before,
+            "old history invalidates consumer caches"
+        );
+        let saved = binding.text(&db);
+        drop(binding);
+        let restored = DataBinding::from_text(&saved, &db, cx);
+        assert!(expressions::running(restored.id(), cx).is_some());
+    });
+}
+
+#[gpui::test]
+fn unavailable_bindings_retry_and_model_expressions_survive_a_cold_database(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::data_binding::Binding as DataBinding;
+    use std::sync::Arc;
+    let (db, _temp) = db_with(&[]);
+    let db = Arc::new(db);
+    let saved = cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        let mut binding = DataBinding::from_text("=rpm * 2.0", &db, cx);
+        assert_eq!(binding.id(), ComponentId(0));
+        assert!(binding.error().is_some());
+        assert_eq!(binding.text(&db), "=rpm * 2.0");
+        let id = ComponentId::new("rpm");
+        db.with_state_mut(|s| {
+            s.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
+        })
+        .unwrap();
+        db.with_state_mut(|s| {
+            s.set_component_metadata(
+                metor_proto_wkt::ComponentMetadata {
+                    component_id: id,
+                    name: "rpm".into(),
+                    metadata: Default::default(),
+                },
+                &db.path,
+            )
+        })
+        .unwrap();
+        db.vtable_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        binding.resolve(&db, cx);
+        assert!(binding.error().is_none());
+        let model = crate::views::viewer_3d::ModelEntry {
+            position_binding: binding.clone(),
+            orientation_binding: binding,
+            ..crate::views::viewer_3d::ModelEntry::empty()
+        };
+        serde_json::to_string(&crate::views::ModelConfig::from(&model)).unwrap()
+    });
+    let (fresh, _temp2) = db_with(&[("rpm", PrimType::F64, &[])]);
+    let fresh = Arc::new(fresh);
+    cx.update(|cx| {
+        expressions::Expressions::init(cx);
+        let config: crate::views::ModelConfig = serde_json::from_str(&saved).unwrap();
+        let position = DataBinding::from_legacy(
+            config.position_binding.unwrap(),
+            config.position_expression.as_deref(),
+            &fresh,
+            cx,
+        );
+        let orientation = DataBinding::from_legacy(
+            config.orientation_binding.unwrap(),
+            config.orientation_expression.as_deref(),
+            &fresh,
+            cx,
+        );
+        let id = position.id();
+        assert_ne!(id, ComponentId(0));
+        assert_eq!(orientation.id(), id);
+        drop(position);
+        assert!(
+            expressions::running(id, cx).is_some(),
+            "second input owns its share"
+        );
+        drop(orientation);
+        assert!(
+            expressions::running(id, cx).is_none(),
+            "last input releases computation"
+        );
+    });
 }

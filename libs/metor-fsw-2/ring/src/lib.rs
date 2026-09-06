@@ -5,10 +5,10 @@
 //! consume the stream, each at its own pace. A write that would overwrite
 //! data a reader has not consumed yet fails with
 //! [`WouldBlock`](WriteError::WouldBlock) until the slowest reader frees
-//! space. Since a record can never be
-//! overwritten while a reader still wants it, reads can borrow directly from
-//! the region ([`View::try_read`], [`View::try_latest`]) without copying and
-//! without having to check afterwards that the bytes held still.
+//! space. A record can never be overwritten while a reader still wants it,
+//! so reads can borrow directly from the region ([`View::try_read`],
+//! [`View::try_latest`]) without copying and without checking afterward that
+//! the bytes held still.
 //!
 //! # Example
 //!
@@ -31,8 +31,8 @@
 //!
 //! All shared state lives in one contiguous region that holds offsets and
 //! atomics but no pointers, so the same code runs over a heap allocation, a
-//! memory-mapped file, or any region the caller provides
-//! ([`RingBuffer::attach_raw`]).
+//! memory-mapped file (the `mmap` feature), or any region the caller
+//! provides ([`RingBuffer::attach_raw`]).
 //!
 //! ```text
 //! 0x00 ┌───────────────────────────┐
@@ -61,9 +61,12 @@
 //! therefore starts 8-aligned.
 //!
 //! Records never straddle the wrap. When one would, the writer moves it to
-//! the start of the next lap and publishes where valid data ends in the
-//! `high_water_mark`. A reader whose cursor lands on that mark skips the wrap
-//! gap and continues at the lap boundary.
+//! the start of the next lap, Release-storing where valid data ends in
+//! `high_water_mark` before Release-storing the new `committed`. A reader
+//! whose cursor lands on that mark skips the wrap gap and continues at the
+//! lap boundary; ordering the marker first guarantees that a reader who
+//! observes a post-wrap `committed` observes the marker too, rather than
+//! mistaking stale gap bytes for a record header.
 //!
 //! Publication is the usual single-writer handshake. The writer fills the
 //! record with plain stores and then Release-stores the new `committed`, and
@@ -91,11 +94,23 @@
 //!
 //! # Waking
 //!
-//! The shared region carries no wake state. Waking is a pair of traits
-//! injected per handle, [`WakeSource`] to notify and [`WakeSink`] to await.
-//! [`NoWake`] serves synchronous consumers, and [`Notifier`] wakes tasks
-//! within one process. Only the data direction wakes: writers use the
-//! non-blocking [`Writer::try_write`], so nothing ever waits for space.
+//! The shared region carries no wake state; waking is a pair of traits
+//! injected per handle, [`WakeSource`] to notify and [`WakeSink`] to await. A
+//! [`WakeSink`] must re-check its ready condition after arming, so a commit
+//! or a freed read between the check and the wait is never missed. [`NoWake`]
+//! serves synchronous consumers with no wake behavior at all, and the
+//! `notify` feature adds [`Notifier`], which wakes every task waiting on
+//! clones of one handle within a process. Only the data direction wakes:
+//! writers use the non-blocking [`Writer::try_write`], so nothing ever waits
+//! for space.
+//!
+//! # Reclaiming a dead process
+//!
+//! A crashed process leaves its writer claim or a reader slot stamped but
+//! never freed, and a stale reader cursor then backpressures the writer
+//! forever. [`RingBuffer::reclaim_owner`] frees whatever a `pid` the caller
+//! knows is dead was still holding; nothing else frees another process's
+//! claim.
 //!
 //! # Verification
 //!
@@ -124,10 +139,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 
 /// Layout version, bumped on any incompatible change. Regions are ephemeral
-/// IPC state rather than archives, so a stale region is recreated, never
-/// migrated. v3 added the reader-slot `owner` tag and made the writer claim
-/// carry the claimant's process id. v4 dropped the reserved cross-process wake
-/// word from the control block. v5 dropped the reader-slot `epoch` word.
+/// IPC state rather than archives, so a stale region is recreated rather than
+/// migrated.
 const VERSION: u16 = 5;
 
 /// The identifying metadata at the start of every region, occupying cache
@@ -222,21 +235,18 @@ const FREE_SLOT: u64 = u64::MAX;
 /// `high_water_mark` value meaning no wrap gap is pending.
 const HWM_NONE: u64 = u64::MAX;
 
-/// A tag identifying the architecture that wrote a region: the byte pattern of
-/// this native `u64` differs across endianness, so comparing tags on attach
-/// rejects a region written by an incompatible target.
+/// A tag identifying the architecture that wrote a region. This native `u64`'s
+/// byte pattern differs across endianness, so comparing tags on attach rejects
+/// a region written by an incompatible target.
 ///
-/// Pointer width is deliberately *not* encoded. Nothing in the region format
-/// is `usize`-shaped — every header, control, and reader-slot field is an
-/// explicit width — and the one place pointer width genuinely matters, a
+/// Pointer width is deliberately not encoded. Nothing in the region format is
+/// `usize`-shaped; every header, control, and reader-slot field has an
+/// explicit width, and the one place pointer width genuinely matters, a
 /// capacity too large for the attaching target's `usize`, is already caught
 /// as [`AttachError::BadGeometry`], which is both narrower and more accurate
-/// than refusing the region outright.
-///
-/// Encoding it would therefore reject a compatible region for no reason, and
-/// the case is not hypothetical: a wasm guest's `usize` is four bytes where
-/// its 64-bit host's is eight, and the two share ring regions in the guest's
-/// linear memory (`metor_fsw_2::wasm`).
+/// than refusing the region outright. A 32-bit target routinely attaches a
+/// region a 64-bit target created, so encoding pointer width would reject a
+/// compatible region for no reason.
 const fn arch_tag() -> u64 {
     (0x0102_0304u32 as u64) << 32
 }
@@ -252,10 +262,10 @@ fn owner_tag() -> u64 {
     std::process::id() as u64
 }
 
-/// Wasm has no process id — `std::process::id` is unsupported there and
-/// panics — and a guest is not a process anyway: its regions live and die with
-/// the instance, so there is no peer to outlive them and nothing to reclaim.
-/// A fixed non-zero tag keeps the "never `0`" invariant.
+/// `std::process::id` panics on wasm, and a guest is not a process anyway:
+/// its regions live and die with the instance, so there is no peer to
+/// outlive them and nothing to reclaim. A fixed non-zero tag keeps the
+/// "never `0`" invariant.
 #[inline]
 #[cfg(all(not(kani), target_arch = "wasm32"))]
 fn owner_tag() -> u64 {
@@ -288,12 +298,6 @@ pub const fn frame_len(payload_len: usize) -> usize {
 
 // ---------------------------------------------------------------------------
 // Position arithmetic
-//
-// The three predicates below carry the crate's load-bearing invariants:
-// records never straddle the wrap, the writer never laps a reader, and a
-// length read out of the region is bounded before it becomes a slice length.
-// They are free functions over plain integers so `verify.rs` can prove them
-// for every input rather than for the handful the unit tests pick.
 // ---------------------------------------------------------------------------
 
 /// Where a record of `rec` bytes goes when written at absolute position
@@ -319,7 +323,7 @@ const fn reserve(committed: u64, rec: u64, capacity: u64) -> (u64, u64) {
 /// Assumes `slowest <= committed`: a cursor is only ever moved to a position
 /// the writer has already published. Violating it costs a wrapped subtraction,
 /// which reads as "full" or overflows the sum, never as space that is not
-/// there — see `KANI.md`. `Writer::fits` checks the assumption under the
+/// there (see `KANI.md`). `Writer::fits` checks the assumption under the
 /// verification cfgs.
 #[inline]
 const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> bool {
@@ -333,7 +337,7 @@ const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> bool {
 /// `u64` and rewritten to avoid overflow. `capacity - 8 - phys` cannot
 /// underflow (`phys <= capacity - 8` for an 8-aligned in-bounds header) and is
 /// a multiple of 8, and for a multiple of 8 `m`, `round_up8(len) > m` exactly
-/// when `len > m` — so comparing the raw length is the same test as comparing
+/// when `len > m`, so comparing the raw length is the same test as comparing
 /// the padded one, without the padding's chance to wrap.
 ///
 /// The caller must not convert `len` to `usize` first: on a 32-bit target
@@ -431,7 +435,7 @@ impl std::error::Error for WriterClaimed {}
 pub enum AttachError {
     BadMagic,
     BadVersion,
-    /// Pointer width or endianness mismatch (see [`arch_tag`]).
+    /// Pointer width or endianness mismatch (see `arch_tag`).
     ArchMismatch,
     /// Region shorter than the fixed header.
     TooSmall,
@@ -499,12 +503,16 @@ enum BackingOwner {
     ///
     /// Retaining the `Box` would be unsound. Moving it into this enum is a
     /// `Unique` retag, which invalidates every pointer already derived from
-    /// it — and `Backing::base` is derived from it, so every access the ring
+    /// it, and `Backing::base` is one of them, so every access the ring
     /// ever makes would be through a dead tag. Miri reports it as the first
     /// write in `init_region`.
-    Heap { words: *mut [Word] },
+    Heap {
+        words: *mut [Word],
+    },
     #[cfg(feature = "mmap")]
-    Mmap { _map: memmap2::MmapMut },
+    Mmap {
+        _map: memmap2::MmapMut,
+    },
     Raw,
 }
 
@@ -554,13 +562,11 @@ impl Backing {
         }
     }
 
-    /// Base of the region.
     #[inline]
     fn base(&self) -> *mut u8 {
         self.base
     }
 
-    /// Length of the region in bytes.
     #[inline]
     fn len(&self) -> usize {
         self.len
@@ -594,18 +600,15 @@ pub trait WakeSource {
     fn notify(&self);
 }
 
-/// Awaits progress. `wait_until` completes once `ready()` returns true, and
-/// implementations must re-check `ready` after arming to avoid lost wakeups.
+/// Awaits progress until `ready()` returns true. See the crate docs for the
+/// re-check-after-arming contract implementations must uphold.
 #[allow(async_fn_in_trait)]
 pub trait WakeSink {
     async fn wait_until<F: FnMut() -> bool>(&self, ready: F);
 }
 
-/// A wake implementation that does nothing.
-///
-/// The `try_*` paths never touch the wake hooks, so this is the right choice
-/// for synchronous consumers. Under `NoWake` the async paths degenerate to
-/// polling driven by the caller.
+/// A [`WakeSource`]/[`WakeSink`] pair that does nothing, for synchronous
+/// consumers; the async paths degenerate to caller-driven polling under it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoWake;
 
@@ -620,9 +623,8 @@ impl WakeSink for NoWake {
     }
 }
 
-/// A shared wait queue that wakes tasks within one process. The writer and
-/// its views share clones of a single `Notifier`, so a commit wakes the
-/// awaiting readers.
+/// A [`WakeSource`]/[`WakeSink`] pair that wakes every task waiting on
+/// clones of the same `Notifier`.
 #[cfg(feature = "notify")]
 #[derive(Clone)]
 pub struct Notifier(Arc<stellarator::sync::WaitQueue>);
@@ -837,15 +839,11 @@ impl RingBuffer {
     /// Format a ring into a region the caller owns, then attach to it.
     ///
     /// The counterpart to [`create_in_memory`](Self::create_in_memory) for a
-    /// host that must place the region somewhere specific rather than on its
-    /// own heap — a wasm host puts rings inside the guest's linear memory so
-    /// the guest can attach to them by offset, since a guest cannot follow a
-    /// pointer into the host.
-    ///
-    /// `len` must be at least [`region_len`] for `cfg`, and `base` must be
-    /// 8-aligned; both are checked. The region is left formatted, so a later
-    /// [`attach_raw`](Self::attach_raw) over the same bytes reads the same
-    /// geometry back.
+    /// caller that must place the region at an address it controls rather
+    /// than on its own heap. `len` must be at least [`region_len`] for `cfg`,
+    /// and `base` must be 8-aligned; both are checked. The region is left
+    /// formatted, so a later [`attach_raw`](Self::attach_raw) over the same
+    /// bytes reads the same geometry back.
     ///
     /// # Safety
     /// `base..base + len` is a live, exclusively-owned region that outlives
@@ -978,14 +976,10 @@ impl RingBuffer {
     }
 
     /// Create the single writer for this buffer, claiming the writer role in
-    /// the shared region.
-    ///
-    /// The claim lives in the region itself, so it is enforced across handles
-    /// and across processes. Dropping the [`Writer`] frees it; a crashed
-    /// process leaks it, and [`reclaim_owner`](RingBuffer::reclaim_owner)
-    /// frees it.
-    ///
-    /// `data` is notified after every commit. Pass [`NoWake`] if only the
+    /// the shared region. The claim is enforced across every handle and
+    /// process; dropping the [`Writer`] frees it, and a crashed process's
+    /// claim is freed by [`reclaim_owner`](RingBuffer::reclaim_owner). `data`
+    /// is notified after every commit; pass [`NoWake`] if only the
     /// synchronous APIs are used.
     pub fn writer<WD: WakeSource>(&self, data: WD) -> Result<Writer<WD>, WriterClaimed> {
         // Acquire on success pairs with the Release store in `Writer::drop`
@@ -1003,23 +997,18 @@ impl RingBuffer {
         })
     }
 
-    /// Forcibly free everything a dead process left claimed in this region:
-    /// every reader slot whose owner tag is `pid`, and the writer claim if
-    /// that process held it. A pinned dead cursor otherwise backpressures the
-    /// writer forever, so a host that detects a peer's death runs this over
-    /// each region the peer had attached.
-    ///
-    /// Freed space wakes no one: writers never wait for space, so the next
-    /// non-blocking write simply finds the room.
+    /// Free every reader slot and the writer claim `pid` still holds in this
+    /// region (see the crate docs). Freed space wakes no one; writers never
+    /// wait for space, so the next non-blocking write simply finds the room.
     ///
     /// # Safety
     /// The caller asserts the process identified by `pid` (its
-    /// `std::process::id()`) is dead — exited and reaped, so none of its
+    /// `std::process::id()`) is dead, exited and reaped, so none of its
     /// stores are still in flight. Reclaiming a live process's claims
-    /// re-creates the very races the claim word and reader registration
-    /// exist to prevent. Handles the dead process left behind must never be
-    /// used again. `pid` must not alias a live claimant through pid reuse;
-    /// reclaim promptly after reaping, before spawning replacements.
+    /// re-creates the races the claim word and reader registration exist to
+    /// prevent, and any handle the dead process held must never be used
+    /// again. `pid` must not alias a live claimant through pid reuse, so
+    /// reclaim promptly after reaping and before spawning replacements.
     pub unsafe fn reclaim_owner(&self, pid: u64) {
         for slot in 0..self.inner.max_readers {
             if self.inner.slot_cursor(slot).load(Acquire) != FREE_SLOT
@@ -1040,7 +1029,7 @@ impl RingBuffer {
     /// Register a new view, claiming a free slot in the reader table.
     ///
     /// A fresh view only sees data committed from now on. The async
-    /// [`View::read_into`] and [`View::read`] await `data`.
+    /// [`View::read`] awaits `data`.
     pub fn view<RD: WakeSink>(&self, data: RD) -> Result<View<RD>, FullReaderTable> {
         let mut start = self.inner.committed().load(Acquire);
         for slot in 0..self.inner.max_readers {
@@ -1104,11 +1093,8 @@ impl RingBuffer {
 }
 
 /// The [`Config`] an existing region was formatted with, read back out of its
-/// header.
-///
-/// For a caller that must build a *second* ring matching a first — a wasm host
-/// giving its guest a region mirroring the coordinator's, so the two sides of
-/// a copy always agree on what a record can be.
+/// header. Useful when a caller must build a second ring matching a first,
+/// so both sides agree on what a record can be.
 ///
 /// # Safety
 /// `base..base + len` is a live, header-valid ring region.
@@ -1133,24 +1119,33 @@ pub fn region_len(cfg: &Config) -> usize {
 /// Compute `(reader_table_offset, data_offset, total_size)` and validate the
 /// config.
 fn layout(cfg: &Config) -> (usize, usize, usize) {
-    assert!(
-        cfg.capacity.is_power_of_two(),
-        "capacity must be a power of two, got {}",
-        cfg.capacity
-    );
-    // Below one record header no write could ever succeed, and `read_len`'s
-    // `phys + 8 <= capacity` contract would break. `read_header` performs the
-    // same check on attach.
-    assert!(
-        cfg.capacity >= 8,
-        "capacity must hold at least one record header (8 bytes), got {}",
-        cfg.capacity
-    );
-    assert!(cfg.max_readers > 0, "max_readers must be > 0");
-    let reader_table_offset = HEADER_SIZE;
-    let data_offset = HEADER_SIZE + cfg.max_readers * READER_SLOT_SIZE;
-    let total = data_offset + cfg.capacity;
-    (reader_table_offset, data_offset, total)
+    checked_layout(cfg)
+        .expect("ring capacity and reader table must form a valid, representable region")
+}
+
+/// The region size, or `None` if the capacity, reader count, or total size
+/// cannot be represented by the ring format and a Rust allocation.
+pub fn checked_region_len(cfg: &Config) -> Option<usize> {
+    checked_layout(cfg).map(|(_, _, total)| total)
+}
+
+fn checked_layout(cfg: &Config) -> Option<(usize, usize, usize)> {
+    if !cfg.capacity.is_power_of_two()
+        || cfg.capacity < 8
+        || cfg.max_readers == 0
+        || u32::try_from(cfg.max_readers).is_err()
+    {
+        return None;
+    }
+    let data_offset = cfg
+        .max_readers
+        .checked_mul(READER_SLOT_SIZE)?
+        .checked_add(HEADER_SIZE)?;
+    let total = data_offset.checked_add(cfg.capacity)?;
+    if total > isize::MAX as usize {
+        return None;
+    }
+    Some((HEADER_SIZE, data_offset, total))
 }
 
 /// Write the header and initialize the control words and reader slots.
@@ -1362,11 +1357,11 @@ impl<WD: WakeSource> Writer<WD> {
         // SAFETY: record is contiguous and in-bounds (caller contract).
         unsafe { self.inner.write_record(phys, bytes) };
         if gap > 0 {
-            // Publish where valid data ends before the gap so readers skip it.
+            // hwm before committed; see the crate docs.
             self.inner.hwm().store(committed, Release);
         }
-        // Release hands the freshly written bytes (and the hwm store) to
-        // readers, which Acquire-load `committed` before touching the ring.
+        // Release hands the freshly written bytes to readers, which
+        // Acquire-load `committed` before touching the ring.
         self.inner.committed().store(end_abs, Release);
         self.data.notify();
     }
@@ -1431,22 +1426,6 @@ impl<RD: WakeSink> View<RD> {
         Ok(true)
     }
 
-    /// Await and copy the next record into `buf`.
-    pub async fn read_into(&mut self, buf: &mut Vec<u8>) -> Result<(), ReadError> {
-        loop {
-            if self.try_read_into(buf)? {
-                return Ok(());
-            }
-            let inner = self.inner.clone();
-            let slot = self.slot;
-            self.data
-                .wait_until(|| {
-                    inner.committed().load(Acquire) > inner.slot_cursor(slot).load(Acquire)
-                })
-                .await;
-        }
-    }
-
     /// Borrow the next record without copying.
     ///
     /// The writer cannot overwrite a record this view has not consumed, so
@@ -1472,8 +1451,7 @@ impl<RD: WakeSink> View<RD> {
         }))
     }
 
-    /// Await the next record and borrow it, the grant twin of
-    /// [`View::read_into`].
+    /// Await the next record and borrow it.
     pub async fn read(&mut self) -> Result<ReadGrant<'_>, ReadError> {
         // Awaiting and borrowing are split for the borrow checker. A grant
         // taken inside the wait loop would pin the `self` borrow across every
@@ -1535,11 +1513,8 @@ impl<RD: WakeSink> View<RD> {
         let cap = self.inner.capacity;
         loop {
             let r = self.inner.slot_cursor(self.slot).load(Acquire);
-            // The load order is load-bearing; `hwm` comes after `committed`.
-            // Seeing a post-wrap `committed` implies the wrap's earlier `hwm`
-            // store is visible, so a reader sitting at a gap always sees the
-            // marker before it could misread stale gap bytes as a record
-            // header.
+            // Load order matters here too: `committed` before `hwm`, the
+            // mirror of the writer's store order (crate docs).
             let c = self.inner.committed().load(Acquire);
             let hwm = self.inner.hwm().load(Acquire);
             if r == hwm {

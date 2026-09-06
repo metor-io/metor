@@ -1,21 +1,27 @@
-//! The free-running authoring form, and the cancellation handle it waits on.
+//! Free-running systems managed by the host executor.
 //!
-//! Every other system form lives in `metor-fsw-2-core`, because a pack, a
-//! shared library, or a wasm guest can construct one. An [`AsyncSystem`]
-//! cannot: it owns a task the coordinator's executor spawns once and never
-//! ticks, so it exists only where there is a runtime to own it. That is why it
-//! is here rather than beside [`CyclicSystem`](crate::CyclicSystem).
+//! The coordinator spawns each [`AsyncSystem`] once. Its task owns pacing,
+//! input waits, and status publication; [`AsyncContext`] provides cancellation.
 
 use core::future::Future;
 
-use metor_fsw_2_core::{System, SystemDescriptor, SystemKind, descriptor_for};
+use metor_fsw_2_core::{StatusPort, System, SystemDescriptor, SystemKind, descriptor_for};
 
-/// Cancellation-aware waits for an [`AsyncSystem`]'s run loop.
+/// An [`AsyncSystem`]'s run-loop handles: cancellation-aware waits, and its
+/// own status record.
 pub struct AsyncContext {
     pub(crate) cancel: stellarator::util::CancelToken,
+    pub(crate) status: StatusPort,
 }
 
 impl AsyncContext {
+    /// The system's `system_status` record. The host never steps a
+    /// free-running system, so it publishes this itself:
+    /// `context.status().tick(elapsed_us)` once per loop iteration.
+    pub fn status(&mut self) -> &mut StatusPort {
+        &mut self.status
+    }
+
     /// Runs `future` until it completes or coordinator shutdown begins.
     /// `None` means the future was cancelled and the run loop should return.
     pub async fn until_cancelled<F: Future>(&self, future: F) -> Option<F::Output> {
@@ -48,7 +54,7 @@ pub trait AsyncSystem: System {
     /// [`CyclicSystem::execute`](crate::CyclicSystem::execute).
     async fn run(
         &mut self,
-        context: &AsyncContext,
+        context: &mut AsyncContext,
         input: &mut Self::Input,
         output: &mut Self::Output,
     );

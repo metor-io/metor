@@ -9,9 +9,7 @@ use std::sync::Arc;
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::dynamic::node::{
-    BuildError, DynamicNode, NodeId, NodeImpl, ValueType, hash_id, op_tag,
-};
+use crate::dynamic::node::{BuildError, DynamicNode, NodeId, NodeImpl, ValueType, hash_id, op_tag};
 
 /// The node id [`from_db`] will give this component.
 ///

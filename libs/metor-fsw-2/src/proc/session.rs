@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 /// The directory holding everything a run shares with its workers, owned by
-/// the [`Coordinator`](crate::Coordinator) and removed best-effort on drop —
+/// the [`Coordinator`](crate::Coordinator) and removed best-effort on drop:
 /// its contents are ephemeral IPC state, never archives. On unix, unlinking
 /// still-mapped files is legal, so removal never races a straggling worker's
 /// mappings.

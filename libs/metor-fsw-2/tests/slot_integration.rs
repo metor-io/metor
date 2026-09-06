@@ -8,8 +8,9 @@
 //! fixture exports, allowed into a slot by name. The tests then drive the
 //! slot's lifecycle with [`SequenceCommand`]s and observe it from the outside.
 //! Together they cover the command-to-phase state machine, occupant swap, name
-//! addressing, the boot registry, and the build-time rejections a bad slot
-//! wiring surfaces as a [`LoadError`](metor_fsw_2::wiring::LoadError).
+//! addressing, the boot registry, occupant params on `allow`, and the
+//! build-time rejections a bad slot wiring surfaces as a
+//! [`LoadError`](metor_fsw_2::wiring::LoadError).
 //!
 //! Two conventions run through every test:
 //!
@@ -17,13 +18,10 @@
 //!   that arrive over an explicitly connected edge, so each target wires its
 //!   producer (the in-process control handle or another system) to the slot
 //!   with an explicit message edge.
-//! * Status taps are opened before the run. An overwrite ring's reader starts
+//! * Status taps are opened before the run. A ring reader starts
 //!   at the live edge, so a view created after the run would see nothing.
 //!
-//! The scripted-uplink command-dispatch tests, which need a test-double
-//! transport the `Wiring` path cannot express, live in-crate under
-//! `coordinator::uplink_tests`. The fixture build runs inside the test; if the
-//! build plumbing is unavailable the body is skipped rather than failed.
+//! The fixture build is required; a build failure fails the test.
 
 #![cfg(not(miri))]
 
@@ -34,15 +32,18 @@ use common::drain_msgs;
 
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::{
-    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
+    AlarmRaised, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+    SequenceRegistry,
 };
+use metor_fsw_2::params::ParamErrorKind;
 use metor_fsw_2::wiring::{LoadErrorKind, Registry, resolve};
 use metor_fsw_2::{
     AllowedOccupantSpec, BuildSystem, ClockSpec, CommandOut, Coordinator, CoordinatorSpec,
-    CyclicSystem, InitialOccupantSpec, Input, NAME_CAP, Out, ParamSource, SequenceStatus,
-    SlotInitState, SlotSpec, SlotStatus, System, SystemInput, SystemOutput, Timestamp, WireError,
-    Wiring, WiringBuilder,
+    CyclicSystem, Frame, InitialOccupantSpec, Input, MsgIn, NAME_CAP, Out, ParamSource,
+    SequenceStatus, SlotInitState, SlotSpec, SlotStatus, System, SystemInput, SystemOutput,
+    Timestamp, WireError, Wiring, WiringBuilder,
 };
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The seq fixture's cargo crate name and cdylib library stem.
 const FIXTURE_CRATE: &str = "metor-fsw-2-seq-fixture";
@@ -70,8 +71,8 @@ fn cmd(ch: &str, command: SequenceCommandKind) -> SequenceCommand {
 // Building and locating the fixture cdylib
 // ---------------------------------------------------------------------------
 
-/// Build the seq fixture cdylib and locate it, skipping on failure.
-fn locate_fixture() -> Option<PathBuf> {
+/// Build and locate the required seq fixture cdylib.
+fn locate_fixture() -> PathBuf {
     common::locate_fixture(FIXTURE_CRATE, FIXTURE_STEM)
 }
 
@@ -139,9 +140,7 @@ fn waiter_slot() -> Wiring {
 /// run state.
 #[test]
 fn slot_load_start_runs_to_done() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -197,9 +196,7 @@ fn slot_load_start_runs_to_done() {
 /// at its next wait and finishes Done with an Aborted run state.
 #[test]
 fn slot_abort_completes_aborted() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut seq_view: Input<SequenceStatus> = Input::new(
@@ -253,9 +250,7 @@ fn slot_abort_completes_aborted() {
 /// slot returns to Loaded and the occupant never polls or publishes.
 #[test]
 fn slot_stop_hard_drops_occupant() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -310,9 +305,7 @@ fn slot_stop_hard_drops_occupant() {
 /// fresh Start runs it to completion again.
 #[test]
 fn slot_reset_reruns_from_start() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut seq_view: Input<SequenceStatus> = Input::new(
@@ -392,9 +385,7 @@ fn two_occupant_slot() -> Wiring {
 /// entries over distinct fixture entries give the slot two occupant names.
 #[test]
 fn load_from_loaded_swaps_occupant() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(two_occupant_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -458,9 +449,7 @@ fn load_from_loaded_swaps_occupant() {
 /// channel was stuck until another terminal state.
 #[test]
 fn reset_then_load_swaps_occupant() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(two_occupant_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -535,9 +524,7 @@ fn reset_then_load_swaps_occupant() {
 /// `Refused` event — and changes nothing.
 #[test]
 fn load_while_running_is_refused() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(two_occupant_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -600,9 +587,7 @@ fn load_while_running_is_refused() {
 /// listing each slot with its allowed occupants.
 #[test]
 fn slot_emits_ordered_sequence_events_and_boot_registry() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let messages = coord.registry();
@@ -679,9 +664,7 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
 /// [`LoadErrorKind::Wire`], carrying the precise variant.
 #[test]
 fn slot_name_over_the_cap_is_a_build_error() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
 
     let long = "a".repeat(NAME_CAP + 1);
     let mut wiring = WiringBuilder::new()
@@ -710,9 +693,7 @@ fn slot_name_over_the_cap_is_a_build_error() {
 /// with no panic, no state change, and no event.
 #[test]
 fn misaddressed_command_matches_no_slot() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(waiter_slot(), &lib);
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -761,9 +742,7 @@ fn misaddressed_command_matches_no_slot() {
 /// adcs slot must run either way and the recovery slot must never leave Empty.
 /// One order per `#[test]` because `stellarator::run` is once per thread.
 fn drive_adcs_of_two_slots(adcs_first: bool) {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
 
     // The one coordinator producer is edged to both slots; only the slot whose
     // name matches a command's channel acts on it, so broad fan-out is
@@ -879,8 +858,8 @@ impl BuildSystem for Autonomy {
 
 /// Build one slot plus the autonomy emitter, with or without the command edge,
 /// and return the phases the slot published over a short run.
-fn autonomy_phases(edged: bool) -> Option<Vec<u8>> {
-    let lib = locate_fixture()?;
+fn autonomy_phases(edged: bool) -> Vec<u8> {
+    let lib = locate_fixture();
 
     let mut builder = WiringBuilder::new()
         .coordinator_spec(seq_coordinator())
@@ -914,16 +893,14 @@ fn autonomy_phases(edged: bool) -> Option<Vec<u8>> {
     });
     let phases = slot_phases(&mut slot_view);
     drop((coord, slot_view));
-    Some(phases)
+    phases
 }
 
 /// Declaring a command output is not enough; without a connected edge the
 /// emitter's commands reach nothing.
 #[test]
 fn command_output_without_an_edge_commands_nothing() {
-    let Some(phases) = autonomy_phases(false) else {
-        return;
-    };
+    let phases = autonomy_phases(false);
     assert!(
         phases.iter().all(|&p| p == 0),
         "an un-edged SequenceCommand producer drives no slot: {phases:?}"
@@ -933,9 +910,7 @@ fn command_output_without_an_edge_commands_nothing() {
 /// The same emit, now over a declared edge, drives the slot to completion.
 #[test]
 fn command_output_with_an_edge_drives_the_slot() {
-    let Some(phases) = autonomy_phases(true) else {
-        return;
-    };
+    let phases = autonomy_phases(true);
     assert!(
         phases.contains(&RUNNING),
         "the edged emitter drove the slot: {phases:?}"
@@ -956,9 +931,7 @@ fn command_output_with_an_edge_drives_the_slot() {
 /// runner-held view.
 #[test]
 fn edge_into_a_host_connected_input_is_rejected() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
 
     let mut wiring = WiringBuilder::new()
         .coordinator_spec(seq_coordinator())
@@ -989,9 +962,7 @@ fn edge_into_a_host_connected_input_is_rejected() {
 /// `coordinator::tests::add_slot_rejects_contract_violations` pins directly).
 #[test]
 fn initial_occupant_outside_allowed_set_is_rejected() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
 
     // The builder's `slot(..).end()` would panic on an `initial` outside the
     // allow set; `add_slot_spec` trusts the spec, so the invalid slot reaches
@@ -1016,6 +987,7 @@ fn initial_occupant_outside_allowed_set_is_rejected() {
             process: false,
             src: None,
             scope: None,
+            status: None,
         })
         .build();
     wiring.artifacts[0].path = Some(lib);
@@ -1068,9 +1040,7 @@ fn beater_views(coord: &Coordinator) -> (Input<SequenceStatus>, Input<SlotStatus
 /// step, never terminal on its own.
 #[test]
 fn cyclic_occupant_runs_steadily() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(beater_slot(), &lib);
     let (mut seq_view, mut slot_view) = beater_views(&coord);
     let mut control = coord.control_handle().expect("taken once per coordinator");
@@ -1097,9 +1067,7 @@ fn cyclic_occupant_runs_steadily() {
 /// and reports a terminal `Aborted`.
 #[test]
 fn cyclic_occupant_abort_is_terminal() {
-    let Some(lib) = locate_fixture() else {
-        return;
-    };
+    let lib = locate_fixture();
     let mut coord = resolve_slot(beater_slot(), &lib);
     let (mut seq_view, mut slot_view) = beater_views(&coord);
     let mut control = coord.control_handle().expect("taken once per coordinator");
@@ -1123,4 +1091,233 @@ fn cyclic_occupant_abort_is_terminal() {
     let phases = slot_phases(&mut slot_view);
     assert_eq!(phases.last(), Some(&DONE), "terminal Done: {phases:?}");
     drop((coord, seq_view, slot_view, control));
+}
+
+// ---------------------------------------------------------------------------
+// Occupant params on `allow`
+// ---------------------------------------------------------------------------
+
+/// Host-side mirror of the fixture's `GainerParams`.
+#[derive(serde::Serialize)]
+struct GainerParams {
+    gain: f64,
+}
+
+/// Host-side mirror of the fixture's `gain_out` frame, byte for byte.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "gain_out")]
+struct GainOut {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    gain: f64,
+}
+
+/// A slot whose single allowed occupant, `gainer`, carries typed params; the
+/// running occupant republishes its configured gain on its user output.
+#[test]
+fn slot_allow_params_reach_the_occupant() {
+    let lib = locate_fixture();
+    let wiring = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("gslot")
+        .output("gain_out")
+        .allow_with_params("gainer", GainerParams { gain: 0.8 })
+        .initial("gainer", SlotInitState::Running)
+        .end()
+        .build();
+    let mut coord = resolve_slot(wiring, &lib);
+    let mut gain_view: Input<GainOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("gslot.gain_out"))
+            .expect("the slot's user output is registered")
+            .expect("a reader slot is available"),
+    );
+    let coord = stellarator::run(|| async move {
+        coord.run_for(6).await;
+        coord
+    });
+    {
+        let out = gain_view
+            .latest()
+            .expect("gain ring readable")
+            .expect("the occupant published its configured gain");
+        assert_eq!(out.get().gain, 0.8, "allow params reached the occupant");
+    }
+    assert!(coord.stopped().is_empty(), "Done is not a hard-stop");
+    drop((coord, gain_view));
+}
+
+/// A typo'd allow param is a spanned `UnknownParam` at resolve, naming the
+/// property, not a silent drop.
+#[test]
+fn slot_allow_unknown_param_is_a_clean_error() {
+    let lib = locate_fixture();
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("gslot")
+        .output("gain_out")
+        .allow_with_value("gainer", serde_json::json!({ "gian": 0.8 }))
+        .initial("gainer", SlotInitState::Running)
+        .end()
+        .build();
+    wiring.artifacts[0].path = Some(lib);
+    let err = match resolve(&wiring, &Registry::new()) {
+        Ok(_) => panic!("expected an UnknownParam error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.kind, LoadErrorKind::Params(ParamErrorKind::UnknownParam { ref property, .. }) if property == "gian"),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Resolve-time rejections and mixed targets
+// ---------------------------------------------------------------------------
+
+/// `waiter` has no user inputs, so declaring an `input("nonsense")` cannot
+/// match the resolved descriptor and resolve reports `SlotContractMismatch`.
+#[test]
+fn slot_declared_contract_mismatch_is_a_clean_error() {
+    let lib = locate_fixture();
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("adcs")
+        .input("nonsense")
+        .allow("waiter")
+        .end()
+        .build();
+    wiring.artifacts[0].path = Some(lib);
+    let err = match resolve(&wiring, &Registry::new()) {
+        Ok(_) => panic!("expected a SlotContractMismatch error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err.kind,
+            LoadErrorKind::SlotContractMismatch { dir: "input", .. }
+        ),
+        "{err:?}"
+    );
+}
+
+/// A runtime `Load` naming an occupant outside the allowed set is rejected
+/// loudly, with a `Failed` event on the slot's events channel naming the bad
+/// occupant and the allowed set, rather than silently leaving the slot Empty.
+#[test]
+fn unknown_runtime_load_is_rejected_with_a_failed_event() {
+    let lib = locate_fixture();
+    let mut coord = resolve_slot(waiter_slot(), &lib);
+
+    // Tap the events channel before the run; an overwrite ring starts a reader
+    // at the live edge, so a tap taken after the emit would miss it.
+    let mut events_view = coord
+        .registry()
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+    control.emit(&load("adcs", "nonesuch")).unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(2).await;
+        coord
+    });
+
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    let failed = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            SequenceEventKind::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("the unknown-occupant Load emitted a Failed event");
+    assert!(
+        failed.contains("nonesuch"),
+        "names the bad occupant: {failed}"
+    );
+    assert!(failed.contains("waiter"), "lists the allowed set: {failed}");
+
+    drop((coord, events_view, control));
+}
+
+/// A `system "alarms"` node coexists with a slot, and is declared first on
+/// purpose. The alarm engine registers a receive-all input, which must come
+/// last in build order; the resolver defers it behind the slot's cyclic
+/// registration so the target still builds. The alarm targets the slot's own
+/// host `SlotStatus.phase` frame and raises when the occupant completes
+/// (Done = 4 > 2.5): to the alarm engine a slot is just another telemetered
+/// component.
+#[test]
+fn alarms_node_before_a_slot_still_builds_and_raises() {
+    let lib = locate_fixture();
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .system("alarms")
+        .ty("Alarms")
+        .params_value(serde_json::json!({
+            "alarm": [{
+                "id": "SLOT_DONE",
+                "name": "Slot Done",
+                "target": { "component": "adcs.slot_status.phase" },
+                "warning": { "above": 2.5 },
+            }],
+        }))
+        .end()
+        .slot("adcs")
+        .allow("waiter")
+        .initial("waiter", SlotInitState::Running)
+        .end()
+        .build();
+    assert_eq!(
+        wiring.systems[0].name, "alarms",
+        "the alarm node comes first"
+    );
+    wiring.artifacts[0].path = Some(lib);
+
+    let coord = resolve(&wiring, &Registry::with_builtins())
+        .expect("the alarm engine's receive-all input defers behind the slot");
+    let mut raised: MsgIn<AlarmRaised> = MsgIn::new(
+        coord
+            .registry()
+            .get(ComponentId::new("alarms.AlarmRaised"))
+            .expect("alarm raise channel registered")
+            .view()
+            .expect("a reader slot is available"),
+    );
+
+    let coord = stellarator::run(|| async move {
+        let mut coord = coord;
+        coord.run_for(6).await;
+        coord
+    });
+
+    let mut got = Vec::new();
+    raised
+        .drain(|r| got.push(r.def_id))
+        .expect("raised ring readable");
+    assert_eq!(got, vec!["SLOT_DONE"], "the slot-phase alarm raised once");
+    drop(coord);
+}
+
+#[test]
+fn stalled_status_reader_does_not_stop_native_slot() {
+    let lib = locate_fixture();
+    let wiring = WiringBuilder::new()
+        .coordinator_spec(seq_coordinator())
+        .artifact("seqs", FIXTURE_CRATE, FIXTURE_STEM)
+        .slot("adcs")
+        .allow("beater")
+        .initial("beater", SlotInitState::Running)
+        .end()
+        .build();
+    let coord = resolve_slot(wiring, &lib);
+    stellarator::run(|| common::assert_status_backpressure(coord, "adcs"));
 }

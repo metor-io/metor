@@ -2,7 +2,7 @@
 //!
 //! This crate is everything a system author writes against, and nothing that
 //! flies a target. `metor-fsw-2` links it, adds the coordinator, the wiring
-//! resolver, the loaders, and the CLI, and re-exports it whole — so a target
+//! resolver, the loaders, and the CLI, and re-exports it whole, so a target
 //! crate still sees one surface, while a pack, a sequence, or a contract crate
 //! depends on this crate alone.
 //!
@@ -61,11 +61,11 @@
 //! An [`Output`] owns a ring writer. An [`Input`] owns a read view into an
 //! upstream ring. A full ring makes a write return [`WriteError`]. The
 //! `publish` helpers keep the cycle moving by dropping the new record and
-//! counting that loss for health telemetry.
+//! reporting that loss on the log.
 //!
-//! Each system has health and log outputs. Cyclic drivers close a health cycle
-//! after each step and send a [`SystemHealth`] frame plus queued [`LogEvent`]
-//! messages.
+//! Each system has a log output; cyclic drivers flush its queued [`LogEvent`]
+//! messages after each step. The host publishes each system's
+//! [`SystemStatus`] run record itself.
 //!
 //! # Packs
 //!
@@ -74,10 +74,6 @@
 //! three paths use the same descriptors, the same [`RingSource`] binding, and
 //! the same [`CyclicSlot`] step interface, so a system never learns which one
 //! it is under.
-//!
-//! # More detail
-//!
-//! Start with [`docs/README.md`](https://github.com/metor-io/metor/blob/main/libs/metor-fsw-2/docs/README.md).
 
 mod binder;
 mod descriptor;
@@ -95,8 +91,9 @@ mod text;
 mod writer;
 
 mod clock;
-pub mod health;
+pub mod log;
 pub mod logfwd;
+pub mod status;
 
 pub mod sequence;
 
@@ -135,10 +132,12 @@ pub use descriptor::{
     Capability, Declarations, Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema,
     SystemDescriptor, SystemKind,
 };
-pub use health::{HealthPort, LogEvent, LogLevel, MAX_ERR_KINDS, MAX_LINES, SystemHealth};
+pub use log::{LogEvent, LogLevel, LogPort, MAX_LINES};
 pub use port::{
     DEFAULT_DEPTH, FrameRef, FrameWriteError, Input, Output, buffer_capacity, capacity_for,
+    checked_capacity_for,
 };
+pub use status::{StatusPort, SystemStatus, host_status_port, publish_status};
 
 pub use message::{
     CommandOut, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, MsgTable, NamedMsg, split_record,
@@ -146,7 +145,7 @@ pub use message::{
 #[doc(hidden)]
 pub use params_docs::ParamsDocEntry;
 pub use system::{
-    BuildCtx, BuildSystem, ConfigureError, CyclicRunner, CyclicSystem, HealthOutput, Out, System,
+    BuildCtx, BuildSystem, ConfigureError, CyclicRunner, CyclicSystem, LogOutput, Out, System,
     SystemInput, SystemOutput, descriptor_for,
 };
 

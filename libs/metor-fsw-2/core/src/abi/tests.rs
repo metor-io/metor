@@ -33,13 +33,9 @@ use crate::abi::{
 };
 use crate::sequence::{Outcome, SequenceStatus, SlotControlIn, wait};
 use crate::{
-    BuildSystem, CyclicSystem, Frame, HealthPort, Input, Out, Output, Pack, System, SystemHealth,
+    BuildSystem, CyclicSystem, Frame, Input, LogLevel, LogPort, Out, Output, Pack, System,
     SystemInput, SystemKind, SystemOutput, buffer_capacity,
 };
-
-// ---------------------------------------------------------------------------
-// Fixture frames and a small cyclic system exported through the ABI.
-// ---------------------------------------------------------------------------
 
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
@@ -94,7 +90,9 @@ impl CyclicSystem for Counter {
         let value = match input.tick.latest() {
             Ok(Some(t)) => t.get().value,
             _ => {
-                output.health().error("no_tick");
+                output
+                    .log()
+                    .fault(LogLevel::Warn, "no_tick", "no tick sample", &[]);
                 return;
             }
         };
@@ -176,12 +174,12 @@ fn counter_entry(
     now: Timestamp,
     tick: &mut Input<TickIn>,
     out: &mut Output<TickOut>,
-    health: &mut HealthPort,
+    log: &mut LogPort,
 ) {
     let value = match tick.latest() {
         Ok(Some(t)) => t.get().value,
         _ => {
-            health.error("no_tick");
+            log.fault(LogLevel::Warn, "no_tick", "no tick sample", &[]);
             return;
         }
     };
@@ -230,10 +228,6 @@ impl Drop for OpenPack {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Host-emulation helpers.
-// ---------------------------------------------------------------------------
-
 fn ring_for<F: Frame>(depth: usize, readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
@@ -260,17 +254,12 @@ fn postcard_round_trip<T: Serialize + DeserializeOwned>(value: &T) -> T {
     postcard::from_bytes(&bytes).expect("test value decodes")
 }
 
-// ---------------------------------------------------------------------------
-// Lifecycle end-to-end: create, bind, write, execute, read back.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn abi_lifecycle_end_to_end() {
     // The host owns the rings. Output descriptor order is the user `out`
-    // followed by the implicit health and log ports.
+    // followed by the implicit log port.
     let in_ring = ring_for::<TickIn>(8, 1);
     let out_ring = ring_for::<TickOut>(8, 1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = log_ring_for(1);
 
     // Register the host's view before the system writes; a fresh view only
@@ -280,7 +269,6 @@ fn abi_lifecycle_end_to_end() {
     let inputs = [handle(&in_ring, ROLE_INPUT)];
     let outputs = [
         handle(&out_ring, ROLE_OUTPUT),
-        handle(&health_ring, ROLE_OUTPUT),
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
@@ -339,7 +327,7 @@ fn abi_lifecycle_end_to_end() {
     }
 
     drop(pack);
-    drop((in_ring, out_ring, health_ring, log_ring, out_view));
+    drop((in_ring, out_ring, log_ring, out_view));
 }
 
 /// An out-of-range entry index is a null state, never a crash; so is a
@@ -362,10 +350,6 @@ fn pack_create_bounds_and_reuse() {
         run_pack_destroy(b);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Manifest round-trip through fsw_pack_describe and postcard.
-// ---------------------------------------------------------------------------
 
 /// Read the manifest back the way a host does: describe for the length, then
 /// copy that many bytes from the pointer the pack still owns.
@@ -424,9 +408,9 @@ fn abi_describe_round_trips() {
     );
     assert_eq!(got.inputs[0].id(), desc.inputs[0].id());
 
-    // The user `out` plus the implicit health and log ports.
+    // The user `out` plus the implicit log port.
     assert_eq!(got.outputs.len(), desc.outputs.len());
-    assert_eq!(got.outputs.len(), 3);
+    assert_eq!(got.outputs.len(), 2);
     assert_eq!(
         got.outputs[0].id().component().expect("table port"),
         TickOut::FRAME_ID
@@ -449,10 +433,6 @@ fn abi_describe_round_trips() {
         "Params schema round-trips"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Telemetry-prefix rewrite on a reconstructed descriptor's outputs.
-// ---------------------------------------------------------------------------
 
 /// Every component id a vtable realizes in registration mode, so a test can
 /// assert exactly which ids the schema bakes in.
@@ -506,10 +486,6 @@ fn dl_announce_prefixes_vtable_ids() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Panic containment: a panicking execute returns Panicked, never unwinds.
-// ---------------------------------------------------------------------------
-
 #[derive(Default)]
 struct Boom;
 
@@ -562,13 +538,11 @@ extern "C" fn boom_execute(state: *mut c_void, now: u64) -> FswStatus {
 fn abi_panic_is_contained() {
     let in_ring = ring_for::<TickIn>(8, 1);
     let out_ring = ring_for::<TickOut>(8, 1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = log_ring_for(1);
 
     let inputs = [handle(&in_ring, ROLE_INPUT)];
     let outputs = [
         handle(&out_ring, ROLE_OUTPUT),
-        handle(&health_ring, ROLE_OUTPUT),
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
@@ -604,12 +578,12 @@ fn abi_panic_is_contained() {
     }
 
     drop(pack);
-    drop((in_ring, out_ring, health_ring, log_ring));
+    drop((in_ring, out_ring, log_ring));
 }
 
-/// [`FswStatus::from_raw`] sits on the trust boundary. The three declared
-/// discriminants round-trip; any other word folds to `Panicked` rather than
-/// being treated as a valid `repr(u32)` value.
+/// The three declared discriminants round-trip through [`FswStatus::from_raw`]
+/// and any other word folds to `Panicked` rather than being treated as a
+/// valid `repr(u32)` value.
 #[test]
 fn from_raw_folds_out_of_range_to_panicked() {
     assert_eq!(FswStatus::from_raw(0), FswStatus::Running);
@@ -624,16 +598,14 @@ fn from_raw_folds_out_of_range_to_panicked() {
 // ---------------------------------------------------------------------------
 // A task entry driven through the pack ABI under the slot-occupant mount:
 // the framework appends the SlotControlIn input after the entry's inputs
-// (none here) and the SequenceStatus output after its health/log tail.
+// (none here) and the SequenceStatus output after its log tail.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn seq_abi_runs_to_done() {
-    // Rings in occupant-mount order: input [control]; outputs [health, log,
-    // status].
+    // Rings in occupant-mount order: input [control]; outputs [log, status].
     let control_ring = ring_for::<SlotControlIn>(8, 1);
     let status_ring = ring_for::<SequenceStatus>(8, 1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = log_ring_for(1);
 
     // Register the host's view before the occupant writes.
@@ -641,7 +613,6 @@ fn seq_abi_runs_to_done() {
 
     let inputs = [handle(&control_ring, ROLE_INPUT)];
     let outputs = [
-        handle(&health_ring, ROLE_OUTPUT),
         handle(&log_ring, ROLE_OUTPUT),
         handle(&status_ring, ROLE_OUTPUT),
     ];
@@ -691,22 +662,15 @@ fn seq_abi_runs_to_done() {
         run_pack_destroy(state);
     }
     drop(pack);
-    drop((
-        control_ring,
-        status_ring,
-        health_ring,
-        log_ring,
-        status_view,
-    ));
+    drop((control_ring, status_ring, log_ring, status_view));
 }
 
 // ---------------------------------------------------------------------------
 // Announce equivalence: the data path (carried unprefixed vtable + metadata,
 // re-prefixed on the host) realizes identically to the static announce path.
-// This is the invariant the merged descriptor family rests on. The contract is
-// realized identity — same component ids, types, shapes, frames, and dynamic
-// paths — not byte identity; every consumer realizes the vtable rather than
-// comparing its serialized bytes.
+// The contract is realized identity (same component ids, types, shapes,
+// frames, and dynamic paths), not byte identity; every consumer realizes the
+// vtable rather than comparing its serialized bytes.
 // ---------------------------------------------------------------------------
 
 /// The data announce of `F` under `prefix`: the port carries the unprefixed
@@ -783,86 +747,67 @@ struct ProbeAxes {
     omega_b: Axes,
 }
 
-/// Everything registration-mode realization surfaces about one field: the
-/// component identity, its schema, its frame tag, and whether it came through
-/// a dynamic terminal.
-#[derive(Debug, PartialEq)]
-struct RealizedShape {
-    component_id: ComponentId,
-    ty: metor_proto::types::PrimType,
-    shape: Vec<usize>,
-    frame: Option<ComponentId>,
-    dynamic: bool,
-}
-
-fn realized_shapes(vt: &VTable) -> Vec<RealizedShape> {
-    vt.realize_fields(None)
-        .map(|f| {
-            let f = f.expect("announce vtable realizes");
-            RealizedShape {
-                component_id: f.component_id,
-                ty: f.ty,
-                shape: f.shape.to_vec(),
-                frame: f.frame,
-                dynamic: f.dynamic,
-            }
-        })
-        .collect()
-}
-
-/// The resolved name strings of every dynamic terminal (`Op::List`/`Op::Map`),
-/// in op order — the strings the prefix rewrite must carry the instance name
-/// onto for top-level dynamics and leave element-relative for nested ones.
-fn dynamic_terminal_names(vt: &VTable) -> Vec<String> {
-    use metor_proto::vtable::Op;
-    vt.ops
-        .iter()
-        .filter_map(|op| {
-            let name = match op {
-                Op::List { name, .. } | Op::Map { name, .. } => *name,
-                _ => return None,
-            };
-            let Ok(Op::Data { offset, len }) = vt.get_op(name) else {
-                return None;
-            };
-            let bytes = &vt.data.as_slice()[offset.to_index()..offset.to_index() + *len as usize];
-            Some(String::from_utf8(bytes.to_vec()).expect("dynamic name is UTF-8"))
-        })
-        .collect()
-}
-
 /// Assert the data announce realizes identically to the static announce of
-/// `F`: the full realized field set, the metadata vector, and the resolved
-/// dynamic path strings.
+/// `F`: the realized field set, the metadata vector, and the resolved dynamic
+/// path strings (the instance prefix must reach top-level dynamic members, so
+/// two instances of one system never collide on their dynamic paths).
 fn assert_announce_eq<F: Frame>(prefix: &str) {
+    use metor_proto::vtable::Op;
+    let realized = |vt: &VTable| {
+        vt.realize_fields(None)
+            .map(|f| {
+                let f = f.expect("announce vtable realizes");
+                (f.component_id, f.ty, f.shape.to_vec(), f.frame, f.dynamic)
+            })
+            .collect::<Vec<_>>()
+    };
+    let dynamic_names = |vt: &VTable| {
+        vt.ops
+            .iter()
+            .filter_map(|op| {
+                let name = match op {
+                    Op::List { name, .. } | Op::Map { name, .. } => *name,
+                    _ => return None,
+                };
+                let Ok(Op::Data { offset, len }) = vt.get_op(name) else {
+                    return None;
+                };
+                let bytes =
+                    &vt.data.as_slice()[offset.to_index()..offset.to_index() + *len as usize];
+                Some(String::from_utf8(bytes.to_vec()).expect("dynamic name is UTF-8"))
+            })
+            .collect::<Vec<_>>()
+    };
     let (svt, smeta) = crate::descriptor::announce_of::<F>(prefix);
     let (dvt, dmeta) = data_announce::<F>(prefix);
     assert_eq!(
-        realized_shapes(&svt),
-        realized_shapes(&dvt),
+        realized(&svt),
+        realized(&dvt),
         "realized field sets match for prefix {prefix:?}"
     );
     assert_eq!(smeta, dmeta, "metadata matches for prefix {prefix:?}");
     assert_eq!(
-        dynamic_terminal_names(&svt),
-        dynamic_terminal_names(&dvt),
+        dynamic_names(&svt),
+        dynamic_names(&dvt),
         "dynamic paths match for prefix {prefix:?}"
     );
 }
 
-/// For a frame of plain scalar fields, the metadata-driven leaf-id rewrite the
-/// data path performs realizes identically to the static announce.
+/// The metadata-driven rewrite the data path performs realizes identically
+/// to the static announce: plain scalar frames, an element-named vector, and
+/// a frame with dynamic members.
 #[test]
-fn announce_data_path_matches_static_scalar() {
+fn announce_data_path_matches_static() {
     for prefix in ["inst", "a.b"] {
         assert_announce_eq::<TickIn>(prefix);
         assert_announce_eq::<TickOut>(prefix);
         assert_announce_eq::<ProbeAxes>(prefix);
+        assert_announce_eq::<ProbeDyn>(prefix);
     }
 }
 
-/// The announce metadata keeps each component's metadata map — element names,
-/// enum variants — under the instance prefix, exactly as the static
+/// The announce metadata keeps each component's metadata map (element names,
+/// enum variants) under the instance prefix, exactly as the static
 /// `metadata(prefix)` path emits it.
 #[test]
 fn announce_preserves_element_names() {
@@ -874,23 +819,6 @@ fn announce_preserves_element_names() {
         .expect("the axes component is announced");
     assert_eq!(m.element_names(), "x,y,z");
 }
-
-/// Frames with dynamic members (`FrameList`/`FrameMap`, including every
-/// system's implicit `health` frame) realize identically too: the
-/// prefix rewrite carries the instance prefix onto the top-level dynamic path
-/// strings, so `inst.health.error_counts.<kind>` ids match the static path and
-/// two instances of one system never collide on their dynamic paths.
-#[test]
-fn announce_data_path_matches_static_dynamic() {
-    for prefix in ["inst", "a.b"] {
-        assert_announce_eq::<ProbeDyn>(prefix);
-        assert_announce_eq::<crate::SystemHealth>(prefix);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PortDesc: both schema arms round-trip through postcard with their axes.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn port_desc_round_trips_both_arms() {
@@ -936,12 +864,8 @@ fn port_desc_round_trips_both_arms() {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// The allocator entry points a wasm host places ring regions through.
-// ---------------------------------------------------------------------------
-
-/// A region has to be attachable as a ring, so it must come back 8-aligned and
-/// zeroed. `attach_raw` rejects a misaligned base outright.
+/// A region must come back 8-aligned and zeroed, since `attach_raw` rejects a
+/// misaligned base outright.
 #[test]
 fn alloc_is_ring_aligned_and_zeroed() {
     let len = 4096;

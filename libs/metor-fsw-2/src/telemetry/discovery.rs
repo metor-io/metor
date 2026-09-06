@@ -1,20 +1,18 @@
 //! mDNS/DNS-SD advertisement for the link server.
 //!
 //! [`advertise`] publishes a [`FSW_SERVICE_TYPE`] service instance so ground
-//! tools (metor-panel) discover this fsw by name on the local link, without a
-//! central registry. Discovery is best-effort: any failure logs and leaves the
-//! link reachable by direct address — a link that can't advertise still
+//! tools discover this fsw by name on the local link, without a central
+//! registry. Discovery is best-effort: any failure logs and leaves the link
+//! reachable by direct address, since a link that can't advertise still
 //! serves. A loopback bind is skipped: loopback isn't a multicast link, so
 //! advertising `127.0.0.1` would be noise nothing on the network can reach.
 
 use std::net::SocketAddr;
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use metor_proto_wkt::{
-    FSW_SERVICE_TYPE, LINK_PROTOCOL_VERSION, TXT_PROTOCOL_VERSION, TXT_ROLE,
-};
+use metor_proto_wkt::{FSW_SERVICE_TYPE, LINK_PROTOCOL_VERSION, TXT_PROTOCOL_VERSION, TXT_ROLE};
 
-/// Advertise this link over mDNS under `name`, returning the running daemon —
+/// Advertise this link over mDNS under `name`, returning the running daemon;
 /// drop it (or [`ServiceDaemon::shutdown`]) to unregister and send a goodbye.
 /// `None` when the bind is loopback or the daemon can't start; the link stays
 /// reachable by direct address either way.
@@ -31,7 +29,10 @@ pub(crate) fn advertise(name: &str, addr: SocketAddr) -> Option<ServiceDaemon> {
             return None;
         }
     };
-    let host = format!("{}.local.", gethostname::gethostname().to_string_lossy());
+    // The daemon is its own mDNS responder, so the host it claims must not be
+    // the OS hostname: the system responder (mDNSResponder, Avahi) treats a
+    // second answerer for its name as a conflict and renames the machine.
+    let host = format!("{name}.metor.local.");
     let protocol_version = LINK_PROTOCOL_VERSION.to_string();
     let props: [(&str, &str); 2] = [
         (TXT_PROTOCOL_VERSION, protocol_version.as_str()),

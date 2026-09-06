@@ -383,12 +383,30 @@ pub struct ConnectionsStore {
     /// The LoD companion task is DB-wide and never stopped, so it spawns at
     /// most once — on the first local-authority connection.
     lod_spawned: bool,
-    /// Last layout JSON written to disk; skips rewrites while idle. Pane and
+    /// Last successful layout write per target; skips rewrites while idle. Pane and
     /// item mutations don't notify the tile group, so autosave poll-compares
     /// instead of observing.
-    last_saved_layout: Option<String>,
+    saved_layouts: SavedLayouts,
     registry_rx: mpsc::Receiver<RegistryOp>,
     _poll: Task<()>,
+}
+
+#[derive(Default)]
+struct SavedLayouts(std::collections::HashMap<TargetId, String>);
+
+impl SavedLayouts {
+    fn save(
+        &mut self,
+        id: &TargetId,
+        json: &str,
+        write: impl FnOnce(&TargetId, &str) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.0.get(id).map(String::as_str) != Some(json) {
+            write(id, json)?;
+            self.0.insert(id.clone(), json.to_owned());
+        }
+        Ok(())
+    }
 }
 
 pub struct GlobalConnections(pub Entity<ConnectionsStore>);
@@ -496,7 +514,7 @@ impl ConnectionsStore {
             active: Vec::new(),
             db,
             lod_spawned: false,
-            last_saved_layout: None,
+            saved_layouts: Default::default(),
             registry_rx,
             _poll: poll,
         }
@@ -520,23 +538,12 @@ impl ConnectionsStore {
             // rather than wiping every saved layout with emptiness.
             return;
         };
-        if self.last_saved_layout.as_deref() == Some(json.as_str()) {
-            return;
-        }
         for conn in &self.active {
-            if let Err(err) = persist::save_layout(&conn.target.id, &json) {
-                tracing::error!(%err, id = %conn.target.id, "layout autosave failed");
+            let id = &conn.target.id;
+            if let Err(err) = self.saved_layouts.save(id, &json, persist::save_layout) {
+                tracing::error!(%err, %id, "layout autosave failed");
             }
         }
-        self.last_saved_layout = Some(json);
-    }
-
-    /// Note a layout the picker just loaded, so the next autosave tick
-    /// doesn't immediately rewrite every file with it. A restore that
-    /// changed formatting (a wrapped pre-multi-window file, say) still
-    /// rewrites once — harmless.
-    pub(crate) fn note_loaded_layout(&mut self, json: String) {
-        self.last_saved_layout = Some(json);
     }
 
     pub(crate) fn db(&self) -> &Arc<DB> {

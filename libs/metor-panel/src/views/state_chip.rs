@@ -1,29 +1,24 @@
-//! Discrete-state indicator: a number rendered as the state it means.
+//! Discrete-state indicator: a value strip whose cells render as the states
+//! they mean.
 //!
 //! Flight software encodes modes, laws, and health as small integers, and a
 //! panel that shows `2` where the operator thinks in `POINTING` is making
-//! them do the lookup. A chip carries that table itself — value, name, and
-//! colour per state — so the mapping lives with the display instead of in
-//! the reader's head.
-//!
-//! The chip is deliberately not a traffic light: it distinguishes *which*
-//! state, not merely on from off, and an unlisted value is shown as unknown
-//! rather than silently folded into "off".
+//! them do the lookup. The chip carries that table itself — value, name, and
+//! colour per state — and hands it to a plain [`ComponentValueStrip`], so a
+//! state reads exactly like every other value cell on the panel: same boxes,
+//! same staleness tint, same click-to-edit. Nothing else is drawn — no
+//! label, no chrome — which is what lets a chip sit inside a schematic.
 
 use std::sync::Arc;
 
-use gpui::{Context, Entity, Hsla, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{App, Context, Entity, Hsla, IntoElement, SharedString, Window, div, prelude::*, px};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 use serde::{Deserialize, Serialize};
 
-use super::binding::{self, ElementRef, component_meta, spawn_meta_resolver, spawn_scalar_stream};
-use super::format_number;
-use crate::theme::theme;
-
-/// Values are integer codes on the wire but arrive as `f64`, so matching
-/// tolerates the conversion rather than comparing exactly.
-const MATCH_TOLERANCE: f64 = 0.5;
+use super::binding;
+use super::monitor::{behavior_snapshot, edit_click};
+use super::value_strip::{ComponentValueStrip, StateTable, StripClick, StripStyle};
 
 /// One row of a chip's lookup table.
 #[derive(facet::Facet)]
@@ -54,12 +49,14 @@ pub struct StateEntryConfig {
 }
 
 /// Persisted shape of a [`StateChip`], shared by the tile and dashboard
-/// surfaces.
+/// surfaces, target-shipped presets, and the Python config API.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct StateChipConfig {
     pub component: String,
     pub element: usize,
+    /// Names the chip in tab titles and widget lists; the chip itself draws
+    /// no label.
     pub label: Option<String>,
     pub states: Vec<StateEntryConfig>,
     /// Shown when the live value matches no entry. Empty falls back to
@@ -68,150 +65,87 @@ pub struct StateChipConfig {
     pub unknown_label: String,
 }
 
-/// Single-element discrete-state indicator.
+/// A bare value strip carrying a state table.
 #[derive(facet::Facet)]
 pub struct StateChip {
-    /// What this chip reads. Editable: picking another component or element
-    /// in the inspector rebinds the stream on the next frame. Declared first
-    /// so the binding heads the inspector page — fields are walked in order.
-    pub component_id: ComponentId,
-    pub element: usize,
-    pub label: SharedString,
-    pub unknown_label: SharedString,
+    /// What this chip reads. Editable: picking another component in the
+    /// inspector rebinds the strip on the next frame. Declared first so the
+    /// binding heads the inspector page — fields are walked in order.
+    pub source: crate::data_binding::Binding,
     pub states: Vec<Entity<StateEntry>>,
-    /// Fallback name for a component nothing has registered;
-    /// [`to_config`](Self::to_config) prefers the live name for the bound id.
+    pub unknown_label: SharedString,
+    /// Carried for the tab title and the config round trip; never drawn.
     #[facet(skip)]
-    component: SharedString,
-    /// What `_task` is actually streaming, compared against the editable
-    /// fields each frame.
+    label: Option<SharedString>,
+    /// Persistence fallback when the bound id resolves to nothing at save
+    /// time: the text the layout was built from. Never a debug-formatted
+    /// id — a saved layout re-hashes this to recover the id, so a
+    /// `"ComponentId(…)"` would silently rebind the chip on the next load.
+    #[facet(skip)]
+    saved_component: SharedString,
+    /// What the strip is actually reading, compared against the editable
+    /// `component_id` each frame.
     #[facet(opaque)]
-    bound: Option<ElementRef>,
-    #[facet(skip)]
-    value: Option<f64>,
+    bound: Option<ComponentId>,
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _expression: Option<crate::dynamic::expressions::Expression>,
+    _binding_changes: gpui::Task<()>,
     #[facet(opaque)]
-    _task: gpui::Task<()>,
+    strip: Entity<ComponentValueStrip>,
     #[facet(opaque)]
-    _resolver_task: gpui::Task<()>,
+    click: StripClick,
 }
 
 impl StateChip {
+    /// A non-zero `element` folds into the `=` tier: one element of a
+    /// component is an expression over it, so the chip's element selection
+    /// rides the standard binding path and serializes back as the expression
+    /// text with `element` 0.
     pub fn from_config(cfg: &StateChipConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
-        let component_id = bound
-            .as_ref()
-            .map(|bound| bound.id)
-            .unwrap_or_else(|| ComponentId::new(&cfg.component));
-        let expression = bound.and_then(|bound| bound.expression);
-        let element = cfg.element;
-        let meta = component_meta(&db, component_id);
+        let text = binding_text(cfg);
+        let source = crate::data_binding::Binding::from_text(&text, &db, cx);
+        let component_id = source.id();
 
-        let task = spawn_scalar_stream(db.clone(), component_id, element, cx, |chip, value, cx| {
-            chip.value = Some(value);
-            cx.notify();
-        });
-
-        let keep_label = cfg.label.is_some();
-        let resolver_task =
-            spawn_meta_resolver(db.clone(), component_id, cx, move |chip, meta, cx| {
-                if !keep_label {
-                    chip.label =
-                        super::meter::default_label(&meta.element_names, element, &meta.name);
-                }
-                cx.notify();
-            });
-
-        let states = cfg
-            .states
-            .iter()
-            .map(|s| {
-                let s = s.clone();
-                cx.new(|_| StateEntry {
-                    label: SharedString::from(s.label),
-                    value: s.value,
-                    color: s.color,
-                })
-            })
-            .collect();
+        let name = binding::component_name(&db, component_id)
+            .unwrap_or_else(|| SharedString::from(text.clone()));
+        let click = edit_click(db.clone(), component_id, name);
+        let strip = new_strip(db.clone(), component_id, click.clone(), cx);
 
         Self {
-            label: cfg
-                .label
-                .clone()
-                .map(SharedString::from)
-                .unwrap_or_else(|| {
-                    super::meter::default_label(&meta.element_names, element, &meta.name)
-                }),
-            unknown_label: SharedString::from(cfg.unknown_label.clone()),
-            states,
-            component: SharedString::from(cfg.component.clone()),
-            component_id,
-            element,
-            bound: Some(ElementRef::new(component_id, element)),
-            value: None,
-            db,
-            _expression: expression,
-            _task: task,
-            _resolver_task: resolver_task,
-        }
-    }
-
-    /// Restart the stream when the inspector has re-pointed the chip.
-    ///
-    /// The state table is *kept*: it is the operator's translation of a code
-    /// space, not something derived from the component, and rebinding
-    /// between two components that share an encoding (a commanded mode and
-    /// the reported one) is the reason to edit the binding at all.
-    fn rebind(&mut self, cx: &mut Context<Self>) {
-        let want = ElementRef::new(self.component_id, self.element);
-        if !binding::rebound(want, &mut self.bound) {
-            return;
-        }
-        self._expression = crate::dynamic::expressions::running(want.component, cx);
-        let element = want.element;
-        let meta = component_meta(&self.db, want.component);
-        self.label = super::meter::default_label(&meta.element_names, element, &meta.name);
-        self.component = meta.name;
-        self.value = None;
-        self._task = spawn_scalar_stream(
-            self.db.clone(),
-            want.component,
-            element,
-            cx,
-            |chip, value, cx| {
-                chip.value = Some(value);
-                cx.notify();
-            },
-        );
-        self._resolver_task = spawn_meta_resolver(
-            self.db.clone(),
-            want.component,
-            cx,
-            move |chip, meta, cx| {
-                chip.label = super::meter::default_label(&meta.element_names, element, &meta.name);
-                cx.notify();
-            },
-        );
-    }
-
-    pub fn to_config(&self, cx: &gpui::App) -> StateChipConfig {
-        StateChipConfig {
-            // Resolve the name for whatever is bound *now*, so a rebind is
-            // what gets saved.
-            // An expression's component is named by a content hash and
-            // labelled with the text that made it, so what round-trips is the
-            // text — a name would rehydrate onto nothing.
-            component: crate::dynamic::expressions::binding_text(&self.db, self.component_id)
-                .or_else(|| {
-                    binding::component_name(&self.db, self.component_id).map(|n| n.to_string())
+            source,
+            states: cfg
+                .states
+                .iter()
+                .map(|s| {
+                    let s = s.clone();
+                    cx.new(|_| StateEntry {
+                        label: SharedString::from(s.label),
+                        value: s.value,
+                        color: s.color,
+                    })
                 })
-                .unwrap_or_else(|| self.component.to_string()),
-            element: self.element,
-            label: Some(self.label.to_string()),
+                .collect(),
+            unknown_label: SharedString::from(cfg.unknown_label.clone()),
+            label: cfg.label.clone().map(SharedString::from),
+            saved_component: SharedString::from(text),
+            bound: Some(component_id),
+            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
+            db,
+            strip,
+            click,
+        }
+    }
+
+    pub fn to_config(&self, cx: &App) -> StateChipConfig {
+        StateChipConfig {
+            // Resolve the text for whatever is bound *now*, so a rebind is
+            // what gets saved. An expression's component is named by a
+            // content hash and labelled with the text that made it, so what
+            // round-trips is the text — a name would rehydrate onto nothing.
+            component: self.source.text(&self.db),
+            element: 0,
+            label: self.label.as_ref().map(|l| l.to_string()),
             states: self
                 .states
                 .iter()
@@ -228,125 +162,85 @@ impl StateChip {
         }
     }
 
-    pub fn component(&self) -> &SharedString {
-        &self.component
+    /// Restart the strip when the inspector has re-pointed the chip.
+    ///
+    /// The state table is *kept*: it is the operator's translation of a code
+    /// space, not something derived from the component, and rebinding
+    /// between two components that share an encoding (a commanded mode and
+    /// the reported one) is the reason to edit the binding at all.
+    pub(crate) fn rebind(&mut self, cx: &mut Context<Self>) {
+        self.source.resolve(&self.db, cx);
+        if self.bound == Some(self.source.id()) {
+            return;
+        }
+        self.bound = Some(self.source.id());
+        let component_id = self.source.id();
+
+        if let Some(name) = binding::component_name(&self.db, component_id) {
+            self.saved_component = name;
+        }
+        self.click = edit_click(self.db.clone(), component_id, self.saved_component.clone());
+        self.strip = new_strip(self.db.clone(), component_id, self.click.clone(), cx);
+    }
+
+    fn style(&self, cx: &App) -> StripStyle {
+        let states = (!self.states.is_empty()).then(|| StateTable {
+            entries: self
+                .states
+                .iter()
+                .map(|e| {
+                    let e = e.read(cx);
+                    (e.value, e.label.clone(), e.color)
+                })
+                .collect(),
+            unknown_label: self.unknown_label.clone(),
+        });
+        StripStyle::boxes().with_states(states)
     }
 }
 
-/// The entry whose code matches `value`, if the table lists one.
-fn match_state(
-    states: &[(f64, SharedString, Option<Hsla>)],
-    value: f64,
-) -> Option<&(f64, SharedString, Option<Hsla>)> {
-    states
-        .iter()
-        .find(|(code, _, _)| (code - value).abs() < MATCH_TOLERANCE)
+/// The chip's element selection as binding text: element 0 is the component
+/// itself; any other element is that expression over it.
+fn binding_text(cfg: &StateChipConfig) -> String {
+    use crate::dynamic::expressions::{body, is_expression};
+    if cfg.element == 0 {
+        cfg.component.clone()
+    } else if is_expression(&cfg.component) {
+        format!("=({})[{}]", body(&cfg.component), cfg.element)
+    } else {
+        format!("={}[{}]", cfg.component, cfg.element)
+    }
+}
+
+fn new_strip(
+    db: Arc<DB>,
+    component_id: ComponentId,
+    click: StripClick,
+    cx: &mut Context<StateChip>,
+) -> Entity<ComponentValueStrip> {
+    let behavior = behavior_snapshot(cx, db.clone(), component_id, click);
+    cx.new(|cx| {
+        ComponentValueStrip::new(db.clone(), component_id, StripStyle::boxes(), behavior, cx)
+    })
 }
 
 impl Render for StateChip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.rebind(cx);
-        let theme = theme(cx);
-        let states: Vec<(f64, SharedString, Option<Hsla>)> = self
-            .states
-            .iter()
-            .map(|e| {
-                let e = e.read(cx);
-                (e.value, e.label.clone(), e.color)
-            })
-            .collect();
+        let style = self.style(cx);
+        let behavior = behavior_snapshot(cx, self.db.clone(), self.source.id(), self.click.clone());
+        self.strip.update(cx, |strip, cx| {
+            strip.set_style(style, cx);
+            strip.set_behavior(behavior, cx);
+        });
 
-        let (text, accent) = match self.value {
-            None => (SharedString::new_static("—"), None),
-            Some(v) => match match_state(&states, v) {
-                Some((_, label, color)) => {
-                    (label.clone(), Some(color.unwrap_or(theme.control_active)))
-                }
-                // An unmatched code is not an error state, but it must not
-                // masquerade as a known one either.
-                None if self.unknown_label.is_empty() => {
-                    (SharedString::from(format_number(v)), None)
-                }
-                None => (self.unknown_label.clone(), None),
-            },
-        };
-        let accent = accent.unwrap_or(theme.text_tertiary);
-
-        let mut tile = div()
+        div()
             .size_full()
             .flex()
-            .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(3.0))
-            .bg(theme.bg_primary)
-            .p(px(6.0));
-
-        if !self.label.is_empty() {
-            tile = tile.child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(theme.text_secondary)
-                    .truncate()
-                    .child(self.label.clone()),
-            );
-        }
-
-        tile.child(
-            div()
-                .px(px(10.0))
-                .py(px(3.0))
-                .rounded(px(4.0))
-                .bg(crate::theme::Theme::dim(accent, 0.18))
-                .border_1()
-                .border_color(accent)
-                .text_size(px(13.0))
-                .text_color(theme.text_primary)
-                .truncate()
-                .child(text),
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn table() -> Vec<(f64, SharedString, Option<Hsla>)> {
-        vec![
-            (0.0, "IDLE".into(), None),
-            (1.0, "SETTLING".into(), None),
-            (2.0, "POINTING".into(), None),
-            (3.0, "SAFE".into(), None),
-        ]
-    }
-
-    #[test]
-    fn integer_codes_match_their_state() {
-        let t = table();
-        assert_eq!(match_state(&t, 0.0).unwrap().1, "IDLE");
-        assert_eq!(match_state(&t, 2.0).unwrap().1, "POINTING");
-        assert_eq!(match_state(&t, 3.0).unwrap().1, "SAFE");
-    }
-
-    #[test]
-    fn float_representation_error_still_matches() {
-        let t = table();
-        assert_eq!(match_state(&t, 2.0000001).unwrap().1, "POINTING");
-        assert_eq!(match_state(&t, 1.9999999).unwrap().1, "POINTING");
-    }
-
-    #[test]
-    fn codes_outside_the_table_do_not_match() {
-        let t = table();
-        assert!(match_state(&t, 7.0).is_none());
-        assert!(match_state(&t, -1.0).is_none());
-        // Exactly between two codes is not either of them.
-        assert!(match_state(&t, 2.5).is_none());
-    }
-
-    #[test]
-    fn an_empty_table_matches_nothing() {
-        assert!(match_state(&[], 0.0).is_none());
+            .p(px(4.0))
+            .overflow_hidden()
+            .child(self.strip.clone())
     }
 }

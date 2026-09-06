@@ -1,0 +1,49 @@
+{
+  "root": "sat1.wheels",
+  "columns": [
+    "name",
+    "value",
+    "unit"
+  ],
+  "sort": "descending",
+  "filter": "speed",
+  "filter_bar": true,
+  "expanded": [
+    "sat1.wheels.wheels.0"
+  ],
+  "collapsed": [
+    "sat1.wheels.status"
+  ],
+  "pivots": [
+    {
+      "path": "sat1.wheels.wheels",
+      "fields": [
+        "speed",
+        "torque"
+      ],
+      "hidden": [
+        "motor.temp"
+      ],
+      "rows": [
+        "3",
+        "0"
+      ]
+    }
+  ],
+  "types": [
+    {
+      "label": "psu",
+      "fields": [
+        "current",
+        "voltage"
+      ],
+      "order": [
+        "voltage"
+      ],
+      "rows": [
+        "sat1.dut2.psu"
+      ]
+    }
+  ],
+  "focus": "psu"
+}

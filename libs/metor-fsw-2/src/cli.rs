@@ -4,10 +4,10 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, Builder, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions,
-    PackageOptions, Registry, WIRING_FILE_NAME, Wiring, build_target, eval_python_target,
-    load_bundle, locate_artifacts, pack_assemble, pack_build, pack_dev, pack_publish,
-    provision_artifacts, refresh_dev_packs, resolve, unpack_metor, write_bundle,
+    BuildOptions, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions, PackageOptions,
+    Registry, WIRING_FILE_NAME, Wiring, build_target, eval_python_target, load_bundle,
+    locate_artifacts, pack_build, pack_dev, provision_artifacts, refresh_dev_packs, resolve,
+    unpack_metor, write_bundle,
 };
 
 mod ui;
@@ -33,7 +33,7 @@ enum Command {
     Package(PackageArgs),
     /// Run a target: a source `.py` (built automatically) or a bundle dir.
     Run(RunArgs),
-    /// Pack-crate commands (`docs/cli.md`).
+    /// Pack-crate commands.
     #[command(subcommand)]
     Pack(PackCmd),
 }
@@ -44,15 +44,8 @@ enum PackCmd {
     /// payload (typed module + `_libs/<triple>/`); what a pack's PEP 517
     /// backend runs on `uv sync`.
     Dev(PackDevArgs),
-    /// Build the pack's wheel payloads for every configured target and
-    /// assemble the fat `py3-none-any` wheel (or stage triples for a CI
-    /// matrix with `--libs-out`).
+    /// Build the pack's `py3-none-any` wheel for the host triple.
     Build(PackBuildArgs),
-    /// Join `--libs` stagings from matrix runners into the fat wheel,
-    /// re-verifying the manifests are identical across triples.
-    Assemble(PackAssembleArgs),
-    /// Build (or take) the pack's wheel and hand it to `uv publish`.
-    Publish(PackPublishArgs),
 }
 
 #[derive(Args, Debug)]
@@ -60,48 +53,9 @@ struct PackBuildArgs {
     /// The pack crate directory (holds `pyproject.toml` + `Cargo.toml`).
     #[arg(default_value = ".")]
     dir: PathBuf,
-    /// Build this triple instead of the config's `targets` (repeatable).
-    #[arg(long = "target", value_name = "TRIPLE")]
-    target: Vec<String>,
-    /// Stage `<triple>/` payloads here without assembling (the CI-matrix
-    /// half; join with `pack assemble`).
-    #[arg(long, value_name = "DIR", conflicts_with = "wheel_out")]
-    libs_out: Option<PathBuf>,
-    /// Write the assembled wheel here (default: `<dir>/dist`).
+    /// Write the wheel here (default: `<dir>/dist`).
     #[arg(long, value_name = "DIR")]
     wheel_out: Option<PathBuf>,
-    /// Override the configured builder for the cargo-family kinds.
-    #[arg(long, value_name = "cargo|zigbuild")]
-    builder: Option<String>,
-}
-
-#[derive(Args, Debug)]
-struct PackAssembleArgs {
-    /// The pack crate directory (holds `pyproject.toml` + `Cargo.toml`).
-    #[arg(default_value = ".")]
-    dir: PathBuf,
-    /// A staging directory of `<triple>/` payloads (repeatable).
-    #[arg(long = "libs", value_name = "DIR", required = true)]
-    libs: Vec<PathBuf>,
-    /// Write the assembled wheel here.
-    #[arg(long, value_name = "DIR", required = true)]
-    wheel_out: PathBuf,
-}
-
-#[derive(Args, Debug)]
-struct PackPublishArgs {
-    /// The pack crate directory (holds `pyproject.toml` + `Cargo.toml`).
-    #[arg(default_value = ".")]
-    dir: PathBuf,
-    /// The index to publish to: a configured index name, or a URL.
-    #[arg(long, value_name = "NAME|URL")]
-    index: Option<String>,
-    /// Publish this wheel instead of building one.
-    #[arg(long, value_name = "FILE")]
-    wheel: Option<PathBuf>,
-    /// Print the `uv publish` invocation instead of running it.
-    #[arg(long)]
-    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -218,64 +172,19 @@ pub async fn run() -> miette::Result<()> {
         Command::Run(a) => cmd_run(a).await,
         Command::Pack(PackCmd::Dev(a)) => cmd_pack_dev(a),
         Command::Pack(PackCmd::Build(a)) => cmd_pack_build(a),
-        Command::Pack(PackCmd::Assemble(a)) => cmd_pack_assemble(a),
-        Command::Pack(PackCmd::Publish(a)) => cmd_pack_publish(a),
     }
 }
 
-/// `pack build`: per-target payloads, then the fat wheel (or a matrix
-/// staging with `--libs-out`).
+/// `pack build`: the host-triple payload and its wheel.
 fn cmd_pack_build(args: PackBuildArgs) -> miette::Result<()> {
-    let builder = match args.builder.as_deref() {
-        None => None,
-        Some("cargo") => Some(Builder::Cargo),
-        Some("zigbuild") => Some(Builder::Zigbuild),
-        Some(other) => {
-            return Err(miette::miette!(
-                "unknown --builder `{other}` (cargo, zigbuild; command templates \
-                 configure via [tool.metor.pack.builder])"
-            ));
-        }
-    };
     let report = pack_build(
         &args.dir,
         &PackBuildOptions {
-            targets: args.target,
-            libs_out: args.libs_out,
             wheel_out: args.wheel_out,
-            builder,
         },
     )
     .into_diagnostic()?;
-    match &report.wheel {
-        Some(wheel) => println!("  {} ({})", wheel.display(), report.triples.join(", ")),
-        None => println!(
-            "  staged {} under {}",
-            report.triples.join(", "),
-            report.staged.display()
-        ),
-    }
-    Ok(())
-}
-
-/// `pack assemble`: join matrix stagings into the fat wheel.
-fn cmd_pack_assemble(args: PackAssembleArgs) -> miette::Result<()> {
-    let report = pack_assemble(&args.dir, &args.libs, &args.wheel_out).into_diagnostic()?;
-    let wheel = report.wheel.expect("assemble always writes a wheel");
-    println!("  {} ({})", wheel.display(), report.triples.join(", "));
-    Ok(())
-}
-
-/// `pack publish`: hand the wheel to `uv publish`.
-fn cmd_pack_publish(args: PackPublishArgs) -> miette::Result<()> {
-    let wheel = pack_publish(
-        &args.dir,
-        args.index.as_deref(),
-        args.wheel.as_deref(),
-        args.dry_run,
-    )
-    .into_diagnostic()?;
-    println!("  {}", wheel.display());
+    println!("  {} ({})", report.wheel.display(), report.triple);
     Ok(())
 }
 
@@ -310,8 +219,7 @@ fn merge_target(cargo_args: &[String], target: Option<&str>) -> Vec<String> {
 }
 
 /// Load a source target into a [`Wiring`]. Targets are Python: a `.py` file
-/// is evaluated by a subprocess CPython. A `.kdl` file gets a clear
-/// removed-feature error; any other extension is unrecognized.
+/// is evaluated by a subprocess CPython; any other extension is unrecognized.
 fn load_source(path: &Path) -> miette::Result<Wiring> {
     if path.extension().is_some_and(|e| e == "py") {
         return eval_python_target(path);
@@ -322,8 +230,8 @@ fn load_source(path: &Path) -> miette::Result<Wiring> {
     ))
 }
 
-/// Refresh a source target's dev packs — the path-source pack dependencies
-/// its pyproject names — so the generated modules (manifest hashes, params)
+/// Refresh a source target's dev packs, the path-source pack dependencies
+/// its pyproject names, so the generated modules (manifest hashes, params)
 /// the target imports are current before it is evaluated. Prebuilt pack
 /// artifacts are only *selected* at provisioning, so this is where their
 /// sources get rebuilt; cargo's incremental build makes a clean tree a no-op.
@@ -404,7 +312,7 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
 
 /// `package --check-ir <bundle>`: re-evaluate the bundle's provenance source
 /// and diff the produced IR against the frozen `wiring.json`, exiting non-zero
-/// on any drift — the determinism backstop, runnable in CI.
+/// on any drift: the determinism backstop, runnable in CI.
 ///
 /// Both sides are normalized before the diff: artifact `path`s are stripped
 /// (never in the frozen IR anyway) and `src` file names cleared, since the
@@ -412,17 +320,13 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
 /// would otherwise read as spurious drift. The line/column of every anchor is
 /// kept, so a genuine emission change is still caught.
 fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
-    // Materialize a readable directory: a `.metor` unpacks to a temp dir held
-    // for the duration of the check, a directory is read in place.
-    let _held;
-    let dir = if bundle.is_file() && bundle.extension().is_some_and(|e| e == METOR_EXTENSION) {
-        let unpacked = unpack_metor(bundle).into_diagnostic()?;
-        let path = unpacked.path().to_path_buf();
-        _held = Some(unpacked);
-        path
-    } else {
-        bundle.to_path_buf()
-    };
+    let unpacked =
+        if bundle.is_file() && bundle.extension().is_some_and(|ext| ext == METOR_EXTENSION) {
+            Some(unpack_metor(bundle).into_diagnostic()?)
+        } else {
+            None
+        };
+    let dir = unpacked.as_ref().map_or(bundle, |temp| temp.path());
 
     let frozen_text = read_file(&dir.join(WIRING_FILE_NAME))?;
     let frozen: Wiring = serde_json::from_str(&frozen_text).map_err(|e| {
@@ -432,7 +336,7 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
         )
     })?;
 
-    let source = find_provenance(&dir).ok_or_else(|| {
+    let source = find_provenance(dir).ok_or_else(|| {
         miette::miette!(
             "bundle `{}` carries no provenance source (target.py); cannot --check-ir",
             bundle.display()
@@ -503,7 +407,6 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     let cycles = args.cycles.unwrap_or(usize::MAX);
     let mut coord = resolve(&wiring, &Registry::with_builtins())?;
 
-    // `run_for` does init, the cycle loop, and shutdown.
     coord.run_for(cycles).await;
 
     // A hard-stopped system is a failed run: name each one and exit non-zero,
@@ -656,7 +559,7 @@ mod tests {
 
     /// Normalized IR clears the `src` file name (the provenance copy sits at a
     /// different path than the original source), so the same target evaluated
-    /// from two paths is not spurious drift — but a real emission change is.
+    /// from two paths is not spurious drift, but a real emission change is.
     #[test]
     fn normalized_ir_ignores_source_path_but_not_content() {
         use crate::wiring::{SourceRef, WiringBuilder};

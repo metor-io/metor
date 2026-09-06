@@ -3,8 +3,7 @@
 //!
 //! One clock is left, and it is the one a source system asks for: a
 //! `@system(rate=)` declares how often it wants to run and the host answers
-//! with a fixed-rate tick. A resample stage uses the same thing for its target
-//! clock.
+//! with a fixed-rate tick.
 
 use std::hash::Hash;
 use std::sync::Arc;
@@ -13,8 +12,7 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 
 use crate::dynamic::node::{
-    BuildError, DynamicNode, NodeImpl, ValueType, default_ring_bytes, hash_id,
-    op_tag, write_sample,
+    BuildError, DynamicNode, NodeImpl, ValueType, default_ring_bytes, hash_id, op_tag, write_sample,
 };
 
 /// Fixed-rate wall-clock generator. Ticks every `1/hz` seconds starting at

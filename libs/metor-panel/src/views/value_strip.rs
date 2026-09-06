@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    App, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, Pixels, Point, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use metor_db::DB;
@@ -65,6 +65,35 @@ impl CellKind {
     }
 }
 
+/// The operator's translation of a code space: value → state name, and
+/// optionally the colour the state shows in.
+///
+/// Flight software encodes modes, laws, and health as small integers, and a
+/// strip that shows `2` where the operator thinks in `POINTING` is making
+/// them do the lookup. The table lives with the display instead of in the
+/// reader's head; a cell whose value matches an entry renders as that state.
+#[derive(Clone, PartialEq)]
+pub struct StateTable {
+    pub entries: Vec<(f64, SharedString, Option<Hsla>)>,
+    /// Shown when the live value matches no entry. Empty falls back to
+    /// rendering the raw number, which is more useful than a blank cell when
+    /// the table is out of date with the flight software.
+    pub unknown_label: SharedString,
+}
+
+/// Values are integer codes on the wire but arrive as `f64`, so matching
+/// tolerates the conversion rather than comparing exactly.
+const STATE_MATCH_TOLERANCE: f64 = 0.5;
+
+impl StateTable {
+    /// The entry whose code matches `value`, if the table lists one.
+    fn matched(&self, value: f64) -> Option<&(f64, SharedString, Option<Hsla>)> {
+        self.entries
+            .iter()
+            .find(|(code, _, _)| (code - value).abs() < STATE_MATCH_TOLERANCE)
+    }
+}
+
 /// Visual mode for the strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripPreset {
@@ -90,6 +119,8 @@ pub struct StripStyle {
     pub unit: SharedString,
     /// Displayed before the first sample arrives.
     pub placeholder: SharedString,
+    /// Render numeric cells as the state their value means.
+    pub states: Option<StateTable>,
 }
 
 impl StripStyle {
@@ -101,6 +132,7 @@ impl StripStyle {
             solo_emphasize: true,
             unit: SharedString::default(),
             placeholder: SharedString::new_static("—"),
+            states: None,
         }
     }
 
@@ -112,6 +144,7 @@ impl StripStyle {
             solo_emphasize: false,
             unit: SharedString::default(),
             placeholder: SharedString::new_static("…"),
+            states: None,
         }
     }
 
@@ -122,6 +155,11 @@ impl StripStyle {
 
     pub fn with_intrinsic_width(mut self) -> Self {
         self.intrinsic_width = true;
+        self
+    }
+
+    pub fn with_states(mut self, states: Option<StateTable>) -> Self {
+        self.states = states;
         self
     }
 }
@@ -137,7 +175,7 @@ pub type StripClick = Arc<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + 
 /// Interactive state supplied afresh by the host each render.
 ///
 /// Snapshot pattern keeps the strip decoupled from the pending-edits global
-/// and lets `Monitor`, `ComponentText`, and `ComponentTable` share one
+/// and lets `Monitor`, `ComponentText`, and `ComponentOutline` share one
 /// widget with different policies.
 #[derive(Default, Clone)]
 pub struct StripBehavior {
@@ -171,6 +209,7 @@ fn style_equivalent(a: &StripStyle, b: &StripStyle) -> bool {
         && a.solo_emphasize == b.solo_emphasize
         && a.unit == b.unit
         && a.placeholder == b.placeholder
+        && a.states == b.states
 }
 
 fn click_ptr(click: &Option<StripClick>) -> usize {
@@ -191,7 +230,7 @@ struct EditingCell {
 /// Live horizontal row of a component's elements.
 ///
 /// Shared widget between `Monitor`, `ComponentBrowser`, and
-/// `ComponentTable`. The strip owns its stream task; hosts refresh the
+/// `ComponentOutline`. The strip owns its stream task; hosts refresh the
 /// visible [`StripStyle`] and [`StripBehavior`] every render.
 pub struct ComponentValueStrip {
     db: Arc<DB>,
@@ -204,6 +243,9 @@ pub struct ComponentValueStrip {
     behavior: StripBehavior,
     cells: Vec<StripCell>,
     kind: CellKind,
+    /// No sample for [`STALE_AFTER`](super::binding::STALE_AFTER); cells
+    /// tint so a dead producer can't pass for a steady one.
+    stale: bool,
     editing: Option<EditingCell>,
     focus: FocusHandle,
     _task: gpui::Task<()>,
@@ -244,6 +286,14 @@ impl ComponentValueStrip {
                     StreamUpdate::Value((cells, raw_values)) => {
                         this.cells = cells;
                         this.raw_values = raw_values;
+                        this.stale = false;
+                    }
+                    StreamUpdate::Stale => this.stale = true,
+                    StreamUpdate::Unavailable => {
+                        this.cells.clear();
+                        this.raw_values.clear();
+                        this.editing = None;
+                        this.stale = false;
                     }
                 }
                 cx.notify();
@@ -261,6 +311,7 @@ impl ComponentValueStrip {
             behavior,
             cells: Vec::new(),
             kind: CellKind::Unknown,
+            stale: false,
             editing: None,
             focus: cx.focus_handle(),
             _task: task,
@@ -342,6 +393,9 @@ impl ComponentValueStrip {
     }
 
     fn enter_text_edit(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::temporal::is_live(cx) {
+            return;
+        }
         if self.behavior.locked {
             return;
         }
@@ -373,6 +427,10 @@ impl ComponentValueStrip {
     }
 
     fn commit_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::temporal::is_live(cx) {
+            self.editing = None;
+            return;
+        }
         let Some(mut edit) = self.editing.take() else {
             return;
         };
@@ -506,6 +564,7 @@ impl Render for ComponentValueStrip {
         // until the user applies or discards them.
         let pending = crate::inspector::edits::pending_edits(cx)
             .get(self.component_id)
+            .filter(|_| crate::temporal::is_live(cx))
             .map(|edit| {
                 let view = edit.value.as_view();
                 let raw: Vec<ElementValue> = view.iter().collect();
@@ -528,9 +587,14 @@ impl Render for ComponentValueStrip {
 
         let kind = self.kind.clone();
         let style = self.style.clone();
-        let behavior = self.behavior.clone();
+        let mut behavior = self.behavior.clone();
+        behavior.locked |= !crate::temporal::is_live(cx);
+        if !crate::temporal::is_live(cx) {
+            behavior.highlighted.clear();
+        }
         let component_id = self.component_id;
         let editing_index = self.editing.as_ref().map(|e| e.index);
+        let stale = self.stale;
         let editing_error = self.editing.as_ref().map(|e| e.error).unwrap_or(false);
 
         let mut row = div().flex().flex_row().items_center().gap(px(4.0));
@@ -555,6 +619,34 @@ impl Render for ComponentValueStrip {
             let has_apply_group =
                 is_pending && !behavior.locked && behavior.on_apply_element.is_some();
 
+            // A state table reinterprets the numeric cell as the state it
+            // means; bool cells keep their toggle rendering, and editing
+            // shows the raw number the operator is typing over.
+            let state = if is_bool {
+                None
+            } else {
+                style.states.as_ref().and_then(|table| {
+                    let value = raw_values.get(idx)?.as_f64();
+                    match table.matched(value) {
+                        Some((_, label, color)) => {
+                            Some((label.clone(), Some(color.unwrap_or(theme.control_active))))
+                        }
+                        None if table.unknown_label.is_empty() => None,
+                        None => Some((table.unknown_label.clone(), None)),
+                    }
+                })
+            };
+            let (display_cell, accent) = match state {
+                Some((text, accent)) => (
+                    StripCell {
+                        label: cell.label.clone(),
+                        value: text,
+                    },
+                    accent,
+                ),
+                None => (cell.clone(), None),
+            };
+
             let atom = if is_editing {
                 build_editing_chrome(
                     component_id,
@@ -568,15 +660,16 @@ impl Render for ComponentValueStrip {
                 )
             } else {
                 build_cell_chrome(
-                    component_id,
-                    idx,
-                    cell,
+                    (component_id.0.wrapping_mul(31) ^ idx as u64) as usize,
+                    &display_cell,
                     &style,
                     &theme,
                     is_solo,
                     is_pending,
+                    stale,
                     is_bool,
                     bool_value,
+                    accent,
                     has_apply_group,
                 )
             };
@@ -769,21 +862,24 @@ fn build_editing_chrome(
     atom
 }
 
+/// One rendered element box. `id_key` distinguishes it from every other
+/// box in the same parent: the live strip hashes component and element,
+/// a table of samples salts in the row.
 #[allow(clippy::too_many_arguments)]
 fn build_cell_chrome(
-    component_id: ComponentId,
-    idx: usize,
+    id_key: usize,
     cell: &StripCell,
     style: &StripStyle,
     theme: &Theme,
     is_solo: bool,
     is_pending: bool,
+    stale: bool,
     is_bool: bool,
     bool_value: bool,
+    accent: Option<gpui::Hsla>,
     inside_apply_group: bool,
 ) -> Stateful<gpui::Div> {
-    let id_hash = component_id.0.wrapping_mul(31) ^ idx as u64;
-    let mut atom = div().id(("strip-cell", id_hash as usize)).flex().flex_row();
+    let mut atom = div().id(("strip-cell", id_key)).flex().flex_row();
     // Round only the left corners when a chevron sits flush against the
     // right edge, so the two halves visually fuse into a single pill.
     if inside_apply_group {
@@ -798,6 +894,8 @@ fn build_cell_chrome(
         // still reads as a frame.
         let track_color = if is_pending {
             theme.drop_target
+        } else if stale {
+            theme.stale_bg()
         } else if bool_value {
             theme.control_active_track
         } else {
@@ -844,10 +942,17 @@ fn build_cell_chrome(
         atom = atom.flex_none();
     }
 
+    // Pending and stale tints outrank the state accent: a chip must not
+    // look healthy while its edit is unsent or its producer is dead.
+    let chip_accent = (!is_pending && !stale).then_some(accent).flatten();
     match style.preset {
         StripPreset::Boxes => {
             let bg = if is_pending {
                 theme.drop_target
+            } else if stale {
+                theme.stale_bg()
+            } else if let Some(accent) = chip_accent {
+                Theme::dim(accent, 0.18)
             } else {
                 theme.bg_secondary
             };
@@ -856,8 +961,15 @@ fn build_cell_chrome(
         StripPreset::Dashboard => {
             if is_pending {
                 atom = atom.bg(theme.drop_target);
+            } else if stale {
+                atom = atom.bg(theme.stale_bg());
+            } else if let Some(accent) = chip_accent {
+                atom = atom.bg(Theme::dim(accent, 0.18));
             }
         }
+    }
+    if let Some(accent) = chip_accent {
+        atom = atom.border_1().border_color(accent);
     }
 
     if let Some(label) = cell.label.as_ref() {
@@ -898,7 +1010,11 @@ fn build_cell_chrome(
         div()
             .flex_1()
             .text_size(value_size)
-            .text_color(theme.text_primary)
+            .text_color(if stale {
+                theme.stale_text()
+            } else {
+                theme.text_primary
+            })
             .text_right()
             .whitespace_nowrap()
             .overflow_hidden()
@@ -944,6 +1060,33 @@ pub fn strip_row_width(n_cells: usize) -> f32 {
         return 0.0;
     }
     n_cells as f32 * STRIP_BOX_CELL_WIDTH + (n_cells.saturating_sub(1)) as f32 * STRIP_CELL_GAP
+}
+
+/// The strip's row of boxes for cells that are already history: no stream,
+/// no editing, no pending tint. A table of past samples paints one of these
+/// per row from the cells it decodes at paint time, and `row_key` keeps the
+/// boxes of different rows distinct.
+pub(crate) fn render_static_cells(
+    row_key: usize,
+    cells: &[StripCell],
+    style: &StripStyle,
+    theme: &Theme,
+) -> gpui::Div {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(STRIP_CELL_GAP));
+    if !style.intrinsic_width {
+        row = row.flex_wrap();
+    }
+    for (idx, cell) in cells.iter().enumerate() {
+        let id_key = row_key.wrapping_mul(64).wrapping_add(idx);
+        row = row.child(build_cell_chrome(
+            id_key, cell, style, theme, false, false, false, false, false, None, false,
+        ));
+    }
+    row
 }
 
 pub(crate) struct ResolvedMetadata {
@@ -1072,6 +1215,51 @@ mod tests {
             CellKind::from_schema(PrimType::U64, false, None),
             CellKind::Numeric
         );
+    }
+
+    fn table() -> StateTable {
+        StateTable {
+            entries: vec![
+                (0.0, "IDLE".into(), None),
+                (1.0, "SETTLING".into(), None),
+                (2.0, "POINTING".into(), None),
+                (3.0, "SAFE".into(), None),
+            ],
+            unknown_label: SharedString::default(),
+        }
+    }
+
+    #[test]
+    fn integer_codes_match_their_state() {
+        let t = table();
+        assert_eq!(t.matched(0.0).unwrap().1, "IDLE");
+        assert_eq!(t.matched(2.0).unwrap().1, "POINTING");
+        assert_eq!(t.matched(3.0).unwrap().1, "SAFE");
+    }
+
+    #[test]
+    fn float_representation_error_still_matches() {
+        let t = table();
+        assert_eq!(t.matched(2.0000001).unwrap().1, "POINTING");
+        assert_eq!(t.matched(1.9999999).unwrap().1, "POINTING");
+    }
+
+    #[test]
+    fn codes_outside_the_table_do_not_match() {
+        let t = table();
+        assert!(t.matched(7.0).is_none());
+        assert!(t.matched(-1.0).is_none());
+        // Exactly between two codes is not either of them.
+        assert!(t.matched(2.5).is_none());
+    }
+
+    #[test]
+    fn an_empty_table_matches_nothing() {
+        let t = StateTable {
+            entries: Vec::new(),
+            unknown_label: SharedString::default(),
+        };
+        assert!(t.matched(0.0).is_none());
     }
 
     #[test]

@@ -18,6 +18,10 @@ use crate::Ty;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompSchema {
     pub ty: Ty,
+    /// Whether the producer stamps each sample with a timestamp the host can
+    /// hand the frame, which is what `deltat` reads. A db's every component
+    /// has one; a vehicle record has one when its struct marks a field.
+    pub timestamp: bool,
 }
 
 /// A frame the host already defines: what a `bind=` target must match.
@@ -25,6 +29,8 @@ pub struct CompSchema {
 pub struct FrameSchema {
     pub name: String,
     pub fields: Vec<(String, Ty)>,
+    /// As [`CompSchema::timestamp`], for the record as a whole.
+    pub timestamp: bool,
 }
 
 /// What a host must answer for a program to be compiled against it.
@@ -40,6 +46,13 @@ pub trait Resolver: Sync {
     /// A frame the host defines, for checking a `bind=` target field by
     /// field.
     fn frame(&self, name: &str) -> Option<FrameSchema>;
+
+    /// Every path [`component`](Self::component) would answer for, so a
+    /// completion can offer what the compiler would accept. Compilation never
+    /// calls this; a host that cannot enumerate simply offers nothing.
+    fn paths(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A host that knows nothing, for compiling a module of plain `def`s.

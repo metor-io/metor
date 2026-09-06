@@ -1,39 +1,12 @@
-//! Provisions a [`Wiring`]'s [`Artifact`](super::Artifact)s: records where
-//! each `.so` lives, building it when the artifact is crate-shaped.
+//! Build or locate the artifacts referenced by [`Wiring`].
 //!
-//! A **crate** artifact names a cargo package that produces a `cdylib`. The
-//! driver runs `cargo build -p <crate_name>` for each one, finds the produced
-//! library in cargo's `--message-format=json` output, and writes its path into
-//! [`Artifact::path`](super::Artifact::path) so the resolver
-//! ([`resolve`](super::resolve)) can `dlopen` it. Since every system cdylib is its
-//! own package, cargo decides what is stale and what can be skipped; the driver
-//! only supplies the list of crates and reads back where their outputs landed.
+//! Cargo artifacts are located through compiler-artifact JSON, respecting
+//! custom target directories and profiles. Prebuilt artifacts are selected
+//! from `<dir>/<target-triple>/<library>`.
 //!
-//! A **prebuilt** artifact instead names a directory of per-triple libraries
-//! ([`Artifact::prebuilt_dir`](super::Artifact::prebuilt_dir) — an installed
-//! pack wheel's `_libs`, or a local pack's `.metor/libs`). Provisioning is a
-//! selection, never a compile: the requested target triple (or the host's)
-//! picks `<dir>/<triple>/<cdylib>`, and a triple the directory does not ship
-//! is a clean error listing the ones it does. The manifest sidecar sits next
-//! to the selected library, so the resolve-time staleness gate
-//! (`check_manifest_hashes`) covers prebuilt artifacts unchanged.
-//!
-//! The library is located by scanning `compiler-artifact` JSON lines for a
-//! `filenames` entry ending in the cdylib file name derived from the
-//! artifact's `lib` stem and the build's target triple, which stays correct
-//! under a custom target directory or profile.
-//!
-//! ## The manifest sidecar
-//!
-//! Unless [`BuildOptions::manifest_sidecar`] is off, each built library also
-//! gets a `<cdylib>.manifest` sidecar next to it: the raw postcard
-//! [`PackManifest`](metor_fsw_2_core::abi::PackManifest) bytes `fsw_pack_describe`
-//! reports, so downstream consumers (pack codegen, cross-arch resolve) can read the
-//! pack's self-description without running the artifact. Sourcing the sidecar
-//! *does* run the crate's `pack()` once, at build time — the same trust model
-//! as a `build.rs`. A cross build (`--target` differing from the host) cannot
-//! run its own output, so the crate is additionally built for the host and
-//! that twin is described instead.
+//! Unless disabled, each library receives a `.manifest` sidecar. Creating it
+//! executes the pack's `pack()` function. Cross-compilation builds a host copy
+//! to describe, since the target library cannot run on the build machine.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -58,7 +31,7 @@ pub struct BuildOptions {
     ///
     /// Sidecar generation executes the crate's `pack()` at build time, the
     /// same trust model as a `build.rs`. Opt out for pack crates that cannot
-    /// be built for the host architecture — a cross build sources its sidecar
+    /// be built for the host architecture: a cross build sources its sidecar
     /// from an additional host-arch build, and that build failing is a hard
     /// error while this flag is on.
     pub manifest_sidecar: bool,
@@ -211,7 +184,7 @@ pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(
     let cross = opts.manifest_sidecar && is_cross(&opts.extra_args);
     let target = requested_target(&opts.extra_args).map(str::to_string);
     // Program artifacts compile last, against the other artifacts' built
-    // manifests — the build-time resolver reads their sidecars.
+    // manifests, which the build-time resolver reads from their sidecars.
     let mut programs: Vec<usize> = Vec::new();
     for (at, artifact) in wiring.artifacts.iter_mut().enumerate() {
         if let Some(dir) = artifact.prebuilt_dir.clone() {
@@ -241,7 +214,7 @@ pub fn provision_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(
             Some(triple) => format!("{} ({triple})", artifact.crate_name),
             None => artifact.crate_name.clone(),
         };
-        let path = build_cdylib("build", &artifact.crate_name, &cdylib, opts, &label)?;
+        let path = build_cdylib(&artifact.crate_name, &cdylib, opts, &label)?;
         if opts.manifest_sidecar {
             write_manifest_sidecar(&artifact.crate_name, &artifact.lib, &path, opts, cross)?;
         }
@@ -292,7 +265,7 @@ fn target_root() -> PathBuf {
 }
 
 /// Select a prebuilt artifact's library for `target` (or the host): the
-/// `<dir>/<triple>/<cdylib>` the pack shipped. No compile, no sidecar work —
+/// `<dir>/<triple>/<cdylib>` the pack shipped. No compile, no sidecar work;
 /// the shipped sidecar sits next to the library and resolve verifies it.
 fn select_prebuilt(
     artifact: &super::model::Artifact,
@@ -333,9 +306,7 @@ fn shipped_triples(dir: &Path) -> Vec<String> {
     triples
 }
 
-/// Runs a cargo-family build and returns the located cdylib path.
-/// `"zigbuild"` runs the `cargo-zigbuild` cross builder with the same
-/// output-location scan.
+/// Runs a cargo build and returns the located cdylib path.
 ///
 /// The build reports through tracing: a `build`-target span for its whole
 /// duration (the CLI renders active spans as a pinned progress line, keyed on
@@ -343,7 +314,6 @@ fn shipped_triples(dir: &Path) -> Vec<String> {
 /// and a `build`-target completion event. Without a subscriber all of it is
 /// silent, so library callers see no output.
 pub(super) fn build_cdylib(
-    subcommand: &str,
     crate_name: &str,
     cdylib: &str,
     opts: &BuildOptions,
@@ -352,7 +322,7 @@ pub(super) fn build_cdylib(
     // Prefer the cargo that invoked this process, falling back to PATH.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(cargo);
-    cmd.args([subcommand, "-p", crate_name, "--message-format=json"]);
+    cmd.args(["build", "-p", crate_name, "--message-format=json"]);
     if opts.release {
         cmd.arg("--release");
     }
@@ -372,8 +342,8 @@ pub(super) fn build_cdylib(
         let child_stderr = child.stderr.take().expect("stderr piped");
         let mut child_stdout = child.stdout.take().expect("stdout piped");
 
-        // Stream cargo's stderr through tracing as it arrives — keeping a
-        // copy for the failure diagnostic — while this thread drains the JSON
+        // Stream cargo's stderr through tracing as it arrives, keeping a copy
+        // for the failure diagnostic, while this thread drains the JSON
         // stdout. Both pipes are consumed concurrently, so neither can fill
         // and stall cargo. A side benefit of the pipe: cargo emits plain
         // `Compiling` lines instead of its own progress bar.
@@ -384,7 +354,7 @@ pub(super) fn build_cdylib(
                 for line in lines.map_while(Result::ok) {
                     tracing::info!(target: "cargo", "{line}");
                     if let Some(unit) = line.trim_start().strip_prefix("Compiling ") {
-                        // `Compiling <name> <version> (<path>)` — drop the path.
+                        // `Compiling <name> <version> (<path>)`; drop the path.
                         let unit = unit.split(" (").next().unwrap_or(unit);
                         span.pb_set_message(&format!("{label} · {unit}"));
                     }
@@ -439,10 +409,9 @@ pub(super) fn build_cdylib(
 
 /// Fill every artifact path without running cargo (`--no-build`): a prebuilt
 /// artifact selects by triple as always, a crate artifact is searched for
-/// under the workspace target directory. A missing
-/// library is a hard [`BuildError::NotBuilt`]. No sidecar work — a previously
-/// built library has its sidecar adjacent, and resolve's staleness gate
-/// covers it.
+/// under the workspace target directory. A missing library is a hard
+/// [`BuildError::NotBuilt`]. No sidecar work; a previously built library has
+/// its sidecar adjacent, and resolve's staleness gate covers it.
 pub fn locate_artifacts(
     wiring: &mut Wiring,
     target_dir: &Path,
@@ -498,15 +467,11 @@ pub(super) fn locate_built(search_root: &Path, cdylib: &str, release: bool) -> O
     None
 }
 
-// ---------------------------------------------------------------------------
-// Manifest sidecars
-// ---------------------------------------------------------------------------
-
 /// Source and write the `<so>.manifest` sidecar for one built artifact.
 ///
 /// A native build describes the just-built library. A cross build cannot run
 /// its own output, so the crate is additionally built for the host (no
-/// `--target`) and that twin is described instead — a host build failure is a
+/// `--target`) and that twin is described instead; a host build failure is a
 /// hard [`BuildError::HostBuild`], never a silently missing sidecar. And
 /// arch-independence of manifests is verified, not assumed: when the target
 /// library already carries an up-to-date sidecar (say, written by a native
@@ -527,7 +492,7 @@ fn write_manifest_sidecar(
         // The host twin's output carries the *host* platform's file name.
         let cdylib = super::cdylib_file_name(lib);
         let label = format!("{crate_name} (host sidecar twin)");
-        build_cdylib("build", crate_name, &cdylib, &host_opts, &label).map_err(|source| {
+        build_cdylib(crate_name, &cdylib, &host_opts, &label).map_err(|source| {
             BuildError::HostBuild {
                 crate_name: crate_name.to_string(),
                 source: Box::new(source),
@@ -558,13 +523,12 @@ fn write_manifest_sidecar(
 
 /// Obtain the raw postcard manifest bytes for a host-runnable pack library.
 ///
-/// Prefers a describe worker — the dlopen quarantined in a short-lived child,
-/// the same isolation `resolve` gives process systems — but re-executing this
+/// Prefers a describe worker, the dlopen quarantined in a short-lived child,
+/// the same isolation `resolve` gives process systems, but re-executing this
 /// binary as a worker requires a `main` that installed
 /// [`worker_entry`](crate::proc::worker_entry); a libtest binary would run
-/// its harness instead (the adcs test suites document that constraint).
-/// Without the guard, and on targets without worker machinery, the library is
-/// described in-process.
+/// its harness instead. Without the guard, and on targets without worker
+/// machinery, the library is described in-process.
 fn describe_manifest(so: &Path) -> Result<Vec<u8>, String> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if crate::proc::worker_guard_installed() {
@@ -607,7 +571,7 @@ pub(super) fn requested_target(extra_args: &[String]) -> Option<&str> {
     target
 }
 
-/// `extra_args` with every `--target` (and its value) removed — the args for
+/// `extra_args` with every `--target` (and its value) removed, the args for
 /// the host-arch twin of a cross build.
 fn strip_target_args(extra_args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(extra_args.len());
@@ -627,7 +591,7 @@ fn strip_target_args(extra_args: &[String]) -> Vec<String> {
 /// compares it against the bundle's; prebuilt selection uses it absent a
 /// `--target`.
 ///
-/// The compile-time triple of this binary answers first — the running host is
+/// The compile-time triple of this binary answers first: the running host is
 /// its own witness, and a prebuilt-only consumer has no cargo to ask. An
 /// unlisted platform falls back to `cargo -vV`'s `host:` line.
 pub(super) fn host_triple() -> Option<String> {
@@ -691,8 +655,8 @@ fn cargo_host_triple() -> Option<String> {
 }
 
 /// The existing sidecar's bytes, provided it is at least as new as the
-/// library it sits next to. A stale sidecar describes an older build and must
-/// not be compared against — cargo rewrote the library since.
+/// library it sits next to. A stale sidecar describes an older build that
+/// cargo has since rewritten, so it must not be compared against.
 fn fresh_sidecar(sidecar: &Path, so: &Path) -> Option<Vec<u8>> {
     let sidecar_mtime = std::fs::metadata(sidecar).ok()?.modified().ok()?;
     let so_mtime = std::fs::metadata(so).ok()?.modified().ok()?;
@@ -725,308 +689,4 @@ pub(super) fn copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn requested_target_parses_both_forms() {
-        assert_eq!(requested_target(&args(&[])), None);
-        assert_eq!(requested_target(&args(&["--release"])), None);
-        assert_eq!(
-            requested_target(&args(&["--target", "thumbv7em-none-eabihf"])),
-            Some("thumbv7em-none-eabihf")
-        );
-        assert_eq!(
-            requested_target(&args(&["--target=thumbv7em-none-eabihf"])),
-            Some("thumbv7em-none-eabihf")
-        );
-        // The last occurrence wins, matching cargo.
-        assert_eq!(
-            requested_target(&args(&["--target=a", "--target", "b"])),
-            Some("b")
-        );
-        // A dangling `--target` names no triple.
-        assert_eq!(requested_target(&args(&["--target"])), None);
-    }
-
-    #[test]
-    fn strip_target_removes_flag_and_value() {
-        assert_eq!(
-            strip_target_args(&args(&[
-                "--features",
-                "x",
-                "--target",
-                "a",
-                "--target=b",
-                "-v"
-            ])),
-            args(&["--features", "x", "-v"])
-        );
-        assert_eq!(
-            strip_target_args(&args(&["--target"])),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn cross_is_a_non_host_target() {
-        assert!(!is_cross(&args(&[])), "no --target is a native build");
-        // No real toolchain targets this triple, so it can never be the host.
-        assert!(is_cross(&args(&["--target", "thumbv7em-none-eabihf"])));
-        if let Some(host) = host_triple() {
-            assert!(
-                !is_cross(&args(&["--target", &host])),
-                "--target naming the host is still a native build"
-            );
-        }
-    }
-
-    /// The freshness gate for the divergence comparison: an existing sidecar
-    /// counts only while it is at least as new as the library.
-    #[test]
-    #[cfg(not(miri))]
-    fn fresh_sidecar_respects_mtimes() {
-        let dir = tempfile::tempdir().unwrap();
-        let so = dir.path().join("libpack.so");
-        std::fs::write(&so, b"library").unwrap();
-        let sidecar = crate::dl::manifest_sidecar_path(&so);
-
-        assert_eq!(fresh_sidecar(&sidecar, &so), None, "no sidecar yet");
-
-        // Written after the library: fresh, so its bytes are compared.
-        std::fs::write(&sidecar, b"manifest").unwrap();
-        assert_eq!(fresh_sidecar(&sidecar, &so), Some(b"manifest".to_vec()));
-
-        // Predating the library: stale, so it is overwritten, not compared.
-        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-        std::fs::File::options()
-            .write(true)
-            .open(&sidecar)
-            .unwrap()
-            .set_modified(earlier)
-            .unwrap();
-        assert_eq!(fresh_sidecar(&sidecar, &so), None);
-    }
-
-    // -----------------------------------------------------------------------
-    // End-to-end over the dl fixture pack. These share the fixture crate's
-    // sidecar in the workspace target dir, so they serialize on one lock, and
-    // they skip (with a note) where the nested cargo build is unavailable —
-    // the same convention as tests/dl_integration.rs.
-    // -----------------------------------------------------------------------
-
-    // Shared with the dl and pack-codegen fixture tests: all three build and
-    // describe the same fixture pack into one target-dir sidecar.
-    #[cfg(not(miri))]
-    use crate::dl::FIXTURE_LOCK;
-
-    #[cfg(not(miri))]
-    fn fixture_wiring() -> Wiring {
-        super::super::WiringBuilder::new()
-            .artifact(
-                "fixture",
-                "metor-fsw-2-dl-fixture",
-                "metor_fsw_2_dl_fixture",
-            )
-            .build()
-    }
-
-    /// The sidecar is the exact bytes `fsw_pack_describe` reports (the plan's
-    /// sidecar-hash ≡ describe-hash property), and decodes to the fixture's
-    /// entries.
-    #[test]
-    #[cfg(not(miri))]
-    fn sidecar_matches_describe() {
-        let _guard = FIXTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut wiring = fixture_wiring();
-        if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
-            eprintln!("skipping: provision_artifacts failed: {e}");
-            return;
-        }
-        let so = wiring.artifacts[0].path.clone().expect("path filled");
-        let sidecar = crate::dl::manifest_sidecar_path(&so);
-        let bytes = std::fs::read(&sidecar).expect("sidecar written next to the .so");
-        let described = crate::dl::describe_raw(&so).expect("in-process describe");
-        assert_eq!(bytes, described, "sidecar bytes ≡ fsw_pack_describe bytes");
-    }
-
-    /// The cross arm verifies arch-independence rather than assuming it: an
-    /// up-to-date target sidecar whose bytes differ from the host-described
-    /// manifest is a hard error, and matching bytes pass. Driven with
-    /// `cross = true` over the host build itself — a real foreign `--target`
-    /// is not buildable in this test environment, but the code path is the
-    /// same: build the host twin, describe it, compare, write.
-    #[test]
-    #[cfg(not(miri))]
-    fn cross_divergence_is_a_hard_error() {
-        let _guard = FIXTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut wiring = fixture_wiring();
-        if let Err(e) = provision_artifacts(&mut wiring, &BuildOptions::default()) {
-            eprintln!("skipping: provision_artifacts failed: {e}");
-            return;
-        }
-        let artifact = &wiring.artifacts[0];
-        let so = artifact.path.clone().expect("path filled");
-        let sidecar = crate::dl::manifest_sidecar_path(&so);
-        let opts = BuildOptions::default();
-
-        // Plant a fresh-but-divergent "target" sidecar; the host-described
-        // bytes must refuse to replace it.
-        std::fs::write(&sidecar, b"divergent").unwrap();
-        let err = write_manifest_sidecar(&artifact.crate_name, &artifact.lib, &so, &opts, true)
-            .expect_err("a fresh divergent sidecar is refused");
-        assert!(
-            matches!(err, BuildError::ManifestDivergence { .. }),
-            "{err}"
-        );
-
-        // Identical bytes pass the comparison and are rewritten in place.
-        let described = crate::dl::describe_raw(&so).expect("in-process describe");
-        std::fs::write(&sidecar, &described).unwrap();
-        write_manifest_sidecar(&artifact.crate_name, &artifact.lib, &so, &opts, true)
-            .expect("a matching sidecar is accepted");
-        assert_eq!(std::fs::read(&sidecar).unwrap(), described);
-    }
-
-    /// `manifest_sidecar: false` builds the library and writes nothing next
-    /// to it.
-    #[test]
-    #[cfg(not(miri))]
-    fn sidecar_opt_out_writes_nothing() {
-        let _guard = FIXTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let opts = BuildOptions {
-            manifest_sidecar: false,
-            ..BuildOptions::default()
-        };
-        let mut wiring = fixture_wiring();
-        if let Err(e) = provision_artifacts(&mut wiring, &opts) {
-            eprintln!("skipping: provision_artifacts failed: {e}");
-            return;
-        }
-        let so = wiring.artifacts[0].path.clone().expect("path filled");
-        let sidecar = crate::dl::manifest_sidecar_path(&so);
-        // Another test (or an earlier run) may have left one; the assertion
-        // is that *this* build does not produce it.
-        let _ = std::fs::remove_file(&sidecar);
-        let mut again = fixture_wiring();
-        provision_artifacts(&mut again, &opts).expect("rebuild is a cargo no-op");
-        assert!(!sidecar.exists(), "opted out, so no sidecar is written");
-    }
-
-    /// A prebuilt artifact is a selection, not a build: the host triple picks
-    /// `<dir>/<triple>/<cdylib>`, the sidecar rides adjacent for the resolve
-    /// gate, and a triple the directory does not ship errors naming the ones
-    /// it does. Laid out from the fixture's host build — exactly the shape
-    /// `pack dev` and an installed pack wheel produce.
-    #[test]
-    #[cfg(not(miri))]
-    fn prebuilt_selects_by_triple() {
-        let _guard = FIXTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut built = fixture_wiring();
-        if let Err(e) = provision_artifacts(&mut built, &BuildOptions::default()) {
-            eprintln!("skipping: provision_artifacts failed: {e}");
-            return;
-        }
-        let so = built.artifacts[0].path.clone().expect("path filled");
-        let host = host_triple().expect("host triple determinable");
-
-        // Lay out `<libs>/<host-triple>/{cdylib, sidecar}`.
-        let tmp = tempfile::tempdir().unwrap();
-        let libs = tmp.path().join("libs");
-        let triple_dir = libs.join(&host);
-        std::fs::create_dir_all(&triple_dir).unwrap();
-        let dst = triple_dir.join(so.file_name().unwrap());
-        std::fs::copy(&so, &dst).unwrap();
-        std::fs::copy(
-            crate::dl::manifest_sidecar_path(&so),
-            crate::dl::manifest_sidecar_path(&dst),
-        )
-        .unwrap();
-
-        let mut wiring = fixture_wiring();
-        wiring.artifacts[0].prebuilt_dir = Some(libs.clone());
-        provision_artifacts(&mut wiring, &BuildOptions::default())
-            .expect("prebuilt selection needs no cargo");
-        assert_eq!(wiring.artifacts[0].path.as_deref(), Some(dst.as_path()));
-
-        // A triple the directory does not ship is a clean error listing the
-        // triples it does.
-        let mut cross = fixture_wiring();
-        cross.artifacts[0].prebuilt_dir = Some(libs);
-        let opts = BuildOptions {
-            extra_args: vec!["--target".into(), "riscv64gc-unknown-linux-gnu".into()],
-            ..BuildOptions::default()
-        };
-        let err = provision_artifacts(&mut cross, &opts).expect_err("missing triple is refused");
-        match err {
-            BuildError::PrebuiltMissing {
-                artifact,
-                triple,
-                available,
-                ..
-            } => {
-                assert_eq!(artifact, "fixture");
-                assert_eq!(triple, "riscv64gc-unknown-linux-gnu");
-                assert_eq!(available, vec![host]);
-            }
-            other => panic!("expected PrebuiltMissing, got {other}"),
-        }
-    }
-
-    /// `locate_artifacts` finds an already-built library without cargo, and a
-    /// never-built one is a hard `NotBuilt` — the `run --no-build` contract.
-    #[test]
-    #[cfg(not(miri))]
-    fn locate_artifacts_finds_built_and_refuses_missing() {
-        let _guard = FIXTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut built = fixture_wiring();
-        if let Err(e) = provision_artifacts(&mut built, &BuildOptions::default()) {
-            eprintln!("skipping: provision_artifacts failed: {e}");
-            return;
-        }
-        let so = built.artifacts[0].path.clone().expect("path filled");
-
-        // Locating from the crate dir walks up to the same workspace target
-        // dir the build wrote into.
-        let mut wiring = fixture_wiring();
-        locate_artifacts(&mut wiring, Path::new("."), false).expect("built library is found");
-        assert_eq!(
-            wiring.artifacts[0].path.as_ref().unwrap().file_name(),
-            so.file_name()
-        );
-
-        // A library that was never built is a hard error naming the crate.
-        let mut missing = super::super::WiringBuilder::new()
-            .artifact("missing", "no-such-crate", "metor_fsw_2_never_built")
-            .build();
-        let err = locate_artifacts(&mut missing, Path::new("."), false)
-            .expect_err("a never-built library is refused");
-        assert!(matches!(err, BuildError::NotBuilt { .. }), "{err}");
-    }
-
-    /// The compile-time triple and cargo's own view of the host agree, so the
-    /// cargo-free fallback never changes what a bundle records or a prebuilt
-    /// selection picks.
-    #[test]
-    fn compiled_triple_matches_cargo() {
-        let (Some(compiled), Some(cargo)) = (compiled_triple(), cargo_host_triple()) else {
-            eprintln!("skipping: platform unlisted or cargo unavailable");
-            return;
-        };
-        assert_eq!(compiled, cargo);
-    }
-}
+mod tests;

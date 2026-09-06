@@ -148,6 +148,18 @@ pub(crate) fn format_number(v: f64) -> String {
     pad_positive(&body)
 }
 
+/// `HH:MM:SS.mmm` local time from a payload timestamp (microseconds).
+pub(crate) fn format_time(t_us: i64) -> String {
+    let Ok(ts) = jiff::Timestamp::from_microsecond(t_us) else {
+        return t_us.to_string();
+    };
+    let hms = ts
+        .to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%H:%M:%S")
+        .to_string();
+    format!("{hms}.{:03}", t_us.rem_euclid(1_000_000) / 1000)
+}
+
 /// Pass-through for already-signed strings and non-finite floats.
 pub(crate) fn pad_positive(s: &str) -> String {
     if s.starts_with('-') {

@@ -39,8 +39,7 @@ pub mod trace_picker;
 #[derive(Clone, facet::Facet)]
 #[facet(pod)]
 pub struct ListTrace {
-    #[facet(skip)]
-    pub component_id: ComponentId,
+    pub source: crate::data_binding::Binding,
     #[facet(skip)]
     pub len: usize,
     pub color: Hsla,
@@ -49,18 +48,23 @@ pub struct ListTrace {
     pub label: SharedString,
     #[facet(inspect::range(min = "0.5", max = "10.0"))]
     pub stroke_width: f32,
+    /// Back-reference to the owning plot, set by [`ListLinePlot::reconcile`],
+    /// so the trace's inspector can ask the plot to follow a new source.
+    #[facet(opaque)]
+    pub line_plot: Option<gpui::WeakEntity<ListLinePlot>>,
 }
 
 impl ListTrace {
     pub fn new(component_id: impl Into<ComponentId>, len: usize, color: Hsla) -> Self {
         Self {
-            component_id: component_id.into(),
+            source: crate::data_binding::Binding::from(component_id.into()),
             len,
             color,
             style: PlotStyle::Line,
             visible: true,
             label: SharedString::new_static(""),
             stroke_width: 1.5,
+            line_plot: None,
         }
     }
 }
@@ -69,7 +73,6 @@ impl ListTrace {
 /// and pan/zoom input.
 pub struct ListPlot {
     line_plot: Entity<ListLinePlot>,
-    _expressions: Vec<crate::dynamic::expressions::Expression>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
@@ -86,7 +89,6 @@ impl ListPlot {
         cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
         Self {
             line_plot,
-            _expressions: Vec::new(),
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,

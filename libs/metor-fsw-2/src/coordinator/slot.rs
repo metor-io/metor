@@ -1,68 +1,22 @@
-//! Runtime-swappable slot occupants.
+//! Runtime-swappable sequence occupants.
 //!
-//! A slot is a cyclic system the coordinator drives every cycle like any
-//! other, except that its occupant can be replaced while the target runs.
-//! Runtime commands `Load`, `Start`, `Stop`, `Abort`, and `Reset` the
-//! occupant over the same create/execute/destroy ABI a statically wired
-//! dynamic system uses; there are no extra lifecycle symbols. Occupants are
-//! sequences, and the loadable set of [`AllowedOccupant`]s is fixed at build
-//! time. Each candidate library is opened and validated up front, and `Load`
-//! selects one by name.
+//! [`SlotRunner`] accepts `Load`, `Start`, `Stop`, `Abort`, and `Reset` commands.
+//! The allowed occupants and their port contracts are checked at build time.
+//! The coordinator owns the rings; unloading an occupant releases its reader
+//! and writer claims so its replacement can bind to the same regions.
 //!
-//! # Ring ownership
+//! The occupant's ports come first in descriptor order. The runner adds command
+//! inputs, a self-tap on [`SequenceStatus`], and status/event outputs. It owns
+//! the writer for the occupant's [`SlotControlIn`] cancellation input.
 //!
-//! The coordinator owns every ring for the whole target. An occupant only
-//! borrows writer and reader handles over them, so dropping the occupant
-//! (its `Drop` runs `fsw_destroy`) releases the ring roles, and a later
-//! `Load` attaches fresh handles over the same regions. [`SlotRunner`]
-//! therefore keeps per-port ring templates and can create any number of
-//! occupants over them, one at a time, each a fresh `fsw_pack_create` state.
+//! `Load` creates an occupant in `Loaded`; `Start` begins polling it. Process
+//! occupants first pass through `Loading`, with one startup step per cycle.
+//! `Stop` drops the live occupant but keeps the selected entry in `Loaded`;
+//! `Reset` or `Load` must recreate it before another `Start`.
 //!
-//! # Registered ports
-//!
-//! The port lists the build pass sees are the occupant's ports followed by
-//! the runner's. The occupant ports form the prefix of each list, in the
-//! occupant descriptor's order, so binding hands the occupant its rings with
-//! a straight prefix walk and the positional bind contract never changes.
-//! Within that prefix the occupant's trailing [`SlotControlIn`] input is
-//! host connected; the runner holds the writer and delivers `Abort` cancel
-//! frames through it. The runner's own tail is a `commands`
-//! [`MsgIn<SequenceCommand>`] fan-in plus a self-tap on the occupant's
-//! [`SequenceStatus`] output on the input side, and the host [`SlotStatus`]
-//! frame plus the slot's events message channel on the output side.
-//!
-//! # Lifecycle and events
-//!
-//! Each [`step`](CyclicSlot::step) drains and applies addressed commands
-//! first, so a command lands the cycle it arrives, then publishes the
-//! [`SlotStatus`] frame and polls the occupant once while the phase is
-//! Running. Once the phase leaves Running the occupant is not polled again.
-//!
-//! [`SlotState`] tracks the phase, while the live occupant future is tracked
-//! separately in [`SlotRunner`]'s `slot` field. A `Stop` hard-drops the
-//! future and returns the state to Loaded with no future behind it, so
-//! `Start` is rejected until a `Reset` rebuilds the occupant (or a `Load`
-//! replaces it — only a running or mid-load occupant blocks `Load`). Every
-//! lifecycle transition emits a [`SequenceChannelEvent`] on the slot's
-//! events channel, tagged with the slot's instance name; the runner is that
-//! ring's only writer, and a command the state machine rejects emits a
-//! `Refused` event rather than being silently dropped, so operators never
-//! see a dead click. Events are emitted per transition rather than derived
-//! from the latest status frame, because two commands can apply in a single
-//! drain and a snapshot would lose the first.
-//!
-//! # Process mode
-//!
-//! A slot whose occupants carry an [`OccupantBacking::Artifact`] runs them
-//! **out of process** (`docs/process-systems.md`): `Load` spawns a worker
-//! instead of calling `fsw_pack_create`. Each Load gets one worker, driven
-//! through the ctl lifecycle and torn down by kill + reclaim, the process
-//! twin of the hard-drop — and the host never dlopens the occupant
-//! artifacts. Everything above the occupant seam (commands, events, status,
-//! the progress drain, the terminal fold) is the same code as in-process;
-//! what differs is the [`Occupant`] variant behind it and one extra phase,
-//! [`SlotState::Loading`], while the spawned worker's pipeline is polled
-//! forward once per cycle.
+//! Commands are drained before polling. Each transition emits a
+//! [`SequenceChannelEvent`], including `Refused` for invalid commands. Events
+//! preserve transitions that a status snapshot could miss within one cycle.
 
 use core::mem::offset_of;
 use std::path::PathBuf;
@@ -80,7 +34,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use metor_fsw_ring::NoWake;
 
 use crate::FrameStr;
-use crate::dl::{DlSlot, DlSystem};
+use crate::dl::DlSlot;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::proc::StepOutcome;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -90,11 +44,6 @@ use metor_fsw_2_core::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus,
 use metor_fsw_2_core::{CyclicSlot, NAME_CAP, SlotState, StopReason, WorkerRunState, WorkerStatus};
 use metor_fsw_2_core::{Input, Output, frame_list_iter};
 use metor_fsw_2_core::{MsgIn, MsgOut};
-use metor_fsw_2_core::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind, compatible};
-
-// ---------------------------------------------------------------------------
-// Host telemetry / control frames
-// ---------------------------------------------------------------------------
 
 /// A fixed frame the host publishes every cycle carrying the slot phase and
 /// the selected occupant's name. Occupant-side detail such as progress lines
@@ -115,317 +64,17 @@ pub struct SlotStatus {
     pub occupant: FrameStr<NAME_CAP>,
 }
 
-// ---------------------------------------------------------------------------
-// Allowed / initial occupants + the registration payload
-// ---------------------------------------------------------------------------
-
-/// Where an [`AllowedOccupant`]'s code lives and how `Load` reaches it.
-pub enum OccupantBacking {
-    /// An opened library in this process; `Load` runs `fsw_pack_create` over the
-    /// handle, which stays loaded across swaps.
-    Dl(Box<DlSystem>),
-    /// A WebAssembly module driven under an interpreter in this process, its
-    /// ports joined to the slot's rings by a copy (`crate::wasm`). Bounded by
-    /// fuel and sandboxed from the host, which is what neither other backing
-    /// offers.
-    ///
-    /// `entry_identity` is the resolved manifest entry's ABI/schema identity.
-    /// `Load` re-reads `path`, finds the entry by occupant name, and accepts
-    /// changed module bytes only while that identity remains compatible.
-    Wasm {
-        path: PathBuf,
-        entry_identity: Vec<u8>,
-    },
-    /// A built cdylib the occupant's **worker process** opens
-    /// (`docs/process-systems.md`); the host keeps only the path and never
-    /// loads the artifact itself. Slots mix backings never: `plan_slot`
-    /// requires the whole allowed set on one side of the seam.
-    Artifact(PathBuf),
-}
-
-/// Fuel granted to each guest call when a slot does not choose its own.
-///
-/// The Phase 0 spike measured a math-heavy commissioning poll at 7,449 units,
-/// so this leaves roughly four orders of magnitude of headroom: generous enough
-/// that a legitimate sequence never trips it, small enough that a runaway is
-/// stopped inside one cycle rather than wedging the vehicle.
-pub const DEFAULT_FUEL_PER_CALL: u64 = 100_000_000;
-/// Generous fixed budget for module setup; the target-configured budget applies
-/// only after the occupant has bound successfully.
-pub const WASM_SETUP_FUEL: u64 = 100_000_000;
-
-/// A candidate occupant a slot is allowed to load, validated at build time.
-/// `Load` selects it by `name`; `descriptor` is the self-description the
-/// slot's contract was derived from and validated against (a dl open or a
-/// describe worker sourced it, per the backing), and `params` is the
-/// postcard blob `fsw_pack_create` decodes.
-pub struct AllowedOccupant {
-    pub name: String,
-    pub params: Vec<u8>,
-    pub descriptor: SystemDescriptor,
-    pub backing: OccupantBacking,
-}
-
-impl AllowedOccupant {
-    /// An in-process occupant over an opened library.
-    pub fn dl(name: impl Into<String>, system: DlSystem, params: Vec<u8>) -> Self {
-        Self {
-            name: name.into(),
-            params,
-            descriptor: system.descriptor().clone(),
-            backing: OccupantBacking::Dl(Box::new(system)),
-        }
-    }
-}
-
-/// Names an [`AllowedOccupant`] to load at startup, so a slot comes up
-/// populated instead of empty. Slot init applies it once, starting
-/// the occupant too when `start` is set.
-#[derive(Clone, Debug)]
-pub struct InitialOccupant {
-    /// The allowed-set occupant name to load at startup.
-    pub occupant: String,
-    /// Whether to also start it, so it is running from the first cycle.
-    pub start: bool,
-}
-
-/// A slot registration `plan_slot` rejected. The wiring front-end maps these
-/// onto its own `LoadError`s; a target author's typo is not a library bug, so
-/// none of these panic.
-#[derive(Clone, Debug, PartialEq, thiserror::Error)]
-pub enum SlotConfigError {
-    #[error("a slot needs at least one allowed occupant")]
-    Empty,
-    #[error("initial occupant `{occupant}` is not in the allowed set (allowed: {allowed})")]
-    UnknownInitial {
-        occupant: String,
-        /// The comma-joined allowed occupant names, for the message.
-        allowed: String,
-    },
-    #[error(
-        "a slot's occupants must share one backing: all in-process or all process-mode \
-         (`Load` may not silently change the slot's fault domain)"
-    )]
-    MixedBacking,
-    #[error(
-        "allowed occupant `{occupant}` is incompatible with the slot contract \
-         (derived from `{base}`)"
-    )]
-    OccupantMismatch { occupant: String, base: String },
-    #[error(
-        "occupant `{occupant}` declares `{port}` itself; the mount appends it \
-         (a pre-pack artifact must be rebuilt)"
-    )]
-    ReservedPort {
-        occupant: String,
-        port: &'static str,
-    },
-    #[error(
-        "allowed occupant `{occupant}` declares a capability; capability \
-         systems are wired for the whole run, never slot occupants"
-    )]
-    CapabilityOccupant { occupant: String },
-}
-
-/// The pure-spec half of slot validation: a non-empty allowed set, and an
-/// `initial` name inside it. The wiring gate runs it before any occupant
-/// artifact is opened (a typo must fail without a dlopen); the descriptor-level
-/// checks live in [`plan_slot`], next to the descriptors they need.
-pub(crate) fn validate_slot_spec(
-    allowed: &[&str],
-    initial: Option<&str>,
-) -> Result<(), SlotConfigError> {
-    if allowed.is_empty() {
-        return Err(SlotConfigError::Empty);
-    }
-    if let Some(init) = initial
-        && !allowed.contains(&init)
-    {
-        return Err(SlotConfigError::UnknownInitial {
-            occupant: init.to_string(),
-            allowed: allowed.join(", "),
-        });
-    }
-    Ok(())
-}
-
-/// Derive a slot's registered contract from its occupant set, the one place the
-/// descriptor-level checks run: backing homogeneity (per-slot means
-/// all-occupants, so a mixed set is
-/// [`MixedBacking`](SlotConfigError::MixedBacking)), mutual occupant
-/// compatibility against the first occupant's contract, the [`SlotPorts`] plan,
-/// and the flattened registered [`SystemDescriptor`]. The returned `bool` is
-/// whether the slot runs process-mode (an all-`Artifact` allow set).
-///
-/// The pure-spec checks ([`validate_slot_spec`]: a non-empty allow set, a valid
-/// `initial`) are the caller's gate, so `allowed` is trusted non-empty here.
-pub(crate) fn plan_slot(
-    name: &str,
-    allowed: &[AllowedOccupant],
-) -> Result<(SystemDescriptor, SlotPorts, bool), SlotConfigError> {
-    let backing = core::mem::discriminant(&allowed[0].backing);
-    if allowed
-        .iter()
-        .any(|a| core::mem::discriminant(&a.backing) != backing)
-    {
-        return Err(SlotConfigError::MixedBacking);
-    }
-    if let Some(occ) = allowed
-        .iter()
-        .find(|a| !a.descriptor.capabilities.is_empty())
-    {
-        return Err(SlotConfigError::CapabilityOccupant {
-            occupant: occ.name.clone(),
-        });
-    }
-    let process = matches!(&allowed[0].backing, OccupantBacking::Artifact(_));
-    // Every allowed occupant must share the contract; the slot sizes and
-    // validates to the first occupant's descriptor (mutual subset).
-    let base = &allowed[0].descriptor;
-    for occ in &allowed[1..] {
-        let d = &occ.descriptor;
-        let ports_match = |a: &[PortDesc], b: &[PortDesc]| {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b)
-                    .all(|(x, y)| compatible(x, y) && compatible(y, x))
-        };
-        if !(ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs)) {
-            return Err(SlotConfigError::OccupantMismatch {
-                occupant: occ.name.clone(),
-                base: allowed[0].name.clone(),
-            });
-        }
-    }
-    let ports = SlotPorts::for_occupant(base, &allowed[0].name)?;
-    // The registered descriptor name is the slot's instance name (a leaked
-    // `&'static str` for the descriptor field and the `SlotRunner` identity).
-    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let registered = ports.registered(leaked);
-    Ok((registered, ports, process))
-}
-
-/// A slot's registered ports as the three concepts they are, not the flat
-/// positional lists the build pass consumes:
-///
-/// - the occupant's **user ports**, in its descriptor's order;
-/// - the **mount-appended occupant tail** — the [`SlotControlIn`] cancel input
-///   and the [`SequenceStatus`] output (a mount property, not descriptor
-///   content: any entry can occupy a slot);
-/// - the **runner tail**, which never crosses to the occupant.
-///
-/// The first two flatten into the occupant lists here because both cross to
-/// the occupant, positionally, as the prefix of each registered list.
-/// [`registered`](Self::registered) flattens prefix then tail into the
-/// [`SystemDescriptor`] the build pass sees; edge resolution, registry keys,
-/// and the occupant-side positional bind ABI all consume that flattening, so
-/// its exact sequence is a compatibility surface (the
-/// `registered_slot_descriptor_snapshot` test pins it).
-pub(crate) struct SlotPorts {
-    /// The occupant's ABI prefix: its user inputs plus the mount-appended,
-    /// host-connected [`SlotControlIn`] (the runner holds the cancel writer).
-    pub occupant_inputs: Vec<PortDesc>,
-    /// The occupant's ABI prefix: its user outputs plus the mount-appended
-    /// [`SequenceStatus`].
-    pub occupant_outputs: Vec<PortDesc>,
-    /// The runner's inputs: the `commands` fan-in (an ordinary edge input, so
-    /// command wiring is ordinary message wiring) and the self-tap over the
-    /// occupant's [`SequenceStatus`] output.
-    pub tail_inputs: Vec<PortDesc>,
-    /// The runner's outputs: the [`SlotStatus`] frame and the `"sequences"`
-    /// events channel, both host-written and registry-tapped.
-    pub tail_outputs: Vec<PortDesc>,
-}
-
-impl SlotPorts {
-    /// Derive the slot's port plan from an occupant contract by extension,
-    /// not surgery: the mount tail is appended to the occupant's own ports,
-    /// then the runner tail is laid out after the prefix. Rejects an occupant
-    /// that declares a mount-appended port itself (a pre-pack artifact).
-    pub(crate) fn for_occupant(
-        base: &SystemDescriptor,
-        occupant: &str,
-    ) -> Result<Self, SlotConfigError> {
-        let control_id = PortId::Component(<SlotControlIn as crate::Frame>::FRAME_ID);
-        let seq_status_id = PortId::Component(<SequenceStatus as crate::Frame>::FRAME_ID);
-        let reserved = |port| SlotConfigError::ReservedPort {
-            occupant: occupant.to_string(),
-            port,
-        };
-        if base.inputs.iter().any(|p| p.id() == control_id) {
-            return Err(reserved("SlotControlIn"));
-        }
-        if base.outputs.iter().any(|p| p.id() == seq_status_id) {
-            return Err(reserved("SequenceStatus"));
-        }
-        let mut occupant_inputs = base.inputs.clone();
-        occupant_inputs.push(PortDesc::of::<SlotControlIn>().with_conn(PortConn::Host));
-        let mut occupant_outputs = base.outputs.clone();
-        occupant_outputs.push(PortDesc::of::<SequenceStatus>());
-        Ok(Self {
-            occupant_inputs,
-            occupant_outputs,
-            tail_inputs: vec![
-                PortDesc::msg::<SequenceCommand>(),
-                PortDesc::of::<SequenceStatus>().with_conn(PortConn::SelfTap(seq_status_id)),
-            ],
-            tail_outputs: vec![
-                PortDesc::of::<SlotStatus>().with_conn(PortConn::Host),
-                PortDesc::msg_named::<SequenceChannelEvent>("sequences").with_conn(PortConn::Host),
-            ],
-        })
-    }
-
-    /// Flatten the plan into the registered descriptor: occupant prefix then
-    /// runner tail, per direction. This sequence is load-bearing (see the
-    /// type docs); extend the plan, never reorder it.
-    pub(crate) fn registered(&self, name: &'static str) -> SystemDescriptor {
-        SystemDescriptor {
-            name: name.into(),
-            kind: SystemKind::Cyclic,
-            inputs: self
-                .occupant_inputs
-                .iter()
-                .chain(&self.tail_inputs)
-                .cloned()
-                .collect(),
-            outputs: self
-                .occupant_outputs
-                .iter()
-                .chain(&self.tail_outputs)
-                .cloned()
-                .collect(),
-            // Sequence occupants declare wired ports only (ReceiveAll is host-only).
-            capabilities: Vec::new(),
-        }
-    }
-}
-
-/// A slot's configuration as recorded at registration, held until `build()`
-/// assembles the [`SlotRunner`] from it.
-pub(crate) struct SlotReg {
-    pub allowed: Vec<AllowedOccupant>,
-    pub initial: Option<InitialOccupant>,
-    /// The named port plan the registered descriptor was flattened from; the
-    /// bind arm reads the occupant/tail split and the tail-port indices off
-    /// it instead of re-deriving them by shape.
-    pub ports: SlotPorts,
-    /// Run occupants out of process (`docs/process-systems.md`): the occupant
-    /// prefix's crossing rings — its outputs, its Edge inputs' producers, and
-    /// the host control ring — are allocated as session-dir files a worker
-    /// process can attach. The runner tail stays host-side either way.
-    pub process: bool,
-}
-
-// ---------------------------------------------------------------------------
-// SlotRunner
-// ---------------------------------------------------------------------------
+mod plan;
+pub use plan::{AllowedOccupant, InitialOccupant, OccupantBacking, SlotConfigError};
+pub(crate) use plan::{
+    DEFAULT_FUEL_PER_CALL, SlotPorts, SlotReg, WASM_SETUP_FUEL, plan_slot, validate_slot_spec,
+};
 
 /// The live occupant, one variant per backing: the dl occupant is a future
 /// polled in this process, the proc occupant a worker process driven over
-/// the ctl block. Dropping either releases everything it held — the dl
-/// occupant's `Drop` runs `fsw_destroy`, the worker's kills, reaps, and
-/// reclaims — so `None`-ing the field is the one teardown spelling for both.
+/// the ctl block. Dropping either releases everything it held (the dl
+/// occupant's `Drop` runs `fsw_pack_destroy`, the worker's kills, reaps, and
+/// reclaims), so `None`-ing the field is the one teardown spelling for both.
 enum Occupant {
     Dl(DlSlot),
     Wasm(Box<crate::wasm::WasmSlot>),
@@ -453,11 +102,8 @@ pub(crate) struct ProcParts {
 /// commands. It holds the per-port [`FswRing`](metor_fsw_2_core::abi::FswRing) templates,
 /// the [`AllowedOccupant`] set, the live occupant, the [`SlotState`], and the
 /// host-owned control and status writers. No occupant exists after `build()`;
-/// the first one is created at `init` or by a runtime `Load`.
-///
-/// The live future is tracked separately from the state. After a hard-drop
-/// `Stop` the state returns to `Loaded` but `slot` is `None`, so `Start` is
-/// rejected and only a `Reset` rebuild can run the occupant again.
+/// the first one is created at `init` or by a runtime `Load` (see the module
+/// docs for the full lifecycle).
 pub(crate) struct SlotRunner {
     /// The slot's instance name, its identity and command address.
     name: Arc<str>,
@@ -506,7 +152,7 @@ pub(crate) struct SlotRunner {
     /// and the seam `worker_status` keys "is there a worker behind this slot" on.
     proc: Option<ProcParts>,
     /// Occupant-worker steps whose ack deadline lapsed with the worker still
-    /// alive, since the coordinator last drained them into its health.
+    /// alive, since the coordinator last drained them onto its log.
     timeouts: u64,
     /// Unplanned worker deaths (pipeline failures included) over the slot's
     /// life, telemetered in the worker list's `restarts` field: Loads are
@@ -577,8 +223,8 @@ impl SlotRunner {
     /// `Loaded`; the proc arm spawns the occupant's worker and lands
     /// `Loading` (announced with a `Loading` event), advanced one pipeline
     /// phase per step so a Load never stalls the cycle loop. The `Loaded`
-    /// event fires when the occupant is actually bound — immediately here
-    /// for dl, from the pipeline for proc.
+    /// event fires when the occupant is actually bound, immediately here for
+    /// dl, from the pipeline for proc.
     fn build_occupant(&mut self, idx: usize) {
         let occ = &self.allowed[idx];
         match &occ.backing {
@@ -689,11 +335,11 @@ impl SlotRunner {
         .map_err(|e| e.to_string())
     }
 
-    /// A worker failed the slot — mid-pipeline or mid-run: land the terminal
-    /// stop and tell the operator why. No auto-restart, deliberately:
-    /// re-running a sequence silently re-issues every command it already
-    /// sent, a target-level decision, so recovery stays with the operator's
-    /// existing `Reset`/`Load`.
+    /// A worker failed the slot, mid-pipeline or mid-run: land the terminal
+    /// stop and tell the operator why. No auto-restart, deliberately, since
+    /// re-running a sequence would silently re-issue every command it
+    /// already sent; recovery stays with the operator's existing
+    /// `Reset`/`Load`.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn fail_occupant(&mut self, reason: String) {
         self.slot = None;
@@ -732,9 +378,9 @@ impl SlotRunner {
     }
 
     /// Block out a proc occupant's initial load inside the coordinator's
-    /// init barrier — init is not cycle time, and `initial state="running"`
-    /// needs the occupant `Loaded` before its `Start` can apply. A failure
-    /// folds exactly as the polled pipeline's would.
+    /// init barrier, since init is not cycle time and `initial
+    /// state="running"` needs the occupant `Loaded` before its `Start` can
+    /// apply. A failure folds exactly as the polled pipeline's would.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn finish_initial_load(&mut self) {
         if !matches!(self.state, SlotState::Loading) {
@@ -784,7 +430,7 @@ impl SlotRunner {
     }
 
     /// Select an allowed occupant by name and build it. Legal from any state
-    /// except a running or mid-load occupant, which must stop first —
+    /// except a running or mid-load occupant, which must stop first;
     /// loading over a `Loaded` slot drops the current occupant and builds
     /// the named one. A name outside the allowed set leaves the state
     /// untouched and emits a `Failed` event naming the allowed set, so the
@@ -840,10 +486,11 @@ impl SlotRunner {
         self.emit_event(SequenceEventKind::Refused { reason });
     }
 
-    /// Hard-drop the occupant (a dl occupant's `Drop` runs `fsw_destroy`,
+    /// Hard-drop the occupant (a dl occupant's `Drop` runs `fsw_pack_destroy`,
     /// releasing the ring roles; a proc occupant's kills and reclaims its
-    /// worker — a sequence has nothing graceful to lose), leaving the slot
-    /// loaded with nothing live behind it. Only a `Reset` can run it again.
+    /// worker, since a sequence has nothing graceful to lose), leaving the
+    /// slot loaded with nothing live behind it. Only a `Reset` can run it
+    /// again.
     fn do_stop(&mut self) {
         if matches!(self.state, SlotState::Running) {
             self.slot = None;
@@ -927,7 +574,7 @@ impl SlotRunner {
         self.detail_scratch = details;
     }
 
-    /// Fold one polled status word into the slot state — the shared tail of
+    /// Fold one polled status word into the slot state, the shared tail of
     /// both backings' step. Drains what the occupant just published before
     /// folding the terminal event, so observers see the final Progress lines
     /// ahead of the Completed/Aborted/Failed derived from them.
@@ -983,12 +630,7 @@ impl SlotRunner {
             _pad: [0; 7],
             occupant,
         };
-        if self.status_out.write(&frame).is_err()
-            && !matches!(self.state, SlotState::Stopped { .. })
-        {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            self.fail_occupant("slot status output blocked".to_string());
-        }
+        self.status_out.publish(&frame);
     }
 }
 
@@ -1066,7 +708,7 @@ impl CyclicSlot for SlotRunner {
 
     fn shutdown(&mut self) {
         // Target teardown is the one graceful exit a proc occupant's worker
-        // gets — shutdown request, grace window, then kill — unlike the
+        // gets (shutdown request, grace window, then kill) unlike the
         // runtime `Stop`'s immediate kill; blocking is acceptable here.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(Occupant::Proc(worker)) = self.slot.as_mut() {
@@ -1083,6 +725,10 @@ impl CyclicSlot for SlotRunner {
         &self.state
     }
 
+    fn drain_status_drops(&mut self) -> u64 {
+        self.status_out.take_dropped()
+    }
+
     fn drain_timeouts(&mut self) -> u64 {
         std::mem::take(&mut self.timeouts)
     }
@@ -1094,7 +740,7 @@ impl CyclicSlot for SlotRunner {
         }
     }
 
-    fn boundary_drop_health_key(&self) -> &'static str {
+    fn boundary_drop_kind(&self) -> &'static str {
         "wasm_boundary_dropped"
     }
 
@@ -1113,8 +759,8 @@ impl CyclicSlot for SlotRunner {
             _ => 0,
         };
         // "Half-born, inside the pipeline" describes a Loading occupant
-        // exactly, hence `Restarting`; any live worker — running, idle, or
-        // Done and holding its roles — reads `Running`, and between workers
+        // exactly, hence `Restarting`; any live worker (running, idle, or
+        // Done and holding its roles) reads `Running`, and between workers
         // the slot reads `Stopped`. The occupant-level story (which one,
         // what phase, the outcome) stays on `SlotStatus` and the events
         // channel; this list answers only "is there a live process here".

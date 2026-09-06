@@ -40,7 +40,7 @@ impl Bench {
         let db = DB::create(temp.path().join("db")).unwrap();
         let id = ComponentId::new(SOURCE);
         db.with_state_mut(|s| {
-            s.insert_component(id, ComponentSchema::new(PrimType::F64, &[]), &db.path)
+            s.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
         })
         .unwrap();
         db.with_state_mut(|s| {
@@ -98,8 +98,14 @@ async fn keystroke_to_updated_output() {
     let compile = compile_start.elapsed();
 
     let build_start = Instant::now();
-    let system =
-        program::system(&compiled, 0, vec![program::PortSource::live(bench.source())], DEFAULT_FUEL, None).unwrap();
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource::live(bench.source())],
+        DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
     let field = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
     let build = build_start.elapsed();
 
@@ -146,8 +152,14 @@ async fn rebuild_with_state() {
     };
 
     let first_build = Arc::new(Compiled::module(&lowpass("0.5"), &resolver).unwrap());
-    let running =
-        program::system(&first_build, 0, vec![program::PortSource::live(bench.source())], DEFAULT_FUEL, None).unwrap();
+    let running = program::system(
+        &first_build,
+        0,
+        vec![program::PortSource::live(bench.source())],
+        DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
     let field = program::field(&first_build, 0, 0, running.node.clone()).unwrap();
     let mut out = field.subscribe();
     bench.push(1, 100.0);
@@ -200,8 +212,14 @@ async fn a_three_system_chain_against_three_legacy_nodes() {
         )
         .unwrap(),
     );
-    let system =
-        program::system(&compiled, 0, vec![program::PortSource::live(bench.source())], DEFAULT_FUEL, None).unwrap();
+    let system = program::system(
+        &compiled,
+        0,
+        vec![program::PortSource::live(bench.source())],
+        DEFAULT_FUEL,
+        None,
+    )
+    .unwrap();
     let expression = program::field(&compiled, 0, 0, system.node.clone()).unwrap();
 
     // Phase 1 priced this against the three `affine` nodes it replaces and
@@ -223,11 +241,7 @@ const CHUNK: usize = 64;
 ///
 /// Only the drain is timed: the pushes and the yields between them are the
 /// harness, not the work being priced.
-async fn drain_cost(
-    bench: &Bench,
-    node: &Arc<dyn DynamicNode>,
-    first_stamp: i64,
-) -> (f64, usize) {
+async fn drain_cost(bench: &Bench, node: &Arc<dyn DynamicNode>, first_stamp: i64) -> (f64, usize) {
     let mut reader = node.subscribe();
     let mut seen = 0usize;
     let mut elapsed = Duration::ZERO;

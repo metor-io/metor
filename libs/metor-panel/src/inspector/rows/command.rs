@@ -52,6 +52,13 @@ impl CommandRow {
 }
 
 impl InspectorRow for CommandRow {
+    fn identity(&self) -> SharedString {
+        format!("command:{:?}:{}", self.tag, self.label).into()
+    }
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }
@@ -60,7 +67,7 @@ impl InspectorRow for CommandRow {
         &self,
         row_ix: usize,
         selected: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let color = theme(cx).text_primary;
@@ -70,6 +77,7 @@ impl InspectorRow for CommandRow {
             self.label.clone(),
             self.tag.clone(),
             color,
+            window,
             cx,
         )
     }

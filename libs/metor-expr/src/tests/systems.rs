@@ -40,7 +40,10 @@ fn vec3() -> Ty {
 
 impl Resolver for Table {
     fn component(&self, path: &str) -> Option<CompSchema> {
-        self.0.get(path).map(|ty| CompSchema { ty: ty.clone() })
+        self.0.get(path).map(|ty| CompSchema {
+            ty: ty.clone(),
+            timestamp: true,
+        })
     }
 
     fn suffix(&self, name: &str) -> Vec<String> {
@@ -124,6 +127,28 @@ impl Run {
         self
     }
 
+    /// Stamp one input frame the way a host does: the sample's timestamp
+    /// into the frame's timestamp field.
+    pub(super) fn stamp(&mut self, port: &str, ts: i64) -> &mut Self {
+        let system = &self.program.manifest.systems[self.system];
+        let index = system
+            .inputs
+            .iter()
+            .position(|p| p.param == port)
+            .unwrap_or_else(|| panic!("no port `{port}`"));
+        let offset = system.inputs[index]
+            .frame
+            .timestamp_field()
+            .expect("a stamped input frame")
+            .offset;
+        let at = self.address("arg_ptr", Some(index as i32)) + offset;
+        let memory = self.instance.get_memory(&self.store, "memory").unwrap();
+        memory
+            .write(&mut self.store, at as usize, &ts.to_le_bytes())
+            .unwrap();
+        self
+    }
+
     pub(super) fn eval(&mut self, now: i64) -> i32 {
         let name = format!("{}_eval", self.name());
         let func = self.instance.get_func(&self.store, &name).unwrap();
@@ -186,7 +211,7 @@ fn nox3(v: [f64; 3]) -> Tensor<f64, Const<3>, ArrayRepr> {
     v.into()
 }
 
-const IMU: &str = "\
+pub(super) const IMU: &str = "\
 class Imu(Frame):
     omega: Tensor[f64, 3]
     accel: Tensor[f64, 3]
@@ -233,6 +258,7 @@ def watchdog(imu: Imu) -> Rate:
 
 /// The default binding is the snake case of the frame class, field by field,
 /// and the manifest records what it resolved to rather than what was written.
+/// The record's own timestamp binds last, as the field a stamped source adds.
 #[test]
 fn ports_bind_by_frame_name_and_the_manifest_records_the_paths() {
     let source = format!(
@@ -244,9 +270,16 @@ fn ports_bind_by_frame_name_and_the_manifest_records_the_paths() {
         system.inputs[0].bindings,
         vec![
             Binding::Component("imu.omega".into()),
-            Binding::Component("imu.accel".into())
+            Binding::Component("imu.accel".into()),
+            Binding::Timestamp
         ]
     );
+    let frame = &system.inputs[0].frame;
+    assert_eq!(
+        frame.timestamp_field().map(|f| f.name.as_str()),
+        Some("@timestamp")
+    );
+    assert_eq!(frame.timestamp_field().map(|f| f.ty.clone()), Some(Ty::I64));
     assert_eq!(system.publishes, vec!["w.rate", "w.hot"]);
     assert_eq!(system.driving, Some(0));
 }

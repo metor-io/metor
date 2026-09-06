@@ -5,9 +5,8 @@
 //! keyed by [`gpui::EntityId`]. Parents embed a `LinePlot` entity and
 //! leave rendering, bounds tracking, and GPU management to it.
 //!
-//! Every self-notify runs [`LinePlot::reconcile`], which spawns or drops
-//! trackers for added or removed traces, invalidates the view override
-//! when a reflected knob changes, and refreshes the cached title.
+//! Configuration edits invalidate reconciliation; sample and image updates
+//! only repaint. Trace and axis observations bridge edits to child entities.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,6 +51,10 @@ struct TraceTracking {
     lod_y_bounds: Option<(f64, f64)>,
     lod_node_bounds: NodeBoundsCache,
     lod_cache_key: Option<ComponentId>,
+    /// How to compute the history this component lacks, when it is an
+    /// expression's. Its ports also size the window while the component
+    /// itself is still empty.
+    plan: Option<crate::dynamic::ops::replay::ReplayPlan>,
 }
 
 impl TraceTracking {
@@ -68,6 +71,7 @@ impl TraceTracking {
             lod_y_bounds: None,
             lod_node_bounds: NodeBoundsCache::default(),
             lod_cache_key: None,
+            plan: None,
         }
     }
 
@@ -90,8 +94,8 @@ const LOD_BUCKET_BUDGET: u64 = RAW_SAMPLE_BUDGET / 2;
 struct OverrideSnapshot {
     /// Per-axis `(min, max)` overrides, index-aligned with `LinePlot::axes`.
     axes: smallvec::SmallVec<[(Option<f64>, Option<f64>); 2]>,
-    /// The *resolved* range, so a global-range edit clears the pan/zoom
-    /// override exactly like a per-plot edit does.
+    /// Only local range settings reset a user's zoom. Global edits change
+    /// the reset bounds, while an explicit sync command clears every zoom.
     x_range: TimeRangeBehavior,
 }
 
@@ -110,7 +114,38 @@ impl OverrideSnapshot {
             .collect();
         Self {
             axes,
-            x_range: lp.resolved_x_range(cx),
+            x_range: lp.x_range.as_custom().copied().unwrap_or_default(),
+        }
+    }
+}
+
+/// Title inputs are compared only when configuration or registry state changes.
+#[derive(PartialEq)]
+enum TitleSnapshot {
+    Auto {
+        traces: Vec<(ComponentId, usize)>,
+        vtable_generation: u64,
+        metadata_generation: u64,
+    },
+    Custom(SharedString),
+}
+
+impl TitleSnapshot {
+    fn capture(lp: &LinePlot, cx: &gpui::App) -> Self {
+        if let Override::Custom(title) = &lp.custom_title {
+            return Self::Custom(title.clone());
+        }
+        Self::Auto {
+            traces: lp
+                .traces
+                .iter()
+                .map(|trace| {
+                    let trace = trace.read(cx);
+                    (trace.source.id(), trace.element_index)
+                })
+                .collect(),
+            vtable_generation: lp.db.vtable_gen.latest(),
+            metadata_generation: lp.db.metadata_gen.latest(),
         }
     }
 }
@@ -119,7 +154,8 @@ impl OverrideSnapshot {
 ///
 /// Owns the render state, traces, per-trace trackers, and the
 /// inspector-reflected view-override fields. Parents `.child(entity.clone())`
-/// into their render trees and mutate this entity's fields directly.
+/// into their render trees. After directly editing configuration fields, call
+/// [`Self::configuration_changed`]; trace and axis entities are observed.
 #[derive(facet::Facet)]
 pub struct LinePlot {
     pub traces: Vec<Entity<Trace>>,
@@ -142,15 +178,31 @@ pub struct LinePlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
+    _configuration_changes: gpui::Task<()>,
+    #[facet(opaque)]
+    configuration_dirty: bool,
+    #[facet(opaque)]
+    axis_subscriptions: HashMap<EntityId, gpui::Subscription>,
+    #[facet(opaque)]
     tracking: HashMap<EntityId, TraceTracking>,
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
+    #[facet(opaque)]
+    inputs: crate::data_binding::InputChanges,
     #[facet(opaque)]
     view_override: Option<PlotView>,
     #[facet(opaque)]
     last_overrides: OverrideSnapshot,
     #[facet(opaque)]
     title_cache: SharedString,
+    #[facet(opaque)]
+    last_title: Option<TitleSnapshot>,
+    #[cfg(test)]
+    #[facet(opaque)]
+    configuration_passes: usize,
+    #[cfg(test)]
+    #[facet(opaque)]
+    title_rebuilds: usize,
     #[facet(opaque)]
     gpu_state: PlotRenderState,
 }
@@ -162,6 +214,12 @@ impl LinePlot {
 
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         cx.observe_self(Self::reconcile).detach();
+        cx.observe_global::<crate::temporal::PlotSync>(|this, cx| {
+            this.x_range = Override::Auto;
+            this.set_view_override(None, cx);
+            this.configuration_changed(cx);
+        })
+        .detach();
         let primary_axis = cx.new(|_| YAxis::new("Y"));
         Self {
             traces: Vec::new(),
@@ -172,17 +230,57 @@ impl LinePlot {
             custom_title: Override::Auto,
             show_alarm_limits: true,
             show_alarm_color: true,
+            _configuration_changes: Self::watch_configuration(db.clone(), cx),
+            configuration_dirty: true,
+            axis_subscriptions: HashMap::new(),
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
+            inputs: Default::default(),
             view_override: None,
             last_overrides: OverrideSnapshot {
                 axes: smallvec::SmallVec::new(),
                 x_range: TimeRangeBehavior::FULL,
             },
             title_cache: "Plot".into(),
+            last_title: None,
+            #[cfg(test)]
+            configuration_passes: 0,
+            #[cfg(test)]
+            title_rebuilds: 0,
             gpu_state: PlotRenderState::default(),
         }
+    }
+
+    /// Invalidate configuration after an edit, preserving ordinary notifications
+    /// for sample arrivals, completed images, and interactive view movement.
+    pub fn configuration_changed(&mut self, cx: &mut Context<Self>) {
+        self.configuration_dirty = true;
+        cx.notify();
+    }
+
+    fn watch_configuration(db: Arc<DB>, cx: &mut Context<Self>) -> gpui::Task<()> {
+        let mut vtable_generation = db.vtable_gen.latest();
+        let mut metadata_generation = db.metadata_gen.latest();
+        cx.spawn(async move |this, cx| {
+            loop {
+                futures_lite::future::race(
+                    db.vtable_gen
+                        .wait_for(|generation| generation != vtable_generation),
+                    db.metadata_gen
+                        .wait_for(|generation| generation != metadata_generation),
+                )
+                .await;
+                vtable_generation = db.vtable_gen.latest();
+                metadata_generation = db.metadata_gen.latest();
+                if this
+                    .update(cx, |lp, cx| lp.configuration_changed(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
     }
 
     /// Replace the trace list from raw values.
@@ -190,8 +288,25 @@ impl LinePlot {
     /// Convenience for callers (sparklines, table rows) that don't need a
     /// persistent `Entity<Trace>` handle for each series.
     pub fn bind_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
-        self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
-        cx.notify();
+        self.traces = traces
+            .into_iter()
+            .map(|mut t| {
+                t.source.resolve(&self.db, cx);
+                cx.new(|_| t)
+            })
+            .collect();
+        self.configuration_changed(cx);
+    }
+
+    /// Forget what `trace` was tracking, so the next reconcile follows the
+    /// component it names now. The inspector calls this after rewriting a
+    /// trace's source; the tracker latched its component when it started
+    /// and would otherwise keep reading the old one.
+    pub fn rebind_trace(&mut self, trace: &Entity<Trace>, cx: &mut Context<Self>) {
+        let id = trace.entity_id();
+        self.tracking.remove(&id);
+        self.tasks.remove(&id);
+        self.configuration_changed(cx);
     }
 
     /// Pin the view to `view`, or clear the override with `None`.
@@ -245,7 +360,7 @@ impl LinePlot {
                 continue;
             }
             if tracking.lod_resolved_gen != Some(vtable_gen) {
-                tracking.lod_levels = resolve_lod_levels(&self.db, cfg.component_id);
+                tracking.lod_levels = resolve_lod_levels(&self.db, cfg.source.id());
                 tracking.lod_resolved_gen = Some(vtable_gen);
             }
             let estimate = component.time_series.estimate_samples(range.clone());
@@ -308,11 +423,18 @@ impl LinePlot {
                 Some(lod) => (&lod.time_series, lod.component_id, true),
                 // Over budget with no published level yet: show raw gaps
                 // but never pull the raw archive for a wide view.
-                None if tracking.over_budget => (&component.time_series, cfg.component_id, false),
-                None => (&component.time_series, cfg.component_id, true),
+                None if tracking.over_budget => (&component.time_series, cfg.source.id(), false),
+                None => (&component.time_series, cfg.source.id(), true),
             };
             gaps.clear();
             series.coverage(visible.clone(), &mut gaps);
+            let mut band = |range: &std::ops::Range<Timestamp>| {
+                let start = ((range.start.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
+                let end = ((range.end.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
+                if end > start {
+                    bands.push((start, end - start));
+                }
+            };
             for gap in &gaps {
                 if hydrate
                     && gap.state == metor_db::manifest::SpanState::RemoteOnly
@@ -320,11 +442,17 @@ impl LinePlot {
                 {
                     hydrator.request(hydrate_id, gap.range.clone());
                 }
-                let start = ((gap.range.start.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
-                let end = ((gap.range.end.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
-                if end > start {
-                    bands.push((start, end - start));
-                }
+                band(&gap.range);
+            }
+            // What an expression has never computed is a gap of the other
+            // kind: nothing to fetch, something to compute. Always against
+            // the raw series — a LoD level is derived from it afterwards.
+            let history = crate::data_binding::BoundHistory {
+                component: component.clone(),
+                plan: tracking.plan.clone(),
+            };
+            for range in history.request_replay(visible.clone(), cx) {
+                band(&range);
             }
         }
         // A year-wide view over a sparse archive yields hundreds of
@@ -345,10 +473,22 @@ impl LinePlot {
 
     /// Bring tracking state and the title cache in sync with `self.traces`.
     ///
-    /// Runs on every self-notify. Spawns a tracker for each new trace,
-    /// drops trackers for removed traces, and resets the pan/zoom override
-    /// when an inspector edit changes the reflected view knobs.
+    /// Sample and image notifications take only the dirty-flag check. Edits
+    /// reconcile tracker membership and reset zoom when reflected bounds change.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.configuration_dirty) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.configuration_passes += 1;
+        }
+        for trace in &self.traces {
+            trace.update(cx, |trace, cx| {
+                trace.source.resolve(&self.db, cx);
+            });
+        }
+
         // Always keep at least the primary axis so traces have a home and
         // the chrome has something to render, and never exceed the chrome
         // budget (the generic "Add" doesn't gate, so cap here).
@@ -357,10 +497,17 @@ impl LinePlot {
             self.axes.push(axis);
         }
         self.axes.truncate(Self::MAX_AXES);
+        self.axis_subscriptions
+            .retain(|id, _| self.axes.iter().any(|axis| axis.entity_id() == *id));
+        for axis in &self.axes {
+            self.axis_subscriptions
+                .entry(axis.entity_id())
+                .or_insert_with(|| cx.observe(axis, |lp, _, cx| lp.configuration_changed(cx)));
+        }
         // Point each trace back at this plot (so the axis picker can list
         // sibling axes) and clamp stale axis indices. Mutating the trace
-        // entity without notifying is safe: the plot doesn't observe its
-        // traces, so this can't re-enter reconcile.
+        // entity without notifying avoids feeding our trace observation back
+        // into configuration reconciliation.
         let self_weak = cx.entity().downgrade();
         let self_id = cx.entity().entity_id();
         let axis_count = self.axes.len();
@@ -378,6 +525,17 @@ impl LinePlot {
                     t.axis_index = 0;
                 }
             });
+        }
+
+        for id in self.inputs.changed_with(
+            &self.traces,
+            &self.db,
+            |trace| vec![(trace.source.id(), trace.element_index)],
+            Self::configuration_changed,
+            cx,
+        ) {
+            self.tracking.remove(&id);
+            self.tasks.remove(&id);
         }
 
         let db = self.db.clone();
@@ -399,10 +557,18 @@ impl LinePlot {
             self.last_overrides = snapshot;
         }
 
-        self.title_cache = match &self.custom_title {
-            Override::Custom(custom) => custom.clone(),
-            Override::Auto => derive_title(&self.traces, &self.db, cx),
-        };
+        let title = TitleSnapshot::capture(self, cx);
+        if self.last_title.as_ref() != Some(&title) {
+            self.title_cache = match &self.custom_title {
+                Override::Custom(custom) => custom.clone(),
+                Override::Auto => derive_title(&self.traces, &self.db, cx),
+            };
+            self.last_title = Some(title);
+            #[cfg(test)]
+            {
+                self.title_rebuilds += 1;
+            }
+        }
     }
 
     /// The view the renderer will use this frame.
@@ -433,24 +599,35 @@ impl LinePlot {
             let Some(comp) = &tracking.component else {
                 continue;
             };
-            if let Some(s) = comp.time_series.start_timestamp() {
-                start = start.min(s.0 as f64);
-                any_time = true;
-            }
-            if let Some(l) = comp.time_series.latest() {
-                end = end.max(l.timestamp().0 as f64);
-                any_time = true;
-            }
-            // Remote-only history has no resident nodes; the manifest is
-            // what lets a full-range view span the whole archive.
-            let manifest = comp.time_series.manifest();
-            if let Some(span) = manifest.spans.first() {
-                start = start.min(span.seal.start_ts.0 as f64);
-                any_time = true;
-            }
-            if let Some(span) = manifest.spans.last() {
-                end = end.max(span.cover_end.0 as f64);
-                any_time = true;
+            let mut extend = |comp: &Component| {
+                if let Some(s) = comp.time_series.start_timestamp() {
+                    start = start.min(s.0 as f64);
+                    any_time = true;
+                }
+                if let Some(l) = comp.time_series.latest() {
+                    end = end.max(l.timestamp().0 as f64);
+                    any_time = true;
+                }
+                // Remote-only history has no resident nodes; the manifest is
+                // what lets a full-range view span the whole archive.
+                let manifest = comp.time_series.manifest();
+                if let Some(span) = manifest.spans.first() {
+                    start = start.min(span.seal.start_ts.0 as f64);
+                    any_time = true;
+                }
+                if let Some(span) = manifest.spans.last() {
+                    end = end.max(span.cover_end.0 as f64);
+                    any_time = true;
+                }
+            };
+            extend(comp);
+            // An expression's component holds only what has been computed;
+            // what *could* be is bounded by its inputs, and that is the
+            // window a backfill fills.
+            if let Some(plan) = &tracking.plan {
+                for port in &plan.ports {
+                    extend(port);
+                }
             }
             let ai = cfg.axis_index.min(axis_count - 1);
             if let Some((lo, hi)) = tracking.y_bounds {
@@ -471,9 +648,11 @@ impl LinePlot {
         if !any_time || start >= end {
             return None;
         }
-        let range = self
-            .resolved_x_range(cx)
-            .calculate_range(Timestamp(start as i64), Timestamp(end as i64));
+        let range = crate::temporal::resolve_range(
+            &self.x_range,
+            Timestamp(start as i64)..Timestamp(end as i64),
+            cx,
+        )?;
         let (min_x, mut max_x) = (range.start.0 as f64, range.end.0 as f64);
         if min_x >= max_x {
             max_x = min_x + 1.0;
@@ -636,14 +815,16 @@ impl LinePlot {
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let trace_id = match this.update(cx, |_, cx| trace.read(cx).component_id) {
+            let trace_id = match this.update(cx, |_, cx| trace.read(cx).source.id()) {
                 Ok(id) => id,
                 Err(_) => return,
             };
             let component = wait_for_component(&db, trace_id).await;
             let installed = this.update(cx, |lp, cx| {
+                let plan = crate::dynamic::expressions::replay_plan(trace_id, &db, cx);
                 if let Some(tracking) = lp.tracking.get_mut(&id) {
                     tracking.component = Some(component.clone());
+                    tracking.plan = plan;
                     cx.notify();
                     true
                 } else {
@@ -786,6 +967,7 @@ impl Render for LinePlot {
                                         color,
                                         stroke_width: config.stroke_width,
                                         x_clip: None,
+                                        time_clip: None,
                                     });
                                     let tail = lod
                                         .time_series
@@ -808,6 +990,7 @@ impl Render for LinePlot {
                                     color: config.color,
                                     stroke_width: config.stroke_width,
                                     x_clip: raw_clip,
+                                    time_clip: None,
                                 });
                             }
                             // X data + a 0..1 Y placeholder; each trace's Y is
@@ -883,7 +1066,7 @@ fn line_plot_gpu_state(lp: &mut LinePlot) -> &mut PlotRenderState {
 /// The LoD companions published for `source`, finest first. Resolved by
 /// the `lod_source_id` metadata key rather than name construction so a
 /// renamed source keeps its levels.
-fn resolve_lod_levels(db: &DB, source: ComponentId) -> Vec<Component> {
+pub(crate) fn resolve_lod_levels(db: &DB, source: ComponentId) -> Vec<Component> {
     let source_key = source.0.to_string();
     db.with_state(|state| {
         let mut levels: Vec<(u64, Component)> = state
@@ -919,7 +1102,7 @@ fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> Share
     let mut order: Vec<ComponentId> = Vec::new();
     for trace in traces {
         let t = trace.read(cx);
-        let id = t.component_id;
+        let id = t.source.id();
         groups
             .entry(id)
             .or_insert_with(|| {
@@ -952,4 +1135,123 @@ fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> Share
         .collect();
 
     SharedString::from(parts.join(", "))
+}
+
+#[cfg(test)]
+#[path = "configuration_tests.rs"]
+mod configuration_tests;
+
+#[cfg(test)]
+mod rebind_tests {
+    use super::*;
+    use metor_db::ComponentSchema;
+    use metor_proto::types::PrimType;
+
+    #[gpui::test]
+    fn temporal_zoom_is_local_until_explicit_sync(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let (a, b) = cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            crate::temporal::TemporalController::init(db.clone(), cx);
+            let a = cx.new(|cx| LinePlot::new(db.clone(), cx));
+            let b = cx.new(|cx| LinePlot::new(db, cx));
+            for plot in [&a, &b] {
+                plot.update(cx, |p, cx| p.reconcile(cx));
+            }
+            (a, b)
+        });
+        cx.update(|cx| {
+            a.update(cx, |p, cx| {
+                p.set_view_override(
+                    Some(PlotView {
+                        x: (20.0, 30.0),
+                        axes: smallvec::smallvec![(2.0, 3.0)],
+                    }),
+                    cx,
+                )
+            });
+            b.update(cx, |p, cx| {
+                p.set_view_override(
+                    Some(PlotView {
+                        x: (50.0, 80.0),
+                        axes: smallvec::smallvec![(0.0, 1.0)],
+                    }),
+                    cx,
+                )
+            });
+            crate::temporal::dispatch(
+                crate::temporal::TimeAction::Range(crate::temporal::TimeRangeSpec::fixed(
+                    Timestamp(100)..Timestamp(200),
+                )),
+                cx,
+            )
+            .unwrap();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(a.read(cx).effective_view(cx).unwrap().x, (20.0, 30.0));
+            assert_eq!(b.read(cx).effective_view(cx).unwrap().x, (50.0, 80.0));
+            crate::temporal::dispatch(crate::temporal::TimeAction::SyncPlots, cx).unwrap();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(a.read(cx).view_override.is_none());
+            assert!(b.read(cx).view_override.is_none());
+        });
+    }
+
+    /// Rewriting a trace's source is only half of a rebind: the plot's
+    /// tracker latched the old component when it started, so the plot has
+    /// to be told to follow the new one.
+    #[gpui::test]
+    fn a_rebound_trace_is_tracked_on_its_new_component(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        for name in ["adcs.rate", "wheels.rpm"] {
+            db.with_state_mut(|s| {
+                s.insert_component(
+                    ComponentId::new(name),
+                    ComponentSchema::new(PrimType::F64, &[][..]),
+                    &db.path,
+                )
+            })
+            .unwrap();
+        }
+        let plot = cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            cx.new(|cx| {
+                let mut lp = LinePlot::new(db.clone(), cx);
+                let trace = Trace::new(
+                    ComponentId::new("adcs.rate"),
+                    0,
+                    crate::theme::DARK.line_colors[0],
+                );
+                lp.bind_traces(vec![trace], cx);
+                lp
+            })
+        });
+        cx.run_until_parked();
+        let trace = cx.update(|cx| plot.read(cx).traces()[0].clone());
+        let tracked = cx.update(|cx| {
+            plot.read(cx)
+                .component_for_trace(&trace, cx)
+                .map(|c| c.component_id)
+        });
+        assert_eq!(tracked, Some(ComponentId::new("adcs.rate")));
+
+        cx.update(|cx| {
+            trace.update(cx, |t, cx| {
+                t.source = crate::data_binding::Binding::from(ComponentId::new("wheels.rpm"));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        let tracked = cx.update(|cx| {
+            plot.read(cx)
+                .component_for_trace(&trace, cx)
+                .map(|c| c.component_id)
+        });
+        assert_eq!(tracked, Some(ComponentId::new("wheels.rpm")));
+    }
 }

@@ -1,26 +1,20 @@
 //! Tests for the system layer. They cover the cyclic execution path, the
-//! self-describing descriptor and its compatibility check, the standard
-//! health counters, and the backpressure a slow reader applies to a writer.
+//! self-describing descriptor and its compatibility check, the fault lines
+//! on the log, and the backpressure a slow reader applies to a writer.
 //! Every port is built by hand on in-memory rings, with no coordinator
 //! involved.
 
 use core::mem::offset_of;
-use std::collections::HashMap;
 
-use metor_component::Decomponentize;
 use metor_fsw_ring::{Config, NoWake, RingBuffer, WriteError};
-use metor_proto::types::{ComponentId, ComponentView, Timestamp};
+use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::descriptor::compatible;
 use crate::{
-    CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, LogEvent, MsgOut, Out, Output,
-    PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemOutput, buffer_capacity,
+    CyclicRunner, CyclicSystem, Frame, FrameList, Input, LogEvent, LogLevel, LogPort, MsgIn,
+    MsgOut, Out, Output, PortDesc, System, SystemInput, SystemKind, SystemOutput, buffer_capacity,
 };
-
-// ---------------------------------------------------------------------------
-// Frames under test: an `Imu` input, a `NavEstimate` output with a dynamic member.
-// ---------------------------------------------------------------------------
 
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
@@ -46,26 +40,6 @@ struct NavEstimate {
     timestamp: Timestamp,
     angle: f64,
     residuals: FrameList<Residual, 4>,
-}
-
-/// A [`Decomponentize`] sink that collects every scalar component a record's
-/// vtable reports, as `f64`.
-#[derive(Default)]
-struct RecSink {
-    values: HashMap<ComponentId, f64>,
-}
-
-impl Decomponentize for RecSink {
-    type Error = core::convert::Infallible;
-    fn apply_value(
-        &mut self,
-        id: ComponentId,
-        value: ComponentView<'_>,
-        _t: Option<Timestamp>,
-    ) -> Result<(), Self::Error> {
-        self.values.insert(id, value.to_f64());
-        Ok(())
-    }
 }
 
 fn ring_for<F: crate::Frame>(depth: usize, readers: usize) -> RingBuffer {
@@ -94,19 +68,18 @@ fn write_until_block(mut write: impl FnMut(u32) -> Result<(), WriteError>) -> u3
     unreachable!()
 }
 
-fn latest_health(input: &mut Input<SystemHealth>) -> RecSink {
-    let record = input
-        .latest()
-        .expect("ring readable")
-        .expect("health published");
-    let mut sink = RecSink::default();
-    record.apply(&mut sink).unwrap().unwrap();
-    sink
+fn drain_log(input: &mut MsgIn<LogEvent>) -> Vec<LogEvent> {
+    let mut events = Vec::new();
+    input.drain(|ev| events.push(ev)).unwrap();
+    events
 }
 
-// ---------------------------------------------------------------------------
-// A sample cyclic system: a unit-gain filter consuming `Imu`, producing `NavEstimate`.
-// ---------------------------------------------------------------------------
+fn field<'a>(ev: &'a LogEvent, key: &str) -> Option<&'a str> {
+    ev.fields
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
 
 struct Filter {
     gain: f64,
@@ -141,14 +114,16 @@ impl CyclicSystem for Filter {
     // Carries the input's timestamp through rather than `now`, so the test can
     // assert the sample stamp survives the cycle.
     fn execute(&mut self, _now: Timestamp, input: &mut FilterIn, output: &mut Out<FilterOut>) {
-        // Read the freshest IMU sample; report a health error when starved.
+        // Read the freshest IMU sample; report a fault when starved.
         let (timestamp, angle, accel) = match input.imu.latest() {
             Ok(Some(imu)) => {
                 let s = imu.get();
                 (s.timestamp, s.omega * self.gain, s.accel)
             }
             _ => {
-                output.health().error("imu_missing");
+                output
+                    .log()
+                    .fault(LogLevel::Warn, "imu_missing", "no imu sample", &[]);
                 return;
             }
         };
@@ -172,7 +147,6 @@ impl CyclicSystem for Filter {
 fn cyclic_filter_end_to_end() {
     let imu_ring = ring_for::<Imu>(8, 2);
     let nav_ring = ring_for::<NavEstimate>(8, 2);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = log_ring_for(1);
 
     // Upstream producer and downstream consumer, both built by hand.
@@ -182,15 +156,12 @@ fn cyclic_filter_end_to_end() {
     let input = FilterIn {
         imu: Input::new(imu_ring.view(NoWake).unwrap()),
     };
-    let health = HealthPort::new(
-        Output::new(health_ring.writer(NoWake).unwrap()),
-        MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap()),
-    );
+    let log = LogPort::new(MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap()));
     let output = Out::new(
         FilterOut {
             nav: Output::new(nav_ring.writer(NoWake).unwrap()),
         },
-        health,
+        log,
     );
 
     let mut runner = CyclicRunner::new(Filter { gain: 2.0 }, input, output);
@@ -271,10 +242,6 @@ fn idle_input_backpressures_writer_and_latest_frees() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// SystemDescriptor + compatibility (subset / ty-shape).
-// ---------------------------------------------------------------------------
-
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]
@@ -315,8 +282,8 @@ fn descriptor_and_compatibility() {
         desc.inputs[0].id().component().expect("table port"),
         Imu::FRAME_ID
     );
-    // The user's nav port plus the two implicit health and log ports.
-    assert_eq!(desc.outputs.len(), 3);
+    // The user's nav port plus the implicit log port.
+    assert_eq!(desc.outputs.len(), 2);
     assert_eq!(
         desc.outputs[0].id().component().expect("table port"),
         NavEstimate::FRAME_ID
@@ -335,49 +302,38 @@ fn descriptor_and_compatibility() {
     assert!(!compatible(&producer, &PortDesc::of::<NavEstimate>()));
 }
 
-// ---------------------------------------------------------------------------
-// Health: standard counters + a named error counter land on the health port.
-// ---------------------------------------------------------------------------
-
 #[test]
-fn health_counters_published() {
+fn faults_land_on_the_log() {
     let imu_ring = ring_for::<Imu>(8, 1);
     let nav_ring = ring_for::<NavEstimate>(8, 1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = log_ring_for(1);
 
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
+    let mut log_in = MsgIn::<LogEvent>::new(log_ring.view(NoWake).unwrap());
 
     let input = FilterIn {
         imu: Input::new(imu_ring.view(NoWake).unwrap()),
     };
-    let health = HealthPort::new(
-        Output::new(health_ring.writer(NoWake).unwrap()),
-        MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap()),
-    );
+    let log = LogPort::new(MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap()));
     let output = Out::new(
         FilterOut {
             nav: Output::new(nav_ring.writer(NoWake).unwrap()),
         },
-        health,
+        log,
     );
 
     let mut runner = CyclicRunner::new(Filter { gain: 1.0 }, input, output);
-    // No IMU is ever published, so every execute bumps the "imu_missing" error.
-    for _ in 0..3 {
-        runner.step(Timestamp::now());
+    // No IMU is ever published, so every execute fires "imu_missing".
+    for i in 0..3 {
+        runner.step(Timestamp(i));
     }
 
-    // Read the freshest health record and apply its vtable.
-    let sink = latest_health(&mut health_in);
-
-    assert_eq!(sink.values[&ComponentId::new("health.cycles")], 3.0);
-    assert_eq!(sink.values[&ComponentId::new("health.errors")], 3.0);
-    assert_eq!(
-        sink.values[&ComponentId::new("health.error_counts.imu_missing")],
-        3.0,
-        "named domain counter lands via the dynamic-frame path"
-    );
+    let events = drain_log(&mut log_in);
+    assert_eq!(events.len(), 3);
+    for (i, ev) in events.iter().enumerate() {
+        assert_eq!(ev.level, LogLevel::Warn);
+        assert_eq!(field(ev, "kind"), Some("imu_missing"));
+        assert_eq!(ev.timestamp, Timestamp(i as i64), "stamped at flush");
+    }
 }
 
 /// A [`RingSource`](crate::RingSource) that hands out pre-created rings in
@@ -421,7 +377,7 @@ impl crate::RingSource for TestSource {
 
 // ---------------------------------------------------------------------------
 // An infallible publish onto an undersized ring counts the drop, and the
-// runner folds it into a `publish_dropped` health error.
+// runner reports it as a `publish_dropped` fault.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -452,43 +408,39 @@ impl CyclicSystem for Chatter {
 }
 
 #[test]
-fn publish_drop_folds_to_health() {
+fn publish_drop_is_reported_on_the_log() {
     // 16 bytes cannot hold one Imu record (24-byte frame + record header).
     let tiny = RingBuffer::create_in_memory(Config {
         capacity: 16,
         max_readers: 1,
     });
-    let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = log_ring_for(1);
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake).unwrap());
+    let mut log_in = MsgIn::<LogEvent>::new(log_ring.view(NoWake).unwrap());
 
-    let input = crate::BindPorts::bind(&mut TestSource {
+    let (): () = crate::BindPorts::bind(&mut TestSource {
         rings: vec![],
         next: 0,
     });
     let output = crate::BindPorts::bind(&mut TestSource {
-        rings: vec![tiny, health_ring.clone(), log_ring.clone()],
+        rings: vec![tiny, log_ring.clone()],
         next: 0,
     });
-    let mut runner = CyclicRunner::new(Chatter, input, output);
+    let mut runner = CyclicRunner::new(Chatter, (), output);
     runner.step(Timestamp(1));
 
-    let sink = latest_health(&mut health_in);
-    assert_eq!(sink.values[&ComponentId::new("health.errors")], 1.0);
+    let events = drain_log(&mut log_in);
+    assert_eq!(events.len(), 1, "one line per cycle with drops");
+    assert_eq!(field(&events[0], "kind"), Some("publish_dropped"));
     assert_eq!(
-        sink.values[&ComponentId::new("health.error_counts.publish_dropped")],
-        1.0,
-        "the port's counted drop lands as a runner health error"
+        field(&events[0], "dropped"),
+        Some("1"),
+        "the port's counted drop lands as a runner fault"
     );
     assert!(
         matches!(runner.state(), crate::SlotState::Running),
         "a drop is an error, not a stop"
     );
 }
-
-// ---------------------------------------------------------------------------
-// #[fsw(...)] attribute lowering + message-log delivery guarantees.
-// ---------------------------------------------------------------------------
 
 use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
 
@@ -585,8 +537,8 @@ fn msg_log_never_loses_records() {
 }
 
 /// A cyclic consumer of a command log sees every emitted record across
-/// cycles. A full ring holds the emitter back rather than dropping, and the
-/// consumer stays `Running`.
+/// cycles, and a full ring holds the emitter back rather than dropping,
+/// leaving the consumer `Running`.
 #[test]
 fn log_input_guaranteed_delivery_through_runner() {
     #[derive(crate::SystemOutput)]
@@ -609,7 +561,6 @@ fn log_input_guaranteed_delivery_through_runner() {
     }
 
     let ring = msg_ring(1);
-    let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = log_ring_for(1);
 
     let input: GuardIn = crate::BindPorts::bind(&mut TestSource {
@@ -618,10 +569,7 @@ fn log_input_guaranteed_delivery_through_runner() {
     });
     let output = Out::new(
         NothingOut {},
-        HealthPort::new(
-            Output::new(health_ring.writer(NoWake).unwrap()),
-            MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap()),
-        ),
+        LogPort::new(MsgOut::<LogEvent>::new(log_ring.writer(NoWake).unwrap())),
     );
     let mut w: crate::MsgOut<SequenceCommand> = crate::MsgOut::new(ring.writer(NoWake).unwrap());
     let seen = std::rc::Rc::new(core::cell::Cell::new(0));

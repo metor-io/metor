@@ -11,7 +11,7 @@ Each load calls the crate's `pack()` function once. The returned `Pack` holds
 entry descriptions and constructors.
 
 A pack crate depends on `metor-fsw-2-core`, not on the host. Everything a pack
-entry touches — ports, frames, messages, health, the ABI — is in that crate,
+entry touches — ports, frames, messages, the log, the ABI — is in that crate,
 and keeping the host out is what lets a pack build for a target the host
 cannot, such as `wasm32-unknown-unknown`.
 
@@ -123,7 +123,7 @@ after the last attached system shutdown. Attached entries can instantiate once
 and cannot fill slots. Each worker calls `pack()` in its own process, so pack
 state does not cross a process boundary.
 
-## ABI v10
+## ABI v12
 
 The current pack ABI version is 10. The host checks the version before any
 other call.

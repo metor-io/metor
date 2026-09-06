@@ -56,21 +56,10 @@ pub fn require_value(
     }
 }
 
-/// Validate that `node` is clock-typed.
-pub fn require_clock(node: &std::sync::Arc<dyn DynamicNode>) -> Result<(), BuildError> {
-    match node.value_type() {
-        ValueType::Clock => Ok(()),
-        v => Err(BuildError::ExpectedClock(v.clone())),
-    }
-}
-
 /// Errors surfaced when *building* a node — schema mismatches, clock
-/// mismatches, or wrong value type for an op. The node editor will render
-/// these as edge errors in a later phase.
+/// mismatches, or wrong value type for an op.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
-    #[error("expected a clock input, got {0:?}")]
-    ExpectedClock(ValueType),
     #[error("expected a value input, got Clock")]
     ExpectedValue,
     #[error("schema mismatch: {a:?} vs {b:?}")]
@@ -306,13 +295,10 @@ impl DynamicNode for NodeImpl {
 /// readable.
 pub mod op_tag {
     pub const FIXED_RATE_CLOCK: &[u8] = b"clock.fixed_rate";
-    pub const ZOH: &[u8] = b"resample.zoh";
-    pub const LINEAR: &[u8] = b"resample.linear";
     pub const PERSIST: &[u8] = b"persist";
     pub const FROM_DB: &[u8] = b"db_source";
     pub const EXPR_SYSTEM: &[u8] = b"expr.system";
     pub const EXPR_FIELD: &[u8] = b"expr.field";
-    pub const EXPR_STAGE: &[u8] = b"expr.stage";
 }
 
 /// Default ring capacity in bytes. Sized per-node from the value byte size

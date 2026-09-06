@@ -203,7 +203,10 @@ fn a_resample_binding_becomes_a_host_stage() {
         &imu_table(),
     )
     .unwrap();
-    assert!(program.manifest.systems.is_empty(), "a stage is not compiled");
+    assert!(
+        program.manifest.systems.is_empty(),
+        "a stage is not compiled"
+    );
     assert_eq!(program.manifest.stages.len(), 2);
 
     let zoh = &program.manifest.stages[0];
@@ -234,7 +237,13 @@ fn a_stage_feeds_what_comes_after_it() {
     )
     .unwrap();
     let scaled = program.manifest.system("scaled").unwrap();
-    assert_eq!(scaled.inputs[0].bindings, vec![crate::Binding::Resampled { stage: 0 }]);
+    assert_eq!(
+        scaled.inputs[0].bindings,
+        vec![
+            crate::Binding::Resampled { stage: 0 },
+            crate::Binding::Timestamp
+        ]
+    );
     assert_eq!(scaled.inputs[0].frame.fields[0].ty, Ty::F64);
     assert_eq!(
         program.manifest.stages[1].source,
@@ -263,7 +272,10 @@ fn a_stage_can_read_a_system() {
     .unwrap();
     assert_eq!(
         program.manifest.stages[0].source,
-        crate::Binding::Produced { system: 0, field: 0 }
+        crate::Binding::Produced {
+            system: 0,
+            field: 0
+        }
     );
     assert_eq!(program.manifest.stages[0].ty, Ty::F64);
 }
@@ -275,12 +287,18 @@ fn a_resample_anywhere_else_says_where_it_belongs() {
         "@system(\"wheels.rpm\")\ndef f(rpm) -> f64:\n    return resample_linear(rpm, 10.0)\n",
     ] {
         let text = refuse(source, &imu_table());
-        assert!(text.contains("top-level binding of its own"), "{source}: {text}");
+        assert!(
+            text.contains("top-level binding of its own"),
+            "{source}: {text}"
+        );
     }
 
     for (source, needle) in [
         ("slow = resample_zoh(wheels.rpm)\n", "a source and a rate"),
-        ("slow = resample_zoh(wheels.rpm, 0.0)\n", "positive number of hertz"),
+        (
+            "slow = resample_zoh(wheels.rpm, 0.0)\n",
+            "positive number of hertz",
+        ),
         ("slow = resample_zoh(nothing.here, 10.0)\n", "no component"),
     ] {
         let text = refuse(source, &imu_table());

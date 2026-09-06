@@ -152,7 +152,10 @@ fn both_emit_paths_compute_the_same_product() {
          \x20   return a @ b\n",
     );
     assert!(!reaches_kernels(&small), "a 2x3 @ 3x4 must be open-coded");
-    assert!(reaches_kernels(&large), "a 16x16 product must call k_matmul");
+    assert!(
+        reaches_kernels(&large),
+        "a 16x16 product must call k_matmul"
+    );
 
     // The same numbers through both, by padding the small product out to the
     // large one's shape with zeros.
@@ -218,7 +221,13 @@ fn a_promoted_axis_leaves_with_the_promotion() {
         &[&v, &m],
         2,
     );
-    assert_eq!(got, vec![1.0 * 1.0 + 2.0 * 3.0 + 3.0 * 5.0, 1.0 * 2.0 + 2.0 * 4.0 + 3.0 * 6.0]);
+    assert_eq!(
+        got,
+        vec![
+            1.0 * 1.0 + 2.0 * 3.0 + 3.0 * 5.0,
+            1.0 * 2.0 + 2.0 * 4.0 + 3.0 * 6.0
+        ]
+    );
 
     // And a chain keeps its shape: (2,3) @ (3,) is rank-1, so it contracts
     // again against another rank-1.
@@ -262,9 +271,10 @@ fn refusals_name_both_shapes() {
     }
 
     // A scalar has no axes to contract, and says so with its type.
-    let text = format!("{}", reject(
-        "def f(a: Tensor[f64, 3], k: f64) -> f64:\n    return sum(a @ k)\n",
-    ));
+    let text = format!(
+        "{}",
+        reject("def f(a: Tensor[f64, 3], k: f64) -> f64:\n    return sum(a @ k)\n",)
+    );
     assert!(text.contains("`@` contracts two tensors"), "{text}");
     assert!(text.contains("f64"), "{text}");
 }
@@ -273,8 +283,9 @@ fn refusals_name_both_shapes() {
 /// migration.
 #[test]
 fn the_old_spelling_names_its_replacement() {
-    let text = format!("{}", reject(
-        "def f(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return dot(a, b)\n",
-    ));
+    let text = format!(
+        "{}",
+        reject("def f(a: Tensor[f64, 3], b: Tensor[f64, 3]) -> f64:\n    return dot(a, b)\n",)
+    );
     assert!(text.contains("`a @ b`"), "{text}");
 }

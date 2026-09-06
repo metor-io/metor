@@ -18,6 +18,10 @@ pub struct EnumRow {
 }
 
 impl InspectorRow for EnumRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }
@@ -93,6 +97,10 @@ struct EnumOptionRow {
 }
 
 impl InspectorRow for EnumOptionRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }

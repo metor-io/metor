@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div, prelude::*};
@@ -9,6 +10,7 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
+use crate::views::outline::model::{PivotLayout, type_key};
 use crate::views::time_series::{LinePlot, Override, Trace};
 #[cfg(test)]
 use crate::views::time_series::{PlotStyle, TimeFormat};
@@ -16,11 +18,11 @@ use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
     AlarmListMode, AlarmView, Annunciator, AttitudeConfig, AttitudeIndicator, ComponentBrowser,
-    ComponentTable, ComponentText, DataTable, Gauge, GaugeConfig, LevelFilter, LogView, Meter,
-    MeterConfig, SequenceControl, SequenceControlConfig, SequenceGrid, SequenceView, StateChip,
-    StateChipConfig, TimeSeriesPlot, TrafficLight, new_component_browser, new_component_table,
-    new_data_table,
+    ComponentOutline, ComponentText, Gauge, GaugeConfig, LevelFilter, LogView, Meter, MeterConfig,
+    OutlineColumns, SequenceControl, SequenceControlConfig, SequenceGrid, SequenceView, StateChip,
+    StateChipConfig, TimeSeriesPlot, TrafficLight, new_component_browser,
 };
+use crate::views::{Col, default_columns};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
@@ -31,7 +33,6 @@ pub use crate::views::ComponentTextConfig as TextPanelConfig;
 pub struct TextPanel {
     inner: Entity<ComponentText>,
     label: SharedString,
-    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl TextPanel {
@@ -45,18 +46,13 @@ impl TextPanel {
         Self {
             inner,
             label: label.into(),
-            _expression: None,
         }
     }
 
     pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
-        let component_id = bound
-            .as_ref()
-            .map(|bound| bound.id)
-            .unwrap_or_else(|| ComponentId::new(&cfg.component));
-        let mut panel = Self::new(db, component_id, cfg.component, cx);
-        panel._expression = bound.and_then(|bound| bound.expression);
+        let binding = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
+        let panel = Self::new(db, binding.id(), cfg.component, cx);
+        panel.inner.update(cx, |view, _| view.source = binding);
         panel
     }
 }
@@ -78,10 +74,14 @@ impl PaneItem for TextPanel {
         "component_text"
     }
 
-    fn to_config(&self, _cx: &App) -> TextPanelConfig {
+    fn to_config(&self, cx: &App) -> TextPanelConfig {
         TextPanelConfig {
-            component: self.label.to_string(),
+            component: self.inner.read(cx).binding_text(),
         }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
     }
 }
 
@@ -333,7 +333,6 @@ pub use crate::views::TrafficLightConfig as TrafficLightPanelConfig;
 pub struct TrafficLightPanel {
     inner: Entity<TrafficLight>,
     label: SharedString,
-    _expression: Option<crate::dynamic::expressions::Expression>,
 }
 
 impl TrafficLightPanel {
@@ -347,25 +346,19 @@ impl TrafficLightPanel {
         Self {
             inner,
             label: label.into(),
-            _expression: None,
         }
     }
 
     pub fn from_config(cfg: TrafficLightPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let bound = crate::dynamic::expressions::bind(&cfg.component, &db, cx).ok();
-        let component_id = bound
-            .as_ref()
-            .map(|bound| bound.id)
-            .unwrap_or_else(|| ComponentId::new(&cfg.component));
-        let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
-        if let Some(color) = cfg.color {
-            inner.update(cx, |t, cx| t.set_color(color, cx));
-        }
-        Self {
-            inner,
-            label: cfg.component.into(),
-            _expression: bound.and_then(|bound| bound.expression),
-        }
+        let binding = crate::data_binding::Binding::from_text(&cfg.component, &db, cx);
+        let panel = Self::new(db, binding.id(), cfg.component, cx);
+        panel.inner.update(cx, |view, cx| {
+            view.source = binding;
+            if let Some(color) = cfg.color {
+                view.set_color(color, cx);
+            }
+        });
+        panel
     }
 }
 
@@ -387,10 +380,7 @@ impl PaneItem for TrafficLightPanel {
     }
 
     fn to_config(&self, cx: &App) -> TrafficLightPanelConfig {
-        TrafficLightPanelConfig {
-            component: self.label.to_string(),
-            color: Some(self.inner.read(cx).color()),
-        }
+        self.inner.read(cx).to_config()
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -481,7 +471,8 @@ impl PaneItem for GaugePanel {
     }
 }
 
-/// Pane item rendering one element of a component as a named discrete state.
+/// Pane item rendering a component's value as the named discrete state it
+/// means — a bare value strip carrying a state table.
 pub struct StateChipPanel {
     inner: Entity<StateChip>,
     label: SharedString,
@@ -646,7 +637,7 @@ impl PaneItem for AnnunciatorPanel {
     }
 
     fn to_config(&self, cx: &App) -> AnnunciatorPanelConfig {
-        self.inner.read(cx).to_config()
+        self.inner.read(cx).to_config(cx)
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -654,100 +645,243 @@ impl PaneItem for AnnunciatorPanel {
     }
 }
 
-/// Persisted shape of a [`TablePanel`]. Currently empty — the panel renders
-/// every component in the DB and has no per-instance configuration.
-#[derive(Serialize, Deserialize, Default)]
+/// Persisted shape of an [`OutlinePanel`]: the filter bar, the columns in
+/// display order, the sort, the root, which branches the user opened or
+/// folded, and every pivot with its arrangement. Paths are full component
+/// names; pivot fields are relative to an instance.
+#[derive(Serialize, Deserialize)]
 #[serde(default)]
-pub struct TablePanelConfig {}
-
-/// Pane item listing every component in the DB as a flat table.
-pub struct TablePanel {
-    inner: Entity<ComponentTable>,
-    label: SharedString,
+pub struct OutlinePanelConfig {
+    pub filter: String,
+    pub filter_bar: bool,
+    pub columns: Vec<String>,
+    pub sort: SortDirection,
+    pub root: String,
+    pub expanded: Vec<String>,
+    pub collapsed: Vec<String>,
+    pub pivots: Vec<PivotConfig>,
+    pub types: Vec<FrameTypeConfig>,
+    pub focus: Option<String>,
 }
 
-impl TablePanel {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| new_component_table(db, cx));
+impl Default for OutlinePanelConfig {
+    fn default() -> Self {
         Self {
-            inner,
-            label: "Components".into(),
+            filter: String::new(),
+            filter_bar: false,
+            columns: default_columns()
+                .iter()
+                .map(|c| c.key().to_string())
+                .collect(),
+            sort: SortDirection::Ascending,
+            root: String::new(),
+            expanded: Vec::new(),
+            collapsed: Vec::new(),
+            pivots: Vec::new(),
+            types: Vec::new(),
+            focus: None,
+        }
+    }
+}
+
+/// Sibling order in the outline's tree.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+/// A pivoted branch and how its grid is arranged: `fields` lead the
+/// columns in that order, `hidden` ones are left out, `rows` lead the
+/// instances by segment.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PivotConfig {
+    pub path: String,
+    pub fields: Vec<String>,
+    pub hidden: Vec<String>,
+    pub rows: Vec<String>,
+}
+
+/// A frame type the outline collected: a label, the leaf paths that
+/// define its shape, and the same arrangement a [`PivotConfig`] carries
+/// (`rows` being full instance paths).
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FrameTypeConfig {
+    pub label: String,
+    pub fields: Vec<String>,
+    pub order: Vec<String>,
+    pub hidden: Vec<String>,
+    pub rows: Vec<String>,
+}
+
+impl PivotLayout {
+    fn from_config(order: Vec<String>, hidden: Vec<String>, rows: Vec<String>) -> Self {
+        Self {
+            order: order.into_iter().map(SharedString::from).collect(),
+            hidden: hidden.into_iter().map(SharedString::from).collect(),
+            rows: rows.into_iter().map(SharedString::from).collect(),
         }
     }
 
-    pub fn from_config(_cfg: TablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::new(db, cx)
+    fn to_config(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut hidden: Vec<String> = self.hidden.iter().map(|s| s.to_string()).collect();
+        hidden.sort();
+        (
+            self.order.iter().map(|s| s.to_string()).collect(),
+            hidden,
+            self.rows.iter().map(|s| s.to_string()).collect(),
+        )
     }
 }
 
-impl Render for TablePanel {
+/// Pane item showing the component namespace as a collapsible tree-table.
+pub struct OutlinePanel {
+    inner: Entity<ComponentOutline>,
+}
+
+impl OutlinePanel {
+    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| ComponentOutline::new(db, cx));
+        Self { inner }
+    }
+
+    pub fn from_config(cfg: OutlinePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let panel = Self::new(db, cx);
+        panel
+            .inner
+            .update(cx, |outline, cx| apply_outline_config(outline, cfg, cx));
+        panel
+    }
+}
+
+/// Restore `cfg` onto a live outline. Shared with the dashboard widget,
+/// which hosts the same view without a pane around it.
+pub fn apply_outline_config(
+    outline: &mut ComponentOutline,
+    cfg: OutlinePanelConfig,
+    cx: &mut Context<ComponentOutline>,
+) {
+    outline.set_filter_visible(cfg.filter_bar, cx);
+    outline.set_filter_text(&cfg.filter, cx);
+    let columns: OutlineColumns = cfg.columns.iter().filter_map(|k| Col::parse(k)).collect();
+    if !columns.is_empty() {
+        outline.set_columns(columns, cx);
+    }
+    outline.set_descending(cfg.sort == SortDirection::Descending, cx);
+    outline.set_root(&cfg.root, cx);
+    outline.set_disclosure(cfg.expanded, cfg.collapsed, cx);
+    let mut layouts = HashMap::new();
+    let mut pivoted = Vec::with_capacity(cfg.pivots.len());
+    for p in cfg.pivots {
+        let layout = PivotLayout::from_config(p.fields, p.hidden, p.rows);
+        if !layout.is_empty() {
+            layouts.insert(SharedString::from(p.path.clone()), layout);
+        }
+        pivoted.push(p.path);
+    }
+    outline.set_pivoted_paths(pivoted, cx);
+    let mut types = Vec::with_capacity(cfg.types.len());
+    for t in cfg.types {
+        let layout = PivotLayout::from_config(t.order, t.hidden, t.rows);
+        if !layout.is_empty() {
+            layouts.insert(type_key(&t.label), layout);
+        }
+        types.push((t.label, t.fields));
+    }
+    outline.set_types(types, cx);
+    outline.set_pivot_layouts(layouts, cx);
+    outline.set_focus(cfg.focus, cx);
+}
+
+/// The persisted shape of a live outline.
+pub fn outline_config(inner: &ComponentOutline, cx: &App) -> OutlinePanelConfig {
+    let layouts = inner.pivot_layouts(cx);
+    let arrangement = |key: &SharedString| {
+        layouts
+            .get(key)
+            .map(PivotLayout::to_config)
+            .unwrap_or_default()
+    };
+    OutlinePanelConfig {
+        filter: inner.filter_text(cx),
+        filter_bar: inner.filter_visible(),
+        columns: inner
+            .columns(cx)
+            .iter()
+            .map(|c| c.key().to_string())
+            .collect(),
+        sort: if inner.descending(cx) {
+            SortDirection::Descending
+        } else {
+            SortDirection::Ascending
+        },
+        root: inner.root(cx),
+        expanded: inner.expanded_paths(cx),
+        collapsed: inner.collapsed_paths(cx),
+        pivots: inner
+            .pivoted_paths(cx)
+            .into_iter()
+            .map(|path| {
+                let (fields, hidden, rows) = arrangement(&SharedString::from(path.clone()));
+                PivotConfig {
+                    path,
+                    fields,
+                    hidden,
+                    rows,
+                }
+            })
+            .collect(),
+        types: inner
+            .types(cx)
+            .into_iter()
+            .map(|(label, fields)| {
+                let (order, hidden, rows) = arrangement(&type_key(&label));
+                FrameTypeConfig {
+                    label,
+                    fields,
+                    order,
+                    hidden,
+                    rows,
+                }
+            })
+            .collect(),
+        focus: inner.focus(cx),
+    }
+}
+
+impl Render for OutlinePanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full().child(self.inner.clone())
     }
 }
 
-impl PaneItem for TablePanel {
-    type Config = TablePanelConfig;
+impl PaneItem for OutlinePanel {
+    type Config = OutlinePanelConfig;
 
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "component_table"
-    }
-
-    fn to_config(&self, _cx: &App) -> TablePanelConfig {
-        TablePanelConfig {}
-    }
-}
-
-/// Persisted shape of a [`DataTablePanel`]. No per-instance configuration today.
-#[derive(Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct DataTablePanelConfig {}
-
-/// Pane item rendering one row per component, grouped by namespace, with
-/// live values per element. Wraps the same [`DataTable`] view used outside
-/// the tile system.
-pub struct DataTablePanel {
-    inner: Entity<DataTable>,
-    label: SharedString,
-}
-
-impl DataTablePanel {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| new_data_table(db, cx));
-        Self {
-            inner,
-            label: "Data Table".into(),
+    /// A rooted outline is named for its root's last segment, so a pane of
+    /// them reads `wheels | power | Outline`.
+    fn tab_title(&self, cx: &App) -> SharedString {
+        let root = self.inner.read(cx).root(cx);
+        match root.rsplit('.').next() {
+            Some(last) if !last.is_empty() => SharedString::from(last.to_string()),
+            _ => SharedString::new_static("Outline"),
         }
     }
 
-    pub fn from_config(_cfg: DataTablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::new(db, cx)
-    }
-}
-
-impl Render for DataTablePanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for DataTablePanel {
-    type Config = DataTablePanelConfig;
-
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
     fn serialization_key() -> &'static str {
-        "data_table"
+        "component_outline"
     }
 
-    fn to_config(&self, _cx: &App) -> DataTablePanelConfig {
-        DataTablePanelConfig {}
+    fn to_config(&self, cx: &App) -> OutlinePanelConfig {
+        outline_config(self.inner.read(cx), cx)
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
     }
 }
 
@@ -762,6 +896,8 @@ impl PaneItem for DataTablePanel {
 pub struct BrowserPanelConfig {
     pub custom_title: Override<String>,
     pub root_override: Vec<String>,
+    pub filter: String,
+    pub filter_bar: bool,
 }
 
 /// Pane item with a Finder-style browser over the component namespace tree.
@@ -794,6 +930,8 @@ impl BrowserPanel {
                 delegate.set_pending_root_path(Some(segments.clone()));
                 delegate.set_root_path(&segments, cx);
             }
+            browser.set_filter_visible(cfg.filter_bar, cx);
+            browser.set_filter_text(&cfg.filter, cx);
         });
         panel
     }
@@ -825,6 +963,8 @@ impl PaneItem for BrowserPanel {
                 .root_override()
                 .map(|segs| segs.iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default(),
+            filter: inner.filter_text(cx),
+            filter_bar: inner.filter_visible(),
         }
     }
 
@@ -995,6 +1135,7 @@ impl Render for ListPlotPanel {
 }
 
 pub use crate::views::list_plot::{ListPlotPanelConfig, ListTraceConfig};
+pub use crate::views::spectrogram::{SpectrogramPanelConfig, SpectrogramTraceConfig};
 
 impl ListPlotPanel {
     pub fn from_config(cfg: ListPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
@@ -1081,11 +1222,7 @@ impl PaneItem for Viewer3dPanel {
     }
 }
 
-/// Rows for the palette's "New Panel" submenu.
-///
-/// Each row adds a freshly-constructed panel to `pane`. The time-series row
-/// detours through the trace picker, then calls `on_open_inspector` (if
-/// provided) so the user can immediately configure the plot.
+/// Construct a registered panel and return its inspectable entity.
 fn add_registered_panel(
     pane: &Entity<Pane>,
     key: &str,
@@ -1132,376 +1269,309 @@ fn inspect_created(
     );
 }
 
+#[derive(Clone)]
+struct PanelMenu {
+    db: Arc<DB>,
+    pane: Entity<Pane>,
+    on_open_inspector: Option<OpenInspectorCallback>,
+}
+
+impl PanelMenu {
+    fn wizard<T: 'static, C: serde::Serialize + 'static>(
+        &self,
+        label: &'static str,
+        key: &'static str,
+        pick: impl Fn(Arc<DB>, Arc<dyn Fn(T, &mut Window, &mut App)>) -> Vec<Box<dyn InspectorRow>>
+        + 'static,
+        configure: fn(T) -> C,
+    ) -> Box<dyn InspectorRow> {
+        let menu = self.clone();
+        Box::new(NavRow::new(
+            label,
+            "",
+            Box::new(move |_| {
+                let commit = menu.clone();
+                pick(
+                    menu.db.clone(),
+                    Arc::new(move |selected, window, cx| {
+                        if let Some(entity) =
+                            add_registered_panel(&commit.pane, key, &configure(selected), cx)
+                        {
+                            inspect_created(
+                                entity,
+                                &commit.db,
+                                &commit.on_open_inspector,
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+                )
+            }),
+        ))
+    }
+
+    fn component<C: serde::Serialize + 'static>(
+        &self,
+        label: &'static str,
+        key: &'static str,
+        configure: fn(String) -> C,
+    ) -> Box<dyn InspectorRow> {
+        let menu = self.clone();
+        Box::new(NavRow::new(
+            label,
+            "",
+            Box::new(move |_| {
+                let pane = menu.pane.clone();
+                let db = menu.db.clone();
+                crate::inspector::trace_picker::binding_picker_rows(
+                    menu.db.clone(),
+                    move |binding, cx| {
+                        add_registered_panel(&pane, key, &configure(binding.text(&db)), cx);
+                    },
+                )
+            }),
+        ))
+    }
+
+    fn instrument(
+        &self,
+        label: &'static str,
+        key: &'static str,
+        configure: fn(ScaleSeed) -> String,
+    ) -> Box<dyn InspectorRow> {
+        let menu = self.clone();
+        Box::new(NavRow::new(
+            label,
+            "",
+            Box::new(move |_| {
+                instrument_wizard_rows(menu.db.clone(), menu.pane.clone(), key, configure)
+            }),
+        ))
+    }
+
+    fn command(
+        &self,
+        label: &'static str,
+        build: impl Fn(Arc<DB>, &mut App) -> Box<dyn PaneItemHandle> + 'static,
+    ) -> Box<dyn InspectorRow> {
+        let menu = self.clone();
+        Box::new(CommandRow::new(
+            label,
+            Arc::new(move |_, cx| {
+                let item = build(menu.db.clone(), cx);
+                menu.pane.update(cx, |pane, cx| pane.add_item(item, cx));
+            }),
+        ))
+    }
+
+    fn configured<C: serde::Serialize + 'static>(
+        &self,
+        label: &'static str,
+        key: &'static str,
+        config: C,
+    ) -> Box<dyn InspectorRow> {
+        let pane = self.pane.clone();
+        Box::new(CommandRow::new(
+            label,
+            Arc::new(move |_, cx| {
+                add_registered_panel(&pane, key, &config, cx);
+            }),
+        ))
+    }
+}
+
+/// Build the panel menu in display order, including downstream add flows.
 pub(crate) fn new_panel_rows(
     db: Arc<DB>,
     pane: Entity<Pane>,
     on_open_inspector: Option<OpenInspectorCallback>,
     cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    let menu = PanelMenu {
+        db,
+        pane,
+        on_open_inspector,
+    };
+    let mut rows = plot_panel_rows(&menu);
+    rows.extend(instrument_panel_rows(&menu));
+    rows.extend(utility_panel_rows(&menu));
+    if let Some(registry) = cx.try_global::<crate::views::dashboard::WidgetRegistry>() {
+        for (label, add_flow) in registry.tile_add_flows() {
+            let menu = menu.clone();
+            rows.push(Box::new(NavRow::new(
+                label,
+                "",
+                Box::new(move |cx| add_flow(menu.pane.clone(), menu.db.clone(), cx)),
+            )));
+        }
+    }
+    rows
+}
 
-    rows.push(Box::new(NavRow::new(
-        "Time Series Plot",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            let on_open_inspector = on_open_inspector.clone();
-            Box::new(move |_cx| {
-                let db_for_select = db.clone();
-                let pane = pane.clone();
-                let on_open_inspector = on_open_inspector.clone();
+fn plot_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
+    vec![
+        menu.wizard(
+            "Time Series Plot",
+            "time_series_plot",
+            |db, commit| {
                 crate::inspector::trace_picker::select_traces_wizard_rows(
-                    db.clone(),
-                    Arc::new(|_cx| 0),
-                    Arc::new(move |traces, window, cx| {
-                        let config = PlotPanelConfig {
-                            traces: traces.iter().map(TraceConfig::from).collect(),
-                            ..Default::default()
-                        };
-                        if let Some(entity) =
-                            add_registered_panel(&pane, "time_series_plot", &config, cx)
-                        {
-                            inspect_created(entity, &db_for_select, &on_open_inspector, window, cx);
-                        }
-                    }),
+                    db,
+                    Arc::new(|_| 0),
+                    commit,
                 )
-            })
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "XY Plot",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            let on_open_inspector = on_open_inspector.clone();
-            Box::new(move |_cx| {
-                let db_for_select = db.clone();
-                let pane = pane.clone();
-                let on_open_inspector = on_open_inspector.clone();
+            },
+            |traces| PlotPanelConfig {
+                traces: traces.iter().map(TraceConfig::from).collect(),
+                ..Default::default()
+            },
+        ),
+        menu.wizard(
+            "XY Plot",
+            "xy_plot",
+            |db, commit| {
                 crate::views::xy_plot::trace_picker::select_xy_trace_wizard_rows(
-                    db.clone(),
-                    Arc::new(|_cx| 0),
-                    Arc::new(move |trace, window, cx| {
-                        let config = XyPlotPanelConfig {
-                            traces: vec![XyTraceConfig::from(&trace)],
-                            ..Default::default()
-                        };
-                        if let Some(entity) = add_registered_panel(&pane, "xy_plot", &config, cx) {
-                            inspect_created(entity, &db_for_select, &on_open_inspector, window, cx);
-                        }
-                    }),
+                    db,
+                    Arc::new(|_| 0),
+                    commit,
                 )
-            })
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "List Plot",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            let on_open_inspector = on_open_inspector.clone();
-            Box::new(move |_cx| {
-                let db_for_select = db.clone();
-                let pane = pane.clone();
-                let on_open_inspector = on_open_inspector.clone();
+            },
+            |trace| XyPlotPanelConfig {
+                traces: vec![XyTraceConfig::from(&trace)],
+                ..Default::default()
+            },
+        ),
+        menu.wizard(
+            "List Plot",
+            "list_plot",
+            |db, commit| {
                 crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
-                    db.clone(),
-                    Arc::new(|_cx| 0),
-                    Arc::new(move |trace, window, cx| {
-                        let config = ListPlotPanelConfig {
-                            traces: vec![ListTraceConfig::from(&trace)],
-                            ..Default::default()
-                        };
-                        if let Some(entity) = add_registered_panel(&pane, "list_plot", &config, cx)
-                        {
-                            inspect_created(entity, &db_for_select, &on_open_inspector, window, cx);
-                        }
-                    }),
+                    db,
+                    Arc::new(|_| 0),
+                    commit,
                 )
-            })
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "Component Text",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            Box::new(move |_cx| {
-                let pane = pane.clone();
-                crate::inspector::trace_picker::component_picker_rows(
-                    db.clone(),
-                    move |_component_id, name, cx| {
-                        add_registered_panel(
-                            &pane,
-                            "component_text",
-                            &TextPanelConfig { component: name },
-                            cx,
-                        );
-                    },
+            },
+            |trace| ListPlotPanelConfig {
+                traces: vec![ListTraceConfig::from(&trace)],
+                ..Default::default()
+            },
+        ),
+        menu.wizard(
+            "Spectrogram",
+            "spectrogram",
+            |db, commit| {
+                crate::views::spectrogram::trace_picker::select_spectrogram_trace_wizard_rows(
+                    db, commit,
                 )
+            },
+            |trace| SpectrogramPanelConfig {
+                traces: vec![SpectrogramTraceConfig::from(&trace)],
+                ..Default::default()
+            },
+        ),
+    ]
+}
+
+fn instrument_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
+    let pane = menu.pane.clone();
+    vec![
+        menu.component("Component Text", "component_text", |component| {
+            TextPanelConfig { component }
+        }),
+        menu.component("Traffic Light", "traffic_light", |component| {
+            TrafficLightPanelConfig {
+                component,
+                color: None,
+            }
+        }),
+        Box::new(NavRow::new(
+            "Annunciator",
+            "",
+            Box::new(move |_| annunciator_pattern_rows(pane.clone())),
+        )),
+        menu.instrument("Meter", "meter", |seed| {
+            serde_json::to_string(&MeterConfig::from(seed)).unwrap()
+        }),
+        menu.instrument("Gauge", "gauge", |seed| {
+            serde_json::to_string(&GaugeConfig::from(seed)).unwrap()
+        }),
+        menu.instrument("State Chip", "state_chip", |seed| {
+            serde_json::to_string(&StateChipConfig {
+                component: seed.component,
+                element: seed.element,
+                label: Some(seed.label),
+                ..Default::default()
             })
-        },
-    )));
+            .unwrap()
+        }),
+        menu.component("Attitude", "attitude", |component| AttitudeConfig {
+            component,
+            ..Default::default()
+        }),
+        menu.component("Map", "map", |component| crate::views::MapConfig {
+            component,
+            ..Default::default()
+        }),
+        menu.component("Samples", "samples_table", |component| {
+            crate::views::SamplesTableConfig { component }
+        }),
+    ]
+}
 
-    rows.push(Box::new(NavRow::new(
-        "Traffic Light",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            Box::new(move |_cx| {
-                let pane = pane.clone();
-                crate::inspector::trace_picker::component_picker_rows(
-                    db.clone(),
-                    move |_component_id, name, cx| {
-                        add_registered_panel(
-                            &pane,
-                            "traffic_light",
-                            &TrafficLightPanelConfig {
-                                component: name,
-                                color: None,
-                            },
-                            cx,
-                        );
-                    },
-                )
-            })
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "Annunciator",
-        SharedString::new_static(""),
-        {
-            let pane = pane.clone();
-            Box::new(move |_cx| annunciator_pattern_rows(pane.clone()))
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "Meter",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            Box::new(move |_cx| {
-                instrument_wizard_rows(db.clone(), pane.clone(), "meter", |seed| {
-                    serde_json::to_string(&MeterConfig::from(seed)).unwrap()
-                })
-            })
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "Gauge",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            Box::new(move |_cx| {
-                instrument_wizard_rows(db.clone(), pane.clone(), "gauge", |seed| {
-                    serde_json::to_string(&GaugeConfig::from(seed)).unwrap()
-                })
-            })
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "State Chip",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            Box::new(move |_cx| {
-                instrument_wizard_rows(db.clone(), pane.clone(), "state_chip", |seed| {
-                    // A chip's state table can't be derived from the schema,
-                    // so it opens showing the raw code until the operator
-                    // names the states.
-                    let cfg = StateChipConfig {
-                        component: seed.component,
-                        element: seed.element,
-                        label: Some(seed.label),
-                        ..Default::default()
-                    };
-                    serde_json::to_string(&cfg).unwrap()
-                })
-            })
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "Attitude",
-        SharedString::new_static(""),
-        {
-            let db = db.clone();
-            let pane = pane.clone();
-            Box::new(move |_cx| {
-                let pane = pane.clone();
-                crate::inspector::trace_picker::component_picker_rows(
-                    db.clone(),
-                    move |_component_id, name, cx| {
-                        let cfg = AttitudeConfig {
-                            component: name,
-                            ..Default::default()
-                        };
-                        add_registered_panel(&pane, "attitude", &cfg, cx);
-                    },
-                )
-            })
-        },
-    )));
-
-    rows.push(Box::new(NavRow::new(
-        "Sequence Control",
-        SharedString::new_static(""),
-        {
-            let pane = pane.clone();
+fn utility_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
+    let pane = menu.pane.clone();
+    vec![
+        Box::new(NavRow::new(
+            "Sequence Control",
+            "",
             Box::new(move |cx| {
                 let pane = pane.clone();
                 crate::views::sequence_control::channel_picker_rows(cx, move |channel, cx| {
-                    let cfg = SequenceControlConfig {
-                        channel,
-                        compact: false,
-                    };
-                    add_registered_panel(&pane, "sequence_control", &cfg, cx);
+                    add_registered_panel(
+                        &pane,
+                        "sequence_control",
+                        &SequenceControlConfig {
+                            channel,
+                            compact: false,
+                        },
+                        cx,
+                    );
                 })
-            })
-        },
-    )));
-
-    rows.push(Box::new(CommandRow::new("Component Table", {
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            add_registered_panel(&pane, "component_table", &TablePanelConfig {}, cx);
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Data Table", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| DataTablePanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Component Browser", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| BrowserPanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("3D Viewer", {
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            add_registered_panel(&pane, "viewer_3d", &Viewer3dPanelConfig::default(), cx);
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Dashboard", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let dashboard = cx.new(|cx| DashboardPanel::new(db, cx));
-                pane.add_item(Box::new(dashboard), cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Alarms", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| AlarmPanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Logs", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| LogPanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Sequences", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| SequencePanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Sequence Grid", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| SequenceGridPanel::new(db, cx)));
-                pane.add_item(item, cx);
-            });
-        })
-    })));
-
-    rows.push(Box::new(CommandRow::new("Graph", {
-        let db = db.clone();
-        let pane = pane.clone();
-        Arc::new(move |_window, cx| {
-            let db = db.clone();
-            pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| crate::canvas::GraphCanvas::new(db, cx)));
-                pane.add_item(item, cx);
-            });
-        })
-    })));
-
-    if let Some(registry) = cx.try_global::<crate::views::dashboard::WidgetRegistry>() {
-        for (label, add_flow) in registry.tile_add_flows() {
-            rows.push(Box::new(NavRow::new(label, "", {
-                let pane = pane.clone();
-                let db = db.clone();
-                Box::new(move |cx| add_flow(pane.clone(), db.clone(), cx))
-            })));
-        }
-    }
-
-    rows
+            }),
+        )),
+        menu.command("Outline", |db, cx| {
+            Box::new(cx.new(|cx| OutlinePanel::new(db, cx)))
+        }),
+        menu.command("Component Browser", |db, cx| {
+            Box::new(cx.new(|cx| BrowserPanel::new(db, cx)))
+        }),
+        menu.configured("3D Viewer", "viewer_3d", Viewer3dPanelConfig::default()),
+        menu.command("Dashboard", |db, cx| {
+            Box::new(cx.new(|cx| DashboardPanel::new(db, cx)))
+        }),
+        menu.command("Alarms", |db, cx| {
+            Box::new(cx.new(|cx| AlarmPanel::new(db, cx)))
+        }),
+        menu.command("Logs", |db, cx| {
+            Box::new(cx.new(|cx| LogPanel::new(db, cx)))
+        }),
+        menu.command("Sequences", |db, cx| {
+            Box::new(cx.new(|cx| SequencePanel::new(db, cx)))
+        }),
+        menu.command("Sequence Grid", |db, cx| {
+            Box::new(cx.new(|cx| SequenceGridPanel::new(db, cx)))
+        }),
+        menu.configured(
+            "Timeline",
+            "timeline",
+            crate::views::TimelineConfig::default(),
+        ),
+        menu.configured(
+            "Execution Timeline",
+            "exec_timeline",
+            crate::views::ExecTimelineConfig::default(),
+        ),
+    ]
 }
 
 /// Single-question wizard for "New Panel → Annunciator": prompts for a glob
@@ -1636,11 +1706,34 @@ mod tests {
                 .is_ok()
         );
 
+        let timeline = crate::views::ExecTimelineConfig {
+            label: "Steps".into(),
+            x_range: "LAST 30 s".into(),
+            show_slots: false,
+            show_coordinator_row: false,
+            trigger: true,
+            hidden_rows: vec!["downlink".into(), "nav".into()],
+        };
+        let s = serde_json::to_string(&timeline).unwrap();
+        let back: crate::views::ExecTimelineConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.label, "Steps");
+        assert_eq!(back.x_range, "LAST 30 s");
+        assert!(!back.show_slots);
+        assert!(!back.show_coordinator_row);
+        assert!(back.trigger);
+        assert_eq!(back.hidden_rows, vec!["downlink", "nav"]);
+        // The toggles default on and the trigger off, so a document written
+        // before they existed shows every lane on the app-wide range.
+        let bare: crate::views::ExecTimelineConfig = serde_json::from_str("{}").unwrap();
+        assert!(bare.show_slots && bare.show_coordinator_row && !bare.trigger);
+
         let viewer = Viewer3dPanelConfig {
             models: vec![ModelConfig {
                 label: "satellite".into(),
                 path: "sat.glb".into(),
                 position_binding: Some(ComponentId(7)),
+                position_expression: None,
+                orientation_expression: None,
                 orientation_binding: None,
             }],
             camera: CameraConfig {
@@ -1699,6 +1792,61 @@ mod tests {
         assert!(matches!(back.x_max_override, Override::Auto));
         assert!(matches!(back.y_min_override, Override::Auto));
         assert!(matches!(back.y_max_override, Override::Custom(v) if (v - 2.5).abs() < 1e-9));
+
+        let spectrogram = SpectrogramPanelConfig {
+            label: "spectrum".into(),
+            traces: vec![SpectrogramTraceConfig {
+                component_id: ComponentId(9),
+                len: 33,
+                visible: true,
+                label: "fft(window(sig, 64))".into(),
+                colormap: crate::views::time_series::Colormap::Mono,
+                scale: crate::views::time_series::IntensityScale::Sqrt,
+                gain: 2.5,
+                expression: Some("=fft(window(sig, 64))".into()),
+            }],
+            custom_title: Override::Custom("Waterfall".into()),
+            x_range: "LAST 30 s".into(),
+            x_time_format: TimeFormat::Utc,
+            y_min_override: Override::Custom(4.0),
+            y_max_override: Override::Auto,
+            intensity_min: Override::Custom(-90.0),
+            intensity_max: Override::Custom(-10.0),
+            sample_rate: Override::Custom(1000.0),
+            show_colorbar: false,
+        };
+        let s = serde_json::to_string(&spectrogram).unwrap();
+        let back: SpectrogramPanelConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.label, "spectrum");
+        assert_eq!(back.traces.len(), 1);
+        assert_eq!(back.traces[0].component_id, ComponentId(9));
+        assert_eq!(back.traces[0].len, 33);
+        assert_eq!(
+            back.traces[0].colormap,
+            crate::views::time_series::Colormap::Mono
+        );
+        assert_eq!(
+            back.traces[0].scale,
+            crate::views::time_series::IntensityScale::Sqrt
+        );
+        assert_eq!(back.traces[0].gain, 2.5);
+        assert_eq!(
+            back.traces[0].expression.as_deref(),
+            Some("=fft(window(sig, 64))")
+        );
+        assert!(matches!(back.custom_title, Override::Custom(s) if s == "Waterfall"));
+        assert_eq!(back.x_range, "LAST 30 s");
+        assert_eq!(back.x_time_format, TimeFormat::Utc);
+        assert!(matches!(back.y_min_override, Override::Custom(v) if (v - 4.0).abs() < 1e-9));
+        assert!(matches!(back.intensity_max, Override::Custom(v) if (v + 10.0).abs() < 1e-9));
+        assert!(matches!(back.sample_rate, Override::Custom(v) if (v - 1000.0).abs() < 1e-9));
+        assert!(!back.show_colorbar);
+
+        // A pane saved before the colorbar existed keeps the legend it had:
+        // absent means "the default", and the default is on.
+        let partial: SpectrogramPanelConfig = serde_json::from_str(r#"{"label":"x"}"#).unwrap();
+        assert!(partial.show_colorbar);
+        assert!(partial.traces.is_empty());
 
         let meter = MeterConfig {
             component: "sat.wheels.h".into(),
@@ -1827,6 +1975,7 @@ mod tests {
         assert!(!partial.hide_readout);
 
         let annunciator = AnnunciatorPanelConfig {
+            conditions: vec![],
             pattern: "*.healthy".into(),
             color: Some(Hsla::default()),
             source: crate::views::AnnunciatorSource::Alarms,
@@ -1864,5 +2013,45 @@ mod tests {
         assert!(!legacy.show_values);
         assert!(!legacy.latch);
         assert_eq!(legacy.columns, 0);
+    }
+
+    /// Cross-language pin: the outline the Python preset builder emits
+    /// (`metor_config.Outline`) must parse into this config exactly.
+    /// `test_golden.py` asserts the builder still produces the fixture;
+    /// this asserts the panel still reads every field of it.
+    #[test]
+    fn the_golden_python_outline_parses() {
+        let blob = include_str!("../../../metor-fsw-2/tests/golden/outline.json");
+        let cfg: OutlinePanelConfig = serde_json::from_str(blob).unwrap();
+        assert_eq!(cfg.root, "sat1.wheels");
+        assert_eq!(cfg.columns, ["name", "value", "unit"]);
+        assert_eq!(cfg.sort, SortDirection::Descending);
+        assert_eq!(cfg.filter, "speed");
+        assert!(cfg.filter_bar);
+        assert_eq!(cfg.expanded, ["sat1.wheels.wheels.0"]);
+        assert_eq!(cfg.collapsed, ["sat1.wheels.status"]);
+        assert_eq!(cfg.pivots.len(), 1);
+        assert_eq!(cfg.pivots[0].path, "sat1.wheels.wheels");
+        assert_eq!(cfg.pivots[0].fields, ["speed", "torque"]);
+        assert_eq!(cfg.pivots[0].hidden, ["motor.temp"]);
+        assert_eq!(cfg.pivots[0].rows, ["3", "0"]);
+        assert_eq!(cfg.types.len(), 1);
+        assert_eq!(cfg.types[0].label, "psu");
+        assert_eq!(cfg.types[0].fields, ["current", "voltage"]);
+        assert_eq!(cfg.types[0].order, ["voltage"]);
+        assert!(cfg.types[0].hidden.is_empty());
+        assert_eq!(cfg.types[0].rows, ["sat1.dut2.psu"]);
+        assert_eq!(cfg.focus.as_deref(), Some("psu"));
+    }
+
+    /// An empty pane state — what the legacy `ComponentTable()` and
+    /// `DataTable()` builders emit — is the default outline.
+    #[test]
+    fn an_empty_outline_state_is_the_default() {
+        let cfg: OutlinePanelConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.columns, ["name", "unit", "type", "value"]);
+        assert_eq!(cfg.sort, SortDirection::Ascending);
+        assert!(cfg.root.is_empty());
+        assert!(cfg.pivots.is_empty());
     }
 }

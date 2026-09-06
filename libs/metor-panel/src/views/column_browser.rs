@@ -1,15 +1,23 @@
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, FocusHandle, Focusable, Hsla,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle,
-    SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, Entity, FocusHandle, Focusable,
+    Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render,
+    ScrollHandle, SharedString, UniformListScrollHandle, Window, actions, div, prelude::*, px,
+    uniform_list,
 };
 use smallvec::SmallVec;
 
 use super::Scrollbar;
+use super::filter_bar::{FilterBar, FilterBarEvent};
 use crate::icons::Icon;
+use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow};
+use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
+use crate::query::Query;
 use crate::theme::theme;
+
+actions!(metor_panel, [ToggleFilterBar]);
 
 const HEADER_HEIGHT: f32 = 28.0;
 const ROW_HEIGHT: f32 = 24.0;
@@ -119,17 +127,47 @@ pub trait ColumnBrowserDelegate: Sized + 'static {
         let _ = (item, window, cx);
     }
 
-    /// Right-click on a row (`item = Some`) or the column body
-    /// (`item = None`). Default: ignore.
-    fn on_context_menu(
+    /// Rows for the right-click menu on a row (`item = Some`) or the column
+    /// body (`item = None`). The browser adds its own rows (the filter bar
+    /// toggle) ahead of these and opens the menu; an empty answer with no
+    /// filter bar opens nothing.
+    fn context_rows(
         &mut self,
         column_ix: usize,
         item: Option<&Self::Item>,
-        position: Point<Pixels>,
-        window: &mut Window,
         cx: &mut Context<ColumnBrowser<Self>>,
-    ) {
-        let _ = (column_ix, item, position, window, cx);
+    ) -> Vec<Box<dyn InspectorRow>> {
+        let _ = (column_ix, item, cx);
+        Vec::new()
+    }
+
+    /// Placeholder for the filter bar. `None` means this tree has nothing
+    /// to filter, and the browser offers no bar at all.
+    fn filter_placeholder(&self) -> Option<SharedString> {
+        None
+    }
+
+    /// The bar's query changed — narrow the tree to it, or restore it when
+    /// the query is empty.
+    fn apply_filter(&mut self, query: &Query, cx: &mut Context<ColumnBrowser<Self>>) {
+        let _ = (query, cx);
+    }
+
+    /// Enter in the bar. Return `true` to have the bar cleared, as when the
+    /// query became something more permanent.
+    fn submit_filter(&mut self, query: &Query, cx: &mut Context<ColumnBrowser<Self>>) -> bool {
+        let _ = (query, cx);
+        false
+    }
+
+    /// Text beside the field — `shown / total`, typically.
+    fn filter_status(&self) -> Option<SharedString> {
+        None
+    }
+
+    /// What Enter would do with the current query, shown while there is one.
+    fn filter_hint(&self) -> Option<SharedString> {
+        None
     }
 
     /// Run before each render so the delegate can auto-extend the
@@ -171,6 +209,11 @@ pub struct ColumnBrowser<D: ColumnBrowserDelegate> {
     scroll_handles: SmallVec<[UniformListScrollHandle; 8]>,
     column_bounds: SmallVec<[Bounds<Pixels>; 8]>,
     hscroll: ScrollHandle,
+    /// The toolbar above the columns, when the delegate filters. Hidden
+    /// until asked for (Cmd-F, the palette, the right-click menu); hiding it
+    /// also clears its query so nothing filters invisibly.
+    filter: Option<Entity<FilterBar>>,
+    filter_visible: bool,
 }
 
 #[derive(Clone)]
@@ -184,15 +227,123 @@ impl Render for ResizeDrag {
 
 impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
     pub fn new(delegate: D, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        let filter = delegate.filter_placeholder().map(|placeholder| {
+            let parent = focus_handle.clone();
+            let bar = cx.new(|cx| FilterBar::new(placeholder, parent, cx));
+            cx.subscribe(&bar, |this, bar, event, cx| {
+                let query = bar.read(cx).query().clone();
+                match event {
+                    FilterBarEvent::Changed => this.delegate.apply_filter(&query, cx),
+                    FilterBarEvent::Submitted => {
+                        if this.delegate.submit_filter(&query, cx) {
+                            bar.update(cx, |bar, cx| bar.clear(cx));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .detach();
+            bar
+        });
         Self {
             delegate,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             focused_column: 0,
             column_widths: SmallVec::new(),
             scroll_handles: SmallVec::new(),
             column_bounds: SmallVec::new(),
             hscroll: ScrollHandle::new(),
+            filter,
+            filter_visible: false,
         }
+    }
+
+    pub fn filter_visible(&self) -> bool {
+        self.filter_visible && self.filter.is_some()
+    }
+
+    /// Show or hide the bar without moving focus; hiding clears the query.
+    pub fn set_filter_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        let Some(bar) = &self.filter else {
+            return;
+        };
+        self.filter_visible = visible;
+        if !visible {
+            bar.update(cx, |bar, cx| bar.clear(cx));
+        }
+        cx.notify();
+    }
+
+    /// The Cmd-F gesture: a hidden bar appears with the caret in it; a
+    /// visible one goes away.
+    pub fn toggle_filter_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = !self.filter_visible();
+        self.set_filter_visible(visible, cx);
+        if visible && let Some(bar) = &self.filter {
+            bar.read(cx).focus(window);
+        }
+    }
+
+    pub fn filter_text(&self, cx: &App) -> String {
+        self.filter
+            .as_ref()
+            .map(|bar| bar.read(cx).text().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Restore a persisted query: the bar shows whenever there is one.
+    pub fn set_filter_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(bar) = &self.filter else {
+            return;
+        };
+        if !text.is_empty() {
+            self.filter_visible = true;
+        }
+        bar.update(cx, |bar, cx| bar.set_text(text, cx));
+        cx.notify();
+    }
+
+    fn open_context_menu(
+        &mut self,
+        column_ix: usize,
+        item: Option<&D::Item>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = open_inspector(cx) else {
+            return;
+        };
+        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+        if self.filter.is_some() {
+            let label = if self.filter_visible() {
+                "Hide filter bar"
+            } else {
+                "Show filter bar"
+            };
+            let browser = cx.entity().downgrade();
+            rows.push(Box::new(CommandRow::new(
+                label,
+                Arc::new(move |window, cx| {
+                    if let Some(browser) = browser.upgrade() {
+                        browser.update(cx, |browser, cx| browser.toggle_filter_bar(window, cx));
+                    }
+                }),
+            )));
+        }
+        rows.extend(self.delegate.context_rows(column_ix, item, cx));
+        if rows.is_empty() {
+            return;
+        }
+        open(
+            InspectorRequest {
+                rows,
+                mode: InspectorMode::Anchored(position),
+            },
+            window,
+            cx,
+        );
     }
 
     pub fn delegate(&self) -> &D {
@@ -445,7 +596,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.delegate.on_context_menu(
+                    this.open_context_menu(
                         column_ix,
                         Some(&item_right),
                         event.position,
@@ -572,8 +723,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.delegate
-                        .on_context_menu(column_ix, None, event.position, window, cx);
+                    this.open_context_menu(column_ix, None, event.position, window, cx);
                 }),
             )
             .child(bounds_canvas)
@@ -636,6 +786,24 @@ impl<D: ColumnBrowserDelegate> Focusable for ColumnBrowser<D> {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+/// The inspector's toggle for a browser's filter bar — the same row on the
+/// palette's panel page and on the tab's right-click menu.
+pub fn filter_bar_row<D: ColumnBrowserDelegate>(browser: Entity<ColumnBrowser<D>>) -> BoolRow {
+    let read = browser.clone();
+    BoolRow::dynamic(
+        "Filter bar",
+        Arc::new(move |cx| read.read(cx).filter_visible()),
+        Arc::new(move |checked, window, cx| {
+            browser.update(cx, |browser, cx| {
+                if checked == browser.filter_visible() {
+                    return;
+                }
+                browser.toggle_filter_bar(window, cx);
+            });
+        }),
+    )
 }
 
 impl<D: ColumnBrowserDelegate> Render for ColumnBrowser<D> {
@@ -711,10 +879,36 @@ impl<D: ColumnBrowserDelegate> Render for ColumnBrowser<D> {
             .children(column_elements);
         strip.style().restrict_scroll_to_axis = Some(true);
 
+        let toolbar = self
+            .filter
+            .clone()
+            .filter(|_| self.filter_visible)
+            .inspect(|bar| {
+                let status = self.delegate.filter_status();
+                let hint = self.delegate.filter_hint();
+                bar.update(cx, |bar, _| {
+                    bar.status = status;
+                    bar.hint = hint;
+                });
+            });
+
         div()
-            .relative()
+            .key_context("ColumnBrowser")
+            .on_action(cx.listener(|this, _: &ToggleFilterBar, window, cx| {
+                this.toggle_filter_bar(window, cx);
+            }))
+            .flex()
+            .flex_col()
             .size_full()
-            .child(strip)
-            .children(hscroll_overlay)
+            .children(toolbar)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(strip)
+                    .children(hscroll_overlay),
+            )
     }
 }

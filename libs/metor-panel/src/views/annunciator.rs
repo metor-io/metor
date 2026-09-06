@@ -54,6 +54,8 @@ pub enum AnnunciatorSource {
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct AnnunciatorConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<String>,
     pub pattern: String,
     pub color: Option<Hsla>,
     pub source: AnnunciatorSource,
@@ -64,8 +66,15 @@ pub struct AnnunciatorConfig {
     pub columns: usize,
 }
 
+/// An explicitly owned condition, edited through the common binding field.
+#[derive(Default, facet::Facet)]
+pub struct Condition {
+    pub source: crate::data_binding::Binding,
+}
+
 /// One matched component's tile.
 struct Tile {
+    _binding: crate::data_binding::Binding,
     id: ComponentId,
     name: SharedString,
     /// `name` with the glob's literal parts removed — the part the pattern's
@@ -95,6 +104,11 @@ struct Tile {
 /// owns their latch, and the acks they publish are wire events.
 #[derive(facet::Facet)]
 pub struct Annunciator {
+    pub conditions: Vec<gpui::Entity<Condition>>,
+    #[facet(opaque)]
+    condition_inputs: crate::data_binding::InputChanges,
+    #[facet(opaque)]
+    bound_conditions: Vec<ComponentId>,
     pub pattern: SharedString,
     pub color: Hsla,
     #[facet(inspect::variants = "Components,Alarms")]
@@ -154,7 +168,19 @@ impl Annunciator {
         if let Some(store) = crate::alarms::try_global(cx) {
             cx.observe(&store, |_, _, cx| cx.notify()).detach();
         }
+        let conditions = cfg
+            .conditions
+            .iter()
+            .map(|text| {
+                cx.new(|cx| Condition {
+                    source: crate::data_binding::Binding::from_text(text, &db, cx),
+                })
+            })
+            .collect();
         Self {
+            conditions,
+            condition_inputs: Default::default(),
+            bound_conditions: Vec::new(),
             compiled_pattern: pattern.clone(),
             pattern,
             color: cfg.color.unwrap_or_else(|| theme(cx).control_active),
@@ -174,8 +200,13 @@ impl Annunciator {
         }
     }
 
-    pub fn to_config(&self) -> AnnunciatorConfig {
+    pub fn to_config(&self, cx: &App) -> AnnunciatorConfig {
         AnnunciatorConfig {
+            conditions: self
+                .conditions
+                .iter()
+                .map(|c| c.read(cx).source.text(&self.db))
+                .collect(),
             pattern: self.pattern.to_string(),
             color: Some(self.color),
             source: self.source,
@@ -223,13 +254,23 @@ impl Annunciator {
             cx.notify();
             return;
         }
-        let matches: Vec<(ComponentId, String)> = match &self.regex {
+        let mut matches: Vec<(ComponentId, String)> = match &self.regex {
             Some(re) => crate::inspector::trace_picker::list_components(&self.db)
                 .into_iter()
                 .filter(|(_, name)| re.is_match(name))
                 .collect(),
             None => Vec::new(),
         };
+
+        for condition in &self.conditions {
+            let source = &condition.read(cx).source;
+            if source.id() != ComponentId(0) && !matches.iter().any(|(id, _)| *id == source.id()) {
+                matches.push((
+                    source.id(),
+                    crate::dynamic::expressions::body(&source.text(&self.db)).to_string(),
+                ));
+            }
+        }
 
         self.tiles
             .retain(|t| matches.iter().any(|(id, _)| *id == t.id));
@@ -275,7 +316,7 @@ impl Annunciator {
 
     /// Tiles for the components the glob matches, from their local latches.
     fn component_visuals(&self, cx: &App) -> Vec<TileVisual> {
-        let latching = self.latch;
+        let latching = self.latch && crate::temporal::is_live(cx);
         let toggles = !latching && self.alarm_when == AlarmWhen::On;
         self.tiles
             .iter()
@@ -284,7 +325,10 @@ impl Annunciator {
                 name: tile.name.clone(),
                 label: self.show_labels.then(|| tile.label.clone()),
                 value: (self.show_values && !tile.is_bool).then(|| value_text(tile)),
-                click: match (latching, toggles && tile.is_bool) {
+                click: match (
+                    latching,
+                    toggles && tile.is_bool && crate::temporal::is_live(cx),
+                ) {
                     (true, _) => Some(TileClick::AckLatch(tile.id)),
                     (false, true) => Some(TileClick::Toggle(tile.id)),
                     (false, false) => None,
@@ -398,6 +442,20 @@ impl Focusable for Annunciator {
 
 impl Render for Annunciator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for condition in &self.conditions {
+            condition.update(cx, |condition, cx| condition.source.resolve(&self.db, cx));
+        }
+        self.condition_inputs
+            .changed(&self.conditions, &self.db, |c| vec![(c.source.id(), 0)], cx);
+        let conditions: Vec<_> = self
+            .conditions
+            .iter()
+            .map(|c| c.read(cx).source.id())
+            .collect();
+        if conditions != self.bound_conditions {
+            self.bound_conditions = conditions;
+            self.reconcile_tiles(cx);
+        }
         if self.compiled_pattern != self.pattern {
             self.recompile_and_reconcile(cx);
         }
@@ -449,31 +507,51 @@ impl Render for Annunciator {
             }
         }
 
-        let ack_all = (self.latch || self.source == AnnunciatorSource::Alarms).then(|| {
-            div().flex().flex_row().justify_end().child(
-                div()
-                    .id("annunciator-ack-all")
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .rounded(px(3.0))
-                    .bg(theme.bg_secondary)
-                    .text_size(px(11.0))
-                    .text_color(theme.text_secondary)
-                    .cursor_pointer()
-                    .child("Ack")
-                    .on_click(cx.listener(|this, _, _window, cx| this.ack_all(cx))),
-            )
-        });
+        let ack_all = ((self.latch && crate::temporal::is_live(cx))
+            || self.source == AnnunciatorSource::Alarms)
+            .then(|| {
+                div().flex().flex_row().justify_end().child(
+                    div()
+                        .id("annunciator-ack-all")
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(3.0))
+                        .bg(theme.bg_secondary)
+                        .text_size(px(11.0))
+                        .text_color(theme.text_secondary)
+                        .cursor_pointer()
+                        .child("Ack")
+                        .on_click(cx.listener(|this, _, _window, cx| this.ack_all(cx))),
+                )
+            });
 
         div()
             .track_focus(&self.focus)
             .size_full()
-            .bg(theme.bg_primary)
             .p(px(8.0))
             .flex()
             .flex_col()
             .gap(px(6.0))
             .children(ack_all)
+            .when(self.source == AnnunciatorSource::Alarms, |d| {
+                d.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_tertiary)
+                        .child("Live alarms"),
+                )
+            })
+            .when(
+                self.source == AnnunciatorSource::Components && !crate::temporal::is_live(cx),
+                |d| {
+                    d.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_tertiary)
+                            .child("Historical conditions · latch history unavailable"),
+                    )
+                },
+            )
             .child(body)
     }
 }
@@ -657,7 +735,7 @@ fn compile_pattern(pattern: &str) -> Option<Regex> {
     if pattern.is_empty() {
         return None;
     }
-    crate::views::component_browser::glob_to_regex(pattern).ok()
+    Some(crate::query::glob_to_regex(pattern))
 }
 
 /// Spawn the watcher task that rebuilds the tile list whenever the DB
@@ -722,19 +800,27 @@ fn build_tile(
     label: SharedString,
     cx: &mut Context<Annunciator>,
 ) -> Tile {
+    let binding = crate::data_binding::Binding::from_legacy(id, None, &db, cx);
     let meta = component_meta(&db, id);
     let task = spawn_on_stream(db, id, cx, move |grid, on, value, cx| {
         let inverted = grid.alarm_when == AlarmWhen::Off;
-        let now = Timestamp::now();
+        let now = crate::temporal::view_time(cx).unwrap_or_else(Timestamp::now);
+        let live = crate::temporal::is_live(cx);
         if let Some(tile) = grid.tiles.iter_mut().find(|t| t.id == id) {
-            tile.latest_on = Some(on);
+            tile.latest_on = on;
             tile.latest_value = value;
-            tile.latch.condition(on ^ inverted, now);
+            if !live || on.is_none() {
+                tile.latch = Latch::default();
+            }
+            if let Some(on) = on {
+                tile.latch.condition(on ^ inverted, now);
+            }
             cx.notify();
         }
     });
 
     Tile {
+        _binding: binding,
         id,
         name,
         label,

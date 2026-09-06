@@ -10,6 +10,10 @@ One directory per distribution (see `../docs/packaging.md`):
   is preferred); `$METOR_CONFIG_PY` points the host at a live checkout of
   `metor-config/` instead.
 - `metor-build/` — the PEP 517/660 build backend pack crates declare.
+- `metor-fsw/` — the `metor-fsw` binary as a wheel, with a locator and a
+  console script, so a target's venv carries its own host.
+- `metor-fsw-abi/` — the pack ABI version marker. Pack wheels pin it so an
+  environment cannot combine a pack with a host of another ABI.
 - `tests/` — the recorder test suite.
 
 ```python

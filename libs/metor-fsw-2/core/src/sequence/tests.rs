@@ -2,7 +2,7 @@
 //! [`CycleClock`] rather than a real coordinator. Covers the [`Wait`] future
 //! (deadline resolution and cancel short-circuit), the free
 //! [`wait`]/[`progress`]/[`aborted`] author API, the [`cycle`] suspension
-//! point of async-fn systems, and the [`check`] combinator built on them —
+//! point of async-fn systems, and the [`check`] combinator built on them:
 //! dwell, budget, cancel precedence, and the [`Check::or_fail`] mapping a body
 //! hangs its one safing site off.
 
@@ -135,8 +135,8 @@ fn clock_is_cleared_after_with_clock() {
     assert!(current().is_none(), "ambient clock cleared on the way out");
 }
 
-/// `cycle()` arms at the current clock and resolves only once a LATER cycle
-/// polls it — never the same cycle, so a `loop { cycle().await; … }` body
+/// `cycle()` arms at the current clock and resolves only once a later cycle
+/// polls it, never the same cycle, so a `loop { cycle().await; … }` body
 /// runs exactly once per coordinator cycle, deterministically.
 #[test]
 fn cycle_resolves_on_the_next_cycle() {
@@ -157,7 +157,7 @@ fn cycle_resolves_on_the_next_cycle() {
 }
 
 /// A predicate already true resolves on the calling cycle when no dwell is
-/// asked for — the "true once" case, and the reason a body can chain checks
+/// asked for, the "true once" case, and the reason a body can chain checks
 /// without burning a cycle apiece.
 #[test]
 fn check_holds_immediately_without_a_dwell() {
@@ -217,7 +217,7 @@ fn check_times_out_on_a_predicate_that_never_holds() {
 }
 
 /// A dwell that cannot complete inside the budget times out even though the
-/// predicate is true — the budget covers the dwell, it does not restart for it.
+/// predicate is true; the budget covers the dwell, it does not restart for it.
 #[test]
 fn check_times_out_when_the_dwell_outlasts_the_budget() {
     let clock = Rc::new(CycleClock::default());

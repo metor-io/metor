@@ -14,6 +14,8 @@ pub enum Offset {
     Latest(Duration),
     /// Absolute epoch.
     Fixed(Timestamp),
+    /// Extended anchors retain Live/View time intent in per-panel overrides.
+    Expression(crate::temporal::TimeExpr),
 }
 
 impl fmt::Display for Offset {
@@ -32,6 +34,7 @@ impl fmt::Display for Offset {
                 write!(f, "-{d}")
             }
             Offset::Fixed(ts) => write!(f, "={}", hifitime::Epoch::from(*ts)),
+            Offset::Expression(expr) => write!(f, "{expr}"),
         }
     }
 }
@@ -88,14 +91,28 @@ impl TimeRangeBehavior {
             Offset::Earliest(duration) => earliest + duration,
             Offset::Latest(duration) => latest - duration,
             Offset::Fixed(timestamp) => timestamp,
+            Offset::Expression(expr) => expr
+                .resolve(&crate::temporal::TimeContext {
+                    extent: Some(earliest..latest),
+                    live: Some(Timestamp::now()),
+                    view: None,
+                })
+                .unwrap_or(earliest),
         };
         let end = match self.end {
             Offset::Earliest(duration) => earliest + duration,
             Offset::Latest(duration) => latest - duration,
             Offset::Fixed(timestamp) => timestamp,
+            Offset::Expression(expr) => expr
+                .resolve(&crate::temporal::TimeContext {
+                    extent: Some(earliest..latest),
+                    live: Some(Timestamp::now()),
+                    view: None,
+                })
+                .unwrap_or(latest),
         };
 
-        clamp_range(earliest..latest, start..end)
+        start..end
     }
 
     /// Preset choices offered by the inspector's range picker.
@@ -113,45 +130,13 @@ impl TimeRangeBehavior {
     ];
 }
 
-/// Inspector rows shared by every time-range chooser: one command per
-/// [`TimeRangeBehavior::PRESETS`] entry plus a freeform text field
-/// speaking the `FromStr` grammar. Callers prepend extra rows (e.g. an
-/// "Auto" reset) and supply the setter.
+/// The same expression editor used by global time controls, committing locally.
 pub fn picker_rows(
     current: gpui::SharedString,
     set: std::sync::Arc<dyn Fn(TimeRangeBehavior, &mut gpui::Window, &mut gpui::App)>,
+    cx: &gpui::App,
 ) -> Vec<Box<dyn crate::inspector::rows::InspectorRow>> {
-    use std::sync::Arc;
-
-    use crate::inspector::rows::{CommandRow, InspectorRow, TextRow};
-
-    let mut rows: Vec<Box<dyn InspectorRow>> = TimeRangeBehavior::PRESETS
-        .iter()
-        .map(|(name, value)| {
-            let set = set.clone();
-            let value = *value;
-            Box::new(CommandRow::new(
-                *name,
-                Arc::new(move |window, cx| set(value, window, cx)),
-            )) as Box<dyn InspectorRow>
-        })
-        .collect();
-    rows.push(Box::new(TextRow::new(
-        gpui::SharedString::new_static("Custom"),
-        current,
-        Arc::new(move |s, window, cx| {
-            if let Ok(value) = s.parse::<TimeRangeBehavior>() {
-                set(value, window, cx);
-            }
-        }),
-    )));
-    rows
-}
-
-fn clamp_range(full: Range<Timestamp>, requested: Range<Timestamp>) -> Range<Timestamp> {
-    let start = requested.start.max(full.start);
-    let end = requested.end.min(full.end);
-    if start >= end { full } else { start..end }
+    crate::temporal::picker::local_range(&current, set, cx)
 }
 
 /// App-wide default time window. Plots whose `x_range` is `Auto` follow
@@ -167,12 +152,20 @@ impl gpui::Global for GlobalTimeRange {}
 impl GlobalTimeRange {
     /// The current global behavior; full range until anyone narrows it.
     pub fn get(cx: &gpui::App) -> TimeRangeBehavior {
+        if crate::temporal::controller(cx).is_some() {
+            return crate::temporal::config(cx).range.into();
+        }
         cx.try_global::<Self>()
             .map(|g| g.behavior)
             .unwrap_or(TimeRangeBehavior::FULL)
     }
 
     pub fn set(cx: &mut gpui::App, behavior: TimeRangeBehavior) {
+        if let Some(controller) = crate::temporal::controller(cx) {
+            let mut config = crate::temporal::config(cx);
+            config.range = behavior.into();
+            controller.update(cx, |c, cx| c.restore(config, cx));
+        }
         cx.set_global(Self { behavior });
         cx.refresh_windows();
     }
@@ -212,7 +205,17 @@ impl FromStr for Offset {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        offset_parser::offset(s).map_err(|_| ())
+        offset_parser::offset(s)
+            .or_else(|_| {
+                crate::temporal::model::parse_instant(
+                    s,
+                    &crate::temporal::model::ParseContext::utc(),
+                    true,
+                )
+                .map(Offset::Expression)
+                .map_err(|_| offset_parser::offset("").unwrap_err())
+            })
+            .map_err(|_| ())
     }
 }
 
@@ -240,8 +243,7 @@ impl FromStr for TimeRangeBehavior {
         // "LAST Xunit" shorthand
         let lower = s.to_lowercase();
         if let Some(rest) = lower.strip_prefix("last ") {
-            let offset: Offset = format!("- {}", rest.trim()).parse().map_err(|_| ())?;
-            if let Offset::Latest(dur) = offset {
+            if let Ok(Offset::Latest(dur)) = format!("- {}", rest.trim()).parse::<Offset>() {
                 return Ok(TimeRangeBehavior::last(dur));
             }
         }
@@ -251,6 +253,12 @@ impl FromStr for TimeRangeBehavior {
             let start: Offset = left.trim().parse().map_err(|_| ())?;
             let end: Offset = right.trim().parse().map_err(|_| ())?;
             return Ok(TimeRangeBehavior { start, end });
+        }
+
+        if let Ok(range) =
+            crate::temporal::model::parse_range(s, &crate::temporal::model::ParseContext::utc())
+        {
+            return Ok(range.into());
         }
 
         // Single offset: use as start, end = latest

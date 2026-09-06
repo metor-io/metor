@@ -15,7 +15,7 @@ and wiring checks.
 
 ## Two crates
 
-`metor-fsw-2-core` is the authoring surface: frames, ports, messages, health,
+`metor-fsw-2-core` is the authoring surface: frames, ports, messages, logs,
 systems, packs, sequences, and the pack ABI. A pack, sequence, or contract
 crate depends on it alone. It compiles for `wasm32-unknown-unknown`.
 
@@ -58,7 +58,7 @@ then stores postcard bytes. Message inputs may read from more than one producer.
 
 Each output has one ring writer. Inputs hold read views. A writer never
 replaces bytes that a reader still holds. A full ring makes a write fail. A
-`publish` helper may drop the new record and report the loss through health.
+`publish` helper may drop the new record and report the loss on the log.
 
 See [Frames](frames.md) and [Ports, messages, and rings](messages.md).
 
@@ -70,6 +70,9 @@ ports.
 Use `Pack::task` for an async function that must advance on the FSW clock.
 The driver polls it once per cycle. Sequences use this form.
 
+A `@system` function in `target.py` is a cyclic system too. It compiles to a
+WebAssembly pack at build time; see [Python systems](python-systems.md).
+
 Use a `CyclicSystem` struct when state and port bundles need named types. Use an
 `AsyncSystem` struct for a free-running task that waits on I/O or host time.
 The coordinator does not poll that task once per cycle. An `AsyncSystem` is the
@@ -80,7 +83,7 @@ See [Systems](system.md) and [Coordinator](coordinator.md).
 
 ## Target input
 
-A `target.py` file and the Rust `WiringBuilder` both produce wiring IR v8.
+A `target.py` file and the Rust `WiringBuilder` both produce wiring IR v9.
 The IR holds shared states, systems, runtime slots, edges, artifacts, and
 coordinator settings.
 
@@ -93,7 +96,9 @@ See [Target wiring](wiring.md).
 ## Code loading
 
 A pack lists the systems that one crate exports. The host may register that
-pack at build time or load its library through ABI v10.
+pack at build time or load its library through ABI v12. A pack built as a
+WebAssembly module runs under an interpreter with a fuel budget and a memory
+ceiling; see [WebAssembly packs](wasm.md).
 
 A process system uses the same pack library in a worker. The host and worker
 share mmap ring files. A small control block sends one cycle timestamp to the

@@ -6,6 +6,7 @@ fn layout() -> TileLayout {
     TileLayout {
         version: 0,
         global_time_range: String::new(),
+        temporal: None,
         root: TileNode::Pane(TilePane {
             active_index: 0,
             tab_orientation: Default::default(),
@@ -19,9 +20,9 @@ fn layout() -> TileLayout {
     }
 }
 
-/// Params deserialize from the JSON shape the Python builder emits — the
+/// Params deserialize from the JSON shape the Python builder emits; the
 /// layout arrives as the structured tree, so a malformed preset fails at
-/// resolution rather than reaching the panel.
+/// resolution rather than reaching a client.
 #[test]
 fn params_deserialize_from_builder_json() {
     let json = r#"{"preset":[{"name":"ops","layout":{
@@ -38,7 +39,7 @@ fn params_deserialize_from_builder_json() {
 }
 
 /// Pins the id the Python recorder's `component_id()` computes for a
-/// qualified name against `ComponentId::new` — the two must agree or preset
+/// qualified name against `ComponentId::new`; the two must agree or preset
 /// traces silently point at nothing.
 #[test]
 fn python_component_id_parity() {
@@ -98,7 +99,10 @@ mod system {
 
         let hydrated: TileLayout =
             serde_json::from_str(&got[0].presets[0].layout).expect("layout json parses");
-        assert_eq!(hydrated.version, TILE_LAYOUT_VERSION, "publish stamps the version");
+        assert_eq!(
+            hydrated.version, TILE_LAYOUT_VERSION,
+            "publish stamps the version"
+        );
         let TileNode::Pane(pane) = hydrated.root else {
             panic!("expected pane root");
         };

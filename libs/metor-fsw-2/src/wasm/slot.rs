@@ -2,8 +2,8 @@
 //!
 //! [`WasmSlot`] is to [`WasmPack`] what `DlSlot` is to `DlPack`: it owns one
 //! bound instance and advances it once per cycle. The lifecycle is the same
-//! ABI in the same order, so the slot runner drives all three backings — dl,
-//! process worker, and wasm — through the same `execute → FswStatus` shape.
+//! ABI in the same order, so the slot runner drives all three backings (dl,
+//! process worker, and wasm) through the same `execute → FswStatus` shape.
 //!
 //! What differs is the cycle body. A dl occupant shares the coordinator's
 //! rings and simply executes; a guest cannot reach them, so each cycle is
@@ -15,8 +15,8 @@
 //! [`FswStatus::Panicked`], which the runner already maps onto
 //! `SlotState::Stopped` exactly as it does a `.so` panic.
 
-use metor_fsw_2_core::Delivery;
 use metor_fsw_2_core::abi::{FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT};
+use metor_fsw_2_core::{Delivery, Mount};
 use metor_proto::types::Timestamp;
 
 use super::{RingBridge, WasmError, WasmPack};
@@ -28,7 +28,7 @@ pub struct WasmSlot {
     /// The guest's instance pointer from `fsw_pack_create`.
     state: i32,
     bridge: Option<RingBridge>,
-    /// Structurally corrupt bridge reads waiting for the coordinator's health
+    /// Structurally corrupt bridge reads waiting for the coordinator's fault
     /// scan. A corruption also stops the occupant; this counter preserves the
     /// specific cause instead of reporting only the generic panic fold.
     boundary_corruptions: u64,
@@ -77,7 +77,15 @@ impl WasmSlot {
         max_memory: usize,
     ) -> Result<Self, WasmError> {
         let pack = WasmPack::open_with_memory_limit(wasm, fuel_per_call, max_memory)?;
-        Self::bind_opened(pack, index, params, instance, host_inputs, host_outputs)
+        Self::bind_opened(
+            pack,
+            index,
+            params,
+            instance,
+            host_inputs,
+            host_outputs,
+            Mount::SlotOccupant,
+        )
     }
 
     /// Bind a freshly read module by entry name after proving its ABI-relevant
@@ -113,18 +121,24 @@ impl WasmSlot {
             instance,
             host_inputs,
             host_outputs,
+            Mount::SlotOccupant,
         )?;
         slot.set_fuel_per_call(poll_fuel);
         Ok(slot)
     }
 
-    fn bind_opened(
+    /// Create entry `index` under `mount`, mirror the host rings into the
+    /// guest, bind, and pin. A wired mount gets the descriptor's own ports and
+    /// nothing else; a slot occupant also gets the appended control input and
+    /// status output.
+    pub(crate) fn bind_opened(
         mut pack: WasmPack,
         index: u32,
         params: &[u8],
         instance: &str,
         host_inputs: &[FswRing],
         host_outputs: &[FswRing],
+        mount: Mount,
     ) -> Result<Self, WasmError> {
         let entry = pack
             .manifest()
@@ -139,9 +153,11 @@ impl WasmSlot {
             .map(|p| p.delivery)
             .collect();
 
-        // Mount 1 is the slot-occupant mount, which appends the control input
-        // and the status output the entry never declares.
-        let state = pack.create(index, 1, params)?;
+        let mount_word = match mount {
+            Mount::Wired => 0,
+            Mount::SlotOccupant => 1,
+        };
+        let state = pack.create(index, mount_word, params)?;
 
         // One guest region per host region, sized from the host's, so the two
         // sides of a leg always agree on what a record can be.
@@ -157,8 +173,9 @@ impl WasmSlot {
         let hin: Vec<_> = host_inputs.iter().map(host).collect();
         let hout: Vec<_> = host_outputs.iter().map(host).collect();
 
-        // Delivery is known only for the entry's declared ports; the mount tail
-        // is snapshot (control, status), so pad rather than assume alignment.
+        // Delivery is known only for the entry's declared ports; an occupant's
+        // mount tail is snapshot (control, status), so pad rather than assume
+        // alignment. A wired mount has no tail and the resize is a no-op.
         let in_delivery = Self::pad_delivery(in_delivery, hin.len());
         let out_delivery = Self::pad_delivery(out_delivery, hout.len());
 
@@ -196,8 +213,8 @@ impl WasmSlot {
     /// One cycle: carry the inputs in, advance the guest, carry the outputs
     /// back out.
     ///
-    /// Returns the raw [`FswStatus`] the runner folds, with every failure —
-    /// trap, fuel exhaustion, moved memory — reported as
+    /// Returns the raw [`FswStatus`] the runner folds, with every failure
+    /// (trap, fuel exhaustion, moved memory) reported as
     /// [`FswStatus::Panicked`]. That is the same word a `.so` occupant returns
     /// when its panic is caught, so the runner's terminal handling needs no
     /// wasm-specific case.
@@ -218,6 +235,17 @@ impl WasmSlot {
         }
     }
 
+    /// Carry inputs across without entering the guest, so upstream producers
+    /// never backpressure on a reader that has stopped moving. What cannot be
+    /// delivered counts as dropped.
+    pub(crate) fn carry_inputs(&mut self) {
+        if self.pack.check_memory_stable().is_ok()
+            && let Some(bridge) = self.bridge.as_mut()
+        {
+            let _ = bridge.pump_in();
+        }
+    }
+
     fn cycle(&mut self, now: Timestamp) -> Result<FswStatus, WasmError> {
         // Before any handle is touched: a grown guest invalidates all of them.
         self.pack.check_memory_stable()?;
@@ -235,23 +263,23 @@ impl WasmSlot {
     /// Tighten (or loosen) the budget each later cycle runs under.
     ///
     /// Binding costs far more fuel than a cycle does, so a slot binds under a
-    /// generous budget and then applies its configured per-poll one — which is
+    /// generous budget and then applies its configured per-poll one, which is
     /// what actually bounds the occupant.
     pub fn set_fuel_per_call(&mut self, fuel: u64) {
         self.pack.set_fuel_per_call(fuel);
     }
 
-    /// Records the bridge could not deliver, for the slot's health.
+    /// Records the bridge could not deliver, for the coordinator's fault scan.
     pub fn dropped(&self) -> u64 {
         self.bridge.as_ref().map_or(0, RingBridge::dropped)
     }
 
-    /// Drain bridge drops for coordinator health.
+    /// Drain bridge drops for the coordinator's fault scan.
     pub fn drain_dropped(&mut self) -> u64 {
         self.bridge.as_mut().map_or(0, RingBridge::drain_dropped)
     }
 
-    /// Drain structurally corrupt bridge reads for coordinator health.
+    /// Drain structurally corrupt bridge reads for the coordinator's fault scan.
     pub fn drain_corruptions(&mut self) -> u64 {
         std::mem::take(&mut self.boundary_corruptions)
     }

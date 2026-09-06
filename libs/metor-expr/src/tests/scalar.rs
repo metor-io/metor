@@ -12,18 +12,13 @@ use crate::{Ty, compile};
 
 #[test]
 fn a_function_is_exported_by_name_with_its_params_by_value() {
-    let wasm = build(
-        "def scale(x: f64, k: f64) -> f64:\n    return x * k\n",
-    );
+    let wasm = build("def scale(x: f64, k: f64) -> f64:\n    return x * k\n");
     assert_eq!(call_f64(&wasm, "scale", &[2.5, 4.0]), 10.0);
 }
 
 #[test]
 fn the_manifest_describes_what_the_host_will_call() {
-    let module = compile(
-        "def mix(a: f64, n: i64, on: bool) -> f64:\n    return a\n",
-    )
-    .unwrap();
+    let module = compile("def mix(a: f64, n: i64, on: bool) -> f64:\n    return a\n").unwrap();
     let sig = &module.manifest.functions[0];
     assert_eq!(sig.name, "mix");
     assert_eq!(
@@ -97,9 +92,7 @@ fn and_or_not_short_circuit() {
 
     // The right operand of a short-circuited `and` never runs, so its trap
     // never happens.
-    let wasm = build(
-        "def safe(n: i64) -> bool:\n    return n != 0 and 10 // n > 2\n",
-    );
+    let wasm = build("def safe(n: i64) -> bool:\n    return n != 0 and 10 // n > 2\n");
     assert!(!run_bool(&wasm, "safe", &[iv(0)]));
     assert!(run_bool(&wasm, "safe", &[iv(3)]));
 }
@@ -252,6 +245,30 @@ fn the_builtin_set_computes_what_it_says() {
     assert_eq!(eval_f64("tanh(0.5)"), libm::tanh(0.5));
 }
 
+#[test]
+fn the_composed_builtins_compute_what_they_say() {
+    assert_eq!(eval_f64("clamp(5.0, 0.0, 1.0)"), 1.0);
+    assert_eq!(eval_f64("clamp(-5.0, 0.0, 1.0)"), 0.0);
+    assert_eq!(eval_f64("clamp(0.5, 0.0, 1.0)"), 0.5);
+    assert_eq!(eval_i64("clamp(7, 1, 3)"), 3);
+    assert_eq!(eval_f64("clamp(7, 1.0, 3)"), 3.0);
+    assert_eq!(eval_f64("sign(-2.5)"), -1.0);
+    assert_eq!(eval_f64("sign(0.0)"), 0.0);
+    assert_eq!(eval_f64("sign(2.5)"), 1.0);
+    assert_eq!(eval_i64("sign(-7)"), -1);
+    assert_eq!(eval_i64("sign(0)"), 0);
+    assert_eq!(eval_i64("sign(7)"), 1);
+    assert_eq!(eval_f64("hypot(3.0, 4.0)"), 5.0);
+    assert_eq!(eval_f64("hypot(3, 4)"), 5.0);
+    assert_eq!(eval_f64("lerp(10.0, 20.0, 0.25)"), 12.5);
+    assert_eq!(eval_f64("lerp(10.0, 20.0, 0.0)"), 10.0);
+    assert_eq!(eval_f64("lerp(10.0, 20.0, 1.0)"), 20.0);
+    assert!((eval_f64("log2(8.0)") - 3.0).abs() < 1e-12);
+    assert!((eval_f64("log10(1000.0)") - 3.0).abs() < 1e-12);
+    assert!((eval_f64("degrees(3.0)") - 3.0f64.to_degrees()).abs() < 1e-12);
+    assert!((eval_f64("radians(180.0)") - 180.0f64.to_radians()).abs() < 1e-12);
+}
+
 /// `round` is `f64.nearest`, which is round-half-to-even — the same rule
 /// Python's `round` uses.
 #[test]
@@ -309,30 +326,69 @@ fn the_subset_refuses_what_it_does_not_implement() {
         ),
         ("def f() -> f64:\n    return {1: 2}\n", "dicts"),
         ("def f() -> f64:\n    return \"hi\"\n", "literals"),
-        ("import math\ndef f() -> f64:\n    return 1.0\n", "classes, functions, and bindings"),
-        ("def f() -> f64:\n    import math\n    return 1.0\n", "imports"),
+        (
+            "import math\ndef f() -> f64:\n    return 1.0\n",
+            "classes, functions, and bindings",
+        ),
+        (
+            "def f() -> f64:\n    import math\n    return 1.0\n",
+            "imports",
+        ),
         ("class A:\n    pass\n", "Frame or State"),
-        ("def f() -> f64:\n    class A:\n        pass\n    return 1.0\n", "classes"),
-        ("def f() -> f64:\n    g = lambda x: x\n    return 1.0\n", "lambdas"),
-        ("def f() -> f64:\n    try:\n        pass\n    except:\n        pass\n    return 1.0\n", "try"),
-        ("def f() -> f64:\n    with open() as g:\n        pass\n    return 1.0\n", "with"),
+        (
+            "def f() -> f64:\n    class A:\n        pass\n    return 1.0\n",
+            "classes",
+        ),
+        (
+            "def f() -> f64:\n    g = lambda x: x\n    return 1.0\n",
+            "lambdas",
+        ),
+        (
+            "def f() -> f64:\n    try:\n        pass\n    except:\n        pass\n    return 1.0\n",
+            "try",
+        ),
+        (
+            "def f() -> f64:\n    with open() as g:\n        pass\n    return 1.0\n",
+            "with",
+        ),
         ("def f() -> f64:\n    del x\n    return 1.0\n", "del"),
         ("def f() -> f64:\n    global g\n    return 1.0\n", "globals"),
         ("def f() -> f64:\n    yield 1.0\n", "yield"),
-        ("def f() -> f64:\n    def g() -> f64:\n        return 1.0\n    return 1.0\n", "nested"),
+        (
+            "def f() -> f64:\n    def g() -> f64:\n        return 1.0\n    return 1.0\n",
+            "nested",
+        ),
         ("def f(x) -> f64:\n    return 1.0\n", "annotated"),
         ("def f(x: f64):\n    return 1.0\n", "return type"),
         ("def f(x: str) -> f64:\n    return 1.0\n", "unknown type"),
-        ("def f() -> f64:\n    return undefined_name\n", "not defined"),
-        ("def f() -> f64:\n    return 1.0\ndef f() -> f64:\n    return 2.0\n", "more than once"),
-        ("def f(x: f64) -> f64:\n    if x > 0.0:\n        return 1.0\n", "every path"),
+        (
+            "def f() -> f64:\n    return undefined_name\n",
+            "not defined",
+        ),
+        (
+            "def f() -> f64:\n    return 1.0\ndef f() -> f64:\n    return 2.0\n",
+            "more than once",
+        ),
+        (
+            "def f(x: f64) -> f64:\n    if x > 0.0:\n        return 1.0\n",
+            "every path",
+        ),
         ("def f() -> f64:\n    break\n", "outside a loop"),
         ("def f() -> f64:\n    return 1 @ 2\n", "`@`"),
         ("def f() -> f64:\n    return 1 & 2\n", "bitwise"),
         ("def f() -> f64:\n    return ~1\n", "`~`"),
-        ("def f(x: f64) -> f64:\n    return x[0]\n", "cannot be indexed"),
-        ("def f(v: Tensor[f64, 3]) -> f64:\n    return v[0:2]\n", "slicing"),
-        ("def f() -> f64:\n    return a.b\n", "`a` is not a frame here"),
+        (
+            "def f(x: f64) -> f64:\n    return x[0]\n",
+            "cannot be indexed",
+        ),
+        (
+            "def f(v: Tensor[f64, 3]) -> f64:\n    return v[0:2]\n",
+            "slicing",
+        ),
+        (
+            "def f() -> f64:\n    return a.b\n",
+            "`a` is not a frame here",
+        ),
     ] {
         let diags = reject(source);
         let text = format!("{diags}");
