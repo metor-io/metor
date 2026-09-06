@@ -234,6 +234,12 @@ impl TimeSeriesPlot {
                         window,
                         cx,
                     );
+                    crate::temporal::paint_playhead(
+                        plot_area(bounds, view.axis_count()),
+                        view.x,
+                        window,
+                        cx,
+                    );
                 }
             },
         )
@@ -416,6 +422,17 @@ impl Render for TimeSeriesPlot {
             .child(self.render_cursors(cx))
             .child(self.render_hover(cx));
 
+        if self.line_plot.read(cx).x_range.as_custom().is_some() {
+            inner = inner.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_tertiary)
+                    .child("Independent range"),
+            );
+        }
         // Measurement panels: a native div tree positioned on top of
         // the cursor overlays. In Track mode this is one mini panel per
         // cursor; in Pinned mode it's a single consolidated panel.

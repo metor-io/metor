@@ -55,10 +55,12 @@ impl ComponentText {
                 ((), move |view| Some(formatter.format(view)))
             },
             |this, update, cx| {
-                if let StreamUpdate::Value(value) = update {
-                    this.value = Some(SharedString::from(value));
-                    cx.notify();
+                match update {
+                    StreamUpdate::Value(value) => this.value = Some(SharedString::from(value)),
+                    StreamUpdate::Unavailable => this.value = None,
+                    _ => {}
                 }
+                cx.notify();
             },
         );
         Self {
@@ -88,7 +90,7 @@ impl Render for ComponentText {
             .child(
                 self.value
                     .clone()
-                    .unwrap_or_else(|| SharedString::new_static("")),
+                    .unwrap_or_else(|| SharedString::new_static("—")),
             )
     }
 }

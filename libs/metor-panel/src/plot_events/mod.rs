@@ -16,6 +16,11 @@
 //! no schema is known yet). The [`EventSourceRegistry`] global holds the built-ins
 //! and hands out (or creates) a source for a requested [`EventKindKey`].
 
+pub(crate) mod details;
+pub(crate) mod flags;
+pub mod index;
+pub(crate) mod popover;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
@@ -209,6 +214,16 @@ fn log_label(ev: &LogEvent) -> SharedString {
     }
 }
 
+fn log_plot_event(event: &LogEvent, theme: &Theme) -> PlotEvent {
+    PlotEvent {
+        ts: event.timestamp,
+        color: log_level_color(event.level, theme),
+        label: log_label(event),
+        short: log_short(event),
+        detail: EventDetail::Log(event.clone()),
+    }
+}
+
 impl EventSource for LogEventSource {
     fn key(&self) -> EventKindKey {
         EventKindKey::Logs
@@ -239,13 +254,7 @@ impl EventSource for LogEventSource {
             .map(|rec| (rec.event.timestamp, &rec.event));
         in_range(items, &range)
             .into_iter()
-            .map(|(ts, ev)| PlotEvent {
-                ts,
-                color: log_level_color(ev.level, &theme),
-                label: log_label(ev),
-                short: log_short(ev),
-                detail: EventDetail::Log(ev.clone()),
-            })
+            .map(|(_, ev)| log_plot_event(ev, &theme))
             .collect()
     }
 
@@ -296,6 +305,16 @@ fn alarm_label(ev: &AlarmEvent) -> SharedString {
     }
 }
 
+fn alarm_plot_event(event: &AlarmEvent, theme: &Theme) -> PlotEvent {
+    PlotEvent {
+        ts: event.timestamp,
+        color: alarm_color(event, theme),
+        label: alarm_label(event),
+        short: alarm_short(event),
+        detail: EventDetail::Alarm(event.clone()),
+    }
+}
+
 impl EventSource for AlarmEventSource {
     fn key(&self) -> EventKindKey {
         EventKindKey::Alarms
@@ -322,13 +341,7 @@ impl EventSource for AlarmEventSource {
         let items = store.state().history().iter().map(|ev| (ev.timestamp, ev));
         in_range(items, &range)
             .into_iter()
-            .map(|(ts, ev)| PlotEvent {
-                ts,
-                color: alarm_color(ev, &theme),
-                label: alarm_label(ev),
-                short: alarm_short(ev),
-                detail: EventDetail::Alarm(ev.clone()),
-            })
+            .map(|(_, ev)| alarm_plot_event(ev, &theme))
             .collect()
     }
 
@@ -345,6 +358,16 @@ struct SequenceEventSource;
 
 fn sequence_label(entry: &SequenceLogEntry) -> SharedString {
     format!("{}: {}", entry.channel_name, entry.label).into()
+}
+
+fn sequence_plot_event(event: &SequenceLogEntry, theme: &Theme) -> PlotEvent {
+    PlotEvent {
+        ts: event.timestamp,
+        color: theme.run_state_color(run_state_index(event.run_state)),
+        label: sequence_label(event),
+        short: event.label.clone(),
+        detail: EventDetail::Sequence(event.clone()),
+    }
 }
 
 impl EventSource for SequenceEventSource {
@@ -373,15 +396,7 @@ impl EventSource for SequenceEventSource {
         let items = store.state().history().iter().map(|e| (e.timestamp, e));
         in_range(items, &range)
             .into_iter()
-            .map(|(ts, entry)| PlotEvent {
-                ts,
-                // Each step takes the color of the run state it moved the channel to.
-                color: theme.run_state_color(run_state_index(entry.run_state)),
-                label: sequence_label(entry),
-                // The step label alone ("Started", "Loaded x") chips well.
-                short: entry.label.clone(),
-                detail: EventDetail::Sequence(entry.clone()),
-            })
+            .map(|(_, entry)| sequence_plot_event(entry, &theme))
             .collect()
     }
 
@@ -503,6 +518,25 @@ struct MsgEventSource {
     entity: Entity<MsgEventStore>,
 }
 
+fn msg_plot_event(
+    ts: Timestamp,
+    detail: EventDetail,
+    name: &SharedString,
+    color: Hsla,
+) -> PlotEvent {
+    let label = match &detail {
+        EventDetail::Raw(len) => format!("{name} · {len} B").into(),
+        _ => name.clone(),
+    };
+    PlotEvent {
+        ts,
+        color,
+        label,
+        short: name.clone(),
+        detail,
+    }
+}
+
 impl EventSource for MsgEventSource {
     fn key(&self) -> EventKindKey {
         EventKindKey::Msg(self.id)
@@ -528,19 +562,7 @@ impl EventSource for MsgEventSource {
         store
             .records_in(range)
             .into_iter()
-            .map(|(ts, detail)| {
-                let label = match &detail {
-                    EventDetail::Raw(len) => format!("{name} · {len} B").into(),
-                    _ => name.clone(),
-                };
-                PlotEvent {
-                    ts,
-                    color,
-                    label,
-                    short: name.clone(),
-                    detail,
-                }
-            })
+            .map(|(ts, detail)| msg_plot_event(ts, detail, &name, color))
             .collect()
     }
 
@@ -637,4 +659,24 @@ impl EventSourceRegistry {
             }
         }
     }
+}
+
+/// Observe a registered source through its typed store without duplicating host dispatch.
+pub(crate) fn observe_target<T: 'static>(
+    target: AnyEntity,
+    cx: &mut Context<T>,
+) -> Option<gpui::Subscription> {
+    if let Ok(store) = target.clone().downcast::<crate::logs::LogStore>() {
+        return Some(cx.observe(&store, |_, _, cx| cx.notify()));
+    }
+    if let Ok(store) = target.clone().downcast::<crate::alarms::AlarmStore>() {
+        return Some(cx.observe(&store, |_, _, cx| cx.notify()));
+    }
+    if let Ok(store) = target.clone().downcast::<crate::sequences::SequenceStore>() {
+        return Some(cx.observe(&store, |_, _, cx| cx.notify()));
+    }
+    target
+        .downcast::<MsgEventStore>()
+        .ok()
+        .map(|store| cx.observe(&store, |_, _, cx| cx.notify()))
 }

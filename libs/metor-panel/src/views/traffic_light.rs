@@ -63,7 +63,7 @@ impl TrafficLight {
 
         let meta = component_meta(&db, component_id);
         let task = spawn_on_stream(db.clone(), source, cx, |this, on, _value, cx| {
-            this.latest_on = Some(on);
+            this.latest_on = on;
             cx.notify();
         });
 

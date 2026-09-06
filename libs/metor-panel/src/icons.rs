@@ -46,6 +46,7 @@ impl AssetSource for IconAssets {
                 Some(include_bytes!("../assets/icons/right-side-bar.svg"))
             }
             "icons/scrub.svg" => Some(include_bytes!("../assets/icons/scrub.svg")),
+            "icons/skip-forward.svg" => Some(include_bytes!("../assets/icons/skip-forward.svg")),
             "icons/search.svg" => Some(include_bytes!("../assets/icons/search.svg")),
             "icons/setting.svg" => Some(include_bytes!("../assets/icons/setting.svg")),
             "icons/subtract.svg" => Some(include_bytes!("../assets/icons/subtract.svg")),
@@ -105,6 +106,7 @@ pub enum Icon {
     Restore,
     RightSideBar,
     Scrub,
+    SkipForward,
     Search,
     Setting,
     Subtract,
@@ -149,6 +151,7 @@ impl Icon {
             Icon::Restore => "icons/restore.svg",
             Icon::RightSideBar => "icons/right-side-bar.svg",
             Icon::Scrub => "icons/scrub.svg",
+            Icon::SkipForward => "icons/skip-forward.svg",
             Icon::Search => "icons/search.svg",
             Icon::Setting => "icons/setting.svg",
             Icon::Subtract => "icons/subtract.svg",

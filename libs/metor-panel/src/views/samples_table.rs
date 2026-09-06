@@ -53,6 +53,8 @@ pub struct SamplesTable {
     /// The stamp row 0 is anchored to. `None` follows the live head.
     #[facet(opaque)]
     head: Option<Timestamp>,
+    #[facet(opaque)]
+    selected_time: Option<Timestamp>,
     /// `(anchor, newest stamp)` the index was built against.
     #[facet(opaque)]
     built: Option<(Timestamp, Timestamp, u64)>,
@@ -84,6 +86,7 @@ impl SamplesTable {
             bound: None,
             series: None,
             head: None,
+            selected_time: None,
             built: None,
             history_task: gpui::Task::ready(()),
             history_start: None,
@@ -116,6 +119,7 @@ impl SamplesTable {
         self.bound = Some(self.source.id());
         self.series = None;
         self.head = None;
+        self.selected_time = None;
         self.built = None;
         self.history_start = None;
         self.newer = 0;
@@ -193,8 +197,15 @@ impl SamplesTable {
         else {
             return;
         };
+        let selected = (!crate::temporal::is_live(cx))
+            .then(|| crate::temporal::view_time(cx))
+            .flatten();
         if self.head.is_none() || self.table.read(cx).at_top() {
-            self.head = Some(latest);
+            if selected != self.selected_time {
+                self.selected_time = selected;
+                self.history_start = None;
+            }
+            self.head = crate::temporal::view_time(cx).or(Some(latest));
         }
         let head = self.head.expect("anchored above");
         if let Some(history) = history {
@@ -252,6 +263,16 @@ impl Render for SamplesTable {
             );
         }
 
+        root = root.child(
+            div()
+                .text_size(px(10.0))
+                .text_color(theme.text_tertiary)
+                .child(if self.table.read(cx).at_top() {
+                    "Following view time"
+                } else {
+                    "Browsing history"
+                }),
+        );
         root = root.child(
             div()
                 .id("samples-older")
@@ -536,6 +557,100 @@ mod tests {
         assert_eq!(index.rows, 0);
         assert_eq!(index.newer, 3);
         assert!(index.sample(0, 8).is_none());
+    }
+
+    #[gpui::test]
+    fn browsing_preserves_anchor_and_page_until_returning_to_top(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let id = ComponentId::new("samples.test");
+        db.with_state_mut(|state| {
+            state.insert_component(id, ComponentSchema::new(PrimType::F64, &[][..]), &db.path)
+        })
+        .unwrap();
+        let component = db
+            .with_state(|state| state.get_component(id).cloned())
+            .unwrap();
+        let values = [
+            10f64.to_le_bytes(),
+            20f64.to_le_bytes(),
+            100f64.to_le_bytes(),
+        ];
+        component
+            .time_series
+            .install_samples(
+                8,
+                [10, 20, 100]
+                    .into_iter()
+                    .zip(&values)
+                    .map(|(t, bytes)| (Timestamp(t), bytes.as_slice())),
+                metor_db::manifest::SpanSource::RemoteFetch,
+            )
+            .unwrap();
+        let view = cx.update(|cx| {
+            crate::temporal::TemporalController::init(db.clone(), cx);
+            crate::temporal::dispatch(
+                crate::temporal::TimeAction::Seek(crate::temporal::TimeExpr::fixed(Timestamp(20))),
+                cx,
+            )
+            .unwrap();
+            cx.new(|cx| {
+                SamplesTable::from_config(
+                    &SamplesTableConfig {
+                        component: "samples.test".into(),
+                    },
+                    db.clone(),
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.head, Some(Timestamp(20)));
+                view.history_start = Some(Timestamp(-120_000_000));
+                view.table.update(cx, |table, _| {
+                    table.set_scroll_offset(gpui::point(px(0.), px(-100.)))
+                });
+                assert!(!view.table.read(cx).at_top());
+            })
+        });
+        for selected in [30, 80, 10] {
+            cx.update(|cx| {
+                crate::temporal::dispatch(
+                    crate::temporal::TimeAction::Seek(crate::temporal::TimeExpr::fixed(Timestamp(
+                        selected,
+                    ))),
+                    cx,
+                )
+                .unwrap();
+                view.update(cx, |view, cx| {
+                    view.refresh(cx);
+                    assert_eq!(view.head, Some(Timestamp(20)));
+                    assert_eq!(view.selected_time, Some(Timestamp(20)));
+                    assert_eq!(view.history_start, Some(Timestamp(-120_000_000)));
+                    assert_eq!(
+                        view.table.read(cx).delegate().index.sample(0, 8).unwrap().0,
+                        Timestamp(20)
+                    );
+                });
+            });
+        }
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.table.update(cx, |table, _| {
+                    table.set_scroll_offset(gpui::point(px(0.), px(0.)))
+                });
+                view.refresh(cx);
+                assert_eq!(view.head, Some(Timestamp(10)));
+                assert_eq!(view.selected_time, Some(Timestamp(10)));
+                assert_eq!(view.history_start, Some(Timestamp(10 - 60_000_000)));
+                assert_eq!(
+                    view.table.read(cx).delegate().index.sample(0, 8).unwrap().0,
+                    Timestamp(10)
+                );
+            })
+        });
     }
 
     #[test]

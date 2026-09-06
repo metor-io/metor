@@ -20,6 +20,7 @@ pub struct NavRow {
     summary: Box<dyn Fn(&App) -> SharedString>,
     pub build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
     tag: Option<SharedString>,
+    accessory: Option<Box<dyn Fn(&mut App) -> Option<super::AccessorySpec>>>,
     /// Text the child page opens with in its search field, when the page
     /// edits something that already has one.
     query: Option<String>,
@@ -37,6 +38,7 @@ impl NavRow {
             summary: Box::new(move |_| summary.clone()),
             build_children,
             tag: None,
+            accessory: None,
             query: None,
         }
     }
@@ -51,8 +53,18 @@ impl NavRow {
             summary,
             build_children,
             tag: None,
+            accessory: None,
             query: None,
         }
+    }
+
+    /// Attach a page companion while keeping navigation in the shared row model.
+    pub fn with_accessory(
+        mut self,
+        build: Box<dyn Fn(&mut App) -> Option<super::AccessorySpec>>,
+    ) -> Self {
+        self.accessory = Some(build);
+        self
     }
 
     pub fn with_tag(mut self, tag: impl Into<SharedString>) -> Self {
@@ -68,6 +80,10 @@ impl NavRow {
 }
 
 impl InspectorRow for NavRow {
+    fn accessory(&self, _: &str, cx: &mut App) -> Option<super::AccessorySpec> {
+        self.accessory.as_ref().and_then(|build| build(cx))
+    }
+
     fn label(&self) -> &str {
         &self.label
     }

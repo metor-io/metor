@@ -174,7 +174,7 @@ fn spawn_marker_stream(
     cx: &mut Context<VectorMarker>,
 ) -> gpui::Task<()> {
     spawn_elements_stream(db.clone(), component, 3, cx, |marker, v, cx| {
-        marker.value = Some([v[0] as f32, v[1] as f32, v[2] as f32]);
+        marker.value = v.map(|v| [v[0] as f32, v[1] as f32, v[2] as f32]);
         cx.notify();
     })
 }
@@ -308,12 +308,14 @@ fn spawn_quat_stream(
     cx: &mut Context<AttitudeIndicator>,
 ) -> gpui::Task<()> {
     spawn_elements_stream(db.clone(), component, offset + 4, cx, move |view, v, cx| {
-        view.quat = Some([
-            v[offset] as f32,
-            v[offset + 1] as f32,
-            v[offset + 2] as f32,
-            v[offset + 3] as f32,
-        ]);
+        view.quat = v.map(|v| {
+            [
+                v[offset] as f32,
+                v[offset + 1] as f32,
+                v[offset + 2] as f32,
+                v[offset + 3] as f32,
+            ]
+        });
         cx.notify();
     })
 }

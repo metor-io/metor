@@ -49,6 +49,13 @@ pub struct InspectEntity {
     pub position: Point<Pixels>,
 }
 
+/// Graphical draft edits feed the same query field used by text completion.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct EditInspectorQuery {
+    pub text: String,
+}
+
 /// Where the inspector draws itself relative to the window.
 #[derive(Clone, Copy)]
 pub enum InspectorMode {
@@ -122,9 +129,12 @@ pub struct Inspector {
     /// change; owned here because the page's own rows stay untouched behind
     /// it. See [`InspectorRow::query_rows`].
     query_rows: Option<Vec<Box<dyn InspectorRow>>>,
+    query_revision: u64,
     selected_index: usize,
     editing: Option<EditState>,
     panel_bounds: Option<Bounds<Pixels>>,
+    accessory: Option<rows::AccessorySpec>,
+    accessory_expanded: bool,
     scroll_handle: UniformListScrollHandle,
     /// `false` for hover-style previews. Suppresses both keyboard focus
     /// capture and the full-window occluding overlay used for
@@ -153,6 +163,7 @@ impl Inspector {
             mode,
             cx,
         );
+        this.seed_query(cx);
         this.selected_index = this.first_selectable_index();
         this
     }
@@ -183,9 +194,12 @@ impl Inspector {
             dismissed: false,
             search: TextField::new("Search...", cx),
             query_rows: None,
+            query_revision: 0,
             selected_index: 0,
             editing: None,
             panel_bounds: None,
+            accessory: None,
+            accessory_expanded: matches!(mode, InspectorMode::Centered),
             scroll_handle: UniformListScrollHandle::new(),
             dismiss_on_outside_click: true,
         }
@@ -234,6 +248,7 @@ impl Inspector {
         });
         self.search.clear();
         self.query_rows = None;
+        self.seed_query(cx);
         self.selected_index = self.first_selectable_index();
         cx.notify();
     }
@@ -246,6 +261,7 @@ impl Inspector {
             }
             self.search.clear();
             self.query_rows = None;
+            self.seed_query(cx);
             self.selected_index = self.first_selectable_index();
             cx.notify();
             true
@@ -266,16 +282,38 @@ impl Inspector {
         }
     }
 
-    /// Ask the current page's provider row, if any, to reinterpret the query.
-    ///
-    /// Called after every query change. The first row that answers wins; an
-    /// empty query always falls back to the page's own rows so a picker opens
-    /// looking exactly as it always has.
+    /// Initialize the page's search placeholder and query, then compute its rows.
+    fn seed_query(&mut self, cx: &mut App) {
+        let placeholder = match &self.current_page().kind {
+            InspectorPageKind::Rows(rows) => rows.iter().find_map(|r| r.query_placeholder()),
+            _ => None,
+        }
+        .unwrap_or("Search...")
+        .to_string();
+        self.search.set_placeholder(&placeholder);
+        if let InspectorPageKind::Rows(rows) = &self.current_page().kind
+            && let Some(query) = rows.iter().find_map(|row| row.initial_query())
+        {
+            self.search.set_text(query);
+            self.search.cursor = self.search.text.len();
+            self.search.mark = self.search.cursor;
+        }
+        self.refresh_query_rows(cx);
+    }
+
+    fn query_edited(&mut self, cx: &mut App) {
+        if let InspectorPageKind::Rows(rows) = &self.current_page().kind {
+            for row in rows {
+                row.query_edited(&self.search.text, cx);
+            }
+        }
+        self.refresh_query_rows(cx);
+    }
+
+    /// The first provider that answers supplies the rows, including for an empty
+    /// query. If no provider answers, the inspector uses the page's own rows.
     fn refresh_query_rows(&mut self, cx: &mut App) {
         self.query_rows = None;
-        if self.search.text.is_empty() {
-            return;
-        }
         let query = self.search.text.clone();
         let cursor = self.search.cursor;
         let computed = match &self.current_page().kind {
@@ -447,7 +485,7 @@ impl Inspector {
                 self.search.text = text;
                 self.search.cursor = cursor.min(self.search.text.len());
                 self.search.mark = self.search.cursor;
-                self.refresh_query_rows(cx);
+                self.query_edited(cx);
                 self.selected_index = self.first_selectable_index();
                 cx.notify();
             }
@@ -496,6 +534,19 @@ impl Inspector {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        if event.keystroke.modifiers.alt && key == "t" {
+            if let Some(accessory) = &self.accessory {
+                accessory.focus.focus(window);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.modifiers.alt && key == "e" && self.accessory.is_some() {
+            self.accessory_expanded = !self.accessory_expanded;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
 
         // View pages only respond to navigation keys; everything else is
         // ignored so it can propagate to the embedded view's focus tree.
@@ -598,13 +649,18 @@ impl Inspector {
             _ => {}
         }
 
+        let previous = self.search.text.clone();
         if self.search.handle_key_down(event, cx) {
-            self.refresh_query_rows(cx);
+            if self.search.text != previous {
+                self.query_edited(cx);
+            } else {
+                self.refresh_query_rows(cx);
+            }
             self.selected_index = self.first_selectable_index();
         }
     }
 
-    fn render_input_bar(&self, cx: &App) -> impl IntoElement {
+    fn render_input_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let mut bar = div()
             .flex()
@@ -652,6 +708,36 @@ impl Inspector {
         }
 
         bar = bar.child(div().flex_1().min_w(px(60.0)).child(self.search.element()));
+        if self.accessory.is_some() {
+            bar = bar.child(
+                div()
+                    .id("time-preview-size")
+                    .px(px(4.0))
+                    .cursor_pointer()
+                    .child(
+                        if self.accessory_expanded {
+                            crate::icons::Icon::ChevronUp
+                        } else {
+                            crate::icons::Icon::ChevronDown
+                        }
+                        .svg_color(12.0, theme.text_secondary),
+                    )
+                    .tooltip(|_, cx| {
+                        crate::views::TooltipText::build(
+                            "Expand/collapse timeline (Alt-E); focus timeline (Alt-T)".into(),
+                            cx,
+                        )
+                    })
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.accessory_expanded = !this.accessory_expanded;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
 
         bar
     }
@@ -694,14 +780,58 @@ impl Inspector {
             .rounded(px(6.0))
             .child(bounds_tracker);
 
-        match &self.current_page().kind {
+        let panel = match &self.current_page().kind {
             InspectorPageKind::Rows(_) => self.render_rows_panel(frame, window, cx),
             InspectorPageKind::View { view, size } => {
                 let view = view.clone();
                 let size = *size;
                 self.render_view_panel(frame, view, size, cx)
             }
+        };
+        let mut group = div()
+            .id("inspector-group")
+            .flex()
+            .flex_col()
+            .on_action(cx.listener(|this, action: &EditInspectorQuery, _, cx| {
+                this.search.set_text(action.text.clone());
+                this.search.cursor = this.search.text.len();
+                this.search.mark = this.search.cursor;
+                this.query_edited(cx);
+                this.selected_index = this.first_selectable_index();
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(panel);
+        if matches!(self.mode, InspectorMode::Anchored(_)) && self.accessory.is_some() {
+            group = group
+                .child(div().h(px(6.0)))
+                .child(self.render_accessory(cx));
         }
+        group
+    }
+
+    fn render_accessory(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = theme(cx);
+        let height = if self.accessory_expanded { 112.0 } else { 31.0 };
+        div()
+            .id("inspector-accessory")
+            .relative()
+            .w_full()
+            .h(px(height))
+            .flex_shrink_0()
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_primary)
+            .rounded(px(4.0))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "tab" {
+                    this.focus_handle.focus(window);
+                    cx.stop_propagation();
+                } else {
+                    this.handle_key_down(event, window, cx);
+                }
+            }))
+            .children(self.accessory.as_ref().map(|a| a.view.clone()))
     }
 
     fn render_rows_panel(
@@ -725,7 +855,11 @@ impl Inspector {
                     .take(200)
                     .map(|&i| rows::measure(rows[i].label(), rows::LABEL_SIZE, window))
                     .fold(px(0.0), Pixels::max);
-                Some((widest + ROW_CHROME).clamp(ANCHORED_MIN_WIDTH, ANCHORED_MAX_WIDTH))
+                Some(if self.accessory.is_some() {
+                    ANCHORED_MAX_WIDTH
+                } else {
+                    (widest + ROW_CHROME).clamp(ANCHORED_MIN_WIDTH, ANCHORED_MAX_WIDTH)
+                })
             }
             InspectorMode::Centered => Some(CENTERED_WIDTH),
             InspectorMode::Inline => None,
@@ -745,8 +879,18 @@ impl Inspector {
         } else {
             let count = indices.len();
             let scroll_handle = self.scroll_handle.clone();
-            let max_items_h = 360.0_f32;
-            let items_h = (count as f32 * ROW_HEIGHT).min(max_items_h);
+            let accessory_height = if self.accessory.is_some() {
+                if self.accessory_expanded { 118.0 } else { 37.0 }
+            } else {
+                0.0
+            };
+            let max_items_h = (f32::from(window.viewport_size().height) - 120.0 - accessory_height)
+                .clamp(56.0, 360.0);
+            let items_h = if self.accessory.is_some() {
+                max_items_h.min(280.0)
+            } else {
+                (count as f32 * ROW_HEIGHT).min(max_items_h)
+            };
             uniform_list(
                 "inspector-items",
                 count,
@@ -820,10 +964,11 @@ impl Inspector {
             _ => frame.w_full().border_0().rounded(px(0.0)),
         };
 
-        frame
-            .max_h(px(400.0))
-            .child(self.render_input_bar(cx))
-            .child(div().py(px(2.0)).child(items_element))
+        let mut frame = frame.max_h(px(540.0)).child(self.render_input_bar(cx));
+        if !matches!(self.mode, InspectorMode::Anchored(_)) && self.accessory.is_some() {
+            frame = frame.child(self.render_accessory(cx));
+        }
+        frame.child(div().py(px(2.0)).child(items_element))
     }
 
     fn render_view_panel(
@@ -876,10 +1021,33 @@ impl Focusable for Inspector {
 
 impl Render for Inspector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let revision = match &self.current_page().kind {
+            InspectorPageKind::Rows(rows) => {
+                rows.iter().map(|r| r.query_revision(cx)).max().unwrap_or(0)
+            }
+            _ => 0,
+        };
+        if revision != self.query_revision {
+            let selected = self
+                .current_rows()
+                .and_then(|rows| rows.get(self.selected_index))
+                .map(|r| r.label().to_string());
+            self.refresh_query_rows(cx);
+            self.query_revision = revision;
+            self.selected_index = selected
+                .and_then(|label| self.current_rows()?.iter().position(|r| r.label() == label))
+                .unwrap_or_else(|| self.first_selectable_index());
+        }
         if self.dismissed {
             return div().into_any_element();
         }
 
+        self.accessory = match &self.current_page().kind {
+            InspectorPageKind::Rows(rows) => {
+                rows.iter().find_map(|r| r.accessory(&self.search.text, cx))
+            }
+            _ => None,
+        };
         let panel = self.render_panel(window, cx);
 
         // The full-window occluder used for click-outside dismissal also
@@ -892,7 +1060,9 @@ impl Render for Inspector {
                 let element = if dismiss_on_outside {
                     let panel = panel.on_mouse_down_out(cx.listener(
                         |this, _: &gpui::MouseDownEvent, window, _cx| {
-                            this.dismiss(window);
+                            if !this.accessory.as_ref().is_some_and(|a| (a.dragging)(_cx)) {
+                                this.dismiss(window);
+                            }
                         },
                     ));
                     let anchored_panel = anchored()
@@ -923,7 +1093,9 @@ impl Render for Inspector {
             InspectorMode::Centered => {
                 let panel = panel.on_mouse_down_out(cx.listener(
                     |this, _: &gpui::MouseDownEvent, window, _cx| {
-                        this.dismiss(window);
+                        if !this.accessory.as_ref().is_some_and(|a| (a.dragging)(_cx)) {
+                            this.dismiss(window);
+                        }
                     },
                 ));
                 let centered = div()
@@ -945,5 +1117,189 @@ impl Render for Inspector {
             // No overlay at all: the host places the panel in its own tree.
             InspectorMode::Inline => panel.into_any_element(),
         }
+    }
+}
+
+#[cfg(test)]
+mod temporal_tests {
+    use super::*;
+    use crate::temporal::{self, picker::Target};
+
+    #[gpui::test]
+    fn timeline_accessory_draws_below_anchored_menu_and_applies_time_edits(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
+        cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            temporal::TemporalController::init(db, cx);
+            temporal::dispatch(
+                temporal::TimeAction::Seek(temporal::TimeExpr::fixed(
+                    metor_proto::types::Timestamp(50_000_000),
+                )),
+                cx,
+            )
+            .unwrap();
+            temporal::dispatch(
+                temporal::TimeAction::Range(temporal::TimeRangeSpec::fixed(
+                    metor_proto::types::Timestamp(0)..metor_proto::types::Timestamp(100_000_000),
+                )),
+                cx,
+            )
+            .unwrap();
+        });
+        let (inspector, cx) = cx.add_window_view(|_, cx| {
+            let rows = temporal::picker::editor(Target::Range, cx);
+            Inspector::new(
+                rows,
+                InspectorMode::Anchored(gpui::point(px(40.0), px(40.0))),
+                cx,
+            )
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let (area, before) = cx.update(|_, cx| {
+            let i = inspector.read(cx);
+            let accessory = i.accessory.as_ref().expect("time page has a companion");
+            let timeline = accessory
+                .view
+                .clone()
+                .downcast::<crate::views::Timeline>()
+                .ok()
+                .unwrap();
+            let area = timeline
+                .read(cx)
+                .content_bounds()
+                .expect("timeline painted");
+            assert!(area.origin.y >= i.panel_bounds.unwrap().bottom());
+            assert!(f32::from(area.size.height) <= 31.0);
+            (area, temporal::config(cx))
+        });
+        // An immediate readout must also draw inside the inspector's deferred
+        // layer, before a range drag takes ownership of the pointer.
+        cx.simulate_mouse_move(
+            area.origin + gpui::point(px(10.0), px(20.0)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        cx.refresh().unwrap();
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: area.origin + gpui::point(px(2.0), px(4.0)),
+            click_count: 1,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: area.origin + gpui::point(px(80.0), px(4.0)),
+            pressed_button: Some(gpui::MouseButton::Left),
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: area.origin + gpui::point(px(80.0), px(4.0)),
+            ..Default::default()
+        });
+        cx.update(|_, cx| {
+            let i = inspector.read(cx);
+            assert!(
+                !i.dismissed,
+                "clicking the companion stays within the menu group"
+            );
+            assert_ne!(temporal::config(cx).range, before.range);
+            assert_eq!(temporal::config(cx).view, before.view);
+            assert!(!i.search.text.contains("+00:00"));
+            assert_eq!(
+                temporal::model::parse_range(&i.search.text, &temporal::model::ParseContext::utc())
+                    .unwrap(),
+                temporal::config(cx).range,
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn time_editor_keyboard_contract_is_identical_in_both_hosts(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            temporal::TemporalController::init(db, cx);
+            for mode in [
+                InspectorMode::Centered,
+                InspectorMode::Anchored(gpui::point(px(20.0), px(20.0))),
+            ] {
+                temporal::dispatch(
+                    temporal::TimeAction::Range(temporal::TimeRangeSpec::fixed(
+                        metor_proto::types::Timestamp(0)
+                            ..metor_proto::types::Timestamp(100_000_000),
+                    )),
+                    cx,
+                )
+                .unwrap();
+                let rows = temporal::picker::editor(Target::Range, cx);
+                let inspector = cx.new(|cx| Inspector::new(rows, mode, cx));
+                inspector.update(cx, |i, cx| {
+                    assert_eq!(i.search.cursor, i.search.text.len());
+                    let key = |key: &str| {
+                        let mut keystroke = gpui::Keystroke::parse(key).unwrap();
+                        if key.chars().count() == 1 {
+                            keystroke.key_char = Some(key.to_string());
+                        }
+                        KeyDownEvent {
+                            keystroke,
+                            is_held: false,
+                        }
+                    };
+                    i.search.set_text("last 2.5");
+                    i.search.cursor = i.search.text.len();
+                    i.search.mark = i.search.cursor;
+                    i.handle_key_down(&key("m"), window, cx);
+                    assert_eq!(temporal::config(cx).range.start.offset, -150_000_000);
+                    let valid = temporal::config(cx);
+                    i.handle_key_down(&key("backspace"), window, cx);
+                    assert_eq!(
+                        temporal::config(cx),
+                        valid,
+                        "incomplete duration keeps the last valid range"
+                    );
+                    i.handle_key_down(&key("tab"), window, cx);
+                    assert_eq!(temporal::config(cx), valid);
+                    let revision = cx.global::<temporal::TemporalRevision>().0;
+                    i.handle_key_down(&key("enter"), window, cx);
+                    assert_eq!(
+                        cx.global::<temporal::TemporalRevision>().0,
+                        revision,
+                        "Enter must not reapply the live edit"
+                    );
+                    assert!(i.dismissed);
+                    assert_eq!(temporal::config(cx).range.start.offset, -150_000_000);
+                });
+                temporal::dispatch(temporal::TimeAction::Live, cx).unwrap();
+                let rows = temporal::picker::editor(Target::View, cx);
+                let inspector = cx.new(|cx| Inspector::new(rows, mode, cx));
+                inspector.update(cx, |i, cx| {
+                    let before = temporal::config(cx);
+                    i.search.set_text("2026-09-05 14:00:00 UTC");
+                    i.query_edited(cx);
+                    let edited = temporal::config(cx);
+                    assert_ne!(edited.view, before.view);
+                    i.handle_key_down(
+                        &KeyDownEvent {
+                            keystroke: gpui::Keystroke::parse("escape").unwrap(),
+                            is_held: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    assert!(i.dismissed);
+                    assert_eq!(
+                        temporal::config(cx),
+                        edited,
+                        "Escape closes with the last applied value"
+                    );
+                });
+            }
+        });
     }
 }

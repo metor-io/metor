@@ -11,7 +11,7 @@ use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType, Tim
 use metor_proto_wkt::Severity;
 use smallvec::SmallVec;
 
-use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
+use crate::ComponentStreamBuilder;
 
 pub(crate) enum StreamUpdate<I, V> {
     Ready(I),
@@ -19,6 +19,8 @@ pub(crate) enum StreamUpdate<I, V> {
     /// No sample has arrived for [`STALE_AFTER`]; the next `Value` ends it.
     /// Sent once per silence, not repeated.
     Stale,
+    /// No valid sample at the selected instant; discard the previous value.
+    Unavailable,
 }
 
 /// How old a sample may be before it is stale — the age of the data by its
@@ -28,14 +30,14 @@ pub(crate) const STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// Per-stream freshness. Timestamps are absolute; future-dated samples age
 /// from receipt, and repeated or regressing stamps never restart the timer.
-struct Freshness {
+pub(crate) struct Freshness {
     latest: Option<Timestamp>,
     advanced_at: Instant,
     age_at_advance: Duration,
 }
 
 impl Freshness {
-    fn new(now: Instant) -> Self {
+    pub(crate) fn new(now: Instant) -> Self {
         Self {
             latest: None,
             advanced_at: now,
@@ -43,7 +45,12 @@ impl Freshness {
         }
     }
 
-    fn observe(&mut self, stamp: Option<Timestamp>, wall: Timestamp, now: Instant) -> Duration {
+    pub(crate) fn observe(
+        &mut self,
+        stamp: Option<Timestamp>,
+        wall: Timestamp,
+        now: Instant,
+    ) -> Duration {
         let age = stamp
             .map(|stamp| sample_age(stamp, wall))
             .unwrap_or_default();
@@ -198,88 +205,39 @@ where
     A: Fn(&mut E, StreamUpdate<I, V>, &mut Context<E>) + Send + 'static,
 {
     let component_id = source.component_id();
+    let reader = crate::temporal::samples::acquire(db.clone(), component_id, cx);
     cx.spawn(async move |this, cx| {
-        let mut stream = source.into_stream(&db).await;
+        let component = crate::wait_for_component(&db, component_id).await;
         let (initial, decode) = prepare(&db, component_id);
-        if this
-            .update(cx, |view, cx| apply(view, StreamUpdate::Ready(initial), cx))
-            .is_err()
-        {
-            return;
-        }
-
-        // Every sample carries its stamp, so each one either is already
-        // stale or says exactly how long until it will be. That remainder
-        // arms one timer; once it fires the view is told and the task waits,
-        // unarmed, for the sample that ends the silence. `None` means stale.
-        let mut remaining: Option<Duration> = None;
-        let mut freshness = Freshness::new(Instant::now());
-
-        // The seed is committed history and may already be over the line.
-        let seed = db.with_state(|state| {
-            let component = state.get_component(component_id)?;
-            let latest = component.time_series.latest()?;
-            let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
-            Some((decode(view), latest.timestamp()))
+        let subscription = this.update(cx, |view, cx| {
+            apply(view, StreamUpdate::Ready(initial), cx);
+            let deliver = move |view: &mut E,
+                                reader: &gpui::Entity<crate::temporal::samples::SelectedReader>,
+                                cx: &mut Context<E>| {
+                let selection = reader.read(cx).selection.clone();
+                match selection.sample {
+                    Some(sample) => {
+                        if let Ok((_, value)) = component.schema.parse_value(&sample.bytes)
+                            && let Some(value) = decode(value)
+                        {
+                            apply(view, StreamUpdate::Value(value), cx);
+                            if selection.stale {
+                                apply(view, StreamUpdate::Stale, cx);
+                            }
+                        } else {
+                            apply(view, StreamUpdate::Unavailable, cx);
+                        }
+                    }
+                    None => apply(view, StreamUpdate::Unavailable, cx),
+                }
+            };
+            deliver(view, &reader, cx);
+            cx.observe(&reader, move |view, reader, cx| deliver(view, &reader, cx))
         });
-        if let Some((seed, stamp)) = seed {
-            let age = freshness.observe(Some(stamp), Timestamp::now(), Instant::now());
-            remaining = STALE_AFTER.checked_sub(age);
-            let stale = remaining.is_none();
-            tracing::debug!(?component_id, ?age, stale, "seeded from history");
-            let result = this.update(cx, |view, cx| {
-                if let Some(seed) = seed {
-                    apply(view, StreamUpdate::Value(seed), cx);
-                }
-                if stale {
-                    apply(view, StreamUpdate::Stale, cx);
-                }
-            });
-            if result.is_err() {
-                return;
-            }
-        }
-
-        loop {
-            let next = async { Some(stream.next().await) };
-            let arrived = match remaining {
-                Some(wait) => {
-                    let timeout = async {
-                        cx.background_executor().timer(wait).await;
-                        None
-                    };
-                    futures_lite::future::race(next, timeout).await
-                }
-                None => next.await,
-            };
-            let (update, stale) = match arrived {
-                Some(sample) => {
-                    // A source without stamps counts from arrival.
-                    let stamp = sample.sample_time();
-                    let age = freshness.observe(stamp, Timestamp::now(), Instant::now());
-                    remaining = STALE_AFTER.checked_sub(age);
-                    tracing::debug!(?component_id, ?age, stamped = stamp.is_some(), "sample");
-                    let value = decode(sample.as_component_view()).map(StreamUpdate::Value);
-                    (value, remaining.is_none())
-                }
-                None => {
-                    remaining = None;
-                    tracing::debug!(?component_id, "stale: timer elapsed");
-                    (None, true)
-                }
-            };
-            let result = this.update(cx, |view, cx| {
-                if let Some(update) = update {
-                    apply(view, update, cx);
-                }
-                if stale {
-                    apply(view, StreamUpdate::Stale, cx);
-                }
-            });
-            if result.is_err() {
-                break;
-            }
-        }
+        // The task owns both the source and the shared-reader lease. GPUI observations
+        // clear cached widget state in the same update cycle as a seek.
+        std::future::pending::<()>().await;
+        drop((subscription, reader, source));
     })
 }
 
@@ -297,7 +255,7 @@ pub(crate) fn spawn_scalar_stream<E, F>(
 ) -> gpui::Task<()>
 where
     E: 'static,
-    F: Fn(&mut E, f64, &mut Context<E>) + Send + 'static,
+    F: Fn(&mut E, Option<f64>, &mut Context<E>) + Send + 'static,
 {
     spawn_seeded_stream(
         db,
@@ -308,10 +266,10 @@ where
                 view.iter().nth(element).map(|value| value.as_f64())
             })
         },
-        move |view, update, cx| {
-            if let StreamUpdate::Value(value) = update {
-                apply(view, value, cx);
-            }
+        move |view, update, cx| match update {
+            StreamUpdate::Value(value) => apply(view, Some(value), cx),
+            StreamUpdate::Unavailable => apply(view, None, cx),
+            _ => {}
         },
     )
 }
@@ -331,7 +289,7 @@ pub(crate) fn spawn_elements_stream<E, F>(
 ) -> gpui::Task<()>
 where
     E: 'static,
-    F: Fn(&mut E, &[f64], &mut Context<E>) + Send + 'static,
+    F: Fn(&mut E, Option<&[f64]>, &mut Context<E>) + Send + 'static,
 {
     spawn_seeded_stream(
         db,
@@ -347,10 +305,10 @@ where
                 (values.len() == count).then_some(values)
             })
         },
-        move |view, update, cx| {
-            if let StreamUpdate::Value(values) = update {
-                apply(view, &values, cx);
-            }
+        move |view, update, cx| match update {
+            StreamUpdate::Value(values) => apply(view, Some(&values), cx),
+            StreamUpdate::Unavailable => apply(view, None, cx),
+            _ => {}
         },
     )
 }
@@ -371,7 +329,7 @@ pub(crate) fn spawn_on_stream<E, F>(
 ) -> gpui::Task<()>
 where
     E: 'static,
-    F: Fn(&mut E, bool, Option<f64>, &mut Context<E>) + Send + 'static,
+    F: Fn(&mut E, Option<bool>, Option<f64>, &mut Context<E>) + Send + 'static,
 {
     spawn_seeded_stream(
         db,
@@ -383,10 +341,10 @@ where
                 Some((any_on(view.iter()), leading))
             })
         },
-        move |view, update, cx| {
-            if let StreamUpdate::Value((on, value)) = update {
-                apply(view, on, value, cx);
-            }
+        move |view, update, cx| match update {
+            StreamUpdate::Value((on, value)) => apply(view, Some(on), value, cx),
+            StreamUpdate::Unavailable => apply(view, None, None, cx),
+            _ => {}
         },
     )
 }
@@ -433,6 +391,9 @@ pub(crate) fn limit_marks(at: ElementRef, cx: &App) -> SmallVec<[(f64, Hsla); 4]
 
 /// Severity of the worst alarm currently raised against `at`, if any.
 pub(crate) fn active_severity(at: ElementRef, cx: &App) -> Option<Severity> {
+    if !crate::temporal::is_live(cx) {
+        return None;
+    }
     crate::alarms::try_global(cx)?
         .read(cx)
         .state()

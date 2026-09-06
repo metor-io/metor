@@ -69,6 +69,7 @@ pub(crate) enum AxisSource<'a> {
     },
     LatestSampleElements {
         component: &'a Component,
+        sample: &'a [u8],
         len: usize,
     },
     /// A derived min/max LoD component (`metor_db::lod`): each sample holds
@@ -115,6 +116,8 @@ pub(crate) struct LineDraw<'a> {
     /// trace render twice in one frame without overlap — min/max buckets
     /// for summarized history plus raw samples clipped to the live tail.
     pub x_clip: Option<(f64, f64)>,
+    /// Acquisition-time window for paired XY samples, independent of numeric axes.
+    pub time_clip: Option<(i64, i64)>,
 }
 
 /// Snap a decimation stride to the nearest power of 4.
@@ -267,6 +270,7 @@ pub(crate) struct ReadbackHandle {
     /// Travels with the frame so the degraded badge always describes the
     /// image actually on screen.
     truncated: bool,
+    generation: u64,
 }
 
 impl ReadbackHandle {
@@ -300,6 +304,7 @@ impl ReadbackHandle {
     ) {
         cx.spawn(async move |this, cx| {
             let truncated = self.truncated;
+            let generation = self.generation;
             let image = cx
                 .background_executor()
                 .spawn(async move { self.read_image() })
@@ -308,7 +313,9 @@ impl ReadbackHandle {
                 return;
             };
             let _ = this.update(cx, |t, cx| {
-                access(t).set_frame(img, truncated);
+                if access(t).generation == generation {
+                    access(t).set_frame(img, truncated);
+                }
                 cx.notify();
             });
         })
@@ -747,6 +754,7 @@ pub(crate) struct PlotRenderState {
     pending_release: Option<Arc<RenderImage>>,
     in_flight: Arc<AtomicBool>,
     degraded: bool,
+    generation: u64,
     /// Intensity-field texture and colormap, allocated on the first frame
     /// that draws one. Per caller, like `target`, since the field is sized to
     /// that caller's grid.
@@ -761,6 +769,7 @@ impl Default for PlotRenderState {
             pending_release: None,
             in_flight: Arc::new(AtomicBool::new(false)),
             degraded: false,
+            generation: 0,
             heatmap: None,
         }
     }
@@ -852,6 +861,7 @@ impl PlotRenderState {
                 padded_bytes_per_row: target.padded_bytes_per_row,
                 in_flight: self.in_flight.clone(),
                 truncated: gpu.cache.truncated,
+                generation: self.generation,
             })
         })
     }
@@ -860,6 +870,13 @@ impl PlotRenderState {
     pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>, truncated: bool) {
         self.pending_release = self.current_frame.replace(image);
         self.degraded = truncated;
+    }
+
+    pub(crate) fn clear_frame(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.current_frame.is_some() {
+            self.pending_release = self.current_frame.take();
+        }
     }
 
     pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
@@ -1008,6 +1025,7 @@ fn plan_trace(
         AxisSource::LatestSampleIndex { len: x_len },
         AxisSource::LatestSampleElements {
             component,
+            sample,
             len: y_len,
             ..
         },
@@ -1022,6 +1040,7 @@ fn plan_trace(
             x_buf,
             y_buf,
             component,
+            sample,
             len,
             trace.style,
             y_epoch,
@@ -1099,10 +1118,21 @@ fn plan_trace(
                 .take(n)
                 .map(|(xn, yn)| {
                     let cap = xn.timestamps().len().min(yn.timestamps().len());
-                    NodePair {
-                        x: NodeView::from_full_slice_capped(xn, cap),
-                        y: NodeView::from_full_slice_capped(yn, cap),
+                    let mut x = NodeView::from_full_slice_capped(xn, cap);
+                    let mut y = NodeView::from_full_slice_capped(yn, cap);
+                    if let Some((start, end)) = trace.time_clip {
+                        let lo = x.full_timestamps()[..cap]
+                            .partition_point(|t| t.0 < start)
+                            .max(y.full_timestamps()[..cap].partition_point(|t| t.0 < start));
+                        let hi = x.full_timestamps()[..cap]
+                            .partition_point(|t| t.0 < end)
+                            .min(y.full_timestamps()[..cap].partition_point(|t| t.0 < end));
+                        x.visible_start = lo;
+                        y.visible_start = lo;
+                        x.visible_len = hi.saturating_sub(lo);
+                        y.visible_len = x.visible_len;
                     }
+                    NodePair { x, y }
                 })
                 .collect()
         }
@@ -1844,7 +1874,7 @@ fn convert_element_strided(
 
 /// Plan one list-plot trace from the component's latest sample.
 ///
-/// Reads `component.time_series.latest()` once, decimates the resulting
+/// Uses the selected sample bytes, decimates the resulting
 /// vector to `pixel_budget`, uploads `(index, value)` pairs and emits a
 /// single draw span. Skipped silently when the component has no samples
 /// yet — the legend/auto-fit path will simply not see this trace.
@@ -1857,6 +1887,7 @@ fn plan_list_trace(
     x_buf: &wgpu::Buffer,
     y_buf: &wgpu::Buffer,
     component: &Component,
+    sample_bytes: &[u8],
     len: usize,
     style: PlotStyle,
     y_epoch: f64,
@@ -1867,10 +1898,6 @@ fn plan_list_trace(
     if len == 0 || pixel_budget == 0 {
         return TracePlan { spans };
     }
-    let Some(latest) = component.time_series.latest() else {
-        return TracePlan { spans };
-    };
-    let sample_bytes = latest.data();
     let schema = &component.schema;
     let prim_size = schema.prim_type.size();
     if prim_size == 0 || sample_bytes.len() < len * prim_size {
@@ -2161,6 +2188,7 @@ mod tests {
                 },
                 stroke_width: 1.0,
                 x_clip: None,
+                time_clip: None,
             };
             let view = PlotBounds::new(min_x as f64, 0.0, max_x as f64, 1.0);
             let drew = gpu.submit(

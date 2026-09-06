@@ -289,6 +289,12 @@ impl ComponentValueStrip {
                         this.stale = false;
                     }
                     StreamUpdate::Stale => this.stale = true,
+                    StreamUpdate::Unavailable => {
+                        this.cells.clear();
+                        this.raw_values.clear();
+                        this.editing = None;
+                        this.stale = false;
+                    }
                 }
                 cx.notify();
             },
@@ -387,6 +393,9 @@ impl ComponentValueStrip {
     }
 
     fn enter_text_edit(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::temporal::is_live(cx) {
+            return;
+        }
         if self.behavior.locked {
             return;
         }
@@ -418,6 +427,10 @@ impl ComponentValueStrip {
     }
 
     fn commit_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::temporal::is_live(cx) {
+            self.editing = None;
+            return;
+        }
         let Some(mut edit) = self.editing.take() else {
             return;
         };
@@ -551,6 +564,7 @@ impl Render for ComponentValueStrip {
         // until the user applies or discards them.
         let pending = crate::inspector::edits::pending_edits(cx)
             .get(self.component_id)
+            .filter(|_| crate::temporal::is_live(cx))
             .map(|edit| {
                 let view = edit.value.as_view();
                 let raw: Vec<ElementValue> = view.iter().collect();
@@ -573,7 +587,11 @@ impl Render for ComponentValueStrip {
 
         let kind = self.kind.clone();
         let style = self.style.clone();
-        let behavior = self.behavior.clone();
+        let mut behavior = self.behavior.clone();
+        behavior.locked |= !crate::temporal::is_live(cx);
+        if !crate::temporal::is_live(cx) {
+            behavior.highlighted.clear();
+        }
         let component_id = self.component_id;
         let editing_index = self.editing.as_ref().map(|e| e.index);
         let stale = self.stale;

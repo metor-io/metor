@@ -30,6 +30,7 @@ pub mod spectrogram;
 pub mod state_chip;
 pub mod table;
 pub mod time_series;
+pub mod timeline;
 pub mod tooltip;
 pub mod traffic_light;
 pub mod value_strip;
@@ -68,6 +69,7 @@ pub use time_series::{
     EventOverlayConfig, MeasurementCursorConfig, MeasurementPanelConfig, PlotPanelConfig,
     PlotStyle, TimeSeriesPlot, Trace, TraceConfig, YAxisConfig,
 };
+pub use timeline::{Timeline, TimelineConfig};
 pub use tooltip::TooltipText;
 pub use traffic_light::{TrafficLight, TrafficLightConfig};
 pub use value_strip::{

@@ -217,7 +217,13 @@ impl Render for SequenceView {
             .h(px(table::HEADER_HEIGHT))
             .flex_shrink_0()
             .border_b_1()
-            .border_color(theme.border_primary);
+            .border_color(theme.border_primary)
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_tertiary)
+                    .child("Live"),
+            );
 
         if let Some(store) = &store {
             let store = store.read(cx);

@@ -274,7 +274,7 @@ pub(super) fn build_trace_add_wizard(
             let new_entities: Vec<_> = traces.into_iter().map(|t| cx.new(|_| t)).collect();
             parent.update(cx, |lp, cx| {
                 lp.traces.extend(new_entities);
-                cx.notify();
+                lp.configuration_changed(cx);
             });
         });
 

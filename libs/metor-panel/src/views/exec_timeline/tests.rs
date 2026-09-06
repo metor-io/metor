@@ -12,6 +12,88 @@ use super::scan::{
 };
 use crate::views::time_series::PlotBounds;
 
+#[gpui::test]
+fn slow_scans_coalesce_live_updates_and_discard_frames_after_edits(cx: &mut gpui::TestAppContext) {
+    use super::ExecTimeline;
+    use gpui::AppContext;
+    use std::sync::Arc;
+    use stellarator::util::AtomicCell;
+
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(metor_db::DB::create(temp.path().join("db")).unwrap());
+    let started = Arc::new(AtomicCell::new(0u64));
+    let release = Arc::new(AtomicCell::new(0u64));
+    let timeline = cx.new(|cx| {
+        let mut timeline = ExecTimeline::new(db, cx);
+        timeline.view_override = Some(PlotBounds::new(0.0, 0.0, 100.0, 1.0));
+        let started = started.clone();
+        let release = release.clone();
+        timeline.scan_task = Some(ExecTimeline::spawn_scan(
+            timeline.scan_requests.clone(),
+            cx,
+            move |input| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    let number = started.latest() + 1;
+                    started.store(number);
+                    release.wait_for(|allowed| allowed >= number).await;
+                    let end = input.window.end;
+                    let mut frame = super::build_frame(input);
+                    frame.data_end = Some(end);
+                    frame
+                }
+            },
+        ));
+        timeline
+    });
+    cx.run_until_parked();
+    assert_eq!(started.latest(), 1);
+    for end in [200.0, 300.0, 400.0, 500.0] {
+        timeline.update(cx, |timeline, cx| {
+            timeline.view_override = Some(PlotBounds::new(0.0, 0.0, end, 1.0));
+            timeline.request_scan(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(started.latest(), 1, "a slow scan must not be replaced");
+        timeline.read_with(cx, |timeline, _| assert!(timeline.frame.is_none()));
+    }
+    release.store(1);
+    cx.run_until_parked();
+    assert_eq!(started.latest(), 2);
+    release.store(2);
+    cx.run_until_parked();
+    timeline.read_with(cx, |timeline, _| {
+        assert_eq!(timeline.frame.as_ref().unwrap().data_end, Some(500))
+    });
+    assert_eq!(
+        started.latest(),
+        2,
+        "the pending updates should produce one scan"
+    );
+
+    timeline.update(cx, |timeline, cx| {
+        timeline.view_override = Some(PlotBounds::new(0.0, 0.0, 600.0, 1.0));
+        timeline.request_scan(cx);
+    });
+    cx.run_until_parked();
+    timeline.update(cx, |timeline, cx| {
+        timeline.view_override = Some(PlotBounds::new(0.0, 0.0, 900.0, 1.0));
+        timeline.restart_scan(cx);
+    });
+    release.store(3);
+    cx.run_until_parked();
+    timeline.read_with(cx, |timeline, _| {
+        assert_eq!(timeline.frame.as_ref().unwrap().data_end, Some(500))
+    });
+    release.store(4);
+    cx.run_until_parked();
+    timeline.read_with(cx, |timeline, _| {
+        assert_eq!(timeline.frame.as_ref().unwrap().data_end, Some(900))
+    });
+    assert_eq!(started.latest(), 4);
+}
+
 fn base_wiring() -> Wiring {
     Wiring {
         ir_version: IR_VERSION,

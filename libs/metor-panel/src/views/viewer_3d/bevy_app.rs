@@ -95,6 +95,7 @@ pub(super) fn build_app() -> SubApps {
 pub(super) struct FrameSlot {
     pub width: u32,
     pub height: u32,
+    pub generation: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -133,6 +134,7 @@ pub(super) fn new_frame_queue() -> FrameQueue {
 pub(super) struct FrameSink {
     pub queue: FrameQueue,
     pub size: (u32, u32),
+    pub generation: u64,
 }
 
 /// Marker requesting that a subtree inherit the root's [`RenderLayers`].
@@ -151,11 +153,18 @@ pub(super) struct PropagateRenderLayers;
 pub(super) struct LiveDelta {
     pub translation: Option<Vec3>,
     pub rotation: Option<Quat>,
+    pub position_missing: bool,
+    pub rotation_missing: bool,
 }
 
 /// System: apply each model's [`LiveDelta`] to its [`Transform`].
-fn compose_transforms(mut q: Query<(&LiveDelta, &mut Transform)>) {
-    for (delta, mut transform) in &mut q {
+fn compose_transforms(mut q: Query<(&LiveDelta, &mut Transform, &mut Visibility)>) {
+    for (delta, mut transform, mut visibility) in &mut q {
+        *visibility = if delta.position_missing || delta.rotation_missing {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
         let mut out = Transform::IDENTITY;
         if let Some(t) = delta.translation {
             out.translation = t;
@@ -215,6 +224,7 @@ fn on_readback_complete(trigger: On<ReadbackComplete>, mut sinks: Query<&mut Fra
     loop {
         match sink.queue.push_ref() {
             Ok(mut slot) => {
+                slot.generation = sink.generation;
                 slot.width = w;
                 slot.height = h;
                 copy_tight_rows(src, &mut slot.bytes, w, h);

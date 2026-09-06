@@ -572,8 +572,8 @@ impl TileGroup {
     pub fn serialize(&self, cx: &App) -> TileLayout {
         TileLayout {
             version: SUPPORTED_LAYOUT_VERSION,
-            global_time_range: crate::views::time_series::time_range::GlobalTimeRange::get(cx)
-                .to_string(),
+            global_time_range: crate::temporal::legacy_range(cx),
+            temporal: Some(crate::temporal::save_layout(cx)),
             root: self.root.serialize(cx),
         }
     }
@@ -642,6 +642,16 @@ impl TileGroup {
             cx,
             serialized.global_time_range.parse().unwrap_or_default(),
         );
+        if let Some(controller) = crate::temporal::controller(cx) {
+            let config = crate::temporal::TemporalConfig {
+                range: crate::temporal::config(cx).range,
+                ..Default::default()
+            };
+            controller.update(cx, |c, cx| c.restore(config, cx));
+        }
+        if let Some(time) = serialized.temporal {
+            crate::temporal::restore_layout(&time, cx);
+        }
         let mut panes = Vec::new();
         let root = Self::deserialize_member(&serialized.root, registry, &mut panes, cx);
         let mut this = Self {
@@ -838,6 +848,7 @@ mod tests {
         let layout = TileLayout {
             version,
             global_time_range: String::new(),
+            temporal: None,
             root: TileNode::Pane(TilePane {
                 active_index: 0,
                 tab_orientation: TabOrientation::Horizontal,
@@ -855,6 +866,7 @@ mod tests {
         let layout = TileLayout {
             version: SUPPORTED_LAYOUT_VERSION,
             global_time_range: String::new(),
+            temporal: None,
             root: TileNode::Pane(TilePane {
                 active_index: 0,
                 tab_orientation: TabOrientation::Horizontal,
@@ -950,6 +962,7 @@ mod tests {
         let layout = TileLayout {
             version: SUPPORTED_LAYOUT_VERSION,
             global_time_range: String::new(),
+            temporal: None,
             root: TileNode::Pane(TilePane {
                 active_index: 0,
                 tab_orientation: TabOrientation::Horizontal,

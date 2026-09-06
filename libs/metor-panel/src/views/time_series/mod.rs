@@ -1,3 +1,4 @@
+use crate::plot_events::popover::event_summary_row;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use metor_proto::types::{ComponentId, PrimType, Timestamp};
 #[allow(unused_imports)]
 use crate::inspect;
 use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
+use crate::temporal::display::elapsed;
 use crate::views::json_tree::JsonTree;
 
 mod render;
@@ -228,28 +230,17 @@ pub(crate) fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
 
 /// Render one X-axis tick label.
 ///
-/// `Relative` shows the offset from `ref_us` (`"0"`, `"1 min 30 s"`).
+/// `Relative` uses the shared compact T0 offset from `ref_us` (`"T+0"`, `"T+01:30"`).
 /// `Utc`/`Local` render absolute wall-clock time; `span_us` (the visible
 /// range) picks the granularity — date is folded in once the window spans
 /// more than a day. Falls back to the relative label if the timestamp is
 /// outside jiff's representable range.
 pub(crate) fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us: f64) -> String {
-    let relative = || {
-        let offset_us = t_us - ref_us;
-        if offset_us == 0 {
-            "0".to_string()
-        } else {
-            format!(
-                "{}",
-                hifitime::Duration::from_microseconds(offset_us as f64)
-            )
-        }
-    };
     match fmt {
-        TimeFormat::Relative => relative(),
+        TimeFormat::Relative => elapsed(Timestamp(t_us), Timestamp(ref_us)),
         TimeFormat::Utc | TimeFormat::Local => {
             let Ok(ts) = jiff::Timestamp::from_microsecond(t_us) else {
-                return relative();
+                return elapsed(Timestamp(t_us), Timestamp(ref_us));
             };
             let pattern = if span_us > 86_400.0 * 1e6 {
                 "%m-%d %H:%M"
@@ -471,7 +462,11 @@ pub fn expand_value_bounds(
 /// for one element index; this scans across many element indices for one
 /// sample. Used by list plots, which redraw fully whenever a new sample
 /// arrives — there is no cross-tick caching opportunity.
-pub fn expand_latest_sample_bounds(component: &Component, len: usize) -> Option<(f64, f64)> {
+pub fn expand_sample_bounds(
+    component: &Component,
+    len: usize,
+    sample: &[u8],
+) -> Option<(f64, f64)> {
     if len == 0 {
         return None;
     }
@@ -480,8 +475,6 @@ pub fn expand_latest_sample_bounds(component: &Component, len: usize) -> Option<
     if prim_size == 0 {
         return None;
     }
-    let latest = component.time_series.latest()?;
-    let sample = latest.data();
     if sample.len() < len * prim_size {
         return None;
     }
@@ -1074,7 +1067,7 @@ impl PlotStyle {
 /// How the X axis renders timestamps.
 ///
 /// `Relative` (the default) labels ticks as offsets from the earliest
-/// sample (`"0"`, `"1 min 30 s"`). The absolute variants render wall-clock
+/// sample (`"T+0"`, `"T+01:30"`). The absolute variants render wall-clock
 /// time so events can be read against real-world clocks; `Utc` uses UTC and
 /// `Local` the machine's timezone. Data positions are unchanged — only the
 /// tick labels and their anchoring differ.
@@ -1486,6 +1479,37 @@ impl TimeSeriesPlot {
         };
         let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view.x_bounds(), cx)
         else {
+            use crate::inspector::{
+                InspectorMode, InspectorRequest,
+                rows::{CommandRow, InspectorRow, NavRow},
+            };
+            let t = Timestamp(cursor::pixel_to_data_x(position.x, pa, view.x_bounds()) as i64);
+            let mut rows: Vec<Box<dyn InspectorRow>> = vec![Box::new(CommandRow::new(
+                "Set view time here",
+                Arc::new(move |_, cx| {
+                    let _ = crate::temporal::dispatch(
+                        crate::temporal::TimeAction::Seek(crate::temporal::TimeExpr::fixed(t)),
+                        cx,
+                    );
+                }),
+            ))];
+            rows.push(Box::new(NavRow::new(
+                "Time controls",
+                "",
+                Box::new(crate::temporal::picker::rows),
+            )));
+            rows.extend(crate::temporal::picker::plot_actions(view.x));
+            if let Some(open) = crate::inspector::open_inspector(cx) {
+                open(
+                    InspectorRequest {
+                        rows,
+                        mode: InspectorMode::Anchored(position),
+                    },
+                    window,
+                    cx,
+                );
+            }
+            cx.stop_propagation();
             return;
         };
         let entity = hit.into_any();
@@ -1606,7 +1630,7 @@ impl TimeSeriesPlot {
                 });
             }
             lp.set_view_override(None, cx);
-            cx.notify();
+            lp.configuration_changed(cx);
         });
     }
 
@@ -1832,19 +1856,7 @@ impl TimeSeriesPlot {
         target: gpui::AnyEntity,
         cx: &mut Context<Self>,
     ) -> Option<Subscription> {
-        if let Ok(store) = target.clone().downcast::<crate::logs::LogStore>() {
-            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
-        }
-        if let Ok(store) = target.clone().downcast::<crate::alarms::AlarmStore>() {
-            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
-        }
-        if let Ok(store) = target.clone().downcast::<crate::sequences::SequenceStore>() {
-            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
-        }
-        if let Ok(store) = target.downcast::<crate::plot_events::MsgEventStore>() {
-            return Some(cx.observe(&store, |_, _, cx| cx.notify()));
-        }
-        None
+        crate::plot_events::observe_target(target, cx)
     }
 
     /// Query this frame's sources over the visible window and cluster the
@@ -1943,25 +1955,11 @@ impl TimeSeriesPlot {
             first.label.clone()
         };
 
-        let mut boxed = div()
-            .flex()
-            .flex_col()
-            .gap_y_0()
-            .px(px(READOUT_PAD_X))
-            .py(px(READOUT_PAD_Y))
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border_primary)
-            .rounded(px(3.0))
-            .child(
-                div()
-                    .text_size(px(LABEL_FONT_SIZE))
-                    .text_color(theme.text_secondary)
-                    .child(header),
-            );
-        for ev in cluster.events.iter().take(EVENT_POPOVER_ROWS) {
-            boxed = boxed.child(event_summary_row(ev, &theme));
-        }
+        let boxed = crate::plot_events::popover::event_card(
+            header,
+            cluster.events.iter().take(EVENT_POPOVER_ROWS),
+            &theme,
+        );
 
         let shown = count.min(EVENT_POPOVER_ROWS);
         let size = gpui::Size {
@@ -2117,44 +2115,13 @@ impl TimeSeriesPlot {
         theme: &crate::theme::Theme,
     ) -> AnyElement {
         let mut body = div().flex().flex_col().gap_y_0().pt_1();
-        match detail {
-            EventDetail::Log(ev) => {
-                body = body
-                    .child(kv_row("level", format!("{:?}", ev.level), theme))
-                    .child(kv_row("source", ev.source.clone(), theme))
-                    .child(kv_row("message", ev.message.clone(), theme));
-                for (k, v) in &ev.fields {
-                    body = body.child(kv_row(k, v.clone(), theme));
-                }
-            }
-            EventDetail::Alarm(ev) => {
-                body = body
-                    .child(kv_row("alarm", ev.def_id.clone(), theme))
-                    .child(kv_row("severity", format!("{:?}", ev.severity), theme));
-                if !ev.detail.is_empty() {
-                    body = body.child(kv_row("detail", ev.detail.clone(), theme));
-                }
-            }
-            EventDetail::Sequence(entry) => {
-                body = body
-                    .child(kv_row("channel", entry.channel_name.to_string(), theme))
-                    .child(kv_row("event", entry.label.to_string(), theme));
-            }
-            EventDetail::Json(_) => {
-                if let Some(tree) = &self.event_json_tree {
-                    body = body.child(tree.clone());
-                }
-            }
-            EventDetail::Raw(len) => {
-                body = body.child(
-                    div()
-                        .text_size(px(LABEL_FONT_SIZE))
-                        .text_color(theme.text_secondary)
-                        .child(SharedString::from(format!(
-                            "{len} bytes (no schema announced)"
-                        ))),
-                );
-            }
+        for (key, value) in crate::plot_events::details::fields(detail) {
+            body = body.child(kv_row(&key, value, theme));
+        }
+        if matches!(detail, EventDetail::Json(_))
+            && let Some(tree) = &self.event_json_tree
+        {
+            body = body.child(tree.clone());
         }
         body.into_any_element()
     }
@@ -2164,30 +2131,6 @@ impl TimeSeriesPlot {
 const EVENT_POPOVER_ROWS: usize = 8;
 
 /// One event summary line: time, a color dot, and the one-line label.
-fn event_summary_row(ev: &PlotEvent, theme: &crate::theme::Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .child(
-            div()
-                .text_size(px(LABEL_FONT_SIZE))
-                .text_color(theme.text_tertiary)
-                .child(SharedString::from(crate::views::format::format_time(
-                    ev.ts.0,
-                ))),
-        )
-        .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(ev.color))
-        .child(
-            div()
-                .flex_1()
-                .text_size(px(LABEL_FONT_SIZE))
-                .text_color(theme.text_secondary)
-                .child(ev.label.clone()),
-        )
-}
-
 /// One `key: value` detail row in the pinned popover.
 fn kv_row(
     key: &str,

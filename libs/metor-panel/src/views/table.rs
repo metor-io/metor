@@ -257,6 +257,11 @@ impl<D: TableDelegate> Table<D> {
         self.scroll_handle.0.borrow().base_handle.offset().y >= Pixels::ZERO
     }
 
+    #[cfg(test)]
+    pub(super) fn set_scroll_offset(&self, offset: gpui::Point<Pixels>) {
+        self.scroll_handle.0.borrow().base_handle.set_offset(offset);
+    }
+
     /// Show `sort` on the column named `name` and clear every other; a
     /// restored layout's chevron, since the delegate owns the order itself.
     pub fn set_sort(&mut self, name: &str, sort: ColumnSort) {

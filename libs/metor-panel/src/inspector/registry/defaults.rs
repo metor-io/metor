@@ -68,12 +68,13 @@ fn replace_trace(trace: &Entity<Trace>, picked: Vec<Trace>, cx: &mut gpui::App) 
             })
             .collect();
         lp.traces.splice(at..at + 1, replacements);
-        cx.notify();
+        lp.configuration_changed(cx);
     });
 }
 
 impl InspectorRegistry {
     pub(super) fn register_defaults(&mut self, db: Arc<DB>) {
+        self.register_inspectable_with_edit::<LinePlot>(LinePlot::configuration_changed);
         self.register_binding(db.clone());
         self.register_inspectable::<crate::views::AttitudeIndicator>();
         self.register_inspectable::<crate::views::VectorMarker>();
@@ -387,6 +388,7 @@ impl InspectorRegistry {
                                 &entity, idx, value, cx,
                             );
                         }),
+                        cx,
                     )
                 }),
             ))
@@ -433,12 +435,20 @@ impl InspectorRegistry {
                             .as_custom()
                             .map(|b| SharedString::from(format!("{b}")))
                             .unwrap_or_default();
-                        rows.extend(crate::views::time_series::time_range::picker_rows(
-                            current_text,
-                            Arc::new(move |value, _w, cx| {
-                                set_override(Override::Custom(value), cx)
+                        rows.push(Box::new(NavRow::new(
+                            "Independent range…",
+                            current_text.clone(),
+                            Box::new(move |cx| {
+                                let set_override = set_override.clone();
+                                crate::views::time_series::time_range::picker_rows(
+                                    current_text.clone(),
+                                    Arc::new(move |value, _w, cx| {
+                                        set_override(Override::Custom(value), cx)
+                                    }),
+                                    cx,
+                                )
                             }),
-                        ));
+                        )));
                         rows
                     }),
                 ))

@@ -236,7 +236,7 @@ impl TimeSeriesPlot {
                     }))
                 })
                 .collect();
-            cx.notify();
+            line_plot.configuration_changed(cx);
         });
         plot.restore_cursors(&config.cursors, cx);
         plot.panel_position = config.measurement_panel.into();

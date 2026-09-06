@@ -322,6 +322,7 @@ mod tests {
         TileLayout {
             version,
             global_time_range: String::new(),
+            temporal: None,
             root: TileNode::Pane(TilePane {
                 active_index: 0,
                 tab_orientation: Default::default(),

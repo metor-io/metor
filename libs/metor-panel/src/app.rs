@@ -22,7 +22,6 @@ use crate::tiles::{
     OpenOutlineAction, PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent,
 };
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
-use crate::views::time_series::time_range::GlobalTimeRange;
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
     MouseUpEvent, Pixels, Point, Render, SharedString, Window, actions, div, point, prelude::*, px,
@@ -853,25 +852,118 @@ impl AppRoot {
             .gap(px(6.0))
             .pr(px(8.0));
 
-        // Global time range: the window every Auto-range plot follows;
-        // clicking opens a preset/custom picker.
-        let range_label = SharedString::from(format!("{}", GlobalTimeRange::get(cx)));
+        let time = crate::temporal::snapshot(cx);
+        let mode = if time.as_ref().is_some_and(|t| t.playing) {
+            "Playing"
+        } else if crate::temporal::is_live(cx) {
+            "Live"
+        } else {
+            "Paused"
+        };
+        let config = crate::temporal::config(cx);
+        let view_label = if mode == "Live" {
+            "Live".to_string()
+        } else {
+            format!(
+                "{mode} {}",
+                crate::temporal::view_time(cx)
+                    .map(|t| crate::temporal::display::label(t, cx))
+                    .unwrap_or_else(|| "Unavailable".into())
+            )
+        };
         right = right.child(
-            Self::titlebar_segment(theme, "global-time-range")
-                .child(range_label)
-                .child(crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary))
+            Self::titlebar_segment(theme, "global-view-time")
+                .child(SharedString::from(view_label))
+                .tooltip(|_, cx| {
+                    let c = crate::temporal::config(cx);
+                    let text = crate::temporal::view_time(cx)
+                        .map(|t| crate::temporal::model::timestamp_text(t, &c.timezone))
+                        .unwrap_or_else(|| "Unavailable".into());
+                    crate::views::tooltip::TooltipText::build(text.into(), cx)
+                })
                 .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
-                    let Some(open) = crate::inspector::open_inspector(cx) else {
-                        return;
-                    };
-                    open(
-                        InspectorRequest {
-                            rows: global_time_range_rows(cx),
-                            mode: InspectorMode::Anchored(event.position),
-                        },
+                    crate::temporal::picker::open(
+                        Some(crate::temporal::picker::Target::View),
+                        InspectorMode::Anchored(event.position),
                         window,
                         cx,
-                    );
+                    )
+                })
+                .on_mouse_down(gpui::MouseButton::Right, |event, window, cx| {
+                    crate::temporal::picker::open(
+                        None,
+                        InspectorMode::Anchored(event.position),
+                        window,
+                        cx,
+                    )
+                }),
+        );
+        if mode != "Live" {
+            right = right.child(
+                Self::titlebar_segment(theme, "time-go-live")
+                    .child(crate::icons::Icon::SkipForward.svg_color(14.0, theme.text_secondary))
+                    .tooltip(|_, cx| {
+                        crate::views::tooltip::TooltipText::build("Go live".into(), cx)
+                    })
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        let _ = crate::temporal::dispatch(crate::temporal::TimeAction::Live, cx);
+                    }),
+            );
+        }
+        right = right.child(
+            Self::titlebar_segment(theme, "global-time-range")
+                .child(SharedString::from(time.as_ref().map_or_else(
+                    || config.range.to_string(),
+                    |t| crate::temporal::display::range(config.range, &config, &t.context),
+                )))
+                .child(crate::icons::Icon::ChevronDown.svg_color(10.0, theme.text_secondary))
+                .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
+                    crate::temporal::picker::open(
+                        Some(crate::temporal::picker::Target::Range),
+                        InspectorMode::Anchored(event.position),
+                        window,
+                        cx,
+                    )
+                })
+                .on_mouse_down(gpui::MouseButton::Right, |event, window, cx| {
+                    crate::temporal::picker::open(
+                        None,
+                        InspectorMode::Anchored(event.position),
+                        window,
+                        cx,
+                    )
+                }),
+        );
+        let action = if mode == "Paused" {
+            crate::temporal::TimeAction::Play { from_start: false }
+        } else {
+            crate::temporal::TimeAction::Pause
+        };
+        right = right.child(
+            Self::titlebar_segment(theme, "time-transport")
+                .child(
+                    if mode == "Paused" {
+                        crate::icons::Icon::Play
+                    } else {
+                        crate::icons::Icon::Pause
+                    }
+                    .svg_color(14.0, theme.text_secondary),
+                )
+                .tooltip(move |_, cx| {
+                    crate::views::tooltip::TooltipText::build(
+                        if mode == "Paused" { "Play" } else { "Pause" }.into(),
+                        cx,
+                    )
+                })
+                .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                    if crate::temporal::dispatch(action.clone(), cx).is_err() {
+                        crate::temporal::picker::open(
+                            None,
+                            InspectorMode::Anchored(event.position),
+                            window,
+                            cx,
+                        );
+                    }
                 }),
         );
 
@@ -961,15 +1053,6 @@ impl AppRoot {
             )
             .into_any_element()
     }
-}
-
-/// Picker rows for the global time range: every preset plus a freeform
-/// text field using `TimeRangeBehavior`'s string grammar.
-fn global_time_range_rows(cx: &gpui::App) -> Vec<Box<dyn InspectorRow>> {
-    crate::views::time_series::time_range::picker_rows(
-        SharedString::from(format!("{}", GlobalTimeRange::get(cx))),
-        Arc::new(|behavior, _window, cx| GlobalTimeRange::set(cx, behavior)),
-    )
 }
 
 /// Builder that owns construction of the panel application.
@@ -1211,7 +1294,9 @@ impl PanelApp {
                 crate::theme::DARK.clone(),
             )));
             edits::init(cx);
+            crate::temporal::TemporalController::init(db.clone(), cx);
             ItemRegistry::init(cx);
+            crate::temporal::picker::register(cx);
             crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
             crate::views::dashboard::WidgetRegistry::init(cx);
             crate::dynamic::expressions::Expressions::init(cx);
@@ -1219,6 +1304,7 @@ impl PanelApp {
             crate::views::map::tiles::TileStore::init(cx);
             crate::backfill::Backfiller::init(db.clone(), cx);
             crate::views::exec_timeline::inspector_rows::register_inspector_rows(cx);
+            crate::views::Timeline::register(cx);
             crate::alarms::AlarmStore::init(db.clone(), cx);
             crate::logs::LogStore::init(db.clone(), cx);
             crate::presets::TargetPresetStore::init(db.clone(), cx);

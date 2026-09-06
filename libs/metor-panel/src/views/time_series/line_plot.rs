@@ -5,9 +5,8 @@
 //! keyed by [`gpui::EntityId`]. Parents embed a `LinePlot` entity and
 //! leave rendering, bounds tracking, and GPU management to it.
 //!
-//! Every self-notify runs [`LinePlot::reconcile`], which spawns or drops
-//! trackers for added or removed traces, invalidates the view override
-//! when a reflected knob changes, and refreshes the cached title.
+//! Configuration edits invalidate reconciliation; sample and image updates
+//! only repaint. Trace and axis observations bridge edits to child entities.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,8 +94,8 @@ const LOD_BUCKET_BUDGET: u64 = RAW_SAMPLE_BUDGET / 2;
 struct OverrideSnapshot {
     /// Per-axis `(min, max)` overrides, index-aligned with `LinePlot::axes`.
     axes: smallvec::SmallVec<[(Option<f64>, Option<f64>); 2]>,
-    /// The *resolved* range, so a global-range edit clears the pan/zoom
-    /// override exactly like a per-plot edit does.
+    /// Only local range settings reset a user's zoom. Global edits change
+    /// the reset bounds, while an explicit sync command clears every zoom.
     x_range: TimeRangeBehavior,
 }
 
@@ -115,7 +114,38 @@ impl OverrideSnapshot {
             .collect();
         Self {
             axes,
-            x_range: lp.resolved_x_range(cx),
+            x_range: lp.x_range.as_custom().copied().unwrap_or_default(),
+        }
+    }
+}
+
+/// Title inputs are compared only when configuration or registry state changes.
+#[derive(PartialEq)]
+enum TitleSnapshot {
+    Auto {
+        traces: Vec<(ComponentId, usize)>,
+        vtable_generation: u64,
+        metadata_generation: u64,
+    },
+    Custom(SharedString),
+}
+
+impl TitleSnapshot {
+    fn capture(lp: &LinePlot, cx: &gpui::App) -> Self {
+        if let Override::Custom(title) = &lp.custom_title {
+            return Self::Custom(title.clone());
+        }
+        Self::Auto {
+            traces: lp
+                .traces
+                .iter()
+                .map(|trace| {
+                    let trace = trace.read(cx);
+                    (trace.source.id(), trace.element_index)
+                })
+                .collect(),
+            vtable_generation: lp.db.vtable_gen.latest(),
+            metadata_generation: lp.db.metadata_gen.latest(),
         }
     }
 }
@@ -124,7 +154,8 @@ impl OverrideSnapshot {
 ///
 /// Owns the render state, traces, per-trace trackers, and the
 /// inspector-reflected view-override fields. Parents `.child(entity.clone())`
-/// into their render trees and mutate this entity's fields directly.
+/// into their render trees. After directly editing configuration fields, call
+/// [`Self::configuration_changed`]; trace and axis entities are observed.
 #[derive(facet::Facet)]
 pub struct LinePlot {
     pub traces: Vec<Entity<Trace>>,
@@ -147,7 +178,11 @@ pub struct LinePlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    _binding_changes: gpui::Task<()>,
+    _configuration_changes: gpui::Task<()>,
+    #[facet(opaque)]
+    configuration_dirty: bool,
+    #[facet(opaque)]
+    axis_subscriptions: HashMap<EntityId, gpui::Subscription>,
     #[facet(opaque)]
     tracking: HashMap<EntityId, TraceTracking>,
     #[facet(opaque)]
@@ -161,6 +196,14 @@ pub struct LinePlot {
     #[facet(opaque)]
     title_cache: SharedString,
     #[facet(opaque)]
+    last_title: Option<TitleSnapshot>,
+    #[cfg(test)]
+    #[facet(opaque)]
+    configuration_passes: usize,
+    #[cfg(test)]
+    #[facet(opaque)]
+    title_rebuilds: usize,
+    #[facet(opaque)]
     gpu_state: PlotRenderState,
 }
 
@@ -171,6 +214,12 @@ impl LinePlot {
 
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         cx.observe_self(Self::reconcile).detach();
+        cx.observe_global::<crate::temporal::PlotSync>(|this, cx| {
+            this.x_range = Override::Auto;
+            this.set_view_override(None, cx);
+            this.configuration_changed(cx);
+        })
+        .detach();
         let primary_axis = cx.new(|_| YAxis::new("Y"));
         Self {
             traces: Vec::new(),
@@ -181,7 +230,9 @@ impl LinePlot {
             custom_title: Override::Auto,
             show_alarm_limits: true,
             show_alarm_color: true,
-            _binding_changes: crate::data_binding::watch_registrations(db.clone(), cx),
+            _configuration_changes: Self::watch_configuration(db.clone(), cx),
+            configuration_dirty: true,
+            axis_subscriptions: HashMap::new(),
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
@@ -192,8 +243,44 @@ impl LinePlot {
                 x_range: TimeRangeBehavior::FULL,
             },
             title_cache: "Plot".into(),
+            last_title: None,
+            #[cfg(test)]
+            configuration_passes: 0,
+            #[cfg(test)]
+            title_rebuilds: 0,
             gpu_state: PlotRenderState::default(),
         }
+    }
+
+    /// Invalidate configuration after an edit, preserving ordinary notifications
+    /// for sample arrivals, completed images, and interactive view movement.
+    pub fn configuration_changed(&mut self, cx: &mut Context<Self>) {
+        self.configuration_dirty = true;
+        cx.notify();
+    }
+
+    fn watch_configuration(db: Arc<DB>, cx: &mut Context<Self>) -> gpui::Task<()> {
+        let mut vtable_generation = db.vtable_gen.latest();
+        let mut metadata_generation = db.metadata_gen.latest();
+        cx.spawn(async move |this, cx| {
+            loop {
+                futures_lite::future::race(
+                    db.vtable_gen
+                        .wait_for(|generation| generation != vtable_generation),
+                    db.metadata_gen
+                        .wait_for(|generation| generation != metadata_generation),
+                )
+                .await;
+                vtable_generation = db.vtable_gen.latest();
+                metadata_generation = db.metadata_gen.latest();
+                if this
+                    .update(cx, |lp, cx| lp.configuration_changed(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
     }
 
     /// Replace the trace list from raw values.
@@ -208,7 +295,7 @@ impl LinePlot {
                 cx.new(|_| t)
             })
             .collect();
-        cx.notify();
+        self.configuration_changed(cx);
     }
 
     /// Forget what `trace` was tracking, so the next reconcile follows the
@@ -219,7 +306,7 @@ impl LinePlot {
         let id = trace.entity_id();
         self.tracking.remove(&id);
         self.tasks.remove(&id);
-        cx.notify();
+        self.configuration_changed(cx);
     }
 
     /// Pin the view to `view`, or clear the override with `None`.
@@ -386,10 +473,16 @@ impl LinePlot {
 
     /// Bring tracking state and the title cache in sync with `self.traces`.
     ///
-    /// Runs on every self-notify. Spawns a tracker for each new trace,
-    /// drops trackers for removed traces, and resets the pan/zoom override
-    /// when an inspector edit changes the reflected view knobs.
+    /// Sample and image notifications take only the dirty-flag check. Edits
+    /// reconcile tracker membership and reset zoom when reflected bounds change.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.configuration_dirty) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.configuration_passes += 1;
+        }
         for trace in &self.traces {
             trace.update(cx, |trace, cx| {
                 trace.source.resolve(&self.db, cx);
@@ -404,10 +497,17 @@ impl LinePlot {
             self.axes.push(axis);
         }
         self.axes.truncate(Self::MAX_AXES);
+        self.axis_subscriptions
+            .retain(|id, _| self.axes.iter().any(|axis| axis.entity_id() == *id));
+        for axis in &self.axes {
+            self.axis_subscriptions
+                .entry(axis.entity_id())
+                .or_insert_with(|| cx.observe(axis, |lp, _, cx| lp.configuration_changed(cx)));
+        }
         // Point each trace back at this plot (so the axis picker can list
         // sibling axes) and clamp stale axis indices. Mutating the trace
-        // entity without notifying is safe: the plot doesn't observe its
-        // traces, so this can't re-enter reconcile.
+        // entity without notifying avoids feeding our trace observation back
+        // into configuration reconciliation.
         let self_weak = cx.entity().downgrade();
         let self_id = cx.entity().entity_id();
         let axis_count = self.axes.len();
@@ -427,10 +527,11 @@ impl LinePlot {
             });
         }
 
-        for id in self.inputs.changed(
+        for id in self.inputs.changed_with(
             &self.traces,
             &self.db,
             |trace| vec![(trace.source.id(), trace.element_index)],
+            Self::configuration_changed,
             cx,
         ) {
             self.tracking.remove(&id);
@@ -456,10 +557,18 @@ impl LinePlot {
             self.last_overrides = snapshot;
         }
 
-        self.title_cache = match &self.custom_title {
-            Override::Custom(custom) => custom.clone(),
-            Override::Auto => derive_title(&self.traces, &self.db, cx),
-        };
+        let title = TitleSnapshot::capture(self, cx);
+        if self.last_title.as_ref() != Some(&title) {
+            self.title_cache = match &self.custom_title {
+                Override::Custom(custom) => custom.clone(),
+                Override::Auto => derive_title(&self.traces, &self.db, cx),
+            };
+            self.last_title = Some(title);
+            #[cfg(test)]
+            {
+                self.title_rebuilds += 1;
+            }
+        }
     }
 
     /// The view the renderer will use this frame.
@@ -539,9 +648,11 @@ impl LinePlot {
         if !any_time || start >= end {
             return None;
         }
-        let range = self
-            .resolved_x_range(cx)
-            .calculate_range(Timestamp(start as i64), Timestamp(end as i64));
+        let range = crate::temporal::resolve_range(
+            &self.x_range,
+            Timestamp(start as i64)..Timestamp(end as i64),
+            cx,
+        )?;
         let (min_x, mut max_x) = (range.start.0 as f64, range.end.0 as f64);
         if min_x >= max_x {
             max_x = min_x + 1.0;
@@ -856,6 +967,7 @@ impl Render for LinePlot {
                                         color,
                                         stroke_width: config.stroke_width,
                                         x_clip: None,
+                                        time_clip: None,
                                     });
                                     let tail = lod
                                         .time_series
@@ -878,6 +990,7 @@ impl Render for LinePlot {
                                     color: config.color,
                                     stroke_width: config.stroke_width,
                                     x_clip: raw_clip,
+                                    time_clip: None,
                                 });
                             }
                             // X data + a 0..1 Y placeholder; each trace's Y is
@@ -1025,10 +1138,68 @@ fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> Share
 }
 
 #[cfg(test)]
+#[path = "configuration_tests.rs"]
+mod configuration_tests;
+
+#[cfg(test)]
 mod rebind_tests {
     use super::*;
     use metor_db::ComponentSchema;
     use metor_proto::types::PrimType;
+
+    #[gpui::test]
+    fn temporal_zoom_is_local_until_explicit_sync(cx: &mut gpui::TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(temp.path().join("db")).unwrap());
+        let (a, b) = cx.update(|cx| {
+            crate::theme::set_theme(cx, Arc::new(crate::theme::DARK.clone()));
+            crate::temporal::TemporalController::init(db.clone(), cx);
+            let a = cx.new(|cx| LinePlot::new(db.clone(), cx));
+            let b = cx.new(|cx| LinePlot::new(db, cx));
+            for plot in [&a, &b] {
+                plot.update(cx, |p, cx| p.reconcile(cx));
+            }
+            (a, b)
+        });
+        cx.update(|cx| {
+            a.update(cx, |p, cx| {
+                p.set_view_override(
+                    Some(PlotView {
+                        x: (20.0, 30.0),
+                        axes: smallvec::smallvec![(2.0, 3.0)],
+                    }),
+                    cx,
+                )
+            });
+            b.update(cx, |p, cx| {
+                p.set_view_override(
+                    Some(PlotView {
+                        x: (50.0, 80.0),
+                        axes: smallvec::smallvec![(0.0, 1.0)],
+                    }),
+                    cx,
+                )
+            });
+            crate::temporal::dispatch(
+                crate::temporal::TimeAction::Range(crate::temporal::TimeRangeSpec::fixed(
+                    Timestamp(100)..Timestamp(200),
+                )),
+                cx,
+            )
+            .unwrap();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(a.read(cx).effective_view(cx).unwrap().x, (20.0, 30.0));
+            assert_eq!(b.read(cx).effective_view(cx).unwrap().x, (50.0, 80.0));
+            crate::temporal::dispatch(crate::temporal::TimeAction::SyncPlots, cx).unwrap();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(a.read(cx).view_override.is_none());
+            assert!(b.read(cx).view_override.is_none());
+        });
+    }
 
     /// Rewriting a trace's source is only half of a rebind: the plot's
     /// tracker latched the old component when it started, so the plot has

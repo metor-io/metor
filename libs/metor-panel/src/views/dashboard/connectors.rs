@@ -323,7 +323,7 @@ where
     E: 'static,
 {
     crate::views::binding::spawn_scalar_stream(db, component, element, cx, move |view, v, cx| {
-        apply(view, v.abs() > threshold, cx);
+        apply(view, v.is_some_and(|v| v.abs() > threshold), cx);
     })
 }
 

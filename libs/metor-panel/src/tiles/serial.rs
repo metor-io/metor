@@ -254,6 +254,7 @@ mod tests {
         TileLayout {
             version: TILE_LAYOUT_VERSION,
             global_time_range: String::new(),
+            temporal: None,
             root: TileNode::Split(TileSplit {
                 axis: SplitAxis::Horizontal,
                 flexes: vec![1.0, 2.0],

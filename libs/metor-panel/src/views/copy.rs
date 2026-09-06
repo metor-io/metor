@@ -11,18 +11,19 @@ use metor_proto::types::ComponentId;
 use super::format::ValueFormatter;
 use crate::inspector::rows::{CommandRow, InspectorRow};
 
-/// The latest sample of `id` as the strip would show it — the whole value,
+/// The selected sample of `id` as the strip would show it — the whole value,
 /// or one element of a vector. `None` before the first sample lands.
-pub(crate) fn latest_value_text(
-    db: &DB,
+pub(crate) fn selected_value_text(
+    db: &Arc<DB>,
     id: ComponentId,
     element: Option<usize>,
+    cx: &gpui::App,
 ) -> Option<String> {
     let formatter = ValueFormatter::resolve(db, id);
     db.with_state(|state| {
         let component = state.get_component(id)?;
-        let latest = component.time_series.latest()?;
-        let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
+        let selected = crate::temporal::samples::current(db, id, cx)?.sample?;
+        let (_size, view) = component.schema.parse_value(&selected.bytes).ok()?;
         let text = match element {
             Some(index) => {
                 let cells = formatter.format_cells(&view, &[]);
@@ -53,12 +54,35 @@ pub(crate) fn copy_rows(
         None => "Copy value".to_string(),
     };
     let name_for_copy = name.clone();
+    let timestamp_db = db.clone();
+    let details_db = db.clone();
     vec![
+        Box::new(crate::inspector::rows::NavRow::new(
+            "Sample details",
+            "",
+            Box::new(move |cx| {
+                vec![Box::new(crate::inspector::rows::header::HeaderRow::new(
+                    crate::temporal::samples::status_text(&details_db, id, cx),
+                ))]
+            }),
+        )),
         Box::new(CommandRow::new(
             SharedString::from(value_label),
             Arc::new(move |_window, cx| {
-                if let Some(text) = latest_value_text(&db, id, element) {
+                if let Some(text) = selected_value_text(&db, id, element, cx) {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }),
+        )),
+        Box::new(CommandRow::new(
+            "Copy sample timestamp",
+            Arc::new(move |_, cx| {
+                if let Some(sample) =
+                    crate::temporal::samples::current(&timestamp_db, id, cx).and_then(|s| s.sample)
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        crate::temporal::model::timestamp_text(sample.timestamp, "UTC"),
+                    ));
                 }
             }),
         )),

@@ -128,7 +128,7 @@ impl Gauge {
 
         let task =
             spawn_scalar_stream(db.clone(), component_id, element, cx, |gauge, value, cx| {
-                gauge.value = Some(value);
+                gauge.value = value;
                 cx.notify();
             });
 
@@ -205,7 +205,7 @@ impl Gauge {
             element,
             cx,
             |gauge, value, cx| {
-                gauge.value = Some(value);
+                gauge.value = value;
                 cx.notify();
             },
         );

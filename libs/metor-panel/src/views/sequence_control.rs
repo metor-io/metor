@@ -106,6 +106,12 @@ impl Render for SequenceControl {
         let arming = self.arming_stop;
 
         let header = div()
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_tertiary)
+                    .child("Live"),
+            )
             .flex()
             .flex_row()
             .items_center()

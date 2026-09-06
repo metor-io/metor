@@ -40,6 +40,29 @@ pub use text_field::TextField;
 
 /// Contract every row in the inspector satisfies.
 pub trait InspectorRow: 'static {
+    /// Persistent companion content belongs to the provider page, outside its row list.
+    fn accessory(&self, _query: &str, _cx: &mut App) -> Option<AccessorySpec> {
+        None
+    }
+    /// Seed a provider page identically when opened directly or through navigation.
+    fn initial_query(&self) -> Option<String> {
+        None
+    }
+
+    /// Domain-specific hint for query pages; ordinary palettes keep Search.
+    fn query_placeholder(&self) -> Option<&str> {
+        None
+    }
+
+    /// Apply a user edit to a provider's query. Seeding a page and refreshing
+    /// previews do not call this hook, so rendering never commits a value.
+    fn query_edited(&self, _query: &str, _cx: &mut App) {}
+
+    /// Rebuild dynamic previews without replacing the query or keyboard selection.
+    fn query_revision(&self, _cx: &App) -> u64 {
+        0
+    }
+
     /// Text matched by the inspector's fuzzy search.
     fn label(&self) -> &str;
 
@@ -104,8 +127,8 @@ pub trait InspectorRow: 'static {
     /// Respond to Tab: insert rather than commit.
     ///
     /// Completion rows override this to push their candidate into the search
-    /// field ([`RowAction::ReplaceQuery`]) without triggering the commit that
-    /// Enter means. Rows with nothing to insert leave the default no-op.
+    /// field ([`RowAction::ReplaceQuery`]) without activating the row. Providers
+    /// can apply the resulting edit through [`Self::query_edited`]. Rows with nothing to insert leave the default no-op.
     fn insert(&mut self, _search: &str, _window: &mut Window, _cx: &mut App) -> RowAction {
         RowAction::Handled
     }
@@ -129,6 +152,14 @@ pub struct PreviewSpec {
     pub view: AnyView,
     pub size: Size<Pixels>,
     pub label: SharedString,
+}
+
+/// A page-owned view, embedded in palettes and floating beneath anchored menus.
+#[derive(Clone)]
+pub struct AccessorySpec {
+    pub view: AnyView,
+    pub focus: gpui::FocusHandle,
+    pub dragging: std::sync::Arc<dyn Fn(&App) -> bool>,
 }
 
 /// Reply from [`InspectorRow::activate`] directing what the host should do next.

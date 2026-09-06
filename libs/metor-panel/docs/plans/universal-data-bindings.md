@@ -112,3 +112,19 @@ unavailable expression sources across widget builders. Additional checks cover
 cold model-expression restoration, delayed producer registration, shared
 computation lifetime, discovery/backfill of existing history, and automatic
 plot tracker invalidation after an input edit.
+
+
+## Global display time
+
+Instantaneous views now lease `temporal::samples::SelectedReader` through the shared
+binding adapters. A selected sample owns its bytes and carries its actual timestamp,
+availability, freshness, and reconstruction status. It is the last eligible sample at
+or before the controller's view time. Scalar readouts, copy actions, vector plots,
+map markers, and 3D transforms use that same selection. Ingestion and operational
+alarm/sequence state continue live while display time is paused.
+
+Historical stateless expressions can be reconstructed in a bounded point query
+without writing output history or mutating the live evaluator. Missing stateful
+outputs require a checkpoint policy and display an unavailable status. See
+[global time and replay](global-time-replay.md) for the anchor model, shared inspector
+workflow, and persistence compatibility.

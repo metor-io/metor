@@ -29,6 +29,7 @@ use gpui::{
 };
 use metor_db::{Component, DB};
 use metor_proto::types::Timestamp;
+use stellarator::util::AtomicCell;
 
 mod config;
 pub use config::ExecTimelineConfig;
@@ -79,6 +80,9 @@ pub struct ExecTimeline {
     tracking: Vec<RowTracking>,
     resolve_tasks: Vec<Task<()>>,
     scan_task: Option<Task<()>>,
+    scan_requests: Arc<AtomicCell<u64>>,
+    scan_epoch: u64,
+    temporal_revision: u64,
     frame: Option<Arc<GanttFrame>>,
 
     pub label: SharedString,
@@ -97,6 +101,7 @@ pub struct ExecTimeline {
     nominal_period_us: i64,
 
     view_override: Option<PlotBounds>,
+    scanned_range: Option<(i64, i64)>,
     hover: Option<Point<Pixels>>,
     lane_area: Option<Bounds<Pixels>>,
     drag_start: Option<Point<Pixels>>,
@@ -107,10 +112,33 @@ pub struct ExecTimeline {
 impl ExecTimeline {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let mut subscriptions = Vec::new();
+        subscriptions.push(cx.observe_global::<crate::temporal::PlotSync>(|this, cx| {
+            this.x_range = Override::Auto;
+            this.trigger = false;
+            this.set_view_override(None, cx);
+            this.restart_scan(cx);
+        }));
         if let Some(store) = crate::wiring::try_global(cx) {
             subscriptions.push(cx.observe(&store, |this, _, cx| this.sync_rows(cx)));
         }
         subscriptions.push(cx.observe_global::<GlobalTimeRange>(|this, cx| this.restart_scan(cx)));
+        subscriptions.push(
+            cx.observe_global::<crate::temporal::TemporalRevision>(|this, cx| {
+                let range = this
+                    .effective_view(cx)
+                    .map(|v| (v.min_x as i64, v.max_x as i64));
+                let revision = crate::temporal::snapshot(cx).map_or(0, |s| s.revision);
+                let edited = revision != this.temporal_revision;
+                this.temporal_revision = revision;
+                if range != this.scanned_range {
+                    if edited {
+                        this.restart_scan(cx);
+                    } else {
+                        this.request_scan(cx);
+                    }
+                }
+            }),
+        );
         let mut this = Self {
             db,
             rows: Vec::new(),
@@ -118,6 +146,9 @@ impl ExecTimeline {
             tracking: Vec::new(),
             resolve_tasks: Vec::new(),
             scan_task: None,
+            scan_requests: Arc::new(AtomicCell::new(0)),
+            scan_epoch: 0,
+            temporal_revision: crate::temporal::snapshot(cx).map_or(0, |s| s.revision),
             frame: None,
             label: SharedString::new_static(""),
             x_range: Override::Auto,
@@ -128,6 +159,7 @@ impl ExecTimeline {
             hidden: HashSet::new(),
             nominal_period_us: 0,
             view_override: None,
+            scanned_range: None,
             hover: None,
             lane_area: None,
             drag_start: None,
@@ -177,15 +209,6 @@ impl ExecTimeline {
         self.trigger = on;
         self.view_override = None;
         self.restart_scan(cx);
-    }
-
-    /// The window this pane actually uses: its own `Custom` range, or the
-    /// app-wide one when set to `Auto`.
-    fn resolved_x_range(&self, cx: &App) -> TimeRangeBehavior {
-        match self.x_range.as_custom() {
-            Some(behavior) => *behavior,
-            None => GlobalTimeRange::get(cx),
-        }
     }
 
     /// Rebuild the lane list from the live wiring and restart everything that
@@ -245,60 +268,104 @@ impl ExecTimeline {
     }
 
     fn restart_scan(&mut self, cx: &mut Context<Self>) {
-        self.scan_task = Some(Self::spawn_scan(cx));
+        self.scan_epoch = self.scan_epoch.wrapping_add(1);
+        self.request_scan(cx);
+    }
+
+    fn request_scan(&mut self, cx: &mut Context<Self>) {
+        self.scanned_range = self
+            .effective_view(cx)
+            .map(|v| (v.min_x as i64, v.max_x as i64));
+        self.scan_requests
+            .store(self.scan_requests.latest().wrapping_add(1));
+        if self.scan_task.is_none() {
+            self.scan_task = Some(Self::spawn_scan(
+                self.scan_requests.clone(),
+                cx,
+                |input| async move { build_frame(input) },
+            ));
+        }
         cx.notify();
     }
 
-    /// The one merged scan task.
-    ///
-    /// Prefix-sum layout is cross-row, so there is no per-row equivalent of
-    /// the plot's per-trace tracker: every lane has to be read against the same
-    /// window in the same pass. The loop wakes on the pacemaker component (the
-    /// envelope's, which ticks every cycle by construction), and every other
-    /// reason to rescan — a new leaf resolving, a pan, a range change — comes
-    /// in as a restart.
-    fn spawn_scan(cx: &mut Context<Self>) -> Task<()> {
+    /// Keep one worker alive and coalesce requests while it scans. Dropping an
+    /// async handle cannot stop a synchronous history scan already on a worker.
+    fn spawn_scan<F, Fut>(
+        requests: Arc<AtomicCell<u64>>,
+        cx: &mut Context<Self>,
+        build: F,
+    ) -> Task<()>
+    where
+        F: Fn(ScanInput) -> Fut + Clone + Send + 'static,
+        Fut: std::future::Future<Output = GanttFrame> + Send + 'static,
+    {
         cx.spawn(async move |this, cx| {
             loop {
-                let Ok(Some(input)) = this.update(cx, |timeline, cx| {
+                let request = requests.latest();
+                let input = this.update(cx, |timeline, cx| {
                     let view = timeline.effective_view(cx)?;
                     let pairs: Vec<(Option<Component>, Option<Component>)> = timeline
                         .tracking
                         .iter()
                         .map(|t| (t.duration.clone(), t.state.clone()))
                         .collect();
-                    Some(ScanInput {
-                        window: view.min_x as i64..view.max_x as i64,
-                        lookback: timeline.lookback_us(&view),
-                        data_end: timeline.data_end(),
-                        nominal_period_us: timeline.nominal_period_us,
-                        pairs,
-                    })
-                }) else {
+                    Some((
+                        timeline.scan_epoch,
+                        ScanInput {
+                            window: view.min_x as i64..view.max_x as i64,
+                            lookback: timeline.lookback_us(&view),
+                            data_end: timeline.data_end(),
+                            nominal_period_us: timeline.nominal_period_us,
+                            pairs,
+                        },
+                    ))
+                });
+                let Ok(input) = input else {
                     return;
+                };
+                let Some((epoch, input)) = input else {
+                    requests.wait_for(|next| next != request).await;
+                    continue;
                 };
                 let pacemaker = input
                     .pairs
                     .first()
                     .and_then(|(d, _)| d.clone())
                     .or_else(|| input.pairs.iter().find_map(|(d, _)| d.clone()));
+                let head = pacemaker
+                    .as_ref()
+                    .and_then(|c| c.time_series.latest().map(|s| s.timestamp()));
 
+                let build = build.clone();
                 let frame = cx
                     .background_executor()
-                    .spawn(async move { build_frame(input) })
+                    .spawn(async move { build(input).await })
                     .await;
                 if this
                     .update(cx, |timeline, cx| {
-                        timeline.frame = Some(Arc::new(frame));
-                        cx.notify();
+                        // Continuous live motion can use the completed frame;
+                        // a user edit or topology change invalidates its meaning.
+                        if timeline.scan_epoch == epoch {
+                            timeline.frame = Some(Arc::new(frame));
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
                     return;
                 }
                 match &pacemaker {
-                    Some(component) => component.time_series.wait().await,
-                    None => return,
+                    Some(component) => {
+                        if component.time_series.latest().map(|s| s.timestamp()) != head {
+                            continue;
+                        }
+                        futures_lite::future::race(
+                            component.time_series.wait(),
+                            requests.wait_for(|next| next != request),
+                        )
+                        .await;
+                    }
+                    None => requests.wait_for(|next| next != request).await,
                 }
             }
         })
@@ -349,9 +416,11 @@ impl ExecTimeline {
         if !any || start >= end {
             return None;
         }
-        let range = self
-            .resolved_x_range(cx)
-            .calculate_range(Timestamp(start as i64), Timestamp(end as i64));
+        let range = crate::temporal::resolve_range(
+            &self.x_range,
+            Timestamp(start as i64)..Timestamp(end as i64),
+            cx,
+        )?;
         let (min_x, mut max_x) = (range.start.0 as f64, range.end.0 as f64);
         if min_x >= max_x {
             max_x = min_x + 1.0;
@@ -517,6 +586,7 @@ impl ExecTimeline {
     /// rather than snapping back to the auto fit.
     fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
         let view = view.map(scan::clamp_window);
+
         let released = self.trigger && view.is_some();
         let changed = self.view_override.map(|v| v.bits()) != view.map(|v| v.bits());
         if changed || released {
@@ -711,6 +781,12 @@ impl Render for ExecTimeline {
             move |bounds, paint, window, cx| {
                 if let Some(paint) = paint {
                     paint_lanes(bounds, &paint, window, cx);
+                    crate::temporal::paint_playhead(
+                        bounds,
+                        (paint.view.min_x, paint.view.max_x),
+                        window,
+                        cx,
+                    );
                 }
             },
         )
@@ -718,6 +794,19 @@ impl Render for ExecTimeline {
         .inset_0();
 
         let mut lane_area = div()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    if let Some(v) = this.effective_view(cx) {
+                        crate::temporal::picker::open_plot_actions(
+                            (v.min_x, v.max_x),
+                            event.position,
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
             .relative()
             .flex_1()
             .min_h_0()

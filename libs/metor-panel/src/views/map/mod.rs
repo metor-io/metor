@@ -14,7 +14,7 @@
 //! triple like the ADCS example's `gps.lla` publishes.
 //!
 //! The trail is the plots' data model in miniature: the visible window is
-//! the app-wide [`GlobalTimeRange`] (or this map's own override), and when
+//! the app-wide [`crate::temporal::TemporalController`] (or this map's own override), and when
 //! the raw history over that window is too dense to decode per frame the
 //! trail reads the component's LoD companions instead — bucket midpoints
 //! stand in for samples, which for a smooth track is exactly a decimation.
@@ -32,7 +32,7 @@ use smallvec::SmallVec;
 
 use super::binding::{component_meta, spawn_elements_stream};
 use super::time_series::Override;
-use super::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
+use super::time_series::time_range::TimeRangeBehavior;
 use crate::theme::{Theme, theme};
 
 pub mod mercator;
@@ -112,7 +112,7 @@ pub struct Map {
     /// Keep the camera centered on the latest sample. Panning clears it;
     /// double-click restores it.
     pub follow: bool,
-    /// Trail window: `Auto` follows the app-wide [`GlobalTimeRange`].
+    /// Trail window: `Auto` follows the app-wide [`crate::temporal::TemporalController`].
     pub time_range: Override<TimeRangeBehavior>,
     /// Fallback name for a component nothing has registered.
     #[facet(skip)]
@@ -251,7 +251,11 @@ impl Map {
             count,
             cx,
             move |map, values, cx| {
-                map.push_sample(values[lat_el], values[lon_el]);
+                if let Some(values) = values {
+                    map.push_sample(values[lat_el], values[lon_el]);
+                } else {
+                    map.position = None;
+                }
                 cx.notify();
             },
         );
@@ -284,15 +288,6 @@ impl Map {
 }
 
 impl Map {
-    /// The trail window this map actually uses: its own `Custom` range, or
-    /// the app-wide [`GlobalTimeRange`] when set to `Auto`.
-    fn resolved_time_range(&self, cx: &gpui::App) -> TimeRangeBehavior {
-        match self.time_range.as_custom() {
-            Some(behavior) => *behavior,
-            None => GlobalTimeRange::get(cx),
-        }
-    }
-
     /// Bring the trail up to date with the resolved window and the data.
     ///
     /// Runs every render but decodes only when its cache key — the window
@@ -313,9 +308,20 @@ impl Map {
         let Some(extent) = history.as_ref().and_then(|h| h.extent()) else {
             return;
         };
-        let range = self
-            .resolved_time_range(cx)
-            .calculate_range(extent.start, extent.end);
+        let Some(mut range) = crate::temporal::resolve_range(&self.time_range, extent.clone(), cx)
+        else {
+            return;
+        };
+        if !crate::temporal::is_live(cx)
+            && let Some(t) = crate::temporal::view_time(cx)
+        {
+            range.end = range.end.min(Timestamp(t.0.saturating_add(1)));
+        }
+        if range.start >= range.end {
+            self.trail.clear();
+            self.trail_key = None;
+            return;
+        }
         if let Some(history) = history {
             history.request(range.clone(), cx);
         }
@@ -404,8 +410,7 @@ fn decode_trail(
         lat_el.max(lon_el) + 1
     };
 
-    let end = Timestamp(range.end.0.saturating_add(1));
-    let Some(slice) = series.time_series.get_range(range.start..end) else {
+    let Some(slice) = series.time_series.get_range(range) else {
         return Vec::new();
     };
     // Node slices arrive newest first; samples within a node are oldest

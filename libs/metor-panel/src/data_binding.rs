@@ -224,6 +224,18 @@ impl InputChanges {
         key: impl Fn(&T) -> Vec<(ComponentId, usize)>,
         cx: &mut gpui::Context<E>,
     ) -> Vec<gpui::EntityId> {
+        self.changed_with(inputs, db, key, |_, cx| cx.notify(), cx)
+    }
+
+    /// Observe configuration edits separately from the history watchers' repaints.
+    pub fn changed_with<T: 'static, E: 'static>(
+        &mut self,
+        inputs: &[gpui::Entity<T>],
+        db: &Arc<DB>,
+        key: impl Fn(&T) -> Vec<(ComponentId, usize)>,
+        on_edit: fn(&mut E, &mut gpui::Context<E>),
+        cx: &mut gpui::Context<E>,
+    ) -> Vec<gpui::EntityId> {
         self.entries
             .retain(|id, _| inputs.iter().any(|input| input.entity_id() == *id));
         let mut changed = Vec::new();
@@ -241,7 +253,7 @@ impl InputChanges {
                     changed.push(id);
                 }
             } else {
-                let subscription = cx.observe(input, |_, _, cx| cx.notify());
+                let subscription = cx.observe(input, move |this, _, cx| on_edit(this, cx));
                 let watchers = want
                     .iter()
                     .filter(|(id, _)| *id != ComponentId(0))
@@ -351,7 +363,12 @@ pub fn component_extent(
         .latest()
         .map(|s| Timestamp(s.timestamp().0.saturating_add(1)))
         .into_iter()
-        .chain(manifest.spans.last().map(|s| s.cover_end))
+        .chain(
+            manifest
+                .spans
+                .last()
+                .map(|s| Timestamp(s.cover_end.0.saturating_add(1))),
+        )
         .max()?;
     (start < end).then_some(start..end)
 }

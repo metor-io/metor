@@ -73,11 +73,11 @@ struct OverrideSnapshot {
 }
 
 impl OverrideSnapshot {
-    fn capture(plot: &SpectrogramPlot, cx: &gpui::App) -> Self {
+    fn capture(plot: &SpectrogramPlot, _cx: &gpui::App) -> Self {
         Self {
             y_min: plot.y_min_override.as_custom().copied(),
             y_max: plot.y_max_override.as_custom().copied(),
-            x_range: plot.resolved_x_range(cx),
+            x_range: plot.x_range.as_custom().copied().unwrap_or_default(),
         }
     }
 }
@@ -140,6 +140,12 @@ pub struct SpectrogramPlot {
 impl SpectrogramPlot {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         cx.observe_self(Self::reconcile).detach();
+        cx.observe_global::<crate::temporal::PlotSync>(|this, cx| {
+            this.x_range = Override::Auto;
+            this.set_view_override(None, cx);
+            cx.notify();
+        })
+        .detach();
         Self {
             traces: Vec::new(),
             x_range: Override::Auto,
@@ -297,9 +303,11 @@ impl SpectrogramPlot {
         if !any || start >= end {
             return None;
         }
-        let range = self
-            .resolved_x_range(cx)
-            .calculate_range(Timestamp(start as i64), Timestamp(end as i64));
+        let range = crate::temporal::resolve_range(
+            &self.x_range,
+            Timestamp(start as i64)..Timestamp(end as i64),
+            cx,
+        )?;
         let (min_x, mut max_x) = (range.start.0 as f64, range.end.0 as f64);
         if min_x >= max_x {
             max_x = min_x + 1.0;

@@ -1562,6 +1562,11 @@ fn utility_panel_rows(menu: &PanelMenu) -> Vec<Box<dyn InspectorRow>> {
             Box::new(cx.new(|cx| SequenceGridPanel::new(db, cx)))
         }),
         menu.configured(
+            "Timeline",
+            "timeline",
+            crate::views::TimelineConfig::default(),
+        ),
+        menu.configured(
             "Execution Timeline",
             "exec_timeline",
             crate::views::ExecTimelineConfig::default(),

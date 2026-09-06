@@ -316,7 +316,7 @@ impl Annunciator {
 
     /// Tiles for the components the glob matches, from their local latches.
     fn component_visuals(&self, cx: &App) -> Vec<TileVisual> {
-        let latching = self.latch;
+        let latching = self.latch && crate::temporal::is_live(cx);
         let toggles = !latching && self.alarm_when == AlarmWhen::On;
         self.tiles
             .iter()
@@ -325,7 +325,10 @@ impl Annunciator {
                 name: tile.name.clone(),
                 label: self.show_labels.then(|| tile.label.clone()),
                 value: (self.show_values && !tile.is_bool).then(|| value_text(tile)),
-                click: match (latching, toggles && tile.is_bool) {
+                click: match (
+                    latching,
+                    toggles && tile.is_bool && crate::temporal::is_live(cx),
+                ) {
                     (true, _) => Some(TileClick::AckLatch(tile.id)),
                     (false, true) => Some(TileClick::Toggle(tile.id)),
                     (false, false) => None,
@@ -504,21 +507,23 @@ impl Render for Annunciator {
             }
         }
 
-        let ack_all = (self.latch || self.source == AnnunciatorSource::Alarms).then(|| {
-            div().flex().flex_row().justify_end().child(
-                div()
-                    .id("annunciator-ack-all")
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .rounded(px(3.0))
-                    .bg(theme.bg_secondary)
-                    .text_size(px(11.0))
-                    .text_color(theme.text_secondary)
-                    .cursor_pointer()
-                    .child("Ack")
-                    .on_click(cx.listener(|this, _, _window, cx| this.ack_all(cx))),
-            )
-        });
+        let ack_all = ((self.latch && crate::temporal::is_live(cx))
+            || self.source == AnnunciatorSource::Alarms)
+            .then(|| {
+                div().flex().flex_row().justify_end().child(
+                    div()
+                        .id("annunciator-ack-all")
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(3.0))
+                        .bg(theme.bg_secondary)
+                        .text_size(px(11.0))
+                        .text_color(theme.text_secondary)
+                        .cursor_pointer()
+                        .child("Ack")
+                        .on_click(cx.listener(|this, _, _window, cx| this.ack_all(cx))),
+                )
+            });
 
         div()
             .track_focus(&self.focus)
@@ -528,6 +533,25 @@ impl Render for Annunciator {
             .flex_col()
             .gap(px(6.0))
             .children(ack_all)
+            .when(self.source == AnnunciatorSource::Alarms, |d| {
+                d.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_tertiary)
+                        .child("Live alarms"),
+                )
+            })
+            .when(
+                self.source == AnnunciatorSource::Components && !crate::temporal::is_live(cx),
+                |d| {
+                    d.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_tertiary)
+                            .child("Historical conditions · latch history unavailable"),
+                    )
+                },
+            )
             .child(body)
     }
 }
@@ -780,11 +804,17 @@ fn build_tile(
     let meta = component_meta(&db, id);
     let task = spawn_on_stream(db, id, cx, move |grid, on, value, cx| {
         let inverted = grid.alarm_when == AlarmWhen::Off;
-        let now = Timestamp::now();
+        let now = crate::temporal::view_time(cx).unwrap_or_else(Timestamp::now);
+        let live = crate::temporal::is_live(cx);
         if let Some(tile) = grid.tiles.iter_mut().find(|t| t.id == id) {
-            tile.latest_on = Some(on);
+            tile.latest_on = on;
             tile.latest_value = value;
-            tile.latch.condition(on ^ inverted, now);
+            if !live || on.is_none() {
+                tile.latch = Latch::default();
+            }
+            if let Some(on) = on {
+                tile.latch.condition(on ^ inverted, now);
+            }
             cx.notify();
         }
     });

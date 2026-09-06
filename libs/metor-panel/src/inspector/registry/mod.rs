@@ -56,6 +56,7 @@ pub(crate) type PokeAdapterVisitor<'v> = dyn FnMut(Poke<'_, 'static>) + 'v;
 pub struct EntityAdapter {
     pub(crate) peek: Arc<dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>)>,
     pub(crate) poke: Arc<dyn for<'v> Fn(&AnyEntity, &mut App, &mut PokeAdapterVisitor<'v>)>,
+    notify_edited: Arc<dyn Fn(&AnyEntity, &mut App)>,
     pub shape_id: ConstTypeId,
 }
 
@@ -147,6 +148,18 @@ impl InspectorRegistry {
         &mut self,
         on_edit: impl Fn(&mut T, &mut gpui::Context<T>) + 'static,
     ) {
+        let on_edit = Arc::new(on_edit);
+        let notify_edited = {
+            let on_edit = on_edit.clone();
+            Arc::new(move |entity: &AnyEntity, cx: &mut App| {
+                if let Ok(entity) = entity.clone().downcast::<T>() {
+                    entity.update(cx, |target, cx| {
+                        on_edit(target, cx);
+                        cx.notify();
+                    });
+                }
+            })
+        };
         let peek: Arc<dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>)> =
             Arc::new(|any_entity, cx, visit| {
                 let Ok(entity) = any_entity.clone().downcast::<T>() else {
@@ -172,9 +185,22 @@ impl InspectorRegistry {
             Arc::new(EntityAdapter {
                 peek,
                 poke,
+                notify_edited,
                 shape_id: T::SHAPE.id,
             }),
         );
+    }
+
+    /// Apply the registered edit hook after a typed list mutation, just as a
+    /// reflected field write does, before notifying the entity's observers.
+    pub(crate) fn notify_edited(entity: &AnyEntity, cx: &mut App) {
+        let adapter = cx
+            .global::<Self>()
+            .entity_adapter(entity.entity_type())
+            .cloned();
+        if let Some(adapter) = adapter {
+            (adapter.notify_edited)(entity, cx);
+        }
     }
 
     pub fn entity_adapter(&self, type_id: TypeId) -> Option<&Arc<EntityAdapter>> {
@@ -243,13 +269,16 @@ impl InspectorRegistry {
                                         sub_rows.push(Box::new(CommandRow::new(
                                             "Remove",
                                             Arc::new(move |_w, cx| {
-                                                remove_parent.update(cx, |p, cx| {
+                                                remove_parent.update(cx, |p, _| {
                                                     let list = get_list_mut(p);
                                                     if idx < list.len() {
                                                         list.remove(idx);
                                                     }
-                                                    cx.notify();
                                                 });
+                                                Self::notify_edited(
+                                                    &remove_parent.clone().into_any(),
+                                                    cx,
+                                                );
                                             }),
                                         )));
                                         sub_rows
@@ -267,10 +296,10 @@ impl InspectorRegistry {
                                     Arc::new(move |_w, cx| {
                                         let item = factory(cx);
                                         let entity = cx.new(|_| item);
-                                        add_parent.update(cx, |p, cx| {
+                                        add_parent.update(cx, |p, _| {
                                             get_list_mut(p).push(entity);
-                                            cx.notify();
                                         });
+                                        Self::notify_edited(&add_parent.clone().into_any(), cx);
                                     }),
                                 )));
                             }

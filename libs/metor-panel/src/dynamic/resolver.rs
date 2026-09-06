@@ -24,6 +24,7 @@ use metor_expr::{CompSchema, Dtype, FrameSchema, Resolver, Ty};
 use metor_proto::types::{ComponentId, PrimType};
 
 /// The component tree as it stood when a compile began.
+#[derive(PartialEq)]
 pub struct DbResolver {
     components: BTreeMap<String, (ComponentId, Ty)>,
 }

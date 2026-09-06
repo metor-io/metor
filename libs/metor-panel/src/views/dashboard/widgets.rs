@@ -61,6 +61,7 @@ pub struct TileViewSpec {
 /// remote handles) instead of being limited to plain function pointers.
 pub struct WidgetSpec {
     pub default_size: (f32, f32),
+    pub minimum_size: (f32, f32),
     pub label: Arc<dyn Fn(&DashboardWidget) -> SharedString>,
     /// Build receives the widget's persisted config string. Each builder
     /// chooses how to parse it (typically `serde_json::from_str` into a
@@ -96,12 +97,19 @@ impl WidgetSpec {
     ) -> Self {
         Self {
             default_size,
+            minimum_size: (40.0, 40.0),
             label: Arc::new(label),
             build: Arc::new(build),
             snapshot: Arc::new(snapshot),
             add_flow: None,
             tile: None,
         }
+    }
+
+    /// Set the smallest usable content size for dashboard resizing.
+    pub fn with_minimum_size(mut self, size: (f32, f32)) -> Self {
+        self.minimum_size = size;
+        self
     }
 
     /// Attach the picker or setup rows used by the Dashboard's “Add Widget”
@@ -307,6 +315,25 @@ impl WidgetRegistry {
                     .map(|plot| plot.read(cx).title(cx))
                     .unwrap_or_else(|_| "Spectrogram".into())
             }),
+        );
+        self.register(
+            WidgetKind::new("timeline"),
+            WidgetSpec::new(
+                (520.0, 112.0),
+                |_| "Timeline".into(),
+                |config, db, cx| {
+                    let config = parse_or_default::<crate::views::TimelineConfig>(config);
+                    as_live(
+                        cx.new(|cx| crate::views::Timeline::from_config(config, db.clone(), cx)),
+                    )
+                },
+                |entity, _, cx| {
+                    let entity = entity.clone().downcast::<crate::views::Timeline>().ok()?;
+                    serde_json::to_string(&entity.read(cx).to_config(cx)).ok()
+                },
+            )
+            .with_minimum_size((80.0, 31.0))
+            .with_tile("timeline", |_| "Timeline".into()),
         );
         self.register(
             WidgetKind::new("exec_timeline"),

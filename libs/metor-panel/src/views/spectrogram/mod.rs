@@ -164,6 +164,19 @@ impl Render for Spectrogram {
                         }
                     }))
                     .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                            if let Some(v) = this.plot.read(cx).effective_view(cx) {
+                                crate::temporal::picker::open_plot_actions(
+                                    (v.min_x, v.max_x),
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
+                    .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
                             if event.click_count == 2 {
@@ -364,6 +377,7 @@ fn paint_chrome(outer: Bounds<Pixels>, chrome: &Chrome, window: &mut Window, cx:
     let pa = plot_area(outer, 1);
     let theme = crate::theme::theme(cx);
     let view = chrome.view;
+    crate::temporal::paint_playhead(pa, (view.min_x, view.max_x), window, cx);
 
     let axis_bg = theme.plot_chrome_bg();
     window.paint_quad(gpui::fill(

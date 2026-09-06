@@ -29,6 +29,8 @@ use super::XyTrace;
 struct XyTraceTracking {
     x_component: Option<Component>,
     y_component: Option<Component>,
+    x_history: Option<crate::data_binding::BoundHistory>,
+    y_history: Option<crate::data_binding::BoundHistory>,
     x_bounds: Option<(f64, f64)>,
     y_bounds: Option<(f64, f64)>,
     /// Per-axis caches keyed by node identity. Reset when the cached
@@ -44,6 +46,8 @@ impl XyTraceTracking {
         Self {
             x_component: None,
             y_component: None,
+            x_history: None,
+            y_history: None,
             x_bounds: None,
             y_bounds: None,
             x_node_bounds: NodeBoundsCache::default(),
@@ -319,6 +323,11 @@ impl XyLinePlot {
                 if let Some(tracking) = lp.tracking.get_mut(&id) {
                     tracking.x_component = Some(x_component.clone());
                     tracking.y_component = Some(y_component.clone());
+                    let trace = trace.read(cx);
+                    tracking.x_history =
+                        crate::data_binding::BoundHistory::for_binding(&trace.x_source, &db, cx);
+                    tracking.y_history =
+                        crate::data_binding::BoundHistory::for_binding(&trace.y_source, &db, cx);
                     cx.notify();
                     true
                 } else {
@@ -383,12 +392,18 @@ impl XyLinePlot {
                 if !matches!(installed, Ok(true)) {
                     break;
                 }
-                // Wake on Y-component data, matching the time-series
-                // tracker. Co-recorded components share cadence in
-                // practice, so X bounds are refreshed in the same
-                // iteration. Cross-cadence pairs lag by one Y tick on
-                // X-bound updates — acceptable for v1.
-                y_component.time_series.wait().await;
+                // Either axis can hydrate first or receive data independently.
+                let mut x_wait = std::pin::pin!(x_component.time_series.wait());
+                let mut y_wait = std::pin::pin!(y_component.time_series.wait());
+                std::future::poll_fn(|cx| {
+                    use std::future::Future;
+                    if x_wait.as_mut().poll(cx).is_ready() || y_wait.as_mut().poll(cx).is_ready() {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
             }
         })
     }
@@ -396,6 +411,22 @@ impl XyLinePlot {
 
 impl Render for XyLinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let range = crate::temporal::snapshot(cx).and_then(|snapshot| snapshot.range);
+        if let Some(range) = &range {
+            for trace in &self.traces {
+                if !trace.read(cx).visible {
+                    continue;
+                }
+                if let Some(tracking) = self.tracking.get(&trace.entity_id()) {
+                    for history in [&tracking.x_history, &tracking.y_history]
+                        .into_iter()
+                        .flatten()
+                    {
+                        history.request(range.clone(), cx);
+                    }
+                }
+            }
+        }
         let weak = cx.entity().downgrade();
         canvas(
             move |bounds, window, cx| {
@@ -429,6 +460,7 @@ impl Render for XyLinePlot {
                                         color: config.color,
                                         stroke_width: config.stroke_width,
                                         x_clip: None,
+                                        time_clip: range.as_ref().map(|r| (r.start.0, r.end.0)),
                                     })
                                 })
                                 .collect();

@@ -601,10 +601,13 @@ async fn wait_for_bounds(
     len: usize,
     want: (f64, f64),
 ) -> (f64, f64) {
-    use crate::views::time_series::expand_latest_sample_bounds;
+    use crate::views::time_series::expand_sample_bounds;
     let mut seen = None;
     for _ in 0..300 {
-        seen = expand_latest_sample_bounds(component, len);
+        seen = component
+            .time_series
+            .latest()
+            .and_then(|sample| expand_sample_bounds(component, len, sample.data()));
         if seen == Some(want) {
             break;
         }

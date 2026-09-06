@@ -125,7 +125,7 @@ impl Meter {
 
         let task =
             spawn_scalar_stream(db.clone(), component_id, element, cx, |meter, value, cx| {
-                meter.value = Some(value);
+                meter.value = value;
                 cx.notify();
             });
 
@@ -204,7 +204,7 @@ impl Meter {
             element,
             cx,
             |meter, value, cx| {
-                meter.value = Some(value);
+                meter.value = value;
                 cx.notify();
             },
         );

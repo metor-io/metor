@@ -33,6 +33,7 @@ pub mod plot_events;
 pub mod presets;
 pub mod query;
 pub mod sequences;
+pub mod temporal;
 pub mod theme;
 pub mod tiles;
 pub mod transient;
@@ -149,6 +150,12 @@ pub struct WalView<'a> {
     _grant: ReadGrant<'a>,
     schema: &'a ComponentSchema,
     offset: usize,
+}
+
+impl WalView<'_> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self._grant[self.offset..self.offset + self.schema.size()]
+    }
 }
 
 impl AsComponentView for WalView<'_> {

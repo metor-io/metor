@@ -11,7 +11,6 @@ use crate::theme::theme;
 
 use super::{DashboardPanel, DashboardWidget, WidgetId, WidgetRect, snap_px};
 
-const MIN_WIDGET_PX: f32 = 40.0;
 const EDGE_ZONE_PX: f32 = 6.0;
 const CORNER_ZONE_PX: f32 = 10.0;
 
@@ -94,6 +93,13 @@ impl DashboardPanel {
         let edge = drag.edge;
         let orig = drag.original_rect;
 
+        let minimum = self
+            .widgets
+            .iter()
+            .find(|w| w.id == widget_id)
+            .map(|w| super::widgets::widget_spec(&w.kind, cx).minimum_size)
+            .unwrap_or((40.0, 40.0));
+
         let Some(pos) = self.pixel_to_canvas(event.event.position) else {
             return;
         };
@@ -105,40 +111,40 @@ impl DashboardPanel {
 
             match edge {
                 ResizeEdge::Right => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
+                    w.rect.w = (snapped.x - orig.x).max(minimum.0);
                 }
                 ResizeEdge::Bottom => {
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
+                    w.rect.h = (snapped.y - orig.y).max(minimum.1);
                 }
                 ResizeEdge::Left => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
+                    let new_x = snapped.x.min(right - minimum.0).max(0.0);
                     w.rect.x = new_x;
                     w.rect.w = right - w.rect.x;
                 }
                 ResizeEdge::Top => {
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
+                    let new_y = snapped.y.min(bottom - minimum.1).max(0.0);
                     w.rect.y = new_y;
                     w.rect.h = bottom - w.rect.y;
                 }
                 ResizeEdge::BottomRight => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
+                    w.rect.w = (snapped.x - orig.x).max(minimum.0);
+                    w.rect.h = (snapped.y - orig.y).max(minimum.1);
                 }
                 ResizeEdge::BottomLeft => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
+                    let new_x = snapped.x.min(right - minimum.0).max(0.0);
                     w.rect.x = new_x;
                     w.rect.w = right - w.rect.x;
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
+                    w.rect.h = (snapped.y - orig.y).max(minimum.1);
                 }
                 ResizeEdge::TopRight => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
+                    w.rect.w = (snapped.x - orig.x).max(minimum.0);
+                    let new_y = snapped.y.min(bottom - minimum.1).max(0.0);
                     w.rect.y = new_y;
                     w.rect.h = bottom - w.rect.y;
                 }
                 ResizeEdge::TopLeft => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
+                    let new_x = snapped.x.min(right - minimum.0).max(0.0);
+                    let new_y = snapped.y.min(bottom - minimum.1).max(0.0);
                     w.rect.x = new_x;
                     w.rect.y = new_y;
                     w.rect.w = right - w.rect.x;
