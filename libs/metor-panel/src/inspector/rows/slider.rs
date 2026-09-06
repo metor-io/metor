@@ -37,6 +37,10 @@ pub struct SliderRow {
 }
 
 impl InspectorRow for SliderRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }
@@ -68,31 +72,34 @@ impl InspectorRow for SliderRow {
             .id(("slider", row_ix))
             .w(px(100.0))
             .h(px(SLIDER_HEIGHT))
-            .cursor(gpui::CursorStyle::PointingHand)
-            .on_drag(
-                SliderDrag {
-                    min,
-                    max,
-                    on_change: on_change_drag,
-                },
-                |drag, _, _, cx| {
-                    cx.new(|_| SliderDrag {
-                        min: drag.min,
-                        max: drag.max,
-                        on_change: drag.on_change.clone(),
+            .when(!super::passive(cx), |slider| {
+                slider
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .on_drag(
+                        SliderDrag {
+                            min,
+                            max,
+                            on_change: on_change_drag,
+                        },
+                        |drag, _, _, cx| {
+                            cx.new(|_| SliderDrag {
+                                min: drag.min,
+                                max: drag.max,
+                                on_change: drag.on_change.clone(),
+                            })
+                        },
+                    )
+                    .on_drag_move(move |event: &DragMoveEvent<SliderDrag>, window, cx| {
+                        let drag = event.drag(cx);
+                        let bounds = event.bounds;
+                        let rel_x = f32::from(event.event.position.x - bounds.origin.x);
+                        let width = f32::from(bounds.size.width);
+                        let frac = (rel_x / width).clamp(0.0, 1.0) as f64;
+                        let new_val = drag.min + frac * (drag.max - drag.min);
+                        let rounded = (new_val * 100.0).round() / 100.0;
+                        let cb = drag.on_change.clone();
+                        cb(rounded, window, cx);
                     })
-                },
-            )
-            .on_drag_move(move |event: &DragMoveEvent<SliderDrag>, window, cx| {
-                let drag = event.drag(cx);
-                let bounds = event.bounds;
-                let rel_x = f32::from(event.event.position.x - bounds.origin.x);
-                let width = f32::from(bounds.size.width);
-                let frac = (rel_x / width).clamp(0.0, 1.0) as f64;
-                let new_val = drag.min + frac * (drag.max - drag.min);
-                let rounded = (new_val * 100.0).round() / 100.0;
-                let cb = drag.on_change.clone();
-                cb(rounded, window, cx);
             })
             .child(
                 canvas(

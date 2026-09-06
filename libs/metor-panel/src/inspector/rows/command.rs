@@ -52,6 +52,13 @@ impl CommandRow {
 }
 
 impl InspectorRow for CommandRow {
+    fn identity(&self) -> SharedString {
+        format!("command:{:?}:{}", self.tag, self.label).into()
+    }
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }

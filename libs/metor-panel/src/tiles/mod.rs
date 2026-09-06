@@ -1,8 +1,12 @@
+mod dock_guide;
 pub(crate) mod drag;
 pub(crate) mod item;
+mod motion;
 pub(crate) mod pane;
 pub mod panels;
 pub(crate) mod serial;
+mod split_preview;
+mod tab;
 
 use gpui::{
     AnyElement, App, Axis, Context, DragMoveEvent, Entity, EventEmitter, IntoElement, Pixels,
@@ -94,6 +98,7 @@ impl From<serde_json::Error> for LoadError {
 }
 
 /// A node in the split tree: a leaf [`Pane`] or an interior [`SplitAxis`].
+#[derive(Clone)]
 enum Member {
     Pane(Entity<Pane>),
     Axis(SplitAxis),
@@ -103,6 +108,7 @@ enum Member {
 ///
 /// `flexes[i]` is the flex-grow weight for `members[i]`; during resize these
 /// values shift within a pair so the total for an axis stays constant.
+#[derive(Clone)]
 struct SplitAxis {
     axis: Axis,
     members: Vec<Member>,
@@ -247,11 +253,27 @@ impl Member {
         &self,
         path: SplitPath,
         tile_group: &Entity<TileGroup>,
+        gaps: &split_preview::GapWeights,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         match self {
             Member::Pane(pane) => {
+                if gaps.contains_key(&pane.entity_id()) {
+                    let placeholder = pane.read(cx).items().is_empty();
+                    let color = if placeholder {
+                        crate::theme::Theme::dim(theme(cx).control_active, 0.11)
+                    } else {
+                        theme(cx).bg_secondary
+                    };
+                    return div()
+                        .size_full()
+                        .bg(color)
+                        .when(placeholder, |gap| {
+                            gap.debug_selector(|| "split-preview-gap".into())
+                        })
+                        .into_any_element();
+                }
                 // Record this pane as current on any click within it. Mouse
                 // events bubble, so this fires after inner handlers (tab clicks,
                 // content interactions) without intercepting them.
@@ -279,8 +301,25 @@ impl Member {
                     if ix > 0 {
                         let prev_locked = locked_along_axis(&axis.members[ix - 1], axis.axis, cx);
                         let cur_locked = locked_along_axis(member, axis.axis, cx);
-                        let handle = if prev_locked.is_some() || cur_locked.is_some() {
-                            render_static_resize_handle(axis.axis, cx).into_any_element()
+                        // Keep exactly one divider between surviving members,
+                        // including when a sole-tab source disappears mid-axis.
+                        let gap_amount = (!gaps.is_empty()).then(|| {
+                            let preceding = axis.members[..ix]
+                                .iter()
+                                .map(|member| gap_weight(member, gaps).unwrap_or(1.0))
+                                .fold(0.0_f32, f32::max);
+                            gap_weight(member, gaps).unwrap_or(1.0) * preceding
+                        });
+                        let handle = if !gaps.is_empty()
+                            || prev_locked.is_some()
+                            || cur_locked.is_some()
+                        {
+                            render_static_resize_handle(axis.axis, cx)
+                                .when_some(gap_amount, |handle, amount| match axis.axis {
+                                    Axis::Horizontal => handle.w(px(RESIZE_HANDLE_SIZE * amount)),
+                                    Axis::Vertical => handle.h(px(RESIZE_HANDLE_SIZE * amount)),
+                                })
+                                .into_any_element()
                         } else {
                             render_resize_handle(path.clone(), ix, axis.axis, tile_group, cx)
                                 .into_any_element()
@@ -288,18 +327,22 @@ impl Member {
                         children.push(handle);
                     }
 
-                    let flex = axis.flexes[ix];
+                    let gap_amount = gap_weight(member, gaps);
+                    let flex = axis.flexes[ix] * gap_amount.unwrap_or(1.0);
                     let mut child_path = path.clone();
                     child_path.push(ix);
 
-                    let child_element = member.render(child_path, tile_group, window, cx);
-                    let locked_px = locked_along_axis(member, axis.axis, cx);
+                    let child_element = member.render(child_path, tile_group, gaps, window, cx);
+                    let locked_px = gap_amount
+                        .is_none()
+                        .then(|| locked_along_axis(member, axis.axis, cx))
+                        .flatten();
 
                     let mut child_div = div()
                         .flex_basis(relative(0.))
                         .overflow_hidden()
-                        .min_w(px(50.0))
-                        .min_h(px(50.0))
+                        .min_w(px(50.0 * gap_amount.unwrap_or(1.0)))
+                        .min_h(px(50.0 * gap_amount.unwrap_or(1.0)))
                         .child(child_element);
                     {
                         let style = child_div.style();
@@ -320,11 +363,14 @@ impl Member {
                 // Resize handles need the axis's on-screen extent; capture it here.
                 let tg = tile_group.clone();
                 let p = path.clone();
+                let committed_layout = gaps.is_empty();
                 let bounds_tracker = gpui::canvas(
                     move |bounds, _window, cx| {
-                        tg.update(cx, |this, _| {
-                            this.axis_bounds.insert(p, bounds);
-                        });
+                        if committed_layout {
+                            tg.update(cx, |this, _| {
+                                this.axis_bounds.insert(p, bounds);
+                            });
+                        }
                     },
                     |_, _, _, _| {},
                 )
@@ -339,6 +385,13 @@ impl Member {
                     .into_any_element()
             }
         }
+    }
+}
+
+fn gap_weight(member: &Member, gaps: &split_preview::GapWeights) -> Option<f32> {
+    match member {
+        Member::Pane(pane) => gaps.get(&pane.entity_id()).copied(),
+        Member::Axis(_) => None,
     }
 }
 
@@ -357,7 +410,7 @@ fn locked_along_axis(member: &Member, axis: Axis, cx: &App) -> Option<f32> {
 /// Static placeholder rendered in place of a draggable resize handle when one
 /// of its neighbors is a locked pane. Same on-screen size as the live handle
 /// so layout doesn't shift when locking is toggled.
-fn render_static_resize_handle(axis: Axis, cx: &App) -> impl IntoElement {
+fn render_static_resize_handle(axis: Axis, cx: &App) -> gpui::Div {
     let theme = theme(cx);
     let mut handle = div().bg(theme.border_primary);
     handle = match axis {
@@ -443,6 +496,7 @@ pub struct TileGroup {
     /// keyboard-driven commands (the transient chord menu) act on. Falls back
     /// to the first pane via [`TileGroup::active_pane`] when unset or stale.
     focused_pane: Option<Entity<Pane>>,
+    split_preview: split_preview::SplitPreview,
 }
 
 impl TileGroup {
@@ -456,6 +510,7 @@ impl TileGroup {
             panes,
             axis_bounds: Default::default(),
             focused_pane: Some(pane),
+            split_preview: Default::default(),
         }
     }
 
@@ -471,6 +526,7 @@ impl TileGroup {
             panes,
             axis_bounds: Default::default(),
             focused_pane: Some(pane),
+            split_preview: Default::default(),
         }
     }
 
@@ -659,6 +715,7 @@ impl TileGroup {
             panes: Vec::new(),
             axis_bounds: Default::default(),
             focused_pane: panes.first().cloned(),
+            split_preview: Default::default(),
         };
         for pane in &panes {
             cx.subscribe(pane, Self::handle_pane_event).detach();
@@ -712,6 +769,26 @@ impl TileGroup {
                 Member::Axis(axis)
             }
         }
+    }
+
+    fn handle_dock_drop(
+        &mut self,
+        dragged: &drag::DraggedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.split_preview.drop_target(window.mouse_position());
+        self.split_preview.clear();
+        if let Some((pane, target)) = target
+            && self.panes.contains(&pane)
+        {
+            let direction = match target {
+                dock_guide::DockTarget::Tab => None,
+                dock_guide::DockTarget::Split(direction) => Some(direction),
+            };
+            pane.update(cx, |pane, cx| pane.drop_in_content(dragged, direction, cx));
+        }
+        cx.notify();
     }
 
     fn handle_pane_event(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Self>) {
@@ -815,11 +892,63 @@ impl Render for TileGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let tile_group = cx.entity().clone();
-
-        div()
+        let (layout, gaps) = self.split_preview.layout(&self.root, window, cx);
+        let tracker = tile_group.clone();
+        let mut root = div()
+            .relative()
             .size_full()
             .bg(theme.bg_secondary)
-            .child(self.root.render(SplitPath::new(), &tile_group, window, cx))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<drag::DraggedTab>, _, cx| {
+                    if this.split_preview.drag_move(&this.panes, event, cx) {
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        tracker.update(cx, |this, _| this.split_preview.bounds = bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(layout.as_ref().unwrap_or(&self.root).render(
+                SplitPath::new(),
+                &tile_group,
+                &gaps,
+                window,
+                cx,
+            ));
+        for (pane, bounds) in self.split_preview.drop_regions() {
+            if !self.panes.contains(pane) {
+                continue;
+            }
+            let bounds = *bounds;
+            let origin = bounds.origin - self.split_preview.bounds.origin;
+            // Original content bounds stay fixed while the visual tree reflows.
+            // This also catches drops into the newly opened gap.
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(origin.x)
+                    .top(origin.y)
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+                    .occlude()
+                    .on_drop(cx.listener(Self::handle_dock_drop)),
+            );
+        }
+        if let Some(guide) = &mut self.split_preview.guide {
+            root = root.child(
+                guide
+                    .render(self.split_preview.bounds.origin, window, cx)
+                    .on_drop(cx.listener(Self::handle_dock_drop)),
+            );
+        }
+        root
     }
 }
 

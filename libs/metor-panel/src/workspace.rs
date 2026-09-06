@@ -69,6 +69,7 @@ fn register_window_tiles(id: WindowId, tiles: &Entity<TileGroup>, cx: &mut App) 
     let map = cx.default_global::<WindowTiles>();
     map.0.retain(|(_, weak)| weak.upgrade().is_some());
     map.0.push((id, tiles.downgrade()));
+    cx.refresh_windows();
 }
 
 /// The tile tree of the active window, falling back to the lowest-id live
@@ -151,6 +152,8 @@ pub(crate) fn open_panel_window(
                 true
             });
             let root = cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx));
+            cx.observe_release(&root, |_, cx| cx.refresh_windows())
+                .detach();
             let tiles = root.read(cx).tiles().clone();
             register_window_tiles(window.window_handle().window_id(), &tiles, cx);
             root

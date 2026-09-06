@@ -1,7 +1,7 @@
 use super::SplitPath;
 use gpui::{
     AnyWindowHandle, App, Bounds, Context, Empty, Entity, Global, IntoElement, Pixels, Point,
-    Render, Window, div, prelude::*, px,
+    Render, Window, prelude::*,
 };
 
 use super::item::PaneItemHandle;
@@ -10,12 +10,11 @@ use crate::theme::theme;
 
 /// Payload carried by gpui while a tab is being dragged.
 ///
-/// The source pane and index are retained so the drop target can remove the
-/// tab from its origin without searching for it.
+/// The source pane and item identity locate the tab even if live updates
+/// change its index while the pointer is moving.
 pub struct DraggedTab {
     pub pane: Entity<Pane>,
     pub item: Box<dyn PaneItemHandle>,
-    pub ix: usize,
 }
 
 /// The tab drag in flight, mirrored app-side because gpui's own payload
@@ -26,7 +25,6 @@ pub struct DraggedTab {
 pub struct ActiveTabDrag {
     pub pane: Entity<Pane>,
     pub item: Box<dyn PaneItemHandle>,
-    pub ix: usize,
     pub source_window: AnyWindowHandle,
 }
 
@@ -40,23 +38,48 @@ pub(crate) fn set_active_tab_drag(drag: ActiveTabDrag, cx: &mut App) {
 /// `cx.has_active_drag()` — a leftover mirror from a drag that ended
 /// without a mouse-up reaching us must not tear anything out.
 pub(crate) fn take_active_tab_drag(cx: &mut App) -> Option<ActiveTabDrag> {
-    cx.has_global::<ActiveTabDrag>()
-        .then(|| cx.remove_global::<ActiveTabDrag>())
+    let drag = cx
+        .has_global::<ActiveTabDrag>()
+        .then(|| cx.remove_global::<ActiveTabDrag>())?;
+    // A cancellation in another window must also restore the source strip.
+    // Defer until drop handlers have consumed their insertion previews.
+    let source = drag.pane.clone();
+    cx.defer(move |cx| source.update(cx, |_, cx| cx.notify()));
+    Some(drag)
 }
 
-impl Render for DraggedTab {
+pub(super) struct TabDragGhost {
+    pub title: gpui::SharedString,
+    pub size: gpui::Size<Pixels>,
+    pub text_style: gpui::TextStyle,
+    pub can_close: bool,
+    pub orientation: super::TabOrientation,
+}
+
+impl Render for TabDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        let title = self.item.tab_title(cx);
-        div()
+        let mut header = super::tab::header(&theme, self.orientation);
+        *header.text_style() = Some(gpui::TextStyleRefinement {
+            font_family: Some(self.text_style.font_family.clone()),
+            font_features: Some(self.text_style.font_features.clone()),
+            font_fallbacks: self.text_style.font_fallbacks.clone(),
+            font_weight: Some(self.text_style.font_weight),
+            font_style: Some(self.text_style.font_style),
+            line_height: Some(self.text_style.line_height),
+            ..Default::default()
+        });
+        header
+            .debug_selector(|| "tab-drag-ghost".into())
+            .w(self.size.width)
+            .h(self.size.height)
             .bg(theme.bg_primary)
-            .border_1()
-            .border_color(theme.border_primary)
-            .px(px(8.0))
-            .py(px(4.0))
+            .text_size(gpui::px(12.0))
             .text_color(theme.text_primary)
-            .text_size(px(12.0))
-            .child(title)
+            .child(self.title.clone())
+            .when(self.can_close, |header| {
+                header.child(super::tab::close_icon(&theme))
+            })
     }
 }
 
@@ -126,7 +149,7 @@ pub fn detect_split_zone(cursor: Point<Pixels>, bounds: Bounds<Pixels>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{point, size};
+    use gpui::{point, px, size};
 
     /// A 100x100 pane at the origin, so relative fractions read straight off
     /// the pixel coordinates.

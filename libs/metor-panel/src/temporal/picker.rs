@@ -689,6 +689,10 @@ impl Provider {
 }
 
 impl InspectorRow for Provider {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn query_edited(&self, query: &str, cx: &mut App) {
         self.apply_edit(query, cx);
     }
@@ -797,6 +801,10 @@ struct TimeCandidate {
     commit: Option<Provider>,
 }
 impl InspectorRow for TimeCandidate {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }

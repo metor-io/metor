@@ -84,6 +84,10 @@ fn parse_for_dtype(text: &str, dtype: PrimType) -> Option<TypedScalar> {
 }
 
 impl InspectorRow for ScalarRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }

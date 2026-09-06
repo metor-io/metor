@@ -17,6 +17,8 @@ use gpui::{
 pub mod completion;
 pub mod drag_paint;
 pub mod edits;
+#[cfg(test)]
+mod motion_tests;
 pub mod palette;
 pub mod plot_preview;
 pub mod reflect;
@@ -25,6 +27,7 @@ pub mod row_list;
 pub mod rows;
 pub mod trace_picker;
 
+use crate::motion::{self, Fade};
 use crate::theme::theme;
 use rows::text_field::TextAlign;
 use rows::{InspectorRow, PreviewSpec, RowAction, TextField, tag_pill};
@@ -119,10 +122,13 @@ struct InspectorPage {
 /// depending on [`InspectorMode`].
 pub struct Inspector {
     pages: Vec<InspectorPage>,
+    live_palette: Option<palette::LivePalette>,
     mode: InspectorMode,
     focus_handle: FocusHandle,
     parent_focus: Option<FocusHandle>,
     pub dismissed: bool,
+    fade: Fade,
+    exit_complete: bool,
     search: TextField,
     /// What a provider row made of the current query, when one did. Shown in
     /// place of the page's fuzzy-filtered rows and re-asked on every query
@@ -188,10 +194,17 @@ impl Inspector {
     fn from_page(page: InspectorPage, mode: InspectorMode, cx: &mut Context<Self>) -> Self {
         Self {
             pages: vec![page],
+            live_palette: None,
             mode,
             focus_handle: cx.focus_handle(),
             parent_focus: None,
             dismissed: false,
+            fade: Fade::entrance(match mode {
+                InspectorMode::Centered => motion::PALETTE_ENTER,
+                InspectorMode::Anchored(_) => motion::MENU_ENTER,
+                InspectorMode::Inline => std::time::Duration::ZERO,
+            }),
+            exit_complete: false,
             search: TextField::new("Search...", cx),
             query_rows: None,
             query_revision: 0,
@@ -205,6 +218,42 @@ impl Inspector {
         }
     }
 
+    pub(crate) fn follow_palette(
+        &mut self,
+        db: Arc<metor_db::DB>,
+        tiles: &gpui::Entity<crate::tiles::TileGroup>,
+    ) {
+        self.live_palette = Some(palette::LivePalette::new(db, tiles));
+    }
+
+    fn refresh_palette(&mut self, cx: &mut Context<Self>) {
+        if self.dismissed {
+            return;
+        }
+        let Some(source) = &mut self.live_palette else {
+            return;
+        };
+        let Some(rows) = source.refresh(cx) else {
+            return;
+        };
+        let selected = self
+            .filtered_indices()
+            .get(self.selected_index)
+            .and_then(|&index| self.current_rows()?.get(index))
+            .map(|row| row.identity());
+        self.pages[0].kind = InspectorPageKind::Rows(rows);
+        if self.pages.len() == 1 {
+            self.refresh_query_rows(cx);
+            self.selected_index = selected
+                .and_then(|key| {
+                    self.filtered_indices()
+                        .iter()
+                        .position(|&index| self.current_rows().unwrap()[index].identity() == key)
+                })
+                .unwrap_or_else(|| self.first_selectable_index());
+        }
+    }
+
     pub fn set_parent_focus(&mut self, handle: FocusHandle) {
         self.parent_focus = Some(handle);
     }
@@ -214,19 +263,39 @@ impl Inspector {
     /// lifecycle (typically dropping the entity on some external signal).
     pub fn set_passive(&mut self) {
         self.dismiss_on_outside_click = false;
+        self.fade = Fade::settled(1.0);
     }
 
     fn current_page(&self) -> &InspectorPage {
         self.pages.last().expect("page stack must never be empty")
     }
 
-    fn dismiss(&mut self, window: &mut Window) {
-        self.dismissed = true;
-        if let Some(parent) = &self.parent_focus {
-            parent.focus(window);
-        } else {
-            window.blur();
+    pub(crate) fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dismissed {
+            return;
         }
+        self.dismissed = true;
+        self.fade.exit(match self.mode {
+            InspectorMode::Centered => motion::PALETTE_EXIT,
+            _ => motion::MENU_EXIT,
+        });
+        let can_fade = self.dismiss_on_outside_click
+            && !matches!(self.mode, InspectorMode::Inline)
+            && self.accessory.is_none()
+            && self
+                .current_rows()
+                .is_some_and(|rows| rows.iter().all(|row| row.supports_exit_fade()));
+        if !can_fade || !motion::enabled(cx) {
+            self.fade.finish();
+        }
+        if self.focus_handle.contains_focused(window, cx) {
+            if let Some(parent) = &self.parent_focus {
+                parent.focus(window);
+            } else {
+                window.blur();
+            }
+        }
+        cx.notify();
     }
 
     fn push_page(
@@ -407,6 +476,9 @@ impl Inspector {
     }
 
     fn activate_row(&mut self, row_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dismissed {
+            return;
+        }
         let search = self.search.text.clone();
         let Some(rows) = self.current_rows_mut() else {
             return;
@@ -479,7 +551,7 @@ impl Inspector {
                 self.pop_page(cx);
             }
             RowAction::Dismiss => {
-                self.dismiss(window);
+                self.dismiss(window, cx);
             }
             RowAction::ReplaceQuery { text, cursor } => {
                 self.search.text = text;
@@ -554,7 +626,7 @@ impl Inspector {
             match key {
                 "escape" => {
                     if !self.pop_page(cx) {
-                        self.dismiss(window);
+                        self.dismiss(window, cx);
                     }
                     cx.notify();
                 }
@@ -591,7 +663,7 @@ impl Inspector {
         match key {
             "escape" => {
                 if !self.pop_page(cx) {
-                    self.dismiss(window);
+                    self.dismiss(window, cx);
                 }
                 cx.notify();
                 return;
@@ -768,16 +840,22 @@ impl Inspector {
             .id("inspector-panel")
             // Names this subtree so a leader keybinding gated on `!Inspector`
             // is suppressed while the search field has focus.
-            .key_context("Inspector TextInput")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.handle_key_down(event, window, cx);
-                cx.notify();
-            }))
+            .when(!self.dismissed, |frame| {
+                frame
+                    .key_context("Inspector TextInput")
+                    .track_focus(&self.focus_handle)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        this.handle_key_down(event, window, cx);
+                        cx.notify();
+                    }))
+            })
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(6.0))
+            .when(!matches!(self.mode, InspectorMode::Inline), |frame| {
+                frame.shadow_sm()
+            })
             .child(bounds_tracker);
 
         let panel = match &self.current_page().kind {
@@ -792,15 +870,17 @@ impl Inspector {
             .id("inspector-group")
             .flex()
             .flex_col()
-            .on_action(cx.listener(|this, action: &EditInspectorQuery, _, cx| {
-                this.search.set_text(action.text.clone());
-                this.search.cursor = this.search.text.len();
-                this.search.mark = this.search.cursor;
-                this.query_edited(cx);
-                this.selected_index = this.first_selectable_index();
-                cx.stop_propagation();
-                cx.notify();
-            }))
+            .when(!self.dismissed, |group| {
+                group.on_action(cx.listener(|this, action: &EditInspectorQuery, _, cx| {
+                    this.search.set_text(action.text.clone());
+                    this.search.cursor = this.search.text.len();
+                    this.search.mark = this.search.cursor;
+                    this.query_edited(cx);
+                    this.selected_index = this.first_selectable_index();
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+            })
             .child(panel);
         if matches!(self.mode, InspectorMode::Anchored(_)) && self.accessory.is_some() {
             group = group
@@ -864,6 +944,11 @@ impl Inspector {
             InspectorMode::Centered => Some(CENTERED_WIDTH),
             InspectorMode::Inline => None,
         };
+        let width = if self.dismissed {
+            self.panel_bounds.map(|bounds| bounds.size.width).or(width)
+        } else {
+            width
+        };
         cx.set_global(rows::LabelFit {
             row_width: width.map(|w| w - ROW_PADDING),
         });
@@ -891,70 +976,103 @@ impl Inspector {
             } else {
                 (count as f32 * ROW_HEIGHT).min(max_items_h)
             };
-            uniform_list(
-                "inspector-items",
-                count,
-                cx.processor(
-                    move |this: &mut Self,
-                          range: Range<usize>,
-                          window: &mut Window,
-                          cx: &mut Context<Self>| {
-                        let theme = crate::theme::theme(cx);
-                        let indices = this.filtered_indices();
-                        let mut out = Vec::with_capacity(range.len());
-                        for vis_ix in range {
-                            let row_idx = indices[vis_ix];
-                            let selected = vis_ix == this.selected_index;
-                            let is_editing = this
-                                .editing
-                                .as_ref()
-                                .is_some_and(|e| e.row_index == row_idx);
+            if self.dismissed {
+                let offset = self.scroll_handle.0.borrow().base_handle.offset().y;
+                let first =
+                    ((-f32::from(offset) / ROW_HEIGHT).floor().max(0.0) as usize).min(count);
+                let end = (first + (items_h / ROW_HEIGHT).ceil() as usize + 1).min(count);
+                let passive_rows = rows::with_passive(cx, |cx| {
+                    let rows = self.current_rows().unwrap();
+                    (first..end)
+                        .map(|vis_ix| {
+                            let row = rows[indices[vis_ix]].render_row(
+                                vis_ix,
+                                vis_ix == self.selected_index,
+                                window,
+                                cx,
+                            );
+                            div()
+                                .absolute()
+                                .top(offset + px(vis_ix as f32 * ROW_HEIGHT))
+                                .w_full()
+                                .h(px(ROW_HEIGHT))
+                                .child(row)
+                        })
+                        .collect::<Vec<_>>()
+                });
+                div()
+                    .relative()
+                    .overflow_hidden()
+                    .h(px(items_h))
+                    .children(passive_rows)
+                    .into_any_element()
+            } else {
+                uniform_list(
+                    "inspector-items",
+                    count,
+                    cx.processor(
+                        move |this: &mut Self,
+                              range: Range<usize>,
+                              window: &mut Window,
+                              cx: &mut Context<Self>| {
+                            let theme = crate::theme::theme(cx);
+                            let indices = this.filtered_indices();
+                            let mut out = Vec::with_capacity(range.len());
+                            for vis_ix in range {
+                                let row_idx = indices[vis_ix];
+                                let selected = vis_ix == this.selected_index;
+                                let is_editing = this
+                                    .editing
+                                    .as_ref()
+                                    .is_some_and(|e| e.row_index == row_idx);
 
-                            let Some(rows) = this.current_rows() else {
-                                unreachable!("render_rows_panel is only entered on Rows pages");
-                            };
+                                let Some(rows) = this.current_rows() else {
+                                    unreachable!("render_rows_panel is only entered on Rows pages");
+                                };
 
-                            let element = if is_editing {
-                                let edit = this.editing.as_ref().unwrap();
-                                let label = SharedString::from(rows[row_idx].label().to_string());
-                                crate::inspector::rows::row_base(vis_ix, selected, cx)
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .text_color(theme.text_primary)
-                                            .child(label),
-                                    )
-                                    .child(div().flex_1().min_w_0().child(edit.field.element()))
-                                    .into_any_element()
-                            } else if rows[row_idx].is_header() {
-                                // Headers are inert: no click-to-select, no
-                                // selection highlight.
-                                rows[row_idx].render_row(vis_ix, selected, window, cx)
-                            } else {
-                                let row_element =
-                                    rows[row_idx].render_row(vis_ix, selected, window, cx);
-                                let row_idx_click = row_idx;
-                                div()
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.selected_index = vis_ix;
-                                            this.activate_row(row_idx_click, window, cx);
-                                        }),
-                                    )
-                                    .child(row_element)
-                                    .into_any_element()
-                            };
+                                let element = if is_editing {
+                                    let edit = this.editing.as_ref().unwrap();
+                                    let label =
+                                        SharedString::from(rows[row_idx].label().to_string());
+                                    crate::inspector::rows::row_base(vis_ix, selected, cx)
+                                        .child(
+                                            div()
+                                                .text_size(px(12.0))
+                                                .text_color(theme.text_primary)
+                                                .child(label),
+                                        )
+                                        .child(div().flex_1().min_w_0().child(edit.field.element()))
+                                        .into_any_element()
+                                } else if rows[row_idx].is_header() {
+                                    // Headers are inert: no click-to-select, no
+                                    // selection highlight.
+                                    rows[row_idx].render_row(vis_ix, selected, window, cx)
+                                } else {
+                                    let row_element =
+                                        rows[row_idx].render_row(vis_ix, selected, window, cx);
+                                    let row_idx_click = row_idx;
+                                    div()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.selected_index = vis_ix;
+                                                this.activate_row(row_idx_click, window, cx);
+                                            }),
+                                        )
+                                        .child(row_element)
+                                        .into_any_element()
+                                };
 
-                            out.push(element);
-                        }
-                        out
-                    },
-                ),
-            )
-            .track_scroll(scroll_handle)
-            .h(px(items_h))
-            .into_any_element()
+                                out.push(element);
+                            }
+                            out
+                        },
+                    ),
+                )
+                .track_scroll(scroll_handle)
+                .h(px(items_h))
+                .into_any_element()
+            }
         };
 
         let frame = match (self.mode, width) {
@@ -1013,6 +1131,8 @@ impl Inspector {
     }
 }
 
+impl gpui::EventEmitter<motion::Closed> for Inspector {}
+
 impl Focusable for Inspector {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1021,13 +1141,22 @@ impl Focusable for Inspector {
 
 impl Render for Inspector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let opacity = self.fade.opacity(window, cx);
+        if self.dismissed && opacity == 0.0 {
+            if !self.exit_complete {
+                self.exit_complete = true;
+                cx.emit(motion::Closed);
+            }
+            return div().into_any_element();
+        }
+        self.refresh_palette(cx);
         let revision = match &self.current_page().kind {
             InspectorPageKind::Rows(rows) => {
                 rows.iter().map(|r| r.query_revision(cx)).max().unwrap_or(0)
             }
             _ => 0,
         };
-        if revision != self.query_revision {
+        if !self.dismissed && revision != self.query_revision {
             let selected = self
                 .current_rows()
                 .and_then(|rows| rows.get(self.selected_index))
@@ -1038,17 +1167,29 @@ impl Render for Inspector {
                 .and_then(|label| self.current_rows()?.iter().position(|r| r.label() == label))
                 .unwrap_or_else(|| self.first_selectable_index());
         }
-        if self.dismissed {
-            return div().into_any_element();
+        if !self.dismissed {
+            self.accessory = match &self.current_page().kind {
+                InspectorPageKind::Rows(rows) => {
+                    rows.iter().find_map(|r| r.accessory(&self.search.text, cx))
+                }
+                _ => None,
+            };
         }
-
-        self.accessory = match &self.current_page().kind {
-            InspectorPageKind::Rows(rows) => {
-                rows.iter().find_map(|r| r.accessory(&self.search.text, cx))
-            }
-            _ => None,
-        };
         let panel = self.render_panel(window, cx);
+        if self.dismissed {
+            let bounds = self.panel_bounds.unwrap_or_default();
+            return deferred(
+                div()
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y)
+                    .opacity(opacity)
+                    .child(panel),
+            )
+            .with_priority(1)
+            .into_any_element();
+        }
+        let panel = panel.opacity(opacity);
 
         // The full-window occluder used for click-outside dismissal also
         // blocks moves to the surface beneath — incompatible with
@@ -1061,7 +1202,7 @@ impl Render for Inspector {
                     let panel = panel.on_mouse_down_out(cx.listener(
                         |this, _: &gpui::MouseDownEvent, window, _cx| {
                             if !this.accessory.as_ref().is_some_and(|a| (a.dragging)(_cx)) {
-                                this.dismiss(window);
+                                this.dismiss(window, _cx);
                             }
                         },
                     ));
@@ -1078,7 +1219,6 @@ impl Render for Inspector {
                         .left_0()
                         .size_full()
                         .child(anchored_panel)
-                        .shadow_sm()
                         .into_any_element()
                 } else {
                     anchored()
@@ -1094,7 +1234,7 @@ impl Render for Inspector {
                 let panel = panel.on_mouse_down_out(cx.listener(
                     |this, _: &gpui::MouseDownEvent, window, _cx| {
                         if !this.accessory.as_ref().is_some_and(|a| (a.dragging)(_cx)) {
-                            this.dismiss(window);
+                            this.dismiss(window, _cx);
                         }
                     },
                 ));
@@ -1109,8 +1249,7 @@ impl Render for Inspector {
                     .flex_col()
                     .items_center()
                     .pt(px(80.0))
-                    .child(panel)
-                    .shadow_sm();
+                    .child(panel);
 
                 deferred(centered).with_priority(1).into_any_element()
             }

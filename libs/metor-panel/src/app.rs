@@ -67,8 +67,8 @@ pub(crate) struct AppRoot {
     pending_inspector_request: Option<(Box<dyn crate::tiles::PaneItemHandle>, Point<Pixels>)>,
     pending_pane_inspector_request: Option<(Entity<crate::tiles::Pane>, Point<Pixels>)>,
     pending_inspector_open: Option<InspectorRequest>,
-    /// The transient chord menu, present only while open. Dropped (and focus
-    /// returned to the root) once it dismisses, mirroring `inspector`.
+    /// The transient chord menu, retained through its passive exit fade.
+    /// Logical dismissal releases focus before the visual is removed.
     transient: Option<Entity<crate::transient::Transient>>,
     /// The connection picker, present only while open, mirroring `inspector`.
     connection_picker: Option<Entity<crate::connections::ConnectionPicker>>,
@@ -151,6 +151,20 @@ impl AppRoot {
             insp.set_parent_focus(parent_focus);
             insp
         });
+        cx.subscribe(
+            &inspector,
+            |this, inspector, _: &crate::motion::Closed, cx| {
+                if this
+                    .inspector
+                    .as_ref()
+                    .is_some_and(|current| current == &inspector)
+                {
+                    this.inspector = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         inspector.focus_handle(cx).focus(window);
         self.inspector = Some(inspector);
         cx.notify();
@@ -164,14 +178,17 @@ impl AppRoot {
         if let Some(inspector) = &self.inspector
             && !inspector.read(cx).dismissed
         {
-            self.inspector = None;
-            self.focus_handle.focus(window);
-            cx.notify();
+            inspector.update(cx, |inspector, cx| inspector.dismiss(window, cx));
             return;
         }
 
-        let rows = ItemRegistry::root_rows(&self.db, cx);
+        let rows = ItemRegistry::root_rows_for(&self.db, &self.tiles, cx);
         self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
+        if let Some(inspector) = &self.inspector {
+            inspector.update(cx, |inspector, _| {
+                inspector.follow_palette(self.db.clone(), &self.tiles)
+            });
+        }
     }
 
     /// Open the transient chord menu. The leader keybinding is suppressed while
@@ -195,6 +212,20 @@ impl AppRoot {
             t.set_parent_focus(parent_focus);
             t
         });
+        cx.subscribe(
+            &transient,
+            |this, transient, _: &crate::motion::Closed, cx| {
+                if this
+                    .transient
+                    .as_ref()
+                    .is_some_and(|current| current == &transient)
+                {
+                    this.transient = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         transient.focus_handle(cx).focus(window);
         self.transient = Some(transient);
         cx.notify();
@@ -449,8 +480,10 @@ impl AppRoot {
         // Deferred: opening and closing windows mid-dispatch re-enters the
         // platform layer.
         cx.defer(move |cx: &mut App| {
-            drag.pane
-                .update(cx, |pane, cx| pane.remove_item(drag.ix, cx));
+            let Some(index) = drag.pane.read(cx).index_of(drag.item.entity_id()) else {
+                return;
+            };
+            drag.pane.update(cx, |pane, cx| pane.remove_item(index, cx));
             let pane = cx.new(|cx| crate::tiles::Pane::new(vec![drag.item], cx));
             let tiles = cx.new(|cx| TileGroup::from_pane(pane, cx));
             crate::workspace::open_panel_window(
@@ -508,20 +541,6 @@ impl Focusable for AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(inspector) = &self.inspector
-            && inspector.read(cx).dismissed
-        {
-            self.inspector = None;
-            self.focus_handle.focus(window);
-        }
-
-        if let Some(transient) = &self.transient
-            && transient.read(cx).dismissed
-        {
-            self.transient = None;
-            self.focus_handle.focus(window);
-        }
-
         if let Some(picker) = &self.connection_picker
             && picker.read(cx).dismissed
         {

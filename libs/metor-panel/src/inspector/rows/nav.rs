@@ -17,6 +17,7 @@ use crate::theme::theme;
 /// summary or [`NavRow::with_dynamic_summary`] for a live one.
 pub struct NavRow {
     pub label: SharedString,
+    identity: Option<SharedString>,
     summary: Box<dyn Fn(&App) -> SharedString>,
     pub build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
     tag: Option<SharedString>,
@@ -35,6 +36,7 @@ impl NavRow {
         let summary = summary.into();
         Self {
             label: label.into(),
+            identity: None,
             summary: Box::new(move |_| summary.clone()),
             build_children,
             tag: None,
@@ -51,6 +53,7 @@ impl NavRow {
         Self {
             label: label.into(),
             summary,
+            identity: None,
             build_children,
             tag: None,
             accessory: None,
@@ -72,6 +75,11 @@ impl NavRow {
         self
     }
 
+    pub(crate) fn with_identity(mut self, identity: SharedString) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
     /// Open the child page with `query` already in its search field.
     pub fn with_query(mut self, query: impl Into<String>) -> Self {
         self.query = Some(query.into());
@@ -80,6 +88,13 @@ impl NavRow {
 }
 
 impl InspectorRow for NavRow {
+    fn identity(&self) -> SharedString {
+        self.identity.clone().unwrap_or_else(|| self.label.clone())
+    }
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn accessory(&self, _: &str, cx: &mut App) -> Option<super::AccessorySpec> {
         self.accessory.as_ref().and_then(|build| build(cx))
     }

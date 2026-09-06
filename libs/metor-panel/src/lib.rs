@@ -28,6 +28,7 @@ pub mod icons;
 pub mod inspect;
 pub mod inspector;
 pub mod logs;
+pub(crate) mod motion;
 pub(crate) mod msg_ingest;
 pub mod plot_events;
 pub mod presets;

@@ -29,7 +29,31 @@ pub struct TileLayout {
     /// absent, in older layouts) means full range.
     #[serde(default)]
     pub global_time_range: String,
+    /// Versioned display-time intent. Older readers use global_time_range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<TemporalLayout>,
     pub root: TileNode,
+}
+
+/// Time expressions are persisted as canonical text so preset producers need
+/// no dependency on a panel-specific parser or runtime clock.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TemporalLayout {
+    pub version: u32,
+    pub view_time: String,
+    pub range_start: String,
+    pub range_end: String,
+    pub timezone: String,
+    #[serde(default)]
+    pub elapsed_display: bool,
+    #[serde(default)]
+    pub t0: Option<i64>,
+    pub source_clock: Option<u64>,
+    #[serde(default)]
+    pub wall_clock: bool,
+    pub scope_prefix: String,
+    pub rate: f64,
+    pub step_micros: i64,
 }
 
 /// Node in the layout tree: a leaf pane or a recursive split.

@@ -60,6 +60,10 @@ impl BoolRow {
 }
 
 impl InspectorRow for BoolRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         &self.label
     }
@@ -83,21 +87,23 @@ impl InspectorRow for BoolRow {
                     .child(self.label.clone()),
             )
             .child(checkbox(self.current(cx), &theme))
-            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
-                if !event.dragging() {
-                    drag_paint::clear(cx);
-                    return;
-                }
-                let Some(target) = drag_paint::current(cx) else {
-                    return;
-                };
-                let current = match &value_source {
-                    Some(f) => f(cx),
-                    None => static_value,
-                };
-                if current != target {
-                    toggle(target, window, cx);
-                }
+            .when(!super::passive(cx), |row| {
+                row.on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                    if !event.dragging() {
+                        drag_paint::clear(cx);
+                        return;
+                    }
+                    let Some(target) = drag_paint::current(cx) else {
+                        return;
+                    };
+                    let current = match &value_source {
+                        Some(f) => f(cx),
+                        None => static_value,
+                    };
+                    if current != target {
+                        toggle(target, window, cx);
+                    }
+                })
             })
             .into_any_element()
     }

@@ -594,6 +594,10 @@ struct ContinueRow {
 }
 
 impl InspectorRow for ContinueRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         "Continue"
     }
@@ -649,6 +653,10 @@ impl InspectorRow for ContinueRow {
 struct DoneRow;
 
 impl InspectorRow for DoneRow {
+    fn supports_exit_fade(&self) -> bool {
+        true
+    }
+
     fn label(&self) -> &str {
         "Done"
     }

@@ -66,6 +66,18 @@ pub trait InspectorRow: 'static {
     /// Text matched by the inspector's fuzzy search.
     fn label(&self) -> &str;
 
+    /// Stable selection key when a live palette rebuilds its rows.
+    fn identity(&self) -> SharedString {
+        self.label().to_owned().into()
+    }
+
+    /// Opt in to exit rendering under [`passive`]. Such rows must omit all
+    /// input handlers and interactive children when that flag is set.
+    /// Custom rows default to immediate dismissal until they support this.
+    fn supports_exit_fade(&self) -> bool {
+        false
+    }
+
     /// Paint the row. `selected` reflects keyboard focus and drives the
     /// selection-background highlight.
     fn render_row(
@@ -243,6 +255,23 @@ pub struct LabelFit {
     pub row_width: Option<Pixels>,
 }
 
+#[derive(Default)]
+struct PassiveRows(bool);
+impl Global for PassiveRows {}
+
+/// Whether a row is being built only as the visual of a dismissed inspector.
+pub fn passive(cx: &App) -> bool {
+    cx.try_global::<PassiveRows>().is_some_and(|mode| mode.0)
+}
+
+pub(super) fn with_passive<R>(cx: &mut App, build: impl FnOnce(&mut App) -> R) -> R {
+    let previous = passive(cx);
+    cx.set_global(PassiveRows(true));
+    let result = build(cx);
+    cx.set_global(PassiveRows(previous));
+    result
+}
+
 impl Global for LabelFit {}
 
 /// The label width a row may use before eliding, if the panel said.
@@ -347,6 +376,7 @@ fn elide_front(
 /// full-width fill would bleed past the curve).
 pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let theme = theme(cx);
+    let interactive = !passive(cx);
     let pill_bg = if selected {
         theme.selection_bg
     } else {
@@ -354,7 +384,9 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
     };
     div()
         .id(("inspector-row", row_ix))
-        .group("inspector-row")
+        .when(interactive, |row| {
+            row.group("inspector-row").cursor_pointer()
+        })
         .relative()
         .flex()
         .flex_row()
@@ -363,7 +395,6 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
         .w_full()
         .h(px(28.0))
         .px(px(12.0))
-        .cursor_pointer()
         .child(
             div()
                 .absolute()
@@ -373,7 +404,9 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
                 .right(px(4.0))
                 .rounded(px(4.0))
                 .bg(pill_bg)
-                .group_hover("inspector-row", |s| s.bg(theme.selection_bg)),
+                .when(interactive, |pill| {
+                    pill.group_hover("inspector-row", |s| s.bg(theme.selection_bg))
+                }),
         )
 }
 
