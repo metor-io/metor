@@ -58,18 +58,8 @@ struct TimelineTooltip {
 }
 impl Render for TimelineTooltip {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = crate::theme::theme(cx);
         let card = match &self.readout {
-            Readout::Time(label) => div()
-                .px(px(6.0))
-                .py(px(4.0))
-                .bg(theme.bg_elevated)
-                .border_1()
-                .border_color(theme.border_primary)
-                .rounded(px(3.0))
-                .text_size(px(crate::views::time_series::LABEL_FONT_SIZE))
-                .text_color(theme.text_secondary)
-                .child(label.clone()),
+            Readout::Time(label) => crate::views::popover::readout_card(cx).child(label.clone()),
             Readout::Events(events, count) => {
                 let first = &events[0].event;
                 let header: SharedString = if *count > 1 {
@@ -77,11 +67,7 @@ impl Render for TimelineTooltip {
                 } else {
                     first.label.clone()
                 };
-                crate::plot_events::popover::event_card(
-                    header,
-                    events.iter().map(|e| &e.event),
-                    &theme,
-                )
+                crate::plot_events::popover::event_card(header, events.iter().map(|e| &e.event), cx)
             }
         };
         card.max_w(px(480.0).min((window.viewport_size().width - px(8.0)).max(px(0.0))))

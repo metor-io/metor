@@ -1,30 +1,18 @@
 //! Shared event readout styling for plots and timeline previews.
 use super::PlotEvent;
+use crate::views::popover::readout_card;
 use crate::views::time_series::LABEL_FONT_SIZE;
-use gpui::{SharedString, div, prelude::*, px};
+use gpui::{App, SharedString, div, prelude::*, px};
 
 pub(crate) fn event_card<'a>(
     header: SharedString,
     events: impl Iterator<Item = &'a PlotEvent>,
-    theme: &crate::theme::Theme,
+    cx: &App,
 ) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_y_0()
-        .px(px(6.0))
-        .py(px(4.0))
-        .bg(theme.bg_elevated)
-        .border_1()
-        .border_color(theme.border_primary)
-        .rounded(px(3.0))
-        .child(
-            div()
-                .text_size(px(LABEL_FONT_SIZE))
-                .text_color(theme.text_secondary)
-                .child(header),
-        )
-        .children(events.map(|event| event_summary_row(event, theme)))
+    let theme = crate::theme::theme(cx);
+    readout_card(cx)
+        .child(div().child(header))
+        .children(events.map(|event| event_summary_row(event, &theme)))
 }
 
 pub(crate) fn event_summary_row(ev: &PlotEvent, theme: &crate::theme::Theme) -> impl IntoElement {

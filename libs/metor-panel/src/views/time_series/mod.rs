@@ -15,6 +15,7 @@ use crate::inspect;
 use crate::plot_events::{EventDetail, EventKindKey, EventSource, EventSourceRegistry, PlotEvent};
 use crate::temporal::display::elapsed;
 use crate::views::json_tree::JsonTree;
+use crate::views::popover::readout_card;
 
 mod render;
 
@@ -282,10 +283,6 @@ pub(crate) const LABEL_FONT_SIZE: f32 = 11.0;
 /// Gap between the pointer and the hover readout box so the box never sits
 /// under the cursor.
 const HOVER_READOUT_OFFSET: f32 = 14.0;
-/// Inner padding on the hover readout box; mirrors the estimate in
-/// [`cursor::estimate_readout_size`] so placement matches the painted box.
-const READOUT_PAD_X: f32 = 6.0;
-const READOUT_PAD_Y: f32 = 4.0;
 
 /// One readout line: the trace's color, its label, and the formatted value
 /// at the crosshair timestamp.
@@ -1760,22 +1757,7 @@ impl TimeSeriesPlot {
             pa.origin.y - px(PADDING),
         );
 
-        let mut boxed = div()
-            .flex()
-            .flex_col()
-            .gap_y_0()
-            .px(px(READOUT_PAD_X))
-            .py(px(READOUT_PAD_Y))
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border_primary)
-            .rounded(px(3.0))
-            .child(
-                div()
-                    .text_size(px(LABEL_FONT_SIZE))
-                    .text_color(theme.text_secondary)
-                    .child(SharedString::from(header)),
-            );
+        let mut boxed = readout_card(cx).child(div().child(SharedString::from(header)));
         for (color, label, value) in rows {
             boxed = boxed.child(
                 div()
@@ -1945,7 +1927,6 @@ impl TimeSeriesPlot {
         let cluster = self.event_clusters.get(idx)?;
         let pa = self.last_plot_area?;
         let view = self.line_plot.read(cx).effective_view(cx)?;
-        let theme = crate::theme::theme(cx);
 
         let count = cluster.events.len();
         let first = cluster.events.first()?;
@@ -1958,7 +1939,7 @@ impl TimeSeriesPlot {
         let boxed = crate::plot_events::popover::event_card(
             header,
             cluster.events.iter().take(EVENT_POPOVER_ROWS),
-            &theme,
+            cx,
         );
 
         let shown = count.min(EVENT_POPOVER_ROWS);
@@ -2071,15 +2052,9 @@ impl TimeSeriesPlot {
 
         let detail = self.event_detail_element(&cluster.events[selected].detail, &theme);
 
-        let panel = div()
-            .flex()
-            .flex_col()
+        let panel = readout_card(cx)
             .gap_1()
             .w(px(300.0))
-            .px(px(READOUT_PAD_X))
-            .py(px(READOUT_PAD_Y))
-            .bg(theme.bg_elevated)
-            .border_1()
             .border_color(theme.selection_bg)
             .rounded(px(4.0))
             .occlude()

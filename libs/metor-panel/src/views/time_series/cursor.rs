@@ -13,6 +13,7 @@ use metor_proto::types::Timestamp;
 
 use super::measurements::{MeasurementKind, MeasurementKindList};
 use super::{LinePlot, TimeSeriesPlot};
+pub(crate) use crate::views::popover::{READOUT_PAD_X, READOUT_PAD_Y};
 
 /// Bytes within a cursor line treated as a click hit. Wider than the painted
 /// stroke so a user landing within a few pixels still opens the inspector
@@ -274,9 +275,6 @@ pub fn pixel_to_data_x(
 const READOUT_CHAR_W: f32 = 6.6;
 /// Line height for one readout row (font size plus leading).
 pub(crate) const READOUT_ROW_H: f32 = 15.0;
-/// Inner padding on the readout box, per side.
-pub(crate) const READOUT_PAD_X: f32 = 6.0;
-pub(crate) const READOUT_PAD_Y: f32 = 4.0;
 /// Width the color swatch plus its trailing gap reserves ahead of a trace
 /// row's label.
 const READOUT_SWATCH_W: f32 = 14.0;

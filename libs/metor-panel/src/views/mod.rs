@@ -21,6 +21,7 @@ pub mod meter;
 pub mod monitor;
 pub mod outline;
 pub mod plot_common;
+pub(crate) mod popover;
 pub mod samples_table;
 pub mod scrollbar;
 pub mod sequence_control;
