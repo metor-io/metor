@@ -1,4 +1,4 @@
-//! Provides a local, non-XLA backend for operating on Tensors.
+//! Owned arrays and borrowed views for tensor operations.
 use crate::{
     AddDim, BroadcastDim, BroadcastedDim, ConstDim, DefaultMap, DefaultMappedDim, Dim, DottedDim,
     Elem, Error, Field, OwnedRepr, RealField, ReplaceDim, ReplaceMappedDim, Repr, ScalarDim,
@@ -1643,15 +1643,6 @@ impl<T: Copy + Default + 'static, D: Dim> crate::ReprMonad<ArrayRepr> for Array<
     type Elem = T;
     type Dim = D;
 
-    type Map<N: OwnedRepr> = Array<T, D>;
-
-    fn map<N: OwnedRepr>(
-        self,
-        _func: impl Fn(Array<Self::Elem, Self::Dim>) -> N::Inner<Self::Elem, Self::Dim>,
-    ) -> Self::Map<N> {
-        self
-    }
-
     fn inner(&self) -> &Array<Self::Elem, Self::Dim> {
         self
     }
@@ -1830,9 +1821,12 @@ mod tests {
 
     #[test]
     fn test_eye() {
-        assert_eq!(Array::eye(), array![[1.0, 0.0], [0.0, 1.0]]);
         assert_eq!(
-            Array::eye(),
+            Array::<f64, (Const<2>, Const<2>)>::eye(),
+            array![[1.0, 0.0], [0.0, 1.0]]
+        );
+        assert_eq!(
+            Array::<f64, (Const<3>, Const<3>)>::eye(),
             array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
         );
     }
@@ -1840,35 +1834,35 @@ mod tests {
     #[test]
     fn test_from_diag() {
         assert_eq!(
-            Array::from_diag(array![1.0, 4.0]),
+            Array::<f64, (Const<2>, Const<2>)>::from_diag(array![1.0, 4.0]),
             array![[1.0, 0.0], [0.0, 4.0]]
         );
         assert_eq!(
-            Array::from_diag(array![1.0, 4.0, 5.0]),
+            Array::<f64, (Const<3>, Const<3>)>::from_diag(array![1.0, 4.0, 5.0]),
             array![[1.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 5.0]]
         );
     }
 
     #[test]
     fn test_abs() {
-        let a = array![[1.0, -2.0], [-3.0, 4.0]];
+        let a: Array<f64, (Const<2>, Const<2>)> = array![[1.0, -2.0], [-3.0, 4.0]];
         assert_eq!(a.abs(), array![[1.0, 2.0], [3.0, 4.0]]);
     }
 
     #[test]
     fn test_atan2() {
-        let x = array![3.0, -3.0];
+        let x: Array<f64, Const<2>> = array![3.0, -3.0];
         let y = array![-3.0, 3.0];
         assert_relative_eq!(y.atan2(&x), array![-FRAC_PI_4, 3.0 * FRAC_PI_4]);
     }
 
     #[test]
     fn test_lu_inverse() {
-        let mut a = array![[1.0, 2.0], [3.0, 4.0]];
+        let mut a: Array<f64, (Const<2>, Const<2>)> = array![[1.0, 2.0], [3.0, 4.0]];
         a.try_lu_inverse_mut().unwrap();
         assert_relative_eq!(a, array![[-2.0, 1.0], [1.5, -0.5]]);
 
-        let mut a = array![[1.0, 0.0], [0.0, 1.0]];
+        let mut a: Array<f64, (Const<2>, Const<2>)> = array![[1.0, 0.0], [0.0, 1.0]];
         a.try_lu_inverse_mut().unwrap();
         assert_eq!(a, array![[1.0, 0.0], [0.0, 1.0]]);
 
@@ -1905,13 +1899,13 @@ mod tests {
 
     #[test]
     fn test_cholesky() {
-        let mut a = array![[1.0, 0.0], [0.0, 1.0]];
+        let mut a: Array<f64, (Const<2>, Const<2>)> = array![[1.0, 0.0], [0.0, 1.0]];
         a.try_cholesky_mut().unwrap();
         assert_eq!(a, array![[1.0, 0.0], [0.0, 1.0]]);
-        let mut a = array![[4.0, 0.0], [0.0, 16.0]];
+        let mut a: Array<f64, (Const<2>, Const<2>)> = array![[4.0, 0.0], [0.0, 16.0]];
         a.try_cholesky_mut().unwrap();
         assert_eq!(a, array![[2.0, 0.0], [0.0, 4.0]]);
-        let a = array![[1., 2., 3.], [0., 2., 3.], [0., 0., 1.]];
+        let a: Array<f64, (Const<3>, Const<3>)> = array![[1., 2., 3.], [0., 2., 3.], [0., 0., 1.]];
         let b = a.dot(&a.transpose());
         assert_relative_eq!(
             b.try_cholesky().unwrap().transpose(),
@@ -1926,7 +1920,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_more_dims() {
-        let a = array![[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]];
+        let a: Array<f64, (Const<3>, Const<2>)> = array![[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]];
         let b = array![5.0, 0.0];
         let out = a.sub(&b);
         assert_eq!(out, array![[-4., 2.], [-4., 2.], [-4., 2.]])
@@ -1934,7 +1928,7 @@ mod tests {
 
     #[test]
     fn test_row() {
-        let a = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
+        let a: Array<f64, (Const<3>, Const<2>)> = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
         assert_eq!(array![1., 2.], a.row(0));
         assert_eq!(array![5., 8.], a.row(1));
         assert_eq!(array![9., 9.], a.row(2));
@@ -1953,12 +1947,12 @@ mod tests {
 
     #[test]
     fn test_map() {
-        let a = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
+        let a: Array<f64, (Const<3>, Const<2>)> = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
         let out: Array<f64, (Const<3>, Const<2>)> =
             a.map(|x: Array<f64, Const<2>>| array![2.0f64, 3.0].add(&x));
         assert_eq!(out, array![[3.0, 5.0], [7.0, 11.0], [11.0, 12.0]]);
 
-        let a = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
+        let a: Array<f64, (Const<3>, Const<2>)> = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
         let out: Array<f64, (Const<3>, Const<1>)> =
             a.map(|x: Array<f64, Const<2>>| x.copy_fixed_slice::<Const<1>>(&[0]));
         assert_eq!(out, array![[1.0,], [5.0,], [9.0,]]);
@@ -1966,7 +1960,7 @@ mod tests {
 
     #[test]
     fn test_rows_iter() {
-        let a = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
+        let a: Array<f64, (Const<3>, Const<2>)> = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
         let rows: Vec<_> = a.rows_iter().collect();
         assert_eq!(
             rows,
@@ -1976,7 +1970,7 @@ mod tests {
 
     #[test]
     fn test_iter_indexed_mut() {
-        let mut a = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
+        let mut a: Array<f64, (Const<3>, Const<2>)> = array![[1.0, 2.0], [5.0, 8.0], [9.0, 9.0]];
         let mut count = 0;
         for _ in a.indexed_iter_mut() {
             count += 1;

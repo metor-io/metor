@@ -6365,12 +6365,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fn-traits"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63fa6a0487cbc51bbe29ca4fd89c0bccc18eca48e7cb750b61d0828074ba40d0"
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10317,7 +10311,6 @@ version = "0.14.2"
 dependencies = [
  "approx",
  "faer",
- "fn-traits",
  "inplace_it",
  "libm",
  "nox-array",

@@ -3,7 +3,7 @@ name = "nox"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition = "2024"
-description = "Tensor library that compiles to XLA (like JAX, but for Rust)."
+description = "Array and tensor math with fixed and dynamic dimensions."
 repository = "https://github.com/metor-sys/metor"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,7 +11,6 @@ repository = "https://github.com/metor-sys/metor"
 [features]
 default = []
 std = ["thiserror/std", "faer/std", "num-traits/std", "nox-array/std"]
-shared = []
 serde = ["dep:serde", "smallvec/serde"]
 
 [dependencies]
@@ -19,7 +18,6 @@ typenum = "1.17.0"
 num-traits = { version = "0.2.15", default-features = false }
 thiserror = { version = "2.0", default-features = false }
 seq-macro = "0.3.5"
-fn-traits = "0.2"
 faer = { version = "0.20", default-features = false, features = ["cholesky", "lu"] }
 libm = "0.2.8"
 inplace_it = "0.3.6"
@@ -36,3 +34,4 @@ approx = "0.5"
 # serialize
 serde.version = "1"
 serde.optional = true
+serde.features = ["derive"]

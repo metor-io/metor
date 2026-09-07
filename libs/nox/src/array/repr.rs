@@ -231,10 +231,6 @@ impl OwnedRepr for ArrayRepr {
         arg.asin()
     }
 
-    fn noop<T1: Field, D1: Dim>(arg: &Self::Inner<T1, D1>) -> Self::Inner<T1, D1> {
-        arg.clone()
-    }
-
     fn try_cholesky<T1: RealField, D1: Dim + SquareDim>(
         arg: &Self::Inner<T1, D1>,
     ) -> Result<Self::Inner<T1, D1>, Error> {
