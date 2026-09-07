@@ -7,9 +7,9 @@ pub enum Error {
     #[error("concat dim failed with dims")]
     InvalidConcatDims,
 
-    /// Error when matrix inversion failed
-    #[error("matrix cholesky failed with {0} arg illegal")]
-    Cholesky(#[from] faer::linalg::cholesky::llt::CholeskyError),
+    /// Error when Cholesky factorization encounters a non-positive pivot.
+    #[error("matrix cholesky failed: {0}")]
+    Cholesky(#[from] faer::linalg::cholesky::llt::factor::LltError),
 
     /// faer stack overflow error
     #[error("size overflow")]

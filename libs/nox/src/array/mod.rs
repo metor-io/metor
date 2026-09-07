@@ -8,18 +8,17 @@ use crate::{Const, Dyn, ShapeConstraint};
 use alloc::{vec, vec::Vec};
 use approx::{AbsDiffEq, RelativeEq};
 use core::default::Default;
+use core::mem::MaybeUninit;
 use core::{cmp, fmt, iter};
 use core::{
     marker::PhantomData,
     ops::{Add, Div, Mul, Neg, Sub},
 };
 use faer::{
-    Parallelism,
+    Accum, MatMut, MatRef, Par,
     linalg::{
-        cholesky::llt::compute::{cholesky_in_place, cholesky_in_place_req},
-        lu::{
-            full_pivoting::compute::lu_in_place_req, partial_pivoting::inverse::invert_in_place_req,
-        },
+        cholesky::llt::factor::{LltRegularization, cholesky_in_place, cholesky_in_place_scratch},
+        lu::partial_pivoting::{factor::lu_in_place_scratch, inverse::inverse_scratch},
     },
     reborrow::ReborrowMut,
 };
@@ -684,28 +683,27 @@ impl<T1: Elem, D1: Dim> Array<T1, D1> {
             1 => (1, dim_left[0]),
             _ => unreachable!("dot is only valid for args of rank 1 or 2"),
         };
-        let left = faer::mat::from_row_major_slice(self.buf.as_buf(), row_left, col_left);
+        let left = MatRef::from_row_major_slice(self.buf.as_buf(), row_left, col_left);
 
         let dim_right = D2::array_shape(&right.buf);
         let dim_right = dim_right.as_ref();
         let row_right = dim_right.as_ref().first().copied().unwrap_or(1);
         let col_right = dim_right.as_ref().get(1).copied().unwrap_or(1);
 
-        let right = faer::mat::from_row_major_slice(right.buf.as_buf(), row_right, col_right);
+        let right = MatRef::from_row_major_slice(right.buf.as_buf(), row_right, col_right);
         let (dims, rank) = matmul_dims(dim_left, dim_right).unwrap();
         let dims = &dims[..rank];
         let mut out: Array<T1, DottedDim<D1, D2>> = Array::zeroed(dims);
         let row_right = dims.as_ref().first().copied().unwrap_or(1);
         let col_right = dims.as_ref().get(1).copied().unwrap_or(1);
-        let out_mat =
-            faer::mat::from_row_major_slice_mut(out.buf.as_mut_buf(), row_right, col_right);
+        let out_mat = MatMut::from_row_major_slice_mut(out.buf.as_mut_buf(), row_right, col_right);
         faer::linalg::matmul::matmul(
             out_mat,
+            Accum::Replace,
             left,
             right,
-            None,
             T1::one_prim(),
-            Parallelism::None,
+            Par::Seq,
         );
         out
     }
@@ -863,32 +861,38 @@ impl<T1: Elem, D1: Dim> Array<T1, D1> {
         D1: SquareDim,
     {
         let n = D1::order(&self.buf);
-        let req = invert_in_place_req::<u32, T1>(n, n, Parallelism::None)
-            .map_err(|_| Error::SizeOverflow)?
-            .or(
-                lu_in_place_req::<u32, T1>(n, n, Parallelism::None, Default::default())
-                    .map_err(|_| Error::SizeOverflow)?,
-            );
+        let req = inverse_scratch::<u32, T1>(n, Par::Seq).or(lu_in_place_scratch::<u32, T1>(
+            n,
+            n,
+            Par::Seq,
+            Default::default(),
+        ));
+        req.layout().map_err(|_| Error::SizeOverflow)?;
         inplace_it::inplace_or_alloc_array(
             req.unaligned_bytes_required(),
-            |work: inplace_it::UninitializedSliceMemoryGuard<u8>| {
-                let mut work = work.init(|_| 0);
-                let mut stack = faer::dyn_stack::PodStack::new(&mut work);
+            |work: inplace_it::UninitializedSliceMemoryGuard<MaybeUninit<u8>>| {
+                let mut work = work.init(|_| MaybeUninit::uninit());
+                let stack = faer::dyn_stack::MemStack::new(&mut work);
                 let mut perm = D1::ipiv(&self.buf);
                 let mut perm_inv = D1::ipiv(&self.buf);
-                let mut mat = faer::mat::from_row_major_slice_mut(self.buf.as_mut_buf(), n, n);
-                let (_info, row_perm) = faer::linalg::lu::partial_pivoting::compute::lu_in_place(
+                // The factorization is separate because faer's inverse writes to
+                // an output matrix while reading both triangular factors.
+                let mut lu = self.clone();
+                let mut mat = MatMut::from_row_major_slice_mut(lu.buf.as_mut_buf(), n, n);
+                let (_info, row_perm) = faer::linalg::lu::partial_pivoting::factor::lu_in_place(
                     mat.rb_mut(),
                     perm.as_mut(),
                     perm_inv.as_mut(),
-                    Parallelism::None,
-                    stack.rb_mut(),
+                    Par::Seq,
+                    stack,
                     Default::default(),
                 );
-                faer::linalg::lu::partial_pivoting::inverse::invert_in_place(
-                    mat,
+                faer::linalg::lu::partial_pivoting::inverse::inverse(
+                    MatMut::from_row_major_slice_mut(self.buf.as_mut_buf(), n, n),
+                    mat.as_ref(),
+                    mat.as_ref(),
                     row_perm,
-                    Parallelism::None,
+                    Par::Seq,
                     stack,
                 );
                 Ok(())
@@ -992,18 +996,21 @@ impl<T1: Elem, D1: Dim> Array<T1, D1> {
         D1: SquareDim,
     {
         let n = D1::order(&self.buf);
-        let req = cholesky_in_place_req::<T1>(n, Parallelism::None, Default::default())
-            .map_err(|_| Error::SizeOverflow)?;
-        let mat = faer::mat::from_row_major_slice_mut(self.buf.as_mut_buf(), n, n);
+        let req = cholesky_in_place_scratch::<T1>(n, Par::Seq, Default::default());
+        req.layout().map_err(|_| Error::SizeOverflow)?;
+        let mat = MatMut::from_row_major_slice_mut(self.buf.as_mut_buf(), n, n);
         inplace_it::inplace_or_alloc_array(
             req.unaligned_bytes_required(),
-            |work: inplace_it::UninitializedSliceMemoryGuard<u8>| {
-                let mut work = work.init(|_| 0);
-                let stack = faer::dyn_stack::PodStack::new(&mut work);
+            |work: inplace_it::UninitializedSliceMemoryGuard<MaybeUninit<u8>>| {
+                let mut work = work.init(|_| MaybeUninit::uninit());
+                let stack = faer::dyn_stack::MemStack::new(&mut work);
                 cholesky_in_place(
                     mat,
-                    Default::default(),
-                    Parallelism::None,
+                    LltRegularization {
+                        dynamic_regularization_delta: T1::zero_prim(),
+                        dynamic_regularization_epsilon: T1::zero_prim(),
+                    },
+                    Par::Seq,
                     stack,
                     Default::default(),
                 )
@@ -1916,6 +1923,56 @@ mod tests {
             ],
             epsilon = 1e-6
         );
+    }
+
+    #[test]
+    fn test_f32_decompositions() {
+        // A zero leading entry requires the LU factorization to pivot rows.
+        let a: Array<f32, (Const<2>, Const<2>)> = array![[0.0, 2.0], [1.0, 3.0]];
+        assert_relative_eq!(
+            a.try_lu_inverse().unwrap(),
+            array![[-1.5, 1.0], [0.5, 0.0]],
+            epsilon = 1e-6
+        );
+        assert_eq!(a, array![[0.0, 2.0], [1.0, 3.0]]);
+
+        let positive: Array<f32, (Const<2>, Const<2>)> = array![[4.0, 2.0], [2.0, 5.0]];
+        assert_relative_eq!(
+            positive.try_cholesky().unwrap(),
+            array![[2.0, 0.0], [1.0, 2.0]],
+            epsilon = 1e-6
+        );
+
+        let indefinite: Array<f32, (Const<2>, Const<2>)> = array![[1.0, 2.0], [2.0, 1.0]];
+        assert!(matches!(indefinite.try_cholesky(), Err(Error::Cholesky(_))));
+    }
+
+    #[test]
+    fn test_dynamic_decompositions() {
+        let fixed: Array<f64, (Const<3>, Const<3>)> =
+            array![[4.0, 2.0, 0.0], [2.0, 5.0, 2.0], [0.0, 2.0, 5.0]];
+        let a: Array<f64, (Dyn, Dyn)> = fixed.to_dyn().cast_dyn();
+        let mut inverse = a.clone();
+        inverse.try_lu_inverse_mut().unwrap();
+        assert_eq!(inverse.shape(), &[3, 3]);
+        let expected_inverse: Array<f64, (Const<3>, Const<3>)> = array![
+            [21.0 / 64.0, -10.0 / 64.0, 4.0 / 64.0],
+            [-10.0 / 64.0, 20.0 / 64.0, -8.0 / 64.0],
+            [4.0 / 64.0, -8.0 / 64.0, 16.0 / 64.0]
+        ];
+        assert_relative_eq!(
+            inverse,
+            expected_inverse.to_dyn().cast_dyn(),
+            epsilon = 1e-12
+        );
+        assert_eq!(a, fixed.to_dyn().cast_dyn());
+
+        let mut lower = a.clone();
+        lower.try_cholesky_mut().unwrap();
+        assert_eq!(lower.shape(), &[3, 3]);
+        let expected_lower: Array<f64, (Const<3>, Const<3>)> =
+            array![[2.0, 0.0, 0.0], [1.0, 2.0, 0.0], [0.0, 1.0, 2.0]];
+        assert_relative_eq!(lower, expected_lower.to_dyn().cast_dyn(), epsilon = 1e-12);
     }
 
     #[test]

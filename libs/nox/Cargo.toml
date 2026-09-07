@@ -10,28 +10,27 @@ repository = "https://github.com/metor-sys/metor"
 
 [features]
 default = []
-std = ["thiserror/std", "faer/std", "num-traits/std", "nox-array/std"]
+std = ["thiserror/std", "faer/std", "nox-array/std"]
 serde = ["dep:serde", "smallvec/serde"]
 
 [dependencies]
-typenum = "1.17.0"
-num-traits = { version = "0.2.15", default-features = false }
-thiserror = { version = "2.0", default-features = false }
-seq-macro = "0.3.5"
-faer = { version = "0.20", default-features = false, features = ["cholesky", "lu"] }
-libm = "0.2.8"
+typenum = "1.20.1"
+thiserror = { version = "2.0.20", default-features = false }
+seq-macro = "0.3.6"
+faer = { version = "0.24.4", default-features = false, features = ["linalg"] }
+libm = "0.2.16"
 inplace_it = "0.3.6"
-smallvec.version = "1.11.2"
+smallvec.version = "1.16.0"
 smallvec.features = ["const_generics", "union"]
 nox-array.path = "./array"
 
-zerocopy.version = "0.8.2"
+zerocopy.version = "0.8.56"
 zerocopy.features = ["derive"]
 
 # debug
-approx = "0.5"
+approx = "0.5.1"
 
 # serialize
-serde.version = "1"
+serde.version = "1.0.229"
 serde.optional = true
 serde.features = ["derive"]
