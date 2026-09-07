@@ -72,6 +72,8 @@ mod vtable_stream;
 
 pub struct DB {
     pub vtable_gen: AtomicCell<u64>,
+    /// Invalidates cached display metadata independently of live sample arrival.
+    pub metadata_gen: AtomicCell<u64>,
     state: RwLock<State>,
     pub recording_cell: PlayingCell,
 
@@ -88,6 +90,7 @@ pub struct DB {
 pub struct State {
     components: HashMap<ComponentId, Component>,
     component_metadata: HashMap<ComponentId, ComponentMetadata>,
+    metadata_generation: u64,
 
     msg_logs: HashMap<PacketId, MsgLog>,
 
@@ -128,6 +131,7 @@ impl DB {
             recording_cell: PlayingCell::new(true),
             path,
             vtable_gen: AtomicCell::new(0),
+            metadata_gen: AtomicCell::new(0),
             default_stream_time_step,
             last_updated: AtomicCell::new(Timestamp(i64::MIN)),
             earliest_timestamp: AtomicCell::new(Timestamp::now()),
@@ -143,7 +147,12 @@ impl DB {
 
     pub fn with_state_mut<O, F: FnOnce(&mut State) -> O>(&self, f: F) -> O {
         let mut state = self.state.write().unwrap();
-        f(&mut state)
+        let generation = state.metadata_generation;
+        let result = f(&mut state);
+        if generation != state.metadata_generation {
+            self.metadata_gen.store(state.metadata_generation);
+        }
+        result
     }
 
     fn db_config(&self) -> DbConfig {
@@ -241,6 +250,7 @@ impl DB {
             state: RwLock::new(state),
             path,
             vtable_gen: AtomicCell::new(0),
+            metadata_gen: AtomicCell::new(0),
             recording_cell: PlayingCell::new(db_state.recording),
             default_stream_time_step: AtomicU64::new(
                 db_state.default_stream_time_step.as_nanos() as u64
@@ -558,6 +568,7 @@ impl State {
         metadata.write(component_metadata_path)?;
         self.component_metadata
             .insert(metadata.component_id, metadata);
+        self.metadata_generation = self.metadata_generation.wrapping_add(1);
         Ok(())
     }
 
