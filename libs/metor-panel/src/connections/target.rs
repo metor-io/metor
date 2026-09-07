@@ -17,7 +17,6 @@ use std::time::Duration;
 use gpui::SharedString;
 use metor_db::DB;
 use metor_db::remote::{Hydrator, MirrorEvent, Peer, RemoteDb, fsw_stream, identify};
-use stellarator::struc_con::ThreadBuilder;
 use stellarator::util::CancelToken;
 
 use super::options::{ConnectionOption, ConnectionOptions, OptionSpec};
@@ -96,23 +95,19 @@ pub struct ConnectContext {
     /// against its spec. A snapshot: changing one restarts the backend
     /// through here rather than mutating it in flight.
     pub options: ConnectionOptions,
+    pub(crate) tasks: crate::background_tasks::BackgroundTasks,
 }
 
 impl ConnectContext {
     /// Spawn a stellar runtime thread whose lifetime is tied to this
-    /// connection's cancel token. The common backend body: spawn tasks, then
-    /// park on `pending()`. The thread handle is detached — dropping a
-    /// `Thread` doesn't cancel it, and the token in the store outlives it.
+    /// connection's cancel token. Shutdown also joins these threads before
+    /// finalizing a managed session's storage.
     pub fn spawn<F, Fut>(&self, f: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        drop(
-            ThreadBuilder::default()
-                .cancel_token(self.cancel.clone())
-                .stellar(f),
-        );
+        self.tasks.spawn(self.cancel.clone(), f);
     }
 }
 

@@ -54,10 +54,14 @@ enum Slot {
     Favorite(PickerEntry),
     Row(PickerEntry),
     ManualAddress,
+    Temporary,
+    RecordTo,
+    OpenRecording,
 }
 
 pub struct ConnectionPicker {
     store: Entity<ConnectionsStore>,
+    startup: Option<Entity<crate::session::startup::SessionStartup>>,
     search: TextField,
     phase: Phase,
     selected: usize,
@@ -78,6 +82,7 @@ impl ConnectionPicker {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
         Self {
             store,
+            startup: None,
             search: TextField::new("Search systems...", cx),
             phase: Phase::Browse,
             selected: 0,
@@ -86,6 +91,17 @@ impl ConnectionPicker {
             parent_focus: None,
             dismissed: false,
         }
+    }
+
+    pub(crate) fn for_startup(
+        store: Entity<ConnectionsStore>,
+        startup: Entity<crate::session::startup::SessionStartup>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&startup, |_, _, cx| cx.notify()).detach();
+        let mut picker = Self::new(store, true, cx);
+        picker.startup = Some(startup);
+        picker
     }
 
     pub fn set_parent_focus(&mut self, handle: FocusHandle) {
@@ -150,6 +166,9 @@ impl ConnectionPicker {
                 .map(Slot::Row),
         );
         slots.push(Slot::ManualAddress);
+        if self.startup.is_some() {
+            slots.extend([Slot::Temporary, Slot::RecordTo, Slot::OpenRecording]);
+        }
         slots
     }
 
@@ -181,6 +200,9 @@ impl ConnectionPicker {
                 }
             }
             Some(Slot::ManualAddress) => self.enter_manual_address(cx),
+            Some(Slot::Temporary) => self.storage_action(0, window, cx),
+            Some(Slot::RecordTo) => self.storage_action(1, window, cx),
+            Some(Slot::OpenRecording) => self.storage_action(2, window, cx),
             None => {}
         }
     }
@@ -223,6 +245,10 @@ impl ConnectionPicker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(startup) = self.startup.clone() {
+            startup.update(cx, |startup, cx| startup.connect(target, window, cx));
+            return;
+        }
         let connected = self.store.read(cx).is_connected(&target.id);
         let id = target.id.clone();
         self.store.update(cx, |store, cx| {
@@ -288,6 +314,19 @@ impl ConnectionPicker {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+        if let Some(startup) = &self.startup {
+            if key == "escape" {
+                startup.read(cx).cancel_open();
+            }
+            if startup.read(cx).busy() {
+                return;
+            }
+            if key == "o" && event.keystroke.modifiers.platform {
+                self.storage_action(2, window, cx);
+                return;
+            }
+        }
+
         match &self.phase {
             // The embedded inspector holds focus and handles its own keys;
             // events bubble up here afterwards, so the dialog stays out of
@@ -334,6 +373,14 @@ impl ConnectionPicker {
             "escape" => self.dismiss(window, cx),
             "up" | "left" => self.move_selection(-1, cx),
             "down" | "right" => self.move_selection(1, cx),
+            "tab" => self.move_selection(
+                if event.keystroke.modifiers.shift {
+                    -1
+                } else {
+                    1
+                },
+                cx,
+            ),
             "enter" | "return" => self.activate_selected(window, cx),
             _ => {
                 if self.search.handle_key_down(event, cx) {
@@ -738,7 +785,7 @@ impl ConnectionPicker {
         body = body.child(list);
 
         // Footer: the ad-hoc escape hatch.
-        let footer_selected = self.selected == slots.len().saturating_sub(1);
+        let footer_selected = matches!(slots.get(self.selected), Some(Slot::ManualAddress));
         body = body.child(
             div()
                 .id("manual-address")
@@ -766,7 +813,80 @@ impl ConnectionPicker {
                 ),
         );
 
+        if self.startup.is_some() {
+            body = body.child(self.render_storage(theme, cx));
+        }
+
         body.into_any_element()
+    }
+
+    fn storage_action(&mut self, action: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(startup) = &self.startup {
+            startup.update(cx, |startup, cx| match action {
+                0 => startup.temporary(cx),
+                1 => startup.record_to(window, cx),
+                _ => startup.choose_open(window, cx),
+            });
+        }
+    }
+
+    fn render_storage(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let startup = self.startup.as_ref().unwrap().read(cx);
+        let temporary = startup.is_temporary();
+        let summary = startup.summary();
+        let error = startup.error.clone();
+        let first_slot = self.slots(cx).len() - 3;
+        let mut buttons = div().flex().items_center().gap(px(8.0));
+        for (action, label) in [(0, "Temporary"), (1, "Record to…"), (2, "Open recording…")] {
+            let chosen = (action == 0 && temporary) || (action == 1 && !temporary);
+            let focused = self.selected == first_slot + action;
+            buttons = buttons.child(
+                div()
+                    .id(("startup-storage", action))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .border_1()
+                    .rounded(px(4.0))
+                    .border_color(if focused {
+                        theme.control_active
+                    } else {
+                        theme.border_primary
+                    })
+                    .when(chosen, |s| s.bg(theme.bg_secondary))
+                    .text_color(if chosen {
+                        theme.text_primary
+                    } else {
+                        theme.text_secondary
+                    })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.bg_secondary))
+                    .child(label)
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.selected = first_slot + action;
+                            this.storage_action(action, window, cx);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        div()
+            .px(px(16.0))
+            .py(px(12.0))
+            .border_t_1()
+            .border_color(theme.border_primary)
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .text_size(px(12.0))
+            .child(buttons)
+            .child(div().text_color(theme.text_secondary).child(summary))
+            .when_some(error, |view, error| {
+                view.child(div().text_color(theme.error_accent).child(error))
+            })
+            .into_any_element()
     }
 
     /// One target's knobs: a back affordance and title, the inline
@@ -1086,7 +1206,11 @@ impl Render for ConnectionPicker {
             .border_color(theme.border_primary)
             .rounded(px(8.0))
             .child(caption)
-            .child(body);
+            .child(body)
+            .when(
+                self.startup.is_some() && !matches!(self.phase, Phase::Browse),
+                |panel| panel.child(self.render_storage(&theme, cx)),
+            );
 
         if self.dismissable(cx) {
             panel = panel.on_mouse_down_out(cx.listener(
@@ -1111,6 +1235,16 @@ impl Render for ConnectionPicker {
             .child(panel)
             .shadow_sm();
 
-        deferred(centered).with_priority(1).into_any_element()
+        if self.startup.is_some() {
+            div()
+                .size_full()
+                .bg(theme.bg_primary)
+                .text_color(theme.text_primary)
+                .font_family(crate::theme::font_family(cx))
+                .child(centered)
+                .into_any_element()
+        } else {
+            deferred(centered).with_priority(1).into_any_element()
+        }
     }
 }

@@ -177,9 +177,14 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
     }
 
     pub fn data(&self) -> &[u8] {
-        let slice: &[u8] = unsafe { slice::from_raw_parts(self.map.as_mut_ptr(), self.map.len()) };
         let end = self.committed_len().load(Ordering::Acquire) as usize;
-        &slice[size_of::<Header<E>>()..end]
+        // Never form a slice over mutable headers or the uncommitted tail.
+        unsafe {
+            slice::from_raw_parts(
+                self.map.as_mut_ptr().add(size_of::<Header<E>>()),
+                end - size_of::<Header<E>>(),
+            )
+        }
     }
 
     pub(crate) fn raw_mmap(&self) -> &Arc<MmapRaw> {
@@ -187,20 +192,36 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize, Error> {
-        let slice: &mut [u8] =
-            unsafe { slice::from_raw_parts_mut(self.map.as_mut_ptr(), self.map.len()) };
-
         let end = self.committed_len().load(Ordering::Acquire) as usize;
         let head_end = end.checked_add(buf.len()).ok_or(Error::MapOverflow)?;
-        if head_end > slice.len() {
+        if head_end > self.map.len() {
             return Err(Error::MapOverflow);
         }
-        let slice = slice.get_mut(end..head_end).ok_or(Error::MapOverflow)?;
-        slice.copy_from_slice(buf);
+        // Only the append range is mutable. Readers, including snapshots, may
+        // hold immutable slices into earlier committed bytes at the same time.
+        unsafe { slice::from_raw_parts_mut(self.map.as_mut_ptr().add(end), buf.len()) }
+            .copy_from_slice(buf);
 
         self.committed_len()
             .store(head_end as u64, Ordering::Release);
         Ok(end - size_of::<Header<E>>())
+    }
+
+    /// Freeze a prefix bounded by its record index, whose commit follows data.
+    pub(crate) fn freeze_prefix(&self, len: usize) -> Result<FrozenLog, Error> {
+        let offset = size_of::<Header<E>>();
+        if len as u64 > self.len() {
+            return Err(Error::MapOverflow);
+        }
+        let mut header = vec![0; offset];
+        header[..8].copy_from_slice(&((offset + len) as u64).to_le_bytes());
+        header[16..16 + size_of::<E>()].copy_from_slice(self.extra().as_bytes());
+        Ok(FrozenLog {
+            map: self.map.clone(),
+            offset,
+            len,
+            header,
+        })
     }
 
     pub fn capacity(&self) -> usize {
@@ -221,5 +242,22 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
     pub fn flush(&self) -> Result<(), Error> {
         self.map.flush()?;
         Ok(())
+    }
+}
+
+/// Pins the mapping even if its node is purged or its filename is reused.
+/// The header is copied; the body is an immutable committed prefix.
+pub(crate) struct FrozenLog {
+    map: Arc<MmapRaw>,
+    offset: usize,
+    len: usize,
+    header: Vec<u8>,
+}
+impl FrozenLog {
+    pub(crate) fn parts(&self) -> [&[u8]; 2] {
+        // Normal storage writers only append beyond the captured boundary;
+        // staging truncation never operates on a published node.
+        let data = unsafe { slice::from_raw_parts(self.map.as_ptr().add(self.offset), self.len) };
+        [&self.header, data]
     }
 }

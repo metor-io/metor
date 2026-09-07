@@ -43,6 +43,13 @@ pub fn default_menu(
             let on_open = on_open_inspector.clone();
             move |_cx| layout_menu(tiles.clone(), on_open.clone())
         }),
+        ChordNode::command("d", "Session database", {
+            let on_open = on_open_inspector.clone();
+            move |window, cx| {
+                let rows = crate::session::rows(cx);
+                open_centered(&on_open, rows, window, cx);
+            }
+        }),
         ChordNode::submenu("a", "Appearance", {
             let on_open = on_open_inspector.clone();
             move |cx| appearance_menu(on_open.clone(), cx)

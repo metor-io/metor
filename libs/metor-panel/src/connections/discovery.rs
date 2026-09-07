@@ -50,7 +50,12 @@ fn browse(handle: RegistryHandle) {
     // Fullname -> the target id we upserted, so a goodbye maps back to the
     // right registry removal without reparsing the address.
     let mut seen: HashMap<String, TargetId> = HashMap::new();
-    while let Ok(event) = events.recv() {
+    while !handle.is_closed() {
+        let event = match events.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(event) => event,
+            Err(_) if !events.is_disconnected() => continue,
+            Err(_) => break,
+        };
         match event {
             ServiceEvent::ServiceResolved(info) => {
                 let Some(addr) = pick_addr(&info) else {

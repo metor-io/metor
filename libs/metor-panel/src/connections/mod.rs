@@ -57,9 +57,15 @@ pub enum RegistryOp {
 #[derive(Clone)]
 pub struct RegistryHandle {
     tx: mpsc::Sender<RegistryOp>,
+    lifetime: std::sync::Weak<()>,
 }
 
 impl RegistryHandle {
+    /// Discovery can stop once its picker or running session is gone.
+    pub fn is_closed(&self) -> bool {
+        self.lifetime.strong_count() == 0
+    }
+
     pub fn upsert(&self, target: ConnectionTarget) {
         let _ = self.tx.send(RegistryOp::Upsert(target));
     }
@@ -379,10 +385,12 @@ impl ConnectionsState {
 pub struct ConnectionsStore {
     state: ConnectionsState,
     active: Vec<ActiveConnection>,
-    db: Arc<DB>,
-    /// The LoD companion task is DB-wide and never stopped, so it spawns at
+    db: Option<Arc<DB>>,
+    _registry_lifetime: Arc<()>,
+    /// The LoD companion task is DB-wide and runs until quit, spawning at
     /// most once — on the first local-authority connection.
     lod_spawned: bool,
+    tasks: crate::background_tasks::BackgroundTasks,
     /// Last successful layout write per target; skips rewrites while idle. Pane and
     /// item mutations don't notify the tile group, so autosave poll-compares
     /// instead of observing.
@@ -440,18 +448,49 @@ pub(crate) fn flush_layout_including(window: &Window, cx: &mut App) {
 impl ConnectionsStore {
     /// Install the store and hand back the producer side of the registry.
     pub fn init(db: Arc<DB>, cx: &mut App) -> RegistryHandle {
+        let (entity, registry) = Self::prepare(cx);
+        Self::activate(entity, db, cx);
+        registry
+    }
+
+    /// Browse and configure targets before selecting live storage.
+    pub(crate) fn prepare(cx: &mut App) -> (Entity<Self>, RegistryHandle) {
         let (tx, rx) = mpsc::channel();
-        let entity = cx.new(|cx| ConnectionsStore::new(db, rx, cx));
+        let lifetime = Arc::new(());
+        let registry = RegistryHandle {
+            tx,
+            lifetime: Arc::downgrade(&lifetime),
+        };
+        let entity = cx.new(|cx| Self::new(rx, lifetime, cx));
+        (entity, registry)
+    }
+
+    pub(crate) fn activate(entity: Entity<Self>, db: Arc<DB>, cx: &mut App) {
+        let tasks = cx
+            .default_global::<crate::background_tasks::BackgroundTasks>()
+            .clone();
+        entity.update(cx, |store, cx| {
+            assert!(
+                store.db.is_none(),
+                "connection store already has a database"
+            );
+            store.db = Some(db);
+            store.tasks = tasks;
+            cx.notify();
+        });
         cx.set_global(GlobalConnections(entity.clone()));
         cx.on_app_quit(move |cx| {
             entity.update(cx, |store, cx| store.flush_layout(None, cx));
             async {}
         })
         .detach();
-        RegistryHandle { tx }
     }
 
-    fn new(db: Arc<DB>, registry_rx: mpsc::Receiver<RegistryOp>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        registry_rx: mpsc::Receiver<RegistryOp>,
+        lifetime: Arc<()>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let poll = cx.spawn(async move |this, cx| {
             let ticks_per_autosave =
                 (AUTOSAVE_INTERVAL.as_millis() / POLL_INTERVAL.as_millis()).max(1) as u32;
@@ -512,8 +551,10 @@ impl ConnectionsStore {
         Self {
             state,
             active: Vec::new(),
-            db,
+            db: None,
+            _registry_lifetime: lifetime,
             lod_spawned: false,
+            tasks: Default::default(),
             saved_layouts: Default::default(),
             registry_rx,
             _poll: poll,
@@ -547,7 +588,9 @@ impl ConnectionsStore {
     }
 
     pub(crate) fn db(&self) -> &Arc<DB> {
-        &self.db
+        self.db
+            .as_ref()
+            .expect("storage selected before connecting")
     }
 
     pub fn set_resolver(&mut self, resolver: AddressResolver) {
@@ -611,13 +654,17 @@ impl ConnectionsStore {
         if self.is_connected(&target.id) {
             return;
         }
+        let Some(db) = self.db.clone() else {
+            return;
+        };
         let cancel = CancelToken::new();
         let status = StatusHandle::default();
         let connected = target.backend.connect(ConnectContext {
-            db: self.db.clone(),
+            db,
             cancel: cancel.clone(),
             status: status.clone(),
             options: self.state.options_for(&target),
+            tasks: self.tasks.clone(),
         });
         if let Some(hydrator) = &connected.hydrator {
             Hydrators::global(cx).insert(target.id.clone(), hydrator.clone());
@@ -652,11 +699,11 @@ impl ConnectionsStore {
             return;
         }
         self.lod_spawned = true;
-        let db = self.db.clone();
-        drop(stellarator::struc_con::stellar(move || async move {
+        let db = self.db().clone();
+        self.tasks.spawn(CancelToken::new(), move || async move {
             metor_db::lod::spawn(db);
             std::future::pending::<()>().await
-        }));
+        });
     }
 
     /// Cancel `id`'s backend. The stellar executor drops the backend's tasks

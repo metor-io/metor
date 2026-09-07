@@ -386,6 +386,15 @@ impl TimeSeries {
         })
     }
 
+    /// Pin a coherent local node set and its coverage metadata. Ingestion
+    /// does not take the structural lock and continues while these are copied.
+    pub(crate) fn snapshot_nodes(
+        &self,
+    ) -> (Arc<ComponentManifest>, Vec<Arc<AtomicNode<TimeSeriesNode>>>) {
+        let _guard = self.structural.lock().unwrap();
+        (self.manifest.load(), self.list.iter().collect())
+    }
+
     /// The current sealed-span snapshot.
     pub fn manifest(&self) -> Arc<ComponentManifest> {
         self.manifest.load()
@@ -1202,8 +1211,7 @@ mod tests {
     #[test]
     fn merge_remote_spans_trims_against_resident_data() {
         let dir = tempfile::tempdir().unwrap();
-        let node =
-            TimeSeriesNode::create(dir.path().join("100"), Timestamp(100), 8).unwrap();
+        let node = TimeSeriesNode::create(dir.path().join("100"), Timestamp(100), 8).unwrap();
         for ts in [100i64, 199] {
             node.data.write(&ts.to_le_bytes()).unwrap();
             node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
@@ -1237,8 +1245,7 @@ mod tests {
 
         // Local resident data at [100, 101].
         let dir = tempfile::tempdir().unwrap();
-        let resident =
-            TimeSeriesNode::create(dir.path().join("100"), Timestamp(100), 8).unwrap();
+        let resident = TimeSeriesNode::create(dir.path().join("100"), Timestamp(100), 8).unwrap();
         for ts in [100i64, 101] {
             resident.data.write(&ts.to_le_bytes()).unwrap();
             resident.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
@@ -1264,7 +1271,9 @@ mod tests {
         staging
             .append_file(NodeFile::Index, src.index.data())
             .unwrap();
-        staging.append_file(NodeFile::Data, src.data.data()).unwrap();
+        staging
+            .append_file(NodeFile::Data, src.data.data())
+            .unwrap();
         let local_seal = staging.trim_to(span.cover_end).unwrap();
         assert_eq!(local_seal.end_ts, Timestamp(90));
         series
@@ -1310,9 +1319,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let series = TimeSeries::create(dir.path()).unwrap();
-            series
-                .merge_remote_spans([remote_seal(0, 99)])
-                .unwrap();
+            series.merge_remote_spans([remote_seal(0, 99)]).unwrap();
         }
         let series = TimeSeries::open(dir.path()).unwrap();
         let manifest = series.manifest();
@@ -1402,9 +1409,7 @@ mod tests {
         }
         let series = TimeSeries::open(dir.path()).unwrap();
 
-        let slice = series
-            .get_range(Timestamp(50)..Timestamp(250))
-            .unwrap();
+        let slice = series.get_range(Timestamp(50)..Timestamp(250)).unwrap();
         let chunks: Vec<Vec<i64>> = slice
             .as_iter()
             .map(|ns| ns.timestamps().iter().map(|t| t.0).collect())
@@ -1418,9 +1423,7 @@ mod tests {
         assert_eq!(slice.len(), 21);
 
         // Single-node ranges still clamp to both ends.
-        let slice = series
-            .get_range(Timestamp(110)..Timestamp(150))
-            .unwrap();
+        let slice = series.get_range(Timestamp(110)..Timestamp(150)).unwrap();
         let chunks: Vec<Vec<i64>> = slice
             .as_iter()
             .map(|ns| ns.timestamps().iter().map(|t| t.0).collect())
@@ -1441,7 +1444,9 @@ mod tests {
 
         // A write more than the age past the head's first sample rolls,
         // and the rolled node seals like any full one.
-        writer.push_buf(Timestamp(150), &2u64.to_le_bytes()).unwrap();
+        writer
+            .push_buf(Timestamp(150), &2u64.to_le_bytes())
+            .unwrap();
         assert_eq!(series.list.iter().count(), 2);
         assert!(series.seal_rolled_nodes().unwrap());
         let manifest = series.manifest();

@@ -72,8 +72,6 @@ impl WorkerHandle {
 
 pub struct DynamicWorker {
     handle: WorkerHandle,
-    /// Detached on drop; producers run until process exit.
-    _thread: stellarator::struc_con::Thread<Option<()>>,
 }
 
 impl Global for DynamicWorker {}
@@ -86,19 +84,25 @@ impl Default for DynamicWorker {
 
 impl DynamicWorker {
     pub fn new() -> Self {
+        Self::with_tasks(crate::background_tasks::BackgroundTasks::default())
+    }
+
+    fn with_tasks(tasks: crate::background_tasks::BackgroundTasks) -> Self {
         let (tx, rx) = unbounded::<Job>();
         let (dispose_tx, dispose_rx) = unbounded::<Arc<dyn DynamicNode>>();
-        let thread = stellarator::struc_con::stellar(move || async move {
+        tasks.spawn(stellarator::util::CancelToken::new(), move || async move {
             run_worker(rx, dispose_rx).await;
         });
         Self {
             handle: WorkerHandle { tx, dispose_tx },
-            _thread: thread,
         }
     }
 
     pub fn init(cx: &mut App) {
-        cx.set_global(Self::new());
+        let tasks = cx
+            .default_global::<crate::background_tasks::BackgroundTasks>()
+            .clone();
+        cx.set_global(Self::with_tasks(tasks));
     }
 
     /// Borrow the cheap clonable handle. Clone it before borrowing other

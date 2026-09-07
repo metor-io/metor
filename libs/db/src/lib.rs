@@ -70,6 +70,8 @@ pub use time_series_2 as time_series;
 
 mod vtable_stream;
 
+pub mod snapshot;
+
 pub struct DB {
     pub vtable_gen: AtomicCell<u64>,
     /// Invalidates cached display metadata independently of live sample arrival.
@@ -164,6 +166,26 @@ impl DB {
         db_state.write(self.path.join("db_state"))
     }
 
+    /// Drain accepted WAL data and flush mapped storage after producers stop.
+    /// Persistence readers belong to the DB, so executor teardown cannot discard
+    /// the final queued samples or messages. Callers must first join all writers.
+    pub fn flush(&self) -> Result<(), Error> {
+        self.with_state(|state| {
+            for component in state.components.values() {
+                component.flush_pending()?;
+                for node in component.time_series.list.iter() {
+                    node.index.flush()?;
+                    node.data.flush()?;
+                }
+            }
+            for log in state.msg_logs.values() {
+                log.flush()?;
+            }
+            Ok::<_, Error>(())
+        })?;
+        self.save_db_state()
+    }
+
     pub fn open(path: PathBuf) -> Result<Self, Error> {
         let mut component_metadata = HashMap::new();
         let mut components = HashMap::new();
@@ -199,7 +221,9 @@ impl DB {
             let engine_owned = lod::is_lod_name(&metadata.name);
             let component = Component::open(&path, component_id, schema.clone(), engine_owned)?;
             if engine_owned {
-                component.time_series.set_max_node_age(lod::lod_node_max_age());
+                component
+                    .time_series
+                    .set_max_node_age(lod::lod_node_max_age());
             }
             component_metadata.insert(component_id, metadata);
             if let Some(latest) = component.time_series.latest() {
@@ -236,6 +260,7 @@ impl DB {
         info!(db.path = ?path, "opened db");
         let db_state = DbConfig::read(path.join("db_state"))?;
         let state = State {
+            db_config: db_state.clone(),
             components,
             component_metadata,
             msg_logs,
@@ -770,9 +795,37 @@ pub struct Component {
     pub wal: Disruptor,
     pub schema: ComponentSchema,
     pub last_timestamp: Arc<AtomicCell<Timestamp>>,
+    persistence: Arc<std::sync::Mutex<Option<ComponentPersistence>>>,
+}
+
+struct ComponentPersistence {
+    reader: disruptor::Reader,
+    writer: Option<time_series::TimerSeriesWriter>,
+    engine_owned: bool,
 }
 
 impl Component {
+    /// Wrap existing storage for read-only consumers without starting an executor.
+    /// Use `create` or `open` when the component needs live WAL persistence.
+    pub fn from_time_series(
+        component_id: ComponentId,
+        schema: ComponentSchema,
+        time_series: TimeSeries,
+    ) -> Self {
+        let last_timestamp = time_series
+            .latest()
+            .map(|t| t.timestamp())
+            .unwrap_or(Timestamp(i64::MIN));
+        Self {
+            component_id,
+            time_series,
+            wal: Disruptor::new(schema.size() * 1024),
+            schema,
+            last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
+            persistence: Default::default(),
+        }
+    }
+
     /// `engine_owned` marks a component whose writer belongs to the LoD
     /// engine (it emits buckets directly); its `persist` runs in drain mode
     /// so it never races [`lod`]'s `setup_levels` for the writer claim.
@@ -798,6 +851,7 @@ impl Component {
             time_series,
             schema,
             last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
+            persistence: Default::default(),
         };
         stellarator::spawn(this.clone().persist(engine_owned));
         stellarator::spawn(this.time_series.clone().lifecycle());
@@ -825,6 +879,7 @@ impl Component {
             time_series,
             schema,
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
+            persistence: Default::default(),
         };
         stellarator::spawn(this.persist(engine_owned));
         stellarator::spawn(this.time_series.clone().lifecycle());
@@ -832,58 +887,59 @@ impl Component {
     }
 
     pub fn persist(&self, engine_owned: bool) -> impl Future<Output = ()> + 'static {
-        let mut reader = self.wal.reader();
-        let time_series = self.time_series.clone();
-        let msg_size = self.schema.size() + size_of::<Timestamp>();
+        self.persistence
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| ComponentPersistence {
+                reader: self.wal.reader(),
+                writer: None,
+                engine_owned,
+            });
+        // This reader only wakes the task. The durable reader and writer stay
+        // with the component when its executor is stopped, for DB::flush.
+        let mut notify = self.wal.reader();
+        let component = self.clone();
         async move {
-            // The writer claim is lazy — taken on the first live sample, not
-            // at spawn — because a component that only ever receives pushed
-            // sealed nodes has no live head, and `install_node` keys its
-            // newer-than-head guard on the writer's existence.
-            //
-            // `engine_owned` components are different: the LoD engine owns
-            // their writer and emits buckets directly, so we decide here, at
-            // construction, never to claim it. That removes the race where
-            // this lazy claim and `setup_levels` fought over the writer —
-            // whichever lost degraded silently. Any WAL traffic for such a
-            // component is bogus; warn-drop it.
-            let mut writer = None;
-            let mut warned_engine_owned = false;
             loop {
-                let buf = reader.next().await;
-                if engine_owned {
-                    if !warned_engine_owned {
-                        warn!("wal traffic for engine-owned component; dropping samples");
-                        warned_engine_owned = true;
-                    }
-                    continue;
+                if let Err(err) = component.flush_pending() {
+                    tracing::error!(?err, "failed to persist wal samples");
                 }
-                if writer.is_none() {
-                    writer = time_series.writer();
-                    if writer.is_none() {
-                        warn!("component writer owned elsewhere; dropping wal samples");
-                        continue;
-                    }
-                }
-                let writer = writer.as_mut().expect("checked above");
-                let mut buf = &buf[..];
-                'parse: while let Some(msg) = buf.get(..msg_size) {
-                    let Some(timestamp) = msg.get(..size_of::<Timestamp>()) else {
-                        break 'parse;
-                    };
-                    let timestamp = Timestamp(i64::from_le_bytes(
-                        timestamp.try_into().expect("wrong size"),
-                    ));
-                    let Some(data) = msg.get(size_of::<Timestamp>()..) else {
-                        break 'parse;
-                    };
-                    if let Err(err) = writer.push_buf(timestamp, data) {
-                        tracing::error!(?err, "failed to persist wal message");
-                    }
-                    buf = &buf[msg_size..];
-                }
+                drop(notify.next().await);
             }
         }
+    }
+
+    fn flush_pending(&self) -> Result<(), Error> {
+        let mut persistence = self.persistence.lock().unwrap();
+        let Some(ComponentPersistence {
+            reader,
+            writer,
+            engine_owned,
+        }) = persistence.as_mut()
+        else {
+            return Ok(());
+        };
+        let msg_size = self.schema.size() + size_of::<Timestamp>();
+        while let Some(buf) = reader.try_next() {
+            // LoD writes directly to its time series; its WAL is drain-only.
+            if *engine_owned {
+                warn!("wal traffic for engine-owned component; dropping samples");
+                continue;
+            }
+            if writer.is_none() {
+                *writer = self.time_series.writer();
+            }
+            let writer = writer.as_mut().ok_or_else(|| {
+                Error::Io(std::io::Error::other("component writer owned elsewhere"))
+            })?;
+            for msg in buf.chunks_exact(msg_size) {
+                let timestamp = Timestamp(i64::from_le_bytes(
+                    msg[..size_of::<Timestamp>()].try_into().unwrap(),
+                ));
+                writer.push_buf(timestamp, &msg[size_of::<Timestamp>()..])?;
+            }
+        }
+        Ok(())
     }
 
     fn as_vtable_op(&self) -> Arc<OpBuilder> {
@@ -1627,10 +1683,8 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 })
                 .await?;
             } else {
-                let staging = store::NodeStaging::create(
-                    &db.path.join(component_id.to_string()),
-                    &seal,
-                )?;
+                let staging =
+                    store::NodeStaging::create(&db.path.join(component_id.to_string()), &seal)?;
                 conn.incoming_node = Some(IncomingNode {
                     component_id,
                     seal,
@@ -2176,11 +2230,11 @@ mod dynamic_ingest_tests {
     use super::*;
     use core::convert::Infallible;
     use metor_proto::com_de::Decomponentize;
+    use metor_proto::types::PACKET_HEADER_LEN;
+    use metor_proto::vtable::builder::FieldBuilder;
     use metor_proto::vtable::builder::{
         list, map, path_component, raw_field, raw_table, schema, timestamp, vtable,
     };
-    use metor_proto::vtable::builder::FieldBuilder;
-    use metor_proto::types::PACKET_HEADER_LEN;
     use std::collections::HashMap;
 
     /// Records every scalar component it sees as an `f64` (mirrors
@@ -2219,7 +2273,11 @@ mod dynamic_ingest_tests {
     fn process_members() -> Vec<FieldBuilder> {
         vec![
             raw_field(0, 8, schema(PrimType::U64, &[], path_component("pid"))),
-            raw_field(8, 8, schema(PrimType::F64, &[], path_component("cpu_usage"))),
+            raw_field(
+                8,
+                8,
+                schema(PrimType::F64, &[], path_component("cpu_usage")),
+            ),
         ]
     }
 
@@ -2275,17 +2333,26 @@ mod dynamic_ingest_tests {
         .unwrap();
         db.with_state(|s| {
             assert!(s.get_component(ComponentId::new("processes.pid")).is_some());
-            assert!(s.get_component(ComponentId::new("processes.cpu_usage")).is_some());
+            assert!(
+                s.get_component(ComponentId::new("processes.cpu_usage"))
+                    .is_some()
+            );
             assert!(s.is_component_hidden(&ComponentId::new("processes.pid")));
             assert!(s.is_component_hidden(&ComponentId::new("processes.cpu_usage")));
-            assert!(s.get_component(ComponentId::new("processes.0.pid")).is_none());
+            assert!(
+                s.get_component(ComponentId::new("processes.0.pid"))
+                    .is_none()
+            );
         });
 
         // 2. ingest a 2-element table -> concrete components, cache, gen bump.
         let gen_before = db.vtable_gen.latest();
         db.ingest_table(id, &list_table(&[1001, 1002], &[0.5, 0.25]))
             .unwrap();
-        assert!(db.vtable_gen.latest() > gen_before, "gen must bump on new series");
+        assert!(
+            db.vtable_gen.latest() > gen_before,
+            "gen must bump on new series"
+        );
         db.with_state(|s| {
             for id in [
                 "processes.0.pid",
@@ -2305,7 +2372,10 @@ mod dynamic_ingest_tests {
         // values landed in the concrete time series
         stellarator::sleep(std::time::Duration::from_millis(100)).await;
         let pid0 = db
-            .with_state(|s| s.get_component(ComponentId::new("processes.0.pid")).cloned())
+            .with_state(|s| {
+                s.get_component(ComponentId::new("processes.0.pid"))
+                    .cloned()
+            })
             .unwrap();
         let latest = pid0.time_series.latest().expect("pid0 sample persisted");
         assert_eq!(u64::from_le_bytes(latest.data().try_into().unwrap()), 1001);
@@ -2315,26 +2385,41 @@ mod dynamic_ingest_tests {
         assert_eq!(sink.values[&ComponentId::new("processes.0.pid")], 1001.0);
         assert_eq!(sink.values[&ComponentId::new("processes.0.cpu_usage")], 0.5);
         assert_eq!(sink.values[&ComponentId::new("processes.1.pid")], 1002.0);
-        assert_eq!(sink.values[&ComponentId::new("processes.1.cpu_usage")], 0.25);
+        assert_eq!(
+            sink.values[&ComponentId::new("processes.1.cpu_usage")],
+            0.25
+        );
 
         // 4. a NEW element appears -> gen bumps, next packet includes it.
         let gen_before = db.vtable_gen.latest();
         db.ingest_table(id, &list_table(&[1001, 1002, 1003], &[0.5, 0.25, 0.75]))
             .unwrap();
-        assert!(db.vtable_gen.latest() > gen_before, "gen must bump for the new element");
+        assert!(
+            db.vtable_gen.latest() > gen_before,
+            "gen must bump for the new element"
+        );
         let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
         assert_eq!(sink.values[&ComponentId::new("processes.2.pid")], 1003.0);
-        assert_eq!(sink.values[&ComponentId::new("processes.2.cpu_usage")], 0.75);
+        assert_eq!(
+            sink.values[&ComponentId::new("processes.2.cpu_usage")],
+            0.75
+        );
 
         // 5. LIVENESS: fewer elements -> dropped element absent next packet.
         db.ingest_table(id, &list_table(&[1001], &[0.5])).unwrap();
         let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
         assert_eq!(sink.values[&ComponentId::new("processes.0.pid")], 1001.0);
         assert!(
-            !sink.values.contains_key(&ComponentId::new("processes.1.pid")),
+            !sink
+                .values
+                .contains_key(&ComponentId::new("processes.1.pid")),
             "vanished element must drop out (authoritative-latest)"
         );
-        assert!(!sink.values.contains_key(&ComponentId::new("processes.2.pid")));
+        assert!(
+            !sink
+                .values
+                .contains_key(&ComponentId::new("processes.2.pid"))
+        );
     }
 
     #[stellarator::test]
@@ -2371,8 +2456,14 @@ mod dynamic_ingest_tests {
 
         db.ingest_table(id, &t).unwrap();
         db.with_state(|s| {
-            assert!(s.get_component(ComponentId::new("processes.htop.pid")).is_some());
-            assert!(s.get_component(ComponentId::new("processes.init.cpu_usage")).is_some());
+            assert!(
+                s.get_component(ComponentId::new("processes.htop.pid"))
+                    .is_some()
+            );
+            assert!(
+                s.get_component(ComponentId::new("processes.init.cpu_usage"))
+                    .is_some()
+            );
             assert!(s.latest_dynamic_tables.contains_key(&id));
             // The keyed member carries its dotted name, not the numeric id, and
             // is visible (only the template stays hidden).
@@ -2385,9 +2476,15 @@ mod dynamic_ingest_tests {
 
         let sink = round_trip(db.dynamic_stream_packet(id).unwrap(), id, &v);
         assert_eq!(sink.values[&ComponentId::new("processes.htop.pid")], 1001.0);
-        assert_eq!(sink.values[&ComponentId::new("processes.htop.cpu_usage")], 0.5);
+        assert_eq!(
+            sink.values[&ComponentId::new("processes.htop.cpu_usage")],
+            0.5
+        );
         assert_eq!(sink.values[&ComponentId::new("processes.init.pid")], 1002.0);
-        assert_eq!(sink.values[&ComponentId::new("processes.init.cpu_usage")], 0.25);
+        assert_eq!(
+            sink.values[&ComponentId::new("processes.init.cpu_usage")],
+            0.25
+        );
     }
 
     /// A scalar-valued map (a `FrameMap<u64, N>` member) has an empty
@@ -2397,7 +2494,11 @@ mod dynamic_ingest_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::create(dir.path().to_path_buf()).unwrap();
         let id: PacketId = [11, 0];
-        let members = vec![raw_field(0, 8, schema(PrimType::U64, &[], path_component("")))];
+        let members = vec![raw_field(
+            0,
+            8,
+            schema(PrimType::U64, &[], path_component("")),
+        )];
         let v = vtable([raw_field(
             8,
             8,

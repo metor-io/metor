@@ -3,7 +3,7 @@ use std::{
     future::Future,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use metor_proto::{buf::UmbraBuf, types::Timestamp};
@@ -26,6 +26,7 @@ pub struct MsgLog {
     data_waker: Arc<WaitQueue>,
     metadata: Option<MsgMetadata>,
     wal: Disruptor,
+    pending: Arc<Mutex<Reader>>,
 }
 
 #[derive(Clone)]
@@ -106,8 +107,8 @@ impl MsgLogNode {
 
 #[derive(Clone)]
 pub struct BufLog {
-    offsets: AppendLog<()>,
-    data_log: AppendLog<()>,
+    pub(crate) offsets: AppendLog<()>,
+    pub(crate) data_log: AppendLog<()>,
 }
 
 impl BufLog {
@@ -233,12 +234,15 @@ impl MsgRef {
 impl MsgLog {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
+        let wal = Disruptor::new(1024 * 1024);
+        let pending = Arc::new(Mutex::new(wal.reader()));
         let this = Self {
             list: Arc::new(AtomicStack::new()),
             path: path.to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
             metadata: None,
-            wal: Disruptor::new(1024 * 1024), // 1MB WAL buffer
+            wal,
+            pending,
         };
         stellarator::spawn(this.clone().persist());
         Ok(this)
@@ -265,12 +269,15 @@ impl MsgLog {
             }
         }
 
+        let wal = Disruptor::new(1024 * 1024);
+        let pending = Arc::new(Mutex::new(wal.reader()));
         let this = Self {
             list,
             path: path.to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
             metadata,
-            wal: Disruptor::new(1024 * 1024), // 1MB WAL buffer
+            wal,
+            pending,
         };
         stellarator::spawn(this.clone().persist());
         Ok(this)
@@ -451,44 +458,38 @@ impl MsgLog {
     }
 
     pub fn persist(self) -> impl Future<Output = ()> {
-        let mut reader = self.wal.reader();
+        let mut notify = self.wal.reader();
         async move {
             loop {
-                let buf = reader.next().await;
-                let mut buf = &buf[..];
-
-                'parse: while buf.len() >= size_of::<Timestamp>() + size_of::<u32>() {
-                    // Read timestamp
-                    let timestamp_bytes = &buf[..size_of::<Timestamp>()];
-                    let timestamp = Timestamp::from_le_bytes(
-                        timestamp_bytes
-                            .try_into()
-                            .expect("timestamp bytes wrong size"),
-                    );
-                    buf = &buf[size_of::<Timestamp>()..];
-
-                    if buf.len() < size_of::<u32>() {
-                        break 'parse;
-                    }
-                    let msg_len_bytes = &buf[..size_of::<u32>()];
-                    let msg_len = u32::from_le_bytes(
-                        msg_len_bytes.try_into().expect("msg_len bytes wrong size"),
-                    ) as usize;
-                    buf = &buf[size_of::<u32>()..];
-
-                    if buf.len() < msg_len {
-                        break 'parse;
-                    }
-                    let msg_data = &buf[..msg_len];
-                    buf = &buf[msg_len..];
-
-                    // Persist to actual storage
-                    if let Err(err) = self.persist_msg(timestamp, msg_data) {
-                        tracing::error!(?err, "failed to persist wal message");
-                    }
+                if let Err(err) = self.flush_pending() {
+                    tracing::error!(?err, "failed to persist wal message");
                 }
+                drop(notify.next().await);
             }
         }
+    }
+
+    pub(crate) fn flush_pending(&self) -> Result<(), Error> {
+        let mut reader = self.pending.lock().unwrap();
+        while let Some(buf) = reader.try_next() {
+            let mut remaining = &buf[..];
+            while let Some((rest, timestamp, msg)) = read_msg(remaining) {
+                self.persist_msg(timestamp, msg)?;
+                remaining = rest;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush accepted messages even if the persistence executor has exited.
+    pub fn flush(&self) -> Result<(), Error> {
+        self.flush_pending()?;
+        for node in self.list.iter() {
+            node.timestamps.flush()?;
+            node.bufs.offsets.flush()?;
+            node.bufs.data_log.flush()?;
+        }
+        Ok(())
     }
 
     fn persist_msg(&self, timestamp: Timestamp, msg: &[u8]) -> Result<(), Error> {

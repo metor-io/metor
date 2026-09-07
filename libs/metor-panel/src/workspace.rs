@@ -93,8 +93,15 @@ pub(crate) fn active_tiles(cx: &App) -> Option<Entity<TileGroup>> {
 
 /// The tile tree owned by `window`'s root, when it is a panel window.
 pub(crate) fn tiles_for(window: &Window, cx: &App) -> Option<Entity<TileGroup>> {
-    let root = window.root::<AppRoot>().flatten()?;
-    Some(root.read(cx).tiles().clone())
+    // The root may already be leased by WindowHandle::update (e.g. Open
+    // restoring a recording). Use its registered tile entity directly.
+    let id = window.window_handle().window_id();
+    cx.try_global::<WindowTiles>()?
+        .0
+        .iter()
+        .find(|(window_id, _)| *window_id == id)?
+        .1
+        .upgrade()
 }
 
 /// Whether any panel window holds an item: the multi-window blank-slate
@@ -149,6 +156,7 @@ pub(crate) fn open_panel_window(
             // is what lets closing the last window behave like quitting.
             window.on_window_should_close(cx, |window, cx| {
                 crate::connections::flush_layout_including(window, cx);
+                crate::session::save_workspace(window_layout(window, cx), cx);
                 true
             });
             let root = cx.new(|cx| AppRoot::new(db, tiles, show_picker_if_disconnected, cx));
@@ -402,5 +410,37 @@ mod tests {
             &displays
         ));
         assert!(!bounds_visible(&bounds(0.0, 0.0, 800.0, 600.0), &[]));
+    }
+    #[gpui::test]
+    fn restoring_and_saving_layout_inside_a_root_update_does_not_reborrow_root(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::create(directory.path().join("db")).unwrap());
+        cx.update(|cx| {
+            cx.set_global(crate::theme::FontSettings {
+                family: "monospace".into(),
+                config: Default::default(),
+            });
+            cx.set_global(crate::theme::ActiveTheme(Arc::new(
+                crate::theme::DARK.clone(),
+            )));
+            cx.set_global(crate::tiles::ItemRegistry::default());
+            crate::inspector::edits::init(cx);
+            crate::temporal::TemporalController::init(db.clone(), cx);
+            let window = open_panel_window(db.clone(), None, None, false, cx).unwrap();
+            let json =
+                serde_json::to_string(&minimal_layout(crate::tiles::SUPPORTED_LAYOUT_VERSION))
+                    .unwrap();
+            window
+                .update(cx, |root, window, cx| {
+                    // This is exactly the lease held by recording-open startup.
+                    assert!(restore_workspace(&json, window, cx, db));
+                    assert_eq!(tiles_for(window, cx).unwrap(), root.tiles().clone());
+                    assert!(window_layout(window, cx).is_some());
+                })
+                .unwrap();
+            cx.shutdown();
+        });
     }
 }

@@ -9649,10 +9649,13 @@ dependencies = [
  "postcard-schema",
  "regex",
  "rustfft",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "smallvec 1.15.2",
  "stellarator",
+ "tar-core",
  "tempfile",
  "thingbuf",
  "thiserror 2.0.19",
@@ -14362,6 +14365,16 @@ checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
 dependencies = [
  "filetime",
  "libc",
+]
+
+[[package]]
+name = "tar-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a870b96d9b5bd13e81517d63a18da0f0c33de072eeb5a293a2e40f3830befa0e"
+dependencies = [
+ "thiserror 2.0.19",
+ "zerocopy",
 ]
 
 [[package]]

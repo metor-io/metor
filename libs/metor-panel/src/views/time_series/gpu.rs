@@ -2011,11 +2011,9 @@ fn convert_latest_sample_strided(
 mod tests {
     use super::super::heatmap::{Colormap, EMPTY_INTENSITY, IntensityScale};
     use super::*;
-    use metor_db::disruptor::Disruptor;
     use metor_db::time_series::{TimeSeries, TimeSeriesNode};
     use metor_proto::types::ComponentId;
     use std::path::Path;
-    use stellarator::util::AtomicCell;
 
     fn f64_schema() -> ComponentSchema {
         ComponentSchema::new(PrimType::F64, &[1][..])
@@ -2069,13 +2067,7 @@ mod tests {
                 node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
             }
         }
-        Component {
-            component_id: ComponentId(1),
-            time_series: TimeSeries::open(dir).unwrap(),
-            wal: Disruptor::new(1024),
-            schema: f64_schema(),
-            last_timestamp: Arc::new(AtomicCell::new(Timestamp(0))),
-        }
+        Component::from_time_series(ComponentId(1), f64_schema(), TimeSeries::open(dir).unwrap())
     }
 
     /// A field-only frame must render: the spectrogram submits no traces at
