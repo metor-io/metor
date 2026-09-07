@@ -1,5 +1,9 @@
 # Telemetry link
 
+For the new offline ICD API for FSW-to-FSW exchange, see
+[Peer endpoint contracts](peer-contracts.md). Peer transport is still planned;
+the link described below is the existing ground telemetry service.
+
 The telemetry link serves telemetry and commands on one TCP socket. Ground tools connect to the flight software. The flight software does not dial a ground address.
 
 Telemetry gives operators and ground tools a live view of the target. The

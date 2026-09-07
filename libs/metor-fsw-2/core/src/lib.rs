@@ -104,6 +104,9 @@ mod params_docs;
 /// shared by the host's static registry and every pack entry's create phase.
 pub mod params;
 
+/// Offline endpoint ICDs for exchanging frames between FSW instances.
+pub mod peer;
+
 pub use dynamic::{FrameList, FrameMap};
 pub use frame::Frame;
 pub use text::FrameStr;

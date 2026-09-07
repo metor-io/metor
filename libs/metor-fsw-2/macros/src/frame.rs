@@ -120,12 +120,51 @@ pub fn frame(input: TokenStream) -> TokenStream {
     let ident = &struct_input.ident;
     let generics = &struct_input.generics;
     let where_clause = &generics.where_clause;
+    let timestamp_offset =
+        struct_input
+            .fields
+            .iter()
+            .find(|f| f.timestamp)
+            .map_or(quote! { None }, |field| {
+                let field_ident = &field.ident;
+                quote! { Some(core::mem::offset_of!(Self, #field_ident) as u64) }
+            });
+    let peer_fields = struct_input.fields.iter().map(|field| {
+        let field_ident = &field.ident;
+        let ty = &field.ty;
+        let padding = field.skipped()
+            && matches!(ty, syn::Type::Array(array)
+                if matches!(&*array.elem, syn::Type::Path(path)
+                    if path.path.is_ident("u8")));
+        let dynamic = if field.is_dynamic() {
+            quote! { Some(<#ty as #fsw2::peer::DynamicField>::bounds()) }
+        } else {
+            quote! { None }
+        };
+        quote! {
+            #fsw2::peer::FieldLayout {
+                offset: core::mem::offset_of!(Self, #field_ident) as u64,
+                size: core::mem::size_of::<#ty>() as u64,
+                alignment: core::mem::align_of::<#ty>() as u64,
+                padding: #padding,
+                dynamic: #dynamic,
+            }
+        }
+    });
     let frame_trait = quote! {
         impl #fsw2::Frame for #ident #generics #where_clause {
             const NAME: &'static str = #frame_name;
             const FRAME_ID: #proto::types::ComponentId = #frame_id;
             fn timestamp(&self) -> #proto::types::Timestamp {
                 #timestamp_body
+            }
+            fn peer_layout() -> Option<#fsw2::peer::FrameLayout> {
+                Some(#fsw2::peer::FrameLayout {
+                    fixed_size: core::mem::size_of::<Self>() as u64,
+                    alignment: core::mem::align_of::<Self>() as u64,
+                    timestamp_offset: #timestamp_offset,
+                    fields: vec![#(#peer_fields),*],
+                })
             }
         }
     };
