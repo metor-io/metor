@@ -38,15 +38,6 @@ impl<T: TensorItem, R: OwnedRepr> ReprMonad<R> for Quaternion<T, R> {
 
     type Dim = Const<4>;
 
-    type Map<N: OwnedRepr> = Quaternion<T, N>;
-
-    fn map<N: OwnedRepr>(
-        self,
-        func: impl Fn(R::Inner<Self::Elem, Self::Dim>) -> N::Inner<Self::Elem, Self::Dim>,
-    ) -> Self::Map<N> {
-        Quaternion(self.0.map(func))
-    }
-
     fn into_inner(self) -> R::Inner<Self::Elem, Self::Dim> {
         self.0.into_inner()
     }

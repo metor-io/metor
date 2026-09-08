@@ -7,4 +7,4 @@ edition = "2024"
 std = []
 
 [dependencies]
-zerocopy = "0.8"
+zerocopy = "0.8.56"

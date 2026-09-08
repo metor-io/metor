@@ -5,8 +5,8 @@
 //! which prelude kernel a call lands on. Codegen reads this and emits; it does
 //! not re-derive types, and it does not re-check anything the checker checked.
 //!
-//! nox's `noxpr` graph layer is deliberately absent. nox enters this crate as
-//! a kernel library and as the differential oracle, never as an IR.
+//! Nox supplies numerical kernels and the differential oracle. This crate
+//! owns the program IR.
 
 use crate::Ty;
 

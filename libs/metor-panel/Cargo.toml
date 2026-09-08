@@ -5,6 +5,9 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+tempfile = "3.13.0"
+tar-core = "0.1.0"
+sha2 = "0.10"
 gpui = "*"
 hifitime.version = "4.0"
 nucleo-matcher = "0.3"
@@ -99,15 +102,26 @@ bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea9
     "reflect_auto_register",
 ] }
 
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"
 objc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSAppearance",
+    "NSGraphics",
+    "NSResponder",
+    "NSView",
+    "NSVisualEffectView",
+] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [dev-dependencies]
-tempfile = "3.13.0"
 gpui = { version = "*", features = ["test-support"] }
 # Builds a concrete schema for the unknown-message decode test.
 postcard-schema = { version = "0.2", features = ["use-std"] }

@@ -210,11 +210,26 @@ impl ComponentManifest {
     }
 
     pub fn write_to(&self, dir: &Path) -> Result<(), Error> {
-        let file = ManifestFile {
+        atomic_write(dir, MANIFEST_FILE, &self.snapshot_bytes()?)
+    }
+
+    pub(crate) fn snapshot_bytes(&self) -> Result<Vec<u8>, Error> {
+        let spans = self
+            .spans
+            .iter()
+            .map(|span| NodeSpan {
+                state: if span.state == SpanState::Fetching {
+                    SpanState::RemoteOnly
+                } else {
+                    span.state
+                },
+                ..*span
+            })
+            .collect();
+        Ok(postcard::to_allocvec(&ManifestFile {
             version: MANIFEST_VERSION,
-            spans: self.spans.to_vec(),
-        };
-        atomic_write(dir, MANIFEST_FILE, &postcard::to_allocvec(&file)?)
+            spans,
+        })?)
     }
 }
 

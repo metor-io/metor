@@ -51,16 +51,6 @@ where
 impl<T: TensorItem + RealField, R: OwnedRepr> ReprMonad<R> for SpatialTransform<T, R> {
     type Elem = T;
     type Dim = Const<7>;
-    type Map<N: OwnedRepr> = SpatialTransform<T, N>;
-
-    fn map<N: OwnedRepr>(
-        self,
-        func: impl Fn(R::Inner<Self::Elem, Self::Dim>) -> N::Inner<Self::Elem, Self::Dim>,
-    ) -> Self::Map<N> {
-        SpatialTransform {
-            inner: Tensor::from_inner(func(self.inner.inner)),
-        }
-    }
 
     fn into_inner(self) -> R::Inner<Self::Elem, Self::Dim> {
         self.inner.inner
@@ -176,16 +166,6 @@ where
 impl<T: TensorItem + RealField, R: OwnedRepr> ReprMonad<R> for SpatialForce<T, R> {
     type Elem = T;
     type Dim = Const<6>;
-    type Map<N: OwnedRepr> = SpatialForce<T, N>;
-
-    fn map<N: OwnedRepr>(
-        self,
-        func: impl Fn(R::Inner<Self::Elem, Self::Dim>) -> N::Inner<Self::Elem, Self::Dim>,
-    ) -> Self::Map<N> {
-        SpatialForce {
-            inner: Tensor::from_inner(func(self.inner.inner)),
-        }
-    }
 
     fn into_inner(self) -> R::Inner<Self::Elem, Self::Dim> {
         self.inner.inner
@@ -266,16 +246,6 @@ pub struct SpatialInertia<T: TensorItem, R: OwnedRepr = DefaultRepr> {
 impl<T: TensorItem + RealField, R: OwnedRepr> ReprMonad<R> for SpatialInertia<T, R> {
     type Elem = T;
     type Dim = Const<7>;
-    type Map<N: OwnedRepr> = SpatialInertia<T, N>;
-
-    fn map<N: OwnedRepr>(
-        self,
-        func: impl Fn(R::Inner<Self::Elem, Self::Dim>) -> N::Inner<Self::Elem, Self::Dim>,
-    ) -> Self::Map<N> {
-        SpatialInertia {
-            inner: Tensor::from_inner(func(self.inner.inner)),
-        }
-    }
 
     fn into_inner(self) -> R::Inner<Self::Elem, Self::Dim> {
         self.inner.inner
@@ -418,16 +388,6 @@ where
 impl<T: TensorItem + RealField, R: OwnedRepr> ReprMonad<R> for SpatialMotion<T, R> {
     type Elem = T;
     type Dim = Const<6>;
-    type Map<N: OwnedRepr> = SpatialMotion<T, N>;
-
-    fn map<N: OwnedRepr>(
-        self,
-        func: impl Fn(R::Inner<Self::Elem, Self::Dim>) -> N::Inner<Self::Elem, Self::Dim>,
-    ) -> Self::Map<N> {
-        SpatialMotion {
-            inner: Tensor::from_inner(func(self.inner.inner)),
-        }
-    }
 
     fn into_inner(self) -> R::Inner<Self::Elem, Self::Dim> {
         self.inner.inner

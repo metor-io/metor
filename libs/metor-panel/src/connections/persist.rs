@@ -68,9 +68,7 @@ pub struct RecentEntry {
 }
 
 fn connections_dir() -> io::Result<PathBuf> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config dir"))?;
-    Ok(base.join("metor").join("panel").join("connections"))
+    Ok(crate::config::config_dir()?.join("connections"))
 }
 
 fn index_path() -> io::Result<PathBuf> {

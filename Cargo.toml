@@ -1,10 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    #"libs/metor-ui",
     "libs/nox",
     "libs/nox-frames",
-    #"apps/metor",
     "libs/metor-component",
     "libs/metor-component/macros",
     "libs/metor-component/derive-impl",
@@ -12,7 +10,6 @@ members = [
     "libs/wmm",
     "libs/metor-proto",
     "libs/metor-proto/stellar",
-    #"libs/metor-proto/bevy",
     "libs/metor-proto/wkt",
     "libs/metor-proto/bbq",
     "libs/metor-proto/frame",
@@ -29,7 +26,6 @@ members = [
     "apps/inscriber",
     "fsw/video-streamer",
     "fsw/gstreamer",
-    "libs/db/eql",
     "libs/metor-proto/kdl",
     "libs/metor-panel",
     "libs/metor-fsw-2",

@@ -1,5 +1,4 @@
 #![recursion_limit = "1024"]
-#![allow(clippy::arc_with_non_send_sync)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;

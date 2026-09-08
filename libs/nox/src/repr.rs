@@ -178,8 +178,6 @@ pub trait OwnedRepr: Repr {
         diag: Self::Inner<T1, D1::SideDim>,
     ) -> Self::Inner<T1, D1>;
 
-    fn noop<T1: Field, D1: Dim>(arg: &Self::Inner<T1, D1>) -> Self::Inner<T1, D1>;
-
     fn try_cholesky<T1: RealField, D1: Dim + SquareDim>(
         arg: &Self::Inner<T1, D1>,
     ) -> Result<Self::Inner<T1, D1>, Error>;
@@ -209,15 +207,10 @@ pub trait OwnedRepr: Repr {
         D2: Dim;
 }
 
+/// Access to the representation and shape metadata of a tensor or spatial value.
 pub trait ReprMonad<R: OwnedRepr> {
     type Elem: Elem;
     type Dim: Dim;
-    type Map<T: OwnedRepr>;
-
-    fn map<N: OwnedRepr>(
-        self,
-        func: impl Fn(R::Inner<Self::Elem, Self::Dim>) -> N::Inner<Self::Elem, Self::Dim>,
-    ) -> Self::Map<N>;
 
     fn into_inner(self) -> R::Inner<Self::Elem, Self::Dim>;
     fn inner(&self) -> &R::Inner<Self::Elem, Self::Dim>;

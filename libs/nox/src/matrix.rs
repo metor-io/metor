@@ -180,16 +180,6 @@ mod tests {
         );
     }
 
-    // #[test]
-    // fn test_inverse() {
-    //     let a = tensor![[1.0, 2.0], [3.0, 4.0]];
-    //     let out = a.try_inverse().unwrap();
-    //     assert_eq!(out, tensor![[-2.0, 1.0], [1.5, -0.5]]);
-    //     let a = tensor![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    //     let out = a.try_inverse().unwrap();
-    //     assert_eq!(out, a);
-    // }
-
     #[test]
     fn test_look_at() {
         // source: nalgebra

@@ -777,6 +777,7 @@ mod tests {
             wal: crate::disruptor::Disruptor::new(1024),
             schema,
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
+            persistence: Default::default(),
         }
     }
 
@@ -954,6 +955,7 @@ mod tests {
             wal: crate::disruptor::Disruptor::new(1024),
             schema,
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
+            persistence: Default::default(),
         };
 
         let (lod, mut level) = level_for(dir.path(), &src, 100);
@@ -1003,6 +1005,7 @@ mod tests {
             wal: crate::disruptor::Disruptor::new(1024),
             schema,
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
+            persistence: Default::default(),
         };
 
         let (lod, mut level) = level_for(dir.path(), &src, 300);
@@ -1049,6 +1052,7 @@ mod tests {
             wal: crate::disruptor::Disruptor::new(1024),
             schema,
             last_timestamp: Arc::new(stellarator::util::AtomicCell::new(Timestamp(i64::MIN))),
+            persistence: Default::default(),
         };
         assert_eq!(
             src.time_series

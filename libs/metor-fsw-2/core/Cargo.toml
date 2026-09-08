@@ -32,6 +32,7 @@ serde = { version = "1.0", features = ["derive"] }
 # `postcard-dyn` encodes against a schema the host never links.
 postcard-dyn = { version = "0.2" }
 serde_json = { version = "1.0" }
+sha2 = "0.10"
 serde_ignored = { version = "0.1" }
 zerocopy = { version = "0.8.2", features = ["derive"] }
 

@@ -56,7 +56,7 @@ pub trait Field:
 }
 
 pub trait RealField:
-    Elem + Field + Neg<Output = Self> + faer::SimpleEntity + faer::ComplexField
+    Elem + Field + Neg<Output = Self> + faer::traits::ComplexField<Real = Self>
 {
     fn sqrt(self) -> Self;
     fn cos(self) -> Self;

@@ -378,3 +378,30 @@ fn unchanged_layouts_save_for_new_targets_and_retry_failed_writes() {
         "changed"
     );
 }
+
+#[gpui::test]
+fn browsing_targets_needs_no_database_and_discovery_can_stop(cx: &mut gpui::TestAppContext) {
+    let (store, registry) = cx.update(ConnectionsStore::prepare);
+    assert!(!registry.is_closed());
+    cx.update(|cx| {
+        assert!(try_global(cx).is_none());
+        assert!(
+            cx.try_global::<crate::background_tasks::BackgroundTasks>()
+                .is_none()
+        );
+        store.update(cx, |store, cx| {
+            assert!(store.db.is_none());
+            let target = ConnectionTarget::custom("unstarted", "Unstarted", "", |_| {
+                panic!("browsing must not start a producer before storage is selected")
+            });
+            store.upsert_target(target.clone(), cx);
+            store.connect(target, cx);
+            assert_eq!(store.state().targets().len(), 1);
+            assert!(store.active().is_empty());
+        });
+    });
+    drop(store);
+    cx.update(|_| {});
+    cx.run_until_parked();
+    assert!(registry.is_closed());
+}

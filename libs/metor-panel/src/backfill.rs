@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,8 @@ struct Inner {
     db: Arc<DB>,
     queue: Mutex<Queue>,
     wake: Condvar,
+    stopped: AtomicBool,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// The backfill service. Cheap to clone — a shared handle.
@@ -67,6 +70,9 @@ impl Backfiller {
             return;
         }
         let mut queue = self.0.queue.lock().unwrap();
+        if self.0.stopped.load(Ordering::Acquire) {
+            return;
+        }
         let key = (component, range.clone());
         if queue.in_flight.as_ref() == Some(&key)
             || queue
@@ -101,13 +107,32 @@ impl Backfiller {
             db,
             queue: Mutex::new(Queue::default()),
             wake: Condvar::new(),
+            stopped: AtomicBool::new(false),
+            thread: Mutex::new(None),
         });
         let served = inner.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("backfill".into())
             .spawn(move || serve(served))
             .expect("spawn the backfill thread");
+        *inner.thread.lock().unwrap() = Some(thread);
         cx.set_global(BackfillGlobal(Backfiller(inner)));
+    }
+
+    pub(crate) fn stop(&self) {
+        let mut queue = self.0.queue.lock().unwrap();
+        self.0.stopped.store(true, Ordering::Release);
+        queue.waiting.clear();
+        self.0.wake.notify_one();
+    }
+
+    pub(crate) fn join(&self) -> std::io::Result<()> {
+        if let Some(thread) = self.0.thread.lock().unwrap().take() {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("backfill thread panicked"))?;
+        }
+        Ok(())
     }
 }
 
@@ -126,6 +151,9 @@ fn serve(inner: Arc<Inner>) {
         let request = {
             let mut queue = inner.queue.lock().unwrap();
             loop {
+                if inner.stopped.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(request) = queue.waiting.pop_front() {
                     queue.in_flight = Some((request.component, request.range.clone()));
                     break request;
@@ -134,7 +162,13 @@ fn serve(inner: Arc<Inner>) {
             }
         };
         let key = (request.component, request.range.clone());
-        let emitted = match fill(&inner.db, request.component, request.range, &request.plan) {
+        let emitted = match fill_until(
+            &inner.db,
+            request.component,
+            request.range,
+            &request.plan,
+            || inner.stopped.load(Ordering::Acquire),
+        ) {
             Ok(emitted) => emitted,
             Err(err) => {
                 tracing::warn!(?err, component = ?request.component, "backfill failed");
@@ -227,6 +261,16 @@ pub fn fill(
     range: Range<Timestamp>,
     plan: &ReplayPlan,
 ) -> Result<usize, BuildError> {
+    fill_until(db, component, range, plan, || false)
+}
+
+fn fill_until(
+    db: &DB,
+    component: ComponentId,
+    range: Range<Timestamp>,
+    plan: &ReplayPlan,
+    stopped: impl Fn() -> bool,
+) -> Result<usize, BuildError> {
     let Some(output) = db.with_state(|s| s.get_component(component).cloned()) else {
         return Ok(0);
     };
@@ -250,6 +294,9 @@ pub fn fill(
     let mut scratch = Vec::new();
 
     for range in wanted_ranges {
+        if stopped() {
+            break;
+        }
         let stats = replay(plan, range, DEFAULT_FUEL, &mut |ts, frame| {
             emitted += 1;
             for (i, (field, _)) in plan.outputs.iter().enumerate() {
@@ -262,7 +309,7 @@ pub fn fill(
                 }
                 chunks[i].push(ts, &scratch);
             }
-            emitted < JOB_BUDGET
+            emitted < JOB_BUDGET && !stopped()
         })?;
         for (i, chunk) in chunks.iter_mut().enumerate() {
             land(db, &targets[i], sizes[i], chunk);

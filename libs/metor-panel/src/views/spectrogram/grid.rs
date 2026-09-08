@@ -270,13 +270,10 @@ pub(crate) fn build_grid_from_lod(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
 
-    use metor_db::disruptor::Disruptor;
     use metor_db::time_series::{TimeSeries, TimeSeriesNode};
     use metor_db::{Component, ComponentSchema};
     use metor_proto::types::{ComponentId, PrimType, Timestamp};
-    use stellarator::util::AtomicCell;
 
     use super::*;
 
@@ -306,13 +303,7 @@ mod tests {
             node.data.write(&bytes).unwrap();
             node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
         }
-        Component {
-            component_id: ComponentId(1),
-            time_series: TimeSeries::open(dir).unwrap(),
-            wal: Disruptor::new(1024),
-            schema,
-            last_timestamp: Arc::new(AtomicCell::new(Timestamp(0))),
-        }
+        Component::from_time_series(ComponentId(1), schema, TimeSeries::open(dir).unwrap())
     }
 
     /// One sample per two columns: every column from the first sample onward
@@ -416,13 +407,11 @@ mod tests {
                 .write(&Timestamp(i as i64 * 1_000).to_le_bytes())
                 .unwrap();
         }
-        let lod = Component {
-            component_id: ComponentId(2),
-            time_series: TimeSeries::open(dir.path()).unwrap(),
-            wal: Disruptor::new(1024),
+        let lod = Component::from_time_series(
+            ComponentId(2),
             schema,
-            last_timestamp: Arc::new(AtomicCell::new(Timestamp(0))),
-        };
+            TimeSeries::open(dir.path()).unwrap(),
+        );
         let mut grid = SpectrogramGrid::default();
         assert!(build_grid_from_lod(
             &lod,

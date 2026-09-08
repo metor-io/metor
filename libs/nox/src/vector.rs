@@ -176,13 +176,6 @@ mod tests {
         assert_eq!(out, tensor![4.0f32])
     }
 
-    // #[test]
-    // fn test_extend() {
-    //     // This test requires extend method which is not available without XLA backend
-    //     let vec = tensor![2.0f32, 1.0, 2.0];
-    //     // Would need to implement extend for ArrayRepr
-    // }
-
     #[test]
     fn test_abs() {
         let a = tensor![-2.0f32, 1.0, -2.0];

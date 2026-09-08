@@ -24,6 +24,7 @@ use crate::query::fuzzy_scores;
 use crate::theme::{Theme, theme};
 
 const DIALOG_WIDTH: f32 = 640.0;
+const STARTUP_SIDEBAR_WIDTH: f32 = 300.0;
 const ROW_HEIGHT: f32 = 36.0;
 
 /// What the dialog is currently doing: browsing, configuring one target,
@@ -54,10 +55,14 @@ enum Slot {
     Favorite(PickerEntry),
     Row(PickerEntry),
     ManualAddress,
+    WriteLocation,
+    OpenRecording,
 }
 
 pub struct ConnectionPicker {
     store: Entity<ConnectionsStore>,
+    startup: Option<Entity<crate::session::startup::SessionStartup>>,
+    logo: Option<Entity<super::logo::AsciiLogo>>,
     search: TextField,
     phase: Phase,
     selected: usize,
@@ -66,6 +71,9 @@ pub struct ConnectionPicker {
     require_connection: bool,
     focus_handle: FocusHandle,
     parent_focus: Option<FocusHandle>,
+    should_move: bool,
+    storage_picker: Option<Entity<Inspector>>,
+    storage_button_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     pub dismissed: bool,
 }
 
@@ -78,14 +86,31 @@ impl ConnectionPicker {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
         Self {
             store,
+            startup: None,
+            logo: None,
             search: TextField::new("Search systems...", cx),
             phase: Phase::Browse,
             selected: 0,
             require_connection,
             focus_handle: cx.focus_handle(),
             parent_focus: None,
+            should_move: false,
+            storage_picker: None,
+            storage_button_bounds: Default::default(),
             dismissed: false,
         }
+    }
+
+    pub(crate) fn for_startup(
+        store: Entity<ConnectionsStore>,
+        startup: Entity<crate::session::startup::SessionStartup>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&startup, |_, _, cx| cx.notify()).detach();
+        let mut picker = Self::new(store, true, cx);
+        picker.startup = Some(startup);
+        picker.logo = Some(cx.new(|_| super::logo::AsciiLogo::new()));
+        picker
     }
 
     pub fn set_parent_focus(&mut self, handle: FocusHandle) {
@@ -150,6 +175,9 @@ impl ConnectionPicker {
                 .map(Slot::Row),
         );
         slots.push(Slot::ManualAddress);
+        if self.startup.is_some() {
+            slots.extend([Slot::WriteLocation, Slot::OpenRecording]);
+        }
         slots
     }
 
@@ -181,6 +209,8 @@ impl ConnectionPicker {
                 }
             }
             Some(Slot::ManualAddress) => self.enter_manual_address(cx),
+            Some(Slot::WriteLocation) => self.open_storage_picker(window, cx),
+            Some(Slot::OpenRecording) => self.open_recording(window, cx),
             None => {}
         }
     }
@@ -223,6 +253,10 @@ impl ConnectionPicker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(startup) = self.startup.clone() {
+            startup.update(cx, |startup, cx| startup.connect(target, window, cx));
+            return;
+        }
         let connected = self.store.read(cx).is_connected(&target.id);
         let id = target.id.clone();
         self.store.update(cx, |store, cx| {
@@ -287,7 +321,29 @@ impl ConnectionPicker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The anchored inspector owns its keys; bubbled events must not
+        // also activate a connection or edit the system search.
+        if self
+            .storage_picker
+            .as_ref()
+            .is_some_and(|picker| !picker.read(cx).dismissed)
+        {
+            return;
+        }
         let key = event.keystroke.key.as_str();
+        if let Some(startup) = &self.startup {
+            if key == "escape" {
+                startup.read(cx).cancel_open();
+            }
+            if startup.read(cx).busy() {
+                return;
+            }
+            if key == "o" && event.keystroke.modifiers.platform {
+                self.open_recording(window, cx);
+                return;
+            }
+        }
+
         match &self.phase {
             // The embedded inspector holds focus and handles its own keys;
             // events bubble up here afterwards, so the dialog stays out of
@@ -334,6 +390,14 @@ impl ConnectionPicker {
             "escape" => self.dismiss(window, cx),
             "up" | "left" => self.move_selection(-1, cx),
             "down" | "right" => self.move_selection(1, cx),
+            "tab" => self.move_selection(
+                if event.keystroke.modifiers.shift {
+                    -1
+                } else {
+                    1
+                },
+                cx,
+            ),
             "enter" | "return" => self.activate_selected(window, cx),
             _ => {
                 if self.search.handle_key_down(event, cx) {
@@ -441,10 +505,8 @@ impl ConnectionPicker {
             )
     }
 
-    /// The connect/disconnect action: a full-height segment at the row's
-    /// right edge — `| info | button |` — split off by a dimmed green/red
-    /// left border, with a faint matching tint and accent text. Width
-    /// follows the label. The row itself only selects.
+    /// A bright outline and tinted fill echo the event flags, with a red
+    /// accent for disconnecting. The row itself only selects.
     fn action_button(
         &self,
         target: ConnectionTarget,
@@ -460,18 +522,21 @@ impl ConnectionPicker {
         div()
             .id(SharedString::from(format!("action-{}", target.id)))
             .flex_shrink_0()
-            .h_full()
-            .px(px(8.0))
+            .h(px(26.0))
+            .mr(px(8.0))
+            .px(px(10.0))
             .flex()
             .min_w(px(75.))
             .items_center()
             .justify_center()
-            .border_l_2()
-            .bg(Theme::dim(accent, 0.11))
+            .border_1()
+            .border_color(accent)
+            .rounded(px(4.0))
+            .bg(Theme::dim(accent, 0.18))
             .text_size(px(12.0))
             .text_color(accent)
             .cursor_pointer()
-            .hover(|s| s.bg(Theme::dim(accent, 0.18)))
+            .hover(|s| s.bg(Theme::dim(accent, 0.26)))
             .child(label)
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -617,6 +682,9 @@ impl ConnectionPicker {
             .child(
                 cell()
                     .flex_shrink_0()
+                    .when(self.startup.is_some(), |cell| {
+                        cell.max_w(px(160.)).overflow_hidden()
+                    })
                     .text_size(px(13.0))
                     .text_color(if available {
                         theme.text_primary
@@ -679,12 +747,20 @@ impl ConnectionPicker {
         self.clamp_selection(slots.len());
         let selectable_favorites = favorites.iter().filter(|e| e.target.is_some()).count();
 
-        let mut body = div().flex().flex_col().min_h_0();
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .when(self.startup.is_some(), |body| body.flex_1());
 
         // Pinned systems first — the fast path sits right under the caption.
         if !favorites.is_empty() {
             let mut card_ix = 0usize;
             let mut cards = div()
+                .id("favorite-systems")
+                .when(self.startup.is_some(), |cards| {
+                    cards.flex_shrink_0().max_h(px(132.)).overflow_y_scroll()
+                })
                 .flex()
                 .flex_row()
                 .flex_wrap()
@@ -711,7 +787,8 @@ impl ConnectionPicker {
             .flex_col()
             .min_h_0()
             .overflow_y_scroll()
-            .max_h(px(288.0))
+            .when(self.startup.is_none(), |list| list.max_h(px(288.0)))
+            .when(self.startup.is_some(), |list| list.flex_1())
             // The caption bar already draws a bottom border; only a card
             // strip above needs its own separator.
             .when(!favorites.is_empty(), |l| {
@@ -738,10 +815,11 @@ impl ConnectionPicker {
         body = body.child(list);
 
         // Footer: the ad-hoc escape hatch.
-        let footer_selected = self.selected == slots.len().saturating_sub(1);
+        let footer_selected = matches!(slots.get(self.selected), Some(Slot::ManualAddress));
         body = body.child(
             div()
                 .id("manual-address")
+                .flex_shrink_0()
                 .h(px(ROW_HEIGHT))
                 .px(px(16.0))
                 .flex()
@@ -767,6 +845,175 @@ impl ConnectionPicker {
         );
 
         body.into_any_element()
+    }
+
+    fn open_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(startup) = &self.startup {
+            startup.update(cx, |startup, cx| startup.choose_open(window, cx));
+        }
+    }
+
+    fn open_storage_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::inspector::rows::CommandRow;
+        use std::sync::Arc;
+        let Some(startup) = self
+            .startup
+            .clone()
+            .filter(|startup| !startup.read(cx).busy())
+        else {
+            return;
+        };
+        let temporary = startup.read(cx).is_temporary();
+        let temporary_startup = startup.clone();
+        let rows: Vec<Box<dyn crate::inspector::rows::InspectorRow>> = vec![
+            Box::new(
+                CommandRow::new(
+                    "Temporary",
+                    Arc::new(move |_, cx| {
+                        temporary_startup.update(cx, |startup, cx| startup.temporary(cx));
+                    }),
+                )
+                .with_tag(if temporary {
+                    "Selected"
+                } else {
+                    "Delete on quit"
+                }),
+            ),
+            Box::new(
+                CommandRow::new(
+                    "Record to…",
+                    Arc::new(move |window, cx| {
+                        startup.update(cx, |startup, cx| startup.record_to(window, cx));
+                    }),
+                )
+                .with_tag(if temporary {
+                    "Keep on disk"
+                } else {
+                    "Selected"
+                }),
+            ),
+        ];
+        let anchor = self.storage_button_bounds.get().bottom_left();
+        let parent_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.focus_handle.clone());
+        let picker = cx.new(|cx| {
+            let mut picker = Inspector::new(rows, InspectorMode::Anchored(anchor), cx);
+            picker.set_parent_focus(parent_focus);
+            picker
+        });
+        cx.subscribe(&picker, |this, picker, _: &crate::motion::Closed, cx| {
+            if this
+                .storage_picker
+                .as_ref()
+                .is_some_and(|current| current == &picker)
+            {
+                this.storage_picker = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        picker.focus_handle(cx).focus(window);
+        self.storage_picker = Some(picker);
+        cx.notify();
+    }
+
+    fn render_storage(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let startup = self.startup.as_ref().unwrap().read(cx);
+        let label = startup.write_location_label();
+        let summary = startup.summary();
+        let error = startup.error.clone();
+        let first_slot = self.slots(cx).len() - 2;
+        let button_bounds = self.storage_button_bounds.clone();
+        let location = div()
+            .id("db-write-location")
+            .relative()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .min_w_0()
+            .px(px(10.))
+            .py(px(6.))
+            .border_1()
+            .rounded(px(4.))
+            .border_color(if self.selected == first_slot {
+                theme.control_active
+            } else {
+                theme.border_primary
+            })
+            .bg(theme.bg_secondary)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.bg_primary))
+            .child(div().min_w_0().truncate().child(label))
+            .child(Icon::ChevronDown.svg_color(10., theme.text_secondary))
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| button_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.selected = first_slot;
+                    this.open_storage_picker(window, cx);
+                }),
+            );
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .text_size(px(12.))
+            .border_t_1()
+            .border_color(theme.border_primary)
+            .child(
+                div()
+                    .px(px(16.))
+                    .py(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(location)
+                    .when_some(summary, |view, summary| {
+                        view.child(div().text_color(theme.text_tertiary).child(summary))
+                    })
+                    .when_some(error, |view, error| {
+                        view.child(div().text_color(theme.error_accent).child(error))
+                    }),
+            )
+            .child(
+                div()
+                    .id("open-saved-recording")
+                    .border_t_1()
+                    .border_color(theme.border_primary)
+                    .px(px(16.))
+                    .py(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.bg_secondary))
+                    .when(self.selected == first_slot + 1, |s| {
+                        s.bg(theme.bg_secondary)
+                    })
+                    .child(Icon::Folder.svg_color(14., theme.text_secondary))
+                    .child("Open recording…")
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.selected = first_slot + 1;
+                            this.open_recording(window, cx);
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// One target's knobs: a back affordance and title, the inline
@@ -998,7 +1245,12 @@ impl Render for ConnectionPicker {
         // Caption bar: sized like the app's other bars — title on the left,
         // search living in the bar itself, close affordance only when
         // leaving is allowed.
-        let mut caption_right = div().flex().flex_row().items_center().gap(px(8.0));
+        let mut caption_right = div()
+            .occlude()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0));
         if matches!(self.phase, Phase::Browse) {
             caption_right = caption_right.child(
                 div()
@@ -1033,21 +1285,74 @@ impl Render for ConnectionPicker {
             );
         }
         let caption = div()
+            .id("connection-caption")
+            .relative()
+            .flex_shrink_0()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .px(px(16.0))
             .py(px(5.0))
-            .border_b_1()
-            .border_color(theme.border_primary)
+            .when(self.startup.is_none(), |caption| {
+                caption.border_b_1().border_color(theme.border_primary)
+            })
             .child(
                 div()
                     .text_size(px(12.0))
                     .text_color(theme.text_primary)
-                    .child(SharedString::new_static("Connections")),
+                    .child("Connections"),
             )
-            .child(caption_right);
+            .child(caption_right)
+            .when(self.startup.is_some(), |caption| {
+                caption
+                    .window_control_area(gpui::WindowControlArea::Drag)
+                    .occlude()
+                    .h(px(32.))
+                    .py_0()
+                    .pl(px(STARTUP_SIDEBAR_WIDTH + 16.))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(STARTUP_SIDEBAR_WIDTH - 1.))
+                            .w(px(1.))
+                            .bg(theme.border_primary),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.should_move = true;
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, _, window, _| {
+                        if this.should_move {
+                            this.should_move = false;
+                            window.start_window_move();
+                        }
+                    }))
+                    .on_mouse_up(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.should_move = false;
+                        }),
+                    )
+                    .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
+                    .when(
+                        crate::window_controls::needs_window_controls(window),
+                        |caption| {
+                            caption.pr_0().child(
+                                crate::window_controls::window_controls_with_close(
+                                    &theme,
+                                    window,
+                                    false,
+                                    |_, cx| cx.quit(),
+                                ),
+                            )
+                        },
+                    )
+            });
 
         // The inline inspector reports Escape-at-root as a dismissal; for
         // this host that means "back to browsing", not "close the dialog".
@@ -1070,8 +1375,65 @@ impl Render for ConnectionPicker {
             }
         };
 
+        let body = if self.startup.is_some() {
+            div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .id("recording-sidebar")
+                        .w(px(STARTUP_SIDEBAR_WIDTH))
+                        .flex_shrink_0()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .border_r_1()
+                        .border_color(theme.border_primary)
+                        .child(
+                            div().flex().flex_col().flex_1().min_h_0().p(px(8.)).child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .when_some(self.logo.clone(), |view, logo| view.child(logo)),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .id("recording-controls")
+                                .flex_shrink_0()
+                                .max_h(px(230.))
+                                .overflow_y_scroll()
+                                .child(self.render_storage(&theme, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("connection-body")
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .child(body),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            body
+        };
+
         let mut panel = div()
             .id("connection-picker-panel")
+            .relative()
             .key_context("ConnectionPicker TextInput")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1079,12 +1441,16 @@ impl Render for ConnectionPicker {
             }))
             .flex()
             .flex_col()
-            .w(px(DIALOG_WIDTH))
-            .max_h(px(560.0))
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border_primary)
-            .rounded(px(8.0))
+            .when(self.startup.is_none(), |panel| {
+                panel
+                    .bg(theme.bg_elevated)
+                    .w(px(DIALOG_WIDTH))
+                    .max_h(px(560.))
+                    .border_1()
+                    .border_color(theme.border_primary)
+                    .rounded(px(8.))
+            })
+            .when(self.startup.is_some(), |panel| panel.size_full())
             .child(caption)
             .child(body);
 
@@ -1095,6 +1461,34 @@ impl Render for ConnectionPicker {
                     cx.notify();
                 },
             ));
+        }
+
+        if self.startup.is_some() {
+            let root = div()
+                .relative()
+                .size_full()
+                .bg(if cfg!(target_os = "macos") {
+                    theme.splash_sidebar_bg()
+                } else {
+                    theme.bg_elevated
+                })
+                .text_color(theme.text_primary)
+                .font_family(crate::theme::font_family(cx))
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(STARTUP_SIDEBAR_WIDTH))
+                        .right_0()
+                        .bg(theme.bg_elevated),
+                )
+                .child(panel)
+                .when_some(self.storage_picker.clone(), |root, picker| {
+                    root.child(picker)
+                });
+            return crate::window_controls::client_side_decorations(root, false, window, cx)
+                .into_any_element();
         }
 
         let centered = div()

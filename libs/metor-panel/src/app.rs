@@ -28,7 +28,7 @@ use gpui::{
     size,
 };
 use metor_db::{DB, Server};
-use stellarator::{net::TcpListener, struc_con::stellar};
+use stellarator::net::TcpListener;
 
 actions!(
     metor_panel,
@@ -602,6 +602,24 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))
             .on_action(cx.listener(Self::open_connections))
+            .on_action(
+                cx.listener(|_, _: &crate::session::SaveSnapshot, window, cx| {
+                    crate::session::save(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|_, _: &crate::session::SaveSnapshotAs, window, cx| {
+                    crate::session::save_as(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|_, _: &crate::session::OpenRecording, window, cx| {
+                    crate::session::open_recording(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|_, _: &crate::session::QuitPanel, window, cx| {
+                crate::session::request_quit(window, cx)
+            }))
             .on_modifiers_changed(cx.listener(
                 |this, event: &gpui::ModifiersChangedEvent, _window, cx| {
                     if !event.modifiers.shift && this.hover_preview.take().is_some() {
@@ -653,7 +671,7 @@ impl Render for AppRoot {
             root = root.child(view.clone());
         }
 
-        crate::window_controls::client_side_decorations(root, window, cx)
+        crate::window_controls::client_side_decorations(root, true, window, cx)
     }
 }
 
@@ -1088,7 +1106,13 @@ impl AppRoot {
 /// window opens, which is where future custom-tile/widget registration will
 /// hook in.
 pub struct PanelApp {
-    db: Arc<DB>,
+    db: Option<Arc<DB>>,
+    session: Option<crate::session::SessionStorage>,
+    offline: bool,
+    workspace: Option<String>,
+    startup_open: Option<std::path::PathBuf>,
+    prepared_connections: Option<(Entity<crate::connections::ConnectionsStore>, RegistryHandle)>,
+    open_handler: Option<crate::session::OpenHandler>,
     server_addr: Option<SocketAddr>,
     targets: Vec<ConnectionTarget>,
     connection_sources: Vec<Box<dyn FnOnce(RegistryHandle)>>,
@@ -1107,8 +1131,21 @@ pub struct PanelApp {
 impl PanelApp {
     /// Start from a consumer-owned database.
     pub fn new(db: Arc<DB>) -> Self {
+        let mut app = Self::choose_session();
+        app.db = Some(db);
+        app
+    }
+
+    /// Choose temporary or persistent storage before starting DB services.
+    pub fn choose_session() -> Self {
         Self {
-            db,
+            db: None,
+            session: None,
+            offline: false,
+            workspace: None,
+            startup_open: None,
+            prepared_connections: None,
+            open_handler: None,
             server_addr: None,
             targets: Vec::new(),
             connection_sources: Vec::new(),
@@ -1120,6 +1157,103 @@ impl PanelApp {
             overlays: Vec::new(),
             views: Vec::new(),
         }
+    }
+
+    /// Start a fresh, panel-owned database that is deleted on quit. Saved
+    /// snapshots are independent files; caller-owned databases passed to
+    /// `new` are never moved or deleted by the panel.
+    pub fn temporary() -> Result<Self, metor_db::Error> {
+        let (session, db) = crate::session::SessionStorage::create()?;
+        let mut app = Self::new(db);
+        app.session = Some(session);
+        Ok(app)
+    }
+
+    /// Record directly into a new `.metor` directory. Existing paths are
+    /// rejected; choosing a destination never opens or overwrites old data.
+    pub fn record_to(path: impl Into<std::path::PathBuf>) -> Result<Self, metor_db::Error> {
+        let (session, db) = crate::session::SessionStorage::record_to(path.into())?;
+        let mut app = Self::new(db);
+        app.session = Some(session);
+        Ok(app)
+    }
+
+    pub(crate) fn prepare_connections(
+        &mut self,
+        discover: bool,
+        cx: &mut App,
+    ) -> Entity<crate::connections::ConnectionsStore> {
+        let (store, registry) = crate::connections::ConnectionsStore::prepare(cx);
+        store.update(cx, |store, cx| {
+            if let Some(resolver) = self.address_resolver.take() {
+                store.set_resolver(resolver);
+            }
+            store.set_default_options(self.default_options.clone());
+            for target in self.targets.drain(..) {
+                store.upsert_target(target, cx);
+            }
+        });
+        if discover {
+            for source in self.connection_sources.drain(..) {
+                source(registry.clone());
+            }
+        }
+        self.prepared_connections = Some((store.clone(), registry));
+        store
+    }
+
+    pub(crate) fn start_connected(
+        mut self,
+        storage: crate::session::SessionStorage,
+        db: Arc<DB>,
+        target: ConnectionTarget,
+        cx: &mut App,
+    ) {
+        self.workspace = crate::connections::persist::load_layout(&target.id);
+        // The explicit choice on the startup screen takes precedence over
+        // builder defaults; it must be the first producer for this recording.
+        self.auto_connect = vec![target.id.clone()];
+        self.targets.push(target);
+        self.start_session(storage, db, cx);
+    }
+
+    pub(crate) fn start_session(
+        mut self,
+        storage: crate::session::SessionStorage,
+        db: Arc<DB>,
+        cx: &mut App,
+    ) {
+        self.db = Some(db);
+        self.session = Some(storage);
+        self.start(cx);
+    }
+
+    /// Open a recording in a temporary offline working copy at startup.
+    pub fn open_recording(path: impl Into<std::path::PathBuf>) -> Self {
+        let mut app = Self::choose_session();
+        app.startup_open = Some(path.into());
+        app
+    }
+
+    /// Override the default new-process Open behavior for embedding programs.
+    pub fn open_handler(
+        mut self,
+        handler: impl Fn(std::path::PathBuf) -> std::io::Result<()> + 'static,
+    ) -> Self {
+        self.open_handler = Some(std::rc::Rc::new(handler));
+        self
+    }
+
+    pub(crate) fn start_imported(
+        mut self,
+        storage: crate::session::SessionStorage,
+        db: Arc<DB>,
+        workspace: Option<String>,
+        cx: &mut App,
+    ) {
+        self.offline = true;
+        self.workspace = workspace;
+        self.start_session(storage, db, cx);
     }
 
     /// Pre-register a connectable target in the picker.
@@ -1262,9 +1396,37 @@ impl PanelApp {
     /// command providers and init hooks, then opens the first window. The
     /// app outlives its last window: closing them all leaves the process in
     /// the dock, and a reopen (dock click) spawns a fresh window.
-    pub fn run(self) {
+    pub fn run(mut self) {
+        let app = Application::new().with_assets(crate::icons::IconAssets);
+        app.on_reopen(|cx| {
+            if crate::workspace::panel_windows(cx).is_empty()
+                && let Some((db, offline)) = cx
+                    .try_global::<RunningDatabase>()
+                    .map(|state| (state.0.clone(), state.1))
+            {
+                crate::workspace::open_panel_window(db, None, None, !offline, cx);
+            }
+        });
+        app.run(move |cx| {
+            initialize_appearance(cx);
+            if self.db.is_some() {
+                self.start(cx);
+            } else {
+                let path = self.startup_open.take();
+                crate::session::startup::open(self, path, cx);
+            }
+        });
+    }
+
+    fn start(self, cx: &mut App) {
         let PanelApp {
             db,
+            session,
+            offline,
+            workspace,
+            startup_open: _,
+            prepared_connections,
+            open_handler,
             server_addr,
             targets,
             connection_sources,
@@ -1277,77 +1439,71 @@ impl PanelApp {
             views,
         } = self;
 
-        if let Some(addr) = server_addr {
+        let db = db.expect("session selected before DB services start");
+        cx.set_global(RunningDatabase(db.clone(), offline));
+        let tasks = crate::background_tasks::BackgroundTasks::default();
+        if let Some(addr) = server_addr.filter(|_| !offline) {
             let server_db = db.clone();
-            stellar(move || async move {
+            tasks.spawn(stellarator::util::CancelToken::new(), move || async move {
                 let server = Server {
                     listener: TcpListener::bind(addr).unwrap(),
                     db: server_db,
                 };
-                server.run().await
+                if let Err(err) = server.run().await {
+                    tracing::error!(%err, "panel server failed");
+                }
             });
         }
 
-        let app = Application::new().with_assets(crate::icons::IconAssets);
-        // A dock-click (macOS "reopen") with every window closed brings the
-        // app back with a fresh window; the process deliberately outlives its
-        // last window so the stores and connections keep running.
-        let reopen_db = db.clone();
-        app.on_reopen(move |cx| {
-            if crate::workspace::panel_windows(cx).is_empty() {
-                crate::workspace::open_panel_window(reopen_db.clone(), None, None, true, cx);
-            }
-        });
-        app.run(move |cx: &mut App| {
-            crate::theme::register_fonts(cx);
-            let cfg = crate::config::load();
-            // Capture the leader before `cfg` moves into the font global; it
-            // parameterizes the chord-menu keybinding below.
-            let leader = cfg.leader.clone();
-            let family = crate::theme::resolve_font_family(cx, &cfg);
-            cx.set_global(crate::theme::FontSettings {
-                family,
-                config: cfg,
-            });
-            cx.set_global(crate::theme::ActiveTheme(Arc::new(
-                crate::theme::DARK.clone(),
-            )));
-            edits::init(cx);
-            crate::temporal::TemporalController::init(db.clone(), cx);
-            ItemRegistry::init(cx);
-            crate::temporal::picker::register(cx);
-            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
-            crate::views::dashboard::WidgetRegistry::init(cx);
-            crate::dynamic::expressions::Expressions::init(cx);
-            crate::dynamic::worker::DynamicWorker::init(cx);
-            crate::views::map::tiles::TileStore::init(cx);
-            crate::backfill::Backfiller::init(db.clone(), cx);
-            crate::views::exec_timeline::inspector_rows::register_inspector_rows(cx);
-            crate::views::Timeline::register(cx);
-            crate::alarms::AlarmStore::init(db.clone(), cx);
-            crate::logs::LogStore::init(db.clone(), cx);
-            crate::presets::TargetPresetStore::init(db.clone(), cx);
-            crate::sequences::SequenceStore::init(db.clone(), cx);
-            crate::plot_events::EventSourceRegistry::init(cx);
-            crate::wiring::WiringStore::init(db.clone(), cx);
-            register_pane_item_deserializers(db.clone(), cx);
-            for (kind, spec) in views {
-                cx.global_mut::<crate::views::dashboard::WidgetRegistry>()
-                    .register(kind, spec);
-            }
-            let registered_tiles = cx
-                .global::<crate::views::dashboard::WidgetRegistry>()
-                .tile_specs();
-            for spec in registered_tiles {
-                cx.global_mut::<crate::tiles::ItemRegistry>()
-                    .register_view(spec, db.clone());
-            }
+        cx.set_global(tasks.clone());
+        let leader = cx
+            .global::<crate::theme::FontSettings>()
+            .config
+            .leader
+            .clone();
+        edits::init(cx);
+        crate::temporal::TemporalController::init(db.clone(), cx);
+        ItemRegistry::init(cx);
+        crate::session::init(session, db.clone(), open_handler, cx);
+        crate::temporal::picker::register(cx);
+        crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+        crate::views::dashboard::WidgetRegistry::init(cx);
+        crate::dynamic::expressions::Expressions::init(cx);
+        crate::dynamic::worker::DynamicWorker::init(cx);
+        crate::views::map::tiles::TileStore::init(cx);
+        crate::backfill::Backfiller::init(db.clone(), cx);
+        crate::views::exec_timeline::inspector_rows::register_inspector_rows(cx);
+        crate::views::Timeline::register(cx);
+        crate::alarms::AlarmStore::init(db.clone(), cx);
+        crate::logs::LogStore::init(db.clone(), cx);
+        crate::presets::TargetPresetStore::init(db.clone(), cx);
+        crate::sequences::SequenceStore::init(db.clone(), cx);
+        crate::plot_events::EventSourceRegistry::init(cx);
+        crate::wiring::WiringStore::init(db.clone(), cx);
+        register_pane_item_deserializers(db.clone(), cx);
+        for (kind, spec) in views {
+            cx.global_mut::<crate::views::dashboard::WidgetRegistry>()
+                .register(kind, spec);
+        }
+        let registered_tiles = cx
+            .global::<crate::views::dashboard::WidgetRegistry>()
+            .tile_specs();
+        for spec in registered_tiles {
+            cx.global_mut::<crate::tiles::ItemRegistry>()
+                .register_view(spec, db.clone());
+        }
 
-            // Connections: seed builder-registered targets, hand the
-            // registry to discovery sources, then fire auto-connects.
-            // LoD spawning is a store concern — it starts with the first
-            // local-authority connection rather than at boot.
-            let registry = crate::connections::ConnectionsStore::init(db.clone(), cx);
+        // Connections: seed builder-registered targets, hand the
+        // registry to discovery sources, then fire auto-connects.
+        // LoD spawning is a store concern — it starts with the first
+        // local-authority connection rather than at boot.
+        if !offline {
+            let registry = if let Some((store, registry)) = prepared_connections {
+                crate::connections::ConnectionsStore::activate(store, db.clone(), cx);
+                registry
+            } else {
+                crate::connections::ConnectionsStore::init(db.clone(), cx)
+            };
             if let Some(store) = crate::connections::try_global(cx) {
                 store.update(cx, |store, cx| {
                     if let Some(resolver) = address_resolver {
@@ -1372,78 +1528,147 @@ impl PanelApp {
                 source(registry.clone());
             }
             register_connection_commands(cx);
+        }
 
-            // Inspector requests route to the window they were made in:
-            // the callback resolves the root of whatever `Window` the
-            // caller passed, so one installation serves every window.
-            cx.set_global(OpenInspectorGlobal(Arc::new(|request, window, cx| {
-                let Some(root) = window.root::<AppRoot>().flatten() else {
-                    return;
-                };
-                root.update(cx, |this, cx| {
-                    this.pending_inspector_open = Some(request);
-                    cx.notify();
-                });
-            })));
-            crate::inspector::palette::register_builtin_providers(db.clone(), cx);
+        // Inspector requests route to the window they were made in:
+        // the callback resolves the root of whatever `Window` the
+        // caller passed, so one installation serves every window.
+        cx.set_global(OpenInspectorGlobal(Arc::new(|request, window, cx| {
+            let Some(root) = window.root::<AppRoot>().flatten() else {
+                return;
+            };
+            root.update(cx, |this, cx| {
+                this.pending_inspector_open = Some(request);
+                cx.notify();
+            });
+        })));
+        crate::inspector::palette::register_builtin_providers(db.clone(), cx);
 
-            // Consumer extensions: register custom palette providers, run
-            // init hooks, then build overlays. All happen after the built-in
-            // registries exist so they can call into any of them; overlays
-            // run last so they can rely on anything a hook installed.
-            for (category, provider) in command_providers {
-                ItemRegistry::register(cx, category, provider);
+        // Consumer extensions: register custom palette providers, run
+        // init hooks, then build overlays. All happen after the built-in
+        // registries exist so they can call into any of them; overlays
+        // run last so they can rely on anything a hook installed.
+        for (category, provider) in command_providers {
+            ItemRegistry::register(cx, category, provider);
+        }
+        for hook in init_hooks {
+            hook(cx);
+        }
+        cx.set_global(OverlayBuilders(overlays));
+
+        // `secondary-` resolves to cmd on macOS and ctrl elsewhere
+        // (`cmd-` would be the Win/Super key off-macOS).
+        cx.set_menus(vec![
+            gpui::Menu {
+                name: "Metor".into(),
+                items: vec![gpui::MenuItem::action(
+                    "Quit Metor",
+                    crate::session::QuitPanel,
+                )],
+            },
+            gpui::Menu {
+                name: "File".into(),
+                items: vec![
+                    gpui::MenuItem::action("Open recording…", crate::session::OpenRecording),
+                    gpui::MenuItem::action("Save snapshot", crate::session::SaveSnapshot),
+                    gpui::MenuItem::action("Save snapshot as…", crate::session::SaveSnapshotAs),
+                ],
+            },
+        ]);
+        cx.bind_keys([
+            KeyBinding::new("secondary-s", crate::session::SaveSnapshot, None),
+            KeyBinding::new("secondary-shift-s", crate::session::SaveSnapshotAs, None),
+            KeyBinding::new("secondary-o", crate::session::OpenRecording, None),
+            KeyBinding::new("secondary-q", crate::session::QuitPanel, None),
+            KeyBinding::new("secondary-p", OpenPalette, None),
+            // The leader opens the transient chord menu, and it is a
+            // bare key — `space` by default — so anything typing into
+            // it must say so. `TextInput` is that: every host owning
+            // an editable field declares it beside its own name, and
+            // one negation covers all of them, including ones that do
+            // not exist yet. Naming the panes individually is what let
+            // the program pane swallow its own spacebar.
+            KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
+            KeyBinding::new("ctrl-tab", CycleTabForward, None),
+            KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+            KeyBinding::new("secondary-l", ToggleCmdLock, None),
+            KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
+            // Scoped to a focused browser: the bar is per pane, and
+            // nothing else claims the find chord yet.
+            KeyBinding::new(
+                "secondary-f",
+                crate::views::column_browser::ToggleFilterBar,
+                Some("ColumnBrowser"),
+            ),
+            KeyBinding::new(
+                "secondary-f",
+                crate::views::column_browser::ToggleFilterBar,
+                Some("ComponentOutline"),
+            ),
+        ]);
+
+        // A non-last close: re-snapshot the survivors right away, so
+        // a quit inside the next autosave interval can't resurrect
+        // the closed window. After the last close this is a no-op,
+        // leaving the should-close snapshot that included it.
+        cx.on_window_closed(|cx| {
+            if !crate::workspace::panel_windows(cx).is_empty() {
+                crate::connections::flush_layout_now(cx);
             }
-            for hook in init_hooks {
-                hook(cx);
-            }
-            cx.set_global(OverlayBuilders(overlays));
+        })
+        .detach();
 
-            set_dock_icon();
-            // `secondary-` resolves to cmd on macOS and ctrl elsewhere
-            // (`cmd-` would be the Win/Super key off-macOS).
-            cx.bind_keys([
-                KeyBinding::new("secondary-p", OpenPalette, None),
-                // The leader opens the transient chord menu, and it is a
-                // bare key — `space` by default — so anything typing into
-                // it must say so. `TextInput` is that: every host owning
-                // an editable field declares it beside its own name, and
-                // one negation covers all of them, including ones that do
-                // not exist yet. Naming the panes individually is what let
-                // the program pane swallow its own spacebar.
-                KeyBinding::new(leader.as_str(), OpenLeader, Some(NOT_TYPING)),
-                KeyBinding::new("ctrl-tab", CycleTabForward, None),
-                KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-                KeyBinding::new("secondary-l", ToggleCmdLock, None),
-                KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
-                // Scoped to a focused browser: the bar is per pane, and
-                // nothing else claims the find chord yet.
-                KeyBinding::new(
-                    "secondary-f",
-                    crate::views::column_browser::ToggleFilterBar,
-                    Some("ColumnBrowser"),
-                ),
-                KeyBinding::new(
-                    "secondary-f",
-                    crate::views::column_browser::ToggleFilterBar,
-                    Some("ComponentOutline"),
-                ),
-            ]);
+        register_shutdown(db.clone(), tasks, cx);
 
-            // A non-last close: re-snapshot the survivors right away, so
-            // a quit inside the next autosave interval can't resurrect
-            // the closed window. After the last close this is a no-op,
-            // leaving the should-close snapshot that included it.
-            cx.on_window_closed(|cx| {
-                if !crate::workspace::panel_windows(cx).is_empty() {
-                    crate::connections::flush_layout_now(cx);
-                }
-            })
-            .detach();
-
-            crate::workspace::open_panel_window(db.clone(), None, None, true, cx);
-        });
+        let window = crate::workspace::open_panel_window(db.clone(), None, None, !offline, cx);
+        if let (Some(window), Some(workspace)) = (window, workspace) {
+            let _ = window.update(cx, |_, window, cx| {
+                crate::workspace::restore_workspace(&workspace, window, cx, db.clone());
+            });
+        }
     }
+}
+
+struct RunningDatabase(Arc<DB>, bool);
+impl gpui::Global for RunningDatabase {}
+
+fn initialize_appearance(cx: &mut App) {
+    crate::theme::register_fonts(cx);
+    let config = crate::config::load();
+    let family = crate::theme::resolve_font_family(cx, &config);
+    cx.set_global(crate::theme::FontSettings { family, config });
+    cx.set_global(crate::theme::ActiveTheme(Arc::new(
+        crate::theme::DARK.clone(),
+    )));
+    set_dock_icon();
+}
+
+pub(crate) fn register_shutdown(
+    db: Arc<DB>,
+    tasks: crate::background_tasks::BackgroundTasks,
+    cx: &mut App,
+) {
+    cx.on_app_quit(move |cx| {
+        crate::session::finish_export(cx);
+        crate::connections::flush_layout_now(cx);
+        crate::session::save_workspace(None, cx);
+        let backfill = crate::backfill::backfiller(cx);
+        if let Some(backfill) = &backfill {
+            backfill.stop();
+        }
+        let workers = tasks.shutdown().map_err(std::io::Error::other);
+        let backfill = backfill.map(|b| b.join()).unwrap_or(Ok(()));
+        let shutdown = workers.and(backfill);
+        if let Some(session) = crate::session::take(cx) {
+            if let Err(err) = session.finish(&db, shutdown) {
+                tracing::error!(%err, "session database finalization failed");
+            }
+        } else if let Err(err) = shutdown {
+            tracing::error!(%err, "panel background shutdown failed");
+        }
+        async {}
+    })
+    .detach();
 }
 
 /// Palette entries for the connection system: "Connect…" opens the picker,

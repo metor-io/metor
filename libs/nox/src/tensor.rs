@@ -46,43 +46,20 @@ where
     }
 }
 
-/// Trait for items that can be contained in Tensors (i.e the `T`, in `Tensor<T>`)
-///
-/// This trait allows `Tensor` to be used like a higher-order container (like a special `Vec` or slice).
-/// In most use cases you only use `Tensor` to hold basic primitives like `f64`,
-/// but you can also have a tensor of [`crate::Quaternion`] or even of another `Tensor`.
+/// Associates a tensor item with the element stored by its representation.
 pub trait TensorItem {
-    /// The type used when mapping across the `Tensor`.
-    /// For example, if you have a `Tensor<f64>` you will get a `Scalar<f64>` when mapping over the tensor
-    type Item;
-
-    /// A helper type that allows you to get a new Tensor with this `TensorItem`, and the specified dimension
-    type Tensor<D>
-    where
-        D: Dim;
-
-    /// The dimension of the underlying item. For example `f64` will be `ScalarDim`
-    type Dim: Dim;
-
-    /// The primitive element that will be stored in actual memory
+    /// The element stored in memory.
     type Elem: Elem;
 }
 
 impl<T: Elem> TensorItem for T {
-    type Item = Scalar<T>;
-    type Tensor<D>
-        = Tensor<T, D>
-    where
-        D: Dim;
-    type Dim = ();
-
     type Elem = T;
 }
 
 impl<T: Field, D: Dim, R: OwnedRepr> Clone for Tensor<T, D, R> {
     fn clone(&self) -> Self {
         Self {
-            inner: R::noop(&self.inner),
+            inner: self.inner.clone(),
             phantom: self.phantom,
         }
     }
@@ -444,41 +421,32 @@ impl_prim!(u32);
 impl_prim!(i64);
 impl_prim!(i32);
 
-/// Trait for mapping dimensions in tensor operations.
-/// Allows for transforming and replacing dimensions in tensor types.
+/// Selects and replaces a dimension when computing concatenated array shapes.
 pub trait ReplaceDim<D> {
-    type Item: Dim;
     type MappedDim: Dim;
     type ReplaceMappedDim<ReplaceDim: Dim>;
-    const MAPPED_DIM: usize;
 }
 
-/// Alias for the mapped dimension type of `T` for dimension `D`.
-pub type MappedDim<T, D> = <T as ReplaceDim<D>>::MappedDim;
-/// Alias for the type replacing the mapped dimension `T` for dimension `D` with `R`.
+/// Replaces the dimension selected by `T` in `D` with `R`.
 pub type ReplaceMappedDim<T, D, R> = <T as ReplaceDim<D>>::ReplaceMappedDim<R>;
 
-/// Represents a mapped dimension used for transforming tensor dimensions.
+/// Marks the dimension to replace in an array shape.
 pub struct Mapped;
 
 impl<D: Dim> ReplaceDim<D> for Mapped {
-    type Item = ();
     type MappedDim = D;
     type ReplaceMappedDim<ReplaceDim: Dim> = ReplaceDim;
-
-    const MAPPED_DIM: usize = 0;
 }
 
-/// Trait that defines the default mapped dimension for use with `.map`
+/// Selects the first dimension for concatenation, treating scalars as length one.
 pub trait DefaultMap
 where
     Self: Sized,
 {
-    /// The default dimension to be mapped, usually the first dim.
     type DefaultMapDim: ReplaceDim<Self>;
 }
 
-/// Alias for the default mapped dimension of `D`.
+/// The first dimension of `D`, or length one for a scalar.
 pub type DefaultMappedDim<D> = <<D as DefaultMap>::DefaultMapDim as ReplaceDim<D>>::MappedDim;
 
 impl DefaultMap for ScalarDim {
@@ -486,125 +454,53 @@ impl DefaultMap for ScalarDim {
 }
 
 impl ReplaceDim<ScalarDim> for Const<1> {
-    type Item = ();
     type MappedDim = Const<1>;
     type ReplaceMappedDim<ReplaceDim: Dim> = ReplaceDim;
-
-    const MAPPED_DIM: usize = 0;
 }
 
-macro_rules! impl_map {
-    ($num:literal; $($ty:tt),+) => {
-
+macro_rules! impl_concat_dims {
+    ($($ty:tt),+) => {
         #[allow(unused_parens)]
-         impl<M, $($ty,)*> DefaultMap for (M, $($ty,)*)
-         where
-             M: Dim,
-            $($ty: Dim, )*
+        impl<M, $($ty,)*> DefaultMap for (M, $($ty,)*)
+        where
+            M: Dim,
+            $($ty: Dim,)*
             ($($ty),*): Dim,
-         {
-             type DefaultMapDim = (Mapped, $($ty,)* );
-         }
-
-        impl_map_inner!($num; TT1; $($ty),*);
-        impl_map_inner!($num; TT1, TT2; $($ty),*);
-        impl_map_inner!($num; TT1, TT2, TT3; $($ty),*);
-        impl_map_inner!($num; TT1, TT2, TT3, TT4 ; $($ty),*);
+        {
+            type DefaultMapDim = (Mapped, $($ty,)*);
+        }
 
         #[allow(unused_parens)]
         impl<M, $($ty,)*> ReplaceDim<(M, $($ty,)*)> for (Mapped, $($ty,)*)
         where
             M: Dim,
-            $($ty: Dim, )*
+            $($ty: Dim,)*
             ($($ty),*): Dim,
         {
-            type Item = ($($ty),*);
             type MappedDim = M;
-            type ReplaceMappedDim<ReplaceDim: Dim> = (ReplaceDim, $($ty),*);
-
-            const MAPPED_DIM: usize = 0;
-        }
-
-        impl<$($ty,)* A> DimConcat<($($ty,)*), A> for (($($ty,)*), A)
-        where
-            $($ty: Dim, )*
-            A: Dim + NonTupleDim
-        {
-            type Output = ($($ty),*, A);
-        }
-
-        impl<$($ty,)* A> DimConcat<A, ($($ty,)*)> for (A, ($($ty,)*))
-        where
-            $($ty: Dim, )*
-            A: Dim + NonTupleDim
-        {
-            type Output = (A,$($ty),*);
+            type ReplaceMappedDim<ReplaceDim: Dim> = (ReplaceDim, $($ty,)*);
         }
     };
 }
 
-macro_rules! impl_map_inner {
-    ($num:literal; $($trail_ty:tt),* ; $($ty:tt),*) => {
-        impl<$($ty,)* $($trail_ty,)* M> ReplaceDim<
-            ($($ty,)* Mapped, $($trail_ty,)*)
-            > for ($($ty,)* M, $($trail_ty,)*)
-              where $($ty: Dim, )*
-              $($trail_ty: Dim, )*
-            M: Dim,
-            (T1, TT1): Dim,
-            ($($ty),*, $($trail_ty),*): Dim,
-        {
-            type Item = ($($ty),*, $($trail_ty),*);
-            type MappedDim = M;
-            type ReplaceMappedDim<ReplaceDim: Dim> = ($($ty),*, ReplaceDim, $($trail_ty),*);
-
-            const MAPPED_DIM: usize = $num;
-        }
-    };
-}
-
-impl_map!(1; T1);
-impl_map!(2; T1, T2);
-impl_map!(3; T1, T2, T3);
-impl_map!(4; T1, T2, T3, T4);
-impl_map!(5; T1, T2, T3, T4, T5);
-impl_map!(6; T1, T2, T3, T4, T5, T6);
-impl_map!(7; T1, T2, T3, T4, T5, T6, T7);
+impl_concat_dims!(T1);
+impl_concat_dims!(T1, T2);
+impl_concat_dims!(T1, T2, T3);
+impl_concat_dims!(T1, T2, T3, T4);
+impl_concat_dims!(T1, T2, T3, T4, T5);
+impl_concat_dims!(T1, T2, T3, T4, T5, T6);
+impl_concat_dims!(T1, T2, T3, T4, T5, T6, T7);
 
 impl<const N: usize> DefaultMap for Const<N> {
     type DefaultMapDim = Mapped;
 }
 
-/// Trait representing the concatenation of dimensions.
-pub trait DimConcat<A, B> {
-    type Output;
-}
-
-impl<const A: usize> DimConcat<Const<A>, ()> for (Const<A>, ()) {
-    type Output = Const<A>;
-}
-
-impl<const A: usize> DimConcat<(), Const<A>> for ((), Const<A>) {
-    type Output = Const<A>;
-}
-
-impl<A: NonScalarDim + NonTupleDim, B: NonScalarDim + NonTupleDim> DimConcat<A, B> for (A, B) {
-    type Output = (A, B);
-}
-
-/// Trait implemented by all non-tuple dimensions, used by the [`DimConcat`] trait
+/// Marks dimensions represented without a type tuple for broadcasting and indexing.
 pub trait NonTupleDim {}
 
 impl NonTupleDim for ScalarDim {}
 impl NonTupleDim for Dyn {}
 impl<const N: usize> NonTupleDim for Const<N> {}
-
-// impl<A: NonScalarDim + TensorDim, B: NonScalarDim + TensorDim> DimConcat<A, B> for (A, B) {
-//     type Output = (A, B);
-// }
-
-/// Alias for the dimension resulting from concatenating dimensions `A` and `B`.
-pub type ConcatDims<A, B> = <(A, B) as DimConcat<A, B>>::Output;
 
 impl<T1: TensorItem + Field, D1: Dim, R: OwnedRepr> Tensor<T1, D1, R> {
     pub fn reshape<D2: Dim + ConstDim>(self) -> Tensor<T1, D2, R>
@@ -1161,15 +1057,6 @@ where
 impl<T: TensorItem, R: OwnedRepr, D: Dim> ReprMonad<R> for Tensor<T, D, R> {
     type Elem = T::Elem;
     type Dim = D;
-
-    type Map<N: OwnedRepr> = Tensor<T, D, N>;
-
-    fn map<N: OwnedRepr>(
-        self,
-        func: impl Fn(<R as Repr>::Inner<Self::Elem, Self::Dim>) -> N::Inner<Self::Elem, Self::Dim>,
-    ) -> Self::Map<N> {
-        Tensor::from_inner(func(self.inner))
-    }
 
     fn inner(&self) -> &<R as Repr>::Inner<Self::Elem, Self::Dim> {
         &self.inner

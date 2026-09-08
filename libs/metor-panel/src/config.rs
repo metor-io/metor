@@ -48,6 +48,9 @@ pub struct PanelConfig {
     pub font: FontConfig,
     #[facet(default)]
     pub motion: MotionPreference,
+    /// Initial folder for recording dialogs, never a recording filename.
+    #[facet(default)]
+    pub recording_parent: Option<String>,
     /// gpui keystroke that opens the transient chord menu (e.g. `"space"`,
     /// `"cmd-k"`).
     #[facet(default = default_leader())]
@@ -59,6 +62,7 @@ impl Default for PanelConfig {
         Self {
             font: FontConfig::default(),
             motion: MotionPreference::default(),
+            recording_parent: None,
             leader: default_leader(),
         }
     }
@@ -71,9 +75,25 @@ fn default_leader() -> String {
 /// Resolve the config file path. Does **not** create the parent directory —
 /// the read path shouldn't materialize anything just by being walked.
 fn config_path() -> io::Result<PathBuf> {
+    Ok(config_dir()?.join("config.json"))
+}
+
+/// Shared parent for panel preferences and connection history.
+#[cfg(not(test))]
+pub(crate) fn config_dir() -> io::Result<PathBuf> {
     let base = dirs::config_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config dir"))?;
-    Ok(base.join("metor").join("panel").join("config.json"))
+    Ok(base.join("metor").join("panel"))
+}
+
+// Startup integration tests exercise real save hooks. Keep their preferences
+// and recents isolated from both the user and other test threads.
+#[cfg(test)]
+pub(crate) fn config_dir() -> io::Result<PathBuf> {
+    thread_local! {
+        static DIRECTORY: tempfile::TempDir = tempfile::tempdir().expect("test config directory");
+    }
+    Ok(DIRECTORY.with(|dir| dir.path().to_owned()))
 }
 
 /// Load the panel config, falling back to defaults on a missing or malformed
@@ -161,5 +181,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(round_trip(&custom).leader, "cmd-k");
+    }
+
+    #[test]
+    fn recording_folder_round_trips_and_defaults_for_older_configs() {
+        let older: PanelConfig = facet_json::from_str("{}").unwrap();
+        assert!(older.recording_parent.is_none());
+        let config = PanelConfig {
+            recording_parent: Some("/Volumes/Recordings".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            round_trip(&config).recording_parent,
+            config.recording_parent
+        );
     }
 }
