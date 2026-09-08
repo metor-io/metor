@@ -74,6 +74,11 @@ pub struct ConnectionPicker {
     should_move: bool,
     storage_picker: Option<Entity<Inspector>>,
     storage_button_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    /// Consumer-supplied overlays, populated only when this picker *is* the
+    /// startup window. In the in-app case [`AppRoot`](crate::app::AppRoot)
+    /// already renders them, so building them here too would put two live
+    /// instances over one window.
+    overlays: Vec<gpui::AnyView>,
     pub dismissed: bool,
 }
 
@@ -97,6 +102,7 @@ impl ConnectionPicker {
             should_move: false,
             storage_picker: None,
             storage_button_bounds: Default::default(),
+            overlays: Vec::new(),
             dismissed: false,
         }
     }
@@ -110,6 +116,7 @@ impl ConnectionPicker {
         let mut picker = Self::new(store, true, cx);
         picker.startup = Some(startup);
         picker.logo = Some(cx.new(|_| super::logo::AsciiLogo::new()));
+        picker.overlays = crate::app::build_overlays(cx);
         picker
     }
 
@@ -1487,6 +1494,12 @@ impl Render for ConnectionPicker {
                 .when_some(self.storage_picker.clone(), |root, picker| {
                     root.child(picker)
                 });
+            // Consumer overlays mount last so they draw over the whole screen,
+            // matching where `AppRoot` puts them.
+            let root = self
+                .overlays
+                .iter()
+                .fold(root, |root, view| root.child(view.clone()));
             return crate::window_controls::client_side_decorations(root, false, window, cx)
                 .into_any_element();
         }

@@ -116,11 +116,7 @@ impl AppRoot {
                 pending_connection_picker = Some(true);
             }
         }
-        let overlay_builders = cx
-            .try_global::<OverlayBuilders>()
-            .map(|b| b.0.clone())
-            .unwrap_or_default();
-        let overlays = overlay_builders.iter().map(|build| build(cx)).collect();
+        let overlays = build_overlays(cx);
         Self {
             db,
             tiles,
@@ -677,10 +673,32 @@ impl Render for AppRoot {
 
 /// Consumer-supplied overlay constructors, installed via [`PanelApp::overlay`].
 /// Held in a global as constructors rather than views so every window builds
-/// its own instances in [`AppRoot::new`].
+/// its own instances.
 struct OverlayBuilders(Vec<std::rc::Rc<dyn Fn(&mut App) -> gpui::AnyView>>);
 
 impl gpui::Global for OverlayBuilders {}
+
+/// Build this window's own instances of the consumer-supplied overlays. Both
+/// [`AppRoot`] and the startup screen call this, so no two windows share a
+/// view entity — element state and hitboxes are per-window.
+pub(crate) fn build_overlays(cx: &mut App) -> Vec<gpui::AnyView> {
+    let builders = cx
+        .try_global::<OverlayBuilders>()
+        .map(|b| b.0.clone())
+        .unwrap_or_default();
+    builders.iter().map(|build| build(cx)).collect()
+}
+
+/// Install the consumer's overlay constructors as a global. Called before the
+/// startup screen opens and again before the first app window, so overlays are
+/// mountable in both; the builders are cloned rather than consumed because the
+/// startup screen hands the [`PanelApp`] on to `start` afterwards.
+pub(crate) fn install_overlay_builders(
+    overlays: &[std::rc::Rc<dyn Fn(&mut App) -> gpui::AnyView>],
+    cx: &mut App,
+) {
+    cx.set_global(OverlayBuilders(overlays.to_vec()));
+}
 
 impl AppRoot {
     /// Active-alarm summary shown on the left of the title bar; clicking opens the alarm
@@ -1412,6 +1430,11 @@ impl PanelApp {
             if self.db.is_some() {
                 self.start(cx);
             } else {
+                // The startup screen is a window like any other, so overlays
+                // have to be installed before it opens: a consumer's overlay
+                // may be the only UI a blocking discovery source (an auth
+                // prompt, say) has to draw into while the screen is up.
+                install_overlay_builders(&self.overlays, cx);
                 let path = self.startup_open.take();
                 crate::session::startup::open(self, path, cx);
             }
@@ -1554,7 +1577,7 @@ impl PanelApp {
         for hook in init_hooks {
             hook(cx);
         }
-        cx.set_global(OverlayBuilders(overlays));
+        install_overlay_builders(&overlays, cx);
 
         // `secondary-` resolves to cmd on macOS and ctrl elsewhere
         // (`cmd-` would be the Win/Super key off-macOS).
