@@ -123,6 +123,32 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// A theme tint over the native blurred backdrop in the splash sidebar.
+    pub(crate) fn splash_sidebar_bg(&self) -> Hsla {
+        Self::dim(self.bg_elevated, 0.25)
+    }
+
+    /// The logo's ember ramp, fading into the current splash surface.
+    pub(crate) fn logo_color(&self, level: f32) -> Hsla {
+        let stops: [gpui::Rgba; 3] = [
+            self.bg_elevated.into(),
+            hex(0x8c360e, 1.).into(),
+            hex(0xff4f00, 1.).into(),
+        ];
+        let value = level.clamp(0., 1.) * 2.;
+        let i = (value as usize).min(1);
+        let fraction = value - i as f32;
+        let a = stops[i];
+        let b = stops[i + 1];
+        gpui::Rgba {
+            r: a.r + (b.r - a.r) * fraction,
+            g: a.g + (b.g - a.g) * fraction,
+            b: a.b + (b.b - a.b) * fraction,
+            a: 1.,
+        }
+        .into()
+    }
+
     /// Drop shadow behind the window when Linux client-side decorations are
     /// active. Derived rather than per-palette: translucent black reads
     /// correctly over any compositor wallpaper.

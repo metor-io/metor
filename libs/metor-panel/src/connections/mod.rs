@@ -15,6 +15,7 @@
 //! and repaints observers.
 
 pub mod discovery;
+pub(crate) mod logo;
 pub mod options;
 pub mod persist;
 mod picker;

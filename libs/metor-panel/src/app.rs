@@ -671,7 +671,7 @@ impl Render for AppRoot {
             root = root.child(view.clone());
         }
 
-        crate::window_controls::client_side_decorations(root, window, cx)
+        crate::window_controls::client_side_decorations(root, true, window, cx)
     }
 }
 

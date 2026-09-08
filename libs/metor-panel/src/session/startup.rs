@@ -1,10 +1,16 @@
 //! Resolve storage before creating a DB, server, or connection worker.
 use std::path::PathBuf;
 
-use gpui::{App, AppContext as _, Context, Focusable as _, SharedString, Window, WindowOptions};
+use gpui::{
+    App, AppContext as _, Bounds, Context, Focusable as _, SharedString, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, point, px, size,
+};
 
 use super::SessionStorage;
 use crate::PanelApp;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 pub(crate) struct SessionStartup {
     app: Option<PanelApp>,
@@ -35,7 +41,33 @@ impl Drop for Opening {
 
 pub(crate) fn open(mut app: PanelApp, path: Option<PathBuf>, cx: &mut App) {
     let store = app.prepare_connections(path.is_none(), cx);
-    if let Err(error) = cx.open_window(WindowOptions::default(), |window, cx| {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            size(px(860.), px(480.)),
+            cx,
+        ))),
+        is_resizable: false,
+        window_background: if cfg!(target_os = "macos") {
+            gpui::WindowBackgroundAppearance::Transparent
+        } else {
+            gpui::WindowBackgroundAppearance::Opaque
+        },
+        titlebar: Some(TitlebarOptions {
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(12.), px(8.))),
+            ..Default::default()
+        }),
+        window_decorations: Some(gpui::WindowDecorations::Client),
+        app_id: Some("metor-panel".into()),
+        ..Default::default()
+    };
+    if let Err(error) = cx.open_window(options, |window, cx| {
+        #[cfg(target_os = "macos")]
+        if let Err(error) = macos::install_sidebar_blur(window, &crate::theme::theme(cx)) {
+            tracing::warn!(%error, "could not install native splash blur");
+            window.set_background_appearance(gpui::WindowBackgroundAppearance::Blurred);
+        }
         window.on_window_should_close(cx, |_, cx| {
             cx.quit();
             true
@@ -268,15 +300,23 @@ impl SessionStartup {
         self.path.is_none()
     }
 
-    pub(crate) fn summary(&self) -> SharedString {
+    pub(crate) fn write_location_label(&self) -> SharedString {
+        self.path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned().into())
+            .unwrap_or_else(|| "Temporary".into())
+    }
+
+    pub(crate) fn summary(&self) -> Option<SharedString> {
         if self.opening.is_some() {
-            "Opening recording… Press Escape to cancel.".into()
+            Some("Opening recording… Press Escape to cancel.".into())
         } else if self.selecting {
-            "Choosing location…".into()
-        } else if let Some(path) = &self.path {
-            format!("Record to {}", path.display()).into()
+            None
         } else {
-            "Temporary data is removed when you quit. Save a snapshot to keep it.".into()
+            self.path
+                .as_ref()
+                .map(|path| format!("Record to {}", path.display()).into())
         }
     }
 

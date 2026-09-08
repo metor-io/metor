@@ -48,6 +48,20 @@ pub(crate) fn needs_window_controls(window: &Window) -> bool {
 /// without native controls. Occluded so the buttons win the non-client
 /// hit-test over the surrounding titlebar drag area.
 pub(crate) fn window_controls(theme: &Theme, window: &Window) -> impl IntoElement {
+    window_controls_with_close(theme, window, true, |window, cx| {
+        // remove_window skips the should-close hook.
+        crate::connections::flush_layout_including(window, cx);
+        window.remove_window();
+    })
+}
+
+/// Startup closes the application; running panels close an individual window.
+pub(crate) fn window_controls_with_close(
+    theme: &Theme,
+    window: &Window,
+    resizable: bool,
+    close: fn(&mut Window, &mut App),
+) -> impl IntoElement {
     let maximize_icon = if window.is_maximized() {
         Icon::Restore
     } else {
@@ -77,29 +91,28 @@ pub(crate) fn window_controls(theme: &Theme, window: &Window) -> impl IntoElemen
                 }
             }),
         )
-        .child(
-            caption_button(
-                "window-maximize",
-                maximize_icon,
-                WindowControlArea::Max,
-                theme,
+        .when(resizable, |controls| {
+            controls.child(
+                caption_button(
+                    "window-maximize",
+                    maximize_icon,
+                    WindowControlArea::Max,
+                    theme,
+                )
+                .hover(|s| s.bg(theme.bg_primary))
+                .on_mouse_up(MouseButton::Left, |_, window, _| {
+                    if !cfg!(target_os = "windows") {
+                        window.zoom_window();
+                    }
+                }),
             )
-            .hover(|s| s.bg(theme.bg_primary))
-            .on_mouse_up(MouseButton::Left, |_, window, _| {
-                if !cfg!(target_os = "windows") {
-                    window.zoom_window();
-                }
-            }),
-        )
+        })
         .child(
             caption_button("window-close", Icon::Close, WindowControlArea::Close, theme)
                 .hover(|s| s.bg(theme.error_accent))
-                .on_mouse_up(MouseButton::Left, |_, window, cx| {
+                .on_mouse_up(MouseButton::Left, move |_, window, cx| {
                     if !cfg!(target_os = "windows") {
-                        // `remove_window` skips the should-close hook, so
-                        // this close flushes the layout itself.
-                        crate::connections::flush_layout_including(window, cx);
-                        window.remove_window();
+                        close(window, cx);
                     }
                 }),
         )
@@ -131,6 +144,7 @@ fn caption_button(
 /// full-size container with zero visual effect.
 pub(crate) fn client_side_decorations(
     element: impl IntoElement,
+    resizable: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> Stateful<Div> {
@@ -172,6 +186,9 @@ pub(crate) fn client_side_decorations(
                 .when(!tiling.left, |div| div.pl(CSD_SHADOW))
                 .when(!tiling.right, |div| div.pr(CSD_SHADOW))
                 .on_mouse_move(move |e, window, cx| {
+                    if !resizable {
+                        return;
+                    }
                     let size = window.window_bounds().get_bounds().size;
                     let new_edge = resize_edge(e.position, CSD_SHADOW, size, tiling);
                     let edge = cx.try_global::<GlobalResizeEdge>();
@@ -183,6 +200,9 @@ pub(crate) fn client_side_decorations(
                     }
                 })
                 .on_mouse_down(MouseButton::Left, move |e, window, _| {
+                    if !resizable {
+                        return;
+                    }
                     let size = window.window_bounds().get_bounds().size;
                     let Some(edge) = resize_edge(e.position, CSD_SHADOW, size, tiling) else {
                         return;
@@ -229,6 +249,7 @@ pub(crate) fn client_side_decorations(
         )
         .map(|div| match decorations {
             Decorations::Server => div,
+            Decorations::Client { .. } if !resizable => div,
             Decorations::Client { tiling, .. } => div.child(
                 canvas(
                     |_bounds, window, _| {
