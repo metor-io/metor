@@ -419,7 +419,6 @@ class Target:
         program, program_artifacts = self._program_ir()
         return {
             "ir_version": IR_VERSION,
-            "metor_config_version": __version__,
             "coordinator": {
                 "cycle_rate": self.cycle_rate,
                 "default_depth": self.default_depth,
@@ -446,9 +445,19 @@ def _the_target() -> Target:
     return _targets[0]
 
 
+def _envelope(targets: list[Target]) -> dict[str, Any]:
+    """The deployment document: the emitter's version and one member
+    ``Wiring`` per target, in the order given."""
+    return {
+        "ir_version": IR_VERSION,
+        "metor_config_version": __version__,
+        "targets": [t.to_ir() for t in targets],
+    }
+
+
 def emit(target: Target | None = None) -> None:
-    """Write the target IR to ``$METOR_IR_OUT`` (stdout if unset)."""
-    ir = (target or _the_target()).to_ir()
+    """Write the deployment IR to ``$METOR_IR_OUT`` (stdout if unset)."""
+    ir = _envelope([target or _the_target()])
     text = json.dumps(ir, indent=2)
     out = os.environ.get("METOR_IR_OUT")
     if out:

@@ -28,7 +28,7 @@ use std::path::Path;
 use adcs_contracts::{BodyState, ModeCmd, tracking_sample};
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{eval_python_target, provision_artifacts, resolve};
+use metor_fsw_2::wiring::{eval_python_deployment, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
 mod common;
@@ -70,7 +70,11 @@ struct Measure {
 /// The registry gets the **same** `pack()` the cdylib exports — one registration serving
 /// the static, dlopen, and process loading modes is the pack surface's whole point.
 fn build_static() -> Coordinator {
-    let mut wiring = eval_python_target(&target_py()).expect("evaluate target.py");
+    let mut wiring = eval_python_deployment(&target_py())
+        .expect("evaluate target.py")
+        .target(None)
+        .expect("its only member")
+        .clone();
     provision_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
     // plant/nav/ctrl: link statically via the Registry rather than dlopen (in-proc static
     // systems are the parity reference); the compiled Python system keeps its wasm artifact

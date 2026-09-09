@@ -33,7 +33,7 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{ParamSource, eval_python_target, provision_artifacts, resolve};
+use metor_fsw_2::wiring::{ParamSource, eval_python_deployment, provision_artifacts, resolve};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, SequenceStatus, split_record};
 
 /// The target file — the same one the CLI runner and the other tests read.
@@ -57,13 +57,14 @@ fn build_coordinator(auto_run: bool) -> Option<Coordinator> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_target(&target_py()) {
-        Ok(w) => w,
+    let deployment = match eval_python_deployment(&target_py()) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("skipping: target.py did not evaluate: {e}");
             return None;
         }
     };
+    let mut wiring = deployment.target(None).expect("its only member").clone();
     // Test binaries can't host a `process=#true` worker (no `worker_entry` in main) — run
     // every system in-process, like `build_sim_coordinator`.
     for spec in &mut wiring.systems {
@@ -377,12 +378,13 @@ fn detumble_times_out_to_failed_with_wheels_idle() {
     if !common::ensure_stubs() {
         return;
     }
-    let Some(mut wiring) = eval_python_target(&target_py())
+    let Some(deployment) = eval_python_deployment(&target_py())
         .map_err(|e| eprintln!("skipping: target.py did not evaluate: {e}"))
         .ok()
     else {
         return;
     };
+    let mut wiring = deployment.target(None).expect("its only member").clone();
     let commissioning = wiring.slots[0]
         .allow
         .iter_mut()

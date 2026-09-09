@@ -9,7 +9,7 @@
 //! consumes — deserialized and re-serialized to prove it is exactly what Rust
 //! accepts and emits.
 
-use metor_fsw_2::ir::{ArtifactKind, EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
+use metor_fsw_2::ir::{ArtifactKind, Deployment, EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
 use metor_fsw_2::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
     InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec,
@@ -330,6 +330,33 @@ fn golden_fixture_round_trips() {
     assert_eq!(
         reserialized, on_disk,
         "the golden fixture must equal its own Rust round-trip after normalization"
+    );
+}
+
+/// The deployment envelope is the document both front-ends emit, so its JSON
+/// must survive a round-trip with its members intact and in order.
+#[test]
+fn envelope_round_trips() {
+    let member = |namespace: &str| {
+        let mut w = maximal();
+        w.coordinator.namespace = Some(namespace.into());
+        w
+    };
+    let deployment = Deployment {
+        ir_version: IR_VERSION,
+        targets: vec![member("plant"), member("fsw")],
+    };
+
+    let json = serde_json::to_string(&deployment).unwrap();
+    let back: Deployment = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, deployment);
+    assert_eq!(
+        back.target(Some("fsw"))
+            .unwrap()
+            .coordinator
+            .namespace
+            .as_deref(),
+        Some("fsw")
     );
 }
 

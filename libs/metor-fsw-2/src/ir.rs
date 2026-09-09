@@ -9,15 +9,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::wiring::LoadError;
+
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 9;
+pub const IR_VERSION: u32 = 10;
 
 /// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
 ///
-/// Produced by [`eval_python_target`](crate::wiring::eval_python_target) or
+/// Produced by [`eval_python_deployment`](crate::wiring::eval_python_deployment) or
 /// [`WiringBuilder`](crate::wiring::WiringBuilder), and consumed by
 /// [`resolve`](crate::wiring::resolve). The telemetry link appears
 /// here as an ordinary [`TCP_SERVER_TYPE`] state plus [`DOWNLINK_TYPE`]/
@@ -73,6 +75,57 @@ impl Wiring {
             artifact.prebuilt_dir = None;
         }
         w
+    }
+}
+
+/// A deployment: the targets one `target.py` declares, in declaration order.
+///
+/// The document a front-end emits is this envelope; each member is a complete
+/// [`Wiring`], stamped with its own [`IR_VERSION`] so a bundle or a
+/// `WiringManifest` stays self-describing on its own. The envelope version
+/// gates the document, the member version gates the member.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Deployment {
+    /// The [`IR_VERSION`] this envelope was produced against.
+    pub ir_version: u32,
+    /// The members, in the order they were declared. `build` provisions them
+    /// in this order; nothing else reads meaning into it.
+    pub targets: Vec<Wiring>,
+}
+
+impl Deployment {
+    /// A clone with every member [`path_stripped`](Wiring::path_stripped).
+    pub fn path_stripped(&self) -> Deployment {
+        Deployment {
+            ir_version: self.ir_version,
+            targets: self.targets.iter().map(Wiring::path_stripped).collect(),
+        }
+    }
+
+    /// The member `namespace` selects: the only member when the deployment
+    /// has one and nothing was requested, else the member whose
+    /// [`CoordinatorSpec::namespace`] equals the request.
+    pub fn target(&self, namespace: Option<&str>) -> Result<&Wiring, LoadError> {
+        let available = || -> Vec<String> {
+            self.targets
+                .iter()
+                .filter_map(|w| w.coordinator.namespace.clone())
+                .collect()
+        };
+        match (self.targets.as_slice(), namespace) {
+            ([], _) => Err(LoadError::EmptyDeployment),
+            ([only], None) => Ok(only),
+            (_, None) => Err(LoadError::TargetRequired {
+                available: available(),
+            }),
+            (targets, Some(requested)) => targets
+                .iter()
+                .find(|w| w.coordinator.namespace.as_deref() == Some(requested))
+                .ok_or_else(|| LoadError::UnknownTarget {
+                    requested: requested.to_string(),
+                    available: available(),
+                }),
+        }
     }
 }
 

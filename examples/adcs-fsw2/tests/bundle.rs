@@ -14,7 +14,8 @@
 use std::path::{Path, PathBuf};
 
 use metor_fsw_2::wiring::{
-    Registry, Wiring, build_target, eval_python_target, load_bundle, provision_artifacts, resolve,
+    Registry, Wiring, build_target, eval_python_deployment, load_bundle, provision_artifacts,
+    resolve,
     write_bundle,
 };
 use metor_fsw_2::{BuildOptions, PackageOptions};
@@ -40,13 +41,14 @@ fn eval_and_build() -> Option<Wiring> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_target(&target("target.py")) {
-        Ok(w) => w,
+    let deployment = match eval_python_deployment(&target("target.py")) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("skipping: target.py did not evaluate: {e}");
             return None;
         }
     };
+    let mut wiring = deployment.target(None).expect("its only member").clone();
     for spec in &mut wiring.systems {
         spec.process = false;
     }

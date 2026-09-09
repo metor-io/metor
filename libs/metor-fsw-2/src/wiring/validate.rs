@@ -13,13 +13,71 @@ use std::collections::HashSet;
 
 use super::LoadError;
 use super::model::IR_VERSION;
-use super::model::{ArtifactKind, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
+use super::model::{
+    ArtifactKind, Deployment, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring,
+};
 use super::resolve::slot_config_error;
 use crate::coordinator::validate_slot_spec;
 
 /// The instance name the coordinator itself occupies. A user spec of this name
 /// collides with it, surfacing as a [`DuplicateInstance`](LoadError::DuplicateInstance).
 const RESERVED_INSTANCE: &str = "coordinator";
+
+/// Reject a structurally invalid [`Deployment`] envelope before selection.
+///
+/// The envelope's own rules only: version, non-empty, and the member identity
+/// rules a deployment of several needs. Each member's own checks stay in
+/// [`validate`], which [`resolve`](super::resolve) runs on the selected one.
+pub fn validate_deployment(deployment: &Deployment) -> Result<(), LoadError> {
+    if deployment.ir_version != IR_VERSION {
+        return Err(LoadError::IrVersionMismatch {
+            found: deployment.ir_version,
+            expected: IR_VERSION,
+        });
+    }
+    if deployment.targets.is_empty() {
+        return Err(LoadError::EmptyDeployment);
+    }
+    if deployment.targets.len() == 1 {
+        return Ok(());
+    }
+
+    let mut seen: Vec<&str> = Vec::new();
+    for (index, member) in deployment.targets.iter().enumerate() {
+        let namespace = member
+            .coordinator
+            .namespace
+            .as_deref()
+            .ok_or(LoadError::NamespaceRequired { index })?;
+        for other in &seen {
+            if *other == namespace {
+                return Err(LoadError::DuplicateNamespace {
+                    namespace: namespace.to_string(),
+                });
+            }
+            if let Some((outer, inner)) = nested(other, namespace) {
+                return Err(LoadError::NamespaceOverlap {
+                    outer: outer.to_string(),
+                    inner: inner.to_string(),
+                });
+            }
+        }
+        seen.push(namespace);
+    }
+    Ok(())
+}
+
+/// The two namespaces ordered outer-first when one is a dotted prefix of the
+/// other, `None` when they are disjoint.
+fn nested<'a>(a: &'a str, b: &'a str) -> Option<(&'a str, &'a str)> {
+    if b.strip_prefix(a).is_some_and(|rest| rest.starts_with('.')) {
+        Some((a, b))
+    } else if a.strip_prefix(b).is_some_and(|rest| rest.starts_with('.')) {
+        Some((b, a))
+    } else {
+        None
+    }
+}
 
 /// Reject a structurally invalid [`Wiring`] before any system is built.
 pub(crate) fn validate(wiring: &Wiring) -> Result<(), LoadError> {
@@ -281,6 +339,103 @@ mod tests {
     use super::*;
     use crate::ir::{Artifact, ProgramDecl, ProgramSpec};
     use crate::wiring::WiringBuilder;
+
+    /// A one-member envelope, its member namespaced when `namespace` is set.
+    fn deployment(namespaces: &[Option<&str>]) -> Deployment {
+        Deployment {
+            ir_version: IR_VERSION,
+            targets: namespaces
+                .iter()
+                .map(|ns| {
+                    let mut w = WiringBuilder::new().build();
+                    w.coordinator.namespace = ns.map(str::to_string);
+                    w
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn envelope_version_and_emptiness_are_checked() {
+        let mut d = deployment(&[None]);
+        assert!(
+            validate_deployment(&d).is_ok(),
+            "one member needs no namespace"
+        );
+
+        d.ir_version = IR_VERSION - 1;
+        assert!(matches!(
+            validate_deployment(&d).unwrap_err(),
+            LoadError::IrVersionMismatch { .. }
+        ));
+
+        let empty = deployment(&[]);
+        assert!(matches!(
+            validate_deployment(&empty).unwrap_err(),
+            LoadError::EmptyDeployment
+        ));
+    }
+
+    #[test]
+    fn several_members_need_distinct_disjoint_namespaces() {
+        assert!(
+            validate_deployment(&deployment(&[Some("fleet.sat1"), Some("fleet.sat2")])).is_ok()
+        );
+
+        assert!(matches!(
+            validate_deployment(&deployment(&[Some("fsw"), None])).unwrap_err(),
+            LoadError::NamespaceRequired { index: 1 }
+        ));
+        assert!(matches!(
+            validate_deployment(&deployment(&[Some("fsw"), Some("fsw")])).unwrap_err(),
+            LoadError::DuplicateNamespace { namespace } if namespace == "fsw"
+        ));
+        assert!(matches!(
+            validate_deployment(&deployment(&[Some("sat"), Some("sat.plant")])).unwrap_err(),
+            LoadError::NamespaceOverlap { outer, inner } if outer == "sat" && inner == "sat.plant"
+        ));
+        assert!(matches!(
+            validate_deployment(&deployment(&[Some("sat.plant"), Some("sat")])).unwrap_err(),
+            LoadError::NamespaceOverlap { outer, inner } if outer == "sat" && inner == "sat.plant"
+        ));
+    }
+
+    #[test]
+    fn selection_covers_every_arm() {
+        let one = deployment(&[None]);
+        assert!(one.target(None).is_ok(), "the only member needs no request");
+        assert!(matches!(
+            one.target(Some("sat")).unwrap_err(),
+            LoadError::UnknownTarget { requested, available }
+                if requested == "sat" && available.is_empty()
+        ));
+
+        let named = deployment(&[Some("fsw")]);
+        assert!(named.target(Some("fsw")).is_ok());
+
+        let two = deployment(&[Some("plant"), Some("fsw")]);
+        assert_eq!(
+            two.target(Some("fsw"))
+                .unwrap()
+                .coordinator
+                .namespace
+                .as_deref(),
+            Some("fsw")
+        );
+        assert!(matches!(
+            two.target(None).unwrap_err(),
+            LoadError::TargetRequired { available } if available == ["plant", "fsw"]
+        ));
+        assert!(matches!(
+            two.target(Some("fws")).unwrap_err(),
+            LoadError::UnknownTarget { requested, .. } if requested == "fws"
+        ));
+
+        assert!(matches!(
+            deployment(&[]).target(None).unwrap_err(),
+            LoadError::EmptyDeployment
+        ));
+    }
 
     fn program_wiring() -> Wiring {
         let mut wiring = WiringBuilder::new()

@@ -1,11 +1,11 @@
 //! Evaluate a `.py` target by running it under a subprocess CPython.
 //!
-//! The target file imports the `metor_config` recorder, builds a target, and
-//! at exit writes the serialized [`Wiring`] IR. This module resolves an
-//! interpreter, materializes the embedded recorder, runs the file, and
-//! ingests the JSON it produced, landing a `Wiring` the shared
-//! [`resolve`](super::resolve) consumes, exactly like the Rust
-//! [`WiringBuilder`](super::WiringBuilder).
+//! The target file imports the `metor_config` recorder, builds its targets,
+//! and at exit writes the serialized [`Deployment`] IR. This module resolves
+//! an interpreter, materializes the embedded recorder, runs the file, and
+//! ingests the JSON it produced, landing an envelope whose selected member is
+//! a `Wiring` the shared [`resolve`](super::resolve) consumes, exactly like
+//! the Rust [`WiringBuilder`](super::WiringBuilder).
 //!
 //! Errors keep their native surface: a Python-level failure prints CPython's
 //! own traceback (the target file is just a script, so `pdb` and IDE debuggers
@@ -16,7 +16,9 @@ use std::process::Command;
 
 use miette::{IntoDiagnostic, miette};
 
-use super::model::Wiring;
+use super::LoadError;
+use super::model::{Deployment, IR_VERSION};
+use super::validate::validate_deployment;
 
 /// The `metor_config` package, embedded file-by-file so the `metor-fsw` binary
 /// carries its own recorder. Materialized to a temp dir at eval time unless
@@ -72,13 +74,13 @@ pub(super) fn metor_config_version() -> &'static str {
         .expect("embedded metor_config declares __version__")
 }
 
-/// Evaluate a `.py` target into a [`Wiring`].
+/// Evaluate a `.py` target file into a [`Deployment`].
 ///
 /// Resolves an interpreter (`$METOR_PYTHON` → `$VIRTUAL_ENV/bin/python` →
 /// `python3`, requiring ≥ 3.10), runs the file with the recorder on
 /// `PYTHONPATH` and `$METOR_IR_OUT` pointed at a temp file, then reads back the
 /// IR. A non-zero exit passes the child's stderr through verbatim.
-pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
+pub fn eval_python_deployment(path: &Path) -> miette::Result<Deployment> {
     let python = resolve_interpreter()?;
 
     // Recorder source, in preference order: a live checkout via
@@ -148,17 +150,34 @@ pub fn eval_python_target(path: &Path) -> miette::Result<Wiring> {
     ingest_ir(&json, path)
 }
 
-/// Deserialize the emitted IR. The IR version is checked at resolve time.
-fn ingest_ir(json: &str, path: &Path) -> miette::Result<Wiring> {
+/// Deserialize the emitted envelope, the one boundary an untrusted document
+/// crosses. The version is read off the raw value first, so a stale recorder
+/// fails with the version message instead of a serde shape error; then
+/// [`validate_deployment`] gates it and everything downstream trusts it. Each
+/// member's own checks stay in resolve.
+fn ingest_ir(json: &str, path: &Path) -> miette::Result<Deployment> {
     let raw: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| miette!("target `{}` emitted invalid JSON: {e}", path.display()))?;
 
-    serde_json::from_value(raw).map_err(|e| {
+    let found = raw
+        .get("ir_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default() as u32;
+    if found != IR_VERSION {
+        return Err(miette::Report::new(LoadError::IrVersionMismatch {
+            found,
+            expected: IR_VERSION,
+        }));
+    }
+
+    let deployment: Deployment = serde_json::from_value(raw).map_err(|e| {
         miette!(
             "target `{}` emitted an IR this host cannot read: {e}",
             path.display()
         )
-    })
+    })?;
+    validate_deployment(&deployment).map_err(miette::Report::new)?;
+    Ok(deployment)
 }
 
 /// Resolve and validate a CPython ≥ 3.10.

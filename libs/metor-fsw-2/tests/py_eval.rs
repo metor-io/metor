@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use metor_fsw_2::wiring::eval_python_target;
+use metor_fsw_2::wiring::eval_python_deployment;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -39,8 +39,14 @@ fn subprocess_eval() {
     // A trivial two-system static target evaluates to the expected Wiring.
     // SAFETY: single-threaded within this test; no other case races the env.
     unsafe { std::env::remove_var("METOR_PYTHON") };
-    let wiring =
-        eval_python_target(&fixture("trivial_target.py")).expect("the trivial target evaluates");
+    let deployment = eval_python_deployment(&fixture("trivial_target.py"))
+        .expect("the trivial target evaluates");
+    assert_eq!(
+        deployment.targets.len(),
+        1,
+        "a bare Target is a deployment of one"
+    );
+    let wiring = deployment.target(None).expect("its only member");
     assert_eq!(wiring.systems.len(), 2);
     assert_eq!(wiring.systems[0].name, "a");
     assert_eq!(wiring.systems[1].name, "b");
@@ -58,14 +64,14 @@ fn subprocess_eval() {
     assert!(src.line > 0);
 
     // A raising target fails; its native traceback is the (stderr) surface.
-    let err =
-        eval_python_target(&fixture("raising_target.py")).expect_err("the raising target fails");
+    let err = eval_python_deployment(&fixture("raising_target.py"))
+        .expect_err("the raising target fails");
     assert!(err.to_string().contains("raising_target.py"));
 
     // $METOR_PYTHON is honored: a bogus interpreter is a clean error.
     unsafe { std::env::set_var("METOR_PYTHON", "/nonexistent/python-xyz") };
-    let err =
-        eval_python_target(&fixture("trivial_target.py")).expect_err("a bogus $METOR_PYTHON fails");
+    let err = eval_python_deployment(&fixture("trivial_target.py"))
+        .expect_err("a bogus $METOR_PYTHON fails");
     assert!(err.to_string().contains("python-xyz"));
     unsafe { std::env::remove_var("METOR_PYTHON") };
 }

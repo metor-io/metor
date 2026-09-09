@@ -21,7 +21,9 @@ use adcs_contracts::{BodyState, V3, Wheels};
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::AlarmRaised;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{ParamSource, Wiring, eval_python_target, provision_artifacts, resolve};
+use metor_fsw_2::wiring::{
+    ParamSource, Wiring, eval_python_deployment, provision_artifacts, resolve,
+};
 use metor_fsw_2::{BuildOptions, Coordinator, Input, MsgIn};
 
 fn target_py() -> std::path::PathBuf {
@@ -68,13 +70,14 @@ fn build_static(k_desat: f64) -> Option<Coordinator> {
     if !common::ensure_stubs() {
         return None;
     }
-    let mut wiring = match eval_python_target(&target_py()) {
-        Ok(w) => w,
+    let deployment = match eval_python_deployment(&target_py()) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("skipping: target.py did not evaluate: {e}");
             return None;
         }
     };
+    let mut wiring = deployment.target(None).expect("its only member").clone();
     // Preload the wheels, becalm the boot tumble, and set this run's desat gain on the
     // evaluated IR's value tree.
     let plant = params_of(&mut wiring, "plant");

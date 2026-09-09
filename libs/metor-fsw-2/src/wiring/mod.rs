@@ -10,7 +10,8 @@
 //! ```
 //!
 //! Both front ends, the Rust [`WiringBuilder`] and an evaluated `.py` target
-//! ([`eval_python_target`]), produce the same [`Wiring`], a plain data model
+//! ([`eval_python_deployment`], whose selected member), produce the same
+//! [`Wiring`], a plain data model
 //! of systems, slots, edges, and coordinator config. [`resolve`](resolve::resolve)
 //! checks it, then creates one internal node per system. Static systems come
 //! from the [`Registry`]. Loaded and process systems come from built
@@ -67,8 +68,8 @@ pub use bundle::{
 };
 pub use error::LoadError;
 pub use model::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, EdgeKind, EdgeSpec,
-    IR_VERSION, InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, ScopeSpec,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, Deployment, EdgeKind,
+    EdgeSpec, IR_VERSION, InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, ScopeSpec,
     SlotInitState, SlotSpec, SourceRef, StateSpec, SystemSpec, TCP_SERVER_TYPE, UPLINK_TYPE,
     Wiring,
 };
@@ -76,9 +77,10 @@ pub use pack_dist::{
     PackBuildOptions, PackBuildReport, PackConfig, PackDevOptions, PackDevReport, PackError,
     pack_build, pack_dev, read_pack_config, refresh_dev_packs,
 };
-pub use py::eval_python_target;
+pub use py::eval_python_deployment;
 pub use registry::{AsyncKind, CyclicKind, IntoNode, Registry};
 pub use resolve::{ResolveOptions, resolve, resolve_with};
+pub use validate::validate_deployment;
 
 // The params codec is `metor-fsw-2-core`'s, since a pack entry decodes its own
 // params with no host in the loop. Re-exported here because the resolver's

@@ -4,10 +4,10 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, ClockSpec, METOR_EXTENSION, PackBuildOptions, PackDevOptions, PackageOptions,
-    Registry, WIRING_FILE_NAME, Wiring, build_target, eval_python_target, load_bundle,
-    locate_artifacts, pack_build, pack_dev, provision_artifacts, refresh_dev_packs, resolve,
-    unpack_metor, write_bundle,
+    BuildOptions, ClockSpec, Deployment, METOR_EXTENSION, PackBuildOptions, PackDevOptions,
+    PackageOptions, Registry, WIRING_FILE_NAME, Wiring, build_target, eval_python_deployment,
+    load_bundle, locate_artifacts, pack_build, pack_dev, provision_artifacts, refresh_dev_packs,
+    resolve, unpack_metor, write_bundle,
 };
 
 mod ui;
@@ -218,11 +218,12 @@ fn merge_target(cargo_args: &[String], target: Option<&str>) -> Vec<String> {
     merged
 }
 
-/// Load a source target into a [`Wiring`]. Targets are Python: a `.py` file
-/// is evaluated by a subprocess CPython; any other extension is unrecognized.
-fn load_source(path: &Path) -> miette::Result<Wiring> {
+/// Load a source target file into a [`Deployment`]. Targets are Python: a
+/// `.py` file is evaluated by a subprocess CPython; any other extension is
+/// unrecognized.
+fn load_source(path: &Path) -> miette::Result<Deployment> {
     if path.extension().is_some_and(|e| e == "py") {
-        return eval_python_target(path);
+        return eval_python_deployment(path);
     }
     Err(miette::miette!(
         "unrecognized target `{}`; targets are Python (`.py`)",
@@ -255,7 +256,10 @@ fn refresh_source_packs(target: &Path, release: bool, cargo_args: &[String]) -> 
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
     let cargo_args = merge_target(&args.cargo_arg, args.triple.as_deref());
     refresh_source_packs(&args.target, args.release, &cargo_args)?;
-    let mut wiring = load_source(&args.target)?;
+    let mut wiring = load_source(&args.target)?
+        .target(None)
+        .into_diagnostic()?
+        .clone();
     provision_artifacts(
         &mut wiring,
         &build_opts(args.release, &cargo_args, args.no_manifest_sidecar),
@@ -287,7 +291,7 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
         .ok_or_else(|| miette::miette!("`package` needs an output path (`-o <out>`)"))?;
     let cargo_args = merge_target(&args.cargo_arg, args.triple.as_deref());
     refresh_source_packs(target, args.release, &cargo_args)?;
-    let mut wiring = load_source(target)?;
+    let mut wiring = load_source(target)?.target(None).into_diagnostic()?.clone();
     provision_artifacts(
         &mut wiring,
         &build_opts(args.release, &cargo_args, args.no_manifest_sidecar),
@@ -342,7 +346,10 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
             bundle.display()
         )
     })?;
-    let produced = load_source(&source)?;
+    let produced = load_source(&source)?
+        .target(None)
+        .into_diagnostic()?
+        .clone();
 
     if normalized_ir(&produced) == normalized_ir(&frozen) {
         println!("--check-ir: {} reproduces its frozen IR", bundle.display());
@@ -463,7 +470,7 @@ fn load_run_wiring(target: &Path) -> miette::Result<Wiring> {
     if is_bundle(target) {
         return load_bundle(target).into_diagnostic();
     }
-    load_source(target)
+    Ok(load_source(target)?.target(None).into_diagnostic()?.clone())
 }
 
 /// Fill a source target's artifact paths: the cargo build driver by default

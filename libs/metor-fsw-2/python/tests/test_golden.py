@@ -261,8 +261,14 @@ class GoldenTest(unittest.TestCase):
     def test_emits_the_golden_fixture(self):
         with open(GOLDEN, encoding="utf-8") as f:
             expected = normalize(json.load(f))
-        actual = normalize(build_target().to_ir())
+        target = build_target()
+        actual = normalize(target.to_ir())
         self.assertEqual(actual, expected)
+
+        # The one-member envelope carries that same `Wiring` unchanged.
+        envelope = mc._target._envelope([target])
+        self.assertEqual(envelope["ir_version"], mc.IR_VERSION)
+        self.assertEqual(normalize(envelope["targets"][0]), expected)
 
     def test_emits_the_golden_dashboard(self):
         # `sat1` so the fixture also pins namespace qualification of every

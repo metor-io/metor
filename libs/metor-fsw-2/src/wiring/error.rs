@@ -29,6 +29,46 @@ pub enum LoadError {
     )]
     IrVersionMismatch { found: u32, expected: u32 },
 
+    /// A [`Deployment`](super::Deployment) with several members and no
+    /// request: the caller must name one. Spanless, like the other envelope
+    /// faults: the document is well-formed, the invocation is not.
+    #[error(
+        "deployment has {} targets; pick one with --target ({})",
+        available.len(),
+        available.join(", ")
+    )]
+    TargetRequired { available: Vec<String> },
+
+    /// A requested namespace no member carries.
+    #[error("deployment has no target `{requested}`; targets: {}", available.join(", "))]
+    UnknownTarget {
+        requested: String,
+        available: Vec<String>,
+    },
+
+    /// A member of a multi-member deployment without a namespace. The
+    /// namespace is a member's identity, so only a deployment of one may
+    /// leave it unset.
+    #[error(
+        "target {index} has no `namespace`; every target of a deployment with more than one \
+         needs one"
+    )]
+    NamespaceRequired { index: usize },
+
+    /// Two members share a namespace, which would merge their component id
+    /// spaces.
+    #[error("duplicate target namespace `{namespace}`")]
+    DuplicateNamespace { namespace: String },
+
+    /// One member's namespace is a dotted prefix of another's, so a
+    /// component id under the inner one names a component in either.
+    #[error("target namespace `{inner}` is nested under `{outer}`; namespaces must be disjoint")]
+    NamespaceOverlap { outer: String, inner: String },
+
+    /// A deployment document with no members: nothing to run.
+    #[error("deployment declares no targets")]
+    EmptyDeployment,
+
     /// A serialized simulated-clock step cannot be represented as a positive
     /// [`Duration`](std::time::Duration).
     #[error(
