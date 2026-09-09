@@ -7,46 +7,19 @@ use thiserror::Error;
 use crate::coordinator::WireError;
 use crate::dl::DlError;
 
-/// A reason a wiring failed to validate or resolve into a runnable system
-/// graph, from missing params through graph-level [`WireError`]s and
-/// shared-library loading failures ([`DlError`]).
-#[derive(Debug)]
-pub struct LoadError {
-    pub kind: LoadErrorKind,
-}
-
-impl std::fmt::Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.kind, f)
-    }
-}
-
-impl std::error::Error for LoadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.kind.source()
-    }
-}
-
 impl Diagnostic for LoadError {}
 
 impl From<ParamError> for LoadError {
     fn from(e: ParamError) -> Self {
-        LoadError {
-            kind: LoadErrorKind::Params(e.kind),
-        }
+        LoadError::Params(e.kind)
     }
 }
 
-impl LoadErrorKind {
-    /// Wrap this error kind for the resolver's public error surface.
-    pub fn bare(self) -> LoadError {
-        LoadError { kind: self }
-    }
-}
-
-/// The payload and display string behind a [`LoadError`].
+/// A reason a wiring failed to validate or resolve into a runnable system
+/// graph, from missing params through graph-level [`WireError`]s and
+/// shared-library loading failures ([`DlError`]).
 #[derive(Error, Debug)]
-pub enum LoadErrorKind {
+pub enum LoadError {
     /// A [`Wiring`](super::Wiring) stamped with a different
     /// [`IR_VERSION`](super::IR_VERSION) than this build's. Spanless: version
     /// skew is producer/host drift, not a mistake in the document text.
@@ -360,4 +333,13 @@ pub enum LoadErrorKind {
     /// set, so every occupant's ports must agree with the first one's.
     #[error("`slot \"{slot}\"` occupant `{occupant}` is incompatible with the slot contract")]
     SlotOccupantMismatch { slot: String, occupant: String },
+}
+
+impl LoadError {
+    pub fn occupant_not_reloadable(slot: impl ToString, occupant: impl ToString) -> Self {
+        LoadError::OccupantNotReloadable {
+            slot: slot.to_string(),
+            occupant: occupant.to_string(),
+        }
+    }
 }

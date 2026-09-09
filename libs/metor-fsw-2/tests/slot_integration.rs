@@ -36,7 +36,7 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceRegistry,
 };
 use metor_fsw_2::params::ParamErrorKind;
-use metor_fsw_2::wiring::{LoadErrorKind, Registry, resolve};
+use metor_fsw_2::wiring::{LoadError, Registry, resolve};
 use metor_fsw_2::{
     AllowedOccupantSpec, BuildSystem, ClockSpec, CommandOut, Coordinator, CoordinatorSpec,
     CyclicSystem, Frame, InitialOccupantSpec, Input, MsgIn, NAME_CAP, Out, ParamSource,
@@ -661,7 +661,7 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
 /// The slot's instance name is the wire address, so an over-long name would
 /// telemeter truncated while addressing untruncated; the build rejects it. The
 /// resolve path surfaces the build-time [`WireError`] wrapped in a
-/// [`LoadErrorKind::Wire`], carrying the precise variant.
+/// [`LoadError::Wire`], carrying the precise variant.
 #[test]
 fn slot_name_over_the_cap_is_a_build_error() {
     let lib = locate_fixture();
@@ -678,8 +678,8 @@ fn slot_name_over_the_cap_is_a_build_error() {
     let err = resolve(&wiring, &Registry::new())
         .err()
         .expect("an over-cap slot name fails the build");
-    match err.kind {
-        LoadErrorKind::Wire {
+    match err {
+        LoadError::Wire {
             source: WireError::SlotNameTooLong { name, len },
         } => {
             assert_eq!(name, long);
@@ -927,7 +927,7 @@ fn command_output_with_an_edge_drives_the_slot() {
 /// `SequenceStatus` self-tap input, the only edge-addressable non-Edge input,
 /// so resolve's `connect` (which checks only ids) succeeds and the build fails
 /// as a [`WireError::HostPort`] — surfaced here wrapped in a
-/// [`LoadErrorKind::Wire`] — rather than binding a foreign producer into a
+/// [`LoadError::Wire`] — rather than binding a foreign producer into a
 /// runner-held view.
 #[test]
 fn edge_into_a_host_connected_input_is_rejected() {
@@ -948,8 +948,8 @@ fn edge_into_a_host_connected_input_is_rejected() {
     let err = resolve(&wiring, &Registry::new())
         .err()
         .expect("an edge into a self-tap input fails");
-    match err.kind {
-        LoadErrorKind::Wire {
+    match err {
+        LoadError::Wire {
             source: WireError::HostPort { system, .. },
         } => assert_eq!(system, "b"),
         other => panic!("expected wrapped HostPort, got {other:?}"),
@@ -957,7 +957,7 @@ fn edge_into_a_host_connected_input_is_rejected() {
 }
 
 /// An initial occupant outside the allowed set is rejected at resolve, before
-/// any artifact is opened, as an [`LoadErrorKind::UnknownInitialOccupant`] (the
+/// any artifact is opened, as an [`LoadError::UnknownInitialOccupant`] (the
 /// front-end mapping of the builder's `SlotConfigError::UnknownInitial`, which
 /// `coordinator::tests::add_slot_rejects_contract_violations` pins directly).
 #[test]
@@ -995,9 +995,9 @@ fn initial_occupant_outside_allowed_set_is_rejected() {
         .err()
         .expect("an initial occupant outside the allowed set is rejected");
     assert!(
-        matches!(err.kind, LoadErrorKind::UnknownInitialOccupant { .. }),
+        matches!(err, LoadError::UnknownInitialOccupant { .. }),
         "got {:?}",
-        err.kind
+        err
     );
 }
 
@@ -1170,7 +1170,7 @@ fn slot_allow_unknown_param_is_a_clean_error() {
         Err(e) => e,
     };
     assert!(
-        matches!(err.kind, LoadErrorKind::Params(ParamErrorKind::UnknownParam { ref property, .. }) if property == "gian"),
+        matches!(err, LoadError::Params(ParamErrorKind::UnknownParam { ref property, .. }) if property == "gian"),
         "{err:?}"
     );
 }
@@ -1198,10 +1198,7 @@ fn slot_declared_contract_mismatch_is_a_clean_error() {
         Err(e) => e,
     };
     assert!(
-        matches!(
-            err.kind,
-            LoadErrorKind::SlotContractMismatch { dir: "input", .. }
-        ),
+        matches!(err, LoadError::SlotContractMismatch { dir: "input", .. }),
         "{err:?}"
     );
 }

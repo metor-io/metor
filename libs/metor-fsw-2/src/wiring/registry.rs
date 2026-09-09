@@ -15,7 +15,7 @@ use metor_fsw_2_core::{BuildCtx, BuildSystem, ConfigureError, CyclicSystem, LogO
 
 use metor_fsw_2_core::params::{NoParams, ParamErrorKind, decode_value_params};
 
-use super::error::{LoadError, LoadErrorKind};
+use super::error::LoadError;
 
 /// Everything a factory decodes to build a [`Node`], erased of the concrete
 /// system type.
@@ -127,12 +127,11 @@ where
             namespace: ctx.namespace,
         })
         .map_err(|e| match e {
-            ConfigureError::UnknownMsg { name, available } => LoadErrorKind::UnknownMsgName {
+            ConfigureError::UnknownMsg { name, available } => LoadError::UnknownMsgName {
                 system: ctx.name.to_string(),
                 msg: name,
                 available: available.join(", "),
-            }
-            .bare(),
+            },
         })?;
     Ok(system.into_node(ctx.name.to_string()))
 }
@@ -326,26 +325,23 @@ impl Registry {
                     // A by-name attach that named a wrong-typed state: refine
                     // the generic create error into the attach diagnostic.
                     metor_fsw_2_core::MakeError::AttachTypeMismatch { system, state } => {
-                        LoadErrorKind::AttachTypeMismatch {
+                        LoadError::AttachTypeMismatch {
                             system: system.to_string(),
                             attach: state.to_string(),
                         }
-                        .bare()
                     }
                     // Reached only when a shared entry's create runs without a
                     // resolved attach; the resolver's pre-check normally
                     // pre-empts it with `MissingAttach`.
                     metor_fsw_2_core::MakeError::MissingAttach { system } => {
-                        LoadErrorKind::MissingAttach {
+                        LoadError::MissingAttach {
                             system: system.to_string(),
                         }
-                        .bare()
                     }
-                    other => LoadErrorKind::PackCreate {
+                    other => LoadError::PackCreate {
                         system: ctx.name.to_string(),
                         message: other.to_string(),
-                    }
-                    .bare(),
+                    },
                 })
             });
             self.factories.insert(
@@ -362,7 +358,7 @@ impl Registry {
 
     /// Whether `ty` names a registered system whose descriptor carries
     /// [`Capability::ReceiveAll`](crate::Capability). Unknown types answer
-    /// `false`; the systems pass reports them as [`LoadErrorKind::UnknownType`] in
+    /// `false`; the systems pass reports them as [`LoadError::UnknownType`] in
     /// document order.
     pub(super) fn is_receive_all(&self, ty: Option<&str>) -> bool {
         ty.and_then(|ty| self.factories.get(ty)).is_some_and(|e| {

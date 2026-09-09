@@ -8,14 +8,8 @@ use metor_proto::types::ComponentId;
 use super::{Dir, Instance, PendingSynth};
 use crate::coordinator::PortRef;
 use crate::coordinator::init::InitGraph;
-use crate::wiring::{EdgeSpec, LoadError, LoadErrorKind};
+use crate::wiring::{EdgeSpec, LoadError};
 
-/// Wire the edges a compiled entry's bindings imply: one edge per distinct
-/// producing port, in the same first-appearance order the compiler grouped
-/// the descriptor's inputs by. The two walks share their key, the binding
-/// list, so a mismatch is artifact/wiring drift and fails loudly. A
-/// `Produced` binding names a *declaration*; `added` maps it to the instance
-/// the declaration was registered under.
 pub(super) fn synth_edges(
     system: &metor_expr::System,
     manifest: &metor_expr::Manifest,
@@ -28,8 +22,7 @@ pub(super) fn synth_edges(
     let consumer = p.handle;
     let desc = &instances[&p.instance].desc;
     let drift = |detail: String| {
-        LoadErrorKind::WasmSystem(format!("Python system `{owner}`: {detail}").into_boxed_str())
-            .bare()
+        LoadError::WasmSystem(format!("Python system `{owner}`: {detail}").into_boxed_str())
     };
     let mut seen: Vec<(String, String)> = Vec::new();
     for port in &system.inputs {
@@ -53,7 +46,6 @@ pub(super) fn synth_edges(
                         "artifact carries a resample stage the build gate rejects".into(),
                     ));
                 }
-                // The stamp rides the record the frame's fields came from.
                 metor_expr::Binding::Timestamp => continue,
             };
             if seen.contains(&key) {
@@ -71,22 +63,20 @@ pub(super) fn synth_edges(
                     input.name, key.0, key.1
                 )));
             }
-            let producer = instances.get(&key.0).ok_or_else(|| {
-                LoadErrorKind::UnknownInstance {
+            let producer = instances
+                .get(&key.0)
+                .ok_or_else(|| LoadError::UnknownInstance {
                     name: key.0.clone(),
-                }
-                .bare()
-            })?;
+                })?;
             let out = producer
                 .desc
                 .outputs
                 .iter()
                 .find(|p| p.name == key.1)
-                .ok_or_else(|| LoadErrorKind::UnknownFrame {
+                .ok_or_else(|| LoadError::UnknownFrame {
                     instance: key.0.clone(),
                     frame: key.1.clone(),
-                })
-                .map_err(LoadErrorKind::bare)?;
+                })?;
             graph.connect(
                 PortRef {
                     system: producer.handle,
@@ -119,10 +109,9 @@ pub(super) fn locate_producer(
     owner: &str,
 ) -> Result<(String, String), LoadError> {
     let bad = |detail: String| {
-        LoadErrorKind::WasmSystem(
+        LoadError::WasmSystem(
             format!("Python system `{owner}`: bound component `{path}` {detail}").into_boxed_str(),
         )
-        .bare()
     };
     let instance = instances
         .keys()
@@ -155,18 +144,17 @@ pub(super) fn locate_producer(
 /// display name (a coordinator-minted channel such as `"commands"`) is then
 /// matched by the packet id the token resolved to on the other endpoint. Only
 /// when neither endpoint matches the token is the edge an
-/// [`UnknownMsg`](LoadErrorKind::UnknownMsg).
+/// [`UnknownMsg`](LoadError::UnknownMsg).
 pub(super) fn resolve_msg_edge(
     instances: &HashMap<String, Instance>,
     edge: &EdgeSpec,
 ) -> Result<(PortRef, PortRef), LoadError> {
     let inst = |name: &str| {
-        instances.get(name).ok_or_else(|| {
-            LoadErrorKind::UnknownInstance {
+        instances
+            .get(name)
+            .ok_or_else(|| LoadError::UnknownInstance {
                 name: name.to_string(),
-            }
-            .bare()
-        })
+            })
     };
     let prod = inst(&edge.from)?;
     let cons = inst(&edge.to)?;
@@ -180,12 +168,9 @@ pub(super) fn resolve_msg_edge(
     let by_id = |ports: &[metor_fsw_2_core::PortDesc], id: PortId| {
         ports.iter().any(|port| port.id() == id).then_some(id)
     };
-    let unknown = |instance: &str, msg: &str| {
-        LoadErrorKind::UnknownMsg {
-            instance: instance.to_string(),
-            msg: msg.to_string(),
-        }
-        .bare()
+    let unknown = |instance: &str, msg: &str| LoadError::UnknownMsg {
+        instance: instance.to_string(),
+        msg: msg.to_string(),
     };
 
     let p_named = by_name(&prod.desc.outputs, &edge.out);
@@ -222,23 +207,21 @@ pub(super) fn resolve_endpoint(
     port_name: &str,
     dir: Dir,
 ) -> Result<PortRef, LoadError> {
-    let inst = instances.get(name).ok_or_else(|| {
-        LoadErrorKind::UnknownInstance {
+    let inst = instances
+        .get(name)
+        .ok_or_else(|| LoadError::UnknownInstance {
             name: name.to_string(),
-        }
-        .bare()
-    })?;
+        })?;
     let ports = match dir {
         Dir::Out => &inst.desc.outputs,
         Dir::In => &inst.desc.inputs,
     };
     let id = PortId::Component(ComponentId::new(port_name));
     if !ports.iter().any(|p| p.id() == id) {
-        return Err(LoadErrorKind::UnknownFrame {
+        return Err(LoadError::UnknownFrame {
             instance: name.to_string(),
             frame: port_name.to_string(),
-        }
-        .bare());
+        });
     }
     Ok(PortRef {
         system: inst.handle,

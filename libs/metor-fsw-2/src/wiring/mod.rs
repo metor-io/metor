@@ -65,7 +65,7 @@ pub use bundle::{
     BundleError, BundleMeta, METOR_EXTENSION, PackProvenance, PackSourceKind, PackageOptions,
     WIRING_FILE_NAME, load_bundle, unpack_metor, write_bundle,
 };
-pub use error::{LoadError, LoadErrorKind};
+pub use error::LoadError;
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, EdgeKind, EdgeSpec,
     IR_VERSION, InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, ScopeSpec,

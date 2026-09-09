@@ -753,7 +753,7 @@ mod integration {
         // And it passes resolve's staleness gate (resolve may fail later for
         // unrelated reasons; StaleStubs specifically must not fire).
         if let Err(e) = super::super::resolve(&wiring, &super::super::Registry::with_builtins())
-            && matches!(e.kind, super::super::LoadErrorKind::StaleStubs { .. })
+            && matches!(e, super::super::LoadError::StaleStubs { .. })
         {
             panic!("fresh pack dev layout wrongly read as stale");
         }

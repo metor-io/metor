@@ -394,7 +394,7 @@ fn dlopen_null_create_reports_stopped() {
 #[test]
 fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
     use metor_fsw_2::DlError;
-    use metor_fsw_2::wiring::LoadErrorKind;
+    use metor_fsw_2::wiring::LoadError;
 
     let _guard = SIDECAR
         .lock()
@@ -431,8 +431,8 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
         Ok(_) => panic!("expected PackTypeRequired"),
         Err(e) => e,
     };
-    match err.kind {
-        LoadErrorKind::PackTypeRequired {
+    match err {
+        LoadError::PackTypeRequired {
             system, available, ..
         } => {
             assert_eq!(system, "counter");
@@ -448,8 +448,8 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
         Ok(_) => panic!("expected PackSystem"),
         Err(e) => e,
     };
-    match err.kind {
-        LoadErrorKind::PackSystem { system, source, .. } => {
+    match err {
+        LoadError::PackSystem { system, source, .. } => {
             assert_eq!(system, "counter");
             match *source {
                 DlError::UnknownPackSystem { name, available } => {

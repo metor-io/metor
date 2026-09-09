@@ -21,7 +21,7 @@ use metor_fsw_2_core::SystemDescriptor;
 use metor_proto::types::ComponentId;
 use slots::resolve_slot;
 
-use super::error::{LoadError, LoadErrorKind};
+use super::error::LoadError;
 use super::model::{
     ClockSpec, CoordinatorSpec, EdgeKind, ParamSource, StateSpec, SystemSpec, Wiring,
 };
@@ -178,15 +178,14 @@ pub fn resolve_with(
                 &mut graph,
             )?,
             (Some(_), true) if wasm_backed => {
-                return Err(LoadErrorKind::WasmSystem(
+                return Err(LoadError::WasmSystem(
                     format!(
                         "system `{}`: `process=#true` is redundant for a wasm system \
                          (the interpreter already isolates it)",
                         spec.name
                     )
                     .into_boxed_str(),
-                )
-                .bare());
+                ));
             }
             (Some(artifact_id), true) => resolve_proc(spec, artifact_id, wiring, &mut graph)?,
             (Some(artifact_id), false) => {
@@ -246,11 +245,10 @@ pub fn resolve_with(
             .get(spec.ty.as_str())
             .expect("the states pass resolved this type");
         if entry.borrow().cell.attached() == 0 {
-            return Err(LoadErrorKind::StateUnused {
+            return Err(LoadError::StateUnused {
                 name: spec.name.clone(),
                 ty: spec.ty.clone(),
-            }
-            .bare());
+            });
         }
     }
 
@@ -274,9 +272,7 @@ pub fn resolve_with(
         }
     }
 
-    graph
-        .build()
-        .map_err(|source| LoadErrorKind::Wire { source }.bare())
+    graph.build().map_err(|source| LoadError::Wire { source })
 }
 
 /// Construct one pack-shared state through its registered
@@ -291,12 +287,11 @@ fn resolve_state(
     let Some(entry) = registry.states.get(spec.ty.as_str()) else {
         let mut available: Vec<&str> = registry.states.keys().copied().collect();
         available.sort_unstable();
-        return Err(LoadErrorKind::UnknownStateType {
+        return Err(LoadError::UnknownStateType {
             name: spec.name.clone(),
             ty: spec.ty.clone(),
             available: available.join(", "),
-        }
-        .bare());
+        });
     };
     // A paramless spec conforms an empty object against the state's schema,
     // the same all-defaults decode a paramless pack entry gets.
@@ -317,12 +312,11 @@ fn resolve_state(
     };
     entry.borrow_mut().create(params).map_err(|e| match e {
         metor_fsw_2_core::MakeError::Params(e) => (*e).into(),
-        other => LoadErrorKind::StateInit {
+        other => LoadError::StateInit {
             name: spec.name.clone(),
             ty: spec.ty.clone(),
             message: other.to_string(),
-        }
-        .bare(),
+        },
     })?;
     let entry = entry.borrow();
     Ok(metor_fsw_2_core::AttachTarget {
@@ -351,7 +345,7 @@ fn resolve_static(
     let factory = registry
         .factories
         .get(ty)
-        .ok_or_else(|| LoadErrorKind::UnknownType { ty: ty.to_string() }.bare())?;
+        .ok_or_else(|| LoadError::UnknownType { ty: ty.to_string() })?;
 
     // Attach/shared consistency: a shared-state entry needs an `attach`, and a
     // plain entry must not carry one. `validate` already proved a present
@@ -363,17 +357,15 @@ fn resolve_static(
                 .expect("validate() proved this attach names a declared state"),
         ),
         (true, None) => {
-            return Err(LoadErrorKind::MissingAttach {
+            return Err(LoadError::MissingAttach {
                 system: spec.name.clone(),
-            }
-            .bare());
+            });
         }
         (false, Some(attach)) => {
-            return Err(LoadErrorKind::AttachOnNonSharedSystem {
+            return Err(LoadError::AttachOnNonSharedSystem {
                 system: spec.name.clone(),
                 attach: attach.to_string(),
-            }
-            .bare());
+            });
         }
         (false, None) => None,
     };
@@ -461,14 +453,13 @@ fn resolve_wasm(
     let max_memory = graph.config.wasm_memory_limit_bytes;
     let module = wasm.open(wiring, artifact_id, &spec.name, max_memory)?;
     let bad = |detail: String| {
-        LoadErrorKind::WasmSystem(
+        LoadError::WasmSystem(
             format!(
                 "system `{}` (artifact `{artifact_id}`): {detail}",
                 spec.name
             )
             .into_boxed_str(),
         )
-        .bare()
     };
     let (index, entry) = wasm_entry(&module.entries, spec.ty.as_deref(), &bad)?;
     let compiled = module
@@ -558,13 +549,10 @@ fn resolve_proc(
         .path
         .as_ref()
         .expect("checked by find_built_artifact");
-    let proc_describe = |detail: String| {
-        LoadErrorKind::ProcDescribe {
-            system: spec.name.clone(),
-            artifact: artifact_id.to_string(),
-            detail,
-        }
-        .bare()
+    let proc_describe = |detail: String| LoadError::ProcDescribe {
+        system: spec.name.clone(),
+        artifact: artifact_id.to_string(),
+        detail,
     };
     let bytes = crate::proc::host::describe_via_worker(None, path)
         .map_err(|e| proc_describe(e.to_string()))?;
@@ -590,10 +578,9 @@ fn resolve_proc(
     _wiring: &Wiring,
     _graph: &mut InitGraph,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    Err(LoadErrorKind::ProcessUnsupported {
+    Err(LoadError::ProcessUnsupported {
         name: spec.name.clone(),
-    }
-    .bare())
+    })
 }
 
 /// Convert the serializable [`CoordinatorSpec`] into the runtime
@@ -608,15 +595,14 @@ fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadE
     }
     if let Some(fuel) = spec.wasm_fuel_per_poll {
         if fuel == 0 {
-            return Err(LoadErrorKind::InvalidWasmFuel.bare());
+            return Err(LoadError::InvalidWasmFuel);
         }
         config.wasm_fuel_per_poll = fuel;
     }
     if let Some(bytes) = spec.wasm_memory_limit_bytes {
-        let bytes = usize::try_from(bytes)
-            .map_err(|_| LoadErrorKind::InvalidWasmMemory { bytes }.bare())?;
+        let bytes = usize::try_from(bytes).map_err(|_| LoadError::InvalidWasmMemory { bytes })?;
         if bytes == 0 {
-            return Err(LoadErrorKind::InvalidWasmMemory { bytes: 0 }.bare());
+            return Err(LoadError::InvalidWasmMemory { bytes: 0 });
         }
         config.wasm_memory_limit_bytes = bytes;
     }
@@ -624,9 +610,9 @@ fn coordinator_config(spec: &CoordinatorSpec) -> Result<CoordinatorConfig, LoadE
         ClockSpec::Wall => ClockMode::Wall,
         ClockSpec::Simulated { dt_secs } => {
             let dt = Duration::try_from_secs_f64(dt_secs)
-                .map_err(|_| LoadErrorKind::InvalidSimulatedStep { dt_secs }.bare())?;
+                .map_err(|_| LoadError::InvalidSimulatedStep { dt_secs })?;
             if dt.is_zero() {
-                return Err(LoadErrorKind::InvalidSimulatedStep { dt_secs }.bare());
+                return Err(LoadError::InvalidSimulatedStep { dt_secs });
             }
             ClockMode::Simulated { dt }
         }

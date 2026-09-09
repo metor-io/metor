@@ -281,7 +281,7 @@ pub struct Artifact {
     /// was produced against, carried through from the
     /// module's `ARTIFACT` constant. [`resolve`](crate::wiring::resolve)
     /// compares it against the live manifest and refuses a stale module
-    /// ([`StaleStubs`](crate::wiring::LoadErrorKind::StaleStubs)). `None` for a
+    /// ([`StaleStubs`](crate::wiring::LoadError::StaleStubs)). `None` for a
     /// builder-authored artifact, which skips the check.
     #[serde(default)]
     pub manifest_hash: Option<String>,
@@ -484,7 +484,7 @@ pub enum ParamSource {
     None,
     /// Canonical postcard `Params` bytes, the typed Rust builder path.
     /// dl-only; the static path rejects it as
-    /// [`StaticPostcardParams`](crate::wiring::LoadErrorKind::StaticPostcardParams).
+    /// [`StaticPostcardParams`](crate::wiring::LoadError::StaticPostcardParams).
     Postcard(Vec<u8>),
     /// A params value tree (schema-conform + encode for loaded, serde
     /// deserialize for static).

@@ -11,14 +11,14 @@
 //!
 use std::collections::HashSet;
 
+use super::LoadError;
 use super::model::IR_VERSION;
 use super::model::{ArtifactKind, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring};
 use super::resolve::slot_config_error;
-use super::{LoadError, LoadErrorKind};
 use crate::coordinator::validate_slot_spec;
 
 /// The instance name the coordinator itself occupies. A user spec of this name
-/// collides with it, surfacing as a [`DuplicateInstance`](LoadErrorKind::DuplicateInstance).
+/// collides with it, surfacing as a [`DuplicateInstance`](LoadError::DuplicateInstance).
 const RESERVED_INSTANCE: &str = "coordinator";
 
 /// Reject a structurally invalid [`Wiring`] before any system is built.
@@ -50,16 +50,14 @@ fn check_artifact_fields(wiring: &Wiring) -> Result<(), LoadError> {
         if artifact.kind == ArtifactKind::Cdylib
             && (artifact.crate_name.is_empty() || artifact.lib.is_empty())
         {
-            return Err(LoadErrorKind::ArtifactMissingCrate {
+            return Err(LoadError::ArtifactMissingCrate {
                 id: artifact.id.clone(),
-            }
-            .bare());
+            });
         }
         if artifact.is_program() && wiring.program.is_none() {
-            return Err(LoadErrorKind::ProgramArtifactWithoutProgram {
+            return Err(LoadError::ProgramArtifactWithoutProgram {
                 id: artifact.id.clone(),
-            }
-            .bare());
+            });
         }
     }
     Ok(())
@@ -73,10 +71,9 @@ fn check_program(wiring: &Wiring) -> Result<(), LoadError> {
         let mut seen = HashSet::new();
         for decl in &program.decls {
             if !seen.insert(&decl.name) {
-                return Err(LoadErrorKind::DuplicateProgramDecl {
+                return Err(LoadError::DuplicateProgramDecl {
                     name: decl.name.clone(),
-                }
-                .bare());
+                });
             }
         }
     }
@@ -99,10 +96,9 @@ fn check_program(wiring: &Wiring) -> Result<(), LoadError> {
             .as_ref()
             .is_some_and(|p| p.decls.iter().any(|d| d.name == entry));
         if !declared {
-            return Err(LoadErrorKind::ProgramUnknownDecl {
+            return Err(LoadError::ProgramUnknownDecl {
                 name: entry.to_string(),
-            }
-            .bare());
+            });
         }
     }
     Ok(())
@@ -112,11 +108,10 @@ fn check_program(wiring: &Wiring) -> Result<(), LoadError> {
 /// version skew is producer/host drift, not a document mistake.
 fn check_ir_version(wiring: &Wiring) -> Result<(), LoadError> {
     if wiring.ir_version != IR_VERSION {
-        return Err(LoadErrorKind::IrVersionMismatch {
+        return Err(LoadError::IrVersionMismatch {
             found: wiring.ir_version,
             expected: IR_VERSION,
-        }
-        .bare());
+        });
     }
     Ok(())
 }
@@ -127,7 +122,7 @@ fn check_ir_version(wiring: &Wiring) -> Result<(), LoadError> {
 fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
     let len = wiring.scopes.len();
     let check = |owner: String, index: Option<usize>| match index {
-        Some(index) if index >= len => Err(LoadErrorKind::BadScopeRef { owner, index, len }.bare()),
+        Some(index) if index >= len => Err(LoadError::BadScopeRef { owner, index, len }),
         _ => Ok(()),
     };
     for scope in &wiring.scopes {
@@ -153,7 +148,7 @@ fn check_instance_names(wiring: &Wiring) -> Result<(), LoadError> {
         .chain(wiring.slots.iter().map(|slot| &slot.name))
     {
         if !seen.insert(name) {
-            return Err(LoadErrorKind::DuplicateInstance { name: name.clone() }.bare());
+            return Err(LoadError::DuplicateInstance { name: name.clone() });
         }
     }
     Ok(())
@@ -165,10 +160,9 @@ fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
     let mut seen = HashSet::new();
     for artifact in &wiring.artifacts {
         if !seen.insert(&artifact.id) {
-            return Err(LoadErrorKind::DuplicateArtifact {
+            return Err(LoadError::DuplicateArtifact {
                 id: artifact.id.clone(),
-            }
-            .bare());
+            });
         }
     }
     Ok(())
@@ -182,10 +176,9 @@ fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
     let mut types = HashSet::new();
     for state in &wiring.states {
         if !names.insert(&state.name) || !types.insert(&state.ty) {
-            return Err(LoadErrorKind::DuplicateState {
+            return Err(LoadError::DuplicateState {
                 name: state.name.clone(),
-            }
-            .bare());
+            });
         }
     }
     Ok(())
@@ -195,13 +188,12 @@ fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
 /// path only, so typed postcard params cannot reach one.
 fn check_state(state: &StateSpec) -> Result<(), LoadError> {
     if matches!(state.params, ParamSource::Postcard(_)) {
-        return Err(LoadErrorKind::StateInit {
+        return Err(LoadError::StateInit {
             name: state.name.clone(),
             ty: state.ty.clone(),
             message: "typed postcard params cannot construct a state (states decode value trees)"
                 .into(),
-        }
-        .bare());
+        });
     }
     Ok(())
 }
@@ -216,49 +208,43 @@ fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
     // `resolve` instead.
     if let Some(attach) = &spec.attach {
         if !wiring.states.iter().any(|s| &s.name == attach) {
-            return Err(LoadErrorKind::AttachUnknownState {
+            return Err(LoadError::AttachUnknownState {
                 system: spec.name.clone(),
                 attach: attach.clone(),
-            }
-            .bare());
+            });
         }
         if spec.artifact.is_some() {
-            return Err(LoadErrorKind::AttachOnNonSharedSystem {
+            return Err(LoadError::AttachOnNonSharedSystem {
                 system: spec.name.clone(),
                 attach: attach.clone(),
-            }
-            .bare());
+            });
         }
     }
     match (&spec.artifact, spec.process) {
         (Some(artifact), _) => {
             if !artifact_exists(wiring, artifact) {
-                return Err(LoadErrorKind::UnknownArtifact {
+                return Err(LoadError::UnknownArtifact {
                     system: spec.name.clone(),
                     artifact: artifact.clone(),
-                }
-                .bare());
+                });
             }
         }
         (None, true) => {
-            return Err(LoadErrorKind::ProcessNeedsArtifact {
+            return Err(LoadError::ProcessNeedsArtifact {
                 name: spec.name.clone(),
-            }
-            .bare());
+            });
         }
         (None, false) => {
             let Some(ty) = spec.ty.as_deref() else {
-                return Err(LoadErrorKind::MissingType {
+                return Err(LoadError::MissingType {
                     name: spec.name.clone(),
-                }
-                .bare());
+                });
             };
             if matches!(spec.params, ParamSource::Postcard(_)) {
-                return Err(LoadErrorKind::StaticPostcardParams {
+                return Err(LoadError::StaticPostcardParams {
                     system: spec.name.clone(),
                     ty: ty.to_string(),
-                }
-                .bare());
+                });
             }
         }
     }
@@ -276,11 +262,10 @@ fn check_slot(slot: &SlotSpec, wiring: &Wiring) -> Result<(), LoadError> {
         if let Some(artifact) = &occ.artifact
             && !artifact_exists(wiring, artifact)
         {
-            return Err(LoadErrorKind::UnknownArtifact {
+            return Err(LoadError::UnknownArtifact {
                 system: slot.name.clone(),
                 artifact: artifact.clone(),
-            }
-            .bare());
+            });
         }
     }
     Ok(())
@@ -333,8 +318,8 @@ mod tests {
         let mut wiring = program_wiring();
         wiring.program.as_mut().unwrap().decls.clear();
         assert!(matches!(
-            validate(&wiring).unwrap_err().kind,
-            LoadErrorKind::ProgramUnknownDecl { name } if name == "f"
+            validate(&wiring).unwrap_err(),
+            LoadError::ProgramUnknownDecl { name } if name == "f"
         ));
     }
 
@@ -343,23 +328,23 @@ mod tests {
         let mut wiring = program_wiring();
         wiring.program = None;
         assert!(matches!(
-            validate(&wiring).unwrap_err().kind,
-            LoadErrorKind::ProgramArtifactWithoutProgram { .. }
+            validate(&wiring).unwrap_err(),
+            LoadError::ProgramArtifactWithoutProgram { .. }
         ));
 
         let mut wiring = program_wiring();
         let decl = wiring.program.as_ref().unwrap().decls[0].clone();
         wiring.program.as_mut().unwrap().decls.push(decl);
         assert!(matches!(
-            validate(&wiring).unwrap_err().kind,
-            LoadErrorKind::DuplicateProgramDecl { .. }
+            validate(&wiring).unwrap_err(),
+            LoadError::DuplicateProgramDecl { .. }
         ));
 
         let mut wiring = program_wiring();
         wiring.artifacts[0].kind = ArtifactKind::Cdylib;
         assert!(matches!(
-            validate(&wiring).unwrap_err().kind,
-            LoadErrorKind::ArtifactMissingCrate { .. }
+            validate(&wiring).unwrap_err(),
+            LoadError::ArtifactMissingCrate { .. }
         ));
     }
 }
