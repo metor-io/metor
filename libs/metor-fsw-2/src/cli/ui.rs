@@ -10,7 +10,6 @@
 //! stderr is not a terminal: indicatif hides its bars and events print as
 //! ordinary lines, and the pre-flight colors are gated on stream support.
 
-use std::io::IsTerminal;
 use std::path::Path;
 
 use owo_colors::{OwoColorize, Stream};
@@ -48,7 +47,7 @@ pub(super) fn init_tracing() {
         .with_target("build", tracing::level_filters::LevelFilter::OFF)
         .with_target("cargo", tracing::level_filters::LevelFilter::OFF)
         .with_default(tracing::Level::INFO);
-    let ansi = std::io::stderr().is_terminal();
+    let ansi = supports_color::on(supports_color::Stream::Stderr).is_some();
     let ui = |meta: &tracing::Metadata<'_>| matches!(meta.target(), "build" | "cargo");
     tracing_subscriber::registry()
         .with(indicatif_layer.with_filter(filter_fn(|meta| meta.target() == "build")))

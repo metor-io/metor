@@ -90,6 +90,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 tracing-indicatif = { version = "0.3" }
 owo-colors = { version = "4.3", features = ["supports-colors"] }
+supports-color = { version = "3" }
 
 [[bin]]
 name = "metor-fsw"

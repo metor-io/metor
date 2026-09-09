@@ -11,6 +11,7 @@ use crate::wiring::{
     provision_artifacts, refresh_dev_packs, resolve, unpack_metor, write_bundle,
 };
 
+mod launch;
 mod ui;
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -167,6 +168,9 @@ struct RunArgs {
     /// Run this many cycles, then stop (default: run until interrupted).
     #[arg(long, value_name = "N")]
     cycles: Option<usize>,
+    /// Skip the pre-flight listing.
+    #[arg(long)]
+    no_preflight: bool,
     /// Serve the telemetry link on this address, overriding the target's
     /// `TcpServer` state (or declaring one, with an all-taps downlink, when
     /// the target has none).
@@ -467,7 +471,9 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     refresh_run_packs(&path, &args)?;
     let mut wiring = load_run_wiring(&path, args.target.as_deref())?;
     apply_overrides(&mut wiring, &args);
-    ui::print_preflight(&wiring, &path);
+    if !args.no_preflight {
+        ui::print_preflight(&wiring, &path);
+    }
     provision_run_artifacts(&mut wiring, &path, &args)?;
 
     let cycles = args.cycles.unwrap_or(usize::MAX);
@@ -702,6 +708,7 @@ mod tests {
             sim_dt: None,
             cycle_rate: None,
             cycles: None,
+            no_preflight: false,
         };
         let dir = tempfile::tempdir().unwrap();
         refresh_run_packs(dir.path(), &args(false)).expect("bundle dir: skipped");

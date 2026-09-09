@@ -9498,6 +9498,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "stellarator",
+ "supports-color 3.0.2",
  "tar",
  "tempfile",
  "thingbuf",
