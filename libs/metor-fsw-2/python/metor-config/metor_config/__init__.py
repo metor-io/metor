@@ -35,6 +35,7 @@ from ._builtins import (
     TcpServer as TcpServer,
     Uplink as Uplink,
     Downlink as Downlink,
+    Presets as Presets,
 )
 from ._dashboard import (
     component_id as component_id,
@@ -80,9 +81,10 @@ from ._version import (
 from ._target import (
     Target as Target,
     emit as emit,
-    Presets as Presets,
 )
+from ._deployment import Deployment as Deployment
 
 # Capture state remains available to the recorder test suite.
 from ._program import _program as _program, _frames as _frames
 from ._target import _targets as _targets
+from ._deployment import _deployments as _deployments

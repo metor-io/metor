@@ -1,0 +1,203 @@
+{
+  "ir_version": 10,
+  "metor_config_version": "0.4.1",
+  "targets": [
+    {
+      "ir_version": 10,
+      "coordinator": {
+        "cycle_rate": 120.0,
+        "default_depth": null,
+        "clock": {
+          "Simulated": {
+            "dt_secs": 0.008333333333333333
+          }
+        },
+        "namespace": "plant",
+        "wasm_fuel_per_poll": null,
+        "wasm_memory_limit_bytes": null
+      },
+      "artifacts": [
+        {
+          "id": "adcs",
+          "path": null,
+          "prebuilt_dir": null,
+          "dist": null,
+          "manifest_hash": null,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 259,
+            "col": 1
+          },
+          "crate_name": "adcs-systems",
+          "lib": "adcs_systems"
+        }
+      ],
+      "states": [
+        {
+          "name": "link",
+          "ty": "TcpServer",
+          "params": {
+            "Value": {
+              "addr": "[::]:2240",
+              "name": "plant"
+            }
+          },
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 258,
+            "col": 1
+          }
+        }
+      ],
+      "systems": [
+        {
+          "name": "plant",
+          "ty": "Plant",
+          "artifact": "adcs",
+          "params": {
+            "Value": {
+              "seed": 42
+            }
+          },
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 259,
+            "col": 1
+          },
+          "scope": null,
+          "attach": null,
+          "layout": null
+        },
+        {
+          "name": "downlink",
+          "ty": "Downlink",
+          "artifact": null,
+          "params": "None",
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 267,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "link",
+          "layout": null
+        }
+      ],
+      "slots": [],
+      "edges": [],
+      "scopes": [],
+      "program": null
+    },
+    {
+      "ir_version": 10,
+      "coordinator": {
+        "cycle_rate": 120.0,
+        "default_depth": null,
+        "clock": {
+          "Simulated": {
+            "dt_secs": 0.008333333333333333
+          }
+        },
+        "namespace": "fsw",
+        "wasm_fuel_per_poll": null,
+        "wasm_memory_limit_bytes": null
+      },
+      "artifacts": [
+        {
+          "id": "program",
+          "kind": "wasm",
+          "path": null,
+          "prebuilt_dir": null,
+          "dist": null,
+          "manifest_hash": null,
+          "src": null
+        }
+      ],
+      "states": [],
+      "systems": [
+        {
+          "name": "adcs.gyro_norm",
+          "ty": "gyro_norm",
+          "artifact": "program",
+          "params": "None",
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 270,
+            "col": 1
+          },
+          "scope": 0,
+          "attach": null,
+          "layout": null
+        },
+        {
+          "name": "presets",
+          "ty": "Presets",
+          "artifact": null,
+          "params": {
+            "Value": {
+              "preset": [
+                {
+                  "name": "ops",
+                  "layout": {
+                    "global_time_range": "LAST 30m",
+                    "root": {
+                      "Pane": {
+                        "active_index": 0,
+                        "hide_tab_bar": false,
+                        "items": [
+                          {
+                            "kind": "time_series_plot",
+                            "state": "{\"label\": \"\", \"x_range\": \"\", \"traces\": [{\"component_id\": 7738328218250057080, \"element_index\": 0, \"label\": \"adcs.gyro_norm\", \"color\": \"#fab387ff\"}]}"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 271,
+            "col": 1
+          },
+          "scope": null,
+          "attach": null,
+          "layout": null
+        }
+      ],
+      "slots": [],
+      "edges": [],
+      "scopes": [
+        {
+          "path": "adcs",
+          "parent": null,
+          "src": {
+            "file": "../../../../../../../../opt/homebrew/Cellar/python@3.13/3.13.5/Frameworks/Python.framework/Versions/3.13/lib/python3.13/contextlib.py",
+            "line": 141,
+            "col": 1
+          }
+        }
+      ],
+      "program": {
+        "source": "@system(\"sensors.gyro_b\")\ndef gyro_norm(gyro_b) -> f64:\n    return (gyro_b @ gyro_b) ** 0.5\n\n",
+        "decls": [
+          {
+            "name": "gyro_norm",
+            "src": {
+              "file": "tests/test_golden.py",
+              "line": 254,
+              "col": 1
+            },
+            "offset": 0
+          }
+        ]
+      }
+    }
+  ]
+}

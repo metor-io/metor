@@ -29,6 +29,8 @@ from metor_config import (
     Component,
     Connector,
     Dashboard,
+    Deployment,
+    Downlink,
     Edge,
     FrameType,
     Gauge,
@@ -36,6 +38,8 @@ from metor_config import (
     Meter,
     Outline,
     Pivot,
+    Presets,
+    Preset,
     Place,
     SequenceControl,
     State,
@@ -64,6 +68,9 @@ DASHBOARD_GOLDEN = os.path.join(
 )
 OUTLINE_GOLDEN = os.path.join(
     os.path.dirname(__file__), "..", "..", "tests", "golden", "outline.json"
+)
+DEPLOYMENT_GOLDEN = os.path.join(
+    os.path.dirname(__file__), "..", "..", "tests", "golden", "deployment.json"
 )
 FIXTURE_PNG = os.path.join(os.path.dirname(__file__), "data", "pixel.png")
 
@@ -237,6 +244,45 @@ def build_target() -> Target:
     return m
 
 
+def build_deployment() -> Deployment:
+    """The two-member deployment whose IR is the golden envelope: a `plant`
+    that only downlinks, and an `fsw` carrying a Python system, a scope, and a
+    preset — the shapes a member may add over a bare `Wiring`."""
+    plant = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="plant")
+    fsw = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="fsw")
+
+    @system("sensors.gyro_b")
+    def gyro_norm(gyro_b) -> f64:
+        return (gyro_b @ gyro_b) ** 0.5
+
+    plant_link = plant.state("link", TcpServer(addr="[::]:2240", name="plant"))
+    plant.add(
+        "plant",
+        System(
+            "Plant",
+            Artifact(id="adcs", crate="adcs-systems", lib="adcs_systems"),
+            seed=42,
+        ),
+    )
+    plant.add("downlink", Downlink(plant_link))
+
+    with fsw.scope("adcs"):
+        fsw.add("gyro_norm", gyro_norm)
+    fsw.add(
+        "presets",
+        Presets(
+            [
+                Preset(
+                    name="ops",
+                    time_range="LAST 30m",
+                    layout=TimeSeriesPlot([Trace("adcs.gyro_norm", element=0)]),
+                )
+            ]
+        ),
+    )
+    return Deployment(targets=[plant, fsw])
+
+
 def normalize(v):
     """Drop the fields the cross-language comparison ignores: every ``src``
     anchor, the top-level ``metor_config_version`` envelope, and each artifact's
@@ -256,6 +302,7 @@ def normalize(v):
 class GoldenTest(unittest.TestCase):
     def setUp(self):
         mc._targets.clear()
+        mc._deployments.clear()
         mc._program.clear()
 
     def test_emits_the_golden_fixture(self):
@@ -265,10 +312,15 @@ class GoldenTest(unittest.TestCase):
         actual = normalize(target.to_ir())
         self.assertEqual(actual, expected)
 
-        # The one-member envelope carries that same `Wiring` unchanged.
-        envelope = mc._target._envelope([target])
+        # The implicit deployment of one carries that same `Wiring` unchanged.
+        envelope = Deployment(targets=[target]).to_ir()
         self.assertEqual(envelope["ir_version"], mc.IR_VERSION)
         self.assertEqual(normalize(envelope["targets"][0]), expected)
+
+    def test_emits_the_golden_deployment(self):
+        with open(DEPLOYMENT_GOLDEN, encoding="utf-8") as f:
+            expected = normalize(json.load(f))
+        self.assertEqual(normalize(build_deployment().to_ir()), expected)
 
     def test_emits_the_golden_dashboard(self):
         # `sat1` so the fixture also pins namespace qualification of every

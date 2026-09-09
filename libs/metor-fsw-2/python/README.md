@@ -26,6 +26,16 @@ nav = m.add("nav", Nav(meas_sigma=0.02))
 m.connect(plant.sensors, nav.sensors)
 ```
 
+Several targets in one file form a `Deployment`; each carries a namespace:
+
+```python
+from metor_config import Deployment, Target
+
+plant = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="plant")
+fsw = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="fsw")
+deploy = Deployment(targets=[plant, fsw])
+```
+
 ## Tests
 
 ```

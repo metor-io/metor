@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
+use crate::ir::IR_VERSION;
 use crate::wiring::{
-    BuildOptions, ClockSpec, Deployment, METOR_EXTENSION, PackBuildOptions, PackDevOptions,
-    PackageOptions, Registry, WIRING_FILE_NAME, Wiring, build_target, eval_python_deployment,
-    load_bundle, locate_artifacts, pack_build, pack_dev, provision_artifacts, refresh_dev_packs,
-    resolve, unpack_metor, write_bundle,
+    BuildOptions, ClockSpec, Deployment, LoadError, METOR_EXTENSION, PackBuildOptions,
+    PackDevOptions, PackageOptions, Registry, WIRING_FILE_NAME, Wiring, build_target,
+    eval_python_deployment, load_bundle, locate_artifacts, pack_build, pack_dev,
+    provision_artifacts, refresh_dev_packs, resolve, unpack_metor, write_bundle,
 };
 
 mod ui;
@@ -73,14 +74,18 @@ struct PackDevArgs {
 
 #[derive(Args, Debug)]
 struct BuildArgs {
-    /// The `.py` target file.
-    target: PathBuf,
+    /// The `.py` deployment file.
+    path: PathBuf,
     /// Build the `--release` profile (default: debug).
     #[arg(long)]
     release: bool,
+    /// Build only this member of the deployment, by namespace. Every member
+    /// is built, in envelope order, when it is omitted.
+    #[arg(long = "target", value_name = "NS")]
+    target: Option<String>,
     /// Provision for this target triple: prebuilt artifacts select their
     /// `<triple>/` payload, crate artifacts cross-compile.
-    #[arg(long = "target", value_name = "TRIPLE")]
+    #[arg(long = "triple", value_name = "TRIPLE")]
     triple: Option<String>,
     /// An extra arg appended to every `cargo build` (repeatable).
     #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
@@ -93,8 +98,12 @@ struct BuildArgs {
 
 #[derive(Args, Debug)]
 struct PackageArgs {
-    /// The `.py` target source. Required unless `--check-ir`.
-    target: Option<PathBuf>,
+    /// The `.py` deployment source. Required unless `--check-ir`.
+    path: Option<PathBuf>,
+    /// Package this member of the deployment, by namespace. Required when
+    /// the deployment has more than one member.
+    #[arg(long = "target", value_name = "NS")]
+    target: Option<String>,
     /// The bundle output: a directory (conventionally `*.bundle`), or a
     /// single-file `*.metor` archive (dispatched by the `.metor` extension).
     #[arg(short = 'o', long = "out", value_name = "OUT")]
@@ -102,7 +111,7 @@ struct PackageArgs {
     /// Package for this target triple: prebuilt artifacts select their
     /// `<triple>/` payload (no cargo), crate artifacts cross-compile, and the
     /// bundle records the triple. Defaults to the host.
-    #[arg(long = "target", value_name = "TRIPLE")]
+    #[arg(long = "triple", value_name = "TRIPLE")]
     triple: Option<String>,
     /// Instead of packaging, re-evaluate the given bundle's provenance source
     /// and diff the produced IR against its frozen `wiring.json`; exit non-zero
@@ -123,9 +132,14 @@ struct PackageArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// A source `.py` target (built automatically) or a bundle directory
+    /// A source `.py` deployment (built automatically) or a bundle directory
     /// (cargo-free). Defaults to `target.py` in the current directory.
-    target: Option<PathBuf>,
+    path: Option<PathBuf>,
+    /// Run this member of the deployment, by namespace. Required when the
+    /// deployment has more than one member; on a bundle it must match the
+    /// frozen namespace.
+    #[arg(long = "target", value_name = "NS")]
+    target: Option<String>,
     /// Locate previously built cdylibs without running cargo; errors when one
     /// is missing. A no-op for bundles, which are always cargo-free.
     #[arg(long)]
@@ -208,7 +222,7 @@ fn cmd_pack_dev(args: PackDevArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// `--target` is sugar for the `--cargo-arg --target …` spelling: one flag
+/// `--triple` is sugar for the `--cargo-arg --target …` spelling: one flag
 /// drives prebuilt selection, crate cross-builds, and the recorded triple.
 fn merge_target(cargo_args: &[String], target: Option<&str>) -> Vec<String> {
     let mut merged = cargo_args.to_vec();
@@ -229,6 +243,46 @@ fn load_source(path: &Path) -> miette::Result<Deployment> {
         "unrecognized target `{}`; targets are Python (`.py`)",
         path.display()
     ))
+}
+
+/// Pick the deployment member `--target` names. The one call into
+/// [`Deployment::target`]; it renders the selection faults against the file
+/// they came from, which the `LoadError` itself does not know.
+fn select<'a>(
+    deployment: &'a Deployment,
+    path: &Path,
+    namespace: Option<&str>,
+) -> miette::Result<&'a Wiring> {
+    let file = file_label(path);
+    deployment.target(namespace).map_err(|err| match err {
+        LoadError::TargetRequired { available } => miette::miette!(
+            "deployment `{file}` has {} targets; pick one with --target ({})",
+            available.len(),
+            available.join(", ")
+        ),
+        LoadError::UnknownTarget {
+            requested,
+            available,
+        } if available.is_empty() => miette::miette!(
+            "target `{file}` has no namespace; `--target {requested}` does not apply"
+        ),
+        LoadError::UnknownTarget {
+            requested,
+            available,
+        } => miette::miette!(
+            "deployment `{file}` has no target `{requested}`; targets: {}",
+            available.join(", ")
+        ),
+        other => miette::miette!("deployment `{file}`: {other}"),
+    })
+}
+
+/// How a target file names itself in a diagnostic: its file name, falling
+/// back to the whole path.
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Refresh a source target's dev packs, the path-source pack dependencies
@@ -252,26 +306,20 @@ fn refresh_source_packs(target: &Path, release: bool, cargo_args: &[String]) -> 
     .map(|_| ())
 }
 
-/// `build`: load the wiring, provision every artifact's `.so`, print them.
+/// `build`: load the deployment, provision every artifact's `.so`, print
+/// them. With no `--target` every member is built, in envelope order.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
     let cargo_args = merge_target(&args.cargo_arg, args.triple.as_deref());
-    refresh_source_packs(&args.target, args.release, &cargo_args)?;
-    let mut wiring = load_source(&args.target)?
-        .target(None)
-        .into_diagnostic()?
-        .clone();
-    provision_artifacts(
-        &mut wiring,
-        &build_opts(args.release, &cargo_args, args.no_manifest_sidecar),
-    )
-    .into_diagnostic()?;
-    for a in &wiring.artifacts {
-        let path = a
-            .path
-            .as_deref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        println!("  {:<28} →  {path}", a.crate_name);
+    refresh_source_packs(&args.path, args.release, &cargo_args)?;
+    let deployment = load_source(&args.path)?;
+    let mut members = match &args.target {
+        Some(ns) => vec![select(&deployment, &args.path, Some(ns))?.clone()],
+        None => deployment.targets.clone(),
+    };
+    let opts = build_opts(args.release, &cargo_args, args.no_manifest_sidecar);
+    for member in &mut members {
+        provision_artifacts(member, &opts).into_diagnostic()?;
+        ui::print_build_member(member);
     }
     Ok(())
 }
@@ -282,7 +330,7 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     }
     // The bundle freezes the evaluated `Wiring` as IR, so the packaged target
     // runs with no Python and no config parse on target.
-    let target = args.target.as_deref().ok_or_else(|| {
+    let source = args.path.as_deref().ok_or_else(|| {
         miette::miette!("`package` needs a target source (`.py`), or `--check-ir <bundle>`")
     })?;
     let out = args
@@ -290,8 +338,8 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
         .as_deref()
         .ok_or_else(|| miette::miette!("`package` needs an output path (`-o <out>`)"))?;
     let cargo_args = merge_target(&args.cargo_arg, args.triple.as_deref());
-    refresh_source_packs(target, args.release, &cargo_args)?;
-    let mut wiring = load_source(target)?.target(None).into_diagnostic()?.clone();
+    refresh_source_packs(source, args.release, &cargo_args)?;
+    let mut wiring = select(&load_source(source)?, source, args.target.as_deref())?.clone();
     provision_artifacts(
         &mut wiring,
         &build_opts(args.release, &cargo_args, args.no_manifest_sidecar),
@@ -300,13 +348,19 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     let opts = PackageOptions {
         release: args.release,
         target: build_target(&cargo_args),
-        provenance: Some(target.to_path_buf()),
+        provenance: Some(source.to_path_buf()),
         // Current time; a reproducible build pins this.
         built_at_unix: None,
     };
     write_bundle(&wiring, &opts, out).into_diagnostic()?;
+    let member = wiring
+        .coordinator
+        .namespace
+        .as_deref()
+        .map(|ns| format!("target `{ns}`, "))
+        .unwrap_or_default();
     println!(
-        "packaged {} artifacts, {} systems → {}",
+        "packaged {member}{} artifacts, {} systems → {}",
         wiring.artifacts.len(),
         wiring.systems.len(),
         out.display()
@@ -323,6 +377,9 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
 /// provenance copy sits at a different path than the original source, which
 /// would otherwise read as spurious drift. The line/column of every anchor is
 /// kept, so a genuine emission change is still caught.
+///
+/// The provenance copy is the whole deployment file, so the member to diff is
+/// the one whose namespace the frozen `wiring.json` carries.
 fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
     let unpacked =
         if bundle.is_file() && bundle.extension().is_some_and(|ext| ext == METOR_EXTENSION) {
@@ -346,10 +403,12 @@ fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
             bundle.display()
         )
     })?;
-    let produced = load_source(&source)?
-        .target(None)
-        .into_diagnostic()?
-        .clone();
+    let produced = select(
+        &load_source(&source)?,
+        &source,
+        frozen.coordinator.namespace.as_deref(),
+    )?
+    .clone();
 
     if normalized_ir(&produced) == normalized_ir(&frozen) {
         println!("--check-ir: {} reproduces its frozen IR", bundle.display());
@@ -401,15 +460,15 @@ fn normalized_ir(wiring: &Wiring) -> String {
 }
 
 async fn cmd_run(args: RunArgs) -> miette::Result<()> {
-    let target = match &args.target {
-        Some(target) => target.clone(),
+    let path = match &args.path {
+        Some(path) => path.clone(),
         None => detect_target()?,
     };
-    refresh_run_packs(&target, &args)?;
-    let mut wiring = load_run_wiring(&target)?;
+    refresh_run_packs(&path, &args)?;
+    let mut wiring = load_run_wiring(&path, args.target.as_deref())?;
     apply_overrides(&mut wiring, &args);
-    ui::print_preflight(&wiring, &target);
-    provision_run_artifacts(&mut wiring, &target, &args)?;
+    ui::print_preflight(&wiring, &path);
+    provision_run_artifacts(&mut wiring, &path, &args)?;
 
     let cycles = args.cycles.unwrap_or(usize::MAX);
     let mut coord = resolve(&wiring, &Registry::with_builtins())?;
@@ -454,39 +513,44 @@ fn detect_target_in(dir: &Path) -> miette::Result<PathBuf> {
 /// ([`refresh_source_packs`]). Skipped for bundles, which are cargo-free by
 /// contract, and under `--no-build`, which extends its "locate, never build"
 /// promise to the packs.
-fn refresh_run_packs(target: &Path, args: &RunArgs) -> miette::Result<()> {
-    if is_bundle(target) || args.no_build {
+fn refresh_run_packs(path: &Path, args: &RunArgs) -> miette::Result<()> {
+    if is_bundle(path) || args.no_build {
         return Ok(());
     }
-    refresh_source_packs(target, args.release, &args.cargo_arg)
+    refresh_source_packs(path, args.release, &args.cargo_arg)
 }
 
-/// Load `run`'s `<TARGET>` into a [`Wiring`]: a bundle directory loads
+/// Load `run`'s `<PATH>` into a [`Wiring`]: a bundle directory loads
 /// cargo-free via [`load_bundle`] with its artifact paths already recorded, a
 /// source `.py` is evaluated (with its dev packs already refreshed by
 /// [`refresh_run_packs`]) and its artifacts provisioned separately by
 /// [`provision_run_artifacts`].
-fn load_run_wiring(target: &Path) -> miette::Result<Wiring> {
-    if is_bundle(target) {
-        return load_bundle(target).into_diagnostic();
-    }
-    Ok(load_source(target)?.target(None).into_diagnostic()?.clone())
+///
+/// A bundle holds one member, so it selects as the deployment of one it is:
+/// `--target` naming its frozen namespace passes, anything else is the same
+/// fault a source file would raise.
+fn load_run_wiring(path: &Path, namespace: Option<&str>) -> miette::Result<Wiring> {
+    let deployment = if is_bundle(path) {
+        Deployment {
+            ir_version: IR_VERSION,
+            targets: vec![load_bundle(path).into_diagnostic()?],
+        }
+    } else {
+        load_source(path)?
+    };
+    Ok(select(&deployment, path, namespace)?.clone())
 }
 
 /// Fill a source target's artifact paths: the cargo build driver by default
 /// (incremental, so a fresh tree is a no-op), or a cargo-free search of the
 /// workspace target dir with `--no-build`. A bundle's paths are already
 /// recorded, so this is a no-op for it.
-fn provision_run_artifacts(
-    wiring: &mut Wiring,
-    target: &Path,
-    args: &RunArgs,
-) -> miette::Result<()> {
-    if is_bundle(target) {
+fn provision_run_artifacts(wiring: &mut Wiring, path: &Path, args: &RunArgs) -> miette::Result<()> {
+    if is_bundle(path) {
         return Ok(());
     }
     if args.no_build {
-        let dir = match target.parent() {
+        let dir = match path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
             _ => Path::new("."),
         };
@@ -627,6 +691,7 @@ mod tests {
     #[test]
     fn refresh_run_packs_skips_and_noops() {
         let args = |no_build| RunArgs {
+            path: None,
             target: None,
             no_build,
             release: false,
@@ -658,5 +723,99 @@ mod tests {
             find_provenance(dir.path()),
             Some(dir.path().join("target.py"))
         );
+    }
+
+    /// Two args cannot both spell `--target`; clap only notices at runtime,
+    /// so the whole command tree is asserted here.
+    #[test]
+    fn command_tree_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    fn member(namespace: Option<&str>, cycle_rate: f64) -> Wiring {
+        use crate::wiring::WiringBuilder;
+        let mut wiring = WiringBuilder::new()
+            .coordinator(cycle_rate, ClockSpec::Wall)
+            .build();
+        wiring.coordinator.namespace = namespace.map(str::to_string);
+        wiring
+    }
+
+    fn deployment(targets: Vec<Wiring>) -> Deployment {
+        Deployment {
+            ir_version: IR_VERSION,
+            targets,
+        }
+    }
+
+    /// Selection over a deployment of several members: the flag is required,
+    /// names a member, and an unknown namespace lists the ones there are.
+    /// Every message names the file, which the `LoadError` cannot.
+    #[test]
+    fn select_needs_a_namespace_when_there_are_several() {
+        let path = Path::new("/build/target.py");
+        let deployment = deployment(vec![
+            member(Some("plant"), 100.0),
+            member(Some("fsw"), 200.0),
+        ]);
+
+        let err = select(&deployment, path, None).expect_err("two members, no request");
+        assert_eq!(
+            err.to_string(),
+            "deployment `target.py` has 2 targets; pick one with --target (plant, fsw)"
+        );
+
+        let err = select(&deployment, path, Some("fws")).expect_err("typo");
+        assert_eq!(
+            err.to_string(),
+            "deployment `target.py` has no target `fws`; targets: plant, fsw"
+        );
+
+        let picked = select(&deployment, path, Some("fsw")).expect("names a member");
+        assert_eq!(picked.coordinator.cycle_rate, 200.0);
+    }
+
+    /// A deployment of one needs no flag, accepts its own namespace, and
+    /// says so plainly when it has none to match against.
+    #[test]
+    fn select_over_a_deployment_of_one() {
+        let path = Path::new("target.py");
+
+        let bare = deployment(vec![member(None, 100.0)]);
+        assert!(select(&bare, path, None).is_ok(), "the only member");
+        let err = select(&bare, path, Some("sat")).expect_err("nothing to match");
+        assert_eq!(
+            err.to_string(),
+            "target `target.py` has no namespace; `--target sat` does not apply"
+        );
+
+        let named = deployment(vec![member(Some("fsw"), 100.0)]);
+        assert!(select(&named, path, None).is_ok(), "still the only member");
+        assert!(
+            select(&named, path, Some("fsw")).is_ok(),
+            "its own namespace"
+        );
+        let err = select(&named, path, Some("sat")).expect_err("a different one");
+        assert_eq!(
+            err.to_string(),
+            "deployment `target.py` has no target `sat`; targets: fsw"
+        );
+    }
+
+    /// `--check-ir` selects by the frozen `wiring.json`'s namespace, so a
+    /// member bundle diffs against the member it was cut from.
+    #[test]
+    fn check_ir_selects_the_frozen_member() {
+        let path = Path::new("target.py");
+        let deployment = deployment(vec![
+            member(Some("plant"), 100.0),
+            member(Some("fsw"), 200.0),
+        ]);
+        let frozen = member(Some("fsw"), 200.0);
+
+        let produced = select(&deployment, path, frozen.coordinator.namespace.as_deref())
+            .expect("the frozen namespace names a member");
+        assert_eq!(normalized_ir(produced), normalized_ir(&frozen));
     }
 }

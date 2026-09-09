@@ -273,6 +273,29 @@ fn locate_artifacts_finds_built_and_refuses_missing() {
     assert!(matches!(err, BuildError::NotBuilt { .. }), "{err}");
 }
 
+/// Two members' programs are both `program.wasm`, so a namespaced member
+/// nests under its namespace, whether the directory is the cdylib one or
+/// the workspace profile dir.
+#[test]
+fn wasm_out_dir_nests_a_namespaced_member() {
+    let mut wiring = super::super::WiringBuilder::new().build();
+    let profile = wasm_out_dir(&wiring, false);
+    assert_eq!(profile.file_name().unwrap(), "debug");
+    wiring.coordinator.namespace = Some("fsw".into());
+    assert_eq!(wasm_out_dir(&wiring, false), profile.join("fsw"));
+
+    let mut adjacent = super::super::WiringBuilder::new()
+        .artifact("pack", "a-pack", "a_pack")
+        .build();
+    adjacent.artifacts[0].path = Some(PathBuf::from("/build/debug/liba_pack.dylib"));
+    assert_eq!(wasm_out_dir(&adjacent, false), Path::new("/build/debug"));
+    adjacent.coordinator.namespace = Some("plant".into());
+    assert_eq!(
+        wasm_out_dir(&adjacent, false),
+        Path::new("/build/debug/plant")
+    );
+}
+
 /// The compile-time triple and cargo's own view of the host agree, so the
 /// cargo-free fallback never changes what a bundle records or a prebuilt
 /// selection picks.

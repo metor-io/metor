@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from ._model import Spec, StateHandle, static_system, _drop_none
+from ._model import Spec, StateHandle, static_system, _drop_none, _params
+from ._dashboard import Preset
 
 
 @dataclass(frozen=True)
@@ -108,3 +109,24 @@ def Downlink(  # noqa: N802
         ),
         state,
     )
+
+
+class _Presets(Spec):
+    """The preset broadcaster's spec. Its component references are
+    namespace-relative, like alarm targets, and are qualified when a target
+    registers it — so the ids match what that target announces."""
+
+    def __init__(self, presets: list[Preset]):
+        super().__init__("Presets", None, {})
+        self._presets = presets
+
+    def _bind(self, target: Any) -> None:
+        self.params = _params(
+            {"preset": [p.to_json(target.namespace) for p in self._presets]}
+        )
+
+
+def Presets(presets: list[Preset]) -> Spec:  # noqa: N802 - a system-type wrapper
+    """The built-in preset broadcaster, its ``PresetsParams`` carrying one
+    entry per preset under the ``preset`` field the Rust struct declares."""
+    return _Presets(presets)

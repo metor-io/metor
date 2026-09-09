@@ -4,7 +4,8 @@
 //! pipeline's tracing output into a live display (active `build`-target
 //! spans render as a pinned progress line with a spinner, label, the crate
 //! cargo is currently compiling, and elapsed time, while `cargo`-target
-//! events stream above it), and [`print_preflight`] lists the systems and
+//! events stream above it), [`print_build_member`] lists what one deployment
+//! member's build produced, and [`print_preflight`] lists the systems and
 //! slots a target will run before it starts. Both degrade to plain text when
 //! stderr is not a terminal: indicatif hides its bars and events print as
 //! ordinary lines, and the pre-flight colors are gated on stream support.
@@ -72,6 +73,27 @@ pub(super) fn init_tracing() {
         .init();
 }
 
+/// Print where one member's artifacts landed, under a bold namespace header
+/// when the member carries one. A deployment of one with no namespace prints
+/// the bare listing, as `build` always has.
+pub(super) fn print_build_member(wiring: &Wiring) {
+    let indent = match &wiring.coordinator.namespace {
+        Some(ns) => {
+            println!("  {}", ns.if_supports_color(Stream::Stdout, |t| t.bold()));
+            "    "
+        }
+        None => "  ",
+    };
+    for a in &wiring.artifacts {
+        let path = a
+            .path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        println!("{indent}{:<28} →  {path}", a.crate_name);
+    }
+}
+
 /// One two-line entry in the pre-flight listing, with the dot color that
 /// signifies its kind.
 struct Entry {
@@ -88,12 +110,17 @@ struct Entry {
 /// a colored dot keying its kind: magenta for pack-loaded systems, yellow
 /// for worker-process systems, cyan for builtins, green for slots. The order
 /// is [`Wiring::systems`] then [`Wiring::slots`], which is also resolve's
-/// registration order.
+/// registration order. A member of a deployment names itself
+/// `target.py · fsw`; a member with no namespace is the file name alone.
 pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
-    let name = target
+    let file = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| target.display().to_string());
+    let name = match &wiring.coordinator.namespace {
+        Some(ns) => format!("{file} · {ns}"),
+        None => file,
+    };
     let clock = match wiring.coordinator.clock {
         ClockSpec::Wall => "wall clock".to_string(),
         ClockSpec::Simulated { dt_secs } => format!("sim dt {} ms", trim(dt_secs * 1e3)),

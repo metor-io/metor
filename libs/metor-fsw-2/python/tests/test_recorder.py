@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import os
 import sys
 import unittest
@@ -16,6 +17,7 @@ from metor_config import (
     Alarms,
     Artifact,
     Component,
+    Deployment,
     Frame,
     State,
     Target,
@@ -36,6 +38,7 @@ class RecorderTest(unittest.TestCase):
     def setUp(self):
         # The capture trackers are module-global; isolate each test.
         mc._targets.clear()
+        mc._deployments.clear()
         mc._program.clear()
 
     def test_artifact_conflicts_are_rejected_without_mutating_ir(self):
@@ -358,7 +361,7 @@ class RecorderTest(unittest.TestCase):
         m.add("omega_norm", omega_norm)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            ir = m.to_ir()
+            ir = Deployment(targets=[m]).to_ir()["targets"][0]
         self.assertIn("@system `staged`", err.getvalue())
         self.assertIn("test_recorder.py", err.getvalue())
         self.assertNotIn("omega_norm`", err.getvalue())
@@ -372,8 +375,7 @@ class RecorderTest(unittest.TestCase):
         def staged() -> f64:
             return 1.0
 
-        with contextlib.redirect_stderr(io.StringIO()):
-            ir = m.to_ir()
+        ir = m.to_ir()
         self.assertIsNone(ir["program"])
         self.assertEqual([a["id"] for a in ir["artifacts"]], [])
 
@@ -427,19 +429,87 @@ class RecorderTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             Alarm(id="x", name="n", target=Component("c"), nope=1)
 
-    def test_exactly_one_target_rule(self):
-        mc._targets.clear()
+    def test_emission_needs_one_deployment_or_one_target(self):
         with self.assertRaisesRegex(RuntimeError, "found 0"):
             mc.emit()
-        Target(cycle_rate=1.0)
+
+        # One bare target is the deployment of one it emits as.
+        one = Target(cycle_rate=1.0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mc.emit()
+        emitted = json.loads(out.getvalue())
+        self.assertEqual(emitted["ir_version"], mc.IR_VERSION)
+        self.assertEqual(emitted["targets"], [one.to_ir()])
+
+        # A second bare target has no implicit deployment to belong to.
+        mc._deployments.clear()
         Target(cycle_rate=2.0)
         with self.assertRaisesRegex(RuntimeError, "found 2"):
             mc.emit()
+
+    def test_deployment_membership_rules(self):
+        a = Target(cycle_rate=1.0, namespace="a")
+        b = Target(cycle_rate=2.0, namespace="b")
+        with self.assertRaisesRegex(TypeError, "must be a Target"):
+            Deployment(targets=[a, "b"])  # type: ignore[list-item]
+        with self.assertRaisesRegex(ValueError, "one deployment"):
+            Deployment(targets=[a, a])
+
+        deployment = Deployment(targets=[a, b])
+        self.assertEqual(
+            [t["coordinator"]["namespace"] for t in deployment.to_ir()["targets"]],
+            ["a", "b"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly one Deployment"):
+            Deployment(targets=[b])
+
+    def test_members_partition_their_python_systems(self):
+        plant = Target(cycle_rate=100.0, namespace="plant")
+        fsw = Target(cycle_rate=100.0, namespace="fsw")
+
+        class RateEstimate(Frame):
+            omega: Tensor[f64, 3]
+
+        @system("imu.omega_b")
+        def omega_norm(omega_b):
+            return (omega_b @ omega_b) ** 0.5
+
+        @system
+        def smooth(est: RateEstimate) -> RateEstimate:
+            return RateEstimate(omega=est.omega)
+
+        @system
+        def staged() -> f64:
+            return 1.0
+
+        plant.add("omega_norm", omega_norm)
+        fsw.add("smooth", smooth)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            members = Deployment(targets=[plant, fsw]).to_ir()["targets"]
+
+        # Each member compiles its own systems, and the shared frame class.
+        self.assertEqual(
+            [d["name"] for d in members[0]["program"]["decls"]],
+            ["RateEstimate", "omega_norm"],
+        )
+        self.assertEqual(
+            [d["name"] for d in members[1]["program"]["decls"]],
+            ["RateEstimate", "smooth"],
+        )
+        self.assertEqual([s["name"] for s in members[0]["systems"]], ["omega_norm"])
+        self.assertEqual([s["name"] for s in members[1]["systems"]], ["smooth"])
+
+        # The never-added warning is one per emission, not one per member.
+        self.assertEqual(err.getvalue().count("@system `staged`"), 1)
 
 
 class PresetTest(unittest.TestCase):
     def setUp(self):
         mc._targets.clear()
+        mc._deployments.clear()
 
     def test_component_id_masks_and_hashes(self):
         # Pinned against the Rust `ComponentId::new` (see the parity test in
@@ -448,8 +518,6 @@ class PresetTest(unittest.TestCase):
         self.assertEqual(mc.component_id("x") >> 63, 0)
 
     def test_presets_qualify_and_embed(self):
-        import json
-
         m = Target(cycle_rate=100.0, namespace="sat1")
         m.add(
             "presets",
@@ -497,21 +565,43 @@ class PresetTest(unittest.TestCase):
         self.assertEqual([i["kind"] for i in tab_pane["items"]], ["logs", "alarm"])
 
     def test_presets_flex_arity_is_checked(self):
-        Target(cycle_rate=100.0)
+        m = Target(cycle_rate=100.0)
         with self.assertRaisesRegex(ValueError, "2 split children but 1 flexes"):
-            mc.Presets(
-                [
-                    mc.Preset(
-                        name="bad",
-                        layout=mc.HSplit(mc.Logs(), mc.DataTable(), flexes=[1.0]),
-                    )
-                ]
+            m.add(
+                "presets",
+                mc.Presets(
+                    [
+                        mc.Preset(
+                            name="bad",
+                            layout=mc.HSplit(mc.Logs(), mc.DataTable(), flexes=[1.0]),
+                        )
+                    ]
+                ),
             )
+
+    def test_presets_qualify_with_the_target_that_adds_them(self):
+        # Construction order no longer decides: the member registering the
+        # presets is the one whose namespace qualifies their references.
+        bare = Target(cycle_rate=100.0)
+        sat = Target(cycle_rate=100.0, namespace="sat1")
+        presets = [mc.Preset(name="ops", layout=mc.TimeSeriesPlot([mc.Trace("a.b")]))]
+
+        def trace(target):
+            spec = next(s for s in target.to_ir()["systems"] if s["name"] == "presets")
+            layout = spec["params"]["Value"]["preset"][0]["layout"]
+            pane = layout["root"]["Pane"]
+            return json.loads(pane["items"][0]["state"])["traces"][0]
+
+        sat.add("presets", mc.Presets(presets))
+        bare.add("presets", mc.Presets(presets))
+        self.assertEqual(trace(sat)["component_id"], mc.component_id("sat1.a.b"))
+        self.assertEqual(trace(bare)["component_id"], mc.component_id("a.b"))
 
 
 class DashboardTest(unittest.TestCase):
     def setUp(self):
         mc._targets.clear()
+        mc._deployments.clear()
 
     def _dashboard_state(self, dashboard, namespace="sat1"):
         import json

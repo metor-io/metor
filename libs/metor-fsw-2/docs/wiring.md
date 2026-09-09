@@ -59,6 +59,35 @@ m.route(uplink, mode, msg="SequenceCommand")
 Message edges can fan in and out. They do not take part in frame cycle checks.
 They cannot use a delay.
 
+## Deployments
+
+One `target.py` may declare several targets. A `Deployment` lists them; each
+member keeps its own clock, systems, and edges, and runs as its own process.
+A member's identity is its `namespace`. With more than one member every
+namespace is required, distinct, and not a dotted prefix of another.
+
+```python
+from metor_config import Deployment, Downlink, Target, TcpServer
+from adcs_pack import Fsw, Plant
+
+plant = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="plant")
+fsw = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="fsw")
+
+plant.add("plant", Plant(seed=42))
+plant.add("downlink", Downlink(plant.state("link", TcpServer(addr="[::]:2240"))))
+
+fsw.add("fsw", Fsw())
+fsw.add("downlink", Downlink(fsw.state("link", TcpServer(addr="[::]:2241"))))
+
+deploy = Deployment(targets=[plant, fsw])
+```
+
+A file with one `Target` and no `Deployment` is a deployment of one. Python
+systems declared with `@system` belong to the target that adds them.
+`Presets` qualify their component references with the namespace of the target
+that adds them. The CLI selects a member with `--target <namespace>`
+([cli.md](cli.md)).
+
 ## Rust targets
 
 `WiringBuilder` builds the same IR without Python:
@@ -83,10 +112,15 @@ checks Rust-built and serialized IR alike and returns a `LoadError`.
 ## The wiring IR
 
 Both examples produce `Wiring`, a plain data value that serde can read and
-write. The current IR version is 8. A host rejects another version during
-resolve.
+write. The current IR version is 10. A host rejects another version during
+ingest and resolve.
 
-The top-level fields are:
+The document a `target.py` emits is an envelope, `Deployment`, with
+`ir_version` and `targets`, one complete `Wiring` per member. The host checks
+the envelope once at ingest, then selects one member; everything after that
+reads a `Wiring`. A bundle stores the member `Wiring` alone.
+
+The `Wiring` fields are:
 
 - `coordinator`: cycle rate, clock, ring depth, and an optional name prefix
 - `artifacts`: loadable pack libraries

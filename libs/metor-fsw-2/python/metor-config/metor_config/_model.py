@@ -59,6 +59,11 @@ class Spec:
         # `Target.add`.
         self.attach: str | None = None
 
+    def _bind(self, target: Any) -> None:
+        """Bind to the target registering this spec, before its params are
+        read. A plain spec's params are already final; a spec whose params
+        depend on the target (:func:`Presets`) renders them here."""
+
     def _param_source(self) -> Any:
         # `ParamSource`, externally tagged: no params -> the unit "None".
         return {"Value": self.params} if self.params else "None"

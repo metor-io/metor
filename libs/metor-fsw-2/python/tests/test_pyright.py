@@ -36,6 +36,7 @@ class PyrightTest(unittest.TestCase):
                 "--outputjson",
                 os.path.join("metor-config", "metor_config"),
                 os.path.join("tests", "data", "demo.py"),
+                os.path.join("tests", "data", "deployment.py"),
             ],
             cwd=os.path.abspath(PYTHON_DIR),
             env={

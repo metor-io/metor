@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use metor_fsw_2::wiring::eval_python_deployment;
+use metor_fsw_2::wiring::{LoadError, eval_python_deployment};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,6 +62,32 @@ fn subprocess_eval() {
         .expect("system carries a source anchor");
     assert!(src.file.as_deref().unwrap().ends_with("trivial_target.py"));
     assert!(src.line > 0);
+
+    // A two-member deployment evaluates, and its members are selected by
+    // namespace: no request is ambiguous, an unknown one names what there is.
+    let deployment = eval_python_deployment(&fixture("deployment_target.py"))
+        .expect("the deployment target evaluates");
+    assert_eq!(
+        deployment
+            .targets
+            .iter()
+            .map(|w| w.coordinator.namespace.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(
+        deployment.target(Some("b")).unwrap().systems[0].name,
+        "fsw",
+        "a request selects that member"
+    );
+    assert!(matches!(
+        deployment.target(None),
+        Err(LoadError::TargetRequired { .. })
+    ));
+    assert!(matches!(
+        deployment.target(Some("c")),
+        Err(LoadError::UnknownTarget { .. })
+    ));
 
     // A raising target fails; its native traceback is the (stderr) surface.
     let err = eval_python_deployment(&fixture("raising_target.py"))

@@ -8,8 +8,8 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import fields
-from typing import Any, Iterator, overload
-from ._version import __version__, IR_VERSION, PROGRAM_ARTIFACT, COORDINATOR
+from typing import TYPE_CHECKING, Any, Iterator, overload
+from ._version import IR_VERSION, PROGRAM_ARTIFACT, COORDINATOR
 from ._model import (
     Artifact,
     Spec,
@@ -19,12 +19,13 @@ from ._model import (
     InPort,
     F,
     H,
-    static_system,
     _handle_name,
     _source_ref,
 )
 from ._program import ExprHandle, _program
-from ._dashboard import Preset
+
+if TYPE_CHECKING:
+    from ._deployment import Deployment
 
 
 _targets: list["Target"] = []
@@ -34,7 +35,8 @@ _INIT_STATES = {"loaded": "Loaded", "running": "Running"}
 
 
 class Target:
-    """A target under construction. Exactly one may exist at emission time.
+    """A target under construction. A file declares one, or several inside a
+    :class:`Deployment`.
 
     ``sim_dt`` (seconds) selects a free-running simulated clock; without it the
     loop paces a wall clock at ``cycle_rate``. ``default_depth`` is the in-flight
@@ -219,6 +221,7 @@ class Target:
         if isinstance(spec, ExprHandle):
             return self._add_expr(full, scope, spec, process, node)
         self._register_spec_artifact(spec)
+        spec._bind(self)
         self._systems.append(
             {
                 "name": full,
@@ -256,6 +259,7 @@ class Target:
                 "multi-instance binding of one function is future work"
             )
         entry["added"] = full
+        entry["target"] = self
         handle.name = full
         self._systems.append(
             {
@@ -287,6 +291,7 @@ class Target:
         full, scope = self._scoped(name)
         for occupant in allow:
             self._register_spec_artifact(occupant)
+            occupant._bind(self)
         occupants = [
             {
                 "occupant": s.ty,
@@ -369,27 +374,14 @@ class Target:
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         """The assembled program blob and the program-built wasm artifact its
         added ``@system`` specs address. The blob carries every captured
-        ``Frame``/``State`` class plus the *added* system declarations, in
-        definition order — compile order is source order; step order is add
-        order; the two are independent. A ``@system`` never added is staged
-        code: legal, but warned about, and left out of the program. Offsets
-        are byte offsets into the assembled source, what the compiler's spans
-        are mapped back through."""
-        for entry in _program:
-            if entry["system"] and entry["added"] is None:
-                src = entry["src"]
-                at = (
-                    f"{src['file']}:{src['line']}"
-                    if src["file"]
-                    else f"line {src['line']}"
-                )
-                print(
-                    f"warning: @system `{entry['name']}` ({at}) was never added and "
-                    f'will not run; register it with target.add("{entry["name"]}", '
-                    f"{entry['name']})",
-                    file=sys.stderr,
-                )
-        included = [e for e in _program if not e["system"] or e["added"] is not None]
+        ``Frame``/``State`` class plus *this* target's added system
+        declarations, in definition order — compile order is source order;
+        step order is add order; the two are independent. Capture is
+        process-global, so a sibling target's systems are left out while its
+        frame and state classes compile in here too, costing nothing.
+        Offsets are byte offsets into the assembled source, what the
+        compiler's spans are mapped back through."""
+        included = [e for e in _program if not e["system"] or e["target"] is self]
         if not any(e["system"] for e in included):
             return None, []
         decls: list[dict[str, Any]] = []
@@ -437,28 +429,33 @@ class Target:
         }
 
 
-def _the_target() -> Target:
-    if len(_targets) != 1:
-        raise RuntimeError(
-            f"exactly one Target must exist at emission, found {len(_targets)}"
-        )
-    return _targets[0]
+def _the_deployment() -> "Deployment":
+    """The deployment a module declares: the one it constructed, or the
+    implicit deployment of its one bare :class:`Target`."""
+    from ._deployment import Deployment, _deployments
+
+    if len(_deployments) == 1:
+        return _deployments[0]
+    if not _deployments and len(_targets) == 1:
+        return Deployment(targets=list(_targets))
+    raise RuntimeError(
+        "exactly one Deployment or one Target must exist at emission, found "
+        f"{len(_targets)} Targets and {len(_deployments)} Deployments"
+    )
 
 
-def _envelope(targets: list[Target]) -> dict[str, Any]:
-    """The deployment document: the emitter's version and one member
-    ``Wiring`` per target, in the order given."""
-    return {
-        "ir_version": IR_VERSION,
-        "metor_config_version": __version__,
-        "targets": [t.to_ir() for t in targets],
-    }
+def emit(root: "Deployment | Target | None" = None) -> None:
+    """Write the deployment IR to ``$METOR_IR_OUT`` (stdout if unset). A bare
+    :class:`Target` emits as the deployment of one it is."""
+    from ._deployment import Deployment
 
-
-def emit(target: Target | None = None) -> None:
-    """Write the deployment IR to ``$METOR_IR_OUT`` (stdout if unset)."""
-    ir = _envelope([target or _the_target()])
-    text = json.dumps(ir, indent=2)
+    if root is None:
+        deployment = _the_deployment()
+    elif isinstance(root, Target):
+        deployment = Deployment(targets=[root])
+    else:
+        deployment = root
+    text = json.dumps(deployment.to_ir(), indent=2)
     out = os.environ.get("METOR_IR_OUT")
     if out:
         with open(out, "w", encoding="utf-8") as f:
@@ -468,22 +465,12 @@ def emit(target: Target | None = None) -> None:
 
 
 def _emit_at_exit() -> None:
-    # Emit only for a well-formed single-target module; a broken module has
-    # already raised, and its traceback is the error surface.
-    if len(_targets) == 1:
-        emit(_targets[0])
+    # Emit only for a well-formed module; a broken module has already raised,
+    # and its traceback is the error surface.
+    from ._deployment import _deployments
 
-
-def Presets(presets: list[Preset]) -> Spec:  # noqa: N802 - a system-type wrapper
-    """The built-in preset broadcaster, its ``PresetsParams`` carrying one
-    entry per preset under the ``preset`` field the Rust struct declares.
-
-    Component references are namespace-relative, like alarm targets: recording
-    qualifies them with the target's namespace, so the ids match what the
-    target registers. The ``Target`` must therefore exist first — the usual
-    ``m.add("presets", Presets([...]))`` order."""
-    namespace = _the_target().namespace
-    return static_system("Presets", preset=[p.to_json(namespace) for p in presets])
+    if len(_deployments) == 1 or (not _deployments and len(_targets) == 1):
+        emit()
 
 
 atexit.register(_emit_at_exit)

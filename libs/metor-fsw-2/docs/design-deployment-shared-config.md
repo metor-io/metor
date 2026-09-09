@@ -228,8 +228,8 @@ target is one `Wiring`, and a test that needs an envelope wraps it.
 
 ### Validation
 
-`src/wiring/validate.rs` gains `validate_deployment(&Deployment)`, run by the
-CLI right after ingestion and before selection:
+`src/wiring/validate.rs` gains `validate_deployment(&Deployment)`, run by
+`ingest_ir` as the one gate an emitted document passes, before selection:
 
 - envelope `ir_version == IR_VERSION`;
 - at least one member;

@@ -24,7 +24,7 @@ Build a cross-compiled target bundle:
 ```sh
 metor-fsw package target.py \
   -o dist/target.metor \
-  --target aarch64-unknown-linux-gnu \
+  --triple aarch64-unknown-linux-gnu \
   --release
 ```
 
@@ -54,7 +54,7 @@ current directory.
 ```sh
 metor-fsw build target.py
 metor-fsw build target.py --release
-metor-fsw build target.py --target aarch64-unknown-linux-gnu
+metor-fsw build target.py --triple aarch64-unknown-linux-gnu
 ```
 
 A local crate artifact runs Cargo. An installed pack selects the library for
@@ -101,7 +101,7 @@ Write a directory bundle or a single `.metor` file:
 metor-fsw package target.py -o dist/target.bundle
 metor-fsw package target.py -o dist/target.metor
 metor-fsw package target.py -o dist/target.metor \
-  --target aarch64-unknown-linux-gnu --release
+  --triple aarch64-unknown-linux-gnu --release
 ```
 
 Check whether a bundle's copied source still emits the same wiring IR:
@@ -111,6 +111,31 @@ metor-fsw package --check-ir dist/target.metor
 ```
 
 Use this check in CI to find config drift or input that changes between runs.
+
+### Deployments
+
+A `target.py` that builds a `Deployment` holds several targets. `--target`
+names one by its namespace:
+
+```sh
+metor-fsw run target.py --target fsw
+metor-fsw run --target plant
+metor-fsw build target.py
+metor-fsw package target.py -o dist/fsw.metor --target fsw
+```
+
+`build` with no `--target` provides every member in file order and prints
+one block per namespace. `package` writes one member per bundle; the bundle
+records the member's namespace, so `--target` on a bundle is accepted when
+it matches and is an error otherwise. A file with one target needs no flag.
+
+Errors name the file and the members:
+
+```text
+deployment `target.py` has 2 targets; pick one with --target (plant, fsw)
+deployment `target.py` has no target `fws`; targets: plant, fsw
+target `target.py` has no namespace; `--target sat` does not apply
+```
 
 ## Pack commands
 

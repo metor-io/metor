@@ -360,12 +360,61 @@ fn envelope_round_trips() {
     );
 }
 
+/// The shared `tests/golden/deployment.json` fixture: the two-member envelope
+/// the Python golden test also pins. Beyond the round-trip, it holds the two
+/// facts a deployment adds over a `Wiring` — members compile only their own
+/// Python systems, and a member's presets are qualified with its namespace.
+#[test]
+fn golden_deployment_round_trips() {
+    const GOLDEN: &str = include_str!("golden/deployment.json");
+    let d: Deployment =
+        serde_json::from_str(GOLDEN).expect("golden fixture deserializes as Deployment");
+    let reserialized = normalize(serde_json::to_value(&d).unwrap());
+    let on_disk = normalize(serde_json::from_str(GOLDEN).unwrap());
+    assert_eq!(
+        reserialized, on_disk,
+        "the golden deployment must equal its own Rust round-trip after normalization"
+    );
+
+    let decls = |w: &Wiring| {
+        w.program
+            .as_ref()
+            .map(|p| p.decls.iter().map(|d| d.name.clone()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let plant = d.target(Some("plant")).unwrap();
+    let fsw = d.target(Some("fsw")).unwrap();
+    assert!(
+        decls(plant).iter().all(|n| !decls(fsw).contains(n)),
+        "a member's program carries only the systems it added"
+    );
+    assert_eq!(decls(fsw), ["gyro_norm"]);
+
+    let presets = fsw
+        .systems
+        .iter()
+        .find(|s| s.ty.as_deref() == Some("Presets"))
+        .expect("the fsw member broadcasts presets");
+    let ParamSource::Value(params) = &presets.params else {
+        panic!("presets carry inline params")
+    };
+    let id = metor_proto::types::ComponentId::new("fsw.adcs.gyro_norm").0;
+    assert!(
+        serde_json::to_string(params)
+            .unwrap()
+            .contains(&id.to_string()),
+        "preset component ids are qualified with the member's namespace"
+    );
+}
+
 /// Strip the fields the cross-language comparison ignores: every `src` anchor
-/// (line numbers track the emitting source) and each artifact's `path` and
-/// `prebuilt_dir` (both machine-located). The `lib` stem is arch-neutral and
-/// stays in the comparison.
+/// (line numbers track the emitting source), the envelope's emitter-only
+/// `metor_config_version`, and each artifact's `path` and `prebuilt_dir` (both
+/// machine-located). The `lib` stem is arch-neutral and stays in the
+/// comparison.
 fn normalize(mut v: Value) -> Value {
     strip_key(&mut v, "src");
+    strip_key(&mut v, "metor_config_version");
     if let Some(artifacts) = v.get_mut("artifacts").and_then(Value::as_array_mut) {
         for a in artifacts {
             if let Some(obj) = a.as_object_mut() {

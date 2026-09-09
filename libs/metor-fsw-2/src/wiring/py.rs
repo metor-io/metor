@@ -53,6 +53,10 @@ const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
         include_str!("../../python/metor-config/metor_config/_target.py"),
     ),
     (
+        "metor_config/_deployment.py",
+        include_str!("../../python/metor-config/metor_config/_deployment.py"),
+    ),
+    (
         "metor_config/py.typed",
         include_str!("../../python/metor-config/metor_config/py.typed"),
     ),
