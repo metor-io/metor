@@ -85,8 +85,8 @@ deploy = Deployment(targets=[plant, fsw])
 A file with one `Target` and no `Deployment` is a deployment of one. Python
 systems declared with `@system` belong to the target that adds them.
 `Presets` qualify their component references with the namespace of the target
-that adds them. The CLI selects a member with `--target <namespace>`
-([cli.md](cli.md)).
+that adds them. The CLI selects a member with `--target <namespace>` or
+runs every member at once ([cli.md](cli.md)).
 
 ## Rust targets
 

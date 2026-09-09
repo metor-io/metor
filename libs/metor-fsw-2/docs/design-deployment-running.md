@@ -492,9 +492,9 @@ PATH as `tests/py_eval.rs` does, invoking `env!("CARGO_BIN_EXE_metor-fsw")`):
   `TcpServer`/`Downlink`/`Alarms` builders so each member runs.)
 - A fixture whose two members declare the same `TcpServer` address, run
   with no `--cycles`: exits 1 within a timeout, stderr names the losing
-  member's bind error under its prefix and ends with
-  ``member `b` exited with status 1``. This proves fail-fast without a
-  fixture that panics.
+  member's bind error under its prefix and ends with ``member `<ns>` exited
+  with status 1`` for whichever member loses the bind. This proves fail-fast
+  without a fixture that panics.
 - `package --target a` and `--target b` from the fixture, then
   `run a.bundle b.bundle --cycles 20`: exits 0 with both prefixes; the
   bundles run cargo-free.

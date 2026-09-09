@@ -8,7 +8,8 @@ use crate::wiring::{
     BuildOptions, ClockSpec, Deployment, LoadError, METOR_EXTENSION, PackBuildOptions,
     PackDevOptions, PackageOptions, Registry, WIRING_FILE_NAME, Wiring, build_target,
     eval_python_deployment, load_bundle, locate_artifacts, pack_build, pack_dev,
-    provision_artifacts, refresh_dev_packs, resolve, unpack_metor, write_bundle,
+    provision_artifacts, refresh_dev_packs, resolve, unpack_metor, validate_deployment,
+    write_bundle,
 };
 
 mod launch;
@@ -133,12 +134,14 @@ struct PackageArgs {
 
 #[derive(Args, Debug)]
 struct RunArgs {
-    /// A source `.py` deployment (built automatically) or a bundle directory
-    /// (cargo-free). Defaults to `target.py` in the current directory.
-    path: Option<PathBuf>,
-    /// Run this member of the deployment, by namespace. Required when the
-    /// deployment has more than one member; on a bundle it must match the
-    /// frozen namespace.
+    /// One source `.py` deployment (built automatically), or one or more
+    /// bundles (cargo-free). Defaults to `target.py` in the current directory.
+    #[arg(value_name = "PATH")]
+    paths: Vec<PathBuf>,
+    /// Run this member of the deployment, by namespace. With several members
+    /// and no `--target`, every member runs in its own process with its output
+    /// prefixed by its namespace; on a bundle it must match the frozen
+    /// namespace.
     #[arg(long = "target", value_name = "NS")]
     target: Option<String>,
     /// Locate previously built cdylibs without running cargo; errors when one
@@ -173,7 +176,8 @@ struct RunArgs {
     no_preflight: bool,
     /// Serve the telemetry link on this address, overriding the target's
     /// `TcpServer` state (or declaring one, with an all-taps downlink, when
-    /// the target has none).
+    /// the target has none). Applies to one member; with several, requires
+    /// `--target`.
     #[arg(long, value_name = "ADDR")]
     serve: Option<std::net::SocketAddr>,
 }
@@ -258,9 +262,17 @@ fn select<'a>(
     namespace: Option<&str>,
 ) -> miette::Result<&'a Wiring> {
     let file = file_label(path);
-    deployment.target(namespace).map_err(|err| match err {
+    deployment
+        .target(namespace)
+        .map_err(|err| deployment_fault(&file, err))
+}
+
+/// Render an envelope fault against the input it came from: a target file's
+/// name, or `bundles` for a set of them.
+fn deployment_fault(label: &str, err: LoadError) -> miette::Report {
+    match err {
         LoadError::TargetRequired { available } => miette::miette!(
-            "deployment `{file}` has {} targets; pick one with --target ({})",
+            "deployment `{label}` has {} targets; pick one with --target ({})",
             available.len(),
             available.join(", ")
         ),
@@ -268,17 +280,17 @@ fn select<'a>(
             requested,
             available,
         } if available.is_empty() => miette::miette!(
-            "target `{file}` has no namespace; `--target {requested}` does not apply"
+            "target `{label}` has no namespace; `--target {requested}` does not apply"
         ),
         LoadError::UnknownTarget {
             requested,
             available,
         } => miette::miette!(
-            "deployment `{file}` has no target `{requested}`; targets: {}",
+            "deployment `{label}` has no target `{requested}`; targets: {}",
             available.join(", ")
         ),
-        other => miette::miette!("deployment `{file}`: {other}"),
-    })
+        other => miette::miette!("deployment `{label}`: {other}"),
+    }
 }
 
 /// How a target file names itself in a diagnostic: its file name, falling
@@ -464,20 +476,62 @@ fn normalized_ir(wiring: &Wiring) -> String {
 }
 
 async fn cmd_run(args: RunArgs) -> miette::Result<()> {
-    let path = match &args.path {
-        Some(path) => path.clone(),
-        None => detect_target()?,
+    let paths = match args.paths.as_slice() {
+        [] => vec![detect_target()?],
+        given => given.to_vec(),
     };
-    refresh_run_packs(&path, &args)?;
-    let mut wiring = load_run_wiring(&path, args.target.as_deref())?;
-    apply_overrides(&mut wiring, &args);
+    let input = classify(&paths)?;
+    // A bundle set is named as a set; one path names itself, as it always has.
+    let label = match paths.as_slice() {
+        [one] => one.clone(),
+        _ => PathBuf::from("bundles"),
+    };
+
+    let deployment = match &input {
+        Input::Source(source) => {
+            refresh_run_packs(source, &args)?;
+            load_source(source)?
+        }
+        Input::Bundles(bundles) => {
+            let mut targets = Vec::new();
+            for bundle in bundles {
+                targets.push(load_bundle(bundle).into_diagnostic()?);
+            }
+            let deployment = Deployment {
+                ir_version: IR_VERSION,
+                targets,
+            };
+            validate_deployment(&deployment).map_err(|err| match err {
+                LoadError::NamespaceRequired { index } => miette::miette!(
+                    "bundles: member {index} (`{}`) has no namespace; every member of a \
+                     deployment needs one",
+                    file_label(&bundles[index])
+                ),
+                other => deployment_fault("bundles", other),
+            })?;
+            deployment
+        }
+    };
+
+    let mut members = match args.target.as_deref() {
+        Some(ns) => vec![select(&deployment, &label, Some(ns))?.clone()],
+        None => deployment.targets.clone(),
+    };
+    check_serve(&members, &args)?;
+
+    let [member] = members.as_mut_slice() else {
+        return run_members(&mut members, &input, &args);
+    };
+    apply_overrides(member, &args);
     if !args.no_preflight {
-        ui::print_preflight(&wiring, &path);
+        ui::print_preflight(member, &label);
     }
-    provision_run_artifacts(&mut wiring, &path, &args)?;
+    if let Input::Source(source) = &input {
+        provision_run_artifacts(member, source, &args)?;
+    }
 
     let cycles = args.cycles.unwrap_or(usize::MAX);
-    let mut coord = resolve(&wiring, &Registry::with_builtins())?;
+    let mut coord = resolve(member, &Registry::with_builtins())?;
 
     coord.run_for(cycles).await;
 
@@ -494,6 +548,99 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
         "{} system(s) hard-stopped during the run",
         stopped.len()
     ))
+}
+
+/// What `run`'s positional paths name. The two inputs differ in one place
+/// only: a source is built and written to temporary bundles, a bundle set is
+/// already the hand-off.
+#[derive(Debug)]
+enum Input {
+    Source(PathBuf),
+    Bundles(Vec<PathBuf>),
+}
+
+/// Sort `run`'s paths into one source target or a set of bundles.
+fn classify(paths: &[PathBuf]) -> miette::Result<Input> {
+    match paths {
+        [one] if !is_bundle(one) => Ok(Input::Source(one.clone())),
+        _ if paths.iter().all(|p| is_bundle(p)) => Ok(Input::Bundles(paths.to_vec())),
+        _ => Err(miette::miette!(
+            "`run` takes one source `.py` or bundles, not both: {}",
+            paths
+                .iter()
+                .map(|p| format!("`{}`", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// `--serve` names one socket, so it names one member.
+fn check_serve(members: &[Wiring], args: &RunArgs) -> miette::Result<()> {
+    if args.serve.is_none() || members.len() < 2 {
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "`--serve` names one socket; pick the member it applies to with --target ({})",
+        namespaces(members).join(", ")
+    ))
+}
+
+/// Every member's namespace, in envelope order. A validated deployment of
+/// several names each of its members.
+fn namespaces(members: &[Wiring]) -> Vec<&str> {
+    members
+        .iter()
+        .map(|m| {
+            m.coordinator
+                .namespace
+                .as_deref()
+                .expect("a validated deployment of several names every member")
+        })
+        .collect()
+}
+
+/// Run several members, each in its own process: provision a source's members
+/// into temporary bundles (a bundle set is the hand-off already), then launch.
+fn run_members(members: &mut [Wiring], input: &Input, args: &RunArgs) -> miette::Result<()> {
+    // The children read the bundles after `launch` spawns them, so the temp
+    // dir is bound here, for the whole run.
+    let temp = tempfile::tempdir().into_diagnostic()?;
+    let bundles = match input {
+        Input::Source(source) => {
+            let opts = PackageOptions {
+                release: args.release,
+                target: build_target(&args.cargo_arg),
+                provenance: Some(source.clone()),
+                built_at_unix: None,
+            };
+            let names: Vec<String> = namespaces(members).iter().map(|s| s.to_string()).collect();
+            let mut bundles = Vec::new();
+            for (member, ns) in members.iter_mut().zip(&names) {
+                provision_run_artifacts(member, source, args)?;
+                let out = temp.path().join(format!("{ns}.bundle"));
+                write_bundle(member, &opts, &out).into_diagnostic()?;
+                bundles.push(out);
+            }
+            bundles
+        }
+        Input::Bundles(paths) => paths.clone(),
+    };
+
+    let plan = launch::plan(members, &bundles);
+    if !args.no_preflight {
+        // Every block before any child starts, so they do not interleave.
+        for (member, entry) in members.iter().zip(&plan) {
+            let mut shown = member.clone();
+            apply_overrides(&mut shown, args);
+            let path = match input {
+                Input::Source(source) => source.as_path(),
+                Input::Bundles(_) => entry.bundle.as_path(),
+            };
+            ui::print_preflight(&shown, path);
+        }
+    }
+    launch::launch(&plan, &launch::overrides(args))
 }
 
 /// `run` with no target uses `target.py` in the current directory.
@@ -516,45 +663,20 @@ fn detect_target_in(dir: &Path) -> miette::Result<PathBuf> {
 }
 
 /// Refresh a source target's dev packs before evaluation
-/// ([`refresh_source_packs`]). Skipped for bundles, which are cargo-free by
-/// contract, and under `--no-build`, which extends its "locate, never build"
-/// promise to the packs.
+/// ([`refresh_source_packs`]). Skipped under `--no-build`, which extends its
+/// "locate, never build" promise to the packs.
 fn refresh_run_packs(path: &Path, args: &RunArgs) -> miette::Result<()> {
-    if is_bundle(path) || args.no_build {
+    if args.no_build {
         return Ok(());
     }
     refresh_source_packs(path, args.release, &args.cargo_arg)
 }
 
-/// Load `run`'s `<PATH>` into a [`Wiring`]: a bundle directory loads
-/// cargo-free via [`load_bundle`] with its artifact paths already recorded, a
-/// source `.py` is evaluated (with its dev packs already refreshed by
-/// [`refresh_run_packs`]) and its artifacts provisioned separately by
-/// [`provision_run_artifacts`].
-///
-/// A bundle holds one member, so it selects as the deployment of one it is:
-/// `--target` naming its frozen namespace passes, anything else is the same
-/// fault a source file would raise.
-fn load_run_wiring(path: &Path, namespace: Option<&str>) -> miette::Result<Wiring> {
-    let deployment = if is_bundle(path) {
-        Deployment {
-            ir_version: IR_VERSION,
-            targets: vec![load_bundle(path).into_diagnostic()?],
-        }
-    } else {
-        load_source(path)?
-    };
-    Ok(select(&deployment, path, namespace)?.clone())
-}
-
 /// Fill a source target's artifact paths: the cargo build driver by default
 /// (incremental, so a fresh tree is a no-op), or a cargo-free search of the
-/// workspace target dir with `--no-build`. A bundle's paths are already
-/// recorded, so this is a no-op for it.
+/// workspace target dir with `--no-build`. A bundle's paths are recorded
+/// already, so only a source reaches this.
 fn provision_run_artifacts(wiring: &mut Wiring, path: &Path, args: &RunArgs) -> miette::Result<()> {
-    if is_bundle(path) {
-        return Ok(());
-    }
     if args.no_build {
         let dir = match path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -569,7 +691,7 @@ fn provision_run_artifacts(wiring: &mut Wiring, path: &Path, args: &RunArgs) -> 
     .into_diagnostic()
 }
 
-/// A `<TARGET>` is a bundle if it is a directory (the bundle layout), ends in
+/// A `<PATH>` is a bundle if it is a directory (the bundle layout), ends in
 /// `.bundle`, or is a single-file `.metor` archive.
 fn is_bundle(path: &Path) -> bool {
     path.is_dir()
@@ -691,13 +813,12 @@ mod tests {
         );
     }
 
-    /// The pre-eval pack refresh leaves bundles alone (cargo-free by
-    /// contract), honors `--no-build`, and is a clean no-op for a target
-    /// with no path-source packs.
+    /// The pre-eval pack refresh honors `--no-build` and is a clean no-op for
+    /// a target with no path-source packs.
     #[test]
     fn refresh_run_packs_skips_and_noops() {
         let args = |no_build| RunArgs {
-            path: None,
+            paths: Vec::new(),
             target: None,
             no_build,
             release: false,
@@ -711,8 +832,6 @@ mod tests {
             no_preflight: false,
         };
         let dir = tempfile::tempdir().unwrap();
-        refresh_run_packs(dir.path(), &args(false)).expect("bundle dir: skipped");
-
         let target = dir.path().join("target.py");
         std::fs::write(&target, "").unwrap();
         refresh_run_packs(&target, &args(true)).expect("--no-build: skipped");
@@ -824,5 +943,101 @@ mod tests {
         let produced = select(&deployment, path, frozen.coordinator.namespace.as_deref())
             .expect("the frozen namespace names a member");
         assert_eq!(normalized_ir(produced), normalized_ir(&frozen));
+    }
+
+    /// `run`'s paths are one source or a set of bundles; a mix is a mistake
+    /// the CLI names before it loads anything.
+    #[test]
+    fn classify_paths() {
+        assert!(matches!(
+            classify(&[PathBuf::from("target.py")]).unwrap(),
+            Input::Source(p) if p == Path::new("target.py")
+        ));
+        let bundles = classify(&[PathBuf::from("a.bundle"), PathBuf::from("b.metor")]).unwrap();
+        assert!(matches!(&bundles, Input::Bundles(p) if p.len() == 2));
+        let err = classify(&[PathBuf::from("target.py"), PathBuf::from("a.bundle")])
+            .expect_err("a source and a bundle");
+        assert_eq!(
+            err.to_string(),
+            "`run` takes one source `.py` or bundles, not both: `target.py`, `a.bundle`"
+        );
+    }
+
+    /// `--serve` is one socket: it needs a member, and with several it says
+    /// which ones there are.
+    #[test]
+    fn serve_needs_a_target_on_several_members() {
+        let args = |target: Option<&str>| RunArgs {
+            paths: Vec::new(),
+            target: target.map(str::to_string),
+            no_build: false,
+            release: false,
+            cargo_arg: Vec::new(),
+            no_manifest_sidecar: false,
+            wall: false,
+            serve: Some("127.0.0.1:2240".parse().unwrap()),
+            sim_dt: None,
+            cycle_rate: None,
+            cycles: None,
+            no_preflight: false,
+        };
+        let both = [member(Some("plant"), 100.0), member(Some("fsw"), 100.0)];
+        let err = check_serve(&both, &args(None)).expect_err("two members, one socket");
+        assert_eq!(
+            err.to_string(),
+            "`--serve` names one socket; pick the member it applies to with --target (plant, fsw)"
+        );
+        assert!(
+            check_serve(&both[1..], &args(Some("fsw"))).is_ok(),
+            "picked"
+        );
+    }
+
+    /// A bundle set validates as a deployment, and its faults name the file
+    /// the member came from.
+    #[test]
+    fn bundle_set_validation_names_the_file() {
+        let paths = [
+            PathBuf::from("dist/plant.metor"),
+            PathBuf::from("fsw.metor"),
+        ];
+        let set = deployment(vec![member(None, 100.0), member(Some("fsw"), 100.0)]);
+        let err = match validate_deployment(&set).unwrap_err() {
+            LoadError::NamespaceRequired { index } => miette::miette!(
+                "bundles: member {index} (`{}`) has no namespace; every member of a \
+                 deployment needs one",
+                file_label(&paths[index])
+            ),
+            other => deployment_fault("bundles", other),
+        };
+        assert_eq!(
+            err.to_string(),
+            "bundles: member 0 (`plant.metor`) has no namespace; every member of a deployment \
+             needs one"
+        );
+
+        let clash = deployment(vec![member(Some("fsw"), 100.0), member(Some("fsw"), 100.0)]);
+        let err = deployment_fault("bundles", validate_deployment(&clash).unwrap_err());
+        assert_eq!(
+            err.to_string(),
+            "deployment `bundles`: duplicate target namespace `fsw`"
+        );
+    }
+
+    /// The launcher's hand-off: a member written into a temp dir and loaded
+    /// back is the same member, namespace and all.
+    #[test]
+    fn temp_bundle_round_trips_a_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("fsw.bundle");
+        let opts = PackageOptions {
+            release: false,
+            target: None,
+            provenance: None,
+            built_at_unix: None,
+        };
+        write_bundle(&member(Some("fsw"), 100.0), &opts, &out).unwrap();
+        let loaded = load_bundle(&out).unwrap();
+        assert_eq!(loaded.coordinator.namespace.as_deref(), Some("fsw"));
     }
 }

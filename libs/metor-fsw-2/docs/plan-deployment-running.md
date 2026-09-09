@@ -335,7 +335,7 @@ Files:
   only if `resolve` rejects a graph whose sole system is the downlink; run
   the fixture by hand once before writing the test.
 - `tests/fixtures/launch_clash.py` (new): the same two members, both on
-  `127.0.0.1:2252`. Member `b` loses the bind.
+  `127.0.0.1:2252`. Whichever member loses the bind fails.
 - `tests/launch.rs` (new), one `#[test]` running the cases in sequence
   (ports and the process-global cwd, the `py_eval.rs` reason), skipping
   with a note without a `python3 >= 3.10` on `PATH` (copy `have_python`
@@ -349,8 +349,9 @@ Files:
      appears before `launch_target.py · b`; every line containing `│`
      starts with `a │` or `b │` (stderr is a pipe here, so no escapes).
   2. `run launch_clash.py`: no `--cycles`. Spawn, poll `try_wait` for up to
-     30 s, kill on timeout and fail. Expect exit 1, a `b │` line carrying
-     the bind error, and the last line ``member `b` exited with status 1``.
+     30 s, kill on timeout and fail. Expect exit 1, a prefixed line carrying
+     the bind error, and the last line ``member `<ns>` exited with status 1``
+     for whichever member loses the bind.
   3. `package launch_target.py --target a -o <tmp>/a.bundle` and the same
      for `b`, then `run <tmp>/a.bundle <tmp>/b.bundle --cycles 20`: exit 0
      with both prefixes.
