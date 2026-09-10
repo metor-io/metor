@@ -9,7 +9,11 @@
 //! consumes — deserialized and re-serialized to prove it is exactly what Rust
 //! accepts and emits.
 
-use metor_fsw_2::ir::{ArtifactKind, Deployment, EdgeKind, IR_VERSION, ScopeSpec, SourceRef};
+use std::collections::BTreeMap;
+
+use metor_fsw_2::ir::{
+    ArtifactKind, Deployment, EdgeKind, IR_VERSION, PeerSpec, ScopeSpec, SourceRef,
+};
 use metor_fsw_2::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DistRef, EdgeSpec,
     InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec,
@@ -92,6 +96,7 @@ fn maximal() -> Wiring {
                 layout: Some((40.0, 80.0)),
                 status: Some("nav.system_status".into()),
                 encompassing: true,
+                peer: None,
             },
             SystemSpec {
                 name: "postcard_sys".into(),
@@ -105,6 +110,7 @@ fn maximal() -> Wiring {
                 layout: None,
                 status: None,
                 encompassing: false,
+                peer: None,
             },
             SystemSpec {
                 name: "bare".into(),
@@ -118,6 +124,7 @@ fn maximal() -> Wiring {
                 layout: None,
                 status: None,
                 encompassing: false,
+                peer: None,
             },
             // A registered `@system`: an ordinary spec, free to sit anywhere
             // in the list, carry a scope, and name its instance apart from
@@ -134,6 +141,30 @@ fn maximal() -> Wiring {
                 layout: Some((420.0, 180.0)),
                 status: None,
                 encompassing: false,
+                peer: None,
+            },
+            // A mirror: the peer type and artifact, no params of its own, and
+            // the `peer` spec that makes the subscriber its implementation.
+            SystemSpec {
+                name: "sim".into(),
+                ty: Some("Plant".into()),
+                artifact: Some("adcs".into()),
+                params: ParamSource::None,
+                src: src(20),
+                process: false,
+                scope: None,
+                attach: None,
+                layout: None,
+                status: None,
+                encompassing: false,
+                peer: Some(PeerSpec {
+                    namespace: "plant".into(),
+                    link: "peer".into(),
+                    port: 2242,
+                    instance: "plant".into(),
+                    telemetered: true,
+                    host: None,
+                }),
             },
         ],
         slots: vec![SlotSpec {
@@ -294,6 +325,15 @@ fn representation_is_externally_tagged() {
     assert_eq!(v["program"]["decls"][0]["name"], json!("omega_norm"));
     assert_eq!(v["program"]["decls"][0]["offset"], json!(0));
 
+    // A mirror carries `peer` and nothing else new; `telemetered` is an
+    // opt-out, so the common `true` never reaches the wire, and `host` is
+    // filled by the CLI rather than a front end.
+    assert_eq!(
+        v["systems"][4]["peer"],
+        json!({ "namespace": "plant", "link": "peer", "port": 2242, "instance": "plant" })
+    );
+    assert!(v["systems"][0].get("peer").is_none());
+
     // Artifact kind renders snake_case and is omitted for the default cdylib;
     // a program-built wasm artifact omits the crate/lib fields entirely.
     assert_eq!(v["artifacts"][2]["kind"], json!("wasm"));
@@ -314,6 +354,29 @@ fn representation_is_externally_tagged() {
         v["artifacts"][1]["dist"],
         json!({ "name": "gnc-pack", "version": "1.2.0" })
     );
+}
+
+/// The two v11 fields are additive: a v10 document carries neither, so it
+/// deserializes once its version is bumped and reads as the defaults —
+/// no `peer`, no `hosts`, and a mirror that is telemetered.
+#[test]
+fn a_v10_document_defaults_the_new_fields() {
+    let mut v = serde_json::to_value(maximal()).unwrap();
+    for system in v["systems"].as_array_mut().unwrap() {
+        system.as_object_mut().unwrap().remove("peer");
+    }
+    let envelope = json!({ "ir_version": IR_VERSION, "targets": [v] });
+
+    let d: Deployment = serde_json::from_value(envelope).unwrap();
+    assert!(d.hosts.is_empty());
+    assert!(d.targets[0].systems.iter().all(|s| s.peer.is_none()));
+
+    let telemetered: PeerSpec = serde_json::from_value(
+        json!({ "namespace": "plant", "link": "peer", "port": 2242, "instance": "plant" }),
+    )
+    .unwrap();
+    assert!(telemetered.telemetered);
+    assert_eq!(telemetered.host, None);
 }
 
 /// The shared fixture: the exact JSON the Python emitter must produce, minus
@@ -345,6 +408,7 @@ fn envelope_round_trips() {
     let deployment = Deployment {
         ir_version: IR_VERSION,
         targets: vec![member("plant"), member("fsw")],
+        hosts: BTreeMap::from([("plant".to_string(), "10.0.0.5".to_string())]),
     };
 
     let json = serde_json::to_string(&deployment).unwrap();

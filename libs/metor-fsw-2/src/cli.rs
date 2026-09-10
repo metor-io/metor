@@ -500,6 +500,7 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
             let deployment = Deployment {
                 ir_version: IR_VERSION,
                 targets,
+                hosts: Default::default(),
             };
             validate_deployment(&deployment).map_err(|err| match err {
                 LoadError::NamespaceRequired { index } => miette::miette!(
@@ -522,7 +523,7 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     let [member] = members.as_mut_slice() else {
         return run_members(&mut members, &input, &args);
     };
-    apply_overrides(member, &args);
+    apply_overrides(member, &args)?;
     if !args.no_preflight {
         ui::print_preflight(member, &label);
     }
@@ -632,7 +633,7 @@ fn run_members(members: &mut [Wiring], input: &Input, args: &RunArgs) -> miette:
         // Every block before any child starts, so they do not interleave.
         for (member, entry) in members.iter().zip(&plan) {
             let mut shown = member.clone();
-            apply_overrides(&mut shown, args);
+            apply_overrides(&mut shown, args)?;
             let path = match input {
                 Input::Source(source) => source.as_path(),
                 Input::Bundles(_) => entry.bundle.as_path(),
@@ -702,7 +703,7 @@ fn is_bundle(path: &Path) -> bool {
 
 /// Apply `run`'s override flags onto the loaded [`Wiring`] before [`resolve`].
 /// A flag always beats the target's own setting.
-fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) {
+fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     if args.wall {
         wiring.coordinator.clock = ClockSpec::Wall;
     } else if let Some(dt_secs) = args.sim_dt {
@@ -713,7 +714,26 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) {
     }
     if let Some(addr) = args.serve {
         use crate::ir::{StateSpec, SystemSpec, TCP_SERVER_TYPE};
-        match wiring.states.iter_mut().find(|s| s.ty == TCP_SERVER_TYPE) {
+        let servers: Vec<usize> = wiring
+            .states
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.ty == TCP_SERVER_TYPE)
+            .map(|(index, _)| index)
+            .collect();
+        if servers.len() > 1 {
+            let names: Vec<&str> = servers
+                .iter()
+                .map(|&index| wiring.states[index].name.as_str())
+                .collect();
+            return Err(miette::miette!(
+                "`--serve` names one socket, but this target declares {} `TcpServer` states \
+                 ({}); set the addresses in the target instead",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+        match servers.first().map(|&index| &mut wiring.states[index]) {
             Some(state) => {
                 // Override only the address; a target-set `name` (advertised
                 // over mDNS) survives the CLI address override.
@@ -734,6 +754,7 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) {
             }
         }
     }
+    Ok(())
 }
 
 /// Build the [`BuildOptions`] from the shared
@@ -838,6 +859,56 @@ mod tests {
         refresh_run_packs(&target, &args(false)).expect("no pyproject: nothing to refresh");
     }
 
+    /// `--serve` edits the target's one link server, declares one when there
+    /// is none, and refuses to guess between several.
+    #[test]
+    fn serve_needs_one_tcp_server() {
+        use crate::ir::{ParamSource, StateSpec, TCP_SERVER_TYPE};
+        use crate::wiring::WiringBuilder;
+
+        let args = RunArgs {
+            paths: Vec::new(),
+            target: None,
+            no_build: false,
+            release: false,
+            cargo_arg: Vec::new(),
+            no_manifest_sidecar: false,
+            wall: false,
+            serve: Some("127.0.0.1:9000".parse().unwrap()),
+            sim_dt: None,
+            cycle_rate: None,
+            cycles: None,
+            no_preflight: false,
+        };
+        let server = |name: &str, addr: &str| StateSpec::tcp_server(name, addr.parse().unwrap());
+
+        let mut none = WiringBuilder::new().build();
+        apply_overrides(&mut none, &args).expect("no server: one is declared");
+        assert_eq!(none.states.len(), 1);
+        assert_eq!(none.systems.len(), 1, "with an all-taps downlink");
+
+        let mut one = WiringBuilder::new().build();
+        one.states.push(server("link", "0.0.0.0:2240"));
+        apply_overrides(&mut one, &args).expect("one server: overridden");
+        let ParamSource::Value(params) = &one.states[0].params else {
+            unreachable!("tcp_server writes a value tree")
+        };
+        assert_eq!(params["addr"], "127.0.0.1:9000");
+
+        let mut several = WiringBuilder::new().build();
+        several.states.push(server("link", "0.0.0.0:2240"));
+        several.states.push(server("peer", "0.0.0.0:2242"));
+        let err = apply_overrides(&mut several, &args).expect_err("ambiguous");
+        assert!(err.to_string().contains("link, peer"), "{err}");
+        assert!(
+            several
+                .states
+                .iter()
+                .all(|s| s.ty != TCP_SERVER_TYPE || !format!("{:?}", s.params).contains("9000")),
+            "nothing is edited on the way out"
+        );
+    }
+
     /// Provenance discovery finds `target.py`, and is `None` when a bundle
     /// carries none.
     #[test]
@@ -872,6 +943,7 @@ mod tests {
         Deployment {
             ir_version: IR_VERSION,
             targets,
+            hosts: Default::default(),
         }
     }
 

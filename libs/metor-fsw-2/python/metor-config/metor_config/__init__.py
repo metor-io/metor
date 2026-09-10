@@ -35,6 +35,8 @@ from ._builtins import (
     TcpServer as TcpServer,
     Uplink as Uplink,
     Downlink as Downlink,
+    Publish as Publish,
+    Subscribe as Subscribe,
     Presets as Presets,
 )
 from ._dashboard import (

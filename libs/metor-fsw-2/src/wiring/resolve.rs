@@ -135,9 +135,17 @@ pub fn resolve_with(
 
     // States pass
     let mut state_tokens: HashMap<&str, metor_fsw_2_core::AttachTarget> = HashMap::new();
+    let mut state_cells: Vec<std::rc::Rc<dyn metor_fsw_2_core::ErasedShared>> = Vec::new();
     for spec in &wiring.states {
-        let target = resolve_state(spec, registry, graph.namespace.as_deref())?;
-        state_tokens.insert(spec.name.as_str(), target);
+        let instance = resolve_state(spec, registry, graph.namespace.as_deref())?;
+        state_tokens.insert(
+            spec.name.as_str(),
+            metor_fsw_2_core::AttachTarget {
+                ty: registry.states[spec.ty.as_str()].borrow().name(),
+                token: instance.token,
+            },
+        );
+        state_cells.push(instance.cell);
     }
 
     // Systems pass
@@ -158,6 +166,9 @@ pub fn resolve_with(
     let mut deferred: Vec<&SystemSpec> = Vec::new();
     let mut packs = PackCache::default();
     let mut wasm = WasmCache::default();
+    // The peer types a mirror describes, by artifact id: one dlopen-describe
+    // per cdylib per resolve, however many mirrors read it.
+    let mut described: HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>> = HashMap::new();
     let mut pending: Vec<PendingSynth> = Vec::new();
     for spec in &wiring.systems {
         // The dl and proc arms must never see a wasm module: dlopen on one
@@ -168,6 +179,18 @@ pub fn resolve_with(
                 .iter()
                 .any(|a| a.id == id && a.kind == ArtifactKind::Wasm)
         });
+        if spec.peer.is_some() {
+            let (handle, desc) = resolve_mirror(
+                spec,
+                wiring,
+                registry,
+                &mut described,
+                &mut wasm,
+                &mut graph,
+            )?;
+            instances.insert(spec.name.clone(), Instance { handle, desc });
+            continue;
+        }
         let (handle, desc) = match (&spec.artifact, spec.process) {
             (Some(artifact_id), false) if wasm_backed => resolve_wasm(
                 spec,
@@ -239,12 +262,8 @@ pub fn resolve_with(
     // Every declared state must have gained an attachment by now (attach
     // counts at entry create): a state serving nobody, a link server with no
     // downlink, is a config defect and fails like any other wiring mistake.
-    for spec in &wiring.states {
-        let entry = registry
-            .states
-            .get(spec.ty.as_str())
-            .expect("the states pass resolved this type");
-        if entry.borrow().cell.attached() == 0 {
+    for (spec, cell) in wiring.states.iter().zip(&state_cells) {
+        if cell.attached() == 0 {
             return Err(LoadError::StateUnused {
                 name: spec.name.clone(),
                 ty: spec.ty.clone(),
@@ -278,13 +297,13 @@ pub fn resolve_with(
 /// Construct one pack-shared state through its registered
 /// [`StateEntry`](crate::StateEntry): decode the spec's params off the value
 /// surface and run the state's init fn. Construction failure (a listener
-/// bind) is a load error, not a runtime one. Returns the
-/// [`AttachTarget`](metor_fsw_2_core::AttachTarget) a by-name attach downcasts.
+/// bind) is a load error, not a runtime one. Returns the instance this
+/// declaration minted, whose token a by-name attach downcasts.
 fn resolve_state(
     spec: &StateSpec,
     registry: &Registry,
     namespace: Option<&str>,
-) -> Result<metor_fsw_2_core::AttachTarget, LoadError> {
+) -> Result<metor_fsw_2_core::StateInstance, LoadError> {
     let Some(entry) = registry.states.get(spec.ty.as_str()) else {
         let mut available: Vec<&str> = registry.states.keys().copied().collect();
         available.sort_unstable();
@@ -319,11 +338,6 @@ fn resolve_state(
             ty: spec.ty.clone(),
             message: other.to_string(),
         },
-    })?;
-    let entry = entry.borrow();
-    Ok(metor_fsw_2_core::AttachTarget {
-        ty: entry.name(),
-        token: entry.token.clone(),
     })
 }
 
@@ -425,6 +439,101 @@ fn wasm_entry<'e>(
             ))),
         },
     }
+}
+
+/// Resolve a mirror of a peer member's instance: its ports are the peer
+/// type's telemetered outputs, and the built-in
+/// [`SubscribeSystem`](crate::SubscribeSystem) fills them.
+///
+/// The peer type's descriptor comes from wherever this target would have got
+/// it had it run the type itself — the registry for a static type, the wasm
+/// module's entries, or a describe of the cdylib, which loads, describes, and
+/// unloads without creating anything in the pack. The framework's own
+/// `system_status` and `log` are dropped (the mirror gets its own from
+/// `push_node`), as are ports the peer never announces, and every input:
+/// a mirror is a source.
+fn resolve_mirror(
+    spec: &SystemSpec,
+    wiring: &Wiring,
+    registry: &Registry,
+    described: &mut HashMap<String, Vec<metor_fsw_2_core::abi::PackEntryDesc>>,
+    wasm: &mut WasmCache,
+    graph: &mut InitGraph,
+) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
+    let peer = spec.peer.as_ref().expect("the caller matched on `peer`");
+    let unknown = || LoadError::PeerType {
+        system: spec.name.clone(),
+        ty: spec.ty.clone().unwrap_or_default(),
+        artifact: spec.artifact.clone(),
+    };
+    let bad = |_detail: String| unknown();
+    let outputs = match &spec.artifact {
+        None => {
+            let ty = spec.ty.as_deref().expect("validate requires a static type");
+            registry
+                .factories
+                .get(ty)
+                .ok_or_else(unknown)?
+                .descriptor
+                .descriptor()
+                .outputs
+        }
+        Some(artifact_id) if is_wasm(wiring, artifact_id) => {
+            let module = wasm.open(
+                wiring,
+                artifact_id,
+                &spec.name,
+                graph.config.wasm_memory_limit_bytes,
+            )?;
+            let (_, entry) = wasm_entry(&module.entries, spec.ty.as_deref(), &bad)?;
+            entry.descriptor.outputs.clone()
+        }
+        Some(artifact_id) => {
+            let entries = match described.entry(artifact_id.to_string()) {
+                std::collections::hash_map::Entry::Occupied(entries) => entries.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let artifact = find_built_artifact(wiring, artifact_id, &spec.name)?;
+                    let path = artifact
+                        .path
+                        .as_ref()
+                        .expect("checked by find_built_artifact");
+                    let dl_error = |source| LoadError::DlOpen {
+                        system: spec.name.clone(),
+                        artifact: artifact_id.to_string(),
+                        source: Box::new(source),
+                    };
+                    let bytes = crate::dl::describe_raw(path).map_err(dl_error)?;
+                    slot.insert(crate::dl::decode_pack_manifest(&bytes).map_err(dl_error)?)
+                }
+            };
+            let (_, entry) = wasm_entry(entries, spec.ty.as_deref(), &bad)?;
+            entry.descriptor.outputs.clone()
+        }
+    };
+
+    let status = metor_fsw_2_core::host_status_port().name;
+    let ports: Vec<metor_fsw_2_core::PortDesc> = outputs
+        .into_iter()
+        .filter(|port| port.telemetered && port.name != status && port.name != "log")
+        .map(|mut port| {
+            port.telemetered = peer.telemetered;
+            port
+        })
+        .collect();
+    let node = crate::coordinator::init::async_node(
+        spec.name.clone(),
+        crate::SubscribeSystem::new(peer.clone(), ports),
+    );
+    let desc = node.desc.clone();
+    Ok((graph.push_node(node), desc))
+}
+
+/// Whether `artifact_id` names a wasm artifact of this wiring.
+fn is_wasm(wiring: &Wiring, artifact_id: &str) -> bool {
+    wiring
+        .artifacts
+        .iter()
+        .any(|a| a.id == artifact_id && a.kind == ArtifactKind::Wasm)
 }
 
 /// One compiled Python instance awaiting edge synthesis, recorded during the

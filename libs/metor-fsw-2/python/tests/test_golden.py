@@ -40,6 +40,8 @@ from metor_config import (
     Pivot,
     Presets,
     Preset,
+    Publish,
+    Subscribe,
     Place,
     SequenceControl,
     State,
@@ -246,8 +248,9 @@ def build_target() -> Target:
 
 def build_deployment() -> Deployment:
     """The two-member deployment whose IR is the golden envelope: a `plant`
-    that only downlinks, and an `fsw` carrying a Python system, a scope, and a
-    preset — the shapes a member may add over a bare `Wiring`."""
+    that downlinks and publishes `plant` to peers, and an `fsw` that mirrors it
+    and carries a Python system, a scope, and a preset — the shapes a member
+    may add over a bare `Wiring`."""
     plant = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="plant")
     fsw = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="fsw")
 
@@ -256,7 +259,8 @@ def build_deployment() -> Deployment:
         return (gyro_b @ gyro_b) ** 0.5
 
     plant_link = plant.state("link", TcpServer(addr="[::]:2240", name="plant"))
-    plant.add(
+    plant_peers = plant.state("peer", TcpServer(addr="[::]:2242", name="plant-peers"))
+    sim = plant.add(
         "plant",
         System(
             "Plant",
@@ -265,7 +269,9 @@ def build_deployment() -> Deployment:
         ),
     )
     plant.add("downlink", Downlink(plant_link))
+    publish = plant.add("publish", Publish(plant_peers, [sim]))
 
+    fsw.add("plant", Subscribe(sim, via=publish))
     with fsw.scope("adcs"):
         fsw.add("gyro_norm", gyro_norm)
     fsw.add(
@@ -280,7 +286,7 @@ def build_deployment() -> Deployment:
             ]
         ),
     )
-    return Deployment(targets=[plant, fsw])
+    return Deployment(targets=[plant, fsw], hosts={"plant": "10.0.0.5"})
 
 
 def normalize(v):

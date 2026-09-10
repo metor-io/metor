@@ -161,7 +161,7 @@ fn decode_static_params<P: serde::de::DeserializeOwned>(
 /// registrations by capability.
 pub(super) struct RegistryEntry {
     pub(super) factory: SystemFactory,
-    descriptor: EntryDescriptor,
+    pub(super) descriptor: EntryDescriptor,
     /// `true` for a pack entry that attaches to a pack-shared state by name
     /// ([`Pack::system_type_shared`](crate::Pack::system_type_shared)): the
     /// resolver requires its spec to carry an `attach`, and rejects an
@@ -171,12 +171,21 @@ pub(super) struct RegistryEntry {
 
 /// A registered type's descriptor without construction: computed on demand
 /// for a type-registered system, carried by value for a pack entry.
-enum EntryDescriptor {
+pub(super) enum EntryDescriptor {
     Fn(fn() -> SystemDescriptor),
     Value(Box<SystemDescriptor>),
 }
 
 impl EntryDescriptor {
+    /// The descriptor itself, computed or cloned. A mirror of this type
+    /// ([`resolve`](super::resolve)) reads its ports without constructing it.
+    pub(super) fn descriptor(&self) -> SystemDescriptor {
+        match self {
+            EntryDescriptor::Fn(f) => f(),
+            EntryDescriptor::Value(d) => (**d).clone(),
+        }
+    }
+
     fn capabilities_contain(&self, cap: crate::Capability) -> bool {
         match self {
             EntryDescriptor::Fn(f) => f().capabilities.contains(&cap),

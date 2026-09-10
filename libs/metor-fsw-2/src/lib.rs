@@ -114,7 +114,8 @@ pub use coordinator::{
     SlotConfigError, SlotStatus, WireError,
 };
 pub use telemetry::{
-    DownlinkParams, LinkParams, LinkState, LinkStats, TelemetrySystem, UplinkParams, UplinkSystem,
+    DownlinkParams, LinkParams, LinkState, LinkStats, PeerStatus, SubscribeOut, SubscribeSystem,
+    TelemetrySystem, UplinkParams, UplinkSystem,
 };
 
 pub use alarm::{AlarmIn, AlarmOut, AlarmSpec, AlarmSystem, AlarmsParams, BandSpec, TargetSpec};

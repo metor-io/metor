@@ -24,6 +24,8 @@ from metor_config import (
     Tensor,
     System,
     Downlink,
+    Publish,
+    Subscribe,
     TcpServer,
     Uplink,
     band,
@@ -504,6 +506,133 @@ class RecorderTest(unittest.TestCase):
 
         # The never-added warning is one per emission, not one per member.
         self.assertEqual(err.getvalue().count("@system `staged`"), 1)
+
+
+class PeerTest(unittest.TestCase):
+    """`Publish`/`Subscribe`: what one member offers a peer, and what the
+    deployment can check that neither target can see alone."""
+
+    def setUp(self):
+        mc._targets.clear()
+        mc._deployments.clear()
+        mc._program.clear()
+
+    def members(self, addr: str = "[::]:2242", instances: bool = True):
+        """A `plant` publishing `sim` on its peer server, and an empty `fsw`."""
+        plant = Target(cycle_rate=100.0, namespace="plant")
+        fsw = Target(cycle_rate=100.0, namespace="fsw")
+        peers = plant.state("peer", TcpServer(addr=addr))
+        sim = plant.add("sim", static_system("Plant"))
+        taps = [sim] if instances else []
+        publish = plant.add("publish", Publish(peers, taps))
+        return plant, fsw, sim, publish
+
+    def test_a_mirror_records_the_peer_spec(self):
+        plant, fsw, sim, _ = self.members()
+        mirror = fsw.add("sim", Subscribe(sim))
+        nav = fsw.add("nav", static_system("Nav"))
+        fsw.connect(mirror.gps, nav.gps)
+
+        ir = Deployment(targets=[plant, fsw], hosts={"plant": "10.0.0.5"}).to_ir()
+        member = ir["targets"][1]["systems"][0]
+        self.assertEqual(member["ty"], "Plant")
+        self.assertEqual(member["params"], "None")
+        self.assertIsNone(member["attach"])
+        self.assertEqual(
+            member["peer"],
+            {
+                "namespace": "plant",
+                "link": "peer",
+                "port": 2242,
+                "instance": "sim",
+            },
+        )
+        self.assertEqual(ir["hosts"], {"plant": "10.0.0.5"})
+
+        # The publish is an ordinary downlink filtered to the offered instance.
+        publish = ir["targets"][0]["systems"][1]
+        self.assertEqual(publish["ty"], "Downlink")
+        self.assertEqual(publish["attach"], "peer")
+        self.assertEqual(publish["params"], {"Value": {"instances": ["sim"]}})
+
+    def test_untelemetered_mirror_records_the_opt_out(self):
+        plant, fsw, sim, _ = self.members()
+        fsw.add("sim", Subscribe(sim, telemetered=False))
+        ir = Deployment(targets=[plant, fsw]).to_ir()
+        self.assertIs(ir["targets"][1]["systems"][0]["peer"]["telemetered"], False)
+        self.assertNotIn("hosts", ir)
+
+    def test_a_mirror_of_this_target_is_rejected(self):
+        plant, _, sim, _ = self.members()
+        with self.assertRaisesRegex(ValueError, "runs on this target"):
+            plant.add("mirror", Subscribe(sim))
+
+    def test_a_mirror_of_a_non_member_is_rejected(self):
+        _, fsw, sim, _ = self.members()
+        fsw.add("sim", Subscribe(sim))
+        with self.assertRaisesRegex(ValueError, "outside this deployment"):
+            Deployment(targets=[fsw])
+
+    def test_an_unpublished_instance_is_rejected(self):
+        plant, fsw, _, _ = self.members()
+        other = plant.add("other", static_system("Nav"))
+        fsw.add("other", Subscribe(other))
+        with self.assertRaisesRegex(ValueError, r"publishes no `other`.*peer"):
+            Deployment(targets=[plant, fsw])
+
+    def test_an_explicit_listing_beats_the_ground_downlink(self):
+        plant, fsw, sim, _ = self.members()
+        plant.add(
+            "downlink", Downlink(plant.state("link", TcpServer(addr="[::]:2240")))
+        )
+        fsw.add("sim", Subscribe(sim))
+        self.assertEqual(
+            Deployment(targets=[plant, fsw]).to_ir()["targets"][1]["systems"][0][
+                "peer"
+            ]["link"],
+            "peer",
+        )
+
+    def test_two_publishers_need_via(self):
+        plant, fsw, sim, publish = self.members()
+        plant.add(
+            "publish2",
+            Publish(plant.state("peer2", TcpServer(addr="[::]:2244")), [sim]),
+        )
+        fsw.add("sim", Subscribe(sim))
+        with self.assertRaisesRegex(ValueError, "more than one downlink.*via="):
+            Deployment(targets=[plant, fsw])
+
+        mc._deployments.clear()
+        fsw._subscribes["sim"].via = publish
+        self.assertEqual(
+            Deployment(targets=[plant, fsw]).to_ir()["targets"][1]["systems"][0][
+                "peer"
+            ]["link"],
+            "peer",
+        )
+
+    def test_a_published_server_declares_its_port(self):
+        plant, fsw, sim, _ = self.members(addr="[::]:0")
+        fsw.add("sim", Subscribe(sim))
+        with self.assertRaisesRegex(ValueError, "binds port 0"):
+            Deployment(targets=[plant, fsw])
+
+    def test_a_python_system_cannot_be_mirrored(self):
+        _, fsw, _, _ = self.members()
+
+        @system("sim.gps")
+        def gps_norm(gps) -> f64:
+            return gps @ gps
+
+        with self.assertRaisesRegex(TypeError, "not a system instance"):
+            Subscribe(fsw.add("gps_norm", gps_norm))
+
+    def test_publish_taps_only_its_own_target(self):
+        _, fsw, sim, _ = self.members()
+        peers = fsw.state("peer", TcpServer(addr="[::]:2243"))
+        with self.assertRaisesRegex(ValueError, "belongs to another target"):
+            fsw.add("publish", Publish(peers, [sim]))
 
 
 class PresetTest(unittest.TestCase):

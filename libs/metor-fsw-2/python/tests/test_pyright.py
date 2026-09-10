@@ -25,39 +25,55 @@ def pyright_command():
     return None
 
 
+def run_pyright(cmd, *paths):
+    """pyright's JSON report over ``paths``, relative to the python dir."""
+    result = subprocess.run(
+        [*cmd, "--outputjson", *paths],
+        cwd=os.path.abspath(PYTHON_DIR),
+        env={
+            **os.environ,
+            "PYTHONPATH": os.path.abspath(os.path.join(PYTHON_DIR, "metor-config")),
+        },
+        capture_output=True,
+        text=True,
+    )
+    # pyright exits 1 on findings; parse the JSON summary either way.
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"pyright produced no JSON report:\n{result.stdout}\n{result.stderr}"
+        )
+
+
 class PyrightTest(unittest.TestCase):
     def test_core_and_generated_module_type_check(self):
         cmd = pyright_command()
         if cmd is None:
             self.skipTest("pyright not available on PATH")
-        result = subprocess.run(
-            [
-                *cmd,
-                "--outputjson",
-                os.path.join("metor-config", "metor_config"),
-                os.path.join("tests", "data", "demo.py"),
-                os.path.join("tests", "data", "deployment.py"),
-            ],
-            cwd=os.path.abspath(PYTHON_DIR),
-            env={
-                **os.environ,
-                "PYTHONPATH": os.path.abspath(os.path.join(PYTHON_DIR, "metor-config")),
-            },
-            capture_output=True,
-            text=True,
+        report = run_pyright(
+            cmd,
+            os.path.join("metor-config", "metor_config"),
+            os.path.join("tests", "data", "demo.py"),
+            os.path.join("tests", "data", "deployment.py"),
         )
-        # pyright exits 1 on findings; parse the JSON summary either way.
-        try:
-            report = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            self.fail(
-                f"pyright produced no JSON report:\n{result.stdout}\n{result.stderr}"
-            )
         errors = report.get("summary", {}).get("errorCount", 0)
         self.assertEqual(
             errors,
             0,
             "pyright found type errors in the recorder core or generated module:\n"
+            + json.dumps(report.get("generalDiagnostics", []), indent=2),
+        )
+
+    def test_a_cross_frame_mirror_edge_is_reported(self):
+        cmd = pyright_command()
+        if cmd is None:
+            self.skipTest("pyright not available on PATH")
+        report = run_pyright(cmd, os.path.join("tests", "data", "deployment_bad.py"))
+        self.assertEqual(
+            report.get("summary", {}).get("errorCount", 0),
+            1,
+            "a mirror's port carries the peer's frame, so this connect is an error:\n"
             + json.dumps(report.get("generalDiagnostics", []), indent=2),
         )
 

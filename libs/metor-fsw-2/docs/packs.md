@@ -120,8 +120,12 @@ pub fn pack() -> Pack {
 ```
 
 The state's lifecycle starts before the first attached system init and ends
-after the last attached system shutdown. Attached entries can instantiate once
-and cannot fill slots. Each worker calls `pack()` in its own process, so pack
+after the last attached system shutdown. Each `state` declaration constructs
+its own instance, so a target may declare several of one type (a ground link
+server and a peer one) and each `attach` picks one. The token
+`shared_state` returns is the first declaration's, the one this pack's own
+entries capture. An attached entry instantiates once per state instance and
+cannot fill slots. Each worker calls `pack()` in its own process, so pack
 state does not cross a process boundary.
 
 ## ABI v12

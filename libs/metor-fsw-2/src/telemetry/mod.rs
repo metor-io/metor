@@ -11,8 +11,10 @@
 
 mod discovery;
 mod link;
+mod subscribe;
 mod uplink;
 
+pub use subscribe::{PeerStatus, SubscribeOut, SubscribeSystem};
 pub use uplink::{UplinkParams, UplinkSystem};
 
 pub use link::{LinkParams, LinkState, LinkStats};

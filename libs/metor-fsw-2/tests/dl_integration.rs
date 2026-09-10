@@ -468,3 +468,76 @@ fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
     let coord = resolve(&good, &registry).expect("an exported type= resolves");
     drop(coord);
 }
+
+/// A mirror of a peer member's instances: one of a pack entry, one of a
+/// static type, with an edge out of the latter into a local loaded system.
+/// The mirror's ports are the peer type's outputs — inputs dropped, the
+/// framework's own ports its own — and its client never connects here, so the
+/// run is a clean idle.
+#[test]
+fn mirrors_of_a_peer_publish_their_types_ports() {
+    let lib_path = locate_fixture();
+    let peer = |instance: &str| metor_fsw_2::ir::PeerSpec {
+        namespace: "a".into(),
+        link: "peer".into(),
+        port: 2242,
+        instance: instance.into(),
+        telemetered: true,
+        host: None,
+    };
+
+    let mut wiring = WiringBuilder::new()
+        .coordinator_spec(dl_coordinator())
+        .artifact(
+            "counter",
+            "metor-fsw-2-dl-fixture",
+            "metor_fsw_2_dl_fixture",
+        )
+        .subscribe("ticker", "Ticker", None, peer("ticker"))
+        .subscribe("counter", "DlCounter", Some("counter"), peer("dl_counter"))
+        .system("echo")
+        .ty("DlEcho")
+        .from_artifact("counter")
+        .end()
+        .connect("ticker", "tick_in", "echo", "tick_in")
+        .build();
+    wiring.coordinator.namespace = Some("b".into());
+    wiring.artifacts[0].path = Some(lib_path);
+
+    let mut coord = resolve(&wiring, &ticker_registry()).expect("both mirrors resolve");
+    let registered = |name: &str| coord.registry().get(ComponentId::new(name)).is_some();
+    assert!(registered("b.counter.tick_out"), "the peer type's output");
+    assert!(registered("b.counter.TickEvent"), "its message channel too");
+    assert!(
+        registered("b.counter.peer_status"),
+        "and the mirror's gauge"
+    );
+    assert!(
+        !registered("b.counter.tick_in"),
+        "a mirror is a source: the peer type's inputs are dropped"
+    );
+
+    let mut status: Input<metor_fsw_2::PeerStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("b.counter.peer_status"))
+            .expect("the mirror's status is registered")
+            .expect("a reader slot is available"),
+    );
+    let coord = stellarator::run(|| async move {
+        coord.run_for(10).await;
+        coord
+    });
+
+    assert!(coord.stopped().is_empty(), "an idle mirror stops nothing");
+    let status = status
+        .latest()
+        .expect("read the status")
+        .expect("the mirror published one record");
+    assert_eq!(
+        status.get().connected,
+        0,
+        "no client yet: the peer is never connected"
+    );
+    drop(coord);
+}

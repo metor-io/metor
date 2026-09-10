@@ -112,7 +112,7 @@ checks Rust-built and serialized IR alike and returns a `LoadError`.
 ## The wiring IR
 
 Both examples produce `Wiring`, a plain data value that serde can read and
-write. The current IR version is 10. A host rejects another version during
+write. The current IR version is 11. A host rejects another version during
 ingest and resolve.
 
 The document a `target.py` emits is an envelope, `Deployment`, with
@@ -178,8 +178,10 @@ picks which instance. A shared-state system given no handle is a resolve-time
 error, and a plain system given one is rejected too.
 
 The resolver creates all states before it creates systems, so a system's
-`attach` resolves to a constructed instance. Each state name and type must be
-unique, and each declared state must serve at least one system.
+`attach` resolves to a constructed instance. Each state name must be unique,
+and each declared state must serve at least one system. Several states of one
+type are fine: a target serving both a ground link and a peer link declares
+two `TcpServer` states.
 
 The built-in network link uses this feature. A `TcpServer` state owns the
 listener; the `Downlink` and `Uplink` systems attach to it by name.
@@ -193,7 +195,9 @@ uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand"]))
 ```
 
 The CLI `run --serve ADDR` changes the address of an existing `TcpServer`. If
-the target has no server, it adds one and adds an all-output downlink.
+the target has no server, it adds one and adds an all-output downlink. A
+target with several servers is an error: the flag names one socket and does
+not pick.
 
 ## Slots
 

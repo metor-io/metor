@@ -4,6 +4,7 @@
 //! produce [`Wiring`]. The resolver converts these specs into runtime types;
 //! the IR itself contains no runtime state.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -14,7 +15,7 @@ use crate::wiring::LoadError;
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
 /// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
-pub const IR_VERSION: u32 = 10;
+pub const IR_VERSION: u32 = 11;
 
 /// A plain-data description of a complete target, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
@@ -91,6 +92,10 @@ pub struct Deployment {
     /// The members, in the order they were declared. `build` provisions them
     /// in this order; nothing else reads meaning into it.
     pub targets: Vec<Wiring>,
+    /// Where each member runs, by namespace, for the deploy renderer. Empty
+    /// for a local run: a subscriber dials loopback and mDNS on its own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hosts: BTreeMap<String, String>,
 }
 
 impl Deployment {
@@ -99,6 +104,7 @@ impl Deployment {
         Deployment {
             ir_version: self.ir_version,
             targets: self.targets.iter().map(Wiring::path_stripped).collect(),
+            hosts: self.hosts.clone(),
         }
     }
 
@@ -452,6 +458,45 @@ pub struct SystemSpec {
     /// round-trips byte-identically.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub encompassing: bool,
+    /// `Some` makes this instance a mirror of a peer member's instance of the
+    /// same `ty` and `artifact`: its ports are the peer type's outputs and its
+    /// implementation is the built-in subscriber, not the type itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<PeerSpec>,
+}
+
+/// Where a mirror's peer instance lives, and what the mirror keeps of it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerSpec {
+    /// The peer member's [`CoordinatorSpec::namespace`].
+    pub namespace: String,
+    /// The [`StateSpec`] name of the `TcpServer` the peer publishes on.
+    pub link: String,
+    /// That server's port, from its `addr`. The bind address itself is a
+    /// listener choice, not a destination, so it is not copied.
+    pub port: u16,
+    /// The peer instance's bare name.
+    pub instance: String,
+    /// Whether the mirror's outputs keep the peer type's telemetry flags.
+    #[serde(
+        default = "peer_telemetered",
+        skip_serializing_if = "peer_is_telemetered"
+    )]
+    pub telemetered: bool,
+    /// Where the peer runs, when a deployment host table named it. Never
+    /// emitted by a front-end; the CLI fills it from `--peer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// `telemetered` defaults to on: a mirror is telemetry like any other node,
+/// so an unset field reads as `true` and a `true` field is left off the wire.
+fn peer_telemetered() -> bool {
+    true
+}
+
+fn peer_is_telemetered(telemetered: &bool) -> bool {
+    *telemetered
 }
 
 impl StateSpec {
@@ -512,6 +557,7 @@ impl SystemSpec {
             layout: None,
             status: None,
             encompassing: false,
+            peer: None,
         }
     }
 }

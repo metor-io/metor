@@ -409,6 +409,43 @@ fn shared_entry_instantiates_once() {
     ));
 }
 
+/// Two `state` declarations of one type are two instances: a target serving
+/// both a ground link and a peer link declares two `TcpServer`s, and each
+/// `attach` resolves to its own. The first is the token the pack's own
+/// entries captured.
+#[test]
+fn two_declarations_are_two_instances() {
+    let mut pack = Pack::new();
+    let tally = pack.shared_state("Tally", |ctx, (): ()| {
+        Ok::<_, std::convert::Infallible>(Tally {
+            value: ctx.name.len() as f64,
+            ..Tally::default()
+        })
+    });
+    let entry = pack.state_entry_mut("Tally").expect("declared");
+    let ground = entry
+        .create(EntryParams::Postcard(&[]))
+        .expect("the first declaration constructs");
+    let peer = entry
+        .create(EntryParams::Postcard(&[]))
+        .expect("so does the second");
+
+    assert!(
+        !std::rc::Rc::ptr_eq(&ground.cell, &peer.cell),
+        "each declaration owns its own instance"
+    );
+    let token = |instance: &metor_fsw_2_core::StateInstance| {
+        instance
+            .token
+            .downcast_ref::<crate::Shared<Tally>>()
+            .expect("the token is this state's")
+            .clone()
+    };
+    token(&ground).get().value = 7.0;
+    assert_eq!(tally.get().value, 7.0, "the pack's token is the first");
+    assert_eq!(token(&peer).get().value, 5.0, "and the second is its own");
+}
+
 /// A failing shared-state init fn (resource acquisition) surfaces as a
 /// create error naming the state, not a panic.
 #[test]
@@ -416,11 +453,13 @@ fn shared_state_init_failure_reports() {
     let mut pack = Pack::new();
     let _tally: crate::Shared<Tally> =
         pack.shared_state("Tally", |_, (): ()| Err("address in use".to_string()));
-    let err = pack
+    let Err(err) = pack
         .state_entry_mut("Tally")
         .unwrap()
         .create(EntryParams::Postcard(&[]))
-        .expect_err("init failed");
+    else {
+        panic!("a failing init fn cannot construct the state")
+    };
     assert!(matches!(
         err,
         MakeError::StateInit { state: "Tally", ref detail } if detail == "address in use"

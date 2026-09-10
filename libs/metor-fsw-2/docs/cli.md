@@ -93,7 +93,8 @@ Useful run flags include:
 --no-preflight
 ```
 
-These flags override target settings. `--no-preflight` skips the listing
+These flags override target settings. `--serve` needs the target to declare
+one `TcpServer` state, or none. `--no-preflight` skips the listing
 printed before a run. A run exits with an error if a system hard-stops.
 
 ### Package a target

@@ -1,9 +1,9 @@
 {
-  "ir_version": 10,
-  "metor_config_version": "0.4.1",
+  "ir_version": 11,
+  "metor_config_version": "0.4.2",
   "targets": [
     {
-      "ir_version": 10,
+      "ir_version": 11,
       "coordinator": {
         "cycle_rate": 120.0,
         "default_depth": null,
@@ -25,7 +25,7 @@
           "manifest_hash": null,
           "src": {
             "file": "tests/test_golden.py",
-            "line": 259,
+            "line": 263,
             "col": 1
           },
           "crate_name": "adcs-systems",
@@ -44,7 +44,22 @@
           },
           "src": {
             "file": "tests/test_golden.py",
-            "line": 258,
+            "line": 261,
+            "col": 1
+          }
+        },
+        {
+          "name": "peer",
+          "ty": "TcpServer",
+          "params": {
+            "Value": {
+              "addr": "[::]:2242",
+              "name": "plant-peers"
+            }
+          },
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 262,
             "col": 1
           }
         }
@@ -62,7 +77,7 @@
           "process": false,
           "src": {
             "file": "tests/test_golden.py",
-            "line": 259,
+            "line": 263,
             "col": 1
           },
           "scope": null,
@@ -77,11 +92,32 @@
           "process": false,
           "src": {
             "file": "tests/test_golden.py",
-            "line": 267,
+            "line": 271,
             "col": 1
           },
           "scope": null,
           "attach": "link",
+          "layout": null
+        },
+        {
+          "name": "publish",
+          "ty": "Downlink",
+          "artifact": null,
+          "params": {
+            "Value": {
+              "instances": [
+                "plant"
+              ]
+            }
+          },
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 272,
+            "col": 1
+          },
+          "scope": null,
+          "attach": "peer",
           "layout": null
         }
       ],
@@ -91,7 +127,7 @@
       "program": null
     },
     {
-      "ir_version": 10,
+      "ir_version": 11,
       "coordinator": {
         "cycle_rate": 120.0,
         "default_depth": null,
@@ -106,6 +142,20 @@
       },
       "artifacts": [
         {
+          "id": "adcs",
+          "path": null,
+          "prebuilt_dir": null,
+          "dist": null,
+          "manifest_hash": null,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 274,
+            "col": 1
+          },
+          "crate_name": "adcs-systems",
+          "lib": "adcs_systems"
+        },
+        {
           "id": "program",
           "kind": "wasm",
           "path": null,
@@ -118,6 +168,27 @@
       "states": [],
       "systems": [
         {
+          "name": "plant",
+          "ty": "Plant",
+          "artifact": "adcs",
+          "params": "None",
+          "process": false,
+          "src": {
+            "file": "tests/test_golden.py",
+            "line": 274,
+            "col": 1
+          },
+          "scope": null,
+          "attach": null,
+          "layout": null,
+          "peer": {
+            "namespace": "plant",
+            "link": "peer",
+            "port": 2242,
+            "instance": "plant"
+          }
+        },
+        {
           "name": "adcs.gyro_norm",
           "ty": "gyro_norm",
           "artifact": "program",
@@ -125,7 +196,7 @@
           "process": false,
           "src": {
             "file": "tests/test_golden.py",
-            "line": 270,
+            "line": 276,
             "col": 1
           },
           "scope": 0,
@@ -163,7 +234,7 @@
           "process": false,
           "src": {
             "file": "tests/test_golden.py",
-            "line": 271,
+            "line": 277,
             "col": 1
           },
           "scope": null,
@@ -191,7 +262,7 @@
             "name": "gyro_norm",
             "src": {
               "file": "tests/test_golden.py",
-              "line": 254,
+              "line": 257,
               "col": 1
             },
             "offset": 0
@@ -199,5 +270,8 @@
         ]
       }
     }
-  ]
+  ],
+  "hosts": {
+    "plant": "10.0.0.5"
+  }
 }

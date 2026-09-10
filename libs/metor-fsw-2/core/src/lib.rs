@@ -162,7 +162,7 @@ pub use descriptor::compatible;
 #[doc(hidden)]
 pub use message::LOG_DEPTH;
 #[doc(hidden)]
-pub use pack::{CreateFn, DriverSlot, StateEntry, decode_params, resolve_defaults};
+pub use pack::{CreateFn, DriverSlot, StateEntry, StateInstance, decode_params, resolve_defaults};
 #[doc(hidden)]
 pub use port::{drain_view, frame_list_iter};
 

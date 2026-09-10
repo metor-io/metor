@@ -31,8 +31,9 @@ use std::net::SocketAddr;
 use serde::Serialize;
 
 use super::model::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, StateSpec, SystemSpec, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, EdgeKind, EdgeSpec,
+    IR_VERSION, InitialOccupantSpec, ParamSource, PeerSpec, SlotInitState, SlotSpec, StateSpec,
+    SystemSpec, Wiring,
 };
 
 /// Wraps the [`Wiring`] under construction, exposing a fluent surface over its
@@ -157,6 +158,7 @@ impl WiringBuilder {
                 layout: None,
                 status: None,
                 encompassing: false,
+                peer: None,
             },
         }
     }
@@ -230,7 +232,7 @@ impl WiringBuilder {
     /// Declares a pack-shared state instance: `ty` is the key a registered
     /// pack declared via [`Pack::shared_state`](crate::Pack::shared_state),
     /// and `params` is its construction value tree. Panics on a duplicate
-    /// state name or type, the builder's insert-time twin of validate.
+    /// state name, the builder's insert-time twin of validate.
     pub fn state(self, name: impl Into<String>, ty: impl Into<String>) -> Self {
         self.state_value(name, ty, serde_json::Value::Object(serde_json::Map::new()))
     }
@@ -245,12 +247,8 @@ impl WiringBuilder {
         let name = name.into();
         let ty = ty.into();
         assert!(
-            !self
-                .wiring
-                .states
-                .iter()
-                .any(|s| s.name == name || s.ty == ty),
-            "state `{name}` (type `{ty}`) is already declared"
+            !self.wiring.states.iter().any(|s| s.name == name),
+            "state `{name}` is already declared"
         );
         self.wiring.states.push(StateSpec {
             name,
@@ -291,6 +289,59 @@ impl WiringBuilder {
     pub fn uplink<'a>(mut self, msgs: impl IntoIterator<Item = &'a str>) -> Self {
         let msgs: Vec<&str> = msgs.into_iter().collect();
         self.push_system(SystemSpec::uplink("uplink", &msgs));
+        self
+    }
+
+    /// Publishes `instances` to peers: a `Downlink` on `state` tapping them
+    /// and nothing else, the Python `Publish` shape. The instance name is
+    /// `<state>_publish`, so a target may publish on every server it serves.
+    pub fn publish<'a>(
+        mut self,
+        state: &str,
+        instances: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let instances: Vec<&str> = instances.into_iter().collect();
+        self.push_system(SystemSpec {
+            name: format!("{state}_publish"),
+            ty: Some(DOWNLINK_TYPE.to_string()),
+            artifact: None,
+            params: ParamSource::Value(serde_json::json!({ "instances": instances })),
+            process: false,
+            src: None,
+            scope: None,
+            attach: Some(state.to_string()),
+            layout: None,
+            status: None,
+            encompassing: false,
+            peer: None,
+        });
+        self
+    }
+
+    /// Mirrors a peer member's instance under `name`: the peer's type `ty`
+    /// from `artifact` (`None` for a static type), run by the built-in
+    /// subscriber, the Python `Subscribe` shape.
+    pub fn subscribe(
+        mut self,
+        name: &str,
+        ty: &str,
+        artifact: Option<&str>,
+        peer: PeerSpec,
+    ) -> Self {
+        self.push_system(SystemSpec {
+            name: name.to_string(),
+            ty: Some(ty.to_string()),
+            artifact: artifact.map(str::to_string),
+            params: ParamSource::None,
+            process: false,
+            src: None,
+            scope: None,
+            attach: None,
+            layout: None,
+            status: None,
+            encompassing: false,
+            peer: Some(peer),
+        });
         self
     }
 

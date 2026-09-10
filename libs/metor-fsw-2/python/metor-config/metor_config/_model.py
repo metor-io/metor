@@ -148,11 +148,12 @@ class PortRef:
 class StateHandle:
     """A declared pack-shared state (:meth:`Target.state`). Pass it to a
     shared-state system's constructor (``Downlink(link)``, ``Uplink(link,
-    …)``) to attach that system to this state; the handle carries only the
-    state's declaration name."""
+    …)``) to attach that system to this state. ``spec`` is the state's own
+    declaration, whose ``addr`` is what a peer of this target dials."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, spec: "Spec | None" = None):
         self.name = name
+        self.spec = spec
 
 
 class SystemHandle:
@@ -161,10 +162,17 @@ class SystemHandle:
     the coordinator, the programmatic escape hatch) has no per-port frame
     types. A generated entry's handle is *typed* as its `System` subclass, so
     its ports resolve against that class's annotations instead of here — that is
-    where frame checking lives."""
+    where frame checking lives.
 
-    def __init__(self, name: str):
+    ``target`` and ``spec`` are the registering :class:`Target` and the
+    :class:`Spec` it registered, both ``None`` for a handle with no spec
+    behind it (a slot, the coordinator). :func:`Subscribe` reads them to
+    mirror a peer instance."""
+
+    def __init__(self, name: str, target: Any = None, spec: "Spec | None" = None):
         self.name = name
+        self.target = target
+        self.spec = spec
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):

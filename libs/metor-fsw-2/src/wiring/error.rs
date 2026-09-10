@@ -258,8 +258,7 @@ pub enum LoadError {
         available: String,
     },
 
-    /// Two `state` specs share one instance name (or one state type, which
-    /// has exactly one instance).
+    /// Two `state` specs share one instance name, which `attach` addresses by.
     #[error("state `{name}` is declared more than once")]
     DuplicateState { name: String },
 
@@ -271,6 +270,41 @@ pub enum LoadError {
          state already advertises — give each server a distinct `name=`"
     )]
     DuplicateLinkName { state: String, name: String },
+
+    /// Two `Downlink` systems attach to one `TcpServer` state: the second
+    /// would replay a conflicting announce set over that server's clients.
+    #[error(
+        "state `{state}` has more than one `Downlink` attached; one server publishes one          announce set"
+    )]
+    DuplicateDownlink { state: String },
+
+    /// A mirror's `peer` spec is not well formed: a mirror runs the built-in
+    /// subscriber, so it takes no params, no worker process, and no state,
+    /// and it names a peer member other than its own.
+    #[error("system `{system}`: {reason}")]
+    PeerSpec { system: String, reason: String },
+
+    /// A mirror's type is not declared where its peer's would be loaded from,
+    /// so there is no descriptor to mirror.
+    #[error(
+        "system `{system}` mirrors type `{ty}`, which {} does not declare",
+        artifact.as_deref().map(|a| format!("artifact `{a}`")).unwrap_or_else(|| "the registry".to_string())
+    )]
+    PeerType {
+        system: String,
+        ty: String,
+        artifact: Option<String>,
+    },
+
+    /// A `hosts` key naming no member of the deployment.
+    #[error("deployment `hosts` names `{namespace}`, which is not a target of this deployment")]
+    UnknownHost { namespace: String },
+
+    /// A mirror pointed at a namespace no member of the deployment carries.
+    #[error(
+        "system `{system}` mirrors target `{namespace}`, which is not a target of this deployment"
+    )]
+    UnknownPeer { system: String, namespace: String },
 
     /// A shared state's own init fn failed, such as a resource acquisition
     /// like a listener bind, or its params did not decode.

@@ -19,7 +19,7 @@ ARTIFACT = Artifact(
     id="demo",
     crate="demo-systems",
     lib="demo_systems",
-    manifest_hash="sha256:19754293a68b18f45aa4ff7b534df3f99b4950ff93afe9a9b8958f4911a3288e",
+    manifest_hash="sha256:c0f4131162751f092f22512caa38f81e991d899618929a3c0287ac93d88c28de",
     prebuilt=str(Path(__file__).resolve().parent / "_libs"),
     abi_version=12,
     dist="demo-pack",
@@ -75,6 +75,16 @@ class Widget(System):
     cmd: InPort[Cmd]  # input, latest-wins
     sensors: OutPort[Sensors]  # output, latest-wins, telemetered
     events: OutPort[Msg]  # output, log
+    system_status: OutPort[SystemStatus]  # output, latest-wins, telemetered, host-written
+
+
+class Sink(System):
+    """`Sink` pack entry."""
+
+    def __init__(self) -> None:
+        super().__init__("Sink", ARTIFACT)
+
+    sensors: InPort[Sensors]  # input, latest-wins
     system_status: OutPort[SystemStatus]  # output, latest-wins, telemetered, host-written
 
 

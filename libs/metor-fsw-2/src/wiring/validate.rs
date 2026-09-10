@@ -14,7 +14,8 @@ use std::collections::HashSet;
 use super::LoadError;
 use super::model::IR_VERSION;
 use super::model::{
-    ArtifactKind, Deployment, ParamSource, SlotSpec, StateSpec, SystemSpec, TCP_SERVER_TYPE, Wiring,
+    ArtifactKind, DOWNLINK_TYPE, Deployment, ParamSource, SlotSpec, StateSpec, SystemSpec,
+    TCP_SERVER_TYPE, Wiring,
 };
 use super::resolve::slot_config_error;
 use crate::coordinator::validate_slot_spec;
@@ -39,8 +40,11 @@ pub fn validate_deployment(deployment: &Deployment) -> Result<(), LoadError> {
         return Err(LoadError::EmptyDeployment);
     }
     if deployment.targets.len() == 1 {
+        // A member runs alone as a deployment of one — a packaged bundle, or
+        // `--target` — and its mirrors then name members no envelope carries.
         return Ok(());
     }
+    check_hosts_and_peers(deployment)?;
 
     let mut seen: Vec<&str> = Vec::new();
     for (index, member) in deployment.targets.iter().enumerate() {
@@ -67,6 +71,36 @@ pub fn validate_deployment(deployment: &Deployment) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// The cross-member rules of a deployment of several: a `hosts` key and a
+/// mirror's `peer.namespace` both name a member. A mirror naming its own
+/// member is [`validate`]'s to reject, since only it knows the member's own
+/// namespace.
+fn check_hosts_and_peers(deployment: &Deployment) -> Result<(), LoadError> {
+    let members: HashSet<&str> = deployment
+        .targets
+        .iter()
+        .filter_map(|w| w.coordinator.namespace.as_deref())
+        .collect();
+    for namespace in deployment.hosts.keys() {
+        if !members.contains(namespace.as_str()) {
+            return Err(LoadError::UnknownHost {
+                namespace: namespace.clone(),
+            });
+        }
+    }
+    for spec in deployment.targets.iter().flat_map(|w| &w.systems) {
+        if let Some(peer) = &spec.peer
+            && !members.contains(peer.namespace.as_str())
+        {
+            return Err(LoadError::UnknownPeer {
+                system: spec.name.clone(),
+                namespace: peer.namespace.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The two namespaces ordered outer-first when one is a dotted prefix of the
 /// other, `None` when they are disjoint.
 fn nested<'a>(a: &'a str, b: &'a str) -> Option<(&'a str, &'a str)> {
@@ -87,6 +121,7 @@ pub(crate) fn validate(wiring: &Wiring) -> Result<(), LoadError> {
     check_artifact_ids(wiring)?;
     check_state_names(wiring)?;
     check_link_names(wiring)?;
+    check_downlinks(wiring)?;
     for state in &wiring.states {
         check_state(state)?;
     }
@@ -227,14 +262,14 @@ fn check_artifact_ids(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
-/// State names and types are each unique: a state type has exactly one
-/// instance (the pack declared one cell), so a second spec of either kind
-/// could only shadow or double-construct.
+/// State names are unique: `attach` addresses a state by name, so a second
+/// spec of one name could only shadow. Several states of one type are fine —
+/// a target serving both a ground link and a peer link declares two
+/// `TcpServer`s.
 fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
     let mut names = HashSet::new();
-    let mut types = HashSet::new();
     for state in &wiring.states {
-        if !names.insert(&state.name) || !types.insert(&state.ty) {
+        if !names.insert(&state.name) {
             return Err(LoadError::DuplicateState {
                 name: state.name.clone(),
             });
@@ -272,6 +307,25 @@ fn check_link_names(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// One `Downlink` per server. A second attached to the same state replays a
+/// second announce set over the same clients, which the wire cannot carry.
+fn check_downlinks(wiring: &Wiring) -> Result<(), LoadError> {
+    let mut served = HashSet::new();
+    for spec in &wiring.systems {
+        if spec.ty.as_deref() != Some(DOWNLINK_TYPE) {
+            continue;
+        }
+        if let Some(attach) = &spec.attach
+            && !served.insert(attach)
+        {
+            return Err(LoadError::DuplicateDownlink {
+                state: attach.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// One state spec's structural rules: states construct on the static value
 /// path only, so typed postcard params cannot reach one.
 fn check_state(state: &StateSpec) -> Result<(), LoadError> {
@@ -290,6 +344,33 @@ fn check_state(state: &StateSpec) -> Result<(), LoadError> {
 /// `process` system must name one, and a static system must carry a `type` and
 /// no [`ParamSource::Postcard`] (the static path has no postcard decoder).
 fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
+    if let Some(peer) = &spec.peer {
+        let reason = if !matches!(spec.params, ParamSource::None) {
+            Some("a mirror runs the built-in subscriber, so it takes no params".to_string())
+        } else if spec.process {
+            Some("a mirror is an async client, not a worker process".to_string())
+        } else if spec.attach.is_some() {
+            Some("a mirror attaches to no state; it dials its peer".to_string())
+        } else if peer.port == 0 {
+            Some(format!(
+                "peer `{}.{}` publishes on port 0, which is a listener choice, not an address",
+                peer.namespace, peer.link
+            ))
+        } else if Some(peer.namespace.as_str()) == wiring.coordinator.namespace.as_deref() {
+            Some(format!(
+                "peer namespace `{}` is this target's own; a mirror names another member",
+                peer.namespace
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(LoadError::PeerSpec {
+                system: spec.name.clone(),
+                reason,
+            });
+        }
+    }
     // An `attach` must name a declared state, and only a static system can hold
     // one: a loaded/process pack cannot own shared state (the pack ABI forbids
     // it). The static shared-vs-plain check needs the registry and lives in
@@ -382,6 +463,7 @@ mod tests {
                     w
                 })
                 .collect(),
+            hosts: Default::default(),
         }
     }
 
@@ -401,16 +483,140 @@ mod tests {
 
     #[test]
     fn servers_advertise_distinct_names() {
-        assert!(check_link_names(&two_servers(Some("sat"), [None, Some("b")])).is_ok());
+        assert!(validate(&two_servers(Some("sat"), [None, Some("b")])).is_ok());
 
         assert!(matches!(
-            check_link_names(&two_servers(Some("sat"), [None, None])).unwrap_err(),
+            validate(&two_servers(Some("sat"), [None, None])).unwrap_err(),
             LoadError::DuplicateLinkName { state, name } if state == "b" && name == "sat"
         ));
         assert!(matches!(
-            check_link_names(&two_servers(None, [Some("one"), Some("one")])).unwrap_err(),
+            validate(&two_servers(None, [Some("one"), Some("one")])).unwrap_err(),
             LoadError::DuplicateLinkName { state, name } if state == "b" && name == "one"
         ));
+    }
+
+    /// A well-formed mirror on member `b` of the plant `a`.
+    fn peer_spec() -> crate::ir::PeerSpec {
+        crate::ir::PeerSpec {
+            namespace: "a".into(),
+            link: "peer".into(),
+            port: 2242,
+            instance: "plant".into(),
+            telemetered: true,
+            host: None,
+        }
+    }
+
+    /// A member `b` whose one system mirrors `a.plant`, after `edit`.
+    fn mirror(edit: impl FnOnce(&mut SystemSpec)) -> Wiring {
+        let mut w = WiringBuilder::new()
+            .subscribe("plant", "Plant", None, peer_spec())
+            .build();
+        w.coordinator.namespace = Some("b".into());
+        edit(&mut w.systems[0]);
+        w
+    }
+
+    #[test]
+    fn a_mirror_takes_nothing_but_its_peer() {
+        assert!(validate(&mirror(|_| {})).is_ok());
+
+        let reason = |w: Wiring| match validate(&w).unwrap_err() {
+            LoadError::PeerSpec { reason, .. } => reason,
+            other => panic!("expected a peer-spec fault, got {other}"),
+        };
+        assert!(
+            reason(mirror(
+                |s| s.params = ParamSource::Value(serde_json::json!({}))
+            ))
+            .contains("params")
+        );
+        assert!(reason(mirror(|s| s.process = true)).contains("worker process"));
+        assert!(
+            reason(mirror(|s| s.attach = Some("link".into()))).contains("attaches to no state")
+        );
+        assert!(reason(mirror(|s| s.peer.as_mut().unwrap().port = 0)).contains("port 0"));
+        assert!(
+            reason(mirror(|s| s.peer.as_mut().unwrap().namespace = "b".into()))
+                .contains("this target's own")
+        );
+    }
+
+    #[test]
+    fn one_downlink_per_server() {
+        let mut w = WiringBuilder::new()
+            .serve("127.0.0.1:2240".parse().unwrap())
+            .build();
+        assert!(validate(&w).is_ok());
+
+        w.systems.push(SystemSpec::downlink("second"));
+        assert!(matches!(
+            validate(&w).unwrap_err(),
+            LoadError::DuplicateDownlink { state } if state == "link"
+        ));
+    }
+
+    #[test]
+    fn hosts_and_peers_name_members() {
+        let members = |mirror: Option<Wiring>| {
+            let mut a = WiringBuilder::new().build();
+            a.coordinator.namespace = Some("a".into());
+            Deployment {
+                ir_version: IR_VERSION,
+                targets: vec![a, mirror.unwrap_or_else(mirror_member)],
+                hosts: Default::default(),
+            }
+        };
+        fn mirror_member() -> Wiring {
+            let mut w = WiringBuilder::new()
+                .subscribe("plant", "Plant", None, peer_spec())
+                .build();
+            w.coordinator.namespace = Some("b".into());
+            w
+        }
+        assert!(validate_deployment(&members(None)).is_ok());
+
+        let mut unknown_host = members(None);
+        unknown_host
+            .hosts
+            .insert("ground".into(), "10.0.0.9".into());
+        assert!(matches!(
+            validate_deployment(&unknown_host).unwrap_err(),
+            LoadError::UnknownHost { namespace } if namespace == "ground"
+        ));
+
+        let mut elsewhere = mirror_member();
+        elsewhere.systems[0].peer.as_mut().unwrap().namespace = "ground".into();
+        assert!(matches!(
+            validate_deployment(&members(Some(elsewhere))).unwrap_err(),
+            LoadError::UnknownPeer { system, namespace } if system == "plant" && namespace == "ground"
+        ));
+    }
+
+    /// The two builder spellings of the peer shapes render the specs the
+    /// Python front end records.
+    #[test]
+    fn publish_and_subscribe_render_their_specs() {
+        let w = WiringBuilder::new()
+            .state("peer", "TcpServer")
+            .publish("peer", ["plant"])
+            .subscribe("mirror", "Plant", Some("adcs"), peer_spec())
+            .build();
+
+        let publish = &w.systems[0];
+        assert_eq!(publish.name, "peer_publish");
+        assert_eq!(publish.ty.as_deref(), Some(DOWNLINK_TYPE));
+        assert_eq!(publish.attach.as_deref(), Some("peer"));
+        assert_eq!(
+            publish.params,
+            ParamSource::Value(serde_json::json!({ "instances": ["plant"] }))
+        );
+
+        let subscribe = &w.systems[1];
+        assert_eq!(subscribe.ty.as_deref(), Some("Plant"));
+        assert_eq!(subscribe.artifact.as_deref(), Some("adcs"));
+        assert_eq!(subscribe.params, ParamSource::None);
+        assert_eq!(subscribe.peer, Some(peer_spec()));
     }
 
     #[test]

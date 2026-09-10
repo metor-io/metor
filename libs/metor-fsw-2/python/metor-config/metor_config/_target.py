@@ -23,6 +23,7 @@ from ._model import (
     _source_ref,
 )
 from ._program import ExprHandle, _program
+from ._builtins import _Subscribe
 
 if TYPE_CHECKING:
     from ._deployment import Deployment
@@ -73,6 +74,9 @@ class Target:
         self._edges: list[dict[str, Any]] = []
         self._scopes: list[dict[str, Any]] = []
         self._scope_stack: list[int] = []
+        # The mirrors this target adds, by instance name. `Deployment` fills
+        # each one's `peer`, the only scope that sees the peer member.
+        self._subscribes: dict[str, _Subscribe] = {}
         _targets.append(self)
 
     # -- scopes -------------------------------------------------------------
@@ -173,6 +177,7 @@ class Target:
         system, from its own params. States live in their own namespace and
         take no edges. The returned handle is passed to a shared-state
         system's constructor (``Downlink(link)``) to attach it."""
+        spec._bind(self)
         self._states.append(
             {
                 "name": name,
@@ -181,7 +186,7 @@ class Target:
                 "src": _source_ref(),
             }
         )
-        return StateHandle(name)
+        return StateHandle(name, spec)
 
     @overload
     def add(
@@ -235,7 +240,9 @@ class Target:
                 "layout": [float(node[0]), float(node[1])] if node else None,
             }
         )
-        return SystemHandle(full)
+        if isinstance(spec, _Subscribe):
+            self._subscribes[full] = spec
+        return SystemHandle(full, self, spec)
 
     def _add_expr(
         self,
@@ -406,6 +413,12 @@ class Target:
         }
         return {"source": "".join(parts), "decls": decls}, [artifact]
 
+    def _system_ir(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """One system entry, with a mirror's ``peer`` spec folded in. Every
+        other system omits the field, as serde does."""
+        mirror = self._subscribes.get(entry["name"])
+        return {**entry, "peer": mirror._peer_json()} if mirror else entry
+
     def to_ir(self) -> dict[str, Any]:
         """The serialized ``Wiring`` this target describes."""
         program, program_artifacts = self._program_ir()
@@ -421,7 +434,7 @@ class Target:
             },
             "artifacts": self._artifacts + program_artifacts,
             "states": self._states,
-            "systems": self._systems,
+            "systems": [self._system_ir(entry) for entry in self._systems],
             "slots": self._slots,
             "edges": self._edges,
             "scopes": self._scopes,
