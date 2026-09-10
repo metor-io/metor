@@ -10,11 +10,13 @@ from metor_config import (
     Component,
     Connector,
     Dashboard,
+    Db,
     Deployment,
     Downlink,
     Edge,
     Gauge,
     HSplit,
+    Ingest,
     Logs,
     Map,
     Meter,
@@ -23,6 +25,7 @@ from metor_config import (
     Preset,
     Presets,
     Publish,
+    Record,
     SequenceControl,
     SequenceList,
     State,
@@ -423,4 +426,14 @@ ctrl_in = plant.add("ctrl", Subscribe(ctrl))
 plant.connect(ctrl_in.torque_cmd, plant_sim.torque_cmd, delayed=True)
 plant.connect(ctrl_in.mtq_cmd, plant_sim.mtq_cmd, delayed=True)
 
-Deployment(targets=[plant, fsw])
+# The gateway: one address the panel connects to for the whole deployment. It
+# streams both members' ground links into an embedded db and records its own
+# telemetry beside them, so a ground tool needs neither link.
+gw = Target(cycle_rate=120.0, namespace="gw")
+
+db = gw.state("db", Db(addr="[::]:2250"))
+gw.add("plant", Ingest(db, plant_link))
+gw.add("fsw", Ingest(db, fsw_link))
+gw.add("record", Record(db))
+
+Deployment(targets=[plant, fsw, gw])

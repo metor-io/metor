@@ -125,14 +125,17 @@ ingests.
    cd examples/adcs-fsw2 && uv run -- cargo run -p metor-fsw-2 --bin metor-fsw -- \
        run target.py
    ```
-   Both members run, each as its own process; `--target fsw` (or `plant`) runs one of
-   them alone.
-   The links are systems in `target.py`: its `downlink` (`TcpDownlink`) streams every frame
-   to the panel, and its `uplink` (`TcpUplink`) opens a **second** connection that ingests
-   the panel's `SequenceCommand`s so you can drive the `mode` slot live (Load/Start/Abort
-   `commissioning` or `safe_mode`). Uplink and downlink use separate connections
-   (docs/messages.md §4.5) — both point at the same metor-db endpoint, and the panel reads
-   the fsw member on `2241` (the plant member serves its own telemetry on `2240`).
+   All three members run, each as its own process; `--target fsw` (or `plant`, or `gw`)
+   runs one of them alone.
+   Connect the panel to the **gateway** on `2250` — one address for the whole deployment.
+   The `gw` member ingests both members' ground links into an embedded metor-db and records
+   its own telemetry beside them, so the panel sees `plant.*`, `fsw.*`, and `gw.*` over that
+   one connection; the picker lists it as a gateway rather than a link. Commands go back the
+   same way: the panel's `SequenceCommand`s, `AlarmAck`s, and `ReloadSequences` are forwarded
+   up the gateway's ingest to the `fsw` member's `uplink`, so the `mode` slot drives live
+   (Load/Start/Abort `commissioning` or `safe_mode`) without a second connection.
+   The members' own links stay reachable for diagnostics — the fsw member on `2241`, the
+   plant member on `2240` — and a panel pointed at one of those sees that member alone.
 3. On a first connection the panel opens the **`adcs-dashboard`** preset this target ships
    (see `target.py`): status chips across the top, the attitude ball with the magnetometer
    direction marked on it, dials for the three body rates, bipolar bars for wheel momentum

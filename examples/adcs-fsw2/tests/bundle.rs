@@ -33,10 +33,10 @@ fn temp_bundle_dir(tag: &str) -> PathBuf {
     ))
 }
 
-/// Evaluate `target.py`'s fsw member into a built `Wiring`, in-process (test binaries can't
-/// host a `process=#true` worker). `None` — skip, not fail — when Python or the build
+/// Evaluate one of `target.py`'s members into a built `Wiring`, in-process (test binaries
+/// can't host a `process=#true` worker). `None` — skip, not fail — when Python or the build
 /// plumbing is unavailable (offline/sandboxed cargo, no CPython ≥ 3.10).
-fn eval_and_build() -> Option<Wiring> {
+fn eval_and_build(member: &str) -> Option<Wiring> {
     if !common::ensure_stubs() {
         return None;
     }
@@ -48,8 +48,8 @@ fn eval_and_build() -> Option<Wiring> {
         }
     };
     let mut wiring = deployment
-        .target(Some("fsw"))
-        .expect("the fsw member")
+        .target(Some(member))
+        .unwrap_or_else(|_| panic!("the `{member}` member"))
         .clone();
     for spec in &mut wiring.systems {
         spec.process = false;
@@ -66,7 +66,7 @@ fn python_target_packages_and_runs() {
     // A `.py` target packages through the IR path, then runs cargo-free with no Python on
     // the run side: load the frozen IR and run it.
     let _guard = common::link_port_guard();
-    let Some(wiring) = eval_and_build() else {
+    let Some(wiring) = eval_and_build("fsw") else {
         return;
     };
 
@@ -131,7 +131,7 @@ fn python_target_round_trips_as_metor_archive() {
     // The single-file `.metor` form: pack the target into one tar, then load it back
     // (unpacked to a temp dir) and run it cargo-free.
     let _guard = common::link_port_guard();
-    let Some(wiring) = eval_and_build() else {
+    let Some(wiring) = eval_and_build("fsw") else {
         return;
     };
 
@@ -159,4 +159,34 @@ fn python_target_round_trips_as_metor_archive() {
     });
 
     let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn gateway_member_packages_and_runs() {
+    // The gateway packages like any other member — no artifacts, no program —
+    // and runs cargo-free with its embedded db served and both ingests dialling
+    // members that are not up here.
+    let _guard = common::link_port_guard();
+    let Some(wiring) = eval_and_build("gw") else {
+        return;
+    };
+
+    let dir = temp_bundle_dir("gw");
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = PackageOptions {
+        target: build_target(&[]),
+        provenance: Some(target("target.py")),
+        ..PackageOptions::default()
+    };
+    write_bundle(&wiring, &opts, &dir).expect("write the bundle");
+    assert!(dir.join("wiring.json").exists(), "frozen IR written");
+
+    let loaded = load_bundle(&dir).expect("load the bundle");
+    assert!(loaded.artifacts.is_empty(), "the gateway builds nothing");
+    let mut coord = resolve(&loaded, &Registry::with_builtins()).expect("resolve the bundle");
+    stellarator::run(move || async move {
+        coord.run_for(20).await;
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -31,5 +31,5 @@ source = { editable = "systems/adcs-sequences" }
 
 [[package]]
 name = "metor-config"
-version = "0.4.2"
+version = "0.4.3"
 source = { editable = "../../libs/metor-fsw-2/python/metor-config" }

@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use metor_proto::types::{Msg, OwnedPacket};
@@ -64,17 +65,24 @@ fn connected(stderr: &str) -> bool {
 /// Kill a spawned deployment and read back what it logged. The launcher
 /// spawns its members as its own children and does not take them down with
 /// it, so the whole process group goes.
-fn kill(mut child: Child) -> String {
+fn kill(mut child: Child, drain: JoinHandle<String>) -> String {
     let _ = Command::new("kill")
         .arg("-9")
         .arg(format!("-{}", child.id()))
         .status();
     let _ = child.wait();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
+    drain.join().expect("the drain thread ends")
+}
+
+/// Read a child's stderr as it arrives: the pipe holds 64 KB, and a member
+/// blocks on the line that fills it until someone reads.
+fn drain(child: &mut Child) -> JoinHandle<String> {
+    let mut pipe = child.stderr.take().expect("the child's stderr");
+    std::thread::spawn(move || {
+        let mut stderr = String::new();
         let _ = pipe.read_to_string(&mut stderr);
-    }
-    stderr
+        stderr
+    })
 }
 
 /// Dial `addr` until an fsw link answers or the deadline passes.
@@ -158,12 +166,13 @@ fn peers_exchange_data() {
 
     // The data assertion: a ground client on `b`'s own link sees the
     // mirrored port announced and then a record on it.
-    let child = fsw(&["run", "comms_target.py"])
+    let mut child = fsw(&["run", "comms_target.py"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .expect("the CLI spawns");
+    let drained = drain(&mut child);
     let deadline = Instant::now() + Duration::from_secs(20);
     let b_link: SocketAddr = "127.0.0.1:2255".parse().unwrap();
     let a_link: SocketAddr = "127.0.0.1:2253".parse().unwrap();
@@ -171,7 +180,7 @@ fn peers_exchange_data() {
         stellarator::run(|| mirrored_frame_arrives(b_link, a_link, deadline));
     });
     let watched = watched.join();
-    let stderr = kill(child);
+    let stderr = kill(child, drained);
     watched.unwrap_or_else(|_| panic!("the mirrored frame arrives:\n{stderr}"));
 
     // One member alone: the mirror runs, finds nobody, and the run still
