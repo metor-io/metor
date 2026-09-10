@@ -356,6 +356,15 @@ fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
                 "peer `{}.{}` publishes on port 0, which is a listener choice, not an address",
                 peer.namespace, peer.link
             ))
+        } else if peer
+            .host
+            .as_ref()
+            .is_some_and(|host| host.trim().is_empty())
+        {
+            Some(format!(
+                "peer `{}.{}` has an empty host override; `--peer <ns>=<host>` names one",
+                peer.namespace, peer.link
+            ))
         } else if Some(peer.namespace.as_str()) == wiring.coordinator.namespace.as_deref() {
             Some(format!(
                 "peer namespace `{}` is this target's own; a mirror names another member",
@@ -536,6 +545,16 @@ mod tests {
             reason(mirror(|s| s.attach = Some("link".into()))).contains("attaches to no state")
         );
         assert!(reason(mirror(|s| s.peer.as_mut().unwrap().port = 0)).contains("port 0"));
+        assert!(
+            reason(mirror(|s| s.peer.as_mut().unwrap().host = Some("  ".into())))
+                .contains("empty host")
+        );
+        assert!(
+            validate(&mirror(
+                |s| s.peer.as_mut().unwrap().host = Some("10.0.0.5".into())
+            ))
+            .is_ok()
+        );
         assert!(
             reason(mirror(|s| s.peer.as_mut().unwrap().namespace = "b".into()))
                 .contains("this target's own")

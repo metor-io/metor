@@ -391,9 +391,14 @@ impl Pack {
             {
                 // Copy the resolved attach target + msgs off the value surface
                 // before `params` moves into decode (the proven `msgs` pattern).
-                let (attach, msgs) = match &params {
-                    EntryParams::Value { attach, msgs, .. } => (*attach, Some(*msgs)),
-                    EntryParams::Postcard(_) => (None, None),
+                let (attach, msgs, namespace) = match &params {
+                    EntryParams::Value {
+                        attach,
+                        msgs,
+                        namespace,
+                        ..
+                    } => (*attach, Some(*msgs), *namespace),
+                    EntryParams::Postcard(_) => (None, None, None),
                 };
                 let attach = attach.ok_or(MakeError::MissingAttach { system: name })?;
                 // Recover the concrete token; a wrong-typed state is a clean
@@ -417,10 +422,7 @@ impl Pack {
                 let p: T::Params = decode_params(params)?;
                 let mut system = ctor(p, token);
                 if let Some(msgs) = msgs {
-                    system.configure(&crate::BuildCtx {
-                        msgs,
-                        namespace: None,
-                    })?;
+                    system.configure(&crate::BuildCtx { msgs, namespace })?;
                 }
                 taken.push(id);
                 cell.attach();

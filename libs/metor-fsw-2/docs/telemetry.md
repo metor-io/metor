@@ -1,8 +1,6 @@
 # Telemetry link
 
-For the new offline ICD API for FSW-to-FSW exchange, see
-[Peer endpoint contracts](peer-contracts.md). Peer transport is still planned;
-the link described below is the existing ground telemetry service.
+One target reads another's data over the same link; see "Peers" below.
 
 The telemetry link serves telemetry and commands on one TCP socket. Ground tools connect to the flight software. The flight software does not dial a ground address.
 
@@ -114,7 +112,7 @@ Each new TCP client receives this data in order:
 4. The latest retained snapshot messages.
 5. Live cycle batches.
 
-`LinkInfo` contains the link protocol version, feature bits, and the message ids that the uplink accepts. The current packet does not contain the mDNS node name.
+`LinkInfo` contains the link protocol version, feature bits, the message ids that the uplink accepts, and, since version 2, the serving target's namespace and the serving state's declaration name. A subscriber checks those two before it reads anything. The packet does not contain the mDNS node name.
 
 The link retains snapshot messages because some of them report boot state once. It does not retain table snapshots. Systems tend to publish table state each cycle, so a new client soon gets a fresh value.
 
@@ -167,3 +165,47 @@ mDNS works on the local multicast link. Routers do not carry it by default. It d
 The TCP link has no auth or encryption. Any host that can reach the port can read telemetry and send accepted command ids. Use discovery and this link only on a trusted network until the link gains peer auth.
 
 Stopping the server shuts down the mDNS service and closes all TCP tasks.
+
+## Peers
+
+A target reads another target's data by mirroring one of its instances. The
+producer serves the instance and the consumer dials it; nothing new goes on
+the wire.
+
+`Publish(state, instances)` is a `Downlink` on a `TcpServer` state, filtered
+to the listed instances. A target may publish on its ground link or on a
+second server kept for peers.
+
+`Subscribe(handle)` takes a system handle from another member of the
+deployment and records a mirror: a system with the peer instance's type and
+artifact, whose ports are that type's outputs and whose implementation is the
+built-in subscriber. Consumers read a mirrored port exactly as they read a
+local one, one cycle plus network time late. Mirror components carry the
+subscriber's namespace, so `fsw.sim.gps.lla` is the plant's `gps` as fsw saw
+it.
+
+The subscriber dials, in order, until a connection verifies:
+
+1. the `--peer <ns>=<host[:port]>` override, when given;
+2. both loopback families on the peer's port;
+3. every mDNS instance of `_metor-fsw._tcp` whose TXT carries `ns=` and
+   `link=` matching the peer.
+
+On connect it checks `LinkInfo`'s protocol version, namespace, and link name,
+then reads the announce replay and binds each mirrored port to the peer's
+packet id, comparing the announced vtable against the port's own. It logs
+`kind=` fault lines like the downlink's:
+
+- `peer_identity` when the address answers as something other than the named
+  peer's link
+- `peer_schema_mismatch` when an announced port's type or shape differs
+- `peer_channel_missing` when the peer announces no channel for a port
+- `peer_disconnect` when the connection ends
+
+A failed round backs off 500 ms, doubling to 10 s, and starts over. While the
+peer is down its consumers read `None`, exactly as they do before the first
+record.
+
+The `peer_status` frame reports `connected`, `sessions`, `records`,
+`last_rx_cycle`, and `dropped`, and publishes when one of them changes. It is
+the mirror's readiness signal; the launcher has no readiness gate.

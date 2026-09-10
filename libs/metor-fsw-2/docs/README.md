@@ -114,6 +114,9 @@ The link service accepts TCP clients, sends schema and identity data, then
 sends live telemetry. Its uplink side turns valid message packets into normal
 message outputs. Local mDNS can announce the server address.
 
+The same link carries target-to-target data: one member publishes an instance
+on a server, another mirrors it and reads its ports like a local system's.
+
 The alarm system reads telemetered frame values and sends alarm messages. A
 runtime slot can load, start, stop, or replace one allowed pack entry.
 

@@ -4,6 +4,8 @@
 //! input waits, and status publication; [`AsyncContext`] provides cancellation.
 
 use core::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use metor_fsw_2_core::{StatusPort, System, SystemDescriptor, SystemKind, descriptor_for};
 
@@ -12,6 +14,7 @@ use metor_fsw_2_core::{StatusPort, System, SystemDescriptor, SystemKind, descrip
 pub struct AsyncContext {
     pub(crate) cancel: stellarator::util::CancelToken,
     pub(crate) status: StatusPort,
+    pub(crate) cycle: Arc<AtomicU64>,
 }
 
 impl AsyncContext {
@@ -20,6 +23,12 @@ impl AsyncContext {
     /// `context.status().tick(elapsed_us)` once per loop iteration.
     pub fn status(&mut self) -> &mut StatusPort {
         &mut self.status
+    }
+
+    /// The coordinator's current cycle count, for a free-running system that
+    /// reports its work against the graph's clock.
+    pub fn cycle(&self) -> u64 {
+        self.cycle.load(Relaxed)
     }
 
     /// Runs `future` until it completes or coordinator shutdown begins.

@@ -180,6 +180,11 @@ struct RunArgs {
     /// `--target`.
     #[arg(long, value_name = "ADDR")]
     serve: Option<std::net::SocketAddr>,
+    /// Dial this host for the named peer member, overriding loopback and mDNS:
+    /// `--peer plant=10.0.0.5[:2242]`. Repeatable. Applies to one member; with
+    /// several, requires `--target`.
+    #[arg(long, value_name = "NS=HOST[:PORT]")]
+    peer: Vec<String>,
 }
 
 pub async fn run() -> miette::Result<()> {
@@ -519,6 +524,7 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
         None => deployment.targets.clone(),
     };
     check_serve(&members, &args)?;
+    check_peer(&members, &args)?;
 
     let [member] = members.as_mut_slice() else {
         return run_members(&mut members, &input, &args);
@@ -583,6 +589,18 @@ fn check_serve(members: &[Wiring], args: &RunArgs) -> miette::Result<()> {
     }
     Err(miette::miette!(
         "`--serve` names one socket; pick the member it applies to with --target ({})",
+        namespaces(members).join(", ")
+    ))
+}
+
+/// `--peer` names one member's view of where its peers live, so it names one
+/// member.
+fn check_peer(members: &[Wiring], args: &RunArgs) -> miette::Result<()> {
+    if args.peer.is_empty() || members.len() < 2 {
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "`--peer` names one member's view; pick it with --target ({})",
         namespaces(members).join(", ")
     ))
 }
@@ -754,7 +772,68 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
             }
         }
     }
+    for value in &args.peer {
+        let (namespace, host, port) = parse_peer(value)?;
+        let mut named = false;
+        for spec in &mut wiring.systems {
+            let Some(peer) = &mut spec.peer else { continue };
+            if peer.namespace != namespace {
+                continue;
+            }
+            peer.host = Some(host.clone());
+            if let Some(port) = port {
+                peer.port = port;
+            }
+            named = true;
+        }
+        if !named {
+            let mirrors: Vec<&str> = wiring
+                .systems
+                .iter()
+                .filter_map(|s| s.peer.as_ref())
+                .map(|p| p.namespace.as_str())
+                .collect();
+            return Err(match mirrors.as_slice() {
+                [] => miette::miette!(
+                    "`--peer {namespace}=…` names no peer; this target subscribes to none"
+                ),
+                _ => miette::miette!(
+                    "`--peer {namespace}=…` names no peer; this target subscribes to {}",
+                    mirrors.join(", ")
+                ),
+            });
+        }
+    }
     Ok(())
+}
+
+/// Split one `--peer` value into `(namespace, host, port)`. A bracketed or
+/// bare IPv6 literal carries colons of its own, so only a trailing colon
+/// outside brackets separates a port; the brackets are stripped so the host
+/// resolves as a literal.
+fn parse_peer(value: &str) -> miette::Result<(&str, String, Option<u16>)> {
+    let (namespace, addr) = value
+        .split_once('=')
+        .ok_or_else(|| miette::miette!("`--peer` takes `<NS>=<HOST[:PORT]>`, got `{value}`"))?;
+    let (host, port) = match addr.rsplit_once(':') {
+        Some((head, tail)) if !head.contains(':') || head.ends_with(']') => {
+            let port = tail
+                .parse::<u16>()
+                .map_err(|_| miette::miette!("`--peer {value}`: `{tail}` is not a port number"))?;
+            (head, Some(port))
+        }
+        _ => (addr, None),
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if namespace.is_empty() || host.is_empty() {
+        return Err(miette::miette!(
+            "`--peer` takes `<NS>=<HOST[:PORT]>`, got `{value}`"
+        ));
+    }
+    Ok((namespace, host.to_string(), port))
 }
 
 /// Build the [`BuildOptions`] from the shared
@@ -851,6 +930,7 @@ mod tests {
             cycle_rate: None,
             cycles: None,
             no_preflight: false,
+            peer: Vec::new(),
         };
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target.py");
@@ -879,6 +959,7 @@ mod tests {
             cycle_rate: None,
             cycles: None,
             no_preflight: false,
+            peer: Vec::new(),
         };
         let server = |name: &str, addr: &str| StateSpec::tcp_server(name, addr.parse().unwrap());
 
@@ -1052,6 +1133,7 @@ mod tests {
             cycle_rate: None,
             cycles: None,
             no_preflight: false,
+            peer: Vec::new(),
         };
         let both = [member(Some("plant"), 100.0), member(Some("fsw"), 100.0)];
         let err = check_serve(&both, &args(None)).expect_err("two members, one socket");
@@ -1062,6 +1144,114 @@ mod tests {
         assert!(
             check_serve(&both[1..], &args(Some("fsw"))).is_ok(),
             "picked"
+        );
+    }
+
+    /// A `run` command line carrying nothing but the given `--peer` values.
+    fn peer_args(peer: &[&str]) -> RunArgs {
+        RunArgs {
+            paths: Vec::new(),
+            target: None,
+            no_build: false,
+            release: false,
+            cargo_arg: Vec::new(),
+            no_manifest_sidecar: false,
+            wall: false,
+            serve: None,
+            sim_dt: None,
+            cycle_rate: None,
+            cycles: None,
+            no_preflight: false,
+            peer: peer.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A member mirroring `plant` and `ground`, the shape `--peer` edits.
+    fn mirrors() -> Wiring {
+        use crate::ir::PeerSpec;
+        use crate::wiring::WiringBuilder;
+        let peer = |namespace: &str, port: u16| PeerSpec {
+            namespace: namespace.to_string(),
+            link: "peer".into(),
+            port,
+            instance: "sim".into(),
+            telemetered: true,
+            host: None,
+        };
+        WiringBuilder::new()
+            .subscribe("sim", "Plant", None, peer("plant", 2242))
+            .subscribe("gnd", "Nav", None, peer("ground", 2244))
+            .build()
+    }
+
+    /// `--peer` writes the host onto the mirrors of the namespace it names,
+    /// and only those; a port suffix moves the port too.
+    #[test]
+    fn peer_override_edits_the_mirror() {
+        let peer_of = |wiring: &Wiring, index: usize| wiring.systems[index].peer.clone().unwrap();
+
+        let mut with_port = mirrors();
+        apply_overrides(&mut with_port, &peer_args(&["plant=10.0.0.5:2300"])).expect("one mirror");
+        assert_eq!(peer_of(&with_port, 0).host.as_deref(), Some("10.0.0.5"));
+        assert_eq!(peer_of(&with_port, 0).port, 2300);
+        assert_eq!(
+            peer_of(&with_port, 1),
+            mirrors().systems[1].peer.clone().unwrap()
+        );
+
+        let mut bare = mirrors();
+        apply_overrides(&mut bare, &peer_args(&["plant=10.0.0.5"])).expect("no port given");
+        assert_eq!(peer_of(&bare, 0).host.as_deref(), Some("10.0.0.5"));
+        assert_eq!(peer_of(&bare, 0).port, 2242, "the target's port stands");
+
+        let mut six = mirrors();
+        apply_overrides(&mut six, &peer_args(&["plant=[fd00::5]:2300"])).expect("an IPv6 literal");
+        assert_eq!(peer_of(&six, 0).host.as_deref(), Some("fd00::5"));
+        assert_eq!(peer_of(&six, 0).port, 2300);
+
+        let err = apply_overrides(&mut mirrors(), &peer_args(&["other=10.0.0.5"]))
+            .expect_err("no such peer");
+        assert_eq!(
+            err.to_string(),
+            "`--peer other=…` names no peer; this target subscribes to plant, ground"
+        );
+
+        use crate::wiring::WiringBuilder;
+        let err = apply_overrides(
+            &mut WiringBuilder::new().build(),
+            &peer_args(&["a=1.2.3.4"]),
+        )
+        .expect_err("no mirrors at all");
+        assert_eq!(
+            err.to_string(),
+            "`--peer a=…` names no peer; this target subscribes to none"
+        );
+
+        let err =
+            apply_overrides(&mut mirrors(), &peer_args(&["plant"])).expect_err("no namespace");
+        assert_eq!(
+            err.to_string(),
+            "`--peer` takes `<NS>=<HOST[:PORT]>`, got `plant`"
+        );
+    }
+
+    /// `--peer` is one member's view of the world: it needs a member, and with
+    /// several it says which ones there are.
+    #[test]
+    fn peer_needs_a_target_on_several_members() {
+        let both = [member(Some("plant"), 100.0), member(Some("fsw"), 100.0)];
+        let err = check_peer(&both, &peer_args(&["plant=10.0.0.5"])).expect_err("two members");
+        assert_eq!(
+            err.to_string(),
+            "`--peer` names one member's view; pick it with --target (plant, fsw)"
+        );
+        assert!(
+            check_peer(&both[1..], &peer_args(&["plant=10.0.0.5"])).is_ok(),
+            "picked"
+        );
+        assert!(
+            check_peer(&both, &peer_args(&[])).is_ok(),
+            "no flag, no rule"
         );
     }
 

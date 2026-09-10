@@ -67,20 +67,29 @@ A member's identity is its `namespace`. With more than one member every
 namespace is required, distinct, and not a dotted prefix of another.
 
 ```python
-from metor_config import Deployment, Downlink, Target, TcpServer
+from metor_config import Deployment, Downlink, Publish, Subscribe, Target, TcpServer
 from adcs_pack import Fsw, Plant
 
 plant = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="plant")
 fsw = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="fsw")
 
-plant.add("plant", Plant(seed=42))
+sim = plant.add("plant", Plant(seed=42))
 plant.add("downlink", Downlink(plant.state("link", TcpServer(addr="[::]:2240"))))
+plant.add("publish", Publish(plant.state("peer", TcpServer(addr="[::]:2242")), [sim]))
 
-fsw.add("fsw", Fsw())
+mirror = fsw.add("plant", Subscribe(sim))
+control = fsw.add("fsw", Fsw())
+fsw.connect(mirror.sensors, control.sensors)
 fsw.add("downlink", Downlink(fsw.state("link", TcpServer(addr="[::]:2241"))))
 
 deploy = Deployment(targets=[plant, fsw])
 ```
+
+`Publish` serves the listed instances on a `TcpServer`; `Subscribe` takes an
+instance handle from another member and adds a mirror of it, typed as that
+instance, whose ports the subscriber wires like any local system's. The
+mirror runs the built-in subscriber, which dials the peer and writes arriving
+records into those ports ([telemetry.md](telemetry.md)).
 
 A file with one `Target` and no `Deployment` is a deployment of one. Python
 systems declared with `@system` belong to the target that adds them.
@@ -116,7 +125,8 @@ write. The current IR version is 11. A host rejects another version during
 ingest and resolve.
 
 The document a `target.py` emits is an envelope, `Deployment`, with
-`ir_version` and `targets`, one complete `Wiring` per member. The host checks
+`ir_version`, `targets` (one complete `Wiring` per member), and `hosts`, the
+optional per-namespace address table a deploy renderer reads. The host checks
 the envelope once at ingest, then selects one member; everything after that
 reads a `Wiring`. A bundle stores the member `Wiring` alone.
 
@@ -125,7 +135,8 @@ The `Wiring` fields are:
 - `coordinator`: cycle rate, clock, ring depth, and an optional name prefix
 - `artifacts`: loadable pack libraries
 - `states`: state shared by entries in one static pack
-- `systems`: fixed system instances
+- `systems`: fixed system instances; a `peer` on one makes it a mirror of
+  another member's instance
 - `slots`: places that can load an allowed entry at run time
 - `edges`: frame and message links
 - `scopes`: block names and parent links recorded by the Python front end

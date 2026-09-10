@@ -106,8 +106,9 @@ struct Entry {
 /// stderr: a header with the effective clock, then one two-line entry each,
 /// instance name and type, with the source (pack distribution, crate, or
 /// builtin; a slot's allowed occupants) dimmed underneath. Each entry carries
-/// a colored dot keying its kind: magenta for pack-loaded systems, yellow
-/// for worker-process systems, cyan for builtins, green for slots. The order
+/// a colored dot keying its kind: magenta for pack-loaded systems and peer
+/// mirrors, yellow for worker-process systems, cyan for builtins, green for
+/// slots. The order
 /// is [`Wiring::systems`] then [`Wiring::slots`], which is also resolve's
 /// registration order. A member of a deployment names itself
 /// `target.py · fsw`; a member with no namespace is the file name alone.
@@ -144,22 +145,18 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
         .map(|sys| {
             let dot = if sys.process {
                 owo_colors::Style::new().bright_yellow()
-            } else if sys.artifact.is_some() {
+            } else if sys.artifact.is_some() || sys.peer.is_some() {
                 owo_colors::Style::new().bright_magenta()
             } else {
                 owo_colors::Style::new().bright_cyan()
             };
-            let mut detail = source_of(wiring, sys.artifact.as_deref());
-            if sys.process {
-                detail.push_str(" · process");
-            }
             Entry {
+                detail: system_detail(wiring, sys),
                 name: sys.name.clone(),
                 ty: sys
                     .ty
                     .clone()
                     .unwrap_or_else(|| "(sole pack entry)".to_string()),
-                detail,
                 dot,
             }
         })
@@ -212,6 +209,19 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
     eprintln!();
 }
 
+/// The dimmed line under one system: where it comes from, then what it is —
+/// a worker process, a mirror of a peer member's instance.
+fn system_detail(wiring: &Wiring, sys: &crate::ir::SystemSpec) -> String {
+    let mut detail = source_of(wiring, sys.artifact.as_deref());
+    if sys.process {
+        detail.push_str(" · process");
+    }
+    if let Some(peer) = &sys.peer {
+        detail.push_str(&format!(" · mirror of {}/{}", peer.namespace, peer.link));
+    }
+    detail
+}
+
 /// Where a system comes from, for the pre-flight listing: its artifact's
 /// distribution (`adcs-pack 1.2.0`), bare crate, or the static registry.
 fn source_of(wiring: &Wiring, artifact: Option<&str>) -> String {
@@ -232,4 +242,40 @@ fn source_of(wiring: &Wiring, artifact: Option<&str>) -> String {
 fn trim(value: f64) -> String {
     let text = format!("{value:.3}");
     text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::PeerSpec;
+    use crate::wiring::WiringBuilder;
+
+    /// A mirror's dimmed line names where its type came from and which peer
+    /// link it mirrors; a worker process keeps its own suffix.
+    #[test]
+    fn detail_names_the_mirrored_peer() {
+        let wiring = WiringBuilder::new()
+            .subscribe(
+                "sim",
+                "Plant",
+                None,
+                PeerSpec {
+                    namespace: "plant".into(),
+                    link: "peer".into(),
+                    port: 2242,
+                    instance: "sim".into(),
+                    telemetered: true,
+                    host: None,
+                },
+            )
+            .system("nav")
+            .ty("Nav")
+            .end()
+            .build();
+        assert_eq!(
+            system_detail(&wiring, &wiring.systems[0]),
+            "builtin · mirror of plant/peer"
+        );
+        assert_eq!(system_detail(&wiring, &wiring.systems[1]), "builtin");
+    }
 }

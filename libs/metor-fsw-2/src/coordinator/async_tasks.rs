@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{
-    AtomicBool, AtomicUsize,
+    AtomicBool, AtomicU64, AtomicUsize,
     Ordering::{Acquire, Release},
 };
 use std::time::{Duration, Instant};
@@ -26,6 +26,9 @@ pub(crate) struct LaunchCtx {
     ready_count: Arc<AtomicUsize>,
     go: Arc<WaitQueue>,
     go_flag: Arc<AtomicBool>,
+    /// The coordinator's progress counter, read by a system that stamps its
+    /// work with the graph's cycle.
+    cycle: Arc<AtomicU64>,
 }
 
 /// Spawns a bound async system onto its own task, exactly once. Erased so the
@@ -62,6 +65,7 @@ where
             let mut context = AsyncContext {
                 cancel: ctx.cancel,
                 status: slot.status,
+                cycle: ctx.cycle,
             };
             slot.system
                 .run(&mut context, &mut slot.input, &mut slot.output)
@@ -111,6 +115,7 @@ impl Coordinator {
                 ready_count: ready_count.clone(),
                 go: go.clone(),
                 go_flag: go_flag.clone(),
+                cycle: self.progress.clone(),
             };
             let handle = pending.launcher.launch(ctx);
             tasks.push(AsyncTask {

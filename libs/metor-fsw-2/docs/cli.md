@@ -90,11 +90,13 @@ Useful run flags include:
 --cycle-rate HZ
 --cycles N
 --serve ADDR
+--peer NS=HOST[:PORT]
 --no-preflight
 ```
 
 These flags override target settings. `--serve` needs the target to declare
-one `TcpServer` state, or none. `--no-preflight` skips the listing
+one `TcpServer` state, or none. `--peer` is repeatable and names where a
+mirrored member runs. `--no-preflight` skips the listing
 printed before a run. A run exits with an error if a system hard-stops.
 
 ### Package a target
@@ -136,6 +138,14 @@ prefixed with its namespace; clock flags apply to every member. The first
 member to fail stops the rest and the run exits non-zero. `--serve` names
 one socket and needs `--target` when there are several members.
 
+Members that mirror each other's instances find their peers on loopback, then
+by mDNS, so a local run and a LAN run need no address. On a routed network,
+`--peer <ns>=<host[:port]>` names the host to dial for every mirror of that
+member; the port defaults to the one the target published on. Like `--serve`
+it is one member's view of the world and needs `--target` when there are
+several. The launcher never passes it; a deploy renderer emits it per member
+from the deployment's `hosts` table.
+
 `build` with no `--target` provides every member in file order and prints
 one block per namespace. `package` writes one member per bundle; the bundle
 records the member's namespace, so `--target` on a bundle is accepted when
@@ -148,6 +158,8 @@ deployment `target.py` has 2 targets; pick one with --target (plant, fsw)
 deployment `target.py` has no target `fws`; targets: plant, fsw
 target `target.py` has no namespace; `--target sat` does not apply
 `--serve` names one socket; pick the member it applies to with --target (plant, fsw)
+`--peer` names one member's view; pick it with --target (plant, fsw)
+`--peer other=…` names no peer; this target subscribes to plant, ground
 `run` takes one source `.py` or bundles, not both: `target.py`, `fsw.metor`
 member `fsw` exited with status 1
 ```

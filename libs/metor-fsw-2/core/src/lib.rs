@@ -158,7 +158,7 @@ pub use system::{
 #[doc(hidden)]
 pub use clock::{now_or_wall, set_now};
 #[doc(hidden)]
-pub use descriptor::compatible;
+pub use descriptor::{announced_covers, compatible};
 #[doc(hidden)]
 pub use message::LOG_DEPTH;
 #[doc(hidden)]

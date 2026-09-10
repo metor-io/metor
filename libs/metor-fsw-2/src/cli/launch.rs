@@ -58,7 +58,9 @@ pub(super) fn overrides(args: &RunArgs) -> Overrides {
     }
 }
 
-/// How one member runs, anywhere: the leaf's argument list.
+/// How one member runs, anywhere: the leaf's argument list. `--peer` is not
+/// here: local members find each other on loopback, and a renderer with the
+/// envelope's `hosts` emits it per member itself.
 pub(super) fn member_argv(bundle: &Path, namespace: &str, overrides: &Overrides) -> Vec<OsString> {
     let mut argv = vec![
         OsString::from("run"),
@@ -317,6 +319,7 @@ mod tests {
             cycles: Some(20),
             no_preflight: false,
             serve: None,
+            peer: Vec::new(),
         };
         assert_eq!(
             overrides(&args),
