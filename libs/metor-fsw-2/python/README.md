@@ -36,6 +36,20 @@ fsw = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="fsw")
 deploy = Deployment(targets=[plant, fsw])
 ```
 
+A gateway member ingests the others into one embedded db the panel dials, and
+records its own outputs there:
+
+```python
+from metor_config import Db, Ingest, Record
+
+# `plant_link` and `fsw_link` are the members' `TcpServer` state handles.
+gw = Target(cycle_rate=120.0, namespace="gw")
+db = gw.state("db", Db(addr="[::]:2250"))
+gw.add("plant", Ingest(db, plant_link))
+gw.add("fsw", Ingest(db, fsw_link, commands=["SequenceCommand"]))
+gw.add("record", Record(db))
+```
+
 ## Tests
 
 ```

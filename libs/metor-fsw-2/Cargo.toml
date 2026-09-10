@@ -29,6 +29,10 @@ metor-fsw-2-macros = { path = "macros" }
 metor-fsw-ring = { path = "ring" }
 memmap2 = "0.9"
 
+# gateway: the embedded db a gateway member serves and its ingest tasks write
+metor-db = { path = "../db" }
+fastrand = "2.2"
+
 # service discovery
 gethostname = "1.1"
 mdns-sd = "0.13"

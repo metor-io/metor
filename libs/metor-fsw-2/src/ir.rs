@@ -169,6 +169,12 @@ pub struct ScopeSpec {
 /// tools connect to it for the downlink stream and command ingest alike.
 pub const TCP_SERVER_TYPE: &str = "TcpServer";
 
+/// State `type=` of the gateway's embedded db, a [`DbState`](crate::DbState)
+/// configured by [`DbParams`](crate::DbParams). It listens on its `addr` and
+/// answers the db protocol, so metor-panel connects to a gateway member as
+/// it connects to any db.
+pub const DB_TYPE: &str = "Db";
+
 /// Registry `type=` of the built-in telemetry downlink, a
 /// [`TelemetrySystem`](crate::TelemetrySystem) attached to the target's
 /// [`TCP_SERVER_TYPE`] state, configured by

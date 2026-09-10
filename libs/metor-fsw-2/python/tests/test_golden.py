@@ -29,18 +29,21 @@ from metor_config import (
     Component,
     Connector,
     Dashboard,
+    Db,
     Deployment,
     Downlink,
     Edge,
     FrameType,
     Gauge,
     Image,
+    Ingest,
     Meter,
     Outline,
     Pivot,
     Presets,
     Preset,
     Publish,
+    Record,
     Subscribe,
     Place,
     SequenceControl,
@@ -73,6 +76,9 @@ OUTLINE_GOLDEN = os.path.join(
 )
 DEPLOYMENT_GOLDEN = os.path.join(
     os.path.dirname(__file__), "..", "..", "tests", "golden", "deployment.json"
+)
+GATEWAY_GOLDEN = os.path.join(
+    os.path.dirname(__file__), "..", "..", "tests", "golden", "deployment_gateway.json"
 )
 FIXTURE_PNG = os.path.join(os.path.dirname(__file__), "data", "pixel.png")
 
@@ -289,6 +295,37 @@ def build_deployment() -> Deployment:
     return Deployment(targets=[plant, fsw], hosts={"plant": "10.0.0.5"})
 
 
+def build_gateway_deployment() -> Deployment:
+    """The three-member deployment whose IR is the gateway golden: a `plant`
+    and an `fsw`, each serving a ground link with an uplink of its own, and a
+    `gw` that ingests both into an embedded db and records its own outputs."""
+    plant = Target(cycle_rate=120.0, namespace="plant")
+    fsw = Target(cycle_rate=120.0, namespace="fsw")
+    gw = Target(cycle_rate=120.0, namespace="gw")
+
+    plant_link = plant.state("link", TcpServer(addr="[::]:2240", name="plant"))
+    plant.add("uplink", Uplink(plant_link, msgs=["AlarmAck"]))
+    plant.add(
+        "plant",
+        System(
+            "Plant",
+            Artifact(id="adcs", crate="adcs-systems", lib="adcs_systems"),
+            seed=42,
+        ),
+    )
+    plant.add("downlink", Downlink(plant_link))
+
+    fsw_link = fsw.state("link", TcpServer(addr="[::]:2241", name="fsw"))
+    fsw.add("uplink", Uplink(fsw_link, msgs=["SequenceCommand", "ReloadSequences"]))
+    fsw.add("downlink", Downlink(fsw_link))
+
+    db = gw.state("db", Db(addr="[::]:2250", store="/var/lib/metor/gw"))
+    gw.add("plant", Ingest(db, plant_link))
+    gw.add("fsw", Ingest(db, fsw_link, commands=["SequenceCommand"]))
+    gw.add("record", Record(db))
+    return Deployment(targets=[plant, fsw, gw])
+
+
 def normalize(v):
     """Drop the fields the cross-language comparison ignores: every ``src``
     anchor, the top-level ``metor_config_version`` envelope, and each artifact's
@@ -327,6 +364,11 @@ class GoldenTest(unittest.TestCase):
         with open(DEPLOYMENT_GOLDEN, encoding="utf-8") as f:
             expected = normalize(json.load(f))
         self.assertEqual(normalize(build_deployment().to_ir()), expected)
+
+    def test_emits_the_golden_gateway_deployment(self):
+        with open(GATEWAY_GOLDEN, encoding="utf-8") as f:
+            expected = normalize(json.load(f))
+        self.assertEqual(normalize(build_gateway_deployment().to_ir()), expected)
 
     def test_emits_the_golden_dashboard(self):
         # `sat1` so the fixture also pins namespace qualification of every

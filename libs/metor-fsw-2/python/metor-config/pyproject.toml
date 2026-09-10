@@ -6,7 +6,7 @@
 
 [project]
 name = "metor-config"
-version = "0.4.2"
+version = "0.4.3"
 description = "Typed target-config recorder for metor-fsw: build a Target, emit Wiring IR"
 requires-python = ">=3.10"
 

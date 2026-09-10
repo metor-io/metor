@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 from ._version import __version__, IR_VERSION
-from ._builtins import _Subscribe
-from ._model import _handle_name
+from ._builtins import _Ingest, _Subscribe
+from ._model import _handle_name, _params
 from ._program import _warn_unadded
 from ._target import Target
 
@@ -45,6 +45,9 @@ class Deployment:
         for target in self.targets:
             for name, mirror in target._subscribes.items():
                 mirror.peer = self._resolve_peer(name, mirror)
+            for name, ingest in target._ingests.items():
+                ingest.params = _params(self._resolve_ingest(name, ingest))
+            _check_command_overlap(target)
         _deployments.append(self)
 
     def _resolve_peer(self, name: str, mirror: _Subscribe) -> dict[str, Any]:
@@ -82,6 +85,54 @@ class Deployment:
         if not mirror.telemetered:
             spec["telemetered"] = False
         return spec
+
+    def _resolve_ingest(self, name: str, ingest: _Ingest) -> dict[str, Any]:
+        """The source one ingest dials: which member serves the named link, on
+        which port, and which command tokens it accepts. Everything here needs
+        both members in scope, which is why it lives at the deployment and not
+        at the ``add``."""
+        source = ingest.source
+        member = source.target
+        if member not in self.targets:
+            raise ValueError(
+                f"`{name}`: `{source.name}` belongs to a target outside this "
+                "deployment; list every member in `Deployment(targets=…)`"
+            )
+        if member.namespace is None:
+            raise ValueError(
+                f"`{name}`: the target serving `{source.name}` has no "
+                "`namespace`; an ingest dials a member by namespace"
+            )
+        state = _state(member, source.name)
+        if state["ty"] != "TcpServer":
+            raise ValueError(
+                f"`{name}`: `{source.name}` is a `{state['ty']}` state; an "
+                "ingest dials a member's `TcpServer` link"
+            )
+        port = _port(state)
+        if port == 0:
+            raise ValueError(
+                f"`{name}`: `{member.namespace}` serves `{source.name}` on "
+                "port 0; an ingested link declares the port the gateway dials"
+            )
+        accepted = _uplink_msgs(member, source.name)
+        if ingest.commands is None:
+            commands = list(accepted)
+        else:
+            for token in ingest.commands:
+                if token not in accepted:
+                    listed = ", ".join(accepted) or "none"
+                    raise ValueError(
+                        f"`{name}`: `{member.namespace}` accepts no `{token}` "
+                        f"on `{source.name}`; its uplinks there list {listed}"
+                    )
+            commands = list(ingest.commands)
+        return {
+            "namespace": member.namespace,
+            "link": source.name,
+            "port": port,
+            "commands": commands,
+        }
 
     def _publisher(
         self, name: str, peer: Target, instance: str, via: Any
@@ -156,3 +207,35 @@ def _port(state: dict[str, Any]) -> int:
     """The port a server state binds, from its `addr` params."""
     addr = state["params"]["Value"]["addr"]
     return int(addr.rsplit(":", 1)[1])
+
+
+def _uplink_msgs(target: Target, link: str) -> list[str]:
+    """The command tokens a member accepts on one link: the ``msgs`` of the
+    ``Uplink``s attached to it, in config order."""
+    tokens: list[str] = []
+    for entry in target._systems:
+        if entry["ty"] != "Uplink" or entry["attach"] != link:
+            continue
+        params = entry["params"]
+        if params == "None":
+            continue
+        tokens += params["Value"].get("msgs") or []
+    return tokens
+
+
+def _check_command_overlap(gateway: Target) -> None:
+    """Two ingests of one gateway may not forward the same token: the uplink
+    that receives it would be picked by dial order."""
+    by_token: dict[tuple[str | None, str], tuple[str, _Ingest]] = {}
+    for name, ingest in gateway._ingests.items():
+        for token in ingest.params["commands"]:
+            first = by_token.get((ingest.attach, token))
+            if first is not None:
+                other, spec = first
+                raise ValueError(
+                    f"`{name}` forwards `{token}` to "
+                    f"`{ingest.params['namespace']}` and `{other}` forwards it "
+                    f"to `{spec.params['namespace']}`; one gateway sends a "
+                    "token to one member, so narrow one with `commands=[…]`"
+                )
+            by_token[(ingest.attach, token)] = (name, ingest)

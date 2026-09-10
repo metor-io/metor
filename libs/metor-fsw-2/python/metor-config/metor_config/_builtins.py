@@ -225,3 +225,88 @@ def Presets(presets: list[Preset]) -> Spec:  # noqa: N802 - a system-type wrappe
     """The built-in preset broadcaster, its ``PresetsParams`` carrying one
     entry per preset under the ``preset`` field the Rust struct declares."""
     return _Presets(presets)
+
+
+def Db(  # noqa: N802 - a system-type wrapper
+    addr: str,
+    path: str | None = None,
+    name: str | None = None,
+    store: str | None = None,
+    max_bytes: int | None = None,
+    max_age_secs: float | None = None,
+) -> Spec:
+    """The built-in embedded db state (``DbParams``): the gateway serves it on
+    ``addr``, which is what the panel dials. Declare it with
+    :meth:`Target.state` and attach :func:`Ingest`s and a :func:`Record` to it.
+
+    ``path`` is the data directory, a fresh temp dir per run when omitted;
+    ``name`` is the mDNS instance name, the namespace by default. ``store``
+    turns on tiering into that directory, bounded by ``max_bytes`` and
+    ``max_age_secs``; without a store nothing is evicted."""
+    return static_system(
+        "Db",
+        **_drop_none(
+            {
+                "addr": addr,
+                "path": path,
+                "name": name,
+                "store": store,
+                "max_bytes": max_bytes,
+                "max_age_secs": max_age_secs,
+            }
+        ),
+    )
+
+
+class _Ingest(Spec):
+    """An :func:`Ingest`'s spec: the member's link, resolved to a
+    ``(namespace, link, port, commands)`` source by :class:`Deployment`, the
+    only scope that sees both members."""
+
+    def __init__(
+        self, db: StateHandle, source: StateHandle, commands: list[str] | None
+    ):
+        super().__init__("Ingest", None, {})
+        self.attach = db.name
+        self.db = db
+        self.source = source
+        self.commands = commands
+
+    def _bind(self, target: Any) -> None:
+        if self.source.target is target:
+            raise ValueError(
+                f"Ingest: `{self.source.name}` is a link of this target; an "
+                "ingest dials another member's link"
+            )
+
+    def _params_json(self) -> Any:
+        if not self.params:
+            raise RuntimeError(
+                f"Ingest: `{self.source.name}` was never resolved against a "
+                "Deployment; list every member in one `Deployment(targets=…)`"
+            )
+        return self._param_source()
+
+
+def Ingest(  # noqa: N802 - a system-type wrapper
+    db: StateHandle, source: StateHandle, commands: list[str] | None = None
+) -> Spec:
+    """Stream one member's telemetry into ``db``: a client of the ``source``
+    link server (the handle :meth:`Target.state` returned for that member's
+    :func:`TcpServer`), and the path its commands take back up. Add one per
+    member; the name is what its status frame is called
+    (``gw.plant.source_status``).
+
+    ``commands`` narrows the tokens forwarded up this link to a subset of the
+    member's :func:`Uplink` ``msgs``; ``None`` is the member's whole set,
+    ``[]`` is none. Two ingests of one gateway may not forward the same
+    token."""
+    return _Ingest(db, source, commands)
+
+
+def Record(db: StateHandle) -> Spec:  # noqa: N802 - a system-type wrapper
+    """Store this target's own telemetered outputs into ``db``, straight from
+    the rings the :func:`Downlink` taps: the coordinator's and each system's
+    ``system_status`` and ``log``, and every :func:`Ingest`'s status frame.
+    One per db."""
+    return _attached(static_system("Record"), db)

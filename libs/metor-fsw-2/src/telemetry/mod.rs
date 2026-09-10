@@ -9,7 +9,7 @@
 //! Slow connections drop whole batches at their byte limit. See [`link`] for
 //! queue and replay policies.
 
-mod discovery;
+pub(crate) mod discovery;
 mod link;
 mod subscribe;
 mod taps;

@@ -471,6 +471,71 @@ fn golden_deployment_round_trips() {
     );
 }
 
+/// The shared `tests/golden/deployment_gateway.json` fixture: the three-member
+/// envelope with a gateway, the one the Python golden test also pins. Beyond the
+/// round-trip it holds what the gateway adds — a `Db` state, one `Ingest` per
+/// member carrying the source its deployment resolved, and a `Record`.
+#[test]
+fn golden_gateway_round_trips() {
+    const GOLDEN: &str = include_str!("golden/deployment_gateway.json");
+    let d: Deployment =
+        serde_json::from_str(GOLDEN).expect("golden fixture deserializes as Deployment");
+    let reserialized = normalize(serde_json::to_value(&d).unwrap());
+    let on_disk = normalize(serde_json::from_str(GOLDEN).unwrap());
+    assert_eq!(
+        reserialized, on_disk,
+        "the golden gateway deployment must equal its own Rust round-trip after normalization"
+    );
+
+    let gw = d.target(Some("gw")).unwrap();
+    let db = gw.states.iter().find(|s| s.name == "db").unwrap();
+    assert_eq!(db.ty, "Db");
+    let ParamSource::Value(params) = &db.params else {
+        panic!("a db state carries inline params")
+    };
+    assert_eq!(params["addr"], json!("[::]:2250"));
+
+    // One ingest per member, attached to the db, each carrying the
+    // `(namespace, link, port, commands)` source the deployment resolved.
+    let sources: Vec<Value> = gw
+        .systems
+        .iter()
+        .filter(|s| s.ty.as_deref() == Some("Ingest"))
+        .map(|s| {
+            assert_eq!(s.attach.as_deref(), Some("db"));
+            let ParamSource::Value(params) = &s.params else {
+                panic!("a resolved ingest carries inline params")
+            };
+            params.clone()
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            json!({
+                "namespace": "plant",
+                "link": "link",
+                "port": 2240,
+                "commands": ["AlarmAck"],
+            }),
+            json!({
+                "namespace": "fsw",
+                "link": "link",
+                "port": 2241,
+                "commands": ["SequenceCommand"],
+            }),
+        ]
+    );
+
+    let record = gw
+        .systems
+        .iter()
+        .find(|s| s.ty.as_deref() == Some("Record"))
+        .expect("the gateway records its own outputs");
+    assert_eq!(record.attach.as_deref(), Some("db"));
+    assert!(matches!(record.params, ParamSource::None));
+}
+
 /// Strip the fields the cross-language comparison ignores: every `src` anchor
 /// (line numbers track the emitting source), the envelope's emitter-only
 /// `metor_config_version`, and each artifact's `path` and `prebuilt_dir` (both

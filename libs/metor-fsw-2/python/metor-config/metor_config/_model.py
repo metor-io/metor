@@ -149,11 +149,14 @@ class StateHandle:
     """A declared pack-shared state (:meth:`Target.state`). Pass it to a
     shared-state system's constructor (``Downlink(link)``, ``Uplink(link,
     …)``) to attach that system to this state. ``spec`` is the state's own
-    declaration, whose ``addr`` is what a peer of this target dials."""
+    declaration, whose ``addr`` is what a peer of this target dials, and
+    ``target`` the :class:`Target` that declared it — :func:`Ingest` reads
+    both to dial the member serving this link."""
 
-    def __init__(self, name: str, spec: "Spec | None" = None):
+    def __init__(self, name: str, spec: "Spec | None" = None, target: Any = None):
         self.name = name
         self.spec = spec
+        self.target = target
 
 
 class SystemHandle:

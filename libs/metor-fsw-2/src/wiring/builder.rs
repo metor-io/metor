@@ -259,6 +259,17 @@ impl WiringBuilder {
         self
     }
 
+    /// Declares the gateway's built-in `Db` state under `name`, listening
+    /// on `addr` with a temp data directory. `Ingest` and `Record` systems
+    /// attach to it by that name.
+    pub fn db(self, name: &str, addr: SocketAddr) -> Self {
+        self.state_value(
+            name,
+            crate::ir::DB_TYPE,
+            serde_json::json!({ "addr": addr.to_string() }),
+        )
+    }
+
     /// Serves the telemetry link: declares the built-in `TcpServer` state
     /// under the name `"link"` listening on `addr`, plus an all-taps
     /// downlink under the instance name `"telemetry"`. For a subset tap,

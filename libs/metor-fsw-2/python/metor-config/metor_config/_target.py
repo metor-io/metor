@@ -23,7 +23,7 @@ from ._model import (
     _source_ref,
 )
 from ._program import ExprHandle, _program
-from ._builtins import _Subscribe
+from ._builtins import _Ingest, _Subscribe
 
 if TYPE_CHECKING:
     from ._deployment import Deployment
@@ -77,6 +77,9 @@ class Target:
         # The mirrors this target adds, by instance name. `Deployment` fills
         # each one's `peer`, the only scope that sees the peer member.
         self._subscribes: dict[str, _Subscribe] = {}
+        # The ingests this target adds, by instance name. `Deployment` fills
+        # each one's params, the only scope that sees the source member.
+        self._ingests: dict[str, _Ingest] = {}
         _targets.append(self)
 
     # -- scopes -------------------------------------------------------------
@@ -186,7 +189,7 @@ class Target:
                 "src": _source_ref(),
             }
         )
-        return StateHandle(name, spec)
+        return StateHandle(name, spec, self)
 
     @overload
     def add(
@@ -242,6 +245,8 @@ class Target:
         )
         if isinstance(spec, _Subscribe):
             self._subscribes[full] = spec
+        if isinstance(spec, _Ingest):
+            self._ingests[full] = spec
         return SystemHandle(full, self, spec)
 
     def _add_expr(
@@ -414,10 +419,16 @@ class Target:
         return {"source": "".join(parts), "decls": decls}, [artifact]
 
     def _system_ir(self, entry: dict[str, Any]) -> dict[str, Any]:
-        """One system entry, with a mirror's ``peer`` spec folded in. Every
-        other system omits the field, as serde does."""
+        """One system entry, with a mirror's ``peer`` spec folded in and an
+        ingest's deployment-resolved params folded over the empty ones it was
+        added with. Every other system omits the field, as serde does."""
         mirror = self._subscribes.get(entry["name"])
-        return {**entry, "peer": mirror._peer_json()} if mirror else entry
+        if mirror:
+            return {**entry, "peer": mirror._peer_json()}
+        ingest = self._ingests.get(entry["name"])
+        if ingest:
+            return {**entry, "params": ingest._params_json()}
+        return entry
 
     def to_ir(self) -> dict[str, Any]:
         """The serialized ``Wiring`` this target describes."""

@@ -218,9 +218,10 @@ impl Registry {
     /// A registry pre-loaded with the built-in systems under their `type=`
     /// names: the alarm engine (`"Alarms"`) and the link pack, one shared
     /// `"TcpServer"` state serving the `"Downlink"` and `"Uplink"` systems
-    /// attached to it, plus the well-known message set in the message table
-    /// so a target's `msgs` list can name any of them out of the box. An
-    /// app-built registry starts here and adds its own systems.
+    /// attached to it, the gateway pack's `"Db"` state, plus the well-known
+    /// message set in the message table so a target's `msgs` list can name
+    /// any of them out of the box. An app-built registry starts here and
+    /// adds its own systems.
     pub fn with_builtins() -> Self {
         use crate::telemetry::{LinkParams, LinkState, TelemetrySystem, UplinkSystem};
         use metor_proto_wkt::{
@@ -248,6 +249,15 @@ impl Registry {
                 <UplinkSystem as BuildSystem>::new(p).attach(link)
             });
         r.register_pack(link_pack);
+        let mut gateway_pack = crate::Pack::new();
+        gateway_pack.shared_state(
+            "Db",
+            |ctx: metor_fsw_2_core::StateCtx<'_>, p: crate::DbParams| {
+                let name = p.name.clone();
+                crate::DbState::open(p, ctx.namespace).map(|s| s.with_identity(ctx.name, name))
+            },
+        );
+        r.register_pack(gateway_pack);
         r.register_msg::<SequenceCommand>()
             .register_msg::<SequenceRegistry>()
             .register_msg::<SequenceChannelEvent>()

@@ -17,8 +17,11 @@ from metor_config import (
     Alarms,
     Artifact,
     Component,
+    Db,
     Deployment,
     Frame,
+    Ingest,
+    Record,
     State,
     Target,
     Tensor,
@@ -633,6 +636,156 @@ class PeerTest(unittest.TestCase):
         peers = fsw.state("peer", TcpServer(addr="[::]:2243"))
         with self.assertRaisesRegex(ValueError, "belongs to another target"):
             fsw.add("publish", Publish(peers, [sim]))
+
+
+class GatewayTest(unittest.TestCase):
+    """`Db`/`Ingest`/`Record`: the sources a gateway dials, and what the
+    deployment can check that neither member can see alone."""
+
+    def setUp(self):
+        mc._targets.clear()
+        mc._deployments.clear()
+        mc._program.clear()
+
+    def members(self, addr: str = "[::]:2240", msgs: list[str] | None = None):
+        """A `plant` serving a ground link with an uplink, and a bare `gw`."""
+        plant = Target(cycle_rate=100.0, namespace="plant")
+        gw = Target(cycle_rate=100.0, namespace="gw")
+        link = plant.state("link", TcpServer(addr=addr))
+        plant.add("uplink", Uplink(link, msgs=msgs or ["AlarmAck", "SequenceCommand"]))
+        plant.add("downlink", Downlink(link))
+        db = gw.state("db", Db(addr="[::]:2250"))
+        return plant, gw, link, db
+
+    def test_an_ingest_records_its_source(self):
+        plant, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link))
+        gw.add("record", Record(db))
+
+        ir = Deployment(targets=[plant, gw]).to_ir()
+        gateway = ir["targets"][1]
+        self.assertEqual(
+            gateway["states"][0]["params"],
+            {"Value": {"addr": "[::]:2250"}},
+        )
+        ingest, record = gateway["systems"]
+        self.assertEqual(ingest["ty"], "Ingest")
+        self.assertEqual(ingest["attach"], "db")
+        self.assertEqual(
+            ingest["params"],
+            {
+                "Value": {
+                    "namespace": "plant",
+                    "link": "link",
+                    "port": 2240,
+                    "commands": ["AlarmAck", "SequenceCommand"],
+                }
+            },
+        )
+        self.assertEqual(record["ty"], "Record")
+        self.assertEqual(record["attach"], "db")
+        self.assertEqual(record["params"], "None")
+
+    def test_commands_narrow_to_a_subset(self):
+        plant, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link, commands=["SequenceCommand"]))
+        ir = Deployment(targets=[plant, gw]).to_ir()
+        params = ir["targets"][1]["systems"][0]["params"]["Value"]
+        self.assertEqual(params["commands"], ["SequenceCommand"])
+
+    def test_an_empty_command_list_forwards_none(self):
+        plant, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link, commands=[]))
+        ir = Deployment(targets=[plant, gw]).to_ir()
+        params = ir["targets"][1]["systems"][0]["params"]["Value"]
+        self.assertEqual(params["commands"], [])
+
+    def test_a_db_carries_its_storage_params(self):
+        gw = Target(cycle_rate=100.0, namespace="gw")
+        gw.state(
+            "db",
+            Db(
+                addr="[::]:2250",
+                path="/var/lib/metor/gw",
+                name="gateway",
+                store="/var/lib/metor/gw/cold",
+                max_bytes=1 << 30,
+                max_age_secs=3600.0,
+            ),
+        )
+        self.assertEqual(
+            gw.to_ir()["states"][0]["params"],
+            {
+                "Value": {
+                    "addr": "[::]:2250",
+                    "path": "/var/lib/metor/gw",
+                    "name": "gateway",
+                    "store": "/var/lib/metor/gw/cold",
+                    "max_bytes": 1 << 30,
+                    "max_age_secs": 3600.0,
+                }
+            },
+        )
+
+    def test_an_ingest_of_this_target_is_rejected(self):
+        _, gw, _, db = self.members()
+        own = gw.state("link", TcpServer(addr="[::]:2251"))
+        with self.assertRaisesRegex(ValueError, "link of this target"):
+            gw.add("self", Ingest(db, own))
+
+    def test_an_ingest_of_a_non_member_is_rejected(self):
+        _, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link))
+        with self.assertRaisesRegex(ValueError, "outside this deployment"):
+            Deployment(targets=[gw])
+
+    def test_a_source_is_a_link_server(self):
+        plant, gw, _, db = self.members()
+        other = plant.state("db", Db(addr="[::]:2252"))
+        gw.add("plant", Ingest(db, other))
+        with self.assertRaisesRegex(ValueError, "is a `Db` state.*TcpServer"):
+            Deployment(targets=[plant, gw])
+
+    def test_an_ingested_link_declares_its_port(self):
+        plant, gw, link, db = self.members(addr="[::]:0")
+        gw.add("plant", Ingest(db, link))
+        with self.assertRaisesRegex(ValueError, "on port 0"):
+            Deployment(targets=[plant, gw])
+
+    def test_an_unaccepted_command_is_rejected(self):
+        plant, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link, commands=["ReloadSequences"]))
+        with self.assertRaisesRegex(
+            ValueError, r"accepts no `ReloadSequences`.*AlarmAck, SequenceCommand"
+        ):
+            Deployment(targets=[plant, gw])
+
+    def test_two_ingests_may_not_forward_one_token(self):
+        plant, gw, link, db = self.members()
+        fsw = Target(cycle_rate=100.0, namespace="fsw")
+        fsw_link = fsw.state("link", TcpServer(addr="[::]:2241"))
+        fsw.add("uplink", Uplink(fsw_link, msgs=["SequenceCommand"]))
+        gw.add("plant", Ingest(db, link))
+        gw.add("fsw", Ingest(db, fsw_link))
+        with self.assertRaisesRegex(
+            ValueError, r"`fsw` forwards `SequenceCommand`.*commands=\[…\]"
+        ):
+            Deployment(targets=[plant, fsw, gw])
+
+        # Narrowing one of the two settles it.
+        mc._deployments.clear()
+        gw._ingests["plant"].commands = ["AlarmAck"]
+        ir = Deployment(targets=[plant, fsw, gw]).to_ir()
+        self.assertEqual(
+            [s["params"]["Value"]["commands"] for s in ir["targets"][2]["systems"]],
+            [["AlarmAck"], ["SequenceCommand"]],
+        )
+
+    def test_an_unresolved_ingest_names_the_deployment(self):
+        _, gw, link, db = self.members()
+        gw.add("plant", Ingest(db, link))
+        with self.assertRaisesRegex(RuntimeError, "never resolved"):
+            gw.to_ir()
 
 
 class PresetTest(unittest.TestCase):

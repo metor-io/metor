@@ -83,7 +83,7 @@ Found while grounding the plan. The design doc was corrected where noted.
 | Fact | Where | Consequence |
 | --- | --- | --- |
 | The host crate depends on `stellarator` with no features; `metor-db` asks for `["miette", "tokio"]` | `Cargo.toml:39`, `libs/db/Cargo.toml` | cargo unifies; `cargo check -p metor-panel` proves nothing else moved |
-| `target/debug/metor-fsw` is 51,091,144 bytes and `target/release/metor-fsw` 11,053,424 bytes before this plan (Sep 10 / Sep 7 builds) | `ls -la target/{debug,release}/metor-fsw` | the "before" of WP1's measurement |
+| `metor-db` costs the binary 5.6x debug and 7.9x release: `target/debug/metor-fsw` goes 51,126,280 -> 286,594,472 bytes and `target/release/metor-fsw` 11,463,168 -> 90,129,776; `cargo clean -p metor-fsw-2` + rebuild goes 4.4 s -> 5.1 s debug and 9.7 s -> 7.5 s release, and the one build that compiles metor-db, datafusion, and arrow costs 44 s debug / 86 s release | WP1, measured either side of the dependency | the `sql` feature of "Decisions", 1 is the lever if the size ever matters |
 | `Registry::with_builtins` registers `link_pack` through `Pack::shared_state` + `system_type_shared` and `register_pack` | `src/wiring/registry.rs:224–263,302` | `gateway_pack` sits beside it |
 | `system_type_shared` runs `ctor(params, token)` then `system.configure(&BuildCtx { msgs, namespace })`, and requires `T: CyclicSystem` | `core/src/pack.rs:369–430` | `IngestSystem::configure` sees its `Shared<DbState>` and can push command ids before `start` |
 | `Shared::get()` is a scoped `RefCell` borrow; `SharedLifecycle::start` runs before the first attached init on the loop task | `core/src/shared.rs:21,40` | `DbState::start` spawns the server the way `LinkState::start` spawns the accept loop |

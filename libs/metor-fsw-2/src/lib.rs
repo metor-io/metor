@@ -87,6 +87,7 @@
 mod alarm;
 mod async_system;
 mod coordinator;
+mod gateway;
 mod io_bridge;
 mod preset;
 mod telemetry;
@@ -113,6 +114,8 @@ pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, InitialOccupant, OccupantBacking,
     SlotConfigError, SlotStatus, WireError,
 };
+pub use gateway::{DbParams, DbState};
+
 pub use telemetry::{
     DownlinkParams, LinkParams, LinkState, LinkStats, PeerStatus, SubscribeOut, SubscribeSystem,
     TelemetrySystem, UplinkParams, UplinkSystem,
@@ -125,9 +128,9 @@ pub use preset::{PresetOut, PresetSpec, PresetSystem, PresetsParams};
 pub use dl::{DlError, DlPack, DlSystem};
 
 pub use ir::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DOWNLINK_TYPE, DistRef, EdgeSpec,
-    InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec, StateSpec,
-    SystemSpec, TCP_SERVER_TYPE, UPLINK_TYPE, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, DB_TYPE, DOWNLINK_TYPE, DistRef,
+    EdgeSpec, InitialOccupantSpec, ParamSource, ProgramDecl, ProgramSpec, SlotInitState, SlotSpec,
+    StateSpec, SystemSpec, TCP_SERVER_TYPE, UPLINK_TYPE, Wiring,
 };
 
 pub use wiring::{BuildError, BuildOptions, BundleError, PackageOptions, WiringBuilder};
