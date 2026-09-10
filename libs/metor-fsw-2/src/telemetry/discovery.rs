@@ -21,7 +21,9 @@ use metor_proto_wkt::{
 /// Advertise this link over mDNS under `name`, returning the running daemon;
 /// drop it (or [`ServiceDaemon::shutdown`]) to unregister and send a goodbye.
 /// `namespace` and `link` ride the TXT records as the machine identity a
-/// subscriber matches on; `name` is the human instance name.
+/// subscriber matches on; `name` is the human instance name. `role` names
+/// what serves this link when it is more than a plain flight computer (a
+/// gateway member's embedded db); `None` advertises `"fsw"`.
 /// `None` when the bind is loopback or the daemon can't start; the link stays
 /// reachable by direct address either way.
 pub(crate) fn advertise(
@@ -29,6 +31,7 @@ pub(crate) fn advertise(
     addr: SocketAddr,
     namespace: Option<&str>,
     link: &str,
+    role: Option<&str>,
 ) -> Option<ServiceDaemon> {
     let ip = addr.ip();
     if ip.is_loopback() {
@@ -49,7 +52,7 @@ pub(crate) fn advertise(
     let protocol_version = LINK_PROTOCOL_VERSION.to_string();
     let mut props: Vec<(&str, &str)> = vec![
         (TXT_PROTOCOL_VERSION, protocol_version.as_str()),
-        (TXT_ROLE, "fsw"),
+        (TXT_ROLE, role.unwrap_or("fsw")),
         (TXT_LINK, link),
     ];
     if let Some(namespace) = namespace {

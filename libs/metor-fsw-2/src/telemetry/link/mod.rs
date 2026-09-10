@@ -43,7 +43,7 @@ use stellarator::JoinHandleDropGuard;
 use stellarator::io::{AsyncWrite, OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::{TcpListener, TcpStream};
 
-use super::Announce;
+use super::taps::Announce;
 
 /// Per-connection pending-byte cap: a batch that would push a connection's
 /// buffered backlog past this is dropped for that connection alone.
@@ -467,6 +467,7 @@ impl crate::SharedLifecycle for LinkState {
             self.local_addr,
             self.namespace.as_deref(),
             &self.link,
+            None,
         );
         let listener = self.listener.take().expect("start runs once");
         let commands = self.control_rx.take().expect("start runs once");

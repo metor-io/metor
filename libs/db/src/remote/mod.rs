@@ -3,6 +3,9 @@
 //! remote-only spans and offload of local spans for archival. Which spans
 //! move, and when, is decided by callers (the panel's gap requests, the
 //! tiering engine); this module owns the how.
+//!
+//! It also owns [`forward`], the command forwarder both remote modes share:
+//! an fsw link tails the link's advertised set, a db mirror the peer's.
 
 mod db;
 mod fsw;
@@ -15,6 +18,84 @@ pub use hydrate::Hydrator;
 pub use hydrate::hydrate_span;
 pub use metor_proto_stellar::{Peer, identify};
 pub use offload::offload_span;
+
+use std::sync::Arc;
+
+use metor_proto::types::{LenPacket, PacketId};
+use metor_proto_stellar::PacketSink;
+use stellarator::io::OwnedWriter;
+use stellarator::net::TcpStream;
+use stellarator::sync::Mutex;
+
+use crate::{DB, Error, msg_log_2::MsgLog};
+
+/// One forwarder for the whole advertised set: drain every log's WAL
+/// reader — a fresh reader only ever sees records committed from now on,
+/// so live-edge needs no cursor, and unlike the dial-in
+/// `handle_msg_stream`'s wait→latest it never coalesces a burst (a
+/// `Load`+`Start` pair both cross) — then park until any log pushes.
+/// Sweep-then-wait makes lost wakes harmless: a push racing the wakeup is
+/// caught by the next sweep, and a push while parked wakes the registered
+/// waiter (the log wakes on `push`, before its persist task runs, which is
+/// also why the WAL and not the persisted nodes is what a live tail reads).
+pub(crate) async fn forward(
+    ids: Vec<PacketId>,
+    tx: Arc<Mutex<PacketSink<OwnedWriter<TcpStream>>>>,
+    db: &Arc<DB>,
+) -> Error {
+    use crate::disruptor::Reader;
+    use crate::msg_log_2::read_msg;
+
+    let mut logs: Vec<(PacketId, MsgLog, Reader)> = Vec::new();
+    for id in ids {
+        let log = match db.with_state_mut(|s| s.get_or_insert_msg_log(id, &db.path).cloned()) {
+            Ok(log) => log,
+            Err(err) => return err,
+        };
+        let reader = log.wal_reader();
+        logs.push((id, log, reader));
+    }
+    if logs.is_empty() {
+        std::future::pending::<()>().await;
+    }
+    loop {
+        for (id, _, reader) in &mut logs {
+            while let Some(grant) = reader.try_next() {
+                let mut buf: &[u8] = &grant;
+                while let Some((rest, _ts, msg)) = read_msg(buf) {
+                    buf = rest;
+                    let mut pkt = LenPacket::msg(*id, msg.len());
+                    pkt.extend_from_slice(msg);
+                    let tx = tx.lock().await;
+                    let (sent, _) = tx.send(pkt).await;
+                    if let Err(err) = sent {
+                        return err.into();
+                    }
+                }
+            }
+        }
+        wait_any(logs.iter().map(|(_, log, _)| log)).await;
+    }
+}
+
+/// Park until any of the logs' wait queues wakes — `futures_lite` has only
+/// the binary race, so this is the n-ary one, polled in order.
+async fn wait_any<'a>(logs: impl Iterator<Item = &'a MsgLog>) {
+    use std::pin::Pin;
+    use std::task::Poll;
+    let mut waits: Vec<Pin<Box<dyn Future<Output = ()> + 'a>>> = logs
+        .map(|log| Box::pin(log.wait()) as Pin<Box<dyn Future<Output = ()> + 'a>>)
+        .collect();
+    std::future::poll_fn(|cx| {
+        for wait in &mut waits {
+            if wait.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
 
 #[cfg(test)]
 mod tests {

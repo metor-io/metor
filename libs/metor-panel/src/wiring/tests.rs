@@ -30,6 +30,7 @@ fn wiring_with_system(name: &str) -> Wiring {
             attach: None,
             layout: None,
             status: None,
+            peer: None,
             encompassing: false,
         }],
         slots: Vec::new(),

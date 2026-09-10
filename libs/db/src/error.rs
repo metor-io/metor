@@ -46,6 +46,8 @@ pub enum Error {
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("schema mismatch")]
     SchemaMismatch,
+    #[error("vtable id {0:?} is registered with a different vtable")]
+    VTableConflict(PacketId),
     #[error("store {0}")]
     Store(#[from] crate::store::StoreError),
 }

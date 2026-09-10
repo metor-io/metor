@@ -9403,6 +9403,7 @@ dependencies = [
  "postcard",
  "postcard-c-codegen",
  "postcard-dyn",
+ "postcard-schema",
  "rustfft",
  "serde",
  "smallvec 1.16.0",

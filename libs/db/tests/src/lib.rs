@@ -348,6 +348,135 @@ mod tests {
         assert!(mirrored, "local db never mirrored the live sample");
     }
 
+    /// Every record of a log, oldest first, after a flush (the WAL trails
+    /// the persisted head by one persist pass).
+    fn log_records(db: &Arc<DB>, id: metor_proto::types::PacketId) -> Vec<(Timestamp, Vec<u8>)> {
+        let Ok(log) = db.with_state_mut(|s| s.get_or_insert_msg_log(id, &db.path).cloned()) else {
+            return Vec::new();
+        };
+        log.flush().unwrap();
+        let Some(slice) = log.get_range(Timestamp(i64::MIN)..Timestamp(i64::MAX)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(Timestamp, Vec<u8>)> = slice
+            .as_iter()
+            .flat_map(|node| {
+                node.msgs()
+                    .map(|(ts, msg)| (ts, msg.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        out.sort_by_key(|(ts, _)| *ts);
+        out
+    }
+
+    fn mirror_db(addr: SocketAddr) -> Arc<DB> {
+        let dir = std::env::temp_dir().join(format!("metor_db_mirror_{}", fastrand::u64(..)));
+        let db = Arc::new(DB::create(dir).unwrap());
+        metor_db::remote::RemoteDb::new(addr).spawn(db.clone());
+        db
+    }
+
+    async fn wait_for(pred: impl Fn() -> bool, what: &str) {
+        for _ in 0..80 {
+            if pred() {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("never saw {what}");
+    }
+
+    const MIRROR_LOG: metor_proto::types::PacketId = [0x41, 7];
+    const MIRROR_CMD: metor_proto::types::PacketId = [0x42, 7];
+
+    /// `SyncMsgs` carries a log's metadata, its latest record with the
+    /// source timestamp, and every record pushed afterwards.
+    #[test]
+    async fn remote_db_mirrors_message_logs() {
+        let (addr, src_db) = setup_test_db().await.unwrap();
+        src_db
+            .with_state_mut(|s| {
+                s.set_msg_metadata(
+                    MIRROR_LOG,
+                    MsgMetadata {
+                        name: "mirror_log".to_string(),
+                        schema: OwnedNamedType {
+                            name: "MirrorLog".to_string(),
+                            ty: postcard_schema::schema::owned::OwnedDataModelType::U8,
+                        },
+                        metadata: Default::default(),
+                    },
+                    &src_db.path,
+                )
+            })
+            .unwrap();
+        src_db.push_msg(Timestamp(100), MIRROR_LOG, b"seed").unwrap();
+
+        let local_db = mirror_db(addr);
+        let probe = local_db.clone();
+        wait_for(
+            move || log_records(&probe, MIRROR_LOG) == vec![(Timestamp(100), b"seed".to_vec())],
+            "the seeded record with its source timestamp",
+        )
+        .await;
+        assert_eq!(
+            local_db.with_state(|s| s
+                .msg_log_iter()
+                .find(|(id, _)| *id == MIRROR_LOG)
+                .and_then(|(_, meta)| meta.map(|m| m.name.clone()))),
+            Some("mirror_log".to_string()),
+            "the log's metadata crossed with it",
+        );
+
+        src_db.push_msg(Timestamp(101), MIRROR_LOG, b"live").unwrap();
+        let probe = local_db.clone();
+        wait_for(
+            move || log_records(&probe, MIRROR_LOG).len() == 2,
+            "the live record",
+        )
+        .await;
+        assert_eq!(
+            log_records(&local_db, MIRROR_LOG),
+            vec![
+                (Timestamp(100), b"seed".to_vec()),
+                (Timestamp(101), b"live".to_vec()),
+            ]
+        );
+    }
+
+    /// A command the peer advertises rides the mirror connection up from
+    /// the live edge, and never comes back down.
+    #[test]
+    async fn remote_db_forwards_advertised_commands_and_never_echoes() {
+        let (addr, src_db) = setup_test_db().await.unwrap();
+        src_db.set_identity(None, vec![MIRROR_CMD]);
+        // Queued on the server before connect: the command log never streams.
+        src_db.push_msg(Timestamp(1), MIRROR_CMD, b"stale").unwrap();
+
+        let local_db = mirror_db(addr);
+        sleep(Duration::from_millis(300)).await;
+        local_db.push_msg(Timestamp(2), MIRROR_CMD, b"go").unwrap();
+
+        let probe = src_db.clone();
+        wait_for(
+            move || {
+                log_records(&probe, MIRROR_CMD)
+                    .iter()
+                    .any(|(_, msg)| msg == b"go")
+            },
+            "the forwarded command",
+        )
+        .await;
+
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            log_records(&local_db, MIRROR_CMD),
+            vec![(Timestamp(2), b"go".to_vec())],
+            "the command neither echoed back nor replayed the server's",
+        );
+    }
+
     #[test]
     async fn test_send_data() {
         let (addr, db) = setup_test_db().await.unwrap();

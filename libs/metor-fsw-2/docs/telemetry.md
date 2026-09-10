@@ -98,7 +98,7 @@ The delivery setting controls how the downlink reads the ring:
 
 For example, a state frame often uses table schema with snapshot delivery. An alarm event uses message schema with log delivery. The downlink handles both through the same tap code.
 
-Table bytes need no data conversion. The downlink gives each table tap a packet id, then sends its vtable and component metadata before table data.
+Table bytes need no data conversion. The downlink gives each table tap a packet id, then sends its vtable and component metadata before table data. A table packet's id is a hash of its announced vtable, so it is stable across connections and links; two tables hashing alike are reported by `telemetry_table_id_collision` and the later one is dropped.
 
 The link also sends `SetMsgMetadata` for each known message id. It sends each message schema once, even when many systems have an output with that id.
 
@@ -156,7 +156,7 @@ _metor-fsw._tcp.local.
 
 The service instance uses `TcpServer.name`. If the config omits the name, it uses the target namespace, and the OS host name when the target has none. A target with several `TcpServer` states must give all but one a `name`, checked when the wiring loads: two servers cannot advertise one instance name.
 
-The TXT record includes the link protocol version as `pv`, the role `fsw`, the serving state's declaration name as `link`, and the target namespace as `ns` when it has one. `ns` and `link` are the machine identity a subscriber matches on; the instance name is for people. A wildcard bind lets the mDNS service list the host network addresses. A fixed non-loopback bind advertises that address.
+The TXT record includes the link protocol version as `pv`, the role (`fsw`, or `gateway` for a db a gateway member serves), the serving state's declaration name as `link`, and the target namespace as `ns` when it has one. `ns` and `link` are the machine identity a subscriber matches on; the instance name is for people. A wildcard bind lets the mDNS service list the host network addresses. A fixed non-loopback bind advertises that address.
 
 The server does not advertise a loopback bind. Local development with `127.0.0.1` still needs a direct address.
 

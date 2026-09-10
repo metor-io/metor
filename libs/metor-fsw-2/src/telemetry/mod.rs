@@ -12,6 +12,7 @@
 mod discovery;
 mod link;
 mod subscribe;
+mod taps;
 mod uplink;
 
 pub use subscribe::{PeerStatus, SubscribeOut, SubscribeSystem};
@@ -19,44 +20,15 @@ pub use uplink::{UplinkParams, UplinkSystem};
 
 pub use link::{LinkParams, LinkState, LinkStats};
 
+use taps::{Tap, Taps, TelemetryMode, Wire, collect_taps};
+
 use metor_fsw_2_core::log::LogLevel;
 use metor_fsw_2_core::{
-    AllOutputs, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Delivery, Out, RegistryEntry,
-    Shared, System, split_record,
+    AllOutputs, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, Shared, System,
+    split_record,
 };
-use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{PACKET_HEADER_LEN, PacketId, PacketTy, Timestamp};
-use metor_proto::vtable::VTable;
-use metor_proto_wkt::{ComponentMetadata, MsgMetadata, SetMsgMetadata};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-/// Which registry entries the downlink taps.
-enum TelemetryMode {
-    /// Tap every entry: every system's user frames and their implicit
-    /// `system_status`/`log`, plus the coordinator-owned `system_status`/`log`/`status`.
-    All,
-    /// Tap only the entries whose instance name or frame name appears in the
-    /// configured lists; matching either is enough.
-    Subset {
-        instances: Vec<String>,
-        frames: Vec<String>,
-    },
-}
-
-impl TelemetryMode {
-    /// Whether `entry` is tapped. The `frames` list matches
-    /// [`RegistryEntry::name`], which covers frame names and channel names
-    /// alike.
-    fn matches(&self, entry: &RegistryEntry) -> bool {
-        match self {
-            TelemetryMode::All => true,
-            TelemetryMode::Subset { instances, frames } => {
-                instances.iter().any(|i| i.as_str() == &*entry.instance)
-                    || frames.iter().any(|f| f.as_str() == entry.name())
-            }
-        }
-    }
-}
 
 /// Wiring parameters for the built-in downlink (`type="Downlink"`): an
 /// optional tap subset. With both lists absent every entry is tapped; with
@@ -117,17 +89,6 @@ impl BuildSystem for TelemetrySystem {
     }
 }
 
-/// One announced tap's wire schema, replayed to each new connection: a table
-/// tap's vtable + component metadata, or a message channel's payload schema.
-pub(crate) enum Announce {
-    Table {
-        packet_id: PacketId,
-        vtable: VTable,
-        metadata: Vec<ComponentMetadata>,
-    },
-    Msg(SetMsgMetadata),
-}
-
 /// Link status and access to the output registry.
 ///
 /// [`AllOutputs`] grants a reader slot on every registered output.
@@ -151,33 +112,6 @@ pub struct LinkStatus {
     pub accepted: u64,
     /// Whole batches dropped for one connection over its pending cap.
     pub dropped: u64,
-}
-
-/// A read view into one tapped buffer plus the delivery axis and the [`Wire`]
-/// framing projected from the entry.
-struct Tap {
-    view: View<NoWake>,
-    delivery: Delivery,
-    wire: Wire,
-    /// Snapshot taps only: the ring's `committed` at the last contribution, so
-    /// a cycle with no new record contributes nothing (the pinned newest
-    /// record is not re-sent). `u64::MAX` means nothing contributed yet.
-    last_committed: u64,
-    /// Snapshot *message* taps: this tap's slot in the link's retained
-    /// store. The newest framed record is held there and replayed to every
-    /// late-joining connection: latest-wins boot state (a wiring manifest,
-    /// a sequence registry) that would otherwise stream exactly once.
-    /// Continuously-republished frames need no retention (a new connection
-    /// sees them within a cycle), so frame taps stay `None`.
-    retain_slot: Option<usize>,
-}
-
-/// How a tap frames a drained record, projected from the entry's schema.
-enum Wire {
-    /// A `Table` packet under the announce-assigned packet id.
-    Table { packet_id: PacketId },
-    /// A self-describing `Msg` packet; the id is the record's first two bytes.
-    Msg,
 }
 
 /// A [`CyclicSystem`] that frames every tapped output buffer's pending
@@ -223,71 +157,21 @@ impl System for TelemetrySystem {
     /// the announce set to the link server, whose accepted connections replay
     /// it before any data.
     fn init(&mut self, output: &mut Self::Output) {
-        // `AllOutputs::entries()` is already filtered to telemetered entries,
-        // so a command channel or an opted-out frame never reaches the matcher.
-        let mut taps = Vec::new();
-        let mut announces = Vec::new();
-        let mut n_tables = 0usize;
-        let mut n_retained = 0usize;
-        let mut announced_msgs = std::collections::HashSet::new();
-        // Deferred log reports: iterating `output.all` borrows the output
-        // bundle, so `output.log()` (a `&mut` borrow) runs after the loop.
-        let mut exhausted: Vec<String> = Vec::new();
-        for entry in output.all.entries() {
-            if !self.mode.matches(entry) {
-                continue;
-            }
-            let Ok(view) = entry.view() else {
-                exhausted.push(format!("{}.{}", entry.instance, entry.name()));
-                continue;
-            };
-            // Delivery and wire are independent projections of the entry:
-            // delivery picks how much each cycle contributes, schema picks
-            // the framing.
-            let wire = match entry.announce() {
-                Some((vtable, metadata)) => {
-                    let packet_id = (n_tables as u16).to_le_bytes();
-                    n_tables += 1;
-                    announces.push(Announce::Table {
-                        packet_id,
-                        vtable,
-                        metadata,
-                    });
-                    Wire::Table { packet_id }
-                }
-                None => {
-                    // Several ports may share a message ID, such as LogEvent.
-                    if let crate::PortSchema::Postcard {
-                        id,
-                        schema: Some(schema),
-                    } = &entry.desc.schema
-                        && announced_msgs.insert(*id)
-                    {
-                        announces.push(Announce::Msg(SetMsgMetadata {
-                            id: *id,
-                            metadata: MsgMetadata {
-                                name: schema.name.clone(),
-                                schema: (**schema).clone(),
-                                metadata: Default::default(),
-                            },
-                        }));
-                    }
-                    Wire::Msg
-                }
-            };
-            let retain_slot = (entry.delivery() == Delivery::Snapshot && matches!(wire, Wire::Msg))
-                .then(|| {
-                    let slot = n_retained;
-                    n_retained += 1;
-                    slot
-                });
-            taps.push(Tap {
-                view,
-                delivery: entry.delivery(),
-                wire,
-                last_committed: u64::MAX,
-                retain_slot,
-            });
+        let Taps {
+            taps,
+            announces,
+            retained,
+            exhausted,
+            collisions,
+        } = collect_taps(&output.all, &self.mode);
+
+        for (refused, kept) in &collisions {
+            output.log().fault(
+                LogLevel::Error,
+                "telemetry_table_id_collision",
+                "two tables hash to one packet id; the later is not downlinked",
+                &[("refused", refused), ("kept", kept)],
+            );
         }
 
         for key in &exhausted {
@@ -315,7 +199,7 @@ impl System for TelemetrySystem {
             self.link = None;
             return;
         }
-        link.get().set_retained_slots(n_retained);
+        link.get().set_retained_slots(retained);
         self.taps = taps;
     }
 }
@@ -401,65 +285,38 @@ impl CyclicSystem for TelemetrySystem {
         // undrained tap view stalls its producer's ring and freezes every
         // consumer of that output, not just telemetry.
         link.prepare_batch(&mut self.batch);
-        let mut batch = (connections != 0).then_some(&mut self.batch);
-        for tap in &mut self.taps {
-            match tap.delivery {
-                // An unchanged `committed` means no new record this cycle;
-                // contribute nothing rather than re-sending the pinned record.
-                Delivery::Snapshot => {
-                    let committed = tap.view.committed();
-                    if committed == tap.last_committed {
-                        continue;
-                    }
-                    tap.last_committed = committed;
-                    match tap.view.try_latest() {
-                        Ok(Some(grant)) => match tap.retain_slot {
-                            // A retained tap frames once and the bytes go
-                            // both ways: appended to this cycle's batch and
-                            // held for future connections' replays, even
-                            // with no connection live right now.
-                            Some(slot) => {
-                                self.retain_scratch.clear();
-                                append_record(&mut self.retain_scratch, &tap.wire, &grant);
-                                if let Some(batch) = &mut batch {
-                                    batch.extend_from_slice(&self.retain_scratch);
-                                }
-                                link.retain(slot, &mut self.retain_scratch);
-                            }
-                            None => {
-                                if let Some(batch) = &mut batch {
-                                    append_record(batch, &tap.wire, &grant);
-                                }
-                            }
-                        },
-                        Ok(None) => {}
-                        Err(_) => output.log().fault(
-                            LogLevel::Error,
-                            "telemetry_input_corrupt",
-                            "tap ring read corrupt",
-                            &[],
-                        ),
-                    }
+        let Self {
+            taps,
+            batch,
+            retain_scratch,
+            ..
+        } = self;
+        let mut batch = (connections != 0).then_some(batch);
+        let corrupt = taps::drain_taps(taps, |wire, retain_slot, rec| match retain_slot {
+            // A retained tap frames once and the bytes go both ways:
+            // appended to this cycle's batch and held for future
+            // connections' replays, even with no connection live right now.
+            Some(slot) => {
+                retain_scratch.clear();
+                append_record(retain_scratch, wire, rec);
+                if let Some(batch) = &mut batch {
+                    batch.extend_from_slice(retain_scratch);
                 }
-                // Every record, in order.
-                Delivery::Log => {
-                    let wire = &tap.wire;
-                    let batch = &mut batch;
-                    let result = metor_fsw_2_core::drain_view(&mut tap.view, |rec| {
-                        if let Some(batch) = batch.as_mut() {
-                            append_record(batch, wire, rec);
-                        }
-                    });
-                    if result.is_err() {
-                        output.log().fault(
-                            LogLevel::Error,
-                            "telemetry_input_corrupt",
-                            "tap ring read corrupt",
-                            &[],
-                        );
-                    }
+                link.retain(slot, retain_scratch);
+            }
+            None => {
+                if let Some(batch) = &mut batch {
+                    append_record(batch, wire, rec);
                 }
             }
+        });
+        if corrupt > 0 {
+            output.log().fault(
+                LogLevel::Error,
+                "telemetry_input_corrupt",
+                "tap ring read corrupt",
+                &[("taps", &corrupt)],
+            );
         }
         if let Some(batch) = batch
             && !batch.is_empty()
@@ -476,6 +333,7 @@ mod tests {
     use metor_fsw_2_core::{MsgTable, PortDesc, RegistryEntry};
     use metor_fsw_ring::{Config, RingBuffer};
     use metor_proto::types::ComponentId;
+    use metor_proto::types::table_id;
 
     fn entry(instance: &str, name: &str) -> RegistryEntry {
         let desc = PortDesc::msg_dynamic(name, PacketId::from([0, 7]));
@@ -501,6 +359,186 @@ mod tests {
         })
         .unwrap();
         sys
+    }
+
+    /// A frame producer, the one table a served target announces beyond the
+    /// coordinator's own.
+    #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+    #[repr(C)]
+    #[metor_fsw(name = "beat")]
+    struct Beat {
+        #[metor_fsw(timestamp)]
+        timestamp: Timestamp,
+        n: u64,
+    }
+
+    #[derive(crate::SystemOutput)]
+    struct BeaterOut {
+        beat: metor_fsw_2_core::Output<Beat>,
+    }
+
+    struct Beater(u64);
+
+    impl System for Beater {
+        type Input = ();
+        type Output = Out<BeaterOut>;
+        const NAME: &'static str = "beater";
+    }
+
+    impl CyclicSystem for Beater {
+        fn execute(&mut self, now: Timestamp, _input: &mut (), output: &mut Self::Output) {
+            self.0 += 1;
+            let _ = output.beat.write(&Beat {
+                timestamp: now,
+                n: self.0,
+            });
+        }
+    }
+
+    impl BuildSystem for Beater {
+        type Params = ();
+        fn new(_params: ()) -> Self {
+            Beater(0)
+        }
+    }
+
+    /// A port nothing else claims, so the ephemeral bind is free when the
+    /// target takes it.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("a free port")
+            .local_addr()
+            .expect("bound")
+            .port()
+    }
+
+    /// Every announced table is keyed by the hash of the vtable it carries,
+    /// never by its position in the announce set.
+    #[cfg(not(miri))]
+    #[stellarator::test]
+    async fn table_ids_are_hashes_of_the_announce() {
+        use crate::wiring::{Registry, WiringBuilder, resolve};
+        use metor_proto::types::{Msg, OwnedPacket};
+        use metor_proto_wkt::VTableMsg;
+
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], free_port()));
+        let wiring = WiringBuilder::new()
+            .coordinator(200.0, crate::ClockSpec::Wall)
+            .system("beat")
+            .ty("Beat")
+            .end()
+            .serve(addr)
+            .build();
+        let mut registry = Registry::with_builtins();
+        registry.register::<Beater, _>("Beat");
+        let mut coord = resolve(&wiring, &registry).expect("the served target resolves");
+
+        let client = async {
+            let metor_proto_stellar::Peer::Fsw { mut rx, .. } = metor_proto_stellar::identify(addr)
+                .await
+                .expect("the link answers")
+            else {
+                panic!("a downlink identifies as an fsw link")
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut seen = 0usize;
+            loop {
+                let pkt = rx.next_grow(buf).await.expect("the link stays up");
+                if let OwnedPacket::Msg(m) = &pkt
+                    && m.id == VTableMsg::ID
+                {
+                    let msg = m.parse::<VTableMsg>().expect("a vtable announce");
+                    assert_ne!(msg.id, [0, 0], "a table id is never a sequence number");
+                    assert_eq!(msg.id, table_id(&msg.vtable));
+                    seen += 1;
+                    if seen == 2 {
+                        return;
+                    }
+                }
+                buf = pkt.into_buf().into_inner();
+            }
+        };
+        futures_lite::future::race(coord.run_for(4000), client).await;
+    }
+
+    /// Two instances of one frame whose prefixed vtables fold to the same
+    /// packet id, found by search over the instance suffix.
+    const COLLIDING: (&str, &str) = ("beat47", "beat335");
+
+    /// The later of two tables hashing alike is refused, and the fault names
+    /// both, so a rename is the visible fix.
+    #[cfg(not(miri))]
+    #[stellarator::test]
+    async fn colliding_tables_fault_and_drop_the_later() {
+        use crate::wiring::{Registry, WiringBuilder, resolve};
+        use metor_fsw_2_core::PortDesc;
+        use metor_proto::types::{Msg, OwnedPacket};
+        use metor_proto_wkt::{LogEvent, VTableMsg};
+
+        let desc = PortDesc::of::<Beat>();
+        let announced = |instance: &str| table_id(&desc.announce(instance).expect("a table").0);
+        let collided = announced(COLLIDING.0);
+        assert_eq!(collided, announced(COLLIDING.1), "the pair still collides");
+
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], free_port()));
+        let wiring = WiringBuilder::new()
+            .coordinator(200.0, crate::ClockSpec::Wall)
+            .system(COLLIDING.0)
+            .ty("Beat")
+            .end()
+            .system(COLLIDING.1)
+            .ty("Beat")
+            .end()
+            .serve(addr)
+            .build();
+        let mut registry = Registry::with_builtins();
+        registry.register::<Beater, _>("Beat");
+        let mut coord = resolve(&wiring, &registry).expect("the target resolves");
+
+        let client = async {
+            let metor_proto_stellar::Peer::Fsw { mut rx, .. } = metor_proto_stellar::identify(addr)
+                .await
+                .expect("the link answers")
+            else {
+                panic!("a downlink identifies as an fsw link")
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut announces = 0usize;
+            loop {
+                let pkt = rx.next_grow(buf).await.expect("the link stays up");
+                if let OwnedPacket::Msg(m) = &pkt {
+                    if m.id == VTableMsg::ID
+                        && m.parse::<VTableMsg>().expect("a vtable announce").id == collided
+                    {
+                        announces += 1;
+                    }
+                    if m.id == LogEvent::ID
+                        && let Ok(ev) = m.parse::<LogEvent>()
+                        && field(&ev, "kind").as_deref() == Some("telemetry_table_id_collision")
+                    {
+                        assert_eq!(
+                            field(&ev, "refused").as_deref(),
+                            Some(&*format!("{}.beat", COLLIDING.1))
+                        );
+                        assert_eq!(
+                            field(&ev, "kept").as_deref(),
+                            Some(&*format!("{}.beat", COLLIDING.0))
+                        );
+                        assert_eq!(announces, 1, "the colliding id is announced once");
+                        return;
+                    }
+                }
+                buf = pkt.into_buf().into_inner();
+            }
+        };
+        futures_lite::future::race(coord.run_for(4000), client).await;
+    }
+
+    fn field(ev: &metor_proto_wkt::LogEvent, key: &str) -> Option<String> {
+        ev.fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
     }
 
     #[test]

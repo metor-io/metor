@@ -7,8 +7,8 @@
 //!
 //! [`fsw_stream`] then runs the fsw mode as two raced loops over the one
 //! connection: ingest (the mirror's shape — every pushed packet through the
-//! local packet handler) and a single command forwarder that tails the
-//! advertised msg logs from the live edge. There is no supervisor here;
+//! local packet handler) and a single [`forward`](super::forward) that
+//! tails the caller's command logs from the live edge. There is no supervisor here;
 //! reconnecting is a plain loop at the call site around
 //! `identify`/`fsw_stream`.
 
@@ -16,22 +16,21 @@ use std::sync::Arc;
 
 use metor_proto::types::{LenPacket, PacketId, PacketTy};
 use metor_proto_stellar::{PacketSink, PacketStream};
-use metor_proto_wkt::LinkInfo;
 use stellarator::io::{OwnedReader, OwnedWriter};
 use stellarator::net::TcpStream;
 use stellarator::sync::Mutex;
 use tracing::warn;
 
-use crate::{ConnState, DB, Error, PacketTx, msg_log_2::MsgLog};
+use crate::{ConnState, DB, Error, PacketTx};
 
 /// Stream an identified fsw link into `db` until the connection drops,
 /// returning the error that ended it (the caller loops). Two raced loops
 /// over the one socket: ingest every pushed packet through the local
 /// packet handler — the same shapes a directly-attached producer sends —
-/// and forward the advertised command set's msg logs up the link from
-/// their live edge (nothing queued before this call is replayed).
+/// and forward `command_ids`' msg logs up the link from their live edge
+/// (nothing queued before this call is replayed).
 pub async fn fsw_stream(
-    info: LinkInfo,
+    command_ids: Vec<PacketId>,
     rx: PacketStream<OwnedReader<TcpStream>>,
     tx: PacketSink<OwnedWriter<TcpStream>>,
     buf: Vec<u8>,
@@ -43,7 +42,7 @@ pub async fn fsw_stream(
     let tx = Arc::new(Mutex::new(tx));
     futures_lite::future::race(
         ingest(rx, buf, tx.clone(), db),
-        forward(info.command_ids, tx, db),
+        super::forward(command_ids, tx, db),
     )
     .await
 }
@@ -76,80 +75,12 @@ async fn ingest(
     }
 }
 
-/// One forwarder for the whole advertised set: drain every log's WAL
-/// reader — a fresh reader only ever sees records committed from now on,
-/// so live-edge needs no cursor, and unlike the dial-in
-/// `handle_msg_stream`'s wait→latest it never coalesces a burst (a
-/// `Load`+`Start` pair both cross) — then park until any log pushes.
-/// Sweep-then-wait makes lost wakes harmless: a push racing the wakeup is
-/// caught by the next sweep, and a push while parked wakes the registered
-/// waiter (the log wakes on `push`, before its persist task runs, which is
-/// also why the WAL and not the persisted nodes is what a live tail reads).
-async fn forward(
-    ids: Vec<PacketId>,
-    tx: Arc<Mutex<PacketSink<OwnedWriter<TcpStream>>>>,
-    db: &Arc<DB>,
-) -> Error {
-    use crate::disruptor::Reader;
-    use crate::msg_log_2::read_msg;
-
-    let mut logs: Vec<(PacketId, MsgLog, Reader)> = Vec::new();
-    for id in ids {
-        let log = match db.with_state_mut(|s| s.get_or_insert_msg_log(id, &db.path).cloned()) {
-            Ok(log) => log,
-            Err(err) => return err,
-        };
-        let reader = log.wal_reader();
-        logs.push((id, log, reader));
-    }
-    if logs.is_empty() {
-        std::future::pending::<()>().await;
-    }
-    loop {
-        for (id, _, reader) in &mut logs {
-            while let Some(grant) = reader.try_next() {
-                let mut buf: &[u8] = &grant;
-                while let Some((rest, _ts, msg)) = read_msg(buf) {
-                    buf = rest;
-                    let mut pkt = LenPacket::msg(*id, msg.len());
-                    pkt.extend_from_slice(msg);
-                    let tx = tx.lock().await;
-                    let (sent, _) = tx.send(pkt).await;
-                    if let Err(err) = sent {
-                        return err.into();
-                    }
-                }
-            }
-        }
-        wait_any(logs.iter().map(|(_, log, _)| log)).await;
-    }
-}
-
-/// Park until any of the logs' wait queues wakes — `futures_lite` has only
-/// the binary race, so this is the n-ary one, polled in order.
-async fn wait_any<'a>(logs: impl Iterator<Item = &'a MsgLog>) {
-    use std::pin::Pin;
-    use std::task::Poll;
-    let mut waits: Vec<Pin<Box<dyn Future<Output = ()> + 'a>>> = logs
-        .map(|log| Box::pin(log.wait()) as Pin<Box<dyn Future<Output = ()> + 'a>>)
-        .collect();
-    std::future::poll_fn(|cx| {
-        for wait in &mut waits {
-            if wait.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
-        }
-        Poll::Pending
-    })
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use metor_proto::types::{IntoLenPacket, OwnedPacket};
     use metor_proto_stellar::{Peer, identify};
-    use metor_proto_wkt::LINK_PROTOCOL_VERSION;
+    use metor_proto_wkt::{LINK_PROTOCOL_VERSION, LinkInfo};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
@@ -255,7 +186,7 @@ mod tests {
         };
         let stream_db = db.clone();
         let _link = stellarator::spawn(async move {
-            let err = fsw_stream(info, rx, tx, buf, &stream_db).await;
+            let err = fsw_stream(info.command_ids, rx, tx, buf, &stream_db).await;
             tracing::info!(?err, "link ended");
         })
         .drop_guard();
@@ -291,6 +222,55 @@ mod tests {
         assert!(
             !seen.iter().any(|(_, payload)| payload == b"stale"),
             "pre-connect commands must not replay: {seen:?}"
+        );
+    }
+
+    /// The forwarded set is the caller's argument, not the link's
+    /// advertisement: a narrowed set sends only its own ids.
+    #[stellarator::test]
+    async fn fsw_stream_forwards_only_the_given_set() {
+        use metor_proto::types::Timestamp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::DB::create(dir.path().join("db")).unwrap());
+        let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let inbound = fake_fsw(listener, vec![CMD_A, CMD_B]);
+
+        let Peer::Fsw { rx, tx, buf, .. } = identify(addr).await.expect("identify") else {
+            panic!("expected an fsw peer");
+        };
+        let stream_db = db.clone();
+        let _link = stellarator::spawn(async move {
+            fsw_stream(vec![CMD_A], rx, tx, buf, &stream_db).await;
+        })
+        .drop_guard();
+
+        // Wait for the link's own push to ingest: the forwarder's readers
+        // are live by then, and only records after them are forwarded.
+        let ingested = db.clone();
+        wait_for(
+            move || {
+                ingested
+                    .with_state_mut(|s| s.get_or_insert_msg_log(DATA, &ingested.path).cloned())
+                    .is_ok_and(|log| log.latest().is_some())
+            },
+            "the link's push",
+        )
+        .await;
+
+        db.push_msg(Timestamp(2), CMD_B, b"dropped").unwrap();
+        db.push_msg(Timestamp(3), CMD_A, b"go").unwrap();
+        let seen = inbound.clone();
+        wait_for(
+            move || !seen.lock().unwrap().is_empty(),
+            "the forwarded command",
+        )
+        .await;
+        stellarator::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            inbound.lock().unwrap().clone(),
+            vec![(CMD_A, b"go".to_vec())]
         );
     }
 }

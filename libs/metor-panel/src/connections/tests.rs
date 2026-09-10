@@ -405,3 +405,30 @@ fn browsing_targets_needs_no_database_and_discovery_can_stop(cx: &mut gpui::Test
     cx.run_until_parked();
     assert!(registry.is_closed());
 }
+
+/// A discovered instance reads as its bare address unless something other
+/// than a plain fsw serves the link.
+#[test]
+fn a_role_beyond_fsw_shows_in_the_detail() {
+    use mdns_sd::ServiceInfo;
+    use metor_proto_wkt::{FSW_SERVICE_TYPE, TXT_ROLE};
+
+    let resolved = |role: &str| {
+        let info = ServiceInfo::new(
+            FSW_SERVICE_TYPE,
+            "gw",
+            "gw.metor.local.",
+            "10.0.0.5",
+            2240,
+            &[(TXT_ROLE, role)][..],
+        )
+        .expect("a well-formed service info");
+        super::discovery::resolved_target(&info).expect("a routable address")
+    };
+
+    assert_eq!(
+        resolved("gateway").detail.as_ref(),
+        "10.0.0.5:2240 · gateway"
+    );
+    assert_eq!(resolved("fsw").detail.as_ref(), "10.0.0.5:2240");
+}

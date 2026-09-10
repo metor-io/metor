@@ -24,7 +24,7 @@ use metor_fsw_ring::{NoWake, Writer};
 use metor_proto::types::{Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{Peer, identify};
-use metor_proto_wkt::{SetComponentMetadata, SetMsgMetadata, VTableMsg};
+use metor_proto_wkt::{LinkInfo, SetComponentMetadata, SetMsgMetadata, VTableMsg};
 use postcard_schema::schema::owned::OwnedNamedType;
 use stellarator::buf::Slice;
 use stellarator::struc_con::Joinable;
@@ -174,7 +174,7 @@ impl AsyncSystem for SubscribeSystem {
         let mut backoff = BACKOFF_INITIAL;
         let mut reported_unreachable = false;
         loop {
-            let mut addrs = direct_candidates(&self.peer);
+            let mut addrs = direct_candidates(self.peer.host.as_deref(), self.peer.port);
             // mDNS is the last candidate and costs its whole timeout, so the
             // round only browses once the direct addresses are spent.
             let mut browsed = self.peer.host.is_some();
@@ -200,7 +200,8 @@ impl AsyncSystem for SubscribeSystem {
                 }
                 if next == addrs.len() && !browsed {
                     browsed = true;
-                    let Some(found) = browse(&self.peer, context).await else {
+                    let Some(found) = browse(&self.peer.namespace, &self.peer.link, context).await
+                    else {
                         return;
                     };
                     addrs.extend(found);
@@ -332,22 +333,7 @@ async fn session(
             return Session::Rejected;
         }
     };
-    if info.protocol_version < MIN_PROTOCOL_VERSION {
-        let detail = format!(
-            "peer speaks link protocol {}; {MIN_PROTOCOL_VERSION} is the first with an identity",
-            info.protocol_version
-        );
-        reject(output, addr, &detail);
-        return Session::Rejected;
-    }
-    if info.namespace.as_deref() != Some(peer.namespace.as_str()) || info.link != peer.link {
-        let detail = format!(
-            "peer here is `{}/{}`, not `{}/{}`",
-            info.namespace.as_deref().unwrap_or(""),
-            info.link,
-            peer.namespace,
-            peer.link
-        );
+    if let Err(detail) = check_identity(&info, &peer.namespace, &peer.link) {
         reject(output, addr, &detail);
         return Session::Rejected;
     }
@@ -577,19 +563,38 @@ fn route(
     }
 }
 
+/// Whether the answering link is the one the peer spec names. `Err` carries
+/// the `peer_identity` detail for a wrong version, namespace, or link.
+pub(crate) fn check_identity(info: &LinkInfo, namespace: &str, link: &str) -> Result<(), String> {
+    if info.protocol_version < MIN_PROTOCOL_VERSION {
+        return Err(format!(
+            "peer speaks link protocol {}; {MIN_PROTOCOL_VERSION} is the first with an identity",
+            info.protocol_version
+        ));
+    }
+    if info.namespace.as_deref() != Some(namespace) || info.link != link {
+        return Err(format!(
+            "peer here is `{}/{}`, not `{namespace}/{link}`",
+            info.namespace.as_deref().unwrap_or(""),
+            info.link,
+        ));
+    }
+    Ok(())
+}
+
 /// Where to dial before mDNS: the `--peer` override alone when it is set,
-/// else both loopback families on the peer's port.
-fn direct_candidates(peer: &PeerSpec) -> Vec<SocketAddr> {
-    let Some(host) = &peer.host else {
+/// else both loopback families on the port.
+pub(crate) fn direct_candidates(host: Option<&str>, port: u16) -> Vec<SocketAddr> {
+    let Some(host) = host else {
         return vec![
-            SocketAddr::from((Ipv6Addr::LOCALHOST, peer.port)),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, peer.port)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         ];
     };
     if let Ok(addr) = host.parse::<SocketAddr>() {
         return vec![addr];
     }
-    match (host.as_str(), peer.port).to_socket_addrs() {
+    match (host, port).to_socket_addrs() {
         Ok(addrs) => addrs.collect(),
         Err(err) => {
             tracing::warn!(%host, %err, "peer host does not resolve");
@@ -600,8 +605,12 @@ fn direct_candidates(peer: &PeerSpec) -> Vec<SocketAddr> {
 
 /// One bounded mDNS round for the peer's link, on its own thread so a silent
 /// multicast link never holds the cycle. `None` means shutdown began.
-async fn browse(peer: &PeerSpec, context: &AsyncContext) -> Option<Vec<SocketAddr>> {
-    let (namespace, link) = (peer.namespace.clone(), peer.link.clone());
+pub(crate) async fn browse(
+    namespace: &str,
+    link: &str,
+    context: &AsyncContext,
+) -> Option<Vec<SocketAddr>> {
+    let (namespace, link) = (namespace.to_string(), link.to_string());
     let round = stellarator::struc_con::thread(move |_| {
         super::discovery::browse_peer(&namespace, &link, BROWSE_TIMEOUT)
     });
@@ -707,7 +716,7 @@ mod client_tests {
 
     use metor_fsw_2_core::{LogPort, MsgOut, NamedMsg, StatusPort, capacity_for};
     use metor_fsw_ring::{Config, RingBuffer, View};
-    use metor_proto::types::{IntoLenPacket, LenPacket};
+    use metor_proto::types::{IntoLenPacket, LenPacket, table_id};
     use metor_proto_wkt::{LINK_PROTOCOL_VERSION, LinkInfo, LogEvent, MsgMetadata};
     use stellarator::io::{AsyncWrite as _, SplitExt as _};
     use stellarator::net::TcpListener;
@@ -751,8 +760,13 @@ mod client_tests {
         n: u64,
     }
 
-    const TICK_ID: PacketId = [0, 0];
     const UNKNOWN_ID: PacketId = [9, 9];
+
+    /// The id the peer announces a table port under: the hash of its prefixed vtable.
+    fn tick_id(port: &PortDesc) -> PacketId {
+        let (vtable, _) = port.announce("a.counter").expect("a table port");
+        table_id(&vtable)
+    }
 
     /// A peer at `a.counter`, dialed through the `--peer` override so the
     /// test's ephemeral port is the only candidate.
@@ -781,9 +795,14 @@ mod client_tests {
 
     /// The server's announce for one table channel: the vtable under the
     /// peer's prefix, then one metadata packet per component.
-    fn table_announce(id: PacketId, port: &PortDesc) -> Vec<u8> {
+    fn table_announce(port: &PortDesc) -> Vec<u8> {
         let (vtable, metadata) = port.announce("a.counter").expect("a table port");
-        let mut blob = (&VTableMsg { id, vtable }).into_len_packet().inner;
+        let mut blob = (&VTableMsg {
+            id: table_id(&vtable),
+            vtable,
+        })
+            .into_len_packet()
+            .inner;
         for m in metadata {
             blob.extend_from_slice(&(&SetComponentMetadata(m)).into_len_packet().inner);
         }
@@ -977,9 +996,10 @@ mod client_tests {
         };
         let beat = postcard::to_allocvec(&Beat { n: 5 }).expect("encodes");
         let mut blob = identity(Some("a"), "peer", LINK_PROTOCOL_VERSION);
-        blob.extend_from_slice(&table_announce(TICK_ID, &PortDesc::of::<Tick>()));
+        let port = PortDesc::of::<Tick>();
+        blob.extend_from_slice(&table_announce(&port));
         blob.extend_from_slice(&msg_announce(Beat::ID, schema_of::<Beat>()));
-        blob.extend_from_slice(&table_packet(TICK_ID, tick.as_bytes()));
+        blob.extend_from_slice(&table_packet(tick_id(&port), tick.as_bytes()));
         blob.extend_from_slice(&msg_packet(Beat::ID, &beat));
         // A retained snapshot behind the replay, for an id no port takes.
         blob.extend_from_slice(&msg_packet(UNKNOWN_ID, b"manifest"));
@@ -1023,8 +1043,12 @@ mod client_tests {
     async fn a_renamed_field_refuses_the_port() {
         let (server, addr) = listener();
         let mut blob = identity(Some("a"), "peer", LINK_PROTOCOL_VERSION);
-        blob.extend_from_slice(&table_announce(TICK_ID, &PortDesc::of::<TickRenamed>()));
-        blob.extend_from_slice(&table_packet(TICK_ID, TickRenamed::default().as_bytes()));
+        let port = PortDesc::of::<TickRenamed>();
+        blob.extend_from_slice(&table_announce(&port));
+        blob.extend_from_slice(&table_packet(
+            tick_id(&port),
+            TickRenamed::default().as_bytes(),
+        ));
         let _peer = fake_peer(server, blob);
 
         let mut mirror = mirror(peer_at(addr), vec![PortDesc::of::<Tick>()]);
@@ -1112,8 +1136,9 @@ mod client_tests {
             count: 1.0,
         };
         let mut blob = identity(Some("a"), "peer", LINK_PROTOCOL_VERSION);
-        blob.extend_from_slice(&table_announce(TICK_ID, &PortDesc::of::<Tick>()));
-        blob.extend_from_slice(&table_packet(TICK_ID, tick.as_bytes()));
+        let port = PortDesc::of::<Tick>();
+        blob.extend_from_slice(&table_announce(&port));
+        blob.extend_from_slice(&table_packet(tick_id(&port), tick.as_bytes()));
         let _peer = fake_peer(right, blob);
 
         let mut peer = peer_at(addr);
@@ -1125,6 +1150,38 @@ mod client_tests {
         assert_eq!(mirror.probe.record(0).as_deref(), Some(tick.as_bytes()));
     }
 
+    /// A link answers for one namespace, one link name, and a protocol new
+    /// enough to carry an identity; anything else is a rejection with its
+    /// reason.
+    #[test]
+    fn identity_takes_one_namespace_link_and_version() {
+        let info = |version, namespace: Option<&str>, link: &str| LinkInfo {
+            protocol_version: version,
+            features: 0,
+            command_ids: Vec::new(),
+            namespace: namespace.map(str::to_string),
+            link: link.into(),
+        };
+        assert!(
+            check_identity(&info(LINK_PROTOCOL_VERSION, Some("a"), "peer"), "a", "peer").is_ok()
+        );
+
+        let old = check_identity(&info(1, Some("a"), "peer"), "a", "peer").unwrap_err();
+        assert!(old.contains("link protocol 1"), "{old}");
+
+        let wrong_ns = check_identity(&info(LINK_PROTOCOL_VERSION, Some("b"), "peer"), "a", "peer")
+            .unwrap_err();
+        assert!(wrong_ns.contains("`b/peer`"), "{wrong_ns}");
+
+        let wrong_link = check_identity(
+            &info(LINK_PROTOCOL_VERSION, Some("a"), "ground"),
+            "a",
+            "peer",
+        )
+        .unwrap_err();
+        assert!(wrong_link.contains("`a/ground`"), "{wrong_link}");
+    }
+
     /// The override is the whole list when it is set; without one both
     /// loopback families come first, in that order.
     #[test]
@@ -1132,20 +1189,20 @@ mod client_tests {
         let mut peer = peer_at(SocketAddr::from((Ipv4Addr::LOCALHOST, 2242)));
         peer.host = Some("10.0.0.5:2300".into());
         assert_eq!(
-            direct_candidates(&peer),
+            direct_candidates(peer.host.as_deref(), peer.port),
             vec![SocketAddr::from(([10, 0, 0, 5], 2300))]
         );
 
         peer.host = Some("10.0.0.5".into());
         assert_eq!(
-            direct_candidates(&peer),
+            direct_candidates(peer.host.as_deref(), peer.port),
             vec![SocketAddr::from(([10, 0, 0, 5], 2242))],
             "a bare host keeps the peer's own port"
         );
 
         peer.host = None;
         assert_eq!(
-            direct_candidates(&peer),
+            direct_candidates(peer.host.as_deref(), peer.port),
             vec![
                 SocketAddr::from((Ipv6Addr::LOCALHOST, 2242)),
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 2242)),
