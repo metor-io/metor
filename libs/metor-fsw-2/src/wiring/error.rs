@@ -263,6 +263,15 @@ pub enum LoadError {
     #[error("state `{name}` is declared more than once")]
     DuplicateState { name: String },
 
+    /// Two `TcpServer` states would advertise one mDNS instance name: an
+    /// unnamed server takes the target namespace (else the host name), so
+    /// all but one must set `name=`.
+    #[error(
+        "state `{state}` advertises the link name `{name}`, which another `TcpServer` \
+         state already advertises — give each server a distinct `name=`"
+    )]
+    DuplicateLinkName { state: String, name: String },
+
     /// A shared state's own init fn failed, such as a resource acquisition
     /// like a listener bind, or its params did not decode.
     #[error("state `{name}` (type `{ty}`) failed to construct: {message}")]

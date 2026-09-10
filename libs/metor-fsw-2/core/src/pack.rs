@@ -52,6 +52,9 @@ pub enum EntryParams<'a> {
         value: &'a serde_json::Value,
         src: &'a str,
         name: &'a str,
+        /// The target namespace, when the front-end set one; the same fact
+        /// [`BuildCtx::namespace`](crate::BuildCtx::namespace) carries.
+        namespace: Option<&'a str>,
         msgs: &'a crate::message::MsgTable,
         /// The shared state this system attaches to, resolved by name from
         /// the target's `SystemSpec::attach` during the states
@@ -244,6 +247,15 @@ impl PackEntry {
     }
 }
 
+/// What a shared state knows about itself at construction: the two facts a
+/// listener's advertised identity is made of.
+pub struct StateCtx<'a> {
+    /// The state's wiring declaration name (`TcpServer(name=)`'s `state`).
+    pub name: &'a str,
+    /// The target namespace, when the front-end set one.
+    pub namespace: Option<&'a str>,
+}
+
 /// The construction half of one pack-declared shared state: decode the
 /// state's own params off its wiring declaration and run the init fn.
 pub(crate) type StateCreateFn = Box<dyn for<'p> FnMut(EntryParams<'p>) -> Result<(), MakeError>>;
@@ -295,7 +307,7 @@ impl Pack {
         S: crate::SharedLifecycle,
         P: DeserializeOwned + postcard_schema::Schema + 'static,
         E: core::fmt::Display + 'static,
-        F: FnMut(P) -> Result<S, E> + 'static,
+        F: FnMut(StateCtx<'_>, P) -> Result<S, E> + 'static,
     {
         let token = crate::Shared::new(name);
         let cell = token.erased();
@@ -306,8 +318,20 @@ impl Pack {
         let create: StateCreateFn = {
             let token = token.clone();
             Box::new(move |params: EntryParams<'_>| {
+                let ctx = match &params {
+                    EntryParams::Value {
+                        name, namespace, ..
+                    } => StateCtx {
+                        name,
+                        namespace: *namespace,
+                    },
+                    EntryParams::Postcard(_) => StateCtx {
+                        name,
+                        namespace: None,
+                    },
+                };
                 let p: P = decode_params(params)?;
-                let state = init(p).map_err(|e| MakeError::StateInit {
+                let state = init(ctx, p).map_err(|e| MakeError::StateInit {
                     state: name,
                     detail: e.to_string(),
                 })?;

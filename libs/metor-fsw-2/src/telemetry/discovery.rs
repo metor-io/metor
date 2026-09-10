@@ -10,13 +10,23 @@
 use std::net::SocketAddr;
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use metor_proto_wkt::{FSW_SERVICE_TYPE, LINK_PROTOCOL_VERSION, TXT_PROTOCOL_VERSION, TXT_ROLE};
+use metor_proto_wkt::{
+    FSW_SERVICE_TYPE, LINK_PROTOCOL_VERSION, TXT_LINK, TXT_NAMESPACE, TXT_PROTOCOL_VERSION,
+    TXT_ROLE,
+};
 
 /// Advertise this link over mDNS under `name`, returning the running daemon;
 /// drop it (or [`ServiceDaemon::shutdown`]) to unregister and send a goodbye.
+/// `namespace` and `link` ride the TXT records as the machine identity a
+/// subscriber matches on; `name` is the human instance name.
 /// `None` when the bind is loopback or the daemon can't start; the link stays
 /// reachable by direct address either way.
-pub(crate) fn advertise(name: &str, addr: SocketAddr) -> Option<ServiceDaemon> {
+pub(crate) fn advertise(
+    name: &str,
+    addr: SocketAddr,
+    namespace: Option<&str>,
+    link: &str,
+) -> Option<ServiceDaemon> {
     let ip = addr.ip();
     if ip.is_loopback() {
         tracing::debug!(%addr, "link bound to loopback; skipping mDNS advertisement");
@@ -34,10 +44,14 @@ pub(crate) fn advertise(name: &str, addr: SocketAddr) -> Option<ServiceDaemon> {
     // second answerer for its name as a conflict and renames the machine.
     let host = format!("{name}.metor.local.");
     let protocol_version = LINK_PROTOCOL_VERSION.to_string();
-    let props: [(&str, &str); 2] = [
+    let mut props: Vec<(&str, &str)> = vec![
         (TXT_PROTOCOL_VERSION, protocol_version.as_str()),
         (TXT_ROLE, "fsw"),
+        (TXT_LINK, link),
     ];
+    if let Some(namespace) = namespace {
+        props.push((TXT_NAMESPACE, namespace));
+    }
     // A wildcard bind (0.0.0.0/::) has no single advertisable address, so let
     // the daemon enumerate the host's interfaces; a specific bind advertises
     // exactly that address.
@@ -56,7 +70,13 @@ pub(crate) fn advertise(name: &str, addr: SocketAddr) -> Option<ServiceDaemon> {
     };
     match daemon.register(info) {
         Ok(()) => {
-            tracing::info!(%name, port = addr.port(), "advertising fsw link over mDNS");
+            tracing::info!(
+                %name,
+                port = addr.port(),
+                namespace,
+                link,
+                "advertising fsw link over mDNS"
+            );
             Some(daemon)
         }
         Err(err) => {

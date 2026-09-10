@@ -223,9 +223,12 @@ impl Registry {
         r.register::<crate::AlarmSystem, _>("Alarms");
         r.register::<crate::PresetSystem, _>("Presets");
         let mut link_pack = crate::Pack::new();
-        link_pack.shared_state("TcpServer", |p: LinkParams| {
-            LinkState::bind(p.addr).map(|s| s.with_name(p.name))
-        });
+        link_pack.shared_state(
+            "TcpServer",
+            |ctx: metor_fsw_2_core::StateCtx<'_>, p: LinkParams| {
+                LinkState::bind(p.addr).map(|s| s.with_identity(ctx.name, ctx.namespace, p.name))
+            },
+        );
         // The resolver hands each `ctor` the `Shared<LinkState>` a target
         // named via `attach=`, and the ctor attaches it.
         let link_pack = link_pack
@@ -314,6 +317,7 @@ impl Registry {
                     value,
                     src: "",
                     name: ctx.name,
+                    namespace: ctx.namespace,
                     msgs: ctx.msgs,
                     attach: ctx.attach,
                 };

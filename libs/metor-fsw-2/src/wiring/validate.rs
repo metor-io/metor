@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use super::LoadError;
 use super::model::IR_VERSION;
 use super::model::{
-    ArtifactKind, Deployment, ParamSource, SlotSpec, StateSpec, SystemSpec, Wiring,
+    ArtifactKind, Deployment, ParamSource, SlotSpec, StateSpec, SystemSpec, TCP_SERVER_TYPE, Wiring,
 };
 use super::resolve::slot_config_error;
 use crate::coordinator::validate_slot_spec;
@@ -86,6 +86,7 @@ pub(crate) fn validate(wiring: &Wiring) -> Result<(), LoadError> {
     check_instance_names(wiring)?;
     check_artifact_ids(wiring)?;
     check_state_names(wiring)?;
+    check_link_names(wiring)?;
     for state in &wiring.states {
         check_state(state)?;
     }
@@ -242,6 +243,35 @@ fn check_state_names(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Every `TcpServer` advertises a distinct mDNS instance name. An unnamed
+/// server takes the target namespace, else the host name, so a second unnamed
+/// server on one target collides exactly as two alike `name=` would.
+fn check_link_names(wiring: &Wiring) -> Result<(), LoadError> {
+    let default = wiring
+        .coordinator
+        .namespace
+        .as_deref()
+        .unwrap_or("<host name>");
+    let mut names = HashSet::new();
+    for state in &wiring.states {
+        if state.ty != TCP_SERVER_TYPE {
+            continue;
+        }
+        let name = match &state.params {
+            ParamSource::Value(value) => value.get("name").and_then(|n| n.as_str()),
+            _ => None,
+        }
+        .unwrap_or(default);
+        if !names.insert(name) {
+            return Err(LoadError::DuplicateLinkName {
+                state: state.name.clone(),
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// One state spec's structural rules: states construct on the static value
 /// path only, so typed postcard params cannot reach one.
 fn check_state(state: &StateSpec) -> Result<(), LoadError> {
@@ -353,6 +383,34 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// A target with two `TcpServer` states, advertising `names`.
+    fn two_servers(namespace: Option<&str>, names: [Option<&str>; 2]) -> Wiring {
+        let mut w = WiringBuilder::new().build();
+        w.coordinator.namespace = namespace.map(str::to_string);
+        w.states = ["a", "b"]
+            .iter()
+            .zip(names)
+            .map(|(state, name)| {
+                StateSpec::tcp_server_named(state, "0.0.0.0:0".parse().unwrap(), name)
+            })
+            .collect();
+        w
+    }
+
+    #[test]
+    fn servers_advertise_distinct_names() {
+        assert!(check_link_names(&two_servers(Some("sat"), [None, Some("b")])).is_ok());
+
+        assert!(matches!(
+            check_link_names(&two_servers(Some("sat"), [None, None])).unwrap_err(),
+            LoadError::DuplicateLinkName { state, name } if state == "b" && name == "sat"
+        ));
+        assert!(matches!(
+            check_link_names(&two_servers(None, [Some("one"), Some("one")])).unwrap_err(),
+            LoadError::DuplicateLinkName { state, name } if state == "b" && name == "one"
+        ));
     }
 
     #[test]

@@ -19,8 +19,8 @@ pub use link::{LinkParams, LinkState, LinkStats};
 
 use metor_fsw_2_core::log::LogLevel;
 use metor_fsw_2_core::{
-    AllOutputs, BuildSystem, CyclicSystem, Delivery, Out, RegistryEntry, Shared, System,
-    split_record,
+    AllOutputs, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Delivery, Out, RegistryEntry,
+    Shared, System, split_record,
 };
 use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{PACKET_HEADER_LEN, PacketId, PacketTy, Timestamp};
@@ -68,7 +68,8 @@ impl TelemetryMode {
 /// ```
 #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema, Debug, Clone, Default)]
 pub struct DownlinkParams {
-    /// Instance names to tap; `None` (with `frames` also `None`) taps everything.
+    /// Bare instance names to tap; the target namespace is applied for you.
+    /// `None` (with `frames` also `None`) taps everything.
     #[serde(default)]
     pub instances: Option<Vec<String>>,
     /// Frame/channel names to tap.
@@ -97,6 +98,20 @@ impl BuildSystem for TelemetrySystem {
             retain_scratch: Vec::new(),
             status: LinkStatus::default(),
         }
+    }
+
+    /// Prefix each authored instance name with the target namespace so the
+    /// subset filter matches [`RegistryEntry::instance`], which the
+    /// coordinator qualifies. `frames` is left alone: it matches
+    /// [`RegistryEntry::name`], which is never qualified.
+    fn configure(&mut self, ctx: &BuildCtx) -> Result<(), ConfigureError> {
+        if let (Some(ns), TelemetryMode::Subset { instances, .. }) = (ctx.namespace, &mut self.mode)
+        {
+            for instance in instances {
+                *instance = format!("{ns}.{instance}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -450,5 +465,50 @@ impl CyclicSystem for TelemetrySystem {
             link.broadcast_buffer(batch);
         }
         link.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metor_fsw_2_core::{MsgTable, PortDesc, RegistryEntry};
+    use metor_fsw_ring::{Config, RingBuffer};
+    use metor_proto::types::ComponentId;
+
+    fn entry(instance: &str, name: &str) -> RegistryEntry {
+        let desc = PortDesc::msg_dynamic(name, PacketId::from([0, 7]));
+        RegistryEntry::new(
+            ComponentId::new(&format!("{instance}.{name}")),
+            instance.into(),
+            desc,
+            RingBuffer::create_in_memory(Config {
+                capacity: 1024,
+                max_readers: 4,
+            }),
+        )
+    }
+
+    fn downlink(namespace: Option<&str>) -> TelemetrySystem {
+        let mut sys = TelemetrySystem::new(DownlinkParams {
+            instances: Some(vec!["nav".into()]),
+            frames: None,
+        });
+        sys.configure(&BuildCtx {
+            msgs: &MsgTable::default(),
+            namespace,
+        })
+        .unwrap();
+        sys
+    }
+
+    #[test]
+    fn subset_matches_qualified_instances() {
+        let sys = downlink(Some("sat"));
+        assert!(sys.mode.matches(&entry("sat.nav", "gyro_b")));
+        assert!(!sys.mode.matches(&entry("nav", "gyro_b")));
+
+        let sys = downlink(None);
+        assert!(sys.mode.matches(&entry("nav", "gyro_b")));
+        assert!(!sys.mode.matches(&entry("sat.nav", "gyro_b")));
     }
 }

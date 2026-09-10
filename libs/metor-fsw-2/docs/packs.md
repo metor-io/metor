@@ -105,12 +105,13 @@ and the resolver rejects it as a slot occupant.
 ## Pack-shared state
 
 `Pack::shared_state` declares state that several entries in one static pack can
-use. A target state declaration supplies its params.
+use. A target state declaration supplies its params. The constructor also gets a
+`StateCtx`: the declaration name and the target namespace.
 
 ```rust
 pub fn pack() -> Pack {
     let mut pack = Pack::new();
-    pack.shared_state("Bus", open_bus);
+    pack.shared_state("Bus", |_ctx, params| open_bus(params));
 
     pack
         .system_type_shared::<Reader, Bus>("Reader", |p, bus| Reader::new(p).attach(bus))

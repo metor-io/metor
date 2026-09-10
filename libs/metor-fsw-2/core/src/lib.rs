@@ -121,7 +121,7 @@ pub use handler::{
 };
 pub use pack::{
     AttachTarget, Created, Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending,
-    StepStatus,
+    StateCtx, StepStatus,
 };
 pub use registry::{AllOutputs, Registry, RegistryEntry};
 #[doc(hidden)]

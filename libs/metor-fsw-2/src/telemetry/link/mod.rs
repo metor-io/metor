@@ -205,9 +205,14 @@ pub struct LinkState {
     /// Bound at construction, taken by `start`.
     listener: Option<TcpListener>,
     local_addr: std::net::SocketAddr,
-    /// The configured node name; `None` resolves to the hostname in
-    /// [`node_name`](Self::node_name).
+    /// The configured node name; `None` resolves to the namespace, else the
+    /// hostname, when the advertisement is made.
     name: Option<String>,
+    /// This server's state declaration name, the `link` half of the identity
+    /// a subscriber matches on.
+    link: String,
+    /// The target namespace, when the front-end set one.
+    namespace: Option<String>,
     /// Configuration is mutated only through the cyclic systems' whole-state
     /// `&mut` grants, before it is encoded and sent to the server task.
     uplink_msgs: Vec<PacketId>,
@@ -240,6 +245,8 @@ impl LinkState {
             listener: Some(listener),
             local_addr,
             name: None,
+            link: String::new(),
+            namespace: None,
             uplink_msgs: Vec::new(),
             announces_set: false,
             pending_announces: None,
@@ -256,10 +263,18 @@ impl LinkState {
         })
     }
 
-    /// Set the configured node name (from [`LinkParams::name`]). A builder
-    /// step off [`bind`](Self::bind) so the registry factory threads it in
-    /// without changing `bind`'s signature.
-    pub fn with_name(mut self, name: Option<String>) -> Self {
+    /// Set this server's identity: its state declaration name, the target
+    /// namespace, and the configured node name (from [`LinkParams::name`]).
+    /// A builder step off [`bind`](Self::bind) so the registry factory
+    /// threads them in without changing `bind`'s signature.
+    pub fn with_identity(
+        mut self,
+        link: &str,
+        namespace: Option<&str>,
+        name: Option<String>,
+    ) -> Self {
+        self.link = link.to_string();
+        self.namespace = namespace.map(str::to_string);
         self.name = name;
         self
     }
@@ -301,6 +316,8 @@ impl LinkState {
             protocol_version: LINK_PROTOCOL_VERSION,
             features: 0,
             command_ids: self.uplink_msgs.clone(),
+            namespace: self.namespace.clone(),
+            link: self.link.clone(),
         };
         let mut blob = (&info).into_len_packet().inner;
         for a in announces {
@@ -443,8 +460,14 @@ impl crate::SharedLifecycle for LinkState {
         let name = self
             .name
             .clone()
+            .or_else(|| self.namespace.clone())
             .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
-        self.advertiser = super::discovery::advertise(&name, self.local_addr);
+        self.advertiser = super::discovery::advertise(
+            &name,
+            self.local_addr,
+            self.namespace.as_deref(),
+            &self.link,
+        );
         let listener = self.listener.take().expect("start runs once");
         let commands = self.control_rx.take().expect("start runs once");
         let inbound = self.inbound_tx.take().expect("start runs once");

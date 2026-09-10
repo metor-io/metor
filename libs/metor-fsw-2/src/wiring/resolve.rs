@@ -136,7 +136,7 @@ pub fn resolve_with(
     // States pass
     let mut state_tokens: HashMap<&str, metor_fsw_2_core::AttachTarget> = HashMap::new();
     for spec in &wiring.states {
-        let target = resolve_state(spec, registry)?;
+        let target = resolve_state(spec, registry, graph.namespace.as_deref())?;
         state_tokens.insert(spec.name.as_str(), target);
     }
 
@@ -283,6 +283,7 @@ pub fn resolve_with(
 fn resolve_state(
     spec: &StateSpec,
     registry: &Registry,
+    namespace: Option<&str>,
 ) -> Result<metor_fsw_2_core::AttachTarget, LoadError> {
     let Some(entry) = registry.states.get(spec.ty.as_str()) else {
         let mut available: Vec<&str> = registry.states.keys().copied().collect();
@@ -307,6 +308,7 @@ fn resolve_state(
         value,
         src: "",
         name: &spec.name,
+        namespace,
         msgs: &registry.msgs,
         attach: None,
     };

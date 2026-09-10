@@ -338,7 +338,7 @@ async fn shared_state_entries_share_one_instance() {
     let mut pack = Pack::new();
     let tally = pack.shared_state("Tally", {
         let report = report.clone();
-        move |(): ()| {
+        move |_, (): ()| {
             Ok::<_, std::convert::Infallible>(Tally {
                 report: Some(report.clone()),
                 ..Tally::default()
@@ -377,7 +377,7 @@ async fn shared_state_entries_share_one_instance() {
 #[test]
 fn shared_entry_requires_constructed_state() {
     let mut pack = Pack::new();
-    let tally = pack.shared_state("Tally", |(): ()| {
+    let tally = pack.shared_state("Tally", |_, (): ()| {
         Ok::<_, std::convert::Infallible>(Tally::default())
     });
     let mut pack = pack.system("bump", system(bump).shared(&tally));
@@ -393,7 +393,7 @@ fn shared_entry_requires_constructed_state() {
 #[test]
 fn shared_entry_instantiates_once() {
     let mut pack = Pack::new();
-    let tally = pack.shared_state("Tally", |(): ()| {
+    let tally = pack.shared_state("Tally", |_, (): ()| {
         Ok::<_, std::convert::Infallible>(Tally::default())
     });
     let mut pack = pack.system("bump", system(bump).shared(&tally));
@@ -415,7 +415,7 @@ fn shared_entry_instantiates_once() {
 fn shared_state_init_failure_reports() {
     let mut pack = Pack::new();
     let _tally: crate::Shared<Tally> =
-        pack.shared_state("Tally", |(): ()| Err("address in use".to_string()));
+        pack.shared_state("Tally", |_, (): ()| Err("address in use".to_string()));
     let err = pack
         .state_entry_mut("Tally")
         .unwrap()
@@ -425,6 +425,40 @@ fn shared_state_init_failure_reports() {
         err,
         MakeError::StateInit { state: "Tally", ref detail } if detail == "address in use"
     ));
+}
+
+/// A shared state is constructed knowing its own declaration name and the
+/// target namespace, the two facts a link's advertised identity is made of.
+#[test]
+fn shared_state_sees_its_declaration_name_and_namespace() {
+    use metor_fsw_2_core::MsgTable;
+    use std::cell::Cell;
+
+    let constructed = Rc::new(Cell::new(false));
+    let mut pack = Pack::new();
+    let _tally: crate::Shared<Tally> = pack.shared_state("Tally", {
+        let constructed = constructed.clone();
+        move |ctx: metor_fsw_2_core::StateCtx<'_>, (): ()| {
+            assert_eq!(ctx.name, "link");
+            assert_eq!(ctx.namespace, Some("sat"));
+            constructed.set(true);
+            Ok::<_, std::convert::Infallible>(Tally::default())
+        }
+    });
+    let value = serde_json::Value::Object(serde_json::Map::new());
+    let msgs = MsgTable::default();
+    pack.state_entry_mut("Tally")
+        .unwrap()
+        .create(EntryParams::Value {
+            value: &value,
+            src: "",
+            name: "link",
+            namespace: Some("sat"),
+            msgs: &msgs,
+            attach: None,
+        })
+        .expect("construct");
+    assert!(constructed.get(), "the state's init fn ran");
 }
 
 /// The host publishes a `system_status` record for every slot it steps, and
@@ -707,6 +741,7 @@ fn system_type_shared_registers_instance_descriptor() {
             value,
             src: "Mint",
             name: "mint",
+            namespace: None,
             msgs,
             attach: Some(attach),
         }
@@ -714,7 +749,7 @@ fn system_type_shared_registers_instance_descriptor() {
 
     fn mint_pack() -> (Pack, AttachTarget) {
         let mut pack = Pack::new();
-        let tally = pack.shared_state("Tally", |(): ()| {
+        let tally = pack.shared_state("Tally", |_, (): ()| {
             Ok::<_, std::convert::Infallible>(Tally::default())
         });
         let attach = AttachTarget {

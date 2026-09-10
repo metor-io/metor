@@ -210,8 +210,9 @@ Lines are postcard messages, so a long line is never truncated. A line the ring 
 ```rust
 pub fn pack() -> Pack {
     let mut pack = Pack::new();
-    let link = pack.shared_state("TcpServer", |params: LinkParams| {
-        LinkState::bind(params.addr).map(|state| state.with_name(params.name))
+    let link = pack.shared_state("TcpServer", |ctx, params: LinkParams| {
+        LinkState::bind(params.addr)
+            .map(|state| state.with_identity(ctx.name, ctx.namespace, params.name))
     });
 
     pack.system("downlink", system(send).shared(&link))

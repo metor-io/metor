@@ -50,6 +50,8 @@ downlink = m.add(
 
 The two lists use OR rules. An entry matches if either list contains its name. The `frames` list also matches message channel names.
 
+Write bare instance names. A target namespace is applied to them for you, so `instances=["nav"]` on a namespaced target matches `sat.nav`.
+
 The uplink creates one message output for each name in `msgs`. A route must connect that output to each user:
 
 ```python
@@ -154,9 +156,9 @@ The current server advertises non-loopback binds with mDNS and DNS-SD. It uses t
 _metor-fsw._tcp.local.
 ```
 
-The service instance uses `TcpServer.name`. If the config omits the name, it uses the OS host name.
+The service instance uses `TcpServer.name`. If the config omits the name, it uses the target namespace, and the OS host name when the target has none. A target with several `TcpServer` states must give all but one a `name`, checked when the wiring loads: two servers cannot advertise one instance name.
 
-The TXT record includes the link protocol version as `pv` and the role `fsw`. A wildcard bind lets the mDNS service list the host network addresses. A fixed non-loopback bind advertises that address.
+The TXT record includes the link protocol version as `pv`, the role `fsw`, the serving state's declaration name as `link`, and the target namespace as `ns` when it has one. `ns` and `link` are the machine identity a subscriber matches on; the instance name is for people. A wildcard bind lets the mDNS service list the host network addresses. A fixed non-loopback bind advertises that address.
 
 The server does not advertise a loopback bind. Local development with `127.0.0.1` still needs a direct address.
 

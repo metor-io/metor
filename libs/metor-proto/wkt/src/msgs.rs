@@ -1101,7 +1101,7 @@ impl Msg for NodeAck {
 
 /// Version of the fsw link identity protocol ([`LinkInfo`]), independent
 /// of [`NODE_PROTOCOL_VERSION`].
-pub const LINK_PROTOCOL_VERSION: u32 = 1;
+pub const LINK_PROTOCOL_VERSION: u32 = 2;
 
 /// Identity push from an fsw link server: the FIRST packet on every
 /// accepted connection, ahead of the schema announce replay. A metor-db
@@ -1118,6 +1118,14 @@ pub struct LinkInfo {
     /// should forward up the link. The uplink's minted ports are
     /// untelemetered, so forwarding these can never echo back down.
     pub command_ids: Vec<PacketId>,
+    /// The serving target's telemetry namespace, when it has one: the bare
+    /// dotted prefix its components carry. Added in protocol version 2.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// The serving `TcpServer` state's declaration name, so a subscriber can
+    /// tell one of a target's links from another. Added in version 2.
+    #[serde(default)]
+    pub link: String,
 }
 
 impl Msg for LinkInfo {
@@ -1136,6 +1144,10 @@ pub const TXT_PROTOCOL_VERSION: &str = "pv";
 /// TXT-record key for the fsw's telemetry namespace, when it has one — the
 /// same bare dotted prefix its components carry.
 pub const TXT_NAMESPACE: &str = "ns";
+
+/// TXT-record key for the serving link's declaration name, the second half
+/// of the machine identity a subscriber matches on (`ns` is the first).
+pub const TXT_LINK: &str = "link";
 
 /// TXT-record key naming the advertised role, always `"fsw"` for a link
 /// server; reserved so one service type can grow sibling roles later.
@@ -1610,9 +1622,40 @@ mod link_info_tests {
             protocol_version: LINK_PROTOCOL_VERSION,
             features: 0,
             command_ids: vec![SequenceCommand::ID, AlarmAck::ID],
+            namespace: Some("sat".into()),
+            link: "ground".into(),
         };
         let bytes = postcard::to_allocvec(&info).expect("encode");
         let back: LinkInfo = postcard::from_bytes(&bytes).expect("decode");
         assert_eq!(back, info);
+    }
+
+    /// A v1 reader decodes a v2 identity: postcard stops at the fields it
+    /// knows and ignores the trailing bytes.
+    #[test]
+    fn link_info_v2_decodes_under_v1() {
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
+        struct LinkInfoV1 {
+            protocol_version: u32,
+            features: u64,
+            command_ids: Vec<PacketId>,
+        }
+        let info = LinkInfo {
+            protocol_version: LINK_PROTOCOL_VERSION,
+            features: 0,
+            command_ids: vec![SequenceCommand::ID],
+            namespace: Some("sat".into()),
+            link: "ground".into(),
+        };
+        let bytes = postcard::to_allocvec(&info).expect("encode");
+        let v1: LinkInfoV1 = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(
+            v1,
+            LinkInfoV1 {
+                protocol_version: 2,
+                features: 0,
+                command_ids: vec![SequenceCommand::ID],
+            }
+        );
     }
 }
