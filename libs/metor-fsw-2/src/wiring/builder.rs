@@ -270,6 +270,48 @@ impl WiringBuilder {
         )
     }
 
+    /// Adds an `Ingest` under `name`, streaming one member's ground link
+    /// into the `Db` state `db`.
+    pub fn ingest(mut self, name: &str, db: &str, params: crate::IngestParams) -> Self {
+        self.push_system(SystemSpec {
+            name: name.to_string(),
+            ty: Some(crate::ir::INGEST_TYPE.to_string()),
+            artifact: None,
+            params: ParamSource::Value(
+                serde_json::to_value(&params).expect("ingest params serialize"),
+            ),
+            process: false,
+            src: None,
+            scope: None,
+            attach: Some(db.to_string()),
+            layout: None,
+            status: None,
+            encompassing: false,
+            peer: None,
+        });
+        self
+    }
+
+    /// Adds a `Record` under `name`, storing this target's own telemetry in
+    /// the `Db` state `db`.
+    pub fn record(mut self, name: &str, db: &str) -> Self {
+        self.push_system(SystemSpec {
+            name: name.to_string(),
+            ty: Some(crate::ir::RECORD_TYPE.to_string()),
+            artifact: None,
+            params: ParamSource::None,
+            process: false,
+            src: None,
+            scope: None,
+            attach: Some(db.to_string()),
+            layout: None,
+            status: None,
+            encompassing: false,
+            peer: None,
+        });
+        self
+    }
+
     /// Serves the telemetry link: declares the built-in `TcpServer` state
     /// under the name `"link"` listening on `addr`, plus an all-taps
     /// downlink under the instance name `"telemetry"`. For a subset tap,

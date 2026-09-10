@@ -210,7 +210,8 @@ pub(super) fn print_preflight(wiring: &Wiring, target: &Path) {
 }
 
 /// The dimmed line under one system: where it comes from, then what it is —
-/// a worker process, a mirror of a peer member's instance.
+/// a worker process, a mirror of a peer member's instance, a gateway's
+/// ingest of one.
 fn system_detail(wiring: &Wiring, sys: &crate::ir::SystemSpec) -> String {
     let mut detail = source_of(wiring, sys.artifact.as_deref());
     if sys.process {
@@ -218,6 +219,15 @@ fn system_detail(wiring: &Wiring, sys: &crate::ir::SystemSpec) -> String {
     }
     if let Some(peer) = &sys.peer {
         detail.push_str(&format!(" · mirror of {}/{}", peer.namespace, peer.link));
+    }
+    if sys.ty.as_deref() == Some(crate::ir::INGEST_TYPE)
+        && let crate::ir::ParamSource::Value(v) = &sys.params
+        && let (Some(namespace), Some(link)) = (
+            v.get("namespace").and_then(|n| n.as_str()),
+            v.get("link").and_then(|l| l.as_str()),
+        )
+    {
+        detail.push_str(&format!(" · ingests {namespace}/{link}"));
     }
     detail
 }
@@ -275,6 +285,31 @@ mod tests {
         assert_eq!(
             system_detail(&wiring, &wiring.systems[0]),
             "builtin · mirror of plant/peer"
+        );
+        assert_eq!(system_detail(&wiring, &wiring.systems[1]), "builtin");
+    }
+
+    /// A gateway's ingest names the member link it streams.
+    #[test]
+    fn detail_names_the_ingested_source() {
+        let wiring = WiringBuilder::new()
+            .db("db", "127.0.0.1:0".parse().unwrap())
+            .ingest(
+                "a",
+                "db",
+                crate::IngestParams {
+                    namespace: "a".into(),
+                    link: "link".into(),
+                    port: 2256,
+                    commands: Vec::new(),
+                    host: None,
+                },
+            )
+            .record("record", "db")
+            .build();
+        assert_eq!(
+            system_detail(&wiring, &wiring.systems[0]),
+            "builtin · ingests a/link"
         );
         assert_eq!(system_detail(&wiring, &wiring.systems[1]), "builtin");
     }

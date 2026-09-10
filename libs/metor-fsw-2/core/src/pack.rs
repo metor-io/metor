@@ -365,11 +365,49 @@ impl Pack {
     /// state of any other type is an `AttachTypeMismatch`. The driver is
     /// wrapped so the state's [`SharedLifecycle`](crate::SharedLifecycle) hooks
     /// run once across all attached entries. Attached entries are cyclic-only,
-    /// instantiable once per state instance, and never slot occupants.
+    /// instantiable once per state instance, and never slot occupants. Use
+    /// [`system_type_shared_many`](Self::system_type_shared_many) where the
+    /// state serves several instances.
     pub fn system_type_shared<T, St>(
+        self,
+        name: &'static str,
+        ctor: impl FnMut(T::Params, crate::Shared<St>) -> T + 'static,
+    ) -> Self
+    where
+        St: crate::SharedLifecycle,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
+        T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
+        T::Input: crate::BindPorts + 'static,
+        T::Output: crate::LogOutput + crate::BindPorts + 'static,
+    {
+        self.shared_entry(name, ctor, true)
+    }
+
+    /// [`system_type_shared`](Self::system_type_shared) for a state that
+    /// serves several attached instances: a gateway's `Db` runs one `Ingest`
+    /// per source member, where a link server runs one `Downlink`.
+    pub fn system_type_shared_many<T, St>(
+        self,
+        name: &'static str,
+        ctor: impl FnMut(T::Params, crate::Shared<St>) -> T + 'static,
+    ) -> Self
+    where
+        St: crate::SharedLifecycle,
+        T: crate::CyclicSystem + crate::BuildSystem + 'static,
+        T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
+        T::Input: crate::BindPorts + 'static,
+        T::Output: crate::LogOutput + crate::BindPorts + 'static,
+    {
+        self.shared_entry(name, ctor, false)
+    }
+
+    /// The shared-entry registration both forms share; `unique` is whether
+    /// one state instance may hold only one of these systems.
+    fn shared_entry<T, St>(
         mut self,
         name: &'static str,
         mut ctor: impl FnMut(T::Params, crate::Shared<St>) -> T + 'static,
+        unique: bool,
     ) -> Self
     where
         St: crate::SharedLifecycle,
@@ -381,7 +419,7 @@ impl Pack {
         let mut descriptor = <T as crate::CyclicSystem>::descriptor();
         descriptor.name = name.into();
         let static_desc = descriptor.clone();
-        // One instance of this entry per state instance: a target with two
+        // A unique entry is built once per state instance: a target with two
         // link servers runs a downlink on each, and neither may be built
         // twice over one server.
         let mut taken: Vec<*const ()> = Vec::new();
@@ -416,7 +454,7 @@ impl Pack {
                     return Err(MakeError::StateNotConstructed { state: cell.name() });
                 }
                 let id = std::rc::Rc::as_ptr(&cell) as *const ();
-                if taken.contains(&id) {
+                if unique && taken.contains(&id) {
                     return Err(MakeError::SharedEntryReinstantiated);
                 }
                 let p: T::Params = decode_params(params)?;

@@ -29,19 +29,24 @@ use crate::{ConnState, DB, Error, PacketTx};
 /// packet handler — the same shapes a directly-attached producer sends —
 /// and forward `command_ids`' msg logs up the link from their live edge
 /// (nothing queued before this call is replayed).
+///
+/// `on_packet` is called once per ingested packet with whether the db took
+/// it, so a caller keeping a gauge counts what crossed without parsing the
+/// stream twice; a caller with no gauge passes `|_| {}`.
 pub async fn fsw_stream(
     command_ids: Vec<PacketId>,
     rx: PacketStream<OwnedReader<TcpStream>>,
     tx: PacketSink<OwnedWriter<TcpStream>>,
     buf: Vec<u8>,
     db: &Arc<DB>,
+    on_packet: impl FnMut(bool),
 ) -> Error {
     // The sink is shared the way the mirror already shares it (`PacketTx`
     // holds it behind this same lock); the ingest arms never reply to an
     // fsw stream, so the forwarder's sends are uncontended in practice.
     let tx = Arc::new(Mutex::new(tx));
     futures_lite::future::race(
-        ingest(rx, buf, tx.clone(), db),
+        ingest(rx, buf, tx.clone(), db, on_packet),
         super::forward(command_ids, tx, db),
     )
     .await
@@ -54,6 +59,7 @@ async fn ingest(
     mut buf: Vec<u8>,
     tx: Arc<Mutex<PacketSink<OwnedWriter<TcpStream>>>>,
     db: &Arc<DB>,
+    mut on_packet: impl FnMut(bool),
 ) -> Error {
     let mut conn = ConnState::default();
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024);
@@ -67,8 +73,12 @@ async fn ingest(
             tx: tx.clone(),
             pkt: Some(resp_pkt),
         };
-        if let Err(err) = crate::handle_packet(&pkt, db, &mut pkt_tx, &mut conn).await {
-            warn!(?err, "failed to ingest fsw link packet");
+        match crate::handle_packet(&pkt, db, &mut pkt_tx, &mut conn).await {
+            Ok(()) => on_packet(true),
+            Err(err) => {
+                warn!(?err, "failed to ingest fsw link packet");
+                on_packet(false);
+            }
         }
         resp_pkt = pkt_tx.pkt.expect("len pkt taken and not given back");
         buf = pkt.into_buf().into_inner();
@@ -186,7 +196,7 @@ mod tests {
         };
         let stream_db = db.clone();
         let _link = stellarator::spawn(async move {
-            let err = fsw_stream(info.command_ids, rx, tx, buf, &stream_db).await;
+            let err = fsw_stream(info.command_ids, rx, tx, buf, &stream_db, |_| {}).await;
             tracing::info!(?err, "link ended");
         })
         .drop_guard();
@@ -242,7 +252,7 @@ mod tests {
         };
         let stream_db = db.clone();
         let _link = stellarator::spawn(async move {
-            fsw_stream(vec![CMD_A], rx, tx, buf, &stream_db).await;
+            fsw_stream(vec![CMD_A], rx, tx, buf, &stream_db, |_| {}).await;
         })
         .drop_guard();
 

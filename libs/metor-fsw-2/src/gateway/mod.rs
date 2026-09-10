@@ -24,6 +24,7 @@ use std::time::Duration;
 use metor_db::store::LocalDirStore;
 use metor_db::tiering::TieringConfig;
 use metor_db::{DB, Server};
+use metor_proto::types::PacketId;
 use stellarator::JoinHandleDropGuard;
 use stellarator::net::TcpListener;
 
@@ -67,6 +68,9 @@ pub struct DbState {
     /// The target namespace, when the front-end set one.
     namespace: Option<String>,
     tiering: Option<(PathBuf, TieringConfig)>,
+    /// The union of the attached ingests' forwarded command ids, gathered in
+    /// their `configure` and advertised from `start`.
+    commands: Vec<PacketId>,
     accept_guard: Option<JoinHandleDropGuard<()>>,
     /// The mDNS advertisement, live between `start` and `shutdown`. `None`
     /// for a loopback bind or a daemon that couldn't start.
@@ -102,6 +106,7 @@ impl DbState {
                 };
                 (store, config)
             }),
+            commands: Vec::new(),
             accept_guard: None,
             advertiser: None,
         })
@@ -127,6 +132,18 @@ impl DbState {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
+
+    /// Union `ids` into what `GetDbInfo` advertises. Attached ingests call
+    /// this from `configure`, which runs before `start` serves the first
+    /// probe, so a ground client never sees a partial command set.
+    pub(crate) fn add_commands(&mut self, ids: &[PacketId]) {
+        for id in ids {
+            if !self.commands.contains(id) {
+                self.commands.push(*id);
+            }
+        }
+        self.db.add_command_ids(ids);
+    }
 }
 
 /// A fresh directory under the OS temp dir, the `serve_tmp_db` shape with
@@ -140,7 +157,8 @@ impl crate::SharedLifecycle for DbState {
     /// coordinator's loop task before the first attached system's init, so
     /// the identity a probe reads is set before anything can be accepted.
     fn start(&mut self) {
-        self.db.set_identity(self.namespace.clone(), Vec::new());
+        self.db
+            .set_identity(self.namespace.clone(), self.commands.clone());
         let name = self
             .name
             .clone()
@@ -180,6 +198,12 @@ impl crate::SharedLifecycle for DbState {
         self.accept_guard = None;
     }
 }
+
+mod ingest;
+mod record;
+
+pub use ingest::{IngestOut, IngestParams, IngestSystem, SourceStatus};
+pub use record::{RecordPorts, RecordSystem};
 
 #[cfg(test)]
 mod tests;

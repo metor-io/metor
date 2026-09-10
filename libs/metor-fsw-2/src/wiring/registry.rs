@@ -218,7 +218,8 @@ impl Registry {
     /// A registry pre-loaded with the built-in systems under their `type=`
     /// names: the alarm engine (`"Alarms"`) and the link pack, one shared
     /// `"TcpServer"` state serving the `"Downlink"` and `"Uplink"` systems
-    /// attached to it, the gateway pack's `"Db"` state, plus the well-known
+    /// attached to it, the gateway pack's `"Db"` state with the `"Ingest"`
+    /// and `"Record"` systems attached to it, plus the well-known
     /// message set in the message table so a target's `msgs` list can name
     /// any of them out of the box. An app-built registry starts here and
     /// adds its own systems.
@@ -257,6 +258,13 @@ impl Registry {
                 crate::DbState::open(p, ctx.namespace).map(|s| s.with_identity(ctx.name, name))
             },
         );
+        let gateway_pack = gateway_pack
+            .system_type_shared_many::<crate::IngestSystem, crate::DbState>("Ingest", |p, db| {
+                crate::IngestSystem::new(p).attach(db)
+            })
+            .system_type_shared::<crate::RecordSystem, crate::DbState>("Record", |(), db| {
+                crate::RecordSystem::new().attach(db)
+            });
         r.register_pack(gateway_pack);
         r.register_msg::<SequenceCommand>()
             .register_msg::<SequenceRegistry>()

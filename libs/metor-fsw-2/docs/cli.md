@@ -144,7 +144,9 @@ by mDNS, so a local run and a LAN run need no address. On a routed network,
 member; the port defaults to the one the target published on. Like `--serve`
 it is one member's view of the world and needs `--target` when there are
 several. The launcher never passes it; a deploy renderer emits it per member
-from the deployment's `hosts` table.
+from the deployment's `hosts` table. It applies to a gateway's ingests the
+same way: `--peer plant=10.0.0.5` on the gateway member names where its
+`Ingest` of `plant` dials. A gateway packages and runs like any member.
 
 `build` with no `--target` provides every member in file order and prints
 one block per namespace. `package` writes one member per bundle; the bundle

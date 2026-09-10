@@ -14,10 +14,11 @@ use std::collections::HashSet;
 use super::LoadError;
 use super::model::IR_VERSION;
 use super::model::{
-    ArtifactKind, DOWNLINK_TYPE, Deployment, ParamSource, SlotSpec, StateSpec, SystemSpec,
-    TCP_SERVER_TYPE, Wiring,
+    ArtifactKind, DOWNLINK_TYPE, Deployment, INGEST_TYPE, ParamSource, RECORD_TYPE, SlotSpec,
+    StateSpec, SystemSpec, TCP_SERVER_TYPE, Wiring,
 };
 use super::resolve::slot_config_error;
+use crate::IngestParams;
 use crate::coordinator::validate_slot_spec;
 
 /// The instance name the coordinator itself occupies. A user spec of this name
@@ -98,7 +99,147 @@ fn check_hosts_and_peers(deployment: &Deployment) -> Result<(), LoadError> {
             });
         }
     }
+    for member in &deployment.targets {
+        check_ingests(deployment, member)?;
+    }
     Ok(())
+}
+
+/// One member's `Ingest`s against the members they name: the source exists,
+/// serves the named link on the named port, accepts every forwarded command,
+/// and shares none of those commands with another source of the same db.
+fn check_ingests(deployment: &Deployment, member: &Wiring) -> Result<(), LoadError> {
+    // `(system name, attached db, token)` of everything forwarded so far, so
+    // an overlap names both instances.
+    let mut forwarded: Vec<(&str, &str, String)> = Vec::new();
+    for spec in &member.systems {
+        let Some(params) = ingest_params(spec) else {
+            continue;
+        };
+        let Some(source) = deployment
+            .targets
+            .iter()
+            .find(|w| w.coordinator.namespace.as_deref() == Some(params.namespace.as_str()))
+        else {
+            return Err(LoadError::UnknownSource {
+                system: spec.name.clone(),
+                namespace: params.namespace.clone(),
+            });
+        };
+        let link_error = |reason: String| LoadError::SourceLink {
+            system: spec.name.clone(),
+            namespace: params.namespace.clone(),
+            link: params.link.clone(),
+            reason,
+        };
+        let Some(link) = source
+            .states
+            .iter()
+            .find(|s| s.name == params.link && s.ty == TCP_SERVER_TYPE)
+        else {
+            return Err(link_error(format!(
+                "`{}` declares no `TcpServer` state named `{}`",
+                params.namespace, params.link
+            )));
+        };
+        match state_port(link) {
+            Some(port) if port == params.port => {}
+            Some(port) => {
+                return Err(link_error(format!(
+                    "that server listens on port {port}, not {}",
+                    params.port
+                )));
+            }
+            None => {
+                return Err(link_error(
+                    "that server's `addr` is not a socket address".to_string(),
+                ));
+            }
+        }
+
+        let accepted = uplink_msgs(source, &params.link);
+        for token in &params.commands {
+            if !accepted.iter().any(|m| m == token) {
+                return Err(LoadError::SourceCommands {
+                    system: spec.name.clone(),
+                    token: token.clone(),
+                    reason: match accepted.as_slice() {
+                        [] => format!(
+                            "`{}/{}` has no `Uplink`, so it accepts no commands",
+                            params.namespace, params.link
+                        ),
+                        _ => format!(
+                            "`{}/{}` accepts {}",
+                            params.namespace,
+                            params.link,
+                            accepted.join(", ")
+                        ),
+                    },
+                });
+            }
+        }
+
+        let attach = spec.attach.as_deref().unwrap_or("");
+        for token in &params.commands {
+            if let Some((first, _, _)) = forwarded
+                .iter()
+                .find(|(_, db, other)| *db == attach && other == token)
+            {
+                return Err(LoadError::CommandOverlap {
+                    first: (*first).to_string(),
+                    second: spec.name.clone(),
+                    token: token.clone(),
+                });
+            }
+            forwarded.push((&spec.name, attach, token.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// The decoded params of an `Ingest` spec, `None` for any other system.
+/// [`check_system`] rejects an `Ingest` whose params do not decode, so a
+/// deployment reaching here has already cleared that gate.
+fn ingest_params(spec: &SystemSpec) -> Option<IngestParams> {
+    if spec.ty.as_deref() != Some(INGEST_TYPE) {
+        return None;
+    }
+    match &spec.params {
+        ParamSource::Value(value) => serde_json::from_value(value.clone()).ok(),
+        _ => None,
+    }
+}
+
+/// The port a `TcpServer` state listens on.
+fn state_port(state: &StateSpec) -> Option<u16> {
+    let ParamSource::Value(value) = &state.params else {
+        return None;
+    };
+    value
+        .get("addr")?
+        .as_str()?
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
+}
+
+/// The command tokens `member`'s `Uplink`s relay off the link state `link`,
+/// in config order.
+fn uplink_msgs(member: &Wiring, link: &str) -> Vec<String> {
+    let mut msgs = Vec::new();
+    for spec in &member.systems {
+        if spec.ty.as_deref() != Some(crate::ir::UPLINK_TYPE)
+            || spec.attach.as_deref() != Some(link)
+        {
+            continue;
+        }
+        if let ParamSource::Value(value) = &spec.params
+            && let Some(list) = value.get("msgs").and_then(|m| m.as_array())
+        {
+            msgs.extend(list.iter().filter_map(|m| m.as_str()).map(str::to_string));
+        }
+    }
+    msgs
 }
 
 /// The two namespaces ordered outer-first when one is a dotted prefix of the
@@ -122,6 +263,7 @@ pub(crate) fn validate(wiring: &Wiring) -> Result<(), LoadError> {
     check_state_names(wiring)?;
     check_link_names(wiring)?;
     check_downlinks(wiring)?;
+    check_records(wiring)?;
     for state in &wiring.states {
         check_state(state)?;
     }
@@ -326,6 +468,25 @@ fn check_downlinks(wiring: &Wiring) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// One `Record` per db. A second would write the same records twice into the
+/// same store.
+fn check_records(wiring: &Wiring) -> Result<(), LoadError> {
+    let mut recorded = HashSet::new();
+    for spec in &wiring.systems {
+        if spec.ty.as_deref() != Some(RECORD_TYPE) {
+            continue;
+        }
+        if let Some(attach) = &spec.attach
+            && !recorded.insert(attach)
+        {
+            return Err(LoadError::DuplicateRecord {
+                state: attach.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// One state spec's structural rules: states construct on the static value
 /// path only, so typed postcard params cannot reach one.
 fn check_state(state: &StateSpec) -> Result<(), LoadError> {
@@ -375,6 +536,38 @@ fn check_system(spec: &SystemSpec, wiring: &Wiring) -> Result<(), LoadError> {
         };
         if let Some(reason) = reason {
             return Err(LoadError::PeerSpec {
+                system: spec.name.clone(),
+                reason,
+            });
+        }
+    }
+    if spec.ty.as_deref() == Some(INGEST_TYPE) {
+        let ParamSource::Value(value) = &spec.params else {
+            return Err(LoadError::IngestSpec {
+                system: spec.name.clone(),
+                reason: "an ingest is configured by a value tree naming its source link".into(),
+            });
+        };
+        let params: IngestParams =
+            serde_json::from_value(value.clone()).map_err(|err| LoadError::IngestSpec {
+                system: spec.name.clone(),
+                reason: format!("its params do not decode: {err}"),
+            })?;
+        let reason = if params.port == 0 {
+            Some(format!(
+                "source `{}/{}` publishes on port 0, which is a listener choice, not an address",
+                params.namespace, params.link
+            ))
+        } else if Some(params.namespace.as_str()) == wiring.coordinator.namespace.as_deref() {
+            Some(format!(
+                "source namespace `{}` is this target's own; a gateway ingests another member",
+                params.namespace
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(LoadError::IngestSpec {
                 system: spec.name.clone(),
                 reason,
             });
@@ -783,6 +976,175 @@ mod tests {
         assert!(matches!(
             validate(&wiring).unwrap_err(),
             LoadError::ArtifactMissingCrate { .. }
+        ));
+    }
+    /// A member serving `link` on `port`, relaying `msgs` off it.
+    fn member(namespace: &str, port: u16, msgs: &[&str]) -> Wiring {
+        let mut w = WiringBuilder::new()
+            .serve(format!("127.0.0.1:{port}").parse().unwrap())
+            .uplink(msgs.iter().copied())
+            .build();
+        w.coordinator.namespace = Some(namespace.to_string());
+        w
+    }
+
+    /// A gateway ingesting `sources`, each `(instance, namespace, port,
+    /// commands)`, into one `Db`.
+    fn gateway(sources: &[(&str, &str, u16, &[&str])]) -> Wiring {
+        let mut b = WiringBuilder::new().db("db", "127.0.0.1:0".parse().unwrap());
+        for (instance, namespace, port, commands) in sources {
+            b = b.ingest(
+                instance,
+                "db",
+                crate::IngestParams {
+                    namespace: (*namespace).to_string(),
+                    link: "link".into(),
+                    port: *port,
+                    commands: commands.iter().map(|c| c.to_string()).collect(),
+                    host: None,
+                },
+            );
+        }
+        let mut w = b.build();
+        w.coordinator.namespace = Some("gw".into());
+        w
+    }
+
+    fn deploy(targets: Vec<Wiring>) -> Deployment {
+        Deployment {
+            ir_version: IR_VERSION,
+            targets,
+            hosts: Default::default(),
+        }
+    }
+
+    /// An ingest names another member's link, on the port that member serves,
+    /// forwarding commands that member accepts.
+    #[test]
+    fn an_ingest_names_a_member_link() {
+        let ok = deploy(vec![
+            member("a", 2240, &["AlarmAck"]),
+            gateway(&[("a", "a", 2240, &["AlarmAck"])]),
+        ]);
+        assert!(validate_deployment(&ok).is_ok());
+
+        let unknown = deploy(vec![
+            member("a", 2240, &[]),
+            gateway(&[("b", "b", 2240, &[])]),
+        ]);
+        assert!(matches!(
+            validate_deployment(&unknown).unwrap_err(),
+            LoadError::UnknownSource { system, namespace } if system == "b" && namespace == "b"
+        ));
+
+        let wrong_port = deploy(vec![
+            member("a", 2240, &[]),
+            gateway(&[("a", "a", 2241, &[])]),
+        ]);
+        assert!(matches!(
+            validate_deployment(&wrong_port).unwrap_err(),
+            LoadError::SourceLink { system, reason, .. }
+                if system == "a" && reason.contains("2240")
+        ));
+
+        let mut no_link = deploy(vec![
+            member("a", 2240, &[]),
+            gateway(&[("a", "a", 2240, &[])]),
+        ]);
+        no_link.targets[0].states.clear();
+        assert!(matches!(
+            validate_deployment(&no_link).unwrap_err(),
+            LoadError::SourceLink { reason, .. } if reason.contains("no `TcpServer`")
+        ));
+    }
+
+    /// A forwarded command the source member's uplink does not relay is
+    /// rejected, naming the token and what the member does accept.
+    #[test]
+    fn an_ingest_forwards_only_accepted_commands() {
+        let bad = deploy(vec![
+            member("a", 2240, &["AlarmAck"]),
+            gateway(&[("a", "a", 2240, &["ReloadSequences"])]),
+        ]);
+        assert!(matches!(
+            validate_deployment(&bad).unwrap_err(),
+            LoadError::SourceCommands { token, reason, .. }
+                if token == "ReloadSequences" && reason.contains("AlarmAck")
+        ));
+
+        let mut none = deploy(vec![
+            member("a", 2240, &[]),
+            gateway(&[("a", "a", 2240, &["AlarmAck"])]),
+        ]);
+        none.targets[0]
+            .systems
+            .retain(|s| s.ty.as_deref() != Some(crate::ir::UPLINK_TYPE));
+        assert!(matches!(
+            validate_deployment(&none).unwrap_err(),
+            LoadError::SourceCommands { reason, .. } if reason.contains("no `Uplink`")
+        ));
+    }
+
+    /// Two sources of one db forwarding one command would send it to two
+    /// members, so the pair is rejected by name.
+    #[test]
+    fn one_db_commands_one_member_per_message() {
+        let clash = deploy(vec![
+            member("a", 2240, &["AlarmAck"]),
+            member("b", 2241, &["AlarmAck"]),
+            gateway(&[
+                ("a", "a", 2240, &["AlarmAck"]),
+                ("b", "b", 2241, &["AlarmAck"]),
+            ]),
+        ]);
+        assert!(matches!(
+            validate_deployment(&clash).unwrap_err(),
+            LoadError::CommandOverlap { first, second, token }
+                if first == "a" && second == "b" && token == "AlarmAck"
+        ));
+
+        let narrowed = deploy(vec![
+            member("a", 2240, &["AlarmAck", "ReloadSequences"]),
+            member("b", 2241, &["AlarmAck"]),
+            gateway(&[
+                ("a", "a", 2240, &["ReloadSequences"]),
+                ("b", "b", 2241, &["AlarmAck"]),
+            ]),
+        ]);
+        assert!(validate_deployment(&narrowed).is_ok());
+    }
+
+    /// An ingest's own params: a listener-chosen port and its own namespace
+    /// are both config defects.
+    #[test]
+    fn an_ingest_names_a_fixed_port_on_another_member() {
+        assert!(matches!(
+            validate(&gateway(&[("a", "a", 0, &[])])).unwrap_err(),
+            LoadError::IngestSpec { system, reason } if system == "a" && reason.contains("port 0")
+        ));
+        assert!(matches!(
+            validate(&gateway(&[("gw", "gw", 2240, &[])])).unwrap_err(),
+            LoadError::IngestSpec { reason, .. } if reason.contains("this target's own")
+        ));
+    }
+
+    /// One recorder per db; a second would store every record twice.
+    #[test]
+    fn one_record_per_db() {
+        let one = WiringBuilder::new()
+            .db("db", "127.0.0.1:0".parse().unwrap())
+            .record("record", "db")
+            .build();
+        assert!(validate(&one).is_ok());
+
+        let two = WiringBuilder::new()
+            .db("db", "127.0.0.1:0".parse().unwrap())
+            .record("record", "db")
+            .record("second", "db")
+            .build();
+        assert!(matches!(
+            validate(&two).unwrap_err(),
+            LoadError::DuplicateRecord { state } if state == "db"
         ));
     }
 }

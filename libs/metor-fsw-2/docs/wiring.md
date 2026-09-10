@@ -67,22 +67,32 @@ A member's identity is its `namespace`. With more than one member every
 namespace is required, distinct, and not a dotted prefix of another.
 
 ```python
-from metor_config import Deployment, Downlink, Publish, Subscribe, Target, TcpServer
+from metor_config import (
+    Db, Deployment, Downlink, Ingest, Publish, Record, Subscribe, Target, TcpServer,
+)
 from adcs_pack import Fsw, Plant
 
-plant = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="plant")
-fsw = Target(cycle_rate=120.0, sim_dt=1 / 120, namespace="fsw")
+plant = Target(cycle_rate=120.0, namespace="plant")
+fsw = Target(cycle_rate=120.0, namespace="fsw")
+gw = Target(cycle_rate=120.0, namespace="gw")
 
+plant_link = plant.state("link", TcpServer(addr="[::]:2240"))
 sim = plant.add("plant", Plant(seed=42))
-plant.add("downlink", Downlink(plant.state("link", TcpServer(addr="[::]:2240"))))
+plant.add("downlink", Downlink(plant_link))
 plant.add("publish", Publish(plant.state("peer", TcpServer(addr="[::]:2242")), [sim]))
 
+fsw_link = fsw.state("link", TcpServer(addr="[::]:2241"))
 mirror = fsw.add("plant", Subscribe(sim))
 control = fsw.add("fsw", Fsw())
 fsw.connect(mirror.sensors, control.sensors)
-fsw.add("downlink", Downlink(fsw.state("link", TcpServer(addr="[::]:2241"))))
+fsw.add("downlink", Downlink(fsw_link))
 
-deploy = Deployment(targets=[plant, fsw])
+db = gw.state("db", Db(addr="[::]:2250"))
+gw.add("plant", Ingest(db, plant_link))
+gw.add("fsw", Ingest(db, fsw_link))
+gw.add("record", Record(db))
+
+deploy = Deployment(targets=[plant, fsw, gw])
 ```
 
 `Publish` serves the listed instances on a `TcpServer`; `Subscribe` takes an
@@ -90,6 +100,11 @@ instance handle from another member and adds a mirror of it, typed as that
 instance, whose ports the subscriber wires like any local system's. The
 mirror runs the built-in subscriber, which dials the peer and writes arriving
 records into those ports ([telemetry.md](telemetry.md)).
+
+`gw` is a gateway: a member whose `Db` state embeds a metor-db that the
+ground connects to. Each `Ingest` streams one member's ground link into it;
+`Record` stores the gateway's own telemetry beside them. A deployment with
+no gateway needs none of this.
 
 A file with one `Target` and no `Deployment` is a deployment of one. Python
 systems declared with `@system` belong to the target that adds them.

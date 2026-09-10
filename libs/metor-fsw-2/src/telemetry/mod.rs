@@ -11,8 +11,8 @@
 
 pub(crate) mod discovery;
 mod link;
-mod subscribe;
-mod taps;
+pub(crate) mod subscribe;
+pub(crate) mod taps;
 mod uplink;
 
 pub use subscribe::{PeerStatus, SubscribeOut, SubscribeSystem};

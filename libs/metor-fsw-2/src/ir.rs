@@ -187,6 +187,17 @@ pub const DOWNLINK_TYPE: &str = "Downlink";
 /// [`UplinkParams`](crate::UplinkParams).
 pub const UPLINK_TYPE: &str = "Uplink";
 
+/// Registry `type=` of the gateway's ingest, an
+/// [`IngestSystem`](crate::IngestSystem) attached to a [`DB_TYPE`] state and
+/// configured by [`IngestParams`](crate::IngestParams): one member's ground
+/// link, streamed into the embedded db.
+pub const INGEST_TYPE: &str = "Ingest";
+
+/// Registry `type=` of the gateway's recorder, a
+/// [`RecordSystem`](crate::RecordSystem) attached to a [`DB_TYPE`] state,
+/// which stores the gateway member's own telemetry in the embedded db.
+pub const RECORD_TYPE: &str = "Record";
+
 /// The captured Python program of one target: every `Frame`/`State` class the
 /// target file declares, plus each `@system` function it adds, assembled in
 /// definition order into one compilation unit. Bindings between systems only

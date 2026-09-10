@@ -776,35 +776,67 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
         let (namespace, host, port) = parse_peer(value)?;
         let mut named = false;
         for spec in &mut wiring.systems {
-            let Some(peer) = &mut spec.peer else { continue };
-            if peer.namespace != namespace {
-                continue;
+            // A mirror carries its source in `peer`, an ingest in its params;
+            // `--peer` names a member, so it moves both.
+            if let Some(peer) = &mut spec.peer {
+                if peer.namespace != namespace {
+                    continue;
+                }
+                peer.host = Some(host.clone());
+                if let Some(port) = port {
+                    peer.port = port;
+                }
+                named = true;
+            } else if spec.ty.as_deref() == Some(crate::ir::INGEST_TYPE)
+                && let crate::ir::ParamSource::Value(v) = &mut spec.params
+                && v.get("namespace").and_then(|n| n.as_str()) == Some(namespace)
+            {
+                v["host"] = serde_json::Value::String(host.clone());
+                if let Some(port) = port {
+                    v["port"] = serde_json::Value::from(port);
+                }
+                named = true;
             }
-            peer.host = Some(host.clone());
-            if let Some(port) = port {
-                peer.port = port;
-            }
-            named = true;
         }
         if !named {
-            let mirrors: Vec<&str> = wiring
-                .systems
-                .iter()
-                .filter_map(|s| s.peer.as_ref())
-                .map(|p| p.namespace.as_str())
-                .collect();
-            return Err(match mirrors.as_slice() {
-                [] => miette::miette!(
-                    "`--peer {namespace}=…` names no peer; this target subscribes to none"
-                ),
-                _ => miette::miette!(
-                    "`--peer {namespace}=…` names no peer; this target subscribes to {}",
-                    mirrors.join(", ")
-                ),
-            });
+            return Err(miette::miette!(
+                "`--peer {namespace}=…` names no peer; this target {}",
+                peer_sources(wiring)
+            ));
         }
     }
     Ok(())
+}
+
+/// What a target's `--peer` flags can name, for the error when one names
+/// nothing: the namespaces it mirrors and the ones it ingests.
+fn peer_sources(wiring: &Wiring) -> String {
+    let mirrors: Vec<&str> = wiring
+        .systems
+        .iter()
+        .filter_map(|s| s.peer.as_ref())
+        .map(|p| p.namespace.as_str())
+        .collect();
+    let ingests: Vec<&str> = wiring
+        .systems
+        .iter()
+        .filter(|s| s.ty.as_deref() == Some(crate::ir::INGEST_TYPE))
+        .filter_map(|s| match &s.params {
+            crate::ir::ParamSource::Value(v) => v.get("namespace").and_then(|n| n.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut parts = Vec::new();
+    if !mirrors.is_empty() {
+        parts.push(format!("subscribes to {}", mirrors.join(", ")));
+    }
+    if !ingests.is_empty() {
+        parts.push(format!("ingests {}", ingests.join(", ")));
+    }
+    match parts.as_slice() {
+        [] => "subscribes to none".to_string(),
+        _ => parts.join(", "),
+    }
 }
 
 /// Split one `--peer` value into `(namespace, host, port)`. A bracketed or
@@ -1232,6 +1264,68 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "`--peer` takes `<NS>=<HOST[:PORT]>`, got `plant`"
+        );
+    }
+
+    /// A gateway's `--peer` moves its ingest's host and port and leaves the
+    /// mirror of another member alone; naming neither lists both.
+    #[test]
+    fn peer_moves_an_ingest_source() {
+        use crate::ir::{ParamSource, PeerSpec};
+        use crate::wiring::WiringBuilder;
+
+        let gateway = || {
+            WiringBuilder::new()
+                .db("db", "127.0.0.1:0".parse().unwrap())
+                .ingest(
+                    "a",
+                    "db",
+                    crate::IngestParams {
+                        namespace: "a".into(),
+                        link: "link".into(),
+                        port: 2256,
+                        commands: Vec::new(),
+                        host: None,
+                    },
+                )
+                .subscribe(
+                    "sim",
+                    "Plant",
+                    None,
+                    PeerSpec {
+                        namespace: "b".into(),
+                        link: "link".into(),
+                        port: 2257,
+                        instance: "sim".into(),
+                        telemetered: true,
+                        host: None,
+                    },
+                )
+                .build()
+        };
+        let source = |wiring: &Wiring| match &wiring.systems[0].params {
+            ParamSource::Value(v) => v.clone(),
+            other => panic!("an ingest is configured by a value tree, got {other:?}"),
+        };
+
+        let mut moved = gateway();
+        apply_overrides(&mut moved, &peer_args(&["a=10.0.0.5:2300"])).expect("the ingest source");
+        assert_eq!(source(&moved)["host"], "10.0.0.5");
+        assert_eq!(source(&moved)["port"], 2300);
+        assert!(
+            moved.systems[1].peer.as_ref().unwrap().host.is_none(),
+            "another member's mirror is untouched"
+        );
+
+        let mut bare = gateway();
+        apply_overrides(&mut bare, &peer_args(&["a=10.0.0.5"])).expect("no port given");
+        assert_eq!(source(&bare)["port"], 2256, "the target's port stands");
+
+        let err = apply_overrides(&mut gateway(), &peer_args(&["c=10.0.0.5"]))
+            .expect_err("no such member");
+        assert_eq!(
+            err.to_string(),
+            "`--peer c=…` names no peer; this target subscribes to b, ingests a"
         );
     }
 

@@ -306,6 +306,53 @@ pub enum LoadError {
     )]
     UnknownPeer { system: String, namespace: String },
 
+    /// Two `Record` systems attach to one `Db` state: both would write the
+    /// same records into the same store.
+    #[error("state `{state}` has more than one `Record` attached; one db records this target once")]
+    DuplicateRecord { state: String },
+
+    /// An `Ingest`'s params are not well formed: they decode as
+    /// [`IngestParams`](crate::IngestParams), name a port a listener chose,
+    /// and name a member other than this one.
+    #[error("system `{system}`: {reason}")]
+    IngestSpec { system: String, reason: String },
+
+    /// An `Ingest` pointed at a namespace no member of the deployment carries.
+    #[error(
+        "system `{system}` ingests target `{namespace}`, which is not a target of this deployment"
+    )]
+    UnknownSource { system: String, namespace: String },
+
+    /// An `Ingest` named a link the source member does not serve on that port.
+    #[error("system `{system}` ingests `{namespace}/{link}`, but {reason}")]
+    SourceLink {
+        system: String,
+        namespace: String,
+        link: String,
+        reason: String,
+    },
+
+    /// An `Ingest` forwards a command the source member's link does not
+    /// accept, so it would be dropped on arrival.
+    #[error("system `{system}` forwards `{token}` up its source link, but {reason}")]
+    SourceCommands {
+        system: String,
+        token: String,
+        reason: String,
+    },
+
+    /// Two `Ingest`s on one `Db` forward the same command, so the gateway's
+    /// forwarder would send one command to two members.
+    #[error(
+        "systems `{first}` and `{second}` both forward `{token}`; a gateway commands one member \
+         per message — narrow one with `commands=[…]`"
+    )]
+    CommandOverlap {
+        first: String,
+        second: String,
+        token: String,
+    },
+
     /// A shared state's own init fn failed, such as a resource acquisition
     /// like a listener bind, or its params did not decode.
     #[error("state `{name}` (type `{ty}`) failed to construct: {message}")]

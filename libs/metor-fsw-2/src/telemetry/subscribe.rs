@@ -604,22 +604,23 @@ pub(crate) fn direct_candidates(host: Option<&str>, port: u16) -> Vec<SocketAddr
 }
 
 /// One bounded mDNS round for the peer's link, on its own thread so a silent
-/// multicast link never holds the cycle. `None` means shutdown began.
+/// multicast link never holds the cycle.
+pub(crate) async fn browse_round(namespace: &str, link: &str) -> Vec<SocketAddr> {
+    let (namespace, link) = (namespace.to_string(), link.to_string());
+    let round = stellarator::struc_con::thread(move |_| {
+        super::discovery::browse_peer(&namespace, &link, BROWSE_TIMEOUT)
+    });
+    round.join().await.unwrap_or_default()
+}
+
+/// [`browse_round`] under the system's cancellation. `None` means shutdown
+/// began; a task cancelled by dropping its guard calls the round directly.
 pub(crate) async fn browse(
     namespace: &str,
     link: &str,
     context: &AsyncContext,
 ) -> Option<Vec<SocketAddr>> {
-    let (namespace, link) = (namespace.to_string(), link.to_string());
-    let round = stellarator::struc_con::thread(move |_| {
-        super::discovery::browse_peer(&namespace, &link, BROWSE_TIMEOUT)
-    });
-    Some(
-        context
-            .until_cancelled(round.join())
-            .await?
-            .unwrap_or_default(),
-    )
+    context.until_cancelled(browse_round(namespace, link)).await
 }
 
 #[cfg(test)]

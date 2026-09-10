@@ -209,3 +209,43 @@ record.
 The `peer_status` frame reports `connected`, `sessions`, `records`,
 `last_rx_cycle`, and `dropped`, and publishes when one of them changes. It is
 the mirror's readiness signal; the launcher has no readiness gate.
+
+## Gateway
+
+A gateway is a member with a `Db` state: an embedded metor-db that listens
+on `addr`, keeps its data under `path` (a temp dir when omitted), and
+advertises over mDNS with `role=gateway` so a picker can tell it from a
+target link. `Db(store=, max_bytes=, max_age_secs=)` maps onto the db's
+tiering; without a store nothing is evicted.
+
+Each `Ingest` attached to the `Db` dials one member's ground link the way a
+subscriber dials a peer: the `--peer` override, both loopback families on the
+link's port, then mDNS by `ns=` and `link=`. It checks `LinkInfo` the same
+way, then streams everything that link announces into the db. Component ids
+carry the member's namespace, so members never collide. A failed round backs
+off 500 ms, doubling to 10 s. Its `source_status` frame reports `connected`,
+`sessions`, `packets`, and `rejected`, and publishes on change; it is named by
+the source, so `gw.plant.source_status` says whether `plant` is live. Fault
+lines:
+
+- `source_identity` when the address answers as something other than the
+  named member's link
+- `source_disconnect` when the connection ends
+- `source_commands` when a configured command token is one the member no
+  longer advertises
+
+`Record` attached to the same `Db` stores the gateway's own telemetry: it
+taps the gateway's rings as a downlink does and writes records straight into
+the db, with no packet framing. It faults `record_table_conflict` when a
+table id is already registered with a different schema and counts records
+the db refuses under `record_rejected`.
+
+Commands travel two hops. A ground db mirroring the gateway forwards the
+command ids the gateway advertises; the gateway forwards each source's
+`commands` up that source's link. The sets are disjoint across one `Db`, so
+a command reaches exactly one member. A command recorded in a db never rides
+that db's message stream back out, so nothing echoes.
+
+The ground connects to the gateway as a db. The mirror carries every
+member's frames, and, when both ends speak the current db protocol, every
+non-command message log too, latest record first, then live.
