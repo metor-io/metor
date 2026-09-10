@@ -13,6 +13,12 @@ Yang-LQR controller in a closed feedback loop (reusing the `metor-adcs` math and
     └────────── torque_cmd + mtq_cmd ───────────────────┘   (one-cycle-delayed)
 ```
 
+It runs as a **deployment of two members**, each its own process on its own wall clock at
+120 Hz: `plant` simulates the vehicle and publishes it, `fsw` flies it and publishes its
+controller. Each mirrors what the other publishes — the fsw member's mirror is named
+`plant`, so every component path reads the same as it did in one process — so the loop
+closes over the network rather than over a shared ring.
+
 The **plant** propagates a real 400 km orbit (point-mass gravity + drag) and the full Euler
 attitude dynamics — `I·ω̇_b = τ_b − ḣ_w − ω_b × (I·ω_b + h_w)`, including the gyroscopic
 coupling of the stored reaction-wheel momentum — under the **disturbance environment** a
@@ -45,8 +51,8 @@ Nadir, velocity-vector/HIL, or magnetorquer-only Detumble), its target computed 
 telemetered wheel momentum and the measured field) or B-cross rate damping in Detumble. Both
 command frames close the loop back into the plant one cycle delayed.
 
-The `mode` **slot** auto-runs the `commissioning` sequence at startup — a **condition-based
-ladder**, not a script of timed waits: estimator warm-up (gated on successive q̂ deltas
+The `mode` **slot** starts empty; `commissioning` is loaded and started from the panel's
+sequence view — a **condition-based ladder**, not a script of timed waits: estimator warm-up (gated on successive q̂ deltas
 settling), an optional magnetorquer detumble (entered only above a rate the wheels shouldn't
 capture; the boot tumble is not), then coarse and fine pointing gated on the live tracking
 error to the velocity-vector target, each phase under a timeout that safes the spacecraft
@@ -117,13 +123,16 @@ ingests.
 2. In another terminal, run the target — telemetry **down**, command **up**:
    ```sh
    cd examples/adcs-fsw2 && uv run -- cargo run -p metor-fsw-2 --bin metor-fsw -- \
-       run target.py --build --wall
+       run target.py
    ```
+   Both members run, each as its own process; `--target fsw` (or `plant`) runs one of
+   them alone.
    The links are systems in `target.py`: its `downlink` (`TcpDownlink`) streams every frame
    to the panel, and its `uplink` (`TcpUplink`) opens a **second** connection that ingests
    the panel's `SequenceCommand`s so you can drive the `mode` slot live (Load/Start/Abort
    `commissioning` or `safe_mode`). Uplink and downlink use separate connections
-   (docs/messages.md §4.5) — both point at the same metor-db endpoint, `127.0.0.1:2240`.
+   (docs/messages.md §4.5) — both point at the same metor-db endpoint, and the panel reads
+   the fsw member on `2241` (the plant member serves its own telemetry on `2240`).
 3. On a first connection the panel opens the **`adcs-dashboard`** preset this target ships
    (see `target.py`): status chips across the top, the attitude ball with the magnetometer
    direction marked on it, dials for the three body rates, bipolar bars for wheel momentum
@@ -157,9 +166,9 @@ ingests.
    nadir safing. The alarm view carries `ADCS_RATE_HIGH` (body rate) and `RW_MOMENTUM_HIGH`
    (wheel-0 stored momentum vs the saturation limit).
 
-The target converges in ~30 s of real time. The terminal prints only a heartbeat — the
-host stays schema-agnostic (it doesn't decode the frames), so convergence is watched in the
-panel (or asserted headlessly by `cargo test`). Ctrl-C to stop. If the panel isn't running
+The target converges in ~30 s of real time once `commissioning` is started. The terminal
+prints only a heartbeat — the host stays schema-agnostic (it doesn't decode the frames), so
+convergence is watched in the panel. Ctrl-C to stop. If the panel isn't running
 the downlink/uplink just fail to connect and the control loop runs unaffected.
 
 > Component names are prefixed by the **instance** name (`nav.attitude_estimate.q_hat_b_eci`),
@@ -177,22 +186,15 @@ ergonomics report.)
 ## Headless test (no panel needed)
 
 ```sh
-cargo test -p adcs-fsw2     # builds the cdylibs, then asserts convergence + parity
+cargo test -p adcs-fsw2     # builds the cdylibs, then resolves and runs the fsw member
 ```
 
-`tests/closed_loop.rs` runs the **same** `target.py` two ways — `plant`/`nav`/`ctrl`
-registered statically (the rlib's `pack()` into a `Registry`) and the same pack `dlopen`'d
-from its cdylib — with the `mode` slot's sequences dlopen in both. It asserts both converge onto the
-commanded pointing target and that the dlopen run matches the static one **bit-for-bit** (same
-systems, same params, same seed, just loaded vs linked). `tests/momentum.rs` preloads the
-wheels and asserts the desaturation law dumps stored momentum through the torquers while the
-target keeps pointing (and that the `RW_MOMENTUM_HIGH` alarm's nested target path resolves
-live). `tests/eclipse.rs` boots inside / just before the Earth-shadow arc (the entry phase
-is computed, not hardcoded) and asserts the CSS heads go dark, SRP switches off, and the
-magnetometer-only estimate rides through the sun loss. `tests/sequences.rs` exercises the `mode` slot end-to-end (auto-run, interactive
-Load→Start→Abort, and the downlinked sequence events); `tests/bundle.rs` checks the target
-bundles and runs. All build real cdylibs, so they are slower than plain unit tests and are
-gated off `miri`. The physics itself is unit-tested underneath: the WMM band, shadow
+The loop itself now spans two processes, so the suite covers what holds on one member.
+`tests/sequences.rs` drives the `mode` slot end-to-end (Load→Start→Abort through the control
+handle), `tests/python_system.rs` resolves the target's compiled Python system — its
+`plant.sensors.gyro_b` binding naming the mirror — and runs it, and `tests/bundle.rs` checks
+the fsw member bundles and runs. All build real cdylibs, so they are slower than plain unit
+tests and are gated off `miri`. The physics itself is unit-tested underneath: the WMM band, shadow
 geometry, and magnetorquer laws in `adcs-contracts`, and the wheel model, disturbance
 magnitudes, total-angular-momentum conservation + the detumble law against the plant's own
 `propagate` in `adcs-systems`.

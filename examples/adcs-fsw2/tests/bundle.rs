@@ -5,9 +5,9 @@
 //! the built `.so`s, not verbatim source — so a target runs with no Python and
 //! no config parse on target. Two legs, both packaged from `target.py` (evaluate
 //! → IR → bundle → run): the directory bundle and the single-file `.metor`
-//! archive. Convergence parity stays in `closed_loop.rs`; here we only assert the
-//! bundle is self-contained and runnable. Gated off `miri` (it builds + `dlopen`s
-//! real cdylibs) and skipped without a CPython ≥ 3.10 to evaluate `target.py`.
+//! archive: here we only assert the bundle is self-contained and runnable.
+//! Gated off `miri` (it builds + `dlopen`s real cdylibs) and skipped without a
+//! CPython ≥ 3.10 to evaluate `target.py`.
 
 #![cfg(not(miri))]
 
@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 
 use metor_fsw_2::wiring::{
     Registry, Wiring, build_target, eval_python_deployment, load_bundle, provision_artifacts,
-    resolve,
-    write_bundle,
+    resolve, write_bundle,
 };
 use metor_fsw_2::{BuildOptions, PackageOptions};
 
@@ -34,9 +33,9 @@ fn temp_bundle_dir(tag: &str) -> PathBuf {
     ))
 }
 
-/// Evaluate `target.py` into a built `Wiring`, in-process (test binaries can't host a
-/// `process=#true` worker). `None` — skip, not fail — when Python or the build plumbing is
-/// unavailable (offline/sandboxed cargo, no CPython ≥ 3.10).
+/// Evaluate `target.py`'s fsw member into a built `Wiring`, in-process (test binaries can't
+/// host a `process=#true` worker). `None` — skip, not fail — when Python or the build
+/// plumbing is unavailable (offline/sandboxed cargo, no CPython ≥ 3.10).
 fn eval_and_build() -> Option<Wiring> {
     if !common::ensure_stubs() {
         return None;
@@ -48,7 +47,10 @@ fn eval_and_build() -> Option<Wiring> {
             return None;
         }
     };
-    let mut wiring = deployment.target(None).expect("its only member").clone();
+    let mut wiring = deployment
+        .target(Some("fsw"))
+        .expect("the fsw member")
+        .clone();
     for spec in &mut wiring.systems {
         spec.process = false;
     }

@@ -10,6 +10,7 @@ from metor_config import (
     Component,
     Connector,
     Dashboard,
+    Deployment,
     Downlink,
     Edge,
     Gauge,
@@ -21,10 +22,12 @@ from metor_config import (
     Place,
     Preset,
     Presets,
+    Publish,
     SequenceControl,
     SequenceList,
     State,
     StateChip,
+    Subscribe,
     Target,
     TcpServer,
     TimeSeriesPlot,
@@ -41,15 +44,12 @@ from metor_config import (
 from adcs_pack import Ctrl, Nav, Plant
 from adcs_seqs import commissioning, safe_mode
 
-m = Target(
-    cycle_rate=120.0,
-    sim_dt=1 / 120,
-    namespace="cube_sat"
-)
+plant = Target(cycle_rate=120.0, namespace="plant")
 
-link = m.state("link", TcpServer(addr="[::]:2240", name="cube_sat"))
+plant_link = plant.state("link", TcpServer(addr="[::]:2240", name="plant"))
+plant_peer = plant.state("peer", TcpServer(addr="[::]:2242", name="plant-peer"))
 
-plant = m.add(
+plant_sim = plant.add(
     "plant",
     Plant(
         init_angle=0.5,
@@ -78,12 +78,23 @@ plant = m.add(
     ),
     process=True,
 )
-nav = m.add("nav", Nav(meas_sigma=0.02))
-ctrl = m.add("ctrl", Ctrl(q_weight=5.0, r_weight=8.0, k_desat=0.0005, k_detumble=0.00005))
+plant.add("downlink", Downlink(plant_link))
+plant.add("publish", Publish(plant_peer, [plant_sim]))
+
+fsw = Target(cycle_rate=120.0, namespace="fsw")
+
+fsw_link = fsw.state("link", TcpServer(addr="[::]:2241", name="fsw"))
+fsw_peer = fsw.state("peer", TcpServer(addr="[::]:2243", name="fsw-peer"))
+
+# The mirror is named `plant`, so every component path the dashboards and
+# alarms already use reads the same on this member.
+sim = fsw.add("plant", Subscribe(plant_sim))
+nav = fsw.add("nav", Nav(meas_sigma=0.02))
+ctrl = fsw.add("ctrl", Ctrl(q_weight=5.0, r_weight=8.0, k_desat=0.0005, k_detumble=0.00005))
 
 # A Python system, compiled at build time into an ordinary wasm pack entry
 # and run by the vehicle like any other cyclic system: the measured body-rate
-# magnitude, published as `cube_sat.gyro_norm.gyro_norm`. The decorator only
+# magnitude, published as `fsw.gyro_norm.gyro_norm`. The decorator only
 # declares it; the `add` registers it, at this position in the step order.
 @system("plant.sensors.gyro_b")
 @node(x=980, y=40)
@@ -91,9 +102,9 @@ def gyro_norm(gyro_b) -> f64:
     return (gyro_b @ gyro_b) ** 0.5
 
 
-m.add("gyro_norm", gyro_norm)
+fsw.add("gyro_norm", gyro_norm)
 
-alarms = m.add(
+alarms = fsw.add(
     "alarms",
     Alarms(alarms=[
         Alarm(
@@ -316,7 +327,7 @@ adcs_dashboard = Dashboard(
 # `adcs-dashboard` leads the list, so a panel with no saved layout for this
 # target opens on it; `adcs-ops` stays available from the preset palette for
 # the plot-centric view that suits debugging a control loop.
-presets = m.add(
+presets = fsw.add(
     "presets",
     Presets([
         Preset(name="adcs-dashboard", time_range="LAST 5m", layout=adcs_dashboard),
@@ -363,9 +374,9 @@ presets = m.add(
     ]),
 )
 
-uplink = m.add("uplink", Uplink(link, msgs=["SequenceCommand", "AlarmAck", "ReloadSequences"]))
+uplink = fsw.add("uplink", Uplink(fsw_link, msgs=["SequenceCommand", "AlarmAck", "ReloadSequences"]))
 
-mode = m.slot(
+mode = fsw.slot(
     "mode",
     inputs=["attitude_estimate", "gps"],
     outputs=["mode_cmd"],
@@ -385,26 +396,31 @@ mode = m.slot(
         ),
         safe_mode(),
     ],
-    initial="commissioning",
-    initial_state="running",
 )
 
-m.connect(plant.sensors, nav.sensors)
-m.connect(plant.gps, nav.gps)
-m.connect(plant.gps, ctrl.gps)
-m.connect(plant.sensors, ctrl.sensors)
-m.connect(plant.wheels, ctrl.wheels)
-m.connect(nav.attitude_estimate, ctrl.attitude_estimate)
-m.connect(nav.attitude_estimate, mode.attitude_estimate)
-m.connect(plant.gps, mode.gps)
+fsw.connect(sim.sensors, nav.sensors)
+fsw.connect(sim.gps, nav.gps)
+fsw.connect(sim.gps, ctrl.gps)
+fsw.connect(sim.sensors, ctrl.sensors)
+fsw.connect(sim.wheels, ctrl.wheels)
+fsw.connect(nav.attitude_estimate, ctrl.attitude_estimate)
+fsw.connect(nav.attitude_estimate, mode.attitude_estimate)
+fsw.connect(sim.gps, mode.gps)
 
-m.connect(mode.mode_cmd, ctrl.mode_cmd, delayed=True)
-m.connect(ctrl.torque_cmd, plant.torque_cmd, delayed=True)
-m.connect(ctrl.mtq_cmd, plant.mtq_cmd, delayed=True)
+fsw.connect(mode.mode_cmd, ctrl.mode_cmd, delayed=True)
 
-downlink = m.add("downlink", Downlink(link))
+downlink = fsw.add("downlink", Downlink(fsw_link))
+fsw.add("publish", Publish(fsw_peer, [ctrl]))
 
-m.route(uplink, mode, msg="SequenceCommand")
-m.route(m.coordinator, mode, msg="SequenceCommand")
-m.route(uplink, alarms, msg="AlarmAck")
-m.route(uplink, m.coordinator, msg="ReloadSequences")
+fsw.route(uplink, mode, msg="SequenceCommand")
+fsw.route(fsw.coordinator, mode, msg="SequenceCommand")
+fsw.route(uplink, alarms, msg="AlarmAck")
+fsw.route(uplink, fsw.coordinator, msg="ReloadSequences")
+
+# The commands come back the other way: the plant mirrors the controller and
+# actuates on what it sent, one cycle late.
+ctrl_in = plant.add("ctrl", Subscribe(ctrl))
+plant.connect(ctrl_in.torque_cmd, plant_sim.torque_cmd, delayed=True)
+plant.connect(ctrl_in.mtq_cmd, plant_sim.mtq_cmd, delayed=True)
+
+Deployment(targets=[plant, fsw])

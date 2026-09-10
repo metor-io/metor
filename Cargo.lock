@@ -90,15 +90,9 @@ name = "adcs-fsw2"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts",
- "adcs-systems",
  "anyhow",
  "metor-fsw-2",
- "postcard",
- "serde",
- "serde_json",
  "stellarator",
- "tempfile",
- "zerocopy",
 ]
 
 [[package]]
