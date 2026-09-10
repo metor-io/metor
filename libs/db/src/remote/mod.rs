@@ -10,9 +10,10 @@ mod hydrate;
 mod offload;
 
 pub use db::{MirrorEvent, RemoteDb};
-pub use fsw::{Peer, fsw_stream, identify};
+pub use fsw::fsw_stream;
 pub use hydrate::Hydrator;
 pub use hydrate::hydrate_span;
+pub use metor_proto_stellar::{Peer, identify};
 pub use offload::offload_span;
 
 #[cfg(test)]
@@ -47,7 +48,9 @@ mod tests {
             let node =
                 TimeSeriesNode::create(dir.join(start.to_string()), Timestamp(start), 8).unwrap();
             for i in 0..4 {
-                node.data.write(&((start + i) as u64).to_le_bytes()).unwrap();
+                node.data
+                    .write(&((start + i) as u64).to_le_bytes())
+                    .unwrap();
                 node.index
                     .write(&Timestamp(start + i).to_le_bytes())
                     .unwrap();
