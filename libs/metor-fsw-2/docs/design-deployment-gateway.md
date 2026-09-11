@@ -669,23 +669,14 @@ The review accepted the proposals above as written, with these calls:
     it fills the 64 KB pipe and blocks the next log line mid-cycle, which is
     how `tests/gateway.rs` flaked. A non-blocking or lossy stderr writer
     would decouple the member's cycle from whoever is reading it.
-11. Deferred: the timer under a ground client's runtime misbehaves both
-    ways. It has been seen spinning at 100% for a long sleep on maitake's
-    1 ns clock (`Sleep::poll` → `Timer::advance_locked` →
-    `wheel::Core::turn_to`), and seen wedged the other way: `Executor::run`
-    passes `None` to `wait_for_io` whenever `try_turn` reports no next
-    deadline, so a client whose only pending work is a 50 ms sleep sits in
-    `kevent` at 0.1% CPU until an unrelated socket wakes it — about a minute
-    in `tests/gateway.rs`, which is the residue of the flake that draining
-    stderr does not remove. The coordinator's own cycle is unaffected; both
-    belong to an investigation in `libs/stellarator` and `maitake`.
-
-The implementation plans are
-[plan-deployment-gateway-1.md](plan-deployment-gateway-1.md) (the
-substrate: table ids, db-to-db message sync and forwarding, the tap
-functions, link identity) and
-[plan-deployment-gateway-2.md](plan-deployment-gateway-2.md) (the member:
-`Db`, `Ingest`, `Record`, Python, validation, tests, the example).
+11. A one-in-five stall of the db mirror traced to maitake's timer wheel:
+    with stellarator's 1 ns tick the top-level wheel wraps every 68.7 s, and
+    a sleep whose deadline crossed the wrap reported a deadline in the past,
+    so the runtime spun in `advance_locked` until the clock crossed it
+    (`wheel.rs`, `next_deadline`'s skipped-rotation count). Fixed, with two
+    wheel tests. The panel's mirror and lod threads were exposed the same
+    way. Any sleep of 67.6 s or more still spins for up to one slot per
+    rotation; nothing in the tree sleeps that long.
 
 ## Testing strategy
 

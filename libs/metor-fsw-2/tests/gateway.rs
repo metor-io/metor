@@ -378,7 +378,6 @@ fn watched(child: Child, body: impl FnOnce() -> Watch + Send + 'static) -> (Watc
 }
 
 #[test]
-#[ignore = "the db mirror stalls for ~60 s in about 1 run in 5 (design-deployment-gateway.md, decision 11); run by hand with --ignored"]
 fn gateway_ingests_a_deployment() {
     if !have_python() {
         eprintln!("skipping gateway_ingests_a_deployment: no python3 >= 3.10 on PATH");
