@@ -11,6 +11,10 @@ each other over the telemetry link. This document designs the last part of
 instance with metor-db embedded that every member's ground link streams into
 and that metor-panel, or any other ground system, connects to as a db.
 
+Parts of this design are revised by
+[design-deployment-revision.md](design-deployment-revision.md); see
+"Revised" under "Decisions".
+
 ## Design
 
 metor-db already ingests an fsw link (`identify`/`fsw_stream`,
@@ -677,6 +681,24 @@ The review accepted the proposals above as written, with these calls:
     wheel tests. The panel's mirror and lod threads were exposed the same
     way. Any sleep of 67.6 s or more still spins for up to one slot per
     rotation; nothing in the tree sleeps that long.
+
+### Revised
+
+[design-deployment-revision.md](design-deployment-revision.md) reverses
+these points once it lands:
+
+- Design decision 2 and "Ingest": the gateway ingests into rings, one
+  mirror per instance of the source member, and the db is fed only by
+  `Record`; `fsw_stream` into the gateway db goes (revision, change 3).
+  Ingested frame rings use log delivery so a slower gateway keeps every
+  sample.
+- Decision 3: with presets published by the gateway alone (change 4), the
+  fold collision is moot for presets; it stands for any other snapshot
+  message two members publish.
+- "Down, late, restarted" and "Commanding" keep their semantics; the
+  message-sync tails and the forwarder stop holding WAL cursors and follow
+  the persisted message nodes, so a stalled mirror connection can no
+  longer make ingest refuse messages (revision, "Out of scope").
 
 ## Testing strategy
 

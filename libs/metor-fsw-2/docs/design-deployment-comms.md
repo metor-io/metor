@@ -12,6 +12,10 @@ there.
 
 The gateway is not designed here. See "Seams for the gateway".
 
+Parts of this design are revised by
+[design-deployment-revision.md](design-deployment-revision.md); see
+"Revised" under "Decisions".
+
 ## Design
 
 The telemetry link already moves components between processes: a `TcpServer`
@@ -649,6 +653,25 @@ The implementation plans are [plan-deployment-comms-1.md](plan-deployment-comms-
 (the foundation: `identify` move, link identity, IR, Python API, the mirror
 at resolve) and [plan-deployment-comms-2.md](plan-deployment-comms-2.md)
 (the client, CLI, docs, integration, the example split).
+
+### Revised
+
+[design-deployment-revision.md](design-deployment-revision.md) reverses
+four points above once it lands:
+
+- Server-side per-client filtering, a non-goal here and rejected under
+  "Alternatives", is added: a subscriber sends the packet ids it wants and
+  the link filters per connection (revision, change 1).
+- A mirror carries the frames its edges read, plus any named in
+  `Subscribe(frames=)`, not every telemetered output of the type
+  (change 2). The type is unchanged.
+- "Ingest as a `Subscribe` of every member instance", rejected under
+  "Alternatives", becomes the gateway's ingest (change 3); the two
+  objections, `@system` descriptors and the coordinator's ports, are
+  answered there.
+- `Presets` move to the gateway and reference components through port
+  handles from any member (change 4); the own-namespace qualification in
+  "`Presets` and namespace qualification" stays for bare strings.
 
 ## Testing strategy
 
