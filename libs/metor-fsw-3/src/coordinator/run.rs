@@ -38,8 +38,7 @@ impl Coordinator {
         self.cycle
     }
 
-    /// Execute every system once, in list order, publishing each one's timing.
-    /// A status write that fails is dropped.
+    /// Execute a single step of the coordinator, running each system once.
     pub fn step(&mut self, now: Timestamp) {
         let cycle_start = Instant::now();
         for entry in &mut self.entries {
@@ -47,21 +46,17 @@ impl Coordinator {
             entry.step.execute(now);
             let _ = entry.status.write(&SystemStatus {
                 timestamp: now,
-                exec_time_ns: nanos(started.elapsed()),
-                exec_offset_ns: nanos(started.duration_since(cycle_start)),
+                exec_time_ns: duration_to_nanos(started.elapsed()),
+                exec_offset_ns: duration_to_nanos(started.duration_since(cycle_start)),
             });
         }
         self.cycle += 1;
     }
 
-    /// Step until `stop` resolves, which is checked once per cycle.
-    ///
-    /// Under a wall clock the loop sleeps out the remainder of the cycle
-    /// budget and yields instead when a cycle overruns; under a simulated
-    /// clock it only yields, so cycles run as fast as the host allows.
+    /// Step until `stop` is ready
     pub async fn run(&mut self, stop: impl Future<Output = ()>) {
         let mut stop = pin!(stop);
-        let budget = self.clock.budget();
+        let budget = self.clock.cycle_budget();
         loop {
             let started = Instant::now();
             let now = self.now();
@@ -80,20 +75,19 @@ impl Coordinator {
     fn now(&self) -> Timestamp {
         match self.clock {
             Clock::Wall { .. } => Timestamp::now(),
-            Clock::Simulated { dt } => simulated(self.epoch, self.cycle, dt),
+            Clock::Simulated { dt } => simulated_time(self.epoch, self.cycle, dt),
         }
     }
 }
 
-/// `epoch + cycle * dt`, saturating rather than wrapping at the ends of the
-/// microsecond range.
-fn simulated(epoch: Timestamp, cycle: u64, dt: core::time::Duration) -> Timestamp {
+/// Calculates the simulation time from an epoch, the current cycle, and dt.
+fn simulated_time(epoch: Timestamp, cycle: u64, dt: core::time::Duration) -> Timestamp {
     let nanos = dt.as_nanos().saturating_mul(u128::from(cycle));
     let micros = i64::try_from(nanos / 1_000).unwrap_or(i64::MAX);
     Timestamp(epoch.0.saturating_add(micros))
 }
 
-fn nanos(elapsed: core::time::Duration) -> u64 {
+fn duration_to_nanos(elapsed: core::time::Duration) -> u64 {
     u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -104,10 +98,8 @@ mod tests {
     use super::*;
     use crate::coordinator::CoordinatorConfig;
     use crate::coordinator::config::{InputConfig, PortRef, SystemConfig};
-    use crate::coordinator::fixtures::{self, Recorder, pipeline_config, table};
+    use crate::tests::utils::{self, Recorder, pipeline_config, table};
 
-    /// `imu -> nav -> control` plus a system reading the two producers' status
-    /// rings.
     fn watched(config: &mut CoordinatorConfig, from: &[&str]) {
         config.systems.push(SystemConfig {
             id: "watch".into(),
@@ -122,7 +114,7 @@ mod tests {
     #[test]
     fn a_pipeline_flows_within_one_cycle() {
         let recorder = Recorder::default();
-        let mut coordinator = fixtures::build(pipeline_config(), &table(&recorder));
+        let mut coordinator = pipeline_config().build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(10));
         assert_eq!(recorder.take(), vec![(Timestamp(1), 3.0)]);
         assert_eq!(coordinator.cycle(), 1);
@@ -133,7 +125,7 @@ mod tests {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.systems.swap(0, 1);
-        let mut coordinator = fixtures::build(config, &table(&recorder));
+        let mut coordinator = config.build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(1));
         assert_eq!(recorder.take(), Vec::new());
         coordinator.step(Timestamp(2));
@@ -155,7 +147,7 @@ mod tests {
                 inputs: Vec::new(),
             },
         );
-        let mut coordinator = fixtures::build(config, &table(&recorder));
+        let mut coordinator = config.build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(5));
         // `imu_offset` stamps 100 later and samples ten times higher.
         assert_eq!(recorder.take(), vec![(Timestamp(101), 21.0)]);
@@ -166,7 +158,7 @@ mod tests {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         watched(&mut config, &["imu", "nav"]);
-        let mut coordinator = fixtures::build(config, &table(&recorder));
+        let mut coordinator = config.build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(99));
 
         let seen = recorder.take_status();
@@ -182,8 +174,8 @@ mod tests {
         let recorder = Recorder::default();
         let mut config = pipeline_config();
         config.clock = Clock::Wall { rate: 10_000.0 };
-        let mut coordinator = fixtures::build(config, &table(&recorder));
-        coordinator.run(fixtures::after_cycles(5)).await;
+        let mut coordinator = config.build(&table(&recorder)).unwrap();
+        coordinator.run(utils::after_cycles(5)).await;
         assert_eq!(coordinator.cycle(), 5);
         assert_eq!(recorder.take().len(), 5);
     }
@@ -194,8 +186,8 @@ mod tests {
         let mut config = pipeline_config();
         // A budget no cycle can meet, so every iteration takes the yield path.
         config.clock = Clock::Wall { rate: 1e12 };
-        let mut coordinator = fixtures::build(config, &table(&recorder));
-        coordinator.run(fixtures::after_cycles(3)).await;
+        let mut coordinator = config.build(&table(&recorder)).unwrap();
+        coordinator.run(utils::after_cycles(3)).await;
         assert_eq!(coordinator.cycle(), 3);
     }
 
@@ -207,9 +199,9 @@ mod tests {
             dt: Duration::from_millis(20),
         };
         watched(&mut config, &["imu"]);
-        let mut coordinator = fixtures::build(config, &table(&recorder));
+        let mut coordinator = config.build(&table(&recorder)).unwrap();
         let epoch = coordinator.epoch.0;
-        coordinator.run(fixtures::after_cycles(3)).await;
+        coordinator.run(utils::after_cycles(3)).await;
 
         let stamps: Vec<_> = recorder
             .take_status()
@@ -221,18 +213,19 @@ mod tests {
 
     #[test]
     fn an_empty_coordinator_still_counts_cycles() {
-        let mut coordinator =
-            fixtures::build(CoordinatorConfig::default(), &table(&Recorder::default()));
+        let mut coordinator = CoordinatorConfig::default()
+            .build(&table(&Recorder::default()))
+            .unwrap();
         coordinator.step(Timestamp(0));
         assert_eq!(coordinator.cycle(), 1);
     }
 
     #[test]
     fn a_simulated_timestamp_saturates_instead_of_wrapping() {
-        let far = simulated(Timestamp(i64::MAX), u64::MAX, Duration::from_secs(1));
+        let far = simulated_time(Timestamp(i64::MAX), u64::MAX, Duration::from_secs(1));
         assert_eq!(far, Timestamp(i64::MAX));
         assert_eq!(
-            simulated(Timestamp(5), 0, Duration::from_secs(1)),
+            simulated_time(Timestamp(5), 0, Duration::from_secs(1)),
             Timestamp(5)
         );
     }

@@ -105,7 +105,7 @@ Files: `src/coordinator/{mod,config,table,build,error}.rs`.
    naming the system and port involved.
 4. `build.rs`: the five passes from the design doc as five fns of no more
    than a screen each, called in sequence by `Coordinator::build`.
-   Reader count per output ring is `edges + reader_slack`. Every ring is
+   Reader count per output ring is the edge count, at least one. Every ring is
    `RingBuffer::create_in_memory`. The status ring for each system is
    allocated and its writer kept by the coordinator.
 5. `Coordinator` holds `Vec<Entry { name, step: Box<dyn Step>, status:

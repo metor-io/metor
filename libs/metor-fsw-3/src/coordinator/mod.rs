@@ -10,8 +10,6 @@
 mod build;
 mod config;
 mod error;
-#[cfg(test)]
-mod fixtures;
 mod run;
 mod status;
 mod table;

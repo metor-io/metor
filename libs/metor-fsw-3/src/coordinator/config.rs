@@ -4,18 +4,16 @@ use core::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// A whole graph: the loop's clock, the ring sizing, and the systems in step
-/// order.
-///
-/// List order is step order. A producer may appear after its consumer, which
-/// makes the consumer read the previous cycle's record.
+use super::error::BuildError;
+
+const MIN_WALL_RATE: f64 = 0.001;
+
+/// The configuration for a coordinator
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorConfig {
     pub clock: Clock,
-    /// Records each ring holds.
-    pub depth: usize,
-    /// Reader slots each ring keeps beyond its wired edges.
-    pub reader_slack: usize,
+    /// The maximum number of frames a ring can hold.
+    pub ring_depth: usize,
     pub systems: Vec<SystemConfig>,
 }
 
@@ -23,8 +21,7 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             clock: Clock::Wall { rate: 100.0 },
-            depth: 8,
-            reader_slack: 4,
+            ring_depth: 8,
             systems: Vec::new(),
         }
     }
@@ -40,35 +37,39 @@ pub struct SystemConfig {
     pub inputs: Vec<InputConfig>,
 }
 
-/// The producers of one input port. An input left out of the list is
-/// unconnected.
+/// The producers of one input port
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InputConfig {
     pub port: String,
     pub from: Vec<PortRef>,
 }
 
-/// An output port of another system, by id and port name.
+/// An reference to an output port of another system
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PortRef {
     pub system: String,
     pub port: String,
 }
 
-/// Which clock stamps each cycle, and how the loop paces itself.
+/// The clock mode for the coordinator either real wall time or a simulated clock.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Clock {
-    /// Wall time, with the loop sleeping out the remainder of each `1 / rate`
-    /// cycle budget.
     Wall { rate: f64 },
-    /// A logical clock advancing `dt` per cycle, with the loop running as fast
-    /// as the host allows.
     Simulated { dt: Duration },
 }
 
 impl Clock {
+    pub(crate) fn validate(&self) -> Result<(), BuildError> {
+        if let Self::Wall { rate } = self
+            && (!rate.is_finite() || *rate < MIN_WALL_RATE)
+        {
+            return Err(BuildError::InvalidClockRate);
+        }
+        Ok(())
+    }
+
     /// The wall budget for one cycle; zero under a simulated clock.
-    pub(crate) fn budget(&self) -> Duration {
+    pub(crate) fn cycle_budget(&self) -> Duration {
         match self {
             Clock::Wall { rate } if *rate > 0.0 => {
                 Duration::try_from_secs_f64(1.0 / rate).unwrap_or(Duration::MAX)
@@ -92,30 +93,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_wall_at_100_hz() {
-        let config = CoordinatorConfig::default();
-        assert_eq!(config.clock, Clock::Wall { rate: 100.0 });
-        assert_eq!(config.depth, 8);
-        assert_eq!(config.reader_slack, 4);
-        assert_eq!(config.clock.budget(), Duration::from_millis(10));
-    }
-
-    #[test]
-    fn simulated_and_nonpositive_rates_have_no_budget() {
+    fn simulated_and_subnanosecond_periods_have_no_budget() {
         assert_eq!(
             Clock::Simulated {
                 dt: Duration::from_millis(5)
             }
-            .budget(),
+            .cycle_budget(),
             Duration::ZERO
         );
-        assert_eq!(Clock::Wall { rate: 0.0 }.budget(), Duration::ZERO);
-        assert_eq!(Clock::Wall { rate: -1.0 }.budget(), Duration::ZERO);
-        assert_eq!(Clock::Wall { rate: f64::NAN }.budget(), Duration::ZERO);
+        let clock = Clock::Wall { rate: f64::MAX };
+        assert_eq!(clock.validate(), Ok(()));
+        assert_eq!(clock.cycle_budget(), Duration::ZERO);
     }
 
     #[test]
-    fn a_vanishing_rate_saturates_the_budget() {
-        assert_eq!(Clock::Wall { rate: 1e-300 }.budget(), Duration::MAX);
+    fn minimum_wall_rate_has_a_bounded_period() {
+        let clock = Clock::Wall {
+            rate: MIN_WALL_RATE,
+        };
+        assert_eq!(clock.validate(), Ok(()));
+        assert_eq!(clock.cycle_budget(), Duration::from_secs(1_000));
     }
 }

@@ -1,11 +1,7 @@
 //! Typed ports over ring handles.
-//!
-//! [`Output<F>`] owns the single writer of one ring; [`Input<F>`] holds one
-//! view per producer, so fan-in is a list of views and an unconnected input is
-//! an empty list. A frame's `#[repr(C)]` bytes are the record, so a write is
-//! one `try_write` and a read is a borrow of the record in place.
 
 use core::marker::PhantomData;
+use core::mem::align_of;
 use core::ops::Deref;
 
 use crate::frame::Frame;
@@ -13,17 +9,35 @@ use crate::system::PortDef;
 use metor_fsw_3_ring::{NoWake, ReadError, ReadGrant, View, WriteError, Writer, frame_len};
 use metor_proto::types::Timestamp;
 
-/// Power-of-two ring capacity holding `depth.max(2)` records of at most
-/// `max_size` payload bytes, or `None` if the size or capacity cannot be
-/// represented. The ring's record length is 32 bits.
+/// Returns the capacity needed for a ring with `depth` records of `max_size` bytes each.
 ///
-/// The floor of two records is what lets a latest-wins reader pin one record
-/// while the writer fills another.
-pub fn capacity_for(max_size: usize, depth: usize) -> Option<usize> {
+/// This is always rounded to a power of two.
+pub fn ring_capacity(max_size: usize, depth: usize) -> Option<usize> {
     u32::try_from(max_size).ok()?;
+    max_size.checked_add(2 * metor_fsw_3_ring::PAYLOAD_ALIGNMENT - 1)?;
     frame_len(max_size)
         .checked_mul(depth.max(2))?
         .checked_next_power_of_two()
+}
+
+/// A frame requires more alignment than ring payloads provide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("frame alignment {alignment} exceeds ring payload alignment {supported}")]
+pub struct UnsupportedAlignment {
+    pub alignment: usize,
+    pub supported: usize,
+}
+
+fn check_alignment<F>() -> Result<(), UnsupportedAlignment> {
+    let alignment = align_of::<F>();
+    let supported = metor_fsw_3_ring::PAYLOAD_ALIGNMENT;
+    if alignment > supported {
+        return Err(UnsupportedAlignment {
+            alignment,
+            supported,
+        });
+    }
+    Ok(())
 }
 
 /// The writing half of one ring, publishing frames of type `F`.
@@ -33,11 +47,13 @@ pub struct Output<F> {
 }
 
 impl<F: Frame> Output<F> {
-    pub fn new(writer: Writer<NoWake>) -> Self {
-        Self {
+    /// Bind a writer, rejecting frames whose alignment exceeds the ring guarantee.
+    pub fn try_new(writer: Writer<NoWake>) -> Result<Self, UnsupportedAlignment> {
+        check_alignment::<F>()?;
+        Ok(Self {
             writer,
             _f: PhantomData,
-        }
+        })
     }
 
     /// This port's entry in a bundle's `defs()` walk.
@@ -46,6 +62,7 @@ impl<F: Frame> Output<F> {
             name,
             frame: F::ID,
             max_size: F::MAX_SIZE,
+            alignment: align_of::<F>(),
         }
     }
 
@@ -55,56 +72,57 @@ impl<F: Frame> Output<F> {
     }
 }
 
-/// The reading half of a port: one view per producer, in edge order.
+/// Reader for a specific frame
 pub struct Input<F> {
     views: Vec<View<NoWake>>,
     _f: PhantomData<F>,
 }
 
 impl<F: Frame> Input<F> {
-    pub fn new(views: Vec<View<NoWake>>) -> Self {
-        Self {
+    /// Creates a new input with the given views, errors when a frame has an unsupported alignment.
+    pub fn try_new(views: Vec<View<NoWake>>) -> Result<Self, UnsupportedAlignment> {
+        check_alignment::<F>()?;
+        Ok(Self {
             views,
             _f: PhantomData,
-        }
+        })
     }
 
-    /// This port's entry in a bundle's `defs()` walk.
+    /// Returns a [`PortDef`] for this frame type
     pub fn def(name: &'static str) -> PortDef {
         PortDef {
             name,
             frame: F::ID,
             max_size: F::MAX_SIZE,
+            alignment: align_of::<F>(),
         }
     }
 
-    /// The newest record across every producer, by frame timestamp. Ties go
-    /// to the earlier producer.
+    /// Returns the latest frame in the input.
     ///
-    /// Each view is advanced to its own newest record, which stays pinned, so
-    /// a cycle with no new data sees the same record again.
+    /// Internally this loops through all of the views, and finds the one with the latest timestamp.
     pub fn latest(&mut self) -> Result<Option<FrameGrant<'_, F>>, ReadError> {
-        let mut best: Option<(Timestamp, ReadGrant<'_>)> = None;
+        let mut latest: Option<(Timestamp, ReadGrant<'_>)> = None;
         for view in self.views.iter_mut() {
             let Some(grant) = view.try_latest()? else {
                 continue;
             };
             let stamp = frame_of::<F>(&grant)?.timestamp();
-            if best.as_ref().is_none_or(|(b, _)| stamp > *b) {
-                best = Some((stamp, grant));
+            if latest.as_ref().is_none_or(|(b, _)| stamp > *b) {
+                latest = Some((stamp, grant));
             }
         }
-        best.map(|(_, grant)| FrameGrant::new(grant)).transpose()
+        latest.map(|(_, grant)| FrameGrant::new(grant)).transpose()
     }
 
-    /// Hand `f` every committed record, producer by producer in edge order.
-    pub fn drain(&mut self, mut f: impl FnMut(&F)) -> Result<(), ReadError> {
-        for view in &mut self.views {
-            while let Some(grant) = view.try_read()? {
-                f(frame_of::<F>(&grant)?);
-            }
-        }
-        Ok(())
+    /// Iterator that drains all frames from the input.
+    ///
+    /// This iterator runs in the order of the internal views, so frames from
+    /// different producers are not ordered by timestamp.
+    pub fn drain(&mut self) -> impl Iterator<Item = Result<&F, ReadError>> + '_ {
+        self.views
+            .iter_mut()
+            .flat_map(|view| view.drain().map(|record| frame_of::<F>(record?)))
     }
 }
 
@@ -143,7 +161,7 @@ fn frame_of<F: Frame>(record: &[u8]) -> Result<&F, ReadError> {
 
 #[cfg(kani)]
 mod proofs {
-    use super::capacity_for;
+    use super::ring_capacity;
 
     /// A capacity always holds two records of the largest size the ring's
     /// 32-bit length field can address.
@@ -152,7 +170,7 @@ mod proofs {
         let max_size: u32 = kani::any();
         let depth: usize = kani::any();
         let max_size = max_size as usize;
-        if let Some(capacity) = capacity_for(max_size, depth) {
+        if let Some(capacity) = ring_capacity(max_size, depth) {
             assert!(capacity.is_power_of_two());
             assert!(capacity >= 2 * metor_fsw_3_ring::frame_len(max_size));
         }
@@ -166,155 +184,232 @@ mod tests {
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use super::*;
+    use crate::tests::utils::Imu;
     use crate::{Componentize, Frame};
 
     #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
-    #[frame(name = "sample")]
-    #[repr(C)]
-    struct Sample {
+    #[repr(C, align(16))]
+    struct Aligned {
         #[frame(timestamp)]
         timestamp: Timestamp,
         value: u64,
     }
 
-    fn sample(ts: i64, value: u64) -> Sample {
-        Sample {
-            timestamp: Timestamp(ts),
-            value,
+    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
+    #[repr(C, align(32))]
+    struct Overaligned {
+        #[frame(timestamp)]
+        timestamp: Timestamp,
+        value: [u64; 3],
+    }
+
+    #[test]
+    fn aligned_frames_remain_readable_through_wraps() {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: 128,
+            max_readers: 1,
+        });
+        let mut output = Output::<Aligned>::try_new(ring.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let mut input = Input::<Aligned>::try_new(vec![ring.view(NoWake).expect("free slot")])
+            .expect("supported alignment");
+        for value in 0..20 {
+            output
+                .write(&Aligned {
+                    timestamp: Timestamp(value as i64),
+                    value,
+                })
+                .expect("ring has room");
+            let frame = input.latest().expect("aligned record").expect("record");
+            assert_eq!(frame.value, value);
         }
+    }
+
+    #[test]
+    fn unsupported_alignment_is_rejected_at_construction() {
+        let ring = ring(4);
+        let error = UnsupportedAlignment {
+            alignment: 32,
+            supported: 16,
+        };
+        assert_eq!(
+            Output::<Overaligned>::try_new(ring.writer(NoWake).expect("free writer")).err(),
+            Some(error)
+        );
+        assert_eq!(
+            Input::<Overaligned>::try_new(vec![ring.view(NoWake).expect("free slot")]).err(),
+            Some(error)
+        );
+        assert_eq!(Input::<Overaligned>::try_new(Vec::new()).err(), Some(error));
+        assert!(ring.writer(NoWake).is_ok());
+        assert_eq!(Input::<Overaligned>::def("input").alignment, 32);
+        assert_eq!(Output::<Aligned>::def("output").alignment, 16);
+    }
+
+    fn sample(ts: i64, sample: f64) -> Imu {
+        Imu::new(ts, sample)
     }
 
     fn ring(depth: usize) -> RingBuffer {
         RingBuffer::create_in_memory(Config {
-            capacity: capacity_for(Sample::MAX_SIZE, depth).expect("valid capacity"),
+            capacity: ring_capacity(Imu::MAX_SIZE, depth).expect("valid capacity"),
             max_readers: 4,
         })
     }
 
-    fn pair(depth: usize) -> (RingBuffer, Output<Sample>, Input<Sample>) {
+    fn pair(depth: usize) -> (RingBuffer, Output<Imu>, Input<Imu>) {
         let ring = ring(depth);
-        let out = Output::new(ring.writer(NoWake).expect("free writer"));
-        let input = Input::new(vec![ring.view(NoWake).expect("free slot")]);
+        let out = Output::try_new(ring.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let input = Input::try_new(vec![ring.view(NoWake).expect("free slot")])
+            .expect("supported alignment");
         (ring, out, input)
     }
 
     #[test]
     fn capacity_is_power_of_two_holding_two_records() {
-        let capacity = capacity_for(64, 1).expect("valid capacity");
+        let capacity = ring_capacity(64, 1).expect("valid capacity");
         assert!(capacity.is_power_of_two());
         assert!(capacity >= 2 * frame_len(64));
-        assert!(capacity_for(usize::MAX, 4).is_none());
-        assert!(capacity_for(1 << 40, 4).is_none());
-        assert!(capacity_for(1 << 30, usize::MAX).is_none());
+        assert!(ring_capacity(usize::MAX, 4).is_none());
+        if let Ok(size) = usize::try_from(1u64 << 40) {
+            assert!(ring_capacity(size, 4).is_none());
+        }
+        #[cfg(target_pointer_width = "32")]
+        assert!(ring_capacity(u32::MAX as usize, 4).is_none());
+        assert!(ring_capacity(1 << 30, usize::MAX).is_none());
     }
 
     #[test]
     fn write_then_latest() {
         let (_ring, mut out, mut input) = pair(4);
-        out.write(&sample(7, 42)).expect("ring has room");
+        out.write(&sample(7, 42.0)).expect("ring has room");
         let got = input.latest().expect("valid record").expect("one record");
-        assert_eq!(got.value, 42);
+        assert_eq!(got.sample, 42.0);
         assert_eq!(got.timestamp, Timestamp(7));
     }
 
     #[test]
     fn latest_repeats_the_pinned_record() {
         let (_ring, mut out, mut input) = pair(4);
-        out.write(&sample(1, 1)).expect("ring has room");
-        assert_eq!(input.latest().expect("valid").expect("record").value, 1);
-        assert_eq!(input.latest().expect("valid").expect("record").value, 1);
+        out.write(&sample(1, 1.0)).expect("ring has room");
+        assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
+        assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
     }
 
     #[test]
     fn drain_visits_records_in_order() {
         let (_ring, mut out, mut input) = pair(8);
         for i in 0..3 {
-            out.write(&sample(i, i as u64)).expect("ring has room");
+            out.write(&sample(i, i as f64)).expect("ring has room");
         }
-        let mut seen = Vec::new();
-        input.drain(|f| seen.push(f.value)).expect("valid records");
-        assert_eq!(seen, vec![0, 1, 2]);
-        seen.clear();
-        input.drain(|f| seen.push(f.value)).expect("valid records");
+        let seen = input
+            .drain()
+            .flat_map(|r| r.ok())
+            .map(|r| r.sample)
+            .collect::<Vec<_>>();
+        assert_eq!(seen, vec![0.0, 1.0, 2.0]);
+        let seen = input.drain().collect::<Vec<_>>();
         assert!(seen.is_empty());
     }
 
     #[test]
     fn latest_picks_the_greater_timestamp_across_producers() {
         let (left, right) = (ring(4), ring(4));
-        let mut a = Output::<Sample>::new(left.writer(NoWake).expect("free writer"));
-        let mut b = Output::<Sample>::new(right.writer(NoWake).expect("free writer"));
-        let mut input = Input::<Sample>::new(vec![
+        let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let mut b = Output::<Imu>::try_new(right.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let mut input = Input::<Imu>::try_new(vec![
             left.view(NoWake).expect("free slot"),
             right.view(NoWake).expect("free slot"),
-        ]);
-        a.write(&sample(9, 1)).expect("ring has room");
-        b.write(&sample(3, 2)).expect("ring has room");
-        assert_eq!(input.latest().expect("valid").expect("record").value, 1);
+        ])
+        .expect("supported alignment");
+        a.write(&sample(9, 1.0)).expect("ring has room");
+        b.write(&sample(3, 2.0)).expect("ring has room");
+        assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
 
-        b.write(&sample(11, 3)).expect("ring has room");
-        assert_eq!(input.latest().expect("valid").expect("record").value, 3);
+        b.write(&sample(11, 3.0)).expect("ring has room");
+        assert_eq!(input.latest().expect("valid").expect("record").sample, 3.0);
     }
 
     #[test]
     fn latest_ties_go_to_the_earlier_producer() {
         let (left, right) = (ring(4), ring(4));
-        let mut a = Output::<Sample>::new(left.writer(NoWake).expect("free writer"));
-        let mut b = Output::<Sample>::new(right.writer(NoWake).expect("free writer"));
-        let mut input = Input::<Sample>::new(vec![
+        let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let mut b = Output::<Imu>::try_new(right.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let mut input = Input::<Imu>::try_new(vec![
             left.view(NoWake).expect("free slot"),
             right.view(NoWake).expect("free slot"),
-        ]);
-        a.write(&sample(5, 1)).expect("ring has room");
-        b.write(&sample(5, 2)).expect("ring has room");
-        assert_eq!(input.latest().expect("valid").expect("record").value, 1);
+        ])
+        .expect("supported alignment");
+        a.write(&sample(5, 1.0)).expect("ring has room");
+        b.write(&sample(5, 2.0)).expect("ring has room");
+        assert_eq!(input.latest().expect("valid").expect("record").sample, 1.0);
     }
 
     #[test]
     fn drain_visits_producers_in_edge_order() {
         let (left, right) = (ring(8), ring(8));
-        let mut a = Output::<Sample>::new(left.writer(NoWake).expect("free writer"));
-        let mut b = Output::<Sample>::new(right.writer(NoWake).expect("free writer"));
-        let mut input = Input::<Sample>::new(vec![
+        let mut a = Output::<Imu>::try_new(left.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let mut b = Output::<Imu>::try_new(right.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let mut input = Input::<Imu>::try_new(vec![
             left.view(NoWake).expect("free slot"),
             right.view(NoWake).expect("free slot"),
-        ]);
-        b.write(&sample(0, 10)).expect("ring has room");
-        a.write(&sample(1, 1)).expect("ring has room");
-        a.write(&sample(2, 2)).expect("ring has room");
-        let mut seen = Vec::new();
-        input.drain(|f| seen.push(f.value)).expect("valid records");
-        assert_eq!(seen, vec![1, 2, 10]);
+        ])
+        .expect("supported alignment");
+        b.write(&sample(0, 10.0)).expect("ring has room");
+        a.write(&sample(1, 1.0)).expect("ring has room");
+        a.write(&sample(2, 2.0)).expect("ring has room");
+        let seen = input
+            .drain()
+            .flat_map(|r| r.ok())
+            .map(|r| r.sample)
+            .collect::<Vec<_>>();
+        assert_eq!(seen, vec![1.0, 2.0, 10.0]);
     }
 
     #[test]
     fn unconnected_input_reads_nothing() {
-        let mut input = Input::<Sample>::new(Vec::new());
+        let mut input = Input::<Imu>::try_new(Vec::new()).expect("supported alignment");
         assert!(input.latest().expect("valid").is_none());
-        let mut seen = 0;
-        input.drain(|_| seen += 1).expect("valid");
-        assert_eq!(seen, 0);
+        assert_eq!(input.drain().count(), 0);
     }
 
     #[test]
     fn full_ring_would_block() {
-        let (_ring, mut out, mut input) = pair(2);
-        out.write(&sample(0, 0)).expect("ring has room");
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: 64,
+            max_readers: 1,
+        });
+        let mut out = Output::try_new(ring.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let mut input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
+            .expect("supported alignment");
+        out.write(&sample(0, 0.0)).expect("ring has room");
         let pinned = input.latest().expect("valid").expect("record");
-        assert_eq!(pinned.value, 0);
+        assert_eq!(pinned.sample, 0.0);
         drop(pinned);
-        // The pinned record plus one more fills a depth-2 ring.
-        out.write(&sample(1, 1)).expect("ring has room");
-        assert_eq!(out.write(&sample(2, 2)), Err(WriteError::WouldBlock));
+        // Two 32-byte records fill the ring.
+        out.write(&sample(1, 1.0)).expect("ring has room");
+        assert_eq!(out.write(&sample(2, 2.0)), Err(WriteError::WouldBlock));
     }
 
     #[test]
     fn short_record_is_corrupt() {
         let ring = ring(4);
         let mut writer = ring.writer(NoWake).expect("free writer");
-        let mut input = Input::<Sample>::new(vec![ring.view(NoWake).expect("free slot")]);
+        let mut input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
+            .expect("supported alignment");
         writer.try_write(&[0u8; 4]).expect("ring has room");
         assert_eq!(input.latest().err(), Some(ReadError::Corrupt));
-        assert_eq!(input.drain(|_| ()).err(), Some(ReadError::Corrupt));
+        assert_eq!(
+            input.drain().next().unwrap().err(),
+            Some(ReadError::Corrupt)
+        );
     }
 }

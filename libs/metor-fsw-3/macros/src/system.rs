@@ -64,9 +64,10 @@ fn bind_body(bundle: &Bundle, arg: &Ident) -> TokenStream2 {
         // PANIC Safety: a named struct's fields all have idents.
         let id = f.ident.as_ref().expect("named field");
         let ty = &f.ty;
-        // PANIC Safety: length checked above; a short list is a coordinator bug.
+        // PANIC Safety: length checked above; the coordinator validates frame alignment.
         quote! {
-            #id: <#ty>::new(#arg.next().expect("checked length")),
+            #id: <#ty>::try_new(#arg.next().expect("checked length"))
+                .expect("unsupported frame alignment"),
         }
     });
     quote! {

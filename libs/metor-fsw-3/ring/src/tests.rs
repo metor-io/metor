@@ -23,6 +23,15 @@ fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
     })
 }
 
+#[test]
+fn alignment_rounding_at_usize_boundary() {
+    assert_eq!(round_up16(0), 0);
+    assert_eq!(round_up16(1), 16);
+    assert_eq!(round_up16(16), 16);
+    assert_eq!(round_up16(usize::MAX - 15), usize::MAX - 15);
+    assert_eq!(frame_len(usize::MAX - 31), usize::MAX - 15);
+}
+
 // ----- Basic single-threaded paths -----
 
 #[test]
@@ -46,16 +55,14 @@ fn roundtrip() {
 /// the reader (kept caught up, so the writer never blocks) must skip it.
 #[test]
 fn wraparound_aligned() {
-    // With capacity 64 and a 16-byte payload each record is 24 bytes. Two fit
-    // at 0 and 24; the third would straddle (48 + 24 > 64), so the writer
-    // leaves a 16-byte gap and wraps to offset 0.
+    // A 17-byte payload occupies 48 bytes and leaves a 16-byte wrap gap.
     let rb = ring(64, 1);
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
 
     for i in 0u8..12 {
-        let msg = [i; 16];
+        let msg = [i; 17];
         w.try_write(&msg).unwrap();
         assert!(v.try_read_into(&mut buf).unwrap());
         assert_eq!(&buf[..], &msg[..], "message {i} survived the wrap");
@@ -113,7 +120,7 @@ fn backpressure() {
     let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
 
-    // Each record is 24 bytes. Two fit (48 <= 64), and a third would
+    // Each record is 32 bytes. Two fit (64 <= 64), and a third would
     // overwrite the idle reader.
     w.try_write(&[1u8; 16]).unwrap();
     w.try_write(&[2u8; 16]).unwrap();
@@ -186,10 +193,8 @@ fn latest_pins_newest() {
 /// The pin is load-bearing. The writer cannot reclaim the pinned record's
 /// bytes, and moving the pin unblocks it.
 ///
-/// With capacity 64 each record is 24 bytes. After two writes the reader pins
-/// the record at absolute 24..48. The third write wraps (gap at 48, record at
-/// absolute 64..88, physical 0..24) and fits, but the fourth (physical
-/// 24..48) would overwrite the pin.
+/// With capacity 64 each record is 32 bytes. The second record pins 32..64.
+/// The third write wraps and fits; the fourth would overwrite the pin.
 #[test]
 fn latest_pin_backpressures_writer() {
     let rb = ring(64, 1);
@@ -364,17 +369,17 @@ fn raw_attach_recovers_geometry() {
 
     // The capacity of 256 was recovered too, since the
     // `InsufficientCapacity` boundary sits exactly at `frame_len(payload) >
-    // 256`. A 249-byte payload makes a 264-byte record and is rejected; a
-    // 248-byte payload makes a 256-byte record, which the capacity allows
+    // 256`. A 241-byte payload makes a 272-byte record and is rejected; a
+    // 240-byte payload makes a 256-byte record, which the capacity allows
     // (it is only backpressured here because the region already holds a
     // byte).
     let mut w = raw.writer(NoWake).unwrap();
     assert_eq!(
-        w.try_write(&[0u8; 249]),
+        w.try_write(&[0u8; 241]),
         Err(WriteError::InsufficientCapacity)
     );
     assert_ne!(
-        w.try_write(&[0u8; 248]),
+        w.try_write(&[0u8; 240]),
         Err(WriteError::InsufficientCapacity)
     );
 }
@@ -490,7 +495,8 @@ fn mmap_roundtrip() {
         capacity: 1024,
         max_readers: 4,
     };
-    let rb = RingBuffer::create_mmap(&path, cfg).unwrap();
+    // SAFETY: this test exclusively owns the new file and its mappings.
+    let rb = unsafe { RingBuffer::create_mmap(&path, cfg) }.unwrap();
     let mut w = rb.writer(NoWake).unwrap();
     let mut v = rb.view(NoWake).unwrap();
 
@@ -659,13 +665,11 @@ fn reader_on_gap_start_reads_through() {
     let mut v = rb.view(NoWake).unwrap();
     let mut buf = Vec::new();
 
-    w.try_write(&[1u8; 16]).unwrap();
-    w.try_write(&[2u8; 16]).unwrap();
-    assert!(v.try_read_into(&mut buf).unwrap());
+    w.try_write(&[1u8; 17]).unwrap();
     assert!(v.try_read_into(&mut buf).unwrap());
     assert_eq!(v.cursor(), 48);
 
-    w.try_write(&[3u8; 16]).unwrap(); // wraps; hwm 48, record at abs 64..88
+    w.try_write(&[3u8; 16]).unwrap(); // wraps; hwm 48, record at abs 64..96
     assert!(
         v.try_read_into(&mut buf).unwrap(),
         "gap skipped, record read"
@@ -698,7 +702,7 @@ fn attach_rejects_truncated() {
 #[test]
 fn attach_rejects_bad_capacity() {
     let (_rb, base, len) = valid_region();
-    for bad in [0u64, 48, 4, u64::MAX] {
+    for bad in [0u64, 48, 4, 8, u64::MAX] {
         // SAFETY: OFF_CAPACITY is inside the live header region.
         unsafe { (base.add(OFF_CAPACITY) as *mut u64).write(bad) };
         assert_eq!(
@@ -770,7 +774,8 @@ fn attach_mmap_rejects_truncated_file() {
         capacity: 1024,
         max_readers: 2,
     };
-    drop(RingBuffer::create_mmap(&path, cfg).unwrap());
+    // SAFETY: the file is new, and the ring drops before truncation.
+    drop(unsafe { RingBuffer::create_mmap(&path, cfg) }.unwrap());
 
     let truncate = |n: u64| {
         std::fs::OpenOptions::new()
@@ -1030,10 +1035,12 @@ fn create_raw_formats_a_caller_owned_region() {
     };
     let len = region_len(&cfg);
     // Over-allocate so the "region may be larger than the ring" case is live.
-    // `u64` words keep the region 8-aligned on every allocator.
-    let mut region = vec![0u64; (len + 64) / 8];
+    // `Word` keeps the region 16-aligned on every allocator.
+    let mut region: Vec<Word> = (0..(len + 64) / 16)
+        .map(|_| Word(UnsafeCell::new([0; 2])))
+        .collect();
     let base = region.as_mut_ptr().cast::<u8>();
-    let region_len = region.len() * 8;
+    let region_len = region.len() * size_of::<Word>();
 
     // SAFETY: `region` outlives every handle below and nothing else reads it.
     let ring = unsafe { RingBuffer::create_raw(base, region_len, cfg) }.expect("formats");
@@ -1063,11 +1070,13 @@ fn create_raw_rejects_bad_regions() {
         max_readers: 4,
     };
     let len = region_len(&cfg);
-    let mut region = vec![0u64; (len + 16) / 8];
+    let mut region: Vec<Word> = (0..(len + 16) / 16)
+        .map(|_| Word(UnsafeCell::new([0; 2])))
+        .collect();
     let base = region.as_mut_ptr().cast::<u8>();
 
     // SAFETY: a live region; the call fails before formatting anything.
-    let misaligned = unsafe { RingBuffer::create_raw(base.wrapping_add(1), len, cfg) };
+    let misaligned = unsafe { RingBuffer::create_raw(base.wrapping_add(8), len, cfg) };
     assert!(matches!(misaligned, Err(AttachError::Misaligned)));
 
     // SAFETY: same, one byte short of the computed layout.
@@ -1102,4 +1111,273 @@ fn checked_region_size_rejects_unrepresentable_geometry() {
         max_readers: 2,
     };
     assert_eq!(checked_region_len(&cfg), Some(region_len(&cfg)));
+}
+
+fn check_payload_alignment(rb: &RingBuffer) {
+    let mut writer = rb.writer(NoWake).unwrap();
+    let mut reader = rb.view(NoWake).unwrap();
+    for len in [0, 1, 8, 16, 17, 31, 1, 16] {
+        let payload = [42u8; 31];
+        writer.try_write(&payload[..len]).unwrap();
+        let grant = reader.try_read().unwrap().unwrap();
+        assert_eq!(&*grant, &payload[..len]);
+        assert!((grant.as_ptr() as usize).is_multiple_of(PAYLOAD_ALIGNMENT));
+    }
+    assert!(rb.committed() > 64);
+}
+
+#[test]
+fn heap_and_raw_payloads_are_aligned_across_wraps() {
+    let rb = ring(64, 1);
+    check_payload_alignment(&rb);
+    let (base, len) = rb.region();
+    assert!((base as usize).is_multiple_of(PAYLOAD_ALIGNMENT));
+    // SAFETY: rb owns the region and outlives the attached handle.
+    let attached = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
+    check_payload_alignment(&attached);
+}
+
+#[test]
+#[cfg(all(feature = "mmap", not(miri)))]
+fn mmap_payloads_are_aligned_across_wraps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aligned.bin");
+    // SAFETY: this test exclusively owns the new file throughout its lifetime.
+    let rb = unsafe {
+        RingBuffer::create_mmap(
+            &path,
+            Config {
+                capacity: 64,
+                max_readers: 1,
+            },
+        )
+    }
+    .unwrap();
+    check_payload_alignment(&rb);
+    // SAFETY: rb keeps the exclusively owned file live throughout attachment.
+    let attached = unsafe { RingBuffer::attach_mmap(&path) }.unwrap();
+    check_payload_alignment(&attached);
+}
+
+#[test]
+fn attach_rejects_old_version_and_eight_byte_alignment() {
+    let (rb, base, len) = valid_region();
+    // SAFETY: this offset stays inside the allocation and fails before reading.
+    assert_eq!(
+        unsafe { RingBuffer::attach_raw(base.add(8), len - 8) }.err(),
+        Some(AttachError::Misaligned)
+    );
+    let mut header = RegionHeader {
+        magic: MAGIC,
+        version: VERSION - 1,
+        flags: 0,
+        capacity: 64,
+        data_offset: rb.inner.data_offset as u64,
+        max_readers: 2,
+        reader_table_offset: HEADER_SIZE as u32,
+        total_size: len as u64,
+        arch_tag: arch_tag(),
+    };
+    assert!(matches!(
+        validate_header(&header, len),
+        Err(AttachError::BadVersion)
+    ));
+    header.version = VERSION;
+    header.data_offset += 8;
+    header.total_size += 8;
+    assert!(matches!(
+        validate_header(&header, len + 8),
+        Err(AttachError::BadGeometry)
+    ));
+}
+
+#[test]
+fn empty_ring_wraps_for_a_full_record() {
+    let ring = ring(64, 1);
+    let mut writer = ring.writer(NoWake).unwrap();
+    for _ in 0..2 {
+        writer.try_write(&[1; 8]).unwrap();
+        writer.try_write(&[2; 48]).unwrap();
+    }
+    assert_eq!(ring.committed(), 256);
+    assert_eq!(
+        writer.try_write(&[0; 49]),
+        Err(WriteError::InsufficientCapacity)
+    );
+    assert_eq!(ring.committed(), 256);
+}
+
+#[test]
+fn caught_up_reader_skips_padding_before_retry() {
+    let ring = ring(64, 1);
+    let mut reader = ring.view(NoWake).unwrap();
+    let mut writer = ring.writer(NoWake).unwrap();
+    writer.try_write(&[1; 8]).unwrap();
+    drop(reader.try_read().unwrap().unwrap());
+    assert_eq!(writer.try_write(&[2; 48]), Err(WriteError::WouldBlock));
+    assert_eq!(ring.committed(), 64);
+    assert!(reader.try_read().unwrap().is_none());
+    writer.try_write(&[2; 48]).unwrap();
+    assert_eq!(&*reader.try_read().unwrap().unwrap(), &[2; 48]);
+}
+
+#[test]
+fn padding_preserves_latest_and_held_grants() {
+    let ring = ring(64, 1);
+    let mut reader = ring.view(NoWake).unwrap();
+    let mut writer = ring.writer(NoWake).unwrap();
+    writer.try_write(&[1; 8]).unwrap();
+    let grant = reader.try_latest().unwrap().unwrap();
+    assert_eq!(writer.try_write(&[2; 48]), Err(WriteError::WouldBlock));
+    assert_eq!(&*grant, &[1; 8]);
+    drop(grant);
+    assert_eq!(&*reader.try_latest().unwrap().unwrap(), &[1; 8]);
+    assert_eq!(reader.cursor(), 0);
+    drop(reader.try_read().unwrap().unwrap());
+    assert!(reader.try_read().unwrap().is_none());
+    writer.try_write(&[2; 48]).unwrap();
+    assert_eq!(&*reader.try_latest().unwrap().unwrap(), &[2; 48]);
+}
+
+#[test]
+fn registration_during_padding_publication() {
+    let ring = ring(64, 1);
+    let mut writer = ring.writer(NoWake).unwrap();
+    writer.try_write(&[1; 8]).unwrap();
+    let consumer = ring.clone();
+    let task = std::thread::spawn(move || {
+        let mut reader = consumer.view(NoWake).unwrap();
+        if let Some(grant) = reader.try_read().unwrap() {
+            assert_eq!(&*grant, &[2; 48]);
+        }
+    });
+    let result = writer.try_write(&[2; 48]);
+    assert!(result.is_ok() || result == Err(WriteError::WouldBlock));
+    task.join().unwrap();
+}
+
+const DEAD_PID: u64 = 999_999_999;
+
+#[test]
+fn reclaim_does_not_free_a_reused_slot() {
+    let ring = ring(64, 1);
+    let reader = ring.view(NoWake).unwrap();
+    ring.inner.slot_owner(0).store(DEAD_PID, Release);
+    drop(reader);
+    assert_eq!(ring.inner.slot_owner(0).load(Acquire), 0);
+    let consumer = ring.clone();
+    let task = std::thread::spawn(move || {
+        let reader = consumer.view(NoWake).unwrap();
+        assert_ne!(consumer.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
+        assert_eq!(consumer.inner.slot_owner(0).load(Acquire), owner_tag());
+        drop(reader);
+    });
+    // SAFETY: the synthetic owner has no live handles.
+    unsafe { ring.reclaim_owner(DEAD_PID) };
+    task.join().unwrap();
+}
+
+#[test]
+fn concurrent_reclaimers_do_not_free_a_new_owner() {
+    let ring = ring(64, 1);
+    ring.inner.slot_cursor(0).store(0, Release);
+    ring.inner.slot_owner(0).store(DEAD_PID, Release);
+    let reclaimer = ring.clone();
+    let task = std::thread::spawn(move || {
+        // SAFETY: the synthetic owner has no live handles.
+        unsafe { reclaimer.reclaim_owner(DEAD_PID) };
+    });
+    // SAFETY: the synthetic owner has no live handles.
+    unsafe { ring.reclaim_owner(DEAD_PID) };
+    if let Ok(reader) = ring.view(NoWake) {
+        assert_ne!(ring.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
+        assert_eq!(ring.inner.slot_owner(0).load(Acquire), owner_tag());
+        task.join().unwrap();
+        assert_ne!(ring.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
+        drop(reader);
+    } else {
+        task.join().unwrap();
+    }
+}
+
+/// A drain borrows every unread record; the records are consumed by the
+/// next read, not by the drain itself.
+#[test]
+fn drain_yields_every_record_and_consumes_on_the_next_read() {
+    let ring = ring(256, 1);
+    let mut writer = ring.writer(NoWake).unwrap();
+    let mut view = ring.view(NoWake).unwrap();
+    for i in 0..3u8 {
+        writer.try_write(&[i; 8]).unwrap();
+    }
+    let records: Vec<&[u8]> = view.drain().map(|r| r.unwrap()).collect();
+    assert_eq!(records, [&[0u8; 8][..], &[1u8; 8], &[2u8; 8]]);
+    // Slices outlive the iterator; the cursor has not moved yet.
+    assert_eq!(view.cursor(), 0);
+    assert!(view.try_read().unwrap().is_none());
+    assert_eq!(view.cursor(), 3 * frame_len(8) as u64);
+    assert!(view.drain().next().is_none());
+}
+
+/// Breaking out early consumes only what was yielded.
+#[test]
+fn drain_break_consumes_only_the_records_yielded() {
+    let ring = ring(256, 1);
+    let mut writer = ring.writer(NoWake).unwrap();
+    let mut view = ring.view(NoWake).unwrap();
+    for i in 0..3u8 {
+        writer.try_write(&[i; 8]).unwrap();
+    }
+    let first = view.drain().next().unwrap().unwrap().to_vec();
+    assert_eq!(first, [0u8; 8]);
+    let rest: Vec<u8> = view.drain().map(|r| r.unwrap()[0]).collect();
+    assert_eq!(rest, [1, 2]);
+}
+
+/// The writer cannot reuse bytes a drain has handed out; it can once the
+/// view settles.
+#[test]
+fn drain_pins_its_records_until_settled() {
+    let ring = ring(64, 1);
+    let mut writer = ring.writer(NoWake).unwrap();
+    let mut view = ring.view(NoWake).unwrap();
+    writer.try_write(&[1; 8]).unwrap();
+    writer.try_write(&[2; 8]).unwrap();
+    let drained: Vec<&[u8]> = view.drain().map(|r| r.unwrap()).collect();
+    assert_eq!(writer.try_write(&[3; 8]), Err(WriteError::WouldBlock));
+    assert_eq!(drained[0], &[1; 8]);
+    assert!(view.try_read().unwrap().is_none());
+    writer.try_write(&[3; 8]).unwrap();
+}
+
+/// A drain reads through a wrap gap like `try_read` does.
+#[test]
+fn drain_reads_through_a_wrap_gap() {
+    let ring = ring(128, 1);
+    let mut writer = ring.writer(NoWake).unwrap();
+    let mut view = ring.view(NoWake).unwrap();
+    // 48-byte records: two fit a lap, the third wraps.
+    for i in 0..2u8 {
+        writer.try_write(&[i; 32]).unwrap();
+    }
+    assert!(view.drain().count() == 2);
+    assert!(view.try_read().unwrap().is_none());
+    writer.try_write(&[7; 32]).unwrap();
+    writer.try_write(&[8; 32]).unwrap();
+    let seen: Vec<u8> = view.drain().map(|r| r.unwrap()[0]).collect();
+    assert_eq!(seen, [7, 8]);
+}
+
+/// A corrupt record is reported once, and the drain ends.
+#[test]
+fn drain_reports_corrupt_once() {
+    let ring = ring(64, 1);
+    let mut writer = ring.writer(NoWake).unwrap();
+    let mut view = ring.view(NoWake).unwrap();
+    writer.try_write(&[1; 8]).unwrap();
+    // SAFETY: scribbling the length field of a published record.
+    unsafe { (ring.inner.data_ptr(0) as *mut u64).write(u64::MAX) };
+    let mut drain = view.drain();
+    assert_eq!(drain.next(), Some(Err(ReadError::Corrupt)));
+    assert!(drain.next().is_none());
 }

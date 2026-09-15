@@ -1,4 +1,4 @@
-//! Frames, systems, and configs the coordinator's tests share.
+//! Frames, systems, and configs the unit tests share.
 
 use core::cell::RefCell;
 use core::future::Future;
@@ -13,16 +13,35 @@ use crate::port::{Input, Output};
 use crate::system::{System, SystemDef};
 use crate::{Frame, SystemInputs, SystemOutputs};
 
-use super::status::SystemStatus;
-use super::{Coordinator, CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable};
+use crate::coordinator::{
+    CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemStatus, SystemTable,
+};
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug, PartialEq)]
 #[frame(name = "imu")]
 #[repr(C)]
 pub struct Imu {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     pub sample: f64,
+}
+
+impl Imu {
+    pub fn new(timestamp: i64, sample: f64) -> Self {
+        Self {
+            timestamp: Timestamp(timestamp),
+            sample,
+        }
+    }
+}
+
+/// A frame with no `name`, so its name is the snake-cased ident.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[repr(C)]
+pub struct BareName {
+    #[frame(timestamp)]
+    pub timestamp: Timestamp,
+    pub value: u64,
 }
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -223,7 +242,10 @@ impl System for StatusWatch {
         inputs: &mut StatusIn,
         _outputs: &mut (),
     ) {
-        let _ = inputs.status.drain(|status| recorder.push_status(*status));
+        for res in inputs.status.drain() {
+            let Ok(status) = res else { continue };
+            recorder.push_status(*status);
+        }
     }
 }
 
@@ -297,10 +319,6 @@ pub fn pipeline_config() -> CoordinatorConfig {
         ],
         ..Default::default()
     }
-}
-
-pub fn build(config: CoordinatorConfig, table: &SystemTable) -> Coordinator {
-    Coordinator::build(config, table).expect("valid config")
 }
 
 /// A stop future for [`Coordinator::run`], which polls it once per cycle.

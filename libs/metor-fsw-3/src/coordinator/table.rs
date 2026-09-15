@@ -8,15 +8,14 @@ use crate::system::{System, SystemDef, SystemInputs, SystemOutputs};
 
 use super::run::{Runner, Step};
 
-/// Binds one system's ports and boxes the runner, with the system type erased.
-type Factory = dyn Fn(Vec<Vec<View<NoWake>>>, Vec<Writer<NoWake>>) -> Box<dyn Step>;
+type SystemMakeFn = dyn Fn(Vec<Vec<View<NoWake>>>, Vec<Writer<NoWake>>) -> Box<dyn Step>;
 
 pub(crate) struct TableEntry {
     pub def: SystemDef,
-    pub make: Box<Factory>,
+    pub make: Box<SystemMakeFn>,
 }
 
-/// Maps a config's `ty` string to the definition and factory of a system type.
+/// A registry of system definitions, and their constructors
 #[derive(Default)]
 pub struct SystemTable {
     entries: HashMap<String, TableEntry>,
@@ -27,12 +26,10 @@ impl SystemTable {
         Self::default()
     }
 
-    /// Register `ty`, replacing any type registered under the same name.
-    ///
-    /// `make` runs once per config entry naming `ty`, at build time.
+    /// Register S under the type `system_ty`, replacing any type registered under the same name.
     pub fn register<S: System + 'static>(
         &mut self,
-        ty: &str,
+        system_ty: &str,
         make: impl Fn() -> (S, S::State) + 'static,
     ) {
         let entry = TableEntry {
@@ -47,7 +44,7 @@ impl SystemTable {
                 })
             }),
         };
-        self.entries.insert(ty.to_string(), entry);
+        self.entries.insert(system_ty.to_string(), entry);
     }
 
     pub(crate) fn get(&self, ty: &str) -> Option<&TableEntry> {
@@ -59,7 +56,7 @@ impl SystemTable {
 mod tests {
     use super::*;
     use crate::Frame;
-    use crate::coordinator::fixtures::{Imu, ImuSource, NavFilter};
+    use crate::tests::utils::{Imu, ImuSource, NavFilter};
 
     #[test]
     fn register_records_the_definition() {

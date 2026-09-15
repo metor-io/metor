@@ -1,12 +1,12 @@
-//! Everything [`Coordinator::build`](super::Coordinator::build) rejects.
-
 use metor_proto::types::ComponentId;
 use thiserror::Error;
 
-/// A config the coordinator refused to build. Every variant names the system
-/// and port that produced it.
+/// Errors associated with [`CoordinatorConfig::build`].
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BuildError {
+    #[error("wall clock rate must be finite and at least 0.001 Hz")]
+    InvalidClockRate,
+
     #[error("system id `{id}` is used twice")]
     DuplicateId { id: String },
 
@@ -35,18 +35,18 @@ pub enum BuildError {
         found: ComponentId,
     },
 
+    #[error("port `{system}.{port}` requires unsupported frame alignment {alignment}")]
+    UnsupportedFrameAlignment {
+        system: String,
+        port: String,
+        alignment: usize,
+    },
+
     #[error("output `{system}.{port}` needs a ring larger than this host can address")]
     RingTooLarge {
         system: String,
         port: String,
         max_size: usize,
-    },
-
-    #[error("output `{system}.{port}` needs {readers} reader slots, more than a ring holds")]
-    TooManyReaders {
-        system: String,
-        port: String,
-        readers: usize,
     },
 
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]

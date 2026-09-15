@@ -64,7 +64,7 @@ struct Top {
 }
 ```
  
-Reading and writing the frame is then done via a "Yoke" (inspired by the fantastic ). So you would have a `Yoke<Top, &[u8]>` that you could then use to read from the frame using generator accessors like `top.processes()`. Similarly this would work for writing as well with `Yoke<Top, &mut [u8]>`.
+Reading and writing the frame is then done via a "Yoke" (inspired by the fantastic ). So you would have a `Yoke<Top, &[u8]>` that you could then use to read from the frame using generator accessors like `top.processes()`. Similarly this would work for writing as well with a `Yoke<Top, &mut [u8]>`; you could use this with `top.processes_mut()` to write to the dynamic data.
 
 ### Messages
 
@@ -82,7 +82,7 @@ type System {
     type State: SystemState;
     type Inputs: SystemInputs;
     type Outputs: SystemOutputs;
-    fn execute(&mut self, state: &mut State, inputs: &Inputs, outputs: &mut Outputs);
+    fn execute(state: &mut State, inputs: &Inputs, outputs: &mut Outputs);
 }
 
 trait SystemState {

@@ -28,6 +28,12 @@ Models live in `src/loom_tests.rs` behind `#[cfg(all(test, ring_loom))]`.
   reader's `committed`-then-`hwm` load order.
 - `writer_claim_handoff`: two threads race the claim CAS; they cannot both
   hold it at once.
+- `reclaim_does_not_free_a_reused_slot` and
+  `concurrent_reclaimers_do_not_free_a_new_owner`: dead-owner reclamation
+  cannot release a live reader's slot during reuse.
+- `registration_during_padding_publication` and
+  `latest_races_padding_publication`: publishing padding preserves reader
+  registration and the latest record's pin.
 - `grant_pins_bytes`: a held `ReadGrant` pins its bytes. The writer must
   refuse a write that would reuse them, and the borrow reads back correctly
   throughout.
@@ -43,11 +49,11 @@ Models live in `src/loom_tests.rs` behind `#[cfg(all(test, ring_loom))]`.
 
 The models are deliberately tiny. The writer's in-use scan is one atomic load
 per reader slot inside a fenced region, so the state space grows fast in both
-`max_readers` and message count. All six use a 32-byte capacity, at most two
+`max_readers` and message count. The models use a 64-byte capacity, at most two
 reader slots, two threads, and at most three records.
 
-The geometry is not arbitrary. Payloads are 12 bytes, so a record's frame is 24,
-which does *not* divide the 32-byte capacity. With a frame that divides it,
+The geometry is not arbitrary. Payloads are 17 bytes, so a record's frame is 48,
+which does *not* divide the 64-byte capacity. With a frame that divides it,
 records land flush against the lap boundary forever and the wrap-gap path never
 runs at all. Two `const` asserts at the top of the module pin that relationship
 so a later edit cannot quietly turn the interesting models into trivial ones.
@@ -66,8 +72,7 @@ rebuilding the world in both directions.
 `--lib` rather than `--all-targets`, because loom is a dev-dependency and only
 the test build of the library links it.
 
-The models run exhaustively and finish in about three seconds. If a future
-model gets too large for that, bound it rather than letting it run unbounded:
+Exhaustive runtime depends on the model. For a bounded scheduling check:
 
 ```sh
 LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg ring_loom" CARGO_TARGET_DIR=target/loom \

@@ -8,8 +8,8 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use metor_fsw_3::{
-    Clock, Coordinator, CoordinatorConfig, Frame, Input, InputConfig, Output, PortRef, System,
-    SystemConfig, SystemDef, SystemInputs, SystemOutputs, SystemStatus, SystemTable, Timestamp,
+    Clock, CoordinatorConfig, Frame, Input, InputConfig, Output, PortRef, System, SystemConfig,
+    SystemDef, SystemInputs, SystemOutputs, SystemStatus, SystemTable, Timestamp,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -183,7 +183,7 @@ impl System for Monitor {
         .into_iter()
         .enumerate()
         {
-            let _ = port.drain(|_| report.borrow_mut().statuses[i] += 1);
+            report.borrow_mut().statuses[i] += port.drain().flat_map(|r| r.ok()).count();
         }
     }
 }
@@ -267,7 +267,7 @@ impl Future for AfterCycles {
 #[test]
 fn ten_cycles_of_the_pipeline() {
     let report = Rc::new(RefCell::new(Report::default()));
-    let mut coordinator = Coordinator::build(config(), &table(&report)).expect("valid config");
+    let mut coordinator = config().build(&table(&report)).expect("valid config");
     assert_eq!(coordinator.rings(), 7);
 
     stellarator::run(|| async move {

@@ -6,10 +6,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// A fixed `#[repr(C)]` struct whose fields share one timestamp and whose
 /// bytes are the ring payload.
-///
-/// The zerocopy supertraits make a forgotten derive an error at the frame
-/// definition; `IntoBytes` also rejects implicit padding there. A frame's
-/// record size is [`Componentize::MAX_SIZE`].
 pub trait Frame:
     AsVTable
     + Componentize
@@ -32,33 +28,14 @@ pub trait Frame:
 #[cfg(test)]
 mod tests {
     use metor_proto::types::{ComponentId, Timestamp};
-    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+    use zerocopy::{FromBytes, IntoBytes};
 
+    use crate::tests::utils::{BareName, Imu};
     use crate::{Componentize, Frame};
-
-    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug, PartialEq)]
-    #[frame(name = "imu")]
-    #[repr(C)]
-    struct Imu {
-        #[frame(timestamp)]
-        timestamp: Timestamp,
-        omega: [f64; 3],
-    }
-
-    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
-    #[repr(C)]
-    struct BareName {
-        #[frame(timestamp)]
-        timestamp: Timestamp,
-        value: u64,
-    }
 
     #[test]
     fn derive_sets_name_id_and_timestamp() {
-        let imu = Imu {
-            timestamp: Timestamp(42),
-            omega: [1.0, 2.0, 3.0],
-        };
+        let imu = Imu::new(42, 1.0);
         assert_eq!(Imu::NAME, "imu");
         assert_eq!(Imu::ID, ComponentId::new("imu"));
         assert_eq!(imu.timestamp(), Timestamp(42));
@@ -72,10 +49,7 @@ mod tests {
 
     #[test]
     fn bytes_round_trip() {
-        let imu = Imu {
-            timestamp: Timestamp(7),
-            omega: [0.5, -0.5, 9.8],
-        };
+        let imu = Imu::new(7, 9.8);
         let back = Imu::read_from_bytes(imu.as_bytes()).expect("exact size");
         assert_eq!(back, imu);
         assert!(Imu::read_from_bytes(&imu.as_bytes()[..8]).is_err());

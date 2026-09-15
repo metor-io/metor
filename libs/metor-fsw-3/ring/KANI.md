@@ -22,8 +22,8 @@ Harnesses live in `src/verify.rs` behind `#[cfg(kani)]`, grouped in four tiers.
 **Position arithmetic**, over symbolic capacities, offsets and lengths, with
 nothing concrete at all:
 
-- `round_up8_correct`, `frame_len_correct`: a frame is 8-aligned, at least a
-  bare header, and no more than 15 bytes larger than its payload.
+- `round_up16_correct`, `frame_len_correct`: a frame is 16-aligned, at least a
+  bare header, and no more than 31 bytes larger than its payload.
 - `straddle_bound_is_sufficient`: the bound `locate` puts on a length field is
   enough for the `slice::from_raw_parts` that follows it. Header, payload and
   padding all stay inside the data region. This is the safety contract of
@@ -52,13 +52,15 @@ nothing concrete at all:
 - `layout_roundtrip`: creating and attaching agree. Any config `layout`
   accepts produces a header validation accepts, with identical geometry.
 
-**Operational**, driving a real heap-backed ring of capacity 32 with symbolic
+**Operational**, driving a real heap-backed ring of capacity 64 with symbolic
 payloads:
 
 - `write_read_roundtrip`: a record reads back byte for byte, and consuming it
   advances the cursor by exactly its frame length.
+- `padding_allows_empty_ring_progress`: separately publishing a wrap gap
+  allows a fitting record to be reserved at the next lap.
 - `backpressure_is_exact`: a write succeeds precisely when the record fits
-  behind the reader, and a rejected write leaves the ring untouched.
+  behind the reader. A rejected write may publish padding, but no payload.
 - `wrap_gap_skip_reads_through`: a reader parked on a wrap gap reads through
   it to the record on the next lap, for every record size that can produce a
   gap. `tests.rs` covers the one size its hard-coded geometry allows.
@@ -160,7 +162,7 @@ Kani reports which regions its proofs reached:
 cargo kani -p metor-fsw-3-ring --coverage -Z source-coverage
 ```
 
-Across the eighteen harnesses that reaches 50 functions in `lib.rs`. Exactly one
+Across the nineteen harnesses that reaches 50 functions in `lib.rs`. Exactly one
 region is reached by no harness: the `min` closure inside
 `Inner::slowest_active_cursor`, which only runs on the second active reader,
 and every harness here registers one. The multi-reader case is covered by the
@@ -193,7 +195,7 @@ error `Display` impls.
   are free functions in `lib.rs` that the writer and reader call; the harnesses
   do not re-implement them. Likewise `validate_header` is exactly what
   `read_header` runs after it reads the bytes.
-- **Failures so far have been in the harnesses.** `round_up8_correct` first
+- **Failures so far have been in the harnesses.** `round_up16_correct` first
   asserted `r < n + 8`, which itself overflows at the top of the input range.
   Kani reported it, correctly, as an arithmetic overflow. It is worth expecting
   that: an assertion over symbolic inputs is as much code as what it checks.

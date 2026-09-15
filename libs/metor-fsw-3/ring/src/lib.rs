@@ -56,9 +56,9 @@
 //!
 //! Positions are absolute byte counts that only grow. The capacity is a power
 //! of two, so the physical offset of a position is `abs & (capacity - 1)`. A
-//! record is an 8-byte header holding the `u32` payload length, followed by
-//! the payload padded out to an 8-byte boundary ([`frame_len`]). Every record
-//! therefore starts 8-aligned.
+//! record is a 16-byte header holding the `u32` payload length, followed by
+//! the payload padded out to a 16-byte boundary ([`frame_len`]). Every record
+//! therefore starts 16-aligned.
 //!
 //! Records never straddle the wrap. When one would, the writer moves it to
 //! the start of the next lap, Release-storing where valid data ends in
@@ -141,7 +141,11 @@ const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 /// Layout version, bumped on any incompatible change. Regions are ephemeral
 /// IPC state rather than archives, so a stale region is recreated rather than
 /// migrated.
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
+
+/// Alignment guaranteed for every record payload.
+pub const PAYLOAD_ALIGNMENT: usize = 16;
+const RECORD_HEADER_SIZE: usize = PAYLOAD_ALIGNMENT;
 
 /// The identifying metadata at the start of every region, occupying cache
 /// line 0. `init_region` writes it once before the region is published and
@@ -183,8 +187,8 @@ struct Control {
 ///
 /// `owner` is the claiming process's id, stamped by [`RingBuffer::view`] so
 /// [`RingBuffer::reclaim_owner`] can free what a dead process left behind. It
-/// is diagnostic state, not synchronization: only read under the reclaim
-/// contract (the owner is dead), and left stale on a free slot.
+/// is cleared before a slot is freed. Reclamation claims the tag atomically
+/// before releasing the cursor.
 ///
 /// `_pad` is not interior-mutable, so a shared `&ReaderSlot` freezes it. That
 /// is sound only because the pad is written exactly once, in `init_region`,
@@ -286,14 +290,20 @@ pub const fn round_up8(n: usize) -> usize {
     (n + 7) & !7
 }
 
+/// Round a payload length up to its required alignment.
+#[inline]
+pub const fn round_up16(n: usize) -> usize {
+    (n + (PAYLOAD_ALIGNMENT - 1)) & !(PAYLOAD_ALIGNMENT - 1)
+}
+
 /// Total size of a record carrying `payload_len` bytes of payload, which is
-/// an 8-byte header plus the payload padded to an 8-byte boundary.
+/// a 16-byte header plus the payload padded to a 16-byte boundary.
 ///
 /// Public so callers can size a buffer for the records they intend to write
 /// without re-deriving the header rule.
 #[inline]
 pub const fn frame_len(payload_len: usize) -> usize {
-    8 + round_up8(payload_len)
+    RECORD_HEADER_SIZE + round_up16(payload_len)
 }
 
 // ---------------------------------------------------------------------------
@@ -334,9 +344,9 @@ const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> bool {
 /// when its header starts at physical offset `phys`.
 ///
 /// This is the straddle predicate `phys + frame_len(len) <= capacity`, kept in
-/// `u64` and rewritten to avoid overflow. `capacity - 8 - phys` cannot
-/// underflow (`phys <= capacity - 8` for an 8-aligned in-bounds header) and is
-/// a multiple of 8, and for a multiple of 8 `m`, `round_up8(len) > m` exactly
+/// `u64` and rewritten to avoid overflow. `capacity - 16 - phys` cannot
+/// underflow for a 16-aligned in-bounds header and is a multiple of 16.
+/// For a multiple of 16 `m`, `round_up16(len) > m` exactly
 /// when `len > m`, so comparing the raw length is the same test as comparing
 /// the padded one, without the padding's chance to wrap.
 ///
@@ -344,7 +354,7 @@ const fn fits(committed: u64, slowest: u64, need: u64, capacity: u64) -> bool {
 /// `frame_len` of a garbage length wraps and defeats this very check.
 #[inline]
 const fn record_fits(len: u64, phys: u64, capacity: u64) -> bool {
-    len <= capacity - 8 - phys
+    len <= capacity - RECORD_HEADER_SIZE as u64 - phys
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +449,7 @@ pub enum AttachError {
     ArchMismatch,
     /// Region shorter than the fixed header.
     TooSmall,
-    /// [`RingBuffer::attach_raw`] base pointer not 8-byte aligned.
+    /// [`RingBuffer::attach_raw`] base pointer not 16-byte aligned.
     Misaligned,
     /// Header fields are internally inconsistent. The capacity is not a
     /// nonzero power of two or does not fit this target's `usize`, or an
@@ -461,7 +471,7 @@ impl core::fmt::Display for AttachError {
                 f.write_str("region was written by a different pointer width or endianness")
             }
             AttachError::TooSmall => f.write_str("region is shorter than the fixed header"),
-            AttachError::Misaligned => f.write_str("region base pointer is not 8-byte aligned"),
+            AttachError::Misaligned => f.write_str("region base pointer is not 16-byte aligned"),
             AttachError::BadGeometry => {
                 f.write_str("region header fields are internally inconsistent")
             }
@@ -478,11 +488,9 @@ impl std::error::Error for AttachError {}
 // Backing storage
 // ---------------------------------------------------------------------------
 
-/// One 8-byte, interior-mutable word, the unit of the heap backing. The
-/// explicit `align(8)` matters because `u64` is only 4-aligned on some 32-bit
-/// targets and the region's `AtomicU64` words need 8.
-#[repr(C, align(8))]
-struct Word(UnsafeCell<u64>);
+/// One 16-byte interior-mutable unit of heap storage.
+#[repr(C, align(16))]
+struct Word(UnsafeCell<[u64; 2]>);
 
 /// The memory a ring lives in, reduced to a `(base, len)` byte range and its
 /// concrete owner.
@@ -490,7 +498,7 @@ struct Word(UnsafeCell<u64>);
 /// Every constructor guarantees the region contract that all of the ring's
 /// `unsafe` relies on. `base..base + len` is a single allocation that is
 /// interior-mutable (writing through pointers derived from `base` is sound),
-/// 8-byte aligned, and stable for the backing's lifetime. The ring forms
+/// 16-byte aligned, and stable for the backing's lifetime. The ring forms
 /// `&AtomicU64` references and plain byte slices over it.
 struct Backing {
     base: *mut u8,
@@ -520,12 +528,14 @@ impl Backing {
     /// Allocate a zeroed heap region of at least `size` bytes.
     ///
     /// The region is a `Box<[Word]>` given up to a raw pointer, which makes it
-    /// interior-mutable and 8-aligned on every target. `Drop` reconstructs the
+    /// interior-mutable and 16-aligned on every target. `Drop` reconstructs the
     /// box to free it.
     pub fn heap(size: usize) -> Self {
-        let count = size.div_ceil(8);
-        let buf: Box<[Word]> = (0..count).map(|_| Word(UnsafeCell::new(0u64))).collect();
-        let len = buf.len() * 8;
+        let count = size.div_ceil(size_of::<Word>());
+        let buf: Box<[Word]> = (0..count)
+            .map(|_| Word(UnsafeCell::new([0u64; 2])))
+            .collect();
+        let len = buf.len() * size_of::<Word>();
         // Give up the box before deriving `base`, so the pointer the ring uses
         // is the one that owns the allocation and nothing retags it later.
         let words = Box::into_raw(buf);
@@ -608,7 +618,7 @@ pub trait WakeSink {
 }
 
 /// A [`WakeSource`]/[`WakeSink`] pair that does nothing, for synchronous
-/// consumers; the async paths degenerate to caller-driven polling under it.
+/// consumers. An async read on an empty ring busy-spins without yielding.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoWake;
 
@@ -766,7 +776,11 @@ impl Inner {
         // SAFETY: p is 8-aligned; [phys, phys+frame_len) is in-bounds.
         unsafe {
             (p as *mut u64).write(len);
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), p.add(8), payload.len());
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                p.add(RECORD_HEADER_SIZE),
+                payload.len(),
+            );
         }
     }
 
@@ -787,17 +801,77 @@ impl Inner {
         hdr & 0xFFFF_FFFF
     }
 
-    /// Copy `len` payload bytes starting at `phys + 8` into `dst`.
+    /// Copy `len` payload bytes starting at `phys + RECORD_HEADER_SIZE` into `dst`.
     ///
     /// # Safety
-    /// `phys + 8 + len <= capacity`, and the record was published (its write
+    /// `phys + RECORD_HEADER_SIZE + len <= capacity`, and the record was published (its write
     /// happens-before this read via `committed`).
+    /// Find the next readable record at or after absolute position `r`,
+    /// skipping a wrap gap `r` sits on. Returns the position after any skip
+    /// and the record, or `None` when caught up.
+    fn locate_from(&self, mut r: u64) -> Result<(u64, Option<Located>), ReadError> {
+        let cap = self.capacity;
+        loop {
+            // Load order matters here too: `committed` before `hwm`, the
+            // mirror of the writer's store order (crate docs).
+            let c = self.committed().load(Acquire);
+            let hwm = self.hwm().load(Acquire);
+            if r == hwm {
+                // Skip the wrap gap and resume at the next lap boundary; the
+                // gap bytes were never data. `hwm` values strictly increase,
+                // so a given `r` can match at most one gap ever and a stale
+                // `hwm` cannot re-trigger.
+                r = (r & !self.mask) + cap;
+                continue;
+            }
+            // The gap skip can transiently park the position ahead of
+            // `committed`, because a wrap's `hwm` publishes before its
+            // `committed`. Hence `>=`.
+            if r >= c {
+                return Ok((r, None));
+            }
+            let phys = (r & self.mask) as usize;
+            // SAFETY: phys is a 16-aligned, in-bounds record start (geometry
+            // guarantees `capacity >= 16`, so `phys <= cap - 16`), and `r < c`
+            // orders this read after the record's publication.
+            let len = unsafe { self.read_len(phys) };
+            // A real record never straddles and the writer can never lap a
+            // reader, so a failure here means the region is corrupt and must
+            // not be borrowed from.
+            if !record_fits(len, phys as u64, cap) {
+                return Err(ReadError::Corrupt);
+            }
+            let len = len as usize;
+            let rec = frame_len(len);
+            return Ok((r, Some(Located { r, phys, len, rec })));
+        }
+    }
+
+    /// Borrow a located record's payload.
+    ///
+    /// # Safety
+    /// `loc` came from `locate_from`, and no cursor at or before `loc.r`
+    /// moves past it while the slice lives.
+    unsafe fn payload(&self, loc: &Located) -> &[u8] {
+        // SAFETY: the record is contiguous and in-bounds (caller contract).
+        unsafe {
+            let p = self.data_ptr(loc.phys + RECORD_HEADER_SIZE);
+            std::slice::from_raw_parts(p as *const u8, loc.len)
+        }
+    }
+
     unsafe fn copy_payload(&self, phys: usize, len: usize, dst: &mut Vec<u8>) {
         dst.clear();
         dst.resize(len, 0);
-        // SAFETY: payload occupies [phys+8, phys+8+len) (caller contract);
+        // SAFETY: payload occupies [phys+RECORD_HEADER_SIZE, phys+RECORD_HEADER_SIZE+len) (caller contract);
         // ordered after the write via `committed`; non-overlapping.
-        unsafe { std::ptr::copy_nonoverlapping(self.data_ptr(phys + 8), dst.as_mut_ptr(), len) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.data_ptr(phys + RECORD_HEADER_SIZE),
+                dst.as_mut_ptr(),
+                len,
+            )
+        };
     }
 }
 
@@ -841,7 +915,7 @@ impl RingBuffer {
     /// The counterpart to [`create_in_memory`](Self::create_in_memory) for a
     /// caller that must place the region at an address it controls rather
     /// than on its own heap. `len` must be at least [`region_len`] for `cfg`,
-    /// and `base` must be 8-aligned; both are checked. The region is left
+    /// and `base` must be 16-aligned; both are checked. The region is left
     /// formatted, so a later [`attach_raw`](Self::attach_raw) over the same
     /// bytes reads the same geometry back.
     ///
@@ -850,7 +924,7 @@ impl RingBuffer {
     /// every [`Writer`] and [`View`] produced here, and nothing else is
     /// reading it while this formats it.
     pub unsafe fn create_raw(base: *mut u8, len: usize, cfg: Config) -> Result<Self, AttachError> {
-        if !(base as usize).is_multiple_of(8) {
+        if !(base as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
             return Err(AttachError::Misaligned);
         }
         let (reader_table_offset, data_offset, total) = layout(&cfg);
@@ -869,8 +943,15 @@ impl RingBuffer {
 
     /// Create a new mmap-backed region at `path`, truncating any existing
     /// file.
+    ///
+    /// # Safety
+    /// All previous ring handles, mappings, and grants over this file must
+    /// be dropped before creation. The caller must have exclusive access
+    /// during creation.
+    /// Until every resulting handle and grant is dropped, the file must not
+    /// be truncated, reformatted, or modified outside the ring protocol.
     #[cfg(feature = "mmap")]
-    pub fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
+    pub unsafe fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
         let (reader_table_offset, data_offset, total) = layout(&cfg);
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -879,8 +960,14 @@ impl RingBuffer {
             .truncate(true)
             .open(path)?;
         file.set_len(total as u64)?;
-        // SAFETY: mapping a file we just sized to `total`; we hold it exclusively.
+        // SAFETY: the file is sized to `total`; the caller guarantees exclusivity.
         let map = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        if !(map.as_ptr() as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                AttachError::Misaligned,
+            ));
+        }
         let backing = Backing::mmap(map);
         // SAFETY: freshly sized, exclusively-held region.
         unsafe { init_region(&backing, &cfg, reader_table_offset, data_offset, total) };
@@ -930,7 +1017,7 @@ impl RingBuffer {
         // This path takes an arbitrary pointer (the heap and mmap backings
         // are aligned by construction), so alignment is checked here.
         // Everything else is validated by the shared `read_header` path.
-        if !(base as usize).is_multiple_of(8) {
+        if !(base as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
             return Err(AttachError::Misaligned);
         }
         // SAFETY: caller asserts a live region of `len` readable bytes (the
@@ -948,6 +1035,9 @@ impl RingBuffer {
     /// everything else before any reference is formed into the region.
     unsafe fn attach(backing: Backing) -> Result<Self, AttachError> {
         let base = backing.base();
+        if !(base as usize).is_multiple_of(PAYLOAD_ALIGNMENT) {
+            return Err(AttachError::Misaligned);
+        }
         // SAFETY: `backing.len()` bytes are readable (caller contract);
         // `read_header` bounds every read against that length.
         let geo = unsafe { read_header(base, backing.len()) }?;
@@ -1012,7 +1102,11 @@ impl RingBuffer {
     pub unsafe fn reclaim_owner(&self, pid: u64) {
         for slot in 0..self.inner.max_readers {
             if self.inner.slot_cursor(slot).load(Acquire) != FREE_SLOT
-                && self.inner.slot_owner(slot).load(Acquire) == pid
+                && self
+                    .inner
+                    .slot_owner(slot)
+                    .compare_exchange(pid, 0, AcqRel, Acquire)
+                    .is_ok()
             {
                 // Free the cursor. Release pairs with the claim CAS in `view`.
                 self.inner.slot_cursor(slot).store(FREE_SLOT, Release);
@@ -1075,6 +1169,7 @@ impl RingBuffer {
                     inner: self.inner.clone(),
                     slot,
                     data,
+                    pending: None,
                 });
             }
         }
@@ -1131,7 +1226,7 @@ pub fn checked_region_len(cfg: &Config) -> Option<usize> {
 
 fn checked_layout(cfg: &Config) -> Option<(usize, usize, usize)> {
     if !cfg.capacity.is_power_of_two()
-        || cfg.capacity < 8
+        || cfg.capacity < RECORD_HEADER_SIZE
         || cfg.max_readers == 0
         || u32::try_from(cfg.max_readers).is_err()
     {
@@ -1253,7 +1348,10 @@ fn validate_header(hdr: &RegionHeader, region_len: usize) -> Result<Geometry, At
     // at least one record header to satisfy `read_len`, and fit this target's
     // `usize` (a 32-bit target can attach a region sized by a 64-bit
     // creator).
-    if !capacity.is_power_of_two() || capacity < 8 || capacity > usize::MAX as u64 {
+    if !capacity.is_power_of_two()
+        || capacity < RECORD_HEADER_SIZE as u64
+        || capacity > usize::MAX as u64
+    {
         return Err(AttachError::BadGeometry);
     }
     if max_readers == 0 {
@@ -1271,11 +1369,11 @@ fn validate_header(hdr: &RegionHeader, region_len: usize) -> Result<Geometry, At
     {
         return Err(AttachError::BadGeometry);
     }
-    // The data region must be 8-aligned and end at or before total_size.
+    // The data region must be 16-aligned and end at or before total_size.
     let data_end = data_offset
         .checked_add(capacity)
         .ok_or(AttachError::BadGeometry)?;
-    if !data_offset.is_multiple_of(8) || data_end > total_size {
+    if !data_offset.is_multiple_of(PAYLOAD_ALIGNMENT as u64) || data_end > total_size {
         return Err(AttachError::BadGeometry);
     }
     // The self-declared total must fit the actual backing region. A file
@@ -1309,15 +1407,26 @@ pub struct Writer<WD: WakeSource> {
 impl<WD: WakeSource> Writer<WD> {
     /// Write one message without blocking. Returns [`WriteError::WouldBlock`]
     /// if writing now would overwrite the slowest active reader.
+    /// A blocked write may publish wrap padding, but never a payload.
     pub fn try_write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
         let rec = frame_len(bytes.len()) as u64;
         if rec > self.inner.capacity {
             return Err(WriteError::InsufficientCapacity);
         }
-        let c = self.inner.committed().load(Relaxed); // sole writer
-        let (start_abs, gap) = self.inner.reserve(c, rec);
+        let mut c = self.inner.committed().load(Relaxed); // sole writer
+        let (start_abs, mut gap) = self.inner.reserve(c, rec);
         if !self.fits(c, gap + rec) {
-            return Err(WriteError::WouldBlock);
+            if gap == 0 || !self.fits(c, gap) {
+                return Err(WriteError::WouldBlock);
+            }
+            self.inner.hwm().store(c, Release);
+            self.inner.committed().store(start_abs, Release);
+            self.data.notify();
+            c = start_abs;
+            gap = 0;
+            if !self.fits(c, rec) {
+                return Err(WriteError::WouldBlock);
+            }
         }
         // SAFETY: rec <= capacity and the wrap was computed, so the record does
         // not straddle; we are the single writer.
@@ -1397,6 +1506,9 @@ pub struct View<RD: WakeSink> {
     inner: Arc<Inner>,
     slot: u32,
     data: RD,
+    /// Where a finished [`Drain`] left off. Applied to the cursor by the next
+    /// `&mut self` call, once every slice the drain handed out is dead.
+    pending: Option<u64>,
 }
 
 impl<RD: WakeSink> View<RD> {
@@ -1416,6 +1528,7 @@ impl<RD: WakeSink> View<RD> {
     /// Prefer [`View::try_read`]. Borrowing is always tear-free here, so this
     /// copying form exists only for callers that must own the bytes.
     pub fn try_read_into(&mut self, buf: &mut Vec<u8>) -> Result<bool, ReadError> {
+        self.settle();
         let Some(loc) = self.locate()? else {
             return Ok(false);
         };
@@ -1433,16 +1546,14 @@ impl<RD: WakeSink> View<RD> {
     /// consumes the record; the cursor advances past it and a waiting writer
     /// is woken.
     pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError> {
+        self.settle();
         let Some(loc) = self.locate()? else {
             return Ok(None);
         };
         // SAFETY: `locate` guarantees the record is in-bounds, and the writer
         // will not overwrite these bytes while the borrow lives (the cursor
         // stays at or before `loc.r` until the grant drops).
-        let slice = unsafe {
-            let p = self.inner.data_ptr(loc.phys + 8);
-            std::slice::from_raw_parts(p as *const u8, loc.len)
-        };
+        let slice = unsafe { self.inner.payload(&loc) };
         Ok(Some(ReadGrant {
             inner: &self.inner,
             slot: self.slot,
@@ -1453,6 +1564,7 @@ impl<RD: WakeSink> View<RD> {
 
     /// Await the next record and borrow it.
     pub async fn read(&mut self) -> Result<ReadGrant<'_>, ReadError> {
+        self.settle();
         // Awaiting and borrowing are split for the borrow checker. A grant
         // taken inside the wait loop would pin the `self` borrow across every
         // iteration. Nothing can consume a record between the successful
@@ -1478,6 +1590,7 @@ impl<RD: WakeSink> View<RD> {
     /// record is committed, or after the stream was fully consumed through
     /// [`View::try_read`] or [`View::try_read_into`].
     pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError> {
+        self.settle();
         loop {
             let Some(loc) = self.locate()? else {
                 return Ok(None);
@@ -1486,13 +1599,10 @@ impl<RD: WakeSink> View<RD> {
             // This is the newest record if nothing is committed past it. The
             // snapshot is retaken each pass, so a racing commit just means
             // one more skip iteration.
-            if end >= self.inner.committed().load(Acquire) {
+            if end >= self.data_end() {
                 // SAFETY: as in `try_read`; the cursor stays at `loc.r` (the
                 // grant's drop re-stores it), so the record stays pinned.
-                let slice = unsafe {
-                    let p = self.inner.data_ptr(loc.phys + 8);
-                    std::slice::from_raw_parts(p as *const u8, loc.len)
-                };
+                let slice = unsafe { self.inner.payload(&loc) };
                 return Ok(Some(ReadGrant {
                     inner: &self.inner,
                     slot: self.slot,
@@ -1507,45 +1617,48 @@ impl<RD: WakeSink> View<RD> {
         }
     }
 
-    /// Find the next readable record, skipping a wrap gap if the cursor sits
-    /// on one. Returns `Ok(None)` when the view is caught up.
+    /// Find the next readable record from the cursor, moving the cursor past
+    /// a wrap gap it sits on. Returns `Ok(None)` when the view is caught up.
     fn locate(&self) -> Result<Option<Located>, ReadError> {
-        let cap = self.inner.capacity;
-        loop {
-            let r = self.inner.slot_cursor(self.slot).load(Acquire);
-            // Load order matters here too: `committed` before `hwm`, the
-            // mirror of the writer's store order (crate docs).
-            let c = self.inner.committed().load(Acquire);
-            let hwm = self.inner.hwm().load(Acquire);
-            if r == hwm {
-                // Skip the wrap gap and resume at the next lap boundary; the
-                // gap bytes were never data. `hwm` values strictly increase,
-                // so a given `r` can match at most one gap ever and a stale
-                // `hwm` cannot re-trigger.
-                let lap_end = (r & !self.inner.mask) + cap;
-                self.inner.slot_cursor(self.slot).store(lap_end, Release);
-                continue;
-            }
-            // The gap skip can transiently park the cursor ahead of
-            // `committed`, because a wrap's `hwm` publishes before its
-            // `committed`. Hence `>=`.
-            if r >= c {
-                return Ok(None); // caught up
-            }
-            let phys = (r & self.inner.mask) as usize;
-            // SAFETY: phys is an 8-aligned, in-bounds record start (geometry
-            // guarantees `capacity >= 8`, so `phys <= cap - 8`), and `r < c`
-            // orders this read after the record's publication.
-            let len = unsafe { self.inner.read_len(phys) };
-            // A real record never straddles and the writer can never lap a
-            // reader, so a failure here means the region is corrupt and must
-            // not be borrowed from.
-            if !record_fits(len, phys as u64, cap) {
-                return Err(ReadError::Corrupt);
-            }
-            let len = len as usize;
-            let rec = frame_len(len);
-            return Ok(Some(Located { r, phys, len, rec }));
+        let r = self.inner.slot_cursor(self.slot).load(Acquire);
+        let (skipped, loc) = self.inner.locate_from(r)?;
+        if skipped != r {
+            self.advance(skipped);
+        }
+        Ok(loc)
+    }
+
+    fn settle(&mut self) {
+        if let Some(pos) = self.pending.take() {
+            self.advance(pos);
+        }
+    }
+
+    /// Iterate every committed record from the cursor, borrowing each in
+    /// place. The records are consumed together, on the next `&mut self`
+    /// call after the iterator and every slice it yielded are dead, so
+    /// slices from one drain may coexist. An early `break` consumes only the
+    /// records yielded so far.
+    pub fn drain(&mut self) -> Drain<'_> {
+        self.settle();
+        let pos = self.cursor();
+        let View { inner, pending, .. } = self;
+        Drain {
+            inner,
+            pos,
+            pending,
+            done: false,
+        }
+    }
+
+    /// The published edge excluding a trailing wrap gap.
+    fn data_end(&self) -> u64 {
+        let committed = self.inner.committed().load(Acquire);
+        let hwm = self.inner.hwm().load(Acquire);
+        if hwm < committed && hwm + self.inner.capacity - (hwm & self.inner.mask) == committed {
+            hwm
+        } else {
+            committed
         }
     }
 
@@ -1558,6 +1671,7 @@ impl<RD: WakeSink> View<RD> {
 
 impl<RD: WakeSink> Drop for View<RD> {
     fn drop(&mut self) {
+        self.inner.slot_owner(self.slot).store(0, Relaxed);
         self.inner.slot_cursor(self.slot).store(FREE_SLOT, Release);
     }
 }
@@ -1587,6 +1701,47 @@ impl Drop for ReadGrant<'_> {
         self.inner
             .slot_cursor(self.slot)
             .store(self.end_abs, Release);
+    }
+}
+
+/// The iterator behind [`View::drain`].
+///
+/// It walks a private position and records it in the view after each step;
+/// the view's cursor moves on its next `&mut self` call, so every slice
+/// yielded here stays pinned until then.
+pub struct Drain<'a> {
+    inner: &'a Inner,
+    pos: u64,
+    pending: &'a mut Option<u64>,
+    done: bool,
+}
+
+impl<'a> Iterator for Drain<'a> {
+    type Item = Result<&'a [u8], ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.inner.locate_from(self.pos) {
+            Ok((_, Some(loc))) => {
+                self.pos = loc.r + loc.rec as u64;
+                *self.pending = Some(self.pos);
+                // SAFETY: the view's cursor is at or before `loc.r` until the
+                // drain's position is applied, which waits for `'a` to end.
+                Some(Ok(unsafe { self.inner.payload(&loc) }))
+            }
+            Ok((pos, None)) => {
+                self.pos = pos;
+                *self.pending = Some(pos);
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
     }
 }
 

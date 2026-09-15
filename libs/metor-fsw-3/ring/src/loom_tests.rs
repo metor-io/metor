@@ -14,13 +14,13 @@ use super::*;
 use crate::sync::thread;
 
 /// Data region size for the models.
-const CAP: usize = 32;
+const CAP: usize = 64;
 /// Payload size, chosen so a record's frame does not divide the capacity.
 /// That is what forces a wrap gap: with a frame that divides it, records land
 /// flush against the lap boundary forever and the gap path never runs.
-const PAYLOAD: usize = 12;
+const PAYLOAD: usize = 17;
 /// Bytes one record occupies, header and padding included.
-const FRAME: usize = 24;
+const FRAME: usize = 48;
 
 const _: () = assert!(FRAME == frame_len(PAYLOAD));
 const _: () = assert!(CAP % FRAME != 0, "a gap would never form");
@@ -88,19 +88,16 @@ fn registration_races_backpressure() {
 
         let (start, seen) = t.join().unwrap();
 
-        // Records 1, 2 and 3 start at 0, CAP and 2 * CAP: each of the last two
-        // wraps, because a second frame never fits in the tail of a lap. So a
-        // view registers at one of exactly three committed positions, each the
-        // end of a whole record, and which one it caught decides what is still
-        // ahead of it.
-        let ahead: &[u8] = if start == FRAME as u64 {
+        // Registration can observe either a record end or separately
+        // published wrap padding. Padding leaves the next record unread.
+        let ahead: &[u8] = if start == FRAME as u64 || start == CAP as u64 {
             &[2, 3]
-        } else if start == (CAP + FRAME) as u64 {
+        } else if start == (CAP + FRAME) as u64 || start == (2 * CAP) as u64 {
             &[3]
         } else if start == (2 * CAP + FRAME) as u64 {
             &[]
         } else {
-            panic!("view registered at {start}, not on a record boundary");
+            panic!("view registered at {start}, not on a published boundary");
         };
 
         // It may not have drained everything the writer went on to commit, but
@@ -270,5 +267,91 @@ fn cursor_never_exceeds_committed_at_fits() {
         let _ = w.try_write(&payload(2));
         let _ = w.try_write(&payload(3));
         reader.join().unwrap();
+    });
+}
+
+#[test]
+fn registration_during_padding_publication() {
+    loom::model(|| {
+        let ring = ring(64, 1);
+        let mut writer = ring.writer(NoWake).unwrap();
+        writer.try_write(&[1; 8]).unwrap();
+        let consumer = ring.clone();
+        let task = thread::spawn(move || {
+            let mut reader = consumer.view(NoWake).unwrap();
+            if let Some(grant) = reader.try_read().unwrap() {
+                assert_eq!(&*grant, &[2; 48]);
+            }
+        });
+        let result = writer.try_write(&[2; 48]);
+        assert!(result.is_ok() || result == Err(WriteError::WouldBlock));
+        task.join().unwrap();
+    });
+}
+
+const DEAD_PID: u64 = 999_999_999;
+
+#[test]
+fn latest_races_padding_publication() {
+    loom::model(|| {
+        let ring = ring(64, 1);
+        let mut reader = ring.view(NoWake).unwrap();
+        let mut writer = ring.writer(NoWake).unwrap();
+        writer.try_write(&[1; 8]).unwrap();
+        let task = thread::spawn(move || {
+            assert_eq!(writer.try_write(&[2; 48]), Err(WriteError::WouldBlock));
+        });
+        let grant = reader.try_latest().unwrap().unwrap();
+        assert_eq!(&*grant, &[1; 8]);
+        task.join().unwrap();
+        assert_eq!(&*grant, &[1; 8]);
+        drop(grant);
+        assert_eq!(&*reader.try_latest().unwrap().unwrap(), &[1; 8]);
+    });
+}
+
+#[test]
+fn reclaim_does_not_free_a_reused_slot() {
+    loom::model(|| {
+        let ring = ring(64, 1);
+        let reader = ring.view(NoWake).unwrap();
+        ring.inner.slot_owner(0).store(DEAD_PID, Release);
+        drop(reader);
+        assert_eq!(ring.inner.slot_owner(0).load(Acquire), 0);
+        let consumer = ring.clone();
+        let task = thread::spawn(move || {
+            let reader = consumer.view(NoWake).unwrap();
+            assert_ne!(consumer.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
+            assert_eq!(consumer.inner.slot_owner(0).load(Acquire), owner_tag());
+            drop(reader);
+        });
+        // SAFETY: the synthetic owner has no live handles.
+        unsafe { ring.reclaim_owner(DEAD_PID) };
+        task.join().unwrap();
+    });
+}
+
+#[test]
+fn concurrent_reclaimers_do_not_free_a_new_owner() {
+    loom::model(|| {
+        let ring = ring(64, 1);
+        ring.inner.slot_cursor(0).store(0, Release);
+        ring.inner.slot_owner(0).store(DEAD_PID, Release);
+        let reclaimer = ring.clone();
+        let task = thread::spawn(move || {
+            // SAFETY: the synthetic owner has no live handles.
+            unsafe { reclaimer.reclaim_owner(DEAD_PID) };
+        });
+        // SAFETY: the synthetic owner has no live handles.
+        unsafe { ring.reclaim_owner(DEAD_PID) };
+        if let Ok(reader) = ring.view(NoWake) {
+            assert_ne!(ring.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
+            assert_eq!(ring.inner.slot_owner(0).load(Acquire), owner_tag());
+            task.join().unwrap();
+            assert_ne!(ring.inner.slot_cursor(0).load(Acquire), FREE_SLOT);
+            drop(reader);
+        } else {
+            task.join().unwrap();
+        }
     });
 }

@@ -4,12 +4,13 @@ use metor_fsw_3_ring::{NoWake, View, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
 
 /// One port of a bundle: its field name, the frame it carries, and the record
-/// size its ring must hold.
+/// size and alignment its ring must support.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortDef {
     pub name: &'static str,
     pub frame: ComponentId,
     pub max_size: usize,
+    pub alignment: usize,
 }
 
 /// A system's ports, in bind order.
@@ -55,6 +56,9 @@ pub trait System {
 pub trait SystemInputs {
     fn defs() -> Vec<PortDef>;
     /// One view list per [`defs`](SystemInputs::defs) entry, in order.
+    ///
+    /// # Panics
+    /// Derived implementations panic on a wrong list length or unsupported frame alignment.
     fn bind(views: Vec<Vec<View<NoWake>>>) -> Self;
 }
 
@@ -62,6 +66,9 @@ pub trait SystemInputs {
 pub trait SystemOutputs {
     fn defs() -> Vec<PortDef>;
     /// One writer per [`defs`](SystemOutputs::defs) entry, in order.
+    ///
+    /// # Panics
+    /// Derived implementations panic on a wrong list length or unsupported frame alignment.
     fn bind(writers: Vec<Writer<NoWake>>) -> Self;
 }
 
@@ -83,29 +90,11 @@ impl SystemOutputs for () {
 mod tests {
     use metor_fsw_3_ring::{Config, RingBuffer};
     use metor_proto::types::Timestamp;
-    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use super::*;
-    use crate::port::{Input, Output, capacity_for};
+    use crate::port::{Input, Output, ring_capacity};
+    use crate::tests::utils::{Imu, Nav};
     use crate::{Componentize, Frame};
-
-    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
-    #[frame(name = "imu")]
-    #[repr(C)]
-    struct Imu {
-        #[frame(timestamp)]
-        timestamp: Timestamp,
-        omega: u64,
-    }
-
-    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
-    #[frame(name = "nav")]
-    #[repr(C)]
-    struct Nav {
-        #[frame(timestamp)]
-        timestamp: Timestamp,
-        attitude: u64,
-    }
 
     #[derive(crate::SystemInputs)]
     struct DerivedIn {
@@ -126,8 +115,8 @@ mod tests {
             let nav = views.pop().expect("two lists");
             let imu = views.pop().expect("two lists");
             Self {
-                imu: Input::new(imu),
-                nav: Input::new(nav),
+                imu: Input::try_new(imu).expect("supported alignment"),
+                nav: Input::try_new(nav).expect("supported alignment"),
             }
         }
     }
@@ -139,7 +128,7 @@ mod tests {
 
     fn ring<F: Frame>() -> RingBuffer {
         RingBuffer::create_in_memory(Config {
-            capacity: capacity_for(F::MAX_SIZE, 4).expect("valid capacity"),
+            capacity: ring_capacity(F::MAX_SIZE, 4).expect("valid capacity"),
             max_readers: 2,
         })
     }
@@ -153,6 +142,7 @@ mod tests {
                 name: "nav",
                 frame: Nav::ID,
                 max_size: Nav::MAX_SIZE,
+                alignment: core::mem::align_of::<Nav>(),
             }]
         );
     }
@@ -180,14 +170,13 @@ mod tests {
             vec![imu.view(NoWake).expect("free slot")],
             vec![nav.view(NoWake).expect("free slot")],
         ]);
-        let mut imu_out = Output::<Imu>::new(imu.writer(NoWake).expect("free writer"));
-        imu_out
-            .write(&Imu {
-                timestamp: Timestamp(1),
-                omega: 5,
-            })
-            .expect("ring has room");
-        assert_eq!(bound.imu.latest().expect("valid").expect("record").omega, 5);
+        let mut imu_out = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        imu_out.write(&Imu::new(1, 5.0)).expect("ring has room");
+        assert_eq!(
+            bound.imu.latest().expect("valid").expect("record").sample,
+            5.0
+        );
         assert!(bound.nav.latest().expect("valid").is_none());
     }
 
@@ -202,13 +191,13 @@ mod tests {
         out.nav
             .write(&Nav {
                 timestamp: Timestamp(2),
-                attitude: 7,
+                estimate: 7.0,
             })
             .expect("ring has room");
         assert!(bound.imu.latest().expect("valid").is_none());
         assert_eq!(
-            bound.nav.latest().expect("valid").expect("record").attitude,
-            7
+            bound.nav.latest().expect("valid").expect("record").estimate,
+            7.0
         );
     }
 

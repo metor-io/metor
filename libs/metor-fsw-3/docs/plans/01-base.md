@@ -1,5 +1,8 @@
 # Base library
 
+The ring and port changes in [Ring review fixes](02-ring-review.md)
+supersede the initial layout and binding details below.
+
 The first slice of metor-fsw-3: rings, fixed frames, typed ports, the
 `System` trait, and a coordinator that runs a list of systems from a
 low-level config. Enough to wire `imu -> nav -> control` and step it.
@@ -124,7 +127,6 @@ trait and lands once the trait has run end to end.
 
 ```rust
 pub struct CoordinatorConfig { pub clock: Clock, pub depth: usize,
-                               pub reader_slack: usize,
                                pub systems: Vec<SystemConfig> }
 pub struct SystemConfig { pub id: String, pub ty: String,
                           pub inputs: Vec<InputConfig> }
@@ -160,7 +162,8 @@ One validation gate, then trust. Passes, in order:
    every `PortRef` names a known system and output port, every consumer
    port name exists on its def.
 2. Frame ids match on every edge.
-3. Count readers per output ring: one per edge plus `reader_slack`.
+3. Count readers per output ring: one per edge, at least one. Nothing
+   attaches after build, so no spare slots are kept.
 4. Allocate one ring per output, capacity `capacity_for(max_size, depth)`,
    plus one status ring per system. A reader count the ring format cannot
    hold is a build error.
