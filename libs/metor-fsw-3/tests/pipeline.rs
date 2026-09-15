@@ -84,7 +84,7 @@ impl System for Gyro {
         SystemDef::new::<(), ImuOut>("gyro")
     }
 
-    fn execute(&self, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
+    fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
         *tick += 1;
         let _ = outputs.imu.write(&Imu {
             timestamp: Timestamp(*tick),
@@ -104,7 +104,7 @@ impl System for NavFilter {
         SystemDef::new::<NavIn, NavOut>("nav_filter")
     }
 
-    fn execute(&self, _state: &mut (), inputs: &mut NavIn, outputs: &mut NavOut) {
+    fn execute(&self, _now: Timestamp, _state: &mut (), inputs: &mut NavIn, outputs: &mut NavOut) {
         let Ok(Some(imu)) = inputs.imu.latest() else {
             return;
         };
@@ -128,7 +128,13 @@ impl System for ControlLaw {
         SystemDef::new::<ControlIn, ControlOut>("control_law")
     }
 
-    fn execute(&self, _state: &mut (), inputs: &mut ControlIn, outputs: &mut ControlOut) {
+    fn execute(
+        &self,
+        _now: Timestamp,
+        _state: &mut (),
+        inputs: &mut ControlIn,
+        outputs: &mut ControlOut,
+    ) {
         let Ok(Some(nav)) = inputs.nav.latest() else {
             return;
         };
@@ -159,7 +165,13 @@ impl System for Monitor {
         SystemDef::new::<MonitorIn, ()>("monitor")
     }
 
-    fn execute(&self, report: &mut Self::State, inputs: &mut MonitorIn, _outputs: &mut ()) {
+    fn execute(
+        &self,
+        _now: Timestamp,
+        report: &mut Self::State,
+        inputs: &mut MonitorIn,
+        _outputs: &mut (),
+    ) {
         if let Ok(Some(control)) = inputs.control.latest() {
             report.borrow_mut().torque = control.torque;
         }

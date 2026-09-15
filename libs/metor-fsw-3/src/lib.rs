@@ -34,9 +34,9 @@
 //!         SystemDef::new::<(), GyroOut>("gyro")
 //!     }
 //!
-//!     fn execute(&self, tick: &mut i64, _inputs: &mut (), outputs: &mut GyroOut) {
+//!     fn execute(&self, now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut GyroOut) {
 //!         *tick += 1;
-//!         let _ = outputs.imu.write(&Imu { timestamp: Timestamp(*tick), omega: 0.1 });
+//!         let _ = outputs.imu.write(&Imu { timestamp: now, omega: 0.1 });
 //!     }
 //! }
 //!

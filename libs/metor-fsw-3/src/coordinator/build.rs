@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+use metor_fsw_3_ring::{Config, NoWake, RingBuffer, checked_region_len};
 use metor_proto::types::{ComponentId, Timestamp};
 
 use crate::port::{Output, capacity_for};
@@ -13,6 +13,9 @@ use super::error::BuildError;
 use super::status::SystemStatus;
 use super::table::{SystemTable, TableEntry};
 use super::{Coordinator, Entry};
+
+/// The output the coordinator appends to every system.
+const STATUS_PORT: &str = "status";
 
 /// One ring to allocate: the output it carries and the readers it must hold.
 struct RingSpec {
@@ -45,8 +48,10 @@ impl Planned<'_> {
     }
 
     /// The ring behind one of this system's output ports, `status` included.
+    /// Pass 1 rejects a declared output named `status`, so the two cannot
+    /// collide.
     fn output_ring(&self, port: &str) -> Option<usize> {
-        if port == "status" {
+        if port == STATUS_PORT {
             return Some(self.status_ring());
         }
         let index = self.entry.def.outputs.iter().position(|p| p.name == port)?;
@@ -97,6 +102,11 @@ fn resolve<'a>(
                 id: system.id.clone(),
                 ty: system.ty.clone(),
             })?;
+        if entry.def.outputs.iter().any(|p| p.name == STATUS_PORT) {
+            return Err(BuildError::ReservedPort {
+                ty: system.ty.clone(),
+            });
+        }
         let planned = Planned {
             id: &system.id,
             entry,
@@ -112,7 +122,7 @@ fn resolve<'a>(
         );
         plan.rings.push(RingSpec::new(
             &system.id,
-            "status",
+            STATUS_PORT,
             SystemStatus::ID,
             SystemStatus::MAX_SIZE,
         ));
@@ -184,34 +194,41 @@ fn check_frames(plan: &Plan<'_>) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Pass 3: one reader slot per edge into a ring, plus the config's slack.
+/// Pass 3: one reader slot per edge into a ring, plus the config's slack. A
+/// ring with no edges and no slack still gets one slot. Pass 4 rejects a
+/// count the ring format cannot hold.
 fn count_readers(systems: &[Planned<'_>], rings: &mut [RingSpec], slack: usize) {
     for ring in rings.iter_mut() {
-        ring.readers = slack;
+        ring.readers = slack.max(1);
     }
     for edge in systems.iter().flat_map(|s| s.inputs.iter().flatten()) {
-        rings[*edge].readers += 1;
+        rings[*edge].readers = rings[*edge].readers.saturating_add(1);
     }
 }
 
 /// Pass 4: one ring per output and one per system's status.
 fn allocate(specs: &[RingSpec], depth: usize) -> Result<Vec<RingBuffer>, BuildError> {
-    specs
-        .iter()
-        .map(|spec| {
-            let capacity =
-                capacity_for(spec.max_size, depth).ok_or_else(|| BuildError::RingTooLarge {
-                    system: spec.system.clone(),
-                    port: spec.port.clone(),
-                    max_size: spec.max_size,
-                })?;
-            Ok(RingBuffer::create_in_memory(Config {
-                capacity,
-                // A ring with no edges and no slack still needs one slot.
-                max_readers: spec.readers.max(1),
-            }))
-        })
-        .collect()
+    specs.iter().map(|spec| ring_for(spec, depth)).collect()
+}
+
+fn ring_for(spec: &RingSpec, depth: usize) -> Result<RingBuffer, BuildError> {
+    let capacity = capacity_for(spec.max_size, depth).ok_or_else(|| BuildError::RingTooLarge {
+        system: spec.system.clone(),
+        port: spec.port.clone(),
+        max_size: spec.max_size,
+    })?;
+    let config = Config {
+        capacity,
+        max_readers: spec.readers,
+    };
+    if checked_region_len(&config).is_none() {
+        return Err(BuildError::TooManyReaders {
+            system: spec.system.clone(),
+            port: spec.port.clone(),
+            readers: spec.readers,
+        });
+    }
+    Ok(RingBuffer::create_in_memory(config))
 }
 
 /// Pass 5: one writer per output, one view per edge, then the erased runner.
@@ -412,6 +429,48 @@ mod tests {
             })
         );
         assert!(port::capacity_for(fixtures::Imu::MAX_SIZE, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn a_reader_count_past_the_ring_format_is_rejected() {
+        let mut config = pipeline_config();
+        config.reader_slack = usize::MAX;
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::TooManyReaders {
+                system: "imu".into(),
+                port: "imu".into(),
+                readers: usize::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn no_slack_and_no_edges_still_builds() {
+        let config = CoordinatorConfig {
+            reader_slack: 0,
+            systems: vec![source("imu")],
+            ..Default::default()
+        };
+        assert!(build(config).is_ok());
+    }
+
+    #[test]
+    fn a_declared_status_output_is_rejected() {
+        let config = CoordinatorConfig {
+            systems: vec![SystemConfig {
+                id: "r".into(),
+                ty: "reserved".into(),
+                inputs: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::ReservedPort {
+                ty: "reserved".into()
+            })
+        );
     }
 
     #[test]

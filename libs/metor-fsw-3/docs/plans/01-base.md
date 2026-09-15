@@ -75,7 +75,7 @@ impl<F: Frame> Input<F> {
 An input holds one view per producer. Zero producers is a legal unconnected
 input. `drain` visits every view in order; producers are not interleaved.
 `latest` pins the newest record on each view and returns the one with the
-greatest timestamp. There is no delivery, fan-in, or connection axis on a
+greatest timestamp; ties go to the earlier producer. There is no delivery, fan-in, or connection axis on a
 port; the reader chooses the read.
 
 `Vec<View>` is allocated at bind time and never grows.
@@ -88,8 +88,8 @@ pub trait System {
     type Inputs: SystemInputs;
     type Outputs: SystemOutputs;
     fn def() -> SystemDef;
-    fn execute(&self, state: &mut Self::State, inputs: &mut Self::Inputs,
-               outputs: &mut Self::Outputs);
+    fn execute(&self, now: Timestamp, state: &mut Self::State,
+               inputs: &mut Self::Inputs, outputs: &mut Self::Outputs);
 }
 
 pub trait SystemInputs  { fn bind(views: Vec<Vec<View<NoWake>>>) -> Self; }
@@ -103,7 +103,9 @@ pub struct PortDef { pub name: &'static str, pub frame: ComponentId,
 
 `execute` takes `&self` so a definition carries no mutable data; `State` is
 the only mutable data, which is what will let a later slice share one state
-between systems. Inputs are `&mut` because a read advances a cursor.
+between systems. Inputs are `&mut` because a read advances a cursor. `now`
+is the cycle's timestamp, the same for every system in the cycle, and what
+a system stamps its frames with.
 
 Binding is positional. `bind` receives one entry per port in `def()` order.
 This is the only bind contract; adapters will receive the same lists as raw
@@ -154,12 +156,14 @@ up here; an unknown type is a build error.
 
 One validation gate, then trust. Passes, in order:
 
-1. Ids unique, every `ty` in the table, every `PortRef` names a known system
-   and output port, every consumer port name exists on its def.
+1. Ids unique, every `ty` in the table, no declared output named `status`,
+   every `PortRef` names a known system and output port, every consumer
+   port name exists on its def.
 2. Frame ids match on every edge.
 3. Count readers per output ring: one per edge plus `reader_slack`.
 4. Allocate one ring per output, capacity `capacity_for(max_size, depth)`,
-   plus one status ring per system.
+   plus one status ring per system. A reader count the ring format cannot
+   hold is a build error.
 5. Bind: create the writer for each output and one view per edge, call
    `Inputs::bind` and `Outputs::bind`, box the runner.
 
@@ -189,6 +193,8 @@ impl Coordinator {
     pub fn step(&mut self, now: Timestamp);
     pub async fn run(&mut self, stop: impl Future<Output = ()>);
     pub fn cycle(&self) -> u64;
+    pub fn rings(&self) -> usize;
+    pub fn entry_names(&self) -> impl Iterator<Item = &str>;
 }
 ```
 
@@ -207,10 +213,12 @@ an error.
 The erased runner:
 
 ```rust
-trait Step { fn name(&self) -> &str; fn execute(&mut self, now: Timestamp); }
+trait Step { fn execute(&mut self, now: Timestamp); }
 struct Runner<S: System> { system: S, state: S::State,
                            inputs: S::Inputs, outputs: S::Outputs }
 ```
+
+The coordinator keeps each entry's config id beside its boxed `Step`.
 
 ## Tests
 

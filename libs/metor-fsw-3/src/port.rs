@@ -11,6 +11,7 @@ use core::ops::Deref;
 use crate::frame::Frame;
 use crate::system::PortDef;
 use metor_fsw_3_ring::{NoWake, ReadError, ReadGrant, View, WriteError, Writer, frame_len};
+use metor_proto::types::Timestamp;
 
 /// Power-of-two ring capacity holding `depth.max(2)` records of at most
 /// `max_size` payload bytes, or `None` if the size or capacity cannot be
@@ -77,30 +78,23 @@ impl<F: Frame> Input<F> {
         }
     }
 
-    /// The newest record across every producer, by frame timestamp.
+    /// The newest record across every producer, by frame timestamp. Ties go
+    /// to the earlier producer.
     ///
     /// Each view is advanced to its own newest record, which stays pinned, so
     /// a cycle with no new data sees the same record again.
     pub fn latest(&mut self) -> Result<Option<FrameGrant<'_, F>>, ReadError> {
-        let mut best: Option<(usize, i64)> = None;
-        for (i, view) in self.views.iter_mut().enumerate() {
+        let mut best: Option<(Timestamp, ReadGrant<'_>)> = None;
+        for view in self.views.iter_mut() {
             let Some(grant) = view.try_latest()? else {
                 continue;
             };
-            let stamp = frame_of::<F>(&grant)?.timestamp().0;
-            if best.is_none_or(|(_, b)| stamp > b) {
-                best = Some((i, stamp));
+            let stamp = frame_of::<F>(&grant)?.timestamp();
+            if best.as_ref().is_none_or(|(b, _)| stamp > *b) {
+                best = Some((stamp, grant));
             }
         }
-        let Some((i, _)) = best else {
-            return Ok(None);
-        };
-        // The losing grants dropped back onto their records, so re-reading the
-        // winner yields the record just measured.
-        match self.views[i].try_latest()? {
-            Some(grant) => FrameGrant::new(grant).map(Some),
-            None => Ok(None),
-        }
+        best.map(|(_, grant)| FrameGrant::new(grant)).transpose()
     }
 
     /// Hand `f` every committed record, producer by producer in edge order.
@@ -260,6 +254,37 @@ mod tests {
 
         b.write(&sample(11, 3)).expect("ring has room");
         assert_eq!(input.latest().expect("valid").expect("record").value, 3);
+    }
+
+    #[test]
+    fn latest_ties_go_to_the_earlier_producer() {
+        let (left, right) = (ring(4), ring(4));
+        let mut a = Output::<Sample>::new(left.writer(NoWake).expect("free writer"));
+        let mut b = Output::<Sample>::new(right.writer(NoWake).expect("free writer"));
+        let mut input = Input::<Sample>::new(vec![
+            left.view(NoWake).expect("free slot"),
+            right.view(NoWake).expect("free slot"),
+        ]);
+        a.write(&sample(5, 1)).expect("ring has room");
+        b.write(&sample(5, 2)).expect("ring has room");
+        assert_eq!(input.latest().expect("valid").expect("record").value, 1);
+    }
+
+    #[test]
+    fn drain_visits_producers_in_edge_order() {
+        let (left, right) = (ring(8), ring(8));
+        let mut a = Output::<Sample>::new(left.writer(NoWake).expect("free writer"));
+        let mut b = Output::<Sample>::new(right.writer(NoWake).expect("free writer"));
+        let mut input = Input::<Sample>::new(vec![
+            left.view(NoWake).expect("free slot"),
+            right.view(NoWake).expect("free slot"),
+        ]);
+        b.write(&sample(0, 10)).expect("ring has room");
+        a.write(&sample(1, 1)).expect("ring has room");
+        a.write(&sample(2, 2)).expect("ring has room");
+        let mut seen = Vec::new();
+        input.drain(|f| seen.push(f.value)).expect("valid records");
+        assert_eq!(seen, vec![1, 2, 10]);
     }
 
     #[test]

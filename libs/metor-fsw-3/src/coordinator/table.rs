@@ -53,14 +53,6 @@ impl SystemTable {
     pub(crate) fn get(&self, ty: &str) -> Option<&TableEntry> {
         self.entries.get(ty)
     }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -75,7 +67,6 @@ mod tests {
         table.register("imu", || (ImuSource, 0));
         let entry = table.get("imu").expect("registered");
         assert_eq!(entry.def.outputs[0].frame, Imu::ID);
-        assert_eq!(table.len(), 1);
     }
 
     #[test]
@@ -85,13 +76,11 @@ mod tests {
         table.register("shared", || (NavFilter, ()));
         let entry = table.get("shared").expect("registered");
         assert_eq!(entry.def.name, NavFilter::def().name);
-        assert_eq!(table.len(), 1);
     }
 
     #[test]
     fn an_unregistered_type_is_absent() {
         let table = SystemTable::new();
-        assert!(table.is_empty());
         assert!(table.get("imu").is_none());
     }
 }

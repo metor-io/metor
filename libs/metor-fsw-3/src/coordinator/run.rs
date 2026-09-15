@@ -26,9 +26,9 @@ pub(crate) struct Runner<S: System> {
 }
 
 impl<S: System> Step for Runner<S> {
-    fn execute(&mut self, _now: Timestamp) {
+    fn execute(&mut self, now: Timestamp) {
         self.system
-            .execute(&mut self.state, &mut self.inputs, &mut self.outputs);
+            .execute(now, &mut self.state, &mut self.inputs, &mut self.outputs);
     }
 }
 
@@ -39,8 +39,7 @@ impl Coordinator {
     }
 
     /// Execute every system once, in list order, publishing each one's timing.
-    ///
-    /// A status write that fails is dropped: nothing in a cycle fails.
+    /// A status write that fails is dropped.
     pub fn step(&mut self, now: Timestamp) {
         let cycle_start = Instant::now();
         for entry in &mut self.entries {
@@ -187,6 +186,17 @@ mod tests {
         coordinator.run(fixtures::after_cycles(5)).await;
         assert_eq!(coordinator.cycle(), 5);
         assert_eq!(recorder.take().len(), 5);
+    }
+
+    #[stellarator::test]
+    async fn an_overrun_cycle_yields_instead_of_sleeping() {
+        let recorder = Recorder::default();
+        let mut config = pipeline_config();
+        // A budget no cycle can meet, so every iteration takes the yield path.
+        config.clock = Clock::Wall { rate: 1e12 };
+        let mut coordinator = fixtures::build(config, &table(&recorder));
+        coordinator.run(fixtures::after_cycles(3)).await;
+        assert_eq!(coordinator.cycle(), 3);
     }
 
     #[stellarator::test]

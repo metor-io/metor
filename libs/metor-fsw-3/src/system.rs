@@ -1,7 +1,7 @@
 //! The [`System`] trait and the port bundles that feed it.
 
 use metor_fsw_3_ring::{NoWake, View, Writer};
-use metor_proto::types::ComponentId;
+use metor_proto::types::{ComponentId, Timestamp};
 
 /// One port of a bundle: its field name, the frame it carries, and the record
 /// size its ring must hold.
@@ -34,6 +34,7 @@ impl SystemDef {
 ///
 /// `execute` takes `&self` so the definition holds no mutable data; `State` is
 /// the only mutable data. Inputs are `&mut` because a read advances a cursor.
+/// `now` is the cycle's timestamp, the same for every system in the cycle.
 pub trait System {
     type State;
     type Inputs: SystemInputs;
@@ -43,6 +44,7 @@ pub trait System {
 
     fn execute(
         &self,
+        now: Timestamp,
         state: &mut Self::State,
         inputs: &mut Self::Inputs,
         outputs: &mut Self::Outputs,

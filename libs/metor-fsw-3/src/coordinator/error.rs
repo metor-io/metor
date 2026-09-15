@@ -41,4 +41,14 @@ pub enum BuildError {
         port: String,
         max_size: usize,
     },
+
+    #[error("output `{system}.{port}` needs {readers} reader slots, more than a ring holds")]
+    TooManyReaders {
+        system: String,
+        port: String,
+        readers: usize,
+    },
+
+    #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
+    ReservedPort { ty: String },
 }

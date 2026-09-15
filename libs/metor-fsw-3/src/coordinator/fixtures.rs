@@ -73,6 +73,37 @@ pub struct StatusIn {
     status: Input<SystemStatus>,
 }
 
+#[derive(SystemOutputs)]
+pub struct ReservedOut {
+    status: Output<Imu>,
+}
+
+/// Declares an output under the coordinator's reserved name.
+pub struct Reserved;
+
+impl System for Reserved {
+    type State = ();
+    type Inputs = ();
+    type Outputs = ReservedOut;
+
+    fn def() -> SystemDef {
+        SystemDef::new::<(), ReservedOut>("reserved")
+    }
+
+    fn execute(
+        &self,
+        now: Timestamp,
+        _state: &mut (),
+        _inputs: &mut (),
+        outputs: &mut ReservedOut,
+    ) {
+        let _ = outputs.status.write(&Imu {
+            timestamp: now,
+            sample: 0.0,
+        });
+    }
+}
+
 /// Counts up and publishes the count as a sample.
 pub struct ImuSource;
 
@@ -85,7 +116,7 @@ impl System for ImuSource {
         SystemDef::new::<(), ImuOut>("imu_source")
     }
 
-    fn execute(&self, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
+    fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
         *tick += 1;
         let _ = outputs.imu.write(&Imu {
             timestamp: Timestamp(*tick),
@@ -106,7 +137,7 @@ impl System for ImuOffset {
         SystemDef::new::<(), ImuOut>("imu_offset")
     }
 
-    fn execute(&self, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
+    fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
         *tick += 1;
         let _ = outputs.imu.write(&Imu {
             timestamp: Timestamp(*tick + 100),
@@ -127,7 +158,7 @@ impl System for NavFilter {
         SystemDef::new::<NavIn, NavOut>("nav_filter")
     }
 
-    fn execute(&self, _state: &mut (), inputs: &mut NavIn, outputs: &mut NavOut) {
+    fn execute(&self, _now: Timestamp, _state: &mut (), inputs: &mut NavIn, outputs: &mut NavOut) {
         spin();
         let Ok(Some(imu)) = inputs.imu.latest() else {
             return;
@@ -153,7 +184,13 @@ impl System for ControlLaw {
         SystemDef::new::<ControlIn, ControlOut>("control_law")
     }
 
-    fn execute(&self, recorder: &mut Recorder, inputs: &mut ControlIn, outputs: &mut ControlOut) {
+    fn execute(
+        &self,
+        _now: Timestamp,
+        recorder: &mut Recorder,
+        inputs: &mut ControlIn,
+        outputs: &mut ControlOut,
+    ) {
         let Ok(Some(nav)) = inputs.nav.latest() else {
             return;
         };
@@ -179,7 +216,13 @@ impl System for StatusWatch {
         SystemDef::new::<StatusIn, ()>("status_watch")
     }
 
-    fn execute(&self, recorder: &mut Recorder, inputs: &mut StatusIn, _outputs: &mut ()) {
+    fn execute(
+        &self,
+        _now: Timestamp,
+        recorder: &mut Recorder,
+        inputs: &mut StatusIn,
+        _outputs: &mut (),
+    ) {
         let _ = inputs.status.drain(|status| recorder.push_status(*status));
     }
 }
@@ -222,6 +265,7 @@ pub fn table(recorder: &Recorder) -> SystemTable {
     table.register("control", move || (ControlLaw, control.clone()));
     let watch = recorder.clone();
     table.register("status_watch", move || (StatusWatch, watch.clone()));
+    table.register("reserved", || (Reserved, ()));
     table
 }
 
