@@ -1,0 +1,23 @@
+[package]
+name = "metor-fsw-3"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+metor-fsw-3-macros = { path = "macros" }
+metor-fsw-3-ring = { path = "ring" }
+
+metor-component = { workspace = true }
+metor-proto = { path = "../metor-proto", features = ["std"] }
+metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
+
+stellarator = { path = "../stellarator" }
+thiserror = "2.0"
+zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[dev-dependencies]
+trybuild = "1"
+
+[lints]
+workspace = true

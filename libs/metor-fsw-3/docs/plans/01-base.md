@@ -43,7 +43,6 @@ pub trait Frame: AsVTable + Componentize + Decomponentize + Metadatatize
 {
     const NAME: &'static str;
     const ID: ComponentId = ComponentId::new(Self::NAME);
-    const MAX_SIZE: usize = size_of::<Self>();
     fn timestamp(&self) -> Timestamp;
 }
 ```
@@ -53,8 +52,9 @@ The component traits come from `metor-component`, shared with panel and db.
 `derive-impl`) and reads `#[frame(name = "..")]` and `#[frame(timestamp)]`.
 A frame without a timestamp field is a derive error.
 
-Fixed frames only: `MAX_SIZE` is the struct size, a write is `as_bytes()`,
-a read is `ref_from_prefix` on the grant.
+Fixed frames only. The record size is `Componentize::MAX_SIZE`, which the
+derive sets from the struct size. A write is `as_bytes()`, a read is
+`ref_from_prefix` on the grant.
 
 ## Ports
 

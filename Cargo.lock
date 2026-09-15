@@ -9571,6 +9571,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "metor-fsw-3"
+version = "0.14.2"
+dependencies = [
+ "metor-component",
+ "metor-fsw-3-macros",
+ "metor-fsw-3-ring",
+ "metor-proto",
+ "metor-proto-wkt",
+ "stellarator",
+ "thiserror 2.0.20",
+ "trybuild",
+ "zerocopy",
+]
+
+[[package]]
+name = "metor-fsw-3-macros"
+version = "0.14.2"
+dependencies = [
+ "convert_case 0.6.0",
+ "darling 0.20.11",
+ "metor-component-derive-impl",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "metor-fsw-3-ring"
+version = "0.14.2"
+dependencies = [
+ "libc",
+ "loom",
+ "memmap2",
+ "stellarator",
+ "tempfile",
+ "zerocopy",
+]
+
+[[package]]
 name = "metor-fsw-ring"
 version = "0.14.2"
 dependencies = [
