@@ -12,6 +12,8 @@ metor-component = { workspace = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
+futures-lite = "2"
+serde = { version = "1", features = ["derive"] }
 stellarator = { path = "../stellarator" }
 thiserror = "2.0"
 zerocopy = { version = "0.8.2", features = ["derive"] }

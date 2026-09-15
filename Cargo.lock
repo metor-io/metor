@@ -9574,11 +9574,13 @@ dependencies = [
 name = "metor-fsw-3"
 version = "0.14.2"
 dependencies = [
+ "futures-lite 2.6.1",
  "metor-component",
  "metor-fsw-3-macros",
  "metor-fsw-3-ring",
  "metor-proto",
  "metor-proto-wkt",
+ "serde",
  "stellarator",
  "thiserror 2.0.20",
  "trybuild",
