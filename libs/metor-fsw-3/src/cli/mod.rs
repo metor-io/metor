@@ -1,3 +1,4 @@
-//! The `metor` binary's pieces. Only the cargo wrapper has landed.
+//! The `metor` binary's pieces.
 
 pub mod build;
+pub mod config;
