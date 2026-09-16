@@ -1,0 +1,18 @@
+# The target-config recorder for metor-fsw-3 (docs/plans/04-packs.md).
+#
+# A target file builds a `Target`, and `emit()` writes the coordinator config
+# `metor run` reads. Stdlib only.
+
+[project]
+name = "metor-config"
+version = "0.1.0"
+description = "Typed target-config recorder for metor-fsw-3: build a Target, emit its config"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "metor_config"
+module-root = ""

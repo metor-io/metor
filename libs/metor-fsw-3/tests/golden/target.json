@@ -1,0 +1,87 @@
+{
+  "config_version": 1,
+  "packs": [
+    {
+      "id": "adcs",
+      "lib": "adcs_systems",
+      "libs": "/abs/.metor/adcs_pack/_libs"
+    }
+  ],
+  "coordinator": {
+    "clock": {
+      "Wall": {
+        "rate": 100.0
+      }
+    },
+    "ring_depth": 8,
+    "systems": [
+      {
+        "id": "plant",
+        "ty": "adcs.plant",
+        "params": {
+          "altitude": 400000.0
+        },
+        "inputs": [
+          {
+            "port": "motor_cmd",
+            "from": [
+              {
+                "system": "ctrl",
+                "port": "motor_cmd"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "nav",
+        "ty": "adcs.nav",
+        "params": {
+          "gain": 0.2
+        },
+        "inputs": [
+          {
+            "port": "imu",
+            "from": [
+              {
+                "system": "plant",
+                "port": "imu"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "mode",
+        "ty": "adcs.mode",
+        "params": null,
+        "inputs": []
+      },
+      {
+        "id": "ctrl",
+        "ty": "adcs.ctrl",
+        "params": null,
+        "inputs": [
+          {
+            "port": "est",
+            "from": [
+              {
+                "system": "nav",
+                "port": "est"
+              }
+            ]
+          },
+          {
+            "port": "mode",
+            "from": [
+              {
+                "system": "mode",
+                "port": "cmd"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
