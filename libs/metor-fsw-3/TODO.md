@@ -28,9 +28,9 @@ anyway.
 
 Systems from outside the binary: the pack ABI shrunk to the fsw-3
 descriptor, the dylib adapter, `metor-build`, the Python recorder with a
-new `to_ir()`, and `metor run`. Keep `copy_atomic` and the ABI marker
-distribution from fsw-2 verbatim. Takes over the ADCS example and the
-slice-2 docs pass from T7 and T8.
+new `to_config()`, and `metor run`. Written fresh: fsw-2 is read for its
+lessons, nothing is copied. Takes over the ADCS example and the slice-2
+docs pass from T7 and T8. `04-packs.md`.
 
 ## 4. Links
 
