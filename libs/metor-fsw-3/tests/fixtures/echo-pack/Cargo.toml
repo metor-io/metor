@@ -1,0 +1,19 @@
+[package]
+name = "echo-pack"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "A pack the metor-fsw-3 dl tests load: an echo, a panicking system, and one with params"
+
+# A real loadable library: `tests/dl.rs` builds it and `dlopen`s the result.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+metor-fsw-3 = { path = "../../.." }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

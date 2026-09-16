@@ -24,6 +24,7 @@ pub use run::Step;
 pub(crate) use run::catch_step;
 pub use status::SystemStatus;
 pub use table::SystemTable;
+pub(crate) use table::TableEntry;
 
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {
@@ -61,7 +62,7 @@ impl Coordinator {
     pub fn latched(&self) -> impl Iterator<Item = &str> {
         self.entries
             .iter()
-            .filter(|entry| entry.latched)
+            .filter(|entry| entry.latched())
             .map(|entry| entry.name.as_str())
     }
 }

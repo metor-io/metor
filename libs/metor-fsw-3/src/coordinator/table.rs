@@ -1,5 +1,6 @@
 //! The registry of system types a config may name.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use metor_fsw_3_ring::{NoWake, RingBuffer};
@@ -22,7 +23,7 @@ type SystemMakeFn = dyn Fn(
 pub(crate) struct TableEntry {
     pub def: SystemDef,
     /// The doc comment on the type's `execute`, empty for the trait path.
-    pub doc: &'static str,
+    pub doc: Cow<'static, str>,
     /// The JSON Schema of the type's params, `None` when it takes none.
     pub schema: Option<Box<RawValue>>,
     pub make: Box<SystemMakeFn>,
@@ -48,17 +49,20 @@ impl SystemTable {
         ty: &str,
         make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
     ) {
-        self.insert(ty, entry::<S>(make, "", None));
+        self.insert(ty, entry::<S>(make, Cow::Borrowed(""), None));
     }
 
     /// Registers a `#[system]` type under `ty`, built by a plain `Fn() -> S` or `Fn(P) -> S`.
     pub fn register<S: SystemFn, M, C: Ctor<S, M> + 'static>(&mut self, ty: &str, ctor: C) {
         let make = move |params: Params<'_>| Ok((FnSystem::default(), ctor.make(params)?));
-        self.insert(ty, entry::<FnSystem<S>>(make, S::DOC, C::schema()));
+        self.insert(
+            ty,
+            entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema()),
+        );
     }
 
     /// Adds an entry, replacing a same-named one in place so order is registration order.
-    fn insert(&mut self, ty: &str, entry: TableEntry) {
+    pub(crate) fn insert(&mut self, ty: &str, entry: TableEntry) {
         match self.index.get(ty) {
             Some(&at) => self.entries[at].1 = entry,
             None => {
@@ -82,7 +86,7 @@ impl SystemTable {
 /// Builds one entry, binding the system's bundles from the rings' handles.
 fn entry<S: System + 'static>(
     make: impl Fn(Params<'_>) -> Result<(S, S::State), ParamError> + 'static,
-    doc: &'static str,
+    doc: Cow<'static, str>,
     schema: Option<Box<RawValue>>,
 ) -> TableEntry {
     TableEntry {

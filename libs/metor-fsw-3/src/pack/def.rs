@@ -42,7 +42,7 @@ impl PackDef<'_> {
             .map(|(ty, entry)| PackSystemDef {
                 ty,
                 def: entry.def.clone(),
-                doc: Cow::Borrowed(entry.doc),
+                doc: entry.doc.clone(),
                 params: entry.schema.as_deref().map(Cow::Borrowed),
             })
             .collect();

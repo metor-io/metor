@@ -1,6 +1,8 @@
 //! metor-fsw is a flight software framework
 
+pub mod cli;
 pub mod coordinator;
+pub mod dl;
 pub mod fn_system;
 pub mod frame;
 pub mod log;
@@ -16,6 +18,7 @@ pub use coordinator::{
     BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, ParamError, Params, PortRef,
     Step, SystemConfig, SystemStatus, SystemTable,
 };
+pub use dl::{DlStep, Pack, PackError, PackFns};
 pub use fn_system::{Ctor, Cycle, FnSystem, InSet, Names, OutSet, Param, SystemFn};
 pub use frame::Frame;
 pub use log::{Log, LogLayer};

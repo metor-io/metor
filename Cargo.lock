@@ -5675,6 +5675,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
+name = "echo-pack"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-3",
+ "schemars 1.2.1",
+ "serde",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9575,6 +9584,7 @@ name = "metor-fsw-3"
 version = "0.14.2"
 dependencies = [
  "futures-lite 2.6.1",
+ "libloading",
  "metor-component",
  "metor-fsw-3-macros",
  "metor-fsw-3-ring",

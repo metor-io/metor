@@ -21,6 +21,11 @@ pub trait Step {
 
     /// Called once after `execute` panicked, with the payload's message.
     fn fault(&mut self, _now: Timestamp, _message: &str) {}
+
+    /// Whether the step latched itself off, as one across an ABI does.
+    fn latched(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct Runner<S: System> {
@@ -111,9 +116,14 @@ impl Coordinator {
 }
 
 impl super::Entry {
+    /// Whether a panic has taken this system out of the cycle.
+    pub(super) fn latched(&self) -> bool {
+        self.latched || self.step.latched()
+    }
+
     /// Runs this system unless it has latched, returning its execution time.
     fn run(&mut self, now: Timestamp) -> Duration {
-        if self.latched {
+        if self.latched() {
             return Duration::ZERO;
         }
         let started = Instant::now();
