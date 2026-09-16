@@ -10,6 +10,9 @@ use crate::system::{PortDef, SystemInputs, SystemOutputs};
 use super::SystemFn;
 use super::param::Param;
 
+/// LOG_PORT is the name of the port that receives log events.
+pub const LOG_PORT: &str = "log";
+
 /// An `InSet` is the bound inputs of a fn system's parameters.
 pub struct InSet<S: SystemFn>(pub(crate) <S::Params as Param>::In);
 
@@ -18,9 +21,6 @@ pub struct OutSet<S: SystemFn> {
     pub(crate) outs: <S::Params as Param>::Out,
     pub(crate) log: Log,
 }
-
-/// The name of the output every fn system ends with.
-pub const LOG_PORT: &str = "log";
 
 impl<S: SystemFn> SystemInputs for InSet<S> {
     fn defs() -> Vec<PortDef> {

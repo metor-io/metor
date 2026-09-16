@@ -1617,6 +1617,13 @@ impl<RD: WakeSink> View<RD> {
         }
     }
 
+    /// Borrows the newest record's bytes until the next mutable access to this view.
+    /// Like [`Self::try_latest`], this keeps the cursor at the record's start.
+    pub fn try_latest_bytes(&mut self) -> Result<Option<&[u8]>, ReadError> {
+        // Dropping a latest grant leaves its record pinned by the view.
+        Ok(self.try_latest()?.map(|grant| grant.slice))
+    }
+
     /// Find the next readable record from the cursor, moving the cursor past
     /// a wrap gap it sits on. Returns `Ok(None)` when the view is caught up.
     fn locate(&self) -> Result<Option<Located>, ReadError> {

@@ -105,6 +105,7 @@ fn resolve<'a>(
                 ty: system.ty.clone(),
             })?;
 
+        check_port_names(&system.id, &entry.def)?;
         if entry.def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
                 ty: system.ty.clone(),
@@ -133,6 +134,33 @@ fn resolve<'a>(
     }
     resolve_edges(config, &mut plan, &index)?;
     Ok(plan)
+}
+
+fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
+    for (index, port) in def.inputs.iter().enumerate() {
+        if def.inputs[..index]
+            .iter()
+            .any(|other| other.name == port.name)
+        {
+            return Err(BuildError::DuplicateInput {
+                system: system.to_string(),
+                port: port.name.to_string(),
+            });
+        }
+    }
+
+    for (index, port) in def.outputs.iter().enumerate() {
+        if def.outputs[..index]
+            .iter()
+            .any(|other| other.name == port.name)
+        {
+            return Err(BuildError::DuplicateOutput {
+                system: system.to_string(),
+                port: port.name.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn check_alignment(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
@@ -337,6 +365,45 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn duplicate_port_names_are_rejected_within_each_direction() {
+        let port = Output::<utils::Imu>::def("sample");
+        for input in [true, false] {
+            let def = crate::SystemDef {
+                name: "test",
+                inputs: if input { vec![port, port] } else { vec![] },
+                outputs: if input { vec![] } else { vec![port, port] },
+            };
+            let expected = if input {
+                BuildError::DuplicateInput {
+                    system: "instance".into(),
+                    port: "sample".into(),
+                }
+            } else {
+                BuildError::DuplicateOutput {
+                    system: "instance".into(),
+                    port: "sample".into(),
+                }
+            };
+            assert_eq!(check_port_names("instance", &def), Err(expected));
+        }
+    }
+
+    #[test]
+    fn input_and_output_can_share_a_name() {
+        let port = Output::<utils::Imu>::def("sample");
+        let def = crate::SystemDef {
+            name: "test",
+            inputs: vec![port],
+            outputs: vec![port],
+        };
+        assert_eq!(check_port_names("instance", &def), Ok(()));
+        assert_eq!(
+            check_port_names("empty", &crate::SystemDef::new::<(), ()>("empty")),
+            Ok(())
+        );
     }
 
     #[test]

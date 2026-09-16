@@ -190,6 +190,22 @@ fn latest_pins_newest() {
     );
 }
 
+#[test]
+fn latest_bytes_remain_pinned_without_a_grant() {
+    let rb = ring(64, 1);
+    let mut w = rb.writer(NoWake).expect("writer");
+    let mut v = rb.view(NoWake).expect("reader");
+    assert_eq!(v.try_latest_bytes(), Ok(None));
+    w.try_write(&[1; 16]).expect("fits");
+    let bytes = v.try_latest_bytes().expect("valid").expect("record");
+    w.try_write(&[2; 16]).expect("fits");
+    assert_eq!(w.try_write(&[3; 16]), Err(WriteError::WouldBlock));
+    assert_eq!(bytes, &[1; 16]);
+    assert_eq!(v.try_latest_bytes(), Ok(Some(&[2; 16][..])));
+    w.try_write(&[3; 16]).expect("old record released");
+    assert_eq!(v.try_latest_bytes(), Ok(Some(&[3; 16][..])));
+}
+
 /// The pin is load-bearing. The writer cannot reclaim the pinned record's
 /// bytes, and moving the pin unblocks it.
 ///

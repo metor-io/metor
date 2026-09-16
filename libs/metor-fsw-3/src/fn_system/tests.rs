@@ -10,7 +10,9 @@ use serde_json::json;
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::*;
-use crate::coordinator::{CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable};
+use crate::coordinator::{
+    BuildError, CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
+};
 use crate::log::Log;
 use crate::port::{Input, Output};
 use crate::tests::utils::{Control, Imu, Nav, NoParams};
@@ -23,7 +25,6 @@ impl Doubler {
     fn execute(&mut self, imu: &mut Input<Imu>, nav: &mut Output<Nav>, now: Timestamp) {
         if let Ok(Some(imu)) = imu.latest() {
             let estimate = imu.sample * 2.0;
-            drop(imu);
             let _ = nav.write(&Nav {
                 timestamp: now,
                 estimate,
@@ -412,4 +413,30 @@ fn a_log_ring_holds_depth_times_ring_depth() {
     let mut coordinator = config.build(&table).expect("valid");
     with_layer(|| coordinator.step(Timestamp(0)));
     assert_eq!(seen.borrow().len(), 64);
+}
+
+#[test]
+fn an_explicit_log_output_cannot_hide_the_implicit_output() {
+    struct LogOutput;
+
+    #[crate::system]
+    impl LogOutput {
+        fn execute(&mut self, log: &mut Output<LogEvent>) {
+            let _ = log;
+        }
+    }
+
+    let mut table = SystemTable::new();
+    table.register("log_output", || LogOutput);
+    let config = CoordinatorConfig {
+        systems: vec![SystemConfig::new("logger", "log_output")],
+        ..Default::default()
+    };
+    assert_eq!(
+        config.build(&table).err(),
+        Some(BuildError::DuplicateOutput {
+            system: "logger".into(),
+            port: "log".into(),
+        })
+    );
 }

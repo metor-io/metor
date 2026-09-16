@@ -1,11 +1,8 @@
-//! Builds a graph from a config and steps it.
+//! The coordinator is the core part of metor-fsw, it is responsible for executing systems in order, and plumbing together ring buffers
 //!
-//! [`Coordinator::build`] resolves a [`CoordinatorConfig`] against a
-//! [`SystemTable`], allocates one ring per output plus one `status` ring per
-//! system, and binds every port. [`Coordinator::step`] then runs the systems in
-//! list order; [`Coordinator::run`] paces that on the stellarator runtime.
-//!
-//! Every allocation happens in `build`. A cycle allocates nothing.
+//! The meat and potatoes of coordinator is in [`build`] which is responsible for passing through the configuration, and connecting
+//! all of the ring buffers together. Beyond that the coordinator is very simple, it just executes systems in order.
+//!  [`run`] contains that code.
 
 mod build;
 mod config;

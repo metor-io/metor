@@ -4,8 +4,8 @@ use serde::de::DeserializeOwned;
 
 use crate::coordinator::{ParamError, Params};
 
-/// A `Ctor` builds a system's state from its params; `M` tells a `Fn() -> S` from a `Fn(P) -> S`.
-pub trait Ctor<S, M> {
+/// A `Ctor` builds a system's state from its params
+pub trait Ctor<S, Marker> {
     /// Builds the state, decoding `params` when the constructor takes them.
     fn make(&self, params: Params<'_>) -> Result<S, ParamError>;
 }

@@ -210,7 +210,6 @@ impl System for NavFilter {
             timestamp: imu.timestamp,
             estimate: imu.sample * 2.0,
         };
-        drop(imu);
         let _ = outputs.nav.write(&nav);
     }
 }
@@ -241,7 +240,6 @@ impl System for ControlLaw {
             timestamp: nav.timestamp,
             command: nav.estimate + 1.0,
         };
-        drop(nav);
         recorder.push_command(control.timestamp, control.command);
         let _ = outputs.control.write(&control);
     }

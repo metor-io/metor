@@ -78,7 +78,6 @@ impl NavFilter {
             timestamp: imu.timestamp,
             attitude: imu.omega * 0.5,
         };
-        drop(imu);
         let _ = nav.write(&out);
     }
 }
@@ -96,7 +95,6 @@ impl ControlLaw {
             timestamp: nav.timestamp,
             torque: -nav.attitude,
         };
-        drop(nav);
         let _ = control.write(&out);
     }
 }

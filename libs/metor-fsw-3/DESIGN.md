@@ -70,7 +70,7 @@ Reading and writing the frame is then done via a "Yoke" (inspired by the fantast
 
 Sometimes you need to send structured data that can not or should not be easily repersented as a series of components. In this case we also support "Messages" that are sent as variables length raw bytes, and not interpreted as a series of components.
 
-In previous versions of metor-fsw, there were different delivery semantics for messages and frames by default. Now all messages and frames use the same delivery semantic. All writes will be read by all readers
+In previous versions of metor-fsw, there were different delivery semantics for messages and frames by default. Now all messages and frames use the same delivery semantic. All writes will be read by all readers. Similarly messages used to be hard-coded for postcard, that should no longer be the case 
 
 ## Systems
 

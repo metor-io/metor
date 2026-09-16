@@ -12,6 +12,12 @@ pub enum BuildError {
     #[error("system id `{id}` is used twice")]
     DuplicateId { id: String },
 
+    #[error("system `{system}` declares input port `{port}` more than once")]
+    DuplicateInput { system: String, port: String },
+
+    #[error("system `{system}` declares output port `{port}` more than once")]
+    DuplicateOutput { system: String, port: String },
+
     #[error("system `{id}` has unregistered type `{ty}`")]
     UnknownType { id: String, ty: String },
 

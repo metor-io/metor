@@ -94,8 +94,11 @@ impl<T: Record> Input<T> {
     pub fn drain(&mut self) -> impl Iterator<Item = Result<T::Read<'_>, RecvError>>;
     pub fn latest(&mut self) -> Result<Option<Latest<'_, T>>, RecvError>;
 }
-impl<T: Record> Latest<'_, T> { pub fn read(&self) -> T::Read<'_>; }
-impl<F: Frame> Deref for Latest<'_, F> { type Target = F; }
+impl<'a, T: Record> Latest<'a, T> {
+    pub fn read(&self) -> &T;
+    pub fn into_inner(self) -> T::Read<'a>;
+}
+impl<T: Record> Deref for Latest<'_, T> { type Target = T; }
 
 pub enum SendError { Oversize { len: usize, max: usize }, Encode(EncodeError), Ring(WriteError) }
 pub enum RecvError { Ring(ReadError), Decode(DecodeError) }
@@ -113,9 +116,10 @@ is that message's choice.
 
 `latest` pins the newest record on each producer and keeps the one with
 the greatest `timestamp()`; a tie or an unstamped record goes to the
-earlier producer. `Latest` holds the pin and decodes on every `read()`,
-which is free for a frame and a full decode for a message, so a frame
-also derefs to `&F` and a sampled message is read once into a local.
+earlier producer. Each candidate is decoded once. `Latest` retains the
+selected value: a borrowed frame or an owned message. `read()` and deref
+borrow that value; `into_inner()` returns it. The input keeps borrowed
+bytes pinned until its next mutable access.
 Commands are still drained, so nothing is skipped; `latest` on a message
 is for the stream where only the newest matters.
 
@@ -323,4 +327,3 @@ None outstanding. Earlier rounds settled: codec on the record type, the
 `#[system]` impl block with `execute` as receiver method, JSON params,
 `#[derive(Record)]` with inferred name and length, and the fn sugar
 owning the log drain.
-

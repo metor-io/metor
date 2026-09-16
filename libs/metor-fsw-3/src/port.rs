@@ -4,10 +4,9 @@ use core::borrow::Borrow;
 use core::marker::PhantomData;
 use core::ops::Deref;
 
-use crate::frame::Frame;
 use crate::record::{DecodeError, EncodeError, Record};
 use crate::system::PortDef;
-use metor_fsw_3_ring::{NoWake, ReadError, ReadGrant, View, WriteError, Writer, frame_len};
+use metor_fsw_3_ring::{NoWake, ReadError, View, WriteError, Writer, frame_len};
 use metor_proto::types::Timestamp;
 
 /// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
@@ -140,48 +139,46 @@ impl<T: Record> Input<T> {
 }
 
 impl<T: Record> Input<T> {
-    /// Returns the newest record across producers, by timestamp, ties and unstamped records to the earlier producer.
+    /// Returns the newest record across producers
+    ///
+    /// Records without timestamps are produced in order of the producers
     pub fn latest(&mut self) -> Result<Option<Latest<'_, T>>, RecvError> {
-        let mut best: Option<(Option<Timestamp>, ReadGrant<'_>)> = None;
+        let mut best: Option<(Option<Timestamp>, T::Read<'_>)> = None;
         for view in self.views.iter_mut() {
-            let Some(grant) = view.try_latest().map_err(RecvError::Ring)? else {
+            let Some(bytes) = view.try_latest_bytes().map_err(RecvError::Ring)? else {
                 continue;
             };
-            let stamp = T::decode(&grant)
-                .map_err(RecvError::Decode)?
-                .borrow()
-                .timestamp();
+            let value = T::decode(bytes).map_err(RecvError::Decode)?;
+            let stamp = value.borrow().timestamp();
             if best.as_ref().is_none_or(|(b, _)| stamp > *b) {
-                best = Some((stamp, grant));
+                best = Some((stamp, value));
             }
         }
-        Ok(best.map(|(_, grant)| Latest {
-            grant,
-            _t: PhantomData,
-        }))
+        Ok(best.map(|(_, decoded)| Latest { decoded }))
     }
 }
 
-/// A `Latest` pins one record and decodes it on each read.
-pub struct Latest<'a, T> {
-    grant: ReadGrant<'a>,
-    _t: PhantomData<T>,
+/// A `Latest` holds a decoded record, borrowed from the input or owned.
+pub struct Latest<'a, T: Record + 'a> {
+    decoded: T::Read<'a>,
 }
 
-impl<T: Record> Latest<'_, T> {
-    /// Decodes the pinned record; a borrow for a frame, an owned value for a message.
-    pub fn read(&self) -> T::Read<'_> {
-        // PANIC Safety: the record decoded when `latest` picked it, and a
-        // grant pins its bytes.
-        T::decode(&self.grant).expect("record decoded at selection")
+impl<'a, T: Record> Latest<'a, T> {
+    /// Borrows the decoded record without decoding again.
+    pub fn read(&self) -> &T {
+        self.decoded.borrow()
+    }
+
+    /// Returns the decoded record: a borrow for a frame, an owned value for a message.
+    pub fn into_inner(self) -> T::Read<'a> {
+        self.decoded
     }
 }
 
-impl<F: Frame> Deref for Latest<'_, F> {
-    type Target = F;
-    fn deref(&self) -> &F {
-        // PANIC Safety: as for `read`; a frame's bytes are the value.
-        crate::record::fixed::decode(&self.grant).expect("record decoded at selection")
+impl<T: Record> Deref for Latest<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.read()
     }
 }
 
@@ -434,7 +431,6 @@ mod tests {
         out.write(&sample(0, 0.0)).expect("ring has room");
         let pinned = input.latest().expect("valid").expect("record");
         assert_eq!(pinned.sample, 0.0);
-        drop(pinned);
         // Two 32-byte records fill the ring.
         out.write(&sample(1, 1.0)).expect("ring has room");
         assert_eq!(
@@ -485,6 +481,63 @@ mod tests {
         ])
         .expect("aligned");
         (left, right, a, b, input)
+    }
+
+    thread_local! {
+        static DECODES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    struct Counted(Stamped);
+
+    impl Record for Counted {
+        const NAME: &'static str = "counted";
+        const MAX_LEN: usize = Stamped::MAX_LEN;
+        type Read<'a> = Self;
+
+        fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError> {
+            self.0.encode(buf)
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+            DECODES.set(DECODES.get() + 1);
+            Stamped::decode(bytes).map(Self)
+        }
+
+        fn timestamp(&self) -> Option<Timestamp> {
+            self.0.timestamp()
+        }
+    }
+
+    #[test]
+    fn latest_decodes_each_candidate_once_and_retains_the_winner() {
+        let (_l, _r, mut a, mut b, mut input) = message_pair_two::<Counted>();
+        DECODES.set(0);
+        assert!(input.latest().expect("empty input").is_none());
+        assert_eq!(DECODES.get(), 0);
+        for (out, at) in [(&mut a, 1), (&mut b, 2)] {
+            out.write(&Counted(Stamped {
+                at: Timestamp(at),
+                text: "sample".into(),
+            }))
+            .expect("fits");
+        }
+        let latest = input.latest().expect("valid").expect("record");
+        assert_eq!(DECODES.get(), 2);
+        assert_eq!(latest.read().0.at, Timestamp(2));
+        assert!(core::ptr::eq(latest.read(), latest.read()));
+        let owned: Counted = latest.into_inner();
+        assert_eq!(owned.0.text, "sample");
+        assert_eq!(DECODES.get(), 2);
+    }
+
+    #[test]
+    fn latest_into_inner_keeps_frames_borrowed() {
+        let (_ring, mut out, mut input) = pair(4);
+        out.write(&sample(1, 2.0)).expect("fits");
+        let frame: &Imu = input.latest().expect("valid").expect("record").into_inner();
+        assert_eq!(frame.sample, 2.0);
+        out.write(&sample(2, 3.0)).expect("fits");
+        assert_eq!(frame.sample, 2.0);
     }
 
     #[test]
