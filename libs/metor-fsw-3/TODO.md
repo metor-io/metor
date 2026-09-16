@@ -14,10 +14,11 @@ in list order. `01-base.md`, `02-ring-review.md`.
 
 `Record` with the codec on the type, one `write` and `latest` and `drain`
 for frames and messages, `#[system]` impl blocks, JSON params, and the
-`log` output with the `tracing` bridge. T1 to T6 landed. Left: the
-review, T7 (the ADCS control loop as a statically linked example and
-convergence test), T8 (docs, and folding shipped deviations back into
-`03-authoring.md`).
+`log` output with the `tracing` bridge. T1 to T6 landed and reviewed.
+T7 (the ADCS control loop as an example and convergence test) and T8
+(docs, and folding shipped deviations back into `03-authoring.md`) are
+deferred to slice 3, since the example has to be rewritten for packs
+anyway.
 
 - Restore `#[derive(Record)]` support for serde-compatible enums. Timestamp
   field parsing currently restricts the derive to structs; enum messages
@@ -28,7 +29,8 @@ convergence test), T8 (docs, and folding shipped deviations back into
 Systems from outside the binary: the pack ABI shrunk to the fsw-3
 descriptor, the dylib adapter, `metor-build`, the Python recorder with a
 new `to_ir()`, and `metor run`. Keep `copy_atomic` and the ABI marker
-distribution from fsw-2 verbatim.
+distribution from fsw-2 verbatim. Takes over the ADCS example and the
+slice-2 docs pass from T7 and T8.
 
 ## 4. Links
 

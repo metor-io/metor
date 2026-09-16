@@ -233,6 +233,9 @@ install the layer with `tracing::subscriber::with_default`.
 
 ## T7. ADCS gate
 
+Deferred to slice 3 with T8: the example is rewritten for packs there,
+so it lands once and against the ABI.
+
 Files: `examples/adcs-fsw3/{Cargo.toml,src/{lib,contracts,plant,nav,ctrl,mode,main}.rs,tests/converge.rs}`,
 workspace `Cargo.toml`.
 

@@ -278,6 +278,8 @@ hand-written bundle can violate. Pass 4 sizes each ring by
 
 ## Gate: the ADCS loop
 
+Deferred to slice 3, where the example is rewritten for packs.
+
 A new crate `examples/adcs-fsw3` holds the contracts and the three systems
 from `examples/adcs-fsw2` as one crate, registered statically. The
 `Frame` derive already handles the nested wheel array; the three state
