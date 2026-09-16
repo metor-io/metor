@@ -209,7 +209,8 @@ impl Future for AfterCycles {
 fn ten_cycles_of_the_pipeline() {
     let report = Rc::new(RefCell::new(Report::default()));
     let mut coordinator = config().build(&table(&report)).expect("valid config");
-    assert_eq!(coordinator.rings(), 7);
+    // Three outputs, three fn-system logs, four status rings.
+    assert_eq!(coordinator.rings(), 10);
 
     stellarator::run(|| async move {
         coordinator.run(AfterCycles { left: 10 }).await;

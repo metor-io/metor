@@ -9586,6 +9586,8 @@ dependencies = [
  "serde_json",
  "stellarator",
  "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
  "trybuild",
  "zerocopy",
 ]

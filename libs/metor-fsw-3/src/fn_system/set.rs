@@ -1,12 +1,14 @@
 //! [`ParamSet`] over tuples of [`Param`], and the bundles that bind one.
 
 use metor_fsw_3_ring::{NoWake, View, Writer};
-use metor_proto::types::Timestamp;
+use metor_proto_wkt::LogEvent;
 
+use crate::log::Log;
+use crate::port::Output;
 use crate::system::{PortDef, SystemInputs, SystemOutputs};
 
 use super::SystemFn;
-use super::param::{Param, Views, Writers};
+use super::param::{Cycle, Param, Views, Writers};
 
 /// A `ParamSet` is the tuple of an `execute` method's parameters, bound and handed over together.
 pub trait ParamSet {
@@ -26,8 +28,11 @@ pub trait ParamSet {
     fn bind_outs(writers: &mut Writers) -> Self::Outs;
 
     /// Produces every parameter's value for one cycle.
-    fn get<'a>(ins: &'a mut Self::Ins, outs: &'a mut Self::Outs, now: Timestamp)
-    -> Self::Items<'a>;
+    fn get<'a>(
+        ins: &'a mut Self::Ins,
+        outs: &'a mut Self::Outs,
+        cx: &mut Cycle<'a>,
+    ) -> Self::Items<'a>;
 }
 
 macro_rules! impl_param_set {
@@ -54,8 +59,8 @@ macro_rules! impl_param_set {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn get<'a>(ins: &'a mut Self::Ins, outs: &'a mut Self::Outs, now: Timestamp) -> Self::Items<'a> {
-                ($( $P::get(&mut ins.$i, &mut outs.$i, now), )*)
+            fn get<'a>(ins: &'a mut Self::Ins, outs: &'a mut Self::Outs, cx: &mut Cycle<'a>) -> Self::Items<'a> {
+                ($( $P::get(&mut ins.$i, &mut outs.$i, cx), )*)
             }
         }
     };
@@ -199,8 +204,14 @@ impl_param_set!(
 /// An `InSet` is the bound inputs of a fn system's parameters.
 pub struct InSet<S: SystemFn>(pub(crate) <S::Params as ParamSet>::Ins);
 
-/// An `OutSet` is the bound outputs of a fn system's parameters.
-pub struct OutSet<S: SystemFn>(pub(crate) <S::Params as ParamSet>::Outs);
+/// An `OutSet` is the bound outputs of a fn system's parameters, plus its `log`.
+pub struct OutSet<S: SystemFn> {
+    pub(crate) outs: <S::Params as ParamSet>::Outs,
+    pub(crate) log: Log,
+}
+
+/// The name of the output every fn system ends with.
+pub const LOG_PORT: &str = "log";
 
 impl<S: SystemFn> SystemInputs for InSet<S> {
     fn defs() -> Vec<PortDef> {
@@ -222,14 +233,18 @@ impl<S: SystemFn> SystemOutputs for OutSet<S> {
     fn defs() -> Vec<PortDef> {
         let (mut inputs, mut outputs) = (Vec::new(), Vec::new());
         S::Params::defs(S::NAMES, &mut inputs, &mut outputs);
+        outputs.push(Output::<LogEvent>::def(LOG_PORT));
         outputs
     }
 
     fn bind(writers: Vec<Writer<NoWake>>) -> Self {
         let mut writers = writers.into_iter();
         let outs = S::Params::bind_outs(&mut writers);
-        // PANIC Safety: the coordinator binds exactly the declared ports.
+        // PANIC Safety: the coordinator binds exactly the declared ports, and
+        // LogEvent needs no alignment.
+        let log = writers.next().expect("one writer for the log output");
+        let log = Log::new(Output::try_new(log).expect("byte alignment"));
         assert!(writers.next().is_none(), "more writers than output params");
-        Self(outs)
+        Self { outs, log }
     }
 }

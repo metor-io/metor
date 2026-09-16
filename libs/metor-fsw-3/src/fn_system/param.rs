@@ -3,6 +3,7 @@
 use metor_fsw_3_ring::{NoWake, View, Writer};
 use metor_proto::types::Timestamp;
 
+use crate::log::Log;
 use crate::port::{Input, Output};
 use crate::record::Record;
 use crate::system::PortDef;
@@ -11,6 +12,30 @@ use crate::system::PortDef;
 pub type Views = std::vec::IntoIter<Vec<View<NoWake>>>;
 /// The writers a bundle binds from, one per output port in order.
 pub type Writers = std::vec::IntoIter<Writer<NoWake>>;
+
+/// A `Cycle` is what one `execute` call receives beyond its ports: the time and the log.
+pub struct Cycle<'a> {
+    pub now: Timestamp,
+    log: Option<&'a mut Log>,
+}
+
+impl<'a> Cycle<'a> {
+    pub(crate) fn new(now: Timestamp, log: &'a mut Log) -> Self {
+        Self {
+            now,
+            log: Some(log),
+        }
+    }
+
+    /// Hands the log to the one `&mut Log` parameter.
+    pub fn take_log(&mut self) -> &'a mut Log {
+        // PANIC Safety: only a system with two `&mut Log` parameters reaches
+        // this, on its first cycle; the message names the fix.
+        self.log
+            .take()
+            .expect("a system takes `&mut Log` at most once")
+    }
+}
 
 /// A `Param` is one `execute` parameter: what it declares, how it binds, and what it hands over each cycle.
 pub trait Param {
@@ -36,7 +61,7 @@ pub trait Param {
     fn get<'a>(
         input: &'a mut Self::In,
         output: &'a mut Self::Out,
-        now: Timestamp,
+        cx: &mut Cycle<'a>,
     ) -> Self::Item<'a>;
 }
 
@@ -58,7 +83,11 @@ impl<T: Record + 'static> Param for Input<T> {
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a>(input: &'a mut Self::In, _output: &'a mut (), _now: Timestamp) -> &'a mut Input<T> {
+    fn get<'a>(
+        input: &'a mut Self::In,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> &'a mut Input<T> {
         input
     }
 }
@@ -84,7 +113,7 @@ impl<T: Record + 'static> Param for Output<T> {
     fn get<'a>(
         _input: &'a mut (),
         output: &'a mut Self::Out,
-        _now: Timestamp,
+        _cx: &mut Cycle<'a>,
     ) -> &'a mut Output<T> {
         output
     }
@@ -101,7 +130,23 @@ impl Param for Timestamp {
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a>(_input: &'a mut (), _output: &'a mut (), now: Timestamp) -> Timestamp {
-        now
+    fn get<'a>(_input: &'a mut (), _output: &'a mut (), cx: &mut Cycle<'a>) -> Timestamp {
+        cx.now
+    }
+}
+
+impl Param for Log {
+    type In = ();
+    type Out = ();
+    type Item<'a> = &'a mut Log;
+
+    fn defs(_name: &'static str, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {}
+
+    fn bind_in(_views: &mut Views) {}
+
+    fn bind_out(_writers: &mut Writers) {}
+
+    fn get<'a>(_input: &'a mut (), _output: &'a mut (), cx: &mut Cycle<'a>) -> &'a mut Log {
+        cx.take_log()
     }
 }

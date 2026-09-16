@@ -3,6 +3,7 @@
 pub mod coordinator;
 pub mod fn_system;
 pub mod frame;
+pub mod log;
 pub mod port;
 pub mod record;
 pub mod system;
@@ -14,11 +15,12 @@ pub use coordinator::{
     BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, ParamError, Params, PortRef,
     Step, SystemConfig, SystemStatus, SystemTable,
 };
-pub use fn_system::{Ctor, FnSystem, InSet, OutSet, Param, ParamSet, SystemFn};
+pub use fn_system::{Ctor, Cycle, FnSystem, InSet, OutSet, Param, ParamSet, SystemFn};
 pub use frame::Frame;
+pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
-pub use port::{FrameGrant, Input, Output, ring_capacity};
+pub use port::{FrameGrant, Input, Output, RecvError, SendError, ring_capacity};
 pub use record::{DecodeError, EncodeError, Record};
 pub use system::{PortDef, System, SystemDef, SystemInputs, SystemOutputs};
 
@@ -29,4 +31,4 @@ pub use metor_proto::types::Timestamp;
 pub use metor_component::path;
 pub use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use postcard::experimental::max_size::MaxSize;
-pub use {metor_proto, metor_proto_wkt, postcard, serde, serde_json, zerocopy};
+pub use {metor_proto, metor_proto_wkt, postcard, serde, serde_json, tracing, zerocopy};

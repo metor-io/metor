@@ -15,8 +15,8 @@ use metor_proto::types::Timestamp;
 use crate::system::{System, SystemDef};
 
 pub use ctor::Ctor;
-pub use param::{Param, Views, Writers};
-pub use set::{InSet, OutSet, ParamSet};
+pub use param::{Cycle, Param, Views, Writers};
+pub use set::{InSet, LOG_PORT, OutSet, ParamSet};
 
 /// A `SystemFn` is a type with an `execute` method whose parameters are the ports.
 pub trait SystemFn: Sized + 'static {
@@ -52,6 +52,7 @@ impl<S: SystemFn> System for FnSystem<S> {
         SystemDef::new::<InSet<S>, OutSet<S>>(S::NAME)
     }
 
+    /// Clears the tracing queue, runs `execute`, then drains the queue onto `log`.
     fn execute(
         &self,
         now: Timestamp,
@@ -59,7 +60,11 @@ impl<S: SystemFn> System for FnSystem<S> {
         inputs: &mut InSet<S>,
         outputs: &mut OutSet<S>,
     ) {
-        state.call(S::Params::get(&mut inputs.0, &mut outputs.0, now));
+        crate::log::clear();
+        outputs.log.begin(now);
+        let mut cx = Cycle::new(now, &mut outputs.log);
+        state.call(S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx));
+        outputs.log.drain_queue();
     }
 }
 

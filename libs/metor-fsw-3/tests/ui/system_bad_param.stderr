@@ -15,6 +15,9 @@ help: the following other types implement trait `Param`
 ...
   | impl Param for Timestamp {
   | ^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Timestamp`
+...
+  | impl Param for Log {
+  | ^^^^^^^^^^^^^^^^^^ `Log`
   = note: required for `(metor_fsw_3::Timestamp, u32)` to implement `ParamSet`
 note: required by a bound in `metor_fsw_3::SystemFn::Params`
  --> src/fn_system/mod.rs
@@ -40,6 +43,9 @@ help: the following other types implement trait `Param`
 ...
   | impl Param for Timestamp {
   | ^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Timestamp`
+...
+  | impl Param for Log {
+  | ^^^^^^^^^^^^^^^^^^ `Log`
   = note: required for `(metor_fsw_3::Timestamp, u32)` to implement `ParamSet`
   = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
 
@@ -60,6 +66,9 @@ help: the following other types implement trait `Param`
 ...
   | impl Param for Timestamp {
   | ^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Timestamp`
+...
+  | impl Param for Log {
+  | ^^^^^^^^^^^^^^^^^^ `Log`
 note: required by a bound in `metor_fsw_3::fn_system::assert_param`
  --> src/fn_system/mod.rs
   |

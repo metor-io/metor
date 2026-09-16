@@ -4,11 +4,14 @@ use core::cell::RefCell;
 use std::rc::Rc;
 
 use metor_proto::types::Timestamp;
+use metor_proto_wkt::{LogEvent, LogLevel};
 use serde::Deserialize;
 use serde_json::json;
+use tracing_subscriber::layer::SubscriberExt;
 
 use super::*;
 use crate::coordinator::{CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable};
+use crate::log::Log;
 use crate::port::{Input, Output};
 use crate::tests::utils::{Control, Imu, Nav, NoParams};
 use crate::{Frame, Record, SystemInputs, SystemOutputs};
@@ -140,7 +143,7 @@ fn the_attribute_names_the_type_and_its_ports() {
     assert_eq!(<Probe<Imu>>::NAME, "probe");
     assert_eq!(
         FnSystem::<Gain>::def().outputs,
-        vec![Output::<Imu>::def("imu")]
+        vec![Output::<Imu>::def("imu"), Output::<LogEvent>::def("log")]
     );
 }
 
@@ -149,10 +152,14 @@ fn defs_follow_parameter_order_and_skip_timestamp() {
     let def = FnSystem::<Doubler>::def();
     assert_eq!(def.name, "doubler");
     assert_eq!(def.inputs, vec![Input::<Imu>::def("imu")]);
-    assert_eq!(def.outputs, vec![Output::<Nav>::def("nav")]);
+    assert_eq!(
+        def.outputs,
+        vec![Output::<Nav>::def("nav"), Output::<LogEvent>::def("log")]
+    );
     assert_eq!(InSet::<Summer>::defs().len(), 2);
     assert_eq!(OutSet::<Summer>::defs()[0].name, "sum");
     assert!(InSet::<Counter>::defs().is_empty());
+    assert_eq!(OutSet::<Counter>::defs().len(), 1);
 }
 
 fn gain_table() -> SystemTable {
@@ -287,4 +294,122 @@ fn a_fn_pipeline_matches_the_trait_pipeline() {
     let nav = seen.borrow().expect("nav published");
     assert_eq!((nav.timestamp, nav.estimate), (Timestamp(7), 3.0));
     assert_eq!(Nav::ID, Output::<Nav>::def("nav").id);
+}
+
+/// Logs one direct line and `lines` traced lines per cycle.
+struct Talker {
+    lines: usize,
+}
+
+#[crate::system]
+impl Talker {
+    fn execute(&mut self, log: &mut Log) {
+        log.info("direct");
+        for i in 0..self.lines {
+            tracing::info!(i, "traced");
+        }
+    }
+}
+
+/// Emits one traced line from the trait path, where nothing drains it.
+struct Noisy;
+
+impl crate::System for Noisy {
+    type State = ();
+    type Inputs = ();
+    type Outputs = ();
+
+    fn def() -> crate::SystemDef {
+        crate::SystemDef::new::<(), ()>("noisy")
+    }
+
+    fn execute(&self, _now: Timestamp, _state: &mut (), _inputs: &mut (), _outputs: &mut ()) {
+        tracing::info!("between systems");
+    }
+}
+
+/// Drains every log line it is wired to.
+struct LogProbe(Rc<RefCell<Vec<LogEvent>>>);
+
+#[crate::system]
+impl LogProbe {
+    fn execute(&mut self, log: &mut Input<LogEvent>) {
+        let mut seen = self.0.borrow_mut();
+        seen.extend(log.drain().map(|r| r.expect("decodes")));
+    }
+}
+
+fn log_config(lines: usize) -> (CoordinatorConfig, SystemTable, Rc<RefCell<Vec<LogEvent>>>) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut table = SystemTable::new();
+    table.register("talker", move || Talker { lines });
+    table.register_system("noisy", |_| Ok((Noisy, ())));
+    let sink = seen.clone();
+    table.register("log_probe", move || LogProbe(sink.clone()));
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("talker", "talker"),
+            SystemConfig::new("noisy", "noisy"),
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "log".into(),
+                    from: vec![PortRef::new("talker", "log"), PortRef::new("probe", "log")],
+                }],
+                ..SystemConfig::new("probe", "log_probe")
+            },
+        ],
+        ..Default::default()
+    };
+    (config, table, seen)
+}
+
+fn with_layer(f: impl FnOnce()) {
+    let subscriber = tracing_subscriber::registry().with(crate::log::layer());
+    tracing::subscriber::with_default(subscriber, f);
+}
+
+#[test]
+fn direct_and_traced_lines_land_on_the_system_log_in_order() {
+    let (config, table, seen) = log_config(1);
+    let mut coordinator = config.build(&table).expect("valid");
+    with_layer(|| coordinator.step(Timestamp(3)));
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].message, "direct");
+    assert_eq!(seen[1].message, "traced");
+    assert!(seen.iter().all(|l| l.timestamp == Timestamp(3)));
+    assert_eq!(seen[1].target, module_path!());
+}
+
+#[test]
+fn a_line_between_systems_reaches_no_ring() {
+    let (config, table, seen) = log_config(0);
+    let mut coordinator = config.build(&table).expect("valid");
+    with_layer(|| coordinator.step(Timestamp(0)));
+    assert!(seen.borrow().iter().all(|l| l.message != "between systems"));
+}
+
+#[test]
+fn the_sixty_fifth_line_is_dropped_and_reported_once() {
+    let (config, table, seen) = log_config(crate::log::MAX_LINES + 1);
+    let mut coordinator = config.build(&table).expect("valid");
+    with_layer(|| coordinator.step(Timestamp(0)));
+    let seen = seen.borrow();
+    let traced = seen.iter().filter(|l| l.message == "traced").count();
+    assert_eq!(traced, crate::log::MAX_LINES);
+    let warnings: Vec<_> = seen.iter().filter(|l| l.level == LogLevel::Warn).collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(
+        warnings[0].fields,
+        vec![("dropped".to_string(), "1".to_string())]
+    );
+}
+
+#[test]
+fn a_log_ring_holds_depth_times_ring_depth() {
+    // 63 traced lines plus the direct line fill 8 * 8 records; nothing is lost.
+    let (config, table, seen) = log_config(63);
+    let mut coordinator = config.build(&table).expect("valid");
+    with_layer(|| coordinator.step(Timestamp(0)));
+    assert_eq!(seen.borrow().len(), 64);
 }
