@@ -55,7 +55,7 @@ impl SystemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Frame;
+    use crate::Record;
     use crate::tests::utils::{Imu, ImuSource, NavFilter};
 
     #[test]
@@ -63,7 +63,7 @@ mod tests {
         let mut table = SystemTable::new();
         table.register("imu", || (ImuSource, 0));
         let entry = table.get("imu").expect("registered");
-        assert_eq!(entry.def.outputs[0].frame, Imu::ID);
+        assert_eq!(entry.def.outputs[0].id, Imu::ID);
     }
 
     #[test]

@@ -3,14 +3,14 @@
 use metor_fsw_3_ring::{NoWake, View, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
 
-/// One port of a bundle: its field name, the frame it carries, and the record
-/// size and alignment its ring must support.
+/// A `PortDef` names one port of a bundle and the record its ring carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortDef {
     pub name: &'static str,
-    pub frame: ComponentId,
-    pub max_size: usize,
+    pub id: ComponentId,
+    pub max_len: usize,
     pub alignment: usize,
+    pub depth: usize,
 }
 
 /// A system's ports, in bind order.
@@ -94,7 +94,7 @@ mod tests {
     use super::*;
     use crate::port::{Input, Output, ring_capacity};
     use crate::tests::utils::{Imu, Nav};
-    use crate::{Componentize, Frame};
+    use crate::{Frame, Record};
 
     #[derive(crate::SystemInputs)]
     struct DerivedIn {
@@ -128,7 +128,7 @@ mod tests {
 
     fn ring<F: Frame>() -> RingBuffer {
         RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(F::MAX_SIZE, 4).expect("valid capacity"),
+            capacity: ring_capacity(F::MAX_LEN, 4).expect("valid capacity"),
             max_readers: 2,
         })
     }
@@ -140,9 +140,10 @@ mod tests {
             DerivedOut::defs(),
             vec![PortDef {
                 name: "nav",
-                frame: Nav::ID,
-                max_size: Nav::MAX_SIZE,
-                alignment: core::mem::align_of::<Nav>(),
+                id: Nav::ID,
+                max_len: size_of::<Nav>(),
+                alignment: align_of::<Nav>(),
+                depth: 1,
             }]
         );
     }

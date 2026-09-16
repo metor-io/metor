@@ -9580,6 +9580,7 @@ dependencies = [
  "metor-fsw-3-ring",
  "metor-proto",
  "metor-proto-wkt",
+ "postcard",
  "serde",
  "stellarator",
  "thiserror 2.0.20",

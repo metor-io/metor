@@ -9,7 +9,6 @@ use metor_fsw_3_ring::{Config, NoWake, RingBuffer, checked_region_len};
 use metor_proto::types::{ComponentId, Timestamp};
 
 use crate::port::{Output, ring_capacity};
-use crate::{Componentize, Frame};
 
 use super::config::CoordinatorConfig;
 use super::error::BuildError;
@@ -22,8 +21,9 @@ const STATUS_PORT: &str = "status";
 struct RingSpec {
     system: String,
     port: String,
-    frame: ComponentId,
-    max_size: usize,
+    id: ComponentId,
+    max_len: usize,
+    depth: usize,
     readers: usize,
 }
 
@@ -61,7 +61,7 @@ impl CoordinatorConfig {
     pub fn build(self, table: &SystemTable) -> Result<Coordinator, BuildError> {
         self.clock.validate()?;
         let mut plan = resolve(&self, table)?;
-        check_frames(&plan)?;
+        check_ids(&plan)?;
         count_readers(&plan.systems, &mut plan.rings);
         let rings = allocate_rings(&plan.rings, self.ring_depth)?;
         let entries = bind_rings(&plan, &rings);
@@ -120,13 +120,11 @@ fn resolve<'a>(
                 .def
                 .outputs
                 .iter()
-                .map(|port| RingSpec::new(&system.id, port.name, port.frame, port.max_size)),
+                .map(|port| RingSpec::new(&system.id, port)),
         );
         plan.rings.push(RingSpec::new(
             &system.id,
-            STATUS_PORT,
-            SystemStatus::ID,
-            SystemStatus::MAX_SIZE,
+            &Output::<SystemStatus>::def(STATUS_PORT),
         ));
         plan.systems.push(planned);
     }
@@ -182,19 +180,19 @@ fn resolve_edges(
     Ok(())
 }
 
-fn check_frames(plan: &Plan<'_>) -> Result<(), BuildError> {
+fn check_ids(plan: &Plan<'_>) -> Result<(), BuildError> {
     for system in &plan.systems {
         for (port, edges) in system.inputs.iter().enumerate() {
             let def = system.entry.def.inputs[port];
             for &ring in edges {
                 let spec = &plan.rings[ring];
-                if spec.frame != def.frame {
-                    return Err(BuildError::FrameMismatch {
+                if spec.id != def.id {
+                    return Err(BuildError::IdMismatch {
                         id: system.id.to_string(),
                         port: def.name.to_string(),
                         from: format!("{}.{}", spec.system, spec.port),
-                        expected: def.frame,
-                        found: spec.frame,
+                        expected: def.id,
+                        found: spec.id,
                     });
                 }
             }
@@ -221,23 +219,22 @@ fn allocate_rings(specs: &[RingSpec], depth: usize) -> Result<Vec<RingBuffer>, B
         .collect()
 }
 
-fn allocate_ring(spec: &RingSpec, depth: usize) -> Result<RingBuffer, BuildError> {
-    let capacity = ring_capacity(spec.max_size, depth).ok_or_else(|| BuildError::RingTooLarge {
+/// Allocates one ring holding `spec.depth * ring_depth` records.
+fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, BuildError> {
+    let too_large = || BuildError::RingTooLarge {
         system: spec.system.clone(),
         port: spec.port.clone(),
-        max_size: spec.max_size,
-    })?;
+        max_len: spec.max_len,
+    };
+    let depth = spec.depth.checked_mul(ring_depth).ok_or_else(too_large)?;
+    let capacity = ring_capacity(spec.max_len, depth).ok_or_else(too_large)?;
     let config = Config {
         capacity,
         max_readers: spec.readers,
     };
     // The capacity fits `usize`, but the region around it may not.
     if checked_region_len(&config).is_none() {
-        return Err(BuildError::RingTooLarge {
-            system: spec.system.clone(),
-            port: spec.port.clone(),
-            max_size: spec.max_size,
-        });
+        return Err(too_large());
     }
     Ok(RingBuffer::create_in_memory(config))
 }
@@ -279,12 +276,13 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Vec<Entry> {
 }
 
 impl RingSpec {
-    fn new(system: &str, port: &str, frame: ComponentId, max_size: usize) -> Self {
+    fn new(system: &str, port: &crate::PortDef) -> Self {
         Self {
             system: system.to_string(),
-            port: port.to_string(),
-            frame,
-            max_size,
+            port: port.name.to_string(),
+            id: port.id,
+            max_len: port.max_len,
+            depth: port.depth,
             readers: 0,
         }
     }
@@ -293,6 +291,7 @@ impl RingSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Record;
     use crate::coordinator::{InputConfig, PortRef, SystemConfig};
     use crate::port;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
@@ -314,9 +313,10 @@ mod tests {
         for input in [true, false] {
             let port = crate::PortDef {
                 name: "aligned",
-                frame: utils::Imu::ID,
-                max_size: 32,
+                id: utils::Imu::ID,
+                max_len: 32,
                 alignment: 32,
+                depth: 1,
             };
             let def = crate::SystemDef {
                 name: "test",
@@ -458,7 +458,7 @@ mod tests {
         config.systems[2].inputs[0].from = vec![PortRef::new("imu", "imu")];
         assert_eq!(
             build(config).err(),
-            Some(BuildError::FrameMismatch {
+            Some(BuildError::IdMismatch {
                 id: "control".into(),
                 port: "nav".into(),
                 from: "imu.imu".into(),
@@ -480,10 +480,10 @@ mod tests {
             Some(BuildError::RingTooLarge {
                 system: "imu".into(),
                 port: "imu".into(),
-                max_size: utils::Imu::MAX_SIZE,
+                max_len: utils::Imu::MAX_LEN,
             })
         );
-        assert!(port::ring_capacity(utils::Imu::MAX_SIZE, usize::MAX).is_none());
+        assert!(port::ring_capacity(utils::Imu::MAX_LEN, usize::MAX).is_none());
     }
 
     #[test]
@@ -500,7 +500,7 @@ mod tests {
             Some(BuildError::RingTooLarge {
                 system: "imu".into(),
                 port: "imu".into(),
-                max_size: utils::Imu::MAX_SIZE,
+                max_len: utils::Imu::MAX_LEN,
             })
         );
     }

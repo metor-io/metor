@@ -1,13 +1,15 @@
 //! The [`Frame`] trait, implemented via `#[derive(Frame)]`.
 
 use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// A fixed `#[repr(C)]` struct whose fields share one timestamp and whose
-/// bytes are the ring payload.
+use crate::Record;
+
+/// A `Frame` is a fixed `#[repr(C)]` record whose fields share one timestamp.
 pub trait Frame:
-    AsVTable
+    Record
+    + AsVTable
     + Componentize
     + Decomponentize
     + Metadatatize
@@ -16,12 +18,7 @@ pub trait Frame:
     + KnownLayout
     + Immutable
 {
-    /// Dotted prefix of every member component's path.
-    const NAME: &'static str;
-    /// Identifier hashed from [`NAME`](Frame::NAME).
-    const ID: ComponentId = ComponentId::new(Self::NAME);
-
-    /// The shared timestamp, read from the `#[frame(timestamp)]` field.
+    /// Returns the shared timestamp from the `#[frame(timestamp)]` field.
     fn timestamp(&self) -> Timestamp;
 }
 
@@ -31,7 +28,7 @@ mod tests {
     use zerocopy::{FromBytes, IntoBytes};
 
     use crate::tests::utils::{BareName, Imu};
-    use crate::{Componentize, Frame};
+    use crate::{Componentize, Frame, Record};
 
     #[test]
     fn derive_sets_name_id_and_timestamp() {

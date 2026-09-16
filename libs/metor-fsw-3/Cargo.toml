@@ -13,6 +13,7 @@ metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
 futures-lite = "2"
+postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
 serde = { version = "1", features = ["derive"] }
 stellarator = { path = "../stellarator" }
 thiserror = "2.0"

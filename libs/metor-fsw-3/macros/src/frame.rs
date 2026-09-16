@@ -114,8 +114,21 @@ pub fn frame(input: TokenStream) -> TokenStream {
         #componentize
         #decomponentize
 
-        impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {
+        impl #impl_generics #fsw::Record for #ident #ty_generics #where_clause {
             const NAME: &'static str = #frame_name;
+            const MAX_LEN: usize = ::core::mem::size_of::<Self>();
+            const ALIGN: usize = ::core::mem::align_of::<Self>();
+            type Read<'a> = &'a Self where Self: 'a;
+            fn encode<'a>(&'a self, _buf: &'a mut [u8])
+                -> Result<&'a [u8], #fsw::EncodeError> {
+                Ok(#fsw::zerocopy::IntoBytes::as_bytes(self))
+            }
+            fn decode(bytes: &[u8]) -> Result<&Self, #fsw::DecodeError> {
+                #fsw::record::fixed::decode(bytes)
+            }
+        }
+
+        impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {
             fn timestamp(&self) -> #proto::types::Timestamp {
                 #timestamp_body
             }

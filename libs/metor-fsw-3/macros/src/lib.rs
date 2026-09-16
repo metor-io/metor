@@ -7,6 +7,7 @@ use quote::quote;
 use syn::Ident;
 
 mod frame;
+mod record;
 mod system;
 
 /// Derives the four component sub-traits and `Frame`. Configured with
@@ -14,6 +15,12 @@ mod system;
 #[proc_macro_derive(Frame, attributes(frame))]
 pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)
+}
+
+/// Derives `Record` over postcard, configured with `#[record(name, max_len, depth)]`.
+#[proc_macro_derive(Record, attributes(record))]
+pub fn record_derive(input: TokenStream) -> TokenStream {
+    record::record(input)
 }
 
 /// Derives `SystemInputs` for a struct of `Input<F>` fields.

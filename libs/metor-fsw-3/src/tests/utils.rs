@@ -7,6 +7,7 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use metor_proto::types::Timestamp;
+use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::port::{Input, Output};
@@ -42,6 +43,20 @@ pub struct BareName {
     #[frame(timestamp)]
     pub timestamp: Timestamp,
     pub value: u64,
+}
+
+/// A message with a static postcard bound, so it states no length.
+#[derive(crate::Record, crate::MaxSize, Serialize, Deserialize, Debug, PartialEq)]
+pub struct Fixed {
+    pub a: u32,
+    pub b: f64,
+}
+
+/// A message with a string, so it states its length.
+#[derive(crate::Record, Serialize, Deserialize, Debug, PartialEq)]
+#[record(max_len = 64, depth = 4)]
+pub struct Note {
+    pub text: String,
 }
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]

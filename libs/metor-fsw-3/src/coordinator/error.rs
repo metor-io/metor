@@ -27,7 +27,7 @@ pub enum BuildError {
     UnknownOutput { system: String, port: String },
 
     #[error("input `{id}.{port}` carries {expected:?} but `{from}` produces {found:?}")]
-    FrameMismatch {
+    IdMismatch {
         id: String,
         port: String,
         from: String,
@@ -46,7 +46,7 @@ pub enum BuildError {
     RingTooLarge {
         system: String,
         port: String,
-        max_size: usize,
+        max_len: usize,
     },
 
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]

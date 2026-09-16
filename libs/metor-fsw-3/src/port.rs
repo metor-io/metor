@@ -1,10 +1,10 @@
 //! Typed ports over ring handles.
 
 use core::marker::PhantomData;
-use core::mem::align_of;
 use core::ops::Deref;
 
 use crate::frame::Frame;
+use crate::record::Record;
 use crate::system::PortDef;
 use metor_fsw_3_ring::{NoWake, ReadError, ReadGrant, View, WriteError, Writer, frame_len};
 use metor_proto::types::Timestamp;
@@ -28,8 +28,8 @@ pub struct UnsupportedAlignment {
     pub supported: usize,
 }
 
-fn check_alignment<F>() -> Result<(), UnsupportedAlignment> {
-    let alignment = align_of::<F>();
+fn check_alignment<T: Record>() -> Result<(), UnsupportedAlignment> {
+    let alignment = T::ALIGN;
     let supported = metor_fsw_3_ring::PAYLOAD_ALIGNMENT;
     if alignment > supported {
         return Err(UnsupportedAlignment {
@@ -60,9 +60,10 @@ impl<F: Frame> Output<F> {
     pub fn def(name: &'static str) -> PortDef {
         PortDef {
             name,
-            frame: F::ID,
-            max_size: F::MAX_SIZE,
-            alignment: align_of::<F>(),
+            id: F::ID,
+            max_len: F::MAX_LEN,
+            alignment: F::ALIGN,
+            depth: F::DEPTH,
         }
     }
 
@@ -92,9 +93,10 @@ impl<F: Frame> Input<F> {
     pub fn def(name: &'static str) -> PortDef {
         PortDef {
             name,
-            frame: F::ID,
-            max_size: F::MAX_SIZE,
-            alignment: align_of::<F>(),
+            id: F::ID,
+            max_len: F::MAX_LEN,
+            alignment: F::ALIGN,
+            depth: F::DEPTH,
         }
     }
 
@@ -185,7 +187,7 @@ mod tests {
 
     use super::*;
     use crate::tests::utils::Imu;
-    use crate::{Componentize, Frame};
+    use crate::{Frame, Record};
 
     #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
     #[repr(C, align(16))]
@@ -252,7 +254,7 @@ mod tests {
 
     fn ring(depth: usize) -> RingBuffer {
         RingBuffer::create_in_memory(Config {
-            capacity: ring_capacity(Imu::MAX_SIZE, depth).expect("valid capacity"),
+            capacity: ring_capacity(Imu::MAX_LEN, depth).expect("valid capacity"),
             max_readers: 4,
         })
     }
