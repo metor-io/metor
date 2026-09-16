@@ -21,6 +21,7 @@ pub use config::{Clock, CoordinatorConfig, InputConfig, PortRef, SystemConfig};
 pub use error::BuildError;
 pub use params::{ParamError, Params};
 pub use run::Step;
+pub(crate) use run::catch_step;
 pub use status::SystemStatus;
 pub use table::SystemTable;
 

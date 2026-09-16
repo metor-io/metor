@@ -22,6 +22,7 @@ pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use pack::def::{PackDef, PackSystemDef};
+pub use pack::{ABI_VERSION, Status};
 pub use port::{Input, Latest, Output, RecvError, SendError, ring_capacity};
 pub use record::{DecodeError, EncodeError, Record};
 pub use system::{PortDef, System, SystemDef, SystemInputs, SystemOutputs};
