@@ -27,14 +27,27 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// One system: the id it is addressed by, the registered type it is built
-/// from, and the edges into its inputs.
+/// A `SystemConfig` names one system, its registered type, its params, and the edges into it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SystemConfig {
     pub id: String,
     pub ty: String,
     #[serde(default)]
+    pub params: serde_json::Value,
+    #[serde(default)]
     pub inputs: Vec<InputConfig>,
+}
+
+impl SystemConfig {
+    /// Returns a system with no params and no inputs.
+    pub fn new(id: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            ty: ty.into(),
+            params: serde_json::Value::Null,
+            inputs: Vec::new(),
+        }
+    }
 }
 
 /// The producers of one input port
@@ -91,6 +104,22 @@ impl PortRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn params_default_to_null_and_round_trip() {
+        let bare: SystemConfig =
+            serde_json::from_str(r#"{"id":"nav","ty":"nav"}"#).expect("params optional");
+        assert_eq!(bare, SystemConfig::new("nav", "nav"));
+        let full = SystemConfig {
+            params: serde_json::json!({ "gain": 2.5 }),
+            ..SystemConfig::new("nav", "nav")
+        };
+        let text = serde_json::to_string(&full).expect("serializable");
+        assert_eq!(
+            serde_json::from_str::<SystemConfig>(&text).expect("round trips"),
+            full
+        );
+    }
 
     #[test]
     fn simulated_and_subnanosecond_periods_have_no_budget() {

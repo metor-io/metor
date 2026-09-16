@@ -192,36 +192,23 @@ fn config() -> CoordinatorConfig {
     CoordinatorConfig {
         clock: Clock::Wall { rate: 5_000.0 },
         systems: vec![
+            SystemConfig::new("imu", "gyro"),
             SystemConfig {
-                id: "imu".into(),
-                ty: "gyro".into(),
-                inputs: Vec::new(),
+                inputs: vec![input("imu", PortRef::new("imu", "imu"))],
+                ..SystemConfig::new("nav", "nav")
             },
             SystemConfig {
-                id: "nav".into(),
-                ty: "nav".into(),
-                inputs: vec![InputConfig {
-                    port: "imu".into(),
-                    from: vec![PortRef::new("imu", "imu")],
-                }],
+                inputs: vec![input("nav", PortRef::new("nav", "nav"))],
+                ..SystemConfig::new("control", "control")
             },
             SystemConfig {
-                id: "control".into(),
-                ty: "control".into(),
-                inputs: vec![InputConfig {
-                    port: "nav".into(),
-                    from: vec![PortRef::new("nav", "nav")],
-                }],
-            },
-            SystemConfig {
-                id: "monitor".into(),
-                ty: "monitor".into(),
                 inputs: vec![
                     input("control", PortRef::new("control", "control")),
                     input("imu_status", PortRef::new("imu", "status")),
                     input("nav_status", PortRef::new("nav", "status")),
                     input("control_status", PortRef::new("control", "status")),
                 ],
+                ..SystemConfig::new("monitor", "monitor")
             },
         ],
         ..Default::default()
@@ -237,11 +224,11 @@ fn input(port: &str, from: PortRef) -> InputConfig {
 
 fn table(report: &Rc<RefCell<Report>>) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("gyro", || (Gyro, 0));
-    table.register("nav", || (NavFilter, ()));
-    table.register("control", || (ControlLaw, ()));
+    table.register_system("gyro", |_| Ok((Gyro, 0)));
+    table.register_system("nav", |_| Ok((NavFilter, ())));
+    table.register_system("control", |_| Ok((ControlLaw, ())));
     let report = report.clone();
-    table.register("monitor", move || (Monitor, report.clone()));
+    table.register_system("monitor", move |_| Ok((Monitor, report.clone())));
     table
 }
 

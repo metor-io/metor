@@ -102,12 +102,11 @@ mod tests {
 
     fn watched(config: &mut CoordinatorConfig, from: &[&str]) {
         config.systems.push(SystemConfig {
-            id: "watch".into(),
-            ty: "status_watch".into(),
             inputs: vec![InputConfig {
                 port: "status".into(),
                 from: from.iter().map(|id| PortRef::new(*id, "status")).collect(),
             }],
+            ..SystemConfig::new("watch", "status_watch")
         });
     }
 
@@ -139,14 +138,9 @@ mod tests {
         config.systems[1].inputs[0]
             .from
             .push(PortRef::new("imu_late", "imu"));
-        config.systems.insert(
-            1,
-            SystemConfig {
-                id: "imu_late".into(),
-                ty: "imu_offset".into(),
-                inputs: Vec::new(),
-            },
-        );
+        config
+            .systems
+            .insert(1, SystemConfig::new("imu_late", "imu_offset"));
         let mut coordinator = config.build(&table(&recorder)).unwrap();
         coordinator.step(Timestamp(5));
         // `imu_offset` stamps 100 later and samples ten times higher.

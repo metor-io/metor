@@ -10,8 +10,8 @@ pub mod system;
 mod tests;
 
 pub use coordinator::{
-    BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, PortRef, Step, SystemConfig,
-    SystemStatus, SystemTable,
+    BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, ParamError, Params, PortRef,
+    Step, SystemConfig, SystemStatus, SystemTable,
 };
 pub use frame::Frame;
 pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs};
@@ -27,4 +27,4 @@ pub use metor_proto::types::Timestamp;
 pub use metor_component::path;
 pub use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use postcard::experimental::max_size::MaxSize;
-pub use {metor_proto, metor_proto_wkt, postcard, serde, zerocopy};
+pub use {metor_proto, metor_proto_wkt, postcard, serde, serde_json, zerocopy};

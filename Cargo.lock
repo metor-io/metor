@@ -9582,6 +9582,8 @@ dependencies = [
  "metor-proto-wkt",
  "postcard",
  "serde",
+ "serde_ignored",
+ "serde_json",
  "stellarator",
  "thiserror 2.0.20",
  "trybuild",

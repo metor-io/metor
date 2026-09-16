@@ -292,17 +292,21 @@ impl Recorder {
     }
 }
 
+/// A params struct with no fields, so any key is unknown.
+#[derive(Deserialize)]
+pub struct NoParams {}
+
 /// Every system type the coordinator tests name, recording into `recorder`.
 pub fn table(recorder: &Recorder) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register("imu", || (ImuSource, 0));
-    table.register("imu_offset", || (ImuOffset, 0));
-    table.register("nav", || (NavFilter, ()));
+    table.register_system("imu", |_| Ok((ImuSource, 0)));
+    table.register_system("imu_offset", |_| Ok((ImuOffset, 0)));
+    table.register_system("nav", |p| p.decode::<NoParams>().map(|_| (NavFilter, ())));
     let control = recorder.clone();
-    table.register("control", move || (ControlLaw, control.clone()));
+    table.register_system("control", move |_| Ok((ControlLaw, control.clone())));
     let watch = recorder.clone();
-    table.register("status_watch", move || (StatusWatch, watch.clone()));
-    table.register("reserved", || (Reserved, ()));
+    table.register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())));
+    table.register_system("reserved", |_| Ok((Reserved, ())));
     table
 }
 
@@ -310,26 +314,20 @@ pub fn table(recorder: &Recorder) -> SystemTable {
 pub fn pipeline_config() -> CoordinatorConfig {
     CoordinatorConfig {
         systems: vec![
+            SystemConfig::new("imu", "imu"),
             SystemConfig {
-                id: "imu".into(),
-                ty: "imu".into(),
-                inputs: Vec::new(),
-            },
-            SystemConfig {
-                id: "nav".into(),
-                ty: "nav".into(),
                 inputs: vec![InputConfig {
                     port: "imu".into(),
                     from: vec![PortRef::new("imu", "imu")],
                 }],
+                ..SystemConfig::new("nav", "nav")
             },
             SystemConfig {
-                id: "control".into(),
-                ty: "control".into(),
                 inputs: vec![InputConfig {
                     port: "nav".into(),
                     from: vec![PortRef::new("nav", "nav")],
                 }],
+                ..SystemConfig::new("control", "control")
             },
         ],
         ..Default::default()

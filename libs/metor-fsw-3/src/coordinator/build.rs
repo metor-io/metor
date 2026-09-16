@@ -12,6 +12,7 @@ use crate::port::{Output, ring_capacity};
 
 use super::config::CoordinatorConfig;
 use super::error::BuildError;
+use super::params::Params;
 use super::status::SystemStatus;
 use super::table::{SystemTable, TableEntry};
 use super::{Coordinator, Entry};
@@ -32,6 +33,7 @@ type RingIndex = usize;
 struct PlannedSystem<'a> {
     id: &'a str,
     entry: &'a TableEntry,
+    params: Params<'a>,
     base_ring_idx: RingIndex,
     inputs: Vec<Vec<RingIndex>>,
 }
@@ -64,7 +66,7 @@ impl CoordinatorConfig {
         check_ids(&plan)?;
         count_readers(&plan.systems, &mut plan.rings);
         let rings = allocate_rings(&plan.rings, self.ring_depth)?;
-        let entries = bind_rings(&plan, &rings);
+        let entries = bind_rings(&plan, &rings)?;
 
         Ok(Coordinator {
             entries,
@@ -112,6 +114,7 @@ fn resolve<'a>(
         let planned = PlannedSystem {
             id: &system.id,
             entry,
+            params: Params(&system.params),
             base_ring_idx: plan.rings.len(),
             inputs: vec![Vec::new(); entry.def.inputs.len()],
         };
@@ -239,7 +242,7 @@ fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, Build
     Ok(RingBuffer::create_in_memory(config))
 }
 
-fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Vec<Entry> {
+fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, BuildError> {
     plan.systems
         .iter()
         .map(|system| {
@@ -261,16 +264,22 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Vec<Entry> {
                         .collect()
                 })
                 .collect();
-            Entry {
+            let step = (system.entry.make)(system.params, views, writers).map_err(|source| {
+                BuildError::Params {
+                    id: system.id.to_string(),
+                    source,
+                }
+            })?;
+            Ok(Entry {
                 name: system.id.to_string(),
-                step: (system.entry.make)(views, writers),
+                step,
                 // PANIC Safety: SystemStatus requires only eight-byte alignment.
                 status: Output::try_new({
                     let ring: &RingBuffer = &rings[system.status_ring()];
                     ring.writer(NoWake).expect("one writer per output ring")
                 })
                 .expect("supported status alignment"),
-            }
+            })
         })
         .collect()
 }
@@ -297,11 +306,7 @@ mod tests {
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
 
     fn source(id: &str) -> SystemConfig {
-        SystemConfig {
-            id: id.into(),
-            ty: "imu".into(),
-            inputs: Vec::new(),
-        }
+        SystemConfig::new(id, "imu")
     }
 
     fn build(config: CoordinatorConfig) -> Result<Coordinator, BuildError> {
@@ -371,12 +376,11 @@ mod tests {
     fn a_status_output_is_an_ordinary_ring() {
         let mut config = pipeline_config();
         config.systems.push(SystemConfig {
-            id: "watch".into(),
-            ty: "status_watch".into(),
             inputs: vec![InputConfig {
                 port: "status".into(),
                 from: vec![PortRef::new("nav", "status")],
             }],
+            ..SystemConfig::new("watch", "status_watch")
         });
         assert!(build(config).is_ok());
     }
@@ -396,11 +400,7 @@ mod tests {
     #[test]
     fn an_unregistered_type_is_rejected() {
         let config = CoordinatorConfig {
-            systems: vec![SystemConfig {
-                id: "imu".into(),
-                ty: "gyro".into(),
-                inputs: Vec::new(),
-            }],
+            systems: vec![SystemConfig::new("imu", "gyro")],
             ..Default::default()
         };
         assert_eq!(
@@ -517,17 +517,26 @@ mod tests {
     #[test]
     fn a_declared_status_output_is_rejected() {
         let config = CoordinatorConfig {
-            systems: vec![SystemConfig {
-                id: "r".into(),
-                ty: "reserved".into(),
-                inputs: Vec::new(),
-            }],
+            systems: vec![SystemConfig::new("r", "reserved")],
             ..Default::default()
         };
         assert_eq!(
             build(config).err(),
             Some(BuildError::ReservedPort {
                 ty: "reserved".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_params_error_names_the_system() {
+        let mut config = pipeline_config();
+        config.systems[1].params = serde_json::json!({ "gain": 2.0 });
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::Params {
+                id: "nav".into(),
+                source: crate::coordinator::ParamError::UnknownKey("gain".into()),
             })
         );
     }

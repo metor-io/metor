@@ -1,6 +1,8 @@
 use metor_proto::types::ComponentId;
 use thiserror::Error;
 
+use super::params::ParamError;
+
 /// Errors associated with [`CoordinatorConfig::build`].
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BuildError {
@@ -51,4 +53,11 @@ pub enum BuildError {
 
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
+
+    #[error("params for `{id}`: {source}")]
+    Params {
+        id: String,
+        #[source]
+        source: ParamError,
+    },
 }

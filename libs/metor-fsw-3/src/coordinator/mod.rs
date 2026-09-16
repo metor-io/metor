@@ -10,6 +10,7 @@
 mod build;
 mod config;
 mod error;
+mod params;
 mod run;
 mod status;
 mod table;
@@ -21,6 +22,7 @@ use crate::port::Output;
 
 pub use config::{Clock, CoordinatorConfig, InputConfig, PortRef, SystemConfig};
 pub use error::BuildError;
+pub use params::{ParamError, Params};
 pub use run::Step;
 pub use status::SystemStatus;
 pub use table::SystemTable;
