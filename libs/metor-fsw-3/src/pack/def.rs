@@ -85,7 +85,10 @@ mod tests {
                 "nav",
                 "control",
                 "status_watch",
-                "reserved"
+                "reserved",
+                "boom",
+                "trap",
+                "log_sink"
             ]
         );
         assert_eq!(def.systems[0].def.outputs[0].name, "imu");

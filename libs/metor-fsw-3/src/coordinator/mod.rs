@@ -29,6 +29,8 @@ struct Entry {
     name: String,
     step: Box<dyn Step>,
     status: Output<SystemStatus>,
+    /// Set once the system panicked; it is never executed again.
+    latched: bool,
 }
 
 /// A built graph: the systems in step order, the clock that stamps each cycle,
@@ -52,5 +54,13 @@ impl Coordinator {
     /// The systems' config ids, in step order.
     pub fn entry_names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.name.as_str())
+    }
+
+    /// The ids of the systems a panic latched off, in step order.
+    pub fn latched(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.latched)
+            .map(|entry| entry.name.as_str())
     }
 }

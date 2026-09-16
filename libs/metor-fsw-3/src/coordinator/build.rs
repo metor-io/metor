@@ -301,6 +301,7 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
             Ok(Entry {
                 name: system.id.to_string(),
                 step,
+                latched: false,
                 // PANIC Safety: SystemStatus requires only eight-byte alignment.
                 status: Output::try_new({
                     let ring: &RingBuffer = &rings[system.status_ring()];

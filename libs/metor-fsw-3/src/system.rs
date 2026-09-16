@@ -49,6 +49,9 @@ pub trait System {
         inputs: &mut Self::Inputs,
         outputs: &mut Self::Outputs,
     );
+
+    /// Called once after `execute` panicked, before the system is latched off.
+    fn fault(&self, _now: Timestamp, _outputs: &mut Self::Outputs, _message: &str) {}
 }
 
 /// A struct of `Input<F>` fields. Derive with `#[derive(SystemInputs)]`.

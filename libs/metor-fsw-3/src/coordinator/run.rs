@@ -1,8 +1,10 @@
 //! The erased runner and the cycle loop.
 
+use core::any::Any;
 use core::future::Future;
 use core::pin::pin;
-use std::time::Instant;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::{Duration, Instant};
 
 use futures_lite::future::poll_once;
 use metor_proto::types::Timestamp;
@@ -16,6 +18,9 @@ use super::status::SystemStatus;
 /// A bound system, stepped once per cycle with the system type erased.
 pub trait Step {
     fn execute(&mut self, now: Timestamp);
+
+    /// Called once after `execute` panicked, with the payload's message.
+    fn fault(&mut self, _now: Timestamp, _message: &str) {}
 }
 
 pub(crate) struct Runner<S: System> {
@@ -30,6 +35,28 @@ impl<S: System> Step for Runner<S> {
         self.system
             .execute(now, &mut self.state, &mut self.inputs, &mut self.outputs);
     }
+
+    fn fault(&mut self, now: Timestamp, message: &str) {
+        self.system.fault(now, &mut self.outputs, message);
+    }
+}
+
+/// Runs one step, returning the panic's message instead of unwinding.
+pub(crate) fn catch_step(step: &mut dyn Step, now: Timestamp) -> Result<(), String> {
+    // PANIC Safety: a panicked step is latched off and only its log output is
+    // touched afterwards, so no caller reads state a panic left half-written.
+    catch_unwind(AssertUnwindSafe(|| step.execute(now))).map_err(|payload| message_of(&*payload))
+}
+
+/// Reads a panic payload as the string `panic!` was given.
+fn message_of(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return (*text).to_string();
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text.clone();
+    }
+    "panic".to_string()
 }
 
 impl Coordinator {
@@ -39,15 +66,18 @@ impl Coordinator {
     }
 
     /// Execute a single step of the coordinator, running each system once.
+    ///
+    /// A system that panicked on an earlier cycle is skipped; its status keeps
+    /// arriving with a zero execution time.
     pub fn step(&mut self, now: Timestamp) {
         let cycle_start = Instant::now();
         for entry in &mut self.entries {
-            let started = Instant::now();
-            entry.step.execute(now);
+            let offset = cycle_start.elapsed();
+            let elapsed = entry.run(now);
             let _ = entry.status.write(&SystemStatus {
                 timestamp: now,
-                exec_time_ns: duration_to_nanos(started.elapsed()),
-                exec_offset_ns: duration_to_nanos(started.duration_since(cycle_start)),
+                exec_time_ns: duration_to_nanos(elapsed),
+                exec_offset_ns: duration_to_nanos(offset),
             });
         }
         self.cycle += 1;
@@ -77,6 +107,24 @@ impl Coordinator {
             Clock::Wall { .. } => Timestamp::now(),
             Clock::Simulated { dt } => simulated_time(self.epoch, self.cycle, dt),
         }
+    }
+}
+
+impl super::Entry {
+    /// Runs this system unless it has latched, returning its execution time.
+    fn run(&mut self, now: Timestamp) -> Duration {
+        if self.latched {
+            return Duration::ZERO;
+        }
+        let started = Instant::now();
+        let result = catch_step(self.step.as_mut(), now);
+        let elapsed = started.elapsed();
+        if let Err(message) = result {
+            self.latched = true;
+            self.step.fault(now, &message);
+            tracing::error!(system = self.name, "system panicked: {message}");
+        }
+        elapsed
     }
 }
 
@@ -212,6 +260,111 @@ mod tests {
             .unwrap();
         coordinator.step(Timestamp(0));
         assert_eq!(coordinator.cycle(), 1);
+    }
+
+    /// `boom -> nav -> control`, with `boom`'s log and status drained after it.
+    fn boom_config() -> CoordinatorConfig {
+        let mut config = pipeline_config();
+        config.systems[0] = SystemConfig::new("boom", "boom");
+        config.systems[1].inputs[0].from = vec![PortRef::new("boom", "imu")];
+        config.systems.push(SystemConfig {
+            inputs: vec![InputConfig {
+                port: "lines".into(),
+                from: vec![PortRef::new("boom", "log")],
+            }],
+            ..SystemConfig::new("logs", "log_sink")
+        });
+        watched(&mut config, &["boom"]);
+        config
+    }
+
+    #[test]
+    fn a_panic_latches_one_system_and_leaves_the_cycle_running() {
+        let recorder = Recorder::default();
+        let mut coordinator = boom_config().build(&table(&recorder)).unwrap();
+        coordinator.step(Timestamp(1));
+        assert_eq!(coordinator.latched().count(), 0);
+        assert!(recorder.take_logs().is_empty());
+
+        coordinator.step(Timestamp(2));
+        assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["boom"]);
+        // `nav` and `control` still ran on the cycle `boom` failed.
+        assert_eq!(
+            recorder.take(),
+            vec![(Timestamp(1), 3.0), (Timestamp(1), 3.0)]
+        );
+    }
+
+    #[test]
+    fn a_panic_writes_one_fault_line_on_the_systems_log() {
+        let recorder = Recorder::default();
+        let mut coordinator = boom_config().build(&table(&recorder)).unwrap();
+        coordinator.step(Timestamp(1));
+        coordinator.step(Timestamp(2));
+        coordinator.step(Timestamp(3));
+
+        let lines = recorder.take_logs();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].level, metor_proto_wkt::LogLevel::Error);
+        assert_eq!(lines[0].timestamp, Timestamp(2));
+        assert_eq!(
+            lines[0].fields,
+            vec![("kind".to_string(), "panic".to_string())]
+        );
+        assert_eq!(lines[0].message, "boom on cycle 2");
+    }
+
+    #[test]
+    fn a_latched_system_keeps_reporting_a_zero_execution_time() {
+        let recorder = Recorder::default();
+        let mut coordinator = boom_config().build(&table(&recorder)).unwrap();
+        for cycle in 1..=3 {
+            coordinator.step(Timestamp(cycle));
+        }
+        let seen = recorder.take_status();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[2].timestamp, Timestamp(3));
+        assert_eq!(seen[2].exec_time_ns, 0);
+    }
+
+    #[test]
+    fn a_trait_path_panic_latches_with_nothing_written() {
+        let recorder = Recorder::default();
+        let mut config = CoordinatorConfig {
+            systems: vec![SystemConfig::new("trap", "trap")],
+            ..Default::default()
+        };
+        watched(&mut config, &["trap"]);
+        let mut coordinator = config.build(&table(&recorder)).unwrap();
+        coordinator.step(Timestamp(1));
+        coordinator.step(Timestamp(2));
+        assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["trap"]);
+        assert!(recorder.take_logs().is_empty());
+        assert_eq!(recorder.take_status().len(), 2);
+    }
+
+    #[test]
+    fn a_payload_that_is_no_string_reads_as_panic() {
+        struct Odd;
+        impl Step for Odd {
+            fn execute(&mut self, _now: Timestamp) {
+                std::panic::panic_any(7u8);
+            }
+        }
+        assert_eq!(catch_step(&mut Odd, Timestamp(0)), Err("panic".to_string()));
+    }
+
+    #[test]
+    fn catch_step_passes_a_clean_step_through() {
+        struct Clean(u64);
+        impl Step for Clean {
+            fn execute(&mut self, _now: Timestamp) {
+                self.0 += 1;
+            }
+        }
+        let mut clean = Clean(0);
+        assert_eq!(catch_step(&mut clean, Timestamp(0)), Ok(()));
+        assert_eq!(clean.0, 1);
     }
 
     #[test]

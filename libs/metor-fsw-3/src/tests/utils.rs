@@ -7,6 +7,7 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 
 use metor_proto::types::Timestamp;
+use metor_proto_wkt::LogEvent;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -271,6 +272,53 @@ impl System for StatusWatch {
     }
 }
 
+/// Publishes a sample, then panics from its second cycle on.
+#[derive(Default)]
+pub struct Boom(u64);
+
+#[crate::system]
+impl Boom {
+    /// Fails on its second cycle.
+    fn execute(&mut self, imu: &mut Output<Imu>, now: Timestamp) {
+        self.0 += 1;
+        assert!(self.0 < 2, "boom on cycle {}", self.0);
+        let _ = imu.write(&Imu {
+            timestamp: now,
+            sample: 1.0,
+        });
+    }
+}
+
+/// A trait-path system that panics, so it has no `log` port to fault onto.
+pub struct Trap;
+
+impl System for Trap {
+    type State = ();
+    type Inputs = ();
+    type Outputs = ();
+
+    fn def() -> SystemDef {
+        SystemDef::new::<(), ()>("trap")
+    }
+
+    fn execute(&self, _now: Timestamp, _state: &mut (), _inputs: &mut (), _outputs: &mut ()) {
+        panic!("trap")
+    }
+}
+
+/// Records every log line it is wired to.
+pub struct LogSink(Recorder);
+
+#[crate::system]
+impl LogSink {
+    fn execute(&mut self, lines: &mut Input<LogEvent>) {
+        for line in lines.drain() {
+            let Ok(line) = line else { continue };
+            self.0.push_log(line);
+        }
+    }
+}
+
 /// What the recording systems saw, shared with the test that built them.
 #[derive(Clone, Default)]
 pub struct Recorder(Rc<RefCell<Recorded>>);
@@ -279,6 +327,7 @@ pub struct Recorder(Rc<RefCell<Recorded>>);
 struct Recorded {
     commands: Vec<(Timestamp, f64)>,
     statuses: Vec<SystemStatus>,
+    logs: Vec<LogEvent>,
 }
 
 impl Recorder {
@@ -290,12 +339,20 @@ impl Recorder {
         self.0.borrow_mut().statuses.push(status);
     }
 
+    fn push_log(&self, line: LogEvent) {
+        self.0.borrow_mut().logs.push(line);
+    }
+
     pub fn take(&self) -> Vec<(Timestamp, f64)> {
         core::mem::take(&mut self.0.borrow_mut().commands)
     }
 
     pub fn take_status(&self) -> Vec<SystemStatus> {
         core::mem::take(&mut self.0.borrow_mut().statuses)
+    }
+
+    pub fn take_logs(&self) -> Vec<LogEvent> {
+        core::mem::take(&mut self.0.borrow_mut().logs)
     }
 }
 
@@ -314,6 +371,10 @@ pub fn table(recorder: &Recorder) -> SystemTable {
     let watch = recorder.clone();
     table.register_system("status_watch", move |_| Ok((StatusWatch, watch.clone())));
     table.register_system("reserved", |_| Ok((Reserved, ())));
+    table.register("boom", Boom::default);
+    table.register_system("trap", |_| Ok((Trap, ())));
+    let logs = recorder.clone();
+    table.register("log_sink", move || LogSink(logs.clone()));
     table
 }
 

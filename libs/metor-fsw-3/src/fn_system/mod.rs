@@ -64,6 +64,12 @@ impl<S: SystemFn> System for FnSystem<S> {
         state.call(S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx));
         outputs.log.drain_queue();
     }
+
+    /// Writes the panic as a fault line on the system's own `log` output.
+    fn fault(&self, now: Timestamp, outputs: &mut OutSet<S>, message: &str) {
+        outputs.log.begin(now);
+        outputs.log.fault("panic", message);
+    }
 }
 
 #[cfg(test)]
