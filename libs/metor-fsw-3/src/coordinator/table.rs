@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use metor_fsw_3_ring::{NoWake, View, Writer};
+use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde_json::value::RawValue;
 
 use crate::fn_system::{Ctor, FnSystem, SystemFn};
@@ -11,10 +11,12 @@ use crate::system::{System, SystemDef, SystemInputs, SystemOutputs};
 use super::params::{ParamError, Params};
 use super::run::{Runner, Step};
 
+/// Builds one bound system from its params and the rings its ports sit on:
+/// one ring list per input port, in edge order, and one ring per output.
 type SystemMakeFn = dyn Fn(
     Params<'_>,
-    Vec<Vec<View<NoWake>>>,
-    Vec<Writer<NoWake>>,
+    Vec<Vec<&RingBuffer>>,
+    Vec<&RingBuffer>,
 ) -> Result<Box<dyn Step>, ParamError>;
 
 pub(crate) struct TableEntry {
@@ -87,8 +89,23 @@ fn entry<S: System + 'static>(
         def: S::def(),
         doc,
         schema,
-        make: Box::new(move |params, views, writers| {
+        make: Box::new(move |params, inputs, outputs| {
             let (system, state) = make(params)?;
+            let views = inputs
+                .into_iter()
+                .map(|rings| {
+                    rings
+                        .into_iter()
+                        // PANIC Safety: the build pass counts one reader slot per edge.
+                        .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
+                        .collect()
+                })
+                .collect();
+            let writers = outputs
+                .into_iter()
+                // PANIC Safety: one ring is allocated per output port.
+                .map(|ring| ring.writer(NoWake).expect("one writer per output ring"))
+                .collect();
             Ok(Box::new(Runner {
                 system,
                 state,

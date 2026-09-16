@@ -274,25 +274,15 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
     plan.systems
         .iter()
         .map(|system| {
-            let outputs = system.entry.def.outputs.len();
-            let writers = (0..outputs)
-                .map(|i| {
-                    let ring: &RingBuffer = &rings[system.base_ring_idx + i];
-                    ring.writer(NoWake).expect("one writer per output ring")
-                })
+            let outputs = (0..system.entry.def.outputs.len())
+                .map(|i| &rings[system.base_ring_idx + i])
                 .collect();
-            let views = system
+            let inputs = system
                 .inputs
                 .iter()
-                .map(|edges| {
-                    edges
-                        .iter()
-                        // PANIC Safety: The ring allocation pass will allocate a ring for every input
-                        .map(|&ring| rings[ring].view(NoWake).expect("a counted reader slot"))
-                        .collect()
-                })
+                .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
                 .collect();
-            let step = (system.entry.make)(system.params, views, writers).map_err(|source| {
+            let step = (system.entry.make)(system.params, inputs, outputs).map_err(|source| {
                 BuildError::Params {
                     id: system.id.to_string(),
                     source,
@@ -608,6 +598,26 @@ mod tests {
                 source: crate::coordinator::ParamError::UnknownKey("gain".into()),
             })
         );
+    }
+
+    #[test]
+    fn every_edge_claims_exactly_one_reader_slot() {
+        let mut config = pipeline_config();
+        // A second consumer of `imu.imu`, so that ring carries two edges.
+        config.systems.push(SystemConfig {
+            inputs: vec![InputConfig {
+                port: "imu".into(),
+                from: vec![PortRef::new("imu", "imu")],
+            }],
+            ..SystemConfig::new("nav_two", "nav")
+        });
+        let coordinator = build(config).expect("valid config");
+        let imu = &coordinator.rings[0];
+        assert_eq!(
+            imu.view(NoWake).err(),
+            Some(metor_fsw_3_ring::FullReaderTable)
+        );
+        assert!(imu.writer(NoWake).is_err());
     }
 
     #[test]
