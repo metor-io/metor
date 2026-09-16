@@ -32,6 +32,10 @@ impl Record for LogEvent {
     fn decode(bytes: &[u8]) -> Result<LogEvent, DecodeError> {
         crate::record::postcard::decode(bytes)
     }
+
+    fn timestamp(&self) -> Option<Timestamp> {
+        Some(self.timestamp)
+    }
 }
 
 /// A `Log` writes one system's log lines, stamped with the cycle time.

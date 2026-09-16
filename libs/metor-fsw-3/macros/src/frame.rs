@@ -126,13 +126,12 @@ pub fn frame(input: TokenStream) -> TokenStream {
             fn decode(bytes: &[u8]) -> Result<&Self, #fsw::DecodeError> {
                 #fsw::record::fixed::decode(bytes)
             }
-        }
-
-        impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {
-            fn timestamp(&self) -> #proto::types::Timestamp {
-                #timestamp_body
+            fn timestamp(&self) -> Option<#proto::types::Timestamp> {
+                Some(#timestamp_body)
             }
         }
+
+        impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {}
     }
     .into()
 }

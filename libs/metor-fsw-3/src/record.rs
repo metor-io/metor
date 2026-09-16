@@ -1,9 +1,13 @@
 //! The [`Record`] trait, which names a ring record and encodes it.
 
-use metor_proto::types::ComponentId;
+use core::borrow::Borrow;
+
+use metor_proto::types::{ComponentId, Timestamp};
 use thiserror::Error;
 
-/// A `Record` names the bytes of one ring record and converts a value to and from them.
+/// A `Record` is an entry on a ring buffer between systems.
+///
+/// Records have unique names and IDs, and provide a way to convert themselves to and from bytes
 pub trait Record {
     const NAME: &'static str;
     const ID: ComponentId = ComponentId::new(Self::NAME);
@@ -13,18 +17,23 @@ pub trait Record {
     /// Writes per cycle this record expects; a ring holds `DEPTH * ring_depth` records.
     const DEPTH: usize = 1;
     /// What a read yields: a borrow for a fixed record, an owned value otherwise.
-    type Read<'a>
+    type Read<'a>: Borrow<Self>
     where
         Self: 'a;
 
-    /// Returns the record bytes, using `buf` as scratch when the value is not already bytes.
+    /// Returns the stamp fan-in orders by; `None` leaves producer order.
+    fn timestamp(&self) -> Option<Timestamp> {
+        None
+    }
+
+    /// Encodes this value into buf, returns a slice of the encoded bytes.
     fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError>;
 
-    /// Reads one record from its bytes.
+    /// Reads one record from the given bytes.
     fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, DecodeError>;
 }
 
-/// An `EncodeError` is why a value produced no record bytes.
+/// An error that occured while encoding
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum EncodeError {
     #[error("value encodes to {len} bytes, more than the record's {max}")]
@@ -33,7 +42,7 @@ pub enum EncodeError {
     Codec,
 }
 
-/// A `DecodeError` is why record bytes produced no value.
+/// An error that occured while decoding
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum DecodeError {
     #[error("record is shorter than the type")]

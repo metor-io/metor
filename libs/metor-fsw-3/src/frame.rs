@@ -1,7 +1,6 @@
 //! The [`Frame`] trait, implemented via `#[derive(Frame)]`.
 
 use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
-use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::Record;
@@ -18,8 +17,6 @@ pub trait Frame:
     + KnownLayout
     + Immutable
 {
-    /// Returns the shared timestamp from the `#[frame(timestamp)]` field.
-    fn timestamp(&self) -> Timestamp;
 }
 
 #[cfg(test)]
@@ -28,14 +25,14 @@ mod tests {
     use zerocopy::{FromBytes, IntoBytes};
 
     use crate::tests::utils::{BareName, Imu};
-    use crate::{Componentize, Frame, Record};
+    use crate::{Componentize, Record};
 
     #[test]
     fn derive_sets_name_id_and_timestamp() {
         let imu = Imu::new(42, 1.0);
         assert_eq!(Imu::NAME, "imu");
         assert_eq!(Imu::ID, ComponentId::new("imu"));
-        assert_eq!(imu.timestamp(), Timestamp(42));
+        assert_eq!(imu.timestamp(), Some(Timestamp(42)));
         assert!(Imu::MAX_SIZE >= size_of::<Imu>());
     }
 

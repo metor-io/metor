@@ -59,6 +59,15 @@ pub struct Note {
     pub text: String,
 }
 
+/// A message with a timestamp, so fan-in orders it like a frame.
+#[derive(crate::Record, Serialize, Deserialize, Debug, PartialEq)]
+#[record(max_len = 64)]
+pub struct Stamped {
+    #[record(timestamp)]
+    pub at: Timestamp,
+    pub text: String,
+}
+
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[frame(name = "nav")]
 #[repr(C)]

@@ -1,5 +1,6 @@
 //! Typed ports over ring handles.
 
+use core::borrow::Borrow;
 use core::marker::PhantomData;
 use core::ops::Deref;
 
@@ -138,51 +139,50 @@ impl<T: Record> Input<T> {
     }
 }
 
-impl<F: Frame> Input<F> {
-    /// Returns the newest frame across producers, by timestamp, ties to the earlier producer.
-    pub fn latest(&mut self) -> Result<Option<FrameGrant<'_, F>>, ReadError> {
-        let mut latest: Option<(Timestamp, ReadGrant<'_>)> = None;
+impl<T: Record> Input<T> {
+    /// Returns the newest record across producers, by timestamp, ties and unstamped records to the earlier producer.
+    pub fn latest(&mut self) -> Result<Option<Latest<'_, T>>, RecvError> {
+        let mut best: Option<(Option<Timestamp>, ReadGrant<'_>)> = None;
         for view in self.views.iter_mut() {
-            let Some(grant) = view.try_latest()? else {
+            let Some(grant) = view.try_latest().map_err(RecvError::Ring)? else {
                 continue;
             };
-            let stamp = frame_of::<F>(&grant)?.timestamp();
-            if latest.as_ref().is_none_or(|(b, _)| stamp > *b) {
-                latest = Some((stamp, grant));
+            let stamp = T::decode(&grant)
+                .map_err(RecvError::Decode)?
+                .borrow()
+                .timestamp();
+            if best.as_ref().is_none_or(|(b, _)| stamp > *b) {
+                best = Some((stamp, grant));
             }
         }
-        latest.map(|(_, grant)| FrameGrant::new(grant)).transpose()
-    }
-}
-
-/// A `FrameGrant` pins one record and reads it as the frame itself.
-pub struct FrameGrant<'a, F> {
-    grant: ReadGrant<'a>,
-    _f: PhantomData<F>,
-}
-
-impl<'a, F: Frame> FrameGrant<'a, F> {
-    fn new(grant: ReadGrant<'a>) -> Result<Self, ReadError> {
-        frame_of::<F>(&grant)?;
-        Ok(Self {
+        Ok(best.map(|(_, grant)| Latest {
             grant,
-            _f: PhantomData,
-        })
+            _t: PhantomData,
+        }))
     }
 }
 
-impl<F: Frame> Deref for FrameGrant<'_, F> {
+/// A `Latest` pins one record and decodes it on each read.
+pub struct Latest<'a, T> {
+    grant: ReadGrant<'a>,
+    _t: PhantomData<T>,
+}
+
+impl<T: Record> Latest<'_, T> {
+    /// Decodes the pinned record; a borrow for a frame, an owned value for a message.
+    pub fn read(&self) -> T::Read<'_> {
+        // PANIC Safety: the record decoded when `latest` picked it, and a
+        // grant pins its bytes.
+        T::decode(&self.grant).expect("record decoded at selection")
+    }
+}
+
+impl<F: Frame> Deref for Latest<'_, F> {
     type Target = F;
     fn deref(&self) -> &F {
-        // PANIC Safety: the record was checked against `F` when the grant was
-        // constructed, and a grant pins its record.
-        frame_of::<F>(&self.grant).expect("record checked at construction")
+        // PANIC Safety: as for `read`; a frame's bytes are the value.
+        crate::record::fixed::decode(&self.grant).expect("record decoded at selection")
     }
-}
-
-/// Reads the fixed region of a record; a short record is a corrupt region, not a panic.
-fn frame_of<F: Frame>(record: &[u8]) -> Result<&F, ReadError> {
-    crate::record::fixed::decode(record).map_err(|_| ReadError::Corrupt)
 }
 
 #[cfg(kani)]
@@ -225,7 +225,7 @@ mod tests {
 
     use super::*;
     use crate::record::{DecodeError, EncodeError};
-    use crate::tests::utils::{Fixed, Imu, Note};
+    use crate::tests::utils::{Fixed, Imu, Note, Stamped};
     use crate::{Frame, Record};
 
     #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
@@ -450,11 +450,92 @@ mod tests {
         let mut input = Input::<Imu>::try_new(vec![ring.view(NoWake).expect("free slot")])
             .expect("supported alignment");
         writer.try_write(&[0u8; 4]).expect("ring has room");
-        assert_eq!(input.latest().err(), Some(ReadError::Corrupt));
+        assert_eq!(
+            input.latest().err(),
+            Some(RecvError::Decode(DecodeError::Truncated))
+        );
         assert_eq!(
             input.drain().next().unwrap().err(),
             Some(RecvError::Decode(DecodeError::Truncated))
         );
+    }
+
+    fn stamped_pair() -> (
+        RingBuffer,
+        RingBuffer,
+        Output<Stamped>,
+        Output<Stamped>,
+        Input<Stamped>,
+    ) {
+        let (left, right) = (
+            RingBuffer::create_in_memory(Config {
+                capacity: ring_capacity(Stamped::MAX_LEN, 4).expect("valid"),
+                max_readers: 1,
+            }),
+            RingBuffer::create_in_memory(Config {
+                capacity: ring_capacity(Stamped::MAX_LEN, 4).expect("valid"),
+                max_readers: 1,
+            }),
+        );
+        let a = Output::try_new(left.writer(NoWake).expect("writer")).expect("aligned");
+        let b = Output::try_new(right.writer(NoWake).expect("writer")).expect("aligned");
+        let input = Input::try_new(vec![
+            left.view(NoWake).expect("slot"),
+            right.view(NoWake).expect("slot"),
+        ])
+        .expect("aligned");
+        (left, right, a, b, input)
+    }
+
+    #[test]
+    fn latest_on_stamped_messages_orders_across_producers() {
+        let (_l, _r, mut a, mut b, mut input) = stamped_pair();
+        a.write(&Stamped {
+            at: Timestamp(9),
+            text: "a".into(),
+        })
+        .expect("fits");
+        b.write(&Stamped {
+            at: Timestamp(3),
+            text: "b".into(),
+        })
+        .expect("fits");
+        assert_eq!(input.latest().unwrap().unwrap().read().text, "a");
+        b.write(&Stamped {
+            at: Timestamp(11),
+            text: "b2".into(),
+        })
+        .expect("fits");
+        let newest = input.latest().unwrap().unwrap();
+        assert_eq!(newest.read().text, "b2");
+        assert_eq!(newest.read().at, Timestamp(11));
+    }
+
+    #[test]
+    fn latest_on_unstamped_messages_keeps_the_earlier_producer() {
+        let (_l, _r, mut a, mut b, mut input) = message_pair_two::<Fixed>();
+        b.write(&Fixed { a: 2, b: 0.0 }).expect("fits");
+        a.write(&Fixed { a: 1, b: 0.0 }).expect("fits");
+        assert_eq!(input.latest().unwrap().unwrap().read().a, 1);
+        assert_eq!(Fixed { a: 1, b: 0.0 }.timestamp(), None);
+    }
+
+    fn message_pair_two<T: Record>() -> (RingBuffer, RingBuffer, Output<T>, Output<T>, Input<T>) {
+        let ring = || {
+            RingBuffer::create_in_memory(Config {
+                capacity: ring_capacity(T::MAX_LEN, 4).expect("valid"),
+                max_readers: 1,
+            })
+        };
+        let (left, right) = (ring(), ring());
+        let a = Output::try_new(left.writer(NoWake).expect("writer")).expect("aligned");
+        let b = Output::try_new(right.writer(NoWake).expect("writer")).expect("aligned");
+        let input = Input::try_new(vec![
+            left.view(NoWake).expect("slot"),
+            right.view(NoWake).expect("slot"),
+        ])
+        .expect("aligned");
+        (left, right, a, b, input)
     }
 
     fn message_pair<T: Record>() -> (RingBuffer, Output<T>, Input<T>) {

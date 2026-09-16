@@ -1,8 +1,4 @@
-//! Systems authored as an `execute` method, lowered onto the [`System`] trait.
-//!
-//! `#[system]` on an impl block emits [`SystemFn`] for the type; [`FnSystem`]
-//! is the [`System`] the table registers for it. Every parameter of `execute`
-//! is a [`Param`], bound positionally in parameter order.
+//! `FnSystem` allows you to author a system using just the execute function
 
 mod ctor;
 mod param;

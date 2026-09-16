@@ -83,7 +83,10 @@ Files: `src/port.rs`, `tests/pipeline.rs`, `src/coordinator/run.rs`.
    with `RecvError { Ring(ReadError), Decode(DecodeError) }`. A decode
    failure yields the error and the iterator continues with the next
    record.
-3. `Input<F: Frame>`: `latest` unchanged. `FrameGrant` unchanged.
+3. `Input<T: Record>`: `latest` over any record, ordered by
+   `Record::timestamp`, returning `Latest<'_, T>` with `read()` and a
+   `Deref` for frames. Amended after T6: the first cut kept `latest` on
+   the `Frame` bound.
 4. `run.rs`: the status write's discarded error type changes; nothing
    else.
 5. `tests/pipeline.rs`: `write` return type only.

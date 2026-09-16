@@ -1,17 +1,28 @@
 //! `#[derive(Record)]` for messages carried as postcard.
 
 use convert_case::{Case, Casing};
-use darling::FromDeriveInput;
+use darling::ast;
+use darling::{FromDeriveInput, FromField};
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
+/// One field, which may be marked `#[record(timestamp)]`.
+#[derive(FromField)]
+#[darling(attributes(record))]
+struct RecordField {
+    ident: Option<Ident>,
+    #[darling(default)]
+    timestamp: bool,
+}
+
 /// The struct being derived plus its `#[record(..)]` attribute.
 #[derive(FromDeriveInput)]
-#[darling(attributes(record))]
+#[darling(attributes(record), supports(struct_any))]
 struct RecordInput {
     ident: Ident,
     generics: Generics,
+    data: ast::Data<(), RecordField>,
     name: Option<String>,
     max_len: Option<usize>,
     depth: Option<usize>,
@@ -35,6 +46,17 @@ pub fn record(input: TokenStream) -> TokenStream {
     let depth = raw
         .depth
         .map(|depth| quote! { const DEPTH: usize = #depth; });
+    let timestamp = raw.data.as_ref().take_struct().and_then(|fields| {
+        fields
+            .into_iter()
+            .find(|f| f.timestamp)
+            .and_then(|f| f.ident.as_ref())
+            .map(|id| {
+                quote! {
+                    fn timestamp(&self) -> Option<#fsw::Timestamp> { Some(self.#id) }
+                }
+            })
+    });
     let ident = &raw.ident;
     let (impl_generics, ty_generics, where_clause) = raw.generics.split_for_impl();
     quote! {
@@ -42,6 +64,7 @@ pub fn record(input: TokenStream) -> TokenStream {
             const NAME: &'static str = #name;
             const MAX_LEN: usize = #max_len;
             #depth
+            #timestamp
             type Read<'a> = Self where Self: 'a;
             fn encode<'a>(&'a self, buf: &'a mut [u8])
                 -> Result<&'a [u8], #fsw::EncodeError> {

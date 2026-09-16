@@ -31,11 +31,7 @@ impl SystemDef {
     }
 }
 
-/// A unit of work the coordinator steps once per cycle.
-///
-/// `execute` takes `&self` so the definition holds no mutable data; `State` is
-/// the only mutable data. Inputs are `&mut` because a read advances a cursor.
-/// `now` is the cycle's timestamp, the same for every system in the cycle.
+/// A `System` is the core composable element of metor-fsw, it provides
 pub trait System {
     type State;
     type Inputs: SystemInputs;

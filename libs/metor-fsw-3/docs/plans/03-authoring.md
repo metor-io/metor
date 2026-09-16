@@ -30,23 +30,25 @@ pub trait Record {
     /// Writes per cycle this record expects; a ring holds `DEPTH * ring_depth`.
     const DEPTH: usize = 1;
     /// What a read yields: `&'a F` for a frame, an owned value for a message.
-    type Read<'a>;
+    type Read<'a>: Borrow<Self>;
     /// The record bytes: a frame returns `as_bytes()`, a message
     /// serializes into `buf` and returns the prefix it filled.
     fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], EncodeError>;
     fn decode(bytes: &[u8]) -> Result<Self::Read<'_>, DecodeError>;
+    /// The stamp fan-in orders by; `None` leaves producer order.
+    fn timestamp(&self) -> Option<Timestamp> { None }
 }
 
 pub trait Frame: Record + AsVTable + Componentize + Decomponentize
-    + Metadatatize + IntoBytes + FromBytes + KnownLayout + Immutable
-{
-    fn timestamp(&self) -> Timestamp;
-}
+    + Metadatatize + IntoBytes + FromBytes + KnownLayout + Immutable {}
 ```
 
 `#[derive(Frame)]` emits both impls: `encode` returns `as_bytes()` and
-ignores `buf`, `decode` is `ref_from_prefix`, and `Read<'a> = &'a Self`.
-A frame's write is the single memcpy into the ring it always was.
+ignores `buf`, `decode` is `ref_from_prefix`, `Read<'a> = &'a Self`, and
+`timestamp` is the `#[frame(timestamp)]` field. A frame's write is the
+single memcpy into the ring it always was. `Read: Borrow<Self>` holds
+for both `&F` and an owned value, which is what lets one `latest` read
+the stamp off either.
 
 A message is `#[derive(Record)]`, the mirror of `#[derive(Frame)]`:
 
@@ -66,7 +68,8 @@ defaults to the snake-cased struct name, as the `Frame` derive does.
 `MAX_LEN` defaults to postcard's `POSTCARD_MAX_SIZE`, so a message of
 fixed-size fields states no length and `MaxSize` proves the bound; a
 message with a `String` or `Vec` has no such bound and must write
-`max_len`, and the derive says so when both are missing. The codec is a
+`max_len`, and the derive says so when both are missing. A field marked
+`#[record(timestamp)]` becomes the message's stamp. The codec is a
 property of the type, chosen once; the port never learns which one it
 was. A second codec is a hand-written impl over another pair of fns,
 and a type that needs two encodings gets a newtype, not a port change.
@@ -89,10 +92,10 @@ impl<T: Record> Output<T> {
 }
 impl<T: Record> Input<T> {
     pub fn drain(&mut self) -> impl Iterator<Item = Result<T::Read<'_>, RecvError>>;
+    pub fn latest(&mut self) -> Result<Option<Latest<'_, T>>, RecvError>;
 }
-impl<F: Frame> Input<F> {
-    pub fn latest(&mut self) -> Result<Option<FrameGrant<'_, F>>, ReadError>;
-}
+impl<T: Record> Latest<'_, T> { pub fn read(&self) -> T::Read<'_>; }
+impl<F: Frame> Deref for Latest<'_, F> { type Target = F; }
 
 pub enum SendError { Oversize { len: usize, max: usize }, Encode(EncodeError), Ring(WriteError) }
 pub enum RecvError { Ring(ReadError), Decode(DecodeError) }
@@ -106,9 +109,15 @@ scratch; a postcard message fills it.
 
 `drain` yields `T::Read<'_>`: a borrowed `&F` for frames, an owned value
 for messages. A message with `String` fields allocates on decode, which
-is that message's choice. `latest` stays on the `Frame` bound because
-fan-in orders by frame timestamp and bytes carry none. Messages are read
-by draining, per producer in bind order, which is how fsw-2 read them too.
+is that message's choice.
+
+`latest` pins the newest record on each producer and keeps the one with
+the greatest `timestamp()`; a tie or an unstamped record goes to the
+earlier producer. `Latest` holds the pin and decodes on every `read()`,
+which is free for a frame and a full decode for a message, so a frame
+also derefs to `&F` and a sampled message is read once into a local.
+Commands are still drained, so nothing is skipped; `latest` on a message
+is for the stream where only the newest matters.
 
 Two `impl` blocks that both define `write` under different bounds would
 not compile: a frame may also derive `Serialize`, and coherence has no
