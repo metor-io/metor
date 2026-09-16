@@ -2,11 +2,14 @@
 
 use metor_fsw_3_ring::{NoWake, View, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
+use serde::{Deserialize, Serialize};
 
 /// A `PortDef` names one port of a bundle and the record its ring carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortDef {
     pub name: &'static str,
+    /// The record's [`NAME`](crate::Record::NAME), the type a config spells.
+    pub record: &'static str,
     pub id: ComponentId,
     pub max_len: usize,
     pub alignment: usize,
@@ -14,7 +17,7 @@ pub struct PortDef {
 }
 
 /// A system's ports, in bind order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemDef {
     pub name: &'static str,
     pub inputs: Vec<PortDef>,
@@ -136,6 +139,7 @@ mod tests {
             DerivedOut::defs(),
             vec![PortDef {
                 name: "nav",
+                record: Nav::NAME,
                 id: Nav::ID,
                 max_len: size_of::<Nav>(),
                 alignment: align_of::<Nav>(),

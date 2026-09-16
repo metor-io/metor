@@ -67,8 +67,9 @@ impl SystemFn for Summer {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 struct GainParams {
+    /// The constant this system publishes.
     k: f64,
 }
 
@@ -83,6 +84,9 @@ impl Gain {
 
 #[crate::system]
 impl Gain {
+    /// Publishes the gain.
+    ///
+    /// One sample per cycle.
     fn execute(&mut self, imu: &mut Output<Imu>) {
         let _ = imu.write(&Imu::new(1, self.0));
     }
@@ -439,4 +443,28 @@ fn an_explicit_log_output_cannot_hide_the_implicit_output() {
             port: "log".into(),
         })
     );
+}
+
+#[test]
+fn the_doc_comment_on_execute_becomes_doc() {
+    assert_eq!(Gain::DOC, "Publishes the gain.\n\nOne sample per cycle.");
+    assert_eq!(Doubler::DOC, "");
+    assert_eq!(<Probe<Imu> as SystemFn>::DOC, "");
+}
+
+#[test]
+fn a_params_ctor_carries_its_schema() {
+    let schema = <fn(GainParams) -> Gain as Ctor<Gain, (GainParams,)>>::schema()
+        .expect("a params ctor has a schema");
+    assert!(
+        schema
+            .get()
+            .contains(r#""description":"The constant this system publishes.""#)
+    );
+    assert!(schema.get().contains(r#""k""#));
+}
+
+#[test]
+fn a_unit_ctor_has_no_schema() {
+    assert!(<fn() -> Summer as Ctor<Summer, ()>>::schema().is_none());
 }

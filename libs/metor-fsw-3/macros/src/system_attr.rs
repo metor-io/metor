@@ -8,7 +8,10 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
-use syn::{FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Pat, Type, parse_macro_input};
+use syn::{
+    Expr, ExprLit, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat, Type,
+    parse_macro_input,
+};
 
 /// One `execute` parameter after the receiver.
 struct Param {
@@ -33,6 +36,7 @@ fn expand(block: &ItemImpl) -> syn::Result<TokenStream2> {
     let name = type_name(&block.self_ty)?;
     let execute = execute_method(block)?;
     let params = params(execute)?;
+    let doc = doc(execute);
     let idents = params.iter().map(|p| &p.ident);
     let keys = params.iter().map(|p| &p.key);
     let names = params.iter().map(|p| p.ident.to_string());
@@ -49,6 +53,7 @@ fn expand(block: &ItemImpl) -> syn::Result<TokenStream2> {
             type Params = (#(#keys,)*);
             const NAME: &'static str = #name;
             const NAMES: &'static [&'static str] = &[#(#names),*];
+            const DOC: &'static str = #doc;
             fn call(&mut self, (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_>) {
                 #(#asserts)*
                 self.execute(#(#idents2),*)
@@ -70,6 +75,27 @@ fn type_name(ty: &Type) -> syn::Result<String> {
             "#[system] needs an impl block for a named type",
         )),
     }
+}
+
+/// Joins `execute`'s doc comment lines, each without its leading space.
+fn doc(method: &ImplItemFn) -> String {
+    method
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("doc"))
+        .filter_map(|attr| match &attr.meta {
+            Meta::NameValue(nv) => match &nv.value {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(text),
+                    ..
+                }) => Some(text.value()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .map(|line| line.strip_prefix(' ').unwrap_or(&line).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Finds `execute` and checks it takes `&mut self`.

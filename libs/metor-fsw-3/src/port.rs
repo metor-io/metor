@@ -91,6 +91,7 @@ impl<T: Record> Output<T> {
     pub fn def(name: &'static str) -> PortDef {
         PortDef {
             name,
+            record: T::NAME,
             id: T::ID,
             max_len: T::MAX_LEN,
             alignment: T::ALIGN,
@@ -316,6 +317,13 @@ mod tests {
         #[cfg(target_pointer_width = "32")]
         assert!(ring_capacity(u32::MAX as usize, 4).is_none());
         assert!(ring_capacity(1 << 30, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn a_port_def_names_its_record() {
+        assert_eq!(Output::<Imu>::def("imu").record, Imu::NAME);
+        assert_eq!(Input::<Note>::def("note").record, Note::NAME);
+        assert_eq!(Input::<Imu>::def("imu"), Output::<Imu>::def("imu"));
     }
 
     #[test]

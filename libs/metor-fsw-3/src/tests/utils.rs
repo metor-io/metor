@@ -300,7 +300,7 @@ impl Recorder {
 }
 
 /// A params struct with no fields, so any key is unknown.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct NoParams {}
 
 /// Every system type the coordinator tests name, recording into `recorder`.

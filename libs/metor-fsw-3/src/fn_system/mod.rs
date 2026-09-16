@@ -20,6 +20,8 @@ pub trait SystemFn: Sized + 'static {
     const NAME: &'static str;
     /// One name per parameter, in parameter order.
     const NAMES: &'static [&'static str];
+    /// The doc comment on `execute`, lines joined with newlines.
+    const DOC: &'static str = "";
 
     /// Calls `execute` with this cycle's parameter values.
     fn call(&mut self, items: <Self::Params as Param>::Item<'_>);

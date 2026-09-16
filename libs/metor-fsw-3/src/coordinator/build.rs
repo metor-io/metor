@@ -346,6 +346,7 @@ mod tests {
         for input in [true, false] {
             let port = crate::PortDef {
                 name: "aligned",
+                record: utils::Imu::NAME,
                 id: utils::Imu::ID,
                 max_len: 32,
                 alignment: 32,
