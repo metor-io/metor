@@ -18,7 +18,7 @@ use crate::coordinator::{
     CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemStatus, SystemTable,
 };
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug, PartialEq)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
 #[frame(name = "imu")]
 #[repr(C)]
 pub struct Imu {
@@ -59,7 +59,7 @@ pub struct Note {
     pub text: String,
 }
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[frame(name = "nav")]
 #[repr(C)]
 pub struct Nav {
@@ -68,7 +68,7 @@ pub struct Nav {
     pub estimate: f64,
 }
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[frame(name = "control")]
 #[repr(C)]
 pub struct Control {

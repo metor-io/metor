@@ -1,6 +1,7 @@
 //! metor-fsw is a flight software framework
 
 pub mod coordinator;
+pub mod fn_system;
 pub mod frame;
 pub mod port;
 pub mod record;
@@ -13,6 +14,7 @@ pub use coordinator::{
     BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, ParamError, Params, PortRef,
     Step, SystemConfig, SystemStatus, SystemTable,
 };
+pub use fn_system::{Ctor, FnSystem, InSet, OutSet, Param, ParamSet, SystemFn};
 pub use frame::Frame;
 pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs};
 pub use metor_fsw_3_ring::{ReadError, WriteError};

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use metor_fsw_3_ring::{NoWake, View, Writer};
 
+use crate::fn_system::{Ctor, FnSystem, SystemFn};
 use crate::system::{System, SystemDef, SystemInputs, SystemOutputs};
 
 use super::params::{ParamError, Params};
@@ -50,6 +51,13 @@ impl SystemTable {
             }),
         };
         self.entries.insert(ty.to_string(), entry);
+    }
+
+    /// Registers a `#[system]` type under `ty`, built by a plain `Fn() -> S` or `Fn(P) -> S`.
+    pub fn register<S: SystemFn, M>(&mut self, ty: &str, ctor: impl Ctor<S, M> + 'static) {
+        self.register_system::<FnSystem<S>>(ty, move |params| {
+            Ok((FnSystem::default(), ctor.make(params)?))
+        });
     }
 
     pub(crate) fn get(&self, ty: &str) -> Option<&TableEntry> {
