@@ -4,23 +4,21 @@ use core::marker::PhantomData;
 use core::ops::Deref;
 
 use crate::frame::Frame;
-use crate::record::Record;
+use crate::record::{DecodeError, EncodeError, Record};
 use crate::system::PortDef;
 use metor_fsw_3_ring::{NoWake, ReadError, ReadGrant, View, WriteError, Writer, frame_len};
 use metor_proto::types::Timestamp;
 
-/// Returns the capacity needed for a ring with `depth` records of `max_size` bytes each.
-///
-/// This is always rounded to a power of two.
-pub fn ring_capacity(max_size: usize, depth: usize) -> Option<usize> {
-    u32::try_from(max_size).ok()?;
-    max_size.checked_add(2 * metor_fsw_3_ring::PAYLOAD_ALIGNMENT - 1)?;
-    frame_len(max_size)
+/// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
+pub fn ring_capacity(max_len: usize, depth: usize) -> Option<usize> {
+    u32::try_from(max_len).ok()?;
+    max_len.checked_add(2 * metor_fsw_3_ring::PAYLOAD_ALIGNMENT - 1)?;
+    frame_len(max_len)
         .checked_mul(depth.max(2))?
         .checked_next_power_of_two()
 }
 
-/// A frame requires more alignment than ring payloads provide.
+/// An `UnsupportedAlignment` is a record aligned above what ring payloads provide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("frame alignment {alignment} exceeds ring payload alignment {supported}")]
 pub struct UnsupportedAlignment {
@@ -40,69 +38,108 @@ fn check_alignment<T: Record>() -> Result<(), UnsupportedAlignment> {
     Ok(())
 }
 
-/// The writing half of one ring, publishing frames of type `F`.
-pub struct Output<F> {
-    writer: Writer<NoWake>,
-    _f: PhantomData<F>,
+/// A `SendError` is why a write published no record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SendError {
+    #[error("record of {len} bytes exceeds the port's {max}")]
+    Oversize { len: usize, max: usize },
+    #[error(transparent)]
+    Encode(EncodeError),
+    #[error(transparent)]
+    Ring(WriteError),
 }
 
-impl<F: Frame> Output<F> {
-    /// Bind a writer, rejecting frames whose alignment exceeds the ring guarantee.
+/// A `RecvError` is why a drained record produced no value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RecvError {
+    #[error(transparent)]
+    Ring(ReadError),
+    #[error(transparent)]
+    Decode(DecodeError),
+}
+
+/// Rejects a record longer than the port's bound before it reaches the ring.
+fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], SendError> {
+    if bytes.len() > max {
+        return Err(SendError::Oversize {
+            len: bytes.len(),
+            max,
+        });
+    }
+    Ok(bytes)
+}
+
+/// An `Output` is the writing half of one ring, publishing records of type `T`.
+pub struct Output<T> {
+    writer: Writer<NoWake>,
+    scratch: Vec<u8>,
+    _t: PhantomData<T>,
+}
+
+impl<T: Record> Output<T> {
+    /// Binds a writer, rejecting records aligned above the ring guarantee.
     pub fn try_new(writer: Writer<NoWake>) -> Result<Self, UnsupportedAlignment> {
-        check_alignment::<F>()?;
+        check_alignment::<T>()?;
         Ok(Self {
             writer,
-            _f: PhantomData,
+            scratch: vec![0; T::MAX_LEN],
+            _t: PhantomData,
         })
     }
 
-    /// This port's entry in a bundle's `defs()` walk.
+    /// Returns this port's entry in a bundle's `defs()` walk.
     pub fn def(name: &'static str) -> PortDef {
         PortDef {
             name,
-            id: F::ID,
-            max_len: F::MAX_LEN,
-            alignment: F::ALIGN,
-            depth: F::DEPTH,
+            id: T::ID,
+            max_len: T::MAX_LEN,
+            alignment: T::ALIGN,
+            depth: T::DEPTH,
         }
     }
 
-    /// Publish one frame as one record.
-    pub fn write(&mut self, frame: &F) -> Result<(), WriteError> {
-        self.writer.try_write(frame.as_bytes())
+    /// Publishes one value as one record.
+    pub fn write(&mut self, value: &T) -> Result<(), SendError> {
+        let bytes = value.encode(&mut self.scratch).map_err(SendError::Encode)?;
+        let bytes = bounded(bytes, T::MAX_LEN)?;
+        self.writer.try_write(bytes).map_err(SendError::Ring)
     }
 }
 
-/// Reader for a specific frame
-pub struct Input<F> {
+/// An `Input` is the reading half of every ring feeding one port of type `T`.
+pub struct Input<T> {
     views: Vec<View<NoWake>>,
-    _f: PhantomData<F>,
+    _t: PhantomData<T>,
+}
+
+impl<T: Record> Input<T> {
+    /// Binds one view per producer, rejecting records aligned above the ring guarantee.
+    pub fn try_new(views: Vec<View<NoWake>>) -> Result<Self, UnsupportedAlignment> {
+        check_alignment::<T>()?;
+        Ok(Self {
+            views,
+            _t: PhantomData,
+        })
+    }
+
+    /// Returns this port's entry in a bundle's `defs()` walk.
+    pub fn def(name: &'static str) -> PortDef {
+        Output::<T>::def(name)
+    }
+
+    /// Reads every unread record, producer by producer in bind order.
+    pub fn drain(&mut self) -> impl Iterator<Item = Result<T::Read<'_>, RecvError>> + '_ {
+        self.views.iter_mut().flat_map(|view| {
+            view.drain().map(|record| {
+                let bytes = record.map_err(RecvError::Ring)?;
+                T::decode(bytes).map_err(RecvError::Decode)
+            })
+        })
+    }
 }
 
 impl<F: Frame> Input<F> {
-    /// Creates a new input with the given views, errors when a frame has an unsupported alignment.
-    pub fn try_new(views: Vec<View<NoWake>>) -> Result<Self, UnsupportedAlignment> {
-        check_alignment::<F>()?;
-        Ok(Self {
-            views,
-            _f: PhantomData,
-        })
-    }
-
-    /// Returns a [`PortDef`] for this frame type
-    pub fn def(name: &'static str) -> PortDef {
-        PortDef {
-            name,
-            id: F::ID,
-            max_len: F::MAX_LEN,
-            alignment: F::ALIGN,
-            depth: F::DEPTH,
-        }
-    }
-
-    /// Returns the latest frame in the input.
-    ///
-    /// Internally this loops through all of the views, and finds the one with the latest timestamp.
+    /// Returns the newest frame across producers, by timestamp, ties to the earlier producer.
     pub fn latest(&mut self) -> Result<Option<FrameGrant<'_, F>>, ReadError> {
         let mut latest: Option<(Timestamp, ReadGrant<'_>)> = None;
         for view in self.views.iter_mut() {
@@ -116,19 +153,9 @@ impl<F: Frame> Input<F> {
         }
         latest.map(|(_, grant)| FrameGrant::new(grant)).transpose()
     }
-
-    /// Iterator that drains all frames from the input.
-    ///
-    /// This iterator runs in the order of the internal views, so frames from
-    /// different producers are not ordered by timestamp.
-    pub fn drain(&mut self) -> impl Iterator<Item = Result<&F, ReadError>> + '_ {
-        self.views
-            .iter_mut()
-            .flat_map(|view| view.drain().map(|record| frame_of::<F>(record?)))
-    }
 }
 
-/// One record, borrowed in place and read as the frame itself.
+/// A `FrameGrant` pins one record and reads it as the frame itself.
 pub struct FrameGrant<'a, F> {
     grant: ReadGrant<'a>,
     _f: PhantomData<F>,
@@ -153,17 +180,28 @@ impl<F: Frame> Deref for FrameGrant<'_, F> {
     }
 }
 
-/// Read the fixed region of a record. A record shorter than `F` is a
-/// corrupt region, not a panic.
+/// Reads the fixed region of a record; a short record is a corrupt region, not a panic.
 fn frame_of<F: Frame>(record: &[u8]) -> Result<&F, ReadError> {
-    F::ref_from_prefix(record)
-        .map(|(frame, _)| frame)
-        .map_err(|_| ReadError::Corrupt)
+    crate::record::fixed::decode(record).map_err(|_| ReadError::Corrupt)
 }
 
 #[cfg(kani)]
 mod proofs {
-    use super::ring_capacity;
+    use super::{SendError, bounded, ring_capacity};
+
+    /// A bounded slice is never longer than the bound.
+    #[kani::proof]
+    fn bounded_never_exceeds_max() {
+        let len: usize = kani::any();
+        let max: usize = kani::any();
+        kani::assume(len <= 64);
+        let bytes = [0u8; 64];
+        match bounded(&bytes[..len], max) {
+            Ok(slice) => assert!(slice.len() <= max),
+            Err(SendError::Oversize { len: l, max: m }) => assert!(l > m),
+            Err(_) => unreachable!(),
+        }
+    }
 
     /// A capacity always holds two records of the largest size the ring's
     /// 32-bit length field can address.
@@ -186,7 +224,8 @@ mod tests {
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use super::*;
-    use crate::tests::utils::Imu;
+    use crate::record::{DecodeError, EncodeError};
+    use crate::tests::utils::{Fixed, Imu, Note};
     use crate::{Frame, Record};
 
     #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Debug)]
@@ -398,7 +437,10 @@ mod tests {
         drop(pinned);
         // Two 32-byte records fill the ring.
         out.write(&sample(1, 1.0)).expect("ring has room");
-        assert_eq!(out.write(&sample(2, 2.0)), Err(WriteError::WouldBlock));
+        assert_eq!(
+            out.write(&sample(2, 2.0)),
+            Err(SendError::Ring(WriteError::WouldBlock))
+        );
     }
 
     #[test]
@@ -411,7 +453,84 @@ mod tests {
         assert_eq!(input.latest().err(), Some(ReadError::Corrupt));
         assert_eq!(
             input.drain().next().unwrap().err(),
-            Some(ReadError::Corrupt)
+            Some(RecvError::Decode(DecodeError::Truncated))
         );
+    }
+
+    fn message_pair<T: Record>() -> (RingBuffer, Output<T>, Input<T>) {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: ring_capacity(T::MAX_LEN, 4).expect("valid capacity"),
+            max_readers: 1,
+        });
+        let out = Output::try_new(ring.writer(NoWake).expect("free writer"))
+            .expect("supported alignment");
+        let input = Input::try_new(vec![ring.view(NoWake).expect("free slot")])
+            .expect("supported alignment");
+        (ring, out, input)
+    }
+
+    #[test]
+    fn message_round_trips_through_write_and_drain() {
+        let (_ring, mut out, mut input) = message_pair::<Note>();
+        out.write(&Note { text: "hi".into() }).expect("fits");
+        out.write(&Note {
+            text: "there".into(),
+        })
+        .expect("fits");
+        let seen: Vec<Note> = input.drain().map(|r| r.expect("decodes")).collect();
+        assert_eq!(seen[0].text, "hi");
+        assert_eq!(seen[1].text, "there");
+        assert_eq!(input.drain().count(), 0);
+    }
+
+    #[test]
+    fn oversize_message_leaves_the_ring_untouched() {
+        let (_ring, mut out, mut input) = message_pair::<Note>();
+        let long = Note {
+            text: "x".repeat(100),
+        };
+        assert_eq!(
+            out.write(&long),
+            Err(SendError::Encode(EncodeError::Oversize {
+                len: 101,
+                max: 64
+            }))
+        );
+        assert_eq!(input.drain().count(), 0);
+    }
+
+    #[test]
+    fn a_corrupt_record_does_not_stop_the_drain() {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: ring_capacity(Fixed::MAX_LEN, 4).expect("valid capacity"),
+            max_readers: 1,
+        });
+        let mut writer = ring.writer(NoWake).expect("free writer");
+        let mut input = Input::<Fixed>::try_new(vec![ring.view(NoWake).expect("free slot")])
+            .expect("supported alignment");
+        let mut buf = [0u8; 16];
+        let good = Fixed { a: 1, b: 2.0 };
+        writer.try_write(&[0xff; 3]).expect("ring has room");
+        writer
+            .try_write(good.encode(&mut buf).expect("fits"))
+            .expect("ring has room");
+        let seen: Vec<_> = input.drain().collect();
+        assert_eq!(
+            seen,
+            vec![Err(RecvError::Decode(DecodeError::Codec)), Ok(good)]
+        );
+    }
+
+    #[test]
+    fn frames_drain_by_reference_and_messages_by_value() {
+        let (_ring, mut out, mut input) = pair(4);
+        out.write(&sample(1, 1.0)).expect("ring has room");
+        let borrowed: Option<&Imu> = input.drain().next().map(|r| r.expect("decodes"));
+        assert_eq!(borrowed.map(|f| f.sample), Some(1.0));
+
+        let (_ring, mut out, mut input) = message_pair::<Fixed>();
+        out.write(&Fixed { a: 3, b: 0.5 }).expect("fits");
+        let owned: Option<Fixed> = input.drain().next().map(|r| r.expect("decodes"));
+        assert_eq!(owned, Some(Fixed { a: 3, b: 0.5 }));
     }
 }
