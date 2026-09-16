@@ -1,6 +1,8 @@
-//! Compile-fail cases for `#[derive(Frame)]`.
+//! Compile-fail and pass cases for the derives and `#[system]`.
 
 #[test]
 fn ui() {
-    trybuild::TestCases::new().compile_fail("tests/ui/*.rs");
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui/*.rs");
+    cases.pass("tests/ui/pass/*.rs");
 }

@@ -1,5 +1,5 @@
-//! `imu -> nav -> control`, with a fourth system reading the three status
-//! rings, run on the stellarator runtime.
+//! `imu -> nav -> control` as `#[system]` blocks, with a trait-path monitor
+//! reading the three status rings, run on the stellarator runtime.
 
 use core::cell::RefCell;
 use core::future::Future;
@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use metor_fsw_3::{
     Clock, CoordinatorConfig, Frame, Input, InputConfig, Output, PortRef, System, SystemConfig,
-    SystemDef, SystemInputs, SystemOutputs, SystemStatus, SystemTable, Timestamp,
+    SystemDef, SystemInputs, SystemStatus, SystemTable, Timestamp, system,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -40,31 +40,6 @@ struct Control {
     torque: f64,
 }
 
-#[derive(SystemOutputs)]
-struct ImuOut {
-    imu: Output<Imu>,
-}
-
-#[derive(SystemInputs)]
-struct NavIn {
-    imu: Input<Imu>,
-}
-
-#[derive(SystemOutputs)]
-struct NavOut {
-    nav: Output<Nav>,
-}
-
-#[derive(SystemInputs)]
-struct ControlIn {
-    nav: Input<Nav>,
-}
-
-#[derive(SystemOutputs)]
-struct ControlOut {
-    control: Output<Control>,
-}
-
 #[derive(SystemInputs)]
 struct MonitorIn {
     control: Input<Control>,
@@ -73,77 +48,56 @@ struct MonitorIn {
     control_status: Input<SystemStatus>,
 }
 
-struct Gyro;
+/// Counts cycles and publishes the count as a rate.
+#[derive(Default)]
+struct Gyro {
+    tick: i64,
+}
 
-impl System for Gyro {
-    type State = i64;
-    type Inputs = ();
-    type Outputs = ImuOut;
-
-    fn def() -> SystemDef {
-        SystemDef::new::<(), ImuOut>("gyro")
-    }
-
-    fn execute(&self, _now: Timestamp, tick: &mut i64, _inputs: &mut (), outputs: &mut ImuOut) {
-        *tick += 1;
-        let _ = outputs.imu.write(&Imu {
-            timestamp: Timestamp(*tick),
-            omega: *tick as f64,
+#[system]
+impl Gyro {
+    fn execute(&mut self, imu: &mut Output<Imu>) {
+        self.tick += 1;
+        let _ = imu.write(&Imu {
+            timestamp: Timestamp(self.tick),
+            omega: self.tick as f64,
         });
     }
 }
 
+/// Halves the newest rate into an attitude.
 struct NavFilter;
 
-impl System for NavFilter {
-    type State = ();
-    type Inputs = NavIn;
-    type Outputs = NavOut;
-
-    fn def() -> SystemDef {
-        SystemDef::new::<NavIn, NavOut>("nav_filter")
-    }
-
-    fn execute(&self, _now: Timestamp, _state: &mut (), inputs: &mut NavIn, outputs: &mut NavOut) {
-        let Ok(Some(imu)) = inputs.imu.latest() else {
+#[system]
+impl NavFilter {
+    fn execute(&mut self, imu: &mut Input<Imu>, nav: &mut Output<Nav>) {
+        let Ok(Some(imu)) = imu.latest() else {
             return;
         };
-        let nav = Nav {
+        let out = Nav {
             timestamp: imu.timestamp,
             attitude: imu.omega * 0.5,
         };
         drop(imu);
-        let _ = outputs.nav.write(&nav);
+        let _ = nav.write(&out);
     }
 }
 
+/// Commands the opposite of the attitude.
 struct ControlLaw;
 
-impl System for ControlLaw {
-    type State = ();
-    type Inputs = ControlIn;
-    type Outputs = ControlOut;
-
-    fn def() -> SystemDef {
-        SystemDef::new::<ControlIn, ControlOut>("control_law")
-    }
-
-    fn execute(
-        &self,
-        _now: Timestamp,
-        _state: &mut (),
-        inputs: &mut ControlIn,
-        outputs: &mut ControlOut,
-    ) {
-        let Ok(Some(nav)) = inputs.nav.latest() else {
+#[system]
+impl ControlLaw {
+    fn execute(&mut self, nav: &mut Input<Nav>, control: &mut Output<Control>) {
+        let Ok(Some(nav)) = nav.latest() else {
             return;
         };
-        let control = Control {
+        let out = Control {
             timestamp: nav.timestamp,
             torque: -nav.attitude,
         };
         drop(nav);
-        let _ = outputs.control.write(&control);
+        let _ = control.write(&out);
     }
 }
 
@@ -224,9 +178,9 @@ fn input(port: &str, from: PortRef) -> InputConfig {
 
 fn table(report: &Rc<RefCell<Report>>) -> SystemTable {
     let mut table = SystemTable::new();
-    table.register_system("gyro", |_| Ok((Gyro, 0)));
-    table.register_system("nav", |_| Ok((NavFilter, ())));
-    table.register_system("control", |_| Ok((ControlLaw, ())));
+    table.register("gyro", Gyro::default);
+    table.register("nav", || NavFilter);
+    table.register("control", || ControlLaw);
     let report = report.clone();
     table.register_system("monitor", move |_| Ok((Monitor, report.clone())));
     table

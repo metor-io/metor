@@ -9,6 +9,7 @@ use syn::Ident;
 mod frame;
 mod record;
 mod system;
+mod system_attr;
 
 /// Derives the four component sub-traits and `Frame`. Configured with
 /// `#[frame(name = "..")]` and one `#[frame(timestamp)]` field.
@@ -21,6 +22,12 @@ pub fn frame_derive(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Record, attributes(record))]
 pub fn record_derive(input: TokenStream) -> TokenStream {
     record::record(input)
+}
+
+/// Emits `SystemFn` for an impl block from its `execute(&mut self, ..)` method.
+#[proc_macro_attribute]
+pub fn system(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    system_attr::system(item)
 }
 
 /// Derives `SystemInputs` for a struct of `Input<F>` fields.

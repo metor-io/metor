@@ -75,40 +75,24 @@ impl Gain {
     fn new(p: GainParams) -> Self {
         Self(p.k)
     }
-
-    fn execute(&mut self, imu: &mut Output<Imu>) {
-        let _ = imu.write(&Imu::new(1, self.0));
-    }
 }
 
-impl SystemFn for Gain {
-    type Params = (Output<Imu>,);
-    const NAME: &'static str = "gain";
-    const NAMES: &'static [&'static str] = &["imu"];
-
-    fn call(&mut self, (imu,): <Self::Params as ParamSet>::Items<'_>) {
-        self.execute(imu);
+#[crate::system]
+impl Gain {
+    fn execute(&mut self, imu: &mut Output<Imu>) {
+        let _ = imu.write(&Imu::new(1, self.0));
     }
 }
 
 /// Records the newest frame on its one input for the test to read.
 struct Probe<T>(Rc<RefCell<Option<T>>>);
 
-impl<T: Frame + Clone> Probe<T> {
+#[crate::system]
+impl<T: Frame + Clone + 'static> Probe<T> {
     fn execute(&mut self, input: &mut Input<T>) {
         if let Ok(Some(frame)) = input.latest() {
             *self.0.borrow_mut() = Some(frame.clone());
         }
-    }
-}
-
-impl<T: Frame + Clone + 'static> SystemFn for Probe<T> {
-    type Params = (Input<T>,);
-    const NAME: &'static str = "probe";
-    const NAMES: &'static [&'static str] = &["input"];
-
-    fn call(&mut self, (input,): <Self::Params as ParamSet>::Items<'_>) {
-        self.execute(input);
     }
 }
 
@@ -147,6 +131,17 @@ impl SystemFn for Counter {
     fn call(&mut self, (): ()) {
         self.execute();
     }
+}
+
+#[test]
+fn the_attribute_names_the_type_and_its_ports() {
+    assert_eq!(Gain::NAME, "gain");
+    assert_eq!(Gain::NAMES, &["imu"]);
+    assert_eq!(<Probe<Imu>>::NAME, "probe");
+    assert_eq!(
+        FnSystem::<Gain>::def().outputs,
+        vec![Output::<Imu>::def("imu")]
+    );
 }
 
 #[test]

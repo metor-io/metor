@@ -29,6 +29,11 @@ pub trait SystemFn: Sized + 'static {
     fn call(&mut self, items: <Self::Params as ParamSet>::Items<'_>);
 }
 
+/// Compiles only when `P` is a `Param`; `#[system]` calls it once per parameter.
+#[doc(hidden)]
+#[inline(always)]
+pub fn assert_param<P: Param>() {}
+
 /// A `FnSystem` is the [`System`] a [`SystemFn`] registers as.
 pub struct FnSystem<S>(PhantomData<S>);
 

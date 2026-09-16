@@ -18,6 +18,6 @@ darling = "0.20.3"
 metor-component-derive-impl = { path = "../../metor-component/derive-impl" }
 proc-macro2 = "1.0.66"
 quote = "1.0.33"
-syn = "2.0.31"
+syn = { version = "2.0.31", features = ["full"] }
 convert_case = "0.6.0"
 proc-macro-crate = "3.0.0"

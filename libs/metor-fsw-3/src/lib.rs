@@ -16,7 +16,7 @@ pub use coordinator::{
 };
 pub use fn_system::{Ctor, FnSystem, InSet, OutSet, Param, ParamSet, SystemFn};
 pub use frame::Frame;
-pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs};
+pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use port::{FrameGrant, Input, Output, ring_capacity};
 pub use record::{DecodeError, EncodeError, Record};

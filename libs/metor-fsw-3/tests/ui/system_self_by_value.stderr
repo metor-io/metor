@@ -1,0 +1,5 @@
+error: `execute` takes `&mut self`
+ --> tests/ui/system_self_by_value.rs:7:16
+  |
+7 |     fn execute(self) {}
+  |                ^^^^

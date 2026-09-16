@@ -1,0 +1,67 @@
+error[E0277]: the trait bound `u32: Param` is not satisfied
+ --> tests/ui/system_bad_param.rs:5:1
+  |
+5 | #[system]
+  | ^^^^^^^^^ the trait `Param` is not implemented for `u32`
+  |
+help: the following other types implement trait `Param`
+ --> src/fn_system/param.rs
+  |
+  | impl<T: Record + 'static> Param for Input<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Input<T>`
+...
+  | impl<T: Record + 'static> Param for Output<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Output<T>`
+...
+  | impl Param for Timestamp {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Timestamp`
+  = note: required for `(metor_fsw_3::Timestamp, u32)` to implement `ParamSet`
+note: required by a bound in `metor_fsw_3::SystemFn::Params`
+ --> src/fn_system/mod.rs
+  |
+  |     type Params: ParamSet;
+  |                  ^^^^^^^^ required by this bound in `SystemFn::Params`
+  = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `u32: Param` is not satisfied
+ --> tests/ui/system_bad_param.rs:5:1
+  |
+5 | #[system]
+  | ^^^^^^^^^ the trait `Param` is not implemented for `u32`
+  |
+help: the following other types implement trait `Param`
+ --> src/fn_system/param.rs
+  |
+  | impl<T: Record + 'static> Param for Input<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Input<T>`
+...
+  | impl<T: Record + 'static> Param for Output<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Output<T>`
+...
+  | impl Param for Timestamp {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Timestamp`
+  = note: required for `(metor_fsw_3::Timestamp, u32)` to implement `ParamSet`
+  = note: this error originates in the attribute macro `system` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `u32: Param` is not satisfied
+ --> tests/ui/system_bad_param.rs:7:49
+  |
+7 |     fn execute(&mut self, now: Timestamp, step: u32) {
+  |                                                 ^^^ the trait `Param` is not implemented for `u32`
+  |
+help: the following other types implement trait `Param`
+ --> src/fn_system/param.rs
+  |
+  | impl<T: Record + 'static> Param for Input<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Input<T>`
+...
+  | impl<T: Record + 'static> Param for Output<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Output<T>`
+...
+  | impl Param for Timestamp {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^ `metor_fsw_3::Timestamp`
+note: required by a bound in `metor_fsw_3::fn_system::assert_param`
+ --> src/fn_system/mod.rs
+  |
+  | pub fn assert_param<P: Param>() {}
+  |                        ^^^^^ required by this bound in `assert_param`
