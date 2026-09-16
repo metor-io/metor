@@ -8,3 +8,7 @@ requires-python = ">=3.11"
 
 [tool.metor.pack]
 id = "echo"
+
+# The fixture is its own target: `metor run target.py` refreshes this pack.
+[tool.uv.sources]
+echo-pack = { path = "." }

@@ -4,6 +4,7 @@ pub mod build;
 pub mod config;
 pub mod module;
 pub mod pack_dev;
+pub mod run;
 
 use std::path::PathBuf;
 
@@ -26,7 +27,7 @@ pub enum Command {
     /// Prints the ABI version this host speaks.
     AbiVersion,
     /// Evaluates a target file and runs the graph it describes.
-    Run,
+    Run(run::Run),
 }
 
 #[derive(Subcommand)]
@@ -56,6 +57,6 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("{ABI_VERSION}");
             Ok(())
         }
-        Command::Run => Err("`run` has not landed yet".to_string()),
+        Command::Run(args) => run::run(args).map_err(|error| error.to_string()),
     }
 }

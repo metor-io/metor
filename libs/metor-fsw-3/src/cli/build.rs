@@ -117,7 +117,7 @@ fn cargo_lib(root: &Path) -> Result<Option<String>, PackDevError> {
     ))
 }
 
-fn read_toml(path: &Path) -> Result<toml::Value, PackDevError> {
+pub(super) fn read_toml(path: &Path) -> Result<toml::Value, PackDevError> {
     let text = std::fs::read_to_string(path).map_err(|source| PackDevError::Read {
         path: path.to_path_buf(),
         source,
@@ -129,7 +129,7 @@ fn read_toml(path: &Path) -> Result<toml::Value, PackDevError> {
 }
 
 /// The string at `path`, absent when any step of it is.
-fn string(table: &toml::Value, path: &[&str]) -> Option<String> {
+pub(super) fn string(table: &toml::Value, path: &[&str]) -> Option<String> {
     path.iter()
         .try_fold(table, |value, key| value.get(key))?
         .as_str()

@@ -9585,6 +9585,7 @@ version = "0.14.2"
 dependencies = [
  "clap 4.6.3",
  "futures-lite 2.6.1",
+ "libc",
  "libloading",
  "metor-component",
  "metor-fsw-3-macros",
