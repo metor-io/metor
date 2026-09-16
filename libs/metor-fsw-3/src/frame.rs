@@ -5,7 +5,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::Record;
 
-/// A `Frame` is a fixed `#[repr(C)]` record whose fields share one timestamp.
+/// A `Frame` is a fixed `#[repr(C)]` that can be decomposed into components
 pub trait Frame:
     Record
     + AsVTable

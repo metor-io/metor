@@ -1,4 +1,4 @@
-//! The [`Param`] trait, one per `execute` parameter type.
+//! The [`Param`] trait, one per `execute` parameter type, and its tuple impls.
 
 use metor_fsw_3_ring::{NoWake, View, Writer};
 use metor_proto::types::Timestamp;
@@ -12,8 +12,10 @@ use crate::system::PortDef;
 pub type Views = std::vec::IntoIter<Vec<View<NoWake>>>;
 /// The writers a bundle binds from, one per output port in order.
 pub type Writers = std::vec::IntoIter<Writer<NoWake>>;
+/// The parameter names a bundle declares under, one per leaf parameter in order.
+pub type Names<'n> = core::slice::Iter<'n, &'static str>;
 
-/// A `Cycle` is what one `execute` call receives beyond its ports: the time and the log.
+/// `Cycle` is the extra parameter passed to execute beyonds its ports.
 pub struct Cycle<'a> {
     pub now: Timestamp,
     log: Option<&'a mut Log>,
@@ -37,7 +39,10 @@ impl<'a> Cycle<'a> {
     }
 }
 
-/// A `Param` is one `execute` parameter: what it declares, how it binds, and what it hands over each cycle.
+/// Param is implemented for parameter types for system fns, and for tuples of them.
+///
+/// For instance [`Input`] implements `Param` to bind an input port.
+/// The goal is to let system fns define what parameters they need from the type system.
 pub trait Param {
     /// The bound input, or `()`.
     type In;
@@ -48,16 +53,16 @@ pub trait Param {
     where
         Self: 'a;
 
-    /// Declares this parameter's port, if it has one, under `name`.
-    fn defs(name: &'static str, inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>);
+    /// Appends this parameter's port definition, if it has one, taking its name from `names`.
+    fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>);
 
-    /// Takes this parameter's view list, if it is an input, from the front of `views`.
+    /// Returns this parameter's input (if one exists) by popping a view from `views`.
     fn bind_in(views: &mut Views) -> Self::In;
 
-    /// Takes this parameter's writer, if it is an output, from the front of `writers`.
+    /// Returns this parameter's output (if one exists) by popping a writer from `writers`.
     fn bind_out(writers: &mut Writers) -> Self::Out;
 
-    /// Produces the value for one cycle.
+    /// Returns the value that will be passed into `execute`
     fn get<'a>(
         input: &'a mut Self::In,
         output: &'a mut Self::Out,
@@ -65,13 +70,19 @@ pub trait Param {
     ) -> Self::Item<'a>;
 }
 
+/// Takes the next leaf parameter's name.
+fn name(names: &mut Names<'_>) -> &'static str {
+    // PANIC Safety: `#[system]` emits one name per parameter.
+    names.next().expect("one name per parameter")
+}
+
 impl<T: Record + 'static> Param for Input<T> {
     type In = Input<T>;
     type Out = ();
     type Item<'a> = &'a mut Input<T>;
 
-    fn defs(name: &'static str, inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
-        inputs.push(Input::<T>::def(name));
+    fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
+        inputs.push(Input::<T>::def(name(names)));
     }
 
     fn bind_in(views: &mut Views) -> Self::In {
@@ -97,8 +108,8 @@ impl<T: Record + 'static> Param for Output<T> {
     type Out = Output<T>;
     type Item<'a> = &'a mut Output<T>;
 
-    fn defs(name: &'static str, _inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>) {
-        outputs.push(Output::<T>::def(name));
+    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>) {
+        outputs.push(Output::<T>::def(name(names)));
     }
 
     fn bind_in(_views: &mut Views) {}
@@ -124,7 +135,9 @@ impl Param for Timestamp {
     type Out = ();
     type Item<'a> = Timestamp;
 
-    fn defs(_name: &'static str, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {}
+    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
+        name(names);
+    }
 
     fn bind_in(_views: &mut Views) {}
 
@@ -140,7 +153,9 @@ impl Param for Log {
     type Out = ();
     type Item<'a> = &'a mut Log;
 
-    fn defs(_name: &'static str, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {}
+    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
+        name(names);
+    }
 
     fn bind_in(_views: &mut Views) {}
 
@@ -150,3 +165,169 @@ impl Param for Log {
         cx.take_log()
     }
 }
+
+/// A tuple of `Param`s is a `Param`: each half is the tuple of the elements' halves.
+macro_rules! impl_param_for_tuple {
+    ($(($P:ident, $i:tt)),*) => {
+        impl<$($P: Param),*> Param for ($($P,)*) {
+            type In = ($($P::In,)*);
+            type Out = ($($P::Out,)*);
+            type Item<'a> = ($($P::Item<'a>,)*) where Self: 'a;
+
+            #[allow(unused_variables)]
+            fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>) {
+                $( $P::append_defs(names, inputs, outputs); )*
+            }
+
+            #[allow(unused_variables, clippy::unused_unit)]
+            fn bind_in(views: &mut Views) -> Self::In {
+                ($( $P::bind_in(views), )*)
+            }
+
+            #[allow(unused_variables, clippy::unused_unit)]
+            fn bind_out(writers: &mut Writers) -> Self::Out {
+                ($( $P::bind_out(writers), )*)
+            }
+
+            #[allow(unused_variables, clippy::unused_unit)]
+            fn get<'a>(input: &'a mut Self::In, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a> {
+                ($( $P::get(&mut input.$i, &mut output.$i, cx), )*)
+            }
+        }
+    };
+}
+
+impl_param_for_tuple!();
+impl_param_for_tuple!((A, 0));
+impl_param_for_tuple!((A, 0), (B, 1));
+impl_param_for_tuple!((A, 0), (B, 1), (C, 2));
+impl_param_for_tuple!((A, 0), (B, 1), (C, 2), (D, 3));
+impl_param_for_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4));
+impl_param_for_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5));
+impl_param_for_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6));
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7)
+);
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8)
+);
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8),
+    (J, 9)
+);
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8),
+    (J, 9),
+    (K, 10)
+);
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8),
+    (J, 9),
+    (K, 10),
+    (L, 11)
+);
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8),
+    (J, 9),
+    (K, 10),
+    (L, 11),
+    (M, 12)
+);
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8),
+    (J, 9),
+    (K, 10),
+    (L, 11),
+    (M, 12),
+    (N, 13)
+);
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8),
+    (J, 9),
+    (K, 10),
+    (L, 11),
+    (M, 12),
+    (N, 13),
+    (O, 14)
+);
+impl_param_for_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7),
+    (I, 8),
+    (J, 9),
+    (K, 10),
+    (L, 11),
+    (M, 12),
+    (N, 13),
+    (O, 14),
+    (P, 15)
+);

@@ -11,18 +11,18 @@ use metor_proto::types::Timestamp;
 use crate::system::{System, SystemDef};
 
 pub use ctor::Ctor;
-pub use param::{Cycle, Param, Views, Writers};
-pub use set::{InSet, LOG_PORT, OutSet, ParamSet};
+pub use param::{Cycle, Names, Param, Views, Writers};
+pub use set::{InSet, LOG_PORT, OutSet};
 
 /// A `SystemFn` is a type with an `execute` method whose parameters are the ports.
 pub trait SystemFn: Sized + 'static {
-    type Params: ParamSet;
+    type Params: Param;
     const NAME: &'static str;
     /// One name per parameter, in parameter order.
     const NAMES: &'static [&'static str];
 
     /// Calls `execute` with this cycle's parameter values.
-    fn call(&mut self, items: <Self::Params as ParamSet>::Items<'_>);
+    fn call(&mut self, items: <Self::Params as Param>::Item<'_>);
 }
 
 /// Compiles only when `P` is a `Param`; `#[system]` calls it once per parameter.

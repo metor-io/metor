@@ -37,7 +37,7 @@ impl SystemFn for Doubler {
     const NAME: &'static str = "doubler";
     const NAMES: &'static [&'static str] = &["imu", "nav", "now"];
 
-    fn call(&mut self, (imu, nav, now): <Self::Params as ParamSet>::Items<'_>) {
+    fn call(&mut self, (imu, nav, now): <Self::Params as Param>::Item<'_>) {
         self.execute(imu, nav, now);
     }
 }
@@ -61,7 +61,7 @@ impl SystemFn for Summer {
     const NAME: &'static str = "summer";
     const NAMES: &'static [&'static str] = &["sum", "a", "b"];
 
-    fn call(&mut self, (sum, a, b): <Self::Params as ParamSet>::Items<'_>) {
+    fn call(&mut self, (sum, a, b): <Self::Params as Param>::Item<'_>) {
         self.execute(sum, a, b);
     }
 }

@@ -14,7 +14,7 @@ src/
   frame.rs         Frame: Record
   port.rs          Input<T>, Output<T>, SendError, RecvError
   system.rs        PortDef, SystemDef, System, bundle traits
-  fn_system/       Param, ParamSet tuples, SystemFn, FnSystem, Ctor
+  fn_system/       Param and its tuple impls, SystemFn, FnSystem, Ctor
   log.rs           LogEvent impl, Log handle, tracing layer, drain
   coordinator/     + params.rs (Params, ParamError), factories in table.rs
 macros/src/
@@ -138,14 +138,14 @@ Files: `src/fn_system/{mod,param,set,ctor}.rs`, `src/coordinator/table.rs`,
    `Item<'a>`, `defs(name, ins, outs)`, `bind(views, writers)`, `get`.
    `Views` and `Writers` are `vec::IntoIter` aliases. Impls for
    `&mut Input<T>`, `&mut Output<T>`, and `Timestamp`. `Log` arrives in T6.
-2. `set.rs`: `ParamSet` for tuples of arity 0 to 16 through one
-   `macro_rules!`: `Ins`, `Outs`, `Items<'a>`, `defs(names, ..)`,
-   `bind`, `get`. `InSet<P>` and `OutSet<P>` wrap `P::Ins` and `P::Outs`
-   and implement `SystemInputs` and `SystemOutputs`; their `defs` walk
-   `P::NAMES` beside the tuple. `OutSet` reserves the trailing `log`
-   writer slot now, as `Option<Output<LogEvent>>` set to `None`, so T6
-   does not change the bind order.
-3. `mod.rs`: `SystemFn: 'static { type Params: ParamSet; const NAMES:
+2. `param.rs` also implements `Param` for tuples of arity 0 to 16
+   through one `macro_rules!`, each half the tuple of the elements'
+   halves; names arrive as an iterator every leaf advances once.
+   `set.rs` holds `InSet<S>` and `OutSet<S>`, which wrap the tuple's
+   `In` and `Out` and implement `SystemInputs` and `SystemOutputs`.
+   Amended after T6: the first cut had a separate `ParamSet` trait for
+   tuples, which duplicated `Param`.
+3. `mod.rs`: `SystemFn: 'static { type Params: Param; const NAMES:
    &'static [&'static str]; const NAME: &'static str; fn call(&mut self,
    now, items: Items<'_>) }`. `FnSystem<S>` implements `System` with
    `State = S`, `Inputs = InSet<S::Params>`, `Outputs = OutSet<S::Params>`;
@@ -156,7 +156,7 @@ Files: `src/fn_system/{mod,param,set,ctor}.rs`, `src/coordinator/table.rs`,
 5. `table.rs`: `register<S: SystemFn, M>(ty, ctor: impl Ctor<S, M> +
    'static)` builds the `SystemDef` from `S::NAME`, `S::NAMES`, and
    `S::Params::defs`, and wraps the ctor in a `SystemFactory`.
-6. `lib.rs`: export `Param`, `ParamSet`, `SystemFn`, `FnSystem`, `Ctor`.
+6. `lib.rs`: export `Param`, `SystemFn`, `FnSystem`, `Ctor`.
 
 Until T5 lands, tests implement `SystemFn` by hand for a two-port
 struct; that hand impl is what the attribute emits, so it doubles as the
@@ -215,7 +215,7 @@ Files: `src/log.rs`, `src/fn_system/{param,set,mod}.rs`, `Cargo.toml`,
    `LogEvent` from the event's level, target, message, fields, file, and
    line, and pushes it. Span scope is left `None` in this slice.
 4. `param.rs`: `impl Param for &mut Log` with `In = ()`, `Out = ()`; its
-   `get` borrows the `log` slot, which `ParamSet::get` passes down as an
+   `get` borrows the `log` slot, which the tuple `Param::get` passes down as an
    extra argument.
 5. `set.rs`: `OutSet::bind` takes the trailing writer into the `log`
    slot, and `OutSet::defs` appends the `log` `PortDef` last.

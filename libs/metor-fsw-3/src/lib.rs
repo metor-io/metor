@@ -15,7 +15,7 @@ pub use coordinator::{
     BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, ParamError, Params, PortRef,
     Step, SystemConfig, SystemStatus, SystemTable,
 };
-pub use fn_system::{Ctor, Cycle, FnSystem, InSet, OutSet, Param, ParamSet, SystemFn};
+pub use fn_system::{Ctor, Cycle, FnSystem, InSet, Names, OutSet, Param, SystemFn};
 pub use frame::Frame;
 pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, system};

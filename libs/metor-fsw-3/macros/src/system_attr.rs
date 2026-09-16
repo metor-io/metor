@@ -49,7 +49,7 @@ fn expand(block: &ItemImpl) -> syn::Result<TokenStream2> {
             type Params = (#(#keys,)*);
             const NAME: &'static str = #name;
             const NAMES: &'static [&'static str] = &[#(#names),*];
-            fn call(&mut self, (#(#idents,)*): <Self::Params as #fsw::ParamSet>::Items<'_>) {
+            fn call(&mut self, (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_>) {
                 #(#asserts)*
                 self.execute(#(#idents2),*)
             }
