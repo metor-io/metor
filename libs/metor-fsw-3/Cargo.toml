@@ -12,6 +12,7 @@ metor-component = { workspace = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
+clap = { version = "4", features = ["derive"] }
 futures-lite = "2"
 libloading = "0.8"
 postcard = { version = "1.1", features = ["alloc", "experimental-derive"] }
@@ -21,12 +22,18 @@ serde_ignored = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
 stellarator = { path = "../stellarator" }
 thiserror = "2.0"
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 zerocopy = { version = "0.8.2", features = ["derive"] }
 
 [dev-dependencies]
+tempfile = "3"
 trybuild = "1"
+
+[[bin]]
+name = "metor"
+path = "src/bin/metor.rs"
 
 [lints]
 workspace = true

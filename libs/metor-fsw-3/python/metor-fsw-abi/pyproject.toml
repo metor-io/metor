@@ -1,0 +1,16 @@
+# A code-free distribution whose version is the fsw-3 ABI version, so a pack
+# and a host of different ABIs fail inside `uv lock`.
+
+[project]
+name = "metor-fsw-abi"
+version = "1"
+description = "The metor-fsw ABI version as a distribution"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "metor_fsw_abi"
+module-root = ""

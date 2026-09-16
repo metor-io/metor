@@ -1,0 +1,10 @@
+# The pack fields `metor pack dev` reads; the defaults cover the rest.
+
+[project]
+name = "echo-pack"
+version = "0.1.0"
+description = "The pack the metor-fsw-3 CLI and dl tests build"
+requires-python = ">=3.11"
+
+[tool.metor.pack]
+id = "echo"

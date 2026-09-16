@@ -9583,6 +9583,7 @@ dependencies = [
 name = "metor-fsw-3"
 version = "0.14.2"
 dependencies = [
+ "clap 4.6.3",
  "futures-lite 2.6.1",
  "libloading",
  "metor-component",
@@ -9596,7 +9597,9 @@ dependencies = [
  "serde_ignored",
  "serde_json",
  "stellarator",
+ "tempfile",
  "thiserror 2.0.20",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "trybuild",

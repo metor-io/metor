@@ -181,3 +181,21 @@ fn an_unknown_status_word_is_a_panic() {
 fn the_abi_version_is_one() {
     assert_eq!(ABI_VERSION, 1);
 }
+
+/// The `metor-fsw-abi` distribution exists to pin this number; a pack's
+/// editable wheel requires it exactly.
+#[test]
+fn the_abi_distributions_version_is_the_abi_version() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/python/metor-fsw-abi/pyproject.toml"
+    );
+    let manifest: toml::Value = std::fs::read_to_string(path)
+        .expect("the distribution is in the tree")
+        .parse()
+        .expect("valid TOML");
+    let version = manifest["project"]["version"]
+        .as_str()
+        .expect("a version string");
+    assert_eq!(version, ABI_VERSION.to_string());
+}

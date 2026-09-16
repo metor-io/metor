@@ -104,6 +104,11 @@ impl Pack {
         self.def.systems.iter()
     }
 
+    /// The descriptor this pack exported.
+    pub fn def(&self) -> &PackDef<'static> {
+        &self.def
+    }
+
     /// The loaded library, shared with every instance created from it.
     pub fn library(&self) -> &Rc<Library> {
         &self.lib
