@@ -9592,6 +9592,7 @@ dependencies = [
  "metor-fsw-3-ring",
  "metor-proto",
  "metor-proto-wkt",
+ "minijinja",
  "postcard",
  "schemars 1.2.1",
  "serde",

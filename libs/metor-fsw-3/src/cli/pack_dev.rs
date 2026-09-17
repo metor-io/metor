@@ -36,6 +36,8 @@ pub enum PackDevError {
     },
     #[error("system `{system}` has an input port and a param both named `{name}`")]
     NameClash { system: String, name: String },
+    #[error("rendering the module: {0}")]
+    Template(#[from] minijinja::Error),
     #[error(transparent)]
     Build(#[from] BuildError),
     #[error(transparent)]
