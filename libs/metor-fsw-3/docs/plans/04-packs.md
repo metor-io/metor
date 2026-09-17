@@ -7,6 +7,9 @@ a built-in registers into. Around the ABI sit the pieces that make a pack
 usable from a target file: `metor-build`, the typed Python module, the
 recorder's `to_config()`, and `metor run`.
 
+The T1–T6 review fixes are implemented below. T7, bounded allocation-free
+logging, remains deferred; log events still allocate strings and vectors.
+
 In scope:
 
 - The ABI: five `extern "C"` exports and JSON throughout: the descriptor
@@ -64,19 +67,27 @@ waits for wasm in slice 6.
 ## ABI
 
 ```rust
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 #[repr(C)]
-pub struct RawSlice { pub ptr: *const u8, pub len: usize }
+pub struct RawSlice { pub ptr: *const c_void, pub len: usize }
 #[repr(C)]
-pub struct RawRing  { pub base: *mut u8, pub len: usize }
+pub struct RawOwner {
+    pub context: *const c_void,
+    pub retain: unsafe extern "C" fn(*const c_void),
+    pub release: unsafe extern "C" fn(*const c_void),
+}
+#[repr(C)]
+pub struct RawRing { pub base: *mut u8, pub len: usize, pub owner: RawOwner }
 /// One input port: its producers' rings, in edge order.
 #[repr(C)]
 pub struct RawPort  { pub rings: *const RawRing, pub len: usize }
 
 extern "C" fn metor_fsw_abi_version() -> u32;
-/// JSON `PackDef`, owned by the pack for the life of the library.
-extern "C" fn metor_fsw_pack_def() -> RawSlice;
+/// Writes JSON `PackDef` into host-owned storage; returns a descriptor status.
+unsafe extern "C" fn metor_fsw_pack_def(
+    dst: *mut u8, capacity: usize, written: *mut usize,
+) -> u32;
 unsafe extern "C" fn metor_fsw_create(
     ty: RawSlice, params: RawSlice,
     inputs: RawSlice, outputs: RawSlice,
@@ -102,10 +113,10 @@ every system in it.
 
 ### Instances
 
-The `*mut c_void` is one system instance: the `Box<dyn Step>` the entry's
-`make` returned, holding that system's state and bound ports, boxed once
-more so the fat pointer fits a thin one. `ty` is consumed by `create`;
-after that, dispatch is by handle.
+The `*mut c_void` comes from `Box<Option<Box<dyn Step>>>`. Taking the
+option retires a failed system and its ports while keeping the opaque
+handle valid until `destroy`. `ty` is read during `create`; later
+dispatch uses the handle.
 
 ```
 host                                   pack
@@ -113,10 +124,10 @@ CoordinatorConfig::build
   per config entry:
     make(params, rings) ------------>  create(ty, params, inputs, outputs)
                                          table.get(ty).make(..) -> Box<dyn Step>
-    DlStep { ptr, lib }  <-----------    Box::into_raw(Box::new(step))
+    DlStep { ptr, lib }  <-----------    Box::into_raw(Box::new(Some(step)))
 Coordinator::step, per cycle:
     DlStep::execute(now) ----------->  execute(ptr, now)
-                                         (*ptr).execute(now) under catch_unwind
+                                         catch_step(slot, now); retire on failure
 drop(Coordinator):
     drop(DlStep) ------------------->  destroy(ptr)
 ```
@@ -128,37 +139,35 @@ as they are two `Runner`s in-process.
 
 ```rust
 #[derive(Serialize, Deserialize)]
-pub struct PackDef<'a> {
-    #[serde(borrow)]
-    pub systems: Vec<PackSystemDef<'a>>,
+pub struct PackDef {
+    pub systems: Vec<PackSystemDef>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct PackSystemDef<'a> {
+pub struct PackSystemDef {
     /// The table key: `register("nav", ..)`.
-    pub ty: &'a str,
+    pub ty: String,
     pub def: SystemDef,
     /// The doc comment on `execute`, or empty.
-    #[serde(borrow)]
-    pub doc: Cow<'a, str>,
+    pub doc: Cow<'static, str>,
     /// JSON Schema of the params struct; `None` for a `Fn() -> S` ctor.
-    #[serde(borrow)]
-    pub params: Option<Cow<'a, RawValue>>,
+    pub params: Option<Box<RawValue>>,
 }
 ```
 
-The descriptor is JSON, written by `serde_json` in the pack and read by
-it on the host. `SystemDef` and `PortDef` gain `Serialize` and
-`Deserialize`. Their names are `&'static str`, which `serde_json` borrows
-from `&'static [u8]` when the string has no escapes, and identifiers have
-none; the host copies the descriptor out of the library once and leaks
-the copy, which is the one init-time allocation. The same `SystemDef`
-type then serves the pack, the wire, and the table. The doc string may
-hold newlines, so it is a `Cow`. The schema is a `RawValue` on both
-sides: `schemars` output boxed in the pack, borrowed on the host, and
-handed to the renderer by `pack dev` as is.
+The host allocates a 1 MiB descriptor buffer during loading. The pack
+serializes JSON directly into it, leaves `written` zero on failure, and
+retains neither pointer. Descriptor status words are `Ok = 0`,
+`TooSmall = 1`, `Encode = 2`, and `Panicked = 3`. The host rejects
+unsuccessful statuses and lengths beyond capacity before decoding.
+The temporary buffer is freed on success and failure.
 
-`PortDef` gains `record: &'static str`, the `Record::NAME`. The build
+`SystemDef` and `PortDef` names and record names use `Cow<'static, str>`.
+Literals can remain borrowed; deserialization produces owned strings,
+including escaped text. The descriptor has no borrowed-buffer lifetime
+or leaked storage. Its schema is an owned `Box<RawValue>`.
+
+`PortDef::record` carries `Record::NAME`. The build
 compares ids; Python needs the name to spell a type. `SystemFn` gains
 `const DOC: &'static str`, read by `#[system]` from the doc comment on
 `execute`. Params field docs ride the schema as `description`, which
@@ -195,36 +204,47 @@ metor_fsw_3::export_pack!(pack);
 ```
 
 A pack is a `SystemTable` built inside the library. `export_pack!` emits
-the five `#[unsafe(no_mangle)] extern "C"` fns, each a one-line call into
-`pack::`. The table is built once behind a `OnceLock` on first use:
-`pack::def` calls the table fn, installs
-`tracing_subscriber::registry().with(log::layer())` as this library's
-global default, and serializes the descriptor from the table's entries
-into a second `OnceLock`. The library has its own `tracing` dispatcher
-and its own thread-local log queue, so `FnSystem::execute` clears and
-drains exactly as it does in-process and every line lands on the
-system's own `log` ring.
+the five `#[unsafe(no_mangle)] extern "C"` functions. An owned thread-local
+`OnceCell<SystemTable>` builds the table once per thread. Descriptor and
+create calls access it through a closure; no table reference escapes.
+Constructor captures live until thread exit, subject to Rust's TLS
+shutdown limitations. Descriptor bytes are not cached.
+
+Initialization installs this library's logging subscriber. `FnSystem`
+uses `with_log_port` to install its log port for a synchronous callback.
+Private cleanup restores the previous TLS slot on return or panic.
+Event formatting temporarily removes the pointer, so recursive logging
+cannot borrow the active port again. There is no public scope guard.
 
 `TableEntry` keeps its order of registration and grows `doc` and
-`params_schema`, so the descriptor is a projection of the table. The
+`schema`, so the descriptor is a projection of the table. The
 exports call plain functions in `pack/`:
 
 - `create` looks `ty` up in the table, attaches every `RawRing` with
-  `RingBuffer::attach_raw`, takes one `view(NoWake)` per input ring and
+  `RingBuffer::attach_owned`, takes one `view(NoWake)` per input ring and
   the `writer(NoWake)` of each output ring, and calls the entry's `make`
   with the params decoded from the JSON. The result is `Box<dyn Step>`
-  boxed again as `*mut c_void`. On a `ParamError` it writes the error as
+  stored in an optional slot behind `*mut c_void`. On a `ParamError` it writes the error as
   JSON into a thread-local buffer, points `error` at it, and returns
   null; the buffer lives until the next `create` on that thread. Attach
-  handles are dropped after binding; writers and views outlive the
-  handle they came from.
-- `execute` calls `Step::execute(now)` inside `catch_unwind`. A panic
-  becomes `Status::Panicked` after `Step::fault` has run, see below.
+  handles are dropped after binding; writers and views keep the backing
+  ownership lease alive.
+- `execute` catches failures, reports the fault, and takes and drops
+  the failed runner. Later calls return `Status::Panicked`.
 - `destroy` drops the box, also inside `catch_unwind`.
 
-Every export is `catch_unwind` at its top. The pack allocates and frees
-the instance box, the descriptor bytes, and the error buffer; the host
-allocates and frees the rings and its copy of the descriptor.
+Descriptor construction, schema generation, create/error serialization,
+execution, fault hooks, and destruction have unwind containment. The
+pack owns its instance slots, TLS table, and error buffer. The host owns
+the descriptor buffer and ring allocations.
+
+For each ring, the host holds a `RingExport` through `create`. Attaching
+acquires a lease through `RawOwner::retain`; final release calls
+`RawOwner::release`. These callbacks use the allocating side's standard
+`Arc` strong-count operations. Only that side interprets the opaque
+context. No Rust `Arc` layout crosses the ABI, and the shared-memory ring
+layout is unchanged. Escaped readers, writers, and grants keep storage
+alive after coordinator destruction.
 
 ### Status word
 
@@ -255,26 +275,25 @@ pub trait System {
 to write `log.fault("panic", message)` on the system's `log` output, so a
 panic reaches the ground the way every other fault does; the trait path
 keeps the default and declares its own port if it wants one. After a
-panic the caller latches the instance: it is never executed again,
-`destroy` still runs at teardown, and the coordinator's status record
-keeps writing a zero exec time for it. Only the log output is touched
-after the panic, which is safe because user code cannot hold it across
-the panic boundary.
+panic, fault reporting runs once and the runner is taken and dropped.
+This releases its input readers so healthy consumers sharing a producer
+can continue. Never reclaim a reader slot while an escaped handle or
+grant still owns it. The coordinator retains the entry's name and status
+writer, reporting zero execution time on subsequent cycles.
 
-The coordinator catches, faults, and latches the same way: `step` wraps
-each entry's `execute` in the same `catch_unwind` helper the pack's
-export uses, and `Entry` carries the latch. A static and a dylib registration of one system then behave
-alike under a panic, which the parity test asserts, and a panic in one
-system is not a loss of the vehicle. The panic message also goes to the
-host's `tracing` at error level once, so a console run shows it.
+Static and pack runners use the same retirement helper. Fault-hook and
+destructor panics are caught separately. Panic payload destruction is
+also guarded; a second payload is deliberately forgotten if destroying
+the first panics. Abort-mode panics, foreign faults, aborting panic hooks,
+and a second destructor panic during an active unwind remain unrecoverable.
 
 ## Host
 
 ```rust
 pub struct Pack {
-    lib: Rc<libloading::Library>,
+    lib: Arc<libloading::Library>,
     fns: PackFns,
-    def: PackDef<'static>,
+    def: PackDef,
 }
 
 /// The exports after the version check, as bare fn pointers valid
@@ -285,9 +304,10 @@ struct PackFns { create: CreateFn, execute: ExecuteFn, destroy: DestroyFn }
 impl Pack {
     /// # Safety
     /// `path` is a metor-fsw-3 pack built against this ABI; the library
-    /// runs arbitrary code on load.
+    /// runs arbitrary code on load. Its artifact must not be removed or
+    /// replaced during this process's lifetime, including this call.
     pub unsafe fn open(path: &Path) -> Result<Pack, PackError>;
-    pub fn systems(&self) -> impl Iterator<Item = &PackSystemDef<'static>>;
+    pub fn systems(&self) -> impl Iterator<Item = &PackSystemDef>;
 }
 
 impl SystemTable {
@@ -300,13 +320,15 @@ pub enum PackError {
     MissingSymbol(&'static str),
     AbiMismatch { found: u32, expected: u32 },
     Decode,
+    DescriptorTooLarge { capacity: usize },
+    DescriptorStatus(u32),
 }
 ```
 
 `open` loads the library, resolves and calls `metor_fsw_abi_version`,
 resolves the other four exports into `PackFns`, calls `metor_fsw_pack_def`,
-copies and leaks the descriptor, and decodes it. `register_pack` inserts
-one entry per system whose `make` closure holds the `Rc<Library>` and a
+decodes owned descriptor data, and frees its buffer. `register_pack` inserts
+one entry per system whose `make` closure holds the `Arc<Library>` and a
 copy of `PackFns`, builds the `RawPort` and `RawRing` arrays from the
 rings it is handed, calls `create`, and wraps the returned pointer in a
 `DlStep` that calls `execute`, latches on `Panicked`, and calls `destroy`
@@ -317,9 +339,8 @@ apart.
 
 ### Table refactor
 
-Today `TableEntry::make` receives `Vec<Vec<View>>` and `Vec<Writer>`
-created by `bind_rings`. A view claimed on the host would consume the
-reader slot the pack is about to claim, so `make` receives rings:
+`TableEntry::make` receives rings so the side that constructs the system
+claims its own reader slots and writer:
 
 ```rust
 type SystemMakeFn = dyn Fn(Params<'_>, Vec<Vec<&RingBuffer>>, Vec<&RingBuffer>)
@@ -327,17 +348,21 @@ type SystemMakeFn = dyn Fn(Params<'_>, Vec<Vec<&RingBuffer>>, Vec<&RingBuffer>)
 ```
 
 In-process entries call `view(NoWake)` and `writer(NoWake)` themselves;
-dylib entries call `region()`. Reader accounting stays one view per
-edge, claimed on whichever side binds. `bind_rings` shrinks to the
-lookup.
+dylib entries create `RingExport` owners and raw descriptors. Reader
+accounting stays one view per edge, claimed on whichever side binds.
 
 ### Teardown
 
-`Coordinator` drops `entries` before `rings`. Each `DlStep` destroys its
-instance, releasing its reader slots and writer, and drops its `Rc`; the
-library unloads when the last one goes, still before any ring it
-attached to is freed. `Pack` itself may be dropped right after
-`register_pack`.
+Dropping `DlStep` destroys its instance slot. Ring backing is freed only
+after its final owning handle or grant releases it. `Pack` may be dropped
+after registration; descriptor storage is reclaimed normally.
+
+Libraries remain resident in a process-wide registry keyed by canonical
+path. Dropping the final `Pack` does not call `dlclose`: guest threads,
+TLS destructors, and ownership callbacks can still execute library code.
+Reopening a loaded path reuses that library. Dynamic unloading requires
+a separate quiescence design. The loaded artifact must remain at its path
+without replacement for the process lifetime.
 
 ## Python
 
@@ -399,8 +424,11 @@ One `Record` marker class per distinct `record` name across the pack's
 ports, so an edge between different records is a pyright error. One
 `System` subclass per entry, named as the PascalCase of `ty`. Params
 render from the JSON Schema: `number`, `integer`, `boolean`, `string`,
-arrays of those, and nested objects as nested `@dataclass`es, with
-`default` values as keyword defaults and `description` as the docstring.
+arrays of those, and nested objects as keyword-only dataclasses.
+Mutable dataclass defaults use factories. System parameters are
+recursively copied into each instance's JSON data, keeping mutable
+defaults independent. Strings and docs use a complete string-literal
+encoder, including control characters and Unicode.
 A param sharing a name with an input port is a `pack dev` error. `log`
 and `status` are annotated as outputs like any other.
 
@@ -460,20 +488,24 @@ the floor for `../` globs.
 `metor-fsw-abi` is a code-free distribution whose version is
 `ABI_VERSION`. `pack dev` stamps `metor-fsw-abi==<ABI_VERSION>` into the
 editable wheel's requirements, so a pack and a host of different ABIs
-fail inside `uv lock` before anything runs. It starts at 1 with fsw-3.
+fail inside `uv lock` before anything runs. The current distribution is
+ABI 2; existing ABI 1 packs must be rebuilt.
 
 ## CLI
 
 `metor pack dev <root>`: reads `pyproject.toml`, runs `cargo build -p
-<crate> --message-format=json` with cargo's stderr inherited, opens the
-built library with `Pack::open`, renders the module, and lays out
-`<root>/.metor/<module>/{__init__.py, py.typed, _libs/<triple>/<cdylib>}`.
-Every file lands through `copy_atomic`, a ten-line fn: a temp file
-beside the destination then `rename`, because macOS kill-caches code
-signatures by inode and a dylib overwritten in place kills the next
-process to `dlopen` it. The descriptor is read by `dlopen` here and
-again at run, and the build's port and param validation is the
-staleness check.
+<crate> --message-format=json` with cargo's stderr inherited, and copies
+the library to `<root>/.metor/<module>/_libs/<triple>/<cdylib>`. It opens
+that staged copy, then writes `__init__.py` and `py.typed` alongside it.
+Files land through a temporary sibling and rename, avoiding in-place
+overwrites of mapped code.
+
+Calls to `pack dev` are serialized. Loaded artifact paths must remain fixed.
+If the staged library path is already loaded, `pack dev` returns
+`AlreadyLoaded` before building or changing files. Rebuilding requires a
+fresh CLI invocation. `metor run` reuses the staged library loaded while
+refreshing the pack; descriptor inspection needs no helper subprocess.
+Calls to `pack dev` are serialized within the process.
 
 `metor run [target.py] [--cycles N] [--wall RATE | --sim-dt SECS]`:
 
@@ -520,9 +552,10 @@ DESIGN.md ABI section is replaced with the shipped exports.
 
 ## Tests
 
-- ABI: `SystemDef` round-trips through `serde_json` and borrows its
-  names from the leaked bytes; a doc string with a newline decodes as an
-  owned `Cow`; a descriptor with one system of every param kind decodes
+- ABI: `SystemDef` round-trips through `serde_json` with owned decoded
+  names and docs, including escapes, after the source buffer is freed;
+  exact-fit and short descriptor buffers respect bounds; a descriptor
+  with one system of every param kind decodes
   and its schema `RawValue` is byte-identical to `schemars` output; a
   `ParamError` round-trips through the error slice.
 - Export: `export_pack!` on a test table exports the five names and
@@ -536,23 +569,29 @@ DESIGN.md ABI section is replaced with the shipped exports.
   `metor_fsw_destroy` is `MissingSymbol` naming it; `register_pack`
   prefixes `"{id}.{ty}"`; a dylib system in a pipeline sees same-cycle
   data; a dylib system latched by a panic keeps its status writes and is
-  not executed again; a coordinator with a dylib entry drops the library
-  before the rings, checked with a drop-order recorder.
-- Runner: an in-process panic latches and writes one fault line, and the
-  next system in the cycle still runs.
+  not executed again; escaped guest handles remain usable after the
+  coordinator and pack are dropped; reopening reuses resident code.
+- Runner: failed consumers release their readers and healthy consumers
+  receive data and status over 32 cycles with ring depth two. Fault-hook
+  and destructor panics still retire once and preserve later execution.
+- Logging: scoped TLS handles nesting, callback and formatting panics,
+  thread isolation, and recursive formatting; focused tests pass Miri.
 - Python: `to_config()` golden for the ADCS target; a loop never
   connected, a loop connected twice, and a fan-in sequence are the
   expected errors or edges; the rendered module for a two-system pack is
-  golden and passes pyright with an edge between different records and a
-  loop connected to a port of another record as the two errors.
+  golden and passes pyright. Generated modules are imported and exercised
+  for required/default field ordering, independent mutable defaults, and
+  escaped strings.
 - CLI: `pack dev` on the example lays out the four files and a second
-  run replaces the dylib at a new inode; `run --cycles 3` on the example
+  CLI invocation replaces the dylib at a new inode; a rebuild in a
+  process that loaded the destination fails without modifying it;
+  `run --cycles 3` on the example
   exits zero; a `config_version` of 0 exits with the version error.
 - Gate: the convergence test above.
 
 ## Open decisions
 
-None outstanding. Settled in review: five plain exports, `ABI_VERSION`
-starting at 1, JSON for the descriptor and error, `loop(T)` typed at
-creation, and panics caught in the coordinator's runner as well as at
-the boundary.
+ABI 2 retains five exports, JSON descriptors and errors, caller-owned
+descriptor storage, opaque ownership callbacks, and resident libraries.
+T7, allocation-free steady-state logging, is deferred. Library unloading
+and rebuilding an already-loaded pack in one process remain out of scope.
