@@ -3,7 +3,7 @@
 use metor_fsw_3_ring::{NoWake, View, Writer};
 use metor_proto_wkt::LogEvent;
 
-use crate::log::Log;
+use crate::log::LogPort;
 use crate::port::Output;
 use crate::system::{PortDef, SystemInputs, SystemOutputs};
 
@@ -19,7 +19,7 @@ pub struct InSet<S: SystemFn>(pub(crate) <S::Params as Param>::In);
 /// An `OutSet` is the bound outputs of a fn system's parameters, plus its `log`.
 pub struct OutSet<S: SystemFn> {
     pub(crate) outs: <S::Params as Param>::Out,
-    pub(crate) log: Log,
+    pub(crate) log: LogPort,
 }
 
 impl<S: SystemFn> SystemInputs for InSet<S> {
@@ -52,7 +52,7 @@ impl<S: SystemFn> SystemOutputs for OutSet<S> {
         // PANIC Safety: the coordinator binds exactly the declared ports, and
         // LogEvent needs no alignment.
         let log = writers.next().expect("one writer for the log output");
-        let log = Log::new(Output::try_new(log).expect("byte alignment"));
+        let log = LogPort::new(Output::try_new(log).expect("byte alignment"));
         assert!(writers.next().is_none(), "more writers than output params");
         Self { outs, log }
     }

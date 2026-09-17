@@ -3,6 +3,7 @@
 use core::cell::RefCell;
 use std::rc::Rc;
 
+use metor_fsw_3_ring::frame_len;
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 use serde::Deserialize;
@@ -14,7 +15,7 @@ use crate::coordinator::{
     BuildError, CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
 };
 use crate::log::Log;
-use crate::port::{Input, Output};
+use crate::port::{Input, Output, ring_capacity};
 use crate::tests::utils::{Control, Imu, Nav, NoParams};
 use crate::{Frame, Record, SystemInputs, SystemOutputs};
 
@@ -394,26 +395,98 @@ fn a_line_between_systems_reaches_no_ring() {
     assert!(seen.borrow().iter().all(|l| l.message != "between systems"));
 }
 
-#[test]
-fn the_sixty_fifth_line_is_dropped_and_reported_once() {
-    let (config, table, seen) = log_config(crate::log::MAX_LINES + 1);
-    let mut coordinator = config.build(&table).expect("valid");
-    with_layer(|| coordinator.step(Timestamp(0)));
-    let seen = seen.borrow();
-    let traced = seen.iter().filter(|l| l.message == "traced").count();
-    assert_eq!(traced, crate::log::MAX_LINES);
-    let warnings: Vec<_> = seen.iter().filter(|l| l.level == LogLevel::Warn).collect();
-    assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0].fields, vec![("dropped".into(), "1".into())]);
+/// Writes `lines` identical padded lines, on its first cycle only.
+struct Padder {
+    line: String,
+    lines: usize,
+}
+
+#[crate::system]
+impl Padder {
+    fn execute(&mut self, log: &mut Log) {
+        for _ in 0..core::mem::take(&mut self.lines) {
+            log.info(self.line.clone());
+        }
+    }
+}
+
+fn pad_config(
+    lines: usize,
+    line: &str,
+) -> (CoordinatorConfig, SystemTable, Rc<RefCell<Vec<LogEvent>>>) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut table = SystemTable::new();
+    let (line, sink) = (line.to_string(), seen.clone());
+    table.register("padder", move || Padder {
+        line: line.clone(),
+        lines,
+    });
+    table.register("log_probe", move || LogProbe(sink.clone()));
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("padder", "padder"),
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "log".into(),
+                    from: vec![PortRef::new("padder", "log")],
+                }],
+                ..SystemConfig::new("probe", "log_probe")
+            },
+        ],
+        ..Default::default()
+    };
+    (config, table, seen)
+}
+
+/// Lines of `line` one `log` ring holds at the default ring depth.
+fn padded_records(line: &str, now: Timestamp) -> usize {
+    let event = LogEvent {
+        timestamp: now,
+        level: LogLevel::Info,
+        source: "".into(),
+        target: "".into(),
+        message: line.to_string().into(),
+        span: None,
+        fields: Vec::new(),
+        file: None,
+        line: None,
+    };
+    let mut buf = vec![0u8; LogEvent::MAX_LEN];
+    let len = event.encode(&mut buf).expect("encodes").len();
+    let depth = LogEvent::DEPTH * CoordinatorConfig::default().ring_depth;
+    ring_capacity(LogEvent::MAX_LEN, depth).expect("valid") / frame_len(len)
 }
 
 #[test]
-fn a_log_ring_holds_depth_times_ring_depth() {
-    // 63 traced lines plus the direct line fill 8 * 8 records; nothing is lost.
-    let (config, table, seen) = log_config(63);
+fn lines_past_the_rings_capacity_are_dropped_and_reported_once() {
+    let line = "p".repeat(LogEvent::MAX_LEN / 2);
+    let records = padded_records(&line, Timestamp(0));
+    let (config, table, seen) = pad_config(records + 3, &line);
     let mut coordinator = config.build(&table).expect("valid");
-    with_layer(|| coordinator.step(Timestamp(0)));
-    assert_eq!(seen.borrow().len(), 64);
+    // The warning waits for the room the drained ring gives back.
+    for cycle in 0..4 {
+        coordinator.step(Timestamp(cycle));
+    }
+    let landed = seen.borrow();
+    let (warnings, infos): (Vec<_>, Vec<_>) =
+        landed.iter().partition(|l| l.level == LogLevel::Warn);
+    assert_eq!(infos.len(), records);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].fields, vec![("dropped".into(), "3".into())]);
+}
+
+#[test]
+fn a_log_ring_holds_depth_times_ring_depth_full_length_lines() {
+    let line = "p".repeat(LogEvent::MAX_LEN / 2);
+    let records = padded_records(&line, Timestamp(0));
+    assert!(records >= LogEvent::DEPTH * CoordinatorConfig::default().ring_depth);
+    let (config, table, seen) = pad_config(records, &line);
+    let mut coordinator = config.build(&table).expect("valid");
+    coordinator.step(Timestamp(0));
+    coordinator.step(Timestamp(1));
+    let landed = seen.borrow();
+    assert_eq!(landed.len(), records);
+    assert!(landed.iter().all(|l| l.level == LogLevel::Info));
 }
 
 #[test]

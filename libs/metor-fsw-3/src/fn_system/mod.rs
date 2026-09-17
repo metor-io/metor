@@ -50,7 +50,7 @@ impl<S: SystemFn> System for FnSystem<S> {
         SystemDef::new::<InSet<S>, OutSet<S>>(S::NAME)
     }
 
-    /// Clears the tracing queue, runs `execute`, then drains the queue onto `log`.
+    /// Points this thread's log lines at the system's own `log` output, then runs `execute`.
     fn execute(
         &self,
         now: Timestamp,
@@ -58,17 +58,15 @@ impl<S: SystemFn> System for FnSystem<S> {
         inputs: &mut InSet<S>,
         outputs: &mut OutSet<S>,
     ) {
-        crate::log::clear();
-        outputs.log.begin(now);
-        let mut cx = Cycle::new(now, &mut outputs.log);
+        let _guard = crate::log::enter(&mut outputs.log, now);
+        let mut log = crate::log::Log::new();
+        let mut cx = Cycle::new(now, &mut log);
         state.call(S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx));
-        outputs.log.drain_queue();
     }
 
     /// Writes the panic as a fault line on the system's own `log` output.
     fn fault(&self, now: Timestamp, outputs: &mut OutSet<S>, message: &str) {
-        outputs.log.begin(now);
-        outputs.log.fault("panic", message.to_string());
+        outputs.log.fault(now, "panic", message.to_string());
     }
 }
 
