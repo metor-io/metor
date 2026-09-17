@@ -13,16 +13,29 @@ fn build() -> SystemTable {
     crate::tests::utils::table(&Recorder::default())
 }
 
-fn ring<T: Record>(readers: usize) -> RingBuffer {
-    RingBuffer::create_in_memory(Config {
-        capacity: ring_capacity(T::MAX_LEN, 8).expect("valid capacity"),
-        max_readers: readers,
-    })
+struct TestRing {
+    ring: RingBuffer,
+    export: metor_fsw_3_ring::RingExport,
 }
 
-fn raw(ring: &RingBuffer) -> RawRing {
-    let (base, len) = ring.region();
-    RawRing { base, len }
+impl core::ops::Deref for TestRing {
+    type Target = RingBuffer;
+    fn deref(&self) -> &RingBuffer {
+        &self.ring
+    }
+}
+
+fn ring<T: Record>(readers: usize) -> TestRing {
+    let ring = RingBuffer::create_in_memory(Config {
+        capacity: ring_capacity(T::MAX_LEN, 8).expect("valid capacity"),
+        max_readers: readers,
+    });
+    let export = ring.export();
+    TestRing { ring, export }
+}
+
+fn raw(ring: &TestRing) -> RawRing {
+    RawRing::of(&ring.export)
 }
 
 /// Calls `create` the way an export does, returning the instance or the error.
@@ -77,24 +90,88 @@ fn input(rings: &[RawRing]) -> RawPort {
     }
 }
 
-#[test]
-fn the_descriptor_decodes_as_the_tables_projection() {
-    let bytes = def(build);
-    // SAFETY: the descriptor lives for the life of the library.
-    let decoded: PackDef<'static> =
-        serde_json::from_slice(unsafe { bytes.as_bytes() }).expect("the descriptor decodes");
-    let types: Vec<_> = decoded.systems.iter().map(|s| s.ty).collect();
-    assert_eq!(types[0], "imu");
-    assert!(types.contains(&"boom"));
-    // The same bytes come back on a second call.
-    assert_eq!(def(build).ptr, bytes.ptr);
+fn descriptor(build: fn() -> SystemTable, buffer: &mut [u8]) -> (u32, usize) {
+    let mut written = usize::MAX;
+    // SAFETY: buffer and length slot are writable, separate, and live for the call.
+    let status = unsafe { def(build, buffer.as_mut_ptr(), buffer.len(), &mut written) };
+    (status, written)
 }
 
 #[test]
-fn an_unknown_type_returns_null_with_no_error() {
+fn the_descriptor_decodes_as_the_tables_projection() {
+    let mut bytes = vec![0u8; 64 * 1024];
+    let (status, len) = descriptor(build, &mut bytes);
+    assert_eq!(status, DefStatus::Ok as u32);
+    let decoded: PackDef = serde_json::from_slice(&bytes[..len]).expect("decodes");
+    let types: Vec<_> = decoded.systems.iter().map(|s| s.ty.as_str()).collect();
+    assert_eq!(types[0], "imu");
+    assert!(types.contains(&"boom"));
+    let mut exact = vec![0; len];
+    assert_eq!(descriptor(build, &mut exact), (status, len));
+    assert_eq!(exact, bytes[..len]);
+
+    let mut short = vec![0xa5; len + 1];
+    assert_eq!(
+        descriptor(build, &mut short[1..len]),
+        (DefStatus::TooSmall as u32, 0)
+    );
+    assert_eq!((short[0], short[len]), (0xa5, 0xa5));
+    assert_eq!(descriptor(build, &mut []), (DefStatus::TooSmall as u32, 0));
+}
+
+#[test]
+fn descriptor_initialization_panics_are_contained() {
+    fn broken() -> SystemTable {
+        panic!("table build");
+    }
+    // Each test thread has an uninitialized table.
+    assert_eq!(
+        descriptor(broken, &mut [0; 128]),
+        (DefStatus::Panicked as u32, 0)
+    );
+    assert_eq!(
+        descriptor(SystemTable::new, &mut [0; 128]),
+        (DefStatus::Ok as u32, 14)
+    );
+}
+
+#[test]
+fn table_captures_are_owned_once_per_thread_and_released_on_exit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Capture;
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn captured() -> SystemTable {
+        let capture = Capture;
+        let mut table = SystemTable::new();
+        table.register_system("imu", move |_| {
+            let _ = &capture;
+            Ok((crate::tests::utils::ImuSource, 0))
+        });
+        table
+    }
+    std::thread::spawn(|| {
+        let mut buffer = [0; 4096];
+        for _ in 0..3 {
+            assert_eq!(descriptor(captured, &mut buffer).0, DefStatus::Ok as u32);
+        }
+        assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+    })
+    .join()
+    .expect("worker");
+    assert_eq!(DROPS.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn an_unknown_type_returns_a_decode_error() {
     let instance = create_raw("gyro", "", &[], &[]);
     assert!(instance.handle.is_null());
-    assert!(instance.error().is_empty());
+    let error: ParamError = serde_json::from_slice(instance.error()).expect("error");
+    assert!(matches!(error, ParamError::Decode(_)));
 }
 
 #[test]
@@ -145,6 +222,7 @@ fn a_panicking_system_returns_panicked_and_writes_one_fault_line() {
         .expect("supported alignment");
     assert_eq!(boom.step(1), Status::Ok);
     assert_eq!(boom.step(2), Status::Panicked);
+    assert_eq!(boom.step(3), Status::Panicked);
 
     let seen: Vec<LogEvent> = lines.drain().map(|r| r.expect("decodes")).collect();
     assert_eq!(seen.len(), 1);
@@ -175,20 +253,15 @@ fn an_unknown_status_word_is_a_panic() {
 }
 
 #[test]
-fn the_abi_version_is_one() {
-    assert_eq!(ABI_VERSION, 1);
+fn the_abi_version_is_two() {
+    assert_eq!(ABI_VERSION, 2);
 }
 
 /// The `metor-fsw-abi` distribution exists to pin this number; a pack's
 /// editable wheel requires it exactly.
 #[test]
 fn the_abi_distributions_version_is_the_abi_version() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/python/metor-fsw-abi/pyproject.toml"
-    );
-    let manifest: toml::Value = std::fs::read_to_string(path)
-        .expect("the distribution is in the tree")
+    let manifest: toml::Value = include_str!("../../python/metor-fsw-abi/pyproject.toml")
         .parse()
         .expect("valid TOML");
     let version = manifest["project"]["version"]

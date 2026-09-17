@@ -2,6 +2,8 @@
 
 use std::cell::UnsafeCell;
 
+use crate::owner::{Lease, RawOwner};
+
 /// A 16-byte aligned, interior-mutable storage unit.
 #[repr(C, align(16))]
 pub(super) struct Word(pub(super) UnsafeCell<[u64; 2]>);
@@ -23,6 +25,9 @@ enum BackingOwner {
         _map: memmap2::MmapMut,
     },
     Raw,
+    Owned {
+        _lease: Lease,
+    },
 }
 
 impl Backing {
@@ -52,6 +57,18 @@ impl Backing {
             base,
             len,
             _owner: BackingOwner::Raw,
+        }
+    }
+
+    /// # Safety
+    /// The owner satisfies `RawOwner`'s contract and retains this entire region.
+    pub(super) unsafe fn owned(base: *mut u8, len: usize, owner: RawOwner) -> Self {
+        // SAFETY: the caller guarantees a live, thread-safe owner.
+        let lease = unsafe { Lease::acquire(owner) };
+        Self {
+            base,
+            len,
+            _owner: BackingOwner::Owned { _lease: lease },
         }
     }
 

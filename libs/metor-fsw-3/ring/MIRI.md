@@ -30,6 +30,9 @@ padding publication without an executor.
 
 Heap storage is 16-byte aligned, including on 32-bit targets. Miri checks the
 raw allocation ownership and pointer accesses on the paths each test executes.
+The ownership callback tests cover exports, independently attached handles,
+validation failure, and final release from another thread within one executable.
+They do not exercise dynamic loading across an ABI.
 Runs with additional seeds sample more schedules; they do not prove the absence
 of races in every execution.
 

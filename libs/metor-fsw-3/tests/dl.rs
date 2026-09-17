@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use metor_fsw_3::cli::build::cargo_build;
 use metor_fsw_3::coordinator::{
@@ -60,6 +60,33 @@ fn open() -> Pack {
     unsafe { Pack::open(fixture()) }.expect("the fixture opens")
 }
 
+#[test]
+fn a_pack_builder_panic_returns_an_error_without_aborting() {
+    const CHILD: &str = "METOR_TEST_PACK_BUILDER_PANIC";
+    if std::env::var_os(CHILD).is_some() {
+        // SAFETY: the fixture uses this workspace's ABI, including panic containment.
+        assert!(matches!(
+            unsafe { Pack::open(fixture()) },
+            Err(PackError::DescriptorStatus(3))
+        ));
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_pack_builder_panic_returns_an_error_without_aborting",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// `source -> <pack>.<ty> -> sink`, with the pack system's params.
 fn pipeline(ty: &str, params: serde_json::Value) -> (CoordinatorConfig, Rc<RefCell<Vec<u32>>>) {
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -108,15 +135,18 @@ fn built(ty: &str, params: serde_json::Value) -> (Coordinator, Rc<RefCell<Vec<u3
 #[test]
 fn a_pack_reports_its_systems_with_their_ports_and_schemas() {
     let pack = open();
-    let types: Vec<_> = pack.systems().map(|s| s.ty).collect();
-    assert_eq!(types, vec!["echo", "boom", "gain"]);
+    let types: Vec<_> = pack.systems().map(|s| s.ty.as_str()).collect();
+    assert_eq!(
+        types,
+        vec!["echo", "boom", "gain", "fail_input", "retained"]
+    );
 
     let echo = pack.systems().next().expect("one system");
     assert_eq!(echo.def.inputs[0].name, "input");
     assert_eq!(echo.def.inputs[0].record, Ping::NAME);
     assert_eq!(echo.def.inputs[0].id, Ping::ID);
     // The `log` output every fn system declares comes last.
-    let outputs: Vec<_> = echo.def.outputs.iter().map(|p| p.name).collect();
+    let outputs: Vec<_> = echo.def.outputs.iter().map(|p| p.name.as_ref()).collect();
     assert_eq!(outputs, vec!["output", "log"]);
     assert_eq!(echo.doc, "Copies the newest ping.");
 
@@ -205,11 +235,48 @@ fn a_panicking_pack_system_latches_and_the_cycle_goes_on() {
 }
 
 #[test]
-fn the_library_unloads_after_the_last_instance() {
+fn the_library_remains_resident_after_the_last_instance() {
     let (coordinator, _seen, pack) = built("echo", serde_json::Value::Null);
-    let weak = Rc::downgrade(pack.library());
+    let weak = Arc::downgrade(pack.library());
     drop(pack);
     assert!(weak.upgrade().is_some(), "an instance still holds it");
     drop(coordinator);
-    assert!(weak.upgrade().is_none(), "the last instance freed it");
+    assert!(weak.upgrade().is_some(), "guest code remains resident");
+    let reopened = open();
+    assert!(weak.ptr_eq(&Arc::downgrade(reopened.library())));
+}
+
+#[test]
+fn a_failed_pack_consumer_does_not_block_a_healthy_consumer() {
+    let pack = open();
+    let (mut config, seen) = pipeline("fail_input", serde_json::Value::Null);
+    config.ring_depth = 2;
+    config.systems[2].inputs[0].from = vec![PortRef::new("source", "output")];
+    let mut coordinator = config.build(&table(&pack, &seen)).expect("builds");
+
+    for cycle in 1..=32 {
+        coordinator.step(Timestamp(cycle));
+    }
+    assert_eq!(*seen.borrow(), (1..=32).collect::<Vec<_>>());
+    assert_eq!(coordinator.latched().collect::<Vec<_>>(), vec!["middle"]);
+}
+
+#[test]
+fn guest_ports_remain_usable_after_the_coordinator_and_pack_drop() {
+    let (mut coordinator, _, pack) = built("retained", serde_json::Value::Null);
+    // SAFETY: the fixture exports this exact function and its code stays resident.
+    let release = unsafe {
+        *pack
+            .library()
+            .get::<unsafe extern "C" fn() -> u32>(b"echo_pack_release_retained")
+            .expect("fixture export")
+    };
+    coordinator.step(Timestamp(1));
+    drop(coordinator);
+    drop(pack);
+
+    // SAFETY: called on the thread that bound the retained fixture ports.
+    assert_eq!(unsafe { release() }, 1);
+    // SAFETY: a repeated call checks that both TLS handles were released.
+    assert_eq!(unsafe { release() }, 0);
 }

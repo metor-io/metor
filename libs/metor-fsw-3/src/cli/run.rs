@@ -115,12 +115,16 @@ pub fn dev_packs(target_dir: &Path) -> Vec<PathBuf> {
     else {
         return Vec::new();
     };
-    sources
+    let mut packs: Vec<_> = sources
         .values()
         .filter_map(|source| string(source, &["path"]))
         .map(|path| target_dir.join(path))
         .filter(|root| is_dev_pack(root))
-        .collect()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
+    packs.sort();
+    packs.dedup();
+    packs
 }
 
 fn is_dev_pack(root: &Path) -> bool {

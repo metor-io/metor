@@ -54,10 +54,23 @@ impl RawSlice {
 
 /// One ring's region, as [`RingBuffer::region`](metor_fsw_3_ring::RingBuffer::region) reports it.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct RawRing {
     pub base: *mut u8,
     pub len: usize,
+    pub owner: metor_fsw_3_ring::RawOwner,
+}
+
+impl RawRing {
+    /// Borrows an export that must remain alive until the receiver attaches.
+    pub fn of(export: &metor_fsw_3_ring::RingExport) -> Self {
+        let (base, len) = export.region();
+        Self {
+            base,
+            len,
+            owner: export.owner(),
+        }
+    }
 }
 
 /// One input port: its producers' rings, in edge order.
@@ -95,13 +108,10 @@ mod tests {
         // SAFETY: `bytes` outlives the borrow.
         assert_eq!(unsafe { raw.as_bytes() }, b"metor");
 
-        let rings = [RawRing {
-            base: core::ptr::null_mut(),
-            len: 7,
-        }];
-        let raw = RawSlice::of(&rings);
-        // SAFETY: `rings` outlives the borrow.
-        assert_eq!(unsafe { raw.as_slice::<RawRing>() }[0].len, 7);
+        let numbers = [7u64];
+        let raw = RawSlice::of(&numbers);
+        // SAFETY: `numbers` outlives the borrow.
+        assert_eq!(unsafe { raw.as_slice::<u64>() }, &numbers);
     }
 
     #[test]

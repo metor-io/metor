@@ -149,30 +149,40 @@ thread_local! {
     static SLOT: Cell<Option<NonNull<LogPort>>> = const { Cell::new(None) };
 }
 
-/// Points this thread at `port` until the guard drops, stamping its lines `now`.
-pub fn enter(port: &mut LogPort, now: Timestamp) -> Guard {
+/// Routes this thread's logs to `port` during `f`, stamping its lines `now`.
+///
+/// ```compile_fail
+/// use metor_fsw_3::log::{LogPort, with_log_port};
+/// use metor_proto::types::Timestamp;
+///
+/// fn cannot_drop_port(mut port: LogPort) {
+///     with_log_port(&mut port, Timestamp(0), || drop(port));
+/// }
+/// ```
+pub fn with_log_port<R>(port: &mut LogPort, now: Timestamp, f: impl FnOnce() -> R) -> R {
     port.now = now;
-    SLOT.set(Some(NonNull::from(port)));
-    Guard(())
+    let _restore = RestoreSlot(SLOT.replace(Some(NonNull::from(port))));
+    let result = f();
+    with_port(LogPort::report_dropped);
+    result
 }
 
-/// A `Guard` reports the lines the ring refused and clears this thread's port.
-pub struct Guard(());
+struct RestoreSlot(Option<NonNull<LogPort>>);
 
-impl Drop for Guard {
+impl Drop for RestoreSlot {
     fn drop(&mut self) {
-        with_port(LogPort::report_dropped);
-        SLOT.set(None);
+        SLOT.set(self.0);
     }
 }
 
 fn with_port(f: impl FnOnce(&mut LogPort)) {
-    let Some(mut port) = SLOT.get() else {
+    let Some(mut port) = SLOT.take() else {
         return;
     };
-    // SAFETY: the pointer is the `&mut LogPort` `enter` borrowed, the slot is
-    // thread-local, and the guard clears it before that borrow ends, so this is
-    // the only reference to the port. A write never re-enters `with_port`.
+    let _restore = RestoreSlot(Some(port));
+    // SAFETY: with_log_port borrows the port until its private guard restores
+    // the previous slot, including on unwind. Removing this thread-local
+    // pointer for the entire callback prevents recursive mutable access.
     f(unsafe { port.as_mut() });
 }
 
@@ -186,21 +196,22 @@ pub struct LogLayer;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let meta = event.metadata();
-        let mut visitor = Fields::default();
-        event.record(&mut visitor);
-        let event = LogEvent {
-            timestamp: Timestamp(0),
-            level: level_of(meta.level()),
-            source: Cow::Borrowed(meta.target()),
-            target: Cow::Borrowed(meta.target()),
-            message: visitor.message,
-            span: None,
-            fields: visitor.fields,
-            file: meta.file().map(Cow::Borrowed),
-            line: meta.line(),
-        };
-        with_port(|port| port.emit(event));
+        with_port(|port| {
+            let meta = event.metadata();
+            let mut visitor = Fields::default();
+            event.record(&mut visitor);
+            port.emit(LogEvent {
+                timestamp: Timestamp(0),
+                level: level_of(meta.level()),
+                source: Cow::Borrowed(meta.target()),
+                target: Cow::Borrowed(meta.target()),
+                message: visitor.message,
+                span: None,
+                fields: visitor.fields,
+                file: meta.file().map(Cow::Borrowed),
+                line: meta.line(),
+            });
+        });
     }
 }
 
@@ -269,12 +280,11 @@ mod tests {
     fn direct_lines_carry_the_stamp_level_and_kind() {
         let (_ring, mut port, mut input) = log_pair(8);
         let mut log = Log;
-        {
-            let _guard = enter(&mut port, Timestamp(5));
+        with_log_port(&mut port, Timestamp(5), || {
             log.info("hello");
             log.warn("careful");
             log.fault("sensor_stale", "no gps");
-        }
+        });
         let seen = lines(&mut input);
         assert_eq!(seen.len(), 3);
         assert!(seen.iter().all(|l| l.timestamp == Timestamp(5)));
@@ -291,12 +301,11 @@ mod tests {
     fn traced_events_land_with_their_fields_and_location() {
         let (_ring, mut port, mut input) = log_pair(8);
         let subscriber = tracing_subscriber::registry().with(layer());
-        {
-            let _guard = enter(&mut port, Timestamp(9));
+        with_log_port(&mut port, Timestamp(9), || {
             tracing::subscriber::with_default(subscriber, || {
                 tracing::warn!(slot = "nav", attempts = 3, "occupant failed");
             });
-        }
+        });
         let seen = lines(&mut input);
         assert_eq!(seen.len(), 1);
         let ev = &seen[0];
@@ -317,8 +326,137 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("between systems");
         });
-        drop(enter(&mut port, Timestamp(0)));
+        with_log_port(&mut port, Timestamp(0), || {});
         assert!(lines(&mut input).is_empty());
+    }
+
+    #[test]
+    fn nested_scopes_restore_the_outer_port() {
+        let (_outer_ring, mut outer, mut outer_input) = log_pair(8);
+        let (_inner_ring, mut inner, mut inner_input) = log_pair(8);
+        let result = with_log_port(&mut outer, Timestamp(1), || {
+            Log.info("before");
+            with_log_port(&mut inner, Timestamp(2), || Log.info("inner"));
+            Log.info("after");
+            42
+        });
+        Log.info("outside");
+        assert_eq!(result, 42);
+        let outer = lines(&mut outer_input);
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer[0].message, "before");
+        assert_eq!(outer[1].message, "after");
+        assert!(outer.iter().all(|line| line.timestamp == Timestamp(1)));
+        let inner = lines(&mut inner_input);
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].message, "inner");
+        assert_eq!(inner[0].timestamp, Timestamp(2));
+    }
+
+    #[test]
+    fn callback_panic_restores_the_previous_slot() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let (_outer_ring, mut outer, mut outer_input) = log_pair(8);
+        let (_inner_ring, mut inner, mut inner_input) = log_pair(8);
+        with_log_port(&mut outer, Timestamp(1), || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                with_log_port(&mut inner, Timestamp(2), || {
+                    Log.info("inner");
+                    // PANIC Safety: caught to verify scope cleanup.
+                    panic!("callback failed");
+                });
+            }));
+            assert!(result.is_err());
+            drop(inner);
+            Log.info("outer");
+        });
+        drop(outer);
+        Log.info("outside");
+        assert!(SLOT.get().is_none());
+        assert_eq!(lines(&mut inner_input).len(), 1);
+        let outer = lines(&mut outer_input);
+        assert_eq!(outer.len(), 1);
+        assert_eq!(outer[0].message, "outer");
+    }
+
+    #[test]
+    fn scopes_are_independent_between_threads() {
+        let (_ring, mut port, mut input) = log_pair(8);
+        with_log_port(&mut port, Timestamp(1), || {
+            let worker = std::thread::spawn(|| {
+                assert!(SLOT.get().is_none());
+                let (_ring, mut port, mut input) = log_pair(8);
+                with_log_port(&mut port, Timestamp(2), || Log.info("worker"));
+                lines(&mut input)
+            });
+            Log.info("main");
+            let worker = worker.join().expect("worker completed");
+            assert_eq!(worker.len(), 1);
+            assert_eq!(worker[0].timestamp, Timestamp(2));
+            assert_eq!(worker[0].message, "worker");
+            Log.info("main after worker");
+        });
+        let main = lines(&mut input);
+        assert_eq!(main.len(), 2);
+        assert!(main.iter().all(|line| line.timestamp == Timestamp(1)));
+    }
+
+    #[test]
+    fn formatting_cannot_reenter_the_active_port() {
+        struct Recursive;
+
+        impl core::fmt::Debug for Recursive {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                Log.info("recursive direct log");
+                tracing::info!("recursive tracing event");
+                f.write_str("formatted")
+            }
+        }
+
+        let (_ring, mut port, mut input) = log_pair(8);
+        let subscriber = tracing_subscriber::registry().with(layer());
+        with_log_port(&mut port, Timestamp(3), || {
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(value = ?Recursive, "outer");
+            });
+            Log.info("after formatting");
+        });
+        let seen = lines(&mut input);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].message, "outer");
+        assert_eq!(seen[0].fields, vec![("value".into(), "formatted".into())]);
+        assert_eq!(seen[1].message, "after formatting");
+    }
+
+    #[test]
+    fn formatting_panic_restores_the_active_port() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        struct Panics;
+
+        impl core::fmt::Debug for Panics {
+            fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                // PANIC Safety: caught to verify the temporarily removed slot.
+                panic!("formatting failed");
+            }
+        }
+
+        let (_ring, mut port, mut input) = log_pair(8);
+        let subscriber = tracing_subscriber::registry().with(layer());
+        with_log_port(&mut port, Timestamp(4), || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                tracing::subscriber::with_default(subscriber, || {
+                    tracing::info!(value = ?Panics);
+                });
+            }));
+            assert!(result.is_err());
+            Log.info("after panic");
+        });
+        let seen = lines(&mut input);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].message, "after panic");
+        assert_eq!(seen[0].timestamp, Timestamp(4));
     }
 
     /// The count survives a ring with no room for the warning and lands once
@@ -330,25 +468,24 @@ mod tests {
         let records = ring_capacity(LogEvent::MAX_LEN, 4).expect("valid")
             / frame_len(encoded_len(&padded, Timestamp(1)));
         let mut log = Log;
-        {
-            let _guard = enter(&mut port, Timestamp(1));
+        with_log_port(&mut port, Timestamp(1), || {
             for _ in 0..records + 3 {
                 log.info(padded.clone());
             }
-        }
+        });
         let seen = lines(&mut input);
         assert_eq!(seen.len(), records);
         assert!(seen.iter().all(|l| l.level == LogLevel::Info));
 
         // The reader releases what it drained on its next call, freeing the ring.
         assert!(lines(&mut input).is_empty());
-        drop(enter(&mut port, Timestamp(2)));
+        with_log_port(&mut port, Timestamp(2), || {});
         let seen = lines(&mut input);
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].level, LogLevel::Warn);
         assert_eq!(seen[0].fields, vec![("dropped".into(), "3".into())]);
 
-        drop(enter(&mut port, Timestamp(3)));
+        with_log_port(&mut port, Timestamp(3), || {});
         assert!(lines(&mut input).is_empty());
     }
 

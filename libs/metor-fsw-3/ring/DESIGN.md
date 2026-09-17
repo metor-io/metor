@@ -72,6 +72,14 @@ Heap storage retains its allocation as a raw owning pointer until final drop.
 All region pointers derive from that allocation; raw-backed regions instead
 rely on the caller to keep the storage live for every handle and borrow.
 
+An exported ring retains its local `Arc<Inner>`. Its `RawOwner` descriptor carries
+an opaque pointer and C retain/release callbacks; only the originating library
+interprets the pointer. `attach_owned` acquires a reference before reading the
+header and releases it on validation failure or when its last derived handle
+drops. Callback code must remain loaded through that final release. These leases
+are process-local and do not change the shared-memory layout or reclaim live
+reader claims. Exporting caller-owned raw storage does not extend its lifetime.
+
 ## Verification limits
 
 [Miri](MIRI.md) checks executed memory accesses, [Kani](KANI.md) checks bounded

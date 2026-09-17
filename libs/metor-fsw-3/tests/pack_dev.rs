@@ -7,7 +7,7 @@ use std::process::Command;
 use metor_fsw_3::cli::build::{PackConfig, cargo_build, cdylib_name, triple};
 use metor_fsw_3::cli::config::PackRef;
 use metor_fsw_3::cli::module::render;
-use metor_fsw_3::cli::pack_dev::pack_dev;
+use metor_fsw_3::cli::pack_dev::{PackDevError, pack_dev};
 use metor_fsw_3::{ABI_VERSION, Pack};
 
 fn root() -> PathBuf {
@@ -60,8 +60,9 @@ fn the_golden_module_type_checks() {
         .expect("pyright runs");
     assert!(
         output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -88,7 +89,7 @@ fn pack_dev_lays_out_the_module_and_replaces_the_dylib() {
         ("echo-pack", "echo_pack")
     );
 
-    pack_dev(&root).expect("lays out");
+    run_pack_dev(&root);
     let module = root.join(".metor").join(&config.module);
     let dylib = module
         .join("_libs")
@@ -107,7 +108,7 @@ fn pack_dev_lays_out_the_module_and_replaces_the_dylib() {
     );
     let inode = dylib.metadata().expect("stats").ino();
 
-    pack_dev(&root).expect("lays out again");
+    run_pack_dev(&root);
     assert_ne!(
         dylib.metadata().expect("stats").ino(),
         inode,
@@ -119,4 +120,54 @@ fn pack_dev_lays_out_the_module_and_replaces_the_dylib() {
         .map(|entry| entry.expect("an entry").file_name())
         .collect();
     assert_eq!(left.len(), 1, "{left:?}");
+}
+
+fn run_pack_dev(root: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_metor"))
+        .args(["pack", "dev"])
+        .current_dir(root)
+        .output()
+        .expect("metor runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn pack_dev_rejects_a_loaded_destination_without_changing_files() {
+    let built = cargo_build("echo-pack", &root(), false).expect("fixture builds");
+    let temp = tempfile::tempdir().expect("temporary staging root");
+    for name in ["pyproject.toml", "Cargo.toml"] {
+        std::fs::copy(root().join(name), temp.path().join(name)).expect("copy config");
+    }
+    let config = PackConfig::read(temp.path()).expect("read copied config");
+    let module = temp.path().join(".metor").join(&config.module);
+    let libs = module.join("_libs").join(triple());
+    std::fs::create_dir_all(&libs).expect("create staging directory");
+    let dylib = libs.join(cdylib_name(&config.lib));
+    std::fs::copy(built, &dylib).expect("stage fixture");
+    let init = module.join("__init__.py");
+    std::fs::write(&init, "existing module\n").expect("write sentinel module");
+    let before = dylib.metadata().expect("library metadata");
+    // SAFETY: this is a copy of the fixture built against this workspace's ABI.
+    drop(unsafe { Pack::open(&dylib) }.expect("load staged fixture"));
+
+    assert!(matches!(
+        pack_dev(temp.path()),
+        Err(PackDevError::AlreadyLoaded(path)) if path == dylib
+    ));
+    let after = dylib.metadata().expect("library remains present");
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.len(), before.len());
+    assert_eq!(
+        after.modified().expect("mtime"),
+        before.modified().expect("mtime")
+    );
+    assert_eq!(
+        std::fs::read_to_string(init).expect("module remains"),
+        "existing module\n"
+    );
+    assert!(!module.join("py.typed").exists());
 }

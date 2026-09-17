@@ -3,13 +3,14 @@
 use metor_fsw_3_ring::{NoWake, View, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// A `PortDef` names one port of a bundle and the record its ring carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortDef {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     /// The record's [`NAME`](crate::Record::NAME), the type a config spells.
-    pub record: &'static str,
+    pub record: Cow<'static, str>,
     pub id: ComponentId,
     pub max_len: usize,
     pub alignment: usize,
@@ -19,7 +20,7 @@ pub struct PortDef {
 /// A system's ports, in bind order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemDef {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
 }
@@ -27,7 +28,7 @@ pub struct SystemDef {
 impl SystemDef {
     pub fn new<I: SystemInputs, O: SystemOutputs>(name: &'static str) -> Self {
         Self {
-            name,
+            name: name.into(),
             inputs: I::defs(),
             outputs: O::defs(),
         }
@@ -50,7 +51,7 @@ pub trait System {
         outputs: &mut Self::Outputs,
     );
 
-    /// Called once after `execute` panicked, before the system is latched off.
+    /// Called once after `execute` panicked, before the runner is destroyed.
     fn fault(&self, _now: Timestamp, _outputs: &mut Self::Outputs, _message: &str) {}
 }
 
@@ -141,8 +142,8 @@ mod tests {
         assert_eq!(
             DerivedOut::defs(),
             vec![PortDef {
-                name: "nav",
-                record: Nav::NAME,
+                name: "nav".into(),
+                record: Nav::NAME.into(),
                 id: Nav::ID,
                 max_len: size_of::<Nav>(),
                 alignment: align_of::<Nav>(),

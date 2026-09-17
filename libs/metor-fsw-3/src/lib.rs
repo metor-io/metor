@@ -7,6 +7,7 @@ pub mod fn_system;
 pub mod frame;
 pub mod log;
 pub mod pack;
+mod panic;
 pub mod port;
 pub mod record;
 pub mod system;

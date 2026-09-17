@@ -3,14 +3,14 @@
 
 from __future__ import annotations
 
-{% if dataclasses %}from dataclasses import dataclass
+{% if dataclasses %}from dataclasses import dataclass, field
 {% endif %}from pathlib import Path
 
 from metor_config import OutPort, Pack, Record, Sources, System
 
 PACK = Pack(
-    id="{{ pack_id }}",
-    lib="{{ lib }}",
+    id={{ pack_id | python_string }},
+    lib={{ lib | python_string }},
     libs=str(Path(__file__).resolve().parent / "_libs"),
     abi_version={{ abi_version }},
 )
@@ -20,9 +20,9 @@ class {{ record }}(Record): ...
 {% endfor %}
 {%- for class in dataclasses %}
 
-@dataclass
+@dataclass(kw_only=True)
 class {{ class.name }}:
-{% if class.doc %}    """{{ class.doc }}"""
+{% if class.doc %}    {{ class.doc | python_string }}
 {% endif %}
 {%- if not class.fields %}    pass
 {% endif %}
@@ -32,20 +32,20 @@ class {{ class.name }}:
 {%- for system in systems %}
 
 class {{ system.name }}(System):
-{% if system.doc %}    """{{ system.doc }}"""
+{% if system.doc %}    {{ system.doc | python_string }}
 
 {% endif %}    _pack = PACK
-    _ty = "{{ system.ty }}"
-    _outputs = ({% for name in system.outputs %}"{{ name }}"{% if not loop.last %}, {% endif %}{% endfor %}{% if system.outputs|length == 1 %},{% endif %})
+    _ty = {{ system.ty | python_string }}
+    _outputs = ({% for name in system.outputs %}{{ name | python_string }}{% if not loop.last %}, {% endif %}{% endfor %}{% if system.outputs|length == 1 %},{% endif %})
 
     def __init__(self
         {%- if system.inputs or system.params %}, *{% endif %}
         {%- for port in system.inputs %}, {{ port.name }}: Sources[{{ port.record }}] = (){% endfor %}
         {%- for field in system.params %}, {{ field.name }}: {{ field.annotation }}{{ field.default }}{% endfor %}) -> None:
         super().__init__({
-            {%- for port in system.inputs %}"{{ port.name }}": {{ port.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
+            {%- for port in system.inputs %}{{ port.name | python_string }}: {{ port.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
         }, {
-            {%- for field in system.params %}"{{ field.name }}": {{ field.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
+            {%- for field in system.params %}{{ field.name | python_string }}: {{ field.name }}{% if not loop.last %}, {% endif %}{% endfor -%}
         })
 
 {% for port in system.ports %}    {{ port.name }}: OutPort[{{ port.record }}]

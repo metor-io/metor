@@ -11,7 +11,7 @@ PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=1,
+    abi_version=2,
 )
 
 
@@ -25,7 +25,7 @@ class SystemStatus(Record): ...
 
 
 class Echo(System):
-    """Copies the newest ping."""
+    "Copies the newest ping."
 
     _pack = PACK
     _ty = "echo"
@@ -40,7 +40,7 @@ class Echo(System):
 
 
 class Boom(System):
-    """Fails on its second cycle."""
+    "Fails on its second cycle."
 
     _pack = PACK
     _ty = "boom"
@@ -55,7 +55,7 @@ class Boom(System):
 
 
 class Gain(System):
-    """Scales the newest ping."""
+    "Scales the newest ping."
 
     _pack = PACK
     _ty = "gain"
@@ -63,6 +63,31 @@ class Gain(System):
 
     def __init__(self, *, input: Sources[Ping] = (), gain: float) -> None:
         super().__init__({"input": input}, {"gain": gain})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class FailInput(System):
+    _pack = PACK
+    _ty = "fail_input"
+    _outputs = ()
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
+
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Retained(System):
+    _pack = PACK
+    _ty = "retained"
+    _outputs = ("output",)
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]

@@ -4,7 +4,6 @@ pub mod raw;
 use core::cell::OnceCell;
 use core::ffi::c_void;
 use std::cell::RefCell;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
@@ -15,7 +14,7 @@ use def::PackDef;
 use raw::{RawPort, RawRing, RawSlice};
 
 /// The ABI the exports in this module are built against.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// What [`execute`] returns: an unknown word is a panic.
 #[repr(u32)]
@@ -35,38 +34,66 @@ impl Status {
     }
 }
 
-/// A pack's table and the descriptor bytes projected from it.
-struct Exported {
-    table: SystemTable,
-    def: Vec<u8>,
+/// Descriptor export status words.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefStatus {
+    Ok = 0,
+    TooSmall = 1,
+    Encode = 2,
+    Panicked = 3,
 }
 
 thread_local! {
-    /// The table this thread built. A `Step` is `!Send`, so a host that drives
-    /// a pack from two threads gets two tables, one per thread.
-    static EXPORTED: OnceCell<&'static Exported> = const { OnceCell::new() };
-
-    /// The error `create` last wrote, alive until the next `create` here.
+    static TABLE: OnceCell<SystemTable> = const { OnceCell::new() };
     static ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Builds the table on first use and installs this library's log layer.
-fn exported(build: fn() -> SystemTable) -> &'static Exported {
-    EXPORTED.with(|cell| {
-        *cell.get_or_init(|| {
+fn with_table<R>(build: fn() -> SystemTable, f: impl FnOnce(&SystemTable) -> R) -> R {
+    TABLE.with(|cell| {
+        f(cell.get_or_init(|| {
             let subscriber = tracing_subscriber::registry().with(crate::log::layer());
-            // A second install returns the layer already in place.
             let _ = tracing::subscriber::set_global_default(subscriber);
-            let table = build();
-            let def = PackDef::from_table(&table);
-            Box::leak(Box::new(Exported { table, def }))
-        })
+            build()
+        }))
     })
 }
 
-/// The descriptor, owned by the pack for the life of the library.
-pub fn def(build: fn() -> SystemTable) -> RawSlice {
-    RawSlice::of(&exported(build).def)
+/// Writes the descriptor into caller-owned storage. Failures leave `written` zero.
+///
+/// # Safety
+/// `dst` points to `capacity` writable bytes (or is null when capacity is zero).
+/// `written` is writable and does not overlap `dst`. Neither pointer is retained.
+pub unsafe fn def(
+    build: fn() -> SystemTable,
+    dst: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> u32 {
+    // SAFETY: the caller supplies a writable result pointer.
+    unsafe { written.write(0) };
+    crate::panic::catch(|| {
+        let buffer = if capacity == 0 {
+            &mut []
+        } else {
+            // SAFETY: the caller supplies this writable, nonoverlapping region.
+            unsafe { core::slice::from_raw_parts_mut(dst, capacity) }
+        };
+        let mut out = std::io::Cursor::new(buffer);
+        let result = with_table(build, |table| {
+            serde_json::to_writer(&mut out, &PackDef::from_table(table))
+        });
+        match result {
+            Ok(()) => {
+                // SAFETY: the cursor wrote at most `capacity` bytes.
+                unsafe { written.write(out.position() as usize) };
+                DefStatus::Ok
+            }
+            Err(error) if error.is_io() => DefStatus::TooSmall,
+            Err(_) => DefStatus::Encode,
+        }
+    })
+    .unwrap_or(DefStatus::Panicked) as u32
 }
 
 /// Builds one system instance and binds it to the rings it was handed.
@@ -76,8 +103,9 @@ pub fn def(build: fn() -> SystemTable) -> RawSlice {
 ///
 /// # Safety
 /// `ty`, `params`, `inputs` (over [`RawPort`]) and `outputs` (over [`RawRing`])
-/// each meet [`RawSlice::as_slice`]'s contract, every named ring region
-/// outlives the returned instance, and `error` is writable.
+/// each meet [`RawSlice::as_slice`]'s contract and every ring has live, valid
+/// ownership callbacks covering its region. `error` is writable and does not
+/// alias the input arrays. Calls on this thread must not reenter `create`.
 pub unsafe fn create(
     build: fn() -> SystemTable,
     ty: RawSlice,
@@ -86,20 +114,20 @@ pub unsafe fn create(
     outputs: RawSlice,
     error: *mut RawSlice,
 ) -> *mut c_void {
-    // SAFETY: the caller's contract carries into the closure unchanged.
-    let made = catch_unwind(AssertUnwindSafe(|| unsafe {
-        make(build, ty, params, inputs, outputs)
-    }));
-    let failed = |slice| {
-        // SAFETY: the caller's contract says `error` is writable.
-        unsafe { error.write(slice) };
-        core::ptr::null_mut()
-    };
-    match made {
-        Ok(Ok(step)) => Box::into_raw(Box::new(step)).cast(),
-        Ok(Err(source)) => failed(store_error(&source)),
-        Err(_) => failed(RawSlice::EMPTY),
-    }
+    // SAFETY: the caller supplies a writable result pointer.
+    unsafe { error.write(RawSlice::EMPTY) };
+    crate::panic::catch(|| {
+        // SAFETY: the caller's arrays and ownership callbacks remain valid here.
+        match unsafe { make(build, ty, params, inputs, outputs) } {
+            Ok(step) => Box::into_raw(Box::new(Some(step))).cast(),
+            Err(source) => {
+                // SAFETY: `error` remains writable for this call.
+                unsafe { error.write(store_error(&source)) };
+                core::ptr::null_mut()
+            }
+        }
+    })
+    .unwrap_or(core::ptr::null_mut())
 }
 
 /// Looks `ty` up, attaches every ring, and binds the entry to them.
@@ -113,12 +141,9 @@ unsafe fn make(
     inputs: RawSlice,
     outputs: RawSlice,
 ) -> Result<Box<dyn Step>, ParamError> {
-    let exported = exported(build);
     // SAFETY: the caller's contract.
     let (ty, params) = unsafe { (ty.as_bytes(), params.as_bytes()) };
-    // PANIC Safety: the host only names a type the descriptor listed.
-    let ty = core::str::from_utf8(ty).expect("a utf-8 type name");
-    let entry = exported.table.get(ty).expect("a type the descriptor named");
+    let ty = core::str::from_utf8(ty).map_err(|e| ParamError::Decode(e.to_string()))?;
 
     let value = decode_params(params)?;
     // SAFETY: the caller's contract.
@@ -127,13 +152,17 @@ unsafe fn make(
         .iter()
         // SAFETY: the caller's contract.
         .map(|port| unsafe { port.rings() }.iter().map(attach).collect())
-        .collect();
-    let outs: Vec<RingBuffer> = out_rings.iter().map(attach).collect();
+        .collect::<Result<_, _>>()?;
+    let outs: Vec<RingBuffer> = out_rings.iter().map(attach).collect::<Result<_, _>>()?;
 
     let views = ins.iter().map(|rings| rings.iter().collect()).collect();
     let writers = outs.iter().collect();
-    // The views and writers `make` claimed hold the region; these handles do not.
-    (entry.make)(Params(&value), views, writers)
+    with_table(build, |table| {
+        let entry = table
+            .get(ty)
+            .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
+        (entry.make)(Params(&value), views, writers)
+    })
 }
 
 /// Reads the params JSON, taking no bytes as no params.
@@ -145,11 +174,10 @@ fn decode_params(bytes: &[u8]) -> Result<serde_json::Value, ParamError> {
 }
 
 /// Attaches to one ring region the host allocated.
-fn attach(ring: &RawRing) -> RingBuffer {
-    // PANIC Safety: the host hands over regions it formatted itself; a bad one
-    // is caught by the export's `catch_unwind`.
-    // SAFETY: `create`'s contract says the region outlives the instance.
-    unsafe { RingBuffer::attach_raw(ring.base, ring.len) }.expect("a live ring region")
+fn attach(ring: &RawRing) -> Result<RingBuffer, ParamError> {
+    // SAFETY: `create` requires live, thread-safe ownership callbacks.
+    unsafe { RingBuffer::attach_owned(ring.base, ring.len, ring.owner) }
+        .map_err(|e| ParamError::Decode(e.to_string()))
 }
 
 /// Serializes `source` into this thread's error buffer.
@@ -167,19 +195,16 @@ fn store_error(source: &ParamError) -> RawSlice {
 /// # Safety
 /// `instance` came from [`create`] on this thread and has not been destroyed.
 pub unsafe fn execute(instance: *mut c_void, now: i64) -> u32 {
-    let now = Timestamp(now);
-    let ran = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: the caller's contract; the instance is a `Box<dyn Step>`.
-        let step = unsafe { &mut *instance.cast::<Box<dyn Step>>() };
-        match catch_step(step.as_mut(), now) {
-            Ok(()) => Status::Ok,
-            Err(message) => {
-                step.fault(now, &message);
-                Status::Panicked
-            }
+    crate::panic::catch(|| {
+        // SAFETY: `create` allocated this slot, and it is still live on this thread.
+        let slot = unsafe { &mut *instance.cast::<Option<Box<dyn Step>>>() };
+        if catch_step(slot, Timestamp(now)) {
+            Status::Ok
+        } else {
+            Status::Panicked
         }
-    }));
-    ran.unwrap_or(Status::Panicked) as u32
+    })
+    .unwrap_or(Status::Panicked) as u32
 }
 
 /// Drops one instance, freeing the reader slots and writer it claimed.
@@ -187,10 +212,10 @@ pub unsafe fn execute(instance: *mut c_void, now: i64) -> u32 {
 /// # Safety
 /// `instance` came from [`create`] on this thread and is destroyed once.
 pub unsafe fn destroy(instance: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    crate::panic::catch(|| {
         // SAFETY: the caller's contract; the box was made by `create`.
-        drop(unsafe { Box::from_raw(instance.cast::<Box<dyn Step>>()) })
-    }));
+        drop(unsafe { Box::from_raw(instance.cast::<Option<Box<dyn Step>>>()) })
+    });
 }
 
 /// Exports `$build`'s table under the five ABI names.
@@ -203,8 +228,12 @@ macro_rules! export_pack {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn metor_fsw_pack_def() -> $crate::pack::raw::RawSlice {
-            $crate::pack::def($build)
+        pub unsafe extern "C" fn metor_fsw_pack_def(
+            dst: *mut u8,
+            capacity: usize,
+            written: *mut usize,
+        ) -> u32 {
+            unsafe { $crate::pack::def($build, dst, capacity, written) }
         }
 
         #[unsafe(no_mangle)]

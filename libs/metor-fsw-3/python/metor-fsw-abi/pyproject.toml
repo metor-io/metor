@@ -3,7 +3,7 @@
 
 [project]
 name = "metor-fsw-abi"
-version = "1"
+version = "2"
 description = "The metor-fsw ABI version as a distribution"
 requires-python = ">=3.11"
 

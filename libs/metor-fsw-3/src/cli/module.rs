@@ -31,7 +31,7 @@ struct Module {
 #[derive(Serialize)]
 struct Class {
     name: String,
-    /// Docstring body, escaped and indented, or empty.
+    /// The class docstring, or empty.
     doc: String,
     fields: Vec<Field>,
 }
@@ -65,14 +65,15 @@ struct Port {
 }
 
 /// Renders `<module>/__init__.py` for `def`.
-pub fn render(pack: &PackRef, abi_version: u32, def: &PackDef<'_>) -> Result<String, PackDevError> {
+pub fn render(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<String, PackDevError> {
     let module = view(pack, abi_version, def)?;
     let mut env = minijinja::Environment::new();
+    env.add_filter("python_string", python_string);
     env.add_template("module", TEMPLATE)?;
     Ok(env.get_template("module")?.render(module)?)
 }
 
-fn view(pack: &PackRef, abi_version: u32, def: &PackDef<'_>) -> Result<Module, PackDevError> {
+fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackDevError> {
     let schemas: Vec<Value> = def
         .systems
         .iter()
@@ -101,11 +102,11 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef<'_>) -> Result<Module, P
     })
 }
 
-fn records(def: &PackDef<'_>) -> Vec<String> {
+fn records(def: &PackDef) -> Vec<String> {
     let mut names: Vec<&str> = BUILTIN_PORTS.iter().map(|(name, _)| *name).collect();
     for port in def.systems.iter().flat_map(ports) {
-        if !names.contains(&port.record) {
-            names.push(port.record);
+        if !names.contains(&port.record.as_ref()) {
+            names.push(&port.record);
         }
     }
     let mut classes: Vec<String> = names.into_iter().map(class_of).collect();
@@ -113,7 +114,7 @@ fn records(def: &PackDef<'_>) -> Vec<String> {
     classes
 }
 
-fn ports<'a>(system: &'a PackSystemDef<'_>) -> impl Iterator<Item = &'a PortDef> {
+fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
     system.def.inputs.iter().chain(&system.def.outputs)
 }
 
@@ -142,7 +143,7 @@ fn pascal(name: &str) -> String {
 }
 
 /// The params schema as an object, or an empty one for a system without params.
-fn parse_schema(system: &PackSystemDef<'_>) -> Result<Value, PackDevError> {
+fn parse_schema(system: &PackSystemDef) -> Result<Value, PackDevError> {
     let Some(raw) = system.params.as_deref() else {
         return Ok(Value::Object(serde_json::Map::new()));
     };
@@ -171,19 +172,19 @@ fn dataclass(name: &str, object: &Value, defs: &BTreeMap<String, Value>) -> Clas
         doc: object
             .get("description")
             .and_then(Value::as_str)
-            .map(|doc| doc_body(doc, "    "))
+            .map(str::to_string)
             .unwrap_or_default(),
-        fields: fields(object, defs),
+        fields: fields(object, defs, true),
     }
 }
 
 /// A schema object's properties as fields, each with its annotation and default.
-fn fields(schema: &Value, defs: &BTreeMap<String, Value>) -> Vec<Field> {
+fn fields(schema: &Value, defs: &BTreeMap<String, Value>, dataclass: bool) -> Vec<Field> {
     properties(schema)
         .into_iter()
         .map(|(name, property)| Field {
             annotation: python_type(&property, defs),
-            default: default_of(&property, is_required(schema, &name)),
+            default: default_of(&property, is_required(schema, &name), dataclass),
             name,
         })
         .collect()
@@ -191,11 +192,11 @@ fn fields(schema: &Value, defs: &BTreeMap<String, Value>) -> Vec<Field> {
 
 /// One system as its `System` subclass.
 fn entry(
-    system: &PackSystemDef<'_>,
+    system: &PackSystemDef,
     schema: &Value,
     defs: &BTreeMap<String, Value>,
 ) -> Result<Entry, PackDevError> {
-    let params = fields(schema, defs);
+    let params = fields(schema, defs, false);
     for field in &params {
         if system.def.inputs.iter().any(|port| port.name == field.name) {
             return Err(PackDevError::NameClash {
@@ -206,13 +207,13 @@ fn entry(
     }
     let port = |port: &PortDef| Port {
         name: port.name.to_string(),
-        record: class_of(port.record),
+        record: class_of(&port.record),
     };
-    let declared = || system.def.outputs.iter().filter(|p| !is_builtin(p.name));
+    let declared = || system.def.outputs.iter().filter(|p| !is_builtin(&p.name));
     Ok(Entry {
-        name: pascal(system.ty),
+        name: pascal(&system.ty),
         ty: system.ty.to_string(),
-        doc: doc_body(&system.doc, "    "),
+        doc: system.doc.to_string(),
         outputs: declared().map(|p| p.name.to_string()).collect(),
         inputs: system.def.inputs.iter().map(port).collect(),
         params,
@@ -280,8 +281,11 @@ fn python_ty(ty: &str, schema: &Value, defs: &BTreeMap<String, Value>) -> String
 }
 
 /// The keyword default: the schema's `default`, or none for a required field.
-fn default_of(schema: &Value, required: bool) -> String {
+fn default_of(schema: &Value, required: bool, dataclass: bool) -> String {
     match schema.get("default") {
+        Some(value) if dataclass && (value.is_array() || value.is_object()) => {
+            format!(" = field(default_factory=lambda: {})", literal(value))
+        }
         Some(value) => format!(" = {}", literal(value)),
         None if required => String::new(),
         None => " = None".to_string(),
@@ -294,7 +298,7 @@ fn literal(value: &Value) -> String {
         Value::Bool(true) => "True".to_string(),
         Value::Bool(false) => "False".to_string(),
         Value::Number(number) => number.to_string(),
-        Value::String(text) => format!("\"{}\"", escape(text)),
+        Value::String(text) => python_string(text),
         Value::Array(items) => format!(
             "[{}]",
             items.iter().map(literal).collect::<Vec<_>>().join(", ")
@@ -303,31 +307,19 @@ fn literal(value: &Value) -> String {
             "{{{}}}",
             fields
                 .iter()
-                .map(|(key, item)| format!("\"{}\": {}", escape(key), literal(item)))
+                .map(|(key, item)| format!("{}: {}", python_string(key), literal(item)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
 }
 
-fn escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// A doc comment as a docstring body: escaped, with its lines kept and indented.
-fn doc_body(doc: &str, indent: &str) -> String {
-    let body = doc
-        .lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join(&format!("\n{indent}"));
-    body.replace('\\', "\\\\").replace("\"\"\"", "\\\"\\\"\\\"")
+fn python_string(text: &str) -> String {
+    Value::String(text.to_string()).to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-
     use metor_proto::types::ComponentId;
     use serde_json::value::RawValue;
 
@@ -336,8 +328,8 @@ mod tests {
 
     fn port(name: &'static str, record: &'static str) -> PortDef {
         PortDef {
-            name,
-            record,
+            name: name.into(),
+            record: record.into(),
             id: ComponentId::new(record),
             max_len: 8,
             alignment: 4,
@@ -350,21 +342,20 @@ mod tests {
         inputs: Vec<PortDef>,
         outputs: Vec<PortDef>,
         params: Option<&'static str>,
-    ) -> PackSystemDef<'static> {
+    ) -> PackSystemDef {
         PackSystemDef {
-            ty,
+            ty: ty.into(),
             def: SystemDef {
-                name: ty,
+                name: ty.into(),
                 inputs,
                 outputs,
             },
-            doc: Cow::Borrowed(""),
-            params: params
-                .map(|text| Cow::Owned(RawValue::from_string(text.into()).expect("json"))),
+            doc: "".into(),
+            params: params.map(|text| RawValue::from_string(text.into()).expect("json")),
         }
     }
 
-    fn rendered(systems: Vec<PackSystemDef<'static>>) -> Result<String, PackDevError> {
+    fn rendered(systems: Vec<PackSystemDef>) -> Result<String, PackDevError> {
         let reference = PackRef {
             id: "test".into(),
             lib: "test_pack".into(),
@@ -394,8 +385,8 @@ mod tests {
         )])
         .expect("renders");
 
-        assert!(text.contains("from dataclasses import dataclass\n"));
-        assert!(text.contains("@dataclass\nclass Limits:\n    \"\"\"Bounds on the actuator.\"\"\"\n    max: float = 1.0\n"));
+        assert!(text.contains("from dataclasses import dataclass, field\n"));
+        assert!(text.contains("@dataclass(kw_only=True)\nclass Limits:\n    \"Bounds on the actuator.\"\n    max: float = 1.0\n"));
         assert!(text.contains("armed: bool = False"));
         assert!(text.contains("mode: str = \"nadir\""));
         assert!(text.contains("gains: list[float] = [1.0, 2.0]"));

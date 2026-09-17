@@ -46,22 +46,41 @@ impl<S: System> Step for Runner<S> {
     }
 }
 
-/// Runs one step, returning the panic's message instead of unwinding.
-pub(crate) fn catch_step(step: &mut dyn Step, now: Timestamp) -> Result<(), String> {
-    // PANIC Safety: a panicked step is latched off and only its log output is
-    // touched afterwards, so no caller reads state a panic left half-written.
-    catch_unwind(AssertUnwindSafe(|| step.execute(now))).map_err(|payload| message_of(&*payload))
+/// Executes once, reporting a fault and retiring the runner on failure.
+pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> bool {
+    let Some(step) = slot.as_mut() else {
+        return false;
+    };
+    // PANIC Safety: a failed step is faulted once and removed before returning.
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if step.latched() {
+            return false;
+        }
+        step.execute(now);
+        !step.latched()
+    }));
+    let healthy = match result {
+        Ok(healthy) => healthy,
+        Err(payload) => {
+            crate::panic::catch(|| step.fault(now, message_of(&*payload)));
+            crate::panic::discard(payload);
+            false
+        }
+    };
+    if !healthy {
+        crate::panic::catch(|| drop(slot.take()));
+    }
+    healthy
 }
 
-/// Reads a panic payload as the string `panic!` was given.
-fn message_of(payload: &(dyn Any + Send)) -> String {
+fn message_of(payload: &(dyn Any + Send)) -> &str {
     if let Some(text) = payload.downcast_ref::<&str>() {
-        return (*text).to_string();
+        return text;
     }
     if let Some(text) = payload.downcast_ref::<String>() {
-        return text.clone();
+        return text;
     }
-    "panic".to_string()
+    "panic"
 }
 
 impl Coordinator {
@@ -116,23 +135,19 @@ impl Coordinator {
 }
 
 impl super::Entry {
-    /// Whether a panic has taken this system out of the cycle.
     pub(super) fn latched(&self) -> bool {
-        self.latched || self.step.latched()
+        self.step.is_none()
     }
 
-    /// Runs this system unless it has latched, returning its execution time.
     fn run(&mut self, now: Timestamp) -> Duration {
         if self.latched() {
             return Duration::ZERO;
         }
         let started = Instant::now();
-        let result = catch_step(self.step.as_mut(), now);
+        let healthy = catch_step(&mut self.step, now);
         let elapsed = started.elapsed();
-        if let Err(message) = result {
-            self.latched = true;
-            self.step.fault(now, &message);
-            tracing::error!(system = self.name, "system panicked: {message}");
+        if !healthy {
+            crate::panic::catch(|| tracing::error!(system = self.name, "system panicked"));
         }
         elapsed
     }
@@ -358,7 +373,10 @@ mod tests {
                 std::panic::panic_any(7u8);
             }
         }
-        assert_eq!(catch_step(&mut Odd, Timestamp(0)), Err("panic".to_string()));
+        assert_eq!(message_of(&7u8), "panic");
+        let mut step: Option<Box<dyn Step>> = Some(Box::new(Odd));
+        assert!(!catch_step(&mut step, Timestamp(0)));
+        assert!(step.is_none());
     }
 
     #[test]
@@ -369,9 +387,9 @@ mod tests {
                 self.0 += 1;
             }
         }
-        let mut clean = Clean(0);
-        assert_eq!(catch_step(&mut clean, Timestamp(0)), Ok(()));
-        assert_eq!(clean.0, 1);
+        let mut step: Option<Box<dyn Step>> = Some(Box::new(Clean(0)));
+        assert!(catch_step(&mut step, Timestamp(0)));
+        assert!(step.is_some());
     }
 
     #[test]

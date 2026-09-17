@@ -90,8 +90,8 @@ impl<T: Record> Output<T> {
     /// Returns this port's entry in a bundle's `defs()` walk.
     pub fn def(name: &'static str) -> PortDef {
         PortDef {
-            name,
-            record: T::NAME,
+            name: name.into(),
+            record: T::NAME.into(),
             id: T::ID,
             max_len: T::MAX_LEN,
             alignment: T::ALIGN,

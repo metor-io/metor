@@ -61,10 +61,11 @@ impl<S: SystemFn> System for FnSystem<S> {
         inputs: &mut InSet<S>,
         outputs: &mut OutSet<S>,
     ) {
-        let _guard = log::enter(&mut outputs.log, now);
-        let mut log = log::Log;
-        let mut cx = Cycle::new(now, &mut log);
-        state.call(S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx));
+        log::with_log_port(&mut outputs.log, now, || {
+            let mut log = log::Log;
+            let mut cx = Cycle::new(now, &mut log);
+            state.call(S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx));
+        });
     }
 
     /// Writes the panic as a fault line on the system's own `log` output.

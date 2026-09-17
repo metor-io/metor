@@ -25,12 +25,14 @@
 pub mod wake;
 
 mod backing;
+mod owner;
 mod region;
 mod sync;
 
 use backing::Backing;
 #[cfg(all(test, not(ring_loom)))]
 use backing::Word;
+pub use owner::{RawOwner, RingExport};
 use region::*;
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
@@ -422,7 +424,7 @@ impl RingBuffer {
     /// # Safety
     /// The region is one writable, interior-mutable allocation, exclusively
     /// accessible during initialization. It must outlive all resulting handles,
-    /// clones, and borrows. Afterwards, access must follow the ring protocol.
+    /// clones, exports, and borrows. Afterwards, access must follow the ring protocol.
     ///
     /// # Panics
     /// Panics on invalid configurations, as [`Self::create_in_memory`] does.
@@ -495,11 +497,32 @@ impl RingBuffer {
     ///
     /// # Safety
     /// The region is one live, interior-mutable allocation containing an initialized
-    /// ring. It must outlive all resulting handles, clones, and borrows. The header
+    /// ring. It must outlive all resulting handles, clones, exports, and borrows. The header
     /// remains immutable; all other access follows the ring protocol.
     pub unsafe fn attach_raw(base: *mut u8, len: usize) -> Result<Self, AttachError> {
         // SAFETY: the caller guarantees the region's lifetime and shared-memory access.
         unsafe { Self::attach(Backing::raw(base, len)) }
+    }
+
+    /// Attach to storage retained through process-local ownership callbacks.
+    ///
+    /// # Safety
+    /// `owner` must satisfy [`RawOwner`]'s contract and keep this entire region
+    /// alive. The region contains an initialized ring with an immutable header;
+    /// all other access follows the ring protocol.
+    pub unsafe fn attach_owned(
+        base: *mut u8,
+        len: usize,
+        owner: RawOwner,
+    ) -> Result<Self, AttachError> {
+        // SAFETY: the caller supplies a live owner and valid shared ring storage.
+        unsafe { Self::attach(Backing::owned(base, len, owner)) }
+    }
+
+    /// Retain this ring while its region and owner are passed across an ABI.
+    /// Raw storage still requires its caller-provided lifetime guarantee.
+    pub fn export(&self) -> RingExport {
+        RingExport::new(self.inner.clone())
     }
 
     /// # Safety

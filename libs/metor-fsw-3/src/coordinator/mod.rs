@@ -7,6 +7,8 @@
 mod build;
 mod config;
 mod error;
+#[cfg(test)]
+mod fault_tests;
 mod params;
 mod run;
 mod status;
@@ -29,10 +31,8 @@ pub(crate) use table::TableEntry;
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {
     name: String,
-    step: Box<dyn Step>,
+    step: Option<Box<dyn Step>>,
     status: Output<SystemStatus>,
-    /// Set once the system panicked; it is never executed again.
-    latched: bool,
 }
 
 /// A built graph: the systems in step order, the clock that stamps each cycle,
@@ -43,7 +43,7 @@ pub struct Coordinator {
     /// Start of the simulated timeline, taken at build.
     epoch: Timestamp,
     cycle: u64,
-    /// Declared last so every port drops before the region it points into.
+    /// Retained handles share ownership of these regions.
     rings: Vec<RingBuffer>,
 }
 
