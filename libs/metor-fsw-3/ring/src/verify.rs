@@ -24,7 +24,7 @@ fn any_record(cap: u64) -> u64 {
 fn round_up16_correct() {
     let n: usize = kani::any();
     kani::assume(n <= usize::MAX - 15);
-    let r = round_up16(n);
+    let r = round_up_16(n);
     assert!(r.is_multiple_of(16));
     // Subtraction avoids overflow in the assertion near `usize::MAX`.
     assert!(r >= n);
@@ -36,7 +36,7 @@ fn frame_len_correct() {
     let n: usize = kani::any();
     kani::assume(n <= usize::MAX - 31);
     let f = frame_len(n);
-    assert_eq!(f, 16 + round_up16(n));
+    assert_eq!(f, 16 + round_up_16(n));
     assert!(f.is_multiple_of(16));
     assert!(f >= 16);
     assert!(f - 16 >= n);
