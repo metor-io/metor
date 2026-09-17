@@ -68,7 +68,7 @@ impl<S: SystemFn> System for FnSystem<S> {
     /// Writes the panic as a fault line on the system's own `log` output.
     fn fault(&self, now: Timestamp, outputs: &mut OutSet<S>, message: &str) {
         outputs.log.begin(now);
-        outputs.log.fault("panic", message);
+        outputs.log.fault("panic", message.to_string());
     }
 }
 

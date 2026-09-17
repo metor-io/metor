@@ -129,12 +129,16 @@ where
             // the first cycle (build/init), which coincides with the epoch.
             timestamp: crate::clock::now_or_wall(),
             level: level_of(meta.level()),
-            source: meta.target().to_string(),
-            target: meta.target().to_string(),
-            message: visitor.message,
-            span,
-            fields: visitor.fields,
-            file: meta.file().map(str::to_string),
+            source: meta.target().to_string().into(),
+            target: meta.target().to_string().into(),
+            message: visitor.message.into(),
+            span: span.map(Into::into),
+            fields: visitor
+                .fields
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+            file: meta.file().map(|f| f.to_string().into()),
             line: meta.line(),
         };
         let mut q = QUEUE.lock().expect("log queue lock is never poisoned");

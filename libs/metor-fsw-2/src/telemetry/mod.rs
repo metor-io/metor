@@ -538,7 +538,7 @@ mod tests {
         ev.fields
             .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| v.to_string())
     }
 
     #[test]

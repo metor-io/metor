@@ -7,6 +7,7 @@
 //! ring of the system that emitted it.
 
 use core::cell::{Cell, RefCell};
+use std::borrow::Cow;
 
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
@@ -58,34 +59,38 @@ impl Log {
     }
 
     /// Writes an info line.
-    pub fn info(&mut self, message: impl Into<String>) {
-        let _ = self.write(LogLevel::Info, message.into(), Vec::new());
+    pub fn info(&mut self, message: impl Into<Cow<'static, str>>) {
+        let _ = self.write(LogLevel::Info, message, Vec::new());
     }
 
     /// Writes a warning line.
-    pub fn warn(&mut self, message: impl Into<String>) {
-        let _ = self.write(LogLevel::Warn, message.into(), Vec::new());
+    pub fn warn(&mut self, message: impl Into<Cow<'static, str>>) {
+        let _ = self.write(LogLevel::Warn, message, Vec::new());
     }
 
     /// Writes an error line whose first field is `kind`, the fault's identity for the ground.
-    pub fn fault(&mut self, kind: &str, message: impl Into<String>) {
-        let fields = vec![("kind".to_string(), kind.to_string())];
-        let _ = self.write(LogLevel::Error, message.into(), fields);
+    pub fn fault(
+        &mut self,
+        kind: impl Into<Cow<'static, str>>,
+        message: impl Into<Cow<'static, str>>,
+    ) {
+        let fields = vec![(Cow::Borrowed("kind"), kind.into())];
+        let _ = self.write(LogLevel::Error, message, fields);
     }
 
     /// Writes one line with the given level and fields.
     pub fn write(
         &mut self,
         level: LogLevel,
-        message: String,
-        fields: Vec<(String, String)>,
+        message: impl Into<Cow<'static, str>>,
+        fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
     ) -> Result<(), SendError> {
         self.output.write(&LogEvent {
             timestamp: self.now,
             level,
-            source: String::new(),
-            target: String::new(),
-            message,
+            source: Cow::Borrowed(""),
+            target: Cow::Borrowed(""),
+            message: message.into(),
             span: None,
             fields,
             file: None,
@@ -123,11 +128,11 @@ pub fn drain(now: Timestamp, output: &mut Output<LogEvent>) {
         let _ = output.write(&LogEvent {
             timestamp: now,
             level: LogLevel::Warn,
-            source: String::new(),
-            target: String::new(),
-            message: "log lines dropped".to_string(),
+            source: Cow::Borrowed(""),
+            target: Cow::Borrowed(""),
+            message: Cow::Borrowed("log lines dropped"),
             span: None,
-            fields: vec![("dropped".to_string(), dropped.to_string())],
+            fields: vec![(Cow::Borrowed("dropped"), dropped.to_string().into())],
             file: None,
             line: None,
         });
@@ -161,12 +166,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
         push(LogEvent {
             timestamp: Timestamp(0),
             level: level_of(meta.level()),
-            source: meta.target().to_string(),
-            target: meta.target().to_string(),
+            source: Cow::Borrowed(meta.target()),
+            target: Cow::Borrowed(meta.target()),
             message: visitor.message,
             span: None,
             fields: visitor.fields,
-            file: meta.file().map(str::to_string),
+            file: meta.file().map(Cow::Borrowed),
             line: meta.line(),
         });
     }
@@ -185,26 +190,26 @@ fn level_of(level: &tracing::Level) -> LogLevel {
 /// Collects an event's `message` and its other fields as strings.
 #[derive(Default)]
 struct Fields {
-    message: String,
-    fields: Vec<(String, String)>,
+    message: Cow<'static, str>,
+    fields: Vec<(Cow<'static, str>, Cow<'static, str>)>,
 }
 
 impl Visit for Fields {
     fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
         if field.name() == "message" {
-            self.message = format!("{value:?}");
+            self.message = format!("{value:?}").into();
         } else {
             self.fields
-                .push((field.name().to_string(), format!("{value:?}")));
+                .push((Cow::Borrowed(field.name()), format!("{value:?}").into()));
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
-            self.message = value.to_string();
+            self.message = value.to_string().into();
         } else {
             self.fields
-                .push((field.name().to_string(), value.to_string()));
+                .push((Cow::Borrowed(field.name()), value.to_string().into()));
         }
     }
 }
@@ -242,15 +247,12 @@ mod tests {
         assert_eq!(seen.len(), 3);
         assert!(seen.iter().all(|l| l.timestamp == Timestamp(5)));
         assert_eq!(
-            (seen[0].level, seen[0].message.as_str()),
+            (seen[0].level, &*seen[0].message),
             (LogLevel::Info, "hello")
         );
         assert_eq!(seen[1].level, LogLevel::Warn);
         assert_eq!(seen[2].level, LogLevel::Error);
-        assert_eq!(
-            seen[2].fields,
-            vec![("kind".to_string(), "sensor_stale".to_string())]
-        );
+        assert_eq!(seen[2].fields, vec![("kind".into(), "sensor_stale".into())]);
     }
 
     #[test]
@@ -292,7 +294,7 @@ mod tests {
         assert_eq!(seen.len(), MAX_LINES + 1);
         let last = seen.last().expect("warning");
         assert_eq!(last.level, LogLevel::Warn);
-        assert_eq!(last.fields, vec![("dropped".to_string(), "2".to_string())]);
+        assert_eq!(last.fields, vec![("dropped".into(), "2".into())]);
         log.drain_queue();
         assert!(lines(&mut input).is_empty());
     }

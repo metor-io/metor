@@ -150,10 +150,7 @@ fn a_panicking_system_returns_panicked_and_writes_one_fault_line() {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].level, LogLevel::Error);
     assert_eq!(seen[0].message, "boom on cycle 2");
-    assert_eq!(
-        seen[0].fields,
-        vec![("kind".to_string(), "panic".to_string())]
-    );
+    assert_eq!(seen[0].fields, vec![("kind".into(), "panic".into())]);
 }
 
 #[test]

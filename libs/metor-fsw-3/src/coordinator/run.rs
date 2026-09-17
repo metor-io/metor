@@ -317,10 +317,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].level, metor_proto_wkt::LogLevel::Error);
         assert_eq!(lines[0].timestamp, Timestamp(2));
-        assert_eq!(
-            lines[0].fields,
-            vec![("kind".to_string(), "panic".to_string())]
-        );
+        assert_eq!(lines[0].fields, vec![("kind".into(), "panic".into())]);
         assert_eq!(lines[0].message, "boom on cycle 2");
     }
 

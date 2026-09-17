@@ -404,10 +404,7 @@ fn the_sixty_fifth_line_is_dropped_and_reported_once() {
     assert_eq!(traced, crate::log::MAX_LINES);
     let warnings: Vec<_> = seen.iter().filter(|l| l.level == LogLevel::Warn).collect();
     assert_eq!(warnings.len(), 1);
-    assert_eq!(
-        warnings[0].fields,
-        vec![("dropped".to_string(), "1".to_string())]
-    );
+    assert_eq!(warnings[0].fields, vec![("dropped".into(), "1".into())]);
 }
 
 #[test]

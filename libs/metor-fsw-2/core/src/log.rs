@@ -127,7 +127,7 @@ where
         if crate::logfwd::pack_mode() {
             let instance = self.instance.clone();
             self.dropped += crate::logfwd::drain(|mut ev| {
-                ev.source = instance.to_string();
+                ev.source = instance.to_string().into();
                 self.emit_event(&ev);
             });
         }
@@ -142,13 +142,13 @@ where
         self.pending.push(LogEvent {
             timestamp: Timestamp(0),
             level,
-            source: self.instance.to_string(),
-            target: String::new(),
-            message: msg.to_string(),
+            source: self.instance.to_string().into(),
+            target: "".into(),
+            message: msg.to_string().into(),
             span: None,
             fields: fields
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string().into(), v.to_string().into()))
                 .collect(),
             file: None,
             line: None,
@@ -165,13 +165,13 @@ where
         let ev = LogEvent {
             timestamp,
             level: LogLevel::Warn,
-            source: self.instance.to_string(),
-            target: String::new(),
-            message: "log lines dropped".to_string(),
+            source: self.instance.to_string().into(),
+            target: "".into(),
+            message: "log lines dropped".into(),
             span: None,
             fields: vec![
-                ("kind".to_string(), "log_dropped".to_string()),
-                ("dropped".to_string(), dropped.to_string()),
+                ("kind".into(), "log_dropped".into()),
+                ("dropped".into(), dropped.to_string().into()),
             ],
             file: None,
             line: None,
@@ -207,10 +207,7 @@ mod tests {
     }
 
     fn field<'a>(ev: &'a LogEvent, key: &str) -> Option<&'a str> {
-        ev.fields
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
+        ev.fields.iter().find(|(k, _)| k == key).map(|(_, v)| &**v)
     }
 
     #[test]
@@ -248,10 +245,7 @@ mod tests {
         let events = drain(&mut log_in);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, LogLevel::Warn);
-        assert_eq!(
-            events[0].fields[0],
-            ("kind".to_string(), "imu_missing".to_string())
-        );
+        assert_eq!(events[0].fields[0], ("kind".into(), "imu_missing".into()));
         assert_eq!(field(&events[0], "age_us"), Some("1500"));
     }
 

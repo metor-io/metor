@@ -394,7 +394,7 @@ impl TableDelegate for LogDelegate {
                 )
                 .into_any_element(),
             COL_SOURCE => {
-                let source = ev.source.clone();
+                let source = ev.source.to_string();
                 let view = self.view.clone();
                 cell.id(("log-source", row_ix))
                     .text_color(theme.text_secondary)
@@ -414,13 +414,15 @@ impl TableDelegate for LogDelegate {
                     .into_any_element()
             }
             COL_MESSAGE => {
-                let mut row = cell.gap_2().child(SharedString::from(ev.message.clone()));
+                let mut row = cell
+                    .gap_2()
+                    .child(SharedString::from(ev.message.to_string()));
                 if let Some(span) = &ev.span {
                     row = row.child(
                         div()
                             .text_color(theme.text_tertiary)
                             .text_size(px(10.0))
-                            .child(SharedString::from(span.clone())),
+                            .child(SharedString::from(span.to_string())),
                     );
                 }
                 for (key, value) in &ev.fields {
