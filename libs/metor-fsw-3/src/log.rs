@@ -1,13 +1,4 @@
-//! The `log` output every fn system has, and the `tracing` bridge onto it.
-//!
-//! A [`LogPort`] owns one system's `log` output. [`enter`] points this thread
-//! at a port for the length of a cycle, so both [`Log`]'s calls and `tracing`
-//! events serialize straight onto that system's ring; a line emitted with no
-//! port entered reaches no ring. A hand-written [`System`] that declares its
-//! own `Output<LogEvent>` captures `tracing` the same way: hold a `LogPort`
-//! and `enter` it inside `execute`.
-//!
-//! [`System`]: crate::System
+//! Log is a tracing_subscriber that takes tracing logs and puts them into [`LogEvent`] messages
 
 use core::cell::Cell;
 use core::ptr::NonNull;
@@ -119,13 +110,9 @@ impl LogPort {
 }
 
 /// A `Log` writes the running system's log lines onto the entered [`LogPort`].
-pub struct Log(());
+pub struct Log;
 
 impl Log {
-    pub(crate) fn new() -> Self {
-        Self(())
-    }
-
     /// Writes an info line.
     pub fn info(&mut self, message: impl Into<Cow<'static, str>>) {
         self.write(LogLevel::Info, message, Vec::new());
@@ -189,10 +176,6 @@ fn with_port(f: impl FnOnce(&mut LogPort)) {
     f(unsafe { port.as_mut() });
 }
 
-fn push(event: LogEvent) {
-    with_port(|port| port.emit(event));
-}
-
 /// Returns the layer that writes `tracing` events to the entered [`LogPort`].
 pub fn layer() -> LogLayer {
     LogLayer
@@ -206,7 +189,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
         let meta = event.metadata();
         let mut visitor = Fields::default();
         event.record(&mut visitor);
-        push(LogEvent {
+        let event = LogEvent {
             timestamp: Timestamp(0),
             level: level_of(meta.level()),
             source: Cow::Borrowed(meta.target()),
@@ -216,7 +199,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogLayer {
             fields: visitor.fields,
             file: meta.file().map(Cow::Borrowed),
             line: meta.line(),
-        });
+        };
+        with_port(|port| port.emit(event));
     }
 }
 
@@ -284,7 +268,7 @@ mod tests {
     #[test]
     fn direct_lines_carry_the_stamp_level_and_kind() {
         let (_ring, mut port, mut input) = log_pair(8);
-        let mut log = Log::new();
+        let mut log = Log;
         {
             let _guard = enter(&mut port, Timestamp(5));
             log.info("hello");
@@ -345,7 +329,7 @@ mod tests {
         let (_ring, mut port, mut input) = log_pair(4);
         let records = ring_capacity(LogEvent::MAX_LEN, 4).expect("valid")
             / frame_len(encoded_len(&padded, Timestamp(1)));
-        let mut log = Log::new();
+        let mut log = Log;
         {
             let _guard = enter(&mut port, Timestamp(1));
             for _ in 0..records + 3 {

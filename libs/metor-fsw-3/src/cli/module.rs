@@ -1,10 +1,4 @@
 //! The typed Python module `pack dev` renders from a pack's descriptor.
-//!
-//! `module.py.jinja` is the shape of the output. This module builds the view
-//! it renders from: one `Record` class per record name the pack's ports
-//! carry, one `@dataclass` per nested params object, and one `System`
-//! subclass per entry, with every Python type and literal already spelled.
-//! The text is deterministic and holds no absolute path.
 
 use std::collections::BTreeMap;
 
@@ -19,7 +13,7 @@ use crate::system::PortDef;
 const TEMPLATE: &str = include_str!("module.py.jinja");
 
 /// The records every system has whatever it declared, named after their Rust types.
-const FRAMEWORK: [(&str, &str); 2] = [("log", "LogEvent"), ("status", "SystemStatus")];
+const BUILTIN_PORTS: [(&str, &str); 2] = [("log", "LogEvent"), ("status", "SystemStatus")];
 
 /// What the template renders.
 #[derive(Serialize)]
@@ -107,9 +101,8 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef<'_>) -> Result<Module, P
     })
 }
 
-/// Every record class the pack's ports name, plus the framework's two, sorted.
 fn records(def: &PackDef<'_>) -> Vec<String> {
-    let mut names: Vec<&str> = FRAMEWORK.iter().map(|(name, _)| *name).collect();
+    let mut names: Vec<&str> = BUILTIN_PORTS.iter().map(|(name, _)| *name).collect();
     for port in def.systems.iter().flat_map(ports) {
         if !names.contains(&port.record) {
             names.push(port.record);
@@ -124,13 +117,12 @@ fn ports<'a>(system: &'a PackSystemDef<'_>) -> impl Iterator<Item = &'a PortDef>
     system.def.inputs.iter().chain(&system.def.outputs)
 }
 
-fn is_framework(port: &str) -> bool {
-    FRAMEWORK.iter().any(|(name, _)| *name == port)
+fn is_builtin(port: &str) -> bool {
+    BUILTIN_PORTS.iter().any(|(name, _)| *name == port)
 }
 
-/// The Python class of a record name: the framework's two, else PascalCase.
 fn class_of(record: &str) -> String {
-    match FRAMEWORK.iter().find(|(name, _)| *name == record) {
+    match BUILTIN_PORTS.iter().find(|(name, _)| *name == record) {
         Some((_, class)) => (*class).to_string(),
         None => pascal(record),
     }
@@ -216,7 +208,7 @@ fn entry(
         name: port.name.to_string(),
         record: class_of(port.record),
     };
-    let declared = || system.def.outputs.iter().filter(|p| !is_framework(p.name));
+    let declared = || system.def.outputs.iter().filter(|p| !is_builtin(p.name));
     Ok(Entry {
         name: pascal(system.ty),
         ty: system.ty.to_string(),
@@ -259,12 +251,12 @@ fn python_type(schema: &Value, defs: &BTreeMap<String, Value>) -> String {
         return "object".to_string();
     }
     match schema.get("type") {
-        Some(Value::String(ty)) => scalar(ty, schema, defs),
+        Some(Value::String(ty)) => python_ty(ty, schema, defs),
         Some(Value::Array(types)) => {
             let names: Vec<String> = types
                 .iter()
                 .filter_map(Value::as_str)
-                .map(|ty| scalar(ty, schema, defs))
+                .map(|ty| python_ty(ty, schema, defs))
                 .collect();
             names.join(" | ")
         }
@@ -272,7 +264,7 @@ fn python_type(schema: &Value, defs: &BTreeMap<String, Value>) -> String {
     }
 }
 
-fn scalar(ty: &str, schema: &Value, defs: &BTreeMap<String, Value>) -> String {
+fn python_ty(ty: &str, schema: &Value, defs: &BTreeMap<String, Value>) -> String {
     match ty {
         "number" => "float".to_string(),
         "integer" => "int".to_string(),
@@ -296,7 +288,6 @@ fn default_of(schema: &Value, required: bool) -> String {
     }
 }
 
-/// One JSON value as the Python literal a default is spelled with.
 fn literal(value: &Value) -> String {
     match value {
         Value::Null => "None".to_string(),

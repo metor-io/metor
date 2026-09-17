@@ -8,7 +8,10 @@ use core::marker::PhantomData;
 
 use metor_proto::types::Timestamp;
 
-use crate::system::{System, SystemDef};
+use crate::{
+    log,
+    system::{System, SystemDef},
+};
 
 pub use ctor::Ctor;
 pub use param::{Cycle, Names, Param, Views, Writers};
@@ -58,8 +61,8 @@ impl<S: SystemFn> System for FnSystem<S> {
         inputs: &mut InSet<S>,
         outputs: &mut OutSet<S>,
     ) {
-        let _guard = crate::log::enter(&mut outputs.log, now);
-        let mut log = crate::log::Log::new();
+        let _guard = log::enter(&mut outputs.log, now);
+        let mut log = log::Log;
         let mut cx = Cycle::new(now, &mut log);
         state.call(S::Params::get(&mut inputs.0, &mut outputs.outs, &mut cx));
     }

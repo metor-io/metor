@@ -35,6 +35,12 @@ pub use metor_proto::types::Timestamp;
 
 pub use metor_component::path;
 pub use metor_component::{AsVTable, Componentize, Decomponentize, Metadatatize};
+pub use metor_proto;
+pub use metor_proto_wkt;
+pub use postcard;
 pub use postcard::experimental::max_size::MaxSize;
-pub use schemars::JsonSchema;
-pub use {metor_proto, metor_proto_wkt, postcard, schemars, serde, serde_json, tracing, zerocopy};
+pub use schemars::{self, JsonSchema};
+pub use serde;
+pub use serde_json;
+pub use tracing;
+pub use zerocopy;

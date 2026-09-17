@@ -1,10 +1,3 @@
-//! The export side of a pack: the descriptor, the five exports, and the macro
-//! that names them.
-//!
-//! A pack is a `SystemTable` built inside a `cdylib`. [`export_pack!`] emits
-//! the five `extern "C"` functions a host resolves; each is one call into this
-//! module, and each catches an unwind so no panic crosses the boundary.
-
 pub mod def;
 pub mod raw;
 
