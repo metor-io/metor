@@ -1,31 +1,15 @@
-//! Kani proof harnesses.
-//!
-//! These cover the sequential half of the crate's correctness argument: the
-//! position arithmetic and the geometry validation that every `unsafe` deref
-//! in `lib.rs` cites. Kani is a bounded model checker with no notion of
-//! threads, so nothing here says anything about the atomic orderings; those
-//! belong to the loom models. `KANI.md` in the crate root has the full split.
-//!
-//! Symbolic capacities are capped at 2^20 rather than left open. The
-//! predicates are all mask arithmetic, so every power of two behaves alike
-//! above the point where a record fits, and the cap keeps the solver honest.
-
+//! Sequential Kani harnesses; see `KANI.md` for assumptions and bounds.
 use super::*;
 
-/// Capacity used by the harnesses that drive a real ring. Small enough that a
-/// handful of writes wraps it, which is where the interesting paths are.
 const CAP: usize = 64;
-/// Bytes in a `CAP`-sized, single-reader region.
 const REGION: usize = HEADER_SIZE + READER_SLOT_SIZE + CAP;
 
-/// A symbolic power-of-two capacity in the range the ring supports.
 fn any_capacity() -> u64 {
     let cap: u64 = kani::any();
     kani::assume(cap.is_power_of_two() && cap >= 16 && cap <= 1 << 20);
     cap
 }
 
-/// A symbolic record size: 16-aligned, at least a bare header, at most a lap.
 fn any_record(cap: u64) -> u64 {
     let rec: u64 = kani::any();
     kani::assume(rec >= 16 && rec <= cap && rec.is_multiple_of(16));
@@ -42,8 +26,7 @@ fn round_up16_correct() {
     kani::assume(n <= usize::MAX - 15);
     let r = round_up16(n);
     assert!(r.is_multiple_of(16));
-    // Stated as a difference: at the top of the admissible range `n + 16` is
-    // itself the overflow this function is being checked against.
+    // Subtraction avoids overflow in the assertion near `usize::MAX`.
     assert!(r >= n);
     assert!(r - n < 16);
 }
@@ -60,18 +43,12 @@ fn frame_len_correct() {
     assert!(f - n < 32);
 }
 
-/// The bound `locate` puts on a length field read out of the region is
-/// sufficient for the `slice::from_raw_parts` that follows it: header, payload
-/// and padding all stay inside the data region. This is the safety contract of
-/// [`View::try_read`] and [`View::try_latest`], discharged for every length a
-/// corrupt region could present.
 #[kani::proof]
 fn straddle_bound_is_sufficient() {
     let cap = any_capacity();
     let phys: u64 = kani::any();
     kani::assume(phys < cap && phys.is_multiple_of(16));
-    // `read_len` masks the header down to 32 bits, so that is the whole range
-    // of lengths any region can produce.
+    // The reader takes the low 32 bits of the length word.
     let len: u64 = kani::any();
     kani::assume(len <= u32::MAX as u64);
 
@@ -82,10 +59,6 @@ fn straddle_bound_is_sufficient() {
     }
 }
 
-/// The same bound also keeps `frame_len` from wrapping on a 32-bit target,
-/// where `usize` is exactly the `u32` the length field holds. Miri needed a
-/// whole i686 run to execute this path for one input; here it holds for all of
-/// them, on any host.
 #[kani::proof]
 fn straddle_bound_blocks_32bit_overflow() {
     let cap = any_capacity();
@@ -104,9 +77,6 @@ fn straddle_bound_blocks_32bit_overflow() {
     }
 }
 
-/// A reserved record never straddles the wrap, and reserving only ever moves
-/// the write position forward, by less than one lap. This discharges
-/// `Writer::commit`'s contiguity precondition.
 #[kani::proof]
 fn reserve_never_straddles() {
     let cap = any_capacity();
@@ -119,12 +89,10 @@ fn reserve_never_straddles() {
     assert_eq!(start - committed, gap);
     assert!(gap < cap);
     assert!(start.is_multiple_of(16));
-    // The record is contiguous: it fits between its own start and the end of
-    // the lap, so `write_record` never runs off the data region.
+    // The whole frame fits before the physical end.
     assert!((start & (cap - 1)) + rec <= cap);
 }
 
-/// Publishing a wrap gap separately lets a fitting record progress without readers.
 #[kani::proof]
 fn padding_allows_empty_ring_progress() {
     let cap = any_capacity();
@@ -140,9 +108,6 @@ fn padding_allows_empty_ring_progress() {
     }
 }
 
-/// Backpressure is sound and not spurious: a write that passes `fits` leaves
-/// the slowest reader within one lap of the new committed position, so no byte
-/// it has yet to consume is reused; and one that fails really did not fit.
 #[kani::proof]
 fn fits_implies_no_lap() {
     let cap = any_capacity();
@@ -166,18 +131,8 @@ fn fits_implies_no_lap() {
     assert_eq!(fits(committed, committed, need, cap), need <= cap);
 }
 
-/// [`fits`]'s `slowest <= committed` precondition is load-bearing, not
-/// decorative. `locate`'s wrap-gap skip parks a cursor ahead of `committed` by
-/// design, so a violation is a real edge rather than a hypothetical one.
-///
-/// What this proves is that violating it is never a *safety* problem: outside
-/// the precondition the subtraction wraps, and the result either overflows the
-/// sum (a panic in a debug build) or reads as "full" (a spurious `WouldBlock`).
-/// It never reports space that is not there. Whether a writer can observe the
-/// edge at all is a question about interleavings, which loom model
-/// `cursor_never_exceeds_committed_at_fits` answers.
 #[kani::proof]
-fn fits_precondition_is_tight() {
+fn fits_checked_arithmetic_outside_precondition() {
     let cap = any_capacity();
     let committed: u64 = kani::any();
     kani::assume(committed <= u64::MAX - 4 * cap);
@@ -191,13 +146,13 @@ fn fits_precondition_is_tight() {
         // Inside the precondition the arithmetic `fits` performs is total.
         assert!((committed - slowest).checked_add(need).is_some());
     } else {
+        // Overflow here can wrap to a successful fit in release builds.
+        // This checks checked arithmetic, not the protocol precondition.
         let raw = committed.wrapping_sub(slowest);
         assert!(raw.checked_add(need).is_none_or(|sum| sum > cap));
     }
 }
 
-/// `round_up16` in `u64`, so the lemmas above stay independent of the host's
-/// pointer width.
 fn round_up16_u64(n: u64) -> u64 {
     (n + 15) & !15
 }
@@ -206,8 +161,6 @@ fn round_up16_u64(n: u64) -> u64 {
 // Tier B: geometry, against a fully hostile header
 // ---------------------------------------------------------------------------
 
-/// A region header with every field independently symbolic: the whole space a
-/// corrupt mapping or a hostile peer could present.
 fn any_header() -> RegionHeader {
     RegionHeader {
         magic: kani::any(),
@@ -222,11 +175,6 @@ fn any_header() -> RegionHeader {
     }
 }
 
-/// No header that [`validate_header`] accepts can put any offset the ring
-/// dereferences outside the region. Together the assertions below are the
-/// standing justification for `Inner::control`, `Inner::slot` and
-/// `Inner::data_ptr`; the five `attach_rejects_*` unit tests sample this
-/// property, and this proves it.
 #[kani::proof]
 fn validate_header_hostile() {
     let hdr = any_header();
@@ -260,14 +208,11 @@ fn validate_header_hostile() {
     let data_end = g.data_offset.checked_add(g.capacity as usize).unwrap();
     assert!(data_end <= region_len);
 
-    // Which makes the whole region at least as large as the fixed header, so
-    // the control block is addressable too.
+    // The control block also fits.
     assert!(region_len >= HEADER_SIZE);
     assert!(OFF_CONTROL + size_of::<Control>() <= HEADER_SIZE);
 }
 
-/// Every reader slot the ring will index lies wholly inside the reader table,
-/// and so inside the region. Discharges `Inner::slot`.
 #[kani::proof]
 fn slot_offsets_in_bounds() {
     let hdr = any_header();
@@ -285,9 +230,6 @@ fn slot_offsets_in_bounds() {
     assert!(off + READER_SLOT_SIZE <= region_len);
 }
 
-/// Every physical data offset the ring will form lies inside the region.
-/// Discharges `Inner::data_ptr`, and with it the `phys + 16 <= capacity`
-/// contract `read_len` relies on for a 16-aligned record start.
 #[kani::proof]
 fn data_ptr_in_bounds() {
     let hdr = any_header();
@@ -297,16 +239,14 @@ fn data_ptr_in_bounds() {
     };
 
     let phys: u64 = kani::any();
-    kani::assume(phys < g.capacity);
+    kani::assume(phys <= g.capacity);
 
-    assert!(g.data_offset + (phys as usize) < region_len);
-    if phys.is_multiple_of(16) {
+    assert!(g.data_offset + (phys as usize) <= region_len);
+    if phys < g.capacity && phys.is_multiple_of(16) {
         assert!(phys + 16 <= g.capacity);
     }
 }
 
-/// Creating and attaching agree: any config `layout` accepts produces a header
-/// `validate_header` accepts, with the identical geometry.
 #[kani::proof]
 fn layout_roundtrip() {
     let capacity: usize = kani::any();
@@ -318,24 +258,25 @@ fn layout_roundtrip() {
         capacity,
         max_readers,
     };
-    let (reader_table_offset, data_offset, total) = layout(&cfg);
+    let geometry = layout(&cfg);
 
     let hdr = RegionHeader {
         magic: MAGIC,
         version: VERSION,
         flags: 0,
         capacity: capacity as u64,
-        data_offset: data_offset as u64,
+        data_offset: geometry.data_offset as u64,
         max_readers: max_readers as u32,
-        reader_table_offset: reader_table_offset as u32,
-        total_size: total as u64,
+        reader_table_offset: geometry.reader_table_offset as u32,
+        total_size: geometry.total_size as u64,
         arch_tag: arch_tag(),
     };
 
-    let g = validate_header(&hdr, total).expect("a header we just laid out");
+    let g = validate_header(&hdr, geometry.total_size).expect("a header we just laid out");
     assert_eq!(g.capacity, capacity as u64);
-    assert_eq!(g.data_offset, data_offset);
-    assert_eq!(g.reader_table_offset, reader_table_offset);
+    assert_eq!(g.data_offset, geometry.data_offset);
+    assert_eq!(g.reader_table_offset, geometry.reader_table_offset);
+    assert_eq!(g.total_size, geometry.total_size);
     assert_eq!(g.max_readers, max_readers as u32);
 }
 
@@ -343,17 +284,6 @@ fn layout_roundtrip() {
 // Tier C: bounded operational proofs on a real ring
 // ---------------------------------------------------------------------------
 
-/// A region in the harness's own frame, 16-aligned and exactly the size
-/// `layout` computes for `(CAP, 1)`.
-///
-/// The harnesses below attach to one of these rather than calling
-/// `create_in_memory`. That constructor builds its backing by collecting an
-/// iterator into a `Box<[Word]>`, and behind that collect sit `RawVec` growth,
-/// reallocation and allocation-failure paths, all of which CBMC unrolls to
-/// the harness's unwind bound and which cost far more than everything these
-/// proofs are actually about. Attaching keeps the real geometry, the real
-/// header validation and the real reader and writer paths, and leaves only
-/// the `Arc` inside `RingBuffer` allocating at all.
 #[repr(C, align(16))]
 struct Region([u8; REGION]);
 
@@ -362,29 +292,23 @@ impl Region {
         Region([0u8; REGION])
     }
 
-    /// Lay out and attach. The ring holds a raw pointer into `self`, so the
-    /// region has to outlive it: declare it first, and it drops last.
     fn attach(&mut self) -> RingBuffer {
         let cfg = Config {
             capacity: CAP,
             max_readers: 1,
         };
-        let (reader_table_offset, data_offset, total) = layout(&cfg);
-        assert_eq!(total, REGION);
+        let geometry = layout(&cfg);
+        assert_eq!(geometry.total_size, REGION);
         let base = self.0.as_mut_ptr();
-        // SAFETY: `base` covers exactly `REGION` bytes and is 16-aligned by the
-        // `repr(align(16))`, which is the region contract `Backing::raw` and
-        // `attach_raw` require. It is exclusively borrowed here.
+        // SAFETY: the aligned region is exclusively held and outlives its handles.
         unsafe {
             let backing = Backing::raw(base, REGION);
-            init_region(&backing, &cfg, reader_table_offset, data_offset, total);
+            init_region(&backing, &geometry);
             RingBuffer::attach_raw(base, REGION).expect("a region we just laid out")
         }
     }
 }
 
-/// A record read back is the record written, byte for byte, and consuming it
-/// advances the cursor by exactly its frame length.
 #[kani::proof]
 #[kani::unwind(12)]
 fn write_read_roundtrip() {
@@ -408,8 +332,6 @@ fn write_read_roundtrip() {
     assert!(v.try_read().unwrap().is_none());
 }
 
-/// Backpressure is exact at the byte level: a write succeeds precisely when
-/// the record fits behind the reader; a rejected write may publish wrap padding.
 #[kani::proof]
 #[kani::unwind(12)]
 fn backpressure_is_exact() {
@@ -453,16 +375,6 @@ fn backpressure_is_exact() {
     }
 }
 
-/// A reader whose cursor lands exactly on a wrap gap reads through it to the
-/// record on the next lap, with the right bytes, for every record size that
-/// can produce a gap. `tests.rs` covers the one size that fits its hard-coded
-/// geometry; this covers all of them.
-///
-/// It also bounds `locate`'s gap-skip loop. Kani's unwind bound is per-harness
-/// rather than per-loop, so the claim it discharges is the weaker "every loop
-/// here closes"; a gap skip that could re-trigger would not close at all, but
-/// the doc comment at the skip argues it cannot, because `hwm` strictly
-/// increases.
 #[kani::proof]
 #[kani::unwind(12)]
 fn wrap_gap_skip_reads_through() {
@@ -505,8 +417,6 @@ fn wrap_gap_skip_reads_through() {
     assert!(v.try_read().unwrap().is_none());
 }
 
-/// `try_latest` serves the newest record and pins it: the cursor parks at its
-/// start, so calling again with nothing new committed returns the same bytes.
 #[kani::proof]
 #[kani::unwind(12)]
 fn try_latest_pins() {
@@ -522,7 +432,7 @@ fn try_latest_pins() {
 
     let g = v.try_latest().unwrap().expect("two records committed");
     assert_eq!(&g[..], &[y]);
-    let pinned = g.end_abs;
+    let pinned = g.release_at;
     drop(g);
     assert_eq!(v.cursor(), pinned);
 
@@ -534,12 +444,6 @@ fn try_latest_pins() {
 // Tier D: symbolic corruption
 // ---------------------------------------------------------------------------
 
-/// Overwrite the whole data region with symbolic bytes and drive the read
-/// paths over it. Whatever a corrupt mapping contains, a read either reports
-/// [`ReadError::Corrupt`], reports caught-up, or hands back a slice that lies
-/// wholly inside the data region. It never reads out of bounds and never
-/// panics: Kani's memory-safety checks carry the former, the assertions pin
-/// the latter. This is the property `ReadError::Corrupt` exists for.
 #[kani::proof]
 #[kani::unwind(12)]
 fn corrupt_data_never_ub() {
@@ -552,9 +456,7 @@ fn corrupt_data_never_ub() {
     // SAFETY: we hold the only handle, and the offsets come from the geometry
     // this region was created with.
     unsafe {
-        // A word at a time rather than a byte at a time: the same 32
-        // arbitrary bytes, in a quarter of the loop iterations CBMC has to
-        // unroll. The data region is 16-aligned and a multiple of 8 long.
+        // Symbolic words cover all data bytes with fewer loop iterations.
         for i in 0..CAP / 8 {
             base.add(REGION - CAP)
                 .cast::<u64>()
@@ -580,15 +482,6 @@ fn corrupt_data_never_ub() {
     }
 }
 
-/// The same, with the data region left zeroed so the control words are the
-/// whole adversary. Covers the `r == hwm` and `r >= c` branches of `locate`
-/// against values no cooperating writer would publish.
-///
-/// Kept to the borrowing path. `try_read_into` copies through a `Vec`, which
-/// drags the allocator model into the formula, and `try_latest` loops until it
-/// reaches the newest record; either on top of three symbolic control words
-/// puts this beyond CBMC's reach. `locate` is the whole of the pointer
-/// arithmetic those three paths share, so bounding it bounds all of them.
 #[kani::proof]
 #[kani::unwind(12)]
 fn corrupt_control_never_ub() {
@@ -617,10 +510,6 @@ fn corrupt_control_never_ub() {
     }
 }
 
-/// `try_latest` over a corrupt region, with the control words pinned to a
-/// consistent pair so its skip-to-newest loop is the only symbolic thing left.
-/// The data region stays fully symbolic, which is what its `locate` call has
-/// to survive.
 #[kani::proof]
 #[kani::unwind(12)]
 fn corrupt_latest_never_ub() {
@@ -631,9 +520,7 @@ fn corrupt_latest_never_ub() {
 
     // SAFETY: sole handle; offsets from this region's own geometry.
     unsafe {
-        // A word at a time rather than a byte at a time: the same 32
-        // arbitrary bytes, in a quarter of the loop iterations CBMC has to
-        // unroll. The data region is 16-aligned and a multiple of 8 long.
+        // Symbolic words cover all data bytes with fewer loop iterations.
         for i in 0..CAP / 8 {
             base.add(REGION - CAP)
                 .cast::<u64>()
