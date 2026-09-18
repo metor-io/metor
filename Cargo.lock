@@ -9594,6 +9594,7 @@ dependencies = [
  "metor-proto-wkt",
  "minijinja",
  "postcard",
+ "postcard-schema",
  "schemars 1.2.1",
  "serde",
  "serde_ignored",

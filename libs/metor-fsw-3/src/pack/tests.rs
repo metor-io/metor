@@ -253,8 +253,8 @@ fn an_unknown_status_word_is_a_panic() {
 }
 
 #[test]
-fn the_abi_version_is_two() {
-    assert_eq!(ABI_VERSION, 2);
+fn the_abi_version_is_three() {
+    assert_eq!(ABI_VERSION, 3);
 }
 
 /// The `metor-fsw-abi` distribution exists to pin this number; a pack's

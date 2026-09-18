@@ -129,6 +129,9 @@ pub fn frame(input: TokenStream) -> TokenStream {
             fn timestamp(&self) -> Option<#proto::types::Timestamp> {
                 Some(#timestamp_body)
             }
+            fn schema() -> #fsw::record::RecordSchema {
+                #fsw::record::RecordSchema::frame::<Self>()
+            }
         }
 
         impl #impl_generics #fsw::Frame for #ident #ty_generics #where_clause {}

@@ -11,7 +11,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The record every system here carries. The host names it `ping` too.
-#[derive(Record, Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
+#[postcard(crate = metor_fsw_3::postcard_schema)]
 #[record(max_len = 8)]
 pub struct Ping {
     pub n: u32,

@@ -28,7 +28,7 @@ pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use pack::def::{PackDef, PackSystemDef};
 pub use pack::{ABI_VERSION, Status};
 pub use port::{Input, Latest, Output, RecvError, SendError, ring_capacity};
-pub use record::{DecodeError, EncodeError, Record};
+pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
 pub use system::{PortDef, System, SystemDef, SystemInputs, SystemOutputs};
 
 pub use metor_fsw_3_ring as ring;
@@ -40,6 +40,8 @@ pub use metor_proto;
 pub use metor_proto_wkt;
 pub use postcard;
 pub use postcard::experimental::max_size::MaxSize;
+pub use postcard_schema;
+pub use postcard_schema::Schema;
 pub use schemars::{self, JsonSchema};
 pub use serde;
 pub use serde_json;

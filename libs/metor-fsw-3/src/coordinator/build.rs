@@ -341,6 +341,7 @@ mod tests {
                 max_len: 32,
                 alignment: 32,
                 depth: 1,
+                schema: utils::Imu::schema(),
             };
             let def = crate::SystemDef {
                 name: "test".into(),

@@ -99,6 +99,29 @@ mod tests {
         );
     }
 
+    /// Every port announces, so the ground needs nothing but the descriptor.
+    #[test]
+    fn every_port_carries_its_schema_across_the_descriptor() {
+        use crate::Record;
+        use crate::record::{MsgCodec, RecordSchema};
+        use crate::tests::utils::Imu;
+
+        let def = decoded(&table(&Recorder::default()));
+        assert_eq!(def.systems[0].def.outputs[0].schema, Imu::schema());
+        let ports = def
+            .systems
+            .iter()
+            .flat_map(|s| s.def.inputs.iter().chain(&s.def.outputs));
+        for port in ports {
+            match &port.schema {
+                RecordSchema::Frame { metadata, .. } => assert!(!metadata.is_empty()),
+                RecordSchema::Msg { codec, .. } => {
+                    assert!(matches!(codec, MsgCodec::Postcard(_)))
+                }
+            }
+        }
+    }
+
     #[test]
     fn an_empty_table_has_no_systems() {
         let def = PackDef::from_table(&SystemTable::new());

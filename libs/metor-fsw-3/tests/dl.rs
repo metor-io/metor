@@ -14,7 +14,8 @@ use metor_fsw_3::{ABI_VERSION, Input, Output, Pack, PackError, Record, Timestamp
 use serde::{Deserialize, Serialize};
 
 /// The pack's record, redeclared here: the component id is the name's hash.
-#[derive(Record, Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug)]
+#[postcard(crate = metor_fsw_3::postcard_schema)]
 #[record(max_len = 8)]
 struct Ping {
     n: u32,

@@ -96,6 +96,7 @@ impl<T: Record> Output<T> {
             max_len: T::MAX_LEN,
             alignment: T::ALIGN,
             depth: T::DEPTH,
+            schema: T::schema(),
         }
     }
 
@@ -513,6 +514,10 @@ mod tests {
 
         fn timestamp(&self) -> Option<Timestamp> {
             self.0.timestamp()
+        }
+
+        fn schema() -> crate::record::RecordSchema {
+            Stamped::schema()
         }
     }
 

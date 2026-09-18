@@ -47,21 +47,23 @@ pub struct BareName {
 }
 
 /// A message with a static postcard bound, so it states no length.
-#[derive(crate::Record, crate::MaxSize, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(
+    crate::Record, crate::MaxSize, crate::Schema, Serialize, Deserialize, Debug, PartialEq,
+)]
 pub struct Fixed {
     pub a: u32,
     pub b: f64,
 }
 
 /// A message with a string, so it states its length.
-#[derive(crate::Record, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(crate::Record, crate::Schema, Serialize, Deserialize, Debug, PartialEq)]
 #[record(max_len = 64, depth = 4)]
 pub struct Note {
     pub text: String,
 }
 
 /// A message with a timestamp, so fan-in orders it like a frame.
-#[derive(crate::Record, Serialize, Deserialize, Debug, PartialEq)]
+#[derive(crate::Record, crate::Schema, Serialize, Deserialize, Debug, PartialEq)]
 #[record(max_len = 64)]
 pub struct Stamped {
     #[record(timestamp)]

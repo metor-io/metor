@@ -29,6 +29,10 @@ impl Record for LogEvent {
     fn timestamp(&self) -> Option<Timestamp> {
         Some(self.timestamp)
     }
+
+    fn schema() -> crate::record::RecordSchema {
+        crate::record::RecordSchema::postcard::<LogEvent>(Self::NAME)
+    }
 }
 
 /// A `LogPort` writes one system's log lines, stamped with the cycle time.

@@ -60,7 +60,7 @@ mod tests {
 
     /// One record for every port here: the build only compares ids across an
     /// edge, and every edge in the golden joins ports of one record.
-    #[derive(Record, serde::Serialize, Deserialize, Clone, Copy, Debug)]
+    #[derive(Record, crate::Schema, serde::Serialize, Deserialize, Clone, Copy, Debug)]
     #[record(max_len = 8)]
     struct Ping {
         n: u32,

@@ -5,6 +5,8 @@ use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
+use crate::record::RecordSchema;
+
 /// A `PortDef` names one port of a bundle and the record its ring carries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortDef {
@@ -15,6 +17,8 @@ pub struct PortDef {
     pub max_len: usize,
     pub alignment: usize,
     pub depth: usize,
+    /// What this port announces to the ground.
+    pub schema: RecordSchema,
 }
 
 /// A system's ports, in bind order.
@@ -148,6 +152,7 @@ mod tests {
                 max_len: size_of::<Nav>(),
                 alignment: align_of::<Nav>(),
                 depth: 1,
+                schema: Nav::schema(),
             }]
         );
     }
