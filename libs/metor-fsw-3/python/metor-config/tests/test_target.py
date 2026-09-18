@@ -221,6 +221,16 @@ class LinkTest(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "exactly one"):
             Subscribe([Ping])
 
+    def test_max_connections_on_a_dialing_link_raises(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "max_connections"):
+            Publish([], connect="127.0.0.1:2240", max_connections=2)
+        with self.assertRaisesRegex(ConfigError, "max_connections"):
+            Subscribe([Ping], connect="127.0.0.1:2240", max_connections=2)
+
+    def test_subscribing_to_one_record_twice_raises(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "twice"):
+            Subscribe([Ping, Ping], listen="0.0.0.0:1")
+
     def test_publishing_something_that_is_no_port_raises(self) -> None:
         with self.assertRaisesRegex(ConfigError, "handles and ports"):
             Publish(["plant.imu"], listen="0.0.0.0:1")  # type: ignore[list-item]

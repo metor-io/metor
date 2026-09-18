@@ -39,7 +39,7 @@ class Publish(System):
         items: Sequence[Item] = (),
         listen: str | None = None,
         connect: str | None = None,
-        max_connections: int = MAX_CONNECTIONS,
+        max_connections: int | None = None,
         pending_cap: int = PENDING_CAP,
         all: bool = False,
     ) -> None:
@@ -78,11 +78,14 @@ class Subscribe(System):
         records: Sequence[type[Record]] = (),
         listen: str | None = None,
         connect: str | None = None,
-        max_connections: int = MAX_CONNECTIONS,
+        max_connections: int | None = None,
         pending_cap: int = PENDING_CAP,
         inbound_cap: int = INBOUND_CAP,
     ) -> None:
         names = [_record_name(record) for record in records]
+        for name in names:
+            if names.count(name) > 1:
+                raise ConfigError(f"a link subscribes to record `{name}` twice")
         super().__init__(
             {},
             {
@@ -97,12 +100,17 @@ class Subscribe(System):
         self._outputs = tuple(names) + ("link_status",)
 
 
-def _transport(listen: str | None, connect: str | None, max_connections: int) -> dict[str, Any]:
+def _transport(
+    listen: str | None, connect: str | None, max_connections: int | None
+) -> dict[str, Any]:
     if (listen is None) == (connect is None):
         raise ConfigError("a link takes exactly one of `listen` and `connect`")
-    if listen is not None:
-        return {"listen": {"addr": listen, "max_connections": max_connections}}
-    return {"connect": {"addr": connect}}
+    if listen is None:
+        if max_connections is not None:
+            raise ConfigError("a dialing link holds one connection, so it takes no `max_connections`")
+        return {"connect": {"addr": connect}}
+    slots = MAX_CONNECTIONS if max_connections is None else max_connections
+    return {"listen": {"addr": listen, "max_connections": slots}}
 
 
 def _record_name(record: type[Record]) -> str:

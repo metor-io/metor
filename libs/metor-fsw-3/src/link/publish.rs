@@ -5,19 +5,17 @@ use metor_proto::types::Timestamp;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::coordinator::ParamError;
+use crate::coordinator::{DEFAULT_RING_DEPTH, ParamError};
 use crate::log::Log;
-use crate::port::{DynInputs, Output};
+use crate::port::{DynInputs, Output, ring_capacity};
 use crate::system::PortDef;
+use crate::thread::MIRROR_FACTOR;
 use crate::{Stop, system};
 
 use super::conn::{self, Connections};
 use super::transport::{Endpoint, Transport, incoming};
 use super::wire::{self, Wire};
 use super::{LinkStatus, pending_cap};
-
-/// Batches one port holds before a slow connection drops one, in records.
-const BATCH_DEPTH: usize = 8;
 
 /// What a `Publish` is configured with.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -164,11 +162,21 @@ fn fill(batch: &mut Vec<u8>, inputs: &mut DynInputs<Notifier>, wire: &[Option<Wi
     }
 }
 
-/// Room for `BATCH_DEPTH` cycles of every port, so a steady batch never grows.
+/// Room for everything the mirrors hold, so a stalled batch never grows.
 fn batch_cap(defs: &[PortDef]) -> usize {
-    defs.iter()
-        .map(|def| (def.max_len + wire::PACKET_OVERHEAD) * def.depth * BATCH_DEPTH)
-        .sum()
+    defs.iter().map(port_cap).sum()
+}
+
+/// The framed bytes one port's mirror holds when it is full.
+///
+/// A target that deepens its rings past [`DEFAULT_RING_DEPTH`] regrows a batch
+/// once, and keeps the larger one.
+fn port_cap(def: &PortDef) -> usize {
+    let Some(capacity) = ring_capacity(def.max_len, def.depth * DEFAULT_RING_DEPTH) else {
+        return 0;
+    };
+    let records = capacity / metor_fsw_3_ring::frame_len(def.max_len).max(1) * MIRROR_FACTOR;
+    records * (def.max_len + wire::PACKET_OVERHEAD)
 }
 
 #[cfg(test)]
@@ -183,6 +191,28 @@ mod tests {
     use crate::tests::utils::{Fixed, Imu};
 
     use super::*;
+
+    /// A mirror as deep as the adapter makes one for a port of `R`.
+    fn mirror_ring<R: Record>() -> RingBuffer {
+        let depth = R::DEPTH * DEFAULT_RING_DEPTH;
+        RingBuffer::create_in_memory(Config {
+            capacity: ring_capacity(R::MAX_LEN, depth).expect("valid capacity") * MIRROR_FACTOR,
+            max_readers: 2,
+        })
+    }
+
+    /// One record on each port, or `false` once either ring is full.
+    fn try_produce(rings: &[RingBuffer; 2], sample: f64) -> bool {
+        let imu = Imu::new(1, sample);
+        let mut buf = [0u8; Fixed::MAX_LEN];
+        let fixed = Fixed { a: 1, b: sample };
+        let bytes = fixed.encode(&mut buf).expect("encodes");
+        let mut writers = [
+            rings[0].writer(Notifier::default()).expect("a free writer"),
+            rings[1].writer(Notifier::default()).expect("a free writer"),
+        ];
+        writers[0].try_write(imu.as_bytes()).is_ok() && writers[1].try_write(bytes).is_ok()
+    }
 
     fn ring<R: Record>() -> RingBuffer {
         RingBuffer::create_in_memory(Config {
@@ -262,6 +292,23 @@ mod tests {
         produce(&rings, 2.0);
         fill(&mut batch, &mut inputs, &[None, None]);
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn a_batch_draining_a_stalled_mirror_still_fits_its_reservation() {
+        let rings = [mirror_ring::<Imu>(), mirror_ring::<Fixed>()];
+        let mut inputs = ports(&rings);
+        let defs: Vec<PortDef> = inputs.iter_mut().map(|(def, _)| def.clone()).collect();
+        let (_, wire) = wire::announce(&defs, None, "pub");
+        let mut batch = Vec::with_capacity(batch_cap(&defs));
+        let reserved = batch.capacity();
+        let mut stalled = 0;
+        while try_produce(&rings, stalled as f64) {
+            stalled += 1;
+        }
+        assert!(stalled > 8, "a stall of {stalled} cycles is not one");
+        fill(&mut batch, &mut inputs, &wire);
+        assert_eq!(batch.capacity(), reserved);
     }
 
     #[test]

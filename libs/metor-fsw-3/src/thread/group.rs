@@ -1,6 +1,7 @@
 //! One background thread running one executor for a group of async systems.
 
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -18,7 +19,33 @@ use super::Launch;
 const JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What a panicked task left behind, read by its system's adapter.
-pub(crate) type Panicked = Arc<Mutex<Option<String>>>;
+///
+/// The flag is what the adapter reads each cycle; the message is taken once.
+#[derive(Clone, Default)]
+pub(crate) struct Panicked(Arc<Slot>);
+
+#[derive(Default)]
+struct Slot {
+    set: AtomicBool,
+    message: Mutex<Option<String>>,
+}
+
+impl Panicked {
+    fn set(&self, message: String) {
+        // PANIC Safety: neither side panics while it holds this lock.
+        *self.0.message.lock().expect("an unpoisoned slot") = Some(message);
+        self.0.set.store(true, Ordering::Release);
+    }
+
+    /// The message the task left, once.
+    pub(crate) fn take(&self) -> Option<String> {
+        if !self.0.set.load(Ordering::Acquire) {
+            return None;
+        }
+        // PANIC Safety: as above.
+        self.0.message.lock().expect("an unpoisoned slot").take()
+    }
+}
 
 /// One async system on its way to a thread.
 pub(crate) struct Member {
@@ -150,9 +177,7 @@ async fn task(running: crate::async_system::Running, panicked: Panicked) {
     if let Err(payload) = caught {
         let message = crate::coordinator::panic_message(&*payload).to_string();
         crate::panic::discard(payload);
-        // PANIC Safety: the adapter only replaces this slot, never panicking
-        // while it holds the lock.
-        *panicked.lock().expect("an unpoisoned slot") = Some(message);
+        panicked.set(message);
     }
 }
 

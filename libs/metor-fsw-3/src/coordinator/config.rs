@@ -8,6 +8,9 @@ use super::error::BuildError;
 
 const MIN_WALL_RATE: f64 = 0.001;
 
+/// Records a ring holds per record `depth`, unless a config says otherwise.
+pub const DEFAULT_RING_DEPTH: usize = 8;
+
 /// The configuration for a coordinator
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorConfig {
@@ -21,7 +24,7 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             clock: Clock::Wall { rate: 100.0 },
-            ring_depth: 8,
+            ring_depth: DEFAULT_RING_DEPTH,
             systems: Vec::new(),
         }
     }

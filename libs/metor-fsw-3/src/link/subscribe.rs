@@ -139,7 +139,8 @@ fn report(
 
 /// The message ports records are routed to, and the longest record any takes.
 ///
-/// A frame port is faulted and skipped: this link routes messages only.
+/// A frame port is faulted and skipped: this link routes messages only. So is
+/// a second port on one record's id, which no peer could address separately.
 fn routes<'a>(
     outputs: &'a mut DynOutputs,
     log: &mut Log,
@@ -148,6 +149,13 @@ fn routes<'a>(
     let mut max_len = 0;
     for (def, output) in outputs.iter_mut() {
         match &def.schema {
+            RecordSchema::Msg { id, .. } if ports.iter().any(|(seen, _)| seen == id) => log.fault(
+                "duplicate_id",
+                format!(
+                    "port `{}` carries a record an earlier port already takes",
+                    def.name
+                ),
+            ),
             RecordSchema::Msg { id, .. } => {
                 max_len = max_len.max(def.max_len);
                 ports.push((*id, output));
@@ -449,6 +457,21 @@ mod tests {
         inbox.accept(&msg(id_of::<Fixed>(), &[0u8; 60]));
         assert_eq!(deliver(&inbox, &mut routed), 1);
         assert!(view.drain().next().is_none());
+    }
+
+    #[test]
+    fn a_second_port_on_one_record_id_is_faulted_and_left_unrouted() {
+        let rings = [ring::<Fixed>(), ring::<Fixed>()];
+        let mut outputs = bind(
+            [
+                Output::<Fixed>::def("cmds.first"),
+                Output::<Fixed>::def("cmds.second"),
+            ],
+            &rings,
+        );
+        let (routed, _) = routes(&mut outputs, &mut Log);
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].0, id_of::<Fixed>());
     }
 
     #[test]

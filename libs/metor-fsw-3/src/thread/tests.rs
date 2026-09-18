@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use metor_proto::types::Timestamp;
 
-use crate::coordinator::SystemConfig;
 use crate::coordinator::{BuildError, Coordinator, CoordinatorConfig, InputConfig, PortRef};
+use crate::coordinator::{ParamError, SystemConfig};
 use crate::tests::utils::{Recorder, table};
 
 /// A system on a named thread, or the shared one when `thread` is `None`.
@@ -89,6 +89,20 @@ fn a_system_that_never_reads_drops_into_its_mirror_and_reports_it() {
     assert!(reports[0].fields.iter().any(|(name, _)| name == "imu"));
     // The producer keeps its own ring; only the mirror refuses records.
     assert!(coordinator.latched().next().is_none());
+}
+
+#[test]
+fn a_mirror_too_large_for_a_region_is_a_param_error() {
+    assert!(super::mirror_config(64).is_ok());
+    // Four times a capacity no region can hold, and one that overflows.
+    assert!(matches!(
+        super::mirror_config(3),
+        Err(ParamError::Decode(_))
+    ));
+    assert!(matches!(
+        super::mirror_config(usize::MAX / 2),
+        Err(ParamError::Decode(_))
+    ));
 }
 
 /// The `kind` field a fault line carries.
