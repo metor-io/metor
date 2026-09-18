@@ -16,6 +16,29 @@
     "ring_depth": 8,
     "systems": [
       {
+        "id": "cmds",
+        "ty": "fsw.subscribe",
+        "params": {
+          "transport": {
+            "listen": {
+              "addr": "127.0.0.1:0",
+              "max_connections": 8
+            }
+          },
+          "namespace": "cube_sat",
+          "link": "cmds",
+          "pending_cap": 1048576,
+          "inbound_cap": 256
+        },
+        "inputs": [],
+        "outputs": [
+          {
+            "port": "ping",
+            "record": "ping"
+          }
+        ]
+      },
+      {
         "id": "plant",
         "ty": "adcs.plant",
         "params": {
@@ -77,6 +100,60 @@
               {
                 "system": "mode",
                 "port": "cmd"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pub",
+        "ty": "fsw.publish",
+        "params": {
+          "transport": {
+            "listen": {
+              "addr": "127.0.0.1:0",
+              "max_connections": 8
+            }
+          },
+          "namespace": "cube_sat",
+          "link": "pub",
+          "pending_cap": 1048576
+        },
+        "thread": "io",
+        "inputs": [
+          {
+            "port": "plant.imu",
+            "from": [
+              {
+                "system": "plant",
+                "port": "imu"
+              }
+            ]
+          },
+          {
+            "port": "plant.log",
+            "from": [
+              {
+                "system": "plant",
+                "port": "log"
+              }
+            ]
+          },
+          {
+            "port": "plant.status",
+            "from": [
+              {
+                "system": "plant",
+                "port": "status"
+              }
+            ]
+          },
+          {
+            "port": "nav.est",
+            "from": [
+              {
+                "system": "nav",
+                "port": "est"
               }
             ]
           }

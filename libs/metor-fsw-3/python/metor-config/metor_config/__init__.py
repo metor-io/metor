@@ -4,6 +4,7 @@ A target file constructs one `Target`, adds the systems a pack module supplies,
 and ends; the config lands in `$METOR_CONFIG_OUT` or on stdout.
 """
 
+from ._builtins import Publish, Subscribe
 from ._config import CONFIG_VERSION, ConfigError
 from ._model import Loop, OutPort, Pack, PortRef, Record, Source, Sources, System
 from ._target import SystemHandle, Target, emit
@@ -15,9 +16,11 @@ __all__ = [
     "OutPort",
     "Pack",
     "PortRef",
+    "Publish",
     "Record",
     "Source",
     "Sources",
+    "Subscribe",
     "System",
     "SystemHandle",
     "Target",

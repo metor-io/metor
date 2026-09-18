@@ -119,9 +119,10 @@ mod tests {
         }
     }
 
-    /// The four `adcs.*` types the golden names, with the golden's port names.
+    /// The four `adcs.*` types the golden names, plus the links it adds.
     fn table() -> SystemTable {
         let mut table = SystemTable::new();
+        crate::link::register_builtins(&mut table);
         table.register("adcs.plant", |_: Altitude| Plant);
         table.register("adcs.nav", |_: Gain| Nav);
         table.register("adcs.mode", || Mode);
@@ -149,7 +150,7 @@ mod tests {
             .expect("the golden's graph builds");
         assert_eq!(
             coordinator.entry_names().collect::<Vec<_>>(),
-            vec!["plant", "nav", "mode", "ctrl"]
+            vec!["cmds", "plant", "nav", "mode", "ctrl", "pub"]
         );
     }
 

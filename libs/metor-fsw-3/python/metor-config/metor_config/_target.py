@@ -55,7 +55,7 @@ class Target:
         self.sim_dt = sim_dt
         self.ring_depth = ring_depth
         self.namespace = namespace
-        self._systems: list[tuple[str, System]] = []
+        self._systems: list[tuple[str, System, str | None]] = []
         self._handles: dict[str, SystemHandle] = {}
         self._packs: dict[str, Pack] = {}
         _targets.append(self)
@@ -65,31 +65,47 @@ class Target:
         its producer. Connect it once the producer exists."""
         return Loop(record)
 
-    def add(self, name: str, system: S) -> S:
+    def add(self, name: str, system: S, thread: str | None = None) -> S:
         """Register ``system`` as ``name``; the returned handle carries its output
         ports. Add order is step order, so a system only names ports of systems
-        already added."""
+        already added. ``thread`` places an async system on a thread of that name.
+        """
         if name in self._handles:
             raise ConfigError(f"system `{name}` is already added")
         pack = system._pack
         check_abi(pack.id, pack.abi_version)
         self._packs.setdefault(pack.id, pack)
-        self._systems.append((name, system))
+        self._systems.append((name, system, thread))
         handle = SystemHandle(name, system._outputs)
         self._handles[name] = handle
         return cast(S, handle)
 
     def to_config(self) -> dict[str, Any]:
-        """The config file as a dict: this target's packs and its coordinator."""
+        """The config file as a dict: this target's packs and its coordinator.
+
+        A pack with no library is built into the host, so it is not listed.
+        """
+        self._finalize()
         return {
             "config_version": CONFIG_VERSION,
-            "packs": [pack.to_json() for pack in self._packs.values()],
+            "packs": [pack.to_json() for pack in self._packs.values() if pack.lib],
             "coordinator": {
                 "clock": self._clock(),
                 "ring_depth": self.ring_depth,
-                "systems": [_system(name, system) for name, system in self._systems],
+                "systems": [
+                    _system(name, system, thread) for name, system, thread in self._systems
+                ],
             },
         }
+
+    def _finalize(self) -> None:
+        """Hands every system that asked for it this target, before emission."""
+        for index, (name, system, _) in enumerate(self._systems):
+            if not system._wants_target:
+                continue
+            system._params["namespace"] = self.namespace
+            system._params["link"] = name
+            system._finalize(self, index)
 
     def _clock(self) -> dict[str, Any]:
         if self.sim_dt is not None:
@@ -97,16 +113,21 @@ class Target:
         return wall_clock(self.cycle_rate)
 
 
-def _system(name: str, system: System) -> dict[str, Any]:
-    return {
+def _system(name: str, system: System, thread: str | None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
         "id": name,
         "ty": f"{system._pack.id}.{system._ty}",
         "params": system._params or None,
-        "inputs": [
-            {"port": port, "from": [_resolve(name, port, source) for source in sources]}
-            for port, sources in system._inputs.items()
-        ],
     }
+    if thread is not None:
+        entry["thread"] = thread
+    entry["inputs"] = [
+        {"port": port, "from": [_resolve(name, port, source) for source in sources]}
+        for port, sources in system._inputs.items()
+    ]
+    if system._dyn_outputs:
+        entry["outputs"] = system._dyn_outputs
+    return entry
 
 
 def _resolve(name: str, port: str, source: Source[Any]) -> dict[str, str]:

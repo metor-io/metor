@@ -15,13 +15,16 @@ PACK = Pack(
 )
 
 
-class LogEvent(Record): ...
+class LogEvent(Record):
+    _name = "log"
 
 
-class Ping(Record): ...
+class Ping(Record):
+    _name = "ping"
 
 
-class SystemStatus(Record): ...
+class SystemStatus(Record):
+    _name = "status"
 
 
 class Echo(System):

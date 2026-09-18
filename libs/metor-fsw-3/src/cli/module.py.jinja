@@ -16,7 +16,8 @@ PACK = Pack(
 )
 {% for record in records %}
 
-class {{ record }}(Record): ...
+class {{ record.class }}(Record):
+    _name = {{ record.name | python_string }}
 {% endfor %}
 {%- for class in dataclasses %}
 

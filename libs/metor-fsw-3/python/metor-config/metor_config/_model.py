@@ -12,7 +12,12 @@ T = TypeVar("T", bound="Record")
 
 
 class Record:
-    """Marker base of a record type; a pack module declares one class per record name."""
+    """Marker base of a record type; a pack module declares one class per record name.
+
+    ``_name`` is the record's name on the host, which a link reads to name a port.
+    """
+
+    _name: str = ""
 
 
 @dataclass(frozen=True)
@@ -99,10 +104,25 @@ class System:
     _pack: Pack
     _ty: str
     _outputs: tuple[str, ...] = ()
+    _wants_target: bool = False
+    """Whether `Target.to_config` fills this system's `namespace` and `link` params."""
 
-    def __init__(self, inputs: dict[str, Sources[Any]], params: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        inputs: dict[str, Sources[Any]],
+        params: dict[str, Any],
+        outputs: list[dict[str, str]] | None = None,
+    ) -> None:
         self._inputs = {port: _sources(port, src) for port, src in inputs.items()}
         self._params = {name: _json(value) for name, value in params.items()}
+        self._dyn_outputs = list(outputs or [])
+
+    def _finalize(self, target: Any, index: int) -> None:
+        """Last chance to read the target this system was added to, at emission.
+
+        ``index`` is this system's place in the target's step order. Emission
+        repeats, so an override rebuilds rather than appends.
+        """
 
 
 def _sources(port: str, sources: Sources[Any]) -> list[Source[Any]]:

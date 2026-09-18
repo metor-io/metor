@@ -12,22 +12,32 @@ from metor_config import OutPort, Pack, Record, Sources, System  # noqa: E402
 PACK = Pack(id="adcs", lib="adcs_systems", libs="/abs/.metor/adcs_pack/_libs", abi_version=1)
 
 
-class Imu(Record): ...
+class Imu(Record):
+    _name = "imu"
 
 
-class LogEvent(Record): ...
+class LogEvent(Record):
+    _name = "log"
 
 
-class SystemStatus(Record): ...
+class SystemStatus(Record):
+    _name = "status"
 
 
-class Est(Record): ...
+class Est(Record):
+    _name = "est"
 
 
-class ModeCmd(Record): ...
+class ModeCmd(Record):
+    _name = "mode_cmd"
 
 
-class MotorCmd(Record): ...
+class MotorCmd(Record):
+    _name = "motor_cmd"
+
+
+class Ping(Record):
+    _name = "ping"
 
 
 class Plant(System):

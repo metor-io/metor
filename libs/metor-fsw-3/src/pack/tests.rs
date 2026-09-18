@@ -286,3 +286,14 @@ fn the_abi_distributions_version_is_the_abi_version() {
         .expect("a version string");
     assert_eq!(version, ABI_VERSION.to_string());
 }
+
+/// The built-in links ship with the host, so `metor_config` declares their
+/// pack at this ABI.
+#[test]
+fn the_builtin_packs_abi_version_is_the_abi_version() {
+    let source = include_str!("../../python/metor-config/metor_config/_config.py");
+    assert!(
+        source.contains(&format!("\nABI_VERSION = {ABI_VERSION}\n")),
+        "metor_config declares another ABI"
+    );
+}

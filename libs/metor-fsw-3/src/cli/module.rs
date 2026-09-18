@@ -21,11 +21,18 @@ struct Module {
     pack_id: String,
     lib: String,
     abi_version: u32,
-    /// Record class names, sorted.
-    records: Vec<String>,
+    /// One class per record the pack carries, sorted by class name.
+    records: Vec<RecordClass>,
     /// Nested params objects, by name.
     dataclasses: Vec<Class>,
     systems: Vec<Entry>,
+}
+
+/// A record's name on the host and the class a target names it by.
+#[derive(Serialize)]
+struct RecordClass {
+    name: String,
+    class: String,
 }
 
 #[derive(Serialize)]
@@ -102,16 +109,22 @@ fn view(pack: &PackRef, abi_version: u32, def: &PackDef) -> Result<Module, PackD
     })
 }
 
-fn records(def: &PackDef) -> Vec<String> {
+fn records(def: &PackDef) -> Vec<RecordClass> {
     let mut names: Vec<&str> = BUILTIN_PORTS.iter().map(|(name, _)| *name).collect();
     for port in def.systems.iter().flat_map(ports) {
         if !names.contains(&port.record.as_ref()) {
             names.push(&port.record);
         }
     }
-    let mut classes: Vec<String> = names.into_iter().map(class_of).collect();
-    classes.sort_unstable();
-    classes
+    let mut records: Vec<RecordClass> = names
+        .into_iter()
+        .map(|name| RecordClass {
+            class: class_of(name),
+            name: name.to_string(),
+        })
+        .collect();
+    records.sort_unstable_by(|a, b| a.class.cmp(&b.class));
+    records
 }
 
 fn ports(system: &PackSystemDef) -> impl Iterator<Item = &PortDef> {
@@ -421,8 +434,8 @@ mod tests {
     fn a_system_with_no_ports_still_has_the_framework_records() {
         let text = rendered(vec![system("mode", vec![], vec![], None)]).expect("renders");
         assert!(!text.contains("dataclass"));
-        assert!(text.contains("class LogEvent(Record): ..."));
-        assert!(text.contains("class SystemStatus(Record): ..."));
+        assert!(text.contains("class LogEvent(Record):\n    _name = \"log\"\n"));
+        assert!(text.contains("class SystemStatus(Record):\n    _name = \"status\"\n"));
         assert!(
             text.contains("    def __init__(self) -> None:\n        super().__init__({}, {})\n")
         );
