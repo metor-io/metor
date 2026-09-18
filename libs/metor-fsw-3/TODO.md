@@ -46,6 +46,10 @@ fixed by metor-panel and metor-db, so it is reproduced, not designed.
   are designed in `05-links.md` and held until two systems must hold
   one socket (bi-directional commanding on one port).
 
+- Link loops: `publish.rs` and `subscribe.rs` repeat the `Event` enum,
+  `next()`, and the prune/re-arm tail, and their params repeat four fields;
+  fold them into one helper in `conn.rs` when a third link arrives.
+
 - Message ids: postcard messages hash the schema name, other codecs the
   record name. Unify in metor-proto-wkt (the panel's matchers depend on
   the current ids), then drop `Msg::ID` from the `Record` derive.

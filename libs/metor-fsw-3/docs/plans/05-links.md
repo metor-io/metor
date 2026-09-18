@@ -102,22 +102,26 @@ Registration is `table.register_async(ty, ctor)`.
 
 ### Thread adapter
 
-`Thread<S: AsyncSystem>` implements `Step` and is what the table binds.
-It owns:
+`Thread` implements `Step` and is what the table binds. It is not
+generic: a system's types are erased into the `Launch` its group's thread
+constructs. It owns:
 
 - one mirror ring per input edge and one per output port, allocated at
   build from the same `PortDef` as the real ring, four times its
   capacity (`MIRROR_FACTOR`), so the adapter needs nothing from the
   coordinator config and works inside a pack unchanged;
-- the thread, spawned at build, running `stellarator::run` around
-  `S::run` with the mirror rings' async ports;
-- a stop flag and the join handle.
+- an `Arc<GroupHandle>` for the thread its system runs on, shared with
+  every other adapter on that group;
+- a `Panicked` slot the task writes into, read through an atomic flag.
 
 Each cycle the adapter's `execute` drains every input view into its
 mirror writer, then drains every output mirror view into the real output
 writer. Both are byte copies; no decode. A mirror write that returns
-`WouldBlock` is a drop, counted per port, reported as one fault line per
-cycle on the system's `log` with the counts (`kind = "mirror_dropped"`).
+`WouldBlock` is a drop, counted per port and reported on the system's
+`log` once per `DROP_REPORT_CYCLES` cycles, carrying every port's count
+since the last line (`kind = "mirror_dropped"`). The line's fields are
+allocated at bind and written in place, so a dropping mirror costs the
+cycle thread nothing.
 The `log` output is owned by the adapter on the cycle thread; the async
 side's lines arrive through the log mirror and are merged in.
 
@@ -126,10 +130,14 @@ the next `execute` of the adapter, at its position in step order. Placing
 a `Subscribe` first and a `Publish` last gives commands and telemetry the
 same cycle they are copied.
 
-A panic on the thread ends the task; the adapter sees the join handle
-complete, writes a `panic` fault line, and latches like a cyclic panic.
-Dropping the adapter sets the stop flag, wakes the thread, joins with a
-bounded wait, and detaches with an error line if the wait expires.
+A panic ends only its own task, which leaves the message in that
+system's `Panicked` slot; the adapter reads it on its next `execute`,
+writes a `panic` fault line, and latches like a cyclic panic. A
+constructor that panics is caught where it runs and reaches the build as
+a param error naming the system, leaving the group's other systems
+running. Dropping the last adapter on a group drops the `GroupHandle`,
+which sets the stop, wakes the thread, waits for it to finish, and
+detaches with an error line at `JOIN_TIMEOUT`.
 
 The adapter composes with packs without touching the ABI: a pack that
 registers an async system exports `Thread<S>` as an ordinary system, and
@@ -147,8 +155,9 @@ A task on a shared thread must not block, since the executor is
 cooperative; a driver that does takes a thread of its own. A panicking
 task is caught per task and latches only its own system.
 
-A pack's async system runs on a private thread inside the pack and
-ignores `thread`; pooling across the ABI is a later concern.
+A pack's async system honors `thread` like any other: the descriptor
+carries the name across the ABI, and the group thread is spawned inside
+the pack, one per name the host placed a system on.
 
 ## State
 
@@ -281,7 +290,10 @@ declares.
 Both systems take a `transport` param:
 
 ```rust
-enum Transport { Listen { addr: String }, Connect { addr: String } }
+enum Transport {
+    Listen { addr: String, max_connections: usize },
+    Connect { addr: String },
+}
 ```
 
 `Listen` binds in the constructor, so a taken port is a build error, and
@@ -341,6 +353,13 @@ the same names for the same producer. `SetMsgMetadata.name` is the
 postcard schema's type name for postcard records, matching the id's
 hash, and the record name for other codecs.
 
+A leaf therefore roots at `{namespace}.{producer}.{port}`, the port's
+name, where fsw-2 rooted it at `{namespace}.{instance}.{frame}`, the
+frame's. The two agree only where a port is named after the record it
+carries: `nav.est` carrying frame `nav_est` announces
+`cube_sat.nav.est.x`, not `cube_sat.nav.nav_est.x`, so a panel layout
+saved against fsw-2 names has to be re-keyed. Open decision 7.
+
 Input port names are `{producer}.{port}`; the Python builder enforces it,
 the Rust side accepts any name.
 
@@ -383,9 +402,9 @@ gps = fsw.add("gps", SerialGps(port="/dev/ttyUSB0"), thread="gps")
 named `{system}.{port}`. `Subscribe` takes record classes and expands
 to `outputs: [{port: <record name>, record: <record name>}]`; its handle
 resolves `cmds.arm` to that port. `Publish(all=True)` expands at emit
-time to every system added before it. A `Publish` handle exposes its
-inputs as attributes (`pub.plant.imu`) so slice 7 can reference them
-from another target; it emits no rings.
+time to every system added before it. A `Publish` handle resolves only its
+own outputs (`link_status` and `log`); the ports it reads stay
+addressable through their producers' handles.
 
 `Publish` and `Subscribe` live in `metor_config` as built-ins with the
 pack id `fsw`, whose empty `lib` is why `to_config().packs` omits it;
@@ -441,8 +460,8 @@ Unit (io-less):
   outputs surface on the next cycle, a panicked task latches, drop joins.
 - Announce blob: golden bytes for one frame and one message port,
   including the re-rooted component ids and the table id.
-- Batch assembly: one packet per record, framing lengths, no allocation
-  after the first batch (assert on a counting allocator in the test).
+- Batch assembly: one packet per record, framing lengths, and a batch
+  that drains a stalled mirror still inside its reservation.
 - Pending buffer: a batch past the cap drops whole and the next smaller
   batch still lands.
 
@@ -458,8 +477,9 @@ Integration (`tests/link.rs`):
 - Simulated clock at full speed: no starvation, drops counted, loop
   cycle count unaffected.
 
-Prover: Kani on the pending-buffer reservation arithmetic and on mirror
-capacity from `MIRROR_FACTOR`.
+Prover: none of this slice's code carries a proof; the `bounded` and
+`ring_capacity` proofs slice 1 wrote cover what a link writes onto a
+ring.
 
 ## Open decisions
 
@@ -482,3 +502,15 @@ capacity from `MIRROR_FACTOR`.
 6. Retained snapshot messages (fsw-2 sent the wiring manifest on
    connect) are absent. The panel gets topology from the config file for
    now; a config-announce message can follow without changing the link.
+7. Component ids root at the port's name, not the frame's, so they
+   diverge from fsw-2 wherever the two differ. The shipped code does
+   this; whether it is what a target wants is not settled. The
+   alternative is rooting at the record name, which keeps fsw-2 layouts
+   working and loses the ability to publish one record from two ports
+   under two names.
+8. Wall stamps under a simulated clock: `link_status`, async log lines,
+   and anything else an async system stamps take `Timestamp::now()`,
+   while every record on the graph carries the cycle's time, so a
+   simulated run's telemetry has two timelines. Either carry the cycle
+   stamp across in the mirror, which the adapter knows, or document the
+   split and leave link telemetry on the wall clock.
