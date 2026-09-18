@@ -11,7 +11,7 @@ use metor_proto_wkt::LogEvent;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::port::{Input, Output};
+use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::system::{System, SystemDef};
 use crate::{Frame, SystemInputs, SystemOutputs};
 
@@ -308,6 +308,33 @@ impl System for Trap {
     }
 }
 
+/// Records the port name and bytes of every dynamic input, each cycle.
+pub struct Tap(Recorder);
+
+#[crate::system]
+impl Tap {
+    fn execute(&mut self, inputs: &mut DynInputs) {
+        for (def, input) in inputs.iter_mut() {
+            for record in input.drain() {
+                let Ok(bytes) = record else { continue };
+                self.0.push_tap(def.name.to_string(), bytes.to_vec());
+            }
+        }
+    }
+}
+
+/// Writes one fixed record onto every port the config gave it.
+pub struct Emit(Vec<u8>);
+
+#[crate::system]
+impl Emit {
+    fn execute(&mut self, outputs: &mut DynOutputs) {
+        for (_, output) in outputs.iter_mut() {
+            let _ = output.write_bytes(&self.0);
+        }
+    }
+}
+
 /// Records every log line it is wired to.
 pub struct LogSink(Recorder);
 
@@ -330,6 +357,7 @@ struct Recorded {
     commands: Vec<(Timestamp, f64)>,
     statuses: Vec<SystemStatus>,
     logs: Vec<LogEvent>,
+    taps: Vec<(String, Vec<u8>)>,
 }
 
 impl Recorder {
@@ -345,6 +373,10 @@ impl Recorder {
         self.0.borrow_mut().logs.push(line);
     }
 
+    fn push_tap(&self, port: String, bytes: Vec<u8>) {
+        self.0.borrow_mut().taps.push((port, bytes));
+    }
+
     pub fn take(&self) -> Vec<(Timestamp, f64)> {
         core::mem::take(&mut self.0.borrow_mut().commands)
     }
@@ -355,6 +387,10 @@ impl Recorder {
 
     pub fn take_logs(&self) -> Vec<LogEvent> {
         core::mem::take(&mut self.0.borrow_mut().logs)
+    }
+
+    pub fn take_taps(&self) -> Vec<(String, Vec<u8>)> {
+        core::mem::take(&mut self.0.borrow_mut().taps)
     }
 }
 
@@ -377,6 +413,9 @@ pub fn table(recorder: &Recorder) -> SystemTable {
     table.register_system("trap", |_| Ok((Trap, ())));
     let logs = recorder.clone();
     table.register("log_sink", move || LogSink(logs.clone()));
+    let taps = recorder.clone();
+    table.register("tap", move || Tap(taps.clone()));
+    table.register("emit", || Emit(Imu::new(1, 5.0).as_bytes().to_vec()));
     table
 }
 

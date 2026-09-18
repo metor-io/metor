@@ -55,7 +55,7 @@ fn defs_body(bundle: &Bundle) -> TokenStream2 {
 }
 
 /// `bind` takes one entry per field, in declaration order.
-fn bind_body(bundle: &Bundle, arg: &Ident) -> TokenStream2 {
+fn bind_body(bundle: &Bundle, arg: &Ident, dir: Dir) -> TokenStream2 {
     let ident = &bundle.ident;
     let name = ident.to_string();
     let fields = bundle.fields();
@@ -64,9 +64,10 @@ fn bind_body(bundle: &Bundle, arg: &Ident) -> TokenStream2 {
         // PANIC Safety: a named struct's fields all have idents.
         let id = f.ident.as_ref().expect("named field");
         let ty = &f.ty;
+        let handles = dir.handles();
         // PANIC Safety: length checked above; the coordinator validates frame alignment.
         quote! {
-            #id: <#ty>::try_new(#arg.next().expect("checked length"))
+            #id: <#ty>::try_new(#arg.next().expect("checked length").#handles)
                 .expect("unsupported frame alignment"),
         }
     });
@@ -99,6 +100,16 @@ enum Dir {
     Outputs,
 }
 
+impl Dir {
+    /// The binding field holding this direction's ring handles.
+    fn handles(self) -> TokenStream2 {
+        match self {
+            Dir::Inputs => quote!(views),
+            Dir::Outputs => quote!(writer),
+        }
+    }
+}
+
 fn expand(parsed: DeriveInput, dir: Dir) -> TokenStream2 {
     let bundle = match Bundle::from_derive_input(&parsed) {
         Ok(b) => b,
@@ -109,15 +120,15 @@ fn expand(parsed: DeriveInput, dir: Dir) -> TokenStream2 {
     let (impl_generics, ty_generics, where_clause) = bundle.generics.split_for_impl();
     let defs = defs_body(&bundle);
     let arg = Ident::new("bound", proc_macro2::Span::call_site());
-    let bind = bind_body(&bundle, &arg);
+    let bind = bind_body(&bundle, &arg, dir);
     let (trait_name, arg_ty) = match dir {
         Dir::Inputs => (
             quote!(SystemInputs),
-            quote!(Vec<Vec<#fsw::ring::View<#fsw::ring::NoWake>>>),
+            quote!(Vec<#fsw::system::InputBinding>),
         ),
         Dir::Outputs => (
             quote!(SystemOutputs),
-            quote!(Vec<#fsw::ring::Writer<#fsw::ring::NoWake>>),
+            quote!(Vec<#fsw::system::OutputBinding>),
         ),
     };
     quote! {

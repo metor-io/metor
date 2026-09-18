@@ -38,8 +38,19 @@ fn raw(ring: &TestRing) -> RawRing {
     RawRing::of(&ring.export)
 }
 
+/// The def the host would resolve for `ty`, as JSON; an unknown type gets an
+/// empty one, since `create` never reaches the bindings.
+fn instance_def(ty: &str) -> Vec<u8> {
+    let def = build()
+        .get(ty)
+        .map(|entry| entry.def.clone())
+        .unwrap_or_else(|| crate::SystemDef::new::<(), ()>("unknown"));
+    serde_json::to_vec(&def).expect("encodes")
+}
+
 /// Calls `create` the way an export does, returning the instance or the error.
 fn create_raw(ty: &str, params: &str, inputs: &[RawPort], outputs: &[RawRing]) -> Instance {
+    let def = instance_def(ty);
     let mut error = RawSlice::EMPTY;
     // SAFETY: every array outlives the call, and the rings outlive the instance.
     let handle = unsafe {
@@ -47,6 +58,7 @@ fn create_raw(ty: &str, params: &str, inputs: &[RawPort], outputs: &[RawRing]) -
             build,
             RawSlice::of(ty.as_bytes()),
             RawSlice::of(params.as_bytes()),
+            RawSlice::of(&def),
             RawSlice::of(inputs),
             RawSlice::of(outputs),
             &raw mut error,

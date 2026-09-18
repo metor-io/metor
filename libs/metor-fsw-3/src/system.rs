@@ -1,6 +1,6 @@
 //! The [`System`] trait and the port bundles that feed it.
 
-use metor_fsw_3_ring::{NoWake, View, Writer};
+use metor_fsw_3_ring::{NoWake, View, WakeSink, WakeSource, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -22,11 +22,18 @@ pub struct PortDef {
 }
 
 /// A system's ports, in bind order.
+///
+/// A dynamic side declares no ports; the config lists them and build
+/// completes each one before the system is bound.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemDef {
     pub name: Cow<'static, str>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
+    #[serde(default)]
+    pub dynamic_inputs: bool,
+    #[serde(default)]
+    pub dynamic_outputs: bool,
 }
 
 impl SystemDef {
@@ -35,8 +42,22 @@ impl SystemDef {
             name: name.into(),
             inputs: I::defs(),
             outputs: O::defs(),
+            dynamic_inputs: I::DYNAMIC,
+            dynamic_outputs: O::DYNAMIC,
         }
     }
+}
+
+/// One input port: the definition build settled on and one view per producer.
+pub struct InputBinding<W: WakeSink = NoWake> {
+    pub def: PortDef,
+    pub views: Vec<View<W>>,
+}
+
+/// One output port: the definition build settled on and its writer.
+pub struct OutputBinding<W: WakeSource = NoWake> {
+    pub def: PortDef,
+    pub writer: Writer<W>,
 }
 
 /// A `System` is the core composable element of metor-fsw, it provides
@@ -61,36 +82,44 @@ pub trait System {
 
 /// A struct of `Input<F>` fields. Derive with `#[derive(SystemInputs)]`.
 pub trait SystemInputs {
+    /// Whether the config names this bundle's ports rather than the type.
+    const DYNAMIC: bool = false;
+
     fn defs() -> Vec<PortDef>;
-    /// One view list per [`defs`](SystemInputs::defs) entry, in order.
+    /// One binding per [`defs`](SystemInputs::defs) entry, in order, then one
+    /// per port the config added to a dynamic bundle.
     ///
     /// # Panics
     /// Derived implementations panic on a wrong list length or unsupported frame alignment.
-    fn bind(views: Vec<Vec<View<NoWake>>>) -> Self;
+    fn bind(inputs: Vec<InputBinding>) -> Self;
 }
 
 /// A struct of `Output<F>` fields. Derive with `#[derive(SystemOutputs)]`.
 pub trait SystemOutputs {
+    /// Whether the config names this bundle's ports rather than the type.
+    const DYNAMIC: bool = false;
+
     fn defs() -> Vec<PortDef>;
-    /// One writer per [`defs`](SystemOutputs::defs) entry, in order.
+    /// One binding per [`defs`](SystemOutputs::defs) entry, in order, then one
+    /// per port the config added to a dynamic bundle.
     ///
     /// # Panics
     /// Derived implementations panic on a wrong list length or unsupported frame alignment.
-    fn bind(writers: Vec<Writer<NoWake>>) -> Self;
+    fn bind(outputs: Vec<OutputBinding>) -> Self;
 }
 
 impl SystemInputs for () {
     fn defs() -> Vec<PortDef> {
         Vec::new()
     }
-    fn bind(_views: Vec<Vec<View<NoWake>>>) -> Self {}
+    fn bind(_inputs: Vec<InputBinding>) -> Self {}
 }
 
 impl SystemOutputs for () {
     fn defs() -> Vec<PortDef> {
         Vec::new()
     }
-    fn bind(_writers: Vec<Writer<NoWake>>) -> Self {}
+    fn bind(_outputs: Vec<OutputBinding>) -> Self {}
 }
 
 #[cfg(test)]
@@ -118,14 +147,38 @@ mod tests {
         fn defs() -> Vec<PortDef> {
             vec![Input::<Imu>::def("imu"), Input::<Nav>::def("nav")]
         }
-        fn bind(mut views: Vec<Vec<View<NoWake>>>) -> Self {
-            let nav = views.pop().expect("two lists");
-            let imu = views.pop().expect("two lists");
+        fn bind(mut inputs: Vec<InputBinding>) -> Self {
+            let nav = inputs.pop().expect("two bindings");
+            let imu = inputs.pop().expect("two bindings");
             Self {
-                imu: Input::try_new(imu).expect("supported alignment"),
-                nav: Input::try_new(nav).expect("supported alignment"),
+                imu: Input::try_new(imu.views).expect("supported alignment"),
+                nav: Input::try_new(nav.views).expect("supported alignment"),
             }
         }
+    }
+
+    /// One binding per def, each over the rings listed beside it.
+    fn bound_in(ports: Vec<(PortDef, Vec<&RingBuffer>)>) -> Vec<InputBinding> {
+        ports
+            .into_iter()
+            .map(|(def, rings)| InputBinding {
+                def,
+                views: rings
+                    .into_iter()
+                    .map(|ring| ring.view(NoWake).expect("free slot"))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn bound_out(ports: Vec<(PortDef, &RingBuffer)>) -> Vec<OutputBinding> {
+        ports
+            .into_iter()
+            .map(|(def, ring)| OutputBinding {
+                def,
+                writer: ring.writer(NoWake).expect("free writer"),
+            })
+            .collect()
     }
 
     #[derive(crate::SystemOutputs)]
@@ -176,10 +229,10 @@ mod tests {
     #[test]
     fn bind_follows_field_order() {
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
-        let mut bound = DerivedIn::bind(vec![
-            vec![imu.view(NoWake).expect("free slot")],
-            vec![nav.view(NoWake).expect("free slot")],
-        ]);
+        let mut bound = DerivedIn::bind(bound_in(vec![
+            (Input::<Imu>::def("imu"), vec![&imu]),
+            (Input::<Nav>::def("nav"), vec![&nav]),
+        ]));
         let mut imu_out = Output::<Imu>::try_new(imu.writer(NoWake).expect("free writer"))
             .expect("supported alignment");
         imu_out.write(&Imu::new(1, 5.0)).expect("ring has room");
@@ -193,11 +246,11 @@ mod tests {
     #[test]
     fn hand_written_bundle_binds_like_the_derive() {
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
-        let mut out = DerivedOut::bind(vec![nav.writer(NoWake).expect("free writer")]);
-        let mut bound = HandIn::bind(vec![
-            vec![imu.view(NoWake).expect("free slot")],
-            vec![nav.view(NoWake).expect("free slot")],
-        ]);
+        let mut out = DerivedOut::bind(bound_out(vec![(Output::<Nav>::def("nav"), &nav)]));
+        let mut bound = HandIn::bind(bound_in(vec![
+            (Input::<Imu>::def("imu"), vec![&imu]),
+            (Input::<Nav>::def("nav"), vec![&nav]),
+        ]));
         out.nav
             .write(&Nav {
                 timestamp: Timestamp(2),
@@ -214,6 +267,36 @@ mod tests {
     #[test]
     #[should_panic(expected = "DerivedIn::defs()")]
     fn bind_with_wrong_length_panics() {
-        let _ = DerivedIn::bind(vec![Vec::new()]);
+        let _ = DerivedIn::bind(bound_in(vec![(Input::<Imu>::def("imu"), Vec::new())]));
+    }
+
+    #[test]
+    fn a_static_bundle_is_not_dynamic() {
+        const { assert!(!DerivedIn::DYNAMIC) };
+        const { assert!(!DerivedOut::DYNAMIC) };
+        let def = SystemDef::new::<DerivedIn, DerivedOut>("nav");
+        assert!(!def.dynamic_inputs && !def.dynamic_outputs);
+    }
+
+    #[test]
+    fn a_dynamic_bundle_declares_no_ports_and_binds_what_it_is_given() {
+        use crate::port::{DynInputs, DynOutputs};
+
+        const { assert!(DynInputs::DYNAMIC) };
+        const { assert!(DynOutputs::DYNAMIC) };
+        let def = SystemDef::new::<DynInputs, DynOutputs>("link");
+        assert!(def.inputs.is_empty() && def.outputs.is_empty());
+        assert!(def.dynamic_inputs && def.dynamic_outputs);
+
+        let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
+        let mut bound = DynInputs::bind(bound_in(vec![
+            (Input::<Imu>::def("plant.imu"), vec![&imu]),
+            (Input::<Nav>::def("nav.nav"), vec![&nav]),
+        ]));
+        let names: Vec<_> = bound
+            .iter_mut()
+            .map(|(def, _)| def.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["plant.imu", "nav.nav"]);
     }
 }

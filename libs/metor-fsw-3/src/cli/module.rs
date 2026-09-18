@@ -350,6 +350,8 @@ mod tests {
                 name: ty.into(),
                 inputs,
                 outputs,
+                dynamic_inputs: false,
+                dynamic_outputs: false,
             },
             doc: "".into(),
             params: params.map(|text| RawValue::from_string(text.into()).expect("json")),

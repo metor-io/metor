@@ -4,8 +4,8 @@ use core::borrow::Borrow;
 use core::marker::PhantomData;
 use core::ops::Deref;
 
-use crate::record::{DecodeError, EncodeError, Record};
-use crate::system::PortDef;
+use crate::record::{Bytes, DecodeError, EncodeError, Record};
+use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 use metor_fsw_3_ring::{NoWake, ReadError, View, WriteError, Writer, frame_len};
 use metor_proto::types::Timestamp;
 
@@ -26,7 +26,7 @@ pub struct UnsupportedAlignment {
     pub supported: usize,
 }
 
-fn check_alignment<T: Record>() -> Result<(), UnsupportedAlignment> {
+fn check_alignment<T: Record + ?Sized>() -> Result<(), UnsupportedAlignment> {
     let alignment = T::ALIGN;
     let supported = metor_fsw_3_ring::PAYLOAD_ALIGNMENT;
     if alignment > supported {
@@ -70,13 +70,13 @@ fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], SendError> {
 }
 
 /// An `Output` is the writing half of one ring, publishing records of type `T`.
-pub struct Output<T> {
+pub struct Output<T: ?Sized> {
     writer: Writer<NoWake>,
     scratch: Vec<u8>,
     _t: PhantomData<T>,
 }
 
-impl<T: Record> Output<T> {
+impl<T: Record + ?Sized> Output<T> {
     /// Binds a writer, rejecting records aligned above the ring guarantee.
     pub fn try_new(writer: Writer<NoWake>) -> Result<Self, UnsupportedAlignment> {
         check_alignment::<T>()?;
@@ -108,13 +108,20 @@ impl<T: Record> Output<T> {
     }
 }
 
+impl Output<Bytes> {
+    /// Publishes a record's bytes as they arrived, without encoding.
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SendError> {
+        self.writer.try_write(bytes).map_err(SendError::Ring)
+    }
+}
+
 /// An `Input` is the reading half of every ring feeding one port of type `T`.
-pub struct Input<T> {
+pub struct Input<T: ?Sized> {
     views: Vec<View<NoWake>>,
     _t: PhantomData<T>,
 }
 
-impl<T: Record> Input<T> {
+impl<T: Record + ?Sized> Input<T> {
     /// Binds one view per producer, rejecting records aligned above the ring guarantee.
     pub fn try_new(views: Vec<View<NoWake>>) -> Result<Self, UnsupportedAlignment> {
         check_alignment::<T>()?;
@@ -140,7 +147,7 @@ impl<T: Record> Input<T> {
     }
 }
 
-impl<T: Record> Input<T> {
+impl<T: Record + ?Sized> Input<T> {
     /// Returns the newest record across producers
     ///
     /// Records without timestamps are produced in order of the producers
@@ -160,12 +167,75 @@ impl<T: Record> Input<T> {
     }
 }
 
+/// A `DynInputs` is the input side of a system whose ports the config lists.
+///
+/// Each port carries the definition build completed for it and the bytes its
+/// producers wrote, undecoded.
+#[derive(Default)]
+pub struct DynInputs {
+    ports: Vec<(PortDef, Input<Bytes>)>,
+}
+
+impl DynInputs {
+    /// Every port's definition and the records waiting on it.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes>)> {
+        self.ports.iter_mut().map(|(def, input)| (&*def, input))
+    }
+}
+
+impl SystemInputs for DynInputs {
+    const DYNAMIC: bool = true;
+
+    fn defs() -> Vec<PortDef> {
+        Vec::new()
+    }
+
+    fn bind(inputs: Vec<InputBinding>) -> Self {
+        let ports = inputs
+            .into_iter()
+            // PANIC Safety: bytes need no alignment.
+            .map(|b| (b.def, Input::try_new(b.views).expect("byte alignment")))
+            .collect();
+        Self { ports }
+    }
+}
+
+/// A `DynOutputs` is the output side of a system whose ports the config lists.
+#[derive(Default)]
+pub struct DynOutputs {
+    ports: Vec<(PortDef, Output<Bytes>)>,
+}
+
+impl DynOutputs {
+    /// Every port's definition and the writer publishing on it.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Output<Bytes>)> {
+        self.ports.iter_mut().map(|(def, output)| (&*def, output))
+    }
+}
+
+impl SystemOutputs for DynOutputs {
+    const DYNAMIC: bool = true;
+
+    fn defs() -> Vec<PortDef> {
+        Vec::new()
+    }
+
+    fn bind(outputs: Vec<OutputBinding>) -> Self {
+        let ports = outputs
+            .into_iter()
+            // PANIC Safety: bytes need no alignment.
+            .map(|b| (b.def, Output::try_new(b.writer).expect("byte alignment")))
+            .collect();
+        Self { ports }
+    }
+}
+
 /// A `Latest` holds a decoded record, borrowed from the input or owned.
-pub struct Latest<'a, T: Record + 'a> {
+pub struct Latest<'a, T: Record + ?Sized + 'a> {
     decoded: T::Read<'a>,
 }
 
-impl<'a, T: Record> Latest<'a, T> {
+impl<'a, T: Record + ?Sized> Latest<'a, T> {
     /// Borrows the decoded record without decoding again.
     pub fn read(&self) -> &T {
         self.decoded.borrow()
@@ -177,7 +247,7 @@ impl<'a, T: Record> Latest<'a, T> {
     }
 }
 
-impl<T: Record> Deref for Latest<'_, T> {
+impl<T: Record + ?Sized> Deref for Latest<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         self.read()

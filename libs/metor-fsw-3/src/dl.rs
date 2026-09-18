@@ -1,10 +1,4 @@
-//! The host side of a pack: load a library, read its descriptor, and register
-//! every system in it into an ordinary [`SystemTable`].
-//!
-//! A registered entry's `make` calls the pack's `create` with the regions of
-//! the rings it was handed, so the pack claims the reader slots and the writer
-//! itself. The returned handle is a [`DlStep`], which keeps the library loaded
-//! through instance destruction; library code remains resident.
+//! Dynamic library pack loading
 
 use core::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -20,8 +14,14 @@ use crate::pack::{ABI_VERSION, DefStatus, Status};
 
 type VersionFn = unsafe extern "C" fn() -> u32;
 type DefFn = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> u32;
-type CreateFn =
-    unsafe extern "C" fn(RawSlice, RawSlice, RawSlice, RawSlice, *mut RawSlice) -> *mut c_void;
+type CreateFn = unsafe extern "C" fn(
+    RawSlice,
+    RawSlice,
+    RawSlice,
+    RawSlice,
+    RawSlice,
+    *mut RawSlice,
+) -> *mut c_void;
 type ExecuteFn = unsafe extern "C" fn(*mut c_void, i64) -> u32;
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
 
@@ -183,9 +183,13 @@ impl SystemTable {
                 def: system.def.clone(),
                 doc: system.doc.clone(),
                 schema: system.params.clone(),
-                make: Box::new(move |params, inputs, outputs| {
+                make: Box::new(move |params, def, inputs, outputs| {
                     let params = serde_json::to_vec(params.0)
                         .map_err(|e| ParamError::Decode(e.to_string()))?;
+                    // The instance def, so the pack binds the ports the host
+                    // resolved, including any the config added.
+                    let def =
+                        serde_json::to_vec(def).map_err(|e| ParamError::Decode(e.to_string()))?;
                     let input_owners: Vec<Vec<_>> = inputs
                         .iter()
                         .map(|rings| rings.iter().map(|ring| ring.export()).collect())
@@ -204,6 +208,7 @@ impl SystemTable {
                         (fns.create)(
                             RawSlice::of(ty.as_bytes()),
                             RawSlice::of(&params),
+                            RawSlice::of(&def),
                             RawSlice::of(&ports),
                             RawSlice::of(&outs),
                             &raw mut error,

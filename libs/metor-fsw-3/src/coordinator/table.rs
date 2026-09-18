@@ -7,15 +7,19 @@ use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde_json::value::RawValue;
 
 use crate::fn_system::{Ctor, FnSystem, SystemFn};
-use crate::system::{System, SystemDef, SystemInputs, SystemOutputs};
+use crate::system::{
+    InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
+};
 
 use super::params::{ParamError, Params};
 use super::run::{Runner, Step};
 
-/// Builds one bound system from its params and the rings its ports sit on:
-/// one ring list per input port, in edge order, and one ring per output.
+/// Builds one bound system from its params, the definition build settled on,
+/// and the rings its ports sit on: one ring list per input port, in edge order,
+/// and one ring per output, both in `def` order.
 type SystemMakeFn = dyn Fn(
     Params<'_>,
+    &SystemDef,
     Vec<Vec<&RingBuffer>>,
     Vec<&RingBuffer>,
 ) -> Result<Box<dyn Step>, ParamError>;
@@ -81,6 +85,31 @@ impl SystemTable {
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &TableEntry)> {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
+
+    /// Every record a registered port declares, by name. `None` is a name two
+    /// registrations define differently, which no config may resolve.
+    pub(crate) fn records(&self) -> HashMap<&str, Option<&PortDef>> {
+        let ports = self
+            .entries()
+            .flat_map(|(_, entry)| entry.def.inputs.iter().chain(&entry.def.outputs));
+        let mut records: HashMap<&str, Option<&PortDef>> = HashMap::new();
+        for port in ports {
+            records
+                .entry(&port.record)
+                .and_modify(|known| {
+                    if known.is_some_and(|known| !carries_alike(known, port)) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(port));
+        }
+        records
+    }
+}
+
+/// Whether two ports agree on everything but their names.
+fn carries_alike(a: &PortDef, b: &PortDef) -> bool {
+    (a.id, a.max_len, a.alignment, a.depth) == (b.id, b.max_len, b.alignment, b.depth)
 }
 
 /// Builds one entry, binding the system's bundles from the rings' handles.
@@ -93,22 +122,30 @@ fn entry<S: System + 'static>(
         def: S::def(),
         doc,
         schema,
-        make: Box::new(move |params, inputs, outputs| {
+        make: Box::new(move |params, def, inputs, outputs| {
             let (system, state) = make(params)?;
-            let views = inputs
-                .into_iter()
-                .map(|rings| {
-                    rings
+            let views = def
+                .inputs
+                .iter()
+                .zip(inputs)
+                .map(|(def, rings)| InputBinding {
+                    def: def.clone(),
+                    views: rings
                         .into_iter()
                         // PANIC Safety: the build pass counts one reader slot per edge.
                         .map(|ring| ring.view(NoWake).expect("a counted reader slot"))
-                        .collect()
+                        .collect(),
                 })
                 .collect();
-            let writers = outputs
-                .into_iter()
-                // PANIC Safety: one ring is allocated per output port.
-                .map(|ring| ring.writer(NoWake).expect("one writer per output ring"))
+            let writers = def
+                .outputs
+                .iter()
+                .zip(outputs)
+                .map(|(def, ring)| OutputBinding {
+                    def: def.clone(),
+                    // PANIC Safety: one ring is allocated per output port.
+                    writer: ring.writer(NoWake).expect("one writer per output ring"),
+                })
                 .collect();
             Ok(Box::new(Runner {
                 system,

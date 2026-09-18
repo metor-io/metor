@@ -57,6 +57,19 @@ pub enum BuildError {
         max_len: usize,
     },
 
+    #[error("dynamic input `{system}.{port}` has more than one producer")]
+    DynamicFanIn { system: String, port: String },
+
+    #[error("output `{system}.{port}` names record `{record}`, which no registered port declares")]
+    UnknownRecord {
+        system: String,
+        port: String,
+        record: String,
+    },
+
+    #[error("record `{record}` is declared differently by two registered ports")]
+    RecordConflict { record: String },
+
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
 

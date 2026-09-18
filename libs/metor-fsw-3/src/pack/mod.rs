@@ -102,14 +102,15 @@ pub unsafe fn def(
 /// `error` when there is one and an empty slice when the failure was a panic.
 ///
 /// # Safety
-/// `ty`, `params`, `inputs` (over [`RawPort`]) and `outputs` (over [`RawRing`])
-/// each meet [`RawSlice::as_slice`]'s contract and every ring has live, valid
-/// ownership callbacks covering its region. `error` is writable and does not
-/// alias the input arrays. Calls on this thread must not reenter `create`.
+/// `ty`, `params`, `def`, `inputs` (over [`RawPort`]) and `outputs` (over
+/// [`RawRing`]) each meet [`RawSlice::as_slice`]'s contract and every ring has
+/// live, valid ownership callbacks covering its region. `error` is writable and
+/// does not alias the input arrays. Calls on this thread must not reenter `create`.
 pub unsafe fn create(
     build: fn() -> SystemTable,
     ty: RawSlice,
     params: RawSlice,
+    def: RawSlice,
     inputs: RawSlice,
     outputs: RawSlice,
     error: *mut RawSlice,
@@ -118,7 +119,7 @@ pub unsafe fn create(
     unsafe { error.write(RawSlice::EMPTY) };
     crate::panic::catch(|| {
         // SAFETY: the caller's arrays and ownership callbacks remain valid here.
-        match unsafe { make(build, ty, params, inputs, outputs) } {
+        match unsafe { make(build, ty, params, def, inputs, outputs) } {
             Ok(step) => Box::into_raw(Box::new(Some(step))).cast(),
             Err(source) => {
                 // SAFETY: `error` remains writable for this call.
@@ -138,14 +139,17 @@ unsafe fn make(
     build: fn() -> SystemTable,
     ty: RawSlice,
     params: RawSlice,
+    def: RawSlice,
     inputs: RawSlice,
     outputs: RawSlice,
 ) -> Result<Box<dyn Step>, ParamError> {
     // SAFETY: the caller's contract.
-    let (ty, params) = unsafe { (ty.as_bytes(), params.as_bytes()) };
+    let (ty, params, def) = unsafe { (ty.as_bytes(), params.as_bytes(), def.as_bytes()) };
     let ty = core::str::from_utf8(ty).map_err(|e| ParamError::Decode(e.to_string()))?;
 
     let value = decode_params(params)?;
+    let def: crate::SystemDef =
+        serde_json::from_slice(def).map_err(|e| ParamError::Decode(e.to_string()))?;
     // SAFETY: the caller's contract.
     let (ports, out_rings) = unsafe { (inputs.as_slice::<RawPort>(), outputs.as_slice()) };
     let ins: Vec<Vec<RingBuffer>> = ports
@@ -161,7 +165,7 @@ unsafe fn make(
         let entry = table
             .get(ty)
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
-        (entry.make)(Params(&value), views, writers)
+        (entry.make)(Params(&value), &def, views, writers)
     })
 }
 
@@ -240,11 +244,12 @@ macro_rules! export_pack {
         pub unsafe extern "C" fn metor_fsw_create(
             ty: $crate::pack::raw::RawSlice,
             params: $crate::pack::raw::RawSlice,
+            def: $crate::pack::raw::RawSlice,
             inputs: $crate::pack::raw::RawSlice,
             outputs: $crate::pack::raw::RawSlice,
             error: *mut $crate::pack::raw::RawSlice,
         ) -> *mut ::core::ffi::c_void {
-            unsafe { $crate::pack::create($build, ty, params, inputs, outputs, error) }
+            unsafe { $crate::pack::create($build, ty, params, def, inputs, outputs, error) }
         }
 
         #[unsafe(no_mangle)]

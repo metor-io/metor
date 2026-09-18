@@ -36,6 +36,9 @@ pub struct SystemConfig {
     pub params: serde_json::Value,
     #[serde(default)]
     pub inputs: Vec<InputConfig>,
+    /// Ports a system with dynamic outputs publishes, named by their record.
+    #[serde(default)]
+    pub outputs: Vec<OutputConfig>,
 }
 
 impl SystemConfig {
@@ -46,8 +49,16 @@ impl SystemConfig {
             ty: ty.into(),
             params: serde_json::Value::Null,
             inputs: Vec::new(),
+            outputs: Vec::new(),
         }
     }
+}
+
+/// One port of a system with dynamic outputs, and the record it carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputConfig {
+    pub port: String,
+    pub record: String,
 }
 
 /// The producers of one input port

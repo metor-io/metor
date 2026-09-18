@@ -19,7 +19,7 @@ use metor_proto::types::Timestamp;
 
 use crate::port::Output;
 
-pub use config::{Clock, CoordinatorConfig, InputConfig, PortRef, SystemConfig};
+pub use config::{Clock, CoordinatorConfig, InputConfig, OutputConfig, PortRef, SystemConfig};
 pub use error::BuildError;
 pub use params::{ParamError, Params};
 pub use run::Step;

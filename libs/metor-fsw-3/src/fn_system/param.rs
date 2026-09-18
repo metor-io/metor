@@ -1,17 +1,47 @@
 //! The [`Param`] trait, one per `execute` parameter type, and its tuple impls.
 
-use metor_fsw_3_ring::{NoWake, View, Writer};
 use metor_proto::types::Timestamp;
 
 use crate::log::Log;
-use crate::port::{Input, Output};
+use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::record::Record;
-use crate::system::PortDef;
+use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 
-/// The view lists a bundle binds from, one per input port in order.
-pub type Views = std::vec::IntoIter<Vec<View<NoWake>>>;
-/// The writers a bundle binds from, one per output port in order.
-pub type Writers = std::vec::IntoIter<Writer<NoWake>>;
+/// The bindings a bundle binds from: one per declared port in order, then the
+/// ports a dynamic bundle's config added.
+pub struct Bindings<B> {
+    declared: std::vec::IntoIter<B>,
+    dynamic: Vec<B>,
+}
+
+impl<B> Bindings<B> {
+    /// Splits `all` after the declared ports; the tail is the dynamic one's.
+    pub(crate) fn new(mut all: Vec<B>, declared: usize) -> Self {
+        let dynamic = all.split_off(declared);
+        Self {
+            declared: all.into_iter(),
+            dynamic,
+        }
+    }
+
+    pub(crate) fn next(&mut self) -> Option<B> {
+        self.declared.next()
+    }
+
+    /// Takes every port the config added, for the one dynamic parameter.
+    fn take_dynamic(&mut self) -> Vec<B> {
+        core::mem::take(&mut self.dynamic)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.declared.len() == 0 && self.dynamic.is_empty()
+    }
+}
+
+/// The input bindings a bundle binds from.
+pub type Views = Bindings<InputBinding>;
+/// The output bindings a bundle binds from.
+pub type Writers = Bindings<OutputBinding>;
 /// The parameter names a bundle declares under, one per leaf parameter in order.
 pub type Names<'n> = core::slice::Iter<'n, &'static str>;
 
@@ -44,6 +74,11 @@ impl<'a> Cycle<'a> {
 /// For instance [`Input`] implements `Param` to bind an input port.
 /// The goal is to let system fns define what parameters they need from the type system.
 pub trait Param {
+    /// Whether this parameter's input ports come from the config.
+    const DYNAMIC_IN: bool = false;
+    /// Whether this parameter's output ports come from the config.
+    const DYNAMIC_OUT: bool = false;
+
     /// The bound input, or `()`.
     type In;
     /// The bound writer, or `()`.
@@ -88,8 +123,8 @@ impl<T: Record + 'static> Param for Input<T> {
     fn bind_in(views: &mut Views) -> Self::In {
         // PANIC Safety: the coordinator binds one list per declared input and
         // validates alignment at build; a mismatch is a coordinator bug.
-        let views = views.next().expect("one view list per input param");
-        Input::try_new(views).expect("alignment checked at build")
+        let binding = views.next().expect("one binding per input param");
+        Input::try_new(binding.views).expect("alignment checked at build")
     }
 
     fn bind_out(_writers: &mut Writers) {}
@@ -117,8 +152,8 @@ impl<T: Record + 'static> Param for Output<T> {
     fn bind_out(writers: &mut Writers) -> Self::Out {
         // PANIC Safety: the coordinator binds one writer per declared output and
         // validates alignment at build; a mismatch is a coordinator bug.
-        let writer = writers.next().expect("one writer per output param");
-        Output::try_new(writer).expect("alignment checked at build")
+        let binding = writers.next().expect("one binding per output param");
+        Output::try_new(binding.writer).expect("alignment checked at build")
     }
 
     fn get<'a>(
@@ -126,6 +161,56 @@ impl<T: Record + 'static> Param for Output<T> {
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
     ) -> &'a mut Output<T> {
+        output
+    }
+}
+
+impl Param for DynInputs {
+    const DYNAMIC_IN: bool = true;
+    type In = DynInputs;
+    type Out = ();
+    type Item<'a> = &'a mut DynInputs;
+
+    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
+        name(names);
+    }
+
+    fn bind_in(views: &mut Views) -> Self::In {
+        SystemInputs::bind(views.take_dynamic())
+    }
+
+    fn bind_out(_writers: &mut Writers) {}
+
+    fn get<'a>(
+        input: &'a mut Self::In,
+        _output: &'a mut (),
+        _cx: &mut Cycle<'a>,
+    ) -> &'a mut DynInputs {
+        input
+    }
+}
+
+impl Param for DynOutputs {
+    const DYNAMIC_OUT: bool = true;
+    type In = ();
+    type Out = DynOutputs;
+    type Item<'a> = &'a mut DynOutputs;
+
+    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
+        name(names);
+    }
+
+    fn bind_in(_views: &mut Views) {}
+
+    fn bind_out(writers: &mut Writers) -> Self::Out {
+        SystemOutputs::bind(writers.take_dynamic())
+    }
+
+    fn get<'a>(
+        _input: &'a mut (),
+        output: &'a mut Self::Out,
+        _cx: &mut Cycle<'a>,
+    ) -> &'a mut DynOutputs {
         output
     }
 }
@@ -170,6 +255,8 @@ impl Param for Log {
 macro_rules! impl_param_for_tuple {
     ($(($P:ident, $i:tt)),*) => {
         impl<$($P: Param),*> Param for ($($P,)*) {
+            const DYNAMIC_IN: bool = false $(|| $P::DYNAMIC_IN)*;
+            const DYNAMIC_OUT: bool = false $(|| $P::DYNAMIC_OUT)*;
             type In = ($($P::In,)*);
             type Out = ($($P::Out,)*);
             type Item<'a> = ($($P::Item<'a>,)*) where Self: 'a;

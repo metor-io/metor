@@ -6,11 +6,12 @@
 use std::collections::HashMap;
 
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer, checked_region_len};
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::types::Timestamp;
 
 use crate::port::{Output, ring_capacity};
+use crate::system::{PortDef, SystemDef};
 
-use super::config::CoordinatorConfig;
+use super::config::{CoordinatorConfig, SystemConfig};
 use super::error::BuildError;
 use super::params::Params;
 use super::status::SystemStatus;
@@ -21,18 +22,20 @@ const STATUS_PORT: &str = "status";
 
 struct RingSpec {
     system: String,
-    port: String,
-    id: ComponentId,
-    max_len: usize,
-    depth: usize,
+    port: PortDef,
     readers: usize,
 }
 
 type RingIndex = usize;
 
+/// One system as build resolved it: its instance def, which a dynamic side's
+/// ports are appended to, and the ring feeding each input port.
 struct PlannedSystem<'a> {
     id: &'a str,
     entry: &'a TableEntry,
+    def: SystemDef,
+    /// Input ports the type declared; the rest came from the config.
+    declared_inputs: usize,
     params: Params<'a>,
     base_ring_idx: RingIndex,
     inputs: Vec<Vec<RingIndex>>,
@@ -45,7 +48,7 @@ struct Plan<'a> {
 
 impl PlannedSystem<'_> {
     fn status_ring(&self) -> RingIndex {
-        self.base_ring_idx + self.entry.def.outputs.len()
+        self.base_ring_idx + self.def.outputs.len()
     }
 
     /// Returns the ring index for a given output port, or `None` if the port is not declared.
@@ -53,8 +56,13 @@ impl PlannedSystem<'_> {
         if port == STATUS_PORT {
             return Some(self.status_ring());
         }
-        let index = self.entry.def.outputs.iter().position(|p| p.name == port)?;
+        let index = self.def.outputs.iter().position(|p| p.name == port)?;
         Some(self.base_ring_idx + index)
+    }
+
+    /// Whether this input port came from the config rather than the type.
+    fn is_dynamic_input(&self, port: usize) -> bool {
+        port >= self.declared_inputs
     }
 }
 
@@ -88,6 +96,7 @@ fn resolve<'a>(
     };
 
     let mut index = HashMap::with_capacity(config.systems.len());
+    let records = table.records();
 
     for system in &config.systems {
         if index.contains_key(system.id.as_str()) {
@@ -105,24 +114,18 @@ fn resolve<'a>(
                 ty: system.ty.clone(),
             })?;
 
-        check_port_names(&system.id, &entry.def)?;
-        if entry.def.outputs.iter().any(|p| p.name == STATUS_PORT) {
+        let mut def = entry.def.clone();
+        add_dynamic_outputs(system, &mut def, &records)?;
+        check_port_names(&system.id, &def)?;
+        if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
                 ty: system.ty.clone(),
             });
         }
-        check_alignment(&system.id, &entry.def)?;
-        let planned = PlannedSystem {
-            id: &system.id,
-            entry,
-            params: Params(&system.params),
-            base_ring_idx: plan.rings.len(),
-            inputs: vec![Vec::new(); entry.def.inputs.len()],
-        };
+        check_alignment(&system.id, &def)?;
+        let base_ring_idx = plan.rings.len();
         plan.rings.extend(
-            entry
-                .def
-                .outputs
+            def.outputs
                 .iter()
                 .map(|port| RingSpec::new(&system.id, port)),
         );
@@ -130,7 +133,15 @@ fn resolve<'a>(
             &system.id,
             &Output::<SystemStatus>::def(STATUS_PORT),
         ));
-        plan.systems.push(planned);
+        plan.systems.push(PlannedSystem {
+            id: &system.id,
+            entry,
+            declared_inputs: def.inputs.len(),
+            inputs: vec![Vec::new(); def.inputs.len()],
+            def,
+            params: Params(&system.params),
+            base_ring_idx,
+        });
     }
     resolve_edges(config, &mut plan, &index)?;
     Ok(plan)
@@ -163,6 +174,39 @@ fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildErr
     Ok(())
 }
 
+/// Appends the config's output ports to a system with dynamic outputs,
+/// completing each one from the record it names.
+fn add_dynamic_outputs(
+    system: &SystemConfig,
+    def: &mut SystemDef,
+    records: &HashMap<&str, Option<&PortDef>>,
+) -> Result<(), BuildError> {
+    for output in &system.outputs {
+        if !def.dynamic_outputs {
+            return Err(BuildError::UnknownOutput {
+                system: system.id.clone(),
+                port: output.port.clone(),
+            });
+        }
+        let known =
+            records
+                .get(output.record.as_str())
+                .ok_or_else(|| BuildError::UnknownRecord {
+                    system: system.id.clone(),
+                    port: output.port.clone(),
+                    record: output.record.clone(),
+                })?;
+        let known = known.ok_or_else(|| BuildError::RecordConflict {
+            record: output.record.clone(),
+        })?;
+        def.outputs.push(PortDef {
+            name: output.port.clone().into(),
+            ..known.clone()
+        });
+    }
+    Ok(())
+}
+
 fn check_alignment(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
     for port in def.inputs.iter().chain(&def.outputs) {
         if port.alignment > metor_fsw_3_ring::PAYLOAD_ALIGNMENT {
@@ -183,13 +227,6 @@ fn resolve_edges(
 ) -> Result<(), BuildError> {
     for (i, system) in config.systems.iter().enumerate() {
         for input in &system.inputs {
-            let def = &plan.systems[i].entry.def;
-            let Some(port) = def.inputs.iter().position(|p| p.name == input.port) else {
-                return Err(BuildError::UnknownInput {
-                    system: system.id.clone(),
-                    port: input.port.clone(),
-                });
-            };
             for from in &input.from {
                 let Some(&producer) = index.get(from.system.as_str()) else {
                     return Err(BuildError::UnknownSystem {
@@ -204,26 +241,67 @@ fn resolve_edges(
                         port: from.port.clone(),
                     });
                 };
-                plan.systems[i].inputs[port].push(ring);
+                let port = input_port(plan, i, &system.id, &input.port, ring)?;
+                let planned = &mut plan.systems[i];
+                planned.inputs[port].push(ring);
+                if planned.is_dynamic_input(port) && planned.inputs[port].len() > 1 {
+                    return Err(BuildError::DynamicFanIn {
+                        system: system.id.clone(),
+                        port: input.port.clone(),
+                    });
+                }
             }
         }
     }
     Ok(())
 }
 
+/// The index of the input port named `port`, appending one to a system with
+/// dynamic inputs and taking its definition from the edge's producer.
+fn input_port(
+    plan: &mut Plan<'_>,
+    i: usize,
+    system: &str,
+    port: &str,
+    ring: RingIndex,
+) -> Result<usize, BuildError> {
+    if let Some(at) = plan.systems[i]
+        .def
+        .inputs
+        .iter()
+        .position(|p| p.name == port)
+    {
+        return Ok(at);
+    }
+    if !plan.systems[i].def.dynamic_inputs {
+        return Err(BuildError::UnknownInput {
+            system: system.to_string(),
+            port: port.to_string(),
+        });
+    }
+    let def = PortDef {
+        name: port.to_string().into(),
+        ..plan.rings[ring].port.clone()
+    };
+    let planned = &mut plan.systems[i];
+    planned.def.inputs.push(def);
+    planned.inputs.push(Vec::new());
+    Ok(planned.def.inputs.len() - 1)
+}
+
 fn check_ids(plan: &Plan<'_>) -> Result<(), BuildError> {
     for system in &plan.systems {
         for (port, edges) in system.inputs.iter().enumerate() {
-            let def = &system.entry.def.inputs[port];
+            let def = &system.def.inputs[port];
             for &ring in edges {
                 let spec = &plan.rings[ring];
-                if spec.id != def.id {
+                if spec.port.id != def.id {
                     return Err(BuildError::IdMismatch {
                         id: system.id.to_string(),
                         port: def.name.to_string(),
-                        from: format!("{}.{}", spec.system, spec.port),
+                        from: format!("{}.{}", spec.system, spec.port.name),
                         expected: def.id,
-                        found: spec.id,
+                        found: spec.port.id,
                     });
                 }
             }
@@ -254,11 +332,15 @@ fn allocate_rings(specs: &[RingSpec], depth: usize) -> Result<Vec<RingBuffer>, B
 fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, BuildError> {
     let too_large = || BuildError::RingTooLarge {
         system: spec.system.clone(),
-        port: spec.port.clone(),
-        max_len: spec.max_len,
+        port: spec.port.name.to_string(),
+        max_len: spec.port.max_len,
     };
-    let depth = spec.depth.checked_mul(ring_depth).ok_or_else(too_large)?;
-    let capacity = ring_capacity(spec.max_len, depth).ok_or_else(too_large)?;
+    let depth = spec
+        .port
+        .depth
+        .checked_mul(ring_depth)
+        .ok_or_else(too_large)?;
+    let capacity = ring_capacity(spec.port.max_len, depth).ok_or_else(too_large)?;
     let config = Config {
         capacity,
         max_readers: spec.readers,
@@ -274,7 +356,7 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
     plan.systems
         .iter()
         .map(|system| {
-            let outputs = (0..system.entry.def.outputs.len())
+            let outputs = (0..system.def.outputs.len())
                 .map(|i| &rings[system.base_ring_idx + i])
                 .collect();
             let inputs = system
@@ -282,12 +364,12 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
                 .iter()
                 .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
                 .collect();
-            let step = (system.entry.make)(system.params, inputs, outputs).map_err(|source| {
-                BuildError::Params {
+            let step = (system.entry.make)(system.params, &system.def, inputs, outputs).map_err(
+                |source| BuildError::Params {
                     id: system.id.to_string(),
                     source,
-                }
-            })?;
+                },
+            )?;
             Ok(Entry {
                 name: system.id.to_string(),
                 step: Some(step),
@@ -303,13 +385,10 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
 }
 
 impl RingSpec {
-    fn new(system: &str, port: &crate::PortDef) -> Self {
+    fn new(system: &str, port: &PortDef) -> Self {
         Self {
             system: system.to_string(),
-            port: port.name.to_string(),
-            id: port.id,
-            max_len: port.max_len,
-            depth: port.depth,
+            port: port.clone(),
             readers: 0,
         }
     }
@@ -317,11 +396,50 @@ impl RingSpec {
 
 #[cfg(test)]
 mod tests {
+    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
     use super::*;
-    use crate::Record;
-    use crate::coordinator::{InputConfig, PortRef, SystemConfig};
-    use crate::port;
+    use crate::coordinator::{InputConfig, OutputConfig, PortRef, SystemConfig};
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
+    use crate::{Frame, Record};
+    use crate::{port, system};
+
+    /// A second frame named `imu`, so the record name resolves two ways.
+    #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[frame(name = "imu")]
+    #[repr(C)]
+    struct WideImu {
+        #[frame(timestamp)]
+        timestamp: Timestamp,
+        sample: f64,
+        extra: f64,
+    }
+
+    struct WideSource;
+
+    #[system]
+    impl WideSource {
+        fn execute(&mut self, imu: &mut Output<WideImu>) {
+            let _ = imu;
+        }
+    }
+
+    fn tap(inputs: Vec<InputConfig>) -> SystemConfig {
+        SystemConfig {
+            inputs,
+            ..SystemConfig::new("tap", "tap")
+        }
+    }
+
+    fn emits(record: &str) -> SystemConfig {
+        SystemConfig {
+            outputs: vec![OutputConfig {
+                port: "imu".into(),
+                record: record.into(),
+            }],
+            ..SystemConfig::new("emit", "emit")
+        }
+    }
 
     fn source(id: &str) -> SystemConfig {
         SystemConfig::new(id, "imu")
@@ -351,6 +469,8 @@ mod tests {
                     Vec::new()
                 },
                 outputs: if input { Vec::new() } else { vec![port] },
+                dynamic_inputs: false,
+                dynamic_outputs: false,
             };
             assert_eq!(
                 check_alignment("test", &def),
@@ -379,6 +499,8 @@ mod tests {
                 } else {
                     vec![port.clone(), port.clone()]
                 },
+                dynamic_inputs: false,
+                dynamic_outputs: false,
             };
             let expected = if input {
                 BuildError::DuplicateInput {
@@ -402,6 +524,8 @@ mod tests {
             name: "test".into(),
             inputs: vec![port.clone()],
             outputs: vec![port],
+            dynamic_inputs: false,
+            dynamic_outputs: false,
         };
         assert_eq!(check_port_names("instance", &def), Ok(()));
         assert_eq!(
@@ -630,6 +754,133 @@ mod tests {
             Some(metor_fsw_3_ring::FullReaderTable)
         );
         assert!(imu.writer(NoWake).is_err());
+    }
+
+    #[test]
+    fn a_dynamic_input_takes_its_name_and_def_from_its_edge() {
+        let recorder = Recorder::default();
+        let mut config = pipeline_config();
+        config.systems.push(tap(vec![
+            InputConfig {
+                port: "imu.imu".into(),
+                from: vec![PortRef::new("imu", "imu")],
+            },
+            InputConfig {
+                port: "nav.nav".into(),
+                from: vec![PortRef::new("nav", "nav")],
+            },
+        ]));
+        let mut coordinator = config.build(&table(&recorder)).expect("valid config");
+        coordinator.step(Timestamp(1));
+        let seen = recorder.take_taps();
+        let ports: Vec<_> = seen.iter().map(|(port, _)| port.as_str()).collect();
+        assert_eq!(ports, vec!["imu.imu", "nav.nav"]);
+        assert_eq!(utils::Imu::decode(&seen[0].1).expect("decodes").sample, 1.0);
+        assert_eq!(
+            utils::Nav::decode(&seen[1].1).expect("decodes").estimate,
+            2.0
+        );
+    }
+
+    #[test]
+    fn a_dynamic_input_with_two_producers_is_rejected() {
+        let mut config = pipeline_config();
+        config
+            .systems
+            .push(SystemConfig::new("imu_two", "imu_offset"));
+        config.systems.push(tap(vec![InputConfig {
+            port: "imu.imu".into(),
+            from: vec![PortRef::new("imu", "imu"), PortRef::new("imu_two", "imu")],
+        }]));
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::DynamicFanIn {
+                system: "tap".into(),
+                port: "imu.imu".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_dynamic_output_is_resolved_by_record_name() {
+        let recorder = Recorder::default();
+        let config = CoordinatorConfig {
+            systems: vec![
+                emits("imu"),
+                SystemConfig {
+                    inputs: vec![InputConfig {
+                        port: "imu".into(),
+                        from: vec![PortRef::new("emit", "imu")],
+                    }],
+                    ..SystemConfig::new("nav", "nav")
+                },
+                SystemConfig {
+                    inputs: vec![InputConfig {
+                        port: "nav".into(),
+                        from: vec![PortRef::new("nav", "nav")],
+                    }],
+                    ..SystemConfig::new("control", "control")
+                },
+            ],
+            ..Default::default()
+        };
+        let mut coordinator = config.build(&table(&recorder)).expect("valid config");
+        coordinator.step(Timestamp(1));
+        assert_eq!(recorder.take(), vec![(Timestamp(1), 11.0)]);
+    }
+
+    #[test]
+    fn an_unknown_record_name_is_rejected() {
+        let config = CoordinatorConfig {
+            systems: vec![emits("gyro")],
+            ..Default::default()
+        };
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::UnknownRecord {
+                system: "emit".into(),
+                port: "imu".into(),
+                record: "gyro".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_record_two_registrations_define_differently_is_rejected() {
+        let recorder = Recorder::default();
+        let mut table = table(&recorder);
+        table.register("wide", || WideSource);
+        let config = CoordinatorConfig {
+            systems: vec![emits("imu")],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.build(&table).err(),
+            Some(BuildError::RecordConflict {
+                record: "imu".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_output_port_on_a_static_system_is_rejected() {
+        let config = CoordinatorConfig {
+            systems: vec![SystemConfig {
+                outputs: vec![OutputConfig {
+                    port: "extra".into(),
+                    record: "imu".into(),
+                }],
+                ..SystemConfig::new("imu", "imu")
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::UnknownOutput {
+                system: "imu".into(),
+                port: "extra".into(),
+            })
+        );
     }
 
     #[test]

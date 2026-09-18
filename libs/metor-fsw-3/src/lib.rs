@@ -16,8 +16,8 @@ pub mod system;
 mod tests;
 
 pub use coordinator::{
-    BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, ParamError, Params, PortRef,
-    Step, SystemConfig, SystemStatus, SystemTable,
+    BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig, ParamError,
+    Params, PortRef, Step, SystemConfig, SystemStatus, SystemTable,
 };
 pub use dl::{DlStep, Pack, PackError, PackFns};
 pub use fn_system::{Ctor, Cycle, FnSystem, InSet, Names, OutSet, Param, SystemFn};
@@ -27,9 +27,11 @@ pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, system}
 pub use metor_fsw_3_ring::{ReadError, WriteError};
 pub use pack::def::{PackDef, PackSystemDef};
 pub use pack::{ABI_VERSION, Status};
-pub use port::{Input, Latest, Output, RecvError, SendError, ring_capacity};
+pub use port::{DynInputs, DynOutputs, Input, Latest, Output, RecvError, SendError, ring_capacity};
 pub use record::{Bytes, DecodeError, EncodeError, MsgCodec, Record, RecordSchema};
-pub use system::{PortDef, System, SystemDef, SystemInputs, SystemOutputs};
+pub use system::{
+    InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
+};
 
 pub use metor_fsw_3_ring as ring;
 pub use metor_proto::types::Timestamp;

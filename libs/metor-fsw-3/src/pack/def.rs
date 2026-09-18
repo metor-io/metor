@@ -68,7 +68,9 @@ mod tests {
                 "reserved",
                 "boom",
                 "trap",
-                "log_sink"
+                "log_sink",
+                "tap",
+                "emit"
             ]
         );
         assert_eq!(def.systems[0].def.outputs[0].name, "imu");

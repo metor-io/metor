@@ -2,10 +2,9 @@
 
 use std::cell::RefCell;
 
-use metor_fsw_3::ring::{NoWake, View, Writer};
 use metor_fsw_3::{
-    Input, Output, PortDef, Record, System, SystemDef, SystemInputs, SystemOutputs, SystemTable,
-    Timestamp, system,
+    Input, InputBinding, Output, OutputBinding, PortDef, Record, System, SystemDef, SystemInputs,
+    SystemOutputs, SystemTable, Timestamp, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -87,9 +86,9 @@ impl SystemInputs for RetainedInput {
         vec![Input::<Ping>::def("input")]
     }
 
-    fn bind(mut views: Vec<Vec<View<NoWake>>>) -> Self {
-        if let Some(views) = views.pop() {
-            RETAINED_INPUT.with(|slot| *slot.borrow_mut() = Input::try_new(views).ok());
+    fn bind(mut inputs: Vec<InputBinding>) -> Self {
+        if let Some(binding) = inputs.pop() {
+            RETAINED_INPUT.with(|slot| *slot.borrow_mut() = Input::try_new(binding.views).ok());
         }
         Self
     }
@@ -102,9 +101,9 @@ impl SystemOutputs for RetainedOutput {
         vec![Output::<Ping>::def("output")]
     }
 
-    fn bind(mut writers: Vec<Writer<NoWake>>) -> Self {
-        if let Some(writer) = writers.pop() {
-            RETAINED_OUTPUT.with(|slot| *slot.borrow_mut() = Output::try_new(writer).ok());
+    fn bind(mut outputs: Vec<OutputBinding>) -> Self {
+        if let Some(binding) = outputs.pop() {
+            RETAINED_OUTPUT.with(|slot| *slot.borrow_mut() = Output::try_new(binding.writer).ok());
         }
         Self
     }
