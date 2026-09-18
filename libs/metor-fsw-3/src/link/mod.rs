@@ -5,6 +5,7 @@
 
 mod conn;
 mod publish;
+mod subscribe;
 mod transport;
 mod wire;
 
@@ -15,6 +16,7 @@ use crate::Frame;
 use crate::coordinator::SystemTable;
 
 pub use publish::{Publish, PublishParams};
+pub use subscribe::{Subscribe, SubscribeParams};
 pub use transport::Transport;
 
 /// The prefix every built-in system registers under, as a pack's id would be.
@@ -65,6 +67,7 @@ impl LinkStatus {
 /// Registers the link systems every target may name, under `fsw.`.
 pub fn register_builtins(table: &mut SystemTable) {
     table.register_async::<Publish, _, _>(&format!("{BUILTIN}.publish"), Publish::new);
+    table.register_async::<Subscribe, _, _>(&format!("{BUILTIN}.subscribe"), Subscribe::new);
 }
 
 #[cfg(test)]

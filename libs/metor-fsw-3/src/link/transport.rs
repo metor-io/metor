@@ -76,6 +76,11 @@ impl Endpoint {
         }
     }
 
+    /// Whether this endpoint accepts peers, rather than dialing one.
+    pub(crate) fn listens(&self) -> bool {
+        matches!(self, Self::Listen { .. })
+    }
+
     /// The address a listener bound, for a caller that asked for port zero.
     pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
         match self {

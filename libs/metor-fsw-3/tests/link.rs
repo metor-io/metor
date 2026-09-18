@@ -1,4 +1,5 @@
-//! A running target's link: what a client sees when it dials a `Publish`.
+//! A running target's links: what a client sees on a `Publish`, and what a
+//! `Subscribe` does with what it is sent.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -10,13 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use metor_fsw_3::coordinator::{
-    CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
+    CoordinatorConfig, InputConfig, OutputConfig, PortRef, SystemConfig, SystemTable,
 };
 use metor_fsw_3::link::register_builtins;
 use metor_fsw_3::{Clock, Frame, Input, LinkStatus, Output, Timestamp, system};
-use metor_proto::types::{Msg, OwnedPacket};
+use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::{PacketStream, Peer, identify};
 use metor_proto_wkt::{SetComponentMetadata, VTableMsg};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use stellarator::io::{OwnedReader, SplitExt};
 use stellarator::net::TcpStream;
@@ -32,6 +34,15 @@ struct Imu {
     #[frame(timestamp)]
     timestamp: Timestamp,
     sample: f64,
+}
+
+#[derive(
+    metor_fsw_3::Record, metor_fsw_3::Schema, Serialize, Deserialize, Clone, Copy, Debug, PartialEq,
+)]
+#[postcard(crate = metor_fsw_3::postcard_schema)]
+#[record(max_len = 8)]
+struct Ping {
+    n: u32,
 }
 
 /// Publishes one sample per cycle, counting up.
@@ -62,12 +73,63 @@ impl StatusSink {
     }
 }
 
+/// Publishes one ping per cycle, counting up.
+#[derive(Default)]
+struct Pinger(u32);
+
+#[system]
+impl Pinger {
+    fn execute(&mut self, ping: &mut Output<Ping>) {
+        self.0 += 1;
+        let _ = ping.write(&Ping { n: self.0 });
+    }
+}
+
+/// Records every ping it is wired to.
+struct PingSink(Arc<Mutex<Vec<u32>>>);
+
+#[system]
+impl PingSink {
+    fn execute(&mut self, ping: &mut Input<Ping>) {
+        for ping in ping.drain().flatten() {
+            // PANIC Safety: no test holds this lock across a panic.
+            self.0.lock().expect("an unpoisoned sink").push(ping.n);
+        }
+    }
+}
+
+/// What a test's systems report back to it.
+#[derive(Clone, Default)]
+struct Seen {
+    statuses: Arc<Mutex<Vec<LinkStatus>>>,
+    pings: Arc<Mutex<Vec<u32>>>,
+}
+
+impl Seen {
+    fn status(&self) -> Option<LinkStatus> {
+        // PANIC Safety: no test holds this lock across a panic.
+        self.statuses
+            .lock()
+            .expect("an unpoisoned sink")
+            .last()
+            .copied()
+    }
+
+    fn pings(&self) -> Vec<u32> {
+        // PANIC Safety: as above.
+        self.pings.lock().expect("an unpoisoned sink").clone()
+    }
+}
+
 /// The systems every test in this file may name, plus the built-in links.
-fn table(statuses: &Arc<Mutex<Vec<LinkStatus>>>) -> SystemTable {
+fn table(seen: &Seen) -> SystemTable {
     let mut table = SystemTable::new();
     table.register("source", Source::default);
-    let statuses = statuses.clone();
+    table.register("pinger", Pinger::default);
+    let statuses = seen.statuses.clone();
     table.register("status_sink", move || StatusSink(statuses.clone()));
+    let pings = seen.pings.clone();
+    table.register("ping_sink", move || PingSink(pings.clone()));
     register_builtins(&mut table);
     table
 }
@@ -118,16 +180,16 @@ impl Drop for Target {
 }
 
 /// Builds and runs `systems` on a thread of its own, cycling at `rate`.
-fn spawn(systems: Vec<SystemConfig>, statuses: &Arc<Mutex<Vec<LinkStatus>>>, rate: f64) -> Target {
+fn spawn(systems: Vec<SystemConfig>, seen: &Seen, rate: f64) -> Target {
     let stop = Arc::new(AtomicBool::new(false));
-    let (flag, statuses) = (stop.clone(), statuses.clone());
+    let (flag, seen) = (stop.clone(), seen.clone());
     let thread = std::thread::spawn(move || {
         let config = CoordinatorConfig {
             clock: Clock::Wall { rate },
             systems,
             ..Default::default()
         };
-        let mut coordinator = config.build(&table(&statuses)).expect("valid config");
+        let mut coordinator = config.build(&table(&seen)).expect("valid config");
         stellarator::run(|| async move { coordinator.run(Until(flag)).await });
     });
     Target {
@@ -185,13 +247,13 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
 #[stellarator::test]
 async fn a_listening_publish_announces_itself_then_streams_its_records() {
     let addr = free_port();
-    let statuses = Arc::new(Mutex::new(Vec::new()));
+    let seen = Seen::default();
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
             publish(json!({ "listen": { "addr": addr.to_string() } }), 1 << 20),
         ],
-        &statuses,
+        &seen,
         500.0,
     );
 
@@ -238,13 +300,13 @@ async fn a_listening_publish_announces_itself_then_streams_its_records() {
 #[stellarator::test]
 async fn a_dialing_publish_finds_a_listener_that_comes_up_late() {
     let addr = free_port();
-    let statuses = Arc::new(Mutex::new(Vec::new()));
+    let seen = Seen::default();
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
             publish(json!({ "connect": { "addr": addr.to_string() } }), 1 << 20),
         ],
-        &statuses,
+        &seen,
         500.0,
     );
     // The link dials while nothing answers, so it backs off and retries.
@@ -276,7 +338,7 @@ async fn a_dialing_publish_finds_a_listener_that_comes_up_late() {
 #[stellarator::test]
 async fn a_client_that_never_reads_drops_its_own_batches_only() {
     let addr = free_port();
-    let statuses = Arc::new(Mutex::new(Vec::new()));
+    let seen = Seen::default();
     let _target = spawn(
         vec![
             SystemConfig::new("imu", "source"),
@@ -288,7 +350,7 @@ async fn a_client_that_never_reads_drops_its_own_batches_only() {
                 PortRef::new("pub", "link_status"),
             ),
         ],
-        &statuses,
+        &seen,
         50_000.0,
     );
 
@@ -308,13 +370,117 @@ async fn a_client_that_never_reads_drops_its_own_batches_only() {
         }
     }
 
-    let latest = || {
-        // PANIC Safety: no test holds this lock across a panic.
-        statuses.lock().expect("an unpoisoned sink").last().copied()
-    };
     until("the link never reported two connections", || {
-        latest().is_some_and(|s| s.connections == 2 && s.batches_dropped > 0)
+        seen.status()
+            .is_some_and(|s| s.connections == 2 && s.batches_dropped > 0)
     })
     .await;
-    assert_eq!(latest().expect("a status").connections, 2);
+    assert_eq!(seen.status().expect("a status").connections, 2);
+}
+
+/// A `Subscribe` over `transport`, publishing what it is sent on `ping`.
+fn subscribe(transport: serde_json::Value) -> SystemConfig {
+    SystemConfig {
+        params: json!({
+            "transport": transport,
+            "namespace": "cube_sat",
+            "link": "cmds",
+        }),
+        outputs: vec![OutputConfig {
+            port: "ping".into(),
+            record: "ping".into(),
+        }],
+        ..SystemConfig::new("cmds", "fsw.subscribe")
+    }
+}
+
+#[stellarator::test]
+async fn a_listening_subscribe_names_its_commands_and_routes_what_it_is_sent() {
+    let addr = free_port();
+    let seen = Seen::default();
+    let _target = spawn(
+        vec![
+            subscribe(json!({ "listen": { "addr": addr.to_string() } })),
+            reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
+            reading(
+                "status",
+                "status_sink",
+                "link_status",
+                PortRef::new("cmds", "link_status"),
+            ),
+        ],
+        &seen,
+        500.0,
+    );
+
+    let Peer::Fsw { info, tx, .. } = dial(addr).await else {
+        panic!("a subscribe is an fsw link")
+    };
+    assert_eq!(info.command_ids, vec![<Ping as Msg>::ID]);
+    assert_eq!(info.link, "cmds");
+
+    tx.send((&Ping { n: 7 }).into_len_packet())
+        .await
+        .0
+        .expect("the link takes commands");
+    until("the ping never reached the consumer", || {
+        seen.pings().contains(&7)
+    })
+    .await;
+
+    // A table is not routed in this slice, and the connection stays up.
+    tx.send(LenPacket::table([1, 2], 8)).await.0.expect("up");
+    until("the table was never counted", || {
+        seen.status().is_some_and(|s| s.inbound_dropped > 0)
+    })
+    .await;
+    tx.send((&Ping { n: 9 }).into_len_packet())
+        .await
+        .0
+        .expect("the link is still up");
+    until("the link stopped routing after a table", || {
+        seen.pings().contains(&9)
+    })
+    .await;
+}
+
+#[stellarator::test]
+async fn a_dialing_subscribe_receives_the_records_a_publish_serves() {
+    let addr = free_port();
+    let (server, client) = (Seen::default(), Seen::default());
+    let _server = spawn(
+        vec![
+            SystemConfig::new("src", "pinger"),
+            SystemConfig {
+                params: json!({
+                    "transport": { "listen": { "addr": addr.to_string() } },
+                    "link": "pub",
+                }),
+                ..reading(
+                    "pub",
+                    "fsw.publish",
+                    "src.ping",
+                    PortRef::new("src", "ping"),
+                )
+            },
+        ],
+        &server,
+        500.0,
+    );
+    let _client = spawn(
+        vec![
+            subscribe(json!({ "connect": { "addr": addr.to_string() } })),
+            reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
+        ],
+        &client,
+        500.0,
+    );
+
+    until("the subscriber never received a record", || {
+        client.pings().len() >= 3
+    })
+    .await;
+    let pings = client.pings();
+    let steps: Vec<u32> = pings.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(steps.iter().all(|step| *step == 1), "{pings:?}");
 }
