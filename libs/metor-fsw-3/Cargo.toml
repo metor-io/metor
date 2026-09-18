@@ -10,6 +10,7 @@ metor-fsw-3-ring = { path = "ring" }
 
 metor-component = { workspace = true }
 metor-proto = { path = "../metor-proto", features = ["std"] }
+metor-proto-stellar = { path = "../metor-proto/stellar" }
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["std"] }
 
 clap = { version = "4", features = ["derive"] }

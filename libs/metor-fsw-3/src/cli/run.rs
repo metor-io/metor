@@ -193,6 +193,7 @@ pub fn load(mut config: TargetConfig, overrides: &Run) -> Result<Coordinator, Ru
     }
 
     let mut table = SystemTable::new();
+    crate::link::register_builtins(&mut table);
     let opened: Vec<Pack> = config
         .packs
         .iter()

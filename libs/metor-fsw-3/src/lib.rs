@@ -6,6 +6,7 @@ pub mod coordinator;
 pub mod dl;
 pub mod fn_system;
 pub mod frame;
+pub mod link;
 pub mod log;
 pub mod pack;
 mod panic;
@@ -28,6 +29,7 @@ pub use fn_system::{
     SystemFn,
 };
 pub use frame::Frame;
+pub use link::{LinkStatus, Transport};
 pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, system};
 pub use metor_fsw_3_ring::{ReadError, WriteError};
