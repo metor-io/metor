@@ -1,5 +1,7 @@
 //! The [`Param`] trait, one per `execute` parameter type, and its tuple impls.
 
+use std::borrow::Cow;
+
 use metor_fsw_3_ring::{NoWake, Notifier, WakeSink};
 use metor_proto::types::Timestamp;
 
@@ -68,6 +70,25 @@ pub type Writers = Bindings<OutputBinding>;
 /// The parameter names a bundle declares under, one per leaf parameter in order.
 pub type Names<'n> = core::slice::Iter<'n, &'static str>;
 
+/// The ports a system's parameters declare, in parameter order.
+#[derive(Default)]
+pub struct Defs {
+    pub inputs: Vec<PortDef>,
+    pub outputs: Vec<PortDef>,
+    /// The parameter that takes every input the config adds, if there is one.
+    pub dynamic_inputs: Option<Cow<'static, str>>,
+    pub dynamic_outputs: Option<Cow<'static, str>>,
+}
+
+impl Defs {
+    /// Every port a system's parameters declare, under the names it gave them.
+    pub fn of<S: crate::fn_system::Ports>() -> Self {
+        let mut defs = Self::default();
+        S::Params::append_defs(&mut S::NAMES.iter(), &mut defs);
+        defs
+    }
+}
+
 /// `Cycle` is the extra parameter passed to execute beyonds its ports.
 pub struct Cycle<'a> {
     pub now: Timestamp,
@@ -97,11 +118,6 @@ impl<'a> Cycle<'a> {
 /// For instance [`Input`] implements `Param` to bind an input port.
 /// The goal is to let system fns define what parameters they need from the type system.
 pub trait Param {
-    /// Whether this parameter's input ports come from the config.
-    const DYNAMIC_IN: bool = false;
-    /// Whether this parameter's output ports come from the config.
-    const DYNAMIC_OUT: bool = false;
-
     /// The bound input, or `()`.
     type In<K: Wiring>;
     /// The bound writer, or `()`.
@@ -112,7 +128,7 @@ pub trait Param {
         Self: 'a;
 
     /// Appends this parameter's port definition, if it has one, taking its name from `names`.
-    fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>);
+    fn append_defs(names: &mut Names<'_>, defs: &mut Defs);
 
     /// Returns this parameter's input (if one exists) by popping a view from `views`.
     fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K>;
@@ -141,8 +157,8 @@ impl<T: Record + 'static + ?Sized, W: WakeSink + 'static> Param for Input<T, W> 
     type Out = ();
     type Item<'a, K: Wiring> = &'a mut Input<T, K::Sink>;
 
-    fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
-        inputs.push(Input::<T>::def(name(names)));
+    fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+        defs.inputs.push(Input::<T>::def(name(names)));
     }
 
     fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K> {
@@ -168,8 +184,8 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
     type Out = Output<T>;
     type Item<'a, K: Wiring> = &'a mut Output<T>;
 
-    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>) {
-        outputs.push(Output::<T>::def(name(names)));
+    fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+        defs.outputs.push(Output::<T>::def(name(names)));
     }
 
     fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
@@ -191,13 +207,18 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
 }
 
 impl<W: WakeSink + 'static> Param for DynInputs<W> {
-    const DYNAMIC_IN: bool = true;
     type In<K: Wiring> = DynInputs<K::Sink>;
     type Out = ();
     type Item<'a, K: Wiring> = &'a mut DynInputs<K::Sink>;
 
-    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
-        name(names);
+    fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+        let taken = defs.dynamic_inputs.replace(name(names).into());
+        // PANIC Safety: only a system with two dynamic input parameters
+        // reaches this, when its definition is built; the message names the fix.
+        assert!(
+            taken.is_none(),
+            "a system takes `&mut DynInputs` at most once"
+        );
     }
 
     fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K> {
@@ -216,13 +237,17 @@ impl<W: WakeSink + 'static> Param for DynInputs<W> {
 }
 
 impl Param for DynOutputs {
-    const DYNAMIC_OUT: bool = true;
     type In<K: Wiring> = ();
     type Out = DynOutputs;
     type Item<'a, K: Wiring> = &'a mut DynOutputs;
 
-    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
-        name(names);
+    fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+        let taken = defs.dynamic_outputs.replace(name(names).into());
+        // PANIC Safety: as for `DynInputs`.
+        assert!(
+            taken.is_none(),
+            "a system takes `&mut DynOutputs` at most once"
+        );
     }
 
     fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
@@ -245,7 +270,7 @@ impl Param for Timestamp {
     type Out = ();
     type Item<'a, K: Wiring> = Timestamp;
 
-    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
+    fn append_defs(names: &mut Names<'_>, _defs: &mut Defs) {
         name(names);
     }
 
@@ -267,7 +292,7 @@ impl Param for Log {
     type Out = ();
     type Item<'a, K: Wiring> = &'a mut Log;
 
-    fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
+    fn append_defs(names: &mut Names<'_>, _defs: &mut Defs) {
         name(names);
     }
 
@@ -288,15 +313,13 @@ impl Param for Log {
 macro_rules! impl_param_for_tuple {
     ($(($P:ident, $i:tt)),*) => {
         impl<$($P: Param),*> Param for ($($P,)*) {
-            const DYNAMIC_IN: bool = false $(|| $P::DYNAMIC_IN)*;
-            const DYNAMIC_OUT: bool = false $(|| $P::DYNAMIC_OUT)*;
             type In<W: Wiring> = ($($P::In<W>,)*);
             type Out = ($($P::Out,)*);
             type Item<'a, W: Wiring> = ($($P::Item<'a, W>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
-            fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>) {
-                $( $P::append_defs(names, inputs, outputs); )*
+            fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
+                $( $P::append_defs(names, defs); )*
             }
 
             #[allow(unused_variables, clippy::unused_unit)]

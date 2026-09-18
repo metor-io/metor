@@ -6,8 +6,10 @@ use crate::log::LogPort;
 use crate::port::Output;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 
+use std::borrow::Cow;
+
 use super::Ports;
-use super::param::{Bindings, Cyclic, Param, Wiring};
+use super::param::{Bindings, Cyclic, Defs, Param, Wiring};
 
 /// LOG_PORT is the name of the port that receives log events.
 pub const LOG_PORT: &str = "log";
@@ -22,12 +24,12 @@ pub struct OutSet<S: Ports> {
 }
 
 impl<S: Ports, K: Wiring> SystemInputs<K::Sink> for InSet<S, K> {
-    const DYNAMIC: bool = <S::Params as Param>::DYNAMIC_IN;
-
     fn defs() -> Vec<PortDef> {
-        let (mut inputs, mut outputs) = (Vec::new(), Vec::new());
-        S::Params::append_defs(&mut S::NAMES.iter(), &mut inputs, &mut outputs);
-        inputs
+        Defs::of::<S>().inputs
+    }
+
+    fn dynamic() -> Option<Cow<'static, str>> {
+        Defs::of::<S>().dynamic_inputs
     }
 
     fn bind(inputs: Vec<InputBinding<K::Sink>>) -> Self {
@@ -44,13 +46,14 @@ impl<S: Ports, K: Wiring> SystemInputs<K::Sink> for InSet<S, K> {
 }
 
 impl<S: Ports> SystemOutputs for OutSet<S> {
-    const DYNAMIC: bool = <S::Params as Param>::DYNAMIC_OUT;
-
     fn defs() -> Vec<PortDef> {
-        let (mut inputs, mut outputs) = (Vec::new(), Vec::new());
-        S::Params::append_defs(&mut S::NAMES.iter(), &mut inputs, &mut outputs);
+        let mut outputs = Defs::of::<S>().outputs;
         outputs.push(Output::<LogEvent>::def(LOG_PORT));
         outputs
+    }
+
+    fn dynamic() -> Option<Cow<'static, str>> {
+        Defs::of::<S>().dynamic_outputs
     }
 
     fn bind(outputs: Vec<OutputBinding>) -> Self {

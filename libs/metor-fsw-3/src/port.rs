@@ -3,6 +3,7 @@
 use core::borrow::Borrow;
 use core::marker::PhantomData;
 use core::ops::Deref;
+use std::borrow::Cow;
 
 use crate::record::{Bytes, DecodeError, EncodeError, Record};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
@@ -264,10 +265,12 @@ impl DynInputs<Notifier> {
 }
 
 impl<W: WakeSink + Clone> SystemInputs<W> for DynInputs<W> {
-    const DYNAMIC: bool = true;
-
     fn defs() -> Vec<PortDef> {
         Vec::new()
+    }
+
+    fn dynamic() -> Option<Cow<'static, str>> {
+        Some(Cow::Borrowed("inputs"))
     }
 
     fn bind(inputs: Vec<InputBinding<W>>) -> Self {
@@ -299,10 +302,12 @@ impl<W: WakeSource> DynOutputs<W> {
 }
 
 impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
-    const DYNAMIC: bool = true;
-
     fn defs() -> Vec<PortDef> {
         Vec::new()
+    }
+
+    fn dynamic() -> Option<Cow<'static, str>> {
+        Some(Cow::Borrowed("outputs"))
     }
 
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self {

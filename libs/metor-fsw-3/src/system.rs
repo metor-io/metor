@@ -30,10 +30,11 @@ pub struct SystemDef {
     pub name: Cow<'static, str>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
+    /// The parameter that takes every input the config adds, if the type has one.
     #[serde(default)]
-    pub dynamic_inputs: bool,
+    pub dynamic_inputs: Option<Cow<'static, str>>,
     #[serde(default)]
-    pub dynamic_outputs: bool,
+    pub dynamic_outputs: Option<Cow<'static, str>>,
 }
 
 impl SystemDef {
@@ -42,8 +43,8 @@ impl SystemDef {
             name: name.into(),
             inputs: I::defs(),
             outputs: O::defs(),
-            dynamic_inputs: I::DYNAMIC,
-            dynamic_outputs: O::DYNAMIC,
+            dynamic_inputs: I::dynamic(),
+            dynamic_outputs: O::dynamic(),
         }
     }
 
@@ -53,8 +54,8 @@ impl SystemDef {
             name: name.into(),
             inputs: I::defs(),
             outputs: O::defs(),
-            dynamic_inputs: I::DYNAMIC,
-            dynamic_outputs: O::DYNAMIC,
+            dynamic_inputs: I::dynamic(),
+            dynamic_outputs: O::dynamic(),
         }
     }
 }
@@ -96,10 +97,14 @@ pub trait System {
 /// `W` is the wake endpoint of the ports it binds: [`NoWake`] for a cyclic
 /// system, [`Notifier`](metor_fsw_3_ring::Notifier) for an async one.
 pub trait SystemInputs<W: WakeSink = NoWake> {
-    /// Whether the config names this bundle's ports rather than the type.
-    const DYNAMIC: bool = false;
-
     fn defs() -> Vec<PortDef>;
+
+    /// The parameter the config's own input ports are bound through, if the
+    /// bundle takes them.
+    fn dynamic() -> Option<Cow<'static, str>> {
+        None
+    }
+
     /// One binding per [`defs`](SystemInputs::defs) entry, in order, then one
     /// per port the config added to a dynamic bundle.
     ///
@@ -112,10 +117,14 @@ pub trait SystemInputs<W: WakeSink = NoWake> {
 ///
 /// `W` is the wake endpoint of the ports it binds, as for [`SystemInputs`].
 pub trait SystemOutputs<W: WakeSource = NoWake> {
-    /// Whether the config names this bundle's ports rather than the type.
-    const DYNAMIC: bool = false;
-
     fn defs() -> Vec<PortDef>;
+
+    /// The parameter the config's own output ports are bound through, if the
+    /// bundle takes them.
+    fn dynamic() -> Option<Cow<'static, str>> {
+        None
+    }
+
     /// One binding per [`defs`](SystemOutputs::defs) entry, in order, then one
     /// per port the config added to a dynamic bundle.
     ///
@@ -288,21 +297,19 @@ mod tests {
 
     #[test]
     fn a_static_bundle_is_not_dynamic() {
-        const { assert!(!DerivedIn::DYNAMIC) };
-        const { assert!(!DerivedOut::DYNAMIC) };
         let def = SystemDef::new::<DerivedIn, DerivedOut>("nav");
-        assert!(!def.dynamic_inputs && !def.dynamic_outputs);
+        assert_eq!(def.dynamic_inputs, None);
+        assert_eq!(def.dynamic_outputs, None);
     }
 
     #[test]
     fn a_dynamic_bundle_declares_no_ports_and_binds_what_it_is_given() {
         use crate::port::{DynInputs, DynOutputs};
 
-        const { assert!(<DynInputs as SystemInputs>::DYNAMIC) };
-        const { assert!(<DynOutputs as SystemOutputs>::DYNAMIC) };
         let def = SystemDef::new::<DynInputs, DynOutputs>("link");
         assert!(def.inputs.is_empty() && def.outputs.is_empty());
-        assert!(def.dynamic_inputs && def.dynamic_outputs);
+        assert_eq!(def.dynamic_inputs.as_deref(), Some("inputs"));
+        assert_eq!(def.dynamic_outputs.as_deref(), Some("outputs"));
 
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
         let mut bound = DynInputs::bind(bound_in(vec![

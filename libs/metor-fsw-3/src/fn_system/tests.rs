@@ -659,3 +659,43 @@ fn a_registered_async_system_relays_through_its_adapter() {
     assert_eq!(estimate, 4.0);
     assert!(seen.contains(&"relaying".into()), "{seen:?}");
 }
+
+/// A dynamic side names the parameter its ports are bound through.
+#[test]
+fn a_dynamic_parameter_names_itself_in_the_definition() {
+    use crate::port::{DynInputs, DynOutputs};
+
+    struct Link;
+
+    #[crate::system]
+    impl Link {
+        fn execute(&mut self, taps: &mut DynInputs, sinks: &mut DynOutputs) {
+            let _ = (taps, sinks);
+        }
+    }
+
+    let def = FnSystem::<Link>::def();
+    assert_eq!(def.dynamic_inputs.as_deref(), Some("taps"));
+    assert_eq!(def.dynamic_outputs.as_deref(), Some("sinks"));
+
+    let static_def = FnSystem::<Doubler>::def();
+    assert_eq!(static_def.dynamic_inputs, None);
+    assert_eq!(static_def.dynamic_outputs, None);
+}
+
+#[test]
+#[should_panic(expected = "a system takes `&mut DynInputs` at most once")]
+fn two_dynamic_inputs_are_rejected_when_the_definition_is_built() {
+    use crate::port::DynInputs;
+
+    struct Twice;
+
+    #[crate::system]
+    impl Twice {
+        fn execute(&mut self, first: &mut DynInputs, second: &mut DynInputs) {
+            let _ = (first, second);
+        }
+    }
+
+    let _ = FnSystem::<Twice>::def();
+}

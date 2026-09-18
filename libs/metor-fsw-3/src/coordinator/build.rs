@@ -188,7 +188,7 @@ fn add_dynamic_outputs(
     records: &HashMap<&str, Option<&PortDef>>,
 ) -> Result<(), BuildError> {
     for output in &system.outputs {
-        if !def.dynamic_outputs {
+        if def.dynamic_outputs.is_none() {
             return Err(BuildError::UnknownOutput {
                 system: system.id.clone(),
                 port: output.port.clone(),
@@ -279,7 +279,7 @@ fn input_port(
     {
         return Ok(at);
     }
-    if !plan.systems[i].def.dynamic_inputs {
+    if plan.systems[i].def.dynamic_inputs.is_none() {
         return Err(BuildError::UnknownInput {
             system: system.to_string(),
             port: port.to_string(),
@@ -492,8 +492,8 @@ mod tests {
                     Vec::new()
                 },
                 outputs: if input { Vec::new() } else { vec![port] },
-                dynamic_inputs: false,
-                dynamic_outputs: false,
+                dynamic_inputs: None,
+                dynamic_outputs: None,
             };
             assert_eq!(
                 check_alignment("test", &def),
@@ -522,8 +522,8 @@ mod tests {
                 } else {
                     vec![port.clone(), port.clone()]
                 },
-                dynamic_inputs: false,
-                dynamic_outputs: false,
+                dynamic_inputs: None,
+                dynamic_outputs: None,
             };
             let expected = if input {
                 BuildError::DuplicateInput {
@@ -547,8 +547,8 @@ mod tests {
             name: "test".into(),
             inputs: vec![port.clone()],
             outputs: vec![port],
-            dynamic_inputs: false,
-            dynamic_outputs: false,
+            dynamic_inputs: None,
+            dynamic_outputs: None,
         };
         assert_eq!(check_port_names("instance", &def), Ok(()));
         assert_eq!(
