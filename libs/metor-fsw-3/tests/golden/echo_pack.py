@@ -11,7 +11,7 @@ PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=3,
+    abi_version=4,
 )
 
 

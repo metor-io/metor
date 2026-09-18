@@ -15,7 +15,7 @@ use def::{Instance, PackDef};
 use raw::{RawPort, RawRing, RawSlice};
 
 /// The ABI the exports in this module are built against.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// What [`execute`] returns: an unknown word is a panic.
 #[repr(u32)]
