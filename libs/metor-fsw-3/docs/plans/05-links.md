@@ -293,15 +293,27 @@ holds one connection.
 ### Connections
 
 `link/conn.rs` is the module both systems call. A `Connections` holds
-the slots: each with a pending egress buffer of `pending_cap` bytes
-(default 1 MiB), a queued count, and the socket halves. `enqueue(batch)`
-copies a batch into every open slot's pending buffer, dropping it whole
-for a slot it does not fit and counting the drop, and wakes that slot's
-writer. `write_half` drains a slot's pending buffer to its socket.
-`read_half` frames inbound packets with `PacketStream` and hands each to
-a caller closure. A closed socket frees its slot. Counters roll up into
-a `LinkStatus` frame (connections, bytes out, batches dropped, inbound
-dropped) each system writes on change on its own `link_status` output.
+one slot per allowed connection. An open slot is the send side of that
+connection's `Outbox` (a `pending_cap`-byte buffer, default 1 MiB,
+behind a `RefCell` with a wake) and the guard of the task that owns the
+socket halves and every other buffer. `enqueue(batch)` copies a batch
+into every open outbox, dropping it whole for one it does not fit and
+counting the drop. The task's write half swaps the outbox out and
+writes it; its read half frames inbound packets with `PacketStream` and
+hands each to the closure given at `open`. A closed socket frees its
+slot on `prune`, folding its byte count into the link. Counters roll up
+into a `LinkStatus` frame (connections, bytes out, batches dropped,
+inbound dropped) each system writes on change on its own `link_status`
+output.
+
+Buffers are allocated per accepted connection, not per slot at
+construction: a cancelled task may still hold the previous occupant's
+outbox, so reusing it would need a reference count check. The per-batch
+path allocates nothing.
+
+Connections arrive through `Incoming`, a task of the link's own that
+accepts or dials one at a time, so the link's loop can race a batch
+against a connection without cancelling an in-flight accept.
 
 ### `Publish`
 
@@ -322,8 +334,12 @@ output. Its `run`:
 
 Wire names: a frame published from port `plant.imu` announces its leaves
 as `{namespace}.plant.imu.{field}`, re-rooting the port-relative vtable
-under that path before hashing the table id. Two `Publish` instances on
-two links announce the same names for the same producer.
+under that path before hashing the table id (the record-relative leaf
+`imu.sample` has its record segment stripped first, so the path is not
+`plant.imu.imu.sample`). Two `Publish` instances on two links announce
+the same names for the same producer. `SetMsgMetadata.name` is the
+postcard schema's type name for postcard records, matching the id's
+hash, and the record name for other codecs.
 
 Input port names are `{producer}.{port}`; the Python builder enforces it,
 the Rust side accepts any name.
@@ -331,8 +347,12 @@ the Rust side accepts any name.
 ### `Subscribe`
 
 An async system with dynamic outputs, a `transport`, and a `link_status`
-output. Its `run` reads every connection and writes each `Msg` packet
-whose id is one of its outputs' wire ids onto that port, verbatim.
+output. Its connection tasks copy each `Msg` packet whose id is one of
+its outputs' wire ids into a bounded inbox (`inbound_cap` slots, default
+256, each sized to the largest output), and its `run` drains the inbox
+onto the ports, verbatim. A full inbox counts a drop. A `Frame` output
+cannot be refused at construction, since port defs arrive at bind; it
+faults `frame_output` on the log at start and is skipped.
 Unmatched ids are ignored, not logged; the panel probes with node
 protocol messages on connect. When listening it sends a `LinkInfo` with
 `command_ids` = its outputs' ids and no announces, so a panel knows what
@@ -368,8 +388,14 @@ inputs as attributes (`pub.plant.imu`) so slice 7 can reference them
 from another target; it emits no rings.
 
 `Publish` and `Subscribe` live in `metor_config` as built-ins with the
-pack id `fsw`; `Arm` and `SetGain` are record classes from pack modules
-or `metor_config.wkt`.
+pack id `fsw`, whose empty `lib` is why `to_config().packs` omits it;
+`Arm` and `SetGain` are record classes from pack modules or
+`metor_config.wkt`. Generated record classes carry `_name`, the record
+name the builders emit. `to_config()` fills each link's `link` (the
+system id) and `namespace` params and expands `all=True` in a
+finalize pass, so repeated emission is stable. `metor_config` keeps its
+own copy of the host ABI number for the built-in pack, pinned by a Rust
+test; an ABI bump touches it too.
 
 ## Build changes
 
@@ -378,11 +404,28 @@ or `metor_config.wkt`.
 - Rings for an async system's ports are allocated twice: the real ring
   and the mirror. Reader counting is unchanged; the mirror has one
   reader.
-- `bind_rings` groups async systems by thread name and, per group, moves
-  the systems' construction closures to the thread so nothing `Rc`
-  crosses.
-- Every `PortDef` in the table gains a schema, so the descriptor grows.
-  The ABI version bumps.
+- A table entry is one closure, `MakeFn = dyn Fn(MakeCx<'_>) ->
+  Result<Box<dyn Step>, ParamError>`, over `MakeCx { id, thread, def,
+  params, inputs, outputs, threads }`. Build calls it and wraps the
+  error; it does not know async systems exist. An async registration's
+  closure allocates its mirrors, hands its member to
+  `threads.get_or_spawn(thread)`, and returns the `Thread` adapter as an
+  ordinary step. Groups accept members after they start, with a
+  synchronous ack per add, so config order does not affect placement.
+  Each adapter owns its `Arc<GroupHandle>`; the coordinator keeps only
+  weak handles, so the last system on a thread dropping is what stops
+  and joins it. A pack keeps its own `Threads` and honors placement in
+  its own pool; the instance id and thread ride in the JSON that
+  already crosses `metor_fsw_create`.
+- The system is constructed on the thread that runs it, from an owned
+  `serde_json::Value`, so nothing `Rc` crosses.
+- Every `PortDef` in the table gains a schema, and the create payload
+  gains the instance id and thread. ABI 4.
+- `metor run --print-ports` prints each listening link's bound address
+  as `<id> <addr>` before cycling, for tests that bind port zero. The
+  address comes from a process-wide registry the link constructors fill
+  by their `link` param, since the `log` line that also carries it is on
+  a background thread and reaches the graph a cycle later.
 
 ## Tests
 

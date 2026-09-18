@@ -48,7 +48,7 @@ pub fn system_outputs(input: TokenStream) -> TokenStream {
 /// A consumer without the crate in `[dependencies]` cannot use these macros.
 pub(crate) fn fsw_crate() -> proc_macro2::TokenStream {
     match crate_name("metor-fsw-3") {
-        Ok(FoundCrate::Itself) => quote!(crate),
+        Ok(FoundCrate::Itself) => quote!(::metor_fsw_3),
         Ok(FoundCrate::Name(name)) => {
             let ident = Ident::new(&name, Span::call_site());
             quote!( #ident )

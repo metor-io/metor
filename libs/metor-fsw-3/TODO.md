@@ -32,13 +32,15 @@ new `to_config()`, and `metor run`. Written fresh: fsw-2 is read for its
 lessons, nothing is copied. Takes over the ADCS example and the slice-2
 docs pass from T7 and T8. `04-packs.md`.
 
-## 4. Links
+## 4. Links, done
 
 `Publish` and `Subscribe`, each over a listen or connect transport, the
 `Thread` adapter and named thread placement for async systems, and
 dynamic ports with a schema on every `PortDef`. The wire format is
 fixed by metor-panel and metor-db, so it is reproduced, not designed.
-`05-links.md`.
+`05-links.md`, `05-links-impl.md`. Landed 2026-09-18; the fixture's
+`metor run` closes the loop from a `Subscribe` through `echo` to a
+`Publish`.
 
 - Shared state: the `&Shared<S>` parameter kind and the one-thread rule
   are designed in `05-links.md` and held until two systems must hold

@@ -1,4 +1,46 @@
-//! metor-fsw is a flight software framework
+//! metor-fsw is a flight software framework.
+//!
+//! Systems are functions over typed ring ports, stepped in order by the
+//! [`Coordinator`]. A system authored as `async fn run` instead runs on a
+//! background thread behind the [`thread`] adapter, which mirrors its ports:
+//!
+//! ```
+//! use metor_fsw_3::ring::Notifier;
+//! use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+//! use metor_fsw_3::{Frame, Input, Output, Stop, SystemTable, Timestamp, system};
+//!
+//! #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+//! #[repr(C)]
+//! struct Gps {
+//!     #[frame(timestamp)]
+//!     timestamp: Timestamp,
+//!     pos: [f64; 3],
+//! }
+//!
+//! struct Relay;
+//!
+//! #[system]
+//! impl Relay {
+//!     /// Copies every fix until stop.
+//!     async fn run(&mut self, gps: &mut Input<Gps, Notifier>, out: &mut Output<Gps>, stop: Stop) {
+//!         while !stop.is_set() {
+//!             let Ok(fix) = gps.next().await else { return };
+//!             let fix = Gps { timestamp: fix.timestamp, pos: fix.pos };
+//!             let _ = out.write(&fix);
+//!         }
+//!     }
+//! }
+//!
+//! let mut table = SystemTable::new();
+//! table.register_async("relay", || Relay);
+//! ```
+//!
+//! The built-in [`link`] systems, `Publish` and `Subscribe`, are async
+//! systems with config-listed ports; they carry a target's records over
+//! metor-proto to whoever connects, and its commands back.
+
+// The derives name this crate by its package name, in doctests as well as here.
+extern crate self as metor_fsw_3;
 
 pub mod async_system;
 pub mod cli;
