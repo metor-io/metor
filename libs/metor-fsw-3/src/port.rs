@@ -79,6 +79,9 @@ fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], SendError> {
 pub struct Output<T: ?Sized, W: WakeSource = NoWake> {
     writer: Writer<W>,
     scratch: Vec<u8>,
+    /// The longest record this port takes: the type's bound, or the binding's
+    /// for a dynamic port, whose record the type does not know.
+    max_len: usize,
     _t: PhantomData<T>,
 }
 
@@ -89,6 +92,7 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
         Ok(Self {
             writer,
             scratch: vec![0; T::MAX_LEN],
+            max_len: T::MAX_LEN,
             _t: PhantomData,
         })
     }
@@ -109,14 +113,26 @@ impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
     /// Publishes one value as one record.
     pub fn write(&mut self, value: &T) -> Result<(), SendError> {
         let bytes = value.encode(&mut self.scratch).map_err(SendError::Encode)?;
-        let bytes = bounded(bytes, T::MAX_LEN)?;
+        let bytes = bounded(bytes, self.max_len)?;
         self.writer.try_write(bytes).map_err(SendError::Ring)
     }
 }
 
 impl<W: WakeSource> Output<Bytes, W> {
+    /// Binds a dynamic port's writer, bounding it by the record `max_len` its
+    /// binding named.
+    pub fn bytes(writer: Writer<W>, max_len: usize) -> Self {
+        Self {
+            writer,
+            scratch: Vec::new(),
+            max_len,
+            _t: PhantomData,
+        }
+    }
+
     /// Publishes a record's bytes as they arrived, without encoding.
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SendError> {
+        let bytes = bounded(bytes, self.max_len)?;
         self.writer.try_write(bytes).map_err(SendError::Ring)
     }
 }
@@ -313,8 +329,10 @@ impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self {
         let ports = outputs
             .into_iter()
-            // PANIC Safety: bytes need no alignment.
-            .map(|b| (b.def, Output::try_new(b.writer).expect("byte alignment")))
+            .map(|b| {
+                let output = Output::bytes(b.writer, b.def.max_len);
+                (b.def, output)
+            })
             .collect();
         Self { ports }
     }

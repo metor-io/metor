@@ -1,6 +1,6 @@
 //! One background thread running one executor for a group of async systems.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -56,26 +56,21 @@ pub(crate) struct GroupHandle {
     name: String,
     stop: StopHandle,
     inbox: Arc<Inbox>,
-    finished: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 /// Starts one empty group on a new thread, which takes members as they come.
 pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, BuildError> {
     let (handle, stop) = stop_pair();
-    let finished = Arc::new(AtomicBool::new(false));
     let inbox = Arc::new(Inbox {
         jobs: Mutex::new(Vec::new()),
         woken: WaitQueue::new(),
     });
     let thread = {
-        let (finished, inbox) = (finished.clone(), inbox.clone());
+        let inbox = inbox.clone();
         std::thread::Builder::new()
             .name(format!("fsw-{name}"))
-            .spawn(move || {
-                stellarator::run(move || run(inbox, stop));
-                finished.store(true, Ordering::Release);
-            })
+            .spawn(move || stellarator::run(move || run(inbox, stop)))
             .map_err(|_| BuildError::ThreadStart {
                 thread: name.to_string(),
             })?
@@ -84,7 +79,6 @@ pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, BuildError> {
         name: name.to_string(),
         stop: handle,
         inbox,
-        finished,
         thread: Some(thread),
     }))
 }
@@ -116,9 +110,10 @@ async fn run(inbox: Arc<Inbox>, stop: Stop) {
     let mut tasks = Vec::new();
     while !stop.is_set() {
         for Job { member, report } in inbox.take() {
-            match member.launch.launch(stop.clone()) {
+            let Member { launch, panicked } = member;
+            match build(launch, stop.clone()) {
                 Ok(running) => {
-                    tasks.push(stellarator::spawn(task(running, member.panicked)));
+                    tasks.push(stellarator::spawn(task(running, panicked)));
                     let _ = report.send(None);
                 }
                 Err(source) => {
@@ -133,6 +128,19 @@ async fn run(inbox: Arc<Inbox>, stop: Stop) {
     }
     for task in tasks {
         let _ = task.await;
+    }
+}
+
+/// Constructs one system, a panicking constructor reading as a param error
+/// rather than taking the group's thread down with it.
+fn build(launch: Box<dyn Launch>, stop: Stop) -> Result<crate::async_system::Running, ParamError> {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| launch.launch(stop))) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = crate::coordinator::panic_message(&*payload).to_string();
+            crate::panic::discard(payload);
+            Err(ParamError::Decode(message))
+        }
     }
 }
 
@@ -154,7 +162,11 @@ impl Drop for GroupHandle {
         self.stop.stop();
         self.inbox.woken.wake_all();
         let deadline = Instant::now() + JOIN_TIMEOUT;
-        while !self.finished.load(Ordering::Acquire) {
+        while self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
             if Instant::now() >= deadline {
                 tracing::error!(thread = self.name, "detaching a thread that would not stop");
                 return;
@@ -169,13 +181,64 @@ impl Drop for GroupHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::channel;
+    use std::sync::mpsc::{channel, sync_channel};
 
     use metor_fsw_3_ring::{Config, Notifier, RingBuffer};
 
+    use super::*;
+    use crate::async_system::Running;
     use crate::port::{Input, Output, ring_capacity};
     use crate::record::Record;
     use crate::tests::utils::Imu;
+
+    /// A launch that panics where a user's constructor would.
+    struct PanicCtor;
+
+    impl Launch for PanicCtor {
+        fn launch(self: Box<Self>, _stop: Stop) -> Result<Running, ParamError> {
+            panic!("a constructor that panics")
+        }
+    }
+
+    /// A launch whose task says it started, then parks.
+    struct Started(SyncSender<()>);
+
+    impl Launch for Started {
+        fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
+            let started = self.0;
+            Ok(Box::pin(async move {
+                let _ = started.send(());
+                stop.wait().await;
+            }))
+        }
+    }
+
+    fn member(launch: Box<dyn Launch>) -> Member {
+        Member {
+            launch,
+            panicked: Panicked::default(),
+        }
+    }
+
+    #[test]
+    fn a_constructor_that_panics_is_a_param_error_its_group_outlives() {
+        let group = spawn("ctor").expect("a thread");
+        let Err(ParamError::Decode(message)) = group.add(member(Box::new(PanicCtor))) else {
+            panic!("a panicking constructor is a param error")
+        };
+        assert!(message.contains("a constructor that panics"), "{message}");
+
+        let (tx, started) = sync_channel(1);
+        group
+            .add(member(Box::new(Started(tx))))
+            .expect("the group still builds");
+        assert_eq!(started.recv_timeout(Duration::from_secs(5)), Ok(()));
+
+        // A thread that died would be detached at the timeout instead.
+        let at = Instant::now();
+        drop(group);
+        assert!(at.elapsed() < JOIN_TIMEOUT / 2, "{:?}", at.elapsed());
+    }
 
     /// The wake this slice rests on: a ring write on this thread must wake a
     /// task parked on an executor of its own.

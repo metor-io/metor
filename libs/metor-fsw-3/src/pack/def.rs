@@ -83,6 +83,7 @@ mod tests {
                 "relay",
                 "sleeper",
                 "async_boom",
+                "ctor_boom",
                 "who_am_i"
             ]
         );

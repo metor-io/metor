@@ -192,13 +192,7 @@ async fn source(incoming: Rc<Incoming>, mut endpoint: Endpoint, stop: Stop) {
             return;
         }
         let stream = match &mut endpoint {
-            Endpoint::Listen { listener, .. } => {
-                futures_lite::future::or(async { listener.accept().await.ok() }, async {
-                    stop.wait().await;
-                    None
-                })
-                .await
-            }
+            Endpoint::Listen { listener, .. } => accept(listener, &stop).await,
             Endpoint::Connect { dialer } => dialer.connect(&stop).await,
         };
         if stop.is_set() {
@@ -211,8 +205,36 @@ async fn source(incoming: Rc<Incoming>, mut endpoint: Endpoint, stop: Stop) {
     }
 }
 
+/// The next peer, or `None` once `stop` is set or an accept failed.
+///
+/// A failure is the host's, not the peer's, so it is waited out rather than
+/// retried at once.
+async fn accept(listener: &TcpListener, stop: &Stop) -> Option<TcpStream> {
+    let accepted = futures_lite::future::or(async { Some(listener.accept().await) }, async {
+        stop.wait().await;
+        None
+    })
+    .await;
+    match accepted {
+        Some(Ok(stream)) => Some(stream),
+        Some(Err(error)) => {
+            accept_failed(&error, stop).await;
+            None
+        }
+        None => None,
+    }
+}
+
+/// One accept failure: a line and a pause, cut short by `stop`.
+async fn accept_failed(error: &stellarator::Error, stop: &Stop) {
+    tracing::warn!(%error, "accept failed, backing off");
+    futures_lite::future::or(stellarator::sleep(BACKOFF_INITIAL), stop.wait()).await;
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::async_system::stop_pair;
 
@@ -271,6 +293,23 @@ mod tests {
             addr: "not a host".into(),
         };
         assert!(matches!(transport.bind(), Err(ParamError::Decode(_))));
+    }
+
+    /// An accept that fails takes `EMFILE` or `ENFILE`, which a test cannot
+    /// force; lowering the process fd limit by hand shows the spin this
+    /// backoff replaces. The stop path is what stays covered here.
+    #[stellarator::test]
+    async fn a_stopped_link_does_not_wait_out_an_accept_failure() {
+        let (handle, stop) = stop_pair();
+        handle.stop();
+        let error = std::io::Error::from(std::io::ErrorKind::Other).into();
+        let started = Instant::now();
+        accept_failed(&error, &stop).await;
+        assert!(
+            started.elapsed() < BACKOFF_INITIAL / 2,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[stellarator::test]

@@ -492,6 +492,9 @@ pub fn table(recorder: &Recorder) -> SystemTable {
     table.register_async("relay", || Relay);
     table.register_async("sleeper", || Sleeper);
     table.register_async("async_boom", || AsyncBoom);
+    table.register_async("ctor_boom", || -> AsyncBoom {
+        panic!("a constructor that panics")
+    });
     table.register_async("who_am_i", || WhoAmI);
     table
 }

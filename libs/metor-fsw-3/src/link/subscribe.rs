@@ -436,6 +436,22 @@ mod tests {
     }
 
     #[test]
+    fn a_record_the_inbox_takes_but_its_port_will_not_is_refused_and_counted() {
+        // Both rings hold the longest record, so only a port's own bound can
+        // refuse one routed to the shorter port.
+        let rings = [ring::<Note>(), ring::<Note>()];
+        let mut outputs = ports(&rings);
+        let (mut routed, max_len) = routes(&mut outputs, &mut Log);
+        let mut view = rings[0].view(NoWake).expect("a free slot");
+        // The inbox bounds by the longest routed record, which is another port's.
+        assert!(Fixed::MAX_LEN < 60 && 60 <= max_len);
+        let inbox = inbox(2);
+        inbox.accept(&msg(id_of::<Fixed>(), &[0u8; 60]));
+        assert_eq!(deliver(&inbox, &mut routed), 1);
+        assert!(view.drain().next().is_none());
+    }
+
+    #[test]
     fn a_frame_output_is_faulted_and_left_unrouted() {
         let rings = [ring::<Fixed>(), ring::<Imu>()];
         let mut outputs = bind(

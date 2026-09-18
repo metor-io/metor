@@ -133,6 +133,31 @@ fn a_panicked_task_latches_its_system_and_leaves_the_thread_running() {
 }
 
 #[test]
+fn a_constructor_that_panics_names_its_system_and_frees_its_thread() {
+    let recorder = Recorder::default();
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("imu", "imu"),
+            reading("relay", "relay", "imu", PortRef::new("imu", "imu")),
+            reading("boom", "ctor_boom", "imu", PortRef::new("imu", "imu")),
+        ],
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let error = config.build(&table(&recorder)).err();
+    let Some(BuildError::Params { id, source }) = error else {
+        panic!("a panicking constructor is a param error")
+    };
+    assert_eq!(id, "boom");
+    assert!(
+        source.to_string().contains("a constructor that panics"),
+        "{source}"
+    );
+    // A thread taken down by the panic would be detached at the join timeout.
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
 fn dropping_the_coordinator_joins_every_thread() {
     let recorder = Recorder::default();
     let config = CoordinatorConfig {
