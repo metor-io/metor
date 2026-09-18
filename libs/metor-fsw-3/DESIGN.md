@@ -96,7 +96,7 @@ trait SystemInputs {
 
 A `SystemDef` contains all of the type information about a system. Basically just what inputs and outputs it expects. This allows the fsw to feed views into the system, and to create new ring buffers for its outputs.
 
-Systems have "state" which is a mutably accesible type that they can put whatever state they need into. States can be shared between systems, but only one system can have mutable access to a state at any given point in time.
+Systems have "state" which is a mutably accesible type that they can put whatever state they need into. A system's state is its own; no other system can reach it. Sharing is an opt-in extra, a parameter naming a shared instance, designed in `docs/plans/05-links.md` and held until a case needs it.
 
 
 ### Defining Systems
@@ -121,6 +121,8 @@ Often we will want systems to run in different contexts; for instance we might w
 
 
 Broadly adapters pretend to be a normal system, and then call out to the "real" system in the background. For WASM that means executign the system in the WASM worker. For a process that means notifying the other process to execute, and using shared memory to bridge the rings. Rings are backed by mmaped memory slices to facilitate this shared memory behaivor.
+
+The first adapter is the thread adapter. A system authored as one `async fn run(.., stop)` runs on a background thread; the adapter mirrors each of its rings and copies records across every cycle, so the loop never waits on IO and a slow consumer drops only its own copies. Async systems share one background thread by default and are placed on a named thread with `fsw.add(.., thread="gps")`. Adapters are ordinary table entries: one closure that takes the instance's id, thread, definition, params, and rings, and returns a step.
 
 
 ## Coordinator
@@ -296,15 +298,16 @@ For production deployments you likely want to distribute the work across multipl
 
 ### Cross target communication
 
-What good is multiple targets if they can't talk to each other? To facilate that metor-fsw supports cross-targets coms. In this you can specify a `Publish` system that will publish a series of frames you pass it as inputs. You can then specify a Subscribe systes that will subscribe to frames you specify, and then recieve them as outputs. 
+What good is multiple targets if they can't talk to each other? To facilate that metor-fsw supports cross-targets coms. A `Publish` system serves the records you pass it as inputs over metor-proto, and a `Subscribe` system receives records and emits them as outputs. Each owns its own socket: a transport of `listen=` or `connect=`, so a target can serve the panel, push into a db, or dial another target with the same two systems.
 
 ```python
 imu = a.add("imu", Imu())
-publish = a.add("publish", Publish([imu]))
-sub = b.add("subscribe", Subscribe([publish.imu.accel]))
+publish = a.add("publish", Publish([imu], listen="0.0.0.0:2240"))
+cmds = a.add("cmds", Subscribe([Arm], listen="0.0.0.0:2241"))
+sub = b.add("subscribe", Subscribe([publish.imu.accel], connect=a_addr))
 ```
 
-You reference the typed output of the Publish system, which allows you to subscrib to fields from a specific target.
+You reference the typed output of the Publish system, which allows you to subscrib to fields from a specific target. The last line, subscribing to a peer's frames with the address resolved by the deployment, is slice 7.
 
 
 ### Gateways
