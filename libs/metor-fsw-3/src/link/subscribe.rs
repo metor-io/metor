@@ -89,11 +89,13 @@ impl Subscribe {
             false => Vec::new(),
         };
         let inbox = Rc::new(Inbox::new(ids, self.inbound_cap, max_len));
-        let mut conns = Connections::new(
-            endpoint.slots(),
-            self.pending_cap,
-            max_len + wire::PACKET_OVERHEAD,
-        );
+        // A listener reads only commands; a dialer must also read past the
+        // peer's announce, which is bounded by what a link may queue.
+        let recv_cap = match listens {
+            true => max_len + wire::PACKET_OVERHEAD,
+            false => self.pending_cap,
+        };
+        let mut conns = Connections::new(endpoint.slots(), self.pending_cap, recv_cap);
         let (incoming, _source) = incoming(endpoint, stop.clone());
         incoming.want();
         let mut dropped = 0;

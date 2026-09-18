@@ -49,6 +49,30 @@ struct Ping {
     n: u32,
 }
 
+/// A frame whose vtable and metadata announce as several kilobytes.
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug)]
+#[frame(name = "wide")]
+#[repr(C)]
+struct Wide {
+    #[frame(timestamp)]
+    timestamp: Timestamp,
+    samples: [f64; 256],
+}
+
+/// Publishes one wide frame per cycle.
+#[derive(Default)]
+struct WideSource;
+
+#[system]
+impl WideSource {
+    fn execute(&mut self, now: Timestamp, wide: &mut Output<Wide>) {
+        let _ = wide.write(&Wide {
+            timestamp: now,
+            samples: [1.0; 256],
+        });
+    }
+}
+
 /// Publishes one sample per cycle, counting up.
 #[derive(Default)]
 struct Source(i64);
@@ -159,6 +183,7 @@ impl Seen {
 fn table(seen: &Seen) -> SystemTable {
     let mut table = SystemTable::new();
     table.register("source", Source::default);
+    table.register("wide", WideSource::default);
     table.register("pinger", Pinger::default);
     let statuses = seen.statuses.clone();
     table.register("status_sink", move || StatusSink(statuses.clone()));
@@ -538,6 +563,48 @@ async fn a_dialing_subscribe_receives_the_records_a_publish_serves() {
     let pings = client.pings();
     let steps: Vec<u32> = pings.windows(2).map(|w| w[1] - w[0]).collect();
     assert!(steps.iter().all(|step| *step == 1), "{pings:?}");
+}
+
+#[stellarator::test]
+async fn a_dialing_subscribe_reads_past_an_announce_larger_than_its_records() {
+    let addr = free_port();
+    let (server, client) = (Seen::default(), Seen::default());
+    let mut publish = reading(
+        "pub",
+        "fsw.publish",
+        "src.ping",
+        PortRef::new("src", "ping"),
+    );
+    publish.inputs.push(InputConfig {
+        port: "wide.wide".into(),
+        from: vec![PortRef::new("wide", "wide")],
+    });
+    publish.params = json!({
+        "transport": { "listen": { "addr": addr.to_string() } },
+        "link": "pub",
+    });
+    let _server = spawn(
+        vec![
+            SystemConfig::new("src", "pinger"),
+            SystemConfig::new("wide", "wide"),
+            publish,
+        ],
+        &server,
+        500.0,
+    );
+    let _client = spawn(
+        vec![
+            subscribe(json!({ "connect": { "addr": addr.to_string() } })),
+            reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
+        ],
+        &client,
+        500.0,
+    );
+
+    until("the subscriber never got past the announce", || {
+        client.pings().len() >= 3
+    })
+    .await;
 }
 
 #[stellarator::test]
