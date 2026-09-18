@@ -54,8 +54,10 @@ pub struct Subscribe {
 impl Subscribe {
     /// Binds the transport, so a taken address fails the build.
     pub fn new(params: SubscribeParams) -> Result<Self, ParamError> {
+        let endpoint = params.transport.bind()?;
+        super::record_bound(&params.link, &endpoint);
         Ok(Self {
-            endpoint: Some(params.transport.bind()?),
+            endpoint: Some(endpoint),
             namespace: params.namespace,
             link: params.link,
             pending_cap: params.pending_cap,

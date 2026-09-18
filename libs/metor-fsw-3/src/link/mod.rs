@@ -9,6 +9,9 @@ mod subscribe;
 mod transport;
 mod wire;
 
+use std::net::SocketAddr;
+use std::sync::Mutex;
+
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -27,6 +30,31 @@ const PENDING_CAP: usize = 1 << 20;
 
 fn pending_cap() -> usize {
     PENDING_CAP
+}
+
+/// The addresses this process's listening links bound, in construction order.
+///
+/// A link binds on the thread it runs on, so an address a target left to the
+/// system reaches the process that built it only through here. `metor run
+/// --print-ports` is the reader, and a test binding port zero the reason.
+static BOUND: Mutex<Vec<(String, SocketAddr)>> = Mutex::new(Vec::new());
+
+/// Records what a link bound, under the name its `link` param gave it.
+fn record_bound(link: &str, endpoint: &transport::Endpoint) {
+    let Some(addr) = endpoint.local_addr() else {
+        return;
+    };
+    // PANIC Safety: nothing panics while it holds this lock.
+    BOUND
+        .lock()
+        .expect("an unpoisoned registry")
+        .push((link.to_string(), addr));
+}
+
+/// Every listening link this process bound, oldest first.
+pub fn bound_ports() -> Vec<(String, SocketAddr)> {
+    // PANIC Safety: as above.
+    BOUND.lock().expect("an unpoisoned registry").clone()
 }
 
 /// What a link reports about its sockets, each cycle its counters change.
@@ -99,6 +127,23 @@ mod tests {
         };
         let first = LinkStatus::new(Timestamp(1), stats, 0);
         assert!(!first.changed(&LinkStatus::new(Timestamp(9), stats, 0)));
+    }
+
+    #[test]
+    fn a_bound_link_reports_the_address_it_took_under_its_name() {
+        let link = Publish::new(PublishParams {
+            transport: Transport::Listen {
+                addr: "127.0.0.1:0".into(),
+                max_connections: 1,
+            },
+            namespace: None,
+            link: "probe".into(),
+            pending_cap: PENDING_CAP,
+        });
+        assert!(link.is_ok(), "a free port binds");
+        let bound = bound_ports();
+        let found = bound.iter().find(|(name, _)| name == "probe");
+        assert!(found.is_some_and(|(_, addr)| addr.port() != 0), "{bound:?}");
     }
 
     #[test]

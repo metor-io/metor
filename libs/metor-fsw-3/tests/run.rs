@@ -11,7 +11,13 @@ fn metor() -> Command {
 fn a_fixed_cycle_count_runs_the_fixtures_target_and_exits_zero() {
     let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-pack/target.py");
     let output = metor()
-        .args(["run", &target.display().to_string(), "--cycles", "3"])
+        .args([
+            "run",
+            &target.display().to_string(),
+            "--cycles",
+            "3",
+            "--print-ports",
+        ])
         .output()
         .expect("metor runs");
     assert!(
@@ -19,6 +25,13 @@ fn a_fixed_cycle_count_runs_the_fixtures_target_and_exits_zero() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let ports = String::from_utf8_lossy(&output.stdout);
+    let links: Vec<&str> = ports
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(link, _)| link)
+        .collect();
+    assert_eq!(links, vec!["cmds", "pub"], "{ports}");
 }
 
 #[test]

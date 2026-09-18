@@ -34,6 +34,9 @@ pub struct Run {
     /// Step a simulated clock by this many seconds per cycle.
     #[arg(long)]
     pub sim_dt: Option<f64>,
+    /// Print `<link> <addr>` for every listening link once the graph is built.
+    #[arg(long)]
+    pub print_ports: bool,
 }
 
 /// A `RunError` is why a target did not run.
@@ -70,6 +73,9 @@ pub fn run(args: Run) -> Result<(), RunError> {
     }
     let config = eval_target(&target, &packs)?;
     let coordinator = load(config, &args)?;
+    if args.print_ports {
+        print_ports();
+    }
 
     watch_sigint();
     let cycles = args.cycles;
@@ -84,6 +90,17 @@ pub fn run(args: Run) -> Result<(), RunError> {
         return Ok(());
     }
     Err(RunError::Latched(latched.join(", ")))
+}
+
+/// Writes every bound link address to stdout, for a caller that asked a link to
+/// take any free port.
+fn print_ports() {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    for (link, addr) in crate::link::bound_ports() {
+        let _ = writeln!(out, "{link} {addr}");
+    }
+    let _ = out.flush();
 }
 
 /// Installs the console layer beside the one that queues lines for `log` ports,
