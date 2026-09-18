@@ -34,9 +34,19 @@ docs pass from T7 and T8. `04-packs.md`.
 
 ## 4. Links
 
-Shared state, `TcpServer`, `Downlink`, `Uplink`. Needs an "every output
-ring with its vtable" surface first. The wire format is fixed by
-metor-panel and metor-db, so it is reproduced, not designed.
+`Publish` and `Subscribe`, each over a listen or connect transport, the
+`Thread` adapter and named thread placement for async systems, and
+dynamic ports with a schema on every `PortDef`. The wire format is
+fixed by metor-panel and metor-db, so it is reproduced, not designed.
+`05-links.md`.
+
+- Shared state: the `&Shared<S>` parameter kind and the one-thread rule
+  are designed in `05-links.md` and held until two systems must hold
+  one socket (bi-directional commanding on one port).
+
+- Message ids: postcard messages hash the schema name, other codecs the
+  record name. Unify in metor-proto-wkt (the panel's matchers depend on
+  the current ids), then drop `Msg::ID` from the `Record` derive.
 
 ## 5. Sequences and slots
 
@@ -47,8 +57,7 @@ only; `SequenceCommand` arrives as an ordinary message.
 ## 6. Process and wasm adapters
 
 The control block and mmap ring files for worker processes; wasmi with
-the guest-allocates-rings protocol and per-call fuel. Both port from
-fsw-2 largely as-is once the ABI from slice 3 is settled.
+the guest-allocates-rings protocol and per-call fuel
 
 ## 7. Deployments and gateway
 
