@@ -3,10 +3,8 @@
 //! Each owns its sockets and runs on a background thread. The wire format is
 //! metor-panel's and metor-db's, reproduced from fsw-2.
 
-// The connection and transport machinery lands before its two callers do.
-#![allow(dead_code)]
-
 mod conn;
+mod publish;
 mod transport;
 mod wire;
 
@@ -16,10 +14,18 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::Frame;
 use crate::coordinator::SystemTable;
 
+pub use publish::{Publish, PublishParams};
 pub use transport::Transport;
 
 /// The prefix every built-in system registers under, as a pack's id would be.
 const BUILTIN: &str = "fsw";
+
+/// Bytes a link queues for one connection before it drops a batch.
+const PENDING_CAP: usize = 1 << 20;
+
+fn pending_cap() -> usize {
+    PENDING_CAP
+}
 
 /// What a link reports about its sockets, each cycle its counters change.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy, Debug, PartialEq)]
@@ -57,7 +63,9 @@ impl LinkStatus {
 }
 
 /// Registers the link systems every target may name, under `fsw.`.
-pub fn register_builtins(_table: &mut SystemTable) {}
+pub fn register_builtins(table: &mut SystemTable) {
+    table.register_async::<Publish, _, _>(&format!("{BUILTIN}.publish"), Publish::new);
+}
 
 #[cfg(test)]
 mod tests {

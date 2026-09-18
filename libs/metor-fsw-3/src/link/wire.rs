@@ -1,6 +1,213 @@
 //! The metor-proto bytes a link speaks.
 
-use metor_proto::types::{PACKET_HEADER_LEN, PacketId, PacketTy};
+use std::collections::HashMap;
+
+use metor_proto::types::{
+    ComponentId, IntoLenPacket, PACKET_HEADER_LEN, PacketId, PacketTy, table_id,
+};
+use metor_proto::vtable::{Op, VTable};
+use metor_proto_wkt::{
+    ComponentMetadata, LINK_PROTOCOL_VERSION, LinkInfo, MsgMetadata, SetComponentMetadata,
+    SetMsgMetadata, VTableMsg,
+};
+
+use crate::record::{MsgCodec, RecordSchema};
+use crate::system::PortDef;
+
+/// How one port's records are framed on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wire {
+    Table { id: PacketId },
+    Msg { id: PacketId },
+}
+
+impl Wire {
+    pub(crate) fn ty(&self) -> PacketTy {
+        match self {
+            Self::Table { .. } => PacketTy::Table,
+            Self::Msg { .. } => PacketTy::Msg,
+        }
+    }
+
+    pub(crate) fn id(&self) -> PacketId {
+        match self {
+            Self::Table { id } | Self::Msg { id } => *id,
+        }
+    }
+}
+
+/// The identity packet a link pushes before anything else.
+pub(crate) fn link_info(
+    command_ids: Vec<PacketId>,
+    namespace: Option<&str>,
+    link: &str,
+) -> Vec<u8> {
+    let info = LinkInfo {
+        protocol_version: LINK_PROTOCOL_VERSION,
+        features: 0,
+        command_ids,
+        namespace: namespace.map(str::to_string),
+        link: link.to_string(),
+    };
+    (&info).into_len_packet().inner
+}
+
+/// The identity and schema replay every new connection receives, and how each
+/// port's records are framed.
+///
+/// A port whose table id collides with an earlier one has no [`Wire`]: two
+/// tables under one id are indistinguishable on the wire.
+pub(crate) fn announce(
+    defs: &[PortDef],
+    namespace: Option<&str>,
+    link: &str,
+) -> (Vec<u8>, Vec<Option<Wire>>) {
+    let mut blob = link_info(Vec::new(), namespace, link);
+    let mut wire = vec![None; defs.len()];
+    let mut tables: Vec<PacketId> = Vec::new();
+    for (at, def) in defs.iter().enumerate() {
+        let RecordSchema::Frame { vtable, metadata } = &def.schema else {
+            continue;
+        };
+        let (vtable, metadata) = reroot(vtable, metadata, &root(namespace, &def.name), &def.record);
+        let id = table_id(&vtable);
+        if tables.contains(&id) {
+            continue;
+        }
+        tables.push(id);
+        wire[at] = Some(Wire::Table { id });
+        blob.extend_from_slice(&VTableMsg { id, vtable }.into_len_packet().inner);
+        for component in metadata {
+            let packet = (&SetComponentMetadata(component)).into_len_packet();
+            blob.extend_from_slice(&packet.inner);
+        }
+    }
+    let mut msgs: Vec<PacketId> = Vec::new();
+    for (at, def) in defs.iter().enumerate() {
+        let RecordSchema::Msg { id, name, codec } = &def.schema else {
+            continue;
+        };
+        wire[at] = Some(Wire::Msg { id: *id });
+        if msgs.contains(id) {
+            continue;
+        }
+        msgs.push(*id);
+        let announce = SetMsgMetadata {
+            id: *id,
+            metadata: msg_metadata(name, codec),
+        };
+        blob.extend_from_slice(&announce.into_len_packet().inner);
+    }
+    (blob, wire)
+}
+
+/// A message's schema as the ground decodes it: the type's own for postcard,
+/// an opaque payload plus the codec's name for anything else.
+fn msg_metadata(name: &str, codec: &MsgCodec) -> MsgMetadata {
+    let (name, schema) = match codec {
+        MsgCodec::Postcard(schema) => (schema.name.to_string(), schema.clone()),
+        _ => (
+            name.to_string(),
+            <Vec<u8> as postcard_schema::Schema>::SCHEMA.into(),
+        ),
+    };
+    let codec = match codec {
+        MsgCodec::Postcard(_) => None,
+        MsgCodec::Json => Some("json".to_string()),
+        MsgCodec::Bytes => Some("bytes".to_string()),
+        MsgCodec::Other(name) => Some(name.clone()),
+    };
+    MsgMetadata {
+        name,
+        schema,
+        metadata: codec
+            .map(|codec| HashMap::from([("codec".to_string(), codec)]))
+            .unwrap_or_default(),
+    }
+}
+
+/// Where a port's components hang: the namespace, then the port's name.
+fn root(namespace: Option<&str>, port: &str) -> String {
+    match namespace {
+        Some(namespace) => format!("{namespace}.{port}"),
+        None => port.to_string(),
+    }
+}
+
+/// Moves a port-relative frame under `root`, so two links announce one
+/// producer's components under one set of ids.
+///
+/// A port's leaves are named `{record}.{field}`; the announced leaf is
+/// `{root}.{field}`. Each leaf id is baked as a standalone eight-byte
+/// `Op::Data` blob, so rewriting those blobs is the whole rehash.
+fn reroot(
+    vtable: &VTable,
+    metadata: &[ComponentMetadata],
+    root: &str,
+    record: &str,
+) -> (VTable, Vec<ComponentMetadata>) {
+    let renamed: Vec<(ComponentMetadata, u64)> = metadata
+        .iter()
+        .map(|component| {
+            let name = rename(&component.name, root, record);
+            let was = ComponentId::new(&component.name).0;
+            (
+                ComponentMetadata {
+                    component_id: ComponentId::new(&name),
+                    name,
+                    metadata: component.metadata.clone(),
+                },
+                was,
+            )
+        })
+        .collect();
+    let ids: HashMap<u64, u64> = renamed
+        .iter()
+        .map(|(component, was)| (*was, component.component_id.0))
+        .collect();
+    let mut vtable = vtable.clone();
+    let rewrites = leaf_ids(&vtable, &ids);
+    if !rewrites.is_empty() {
+        let mut data = vtable.data.to_vec();
+        for (offset, id) in rewrites {
+            data[offset..offset + 8].copy_from_slice(&id.to_le_bytes());
+        }
+        vtable.data = data;
+    }
+    (vtable, renamed.into_iter().map(|(c, _)| c).collect())
+}
+
+/// The leaf name under `root`, with the record's own segment dropped.
+fn rename(name: &str, root: &str, record: &str) -> String {
+    match name
+        .strip_prefix(record)
+        .and_then(|rest| rest.strip_prefix('.'))
+    {
+        Some(field) => format!("{root}.{field}"),
+        None => format!("{root}.{name}"),
+    }
+}
+
+/// Every eight-byte `Op::Data` blob holding a leaf id, and what to write there.
+fn leaf_ids(vtable: &VTable, ids: &HashMap<u64, u64>) -> Vec<(usize, u64)> {
+    let data = vtable.data.as_slice();
+    vtable
+        .ops
+        .iter()
+        .filter_map(|op| {
+            let Op::Data { offset, len } = op else {
+                return None;
+            };
+            let at = offset.to_index();
+            let slot = data.get(at..at.checked_add(*len as usize)?)?;
+            let bytes: [u8; 8] = slot.try_into().ok()?;
+            Some((at, *ids.get(&u64::from_le_bytes(bytes))?))
+        })
+        .collect()
+}
+
+/// The bytes one packet adds beyond its payload: the length prefix and header.
+pub(crate) const PACKET_OVERHEAD: usize = 4 + PACKET_HEADER_LEN;
 
 /// Appends one length-prefixed packet, the framing a `LenPacket` builds.
 pub(crate) fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, payload: &[u8]) {
@@ -13,9 +220,143 @@ pub(crate) fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, pay
 
 #[cfg(test)]
 mod tests {
-    use metor_proto::types::{IntoLenPacket, LenPacket};
+    use metor_proto::types::LenPacket;
+
+    use crate::Record;
+    use crate::port::Input;
+    use crate::record::MsgCodec;
+    use crate::tests::utils::{Fixed, Imu};
 
     use super::*;
+
+    /// A record whose payload is JSON, so it announces a codec.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Telecommand {
+        arm: bool,
+    }
+
+    impl Record for Telecommand {
+        const NAME: &'static str = "telecommand";
+        const MAX_LEN: usize = 16;
+        type Read<'a> = Self;
+
+        fn encode<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], crate::EncodeError> {
+            crate::record::json::encode(self, buf)
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Self, crate::DecodeError> {
+            crate::record::json::decode(bytes)
+        }
+
+        fn schema() -> RecordSchema {
+            RecordSchema::msg(Self::NAME, MsgCodec::Json)
+        }
+    }
+
+    fn imu_port() -> PortDef {
+        Input::<Imu>::def("plant.imu")
+    }
+
+    fn announced(defs: &[PortDef]) -> (Vec<u8>, Vec<Option<Wire>>) {
+        announce(defs, Some("cube_sat"), "pub")
+    }
+
+    #[test]
+    fn a_frame_and_a_message_port_announce_the_blob_a_client_replays() {
+        let defs = vec![imu_port(), Input::<Fixed>::def("cmds.fixed")];
+        let (blob, wire) = announced(&defs);
+
+        let RecordSchema::Frame { vtable, metadata } = &defs[0].schema else {
+            panic!("a frame port")
+        };
+        let (vtable, metadata) = reroot(vtable, metadata, "cube_sat.plant.imu", Imu::NAME);
+        let id = table_id(&vtable);
+        let info = LinkInfo {
+            protocol_version: LINK_PROTOCOL_VERSION,
+            features: 0,
+            command_ids: Vec::new(),
+            namespace: Some("cube_sat".into()),
+            link: "pub".into(),
+        };
+        let mut expected = (&info).into_len_packet().inner;
+        expected.extend_from_slice(&VTableMsg { id, vtable }.into_len_packet().inner);
+        for component in metadata {
+            expected.extend_from_slice(&(&SetComponentMetadata(component)).into_len_packet().inner);
+        }
+        let RecordSchema::Msg { id: msg, .. } = &defs[1].schema else {
+            panic!("a message port")
+        };
+        let announce = SetMsgMetadata {
+            id: *msg,
+            metadata: MsgMetadata {
+                name: "Fixed".into(),
+                schema: <Fixed as postcard_schema::Schema>::SCHEMA.into(),
+                metadata: HashMap::new(),
+            },
+        };
+        expected.extend_from_slice(&announce.into_len_packet().inner);
+
+        assert_eq!(blob, expected);
+        assert_eq!(
+            wire,
+            vec![Some(Wire::Table { id }), Some(Wire::Msg { id: *msg })]
+        );
+    }
+
+    #[test]
+    fn a_frames_leaves_hang_under_the_namespace_and_the_port() {
+        let def = imu_port();
+        let RecordSchema::Frame { vtable, metadata } = &def.schema else {
+            panic!("a frame port")
+        };
+        let (vtable, metadata) = reroot(vtable, metadata, "cube_sat.plant.imu", Imu::NAME);
+        let leaf = ComponentId::new("cube_sat.plant.imu.sample");
+        assert_eq!(metadata[0].name, "cube_sat.plant.imu.sample");
+        assert_eq!(metadata[0].component_id, leaf);
+        assert!(vtable.data.windows(8).any(|w| w == leaf.0.to_le_bytes()));
+        assert_ne!(table_id(&vtable), def.schema.packet_id());
+    }
+
+    #[test]
+    fn a_json_message_announces_the_codec_the_ground_decodes_it_with() {
+        let defs = vec![Input::<Telecommand>::def("cmds.telecommand")];
+        let (blob, wire) = announced(&defs);
+        let metadata = msg_metadata("telecommand", &MsgCodec::Json);
+        assert_eq!(
+            metadata.metadata.get("codec").map(String::as_str),
+            Some("json")
+        );
+        assert_eq!(
+            metadata.schema,
+            <Vec<u8> as postcard_schema::Schema>::SCHEMA.into()
+        );
+        assert_eq!(metadata.name, "telecommand");
+        let announce = SetMsgMetadata {
+            id: wire[0].expect("a wire").id(),
+            metadata,
+        };
+        assert!(blob.ends_with(&announce.into_len_packet().inner));
+    }
+
+    #[test]
+    fn two_ports_over_one_table_announce_once_and_the_second_carries_nothing() {
+        let defs = vec![imu_port(), imu_port()];
+        let (blob, wire) = announced(&defs);
+        assert!(wire[0].is_some() && wire[1].is_none());
+        let once = announced(&defs[..1]).0;
+        assert_eq!(blob, once);
+    }
+
+    #[test]
+    fn one_message_id_on_two_ports_announces_once_and_both_ports_carry_it() {
+        let defs = vec![
+            Input::<Fixed>::def("a.fixed"),
+            Input::<Fixed>::def("b.fixed"),
+        ];
+        let (blob, wire) = announced(&defs);
+        assert_eq!(wire[0], wire[1]);
+        assert_eq!(blob, announced(&defs[..1]).0);
+    }
 
     #[test]
     fn a_packet_frames_as_its_len_packet_does() {
