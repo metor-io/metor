@@ -113,6 +113,7 @@ fn strings_and_dictionary_keys_round_trip_through_python() {
         schema,
         text,
         r#"
+import inspect
 import json
 from generated import PACK, Nested, Probe
 from metor_config import Target
@@ -120,7 +121,9 @@ from metor_config import Target
 with open('expected.json') as file:
     expected = json.load(file)
 assert PACK.id == PACK.lib == expected
-assert Probe.__doc__ == Nested.__doc__ == expected
+# Python 3.13 cleans docstrings at compile time; compare both sides cleaned.
+for cls in (Probe, Nested):
+    assert inspect.cleandoc(cls.__doc__) == inspect.cleandoc(expected)
 target = Target(1)
 target.add('probe', Probe())
 config = target.to_config()
