@@ -6,7 +6,9 @@ use core::ops::Deref;
 
 use crate::record::{Bytes, DecodeError, EncodeError, Record};
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
-use metor_fsw_3_ring::{NoWake, ReadError, View, WriteError, Writer, frame_len};
+use metor_fsw_3_ring::{
+    NoWake, Notifier, ReadError, View, WakeSink, WakeSource, WriteError, Writer, frame_len,
+};
 use metor_proto::types::Timestamp;
 
 /// Returns the power-of-two capacity for a ring of `depth` records of `max_len` bytes.
@@ -70,15 +72,18 @@ fn bounded(bytes: &[u8], max: usize) -> Result<&[u8], SendError> {
 }
 
 /// An `Output` is the writing half of one ring, publishing records of type `T`.
-pub struct Output<T: ?Sized> {
-    writer: Writer<NoWake>,
+///
+/// `W` is the endpoint notified after each write; a cyclic system's ports use
+/// [`NoWake`] and an async system's mirror ports a [`Notifier`].
+pub struct Output<T: ?Sized, W: WakeSource = NoWake> {
+    writer: Writer<W>,
     scratch: Vec<u8>,
     _t: PhantomData<T>,
 }
 
-impl<T: Record + ?Sized> Output<T> {
+impl<T: Record + ?Sized, W: WakeSource> Output<T, W> {
     /// Binds a writer, rejecting records aligned above the ring guarantee.
-    pub fn try_new(writer: Writer<NoWake>) -> Result<Self, UnsupportedAlignment> {
+    pub fn try_new(writer: Writer<W>) -> Result<Self, UnsupportedAlignment> {
         check_alignment::<T>()?;
         Ok(Self {
             writer,
@@ -108,7 +113,7 @@ impl<T: Record + ?Sized> Output<T> {
     }
 }
 
-impl Output<Bytes> {
+impl<W: WakeSource> Output<Bytes, W> {
     /// Publishes a record's bytes as they arrived, without encoding.
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SendError> {
         self.writer.try_write(bytes).map_err(SendError::Ring)
@@ -116,21 +121,29 @@ impl Output<Bytes> {
 }
 
 /// An `Input` is the reading half of every ring feeding one port of type `T`.
-pub struct Input<T: ?Sized> {
-    views: Vec<View<NoWake>>,
+///
+/// `W` is the endpoint its views wait on; every view of an async system shares
+/// one [`Notifier`], so waiting on any of them wakes on any record.
+pub struct Input<T: ?Sized, W: WakeSink = NoWake> {
+    views: Vec<View<W>>,
+    /// The endpoint the views share, absent when this port has no producer.
+    wake: Option<W>,
     _t: PhantomData<T>,
 }
 
-impl<T: Record + ?Sized> Input<T> {
+impl<T: Record + ?Sized, W: WakeSink + Clone> Input<T, W> {
     /// Binds one view per producer, rejecting records aligned above the ring guarantee.
-    pub fn try_new(views: Vec<View<NoWake>>) -> Result<Self, UnsupportedAlignment> {
+    pub fn try_new(views: Vec<View<W>>) -> Result<Self, UnsupportedAlignment> {
         check_alignment::<T>()?;
         Ok(Self {
+            wake: views.first().map(|view| view.wake().clone()),
             views,
             _t: PhantomData,
         })
     }
+}
 
+impl<T: Record + ?Sized, W: WakeSink> Input<T, W> {
     /// Returns this port's entry in a bundle's `defs()` walk.
     pub fn def(name: &'static str) -> PortDef {
         Output::<T>::def(name)
@@ -145,9 +158,7 @@ impl<T: Record + ?Sized> Input<T> {
             })
         })
     }
-}
 
-impl<T: Record + ?Sized> Input<T> {
     /// Returns the newest record across producers
     ///
     /// Records without timestamps are produced in order of the producers
@@ -165,32 +176,101 @@ impl<T: Record + ?Sized> Input<T> {
         }
         Ok(best.map(|(_, decoded)| Latest { decoded }))
     }
+
+    /// Applies deferred drain consumption, then reports the first producer with a record.
+    fn ready(&mut self) -> Option<usize> {
+        self.views.iter_mut().position(|view| {
+            view.settle();
+            view.has_record()
+        })
+    }
+}
+
+impl<T: Record + ?Sized> Input<T, Notifier> {
+    /// Waits for the next record, then reads it from the first producer holding one.
+    ///
+    /// Never resolves on a port with no producer.
+    pub async fn next(&mut self) -> Result<T::Read<'_>, RecvError> {
+        let at = loop {
+            if let Some(at) = self.ready() {
+                break at;
+            }
+            match &self.wake {
+                Some(wake) => {
+                    wake.wait_until(|| self.views.iter().any(View::has_record))
+                        .await
+                }
+                None => core::future::pending().await,
+            }
+        };
+        // PANIC Safety: `ready` located a record on this view and nothing
+        // consumed it since; the view is this port's alone.
+        let bytes = self.views[at]
+            .drain()
+            .next()
+            .expect("a located record")
+            .map_err(RecvError::Ring)?;
+        T::decode(bytes).map_err(RecvError::Decode)
+    }
 }
 
 /// A `DynInputs` is the input side of a system whose ports the config lists.
 ///
 /// Each port carries the definition build completed for it and the bytes its
 /// producers wrote, undecoded.
-#[derive(Default)]
-pub struct DynInputs {
-    ports: Vec<(PortDef, Input<Bytes>)>,
+pub struct DynInputs<W: WakeSink = NoWake> {
+    ports: Vec<(PortDef, Input<Bytes, W>)>,
 }
 
-impl DynInputs {
+impl<W: WakeSink> Default for DynInputs<W> {
+    fn default() -> Self {
+        Self { ports: Vec::new() }
+    }
+}
+
+impl<W: WakeSink> DynInputs<W> {
     /// Every port's definition and the records waiting on it.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes>)> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Input<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, input)| (&*def, input))
     }
 }
 
-impl SystemInputs for DynInputs {
+impl DynInputs<Notifier> {
+    /// Waits until any port has a record.
+    ///
+    /// Never resolves while no port has a producer.
+    pub async fn any_ready(&mut self) {
+        loop {
+            if self
+                .ports
+                .iter_mut()
+                .any(|(_, input)| input.ready().is_some())
+            {
+                return;
+            }
+            let wake = self.ports.iter().find_map(|(_, input)| input.wake.as_ref());
+            match wake {
+                Some(wake) => wake.wait_until(|| self.any_has_record()).await,
+                None => core::future::pending().await,
+            }
+        }
+    }
+
+    fn any_has_record(&self) -> bool {
+        self.ports
+            .iter()
+            .any(|(_, input)| input.views.iter().any(View::has_record))
+    }
+}
+
+impl<W: WakeSink + Clone> SystemInputs<W> for DynInputs<W> {
     const DYNAMIC: bool = true;
 
     fn defs() -> Vec<PortDef> {
         Vec::new()
     }
 
-    fn bind(inputs: Vec<InputBinding>) -> Self {
+    fn bind(inputs: Vec<InputBinding<W>>) -> Self {
         let ports = inputs
             .into_iter()
             // PANIC Safety: bytes need no alignment.
@@ -201,26 +281,31 @@ impl SystemInputs for DynInputs {
 }
 
 /// A `DynOutputs` is the output side of a system whose ports the config lists.
-#[derive(Default)]
-pub struct DynOutputs {
-    ports: Vec<(PortDef, Output<Bytes>)>,
+pub struct DynOutputs<W: WakeSource = NoWake> {
+    ports: Vec<(PortDef, Output<Bytes, W>)>,
 }
 
-impl DynOutputs {
+impl<W: WakeSource> Default for DynOutputs<W> {
+    fn default() -> Self {
+        Self { ports: Vec::new() }
+    }
+}
+
+impl<W: WakeSource> DynOutputs<W> {
     /// Every port's definition and the writer publishing on it.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Output<Bytes>)> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PortDef, &mut Output<Bytes, W>)> {
         self.ports.iter_mut().map(|(def, output)| (&*def, output))
     }
 }
 
-impl SystemOutputs for DynOutputs {
+impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
     const DYNAMIC: bool = true;
 
     fn defs() -> Vec<PortDef> {
         Vec::new()
     }
 
-    fn bind(outputs: Vec<OutputBinding>) -> Self {
+    fn bind(outputs: Vec<OutputBinding<W>>) -> Self {
         let ports = outputs
             .into_iter()
             // PANIC Safety: bytes need no alignment.
@@ -749,5 +834,93 @@ mod tests {
         out.write(&Fixed { a: 3, b: 0.5 }).expect("fits");
         let owned: Option<Fixed> = input.drain().next().map(|r| r.expect("decodes"));
         assert_eq!(owned, Some(Fixed { a: 3, b: 0.5 }));
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use futures_lite::future::poll_once;
+    use metor_fsw_3_ring::{Config, Notifier, RingBuffer};
+
+    use super::*;
+    use crate::system::InputBinding;
+    use crate::tests::utils::Imu;
+
+    /// One ring holding four `Imu` records, woken through `wake`.
+    fn woken(wake: &Notifier) -> (RingBuffer, Output<Imu, Notifier>, Input<Imu, Notifier>) {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: ring_capacity(Imu::MAX_LEN, 4).expect("valid capacity"),
+            max_readers: 1,
+        });
+        let out = Output::try_new(ring.writer(wake.clone()).expect("free writer"))
+            .expect("supported alignment");
+        let input = Input::try_new(vec![ring.view(wake.clone()).expect("free slot")])
+            .expect("supported alignment");
+        (ring, out, input)
+    }
+
+    #[stellarator::test]
+    async fn next_pends_until_a_record_lands() {
+        let wake = Notifier::default();
+        let (_ring, mut out, mut input) = woken(&wake);
+        assert!(poll_once(input.next()).await.is_none());
+        out.write(&Imu::new(1, 1.0)).expect("ring has room");
+        out.write(&Imu::new(2, 2.0)).expect("ring has room");
+        assert_eq!(input.next().await.expect("record").sample, 1.0);
+        assert_eq!(input.next().await.expect("record").sample, 2.0);
+        assert!(poll_once(input.next()).await.is_none());
+    }
+
+    #[stellarator::test]
+    async fn next_on_a_port_with_no_producer_never_resolves() {
+        let mut input = Input::<Imu, Notifier>::try_new(Vec::new()).expect("supported alignment");
+        assert!(poll_once(input.next()).await.is_none());
+    }
+
+    #[stellarator::test]
+    async fn a_write_from_another_thread_wakes_the_waiting_port() {
+        let wake = Notifier::default();
+        let (ring, out, mut input) = woken(&wake);
+        drop(out);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(core::time::Duration::from_millis(20));
+            let mut out = Output::<Imu, _>::try_new(ring.writer(wake).expect("free writer"))
+                .expect("supported alignment");
+            out.write(&Imu::new(7, 7.0)).expect("ring has room");
+            ring
+        });
+        assert_eq!(input.next().await.expect("record").sample, 7.0);
+        let _ring = writer.join().expect("the writer thread finished");
+    }
+
+    #[stellarator::test]
+    async fn any_ready_pends_until_one_port_has_a_record() {
+        let wake = Notifier::default();
+        let (_left, mut a, _) = woken(&wake);
+        let (right, _, _) = woken(&wake);
+        let mut inputs = DynInputs::<Notifier>::bind(vec![
+            InputBinding {
+                def: Input::<Imu>::def("a.imu"),
+                views: Vec::new(),
+            },
+            InputBinding {
+                def: Input::<Imu>::def("b.imu"),
+                views: vec![right.view(wake.clone()).expect("free slot")],
+            },
+        ]);
+        assert!(poll_once(inputs.any_ready()).await.is_none());
+        a.write(&Imu::new(1, 1.0)).expect("ring has room");
+        // The record landed on a ring no port reads, so nothing is ready.
+        assert!(poll_once(inputs.any_ready()).await.is_none());
+        let mut out = Output::<Imu, _>::try_new(right.writer(wake).expect("free writer"))
+            .expect("supported alignment");
+        out.write(&Imu::new(2, 2.0)).expect("ring has room");
+        inputs.any_ready().await;
+        let seen: Vec<_> = inputs
+            .iter_mut()
+            .flat_map(|(def, input)| input.drain().map(move |r| (def.name.to_string(), r)))
+            .map(|(name, bytes)| (name, bytes.expect("bytes").len()))
+            .collect();
+        assert_eq!(seen, vec![("b.imu".to_string(), Imu::MAX_LEN)]);
     }
 }

@@ -3,7 +3,7 @@
 use core::cell::RefCell;
 use std::rc::Rc;
 
-use metor_fsw_3_ring::frame_len;
+use metor_fsw_3_ring::{Notifier, frame_len};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 use serde::Deserialize;
@@ -11,6 +11,7 @@ use serde_json::json;
 use tracing_subscriber::layer::SubscriberExt;
 
 use super::*;
+use crate::async_system::Stop;
 use crate::coordinator::{
     BuildError, CoordinatorConfig, InputConfig, PortRef, SystemConfig, SystemTable,
 };
@@ -34,12 +35,14 @@ impl Doubler {
     }
 }
 
-impl SystemFn for Doubler {
+impl Ports for Doubler {
     type Params = (Input<Imu>, Output<Nav>, Timestamp);
     const NAME: &'static str = "doubler";
     const NAMES: &'static [&'static str] = &["imu", "nav", "now"];
+}
 
-    fn call(&mut self, (imu, nav, now): <Self::Params as Param>::Item<'_>) {
+impl SystemFn for Doubler {
+    fn call(&mut self, (imu, nav, now): <Self::Params as Param>::Item<'_, Cyclic>) {
         self.execute(imu, nav, now);
     }
 }
@@ -58,12 +61,14 @@ impl Summer {
     }
 }
 
-impl SystemFn for Summer {
+impl Ports for Summer {
     type Params = (Output<Control>, Input<Imu>, Input<Imu>);
     const NAME: &'static str = "summer";
     const NAMES: &'static [&'static str] = &["sum", "a", "b"];
+}
 
-    fn call(&mut self, (sum, a, b): <Self::Params as Param>::Item<'_>) {
+impl SystemFn for Summer {
+    fn call(&mut self, (sum, a, b): <Self::Params as Param>::Item<'_, Cyclic>) {
         self.execute(sum, a, b);
     }
 }
@@ -132,11 +137,13 @@ impl Counter {
     }
 }
 
-impl SystemFn for Counter {
+impl Ports for Counter {
     type Params = ();
     const NAME: &'static str = "counter";
     const NAMES: &'static [&'static str] = &[];
+}
 
+impl SystemFn for Counter {
     fn call(&mut self, (): ()) {
         self.execute();
     }
@@ -519,7 +526,7 @@ fn an_explicit_log_output_cannot_hide_the_implicit_output() {
 fn the_doc_comment_on_execute_becomes_doc() {
     assert_eq!(Gain::DOC, "Publishes the gain.\n\nOne sample per cycle.");
     assert_eq!(Doubler::DOC, "");
-    assert_eq!(<Probe<Imu> as SystemFn>::DOC, "");
+    assert_eq!(<Probe<Imu> as Ports>::DOC, "");
 }
 
 #[test]
@@ -537,4 +544,122 @@ fn a_params_ctor_carries_its_schema() {
 #[test]
 fn a_unit_ctor_has_no_schema() {
     assert!(<fn() -> Summer as Ctor<Summer, ()>>::schema().is_none());
+}
+
+/// Doubles every sample as it arrives, until stop.
+struct Relay;
+
+#[crate::system]
+impl Relay {
+    /// Forwards records as they arrive.
+    async fn run(
+        &mut self,
+        imu: &mut Input<Imu, Notifier>,
+        nav: &mut Output<Nav>,
+        log: &mut Log,
+        stop: Stop,
+    ) {
+        log.info("relaying");
+        loop {
+            let waited =
+                futures_lite::future::or(async { imu.next().await.ok().copied() }, async {
+                    stop.wait().await;
+                    None
+                });
+            let Some(sample) = waited.await else { return };
+            let _ = nav.write(&Nav {
+                timestamp: sample.timestamp,
+                estimate: sample.sample * 2.0,
+            });
+        }
+    }
+}
+
+/// The cyclic twin of [`Relay`], to compare definitions.
+struct RelayCyclic;
+
+#[crate::system]
+impl RelayCyclic {
+    /// Forwards records as they arrive.
+    fn execute(&mut self, imu: &mut Input<Imu>, nav: &mut Output<Nav>, log: &mut Log) {
+        let _ = (imu, nav, log);
+    }
+}
+
+#[test]
+fn an_async_block_declares_the_same_ports_as_its_cyclic_twin() {
+    assert_eq!(Relay::NAMES, &["imu", "nav", "log"]);
+    assert_eq!(Relay::DOC, "Forwards records as they arrive.");
+    let (relay, cyclic) = (
+        FnAsyncSystem::<Relay>::def(),
+        FnSystem::<RelayCyclic>::def(),
+    );
+    assert_eq!(relay.inputs, cyclic.inputs);
+    assert_eq!(relay.outputs, cyclic.outputs);
+    assert_eq!(relay.name, "relay");
+}
+
+#[stellarator::test]
+async fn a_registered_async_system_runs_until_its_stop() {
+    use crate::async_system::stop_pair;
+    use crate::coordinator::Make;
+    use crate::system::{InputBinding, OutputBinding};
+    use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
+
+    fn ring<R: Record + ?Sized>() -> RingBuffer {
+        RingBuffer::create_in_memory(Config {
+            capacity: ring_capacity(R::MAX_LEN, 8).expect("valid capacity"),
+            max_readers: 1,
+        })
+    }
+
+    let mut table = SystemTable::new();
+    table.register_async("relay", || Relay);
+    let entry = table.get("relay").expect("registered");
+    assert_eq!(entry.def.inputs, vec![Input::<Imu>::def("imu")]);
+    let Make::Async(make) = &entry.make else {
+        panic!("an async registration");
+    };
+
+    let wake = Notifier::default();
+    let (imu, nav, log) = (ring::<Imu>(), ring::<Nav>(), ring::<LogEvent>());
+    let mut source = Output::<Imu, _>::try_new(imu.writer(wake.clone()).expect("free writer"))
+        .expect("supported alignment");
+    let mut estimates = Input::<Nav>::try_new(vec![nav.view(NoWake).expect("free slot")])
+        .expect("supported alignment");
+    let mut lines = Input::<LogEvent>::try_new(vec![log.view(NoWake).expect("free slot")])
+        .expect("supported alignment");
+    let launch = make(
+        json!(null),
+        vec![InputBinding {
+            def: Input::<Imu>::def("imu"),
+            views: vec![imu.view(wake.clone()).expect("free slot")],
+        }],
+        vec![
+            OutputBinding {
+                def: Output::<Nav>::def("nav"),
+                writer: nav.writer(NoWake).expect("free writer"),
+            },
+            OutputBinding {
+                def: Output::<LogEvent>::def("log"),
+                writer: log.writer(NoWake).expect("free writer"),
+            },
+        ],
+    );
+    let (handle, stop) = stop_pair();
+    let task = stellarator::spawn(launch.launch(stop).expect("no params"));
+
+    source.write(&Imu::new(3, 2.0)).expect("ring has room");
+    while estimates.latest().expect("valid").is_none() {
+        stellarator::yield_now().await;
+    }
+    assert_eq!(
+        estimates.latest().expect("valid").expect("record").estimate,
+        4.0
+    );
+    let seen: Vec<_> = lines.drain().map(|l| l.expect("decodes").message).collect();
+    assert!(seen.contains(&"relaying".into()), "{seen:?}");
+
+    handle.stop();
+    task.await.expect("the task ended");
 }

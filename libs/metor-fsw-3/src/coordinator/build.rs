@@ -15,7 +15,7 @@ use super::config::{CoordinatorConfig, SystemConfig};
 use super::error::BuildError;
 use super::params::Params;
 use super::status::SystemStatus;
-use super::table::{SystemTable, TableEntry};
+use super::table::{Make, SystemTable, TableEntry};
 use super::{Coordinator, Entry};
 
 const STATUS_PORT: &str = "status";
@@ -364,12 +364,17 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
                 .iter()
                 .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
                 .collect();
-            let step = (system.entry.make)(system.params, &system.def, inputs, outputs).map_err(
-                |source| BuildError::Params {
+            let Make::Cyclic(make) = &system.entry.make else {
+                return Err(BuildError::AsyncUnplaced {
+                    id: system.id.to_string(),
+                });
+            };
+            let step = make(system.params, &system.def, inputs, outputs).map_err(|source| {
+                BuildError::Params {
                     id: system.id.to_string(),
                     source,
-                },
-            )?;
+                }
+            })?;
             Ok(Entry {
                 name: system.id.to_string(),
                 step: Some(step),

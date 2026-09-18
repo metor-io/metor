@@ -8,26 +8,38 @@ use core::marker::PhantomData;
 
 use metor_proto::types::Timestamp;
 
+use crate::async_system::{AsyncSystem, Stop};
 use crate::{
     log,
     system::{System, SystemDef},
 };
 
 pub use ctor::Ctor;
-pub use param::{Cycle, Names, Param, Views, Writers};
+pub use param::{Cycle, Cyclic, Names, Param, Views, Wiring, Woken, Writers};
 pub use set::{InSet, LOG_PORT, OutSet};
 
-/// A `SystemFn` is a type with an `execute` method whose parameters are the ports.
-pub trait SystemFn: Sized + 'static {
+/// A `Ports` names one authored system's parameters, which are its ports.
+pub trait Ports: Sized + 'static {
     type Params: Param;
     const NAME: &'static str;
     /// One name per parameter, in parameter order.
     const NAMES: &'static [&'static str];
-    /// The doc comment on `execute`, lines joined with newlines.
+    /// The doc comment on the method, lines joined with newlines.
     const DOC: &'static str = "";
+}
 
+/// A `SystemFn` is a type with an `execute` method whose parameters are the ports.
+pub trait SystemFn: Ports {
     /// Calls `execute` with this cycle's parameter values.
-    fn call(&mut self, items: <Self::Params as Param>::Item<'_>);
+    fn call(&mut self, items: <Self::Params as Param>::Item<'_, Cyclic>);
+}
+
+/// An `AsyncSystemFn` is a type with an `async run` method whose parameters are
+/// the ports, plus the [`Stop`] that ends it.
+#[allow(async_fn_in_trait)]
+pub trait AsyncSystemFn: Ports {
+    /// Calls `run`, which returns once `stop` resolves.
+    async fn call(&mut self, items: <Self::Params as Param>::Item<'_, Woken>, stop: Stop);
 }
 
 /// Compiles only when `P` is a `Param`; `#[system]` calls it once per parameter.
@@ -41,6 +53,40 @@ pub struct FnSystem<S>(PhantomData<S>);
 impl<S> Default for FnSystem<S> {
     fn default() -> Self {
         Self(PhantomData)
+    }
+}
+
+/// A `FnAsyncSystem` is the [`AsyncSystem`] an [`AsyncSystemFn`] registers as.
+pub struct FnAsyncSystem<S>(PhantomData<S>);
+
+impl<S> Default for FnAsyncSystem<S> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<S: AsyncSystemFn> AsyncSystem for FnAsyncSystem<S> {
+    type State = S;
+    type Inputs = InSet<S, Woken>;
+    type Outputs = OutSet<S>;
+
+    fn def() -> SystemDef {
+        SystemDef::new_async::<InSet<S, Woken>, OutSet<S>>(S::NAME)
+    }
+
+    /// Points each poll's log lines at the system's own `log` output, then runs `run`.
+    async fn run(
+        &self,
+        state: &mut S,
+        inputs: &mut InSet<S, Woken>,
+        outputs: &mut OutSet<S>,
+        stop: Stop,
+    ) {
+        let mut log = log::Log;
+        let mut cx = Cycle::new(Timestamp::now(), &mut log);
+        let items = S::Params::get::<Woken>(&mut inputs.0, &mut outputs.outs, &mut cx);
+        let call = core::pin::pin!(state.call(items, stop));
+        log::log_scope(&mut outputs.log, call).await;
     }
 }
 

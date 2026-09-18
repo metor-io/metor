@@ -171,6 +171,34 @@ pub fn with_log_port<R>(port: &mut LogPort, now: Timestamp, f: impl FnOnce() -> 
     result
 }
 
+/// Routes this thread's logs to `port` for each poll of `inner`, stamping its
+/// lines with the wall time of that poll.
+pub fn log_scope<F: core::future::Future + Unpin>(port: &mut LogPort, inner: F) -> LogScope<'_, F> {
+    LogScope { port, inner }
+}
+
+/// The future [`log_scope`] returns.
+pub struct LogScope<'a, F> {
+    port: &'a mut LogPort,
+    inner: F,
+}
+
+impl<F: core::future::Future + Unpin> core::future::Future for LogScope<'_, F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<F::Output> {
+        let this = self.get_mut();
+        this.port.now = Timestamp::now();
+        let _restore = RestoreSlot(SLOT.replace(Some(NonNull::from(&mut *this.port))));
+        let polled = core::pin::Pin::new(&mut this.inner).poll(cx);
+        with_port(LogPort::report_dropped);
+        polled
+    }
+}
+
 struct RestoreSlot(Option<NonNull<LogPort>>);
 
 impl Drop for RestoreSlot {

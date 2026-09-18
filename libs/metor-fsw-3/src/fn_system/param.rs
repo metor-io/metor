@@ -1,11 +1,34 @@
 //! The [`Param`] trait, one per `execute` parameter type, and its tuple impls.
 
+use metor_fsw_3_ring::{NoWake, Notifier, WakeSink};
 use metor_proto::types::Timestamp;
 
 use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::record::Record;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
+
+/// Which wake endpoint a system's input ports carry.
+///
+/// Outputs never wake anyone: the cycle thread drains an async system's
+/// outputs itself, so they stay [`NoWake`] under either wiring.
+pub trait Wiring: 'static {
+    type Sink: WakeSink + Clone;
+}
+
+/// The cycle thread's ports: a read finds a record or does not.
+pub struct Cyclic;
+
+/// A background thread's ports: a read parks until the cycle copies a record.
+pub struct Woken;
+
+impl Wiring for Cyclic {
+    type Sink = NoWake;
+}
+
+impl Wiring for Woken {
+    type Sink = Notifier;
+}
 
 /// The bindings a bundle binds from: one per declared port in order, then the
 /// ports a dynamic bundle's config added.
@@ -39,7 +62,7 @@ impl<B> Bindings<B> {
 }
 
 /// The input bindings a bundle binds from.
-pub type Views = Bindings<InputBinding>;
+pub type Views<K> = Bindings<InputBinding<<K as Wiring>::Sink>>;
 /// The output bindings a bundle binds from.
 pub type Writers = Bindings<OutputBinding>;
 /// The parameter names a bundle declares under, one per leaf parameter in order.
@@ -80,11 +103,11 @@ pub trait Param {
     const DYNAMIC_OUT: bool = false;
 
     /// The bound input, or `()`.
-    type In;
+    type In<K: Wiring>;
     /// The bound writer, or `()`.
     type Out;
     /// The value `execute` receives.
-    type Item<'a>
+    type Item<'a, K: Wiring>
     where
         Self: 'a;
 
@@ -92,17 +115,17 @@ pub trait Param {
     fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>);
 
     /// Returns this parameter's input (if one exists) by popping a view from `views`.
-    fn bind_in(views: &mut Views) -> Self::In;
+    fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K>;
 
     /// Returns this parameter's output (if one exists) by popping a writer from `writers`.
     fn bind_out(writers: &mut Writers) -> Self::Out;
 
     /// Returns the value that will be passed into `execute`
-    fn get<'a>(
-        input: &'a mut Self::In,
+    fn get<'a, K: Wiring>(
+        input: &'a mut Self::In<K>,
         output: &'a mut Self::Out,
         cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a>;
+    ) -> Self::Item<'a, K>;
 }
 
 /// Takes the next leaf parameter's name.
@@ -111,16 +134,18 @@ fn name(names: &mut Names<'_>) -> &'static str {
     names.next().expect("one name per parameter")
 }
 
-impl<T: Record + 'static> Param for Input<T> {
-    type In = Input<T>;
+/// Both `Input<T>` and `Input<T, Notifier>` name the same port; the wiring
+/// picks which one a system is handed.
+impl<T: Record + 'static + ?Sized, W: WakeSink + 'static> Param for Input<T, W> {
+    type In<K: Wiring> = Input<T, K::Sink>;
     type Out = ();
-    type Item<'a> = &'a mut Input<T>;
+    type Item<'a, K: Wiring> = &'a mut Input<T, K::Sink>;
 
     fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
         inputs.push(Input::<T>::def(name(names)));
     }
 
-    fn bind_in(views: &mut Views) -> Self::In {
+    fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K> {
         // PANIC Safety: the coordinator binds one list per declared input and
         // validates alignment at build; a mismatch is a coordinator bug.
         let binding = views.next().expect("one binding per input param");
@@ -129,25 +154,25 @@ impl<T: Record + 'static> Param for Input<T> {
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a>(
-        input: &'a mut Self::In,
+    fn get<'a, K: Wiring>(
+        input: &'a mut Self::In<K>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> &'a mut Input<T> {
+    ) -> Self::Item<'a, K> {
         input
     }
 }
 
-impl<T: Record + 'static> Param for Output<T> {
-    type In = ();
+impl<T: Record + 'static + ?Sized> Param for Output<T> {
+    type In<K: Wiring> = ();
     type Out = Output<T>;
-    type Item<'a> = &'a mut Output<T>;
+    type Item<'a, K: Wiring> = &'a mut Output<T>;
 
     fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>) {
         outputs.push(Output::<T>::def(name(names)));
     }
 
-    fn bind_in(_views: &mut Views) {}
+    fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
         // PANIC Safety: the coordinator binds one writer per declared output and
@@ -156,97 +181,105 @@ impl<T: Record + 'static> Param for Output<T> {
         Output::try_new(binding.writer).expect("alignment checked at build")
     }
 
-    fn get<'a>(
+    fn get<'a, K: Wiring>(
         _input: &'a mut (),
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
-    ) -> &'a mut Output<T> {
+    ) -> Self::Item<'a, K> {
         output
     }
 }
 
-impl Param for DynInputs {
+impl<W: WakeSink + 'static> Param for DynInputs<W> {
     const DYNAMIC_IN: bool = true;
-    type In = DynInputs;
+    type In<K: Wiring> = DynInputs<K::Sink>;
     type Out = ();
-    type Item<'a> = &'a mut DynInputs;
+    type Item<'a, K: Wiring> = &'a mut DynInputs<K::Sink>;
 
     fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
         name(names);
     }
 
-    fn bind_in(views: &mut Views) -> Self::In {
+    fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K> {
         SystemInputs::bind(views.take_dynamic())
     }
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a>(
-        input: &'a mut Self::In,
+    fn get<'a, K: Wiring>(
+        input: &'a mut Self::In<K>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> &'a mut DynInputs {
+    ) -> Self::Item<'a, K> {
         input
     }
 }
 
 impl Param for DynOutputs {
     const DYNAMIC_OUT: bool = true;
-    type In = ();
+    type In<K: Wiring> = ();
     type Out = DynOutputs;
-    type Item<'a> = &'a mut DynOutputs;
+    type Item<'a, K: Wiring> = &'a mut DynOutputs;
 
     fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
         name(names);
     }
 
-    fn bind_in(_views: &mut Views) {}
+    fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
         SystemOutputs::bind(writers.take_dynamic())
     }
 
-    fn get<'a>(
+    fn get<'a, K: Wiring>(
         _input: &'a mut (),
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
-    ) -> &'a mut DynOutputs {
+    ) -> Self::Item<'a, K> {
         output
     }
 }
 
 impl Param for Timestamp {
-    type In = ();
+    type In<K: Wiring> = ();
     type Out = ();
-    type Item<'a> = Timestamp;
+    type Item<'a, K: Wiring> = Timestamp;
 
     fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
         name(names);
     }
 
-    fn bind_in(_views: &mut Views) {}
+    fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a>(_input: &'a mut (), _output: &'a mut (), cx: &mut Cycle<'a>) -> Timestamp {
+    fn get<'a, K: Wiring>(
+        _input: &'a mut (),
+        _output: &'a mut (),
+        cx: &mut Cycle<'a>,
+    ) -> Timestamp {
         cx.now
     }
 }
 
 impl Param for Log {
-    type In = ();
+    type In<K: Wiring> = ();
     type Out = ();
-    type Item<'a> = &'a mut Log;
+    type Item<'a, K: Wiring> = &'a mut Log;
 
     fn append_defs(names: &mut Names<'_>, _inputs: &mut Vec<PortDef>, _outputs: &mut Vec<PortDef>) {
         name(names);
     }
 
-    fn bind_in(_views: &mut Views) {}
+    fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a>(_input: &'a mut (), _output: &'a mut (), cx: &mut Cycle<'a>) -> &'a mut Log {
+    fn get<'a, K: Wiring>(
+        _input: &'a mut (),
+        _output: &'a mut (),
+        cx: &mut Cycle<'a>,
+    ) -> &'a mut Log {
         cx.take_log()
     }
 }
@@ -257,9 +290,9 @@ macro_rules! impl_param_for_tuple {
         impl<$($P: Param),*> Param for ($($P,)*) {
             const DYNAMIC_IN: bool = false $(|| $P::DYNAMIC_IN)*;
             const DYNAMIC_OUT: bool = false $(|| $P::DYNAMIC_OUT)*;
-            type In = ($($P::In,)*);
+            type In<W: Wiring> = ($($P::In<W>,)*);
             type Out = ($($P::Out,)*);
-            type Item<'a> = ($($P::Item<'a>,)*) where Self: 'a;
+            type Item<'a, W: Wiring> = ($($P::Item<'a, W>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
             fn append_defs(names: &mut Names<'_>, inputs: &mut Vec<PortDef>, outputs: &mut Vec<PortDef>) {
@@ -267,8 +300,8 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn bind_in(views: &mut Views) -> Self::In {
-                ($( $P::bind_in(views), )*)
+            fn bind_in<W: Wiring>(views: &mut Views<W>) -> Self::In<W> {
+                ($( $P::bind_in::<W>(views), )*)
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
@@ -277,8 +310,8 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn get<'a>(input: &'a mut Self::In, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a> {
-                ($( $P::get(&mut input.$i, &mut output.$i, cx), )*)
+            fn get<'a, W: Wiring>(input: &'a mut Self::In<W>, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a, W> {
+                ($( $P::get::<W>(&mut input.$i, &mut output.$i, cx), )*)
             }
         }
     };

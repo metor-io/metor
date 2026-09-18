@@ -1,6 +1,6 @@
 //! The [`System`] trait and the port bundles that feed it.
 
-use metor_fsw_3_ring::{NoWake, View, WakeSink, WakeSource, Writer};
+use metor_fsw_3_ring::{NoWake, Notifier, View, WakeSink, WakeSource, Writer};
 use metor_proto::types::{ComponentId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -46,6 +46,17 @@ impl SystemDef {
             dynamic_outputs: O::DYNAMIC,
         }
     }
+
+    /// The same definition for an async system, whose inputs park on a notifier.
+    pub fn new_async<I: SystemInputs<Notifier>, O: SystemOutputs>(name: &'static str) -> Self {
+        Self {
+            name: name.into(),
+            inputs: I::defs(),
+            outputs: O::defs(),
+            dynamic_inputs: I::DYNAMIC,
+            dynamic_outputs: O::DYNAMIC,
+        }
+    }
 }
 
 /// One input port: the definition build settled on and one view per producer.
@@ -81,7 +92,10 @@ pub trait System {
 }
 
 /// A struct of `Input<F>` fields. Derive with `#[derive(SystemInputs)]`.
-pub trait SystemInputs {
+///
+/// `W` is the wake endpoint of the ports it binds: [`NoWake`] for a cyclic
+/// system, [`Notifier`](metor_fsw_3_ring::Notifier) for an async one.
+pub trait SystemInputs<W: WakeSink = NoWake> {
     /// Whether the config names this bundle's ports rather than the type.
     const DYNAMIC: bool = false;
 
@@ -91,11 +105,13 @@ pub trait SystemInputs {
     ///
     /// # Panics
     /// Derived implementations panic on a wrong list length or unsupported frame alignment.
-    fn bind(inputs: Vec<InputBinding>) -> Self;
+    fn bind(inputs: Vec<InputBinding<W>>) -> Self;
 }
 
 /// A struct of `Output<F>` fields. Derive with `#[derive(SystemOutputs)]`.
-pub trait SystemOutputs {
+///
+/// `W` is the wake endpoint of the ports it binds, as for [`SystemInputs`].
+pub trait SystemOutputs<W: WakeSource = NoWake> {
     /// Whether the config names this bundle's ports rather than the type.
     const DYNAMIC: bool = false;
 
@@ -105,21 +121,21 @@ pub trait SystemOutputs {
     ///
     /// # Panics
     /// Derived implementations panic on a wrong list length or unsupported frame alignment.
-    fn bind(outputs: Vec<OutputBinding>) -> Self;
+    fn bind(outputs: Vec<OutputBinding<W>>) -> Self;
 }
 
-impl SystemInputs for () {
+impl<W: WakeSink> SystemInputs<W> for () {
     fn defs() -> Vec<PortDef> {
         Vec::new()
     }
-    fn bind(_inputs: Vec<InputBinding>) -> Self {}
+    fn bind(_inputs: Vec<InputBinding<W>>) -> Self {}
 }
 
-impl SystemOutputs for () {
+impl<W: WakeSource> SystemOutputs<W> for () {
     fn defs() -> Vec<PortDef> {
         Vec::new()
     }
-    fn bind(_outputs: Vec<OutputBinding>) -> Self {}
+    fn bind(_outputs: Vec<OutputBinding<W>>) -> Self {}
 }
 
 #[cfg(test)]
@@ -282,8 +298,8 @@ mod tests {
     fn a_dynamic_bundle_declares_no_ports_and_binds_what_it_is_given() {
         use crate::port::{DynInputs, DynOutputs};
 
-        const { assert!(DynInputs::DYNAMIC) };
-        const { assert!(DynOutputs::DYNAMIC) };
+        const { assert!(<DynInputs as SystemInputs>::DYNAMIC) };
+        const { assert!(<DynOutputs as SystemOutputs>::DYNAMIC) };
         let def = SystemDef::new::<DynInputs, DynOutputs>("link");
         assert!(def.inputs.is_empty() && def.outputs.is_empty());
         assert!(def.dynamic_inputs && def.dynamic_outputs);

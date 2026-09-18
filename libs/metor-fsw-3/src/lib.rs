@@ -1,5 +1,6 @@
 //! metor-fsw is a flight software framework
 
+pub mod async_system;
 pub mod cli;
 pub mod coordinator;
 pub mod dl;
@@ -15,12 +16,16 @@ pub mod system;
 #[cfg(test)]
 mod tests;
 
+pub use async_system::{AsyncSystem, Stop};
 pub use coordinator::{
     BuildError, Clock, Coordinator, CoordinatorConfig, InputConfig, OutputConfig, ParamError,
     Params, PortRef, Step, SystemConfig, SystemStatus, SystemTable,
 };
 pub use dl::{DlStep, Pack, PackError, PackFns};
-pub use fn_system::{Ctor, Cycle, FnSystem, InSet, Names, OutSet, Param, SystemFn};
+pub use fn_system::{
+    AsyncSystemFn, Ctor, Cycle, FnAsyncSystem, FnSystem, InSet, Names, OutSet, Param, Ports,
+    SystemFn,
+};
 pub use frame::Frame;
 pub use log::{Log, LogLayer};
 pub use metor_fsw_3_macros::{Frame, Record, SystemInputs, SystemOutputs, system};

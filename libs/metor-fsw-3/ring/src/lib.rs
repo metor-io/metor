@@ -558,6 +558,14 @@ impl RingBuffer {
         self.inner.control().committed.load(Acquire)
     }
 
+    /// The geometry this region was created with.
+    pub fn config(&self) -> Config {
+        Config {
+            capacity: self.inner.geometry.capacity as usize,
+            max_readers: self.inner.geometry.max_readers as usize,
+        }
+    }
+
     /// Claim the region's only writer. Dropping it releases the claim.
     /// `data` is notified after publication; use [`NoWake`] for synchronous readers.
     pub fn writer<WD: WakeSource>(&self, data: WD) -> Result<Writer<WD>, WriterClaimed> {
@@ -775,6 +783,23 @@ impl<RD: WakeSink> View<RD> {
         self.inner.control().committed.load(Acquire)
     }
 
+    /// The endpoint this view waits on, for a caller waiting on several views.
+    pub fn wake(&self) -> &RD {
+        &self.data
+    }
+
+    /// Whether an unread record is waiting, skipping any wrap padding.
+    pub fn has_record(&self) -> bool {
+        matches!(self.locate(), Ok(Some(_)))
+    }
+
+    /// Apply a drain's deferred consumption now, so the cursor is exact.
+    pub fn settle(&mut self) {
+        if let Some(pos) = self.pending.take() {
+            self.advance(pos);
+        }
+    }
+
     /// Copy and consume the next record; return `false` when caught up.
     /// Leaves `buf` unchanged on an empty read or error. Reserve enough buffer
     /// capacity during initialization to avoid allocation while reading.
@@ -858,12 +883,6 @@ impl<RD: WakeSink> View<RD> {
             cursor: &self.inner.slot(self.slot).cursor,
             release_at,
             slice,
-        }
-    }
-
-    fn settle(&mut self) {
-        if let Some(pos) = self.pending.take() {
-            self.advance(pos);
         }
     }
 

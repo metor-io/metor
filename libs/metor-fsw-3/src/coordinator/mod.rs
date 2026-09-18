@@ -25,8 +25,8 @@ pub use params::{ParamError, Params};
 pub use run::Step;
 pub(crate) use run::catch_step;
 pub use status::SystemStatus;
-pub use table::SystemTable;
-pub(crate) use table::TableEntry;
+pub use table::{Launch, SystemTable};
+pub(crate) use table::{Make, TableEntry};
 
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {

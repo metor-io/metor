@@ -1,4 +1,5 @@
-//! `#[system]` on an impl block: emits `SystemFn` for the type from its `execute` method.
+//! `#[system]` on an impl block: emits `SystemFn` from an `execute` method, or
+//! `AsyncSystemFn` from an `async run(.., stop: Stop)` method.
 //!
 //! The attribute reads parameter identifiers and doc comments. It never
 //! classifies a type; each parameter type's `Param` impl does that.
@@ -34,32 +35,70 @@ pub fn system(item: TokenStream) -> TokenStream {
 fn expand(block: &ItemImpl) -> syn::Result<TokenStream2> {
     let fsw = crate::fsw_crate();
     let name = type_name(&block.self_ty)?;
-    let execute = execute_method(block)?;
-    let params = params(execute)?;
-    let doc = doc(execute);
-    let idents = params.iter().map(|p| &p.ident);
+    let method = method(block)?;
+    let is_async = method.sig.asyncness.is_some();
+    let mut params = params(method)?;
+    let stop = if is_async { Some(take_stop(method, &mut params)?) } else { None };
+    let doc = doc(method);
+    let idents = params.iter().map(|p| &p.ident).collect::<Vec<_>>();
     let keys = params.iter().map(|p| &p.key);
     let names = params.iter().map(|p| p.ident.to_string());
     let self_ty = &block.self_ty;
     let (impl_generics, _, where_clause) = block.generics.split_for_impl();
-    let idents2 = idents.clone();
     // Spanned at each parameter type, so a type that is no `Param` errors there.
     let asserts = params.iter().map(|p| {
         let key = &p.key;
         quote_spanned! { key.span() => #fsw::fn_system::assert_param::<#key>(); }
     });
+    let call = match stop {
+        Some(stop) => quote! {
+            impl #impl_generics #fsw::AsyncSystemFn for #self_ty #where_clause {
+                async fn call(
+                    &mut self,
+                    (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_, #fsw::fn_system::Woken>,
+                    #stop: #fsw::Stop,
+                ) {
+                    #(#asserts)*
+                    self.run(#(#idents,)* #stop).await
+                }
+            }
+        },
+        None => quote! {
+            impl #impl_generics #fsw::SystemFn for #self_ty #where_clause {
+                fn call(
+                    &mut self,
+                    (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_, #fsw::fn_system::Cyclic>,
+                ) {
+                    #(#asserts)*
+                    self.execute(#(#idents),*)
+                }
+            }
+        },
+    };
     Ok(quote! {
-        impl #impl_generics #fsw::SystemFn for #self_ty #where_clause {
+        impl #impl_generics #fsw::Ports for #self_ty #where_clause {
             type Params = (#(#keys,)*);
             const NAME: &'static str = #name;
             const NAMES: &'static [&'static str] = &[#(#names),*];
             const DOC: &'static str = #doc;
-            fn call(&mut self, (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_>) {
-                #(#asserts)*
-                self.execute(#(#idents2),*)
-            }
         }
+        #call
     })
+}
+
+/// Removes the trailing `stop: Stop` parameter, which is no port.
+fn take_stop(method: &ImplItemFn, params: &mut Vec<Param>) -> syn::Result<Ident> {
+    let is_stop = params
+        .last()
+        .is_some_and(|p| matches!(&p.key, Type::Path(path) if path.path.segments.last().is_some_and(|s| s.ident == "Stop")));
+    if !is_stop {
+        return Err(syn::Error::new(
+            method.sig.span(),
+            "`run` takes `stop: Stop` as its last parameter",
+        ));
+    }
+    // PANIC Safety: the check above found the parameter.
+    Ok(params.pop().expect("a last parameter").ident)
 }
 
 /// Returns the snake-cased last path segment of the impl's type.
@@ -77,7 +116,7 @@ fn type_name(ty: &Type) -> syn::Result<String> {
     }
 }
 
-/// Joins `execute`'s doc comment lines, each without its leading space.
+/// Joins the method's doc comment lines, each without its leading space.
 fn doc(method: &ImplItemFn) -> String {
     method
         .attrs
@@ -98,26 +137,45 @@ fn doc(method: &ImplItemFn) -> String {
         .join("\n")
 }
 
-/// Finds `execute` and checks it takes `&mut self`.
-fn execute_method(block: &ItemImpl) -> syn::Result<&ImplItemFn> {
-    let found = block.items.iter().find_map(|item| match item {
-        ImplItem::Fn(f) if f.sig.ident == "execute" => Some(f),
-        _ => None,
-    });
-    let Some(method) = found else {
-        return Err(syn::Error::new(
-            block.self_ty.span(),
-            "#[system] needs an `execute` method in this impl block",
-        ));
+/// Finds the one `execute` or `async run` method and checks it takes `&mut self`.
+fn method(block: &ItemImpl) -> syn::Result<&ImplItemFn> {
+    let named = |name: &str| {
+        block.items.iter().find_map(move |item| match item {
+            ImplItem::Fn(f) if f.sig.ident == name => Some(f),
+            _ => None,
+        })
     };
+    let method = match (named("execute"), named("run")) {
+        (Some(_), Some(run)) => {
+            return Err(syn::Error::new(
+                run.sig.span(),
+                "#[system] takes either `execute` or `run`, not both",
+            ));
+        }
+        (Some(execute), None) => execute,
+        (None, Some(run)) if run.sig.asyncness.is_some() => run,
+        (None, Some(run)) => {
+            return Err(syn::Error::new(run.sig.span(), "`run` must be `async`"));
+        }
+        (None, None) => {
+            return Err(syn::Error::new(
+                block.self_ty.span(),
+                "#[system] needs an `execute` or `run` method in this impl block",
+            ));
+        }
+    };
+    let what = &method.sig.ident;
     match method.sig.inputs.first() {
         Some(FnArg::Receiver(recv)) if recv.reference.is_some() && recv.mutability.is_some() => {
             Ok(method)
         }
-        Some(arg) => Err(syn::Error::new(arg.span(), "`execute` takes `&mut self`")),
+        Some(arg) => Err(syn::Error::new(
+            arg.span(),
+            format!("`{what}` takes `&mut self`"),
+        )),
         None => Err(syn::Error::new(
             method.sig.span(),
-            "`execute` takes `&mut self`",
+            format!("`{what}` takes `&mut self`"),
         )),
     }
 }

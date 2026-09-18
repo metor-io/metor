@@ -1516,3 +1516,35 @@ fn checked_frame_length_respects_the_stored_length_width() {
         Err(WriteError::InsufficientCapacity)
     );
 }
+
+#[test]
+fn config_reports_the_geometry_it_was_created_with() {
+    let rb = ring(1024, 3);
+    let config = rb.config();
+    assert_eq!(config.capacity, 1024);
+    assert_eq!(config.max_readers, 3);
+}
+
+#[test]
+fn has_record_tracks_unread_data_across_a_deferred_drain() {
+    let rb = ring(1024, 1);
+    let mut w = rb.writer(NoWake).unwrap();
+    let mut v = rb.view(NoWake).unwrap();
+    assert!(!v.has_record());
+    w.try_write(b"one").unwrap();
+    assert!(v.has_record());
+    // A drain defers consumption, so the record still reads until it settles.
+    assert_eq!(v.drain().count(), 1);
+    assert!(v.has_record());
+    v.settle();
+    assert!(!v.has_record());
+    v.settle();
+    assert!(!v.has_record());
+}
+
+#[test]
+fn a_view_lends_out_the_endpoint_it_waits_on() {
+    let rb = ring(64, 1);
+    let v = rb.view(NoWake).unwrap();
+    let NoWake = *v.wake();
+}

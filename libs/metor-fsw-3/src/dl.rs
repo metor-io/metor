@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use libloading::Library;
 use metor_proto::types::Timestamp;
 
-use crate::coordinator::{ParamError, Step, SystemTable, TableEntry};
+use crate::coordinator::{Make, ParamError, Step, SystemTable, TableEntry};
 use crate::pack::def::{PackDef, PackSystemDef};
 use crate::pack::raw::{RawPort, RawRing, RawSlice};
 use crate::pack::{ABI_VERSION, DefStatus, Status};
@@ -183,7 +183,7 @@ impl SystemTable {
                 def: system.def.clone(),
                 doc: system.doc.clone(),
                 schema: system.params.clone(),
-                make: Box::new(move |params, def, inputs, outputs| {
+                make: Make::Cyclic(Box::new(move |params, def, inputs, outputs| {
                     let params = serde_json::to_vec(params.0)
                         .map_err(|e| ParamError::Decode(e.to_string()))?;
                     // The instance def, so the pack binds the ports the host
@@ -223,7 +223,7 @@ impl SystemTable {
                         lib: lib.clone(),
                         latched: false,
                     }))
-                }),
+                })),
             };
             self.insert(&format!("{id}.{}", system.ty), entry);
         }

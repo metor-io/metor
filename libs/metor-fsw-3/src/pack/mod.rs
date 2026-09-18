@@ -165,7 +165,12 @@ unsafe fn make(
         let entry = table
             .get(ty)
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
-        (entry.make)(Params(&value), &def, views, writers)
+        let crate::coordinator::Make::Cyclic(make) = &entry.make else {
+            return Err(ParamError::Decode(format!(
+                "system type `{ty}` is async and has no thread yet"
+            )));
+        };
+        make(Params(&value), &def, views, writers)
     })
 }
 

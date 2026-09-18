@@ -1,5 +1,5 @@
 use metor_fsw_3::zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-use metor_fsw_3::{Frame, Input, Output, SystemFn, SystemTable, Timestamp, system};
+use metor_fsw_3::{Frame, Input, Output, Ports, SystemTable, Timestamp, system};
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]

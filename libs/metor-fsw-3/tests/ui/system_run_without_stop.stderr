@@ -1,0 +1,5 @@
+error: `run` takes `stop: Stop` as its last parameter
+ --> tests/ui/system_run_without_stop.rs:7:5
+  |
+7 |     async fn run(&mut self, now: Timestamp) {
+  |     ^^^^^

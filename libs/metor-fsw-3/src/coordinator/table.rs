@@ -3,10 +3,11 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use metor_fsw_3_ring::{NoWake, RingBuffer};
+use metor_fsw_3_ring::{NoWake, Notifier, RingBuffer};
 use serde_json::value::RawValue;
 
-use crate::fn_system::{Ctor, FnSystem, SystemFn};
+use crate::async_system::{AsyncSystem, Running, Stop};
+use crate::fn_system::{AsyncSystemFn, Ctor, FnAsyncSystem, FnSystem, SystemFn};
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
 };
@@ -24,13 +25,58 @@ type SystemMakeFn = dyn Fn(
     Vec<&RingBuffer>,
 ) -> Result<Box<dyn Step>, ParamError>;
 
+/// Builds one launchable async system from its params and the mirror rings'
+/// bindings, both owned, so nothing borrowed crosses to the system's thread.
+type AsyncMakeFn = dyn Fn(serde_json::Value, Vec<InputBinding<Notifier>>, Vec<OutputBinding>) -> Box<dyn Launch>
+    + Send
+    + Sync;
+
+/// How a registered type is bound: on the cycle thread, or on its own.
+pub(crate) enum Make {
+    Cyclic(Box<SystemMakeFn>),
+    // The thread adapter binds this; the cycle path only rejects it.
+    #[allow(dead_code)]
+    Async(Box<AsyncMakeFn>),
+}
+
+/// A `Launch` constructs one async system on the thread that will run it.
+pub trait Launch: Send {
+    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError>;
+}
+
+/// One async system's ingredients, owned until its thread constructs it.
+struct AsyncLaunch<A: AsyncSystem, M> {
+    make: std::sync::Arc<M>,
+    params: serde_json::Value,
+    inputs: Vec<InputBinding<Notifier>>,
+    outputs: Vec<OutputBinding>,
+    _a: std::marker::PhantomData<fn() -> A>,
+}
+
+impl<A, M> Launch for AsyncLaunch<A, M>
+where
+    A: AsyncSystem + 'static,
+    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+{
+    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
+        let (system, mut state) = (self.make)(Params(&self.params))?;
+        let mut inputs = A::Inputs::bind(self.inputs);
+        let mut outputs = A::Outputs::bind(self.outputs);
+        Ok(Box::pin(async move {
+            system
+                .run(&mut state, &mut inputs, &mut outputs, stop)
+                .await;
+        }))
+    }
+}
+
 pub(crate) struct TableEntry {
     pub def: SystemDef,
     /// The doc comment on the type's `execute`, empty for the trait path.
     pub doc: Cow<'static, str>,
     /// The JSON Schema of the type's params, `None` when it takes none.
     pub schema: Option<Box<RawValue>>,
-    pub make: Box<SystemMakeFn>,
+    pub make: Make,
 }
 
 /// A `SystemTable` maps each type name a config may use to its definition and constructor.
@@ -62,6 +108,28 @@ impl SystemTable {
         self.insert(
             ty,
             entry::<FnSystem<S>>(make, Cow::Borrowed(S::DOC), C::schema()),
+        );
+    }
+
+    /// Registers an `AsyncSystem` under `ty`, constructed on its own thread.
+    pub fn register_async_system<A: AsyncSystem + 'static>(
+        &mut self,
+        ty: &str,
+        make: impl Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+    ) {
+        self.insert(ty, async_entry::<A, _>(make, Cow::Borrowed(""), None));
+    }
+
+    /// Registers a `#[system]` type with an `async run` under `ty`.
+    pub fn register_async<S: AsyncSystemFn, M, C: Ctor<S, M> + Send + Sync + 'static>(
+        &mut self,
+        ty: &str,
+        ctor: C,
+    ) {
+        let make = move |params: Params<'_>| Ok((FnAsyncSystem::default(), ctor.make(params)?));
+        self.insert(
+            ty,
+            async_entry::<FnAsyncSystem<S>, _>(make, Cow::Borrowed(S::DOC), C::schema()),
         );
     }
 
@@ -122,7 +190,7 @@ fn entry<S: System + 'static>(
         def: S::def(),
         doc,
         schema,
-        make: Box::new(move |params, def, inputs, outputs| {
+        make: Make::Cyclic(Box::new(move |params, def, inputs, outputs| {
             let (system, state) = make(params)?;
             let views = def
                 .inputs
@@ -153,7 +221,30 @@ fn entry<S: System + 'static>(
                 inputs: S::Inputs::bind(views),
                 outputs: S::Outputs::bind(writers),
             }))
-        }),
+        })),
+    }
+}
+
+/// Builds one async entry, keeping the constructor and bindings for its thread.
+fn async_entry<A, M>(make: M, doc: Cow<'static, str>, schema: Option<Box<RawValue>>) -> TableEntry
+where
+    A: AsyncSystem + 'static,
+    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+{
+    let make = std::sync::Arc::new(make);
+    TableEntry {
+        def: A::def(),
+        doc,
+        schema,
+        make: Make::Async(Box::new(move |params, inputs, outputs| {
+            Box::new(AsyncLaunch::<A, M> {
+                make: make.clone(),
+                params,
+                inputs,
+                outputs,
+                _a: std::marker::PhantomData,
+            })
+        })),
     }
 }
 
@@ -199,6 +290,40 @@ mod tests {
             table.get("imu").expect("registered").def.name,
             ImuOffset::def().name
         );
+    }
+
+    /// An async system with no ports, which returns when its stop is set.
+    struct Idle;
+
+    impl AsyncSystem for Idle {
+        type State = ();
+        type Inputs = ();
+        type Outputs = ();
+
+        fn def() -> SystemDef {
+            SystemDef::new_async::<(), ()>("idle")
+        }
+
+        async fn run(&self, _state: &mut (), _in: &mut (), _out: &mut (), stop: Stop) {
+            stop.wait().await;
+        }
+    }
+
+    #[test]
+    fn an_async_registration_keeps_its_definition_and_launches_on_its_thread() {
+        let mut table = SystemTable::new();
+        table.register_async_system("idle", |_| Ok((Idle, ())));
+        let entry = table.get("idle").expect("registered");
+        assert_eq!(entry.def.name, "idle");
+        assert!(entry.def.inputs.is_empty() && entry.def.outputs.is_empty());
+        let Make::Async(make) = &entry.make else {
+            panic!("an async registration");
+        };
+        let launch = make(serde_json::Value::Null, Vec::new(), Vec::new());
+        let (handle, stop) = crate::async_system::stop_pair();
+        handle.stop();
+        let running = launch.launch(stop).expect("no params");
+        futures_lite::future::block_on(running);
     }
 
     #[test]
