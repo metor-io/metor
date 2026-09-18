@@ -70,7 +70,11 @@ mod tests {
                 "trap",
                 "log_sink",
                 "tap",
-                "emit"
+                "emit",
+                "relay",
+                "sleeper",
+                "async_boom",
+                "who_am_i"
             ]
         );
         assert_eq!(def.systems[0].def.outputs[0].name, "imu");

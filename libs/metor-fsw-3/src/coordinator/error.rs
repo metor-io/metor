@@ -73,8 +73,11 @@ pub enum BuildError {
     #[error("type `{ty}` declares an output named `status`, which the coordinator reserves")]
     ReservedPort { ty: String },
 
-    #[error("system `{id}` is async and has no thread yet")]
-    AsyncUnplaced { id: String },
+    #[error("cyclic system `{id}` cannot be placed on thread `{thread}`")]
+    ThreadOnCyclic { id: String, thread: String },
+
+    #[error("thread `{thread}` failed to start")]
+    ThreadStart { thread: String },
 
     #[error("params for `{id}`: {source}")]
     Params {

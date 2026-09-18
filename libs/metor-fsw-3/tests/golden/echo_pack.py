@@ -39,6 +39,21 @@ class Echo(System):
     status: OutPort[SystemStatus]
 
 
+class Relay(System):
+    "Copies every ping."
+
+    _pack = PACK
+    _ty = "relay"
+    _outputs = ("output",)
+
+    def __init__(self, *, input: Sources[Ping] = ()) -> None:
+        super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
 class Boom(System):
     "Fails on its second cycle."
 

@@ -181,6 +181,7 @@ impl SystemTable {
             let ty = system.ty.to_string();
             let entry = TableEntry {
                 def: system.def.clone(),
+                pack: true,
                 doc: system.doc.clone(),
                 schema: system.params.clone(),
                 make: Make::Cyclic(Box::new(move |params, def, inputs, outputs| {

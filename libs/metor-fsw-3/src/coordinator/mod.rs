@@ -23,10 +23,10 @@ pub use config::{Clock, CoordinatorConfig, InputConfig, OutputConfig, PortRef, S
 pub use error::BuildError;
 pub use params::{ParamError, Params};
 pub use run::Step;
-pub(crate) use run::catch_step;
+pub(crate) use run::{catch_step, message_of as panic_message};
 pub use status::SystemStatus;
+pub(crate) use table::{AsyncMakeFn, Make, TableEntry};
 pub use table::{Launch, SystemTable};
-pub(crate) use table::{Make, TableEntry};
 
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {
@@ -39,6 +39,10 @@ struct Entry {
 /// and the rings holding them together.
 pub struct Coordinator {
     entries: Vec<Entry>,
+    /// Dropped after the systems and before the rings, so every background
+    /// thread is stopped while its ports still exist.
+    #[allow(dead_code)]
+    groups: Vec<std::sync::Arc<crate::thread::group::GroupHandle>>,
     clock: Clock,
     /// Start of the simulated timeline, taken at build.
     epoch: Timestamp,

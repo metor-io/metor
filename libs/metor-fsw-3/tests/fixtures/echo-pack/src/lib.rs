@@ -2,9 +2,10 @@
 
 use std::cell::RefCell;
 
+use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::{
-    Input, InputBinding, Output, OutputBinding, PortDef, Record, System, SystemDef, SystemInputs,
-    SystemOutputs, SystemTable, Timestamp, system,
+    Input, InputBinding, Output, OutputBinding, PortDef, Record, Stop, System, SystemDef,
+    SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,31 @@ impl Echo {
         if let Ok(Some(ping)) = input.latest() {
             let n = ping.n;
             let _ = output.write(&Ping { n });
+        }
+    }
+}
+
+/// Copies every ping as it arrives, on a thread inside the pack.
+#[derive(Default)]
+pub struct Relay;
+
+#[system]
+impl Relay {
+    /// Copies every ping.
+    async fn run(
+        &mut self,
+        input: &mut Input<Ping, Notifier>,
+        output: &mut Output<Ping>,
+        stop: Stop,
+    ) {
+        while !stop.is_set() {
+            let ping = futures_lite::future::or(async { input.next().await.ok() }, async {
+                stop.wait().await;
+                None
+            })
+            .await;
+            let Some(ping) = ping else { return };
+            let _ = output.write(&Ping { n: ping.n });
         }
     }
 }
@@ -155,6 +181,7 @@ pub fn pack() -> SystemTable {
     }
     let mut table = SystemTable::new();
     table.register("echo", Echo::default);
+    table.register_async("relay", Relay::default);
     table.register("boom", Boom::default);
     table.register("gain", Gain::new);
     table.register("fail_input", FailInput::default);

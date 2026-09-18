@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 metor-fsw-3 = { path = "../../.." }
+futures-lite = "2"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 

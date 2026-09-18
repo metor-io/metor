@@ -11,6 +11,9 @@ use metor_proto_wkt::LogEvent;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use metor_fsw_3_ring::Notifier;
+
+use crate::async_system::Stop;
 use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::system::{System, SystemDef};
 use crate::{Frame, SystemInputs, SystemOutputs};
@@ -335,6 +338,76 @@ impl Emit {
     }
 }
 
+/// Doubles every sample as it arrives, on a background thread.
+pub struct Relay;
+
+#[crate::system]
+impl Relay {
+    /// Publishes one estimate per sample.
+    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, nav: &mut Output<Nav>, stop: Stop) {
+        while let Some(sample) = next(imu, &stop).await {
+            let _ = nav.write(&Nav {
+                timestamp: sample.timestamp,
+                estimate: sample.sample * 2.0,
+            });
+        }
+    }
+}
+
+/// Reads nothing, so its input mirror fills and drops.
+pub struct Sleeper;
+
+#[crate::system]
+impl Sleeper {
+    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, stop: Stop) {
+        let _ = imu;
+        stop.wait().await;
+    }
+}
+
+/// Panics once it has read one record.
+pub struct AsyncBoom;
+
+#[crate::system]
+impl AsyncBoom {
+    async fn run(&mut self, imu: &mut Input<Imu, Notifier>, stop: Stop) {
+        if next(imu, &stop).await.is_some() {
+            panic!("boom on the background thread");
+        }
+    }
+}
+
+/// Publishes the hash of its thread's id once, then waits for stop.
+pub struct WhoAmI;
+
+#[crate::system]
+impl WhoAmI {
+    async fn run(&mut self, nav: &mut Output<Nav>, stop: Stop) {
+        let _ = nav.write(&Nav {
+            timestamp: Timestamp(0),
+            estimate: thread_id() as f64,
+        });
+        stop.wait().await;
+    }
+}
+
+/// The next sample, or `None` once stop resolves.
+async fn next(imu: &mut Input<Imu, Notifier>, stop: &Stop) -> Option<Imu> {
+    futures_lite::future::or(async { imu.next().await.ok().copied() }, async {
+        stop.wait().await;
+        None
+    })
+    .await
+}
+
+/// This thread's id, hashed into a number a frame can carry.
+fn thread_id() -> u64 {
+    use core::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    hasher.finish() % (1 << 40)
+}
+
 /// Records every log line it is wired to.
 pub struct LogSink(Recorder);
 
@@ -416,6 +489,10 @@ pub fn table(recorder: &Recorder) -> SystemTable {
     let taps = recorder.clone();
     table.register("tap", move || Tap(taps.clone()));
     table.register("emit", || Emit(Imu::new(1, 5.0).as_bytes().to_vec()));
+    table.register_async("relay", || Relay);
+    table.register_async("sleeper", || Sleeper);
+    table.register_async("async_boom", || AsyncBoom);
+    table.register_async("who_am_i", || WhoAmI);
     table
 }
 

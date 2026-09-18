@@ -27,15 +27,13 @@ type SystemMakeFn = dyn Fn(
 
 /// Builds one launchable async system from its params and the mirror rings'
 /// bindings, both owned, so nothing borrowed crosses to the system's thread.
-type AsyncMakeFn = dyn Fn(serde_json::Value, Vec<InputBinding<Notifier>>, Vec<OutputBinding>) -> Box<dyn Launch>
+pub(crate) type AsyncMakeFn = dyn Fn(serde_json::Value, Vec<InputBinding<Notifier>>, Vec<OutputBinding>) -> Box<dyn Launch>
     + Send
     + Sync;
 
 /// How a registered type is bound: on the cycle thread, or on its own.
 pub(crate) enum Make {
     Cyclic(Box<SystemMakeFn>),
-    // The thread adapter binds this; the cycle path only rejects it.
-    #[allow(dead_code)]
     Async(Box<AsyncMakeFn>),
 }
 
@@ -72,6 +70,8 @@ where
 
 pub(crate) struct TableEntry {
     pub def: SystemDef,
+    /// Registered across a pack ABI, so where it runs is the pack's business.
+    pub pack: bool,
     /// The doc comment on the type's `execute`, empty for the trait path.
     pub doc: Cow<'static, str>,
     /// The JSON Schema of the type's params, `None` when it takes none.
@@ -188,6 +188,7 @@ fn entry<S: System + 'static>(
 ) -> TableEntry {
     TableEntry {
         def: S::def(),
+        pack: false,
         doc,
         schema,
         make: Make::Cyclic(Box::new(move |params, def, inputs, outputs| {
@@ -234,6 +235,7 @@ where
     let make = std::sync::Arc::new(make);
     TableEntry {
         def: A::def(),
+        pack: false,
         doc,
         schema,
         make: Make::Async(Box::new(move |params, inputs, outputs| {

@@ -39,6 +39,9 @@ pub struct SystemConfig {
     /// Ports a system with dynamic outputs publishes, named by their record.
     #[serde(default)]
     pub outputs: Vec<OutputConfig>,
+    /// The background thread an async system runs on; `None` is the shared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 
 impl SystemConfig {
@@ -50,6 +53,7 @@ impl SystemConfig {
             params: serde_json::Value::Null,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            thread: None,
         }
     }
 }

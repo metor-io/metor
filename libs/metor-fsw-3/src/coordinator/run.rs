@@ -73,7 +73,7 @@ pub(crate) fn catch_step(slot: &mut Option<Box<dyn Step>>, now: Timestamp) -> bo
     healthy
 }
 
-fn message_of(payload: &(dyn Any + Send)) -> &str {
+pub(crate) fn message_of(payload: &(dyn Any + Send)) -> &str {
     if let Some(text) = payload.downcast_ref::<&str>() {
         return text;
     }

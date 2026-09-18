@@ -12,6 +12,7 @@ mod panic;
 pub mod port;
 pub mod record;
 pub mod system;
+pub mod thread;
 
 #[cfg(test)]
 mod tests;

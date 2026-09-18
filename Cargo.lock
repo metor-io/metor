@@ -5678,6 +5678,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 name = "echo-pack"
 version = "0.14.2"
 dependencies = [
+ "futures-lite 2.6.1",
  "metor-fsw-3",
  "schemars 1.2.1",
  "serde",

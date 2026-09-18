@@ -4,12 +4,15 @@
 //! then allocated the rings with the appropriate reader capacity.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer, checked_region_len};
 use metor_proto::types::Timestamp;
 
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
+use crate::thread::Thread;
+use crate::thread::group::{self, GroupHandle, Member};
 
 use super::config::{CoordinatorConfig, SystemConfig};
 use super::error::BuildError;
@@ -19,6 +22,9 @@ use super::table::{Make, SystemTable, TableEntry};
 use super::{Coordinator, Entry};
 
 const STATUS_PORT: &str = "status";
+
+/// The thread every async system lands on unless its config names another.
+const DEFAULT_THREAD: &str = "default";
 
 struct RingSpec {
     system: String,
@@ -37,6 +43,8 @@ struct PlannedSystem<'a> {
     /// Input ports the type declared; the rest came from the config.
     declared_inputs: usize,
     params: Params<'a>,
+    /// The background thread this system is placed on, if it is async.
+    thread: &'a str,
     base_ring_idx: RingIndex,
     inputs: Vec<Vec<RingIndex>>,
 }
@@ -74,10 +82,11 @@ impl CoordinatorConfig {
         check_ids(&plan)?;
         count_readers(&plan.systems, &mut plan.rings);
         let rings = allocate_rings(&plan.rings, self.ring_depth)?;
-        let entries = bind_rings(&plan, &rings)?;
+        let (entries, groups) = bind_rings(&plan, &rings)?;
 
         Ok(Coordinator {
             entries,
+            groups,
             clock: self.clock,
             epoch: Timestamp::now(),
             cycle: 0,
@@ -114,6 +123,7 @@ fn resolve<'a>(
                 ty: system.ty.clone(),
             })?;
 
+        check_placement(system, entry)?;
         let mut def = entry.def.clone();
         add_dynamic_outputs(system, &mut def, &records)?;
         check_port_names(&system.id, &def)?;
@@ -140,11 +150,26 @@ fn resolve<'a>(
             inputs: vec![Vec::new(); def.inputs.len()],
             def,
             params: Params(&system.params),
+            thread: system.thread.as_deref().unwrap_or(DEFAULT_THREAD),
             base_ring_idx,
         });
     }
     resolve_edges(config, &mut plan, &index)?;
     Ok(plan)
+}
+
+/// Only an async system may name a thread; a pack's placement is its own.
+fn check_placement(system: &SystemConfig, entry: &TableEntry) -> Result<(), BuildError> {
+    let Some(thread) = &system.thread else {
+        return Ok(());
+    };
+    if entry.pack || matches!(entry.make, Make::Async(_)) {
+        return Ok(());
+    }
+    Err(BuildError::ThreadOnCyclic {
+        id: system.id.clone(),
+        thread: thread.clone(),
+    })
 }
 
 fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
@@ -352,30 +377,81 @@ fn allocate_ring(spec: &RingSpec, ring_depth: usize) -> Result<RingBuffer, Build
     Ok(RingBuffer::create_in_memory(config))
 }
 
-fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, BuildError> {
-    plan.systems
+/// One bound system before its group has a thread.
+enum Built {
+    Cyclic(Box<dyn super::Step>),
+    /// The adapter and the index of the group it is placed in.
+    Async(Thread, usize),
+}
+
+fn bind_rings(
+    plan: &Plan<'_>,
+    rings: &[RingBuffer],
+) -> Result<(Vec<Entry>, Vec<Arc<GroupHandle>>), BuildError> {
+    let mut built = Vec::with_capacity(plan.systems.len());
+    let mut placements: Vec<(&str, Vec<Member>)> = Vec::new();
+    for system in &plan.systems {
+        let outputs: Vec<&RingBuffer> = (0..system.def.outputs.len())
+            .map(|i| &rings[system.base_ring_idx + i])
+            .collect();
+        let inputs: Vec<Vec<&RingBuffer>> = system
+            .inputs
+            .iter()
+            .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
+            .collect();
+        built.push(match &system.entry.make {
+            Make::Cyclic(make) => {
+                let step = make(system.params, &system.def, inputs, outputs).map_err(|source| {
+                    BuildError::Params {
+                        id: system.id.to_string(),
+                        source,
+                    }
+                })?;
+                Built::Cyclic(step)
+            }
+            Make::Async(make) => {
+                let (thread, member) = crate::thread::bind(
+                    make,
+                    system.id,
+                    &system.def,
+                    system.params.0.clone(),
+                    inputs,
+                    outputs,
+                );
+                let at = match placements
+                    .iter()
+                    .position(|(name, _)| *name == system.thread)
+                {
+                    Some(at) => at,
+                    None => {
+                        placements.push((system.thread, Vec::new()));
+                        placements.len() - 1
+                    }
+                };
+                placements[at].1.push(member);
+                Built::Async(thread, at)
+            }
+        });
+    }
+
+    let groups = placements
+        .into_iter()
+        .map(|(name, members)| group::spawn(name, members))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let entries = plan
+        .systems
         .iter()
-        .map(|system| {
-            let outputs = (0..system.def.outputs.len())
-                .map(|i| &rings[system.base_ring_idx + i])
-                .collect();
-            let inputs = system
-                .inputs
-                .iter()
-                .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
-                .collect();
-            let Make::Cyclic(make) = &system.entry.make else {
-                return Err(BuildError::AsyncUnplaced {
-                    id: system.id.to_string(),
-                });
-            };
-            let step = make(system.params, &system.def, inputs, outputs).map_err(|source| {
-                BuildError::Params {
-                    id: system.id.to_string(),
-                    source,
+        .zip(built)
+        .map(|(system, built)| {
+            let step: Box<dyn super::Step> = match built {
+                Built::Cyclic(step) => step,
+                Built::Async(mut thread, at) => {
+                    thread.place(groups[at].clone());
+                    Box::new(thread)
                 }
-            })?;
-            Ok(Entry {
+            };
+            Entry {
                 name: system.id.to_string(),
                 step: Some(step),
                 // PANIC Safety: SystemStatus requires only eight-byte alignment.
@@ -384,9 +460,10 @@ fn bind_rings(plan: &Plan<'_>, rings: &[RingBuffer]) -> Result<Vec<Entry>, Build
                     ring.writer(NoWake).expect("one writer per output ring")
                 })
                 .expect("supported status alignment"),
-            })
+            }
         })
-        .collect()
+        .collect();
+    Ok((entries, groups))
 }
 
 impl RingSpec {

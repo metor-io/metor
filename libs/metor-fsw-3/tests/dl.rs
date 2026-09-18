@@ -139,7 +139,7 @@ fn a_pack_reports_its_systems_with_their_ports_and_schemas() {
     let types: Vec<_> = pack.systems().map(|s| s.ty.as_str()).collect();
     assert_eq!(
         types,
-        vec!["echo", "boom", "gain", "fail_input", "retained"]
+        vec!["echo", "relay", "boom", "gain", "fail_input", "retained"]
     );
 
     let echo = pack.systems().next().expect("one system");
@@ -194,6 +194,24 @@ fn a_pack_system_moves_a_record_within_one_cycle() {
     coordinator.step(Timestamp(2));
     assert_eq!(*seen.borrow(), vec![1, 2]);
     assert_eq!(coordinator.latched().count(), 0);
+}
+
+#[test]
+fn a_pack_async_system_relays_a_record_from_its_own_thread() {
+    let (mut coordinator, seen, _pack) = built("relay", serde_json::Value::Null);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut cycle = 0;
+    while seen.borrow().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pack never relayed"
+        );
+        cycle += 1;
+        coordinator.step(Timestamp(cycle));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(coordinator.latched().count(), 0);
+    assert_eq!(&seen.borrow()[..2], &[1, 2]);
 }
 
 #[test]

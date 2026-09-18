@@ -165,12 +165,15 @@ unsafe fn make(
         let entry = table
             .get(ty)
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
-        let crate::coordinator::Make::Cyclic(make) = &entry.make else {
-            return Err(ParamError::Decode(format!(
-                "system type `{ty}` is async and has no thread yet"
-            )));
-        };
-        make(Params(&value), &def, views, writers)
+        match &entry.make {
+            crate::coordinator::Make::Cyclic(make) => make(Params(&value), &def, views, writers),
+            // A pack's async system runs on a thread inside the pack; the host
+            // sees an ordinary step and its `thread` placement is ignored.
+            crate::coordinator::Make::Async(make) => {
+                crate::thread::Thread::alone(make, ty, &def, value.clone(), views, writers)
+                    .map(|thread| Box::new(thread) as Box<dyn Step>)
+            }
+        }
     })
 }
 
