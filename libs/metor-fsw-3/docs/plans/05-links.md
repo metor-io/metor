@@ -502,12 +502,14 @@ ring.
 6. Retained snapshot messages (fsw-2 sent the wiring manifest on
    connect) are absent. The panel gets topology from the config file for
    now; a config-announce message can follow without changing the link.
-7. Component ids root at the port's name, not the frame's, so they
-   diverge from fsw-2 wherever the two differ. The shipped code does
-   this; whether it is what a target wants is not settled. The
-   alternative is rooting at the record name, which keeps fsw-2 layouts
-   working and loses the ability to publish one record from two ports
-   under two names.
+7. Decided 2026-09-18: component ids root at the port's name,
+   `{namespace}.{producer}.{port}.{field}`, not the frame's. Two ports of
+   one record on one system announce as two tables, and a name says
+   where its data came from. fsw-2 layouts keyed by a frame name that
+   differs from its port name are re-keyed. A frame subscription in
+   slice 7 references a `Publish` port, so its output takes the source
+   port's name and binds the announced table id; messages stay routed
+   by record id.
 8. Wall stamps under a simulated clock: `link_status`, async log lines,
    and anything else an async system stamps take `Timestamp::now()`,
    while every record on the graph carries the cycle's time, so a

@@ -68,4 +68,8 @@ the guest-allocates-rings protocol and per-call fuel
 ## 7. Deployments and gateway
 
 `Deployment` of several targets, `Publish` and `Subscribe` mirrors, and
-the gateway target with the embedded db.
+the gateway target with the embedded db. Frame subscription lands here:
+`Subscribe([publish.nav.est])` references a peer's `Publish` port, the
+output takes that port's name and record, and routing binds the
+announced table id (`05-links.md`, decision 7). A dialed `Subscribe`
+toward a db peer needs a `MsgStream` request per id.
