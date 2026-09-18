@@ -4,20 +4,88 @@
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+
 use metor_proto::types::OwnedPacket;
 use metor_proto_stellar::PacketStream;
 use stellarator::JoinHandleDropGuard;
-use stellarator::buf::Slice;
-use stellarator::io::{AsyncWrite, OwnedReader, OwnedWriter, SplitExt};
+use stellarator::buf::{IoBuf, IoBufMut, Slice};
+use stellarator::io::{AsyncWrite, GrowableBuf, OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
 
-/// A connection's first receive buffer; `next_grow` grows it to the largest
-/// packet the peer sends.
-const RECV_BUF: usize = 1024;
+/// A connection's first receive buffer, and the smallest cap a link may set.
+pub(crate) const RECV_BUF: usize = 1024;
 
 /// One inbound packet, borrowed by a connection's read half.
-pub(crate) type Packet = OwnedPacket<Slice<Vec<u8>>>;
+pub(crate) type Packet = OwnedPacket<Slice<Capped>>;
+
+/// A receive buffer that never grows past its cap, so the length prefix a peer
+/// sends cannot pick the size of a link's allocation.
+///
+/// Refusing to grow empties the buffer, which fails the read that follows and
+/// closes the connection.
+pub(crate) struct Capped {
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl Capped {
+    /// A buffer of [`RECV_BUF`] bytes, growable to `cap` and no further.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            buf: vec![0u8; RECV_BUF],
+            cap: cap.max(RECV_BUF),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Capped {
+    /// A buffer already holding `bytes`, for a test framing its own packet.
+    pub(crate) fn filled(bytes: Vec<u8>) -> Self {
+        let cap = bytes.len();
+        Self { buf: bytes, cap }
+    }
+}
+
+impl GrowableBuf for Capped {
+    fn grow(&mut self, new_len: usize) {
+        match new_len > self.cap {
+            true => self.buf.clear(),
+            false if new_len > self.buf.len() => self.buf.resize(new_len, 0),
+            false => {}
+        }
+    }
+}
+
+// SAFETY: every method delegates to the `Vec` this buffer owns.
+unsafe impl IoBuf for Capped {
+    fn stable_init_ptr(&self) -> *const u8 {
+        self.buf.stable_init_ptr()
+    }
+
+    fn init_len(&self) -> usize {
+        self.buf.init_len()
+    }
+
+    fn total_len(&self) -> usize {
+        self.buf.total_len()
+    }
+}
+
+// SAFETY: as above.
+unsafe impl IoBufMut for Capped {
+    fn stable_mut_ptr(&mut self) -> NonNull<MaybeUninit<u8>> {
+        self.buf.stable_mut_ptr()
+    }
+
+    unsafe fn set_init(&mut self, len: usize) {
+        // SAFETY: the caller promises `len` bytes of the `Vec` are initialized.
+        unsafe { self.buf.set_init(len) }
+    }
+}
 
 /// An `Outbox` is the queue between the link and one connection's writer:
 /// the link fills it, the writer swaps it out. Both run on one executor, so
@@ -92,17 +160,23 @@ struct Open {
 pub(crate) struct Connections {
     slots: Vec<Option<Open>>,
     cap: usize,
+    recv_cap: usize,
+    /// Woken by every connection that ends, so a link notices without traffic.
+    ended: Rc<WaitQueue>,
     /// Bytes written by connections that have since closed.
     bytes_out: u64,
     batches_dropped: u64,
 }
 
 impl Connections {
-    /// `count` slots, each connection with a `cap`-byte outbox.
-    pub(crate) fn new(count: usize, cap: usize) -> Self {
+    /// `count` slots, each connection with a `cap`-byte outbox and a receive
+    /// buffer of at most `recv_cap` bytes.
+    pub(crate) fn new(count: usize, cap: usize, recv_cap: usize) -> Self {
         Self {
             slots: (0..count).map(|_| None).collect(),
             cap,
+            recv_cap,
+            ended: Rc::new(WaitQueue::new()),
             bytes_out: 0,
             batches_dropped: 0,
         }
@@ -111,6 +185,18 @@ impl Connections {
     /// Whether another connection would find a slot.
     pub(crate) fn has_free(&self) -> bool {
         self.slots.iter().any(Option::is_none)
+    }
+
+    /// Resolves once a connection has ended, its slot still waiting to be pruned.
+    pub(crate) async fn ended(&self) {
+        let _ = self.ended.wait_for(|| self.any_closed()).await;
+    }
+
+    fn any_closed(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|open| open.outbox.closed.get())
     }
 
     /// Frees the slots whose connection ended, keeping their byte counts.
@@ -140,7 +226,16 @@ impl Connections {
         };
         let outbox = Rc::new(Outbox::new(self.cap));
         let (rx, tx) = stream.split();
-        let task = stellarator::spawn(serve(outbox.clone(), rx, tx, seed, on_packet)).drop_guard();
+        let serving = serve(
+            outbox.clone(),
+            self.ended.clone(),
+            rx,
+            tx,
+            seed,
+            Capped::new(self.recv_cap),
+            on_packet,
+        );
+        let task = stellarator::spawn(serving).drop_guard();
         *slot = Some(Open {
             outbox,
             _task: task,
@@ -171,13 +266,16 @@ impl Connections {
 /// One connection's life: the halves race, and either one ending closes it.
 async fn serve(
     outbox: Rc<Outbox>,
+    ended: Rc<WaitQueue>,
     rx: OwnedReader<TcpStream>,
     tx: OwnedWriter<TcpStream>,
     seed: Vec<u8>,
+    buf: Capped,
     on_packet: impl FnMut(&Packet),
 ) {
-    futures_lite::future::or(write_half(&outbox, tx, seed), read_half(rx, on_packet)).await;
+    futures_lite::future::or(write_half(&outbox, tx, seed), read_half(rx, buf, on_packet)).await;
     outbox.close();
+    ended.wake_all();
 }
 
 /// Writes the seed, then every batch the link queues, one buffer at a time.
@@ -202,9 +300,11 @@ async fn write_half(outbox: &Outbox, tx: OwnedWriter<TcpStream>, seed: Vec<u8>) 
 }
 
 /// Reads packets until the peer errors or hangs up, reusing one buffer.
-async fn read_half(rx: OwnedReader<TcpStream>, mut on_packet: impl FnMut(&Packet)) {
+///
+/// A packet past the buffer's cap is a read error, so it ends the connection.
+async fn read_half(rx: OwnedReader<TcpStream>, buf: Capped, mut on_packet: impl FnMut(&Packet)) {
     let mut stream = PacketStream::new(rx);
-    let mut buf = vec![0u8; RECV_BUF];
+    let mut buf = buf;
     loop {
         let Ok(packet) = stream.next_grow(buf).await else {
             return;
@@ -250,7 +350,7 @@ mod tests {
 
     #[test]
     fn a_link_with_no_connections_queues_nothing_and_counts_nothing() {
-        let mut conns = Connections::new(2, 16);
+        let mut conns = Connections::new(2, 16, RECV_BUF);
         assert!(conns.has_free());
         conns.enqueue(b"batch");
         assert_eq!(
@@ -267,7 +367,7 @@ mod tests {
     async fn a_full_slot_list_refuses_the_next_connection() {
         let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
         let addr = listener.local_addr().expect("bound");
-        let mut conns = Connections::new(1, 64);
+        let mut conns = Connections::new(1, 64, RECV_BUF);
         for expected in [true, false] {
             let client = TcpStream::connect(addr).await.expect("the listener is up");
             let served = listener.accept().await.expect("a connection");
@@ -282,7 +382,7 @@ mod tests {
     async fn a_closed_connection_frees_its_slot_and_keeps_its_bytes() {
         let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
         let addr = listener.local_addr().expect("bound");
-        let mut conns = Connections::new(1, 64);
+        let mut conns = Connections::new(1, 64, RECV_BUF);
         let client = TcpStream::connect(addr).await.expect("the listener is up");
         let served = listener.accept().await.expect("a connection");
         assert!(conns.open(served, b"seed".to_vec(), |_| {}));

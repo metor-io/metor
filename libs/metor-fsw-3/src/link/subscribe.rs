@@ -89,18 +89,24 @@ impl Subscribe {
             false => Vec::new(),
         };
         let inbox = Rc::new(Inbox::new(ids, self.inbound_cap, max_len));
-        let mut conns = Connections::new(endpoint.slots(), self.pending_cap);
+        let mut conns = Connections::new(
+            endpoint.slots(),
+            self.pending_cap,
+            max_len + wire::PACKET_OVERHEAD,
+        );
         let (incoming, _source) = incoming(endpoint, stop.clone());
         incoming.want();
         let mut dropped = 0;
         let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
         loop {
-            match next(&incoming, &inbox, &stop).await {
+            let event = next(&incoming, &inbox, &conns, &stop).await;
+            match event {
                 Event::Connected(stream) => {
                     let inbox = inbox.clone();
                     conns.open(stream, seed.clone(), move |packet| inbox.accept(packet));
                 }
                 Event::Inbound => dropped += deliver(&inbox, &mut ports),
+                Event::Closed => {}
                 Event::Stop => return,
             }
             conns.prune();
@@ -173,21 +179,27 @@ fn deliver(inbox: &Inbox, ports: &mut [(PacketId, &mut Output<Bytes>)]) -> u64 {
 enum Event {
     Connected(stellarator::net::TcpStream),
     Inbound,
+    Closed,
     Stop,
 }
 
-/// The first of a connection, a packet, and the stop.
-async fn next(incoming: &Incoming, inbox: &Inbox, stop: &Stop) -> Event {
+/// The first of a connection, a packet, a connection ending, and the stop.
+async fn next(incoming: &Incoming, inbox: &Inbox, conns: &Connections, stop: &Stop) -> Event {
     let connected = async { Event::Connected(incoming.next().await) };
     let inbound = async {
         inbox.stirred().await;
         Event::Inbound
     };
+    let closed = async {
+        conns.ended().await;
+        Event::Closed
+    };
     let stopped = async {
         stop.wait().await;
         Event::Stop
     };
-    futures_lite::future::or(futures_lite::future::or(connected, inbound), stopped).await
+    let first = futures_lite::future::or(connected, inbound);
+    futures_lite::future::or(futures_lite::future::or(first, closed), stopped).await
 }
 
 /// One inbound packet, copied out of a connection's buffer.
@@ -313,7 +325,9 @@ mod tests {
         let mut bytes = vec![ty as u8, id[0], id[1], 0];
         bytes.extend_from_slice(payload);
         let len = bytes.len();
-        let buf = metor_proto::buf::IoBuf::try_slice(bytes, 0..len).expect("the whole buffer");
+        let buf =
+            metor_proto::buf::IoBuf::try_slice(crate::link::conn::Capped::filled(bytes), 0..len)
+                .expect("the whole buffer");
         OwnedPacket::parse_with_offset(buf, 0).expect("a framed packet")
     }
 

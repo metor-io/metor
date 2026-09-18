@@ -11,7 +11,7 @@ use crate::port::{DynInputs, Output};
 use crate::system::PortDef;
 use crate::{Stop, system};
 
-use super::conn::Connections;
+use super::conn::{self, Connections};
 use super::transport::{Endpoint, Transport, incoming};
 use super::wire::{self, Wire};
 use super::{LinkStatus, pending_cap};
@@ -73,13 +73,14 @@ impl Publish {
         if let Some(addr) = endpoint.local_addr() {
             log.info(format!("listening on {addr}"));
         }
-        let mut conns = Connections::new(endpoint.slots(), self.pending_cap);
+        let mut conns = Connections::new(endpoint.slots(), self.pending_cap, conn::RECV_BUF);
         let (incoming, _source) = incoming(endpoint, stop.clone());
         incoming.want();
         let mut batch = Vec::with_capacity(batch_cap(&defs));
         let mut reported = LinkStatus::new(Timestamp(0), Default::default(), 0);
         loop {
-            match next(&incoming, inputs, &stop).await {
+            let event = next(&incoming, inputs, &conns, &stop).await;
+            match event {
                 Event::Connected(stream) => {
                     conns.open(stream, blob.clone(), |_| {});
                 }
@@ -90,6 +91,7 @@ impl Publish {
                         conns.enqueue(&batch);
                     }
                 }
+                Event::Closed => {}
                 Event::Stop => return,
             }
             conns.prune();
@@ -122,13 +124,15 @@ fn report_collisions(log: &mut Log, defs: &[PortDef], wire: &[Option<Wire>]) {
 enum Event {
     Connected(stellarator::net::TcpStream),
     Ready,
+    Closed,
     Stop,
 }
 
-/// The first of a connection, a record, and the stop.
+/// The first of a connection, a record, a connection ending, and the stop.
 async fn next(
     incoming: &super::transport::Incoming,
     inputs: &mut DynInputs<Notifier>,
+    conns: &Connections,
     stop: &Stop,
 ) -> Event {
     let connected = async { Event::Connected(incoming.next().await) };
@@ -136,11 +140,16 @@ async fn next(
         inputs.any_ready().await;
         Event::Ready
     };
+    let closed = async {
+        conns.ended().await;
+        Event::Closed
+    };
     let stopped = async {
         stop.wait().await;
         Event::Stop
     };
-    futures_lite::future::or(futures_lite::future::or(connected, ready), stopped).await
+    let first = futures_lite::future::or(connected, ready);
+    futures_lite::future::or(futures_lite::future::or(first, closed), stopped).await
 }
 
 /// Appends one packet per waiting record, in port order.

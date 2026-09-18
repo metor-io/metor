@@ -19,12 +19,12 @@ use metor_fsw_3::coordinator::{
 use metor_fsw_3::link::register_builtins;
 use metor_fsw_3::{Clock, Frame, Input, LinkStatus, Output, Timestamp, system};
 use metor_proto::types::{IntoLenPacket, LenPacket, Msg, OwnedPacket};
-use metor_proto_stellar::{PacketStream, Peer, identify};
+use metor_proto_stellar::{PacketSink, PacketStream, Peer, identify};
 use metor_proto_wkt::LogEvent;
 use metor_proto_wkt::{SetComponentMetadata, VTableMsg};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use stellarator::io::{OwnedReader, SplitExt};
+use stellarator::io::{AsyncWrite, OwnedReader, SplitExt};
 use stellarator::net::TcpStream;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -261,6 +261,18 @@ async fn dial(addr: SocketAddr) -> Peer {
     loop {
         match identify(addr).await {
             Ok(peer) => return peer,
+            Err(e) => assert!(Instant::now() < deadline, "never came up: {e}"),
+        }
+        stellarator::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Connects until the target's listener is up, without a handshake.
+async fn raw_dial(addr: SocketAddr) -> TcpStream {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return stream,
             Err(e) => assert!(Instant::now() < deadline, "never came up: {e}"),
         }
         stellarator::sleep(Duration::from_millis(5)).await;
@@ -526,6 +538,110 @@ async fn a_dialing_subscribe_receives_the_records_a_publish_serves() {
     let pings = client.pings();
     let steps: Vec<u32> = pings.windows(2).map(|w| w[1] - w[0]).collect();
     assert!(steps.iter().all(|step| *step == 1), "{pings:?}");
+}
+
+#[stellarator::test]
+async fn a_length_prefix_past_the_receive_cap_closes_the_connection() {
+    let addr = free_port();
+    let seen = Seen::default();
+    let _target = spawn(
+        vec![
+            SystemConfig::new("imu", "source"),
+            publish(json!({ "listen": { "addr": addr.to_string() } }), 1 << 20),
+            reading(
+                "status",
+                "status_sink",
+                "link_status",
+                PortRef::new("pub", "link_status"),
+            ),
+        ],
+        &seen,
+        500.0,
+    );
+
+    let peer = raw_dial(addr).await;
+    until("the link never took the connection", || {
+        seen.status().is_some_and(|s| s.connections == 1)
+    })
+    .await;
+
+    // Four gigabytes the link must refuse rather than allocate.
+    let (written, _) = peer.write_all(u32::MAX.to_le_bytes().to_vec()).await;
+    written.expect("the link takes the prefix");
+    until("the link kept a connection it cannot serve", || {
+        seen.status().is_some_and(|s| s.connections == 0)
+    })
+    .await;
+}
+
+#[stellarator::test]
+async fn a_peer_that_hangs_up_frees_the_only_slot_for_the_next_one() {
+    let addr = free_port();
+    let seen = Seen::default();
+    let _target = spawn(
+        vec![
+            subscribe(json!({ "listen": { "addr": addr.to_string(), "max_connections": 1 } })),
+            reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
+        ],
+        &seen,
+        500.0,
+    );
+
+    // A peer that takes the slot and leaves without ever sending a command.
+    let Peer::Fsw { rx, tx, .. } = dial(addr).await else {
+        panic!("a subscribe is an fsw link")
+    };
+    drop((rx, tx));
+
+    // Nothing else stirs the link, so only the hang-up can free the slot.
+    let Peer::Fsw { tx, .. } = dial(addr).await else {
+        panic!("a subscribe is an fsw link")
+    };
+    tx.send((&Ping { n: 3 }).into_len_packet())
+        .await
+        .0
+        .expect("the link takes commands");
+    until("the second peer never reached the consumer", || {
+        seen.pings().contains(&3)
+    })
+    .await;
+}
+
+#[stellarator::test]
+async fn a_dialing_subscribe_redials_a_peer_that_comes_back() {
+    let listener = stellarator::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let addr = listener.local_addr().expect("bound");
+    let seen = Seen::default();
+    let _target = spawn(
+        vec![
+            subscribe(json!({ "connect": { "addr": addr.to_string() } })),
+            reading("sink", "ping_sink", "ping", PortRef::new("cmds", "ping")),
+        ],
+        &seen,
+        500.0,
+    );
+
+    drop(listener.accept().await.expect("the link dials"));
+    drop(listener);
+
+    // The peer comes back on the same address; only a redial reaches it.
+    let listener = stellarator::net::TcpListener::bind(addr).expect("the peer's address");
+    let peer = futures_lite::future::or(async { listener.accept().await.ok() }, async {
+        stellarator::sleep(DEADLINE).await;
+        None
+    })
+    .await
+    .expect("the link never redialed");
+    let (_rx, tx) = peer.split();
+    PacketSink::new(tx)
+        .send((&Ping { n: 5 }).into_len_packet())
+        .await
+        .0
+        .expect("the redialed link takes commands");
+    until("the redialed link never routed a command", || {
+        seen.pings().contains(&5)
+    })
+    .await;
 }
 
 /// A `Publish` dialing `addr`, serving `imu.imu` and logging onto `pub.log`.
