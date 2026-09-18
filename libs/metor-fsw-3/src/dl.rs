@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use libloading::Library;
 use metor_proto::types::Timestamp;
 
-use crate::coordinator::{Make, ParamError, Step, SystemTable, TableEntry};
-use crate::pack::def::{PackDef, PackSystemDef};
+use crate::coordinator::{ParamError, Step, SystemTable, TableEntry};
+use crate::pack::def::{Instance, PackDef, PackSystemDef};
 use crate::pack::raw::{RawPort, RawRing, RawSlice};
 use crate::pack::{ABI_VERSION, DefStatus, Status};
 
@@ -181,16 +181,20 @@ impl SystemTable {
             let ty = system.ty.to_string();
             let entry = TableEntry {
                 def: system.def.clone(),
-                pack: true,
                 doc: system.doc.clone(),
                 schema: system.params.clone(),
-                make: Make::Cyclic(Box::new(move |params, def, inputs, outputs| {
+                make: Box::new(move |params, def, inputs, outputs, cx| {
                     let params = serde_json::to_vec(params.0)
                         .map_err(|e| ParamError::Decode(e.to_string()))?;
                     // The instance def, so the pack binds the ports the host
-                    // resolved, including any the config added.
-                    let def =
-                        serde_json::to_vec(def).map_err(|e| ParamError::Decode(e.to_string()))?;
+                    // resolved, including any the config added, and places the
+                    // system on the thread the config named.
+                    let instance = Instance {
+                        def: def.clone(),
+                        thread: cx.thread.to_string(),
+                    };
+                    let def = serde_json::to_vec(&instance)
+                        .map_err(|e| ParamError::Decode(e.to_string()))?;
                     let input_owners: Vec<Vec<_>> = inputs
                         .iter()
                         .map(|rings| rings.iter().map(|ring| ring.export()).collect())
@@ -224,7 +228,7 @@ impl SystemTable {
                         lib: lib.clone(),
                         latched: false,
                     }))
-                })),
+                }),
             };
             self.insert(&format!("{id}.{}", system.ty), entry);
         }

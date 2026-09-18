@@ -25,8 +25,8 @@ pub use params::{ParamError, Params};
 pub use run::Step;
 pub(crate) use run::{catch_step, message_of as panic_message};
 pub use status::SystemStatus;
-pub(crate) use table::{AsyncMakeFn, Make, TableEntry};
-pub use table::{Launch, SystemTable};
+pub(crate) use table::TableEntry;
+pub use table::{MakeCx, SystemTable};
 
 /// One bound system and the status port the coordinator owns for it.
 struct Entry {
@@ -39,10 +39,10 @@ struct Entry {
 /// and the rings holding them together.
 pub struct Coordinator {
     entries: Vec<Entry>,
-    /// Dropped after the systems and before the rings, so every background
-    /// thread is stopped while its ports still exist.
+    /// The named groups build placed async systems on, held weakly: each
+    /// adapter owns its group, so a thread stops when its systems drop.
     #[allow(dead_code)]
-    groups: Vec<std::sync::Arc<crate::thread::group::GroupHandle>>,
+    threads: crate::thread::Threads,
     clock: Clock,
     /// Start of the simulated timeline, taken at build.
     epoch: Timestamp,

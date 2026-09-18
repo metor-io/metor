@@ -599,17 +599,18 @@ fn an_async_block_declares_the_same_ports_as_its_cyclic_twin() {
     assert_eq!(relay.name, "relay");
 }
 
-#[stellarator::test]
-async fn a_registered_async_system_runs_until_its_stop() {
-    use crate::async_system::stop_pair;
-    use crate::coordinator::Make;
-    use crate::system::{InputBinding, OutputBinding};
+/// A registered async system builds on its own thread and relays through the
+/// adapter the cycle thread steps.
+#[test]
+fn a_registered_async_system_relays_through_its_adapter() {
+    use crate::coordinator::MakeCx;
+    use crate::thread::{DEFAULT_THREAD, Threads};
     use metor_fsw_3_ring::{Config, NoWake, RingBuffer};
 
     fn ring<R: Record + ?Sized>() -> RingBuffer {
         RingBuffer::create_in_memory(Config {
             capacity: ring_capacity(R::MAX_LEN, 8).expect("valid capacity"),
-            max_readers: 1,
+            max_readers: 2,
         })
     }
 
@@ -617,49 +618,44 @@ async fn a_registered_async_system_runs_until_its_stop() {
     table.register_async("relay", || Relay);
     let entry = table.get("relay").expect("registered");
     assert_eq!(entry.def.inputs, vec![Input::<Imu>::def("imu")]);
-    let Make::Async(make) = &entry.make else {
-        panic!("an async registration");
-    };
 
-    let wake = Notifier::default();
     let (imu, nav, log) = (ring::<Imu>(), ring::<Nav>(), ring::<LogEvent>());
-    let mut source = Output::<Imu, _>::try_new(imu.writer(wake.clone()).expect("free writer"))
+    let mut source = Output::<Imu, _>::try_new(imu.writer(NoWake).expect("free writer"))
         .expect("supported alignment");
     let mut estimates = Input::<Nav>::try_new(vec![nav.view(NoWake).expect("free slot")])
         .expect("supported alignment");
     let mut lines = Input::<LogEvent>::try_new(vec![log.view(NoWake).expect("free slot")])
         .expect("supported alignment");
-    let launch = make(
-        json!(null),
-        vec![InputBinding {
-            def: Input::<Imu>::def("imu"),
-            views: vec![imu.view(wake.clone()).expect("free slot")],
-        }],
-        vec![
-            OutputBinding {
-                def: Output::<Nav>::def("nav"),
-                writer: nav.writer(NoWake).expect("free writer"),
-            },
-            OutputBinding {
-                def: Output::<LogEvent>::def("log"),
-                writer: log.writer(NoWake).expect("free writer"),
-            },
-        ],
-    );
-    let (handle, stop) = stop_pair();
-    let task = stellarator::spawn(launch.launch(stop).expect("no params"));
+
+    let mut threads = Threads::new();
+    let def = entry.def.clone();
+    let mut step = (entry.make)(
+        crate::coordinator::Params(&json!(null)),
+        &def,
+        vec![vec![&imu]],
+        vec![&nav, &log],
+        &mut MakeCx {
+            thread: DEFAULT_THREAD,
+            threads: &mut threads,
+        },
+    )
+    .expect("no params");
 
     source.write(&Imu::new(3, 2.0)).expect("ring has room");
-    while estimates.latest().expect("valid").is_none() {
-        stellarator::yield_now().await;
-    }
-    assert_eq!(
-        estimates.latest().expect("valid").expect("record").estimate,
-        4.0
-    );
-    let seen: Vec<_> = lines.drain().map(|l| l.expect("decodes").message).collect();
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+    let mut seen = Vec::new();
+    let estimate = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the thread never relayed"
+        );
+        step.execute(Timestamp(1));
+        seen.extend(lines.drain().map(|l| l.expect("decodes").message));
+        if let Some(nav) = estimates.latest().expect("valid") {
+            break nav.estimate;
+        }
+        std::thread::sleep(core::time::Duration::from_millis(1));
+    };
+    assert_eq!(estimate, 4.0);
     assert!(seen.contains(&"relaying".into()), "{seen:?}");
-
-    handle.stop();
-    task.await.expect("the task ended");
 }

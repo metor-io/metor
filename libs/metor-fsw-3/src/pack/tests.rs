@@ -45,7 +45,11 @@ fn instance_def(ty: &str) -> Vec<u8> {
         .get(ty)
         .map(|entry| entry.def.clone())
         .unwrap_or_else(|| crate::SystemDef::new::<(), ()>("unknown"));
-    serde_json::to_vec(&def).expect("encodes")
+    let instance = crate::pack::def::Instance {
+        def,
+        thread: crate::thread::DEFAULT_THREAD.to_string(),
+    };
+    serde_json::to_vec(&instance).expect("encodes")
 }
 
 /// Calls `create` the way an export does, returning the instance or the error.

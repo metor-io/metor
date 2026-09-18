@@ -4,19 +4,93 @@
 pub(crate) mod group;
 #[cfg(test)]
 mod tests;
+mod threads;
 
 use std::borrow::Cow;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use metor_fsw_3_ring::{Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 
-use crate::coordinator::{AsyncMakeFn, ParamError, Step};
+use crate::async_system::{AsyncSystem, Running, Stop};
+use crate::coordinator::{MakeCx, ParamError, Params, Step};
 use crate::record::Record;
-use crate::system::{InputBinding, OutputBinding, SystemDef};
+use crate::system::{InputBinding, OutputBinding, SystemDef, SystemInputs, SystemOutputs};
 
 use group::{GroupHandle, Member, Panicked};
+
+pub use threads::Threads;
+
+/// The thread every async system lands on unless its config names another.
+pub const DEFAULT_THREAD: &str = "default";
+
+/// A `Launch` constructs one async system on the thread that will run it.
+pub(crate) trait Launch: Send {
+    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError>;
+}
+
+/// One async system's ingredients, owned until its thread constructs it.
+struct AsyncLaunch<A: AsyncSystem, M> {
+    make: Arc<M>,
+    params: serde_json::Value,
+    inputs: Vec<InputBinding<Notifier>>,
+    outputs: Vec<OutputBinding>,
+    _a: PhantomData<fn() -> A>,
+}
+
+impl<A, M> Launch for AsyncLaunch<A, M>
+where
+    A: AsyncSystem + 'static,
+    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+{
+    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
+        let (system, mut state) = (self.make)(Params(&self.params))?;
+        let mut inputs = A::Inputs::bind(self.inputs);
+        let mut outputs = A::Outputs::bind(self.outputs);
+        Ok(Box::pin(async move {
+            system
+                .run(&mut state, &mut inputs, &mut outputs, stop)
+                .await;
+        }))
+    }
+}
+
+/// Places one async system on the group `cx` names: mirrors for its ports, the
+/// system built and running on that group's thread, and the adapter that
+/// copies between them each cycle.
+pub(crate) fn place<A, M>(
+    make: Arc<M>,
+    params: serde_json::Value,
+    def: &SystemDef,
+    inputs: Vec<Vec<&RingBuffer>>,
+    outputs: Vec<&RingBuffer>,
+    cx: &mut MakeCx<'_>,
+) -> Result<Box<dyn Step>, ParamError>
+where
+    A: AsyncSystem + 'static,
+    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
+{
+    let (mut thread, bound_in, bound_out) = bind(def, inputs, outputs);
+    let member = Member {
+        launch: Box::new(AsyncLaunch::<A, M> {
+            make,
+            params,
+            inputs: bound_in,
+            outputs: bound_out,
+            _a: PhantomData,
+        }),
+        panicked: thread.panicked.clone(),
+    };
+    let group = cx
+        .threads
+        .get_or_spawn(cx.thread)
+        .map_err(|e| ParamError::Decode(e.to_string()))?;
+    group.add(member)?;
+    thread.group = Some(group);
+    Ok(Box::new(thread))
+}
 
 /// How much deeper a mirror ring is than the ring it mirrors.
 const MIRROR_FACTOR: usize = 4;
@@ -161,16 +235,13 @@ impl Thread {
     }
 }
 
-/// Binds one async system: mirrors for its ports, the adapter for the cycle
-/// thread, and the launch its thread will construct it from.
-pub(crate) fn bind(
-    make: &AsyncMakeFn,
-    id: &str,
+/// Mirrors every port of one async system, returning the adapter for the cycle
+/// thread and the bindings its own thread reads and writes.
+fn bind(
     def: &SystemDef,
-    params: serde_json::Value,
     inputs: Vec<Vec<&RingBuffer>>,
     outputs: Vec<&RingBuffer>,
-) -> (Thread, Member) {
+) -> (Thread, Vec<InputBinding<Notifier>>, Vec<OutputBinding>) {
     let wake = Notifier::default();
     let mut edges = Vec::new();
     let mut bound_in = Vec::with_capacity(def.inputs.len());
@@ -220,35 +291,7 @@ pub(crate) fn bind(
         latched: false,
         group: None,
     };
-    let member = Member {
-        id: id.to_string(),
-        launch: make(params, bound_in, bound_out),
-        panicked: thread.panicked.clone(),
-    };
-    (thread, member)
-}
-
-impl Thread {
-    /// Keeps the group alive for as long as this adapter is bound.
-    pub(crate) fn place(&mut self, group: Arc<GroupHandle>) {
-        self.group = Some(group);
-    }
-
-    /// Binds one async system on a private thread of its own, for a pack.
-    pub(crate) fn alone(
-        make: &AsyncMakeFn,
-        id: &str,
-        def: &SystemDef,
-        params: serde_json::Value,
-        inputs: Vec<Vec<&RingBuffer>>,
-        outputs: Vec<&RingBuffer>,
-    ) -> Result<Self, ParamError> {
-        let (mut thread, member) = bind(make, id, def, params, inputs, outputs);
-        let group =
-            group::spawn(id, vec![member]).map_err(|e| ParamError::Decode(e.to_string()))?;
-        thread.place(group);
-        Ok(thread)
-    }
+    (thread, bound_in, bound_out)
 }
 
 /// A ring of the same records as `real`, several times as deep.

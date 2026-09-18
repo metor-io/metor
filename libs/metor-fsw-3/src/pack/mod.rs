@@ -9,8 +9,9 @@ use metor_fsw_3_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 use tracing_subscriber::layer::SubscriberExt;
 
-use crate::coordinator::{ParamError, Params, Step, SystemTable, catch_step};
-use def::PackDef;
+use crate::coordinator::{MakeCx, ParamError, Params, Step, SystemTable, catch_step};
+use crate::thread::Threads;
+use def::{Instance, PackDef};
 use raw::{RawPort, RawRing, RawSlice};
 
 /// The ABI the exports in this module are built against.
@@ -46,6 +47,8 @@ pub enum DefStatus {
 
 thread_local! {
     static TABLE: OnceCell<SystemTable> = const { OnceCell::new() };
+    /// The groups this pack runs its own async systems on.
+    static THREADS: RefCell<Threads> = RefCell::new(Threads::new());
     static ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -148,7 +151,7 @@ unsafe fn make(
     let ty = core::str::from_utf8(ty).map_err(|e| ParamError::Decode(e.to_string()))?;
 
     let value = decode_params(params)?;
-    let def: crate::SystemDef =
+    let instance: Instance =
         serde_json::from_slice(def).map_err(|e| ParamError::Decode(e.to_string()))?;
     // SAFETY: the caller's contract.
     let (ports, out_rings) = unsafe { (inputs.as_slice::<RawPort>(), outputs.as_slice()) };
@@ -165,15 +168,15 @@ unsafe fn make(
         let entry = table
             .get(ty)
             .ok_or_else(|| ParamError::Decode(format!("unknown system type `{ty}`")))?;
-        match &entry.make {
-            crate::coordinator::Make::Cyclic(make) => make(Params(&value), &def, views, writers),
-            // A pack's async system runs on a thread inside the pack; the host
-            // sees an ordinary step and its `thread` placement is ignored.
-            crate::coordinator::Make::Async(make) => {
-                crate::thread::Thread::alone(make, ty, &def, value.clone(), views, writers)
-                    .map(|thread| Box::new(thread) as Box<dyn Step>)
-            }
-        }
+        // A pack's async system runs on a thread inside the pack, on the group
+        // the host's config placed it on.
+        THREADS.with_borrow_mut(|threads| {
+            let mut cx = MakeCx {
+                thread: &instance.thread,
+                threads,
+            };
+            (entry.make)(Params(&value), &instance.def, views, writers, &mut cx)
+        })
     })
 }
 

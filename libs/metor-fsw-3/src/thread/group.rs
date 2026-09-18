@@ -1,15 +1,18 @@
 //! One background thread running one executor for a group of async systems.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use futures_lite::FutureExt;
+use stellarator::sync::WaitQueue;
 
 use crate::async_system::{Stop, StopHandle, stop_pair};
-use crate::coordinator::{BuildError, Launch, ParamError};
+use crate::coordinator::{BuildError, ParamError};
+
+use super::Launch;
 
 /// How long a dropped group waits for its thread before detaching it.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -19,71 +22,115 @@ pub(crate) type Panicked = Arc<Mutex<Option<String>>>;
 
 /// One async system on its way to a thread.
 pub(crate) struct Member {
-    pub id: String,
     pub launch: Box<dyn Launch>,
     pub panicked: Panicked,
+}
+
+/// One member and the slot its construction result is reported through.
+struct Job {
+    member: Member,
+    report: SyncSender<Option<ParamError>>,
+}
+
+/// The jobs waiting for the group's thread to build them.
+struct Inbox {
+    jobs: Mutex<Vec<Job>>,
+    woken: WaitQueue,
+}
+
+impl Inbox {
+    /// Takes every waiting job.
+    fn take(&self) -> Vec<Job> {
+        // PANIC Safety: neither side panics while it holds this lock.
+        core::mem::take(&mut *self.jobs.lock().expect("an unpoisoned inbox"))
+    }
+
+    fn is_empty(&self) -> bool {
+        // PANIC Safety: as above.
+        self.jobs.lock().expect("an unpoisoned inbox").is_empty()
+    }
 }
 
 /// A `GroupHandle` owns one thread; dropping it stops and joins that thread.
 pub(crate) struct GroupHandle {
     name: String,
     stop: StopHandle,
+    inbox: Arc<Inbox>,
     finished: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
-/// Starts `members` on one new thread, returning once every system is built.
-pub(crate) fn spawn(name: &str, members: Vec<Member>) -> Result<Arc<GroupHandle>, BuildError> {
+/// Starts one empty group on a new thread, which takes members as they come.
+pub(crate) fn spawn(name: &str) -> Result<Arc<GroupHandle>, BuildError> {
     let (handle, stop) = stop_pair();
     let finished = Arc::new(AtomicBool::new(false));
-    let (report, built) = sync_channel(1);
+    let inbox = Arc::new(Inbox {
+        jobs: Mutex::new(Vec::new()),
+        woken: WaitQueue::new(),
+    });
     let thread = {
-        let finished = finished.clone();
+        let (finished, inbox) = (finished.clone(), inbox.clone());
         std::thread::Builder::new()
             .name(format!("fsw-{name}"))
             .spawn(move || {
-                stellarator::run(move || run(members, stop, report));
+                stellarator::run(move || run(inbox, stop));
                 finished.store(true, Ordering::Release);
             })
             .map_err(|_| BuildError::ThreadStart {
                 thread: name.to_string(),
             })?
     };
-    let group = Arc::new(GroupHandle {
+    Ok(Arc::new(GroupHandle {
         name: name.to_string(),
         stop: handle,
+        inbox,
         finished,
         thread: Some(thread),
-    });
-    match collect(built, name)? {
-        Some((id, source)) => Err(BuildError::Params { id, source }),
-        None => Ok(group),
-    }
+    }))
 }
 
-/// Waits for the thread's build report, taking a closed channel as a panic.
-fn collect(
-    built: Receiver<Option<(String, ParamError)>>,
-    name: &str,
-) -> Result<Option<(String, ParamError)>, BuildError> {
-    built.recv().map_err(|_| BuildError::ThreadStart {
-        thread: name.to_string(),
-    })
-}
-
-/// Builds every member on this thread, then runs them until they end.
-async fn run(members: Vec<Member>, stop: Stop, report: SyncSender<Option<(String, ParamError)>>) {
-    let mut tasks = Vec::with_capacity(members.len());
-    for member in members {
-        match member.launch.launch(stop.clone()) {
-            Ok(running) => tasks.push(stellarator::spawn(task(running, member.panicked))),
-            Err(source) => {
-                let _ = report.send(Some((member.id, source)));
-                return;
-            }
+impl GroupHandle {
+    /// Builds one member on this group's thread, returning once it is running.
+    pub(crate) fn add(&self, member: Member) -> Result<(), ParamError> {
+        let (report, built) = sync_channel(1);
+        // PANIC Safety: neither side panics while it holds this lock.
+        self.inbox
+            .jobs
+            .lock()
+            .expect("an unpoisoned inbox")
+            .push(Job { member, report });
+        self.inbox.woken.wake_all();
+        match built.recv() {
+            Ok(None) => Ok(()),
+            Ok(Some(source)) => Err(source),
+            Err(_) => Err(ParamError::Decode(format!(
+                "thread `{}` stopped before it built the system",
+                self.name
+            ))),
         }
     }
-    let _ = report.send(None);
+}
+
+/// Builds every member the group is handed, running them until the stop is set.
+async fn run(inbox: Arc<Inbox>, stop: Stop) {
+    let mut tasks = Vec::new();
+    while !stop.is_set() {
+        for Job { member, report } in inbox.take() {
+            match member.launch.launch(stop.clone()) {
+                Ok(running) => {
+                    tasks.push(stellarator::spawn(task(running, member.panicked)));
+                    let _ = report.send(None);
+                }
+                Err(source) => {
+                    let _ = report.send(Some(source));
+                }
+            }
+        }
+        let _ = inbox
+            .woken
+            .wait_for(|| stop.is_set() || !inbox.is_empty())
+            .await;
+    }
     for task in tasks {
         let _ = task.await;
     }
@@ -105,6 +152,7 @@ impl Drop for GroupHandle {
     /// Stops the thread and joins it, detaching it if it outlives the timeout.
     fn drop(&mut self) {
         self.stop.stop();
+        self.inbox.woken.wake_all();
         let deadline = Instant::now() + JOIN_TIMEOUT;
         while !self.finished.load(Ordering::Acquire) {
             if Instant::now() >= deadline {

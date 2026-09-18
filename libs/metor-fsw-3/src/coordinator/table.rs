@@ -3,14 +3,15 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use metor_fsw_3_ring::{NoWake, Notifier, RingBuffer};
+use metor_fsw_3_ring::{NoWake, RingBuffer};
 use serde_json::value::RawValue;
 
-use crate::async_system::{AsyncSystem, Running, Stop};
+use crate::async_system::AsyncSystem;
 use crate::fn_system::{AsyncSystemFn, Ctor, FnAsyncSystem, FnSystem, SystemFn};
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
 };
+use crate::thread::{DEFAULT_THREAD, Threads};
 
 use super::params::{ParamError, Params};
 use super::run::{Runner, Step};
@@ -18,65 +19,28 @@ use super::run::{Runner, Step};
 /// Builds one bound system from its params, the definition build settled on,
 /// and the rings its ports sit on: one ring list per input port, in edge order,
 /// and one ring per output, both in `def` order.
-type SystemMakeFn = dyn Fn(
+pub(crate) type MakeFn = dyn Fn(
     Params<'_>,
     &SystemDef,
     Vec<Vec<&RingBuffer>>,
     Vec<&RingBuffer>,
+    &mut MakeCx<'_>,
 ) -> Result<Box<dyn Step>, ParamError>;
 
-/// Builds one launchable async system from its params and the mirror rings'
-/// bindings, both owned, so nothing borrowed crosses to the system's thread.
-pub(crate) type AsyncMakeFn = dyn Fn(serde_json::Value, Vec<InputBinding<Notifier>>, Vec<OutputBinding>) -> Box<dyn Launch>
-    + Send
-    + Sync;
-
-/// How a registered type is bound: on the cycle thread, or on its own.
-pub(crate) enum Make {
-    Cyclic(Box<SystemMakeFn>),
-    Async(Box<AsyncMakeFn>),
-}
-
-/// A `Launch` constructs one async system on the thread that will run it.
-pub trait Launch: Send {
-    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError>;
-}
-
-/// One async system's ingredients, owned until its thread constructs it.
-struct AsyncLaunch<A: AsyncSystem, M> {
-    make: std::sync::Arc<M>,
-    params: serde_json::Value,
-    inputs: Vec<InputBinding<Notifier>>,
-    outputs: Vec<OutputBinding>,
-    _a: std::marker::PhantomData<fn() -> A>,
-}
-
-impl<A, M> Launch for AsyncLaunch<A, M>
-where
-    A: AsyncSystem + 'static,
-    M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
-{
-    fn launch(self: Box<Self>, stop: Stop) -> Result<Running, ParamError> {
-        let (system, mut state) = (self.make)(Params(&self.params))?;
-        let mut inputs = A::Inputs::bind(self.inputs);
-        let mut outputs = A::Outputs::bind(self.outputs);
-        Ok(Box::pin(async move {
-            system
-                .run(&mut state, &mut inputs, &mut outputs, stop)
-                .await;
-        }))
-    }
+/// Where a system is placed, for a `make` that runs it off the cycle thread.
+pub struct MakeCx<'a> {
+    /// The thread the config named, or [`DEFAULT_THREAD`].
+    pub thread: &'a str,
+    pub threads: &'a mut Threads,
 }
 
 pub(crate) struct TableEntry {
     pub def: SystemDef,
-    /// Registered across a pack ABI, so where it runs is the pack's business.
-    pub pack: bool,
     /// The doc comment on the type's `execute`, empty for the trait path.
     pub doc: Cow<'static, str>,
     /// The JSON Schema of the type's params, `None` when it takes none.
     pub schema: Option<Box<RawValue>>,
-    pub make: Make,
+    pub make: Box<MakeFn>,
 }
 
 /// A `SystemTable` maps each type name a config may use to its definition and constructor.
@@ -188,10 +152,14 @@ fn entry<S: System + 'static>(
 ) -> TableEntry {
     TableEntry {
         def: S::def(),
-        pack: false,
         doc,
         schema,
-        make: Make::Cyclic(Box::new(move |params, def, inputs, outputs| {
+        make: Box::new(move |params, def, inputs, outputs, cx| {
+            if cx.thread != DEFAULT_THREAD {
+                return Err(ParamError::Thread {
+                    thread: cx.thread.to_string(),
+                });
+            }
             let (system, state) = make(params)?;
             let views = def
                 .inputs
@@ -222,11 +190,11 @@ fn entry<S: System + 'static>(
                 inputs: S::Inputs::bind(views),
                 outputs: S::Outputs::bind(writers),
             }))
-        })),
+        }),
     }
 }
 
-/// Builds one async entry, keeping the constructor and bindings for its thread.
+/// Builds one async entry, whose `make` places the system on its group's thread.
 fn async_entry<A, M>(make: M, doc: Cow<'static, str>, schema: Option<Box<RawValue>>) -> TableEntry
 where
     A: AsyncSystem + 'static,
@@ -235,18 +203,11 @@ where
     let make = std::sync::Arc::new(make);
     TableEntry {
         def: A::def(),
-        pack: false,
         doc,
         schema,
-        make: Make::Async(Box::new(move |params, inputs, outputs| {
-            Box::new(AsyncLaunch::<A, M> {
-                make: make.clone(),
-                params,
-                inputs,
-                outputs,
-                _a: std::marker::PhantomData,
-            })
-        })),
+        make: Box::new(move |params, def, inputs, outputs, cx| {
+            crate::thread::place::<A, M>(make.clone(), params.0.clone(), def, inputs, outputs, cx)
+        }),
     }
 }
 
@@ -254,6 +215,7 @@ where
 mod tests {
     use super::*;
     use crate::Record;
+    use crate::async_system::Stop;
     use crate::tests::utils::{Imu, ImuOffset, ImuSource, NavFilter};
 
     #[test]
@@ -318,14 +280,23 @@ mod tests {
         let entry = table.get("idle").expect("registered");
         assert_eq!(entry.def.name, "idle");
         assert!(entry.def.inputs.is_empty() && entry.def.outputs.is_empty());
-        let Make::Async(make) = &entry.make else {
-            panic!("an async registration");
-        };
-        let launch = make(serde_json::Value::Null, Vec::new(), Vec::new());
-        let (handle, stop) = crate::async_system::stop_pair();
-        handle.stop();
-        let running = launch.launch(stop).expect("no params");
-        futures_lite::future::block_on(running);
+        let mut threads = Threads::new();
+        let def = entry.def.clone();
+        let step = (entry.make)(
+            Params(&serde_json::Value::Null),
+            &def,
+            Vec::new(),
+            Vec::new(),
+            &mut MakeCx {
+                thread: DEFAULT_THREAD,
+                threads: &mut threads,
+            },
+        )
+        .expect("no params");
+        let started = std::time::Instant::now();
+        drop(step);
+        // A group the adapter still owned would take the whole join timeout.
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[test]

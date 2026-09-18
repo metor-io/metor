@@ -164,7 +164,7 @@ fn assert_retirement(fault_panics: bool, drop_panics: bool) {
         },
         epoch: Timestamp(0),
         cycle: 0,
-        groups: Vec::new(),
+        threads: crate::thread::Threads::new(),
         rings: vec![data, producer_status, failed_status, healthy_status],
     };
 

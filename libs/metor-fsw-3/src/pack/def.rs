@@ -8,6 +8,14 @@ use serde_json::value::RawValue;
 use crate::coordinator::SystemTable;
 use crate::system::SystemDef;
 
+/// An `Instance` is what the host hands `create`: the definition build settled
+/// on, including the ports a config added, and where the system is placed.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Instance {
+    pub def: SystemDef,
+    pub thread: String,
+}
+
 /// A `PackDef` is every system a pack exports, in registration order.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PackDef {
