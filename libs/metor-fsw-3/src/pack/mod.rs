@@ -171,11 +171,15 @@ unsafe fn make(
         // A pack's async system runs on a thread inside the pack, on the group
         // the host's config placed it on.
         THREADS.with_borrow_mut(|threads| {
-            let mut cx = MakeCx {
+            (entry.make)(MakeCx {
+                id: &instance.id,
                 thread: &instance.thread,
+                def: &instance.def,
+                params: Params(&value),
+                inputs: views,
+                outputs: writers,
                 threads,
-            };
-            (entry.make)(Params(&value), &instance.def, views, writers, &mut cx)
+            })
         })
     })
 }

@@ -60,23 +60,16 @@ where
 /// Places one async system on the group `cx` names: mirrors for its ports, the
 /// system built and running on that group's thread, and the adapter that
 /// copies between them each cycle.
-pub(crate) fn place<A, M>(
-    make: Arc<M>,
-    params: serde_json::Value,
-    def: &SystemDef,
-    inputs: Vec<Vec<&RingBuffer>>,
-    outputs: Vec<&RingBuffer>,
-    cx: &mut MakeCx<'_>,
-) -> Result<Box<dyn Step>, ParamError>
+pub(crate) fn place<A, M>(make: Arc<M>, cx: MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>
 where
     A: AsyncSystem + 'static,
     M: Fn(Params<'_>) -> Result<(A, A::State), ParamError> + Send + Sync + 'static,
 {
-    let (mut thread, bound_in, bound_out) = bind(def, inputs, outputs);
+    let (mut thread, bound_in, bound_out) = bind(cx.def, cx.inputs, cx.outputs);
     let member = Member {
         launch: Box::new(AsyncLaunch::<A, M> {
             make,
-            params,
+            params: cx.params.0.clone(),
             inputs: bound_in,
             outputs: bound_out,
             _a: PhantomData,

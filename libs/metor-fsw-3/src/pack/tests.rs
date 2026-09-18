@@ -46,6 +46,7 @@ fn instance_def(ty: &str) -> Vec<u8> {
         .map(|entry| entry.def.clone())
         .unwrap_or_else(|| crate::SystemDef::new::<(), ()>("unknown"));
     let instance = crate::pack::def::Instance {
+        id: ty.to_string(),
         def,
         thread: crate::thread::DEFAULT_THREAD.to_string(),
     };

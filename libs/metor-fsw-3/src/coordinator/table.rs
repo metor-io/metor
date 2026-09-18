@@ -16,23 +16,22 @@ use crate::thread::{DEFAULT_THREAD, Threads};
 use super::params::{ParamError, Params};
 use super::run::{Runner, Step};
 
-/// Builds one bound system from its params, the definition build settled on,
-/// and the rings its ports sit on: one ring list per input port, in edge order,
-/// and one ring per output, both in `def` order.
-pub(crate) type MakeFn = dyn Fn(
-    Params<'_>,
-    &SystemDef,
-    Vec<Vec<&RingBuffer>>,
-    Vec<&RingBuffer>,
-    &mut MakeCx<'_>,
-) -> Result<Box<dyn Step>, ParamError>;
-
-/// Where a system is placed, for a `make` that runs it off the cycle thread.
+/// Everything one system is built from: its config id, where it is placed, the
+/// definition build settled on, its params, and the rings its ports sit on —
+/// one ring list per input port, in edge order, and one ring per output, both
+/// in `def` order.
 pub struct MakeCx<'a> {
-    /// The thread the config named, or [`DEFAULT_THREAD`].
+    pub id: &'a str,
     pub thread: &'a str,
+    pub def: &'a SystemDef,
+    pub params: Params<'a>,
+    pub inputs: Vec<Vec<&'a RingBuffer>>,
+    pub outputs: Vec<&'a RingBuffer>,
     pub threads: &'a mut Threads,
 }
+
+/// Builds one bound system from a [`MakeCx`].
+pub(crate) type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>;
 
 pub(crate) struct TableEntry {
     pub def: SystemDef,
@@ -154,17 +153,18 @@ fn entry<S: System + 'static>(
         def: S::def(),
         doc,
         schema,
-        make: Box::new(move |params, def, inputs, outputs, cx| {
+        make: Box::new(move |cx| {
             if cx.thread != DEFAULT_THREAD {
                 return Err(ParamError::Thread {
                     thread: cx.thread.to_string(),
                 });
             }
-            let (system, state) = make(params)?;
-            let views = def
+            let (system, state) = make(cx.params)?;
+            let views = cx
+                .def
                 .inputs
                 .iter()
-                .zip(inputs)
+                .zip(cx.inputs)
                 .map(|(def, rings)| InputBinding {
                     def: def.clone(),
                     views: rings
@@ -174,10 +174,11 @@ fn entry<S: System + 'static>(
                         .collect(),
                 })
                 .collect();
-            let writers = def
+            let writers = cx
+                .def
                 .outputs
                 .iter()
-                .zip(outputs)
+                .zip(cx.outputs)
                 .map(|(def, ring)| OutputBinding {
                     def: def.clone(),
                     // PANIC Safety: one ring is allocated per output port.
@@ -205,9 +206,7 @@ where
         def: A::def(),
         doc,
         schema,
-        make: Box::new(move |params, def, inputs, outputs, cx| {
-            crate::thread::place::<A, M>(make.clone(), params.0.clone(), def, inputs, outputs, cx)
-        }),
+        make: Box::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
     }
 }
 
@@ -282,16 +281,15 @@ mod tests {
         assert!(entry.def.inputs.is_empty() && entry.def.outputs.is_empty());
         let mut threads = Threads::new();
         let def = entry.def.clone();
-        let step = (entry.make)(
-            Params(&serde_json::Value::Null),
-            &def,
-            Vec::new(),
-            Vec::new(),
-            &mut MakeCx {
-                thread: DEFAULT_THREAD,
-                threads: &mut threads,
-            },
-        )
+        let step = (entry.make)(MakeCx {
+            id: "idle",
+            thread: DEFAULT_THREAD,
+            def: &def,
+            params: Params(&serde_json::Value::Null),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            threads: &mut threads,
+        })
         .expect("no params");
         let started = std::time::Instant::now();
         drop(step);

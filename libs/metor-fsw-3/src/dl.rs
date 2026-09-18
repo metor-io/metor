@@ -183,23 +183,26 @@ impl SystemTable {
                 def: system.def.clone(),
                 doc: system.doc.clone(),
                 schema: system.params.clone(),
-                make: Box::new(move |params, def, inputs, outputs, cx| {
-                    let params = serde_json::to_vec(params.0)
+                make: Box::new(move |cx| {
+                    let params = serde_json::to_vec(cx.params.0)
                         .map_err(|e| ParamError::Decode(e.to_string()))?;
                     // The instance def, so the pack binds the ports the host
                     // resolved, including any the config added, and places the
                     // system on the thread the config named.
                     let instance = Instance {
-                        def: def.clone(),
+                        id: cx.id.to_string(),
+                        def: cx.def.clone(),
                         thread: cx.thread.to_string(),
                     };
                     let def = serde_json::to_vec(&instance)
                         .map_err(|e| ParamError::Decode(e.to_string()))?;
-                    let input_owners: Vec<Vec<_>> = inputs
+                    let input_owners: Vec<Vec<_>> = cx
+                        .inputs
                         .iter()
                         .map(|rings| rings.iter().map(|ring| ring.export()).collect())
                         .collect();
-                    let output_owners: Vec<_> = outputs.iter().map(|ring| ring.export()).collect();
+                    let output_owners: Vec<_> =
+                        cx.outputs.iter().map(|ring| ring.export()).collect();
                     let edges: Vec<Vec<RawRing>> = input_owners
                         .iter()
                         .map(|rings| rings.iter().map(RawRing::of).collect())

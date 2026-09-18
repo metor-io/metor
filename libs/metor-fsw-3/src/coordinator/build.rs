@@ -373,12 +373,16 @@ fn bind_rings(
             .iter()
             .map(|edges| edges.iter().map(|&ring| &rings[ring]).collect())
             .collect();
-        let mut cx = MakeCx {
+        let step = (system.entry.make)(MakeCx {
+            id: system.id,
             thread: system.thread,
+            def: &system.def,
+            params: system.params,
+            inputs,
+            outputs,
             threads,
-        };
-        let step = (system.entry.make)(system.params, &system.def, inputs, outputs, &mut cx)
-            .map_err(|source| build_error(system.id, source))?;
+        })
+        .map_err(|source| build_error(system.id, source))?;
         entries.push(Entry {
             name: system.id.to_string(),
             step: Some(step),

@@ -12,6 +12,7 @@ use crate::system::SystemDef;
 /// on, including the ports a config added, and where the system is placed.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Instance {
+    pub id: String,
     pub def: SystemDef,
     pub thread: String,
 }

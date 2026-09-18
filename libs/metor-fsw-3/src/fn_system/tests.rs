@@ -629,16 +629,15 @@ fn a_registered_async_system_relays_through_its_adapter() {
 
     let mut threads = Threads::new();
     let def = entry.def.clone();
-    let mut step = (entry.make)(
-        crate::coordinator::Params(&json!(null)),
-        &def,
-        vec![vec![&imu]],
-        vec![&nav, &log],
-        &mut MakeCx {
-            thread: DEFAULT_THREAD,
-            threads: &mut threads,
-        },
-    )
+    let mut step = (entry.make)(MakeCx {
+        id: "relay",
+        thread: DEFAULT_THREAD,
+        def: &def,
+        params: crate::coordinator::Params(&json!(null)),
+        inputs: vec![vec![&imu]],
+        outputs: vec![&nav, &log],
+        threads: &mut threads,
+    })
     .expect("no params");
 
     source.write(&Imu::new(3, 2.0)).expect("ring has room");
