@@ -55,7 +55,7 @@ fn expand(block: &ItemImpl) -> syn::Result<TokenStream2> {
             impl #impl_generics #fsw::AsyncSystemFn for #self_ty #where_clause {
                 async fn call(
                     &mut self,
-                    (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_, #fsw::fn_system::Woken>,
+                    (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_, #fsw::ring::Notifier>,
                     #stop: #fsw::Stop,
                 ) {
                     #(#asserts)*
@@ -67,7 +67,7 @@ fn expand(block: &ItemImpl) -> syn::Result<TokenStream2> {
             impl #impl_generics #fsw::SystemFn for #self_ty #where_clause {
                 fn call(
                     &mut self,
-                    (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_, #fsw::fn_system::Cyclic>,
+                    (#(#idents,)*): <Self::Params as #fsw::Param>::Item<'_, #fsw::ring::NoWake>,
                 ) {
                     #(#asserts)*
                     self.execute(#(#idents),*)

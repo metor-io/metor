@@ -3,7 +3,7 @@
 use core::cell::RefCell;
 use std::rc::Rc;
 
-use metor_fsw_3_ring::{Notifier, frame_len};
+use metor_fsw_3_ring::{NoWake, Notifier, frame_len};
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{LogEvent, LogLevel};
 use serde::Deserialize;
@@ -42,7 +42,7 @@ impl Ports for Doubler {
 }
 
 impl SystemFn for Doubler {
-    fn call(&mut self, (imu, nav, now): <Self::Params as Param>::Item<'_, Cyclic>) {
+    fn call(&mut self, (imu, nav, now): <Self::Params as Param>::Item<'_, NoWake>) {
         self.execute(imu, nav, now);
     }
 }
@@ -68,7 +68,7 @@ impl Ports for Summer {
 }
 
 impl SystemFn for Summer {
-    fn call(&mut self, (sum, a, b): <Self::Params as Param>::Item<'_, Cyclic>) {
+    fn call(&mut self, (sum, a, b): <Self::Params as Param>::Item<'_, NoWake>) {
         self.execute(sum, a, b);
     }
 }

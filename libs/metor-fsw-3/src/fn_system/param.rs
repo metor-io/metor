@@ -2,35 +2,13 @@
 
 use std::borrow::Cow;
 
-use metor_fsw_3_ring::{NoWake, Notifier, WakeSink};
+use metor_fsw_3_ring::WakeSink;
 use metor_proto::types::Timestamp;
 
 use crate::log::Log;
 use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::record::Record;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
-
-/// Which wake endpoint a system's input ports carry.
-///
-/// Outputs never wake anyone: the cycle thread drains an async system's
-/// outputs itself, so they stay [`NoWake`] under either wiring.
-pub trait Wiring: 'static {
-    type Sink: WakeSink + Clone;
-}
-
-/// The cycle thread's ports: a read finds a record or does not.
-pub struct Cyclic;
-
-/// A background thread's ports: a read parks until the cycle copies a record.
-pub struct Woken;
-
-impl Wiring for Cyclic {
-    type Sink = NoWake;
-}
-
-impl Wiring for Woken {
-    type Sink = Notifier;
-}
 
 /// The bindings a bundle binds from: one per declared port in order, then the
 /// ports a dynamic bundle's config added.
@@ -64,7 +42,7 @@ impl<B> Bindings<B> {
 }
 
 /// The input bindings a bundle binds from.
-pub type Views<K> = Bindings<InputBinding<<K as Wiring>::Sink>>;
+pub type Views<W> = Bindings<InputBinding<W>>;
 /// The output bindings a bundle binds from.
 pub type Writers = Bindings<OutputBinding>;
 /// The parameter names a bundle declares under, one per leaf parameter in order.
@@ -115,15 +93,19 @@ impl<'a> Cycle<'a> {
 
 /// Param is implemented for parameter types for system fns, and for tuples of them.
 ///
+/// `W` is the wake an input carries: `NoWake` on the cycle thread, `Notifier`
+/// on a background thread. Outputs never wake anyone, since the cycle thread
+/// drains an async system's outputs itself.
+///
 /// For instance [`Input`] implements `Param` to bind an input port.
 /// The goal is to let system fns define what parameters they need from the type system.
 pub trait Param {
     /// The bound input, or `()`.
-    type In<K: Wiring>;
+    type In<W: WakeSink + Clone + 'static>;
     /// The bound writer, or `()`.
     type Out;
     /// The value `execute` receives.
-    type Item<'a, K: Wiring>
+    type Item<'a, W: WakeSink + Clone + 'static>
     where
         Self: 'a;
 
@@ -131,17 +113,17 @@ pub trait Param {
     fn append_defs(names: &mut Names<'_>, defs: &mut Defs);
 
     /// Returns this parameter's input (if one exists) by popping a view from `views`.
-    fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K>;
+    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W>;
 
     /// Returns this parameter's output (if one exists) by popping a writer from `writers`.
     fn bind_out(writers: &mut Writers) -> Self::Out;
 
     /// Returns the value that will be passed into `execute`
-    fn get<'a, K: Wiring>(
-        input: &'a mut Self::In<K>,
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        input: &'a mut Self::In<W>,
         output: &'a mut Self::Out,
         cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a, K>;
+    ) -> Self::Item<'a, W>;
 }
 
 /// Takes the next leaf parameter's name.
@@ -152,16 +134,16 @@ fn name(names: &mut Names<'_>) -> &'static str {
 
 /// Both `Input<T>` and `Input<T, Notifier>` name the same port; the wiring
 /// picks which one a system is handed.
-impl<T: Record + 'static + ?Sized, W: WakeSink + 'static> Param for Input<T, W> {
-    type In<K: Wiring> = Input<T, K::Sink>;
+impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> {
+    type In<W: WakeSink + Clone + 'static> = Input<T, W>;
     type Out = ();
-    type Item<'a, K: Wiring> = &'a mut Input<T, K::Sink>;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Input<T, W>;
 
     fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
         defs.inputs.push(Input::<T>::def(name(names)));
     }
 
-    fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K> {
+    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
         // PANIC Safety: the coordinator binds one list per declared input and
         // validates alignment at build; a mismatch is a coordinator bug.
         let binding = views.next().expect("one binding per input param");
@@ -170,25 +152,25 @@ impl<T: Record + 'static + ?Sized, W: WakeSink + 'static> Param for Input<T, W> 
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a, K: Wiring>(
-        input: &'a mut Self::In<K>,
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        input: &'a mut Self::In<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a, K> {
+    ) -> Self::Item<'a, W> {
         input
     }
 }
 
 impl<T: Record + 'static + ?Sized> Param for Output<T> {
-    type In<K: Wiring> = ();
+    type In<W: WakeSink + Clone + 'static> = ();
     type Out = Output<T>;
-    type Item<'a, K: Wiring> = &'a mut Output<T>;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Output<T>;
 
     fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
         defs.outputs.push(Output::<T>::def(name(names)));
     }
 
-    fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
         // PANIC Safety: the coordinator binds one writer per declared output and
@@ -197,19 +179,19 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
         Output::try_new(binding.writer).expect("alignment checked at build")
     }
 
-    fn get<'a, K: Wiring>(
+    fn get<'a, W: WakeSink + Clone + 'static>(
         _input: &'a mut (),
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a, K> {
+    ) -> Self::Item<'a, W> {
         output
     }
 }
 
-impl<W: WakeSink + 'static> Param for DynInputs<W> {
-    type In<K: Wiring> = DynInputs<K::Sink>;
+impl<D: WakeSink + 'static> Param for DynInputs<D> {
+    type In<W: WakeSink + Clone + 'static> = DynInputs<W>;
     type Out = ();
-    type Item<'a, K: Wiring> = &'a mut DynInputs<K::Sink>;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut DynInputs<W>;
 
     fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
         let taken = defs.dynamic_inputs.replace(name(names).into());
@@ -221,25 +203,25 @@ impl<W: WakeSink + 'static> Param for DynInputs<W> {
         );
     }
 
-    fn bind_in<K: Wiring>(views: &mut Views<K>) -> Self::In<K> {
+    fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
         SystemInputs::bind(views.take_dynamic())
     }
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a, K: Wiring>(
-        input: &'a mut Self::In<K>,
+    fn get<'a, W: WakeSink + Clone + 'static>(
+        input: &'a mut Self::In<W>,
         _output: &'a mut (),
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a, K> {
+    ) -> Self::Item<'a, W> {
         input
     }
 }
 
 impl Param for DynOutputs {
-    type In<K: Wiring> = ();
+    type In<W: WakeSink + Clone + 'static> = ();
     type Out = DynOutputs;
-    type Item<'a, K: Wiring> = &'a mut DynOutputs;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut DynOutputs;
 
     fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
         let taken = defs.dynamic_outputs.replace(name(names).into());
@@ -250,35 +232,35 @@ impl Param for DynOutputs {
         );
     }
 
-    fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
         SystemOutputs::bind(writers.take_dynamic())
     }
 
-    fn get<'a, K: Wiring>(
+    fn get<'a, W: WakeSink + Clone + 'static>(
         _input: &'a mut (),
         output: &'a mut Self::Out,
         _cx: &mut Cycle<'a>,
-    ) -> Self::Item<'a, K> {
+    ) -> Self::Item<'a, W> {
         output
     }
 }
 
 impl Param for Timestamp {
-    type In<K: Wiring> = ();
+    type In<W: WakeSink + Clone + 'static> = ();
     type Out = ();
-    type Item<'a, K: Wiring> = Timestamp;
+    type Item<'a, W: WakeSink + Clone + 'static> = Timestamp;
 
     fn append_defs(names: &mut Names<'_>, _defs: &mut Defs) {
         name(names);
     }
 
-    fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a, K: Wiring>(
+    fn get<'a, W: WakeSink + Clone + 'static>(
         _input: &'a mut (),
         _output: &'a mut (),
         cx: &mut Cycle<'a>,
@@ -288,19 +270,19 @@ impl Param for Timestamp {
 }
 
 impl Param for Log {
-    type In<K: Wiring> = ();
+    type In<W: WakeSink + Clone + 'static> = ();
     type Out = ();
-    type Item<'a, K: Wiring> = &'a mut Log;
+    type Item<'a, W: WakeSink + Clone + 'static> = &'a mut Log;
 
     fn append_defs(names: &mut Names<'_>, _defs: &mut Defs) {
         name(names);
     }
 
-    fn bind_in<K: Wiring>(_views: &mut Views<K>) {}
+    fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(_writers: &mut Writers) {}
 
-    fn get<'a, K: Wiring>(
+    fn get<'a, W: WakeSink + Clone + 'static>(
         _input: &'a mut (),
         _output: &'a mut (),
         cx: &mut Cycle<'a>,
@@ -313,9 +295,9 @@ impl Param for Log {
 macro_rules! impl_param_for_tuple {
     ($(($P:ident, $i:tt)),*) => {
         impl<$($P: Param),*> Param for ($($P,)*) {
-            type In<W: Wiring> = ($($P::In<W>,)*);
+            type In<W: WakeSink + Clone + 'static> = ($($P::In<W>,)*);
             type Out = ($($P::Out,)*);
-            type Item<'a, W: Wiring> = ($($P::Item<'a, W>,)*) where Self: 'a;
+            type Item<'a, W: WakeSink + Clone + 'static> = ($($P::Item<'a, W>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
             fn append_defs(names: &mut Names<'_>, defs: &mut Defs) {
@@ -323,7 +305,7 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn bind_in<W: Wiring>(views: &mut Views<W>) -> Self::In<W> {
+            fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
                 ($( $P::bind_in::<W>(views), )*)
             }
 
@@ -333,7 +315,7 @@ macro_rules! impl_param_for_tuple {
             }
 
             #[allow(unused_variables, clippy::unused_unit)]
-            fn get<'a, W: Wiring>(input: &'a mut Self::In<W>, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a, W> {
+            fn get<'a, W: WakeSink + Clone + 'static>(input: &'a mut Self::In<W>, output: &'a mut Self::Out, cx: &mut Cycle<'a>) -> Self::Item<'a, W> {
                 ($( $P::get::<W>(&mut input.$i, &mut output.$i, cx), )*)
             }
         }

@@ -8,6 +8,8 @@ use core::marker::PhantomData;
 
 use metor_proto::types::Timestamp;
 
+use metor_fsw_3_ring::{NoWake, Notifier};
+
 use crate::async_system::{AsyncSystem, Stop};
 use crate::{
     log,
@@ -15,7 +17,7 @@ use crate::{
 };
 
 pub use ctor::Ctor;
-pub use param::{Cycle, Cyclic, Names, Param, Views, Wiring, Woken, Writers};
+pub use param::{Cycle, Names, Param, Views, Writers};
 pub use set::{InSet, LOG_PORT, OutSet};
 
 /// A `Ports` names one authored system's parameters, which are its ports.
@@ -31,7 +33,7 @@ pub trait Ports: Sized + 'static {
 /// A `SystemFn` is a type with an `execute` method whose parameters are the ports.
 pub trait SystemFn: Ports {
     /// Calls `execute` with this cycle's parameter values.
-    fn call(&mut self, items: <Self::Params as Param>::Item<'_, Cyclic>);
+    fn call(&mut self, items: <Self::Params as Param>::Item<'_, NoWake>);
 }
 
 /// An `AsyncSystemFn` is a type with an `async run` method whose parameters are
@@ -39,7 +41,7 @@ pub trait SystemFn: Ports {
 #[allow(async_fn_in_trait)]
 pub trait AsyncSystemFn: Ports {
     /// Calls `run`, which returns once `stop` resolves.
-    async fn call(&mut self, items: <Self::Params as Param>::Item<'_, Woken>, stop: Stop);
+    async fn call(&mut self, items: <Self::Params as Param>::Item<'_, Notifier>, stop: Stop);
 }
 
 /// Compiles only when `P` is a `Param`; `#[system]` calls it once per parameter.
@@ -67,24 +69,24 @@ impl<S> Default for FnAsyncSystem<S> {
 
 impl<S: AsyncSystemFn> AsyncSystem for FnAsyncSystem<S> {
     type State = S;
-    type Inputs = InSet<S, Woken>;
+    type Inputs = InSet<S, Notifier>;
     type Outputs = OutSet<S>;
 
     fn def() -> SystemDef {
-        SystemDef::new_async::<InSet<S, Woken>, OutSet<S>>(S::NAME)
+        SystemDef::new_async::<InSet<S, Notifier>, OutSet<S>>(S::NAME)
     }
 
     /// Points each poll's log lines at the system's own `log` output, then runs `run`.
     async fn run(
         &self,
         state: &mut S,
-        inputs: &mut InSet<S, Woken>,
+        inputs: &mut InSet<S, Notifier>,
         outputs: &mut OutSet<S>,
         stop: Stop,
     ) {
         let mut log = log::Log;
         let mut cx = Cycle::new(Timestamp::now(), &mut log);
-        let items = S::Params::get::<Woken>(&mut inputs.0, &mut outputs.outs, &mut cx);
+        let items = S::Params::get::<Notifier>(&mut inputs.0, &mut outputs.outs, &mut cx);
         let call = core::pin::pin!(state.call(items, stop));
         log::log_scope(&mut outputs.log, call).await;
     }
