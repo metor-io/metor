@@ -76,7 +76,7 @@ pub fn pack_dev(root: &Path) -> Result<(), PackDevError> {
     })?;
     // SAFETY: this staged copy was just built against the pack ABI.
     let pack = unsafe { Pack::open(&dylib) }?;
-    let text = render(&reference, ABI_VERSION, pack.def())?;
+    let text = render(&reference, ABI_VERSION, pack.descriptor())?;
     let init = module.join("__init__.py");
     write_atomic(&init, text.as_bytes())?;
     let typed = module.join("py.typed");

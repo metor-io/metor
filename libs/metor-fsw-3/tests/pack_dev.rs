@@ -26,7 +26,7 @@ fn the_fixtures_module_is_the_golden() {
         lib: "echo_pack".into(),
         libs: "unused".into(),
     };
-    let text = render(&reference, ABI_VERSION, pack.def()).expect("renders");
+    let text = render(&reference, ABI_VERSION, pack.descriptor()).expect("renders");
     assert_eq!(text, GOLDEN);
     assert!(
         !text.contains(env!("CARGO_MANIFEST_DIR")),

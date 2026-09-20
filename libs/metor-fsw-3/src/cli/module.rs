@@ -359,6 +359,8 @@ mod tests {
     ) -> PackSystemDef {
         PackSystemDef {
             ty: ty.into(),
+            takes_inputs: false,
+            takes_outputs: false,
             def: SystemDef {
                 name: ty.into(),
                 inputs,

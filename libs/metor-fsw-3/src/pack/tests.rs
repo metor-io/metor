@@ -139,6 +139,70 @@ fn the_descriptor_decodes_as_the_tables_projection() {
     assert_eq!(descriptor(build, &mut []), (DefStatus::TooSmall as u32, 0));
 }
 
+/// Calls the definition export the way the host does.
+fn system_def_raw(ty: &str, cx: &DefCxOwned, buffer: &mut [u8]) -> (u32, usize) {
+    let cx = serde_json::to_vec(cx).expect("encodes");
+    let mut written = usize::MAX;
+    // SAFETY: both arrays outlive the call; the result slots are writable.
+    let status = unsafe {
+        system_def(
+            build,
+            RawSlice::of(ty.as_bytes()),
+            RawSlice::of(&cx),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut written,
+        )
+    };
+    (status, written)
+}
+
+#[test]
+fn a_definition_export_answers_with_the_ports_the_config_names() {
+    let producer = crate::Output::<Imu>::def("imu");
+    let cx = DefCxOwned {
+        inputs: vec![("plant.imu".to_string(), producer)],
+        ..DefCxOwned::default()
+    };
+    let mut bytes = vec![0u8; 64 * 1024];
+    let (status, len) = system_def_raw("tap", &cx, &mut bytes);
+    assert_eq!(status, DefStatus::Ok as u32);
+    let def: SystemDef = serde_json::from_slice(&bytes[..len]).expect("decodes");
+    assert_eq!(def.inputs[0].name, "plant.imu");
+    assert_eq!(
+        system_def_raw("tap", &cx, &mut bytes[..len - 1]),
+        (DefStatus::TooSmall as u32, 0)
+    );
+}
+
+#[test]
+fn a_refused_definition_comes_back_as_its_error() {
+    let mut bytes = vec![0u8; 4096];
+    let (status, len) = system_def_raw("missing", &DefCxOwned::default(), &mut bytes);
+    assert_eq!(status, DefStatus::Refused as u32);
+    assert!(matches!(
+        serde_json::from_slice(&bytes[..len]).expect("decodes"),
+        DefError::Pack { message } if message.contains("missing")
+    ));
+
+    let cx = DefCxOwned {
+        outputs: vec![crate::OutputConfig {
+            port: "out".into(),
+            record: "gyro".into(),
+        }],
+        ..DefCxOwned::default()
+    };
+    let (status, len) = system_def_raw("emit", &cx, &mut bytes);
+    assert_eq!(status, DefStatus::Refused as u32);
+    assert_eq!(
+        serde_json::from_slice::<DefError>(&bytes[..len]).expect("decodes"),
+        DefError::UnknownRecord {
+            port: "out".into(),
+            record: "gyro".into(),
+        }
+    );
+}
+
 #[test]
 fn descriptor_initialization_panics_are_contained() {
     fn broken() -> SystemTable {
@@ -275,8 +339,8 @@ fn an_unknown_status_word_is_a_panic() {
 }
 
 #[test]
-fn the_abi_version_is_four() {
-    assert_eq!(ABI_VERSION, 4);
+fn the_abi_version_is_five() {
+    assert_eq!(ABI_VERSION, 5);
 }
 
 /// The `metor-fsw-abi` distribution exists to pin this number; a pack's

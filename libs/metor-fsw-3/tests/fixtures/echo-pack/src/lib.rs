@@ -4,8 +4,8 @@ use std::cell::RefCell;
 
 use metor_fsw_3::ring::Notifier;
 use metor_fsw_3::{
-    DefCx, DefError, Input, InputBinding, Output, OutputBinding, PortDef, Record, Stop, System,
-    SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
+    DefCx, DefError, DynInputs, Input, InputBinding, Output, OutputBinding, PortDef, Record, Stop,
+    System, SystemDef, SystemInputs, SystemOutputs, SystemTable, Timestamp, system,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,30 @@ impl Relay {
             .await;
             let Some(ping) = ping else { return };
             let _ = output.write(&Ping { n: ping.n });
+        }
+    }
+}
+
+/// Sums the pings on every port its config gave it.
+#[derive(Default)]
+pub struct Tap;
+
+#[system]
+impl Tap {
+    /// Adds up what every configured port carries.
+    fn execute(&mut self, taps: &mut DynInputs, output: &mut Output<Ping>) {
+        let mut n = 0;
+        for (_, input) in taps.iter_mut() {
+            for record in input.drain() {
+                let Ok(bytes) = record else { continue };
+                let Ok(ping) = Ping::decode(&bytes) else {
+                    continue;
+                };
+                n += ping.n;
+            }
+        }
+        if n > 0 {
+            let _ = output.write(&Ping { n });
         }
     }
 }
@@ -187,6 +211,7 @@ pub fn pack() -> SystemTable {
     table
         .register_async("relay", Relay::default)
         .expect("valid records");
+    table.register("tap", Tap::default).expect("valid records");
     table
         .register("boom", Boom::default)
         .expect("valid records");

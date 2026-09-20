@@ -11,7 +11,7 @@ PACK = Pack(
     id="echo",
     lib="echo_pack",
     libs=str(Path(__file__).resolve().parent / "_libs"),
-    abi_version=4,
+    abi_version=5,
 )
 
 
@@ -54,6 +54,21 @@ class Relay(System):
 
     def __init__(self, *, input: Sources[Ping] = ()) -> None:
         super().__init__({"input": input}, {})
+
+    output: OutPort[Ping]
+    log: OutPort[LogEvent]
+    status: OutPort[SystemStatus]
+
+
+class Tap(System):
+    "Adds up what every configured port carries."
+
+    _pack = PACK
+    _ty = "tap"
+    _outputs = ("output",)
+
+    def __init__(self) -> None:
+        super().__init__({}, {})
 
     output: OutPort[Ping]
     log: OutPort[LogEvent]

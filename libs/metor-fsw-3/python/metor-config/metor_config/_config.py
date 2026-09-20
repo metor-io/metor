@@ -7,7 +7,7 @@ from typing import Any
 
 CONFIG_VERSION = 1
 
-ABI_VERSION = 4
+ABI_VERSION = 5
 """The host ABI the built-in systems are compiled against; a Rust test pins it."""
 
 ABI_ENV = "METOR_FSW_ABI_VERSION"

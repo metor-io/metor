@@ -143,8 +143,20 @@ fn a_pack_reports_its_systems_with_their_ports_and_schemas() {
     let types: Vec<_> = pack.systems().map(|s| s.ty.as_str()).collect();
     assert_eq!(
         types,
-        vec!["echo", "relay", "boom", "gain", "fail_input", "retained"]
+        vec![
+            "echo",
+            "relay",
+            "tap",
+            "boom",
+            "gain",
+            "fail_input",
+            "retained"
+        ]
     );
+
+    let tap = pack.systems().find(|s| s.ty == "tap").expect("tap");
+    assert!(tap.takes_inputs && !tap.takes_outputs);
+    assert!(tap.def.inputs.is_empty());
 
     let echo = pack.systems().next().expect("one system");
     assert_eq!(echo.def.inputs[0].name, "input");
@@ -159,6 +171,42 @@ fn a_pack_reports_its_systems_with_their_ports_and_schemas() {
     let schema = gain.params.as_deref().expect("gain takes params").get();
     assert!(schema.contains(r#""description":"Scales every ping.""#));
     assert!(pack.systems().next().expect("echo").params.is_none());
+}
+
+/// The host wires two of the fixture's outputs into one pack system, which
+/// declares neither: the ports come back with the definition the pack computed.
+#[test]
+fn a_pack_system_takes_the_input_ports_its_config_names() {
+    let pack = open();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let taps = ["source", "other"].map(|id| InputConfig {
+        port: format!("{id}.output"),
+        from: vec![PortRef::new(id, "output")],
+    });
+    let config = CoordinatorConfig {
+        systems: vec![
+            SystemConfig::new("source", "source"),
+            SystemConfig::new("other", "source"),
+            SystemConfig {
+                inputs: taps.to_vec(),
+                ..SystemConfig::new("tap", "echo.tap")
+            },
+            SystemConfig {
+                inputs: vec![InputConfig {
+                    port: "input".into(),
+                    from: vec![PortRef::new("tap", "output")],
+                }],
+                ..SystemConfig::new("sink", "sink")
+            },
+        ],
+        ..Default::default()
+    };
+    let mut coordinator = config
+        .build(&table(&pack, &seen))
+        .expect("the config builds");
+    coordinator.step(Timestamp(1));
+    // One ping from each source, summed on the pack's side.
+    assert_eq!(*seen.borrow(), vec![2]);
 }
 
 #[test]
