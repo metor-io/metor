@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use metor_fsw_3_ring::{Config, NoWake, RingBuffer, checked_region_len};
 use metor_proto::types::Timestamp;
 
+use crate::def::{DefCx, Records};
 use crate::port::{Output, ring_capacity};
 use crate::system::{PortDef, SystemDef};
 use crate::thread::{DEFAULT_THREAD, Threads};
@@ -29,14 +30,12 @@ struct RingSpec {
 
 type RingIndex = usize;
 
-/// One system as build resolved it: its instance def, which a dynamic side's
-/// ports are appended to, and the ring feeding each input port.
+/// One system as build resolved it: the definition its type computed and the
+/// rings feeding each of its input ports.
 struct PlannedSystem<'a> {
     id: &'a str,
     entry: &'a TableEntry,
     def: SystemDef,
-    /// Input ports the type declared; the rest came from the config.
-    declared_inputs: usize,
     params: Params<'a>,
     /// The background thread this system is placed on, if it is async.
     thread: &'a str,
@@ -61,11 +60,6 @@ impl PlannedSystem<'_> {
         }
         let index = self.def.outputs.iter().position(|p| p.name == port)?;
         Some(self.base_ring_idx + index)
-    }
-
-    /// Whether this input port came from the config rather than the type.
-    fn is_dynamic_input(&self, port: usize) -> bool {
-        port >= self.declared_inputs
     }
 }
 
@@ -95,22 +89,14 @@ fn resolve<'a>(
     config: &'a CoordinatorConfig,
     table: &'a SystemTable,
 ) -> Result<Plan<'a>, BuildError> {
+    let index = index(config)?;
+    let records = table.records();
     let mut plan = Plan {
         systems: Vec::with_capacity(config.systems.len()),
         rings: vec![],
     };
 
-    let mut index = HashMap::with_capacity(config.systems.len());
-
     for system in &config.systems {
-        if index.contains_key(system.id.as_str()) {
-            return Err(BuildError::DuplicateId {
-                id: system.id.clone(),
-            });
-        }
-
-        index.insert(system.id.as_str(), plan.systems.len());
-
         let entry = table
             .get(&system.ty)
             .ok_or_else(|| BuildError::UnknownType {
@@ -118,8 +104,7 @@ fn resolve<'a>(
                 ty: system.ty.clone(),
             })?;
 
-        let mut def = entry.def.clone();
-        add_dynamic_outputs(system, &mut def, table)?;
+        let def = instance_def(system, entry, &plan, &index, &records)?;
         check_port_names(&system.id, &def)?;
         if def.outputs.iter().any(|p| p.name == STATUS_PORT) {
             return Err(BuildError::ReservedPort {
@@ -127,6 +112,7 @@ fn resolve<'a>(
             });
         }
         check_alignment(&system.id, &def)?;
+        check_outputs(system, &def)?;
         let base_ring_idx = plan.rings.len();
         plan.rings.extend(
             def.outputs
@@ -140,7 +126,6 @@ fn resolve<'a>(
         plan.systems.push(PlannedSystem {
             id: &system.id,
             entry,
-            declared_inputs: def.inputs.len(),
             inputs: vec![Vec::new(); def.inputs.len()],
             def,
             params: Params(&system.params),
@@ -150,6 +135,80 @@ fn resolve<'a>(
     }
     resolve_edges(config, &mut plan, &index)?;
     Ok(plan)
+}
+
+/// Each system's position in the config, by id.
+fn index(config: &CoordinatorConfig) -> Result<HashMap<&str, usize>, BuildError> {
+    let mut index = HashMap::with_capacity(config.systems.len());
+    for (at, system) in config.systems.iter().enumerate() {
+        if index.insert(system.id.as_str(), at).is_some() {
+            return Err(BuildError::DuplicateId {
+                id: system.id.clone(),
+            });
+        }
+    }
+    Ok(index)
+}
+
+/// The definition the type computes from this instance's config.
+fn instance_def(
+    system: &SystemConfig,
+    entry: &TableEntry,
+    plan: &Plan<'_>,
+    index: &HashMap<&str, usize>,
+    records: &Records,
+) -> Result<SystemDef, BuildError> {
+    let producers = producers(system, entry, plan, index)?;
+    let inputs: Vec<(&str, &PortDef)> = producers.iter().map(|(port, def)| (*port, def)).collect();
+    let cx = DefCx {
+        inputs: &inputs,
+        outputs: &system.outputs,
+        records,
+    };
+    entry.def_for(&cx).map_err(|source| BuildError::Def {
+        id: system.id.clone(),
+        source,
+    })
+}
+
+/// One entry per config edge: the input port it names and the def of the
+/// output feeding it. A producer this pass has not resolved yet only feeds a
+/// port the type declares, which needs no def of its own.
+fn producers<'a>(
+    system: &'a SystemConfig,
+    entry: &TableEntry,
+    plan: &Plan<'_>,
+    index: &HashMap<&str, usize>,
+) -> Result<Vec<(&'a str, PortDef)>, BuildError> {
+    let mut edges = Vec::new();
+    for input in &system.inputs {
+        for from in &input.from {
+            let Some(&at) = index.get(from.system.as_str()) else {
+                return Err(BuildError::UnknownSystem {
+                    id: system.id.clone(),
+                    port: input.port.clone(),
+                    from: from.system.clone(),
+                });
+            };
+            let Some(producer) = plan.systems.get(at) else {
+                if entry.def.inputs.iter().any(|p| p.name == input.port) {
+                    continue;
+                }
+                return Err(BuildError::DynamicFromLater {
+                    system: system.id.clone(),
+                    port: input.port.clone(),
+                });
+            };
+            let Some(ring) = producer.output_ring(&from.port) else {
+                return Err(BuildError::UnknownOutput {
+                    system: from.system.clone(),
+                    port: from.port.clone(),
+                });
+            };
+            edges.push((input.port.as_str(), plan.rings[ring].port.clone()));
+        }
+    }
+    Ok(edges)
 }
 
 fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildError> {
@@ -179,30 +238,15 @@ fn check_port_names(system: &str, def: &crate::SystemDef) -> Result<(), BuildErr
     Ok(())
 }
 
-/// Appends the config's output ports to a system with dynamic outputs
-fn add_dynamic_outputs(
-    system: &SystemConfig,
-    def: &mut SystemDef,
-    table: &SystemTable,
-) -> Result<(), BuildError> {
+/// Every output the config lists is one the type took.
+fn check_outputs(system: &SystemConfig, def: &SystemDef) -> Result<(), BuildError> {
     for output in &system.outputs {
-        if def.dynamic_outputs.is_none() {
+        if !def.outputs.iter().any(|port| port.name == output.port) {
             return Err(BuildError::UnknownOutput {
                 system: system.id.clone(),
                 port: output.port.clone(),
             });
         }
-        let known = table
-            .record(&output.record)
-            .ok_or_else(|| BuildError::UnknownRecord {
-                system: system.id.clone(),
-                port: output.port.clone(),
-                record: output.record.clone(),
-            })?;
-        def.outputs.push(PortDef {
-            name: output.port.clone().into(),
-            ..known.clone()
-        });
     }
     Ok(())
 }
@@ -227,13 +271,12 @@ fn resolve_edges(
 ) -> Result<(), BuildError> {
     for (i, system) in config.systems.iter().enumerate() {
         for input in &system.inputs {
-            if input.from.is_empty()
-                && !plan.systems[i]
-                    .def
-                    .inputs
-                    .iter()
-                    .any(|p| p.name == input.port)
-            {
+            let port = plan.systems[i]
+                .def
+                .inputs
+                .iter()
+                .position(|p| p.name == input.port);
+            if input.from.is_empty() && port.is_none() {
                 return Err(BuildError::UnknownInput {
                     system: system.id.clone(),
                     port: input.port.clone(),
@@ -253,52 +296,17 @@ fn resolve_edges(
                         port: from.port.clone(),
                     });
                 };
-                let port = input_port(plan, i, &system.id, &input.port, ring)?;
-                let planned = &mut plan.systems[i];
-                planned.inputs[port].push(ring);
-                if planned.is_dynamic_input(port) && planned.inputs[port].len() > 1 {
-                    return Err(BuildError::DynamicFanIn {
+                let Some(port) = port else {
+                    return Err(BuildError::UnknownInput {
                         system: system.id.clone(),
                         port: input.port.clone(),
                     });
-                }
+                };
+                plan.systems[i].inputs[port].push(ring);
             }
         }
     }
     Ok(())
-}
-
-/// The index of the input port named `port`, appending one to a system with
-/// dynamic inputs and taking its definition from the edge's producer.
-fn input_port(
-    plan: &mut Plan<'_>,
-    i: usize,
-    system: &str,
-    port: &str,
-    ring: RingIndex,
-) -> Result<usize, BuildError> {
-    if let Some(at) = plan.systems[i]
-        .def
-        .inputs
-        .iter()
-        .position(|p| p.name == port)
-    {
-        return Ok(at);
-    }
-    if plan.systems[i].def.dynamic_inputs.is_none() {
-        return Err(BuildError::UnknownInput {
-            system: system.to_string(),
-            port: port.to_string(),
-        });
-    }
-    let def = PortDef {
-        name: port.to_string().into(),
-        ..plan.rings[ring].port.clone()
-    };
-    let planned = &mut plan.systems[i];
-    planned.def.inputs.push(def);
-    planned.inputs.push(Vec::new());
-    Ok(planned.def.inputs.len() - 1)
 }
 
 fn check_ids(plan: &Plan<'_>) -> Result<(), BuildError> {
@@ -433,6 +441,7 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{InputConfig, OutputConfig, PortRef, SystemConfig};
+    use crate::def::DefError;
     use crate::tests::utils::{self, Recorder, pipeline_config, table};
     use crate::{Frame, Record};
     use crate::{port, system};
@@ -502,8 +511,6 @@ mod tests {
                     Vec::new()
                 },
                 outputs: if input { Vec::new() } else { vec![port] },
-                dynamic_inputs: None,
-                dynamic_outputs: None,
             };
             assert_eq!(
                 check_alignment("test", &def),
@@ -532,8 +539,6 @@ mod tests {
                 } else {
                     vec![port.clone(), port.clone()]
                 },
-                dynamic_inputs: None,
-                dynamic_outputs: None,
             };
             let expected = if input {
                 BuildError::DuplicateInput {
@@ -557,8 +562,6 @@ mod tests {
             name: "test".into(),
             inputs: vec![port.clone()],
             outputs: vec![port],
-            dynamic_inputs: None,
-            dynamic_outputs: None,
         };
         assert_eq!(check_port_names("instance", &def), Ok(()));
         assert_eq!(
@@ -831,9 +834,11 @@ mod tests {
         }]));
         assert_eq!(
             build(config).err(),
-            Some(BuildError::DynamicFanIn {
-                system: "tap".into(),
-                port: "imu.imu".into(),
+            Some(BuildError::Def {
+                id: "tap".into(),
+                source: DefError::FanIn {
+                    port: "imu.imu".into(),
+                },
             })
         );
     }
@@ -874,10 +879,12 @@ mod tests {
         };
         assert_eq!(
             build(config).err(),
-            Some(BuildError::UnknownRecord {
-                system: "emit".into(),
-                port: "imu".into(),
-                record: "gyro".into(),
+            Some(BuildError::Def {
+                id: "emit".into(),
+                source: DefError::UnknownRecord {
+                    port: "imu".into(),
+                    record: "gyro".into(),
+                },
             })
         );
     }
@@ -945,6 +952,51 @@ mod tests {
                 port: "extra".into(),
             })
         );
+    }
+
+    /// A `loop()` edge into an undeclared port has no producer definition yet.
+    #[test]
+    fn an_undeclared_input_cannot_read_a_later_system() {
+        let mut config = pipeline_config();
+        config.systems.push(tap(vec![InputConfig {
+            port: "late.nav".into(),
+            from: vec![PortRef::new("late", "nav")],
+        }]));
+        config.systems.push(SystemConfig::new("late", "nav"));
+        assert_eq!(
+            build(config).err(),
+            Some(BuildError::DynamicFromLater {
+                system: "tap".into(),
+                port: "late.nav".into(),
+            })
+        );
+    }
+
+    /// A declared port takes its definition from the type, so its producer may
+    /// come later.
+    #[test]
+    fn a_declared_input_may_read_a_later_system() {
+        let config = CoordinatorConfig {
+            systems: vec![
+                SystemConfig {
+                    inputs: vec![InputConfig {
+                        port: "nav".into(),
+                        from: vec![PortRef::new("nav", "nav")],
+                    }],
+                    ..SystemConfig::new("control", "control")
+                },
+                SystemConfig::new("imu", "imu"),
+                SystemConfig {
+                    inputs: vec![InputConfig {
+                        port: "imu".into(),
+                        from: vec![PortRef::new("imu", "imu")],
+                    }],
+                    ..SystemConfig::new("nav", "nav")
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(build(config).is_ok());
     }
 
     #[test]

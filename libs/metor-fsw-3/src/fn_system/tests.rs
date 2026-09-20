@@ -683,42 +683,66 @@ fn a_registered_async_system_relays_through_its_adapter() {
     assert!(seen.contains(&"relaying".into()), "{seen:?}");
 }
 
-/// A dynamic side names the parameter its ports are bound through.
+/// A dynamic parameter takes the ports the config named, wherever it sits.
 #[test]
-fn a_dynamic_parameter_names_itself_in_the_definition() {
+fn a_dynamic_parameter_takes_the_config_ports_around_a_declared_one() {
+    use crate::def::{DefCx, Records};
     use crate::port::{DynInputs, DynOutputs};
 
     struct Link;
 
     #[crate::system]
     impl Link {
-        fn execute(&mut self, taps: &mut DynInputs, sinks: &mut DynOutputs) {
-            let _ = (taps, sinks);
+        fn execute(&mut self, taps: &mut DynInputs, imu: &mut Input<Imu>, sinks: &mut DynOutputs) {
+            let _ = (taps, imu, sinks);
         }
     }
 
     let def = static_def::<FnSystem<Link>>();
-    assert_eq!(def.dynamic_inputs.as_deref(), Some("taps"));
-    assert_eq!(def.dynamic_outputs.as_deref(), Some("sinks"));
+    assert_eq!(def.inputs, vec![Input::<Imu>::def("imu")]);
 
-    let plain = static_def::<FnSystem<Doubler>>();
-    assert_eq!(plain.dynamic_inputs, None);
-    assert_eq!(plain.dynamic_outputs, None);
+    let producer = Output::<Nav>::def("nav");
+    let declared = Output::<Imu>::def("imu");
+    let edges = [("nav.nav", &producer), ("imu", &declared)];
+    let records = Records::of([Output::<Nav>::def("nav")].iter());
+    let outputs = [crate::coordinator::OutputConfig {
+        port: "sink".into(),
+        record: Nav::NAME.into(),
+    }];
+    let cx = DefCx {
+        inputs: &edges,
+        outputs: &outputs,
+        records: &records,
+    };
+    let def = FnSystem::<Link>::def(&cx).expect("a definition");
+    let names: Vec<_> = def.inputs.iter().map(|port| port.name.as_ref()).collect();
+    assert_eq!(names, vec!["nav.nav", "imu"]);
+    let names: Vec<_> = def.outputs.iter().map(|port| port.name.as_ref()).collect();
+    assert_eq!(names, vec!["sink", "log"]);
 }
 
+/// Two producers on one undeclared port have no one definition to take.
 #[test]
-#[should_panic(expected = "a system takes `&mut DynInputs` at most once")]
-fn two_dynamic_inputs_are_rejected_when_the_definition_is_built() {
+fn a_dynamic_input_refuses_a_second_producer() {
+    use crate::def::{DefCx, DefError};
     use crate::port::DynInputs;
 
-    struct Twice;
+    struct Tap;
 
     #[crate::system]
-    impl Twice {
-        fn execute(&mut self, first: &mut DynInputs, second: &mut DynInputs) {
-            let _ = (first, second);
+    impl Tap {
+        fn execute(&mut self, taps: &mut DynInputs) {
+            let _ = taps;
         }
     }
 
-    let _ = static_def::<FnSystem<Twice>>();
+    let first = Output::<Imu>::def("imu");
+    let second = Output::<Imu>::def("imu");
+    let edges = [("plant.imu", &first), ("plant.imu", &second)];
+    assert_eq!(
+        FnSystem::<Tap>::def(&DefCx::of_inputs(&edges)),
+        Err(DefError::FanIn {
+            port: "plant.imu".into()
+        })
+    );
 }

@@ -41,20 +41,12 @@ impl PortDef {
     }
 }
 
-/// A system's ports, in bind order.
-///
-/// A dynamic side declares no ports; the config lists them and build
-/// completes each one before the system is bound.
+/// One instance's ports, in bind order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemDef {
     pub name: Cow<'static, str>,
     pub inputs: Vec<PortDef>,
     pub outputs: Vec<PortDef>,
-    /// The parameter that takes every input the config adds, if the type has one.
-    #[serde(default)]
-    pub dynamic_inputs: Option<Cow<'static, str>>,
-    #[serde(default)]
-    pub dynamic_outputs: Option<Cow<'static, str>>,
 }
 
 impl SystemDef {
@@ -67,8 +59,6 @@ impl SystemDef {
             name: name.into(),
             inputs: I::defs(cx)?,
             outputs: O::defs(cx)?,
-            dynamic_inputs: I::dynamic(),
-            dynamic_outputs: O::dynamic(),
         })
     }
 
@@ -81,8 +71,6 @@ impl SystemDef {
             name: name.into(),
             inputs: I::defs(cx)?,
             outputs: O::defs(cx)?,
-            dynamic_inputs: I::dynamic(),
-            dynamic_outputs: O::dynamic(),
         })
     }
 }
@@ -127,14 +115,7 @@ pub trait System {
 pub trait SystemInputs<W: WakeSink = NoWake> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
 
-    /// The parameter the config's own input ports are bound through, if the
-    /// bundle takes them.
-    fn dynamic() -> Option<Cow<'static, str>> {
-        None
-    }
-
-    /// One binding per [`defs`](SystemInputs::defs) entry, in order, then one
-    /// per port the config added to a dynamic bundle.
+    /// One binding per [`defs`](SystemInputs::defs) entry, in order.
     ///
     /// # Panics
     /// Derived implementations panic on a wrong list length or unsupported frame alignment.
@@ -147,14 +128,7 @@ pub trait SystemInputs<W: WakeSink = NoWake> {
 pub trait SystemOutputs<W: WakeSource = NoWake> {
     fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError>;
 
-    /// The parameter the config's own output ports are bound through, if the
-    /// bundle takes them.
-    fn dynamic() -> Option<Cow<'static, str>> {
-        None
-    }
-
-    /// One binding per [`defs`](SystemOutputs::defs) entry, in order, then one
-    /// per port the config added to a dynamic bundle.
+    /// One binding per [`defs`](SystemOutputs::defs) entry, in order.
     ///
     /// # Panics
     /// Derived implementations panic on a wrong list length or unsupported frame alignment.
@@ -329,22 +303,18 @@ mod tests {
     }
 
     #[test]
-    fn a_static_bundle_is_not_dynamic() {
-        let def = SystemDef::new::<DerivedIn, DerivedOut>("nav", &DefCx::empty())
-            .expect("a static definition");
-        assert_eq!(def.dynamic_inputs, None);
-        assert_eq!(def.dynamic_outputs, None);
-    }
-
-    #[test]
-    fn a_dynamic_bundle_declares_no_ports_and_binds_what_it_is_given() {
+    fn a_dynamic_bundle_takes_its_ports_from_the_config_and_binds_them() {
         use crate::port::{DynInputs, DynOutputs};
 
         let def = SystemDef::new::<DynInputs, DynOutputs>("link", &DefCx::empty())
             .expect("a static definition");
         assert!(def.inputs.is_empty() && def.outputs.is_empty());
-        assert_eq!(def.dynamic_inputs.as_deref(), Some("inputs"));
-        assert_eq!(def.dynamic_outputs.as_deref(), Some("outputs"));
+
+        let producer = Output::<Imu>::def("imu");
+        let edges = [("plant.imu", &producer)];
+        let def = SystemDef::new::<DynInputs, DynOutputs>("link", &DefCx::of_inputs(&edges))
+            .expect("one config port");
+        assert_eq!(def.inputs, vec![Input::<Imu>::def("plant.imu")]);
 
         let (imu, nav) = (ring::<Imu>(), ring::<Nav>());
         let mut bound = DynInputs::bind(bound_in(vec![

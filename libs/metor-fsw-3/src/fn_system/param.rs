@@ -11,34 +11,36 @@ use crate::port::{DynInputs, DynOutputs, Input, Output};
 use crate::record::Record;
 use crate::system::{InputBinding, OutputBinding, PortDef, SystemInputs, SystemOutputs};
 
-/// The bindings a bundle binds from: one per declared port in order, then the
-/// ports a dynamic bundle's config added.
+/// The bindings a bundle binds from, in parameter order: each parameter takes
+/// the share its [`Defs`] walk appended.
 pub struct Bindings<B> {
-    declared: std::vec::IntoIter<B>,
-    dynamic: Vec<B>,
+    items: std::vec::IntoIter<B>,
+    counts: std::vec::IntoIter<usize>,
 }
 
 impl<B> Bindings<B> {
-    /// Creates a binding from 'all' with the first `declared` ports reserved for declared ports.
-    pub(crate) fn new(mut all: Vec<B>, declared: usize) -> Self {
-        let dynamic = all.split_off(declared);
+    /// Hands out `items` in the shares `counts` names.
+    pub(crate) fn new(items: Vec<B>, counts: Vec<usize>) -> Self {
         Self {
-            declared: all.into_iter(),
-            dynamic,
+            items: items.into_iter(),
+            counts: counts.into_iter(),
         }
     }
 
+    /// The one binding the next parameter takes.
     pub(crate) fn next(&mut self) -> Option<B> {
-        self.declared.next()
+        self.counts.next()?;
+        self.items.next()
     }
 
-    /// Takes every port the config added, for the one dynamic parameter.
-    fn take_dynamic(&mut self) -> Vec<B> {
-        core::mem::take(&mut self.dynamic)
+    /// Every binding the next parameter takes.
+    pub(crate) fn take(&mut self) -> Vec<B> {
+        let count = self.counts.next().unwrap_or_default();
+        self.items.by_ref().take(count).collect()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.declared.len() == 0 && self.dynamic.is_empty()
+        self.items.len() == 0
     }
 }
 
@@ -49,26 +51,74 @@ pub type Writers = Bindings<OutputBinding>;
 /// A bundles parameter names
 pub type ParamNames<'n> = core::slice::Iter<'n, &'static str>;
 
-/// The port definitions for a system
+/// The ports a system's parameters take under one instance's config, and how
+/// many each of them took.
 #[derive(Default)]
-pub struct PortDefs {
-    /// Static inputs
+pub struct Defs {
     pub inputs: Vec<PortDef>,
-    /// Static outputs
     pub outputs: Vec<PortDef>,
-    /// The name of the dynamic input parameter
-    pub dynamic_inputs: Option<Cow<'static, str>>,
-    /// The name of the dynamic output parameter
-    pub dynamic_outputs: Option<Cow<'static, str>>,
+    /// One count per input parameter, in parameter order.
+    pub(crate) input_counts: Vec<usize>,
+    /// One count per output parameter, in parameter order.
+    pub(crate) output_counts: Vec<usize>,
+    declared_inputs: Vec<Cow<'static, str>>,
+    declared_outputs: Vec<Cow<'static, str>>,
 }
 
-impl PortDefs {
-    /// Every port a system's parameters declare, under the names it gave them.
+impl Defs {
+    /// Every port a system's parameters take under `cx`, under the names it gave them.
     pub fn of<S: crate::fn_system::Ports>(cx: &DefCx<'_>) -> Result<Self, DefError> {
-        let mut defs = Self::default();
+        let declared = Self::walk::<S>(&DefCx::empty(), Self::default())?;
+        Self::walk::<S>(
+            cx,
+            Self {
+                declared_inputs: names(&declared.inputs),
+                declared_outputs: names(&declared.outputs),
+                ..Self::default()
+            },
+        )
+    }
+
+    fn walk<S: crate::fn_system::Ports>(cx: &DefCx<'_>, mut defs: Self) -> Result<Self, DefError> {
         S::Params::append_defs(&mut S::NAMES.iter(), cx, &mut defs)?;
         Ok(defs)
     }
+
+    /// Appends the one port a declared parameter names.
+    pub fn push_input(&mut self, def: PortDef) {
+        self.inputs.push(def);
+        self.input_counts.push(1);
+    }
+
+    pub fn push_output(&mut self, def: PortDef) {
+        self.outputs.push(def);
+        self.output_counts.push(1);
+    }
+
+    /// Appends the ports one parameter takes from the config.
+    pub fn push_inputs(&mut self, defs: Vec<PortDef>) {
+        self.input_counts.push(defs.len());
+        self.inputs.extend(defs);
+    }
+
+    pub fn push_outputs(&mut self, defs: Vec<PortDef>) {
+        self.output_counts.push(defs.len());
+        self.outputs.extend(defs);
+    }
+
+    /// The input ports the type declares whatever its config.
+    pub fn declared_inputs(&self) -> &[Cow<'static, str>] {
+        &self.declared_inputs
+    }
+
+    /// The output ports the type declares whatever its config.
+    pub fn declared_outputs(&self) -> &[Cow<'static, str>] {
+        &self.declared_outputs
+    }
+}
+
+fn names(ports: &[PortDef]) -> Vec<Cow<'static, str>> {
+    ports.iter().map(|port| port.name.clone()).collect()
 }
 
 /// `Cycle` is the extra parameter passed to execute beyonds its ports.
@@ -118,7 +168,7 @@ pub trait Param {
     fn append_defs(
         names: &mut ParamNames<'_>,
         cx: &DefCx<'_>,
-        defs: &mut PortDefs,
+        defs: &mut Defs,
     ) -> Result<(), DefError>;
 
     /// Returns this parameter's input (if one exists) by popping a view from `views`.
@@ -151,9 +201,9 @@ impl<T: Record + 'static + ?Sized, D: WakeSink + 'static> Param for Input<T, D> 
     fn append_defs(
         names: &mut ParamNames<'_>,
         _cx: &DefCx<'_>,
-        defs: &mut PortDefs,
+        defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.inputs.push(Input::<T>::def(name(names)));
+        defs.push_input(Input::<T>::def(name(names)));
         Ok(())
     }
 
@@ -183,9 +233,9 @@ impl<T: Record + 'static + ?Sized> Param for Output<T> {
     fn append_defs(
         names: &mut ParamNames<'_>,
         _cx: &DefCx<'_>,
-        defs: &mut PortDefs,
+        defs: &mut Defs,
     ) -> Result<(), DefError> {
-        defs.outputs.push(Output::<T>::def(name(names)));
+        defs.push_output(Output::<T>::def(name(names)));
         Ok(())
     }
 
@@ -214,21 +264,17 @@ impl<D: WakeSink + 'static> Param for DynInputs<D> {
 
     fn append_defs(
         names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
-        defs: &mut PortDefs,
+        cx: &DefCx<'_>,
+        defs: &mut Defs,
     ) -> Result<(), DefError> {
-        let taken = defs.dynamic_inputs.replace(name(names).into());
-        // PANIC Safety: only a system with two dynamic input parameters
-        // reaches this, when its definition is built; the message names the fix.
-        assert!(
-            taken.is_none(),
-            "a system takes `&mut DynInputs` at most once"
-        );
+        name(names);
+        let ports = crate::port::dyn_input_defs(cx, defs.declared_inputs())?;
+        defs.push_inputs(ports);
         Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(views: &mut Views<W>) -> Self::In<W> {
-        SystemInputs::bind(views.take_dynamic())
+        SystemInputs::bind(views.take())
     }
 
     fn bind_out(_writers: &mut Writers) {}
@@ -249,22 +295,19 @@ impl Param for DynOutputs {
 
     fn append_defs(
         names: &mut ParamNames<'_>,
-        _cx: &DefCx<'_>,
-        defs: &mut PortDefs,
+        cx: &DefCx<'_>,
+        defs: &mut Defs,
     ) -> Result<(), DefError> {
-        let taken = defs.dynamic_outputs.replace(name(names).into());
-        // PANIC Safety: as for `DynInputs`.
-        assert!(
-            taken.is_none(),
-            "a system takes `&mut DynOutputs` at most once"
-        );
+        name(names);
+        let ports = crate::port::dyn_output_defs(cx, defs.declared_outputs())?;
+        defs.push_outputs(ports);
         Ok(())
     }
 
     fn bind_in<W: WakeSink + Clone + 'static>(_views: &mut Views<W>) {}
 
     fn bind_out(writers: &mut Writers) -> Self::Out {
-        SystemOutputs::bind(writers.take_dynamic())
+        SystemOutputs::bind(writers.take())
     }
 
     fn get<'a, W: WakeSink + Clone + 'static>(
@@ -284,7 +327,7 @@ impl Param for Timestamp {
     fn append_defs(
         names: &mut ParamNames<'_>,
         _cx: &DefCx<'_>,
-        _defs: &mut PortDefs,
+        _defs: &mut Defs,
     ) -> Result<(), DefError> {
         name(names);
         Ok(())
@@ -311,7 +354,7 @@ impl Param for Log {
     fn append_defs(
         names: &mut ParamNames<'_>,
         _cx: &DefCx<'_>,
-        _defs: &mut PortDefs,
+        _defs: &mut Defs,
     ) -> Result<(), DefError> {
         name(names);
         Ok(())
@@ -339,7 +382,7 @@ macro_rules! impl_param_for_tuple {
             type Item<'a, W: WakeSink + Clone + 'static> = ($($P::Item<'a, W>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
-            fn append_defs(names: &mut ParamNames<'_>, cx: &DefCx<'_>, defs: &mut PortDefs) -> Result<(), DefError> {
+            fn append_defs(names: &mut ParamNames<'_>, cx: &DefCx<'_>, defs: &mut Defs) -> Result<(), DefError> {
                 $( $P::append_defs(names, cx, defs)?; )*
                 Ok(())
             }

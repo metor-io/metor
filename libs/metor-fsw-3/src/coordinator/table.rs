@@ -9,7 +9,7 @@ use serde_json::value::RawValue;
 
 use crate::RecordSchema;
 use crate::async_system::AsyncSystem;
-use crate::def::{DefCx, DefError};
+use crate::def::{DefCx, DefError, Records};
 use crate::fn_system::{AsyncSystemFn, Ctor, FnAsyncSystem, FnSystem, SystemFn};
 use crate::system::{
     InputBinding, OutputBinding, PortDef, System, SystemDef, SystemInputs, SystemOutputs,
@@ -37,13 +37,25 @@ pub struct MakeCx<'a> {
 /// Builds a system from [`MakeCx`].
 pub(crate) type MakeFn = dyn Fn(MakeCx<'_>) -> Result<Box<dyn Step>, ParamError>;
 
+/// Computes one instance's definition from its config.
+pub(crate) type DefFn = dyn Fn(&DefCx<'_>) -> Result<SystemDef, DefError>;
+
 pub(crate) struct TableEntry {
+    /// The ports the type declares whatever a config says.
     pub def: SystemDef,
+    pub def_fn: Box<DefFn>,
     /// The doc comment on the type's `execute`, empty for the trait path.
     pub doc: Cow<'static, str>,
     /// The JSON Schema of the type's params, `None` when it takes none.
     pub schema: Option<Box<RawValue>>,
     pub make: Box<MakeFn>,
+}
+
+impl TableEntry {
+    /// This type's definition under one instance's config.
+    pub(crate) fn def_for(&self, cx: &DefCx<'_>) -> Result<SystemDef, DefError> {
+        (self.def_fn)(cx)
+    }
 }
 
 /// A `SystemTable` maps systems names to their definitions and constructors.
@@ -147,11 +159,12 @@ impl SystemTable {
         self.entries.iter().map(|(ty, entry)| (ty.as_str(), entry))
     }
 
-    /// Finds a record among the registered ports and the implicit status port.
-    pub(crate) fn record(&self, name: &str) -> Option<&PortDef> {
-        core::iter::once(&*STATUS)
-            .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def)))
-            .find(|port| port.record == name)
+    /// Every record the registered ports and the implicit status port declare.
+    pub(crate) fn records(&self) -> Records {
+        Records::of(
+            core::iter::once(&*STATUS)
+                .chain(self.entries().flat_map(|(_, entry)| ports(&entry.def))),
+        )
     }
 }
 
@@ -226,6 +239,7 @@ fn entry<S: System + 'static>(
 ) -> Result<TableEntry, DefError> {
     Ok(TableEntry {
         def: S::def(&DefCx::empty())?,
+        def_fn: Box::new(S::def),
         doc,
         schema,
         make: Box::new(move |cx| {
@@ -283,6 +297,7 @@ where
     let make = std::sync::Arc::new(make);
     Ok(TableEntry {
         def: A::def(&DefCx::empty())?,
+        def_fn: Box::new(A::def),
         doc,
         schema,
         make: Box::new(move |cx| crate::thread::place::<A, M>(make.clone(), cx)),
@@ -297,6 +312,11 @@ mod tests {
     use crate::tests::utils::{Imu, ImuOffset, ImuSource, NavFilter};
     use crate::{MsgCodec, Output};
     use metor_proto::types::ComponentId;
+
+    /// The port declaring `name`, as the table sees it.
+    fn record(table: &SystemTable, name: &str) -> Option<PortDef> {
+        table.records().get(name).cloned()
+    }
 
     /// A type's definition under the empty context.
     fn static_def<S: System>() -> SystemDef {
@@ -325,8 +345,8 @@ mod tests {
     #[test]
     fn record_lookup_includes_implicit_status_and_repeated_ports() {
         let mut table = SystemTable::new();
-        assert_eq!(table.record("status"), Some(&*STATUS));
-        assert!(table.record("missing").is_none());
+        assert_eq!(record(&table, "status"), Some(STATUS.clone()));
+        assert!(record(&table, "missing").is_none());
         let first = Output::<Imu>::def("first");
         let mut second = first.clone();
         second.name = "second".into();
@@ -336,7 +356,7 @@ mod tests {
         table
             .insert("two", declared(vec![first.clone()]))
             .expect("same record");
-        assert_eq!(table.record(Imu::NAME), Some(&first));
+        assert_eq!(record(&table, Imu::NAME), Some(first.clone()));
     }
 
     #[test]
@@ -353,7 +373,7 @@ mod tests {
             })
         );
         assert!(table.get("bytes").is_none());
-        assert_eq!(table.record("command"), Some(&first));
+        assert_eq!(record(&table, "command"), Some(first.clone()));
     }
 
     #[test]
@@ -392,8 +412,8 @@ mod tests {
             Err(BuildError::RecordConflict { .. })
         ));
         assert_eq!(table.entries().count(), 0);
-        assert!(table.record("unrelated").is_none());
-        assert!(table.record("command").is_none());
+        assert!(record(&table, "unrelated").is_none());
+        assert!(record(&table, "command").is_none());
     }
 
     #[test]
@@ -424,8 +444,8 @@ mod tests {
         assert!(table.get("new").is_some());
         assert!(table.get("bad").is_none());
         assert!(table.get("later").is_none());
-        assert_eq!(table.record("command"), Some(&original));
-        assert!(table.record("new").is_some());
+        assert_eq!(record(&table, "command"), Some(original.clone()));
+        assert!(record(&table, "new").is_some());
     }
 
     #[test]
@@ -443,8 +463,8 @@ mod tests {
         ];
         table.insert_all(pack).expect("compatible replacement");
         assert_eq!(table.entries().count(), 1);
-        assert!(table.record("first").is_none());
-        assert!(table.record("second").is_some());
+        assert!(record(&table, "first").is_none());
+        assert!(record(&table, "second").is_some());
     }
 
     #[test]
@@ -465,7 +485,7 @@ mod tests {
             table.insert_all(pack),
             Err(BuildError::RecordConflict { .. })
         ));
-        assert_eq!(table.record("command"), Some(&old));
+        assert_eq!(record(&table, "command"), Some(old.clone()));
         assert_eq!(
             table.entries().map(|(name, _)| name).collect::<Vec<_>>(),
             ["one", "two"]
@@ -533,9 +553,9 @@ mod tests {
         table
             .insert("one", declared(vec![new.clone()]))
             .expect("replacement");
-        assert!(table.record("old").is_none());
-        assert_eq!(table.record("shared"), Some(&shared));
-        assert_eq!(table.record("new"), Some(&new));
+        assert!(record(&table, "old").is_none());
+        assert_eq!(record(&table, "shared"), Some(shared.clone()));
+        assert_eq!(record(&table, "new"), Some(new.clone()));
         assert_eq!(
             table.entries().map(|(name, _)| name).collect::<Vec<_>>(),
             ["one", "two"]

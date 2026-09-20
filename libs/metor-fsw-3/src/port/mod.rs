@@ -222,10 +222,46 @@ impl<T: Record + ?Sized> Input<T, Notifier> {
     }
 }
 
+/// One port per config edge no declared port took, under the config's name
+/// and its producer's definition.
+pub fn dyn_input_defs(
+    cx: &DefCx<'_>,
+    declared: &[Cow<'static, str>],
+) -> Result<Vec<PortDef>, DefError> {
+    let mut ports: Vec<PortDef> = Vec::new();
+    for (name, producer) in cx.inputs {
+        if declared.iter().any(|taken| taken == name) {
+            continue;
+        }
+        if ports.iter().any(|port| port.name == *name) {
+            return Err(DefError::FanIn {
+                port: name.to_string(),
+            });
+        }
+        ports.push(PortDef {
+            name: name.to_string().into(),
+            ..(*producer).clone()
+        });
+    }
+    Ok(ports)
+}
+
+/// One port per config output no declared port took, defined by the record it names.
+pub fn dyn_output_defs(
+    cx: &DefCx<'_>,
+    declared: &[Cow<'static, str>],
+) -> Result<Vec<PortDef>, DefError> {
+    cx.outputs
+        .iter()
+        .filter(|output| !declared.iter().any(|taken| *taken == output.port))
+        .map(|output| cx.records.port(&output.port, &output.record))
+        .collect()
+}
+
 /// A `DynInputs` is the input side of a system whose ports the config lists.
 ///
-/// Each port carries the definition build completed for it and the bytes its
-/// producers wrote, undecoded.
+/// Each port carries the definition it computed from the config and the bytes
+/// its producer wrote, undecoded.
 pub struct DynInputs<W: WakeSink = NoWake> {
     ports: Vec<(PortDef, Input<Bytes, W>)>,
 }
@@ -253,12 +289,8 @@ impl DynInputs<Notifier> {
 }
 
 impl<W: WakeSink> SystemInputs<W> for DynInputs<W> {
-    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-        Ok(Vec::new())
-    }
-
-    fn dynamic() -> Option<Cow<'static, str>> {
-        Some(Cow::Borrowed("inputs"))
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        dyn_input_defs(cx, &[])
     }
 
     fn bind(inputs: Vec<InputBinding<W>>) -> Self {
@@ -290,12 +322,8 @@ impl<W: WakeSource> DynOutputs<W> {
 }
 
 impl<W: WakeSource> SystemOutputs<W> for DynOutputs<W> {
-    fn defs(_cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
-        Ok(Vec::new())
-    }
-
-    fn dynamic() -> Option<Cow<'static, str>> {
-        Some(Cow::Borrowed("outputs"))
+    fn defs(cx: &DefCx<'_>) -> Result<Vec<PortDef>, DefError> {
+        dyn_output_defs(cx, &[])
     }
 
     fn bind(outputs: Vec<OutputBinding<W>>) -> Self {

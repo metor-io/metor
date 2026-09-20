@@ -181,8 +181,10 @@ impl SystemTable {
         for system in pack.systems() {
             let (lib, fns) = (pack.lib.clone(), pack.fns);
             let ty = system.ty.to_string();
+            let def = system.def.clone();
             let entry = TableEntry {
-                def: system.def.clone(),
+                def: def.clone(),
+                def_fn: Box::new(move |_cx| Ok(def.clone())),
                 doc: system.doc.clone(),
                 schema: system.params.clone(),
                 make: Box::new(move |cx| {

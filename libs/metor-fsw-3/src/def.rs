@@ -32,6 +32,26 @@ impl DefCx<'static> {
     }
 }
 
+impl<'a> DefCx<'a> {
+    /// The context of one instance's input edges.
+    pub fn of_inputs(inputs: &'a [(&'a str, &'a PortDef)]) -> Self {
+        Self {
+            inputs,
+            outputs: &[],
+            records: &NO_RECORDS,
+        }
+    }
+
+    /// The context of one instance's output ports.
+    pub fn of_outputs(outputs: &'a [OutputConfig], records: &'a Records) -> Self {
+        Self {
+            inputs: &[],
+            outputs,
+            records,
+        }
+    }
+}
+
 /// A `DefError` is why a type refused its instance config.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum DefError {
@@ -68,6 +88,11 @@ impl Records {
             }
         }
         Self(records)
+    }
+
+    /// The port declaring `record`, absent when it is unknown or disputed.
+    pub fn get(&self, record: &str) -> Option<&PortDef> {
+        self.0.get(record)?.as_ref()
     }
 
     /// The record `record` names, as a port called `port`.
